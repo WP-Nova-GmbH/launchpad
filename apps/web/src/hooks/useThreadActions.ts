@@ -25,7 +25,6 @@ import {
   readEnvironmentSupportsSettlement,
   readEnvironmentSupportsSnooze,
   readEnvironmentSupportsVisitedTracking,
-  readEnvironmentAllThreadRefs,
   readEnvironmentThreadRefs,
   readProject,
   readThreadShell,
@@ -37,6 +36,7 @@ import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { useClientSettings } from "./useSettings";
 import { useAtomCommand } from "../state/use-atom-command";
+import { orchestrationEnvironment } from "../state/orchestration";
 
 export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArchiveBlockedError>()(
   "ThreadArchiveBlockedError",
@@ -134,6 +134,10 @@ export function useThreadActions() {
   });
   const deleteThreadMutation = useAtomCommand(threadEnvironment.delete, {
     reportFailure: false,
+  });
+  const listAllThreadRefs = useAtomCommand(orchestrationEnvironment.v2.listAllThreadRefs, {
+    reportFailure: false,
+    reportDefect: false,
   });
   const settleThreadMutation = useAtomCommand(threadEnvironment.settle, {
     reportFailure: false,
@@ -264,12 +268,20 @@ export function useThreadActions() {
         const shell = readThreadShell(ref);
         return shell === null ? [] : [shell];
       });
-      // Worktree bookkeeping must include hidden subagent threads: deleting a
-      // parent does not cascade to them, so they can still hold the worktree.
-      const allThreads = readEnvironmentAllThreadRefs(threadRef.environmentId).flatMap((ref) => {
-        const shell = readThreadShell(ref);
-        return shell === null ? [] : [shell];
+      // Worktree bookkeeping must include hidden subagent threads. Older
+      // servers do not expose this unfiltered query, so failure conservatively
+      // disables cleanup instead of guessing from the user-facing snapshot.
+      const allThreadRefsResult = await listAllThreadRefs({
+        environmentId: threadRef.environmentId,
+        input: {},
       });
+      const allThreads =
+        allThreadRefsResult._tag === "Success"
+          ? allThreadRefsResult.value.threadRefs.map((ref) => ({
+              id: ref.threadId,
+              worktreePath: ref.worktreePath,
+            }))
+          : null;
       const threadProject = readProject({
         environmentId: threadRef.environmentId,
         projectId: thread.projectId,
@@ -284,15 +296,15 @@ export function useThreadActions() {
             )
           : undefined;
       const survivingThreads =
-        deletedIds && deletedIds.size > 0
+        allThreads !== null && deletedIds && deletedIds.size > 0
           ? allThreads.filter(
               (entry) => entry.id === threadRef.threadId || !deletedIds.has(entry.id),
             )
           : allThreads;
-      const orphanedWorktreePath = getOrphanedWorktreePathForThread(
-        survivingThreads,
-        threadRef.threadId,
-      );
+      const orphanedWorktreePath =
+        survivingThreads === null
+          ? null
+          : getOrphanedWorktreePathForThread(survivingThreads, threadRef.threadId);
       const displayWorktreePath = orphanedWorktreePath
         ? formatWorktreePathForDisplay(orphanedWorktreePath)
         : null;
@@ -442,6 +454,7 @@ export function useThreadActions() {
       closeTerminal,
       deleteThreadMutation,
       getCurrentRouteThreadRef,
+      listAllThreadRefs,
       refreshVcsStatus,
       removeWorktree,
       router,

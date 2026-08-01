@@ -25,6 +25,7 @@ import {
   OrchestrationV2Command,
   OrchestrationV2DomainEvent,
   OrchestrationV2DomainEventJson,
+  OrchestrationV2ListAllThreadRefsResult,
   OrchestrationV2ShellSnapshot,
   OrchestrationV2Subagent,
   OrchestrationV2SubagentActivation,
@@ -51,6 +52,9 @@ const decodeOrchestrationV2Subagent = Schema.decodeUnknownSync(OrchestrationV2Su
 const decodeOrchestrationV2SubagentActivation = Schema.decodeUnknownSync(
   OrchestrationV2SubagentActivation,
 );
+const decodeOrchestrationV2ListAllThreadRefsResult = Schema.decodeUnknownSync(
+  OrchestrationV2ListAllThreadRefsResult,
+);
 const decodeOrchestrationV2DomainEventJson = Schema.decodeUnknownSync(
   OrchestrationV2DomainEventJson,
 );
@@ -59,6 +63,25 @@ const decodeStoredOrchestrationV2Subagent = Schema.decodeUnknownSync(
 );
 
 describe("orchestration V2 contracts", () => {
+  it("decodes compact unfiltered thread references", () => {
+    expect(
+      decodeOrchestrationV2ListAllThreadRefsResult({
+        threadRefs: [
+          {
+            threadId: "thread-1",
+            projectId: "project-1",
+            worktreePath: "/workspace/project/.worktrees/feature",
+          },
+          {
+            threadId: "thread-2",
+            projectId: "project-1",
+            worktreePath: null,
+          },
+        ],
+      }).threadRefs,
+    ).toHaveLength(2);
+  });
+
   it("lets legacy snapshot decoders ignore enrichment metadata", () => {
     const decoded = decodeLegacyShellStreamItem({
       kind: "snapshot",
