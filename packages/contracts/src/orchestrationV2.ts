@@ -2179,6 +2179,7 @@ export const OrchestrationV2ThreadLaunchInput = Schema.Struct({
   reuseExistingThread: Schema.optional(Schema.Boolean),
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  titleSeed: Schema.optional(TrimmedNonEmptyString),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
