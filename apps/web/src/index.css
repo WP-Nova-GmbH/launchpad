@@ -1416,11 +1416,6 @@ label:has(> select#reasoning-effort) select {
   margin: 0.65rem 0;
   overflow: hidden;
   border-radius: var(--radius);
-  background: color-mix(in srgb, var(--muted) 96%, var(--foreground));
-}
-
-.dark .chat-markdown .chat-markdown-codeblock {
-  background: color-mix(in srgb, var(--muted) 20%, var(--background));
 }
 
 .chat-markdown .chat-markdown-codeblock-header {

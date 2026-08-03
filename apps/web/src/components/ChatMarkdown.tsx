@@ -594,7 +594,7 @@ function MarkdownCodeBlock({
 
   return (
     <div
-      className="chat-markdown-codeblock leading-snug"
+      className="chat-markdown-codeblock bg-secondary leading-snug dark:bg-input/32"
       data-language={language}
       data-wrap={wrapped ? "true" : "false"}
     >
