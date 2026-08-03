@@ -119,6 +119,7 @@ export interface BootServiceStatus {
   readonly supported: boolean;
   readonly installed: boolean;
   readonly current: boolean;
+  readonly installedVersion?: string;
   readonly unitPath: string;
   readonly logPath: string;
 }
@@ -373,6 +374,7 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
     return {
       supported: true,
       installed: true,
+      ...(state?.activeVersion === undefined ? {} : { installedVersion: state.activeVersion }),
       current:
         unit === renderBootServiceUnit(plan) &&
         launcherExists &&

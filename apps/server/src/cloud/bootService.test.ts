@@ -101,7 +101,10 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
         activeVersion: "1.2.3",
       });
       expect(yield* fs.readFileString(plan.launcherPath)).toBe("export {};\n");
-      expect((yield* service.status).current).toBe(true);
+      expect(yield* service.status).toMatchObject({
+        current: true,
+        installedVersion: "1.2.3",
+      });
       yield* fs.writeFileString(
         statePath,
         '{"protocol":1,"activeVersion":"1.2.3","update":{"id":"u","fromVersion":"1.2.3","targetVersion":"1.2.4","status":"pending"}}',
