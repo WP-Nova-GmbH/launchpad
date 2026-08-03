@@ -606,7 +606,7 @@ function MarkdownCodeBlock({
             theme={theme}
           />
         </span>
-        <span className="flex items-center gap-0.5">
+        <span className="flex items-center gap-0.5" role="toolbar" aria-label="Code block actions">
           <Tooltip>
             <TooltipTrigger
               render={
