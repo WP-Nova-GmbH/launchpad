@@ -12,3 +12,6 @@
 10. `10-unify-process-session-abstraction.md`
 19. `19-version-control-phase-1-vcs-driver-foundation.md`
 20. `20-version-control-phase-2-source-control-provider-foundation.md`
+21. `21-org-control-plane-foundation.md`
+22. `22-org-control-plane-roadmap.md`
+23. `23-org-control-plane-agent-brief.md`
