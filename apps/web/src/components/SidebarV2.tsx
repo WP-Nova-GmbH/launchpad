@@ -2212,9 +2212,13 @@ export default function SidebarV2() {
         const thread = threadByKeyRef.current.get(threadKey);
         return thread ? [thread] : [];
       });
+      // Pinned threads count as un-snoozable: the pin overrides snooze
+      // classification, so snoozing one would toast and navigate as if the
+      // row left the inbox while the pinned card stays visible.
       const canSnoozeSelection = selectedThreads.every(
         (thread) =>
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true &&
+          thread.pinnedAt == null &&
           canSnooze(thread, { now: selectionNow.toISOString() }),
       );
       const titleRegenerationThreads = selectedThreads.filter(
@@ -2297,11 +2301,13 @@ export default function SidebarV2() {
         // Post-settle navigation must skip threads settling in this same
         // batch — they are all leaving the card block together. Rows that
         // are already explicitly settled are skipped: nothing to do on a
-        // valid mixed selection.
+        // valid mixed selection. Pinned rows are skipped the same way: the
+        // pin overrides settled classification, so settling one would only
+        // stamp invisible state that surfaces after unpin.
         const coSettlingKeys = new Set(threadKeys);
         for (const threadKey of threadKeys) {
           const thread = threadByKeyRef.current.get(threadKey);
-          if (!thread || thread.settledOverride === "settled") continue;
+          if (!thread || thread.settledOverride === "settled" || thread.pinnedAt != null) continue;
           attemptSettle(scopeThreadRef(thread.environmentId, thread.id), { coSettlingKeys });
         }
         clearSelection();
