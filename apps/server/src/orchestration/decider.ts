@@ -630,6 +630,60 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       };
     }
 
+    case "thread.pin": {
+      const thread = yield* requireThreadNotArchived({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      const occurredAt = yield* nowIso;
+      // Re-pinning an already-pinned thread is a duplicate (double-click,
+      // raced clients): re-emit with the original timestamps so the
+      // projection is a no-op. Pinning has no lifecycle invariants — a pin
+      // only ever promotes visibility, so it can never hide pending work.
+      const existingPinnedAt = thread.pinnedAt ?? null;
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.pinned",
+        payload: {
+          threadId: command.threadId,
+          pinnedAt: existingPinnedAt ?? occurredAt,
+          updatedAt: existingPinnedAt !== null ? thread.updatedAt : occurredAt,
+        },
+      };
+    }
+
+    case "thread.unpin": {
+      const thread = yield* requireThreadNotArchived({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      // Idempotent by re-emission (see thread.settle): unpinning a thread
+      // that is not pinned lands on the same null state without churning
+      // updatedAt.
+      const alreadyUnpinned = thread.pinnedAt == null;
+      const occurredAt = yield* nowIso;
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.unpinned",
+        payload: {
+          threadId: command.threadId,
+          updatedAt: alreadyUnpinned ? thread.updatedAt : occurredAt,
+        },
+      };
+    }
+
     case "thread.meta.update": {
       const thread = yield* requireThread({
         readModel,

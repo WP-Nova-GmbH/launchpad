@@ -288,6 +288,43 @@ describe("buildThreadListV2Items", () => {
     expect(layout.snoozedCount).toBe(1);
   });
 
+  it("renders pinned threads first and exempts them from the lifecycle — parity with web", () => {
+    const layout = buildThreadListV2Items({
+      threads: [
+        makeThread({ id: ThreadId.make("active"), title: "Active" }),
+        makeThread({
+          id: ThreadId.make("pinned-snoozed"),
+          title: "Pinned while snoozed",
+          pinnedAt: "2026-06-01T12:00:00.000Z",
+          // The pin overrides the snooze: the thread must render in the
+          // pinned block, not vanish into the snoozed shelf.
+          snoozedUntil: "2026-06-03T09:00:00.000Z",
+          snoozedAt: "2026-06-01T11:00:00.000Z",
+        }),
+        makeThread({
+          id: ThreadId.make("pinned-settled"),
+          title: "Pinned while settled",
+          pinnedAt: "2026-06-01T12:00:00.000Z",
+          settledOverride: "settled",
+          settledAt: "2026-06-01T12:00:00.000Z",
+        }),
+      ],
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+    });
+
+    expect(layout.items.map((item) => item.thread.id)).toEqual([
+      "pinned-settled",
+      "pinned-snoozed",
+      "active",
+    ]);
+    expect(layout.items.map((item) => item.pinned)).toEqual([true, true, false]);
+    expect(layout.items.every((item) => !item.snoozed)).toBe(true);
+    expect(layout.snoozedCount).toBe(0);
+    expect(layout.settledCount).toBe(0);
+  });
+
   it("classifies snooze with the second-precise clock and reports the next wake", () => {
     const layout = buildThreadListV2Items({
       threads: [

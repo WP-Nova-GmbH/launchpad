@@ -82,6 +82,13 @@ const SNOOZED_MENU_ACTIONS: MenuAction[] = [
   { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
 ];
 
+// Pinned rows: the pin overrides settle/snooze, so Unpin is the only
+// lifecycle item on offer.
+const PINNED_MENU_ACTIONS: MenuAction[] = [
+  { id: "unpin", title: "Unpin", image: "pin.slash" },
+  { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
+];
+
 // Pre-settlement servers: no lifecycle items, archive fills the gap.
 const LEGACY_MENU_ACTIONS: MenuAction[] = [
   { id: "archive", title: "Archive", image: "archivebox" },
@@ -305,6 +312,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly variant: "card" | "slim";
   /** Snoozed-shelf row: shows its wake time and offers Wake. */
   readonly snoozed?: boolean;
+  /** Pinned-block row: shows the pin glyph and offers Unpin. */
+  readonly pinned?: boolean;
   /** Preformatted against the parent minute tick so this memoized row's
       countdown keeps moving. */
   readonly snoozeWakeLabelText?: string;
@@ -337,11 +346,15 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly onUnsnoozeThread: (thread: EnvironmentThreadShell) => void;
   readonly onUnsettleThread: (thread: EnvironmentThreadShell) => void;
   readonly onArchiveThread: (thread: EnvironmentThreadShell) => void;
+  readonly onPinThread: (thread: EnvironmentThreadShell) => void;
+  readonly onUnpinThread: (thread: EnvironmentThreadShell) => void;
   /** False on environments whose server predates thread.settle/unsettle:
       swipe + menu fall back to Archive instead of failing on use. */
   readonly settlementSupported: boolean;
   /** False on servers that predate thread.snooze/unsnooze. */
   readonly snoozeSupported: boolean;
+  /** False on servers that predate thread.pin/unpin. */
+  readonly pinningSupported: boolean;
   readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
   readonly onSwipeableClose: (methods: SwipeableMethods) => void;
   /** Reports this row's live PR state up so the partition can auto-settle
@@ -368,9 +381,12 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     onUnsnoozeThread,
     onUnsettleThread,
     onArchiveThread,
+    onPinThread,
+    onUnpinThread,
     onChangeRequestState,
   } = props;
   const snoozedRow = props.snoozed === true;
+  const pinnedRow = props.pinned === true;
 
   const pr = useThreadPr(thread, props.projectCwd ?? props.project?.workspaceRoot ?? null);
   const prState = pr?.state ?? null;
@@ -383,6 +399,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const drawerColor = useThemeColor("--color-drawer");
   const pressedBackgroundColor = useThemeColor("--color-subtle");
   const selectedBackgroundColor = useThemeColor("--color-user-bubble");
+  const pinTintColor = useThemeColor("--color-foreground-muted");
   const sidebarPane = props.pane === "sidebar";
   const selected = props.selected === true;
 
@@ -398,6 +415,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   );
   const handleUnsnooze = useCallback(() => onUnsnoozeThread(thread), [onUnsnoozeThread, thread]);
   const handleUnsettle = useCallback(() => onUnsettleThread(thread), [onUnsettleThread, thread]);
+  const handlePin = useCallback(() => onPinThread(thread), [onPinThread, thread]);
+  const handleUnpin = useCallback(() => onUnpinThread(thread), [onUnpinThread, thread]);
   const handleArchive = useCallback(() => onArchiveThread(thread), [onArchiveThread, thread]);
 
   // Swipe: the v2 primary action is the lifecycle transition. Every settled
@@ -420,6 +439,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     snoozeSupported: props.snoozeSupported,
     snoozable: canSnooze(thread, { now: new Date().toISOString() }),
     snoozed: snoozedRow,
+    pinned: pinnedRow,
   });
   const snoozePresets = useMemo(
     () => (swipeActions.secondary === "snooze" ? resolveSnoozePresets(new Date()) : ([] as const)),
@@ -443,15 +463,29 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         image: "clock",
         subactions: snoozePresetActions,
       },
+      ...(props.pinningSupported ? [{ id: "pin", title: "Pin", image: "pin" } as MenuAction] : []),
       { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
     ],
-    [snoozePresetActions],
+    [props.pinningSupported, snoozePresetActions],
+  );
+  const cardMenuActions = useMemo<MenuAction[]>(
+    () =>
+      props.pinningSupported
+        ? [
+            CARD_MENU_ACTIONS[0]!,
+            { id: "pin", title: "Pin", image: "pin" },
+            ...CARD_MENU_ACTIONS.slice(1),
+          ]
+        : CARD_MENU_ACTIONS,
+    [props.pinningSupported],
   );
   const handleMenuAction = useCallback(
     ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
       if (nativeEvent.event === "settle") handleSettle();
       if (nativeEvent.event === "unsettle") handleUnsettle();
       if (nativeEvent.event === "unsnooze") handleUnsnooze();
+      if (nativeEvent.event === "pin") handlePin();
+      if (nativeEvent.event === "unpin") handleUnpin();
       if (nativeEvent.event === "archive") handleArchive();
       if (nativeEvent.event === "delete") handleDelete();
       const snoozeSelection = resolveThreadListV2SnoozeMenuSelection({
@@ -468,8 +502,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     [
       handleArchive,
       handleDelete,
+      handlePin,
       handleSettle,
       handleSnooze,
+      handleUnpin,
       handleUnsettle,
       handleUnsnooze,
       snoozePresets,
@@ -485,6 +521,14 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         icon: "archivebox" as const,
         label: "Archive",
         onPress: handleArchive,
+      };
+    }
+    if (swipeActions.primary === "unpin") {
+      return {
+        accessibilityLabel: `Unpin ${thread.title}`,
+        icon: "pin.slash" as const,
+        label: "Unpin",
+        onPress: handleUnpin,
       };
     }
     if (swipeActions.primary === "unsnooze") {
@@ -511,6 +555,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   }, [
     handleArchive,
     handleSettle,
+    handleUnpin,
     handleUnsettle,
     handleUnsnooze,
     swipeActions.primary,
@@ -560,6 +605,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         >
           {props.projectTitle ?? props.project?.title ?? ""}
         </Text>
+        {pinnedRow ? (
+          <SymbolView name="pin" size={11} tintColor={pinTintColor} type="monochrome" />
+        ) : null}
         <Text
           className={cn(
             "text-xs tabular-nums",
@@ -797,15 +845,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         {(close) => (
           <ControlPillMenu
             actions={
-              snoozedRow
-                ? SNOOZED_MENU_ACTIONS
-                : !props.settlementSupported
-                  ? LEGACY_MENU_ACTIONS
-                  : canUnsettle
-                    ? SLIM_MENU_ACTIONS
-                    : swipeActions.secondary === "snooze"
-                      ? snoozableCardMenuActions
-                      : CARD_MENU_ACTIONS
+              pinnedRow
+                ? PINNED_MENU_ACTIONS
+                : snoozedRow
+                  ? SNOOZED_MENU_ACTIONS
+                  : !props.settlementSupported
+                    ? LEGACY_MENU_ACTIONS
+                    : canUnsettle
+                      ? SLIM_MENU_ACTIONS
+                      : swipeActions.secondary === "snooze"
+                        ? snoozableCardMenuActions
+                        : cardMenuActions
             }
             onPressAction={handleMenuAction}
             shouldOpenOnLongPress
