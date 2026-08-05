@@ -23,6 +23,10 @@
       "types": "./src/git.ts",
       "import": "./src/git.ts"
     },
+    "./runnerCredentials": {
+      "types": "./src/runnerCredentials.ts",
+      "import": "./src/runnerCredentials.ts"
+    },
     "./sourceControl": {
       "types": "./src/sourceControl.ts",
       "import": "./src/sourceControl.ts"

@@ -16,6 +16,7 @@ import {
   VcsProcessTimeoutError,
 } from "@t3tools/contracts";
 import * as ProcessRunner from "../processRunner.ts";
+import { runnerSourceControlEnv } from "./runnerCredentials.ts";
 
 export interface VcsProcessInput {
   readonly operation: string;
@@ -97,6 +98,13 @@ export const make = Effect.gen(function* () {
       argumentCount: input.args.length,
     };
 
+    // Every VCS subprocess the server runs is server-initiated — agents reach
+    // git through their own shell, never through here — so this is where the
+    // runner's push credential is granted (ADR-0009). It resolves to null when
+    // no runner credential is configured, leaving the inherited environment
+    // exactly as it was.
+    const resolvedEnv = input.env ?? runnerSourceControlEnv(globalThis.process.env) ?? null;
+
     const result = yield* processRunner
       .run({
         command: input.command,
@@ -104,7 +112,7 @@ export const make = Effect.gen(function* () {
         cwd: input.cwd,
         ...(input.spawnCwd !== undefined ? { spawnCwd: input.spawnCwd } : {}),
         ...(input.stdin !== undefined ? { stdin: input.stdin } : {}),
-        ...(input.env !== undefined ? { env: input.env } : {}),
+        ...(resolvedEnv !== null ? { env: resolvedEnv } : {}),
         timeout: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         maxOutputBytes: input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
         outputMode: "truncate",
