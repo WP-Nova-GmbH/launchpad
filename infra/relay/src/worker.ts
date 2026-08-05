@@ -19,6 +19,7 @@ import {
   clientApi,
   dpopClientApi,
   healthApi,
+  jobsApi,
   metadataApi,
   mobileApi,
   relayClientAuthLayer,
@@ -41,6 +42,7 @@ import * as DpopProofs from "./auth/DpopProofs.ts";
 import * as RelayTokens from "./auth/RelayTokens.ts";
 import * as EnvironmentCredentials from "./environments/EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "./environments/EnvironmentLinks.ts";
+import * as Jobs from "./jobs/Jobs.ts";
 import * as ManagedEndpointAllocations from "./environments/ManagedEndpointAllocations.ts";
 import * as LiveActivities from "./agentActivity/LiveActivities.ts";
 import * as RelayDb from "./db.ts";
@@ -88,6 +90,7 @@ const relayApiLayer = Layer.mergeAll(
   clientApi,
   tokenApi,
   dpopClientApi,
+  jobsApi,
   serverApi,
 );
 
@@ -209,7 +212,8 @@ export const ApiLive = Api.make(
       Layer.provideMerge(
         ApnsDeliveryQueue.layerCloudflareQueues(apnsDeliveryQueueSender, alchemyRuntimeContext),
       ),
-      Layer.provideMerge(AgentActivityRows.layer),
+      // Row stores that need nothing but RelayDb.
+      Layer.provideMerge(Layer.mergeAll(AgentActivityRows.layer, Jobs.layer)),
       Layer.provideMerge(Devices.layer),
       Layer.provideMerge(EnvironmentCredentials.layer),
       Layer.provideMerge(

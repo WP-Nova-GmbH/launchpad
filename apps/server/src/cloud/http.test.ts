@@ -1,5 +1,8 @@
+import * as NodeCrypto from "node:crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
@@ -11,21 +14,38 @@ import {
   type HttpClientRequest,
 } from "effect/unstable/http";
 
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, type OrchestrationProjectShell } from "@t3tools/contracts";
 import { RelayClientTracer } from "@t3tools/shared/relayTracing";
+import {
+  normalizeRelayIssuer,
+  RELAY_DISPATCH_JOB_REQUEST_TYP,
+  RELAY_DISPATCH_JOB_RESPONSE_TYP,
+  signRelayJwt,
+  verifyRelayJwt,
+} from "@t3tools/shared/relayJwt";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import type { JobRequest } from "../jobs/Services/JobRunner.ts";
+import type { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { CLOUD_CLI_DESIRED_LINK_SECRET } from "./CliState.ts";
 import * as CliTokenManager from "./CliTokenManager.ts";
 import type { RelayLinkProofRequest } from "@t3tools/contracts/relay";
-import { CLOUD_ENDPOINT_RUNTIME_CONFIG, RELAY_URL_SECRET } from "./config.ts";
 import {
+  CLOUD_ENDPOINT_RUNTIME_CONFIG,
+  CLOUD_LINKED_USER_ID,
+  CLOUD_MINT_PUBLIC_KEY,
+  RELAY_ISSUER_SECRET,
+  RELAY_URL_SECRET,
+} from "./config.ts";
+import {
+  cloudDispatchJobHandler,
   consumeCloudReplayGuards,
   isSupportedLinkProviderKind,
   linkProofScopes,
   reconcileDesiredCloudLink,
   releaseManagedTunnelOnShutdown,
+  type CloudDispatchJobDependencies,
 } from "./http.ts";
 import * as ManagedEndpointRuntime from "./ManagedEndpointRuntime.ts";
 import { traceAuthenticatedRelayRequest, traceRelayRequest } from "./traceRelayRequest.ts";
@@ -464,6 +484,316 @@ describe("releaseManagedTunnelOnShutdown", () => {
       }),
     );
   });
+});
+
+describe("cloudDispatchJobHandler", () => {
+  const RELAY_ISSUER = "https://relay.example.test";
+  const ENVIRONMENT_ID = EnvironmentId.make("env_dispatch");
+  const LINKED_CLOUD_USER_ID = "cloud-user-1";
+  const REPOSITORY_CANONICAL_KEY = "github.com/acme/widgets";
+  const WORKSPACE_ROOT = "/workspaces/widgets";
+  const PROJECT_ID = ProjectId.make("project-widgets");
+  const NOW = "2026-05-01T00:00:00.000Z";
+  // Mirrors the secret `environmentKeys.ts` stores the environment key pair
+  // under; seeding it lets the test verify the response proof's signature.
+  const ENVIRONMENT_KEY_PAIR_SECRET = "cloud-link-ed25519-key-pair";
+
+  const relayKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
+    privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    publicKeyEncoding: { format: "pem", type: "spki" },
+  });
+  const environmentKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
+    privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    publicKeyEncoding: { format: "pem", type: "spki" },
+  });
+
+  const encode = (value: string) => new TextEncoder().encode(value);
+
+  function makeDispatchSecretStore(): ServerSecretStore.ServerSecretStore["Service"] {
+    const values = new Map<string, Uint8Array>([
+      [CLOUD_MINT_PUBLIC_KEY, encode(relayKeyPair.publicKey)],
+      [RELAY_ISSUER_SECRET, encode(RELAY_ISSUER)],
+      [CLOUD_LINKED_USER_ID, encode(LINKED_CLOUD_USER_ID)],
+      [
+        ENVIRONMENT_KEY_PAIR_SECRET,
+        encode(
+          JSON.stringify({
+            privateKey: environmentKeyPair.privateKey,
+            publicKey: environmentKeyPair.publicKey,
+          }),
+        ),
+      ],
+    ]);
+    return {
+      get: (name) => Effect.sync(() => Option.fromNullishOr(values.get(name))),
+      set: (name, value) =>
+        Effect.sync(() => {
+          values.set(name, value);
+        }),
+      create: (name, value) =>
+        values.has(name)
+          ? Effect.fail(storeFailure("AlreadyExists"))
+          : Effect.sync(() => {
+              values.set(name, value);
+            }),
+      getOrCreateRandom: unusedSecretStoreOperation,
+      remove: (name) =>
+        Effect.sync(() => {
+          values.delete(name);
+        }),
+    };
+  }
+
+  const projectShell = {
+    id: PROJECT_ID,
+    title: "Widgets",
+    workspaceRoot: WORKSPACE_ROOT,
+    defaultModelSelection: { instanceId: "codex", model: "gpt-5.3-codex" },
+    scripts: [],
+    createdAt: NOW,
+    updatedAt: NOW,
+  } as unknown as OrchestrationProjectShell;
+
+  interface DispatchHarness {
+    readonly dependencies: CloudDispatchJobDependencies;
+    readonly runs: Array<JobRequest>;
+    readonly started: Deferred.Deferred<void>;
+  }
+
+  const makeDispatchHarness = (options?: {
+    /** What each checkout's git remote canonically resolves to. */
+    readonly canonicalKey?: string | null;
+  }) =>
+    Effect.gen(function* () {
+      const runs: Array<JobRequest> = [];
+      const started = yield* Deferred.make<void>();
+      const canonicalKey =
+        options?.canonicalKey === undefined ? REPOSITORY_CANONICAL_KEY : options.canonicalKey;
+      const dependencies: CloudDispatchJobDependencies = {
+        secrets: makeDispatchSecretStore(),
+        environment: ServerEnvironment.ServerEnvironment.of({
+          getEnvironmentId: Effect.succeed(ENVIRONMENT_ID),
+          getDescriptor: Effect.die("unused environment descriptor"),
+        }),
+        jobRunner: {
+          run: (request) =>
+            Effect.gen(function* () {
+              runs.push(request);
+              yield* Deferred.succeed(started, undefined);
+              return {
+                jobId: request.jobId,
+                status: "completed",
+                threadId: null,
+                branch: null,
+                worktreePath: null,
+                pullRequestUrl: null,
+                steps: [],
+                failedStepId: null,
+              };
+            }),
+        },
+        // Only `getShellSnapshot` is reached from the dispatch path.
+        snapshotQuery: {
+          getShellSnapshot: () =>
+            Effect.succeed({
+              snapshotSequence: 1,
+              projects: [projectShell],
+              threads: [],
+              updatedAt: NOW,
+            }),
+        } as unknown as ProjectionSnapshotQuery["Service"],
+        repositoryIdentity: {
+          resolve: (cwd) =>
+            Effect.succeed(
+              cwd === WORKSPACE_ROOT && canonicalKey !== null
+                ? {
+                    canonicalKey,
+                    locator: {
+                      source: "git-remote",
+                      remoteName: "origin",
+                      remoteUrl: `https://${canonicalKey}.git`,
+                    },
+                    rootPath: cwd,
+                  }
+                : null,
+            ),
+        },
+      };
+      return { dependencies, runs, started } satisfies DispatchHarness;
+    });
+
+  let dispatchJti = 0;
+  const signDispatchProof = (options?: {
+    readonly audience?: string;
+    readonly repositoryCanonicalKey?: string;
+    readonly subject?: string;
+  }) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const iat = Math.floor(now.epochMilliseconds / 1_000);
+      dispatchJti += 1;
+      return yield* signRelayJwt({
+        privateKey: relayKeyPair.privateKey,
+        typ: RELAY_DISPATCH_JOB_REQUEST_TYP,
+        payload: {
+          iss: normalizeRelayIssuer(RELAY_ISSUER),
+          aud: options?.audience ?? `t3-env:${ENVIRONMENT_ID}`,
+          sub: options?.subject ?? LINKED_CLOUD_USER_ID,
+          jti: `dispatch-${dispatchJti}`,
+          iat,
+          exp: iat + 120,
+          environmentId: ENVIRONMENT_ID,
+          jobId: "job-1",
+          repositoryCanonicalKey: options?.repositoryCanonicalKey ?? REPOSITORY_CANONICAL_KEY,
+          baseBranch: "main",
+          instruction: "Add a health check endpoint",
+        },
+      });
+    });
+
+  const provideDispatchHarness = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(
+      Effect.provideService(
+        HttpServerRequest.HttpServerRequest,
+        HttpServerRequest.fromWeb(
+          new Request("https://environment.example.test/api/t3-connect/dispatch-job", {
+            method: "POST",
+          }),
+        ),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    );
+
+  it.effect("accepts a job for a repository this environment already holds", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeDispatchHarness();
+      const proof = yield* signDispatchProof();
+
+      const response = yield* cloudDispatchJobHandler(harness.dependencies, { proof });
+
+      expect(response.accepted).toBe(true);
+      // The response comes back on acceptance, not on completion, so the run is
+      // observed through the fork rather than the handler's result.
+      yield* Deferred.await(harness.started).pipe(Effect.timeout("2 seconds"));
+      expect(harness.runs).toHaveLength(1);
+      expect(harness.runs[0]).toMatchObject({
+        jobId: "job-1",
+        projectId: PROJECT_ID,
+        baseBranch: "main",
+        instruction: "Add a health check endpoint",
+      });
+      expect(harness.runs[0]?.workflow.steps.map((step) => step.id)).toEqual([
+        "implement",
+        "review",
+        "push",
+        "open-pull-request",
+      ]);
+
+      // The environment→relay direction is the opposite of the request's.
+      const now = yield* DateTime.now;
+      const responsePayload = yield* verifyRelayJwt({
+        publicKey: environmentKeyPair.publicKey,
+        token: response.proof,
+        typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+        issuer: `t3-env:${ENVIRONMENT_ID}`,
+        audience: normalizeRelayIssuer(RELAY_ISSUER),
+        nowEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),
+      });
+      expect(responsePayload).toMatchObject({
+        environmentId: ENVIRONMENT_ID,
+        jobId: "job-1",
+        accepted: true,
+      });
+    }).pipe(provideDispatchHarness),
+  );
+
+  it.effect("refuses an unregistered repository instead of failing", () =>
+    Effect.gen(function* () {
+      // ADR-0006: an executor only works on repositories it already has, so a
+      // job for a checkout it does not hold is answered, not errored.
+      const harness = yield* makeDispatchHarness({ canonicalKey: "github.com/acme/other" });
+      const proof = yield* signDispatchProof();
+
+      const response = yield* cloudDispatchJobHandler(harness.dependencies, { proof });
+
+      expect(response.accepted).toBe(false);
+      expect(harness.runs).toEqual([]);
+
+      const now = yield* DateTime.now;
+      const responsePayload = yield* verifyRelayJwt({
+        publicKey: environmentKeyPair.publicKey,
+        token: response.proof,
+        typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+        issuer: `t3-env:${ENVIRONMENT_ID}`,
+        audience: normalizeRelayIssuer(RELAY_ISSUER),
+        nowEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),
+      });
+      expect(responsePayload).toMatchObject({ jobId: "job-1", accepted: false });
+    }).pipe(provideDispatchHarness),
+  );
+
+  it.effect("refuses a checkout with no remote to resolve", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeDispatchHarness({ canonicalKey: null });
+      const proof = yield* signDispatchProof();
+
+      const response = yield* cloudDispatchJobHandler(harness.dependencies, { proof });
+
+      expect(response.accepted).toBe(false);
+      expect(harness.runs).toEqual([]);
+    }).pipe(provideDispatchHarness),
+  );
+
+  it.effect("rejects a proof minted for another environment", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeDispatchHarness();
+      const proof = yield* signDispatchProof({ audience: "t3-env:env_somebody_else" });
+
+      const error = yield* Effect.flip(cloudDispatchJobHandler(harness.dependencies, { proof }));
+
+      expect(error).toMatchObject({
+        _tag: "EnvironmentHttpUnauthorizedError",
+        message: "Invalid cloud job dispatch request.",
+      });
+      expect(harness.runs).toEqual([]);
+    }).pipe(provideDispatchHarness),
+  );
+
+  it.effect("rejects a proof dispatched on behalf of another account", () =>
+    Effect.gen(function* () {
+      // The mint and health legs both bind `sub` to this install's linked
+      // account; a dispatch that did not would let a proof minted for someone
+      // else's link drive this machine.
+      const harness = yield* makeDispatchHarness();
+      const proof = yield* signDispatchProof({ subject: "cloud-user-someone-else" });
+
+      const error = yield* Effect.flip(cloudDispatchJobHandler(harness.dependencies, { proof }));
+
+      expect(error).toMatchObject({
+        _tag: "EnvironmentHttpUnauthorizedError",
+        message: "Invalid cloud job dispatch request.",
+      });
+      expect(harness.runs).toEqual([]);
+    }).pipe(provideDispatchHarness),
+  );
+
+  it.effect("consumes a dispatch proof exactly once", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeDispatchHarness();
+      const proof = yield* signDispatchProof();
+
+      const first = yield* cloudDispatchJobHandler(harness.dependencies, { proof });
+      expect(first.accepted).toBe(true);
+
+      const replay = yield* Effect.flip(cloudDispatchJobHandler(harness.dependencies, { proof }));
+      expect(replay).toMatchObject({
+        _tag: "EnvironmentHttpConflictError",
+        message: "Cloud job dispatch request was already consumed.",
+      });
+      expect(harness.runs).toHaveLength(1);
+    }).pipe(provideDispatchHarness),
+  );
 });
 
 describe("link proof provider kinds", () => {

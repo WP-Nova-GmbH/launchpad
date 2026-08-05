@@ -11,12 +11,17 @@ import {
   EnvironmentHttpConflictError,
   EnvironmentHttpInternalServerError,
   EnvironmentHttpUnauthorizedError,
+  type OrchestrationProjectShell,
 } from "@t3tools/contracts";
 import {
+  RelayCloudDispatchJobProofPayload,
+  RelayCloudDispatchJobRequest,
   RelayCloudEnvironmentHealthProofPayload,
   RelayCloudEnvironmentHealthRequest,
   RelayCloudMintCredentialProofPayload,
   RelayCloudMintCredentialRequest,
+  RelayEnvironmentDispatchJobResponseProofPayload,
+  type RelayEnvironmentDispatchJobResponse as RelayEnvironmentDispatchJobResponseShape,
   RelayEnvironmentHealthResponseProofPayload,
   type RelayEnvironmentHealthResponse as RelayEnvironmentHealthResponseShape,
   RelayEnvironmentConfigRequest,
@@ -33,6 +38,8 @@ import {
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import {
   normalizeRelayIssuer,
+  RELAY_DISPATCH_JOB_REQUEST_TYP,
+  RELAY_DISPATCH_JOB_RESPONSE_TYP,
   RELAY_HEALTH_REQUEST_TYP,
   RELAY_HEALTH_RESPONSE_TYP,
   RELAY_LINK_PROOF_TYP,
@@ -48,6 +55,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as HttpEffect from "effect/unstable/http/HttpEffect";
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
@@ -57,6 +65,11 @@ import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { requireEnvironmentScope } from "../auth/http.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import { JobRunner } from "../jobs/Services/JobRunner.ts";
+import { m0Workflow } from "../jobs/workflow.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
+import { forkParked } from "../serverActivation.ts";
 import * as ManagedEndpointRuntime from "./ManagedEndpointRuntime.ts";
 import {
   CLOUD_ENDPOINT_RUNTIME_CONFIG,
@@ -82,6 +95,7 @@ const CLOUD_MINT_NONCE_PREFIX = "cloud-mint-nonce-";
 const CLOUD_MINT_JTI_PREFIX = "cloud-mint-jti-";
 const CLOUD_HEALTH_NONCE_PREFIX = "cloud-health-nonce-";
 const CLOUD_HEALTH_JTI_PREFIX = "cloud-health-jti-";
+const CLOUD_DISPATCH_JOB_JTI_PREFIX = "cloud-dispatch-job-jti-";
 const CLOUD_PROOF_MAX_LIFETIME_SECONDS = 5 * 60;
 const CLOUD_PROOF_CLOCK_SKEW_SECONDS = 60;
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -344,6 +358,41 @@ function hasBoundedCloudProofLifetime(input: {
 
 const decodeCloudHealthProof = Schema.decodeUnknownEffect(RelayCloudEnvironmentHealthProofPayload);
 const decodeCloudMintProof = Schema.decodeUnknownEffect(RelayCloudMintCredentialProofPayload);
+const decodeCloudDispatchJobProof = Schema.decodeUnknownEffect(RelayCloudDispatchJobProofPayload);
+
+/** The key every relay → environment proof is verified against. */
+function readCloudMintPublicKey(secrets: ServerSecretStore.ServerSecretStore["Service"]) {
+  return secrets
+    .get(CLOUD_MINT_PUBLIC_KEY)
+    .pipe(
+      Effect.flatMap((bytes) =>
+        Option.isSome(bytes)
+          ? Effect.succeed(bytesToString(bytes.value))
+          : Effect.fail(new EnvironmentAuth.ServerAuthCloudMintPublicKeyMissingError({})),
+      ),
+    );
+}
+
+/** The issuer those proofs must carry; older links only stored the relay URL. */
+function readCloudRelayIssuer(secrets: ServerSecretStore.ServerSecretStore["Service"]) {
+  return secrets
+    .get(RELAY_ISSUER_SECRET)
+    .pipe(
+      Effect.flatMap((bytes) =>
+        Option.isSome(bytes)
+          ? Effect.succeed(bytesToString(bytes.value))
+          : secrets
+              .get(RELAY_URL_SECRET)
+              .pipe(
+                Effect.flatMap((fallbackBytes) =>
+                  Option.isSome(fallbackBytes)
+                    ? Effect.succeed(bytesToString(fallbackBytes.value))
+                    : Effect.fail(new EnvironmentAuth.ServerAuthCloudRelayIssuerMissingError({})),
+                ),
+              ),
+      ),
+    );
+}
 
 interface CloudHttpDependencies {
   readonly secrets: ServerSecretStore.ServerSecretStore["Service"];
@@ -777,32 +826,8 @@ const cloudPreferencesHandler = Effect.fn("environment.cloud.preferences")(
 
 const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
   function* (dependencies: CloudHttpDependencies, request: RelayCloudEnvironmentHealthRequest) {
-    const cloudMintPublicKey = yield* dependencies.secrets
-      .get(CLOUD_MINT_PUBLIC_KEY)
-      .pipe(
-        Effect.flatMap((bytes) =>
-          Option.isSome(bytes)
-            ? Effect.succeed(bytesToString(bytes.value))
-            : Effect.fail(new EnvironmentAuth.ServerAuthCloudMintPublicKeyMissingError({})),
-        ),
-      );
-    const relayIssuer = yield* dependencies.secrets
-      .get(RELAY_ISSUER_SECRET)
-      .pipe(
-        Effect.flatMap((bytes) =>
-          Option.isSome(bytes)
-            ? Effect.succeed(bytesToString(bytes.value))
-            : dependencies.secrets
-                .get(RELAY_URL_SECRET)
-                .pipe(
-                  Effect.flatMap((fallbackBytes) =>
-                    Option.isSome(fallbackBytes)
-                      ? Effect.succeed(bytesToString(fallbackBytes.value))
-                      : Effect.fail(new EnvironmentAuth.ServerAuthCloudRelayIssuerMissingError({})),
-                  ),
-                ),
-        ),
-      );
+    const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
+    const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
     const environmentId = yield* dependencies.environment.getEnvironmentId;
     const linkedCloudUserId = yield* readInstalledCloudUserId(dependencies.secrets);
     const now = yield* DateTime.now;
@@ -895,32 +920,8 @@ const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
 
 const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")(
   function* (dependencies: CloudHttpDependencies, request: RelayCloudMintCredentialRequest) {
-    const cloudMintPublicKey = yield* dependencies.secrets
-      .get(CLOUD_MINT_PUBLIC_KEY)
-      .pipe(
-        Effect.flatMap((bytes) =>
-          Option.isSome(bytes)
-            ? Effect.succeed(bytesToString(bytes.value))
-            : Effect.fail(new EnvironmentAuth.ServerAuthCloudMintPublicKeyMissingError({})),
-        ),
-      );
-    const relayIssuer = yield* dependencies.secrets
-      .get(RELAY_ISSUER_SECRET)
-      .pipe(
-        Effect.flatMap((bytes) =>
-          Option.isSome(bytes)
-            ? Effect.succeed(bytesToString(bytes.value))
-            : dependencies.secrets
-                .get(RELAY_URL_SECRET)
-                .pipe(
-                  Effect.flatMap((fallbackBytes) =>
-                    Option.isSome(fallbackBytes)
-                      ? Effect.succeed(bytesToString(fallbackBytes.value))
-                      : Effect.fail(new EnvironmentAuth.ServerAuthCloudRelayIssuerMissingError({})),
-                  ),
-                ),
-        ),
-      );
+    const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
+    const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
     const environmentId = yield* dependencies.environment.getEnvironmentId;
     const linkedCloudUserId = yield* readInstalledCloudUserId(dependencies.secrets);
     const now = yield* DateTime.now;
@@ -1014,11 +1015,197 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
   ),
 );
 
+/**
+ * What the job dispatch handler needs, and nothing the rest of this module
+ * carries: the relay-facing crypto material plus the executor-side services
+ * that turn an accepted dispatch into a running job.
+ */
+export interface CloudDispatchJobDependencies {
+  readonly secrets: ServerSecretStore.ServerSecretStore["Service"];
+  readonly environment: ServerEnvironment.ServerEnvironment["Service"];
+  readonly jobRunner: JobRunner["Service"];
+  readonly snapshotQuery: ProjectionSnapshotQuery["Service"];
+  readonly repositoryIdentity: RepositoryIdentityResolver["Service"];
+}
+
+const cloudDispatchJobDependencies = Effect.gen(function* () {
+  return {
+    secrets: yield* ServerSecretStore.ServerSecretStore,
+    environment: yield* ServerEnvironment.ServerEnvironment,
+    jobRunner: yield* JobRunner,
+    snapshotQuery: yield* ProjectionSnapshotQuery,
+    repositoryIdentity: yield* RepositoryIdentityResolver,
+  } satisfies CloudDispatchJobDependencies;
+});
+
+/**
+ * Find the project this environment already holds for `repositoryCanonicalKey`.
+ *
+ * The canonical key is derived from each checkout's git remote rather than read
+ * off the projection, so a project whose remote changed is matched by what it
+ * actually points at now. A checkout with no remote resolves to `null` and can
+ * never match.
+ */
+const resolveDispatchJobProject = Effect.fn("environment.cloud.resolveDispatchJobProject")(
+  function* (dependencies: CloudDispatchJobDependencies, repositoryCanonicalKey: string) {
+    const shell = yield* dependencies.snapshotQuery.getShellSnapshot();
+    let matched: OrchestrationProjectShell | null = null;
+    for (const project of shell.projects) {
+      const identity = yield* dependencies.repositoryIdentity.resolve(project.workspaceRoot);
+      if (identity !== null && identity.canonicalKey === repositoryCanonicalKey) {
+        matched = project;
+        break;
+      }
+    }
+    return matched;
+  },
+);
+
+/**
+ * Relay → environment job dispatch (ADR-0005: the relay triggers, the executor
+ * orchestrates).
+ *
+ * Authenticated exactly like `mint-credential`: a proof signed by the relay
+ * issuer, audience-bound to this environment, and single-use by `jti`. The
+ * answer says only whether the job was accepted — a run takes minutes and the
+ * relay's request deadline is seconds, so the run is forked into the caller's
+ * scope and the response goes back the moment the job is under way.
+ */
+export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob")(
+  function* (dependencies: CloudDispatchJobDependencies, request: RelayCloudDispatchJobRequest) {
+    const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
+    const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
+    const environmentId = yield* dependencies.environment.getEnvironmentId;
+    const linkedCloudUserId = yield* readInstalledCloudUserId(dependencies.secrets);
+    const now = yield* DateTime.now;
+    const nowSeconds = Math.floor(now.epochMilliseconds / 1_000);
+    const proofOption = yield* verifyRelayJwt({
+      publicKey: cloudMintPublicKey,
+      token: request.proof,
+      typ: RELAY_DISPATCH_JOB_REQUEST_TYP,
+      issuer: normalizeRelayIssuer(relayIssuer),
+      audience: `t3-env:${environmentId}`,
+      nowEpochSeconds: nowSeconds,
+    }).pipe(Effect.flatMap(decodeCloudDispatchJobProof), Effect.option);
+    if (
+      Option.isNone(proofOption) ||
+      proofOption.value.environmentId !== environmentId ||
+      // The relay signs `sub` with the user it dispatched on behalf of. Binding
+      // it to this install's linked account means a proof minted for someone
+      // else's link cannot drive this machine, matching what the mint and
+      // health legs already require.
+      proofOption.value.sub !== linkedCloudUserId ||
+      !hasBoundedCloudProofLifetime({ ...proofOption.value, nowSeconds })
+    ) {
+      return yield* new EnvironmentHttpUnauthorizedError({
+        message: "Invalid cloud job dispatch request.",
+      });
+    }
+    const proof = proofOption.value;
+
+    const consumedReplayGuards = yield* consumeCloudReplayGuards({
+      secrets: dependencies.secrets,
+      names: [`${CLOUD_DISPATCH_JOB_JTI_PREFIX}${proof.jti}`],
+      value: stringToBytes(DateTime.formatIso(now)),
+    });
+    if (!consumedReplayGuards) {
+      return yield* new EnvironmentHttpConflictError({
+        message: "Cloud job dispatch request was already consumed.",
+      });
+    }
+
+    // ADR-0006: an executor works only on repositories it already has. A job
+    // aimed at a checkout this environment does not hold is refused, not
+    // failed — refusing is the answer, and the relay picks another executor.
+    const project = yield* resolveDispatchJobProject(
+      dependencies,
+      proof.repositoryCanonicalKey,
+    ).pipe(
+      Effect.catch(
+        failEnvironmentCloudInternalError("Could not resolve the dispatched job's repository."),
+      ),
+    );
+    const accepted = project !== null;
+
+    const keyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(dependencies.secrets);
+    const responseExpiresAt = DateTime.add(now, { minutes: 5 });
+    const responsePayload = {
+      iss: `t3-env:${environmentId}`,
+      aud: normalizeRelayIssuer(relayIssuer),
+      sub: environmentId,
+      jti: yield* Crypto.Crypto.pipe(Effect.flatMap((crypto) => crypto.randomUUIDv4)),
+      iat: nowSeconds,
+      exp: Math.floor(responseExpiresAt.epochMilliseconds / 1_000),
+      environmentId,
+      jobId: proof.jobId,
+      accepted,
+    } satisfies RelayEnvironmentDispatchJobResponseProofPayload;
+    const responseProof = yield* signRelayJwt({
+      privateKey: keyPair.privateKey,
+      typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+      payload: responsePayload,
+    });
+
+    // Signed before the fork so a signing failure cannot leave a job running
+    // that the relay was told nothing about.
+    if (project !== null) {
+      yield* forkParked(
+        dependencies.jobRunner
+          .run({
+            jobId: proof.jobId,
+            projectId: project.id,
+            instruction: proof.instruction,
+            baseBranch: proof.baseBranch,
+            workflow: m0Workflow({ instruction: proof.instruction }),
+          })
+          .pipe(
+            // Nothing consumes the outcome yet — reporting it back to the relay
+            // is the next seam, not this one.
+            Effect.tap((outcome) =>
+              Effect.logInfo("Dispatched job finished", {
+                jobId: outcome.jobId,
+                status: outcome.status,
+                threadId: outcome.threadId,
+                failedStepId: outcome.failedStepId,
+                pullRequestUrl: outcome.pullRequestUrl,
+              }),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logError("Dispatched job could not run", { jobId: proof.jobId, cause }),
+            ),
+          ),
+      );
+    }
+
+    yield* appendCloudCredentialResponseHeaders;
+    return { accepted, proof: responseProof } satisfies RelayEnvironmentDispatchJobResponseShape;
+  },
+  Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+    failEnvironmentCloudInternalError(error.message)(error),
+  ),
+  Effect.catchIf(
+    ServerSecretStore.isSecretStoreError,
+    failEnvironmentCloudInternalError("Could not answer the cloud job dispatch request."),
+  ),
+  Effect.catchTag(
+    "RelayJwtError",
+    failEnvironmentCloudInternalError("Could not answer the cloud job dispatch request."),
+  ),
+  Effect.catchTag(
+    "PlatformError",
+    failEnvironmentCloudInternalError("Could not answer the cloud job dispatch request."),
+  ),
+);
+
 export const connectHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
   "connect",
   Effect.fnUntraced(function* (handlers) {
     const dependencies = yield* cloudHttpDependencies;
+    const dispatchJobDependencies = yield* cloudDispatchJobDependencies;
+    // A dispatched job outlives the request that started it, so it is forked
+    // into this layer's scope — the request scope closes with the response.
+    const jobScope = yield* Effect.scope;
     return handlers
       .handle("linkProof", ({ payload }) => cloudLinkProofHandler(dependencies, payload))
       .handle("relayConfig", ({ payload }) => cloudRelayConfigHandler(dependencies, payload))
@@ -1029,6 +1216,13 @@ export const connectHttpApiLayer = HttpApiBuilder.group(
       .handle("mintCredential", ({ payload }) => cloudMintCredentialHandler(dependencies, payload))
       .handle("t3MintCredential", ({ payload }) =>
         traceRelayRequest(cloudMintCredentialHandler(dependencies, payload)),
+      )
+      .handle("t3DispatchJob", ({ payload }) =>
+        traceRelayRequest(
+          cloudDispatchJobHandler(dispatchJobDependencies, payload).pipe(
+            Effect.provideService(Scope.Scope, jobScope),
+          ),
+        ),
       );
   }),
 );

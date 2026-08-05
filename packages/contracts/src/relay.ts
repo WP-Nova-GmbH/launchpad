@@ -653,10 +653,17 @@ export type RelayEnvironmentConnectRequest = typeof RelayEnvironmentConnectReque
 export const RelayEnvironmentConnectScope = "environment:connect" as const;
 export const RelayEnvironmentStatusScope = "environment:status" as const;
 export const RelayMobileRegistrationScope = "mobile:registration" as const;
+/**
+ * Dispatching a job runs work on the user's machine, which neither connecting
+ * nor reading status does. It is its own scope so a token minted for a client
+ * that only mirrors state cannot start an agent.
+ */
+export const RelayJobDispatchScope = "jobs:dispatch" as const;
 export const RelayDpopAccessTokenScope = Schema.Literals([
   RelayEnvironmentConnectScope,
   RelayEnvironmentStatusScope,
   RelayMobileRegistrationScope,
+  RelayJobDispatchScope,
 ]);
 export type RelayDpopAccessTokenScope = typeof RelayDpopAccessTokenScope.Type;
 
@@ -828,6 +835,99 @@ export const RelayEnvironmentMintResponse = Schema.Struct({
   proof: TrimmedNonEmptyString,
 });
 export type RelayEnvironmentMintResponse = typeof RelayEnvironmentMintResponse.Type;
+
+// ---------------------------------------------------------------------------
+// Jobs
+//
+// The relay owns a job's coarse state and nothing finer (ADR-0005). What the
+// agent actually did inside a thread is the environment's to answer; the relay
+// records only which executor, which repository, and where the run got to.
+// ---------------------------------------------------------------------------
+
+export const RelayJobId = TrimmedNonEmptyString.pipe(Schema.brand("RelayJobId"));
+export type RelayJobId = typeof RelayJobId.Type;
+
+/**
+ * The whole of the relay's job model. Deliberately coarse: if the relay ever
+ * needs turn-level detail, the seam is being violated.
+ */
+export const RelayJobStatus = Schema.Literals([
+  "queued",
+  "dispatched",
+  "running",
+  "awaiting_review",
+  "paused",
+  "done",
+  "failed",
+]);
+export type RelayJobStatus = typeof RelayJobStatus.Type;
+
+export const RelayCreateJobRequest = Schema.Struct({
+  environmentId: EnvironmentId,
+  /** `host/owner/repo`, as `normalizeGitRemoteUrl` produces it. */
+  repositoryCanonicalKey: TrimmedNonEmptyString,
+  baseBranch: TrimmedNonEmptyString,
+  /**
+   * The instruction as it stood when the job was dispatched. Snapshotted by
+   * the caller rather than referenced, so editing the source afterwards cannot
+   * silently change what a running agent was told (ADR-0011).
+   */
+  instruction: TrimmedNonEmptyString,
+});
+export type RelayCreateJobRequest = typeof RelayCreateJobRequest.Type;
+
+export const RelayJob = Schema.Struct({
+  jobId: RelayJobId,
+  status: RelayJobStatus,
+  environmentId: EnvironmentId,
+  repositoryCanonicalKey: TrimmedNonEmptyString,
+  baseBranch: TrimmedNonEmptyString,
+  /** Set once the executor has a thread; the relay never reads into it. */
+  threadId: Schema.NullOr(ThreadId),
+  detail: Schema.NullOr(TrimmedNonEmptyString),
+  createdAt: TrimmedNonEmptyString,
+  updatedAt: TrimmedNonEmptyString,
+});
+export type RelayJob = typeof RelayJob.Type;
+
+/**
+ * Relay → environment. Same proof-authenticated, bearer-free shape as
+ * `mint-credential`: the relay signs, the environment verifies against the
+ * relay issuer, and the response is signed back.
+ */
+export const RelayCloudDispatchJobProofPayload = Schema.Struct({
+  ...RelaySignedJwtRegisteredClaims,
+  environmentId: EnvironmentId,
+  jobId: RelayJobId,
+  repositoryCanonicalKey: TrimmedNonEmptyString,
+  baseBranch: TrimmedNonEmptyString,
+  instruction: TrimmedNonEmptyString,
+});
+export type RelayCloudDispatchJobProofPayload = typeof RelayCloudDispatchJobProofPayload.Type;
+
+export const RelayCloudDispatchJobRequest = Schema.Struct({
+  proof: TrimmedNonEmptyString,
+});
+export type RelayCloudDispatchJobRequest = typeof RelayCloudDispatchJobRequest.Type;
+
+export const RelayEnvironmentDispatchJobResponseProofPayload = Schema.Struct({
+  ...RelaySignedJwtRegisteredClaims,
+  environmentId: EnvironmentId,
+  jobId: RelayJobId,
+  accepted: Schema.Boolean,
+});
+export type RelayEnvironmentDispatchJobResponseProofPayload =
+  typeof RelayEnvironmentDispatchJobResponseProofPayload.Type;
+
+/**
+ * The environment answers as soon as it has accepted the job, not when the job
+ * finishes: a run takes minutes and the relay's request deadline is seconds.
+ */
+export const RelayEnvironmentDispatchJobResponse = Schema.Struct({
+  accepted: Schema.Boolean,
+  proof: TrimmedNonEmptyString,
+});
+export type RelayEnvironmentDispatchJobResponse = typeof RelayEnvironmentDispatchJobResponse.Type;
 
 export const RelayDeliveryKind = Schema.Literals([
   "live_activity_start",
@@ -1046,6 +1146,37 @@ export const RelayGetEnvironmentStatusEndpoint = HttpApiEndpoint.post(
   },
 ).annotate(OpenApi.Summary, "Check environment status");
 
+const RelayJobErrors = [
+  RelayAuthInvalidError,
+  RelayEnvironmentConnectNotAuthorizedError,
+  RelayEnvironmentEndpointUnavailableError,
+  RelayEnvironmentEndpointTimedOutError,
+  RelayInternalError,
+] as const;
+
+const RelayCreateJobEndpoint = HttpApiEndpoint.post("createJob", "/v1/jobs", {
+  headers: RelayDpopRequestHeaders,
+  payload: RelayCreateJobRequest,
+  success: RelayJob,
+  error: RelayJobErrors,
+}).annotate(OpenApi.Summary, "Dispatch a job to an executor");
+
+const RelayGetJobEndpoint = HttpApiEndpoint.get("getJob", "/v1/jobs/:jobId", {
+  headers: RelayDpopRequestHeaders,
+  params: Schema.Struct({ jobId: RelayJobId }),
+  success: RelayJob,
+  error: RelayJobErrors,
+}).annotate(OpenApi.Summary, "Read a job's coarse state");
+
+/**
+ * Its own group rather than an addition to `dpopClient`, because auth is
+ * declared per group and jobs need their own scope.
+ */
+export const RelayJobsGroup = HttpApiGroup.make("jobs")
+  .add(RelayCreateJobEndpoint, RelayGetJobEndpoint)
+  .annotate(OpenApi.Description, "Dispatching jobs to executors and reading their coarse state.")
+  .middleware(RelayDpopClientAuth);
+
 export const RelayDpopClientGroup = HttpApiGroup.make("dpopClient")
   .add(RelayConnectEnvironmentEndpoint, RelayGetEnvironmentStatusEndpoint)
   .annotate(OpenApi.Description, "DPoP-authenticated client access to linked environments.")
@@ -1078,6 +1209,7 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayClientGroup,
     RelayTokenGroup,
     RelayDpopClientGroup,
+    RelayJobsGroup,
     RelayServerGroup,
   )
   .annotate(OpenApi.Title, "T3 Code Relay API")

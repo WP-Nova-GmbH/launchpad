@@ -2,6 +2,7 @@ import type {
   RelayAgentActivityAggregateState,
   RelayAgentActivityState,
   RelayAgentAwarenessPreferences,
+  RelayJobStatus,
 } from "@t3tools/contracts/relay";
 import {
   boolean,
@@ -129,6 +130,31 @@ export const relayEnvironmentCredentials = pgTable(
       table.environmentPublicKey,
       table.revokedAt,
     ),
+  ],
+);
+
+export const relayJobs = pgTable(
+  "relay_jobs",
+  {
+    jobId: varchar("job_id", { length: 64 }).primaryKey(),
+    environmentId: varchar("environment_id", { length: 191 }).notNull(),
+    // Denormalized from relay_environment_links so a job can be authorized
+    // against its owner without a join, and still be readable once the link
+    // that created it is revoked.
+    ownerUserId: varchar("owner_user_id", { length: 191 }).notNull(),
+    repositoryCanonicalKey: text("repository_canonical_key").notNull(),
+    baseBranch: text("base_branch").notNull(),
+    // Snapshotted at dispatch, never a reference (ADR-0011).
+    instruction: text("instruction").notNull(),
+    status: varchar("status", { length: 32 }).notNull().$type<RelayJobStatus>(),
+    threadId: varchar("thread_id", { length: 191 }),
+    detail: text("detail"),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    index("idx_relay_jobs_owner").on(table.ownerUserId, table.createdAt),
+    index("idx_relay_jobs_environment").on(table.environmentId, table.createdAt),
   ],
 );
 

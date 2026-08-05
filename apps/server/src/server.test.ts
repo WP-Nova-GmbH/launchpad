@@ -97,6 +97,7 @@ import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
+import { JobRunner } from "./jobs/Services/JobRunner.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -355,6 +356,7 @@ const buildAppUnderTest = (options?: {
     repositoryIdentityResolver?: Partial<
       RepositoryIdentityResolver.RepositoryIdentityResolver["Service"]
     >;
+    jobRunner?: Partial<JobRunner["Service"]>;
     cloudManagedEndpointRuntime?: Partial<
       CloudManagedEndpointRuntime.CloudManagedEndpointRuntime["Service"]
     >;
@@ -853,6 +855,12 @@ const buildAppUnderTest = (options?: {
         Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
           resolve: () => Effect.succeed(null),
           ...options?.layers?.repositoryIdentityResolver,
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(JobRunner)({
+          run: () => Effect.die("unused job run"),
+          ...options?.layers?.jobRunner,
         }),
       ),
       Layer.provide(

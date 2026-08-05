@@ -35,10 +35,12 @@ import {
 } from "./orchestration.ts";
 import {
   RelayCloudEnvironmentHealthRequest,
+  RelayCloudDispatchJobRequest,
   RelayCloudMintCredentialRequest,
   RelayEnvironmentConfigRequest,
   RelayEnvironmentHealthResponse,
   RelayEnvironmentLinkProof,
+  RelayEnvironmentDispatchJobResponse,
   RelayEnvironmentMintResponse,
   RelayLinkProofRequest,
 } from "./relay.ts";
@@ -546,6 +548,15 @@ export class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")
     HttpApiEndpoint.post("t3MintCredential", "/api/t3-connect/mint-credential", {
       payload: RelayCloudMintCredentialRequest,
       success: RelayEnvironmentMintResponse,
+      error: EnvironmentHttpCloudErrors,
+    }),
+  )
+  .add(
+    // Proof-authenticated and bearer-free, exactly like mint-credential: a
+    // dispatch arrives from the relay, not from a signed-in human.
+    HttpApiEndpoint.post("t3DispatchJob", "/api/t3-connect/dispatch-job", {
+      payload: RelayCloudDispatchJobRequest,
+      success: RelayEnvironmentDispatchJobResponse,
       error: EnvironmentHttpCloudErrors,
     }),
   ) {}

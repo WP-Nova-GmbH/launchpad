@@ -2,18 +2,27 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeCryptoLayer from "@effect/platform-node/NodeCrypto";
 
 import {
+  RelayCloudDispatchJobProofPayload,
+  RelayCloudDispatchJobRequest,
   RelayCloudEnvironmentHealthRequest,
   RelayCloudMintCredentialRequest,
   RelayCloudEnvironmentHealthProofPayload,
   RelayCloudMintCredentialProofPayload,
+  RelayEnvironmentDispatchJobResponse,
+  RelayEnvironmentDispatchJobResponseProofPayload,
   RelayEnvironmentHealthResponse,
   RelayEnvironmentHealthResponseProofPayload,
   RelayEnvironmentMintResponse,
   RelayEnvironmentMintResponseProofPayload,
+  RelayJobId,
 } from "@t3tools/contracts/relay";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
-import { RELAY_HEALTH_RESPONSE_TYP, RELAY_MINT_RESPONSE_TYP } from "@t3tools/shared/relayJwt";
+import {
+  RELAY_DISPATCH_JOB_RESPONSE_TYP,
+  RELAY_HEALTH_RESPONSE_TYP,
+  RELAY_MINT_RESPONSE_TYP,
+} from "@t3tools/shared/relayJwt";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -52,6 +61,9 @@ const decodeHealthRequestBody = Schema.decodeUnknownSync(
 );
 const decodeMintRequestBody = Schema.decodeUnknownSync(
   Schema.fromJsonString(RelayCloudMintCredentialRequest),
+);
+const decodeDispatchJobRequestBody = Schema.decodeUnknownSync(
+  Schema.fromJsonString(RelayCloudDispatchJobRequest),
 );
 const isEnvironmentConnectNotAuthorized = Schema.is(
   EnvironmentConnector.EnvironmentConnectNotAuthorized,
@@ -153,6 +165,32 @@ function signHealthResponse(
     checkedAt: payload.checkedAt,
     proof: signTestJwt(payload, RELAY_HEALTH_RESPONSE_TYP, privateKey),
     ...overrides,
+  };
+}
+
+function signDispatchJobResponse(
+  request: RelayCloudDispatchJobRequest,
+  overrides: Partial<RelayEnvironmentDispatchJobResponseProofPayload> = {},
+  bodyOverrides: Partial<RelayEnvironmentDispatchJobResponse> = {},
+  privateKey = environmentKeyPair.privateKey,
+): RelayEnvironmentDispatchJobResponse {
+  const requestProof = decodeRequestProof<RelayCloudDispatchJobProofPayload>(request.proof);
+  const payload = {
+    iss: `t3-env:${requestProof.environmentId}`,
+    aud: "https://relay.example.test",
+    sub: requestProof.environmentId,
+    jti: "dispatch-job-response-jti",
+    iat: requestProof.iat,
+    exp: requestProof.exp,
+    environmentId: requestProof.environmentId,
+    jobId: requestProof.jobId,
+    accepted: true,
+    ...overrides,
+  } satisfies RelayEnvironmentDispatchJobResponseProofPayload;
+  return {
+    accepted: payload.accepted,
+    proof: signTestJwt(payload, RELAY_DISPATCH_JOB_RESPONSE_TYP, privateKey),
+    ...bodyOverrides,
   };
 }
 
@@ -783,6 +821,219 @@ describe("EnvironmentConnector", () => {
         expect(result.cause.toString()).toContain("EnvironmentMintResponseInvalid");
       }
     }).pipe(Effect.provide(connectorTestLayer(execute)));
+  });
+
+  it.effect("dispatches a signed job and takes the environment's signed acceptance", () => {
+    const seenUrls: Array<string> = [];
+    const seenProofs: Array<RelayCloudDispatchJobProofPayload> = [];
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const dispatchRequest = decodeDispatchJobRequestBody(requestBodyText(request));
+        seenUrls.push(request.url);
+        seenProofs.push(decodeRequestProof(dispatchRequest.proof));
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(signDispatchJobResponse(dispatchRequest), { status: 200 }),
+        );
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* connector.dispatchJob({
+        userId: "user_123",
+        environmentId: "env-connector-test",
+        jobId: RelayJobId.make("job-connector-test"),
+        repositoryCanonicalKey: "github.com/acme/app",
+        baseBranch: "main",
+        instruction: "Fix the flaky login test.",
+      });
+
+      expect(seenUrls).toEqual(["https://env.example.test/api/t3-connect/dispatch-job"]);
+      expect(seenProofs[0]).toMatchObject({
+        iss: "https://relay.example.test",
+        aud: "t3-env:env-connector-test",
+        sub: "user_123",
+        environmentId: "env-connector-test",
+        jobId: "job-connector-test",
+        repositoryCanonicalKey: "github.com/acme/app",
+        baseBranch: "main",
+        instruction: "Fix the flaky login test.",
+      });
+      expect(result).toEqual({ accepted: true });
+    }).pipe(Effect.provide(connectorTestLayer(execute)));
+  });
+
+  it.effect("reports a signed refusal as a refusal rather than a failure", () => {
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const dispatchRequest = decodeDispatchJobRequestBody(requestBodyText(request));
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(signDispatchJobResponse(dispatchRequest, { accepted: false }), {
+            status: 200,
+          }),
+        );
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      expect(
+        yield* connector.dispatchJob({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+          jobId: RelayJobId.make("job-connector-test"),
+          repositoryCanonicalKey: "github.com/acme/app",
+          baseBranch: "main",
+          instruction: "Fix the flaky login test.",
+        }),
+      ).toEqual({ accepted: false });
+    }).pipe(Effect.provide(connectorTestLayer(execute)));
+  });
+
+  it.effect("rejects a refusal the unsigned response body flipped to accepted", () => {
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const dispatchRequest = decodeDispatchJobRequestBody(requestBodyText(request));
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(
+            signDispatchJobResponse(dispatchRequest, { accepted: false }, { accepted: true }),
+            { status: 200 },
+          ),
+        );
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* Effect.exit(
+        connector.dispatchJob({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+          jobId: RelayJobId.make("job-connector-test"),
+          repositoryCanonicalKey: "github.com/acme/app",
+          baseBranch: "main",
+          instruction: "Fix the flaky login test.",
+        }),
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.cause.toString()).toContain("EnvironmentMintResponseInvalid");
+      }
+    }).pipe(Effect.provide(connectorTestLayer(execute)));
+  });
+
+  it.effect("rejects dispatch answers bound to a different job", () => {
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const dispatchRequest = decodeDispatchJobRequestBody(requestBodyText(request));
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(
+            signDispatchJobResponse(dispatchRequest, {
+              jobId: RelayJobId.make("some-other-job"),
+            }),
+            { status: 200 },
+          ),
+        );
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* Effect.exit(
+        connector.dispatchJob({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+          jobId: RelayJobId.make("job-connector-test"),
+          repositoryCanonicalKey: "github.com/acme/app",
+          baseBranch: "main",
+          instruction: "Fix the flaky login test.",
+        }),
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.cause.toString()).toContain("EnvironmentMintResponseInvalid");
+      }
+    }).pipe(Effect.provide(connectorTestLayer(execute)));
+  });
+
+  it.effect("only accepts dispatch answers signed by the user's linked environment key", () => {
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const dispatchRequest = decodeDispatchJobRequestBody(requestBodyText(request));
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(
+            signDispatchJobResponse(dispatchRequest, {}, {}, otherEnvironmentKeyPair.privateKey),
+            { status: 200 },
+          ),
+        );
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* Effect.exit(
+        connector.dispatchJob({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+          jobId: RelayJobId.make("job-connector-test"),
+          repositoryCanonicalKey: "github.com/acme/app",
+          baseBranch: "main",
+          instruction: "Fix the flaky login test.",
+        }),
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.cause.toString()).toContain("EnvironmentMintResponseInvalid");
+      }
+    }).pipe(Effect.provide(connectorTestLayer(execute)));
+  });
+
+  it.effect("gives up on a hung dispatch well inside the relay's request deadline", () => {
+    let resolveRequestStarted: (() => void) | undefined;
+    const requestStarted = new Promise<void>((resolve) => {
+      resolveRequestStarted = () => resolve();
+    });
+    const execute = () =>
+      Effect.sync(() => {
+        resolveRequestStarted?.();
+      }).pipe(Effect.andThen(Effect.never as Effect.Effect<HttpClientResponse.HttpClientResponse>));
+
+    // The handler still has to record the outcome on the job inside the relay's
+    // 9s request deadline, so the transport budget has to leave room for it.
+    expect(EnvironmentConnector.ENVIRONMENT_DISPATCH_JOB_REQUEST_TIMEOUT_MS).toBeLessThan(9_000);
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const resultFiber = yield* connector
+        .dispatchJob({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+          jobId: RelayJobId.make("job-connector-test"),
+          repositoryCanonicalKey: "github.com/acme/app",
+          baseBranch: "main",
+          instruction: "Fix the flaky login test.",
+        })
+        .pipe(Effect.result, Effect.forkScoped);
+
+      yield* Effect.promise(() => requestStarted);
+      yield* TestClock.adjust(
+        Duration.millis(EnvironmentConnector.ENVIRONMENT_DISPATCH_JOB_REQUEST_TIMEOUT_MS),
+      );
+      const result = yield* Fiber.join(resultFiber);
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure._tag).toBe("EnvironmentMintRequestTimedOut");
+        expect(result.failure).toMatchObject({
+          environmentId: "env-connector-test",
+          operation: "dispatch-job",
+          timeoutMs: EnvironmentConnector.ENVIRONMENT_DISPATCH_JOB_REQUEST_TIMEOUT_MS,
+        });
+      }
+    }).pipe(Effect.provide(Layer.merge(TestClock.layer(), connectorTestLayer(execute))));
   });
 
   it.effect("times out hung managed endpoint mint requests", () => {

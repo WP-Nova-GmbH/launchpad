@@ -15,9 +15,12 @@ import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import { EnvironmentId } from "@t3tools/contracts";
-import { RelayEnvironmentAuth } from "@t3tools/contracts/relay";
+import { RelayEnvironmentAuth, RelayJobId } from "@t3tools/contracts/relay";
 
 import {
+  dispatchJobRecord,
+  ENVIRONMENT_REJECTED_JOB_DETAIL,
+  readJobForUser,
   RELAY_REQUEST_DEADLINE_MS,
   relayCors,
   relayDocsRedirectRoute,
@@ -31,8 +34,10 @@ import {
 } from "./Api.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as RelayDb from "../db.ts";
+import * as EnvironmentConnector from "../environments/EnvironmentConnector.ts";
 import * as EnvironmentCredentials from "../environments/EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "../environments/EnvironmentLinks.ts";
+import * as Jobs from "../jobs/Jobs.ts";
 import * as ManagedEndpointProvider from "../environments/ManagedEndpointProvider.ts";
 
 vi.mock("@clerk/backend", () => ({
@@ -393,6 +398,257 @@ describe("relay environment unlink", () => {
       ),
     );
   });
+});
+
+const queuedJobRecord = {
+  jobId: RelayJobId.make("job-1"),
+  ownerUserId: "user-1",
+  status: "queued",
+  environmentId: EnvironmentId.make("environment-1"),
+  repositoryCanonicalKey: "github.com/acme/app",
+  baseBranch: "main",
+  threadId: null,
+  detail: null,
+  createdAt: "2026-08-05T00:00:00.000Z",
+  updatedAt: "2026-08-05T00:00:00.000Z",
+} satisfies Jobs.RelayJobRecord;
+
+const createJobRequest = {
+  environmentId: queuedJobRecord.environmentId,
+  repositoryCanonicalKey: queuedJobRecord.repositoryCanonicalKey,
+  baseBranch: queuedJobRecord.baseBranch,
+  instruction: "Fix the flaky login test.",
+} as const;
+
+function relayJobsTestLayer(input?: {
+  readonly getForUser?: EnvironmentLinks.EnvironmentLinks["Service"]["getForUser"];
+  readonly create?: Jobs.Jobs["Service"]["create"];
+  readonly getById?: Jobs.Jobs["Service"]["getById"];
+  readonly updateStatus?: Jobs.Jobs["Service"]["updateStatus"];
+  readonly dispatchJob?: EnvironmentConnector.EnvironmentConnector["Service"]["dispatchJob"];
+}) {
+  return Layer.mergeAll(
+    Layer.succeed(
+      EnvironmentLinks.EnvironmentLinks,
+      EnvironmentLinks.EnvironmentLinks.of({
+        upsert: () => Effect.die("unused upsert"),
+        listUsersForEnvironment: () => Effect.die("unused listUsersForEnvironment"),
+        listDeliveryUsersForEnvironment: () => Effect.die("unused listDeliveryUsersForEnvironment"),
+        listPublicKeysForEnvironment: () => Effect.die("unused listPublicKeysForEnvironment"),
+        listForUser: () => Effect.die("unused listForUser"),
+        getForUser: input?.getForUser ?? (() => Effect.succeed(linkedEnvironmentRecord)),
+        revokeForUser: () => Effect.die("unused revokeForUser"),
+      }),
+    ),
+    Layer.succeed(
+      Jobs.Jobs,
+      Jobs.Jobs.of({
+        create:
+          input?.create ??
+          ((created) =>
+            Effect.succeed({
+              ...queuedJobRecord,
+              jobId: created.jobId,
+              ownerUserId: created.ownerUserId,
+              environmentId: created.environmentId,
+              repositoryCanonicalKey: created.repositoryCanonicalKey,
+              baseBranch: created.baseBranch,
+            })),
+        getById: input?.getById ?? (() => Effect.die("unused getById")),
+        updateStatus:
+          input?.updateStatus ??
+          ((updated) =>
+            Effect.succeed({
+              ...queuedJobRecord,
+              status: updated.status,
+              detail: updated.detail,
+            })),
+      }),
+    ),
+    Layer.succeed(
+      EnvironmentConnector.EnvironmentConnector,
+      EnvironmentConnector.EnvironmentConnector.of({
+        connect: () => Effect.die("unused connect"),
+        status: () => Effect.die("unused status"),
+        dispatchJob: input?.dispatchJob ?? (() => Effect.succeed({ accepted: true })),
+      }),
+    ),
+  );
+}
+
+describe("relay job dispatch", () => {
+  it.effect("queues a job, dispatches it, and answers without the owner", () => {
+    const calls: Array<string> = [];
+    return Effect.gen(function* () {
+      const job = yield* dispatchJobRecord({
+        userId: "user-1",
+        jobId: RelayJobId.make("job-1"),
+        request: createJobRequest,
+      });
+
+      expect(calls).toEqual(["create", "dispatch", "update:dispatched"]);
+      expect(job).toMatchObject({
+        jobId: "job-1",
+        status: "dispatched",
+        environmentId: "environment-1",
+        repositoryCanonicalKey: "github.com/acme/app",
+        baseBranch: "main",
+        detail: null,
+      });
+      // The denormalized owner is the relay's business, not the caller's.
+      expect(Object.hasOwn(job, "ownerUserId")).toBe(false);
+    }).pipe(
+      Effect.provide(
+        relayJobsTestLayer({
+          create: (created) =>
+            Effect.sync(() => {
+              calls.push("create");
+              return { ...queuedJobRecord, jobId: created.jobId };
+            }),
+          dispatchJob: (dispatched) =>
+            Effect.sync(() => {
+              calls.push("dispatch");
+              expect(dispatched).toMatchObject({
+                userId: "user-1",
+                environmentId: "environment-1",
+                jobId: "job-1",
+                instruction: "Fix the flaky login test.",
+              });
+              return { accepted: true };
+            }),
+          updateStatus: (updated) =>
+            Effect.sync(() => {
+              calls.push(`update:${updated.status}`);
+              return { ...queuedJobRecord, status: updated.status, detail: updated.detail };
+            }),
+        }),
+      ),
+    );
+  });
+
+  it.effect("records the dispatch failure on the job before failing the request", () => {
+    const updates: Array<{ status: string; detail: string | null }> = [];
+    const failure = new EnvironmentConnector.EnvironmentMintRequestTimedOut({
+      environmentId: "environment-1",
+      operation: "dispatch-job",
+      timeoutMs: EnvironmentConnector.ENVIRONMENT_DISPATCH_JOB_REQUEST_TIMEOUT_MS,
+    });
+
+    return Effect.gen(function* () {
+      expect(
+        yield* Effect.flip(
+          dispatchJobRecord({
+            userId: "user-1",
+            jobId: RelayJobId.make("job-1"),
+            request: createJobRequest,
+          }),
+        ),
+      ).toBe(failure);
+      expect(updates).toEqual([{ status: "failed", detail: "environment_endpoint_timed_out" }]);
+    }).pipe(
+      Effect.provide(
+        relayJobsTestLayer({
+          dispatchJob: () => Effect.fail(failure),
+          updateStatus: (updated) =>
+            Effect.sync(() => {
+              updates.push({ status: updated.status, detail: updated.detail });
+              return { ...queuedJobRecord, status: updated.status, detail: updated.detail };
+            }),
+        }),
+      ),
+    );
+  });
+
+  it.effect("settles a signed refusal as a failed job rather than a failed request", () =>
+    Effect.gen(function* () {
+      const job = yield* dispatchJobRecord({
+        userId: "user-1",
+        jobId: RelayJobId.make("job-1"),
+        request: createJobRequest,
+      });
+
+      expect(job).toMatchObject({
+        jobId: "job-1",
+        status: "failed",
+        detail: ENVIRONMENT_REJECTED_JOB_DETAIL,
+      });
+    }).pipe(
+      Effect.provide(
+        relayJobsTestLayer({ dispatchJob: () => Effect.succeed({ accepted: false }) }),
+      ),
+    ),
+  );
+
+  it.effect("refuses to record a job for an environment the user has not linked", () => {
+    let created = 0;
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        dispatchJobRecord({
+          userId: "user-1",
+          jobId: RelayJobId.make("job-1"),
+          request: createJobRequest,
+        }),
+      );
+
+      expect(Predicate.isTagged(error, "EnvironmentConnectNotAuthorized")).toBe(true);
+      if (Predicate.isTagged(error, "EnvironmentConnectNotAuthorized")) {
+        expect(error).toMatchObject({
+          environmentId: "environment-1",
+          operation: "dispatch-job",
+          reason: "environment_link_not_found",
+        });
+      }
+      expect(created).toBe(0);
+    }).pipe(
+      Effect.provide(
+        relayJobsTestLayer({
+          getForUser: () => Effect.succeed(null),
+          create: (job) =>
+            Effect.sync(() => {
+              created += 1;
+              return { ...queuedJobRecord, jobId: job.jobId };
+            }),
+          dispatchJob: () => Effect.die("must not dispatch an unlinked environment"),
+        }),
+      ),
+    );
+  });
+});
+
+describe("relay job reads", () => {
+  it.effect("answers the owner's job without the owner", () =>
+    Effect.gen(function* () {
+      const job = yield* readJobForUser({
+        userId: "user-1",
+        jobId: RelayJobId.make("job-1"),
+      });
+
+      expect(job).toMatchObject({ jobId: "job-1", status: "queued" });
+      expect(job !== null && Object.hasOwn(job, "ownerUserId")).toBe(false);
+    }).pipe(Effect.provide(relayJobsTestLayer({ getById: () => Effect.succeed(queuedJobRecord) }))),
+  );
+
+  it.effect("hides a job owned by another user", () =>
+    Effect.gen(function* () {
+      expect(
+        yield* readJobForUser({
+          userId: "user-2",
+          jobId: RelayJobId.make("job-1"),
+        }),
+      ).toBeNull();
+    }).pipe(Effect.provide(relayJobsTestLayer({ getById: () => Effect.succeed(queuedJobRecord) }))),
+  );
+
+  it.effect("reads a missing job as no job", () =>
+    Effect.gen(function* () {
+      expect(
+        yield* readJobForUser({
+          userId: "user-1",
+          jobId: RelayJobId.make("job-missing"),
+        }),
+      ).toBeNull();
+    }).pipe(Effect.provide(relayJobsTestLayer({ getById: () => Effect.succeed(null) }))),
+  );
 });
 
 describe("relay request tracing", () => {

@@ -32,6 +32,8 @@ import {
   RelayDpopClientAuth,
   RelayEnvironmentConnectScope,
   RelayEnvironmentStatusScope,
+  RelayJobDispatchScope,
+  RelayJobId,
   RelayMobileRegistrationScope,
   RelayAuthInvalidError,
   type RelayAuthInvalidReason,
@@ -45,6 +47,7 @@ import {
   RelayEnvironmentLinkUnavailableError,
   RelayEnvironmentLinkLimitExceededError,
   RelayEnvironmentPrincipal,
+  type RelayCreateJobRequest,
   type RelayEnvironmentConnectRequest,
   type RelayDpopAccessTokenScope,
   RelayInternalError,
@@ -58,6 +61,7 @@ import * as DpopProofs from "../auth/DpopProofs.ts";
 import * as RelayTokens from "../auth/RelayTokens.ts";
 import * as EnvironmentCredentials from "../environments/EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "../environments/EnvironmentLinks.ts";
+import * as Jobs from "../jobs/Jobs.ts";
 import * as LiveActivities from "../agentActivity/LiveActivities.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as AgentActivityPublisher from "../agentActivity/AgentActivityPublisher.ts";
@@ -361,6 +365,7 @@ export const metadataApi = HttpApiBuilder.group(
       RelayEnvironmentConnectScope,
       RelayEnvironmentStatusScope,
       RelayMobileRegistrationScope,
+      RelayJobDispatchScope,
     ] as const;
     return handlers
       .handle("authorizationServer", () =>
@@ -463,6 +468,103 @@ export const unlinkEnvironmentRecord = Effect.fn("relay.api.client.unlinkEnviron
     return unlinked;
   },
 );
+
+/**
+ * Recorded on a job the environment answered but refused. A signed refusal is
+ * a definite answer, not a broken endpoint, so it settles the job instead of
+ * failing the request.
+ */
+export const ENVIRONMENT_REJECTED_JOB_DETAIL = "environment_rejected";
+
+/**
+ * Mirrors the error code the caller is about to receive, so the row explains
+ * the same failure the response did.
+ */
+function dispatchFailureDetail(error: EnvironmentConnector.EnvironmentConnectorError): string {
+  switch (error._tag) {
+    case "EnvironmentConnectNotAuthorized":
+      return `environment_connect_not_authorized: ${error.reason}`;
+    case "EnvironmentMintRequestFailed":
+      return "environment_endpoint_unavailable: endpoint_request_failed";
+    case "EnvironmentMintRequestTimedOut":
+      return "environment_endpoint_timed_out";
+    case "EnvironmentMintResponseInvalid":
+      return "environment_endpoint_unavailable: endpoint_response_invalid";
+    default:
+      return "internal_error";
+  }
+}
+
+export const dispatchJobRecord = Effect.fn("relay.api.jobs.dispatchJobRecord")(function* (input: {
+  readonly userId: string;
+  readonly jobId: RelayJobId;
+  readonly request: RelayCreateJobRequest;
+}) {
+  const links = yield* EnvironmentLinks.EnvironmentLinks;
+  const jobs = yield* Jobs.Jobs;
+  const connector = yield* EnvironmentConnector.EnvironmentConnector;
+
+  // Refused before a row exists: a job aimed at an environment this user has
+  // not linked is not a failed job, it is not a job at all.
+  const link = yield* links.getForUser({
+    userId: input.userId,
+    environmentId: input.request.environmentId,
+  });
+  if (!link) {
+    return yield* new EnvironmentConnector.EnvironmentConnectNotAuthorized({
+      environmentId: input.request.environmentId,
+      operation: "dispatch-job",
+      reason: "environment_link_not_found",
+    });
+  }
+
+  const created = yield* jobs.create({
+    jobId: input.jobId,
+    ownerUserId: input.userId,
+    environmentId: input.request.environmentId,
+    repositoryCanonicalKey: input.request.repositoryCanonicalKey,
+    baseBranch: input.request.baseBranch,
+    instruction: input.request.instruction,
+  });
+
+  const dispatched = yield* connector
+    .dispatchJob({
+      userId: input.userId,
+      environmentId: link.environmentId,
+      jobId: input.jobId,
+      repositoryCanonicalKey: input.request.repositoryCanonicalKey,
+      baseBranch: input.request.baseBranch,
+      instruction: input.request.instruction,
+    })
+    .pipe(
+      // The row outlives the request, so the outcome has to reach it before the
+      // failure is answered. A lost status write must not mask the real error.
+      Effect.tapError((error) =>
+        jobs
+          .updateStatus({
+            jobId: input.jobId,
+            status: "failed",
+            detail: dispatchFailureDetail(error),
+          })
+          .pipe(Effect.ignore),
+      ),
+    );
+
+  const status = dispatched.accepted ? ("dispatched" as const) : ("failed" as const);
+  const detail = dispatched.accepted ? null : ENVIRONMENT_REJECTED_JOB_DETAIL;
+  const settled = yield* jobs.updateStatus({ jobId: input.jobId, status, detail });
+  return Jobs.toRelayJob(settled ?? { ...created, status, detail });
+});
+
+export const readJobForUser = Effect.fn("relay.api.jobs.readJobForUser")(function* (input: {
+  readonly userId: string;
+  readonly jobId: RelayJobId;
+}) {
+  const jobs = yield* Jobs.Jobs;
+  const record = yield* jobs.getById({ jobId: input.jobId });
+  // Someone else's job reads exactly like a job that does not exist.
+  return record && record.ownerUserId === input.userId ? Jobs.toRelayJob(record) : null;
+});
 
 export const mobileApi = HttpApiBuilder.group(
   RelayApi,
@@ -850,6 +952,79 @@ export const dpopClientApi = HttpApiBuilder.group(
   }),
 );
 
+export const jobsApi = HttpApiBuilder.group(
+  RelayApi,
+  "jobs",
+  Effect.fnUntraced(function* (handlers) {
+    const crypto = yield* Crypto.Crypto;
+    const dpopProofs = yield* DpopProofs.DpopProofReplay;
+    return handlers
+      .handle(
+        "createJob",
+        Effect.fn("relay.api.jobs.createJob")(
+          function* (args) {
+            const { payload } = args;
+            const { userId, token } = yield* RelayClientPrincipal;
+            const proofKeyThumbprint = yield* requireDpopPrincipalScope(RelayJobDispatchScope);
+            yield* requireDpopThumbprint(proofKeyThumbprint, {
+              expectedAccessToken: token,
+            }).pipe(Effect.provideService(DpopProofs.DpopProofReplay, dpopProofs));
+            const jobId = yield* crypto.randomUUIDv4.pipe(
+              Effect.catch(() => relayInternalErrorResponse("internal_error")),
+            );
+            return yield* dispatchJobRecord({
+              userId,
+              jobId: RelayJobId.make(jobId),
+              request: payload,
+            });
+          },
+          mapRelayCommonApiErrors("invalid_dpop"),
+          mapErrorTags({
+            EnvironmentConnectNotAuthorized: (error, traceId) =>
+              new RelayEnvironmentConnectNotAuthorizedError({
+                code: "environment_connect_not_authorized",
+                reason: error.reason,
+                traceId,
+              }),
+            EnvironmentMintRequestFailed: (_error, traceId) =>
+              new RelayEnvironmentEndpointUnavailableError({
+                code: "environment_endpoint_unavailable",
+                reason: "endpoint_request_failed",
+                traceId,
+              }),
+            EnvironmentMintRequestTimedOut: (_error, traceId) =>
+              new RelayEnvironmentEndpointTimedOutError({
+                code: "environment_endpoint_timed_out",
+                traceId,
+              }),
+            EnvironmentMintResponseInvalid: (_error, traceId) =>
+              new RelayEnvironmentEndpointUnavailableError({
+                code: "environment_endpoint_unavailable",
+                reason: "endpoint_response_invalid",
+                traceId,
+              }),
+          }),
+        ),
+      )
+      .handle(
+        "getJob",
+        Effect.fn("relay.api.jobs.getJob")(function* (args) {
+          const { params } = args;
+          const { userId, token } = yield* RelayClientPrincipal;
+          const proofKeyThumbprint = yield* requireDpopPrincipalScope(RelayJobDispatchScope);
+          yield* requireDpopThumbprint(proofKeyThumbprint, {
+            expectedAccessToken: token,
+          }).pipe(Effect.provideService(DpopProofs.DpopProofReplay, dpopProofs));
+          const job = yield* readJobForUser({ userId, jobId: params.jobId });
+          if (!job) {
+            return yield* relayAuthInvalidError("not_authorized");
+          }
+          return job;
+        }, mapRelayCommonApiErrors("invalid_dpop")),
+      );
+  }),
+);
+
 export const serverApi = HttpApiBuilder.group(
   RelayApi,
   "server",
@@ -1018,6 +1193,7 @@ const RelayCommonPersistenceError = Schema.Union([
   ManagedEndpointAllocations.ManagedEndpointAllocationPersistenceError,
   EnvironmentCredentials.EnvironmentCredentialAuthenticatePersistenceError,
   EnvironmentCredentials.EnvironmentCredentialRevokePersistenceError,
+  Jobs.JobPersistenceError,
   DpopProofs.DpopProofReplayPersistenceError,
   LiveActivities.LiveActivityTargetListPersistenceError,
   AgentActivityRows.AgentActivityRowUpsertPersistenceError,

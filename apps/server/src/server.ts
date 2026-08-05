@@ -47,6 +47,7 @@ import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import * as GitManager from "./git/GitManager.ts";
+import { JobRunnerLive } from "./jobs/Layers/JobRunner.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
@@ -358,7 +359,11 @@ const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
   Layer.provideMerge(OrchestrationLayerLive),
 );
 
-const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
+// `JobRunnerLive` is a long-lived root like `ProviderSessionReaperLive`: the
+// dispatch-job endpoint resolves it once and forks runs against it, so it is
+// merged in here where the orchestration engine, projections, git, and text
+// generation it needs are all in scope.
+const RuntimeCoreDependenciesLive = Layer.mergeAll(ReactorLayerLive, JobRunnerLive).pipe(
   // Core Services
   Layer.provideMerge(ServerSettingsLayerLive),
   Layer.provideMerge(CheckpointingLayerLive),

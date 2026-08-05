@@ -8,6 +8,8 @@ import {
 import { makeEnvironmentHttpApiClient } from "@t3tools/client-runtime/rpc";
 import {
   RelayCloudEnvironmentHealthProofPayload,
+  RelayCloudDispatchJobProofPayload,
+  RelayEnvironmentDispatchJobResponseProofPayload,
   RelayEnvironmentHealthResponse,
   RelayEnvironmentHealthResponseProofPayload,
   RelayEnvironmentMintResponse,
@@ -15,10 +17,14 @@ import {
   RelayCloudMintCredentialProofPayload,
   RelayEnvironmentConnectNotAuthorizedReason,
   type RelayEnvironmentConnectResponse,
+  type RelayEnvironmentDispatchJobResponse,
   type RelayEnvironmentStatusResponse,
+  type RelayJobId,
 } from "@t3tools/contracts/relay";
 import {
   normalizeRelayIssuer,
+  RELAY_DISPATCH_JOB_REQUEST_TYP,
+  RELAY_DISPATCH_JOB_RESPONSE_TYP,
   RELAY_HEALTH_REQUEST_TYP,
   RELAY_HEALTH_RESPONSE_TYP,
   RELAY_MINT_REQUEST_TYP,
@@ -68,11 +74,14 @@ function environmentConnectNotAuthorizedReasonMessage(
   }
 }
 
+const EnvironmentConnectorOperation = Schema.Literals(["connect", "status", "dispatch-job"]);
+type EnvironmentConnectorOperation = typeof EnvironmentConnectorOperation.Type;
+
 export class EnvironmentConnectNotAuthorized extends Schema.TaggedErrorClass<EnvironmentConnectNotAuthorized>()(
   "EnvironmentConnectNotAuthorized",
   {
     environmentId: Schema.String,
-    operation: Schema.Literals(["connect", "status"]),
+    operation: EnvironmentConnectorOperation,
     reason: RelayEnvironmentConnectNotAuthorizedReason,
   },
 ) {
@@ -85,7 +94,7 @@ export class EnvironmentMintRequestFailed extends Schema.TaggedErrorClass<Enviro
   "EnvironmentMintRequestFailed",
   {
     environmentId: Schema.String,
-    operation: Schema.Literals(["connect", "status"]),
+    operation: EnvironmentConnectorOperation,
     cause: Schema.Defect(),
   },
 ) {
@@ -98,11 +107,12 @@ export class EnvironmentMintRequestTimedOut extends Schema.TaggedErrorClass<Envi
   "EnvironmentMintRequestTimedOut",
   {
     environmentId: Schema.String,
+    operation: EnvironmentConnectorOperation,
     timeoutMs: Schema.Number,
   },
 ) {
   override get message(): string {
-    return `Environment '${this.environmentId}' mint request timed out after ${this.timeoutMs}ms`;
+    return `Environment '${this.environmentId}' ${this.operation} request timed out after ${this.timeoutMs}ms`;
   }
 }
 
@@ -110,7 +120,7 @@ export class EnvironmentMintResponseInvalid extends Schema.TaggedErrorClass<Envi
   "EnvironmentMintResponseInvalid",
   {
     environmentId: Schema.String,
-    operation: Schema.Literals(["connect", "status"]),
+    operation: EnvironmentConnectorOperation,
   },
 ) {
   override get message(): string {
@@ -127,7 +137,18 @@ export type EnvironmentConnectorError =
   | ManagedEndpointAllocations.ManagedEndpointAllocationPersistenceError;
 
 export const ENVIRONMENT_MINT_REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * Shorter than the mint timeout because dispatch answers inside a relay request
+ * that must finish within `RELAY_REQUEST_DEADLINE_MS` (9s) *and* still record
+ * the dispatch outcome on the job afterwards. The environment answers as soon
+ * as it has accepted the job, so this is a transport budget, not a run budget.
+ */
+export const ENVIRONMENT_DISPATCH_JOB_REQUEST_TIMEOUT_MS = 5_000;
 const ENVIRONMENT_HEALTH_CLOCK_SKEW_MILLIS = 60 * 1_000;
+
+export interface EnvironmentDispatchJobResult {
+  readonly accepted: boolean;
+}
 
 export class EnvironmentConnector extends Context.Service<
   EnvironmentConnector,
@@ -142,6 +163,14 @@ export class EnvironmentConnector extends Context.Service<
       readonly userId: string;
       readonly environmentId: string;
     }) => Effect.Effect<RelayEnvironmentStatusResponse, EnvironmentConnectorError>;
+    readonly dispatchJob: (input: {
+      readonly userId: string;
+      readonly environmentId: string;
+      readonly jobId: RelayJobId;
+      readonly repositoryCanonicalKey: string;
+      readonly baseBranch: string;
+      readonly instruction: string;
+    }) => Effect.Effect<EnvironmentDispatchJobResult, EnvironmentConnectorError>;
   }
 >()("t3code-relay/environments/EnvironmentConnector") {}
 
@@ -150,6 +179,9 @@ const decodeMintResponseProof = Schema.decodeUnknownEffect(
 );
 const decodeHealthResponseProof = Schema.decodeUnknownEffect(
   RelayEnvironmentHealthResponseProofPayload,
+);
+const decodeDispatchJobResponseProof = Schema.decodeUnknownEffect(
+  RelayEnvironmentDispatchJobResponseProofPayload,
 );
 const isEnvironmentHealthError = Schema.is(
   Schema.Union([
@@ -244,6 +276,37 @@ function verifyEnvironmentResponse(input: {
   );
 }
 
+function verifyEnvironmentDispatchJobResponse(input: {
+  readonly response: RelayEnvironmentDispatchJobResponse;
+  readonly environmentId: string;
+  readonly jobId: RelayJobId;
+  readonly environmentPublicKeys: ReadonlyArray<string>;
+  readonly relayIssuer: string;
+  readonly nowEpochSeconds: number;
+}) {
+  return verifyWithEnvironmentKeys({
+    token: input.response.proof,
+    typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+    issuer: `t3-env:${input.environmentId}`,
+    audience: normalizeRelayIssuer(input.relayIssuer),
+    nowEpochSeconds: input.nowEpochSeconds,
+    environmentPublicKeys: input.environmentPublicKeys,
+    decodePayload: decodeDispatchJobResponseProof,
+  }).pipe(
+    Effect.map(
+      (proof) =>
+        proof !== null &&
+        proof.environmentId === input.environmentId &&
+        // The job id is what binds this answer to this dispatch; the payload
+        // carries no nonce because a job is dispatched once.
+        proof.jobId === input.jobId &&
+        // Only the signed verdict counts, so an unsigned body cannot turn a
+        // refusal into an acceptance.
+        proof.accepted === input.response.accepted,
+    ),
+  );
+}
+
 function verifyEnvironmentHealthResponse(input: {
   readonly response: RelayEnvironmentHealthResponse;
   readonly environmentId: string;
@@ -301,7 +364,7 @@ const make = Effect.gen(function* () {
     );
   const resolveManagedEndpoint = Effect.fn("relay.environment_connector.resolve_managed_endpoint")(
     function* (input: {
-      readonly operation: "connect" | "status";
+      readonly operation: EnvironmentConnectorOperation;
       readonly link: EnvironmentLinks.RelayLinkedEnvironmentRecord;
       readonly allocation: ManagedEndpointAllocations.ManagedEndpointAllocation | null;
     }) {
@@ -640,6 +703,7 @@ const make = Effect.gen(function* () {
                 Effect.fail(
                   new EnvironmentMintRequestTimedOut({
                     environmentId: input.environmentId,
+                    operation: "connect",
                     timeoutMs: ENVIRONMENT_MINT_REQUEST_TIMEOUT_MS,
                   }),
                 ),
@@ -668,6 +732,113 @@ const make = Effect.gen(function* () {
         credential: decoded.credential,
         expiresAt: decoded.expiresAt,
       };
+    }),
+    dispatchJob: Effect.fn("relay.environment_connector.dispatch_job")(function* (input) {
+      yield* Effect.annotateCurrentSpan({
+        "relay.environment_id": input.environmentId,
+        "relay.operation": "dispatch-job",
+        "relay.job_id": input.jobId,
+      });
+      const { link, allocation } = yield* Effect.all(
+        {
+          link: links.getForUser(input),
+          allocation: allocations.get(input),
+        },
+        { concurrency: 2 },
+      );
+      if (!link) {
+        return yield* new EnvironmentConnectNotAuthorized({
+          environmentId: input.environmentId,
+          operation: "dispatch-job",
+          reason: "environment_link_not_found",
+        });
+      }
+      const endpoint = yield* resolveManagedEndpoint({
+        operation: "dispatch-job",
+        link,
+        allocation,
+      });
+      const now = yield* DateTime.now;
+      const expiresAt = DateTime.add(now, { minutes: 2 });
+      const payload = {
+        iss: relayIssuer,
+        aud: `t3-env:${link.environmentId}`,
+        sub: input.userId,
+        jti: yield* crypto.randomUUIDv4.pipe(
+          Effect.mapError(
+            (cause) =>
+              new EnvironmentMintRequestFailed({
+                environmentId: input.environmentId,
+                operation: "dispatch-job",
+                cause,
+              }),
+          ),
+        ),
+        iat: Math.floor(now.epochMilliseconds / 1_000),
+        exp: Math.floor(expiresAt.epochMilliseconds / 1_000),
+        environmentId: link.environmentId,
+        jobId: input.jobId,
+        repositoryCanonicalKey: input.repositoryCanonicalKey,
+        baseBranch: input.baseBranch,
+        instruction: input.instruction,
+      } satisfies RelayCloudDispatchJobProofPayload;
+      const proof = yield* signRelayJwt({
+        privateKey: Redacted.value(settings.cloudMintPrivateKey),
+        typ: RELAY_DISPATCH_JOB_REQUEST_TYP,
+        payload,
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new EnvironmentMintRequestFailed({
+              environmentId: input.environmentId,
+              operation: "dispatch-job",
+              cause,
+            }),
+        ),
+      );
+      const environmentClient = yield* makeEnvironmentClient(endpoint.httpBaseUrl);
+      // Returns when the environment has *accepted* the job, never when the job
+      // is done: a run takes minutes and this request has seconds.
+      const decoded = yield* environmentClient.connect.t3DispatchJob({ payload: { proof } }).pipe(
+        withoutRedirects,
+        Effect.mapError(
+          (cause) =>
+            new EnvironmentMintRequestFailed({
+              environmentId: input.environmentId,
+              operation: "dispatch-job",
+              cause,
+            }),
+        ),
+        Effect.timeoutOption(Duration.millis(ENVIRONMENT_DISPATCH_JOB_REQUEST_TIMEOUT_MS)),
+        Effect.flatMap(
+          Option.match({
+            onNone: () =>
+              Effect.fail(
+                new EnvironmentMintRequestTimedOut({
+                  environmentId: input.environmentId,
+                  operation: "dispatch-job",
+                  timeoutMs: ENVIRONMENT_DISPATCH_JOB_REQUEST_TIMEOUT_MS,
+                }),
+              ),
+            onSome: Effect.succeed,
+          }),
+        ),
+      );
+      const verified = yield* verifyEnvironmentDispatchJobResponse({
+        response: decoded,
+        environmentId: input.environmentId,
+        jobId: input.jobId,
+        environmentPublicKeys: [link.environmentPublicKey],
+        relayIssuer,
+        nowEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),
+      });
+      if (!verified) {
+        return yield* new EnvironmentMintResponseInvalid({
+          environmentId: input.environmentId,
+          operation: "dispatch-job",
+        });
+      }
+      return { accepted: decoded.accepted };
     }),
   });
 });

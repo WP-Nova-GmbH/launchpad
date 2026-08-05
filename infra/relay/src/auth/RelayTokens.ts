@@ -2,6 +2,7 @@ import {
   RelayDpopAccessTokenScope,
   RelayEnvironmentConnectScope,
   RelayEnvironmentStatusScope,
+  RelayJobDispatchScope,
   RelayMobileClientId,
   RelayMobileRegistrationScope,
   RelayWebClientId,
@@ -68,8 +69,13 @@ const allowedScopesByClientId: Record<
     RelayEnvironmentConnectScope,
     RelayEnvironmentStatusScope,
     RelayMobileRegistrationScope,
+    RelayJobDispatchScope,
   ]),
-  [RelayWebClientId]: new Set([RelayEnvironmentConnectScope, RelayEnvironmentStatusScope]),
+  [RelayWebClientId]: new Set([
+    RelayEnvironmentConnectScope,
+    RelayEnvironmentStatusScope,
+    RelayJobDispatchScope,
+  ]),
 };
 
 function resolveDpopAccessTokenScopes(input: {
