@@ -1,7 +1,12 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import type { ChatAttachment, ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import type {
+  ChatAttachment,
+  ModelSelection,
+  ProviderInstanceId,
+  ProviderRuntimeToolKind,
+} from "@t3tools/contracts";
 import { TextGenerationError } from "@t3tools/contracts";
 
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
@@ -73,6 +78,37 @@ export interface ThreadTitleGenerationResult {
   title: string;
 }
 
+/**
+ * One approval request, put to the supervisor model that answers approvals
+ * during an unattended job (ADR-0008).
+ *
+ * `toolKind` is the classification the request already carries — `file-read`
+ * never reaches here because it auto-approves without a model call, and
+ * `other` means the request could not be classified, which is a reason for
+ * more caution rather than less.
+ */
+export interface ApprovalVerdictGenerationInput {
+  cwd: string;
+  toolKind: ProviderRuntimeToolKind;
+  requestType: string;
+  /** What the agent is asking to do, as the provider described it. */
+  requestDetail?: string | undefined;
+  /** The instruction the step was given, so the verdict can judge relevance. */
+  stepInstruction: string;
+  policy?: TextGenerationPolicy | undefined;
+  /** What model and provider to use for generation. */
+  modelSelection: ModelSelection;
+}
+
+export interface ApprovalVerdictGenerationResult {
+  /**
+   * A decision, not a confidence score: a self-reported number needs a
+   * threshold nobody can calibrate (ADR-0008).
+   */
+  verdict: "approve" | "deny" | "escalate";
+  reasoning: string;
+}
+
 export interface TextGenerationService {
   generateCommitMessage(
     input: CommitMessageGenerationInput,
@@ -80,6 +116,9 @@ export interface TextGenerationService {
   generatePrContent(input: PrContentGenerationInput): Promise<PrContentGenerationResult>;
   generateBranchName(input: BranchNameGenerationInput): Promise<BranchNameGenerationResult>;
   generateThreadTitle(input: ThreadTitleGenerationInput): Promise<ThreadTitleGenerationResult>;
+  generateApprovalVerdict(
+    input: ApprovalVerdictGenerationInput,
+  ): Promise<ApprovalVerdictGenerationResult>;
 }
 
 /**
@@ -113,6 +152,14 @@ export class TextGeneration extends Context.Service<
     readonly generateThreadTitle: (
       input: ThreadTitleGenerationInput,
     ) => Effect.Effect<ThreadTitleGenerationResult, TextGenerationError>;
+
+    /**
+     * Answer one approval request on behalf of the absent human during an
+     * unattended job (ADR-0008).
+     */
+    readonly generateApprovalVerdict: (
+      input: ApprovalVerdictGenerationInput,
+    ) => Effect.Effect<ApprovalVerdictGenerationResult, TextGenerationError>;
   }
 >()("t3/textGeneration/TextGeneration") {}
 
@@ -123,7 +170,8 @@ type TextGenerationOp =
   | "generateCommitMessage"
   | "generatePrContent"
   | "generateBranchName"
-  | "generateThreadTitle";
+  | "generateThreadTitle"
+  | "generateApprovalVerdict";
 
 const resolveInstance = (
   registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
@@ -162,6 +210,10 @@ export const makeTextGenerationFromRegistry = (
     generateThreadTitle: (input) =>
       resolveInstance(registry, "generateThreadTitle", input.modelSelection.instanceId).pipe(
         Effect.flatMap((textGeneration) => textGeneration.generateThreadTitle(input)),
+      ),
+    generateApprovalVerdict: (input) =>
+      resolveInstance(registry, "generateApprovalVerdict", input.modelSelection.instanceId).pipe(
+        Effect.flatMap((textGeneration) => textGeneration.generateApprovalVerdict(input)),
       ),
   });
 

@@ -292,6 +292,11 @@ function createTextGeneration(
       Effect.succeed({
         title: "Update workflow",
       }),
+    generateApprovalVerdict: () =>
+      Effect.succeed({
+        verdict: "approve" as const,
+        reasoning: "fake approval verdict",
+      }),
     ...overrides,
   };
 
@@ -324,6 +329,17 @@ function createTextGeneration(
           (cause) =>
             new TextGenerationError({
               operation: "generateBranchName",
+              detail: "fake text generation failed",
+              ...(cause !== undefined ? { cause } : {}),
+            }),
+        ),
+      ),
+    generateApprovalVerdict: (input) =>
+      implementation.generateApprovalVerdict(input).pipe(
+        Effect.mapError(
+          (cause) =>
+            new TextGenerationError({
+              operation: "generateApprovalVerdict",
               detail: "fake text generation failed",
               ...(cause !== undefined ? { cause } : {}),
             }),

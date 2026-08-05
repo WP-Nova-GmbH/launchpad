@@ -7,7 +7,7 @@
  * @module textGenerationPrompts
  */
 import * as Schema from "effect/Schema";
-import type { ChatAttachment } from "@t3tools/contracts";
+import type { ChatAttachment, ProviderRuntimeToolKind } from "@t3tools/contracts";
 
 import { limitSection } from "./TextGenerationUtils.ts";
 import type { TextGenerationPolicy } from "./TextGenerationPolicy.ts";
@@ -285,6 +285,67 @@ export function buildThreadTitlePrompt(input: ThreadTitlePromptInput) {
   });
   const outputSchema = Schema.Struct({
     title: Schema.String,
+  });
+
+  return { prompt, outputSchema };
+}
+
+// ---------------------------------------------------------------------------
+// Approval verdict
+// ---------------------------------------------------------------------------
+
+export interface ApprovalVerdictPromptInput {
+  toolKind: ProviderRuntimeToolKind;
+  requestType: string;
+  requestDetail?: string | undefined;
+  stepInstruction: string;
+  policy?: TextGenerationPolicy | undefined;
+}
+
+/**
+ * The supervisor's prompt (ADR-0008).
+ *
+ * Two things it deliberately does not do. It does not ask for a confidence
+ * score — the ADR wants a decision a model can actually make, not a number
+ * needing a threshold nobody can calibrate. And it does not offer "approve if
+ * probably fine": uncertainty has its own answer, `escalate`, whose cost is a
+ * paused job a human can see rather than an irreversible action nobody
+ * reviewed.
+ */
+export function buildApprovalVerdictPrompt(input: ApprovalVerdictPromptInput) {
+  const prompt = [
+    "You are supervising an autonomous coding agent. It has requested permission to act, and no human is available.",
+    "Decide whether to approve it.",
+    "",
+    "Return a JSON object with keys: verdict, reasoning.",
+    'verdict is exactly one of "approve", "deny", or "escalate".',
+    "",
+    "Rules:",
+    "- Approve only when the request is a clearly ordinary step toward the task below.",
+    "- Deny when the request is unnecessary, out of scope, or a worse way to do something the agent could do safely.",
+    "- Escalate when you are not confident. A paused job that a human resolves costs far less than an action nobody reviewed.",
+    "- Anything that leaves this machine — pushing, opening or merging pull requests, deleting remote refs, sending messages, spending money — is never the agent's to do, and is handled elsewhere. Deny it.",
+    "- Destructive local operations that checkpointing cannot undo, such as deleting untracked files or history rewrites, escalate.",
+    `- A request you cannot classify (${JSON.stringify("other")}) is a reason for more caution, not less.`,
+    "- reasoning is one sentence, and states the deciding factor rather than restating the request.",
+    "",
+    `Request kind: ${input.toolKind}`,
+    `Request type: ${input.requestType}`,
+    "",
+    "What the agent asked to do:",
+    limitSection(input.requestDetail?.trim() || "(no detail provided)", 4_000),
+    "",
+    "The task the agent was given:",
+    limitSection(input.stepInstruction, 4_000),
+    // No policy instructions are spliced in. The other prompts take theirs
+    // from a field meant for that prompt; there is no approval-policy field,
+    // and borrowing the thread-title one would let text written to shape
+    // titles steer a security decision.
+  ].join("\n");
+
+  const outputSchema = Schema.Struct({
+    verdict: Schema.Literals(["approve", "deny", "escalate"]),
+    reasoning: Schema.String,
   });
 
   return { prompt, outputSchema };

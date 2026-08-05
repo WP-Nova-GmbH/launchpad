@@ -20,6 +20,7 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { TextGenerationError } from "@t3tools/contracts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
+  buildApprovalVerdictPrompt,
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
   buildPrContentPrompt,
@@ -85,7 +86,8 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle",
+      | "generateThreadTitle"
+      | "generateApprovalVerdict",
     value: unknown,
     detail: string,
   ): Effect.Effect<string, TextGenerationError> =>
@@ -115,7 +117,8 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "generateApprovalVerdict";
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -359,10 +362,35 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       };
     });
 
+  const generateApprovalVerdict: TextGeneration.TextGeneration["Service"]["generateApprovalVerdict"] =
+    Effect.fn("ClaudeTextGeneration.generateApprovalVerdict")(function* (input) {
+      const { prompt, outputSchema } = buildApprovalVerdictPrompt({
+        toolKind: input.toolKind,
+        requestType: input.requestType,
+        requestDetail: input.requestDetail,
+        stepInstruction: input.stepInstruction,
+        policy: input.policy,
+      });
+
+      const generated = yield* runClaudeJson({
+        operation: "generateApprovalVerdict",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+
+      return {
+        verdict: generated.verdict,
+        reasoning: generated.reasoning,
+      } satisfies TextGeneration.ApprovalVerdictGenerationResult;
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
+    generateApprovalVerdict,
   } satisfies TextGeneration.TextGeneration["Service"];
 });

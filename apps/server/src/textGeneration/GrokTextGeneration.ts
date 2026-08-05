@@ -13,6 +13,7 @@ import { extractJsonObject } from "@t3tools/shared/schemaJson";
 import { TextGenerationError } from "@t3tools/contracts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
+  buildApprovalVerdictPrompt,
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
   buildPrContentPrompt,
@@ -52,7 +53,8 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "generateApprovalVerdict";
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -251,10 +253,35 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
       } satisfies TextGeneration.ThreadTitleGenerationResult;
     });
 
+  const generateApprovalVerdict: TextGeneration.TextGeneration["Service"]["generateApprovalVerdict"] =
+    Effect.fn("GrokTextGeneration.generateApprovalVerdict")(function* (input) {
+      const { prompt, outputSchema } = buildApprovalVerdictPrompt({
+        toolKind: input.toolKind,
+        requestType: input.requestType,
+        requestDetail: input.requestDetail,
+        stepInstruction: input.stepInstruction,
+        policy: input.policy,
+      });
+
+      const generated = yield* runGrokJson({
+        operation: "generateApprovalVerdict",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+
+      return {
+        verdict: generated.verdict,
+        reasoning: generated.reasoning,
+      } satisfies TextGeneration.ApprovalVerdictGenerationResult;
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
+    generateApprovalVerdict,
   } satisfies TextGeneration.TextGeneration["Service"];
 });

@@ -22,6 +22,7 @@ import { expandHomePath } from "../pathExpansion.ts";
 import { codexExecLaunchArgs, resolveCodexLaunchArgs } from "../provider/Layers/codexLaunchArgs.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
+  buildApprovalVerdictPrompt,
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
   buildPrContentPrompt,
@@ -101,7 +102,8 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle",
+      | "generateThreadTitle"
+      | "generateApprovalVerdict",
     value: unknown,
   ): Effect.Effect<string, TextGenerationError> =>
     encodeJsonString(value).pipe(
@@ -120,7 +122,8 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle",
+      | "generateThreadTitle"
+      | "generateApprovalVerdict",
     attachments: TextGeneration.BranchNameGenerationInput["attachments"],
   ): Effect.fn.Return<MaterializedImageAttachments, TextGenerationError> {
     if (!attachments || attachments.length === 0) {
@@ -162,7 +165,8 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "generateApprovalVerdict";
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -405,10 +409,36 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       } satisfies TextGeneration.ThreadTitleGenerationResult;
     });
 
+  const generateApprovalVerdict: TextGeneration.TextGeneration["Service"]["generateApprovalVerdict"] =
+    Effect.fn("CodexTextGeneration.generateApprovalVerdict")(function* (input) {
+      const { prompt, outputSchema } = buildApprovalVerdictPrompt({
+        toolKind: input.toolKind,
+        requestType: input.requestType,
+        requestDetail: input.requestDetail,
+        stepInstruction: input.stepInstruction,
+        policy: input.policy,
+      });
+
+      const generated = yield* runCodexJson({
+        operation: "generateApprovalVerdict",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        imagePaths: [],
+        modelSelection: input.modelSelection,
+      });
+
+      return {
+        verdict: generated.verdict,
+        reasoning: generated.reasoning,
+      } satisfies TextGeneration.ApprovalVerdictGenerationResult;
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
+    generateApprovalVerdict,
   } satisfies TextGeneration.TextGeneration["Service"];
 });

@@ -19,6 +19,7 @@ import { extractJsonObject } from "@t3tools/shared/schemaJson";
 import * as ServerConfig from "../config.ts";
 import { resolveAttachmentPath } from "../attachmentStore.ts";
 import {
+  buildApprovalVerdictPrompt,
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
   buildPrContentPrompt,
@@ -39,6 +40,7 @@ const OpenCodeTextGenerationOperation = Schema.Literals([
   "generatePrContent",
   "generateBranchName",
   "generateThreadTitle",
+  "generateApprovalVerdict",
 ]);
 
 type OpenCodeTextGenerationOperation = typeof OpenCodeTextGenerationOperation.Type;
@@ -253,7 +255,8 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "generateApprovalVerdict";
   }) =>
     sharedServerMutex.withPermit(
       Effect.gen(function* () {
@@ -615,10 +618,35 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
       };
     });
 
+  const generateApprovalVerdict: TextGeneration.TextGeneration["Service"]["generateApprovalVerdict"] =
+    Effect.fn("OpenCodeTextGeneration.generateApprovalVerdict")(function* (input) {
+      const { prompt, outputSchema } = buildApprovalVerdictPrompt({
+        toolKind: input.toolKind,
+        requestType: input.requestType,
+        requestDetail: input.requestDetail,
+        stepInstruction: input.stepInstruction,
+        policy: input.policy,
+      });
+      const generated = yield* runOpenCodeJson({
+        operation: "generateApprovalVerdict",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+        attachments: [],
+      });
+
+      return {
+        verdict: generated.verdict,
+        reasoning: generated.reasoning,
+      } satisfies TextGeneration.ApprovalVerdictGenerationResult;
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
+    generateApprovalVerdict,
   } satisfies TextGeneration.TextGeneration["Service"];
 });
