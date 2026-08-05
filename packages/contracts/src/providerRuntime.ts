@@ -1033,9 +1033,44 @@ export type ProviderRuntimeApprovalRequestedEvent = ProviderRuntimeRequestOpened
 const ProviderRuntimeApprovalResolvedEvent = ProviderRuntimeRequestResolvedEvent;
 export type ProviderRuntimeApprovalResolvedEvent = ProviderRuntimeRequestResolvedEvent;
 
-// Legacy helper aliases retained for adapters/tests.
-const ProviderRuntimeToolKind = Schema.Literals(["command", "file-read", "file-change", "other"]);
+/**
+ * What a request is asking permission to do. This is the classification an
+ * approval is judged by — see ADR-0008, where it is what decides whether a
+ * supervisor model is consulted at all.
+ *
+ * `other` is the fail-closed member: it means "this request has no kind we
+ * recognise", not "this request is harmless". Requests that land there must
+ * never be auto-approved.
+ */
+export const ProviderRuntimeToolKind = Schema.Literals([
+  "command",
+  "file-read",
+  "file-change",
+  "other",
+]);
 export type ProviderRuntimeToolKind = typeof ProviderRuntimeToolKind.Type;
+
+/**
+ * Classify a canonical request type. Total by construction: an unrecognised or
+ * absent request type is `other`, so a new provider request type cannot become
+ * silently benign by failing to match a case here.
+ */
+export function providerRuntimeToolKindForRequestType(
+  requestType: string | undefined,
+): ProviderRuntimeToolKind {
+  switch (requestType) {
+    case "command_execution_approval":
+    case "exec_command_approval":
+      return "command";
+    case "file_read_approval":
+      return "file-read";
+    case "file_change_approval":
+    case "apply_patch_approval":
+      return "file-change";
+    default:
+      return "other";
+  }
+}
 
 export const ProviderRuntimeTurnStatus = RuntimeTurnState;
 export type ProviderRuntimeTurnStatus = RuntimeTurnState;

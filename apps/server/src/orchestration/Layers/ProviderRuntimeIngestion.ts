@@ -16,6 +16,8 @@ import {
   type OrchestrationThread,
   type OrchestrationThreadActivity,
   type ProviderRuntimeEvent,
+  type ProviderRuntimeToolKind,
+  providerRuntimeToolKindForRequestType,
 } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
@@ -290,21 +292,17 @@ function sessionStatusAllowsActiveTurn(
   return status === "starting" || status === "running";
 }
 
+/**
+ * The activity payload carries only the three kinds clients render; `other`
+ * stays off the wire as an absent `requestKind`, exactly as before. The
+ * classification itself is `providerRuntimeToolKindForRequestType` so that the
+ * supervisor and this projection can never drift apart.
+ */
 function requestKindFromCanonicalRequestType(
   requestType: string | undefined,
-): "command" | "file-read" | "file-change" | undefined {
-  switch (requestType) {
-    case "command_execution_approval":
-    case "exec_command_approval":
-      return "command";
-    case "file_read_approval":
-      return "file-read";
-    case "file_change_approval":
-    case "apply_patch_approval":
-      return "file-change";
-    default:
-      return undefined;
-  }
+): Exclude<ProviderRuntimeToolKind, "other"> | undefined {
+  const toolKind = providerRuntimeToolKindForRequestType(requestType);
+  return toolKind === "other" ? undefined : toolKind;
 }
 
 export function runtimeEventToActivities(
