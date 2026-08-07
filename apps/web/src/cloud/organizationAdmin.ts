@@ -15,7 +15,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { runtime } from "../lib/runtime";
 import { decodedRelayClientError } from "./linkEnvironment";
-import { resolveCloudPublicConfig, resolveRelayClerkTokenOptions } from "./publicConfig";
+import { resolveRelayClerkTokenOptions } from "./publicConfig";
 
 type TenancyClient = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
 
@@ -37,7 +37,6 @@ export interface IssuedInvitation {
 }
 
 export interface OrganizationAdminState {
-  readonly relayConfigured: boolean;
   readonly isSignedIn: boolean;
   readonly snapshot: OrganizationAdminSnapshot | null;
   readonly loading: boolean;
@@ -89,10 +88,13 @@ function failureMessage(cause: unknown): string {
  * Drives the organization settings surface. Every call carries a fresh Clerk
  * token: tenancy lives in the relay, so the token proves who is asking and
  * nothing more.
+ *
+ * Only callable under a `ClerkProvider`, which `main.tsx` mounts solely when
+ * `hasCloudPublicConfig()` holds — so callers must check that first and render
+ * something else when it does not.
  */
 export function useOrganizationAdmin(): OrganizationAdminState {
   const { getToken, isSignedIn } = useAuth();
-  const relayConfigured = resolveCloudPublicConfig().relayUrl !== null;
   const [snapshot, setSnapshot] = useState<OrganizationAdminSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -122,7 +124,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
   );
 
   const load = useCallback(async () => {
-    if (!relayConfigured || !isSignedIn) {
+    if (!isSignedIn) {
       setSnapshot(null);
       return;
     }
@@ -154,7 +156,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     } finally {
       setLoading(false);
     }
-  }, [call, isSignedIn, relayConfigured]);
+  }, [call, isSignedIn]);
 
   useEffect(() => {
     void load();
@@ -179,7 +181,6 @@ export function useOrganizationAdmin(): OrganizationAdminState {
   );
 
   return {
-    relayConfigured,
     isSignedIn: isSignedIn ?? false,
     snapshot,
     loading,

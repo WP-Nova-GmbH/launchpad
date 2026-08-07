@@ -1,5 +1,5 @@
 import { BuildingIcon, CopyIcon, FolderGit2Icon, TrashIcon, UsersIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type {
   RelayInvitation,
   RelayOrgRole,
@@ -11,6 +11,7 @@ import type {
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useProjects } from "../../state/entities";
 import { useOrganizationAdmin, type OrganizationAdminState } from "../../cloud/organizationAdmin";
+import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../ui/empty";
@@ -539,54 +540,40 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
   );
 }
 
-export function OrganizationSettings() {
-  const state = useOrganizationAdmin();
+function OrganizationSettingsNotice({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <SettingsPageContainer>
+      <SettingsSection
+        id={searchableSetting("organization").id}
+        title={searchableSetting("organization").title}
+      >
+        <Empty className="min-h-64">
+          <EmptyMedia variant="icon">
+            <BuildingIcon />
+          </EmptyMedia>
+          <EmptyHeader>
+            <EmptyTitle>{title}</EmptyTitle>
+            <EmptyDescription>{children}</EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      </SettingsSection>
+    </SettingsPageContainer>
+  );
+}
 
-  if (!state.relayConfigured) {
-    return (
-      <SettingsPageContainer>
-        <SettingsSection
-          id={searchableSetting("organization").id}
-          title={searchableSetting("organization").title}
-        >
-          <Empty className="min-h-64">
-            <EmptyMedia variant="icon">
-              <BuildingIcon />
-            </EmptyMedia>
-            <EmptyHeader>
-              <EmptyTitle>T3 Connect is not configured</EmptyTitle>
-              <EmptyDescription>
-                Organizations live in the relay, so this build needs a relay URL before it can show
-                one.
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        </SettingsSection>
-      </SettingsPageContainer>
-    );
-  }
+/**
+ * Split from `OrganizationSettings` because the state hook reads Clerk, and
+ * `ClerkProvider` is only mounted when T3 Connect is configured. Calling the
+ * hook above that check would crash the app on a build without it.
+ */
+function ConfiguredOrganizationSettings() {
+  const state = useOrganizationAdmin();
 
   if (!state.isSignedIn) {
     return (
-      <SettingsPageContainer>
-        <SettingsSection
-          id={searchableSetting("organization").id}
-          title={searchableSetting("organization").title}
-        >
-          <Empty className="min-h-64">
-            <EmptyMedia variant="icon">
-              <BuildingIcon />
-            </EmptyMedia>
-            <EmptyHeader>
-              <EmptyTitle>Sign in to T3 Connect</EmptyTitle>
-              <EmptyDescription>
-                Your organization is created the first time you ask for it, so signing in is all it
-                takes.
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        </SettingsSection>
-      </SettingsPageContainer>
+      <OrganizationSettingsNotice title="Sign in to T3 Connect">
+        Your organization is created the first time you ask for it, so signing in is all it takes.
+      </OrganizationSettingsNotice>
     );
   }
 
@@ -610,4 +597,16 @@ export function OrganizationSettings() {
       )}
     </SettingsPageContainer>
   );
+}
+
+export function OrganizationSettings() {
+  if (!hasCloudPublicConfig()) {
+    return (
+      <OrganizationSettingsNotice title="T3 Connect is not configured">
+        Organizations live in the relay, so this build needs T3 Connect&apos;s keys and a relay URL
+        before it can show one.
+      </OrganizationSettingsNotice>
+    );
+  }
+  return <ConfiguredOrganizationSettings />;
 }
