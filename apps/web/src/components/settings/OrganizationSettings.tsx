@@ -1,0 +1,613 @@
+import { BuildingIcon, CopyIcon, FolderGit2Icon, TrashIcon, UsersIcon } from "lucide-react";
+import { useMemo, useState } from "react";
+import type {
+  RelayInvitation,
+  RelayOrgRole,
+  RelayRepositoryId,
+  RelayRepositoryRole,
+  RelayRepositorySummary,
+} from "@t3tools/contracts/relay";
+
+import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
+import { useProjects } from "../../state/entities";
+import { useOrganizationAdmin, type OrganizationAdminState } from "../../cloud/organizationAdmin";
+import { Badge } from "../ui/badge";
+import { Button } from "../ui/button";
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../ui/empty";
+import { Input } from "../ui/input";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
+import { Spinner } from "../ui/spinner";
+import { unregisteredCheckouts } from "./OrganizationSettings.logic";
+import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
+import { searchableSetting } from "./settingsSearch";
+
+const ORG_ROLE_LABELS: Readonly<Record<RelayOrgRole, string>> = {
+  admin: "Admin",
+  member: "Member",
+};
+
+const REPOSITORY_ROLE_LABELS: Readonly<Record<RelayRepositoryRole, string>> = {
+  maintainer: "Maintainer",
+  developer: "Developer",
+};
+
+function RoleBadge({ children }: { children: string }) {
+  return (
+    <Badge variant="secondary" className="font-normal">
+      {children}
+    </Badge>
+  );
+}
+
+function OrganizationSection({ state }: { state: OrganizationAdminState }) {
+  const membership = state.snapshot?.membership;
+  const [name, setName] = useState("");
+  const [joinToken, setJoinToken] = useState("");
+  const isAdmin = membership?.role === "admin";
+  const pendingName = name.trim();
+
+  if (!membership) return null;
+
+  return (
+    <SettingsSection
+      id={searchableSetting("organization").id}
+      title={searchableSetting("organization").title}
+      icon={<BuildingIcon className="size-4 text-muted-foreground" />}
+    >
+      <SettingsRow
+        title={membership.organization.name}
+        description={`You are ${membership.role === "admin" ? "an admin" : "a member"} of this organization.`}
+        control={<RoleBadge>{ORG_ROLE_LABELS[membership.role]}</RoleBadge>}
+      />
+      {isAdmin ? (
+        <SettingsRow
+          title="Name"
+          description="What this organization is called across every client."
+          control={
+            <div className="flex w-full items-center gap-2 sm:w-auto">
+              <Input
+                nativeInput
+                value={name}
+                placeholder={membership.organization.name}
+                aria-label="Organization name"
+                onChange={(event) => setName(event.currentTarget.value)}
+                className="w-full sm:w-56"
+              />
+              <Button
+                size="sm"
+                disabled={state.busy || pendingName.length === 0}
+                onClick={() => {
+                  void state.renameOrganization(pendingName).then((ok) => {
+                    if (ok) setName("");
+                  });
+                }}
+              >
+                Rename
+              </Button>
+            </div>
+          }
+        />
+      ) : null}
+      <SettingsRow
+        title="Join another organization"
+        description="Paste an invitation link's token. Joining means leaving this organization, so it only works while this one is empty."
+        control={
+          <div className="flex w-full items-center gap-2 sm:w-auto">
+            <Input
+              nativeInput
+              value={joinToken}
+              placeholder="Invitation token"
+              aria-label="Invitation token"
+              onChange={(event) => setJoinToken(event.currentTarget.value)}
+              className="w-full sm:w-56"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={state.busy || joinToken.trim().length === 0}
+              onClick={() => {
+                void state.acceptInvitation(joinToken.trim()).then((ok) => {
+                  if (ok) setJoinToken("");
+                });
+              }}
+            >
+              Join
+            </Button>
+          </div>
+        }
+      />
+    </SettingsSection>
+  );
+}
+
+function MembersSection({ state }: { state: OrganizationAdminState }) {
+  const snapshot = state.snapshot;
+  const [email, setEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<RelayOrgRole>("member");
+  const { copyToClipboard } = useCopyToClipboard({ target: "invitation token" });
+
+  if (!snapshot) return null;
+  const isAdmin = snapshot.membership.role === "admin";
+
+  return (
+    <SettingsSection
+      id={searchableSetting("organization-members").id}
+      title={searchableSetting("organization-members").title}
+      icon={<UsersIcon className="size-4 text-muted-foreground" />}
+    >
+      {snapshot.members.map((member) => {
+        const isSelf = member.userId === snapshot.membership.userId;
+        return (
+          <SettingsRow
+            key={member.userId}
+            title={<span className="font-mono text-xs">{member.userId}</span>}
+            description={isSelf ? "You" : `Joined ${member.joinedAt.slice(0, 10)}`}
+            control={
+              isAdmin && !isSelf ? (
+                <div className="flex items-center gap-2">
+                  <Select
+                    value={member.role}
+                    onValueChange={(value) => {
+                      if (typeof value !== "string") return;
+                      void state.updateMemberRole({
+                        userId: member.userId,
+                        role: value as RelayOrgRole,
+                      });
+                    }}
+                  >
+                    <SelectTrigger className="w-32" aria-label={`Role for ${member.userId}`}>
+                      <SelectValue>{ORG_ROLE_LABELS[member.role]}</SelectValue>
+                    </SelectTrigger>
+                    <SelectPopup align="end" alignItemWithTrigger={false}>
+                      <SelectItem hideIndicator value="member">
+                        Member
+                      </SelectItem>
+                      <SelectItem hideIndicator value="admin">
+                        Admin
+                      </SelectItem>
+                    </SelectPopup>
+                  </Select>
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    aria-label={`Remove ${member.userId}`}
+                    disabled={state.busy}
+                    onClick={() => void state.removeMember(member.userId)}
+                  >
+                    <TrashIcon className="size-3.5" />
+                  </Button>
+                </div>
+              ) : (
+                <RoleBadge>{ORG_ROLE_LABELS[member.role]}</RoleBadge>
+              )
+            }
+          />
+        );
+      })}
+
+      {isAdmin ? (
+        <>
+          <SettingsRow
+            title="Invite someone"
+            description="There is no email delivery yet, so the link comes back here for you to send."
+            control={
+              <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+                <Input
+                  nativeInput
+                  type="email"
+                  value={email}
+                  placeholder="person@example.com"
+                  aria-label="Invitation email"
+                  onChange={(event) => setEmail(event.currentTarget.value)}
+                  className="w-full sm:w-56"
+                />
+                <Select
+                  value={inviteRole}
+                  onValueChange={(value) => {
+                    if (typeof value === "string") setInviteRole(value as RelayOrgRole);
+                  }}
+                >
+                  <SelectTrigger className="w-32" aria-label="Invitation role">
+                    <SelectValue>{ORG_ROLE_LABELS[inviteRole]}</SelectValue>
+                  </SelectTrigger>
+                  <SelectPopup align="end" alignItemWithTrigger={false}>
+                    <SelectItem hideIndicator value="member">
+                      Member
+                    </SelectItem>
+                    <SelectItem hideIndicator value="admin">
+                      Admin
+                    </SelectItem>
+                  </SelectPopup>
+                </Select>
+                <Button
+                  size="sm"
+                  disabled={state.busy || email.trim().length === 0}
+                  onClick={() => {
+                    void state
+                      .inviteMember({ email: email.trim(), role: inviteRole })
+                      .then((ok) => {
+                        if (ok) setEmail("");
+                      });
+                  }}
+                >
+                  Invite
+                </Button>
+              </div>
+            }
+          />
+          {snapshot.invitations.map((invitation: RelayInvitation) => {
+            const issued = state.issuedInvitations.find(
+              (entry) => entry.invitation.invitationId === invitation.invitationId,
+            );
+            return (
+              <SettingsRow
+                key={invitation.invitationId}
+                title={invitation.email}
+                description={`Invited as ${ORG_ROLE_LABELS[invitation.role].toLowerCase()} · expires ${invitation.expiresAt.slice(0, 10)}${
+                  issued ? "" : " · the token was only shown when it was created"
+                }`}
+                control={
+                  <div className="flex items-center gap-2">
+                    {issued ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => copyToClipboard(issued.token, undefined)}
+                      >
+                        <CopyIcon className="size-3.5" />
+                        Copy token
+                      </Button>
+                    ) : null}
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      aria-label={`Revoke the invitation for ${invitation.email}`}
+                      disabled={state.busy}
+                      onClick={() => void state.revokeInvitation(invitation.invitationId)}
+                    >
+                      <TrashIcon className="size-3.5" />
+                    </Button>
+                  </div>
+                }
+              />
+            );
+          })}
+        </>
+      ) : null}
+    </SettingsSection>
+  );
+}
+
+function RepositoryRow({
+  entry,
+  state,
+  canConfigure,
+  members,
+}: {
+  entry: RelayRepositorySummary;
+  state: OrganizationAdminState;
+  canConfigure: boolean;
+  members: ReadonlyArray<{ readonly userId: string }>;
+}) {
+  const [alias, setAlias] = useState("");
+  const [grantUserId, setGrantUserId] = useState("");
+  const [grantRole, setGrantRole] = useState<RelayRepositoryRole>("developer");
+  const repositoryId = entry.repository.repositoryId as RelayRepositoryId;
+
+  return (
+    <SettingsRow
+      title={entry.repository.name}
+      description={
+        entry.role ? `Your role: ${REPOSITORY_ROLE_LABELS[entry.role]}` : "No role of your own"
+      }
+      control={
+        canConfigure ? (
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`Remove ${entry.repository.name}`}
+            disabled={state.busy}
+            onClick={() => void state.deleteRepository(repositoryId)}
+          >
+            <TrashIcon className="size-3.5" />
+          </Button>
+        ) : null
+      }
+    >
+      <div className="space-y-2 pb-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {entry.repository.canonicalKeys.map((canonicalKey) => (
+            <Badge key={canonicalKey} variant="outline" className="gap-1 font-mono text-[11px]">
+              {canonicalKey}
+              {canConfigure && entry.repository.canonicalKeys.length > 1 ? (
+                <button
+                  type="button"
+                  aria-label={`Remove ${canonicalKey}`}
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => void state.removeAlias({ repositoryId, canonicalKey })}
+                >
+                  ×
+                </button>
+              ) : null}
+            </Badge>
+          ))}
+        </div>
+        {canConfigure ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              nativeInput
+              value={alias}
+              placeholder="host/owner/repo"
+              aria-label={`Additional key for ${entry.repository.name}`}
+              onChange={(event) => setAlias(event.currentTarget.value)}
+              className="w-full sm:w-64"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={state.busy || alias.trim().length === 0}
+              onClick={() => {
+                void state
+                  .addAlias({ repositoryId, canonicalKey: alias.trim().toLowerCase() })
+                  .then((ok) => {
+                    if (ok) setAlias("");
+                  });
+              }}
+            >
+              Add key
+            </Button>
+          </div>
+        ) : null}
+        {canConfigure ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              value={grantUserId}
+              onValueChange={(value) => {
+                if (typeof value === "string") setGrantUserId(value);
+              }}
+            >
+              <SelectTrigger
+                className="w-full sm:w-64"
+                aria-label={`Grant access to ${entry.repository.name}`}
+              >
+                <SelectValue>{grantUserId || "Choose a member"}</SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="start" alignItemWithTrigger={false}>
+                {members.map((member) => (
+                  <SelectItem hideIndicator key={member.userId} value={member.userId}>
+                    {member.userId}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+            <Select
+              value={grantRole}
+              onValueChange={(value) => {
+                if (typeof value === "string") setGrantRole(value as RelayRepositoryRole);
+              }}
+            >
+              <SelectTrigger className="w-36" aria-label="Repository role">
+                <SelectValue>{REPOSITORY_ROLE_LABELS[grantRole]}</SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="start" alignItemWithTrigger={false}>
+                <SelectItem hideIndicator value="developer">
+                  Developer
+                </SelectItem>
+                <SelectItem hideIndicator value="maintainer">
+                  Maintainer
+                </SelectItem>
+              </SelectPopup>
+            </Select>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={state.busy || grantUserId.length === 0}
+              onClick={() => {
+                void state
+                  .grantAccess({ repositoryId, userId: grantUserId, role: grantRole })
+                  .then((ok) => {
+                    if (ok) setGrantUserId("");
+                  });
+              }}
+            >
+              Grant
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </SettingsRow>
+  );
+}
+
+function useUnregisteredCheckouts(repositories: ReadonlyArray<RelayRepositorySummary>) {
+  const projects = useProjects();
+  return useMemo(() => unregisteredCheckouts(projects, repositories), [projects, repositories]);
+}
+
+function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
+  const snapshot = state.snapshot;
+  const [name, setName] = useState("");
+  const [canonicalKey, setCanonicalKey] = useState("");
+  const unregistered = useUnregisteredCheckouts(snapshot?.repositories ?? []);
+
+  if (!snapshot) return null;
+  const isAdmin = snapshot.membership.role === "admin";
+
+  return (
+    <SettingsSection
+      id={searchableSetting("organization-repositories").id}
+      title={searchableSetting("organization-repositories").title}
+      icon={<FolderGit2Icon className="size-4 text-muted-foreground" />}
+    >
+      {snapshot.repositories.length === 0 ? (
+        <Empty className="min-h-48">
+          <EmptyMedia variant="icon">
+            <FolderGit2Icon />
+          </EmptyMedia>
+          <EmptyHeader>
+            <EmptyTitle>No repositories yet</EmptyTitle>
+            <EmptyDescription>
+              A repository is recognised by the git remote of a checkout, reduced to
+              <span className="font-mono"> host/owner/repo</span>. Mirrors and forks become extra
+              keys on the same repository.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : (
+        snapshot.repositories.map((entry) => (
+          <RepositoryRow
+            key={entry.repository.repositoryId}
+            entry={entry}
+            state={state}
+            canConfigure={isAdmin || entry.role === "maintainer"}
+            members={snapshot.members}
+          />
+        ))
+      )}
+      {isAdmin
+        ? unregistered.map((checkout) => (
+            <SettingsRow
+              key={checkout.canonicalKey}
+              title={<span className="font-mono text-xs">{checkout.canonicalKey}</span>}
+              description="Checked out on a machine you can see, but not part of this organization."
+              control={
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={state.busy}
+                  onClick={() =>
+                    void state.registerRepository({
+                      name: checkout.suggestedName,
+                      canonicalKey: checkout.canonicalKey,
+                    })
+                  }
+                >
+                  Register
+                </Button>
+              }
+            />
+          ))
+        : null}
+      {isAdmin ? (
+        <SettingsRow
+          title="Register a repository"
+          description="Whoever registers it becomes its first maintainer."
+          control={
+            <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+              <Input
+                nativeInput
+                value={name}
+                placeholder="Name"
+                aria-label="Repository name"
+                onChange={(event) => setName(event.currentTarget.value)}
+                className="w-full sm:w-40"
+              />
+              <Input
+                nativeInput
+                value={canonicalKey}
+                placeholder="github.com/acme/app"
+                aria-label="Canonical key"
+                onChange={(event) => setCanonicalKey(event.currentTarget.value)}
+                className="w-full sm:w-64"
+              />
+              <Button
+                size="sm"
+                disabled={
+                  state.busy || name.trim().length === 0 || canonicalKey.trim().length === 0
+                }
+                onClick={() => {
+                  void state
+                    .registerRepository({
+                      name: name.trim(),
+                      canonicalKey: canonicalKey.trim().toLowerCase(),
+                    })
+                    .then((ok) => {
+                      if (ok) {
+                        setName("");
+                        setCanonicalKey("");
+                      }
+                    });
+                }}
+              >
+                Register
+              </Button>
+            </div>
+          }
+        />
+      ) : null}
+    </SettingsSection>
+  );
+}
+
+export function OrganizationSettings() {
+  const state = useOrganizationAdmin();
+
+  if (!state.relayConfigured) {
+    return (
+      <SettingsPageContainer>
+        <SettingsSection
+          id={searchableSetting("organization").id}
+          title={searchableSetting("organization").title}
+        >
+          <Empty className="min-h-64">
+            <EmptyMedia variant="icon">
+              <BuildingIcon />
+            </EmptyMedia>
+            <EmptyHeader>
+              <EmptyTitle>T3 Connect is not configured</EmptyTitle>
+              <EmptyDescription>
+                Organizations live in the relay, so this build needs a relay URL before it can show
+                one.
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        </SettingsSection>
+      </SettingsPageContainer>
+    );
+  }
+
+  if (!state.isSignedIn) {
+    return (
+      <SettingsPageContainer>
+        <SettingsSection
+          id={searchableSetting("organization").id}
+          title={searchableSetting("organization").title}
+        >
+          <Empty className="min-h-64">
+            <EmptyMedia variant="icon">
+              <BuildingIcon />
+            </EmptyMedia>
+            <EmptyHeader>
+              <EmptyTitle>Sign in to T3 Connect</EmptyTitle>
+              <EmptyDescription>
+                Your organization is created the first time you ask for it, so signing in is all it
+                takes.
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        </SettingsSection>
+      </SettingsPageContainer>
+    );
+  }
+
+  return (
+    <SettingsPageContainer>
+      {state.error ? (
+        <p role="alert" className="px-3 text-sm text-destructive sm:px-4">
+          {state.error}
+        </p>
+      ) : null}
+      {state.loading && !state.snapshot ? (
+        <div className="flex min-h-64 items-center justify-center">
+          <Spinner />
+        </div>
+      ) : (
+        <>
+          <OrganizationSection state={state} />
+          <MembersSection state={state} />
+          <RepositoriesSection state={state} />
+        </>
+      )}
+    </SettingsPageContainer>
+  );
+}

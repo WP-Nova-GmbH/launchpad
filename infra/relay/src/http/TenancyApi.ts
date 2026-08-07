@@ -40,6 +40,7 @@ function toApiMembership(
 ): RelayOrganizationMembership {
   return {
     organization: toApiOrganization(record.organization),
+    userId: record.userId,
     role: record.role,
     joinedAt: record.joinedAt,
   };

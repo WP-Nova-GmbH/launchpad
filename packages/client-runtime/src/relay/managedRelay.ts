@@ -95,6 +95,24 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "unregister relay mobile device",
   "register relay live activity",
   "read relay agent activity snapshot",
+  "read relay organization",
+  "rename relay organization",
+  "list relay organization members",
+  "update relay organization member",
+  "remove relay organization member",
+  "list relay invitations",
+  "create relay invitation",
+  "revoke relay invitation",
+  "accept relay invitation",
+  "list relay repositories",
+  "register relay repository",
+  "look up relay repository",
+  "delete relay repository",
+  "add relay repository alias",
+  "remove relay repository alias",
+  "list relay repository access",
+  "grant relay repository access",
+  "revoke relay repository access",
 ]);
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
@@ -111,6 +129,24 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay mobile device unregistration",
   "Relay Live Activity registration",
   "Relay agent activity snapshot",
+  "Relay organization read",
+  "Relay organization rename",
+  "Relay organization member listing",
+  "Relay organization member update",
+  "Relay organization member removal",
+  "Relay invitation listing",
+  "Relay invitation creation",
+  "Relay invitation revocation",
+  "Relay invitation acceptance",
+  "Relay repository listing",
+  "Relay repository registration",
+  "Relay repository lookup",
+  "Relay repository removal",
+  "Relay repository alias addition",
+  "Relay repository alias removal",
+  "Relay repository access listing",
+  "Relay repository access grant",
+  "Relay repository access revocation",
 ]);
 export type ManagedRelayRequestActivity = typeof ManagedRelayRequestActivity.Type;
 
@@ -204,7 +240,7 @@ export const ManagedRelayClientError = Schema.Union([
 ]);
 export type ManagedRelayClientError = typeof ManagedRelayClientError.Type;
 
-type RelayHttpRequestError =
+export type RelayHttpRequestError =
   | RelayProtectedErrorType
   | HttpClientError.HttpClientError
   | Schema.SchemaError;
@@ -303,7 +339,7 @@ export class ManagedRelayClient extends Context.Service<
 
 const isRelayProtectedError = Schema.is(RelayProtectedError);
 
-function relayRequestError(action: ManagedRelayRequestAction) {
+export function relayRequestError(action: ManagedRelayRequestAction) {
   return (cause: RelayHttpRequestError): ManagedRelayClientError =>
     new ManagedRelayRequestFailedError({
       action,
@@ -328,7 +364,7 @@ function isRejectedDpopAccessToken(error: ManagedRelayClientError): boolean {
   );
 }
 
-function timeoutRelayRequest(activity: ManagedRelayRequestActivity) {
+export function timeoutRelayRequest(activity: ManagedRelayRequestActivity) {
   return <A, E, R>(
     effect: Effect.Effect<A, E, R>,
   ): Effect.Effect<A, E | ManagedRelayClientError, R> =>
@@ -387,7 +423,7 @@ function relayAccountId(clerkToken: string): Option.Option<string> {
   }
 }
 
-function bearerHeaders(clerkToken: string) {
+export function bearerHeaders(clerkToken: string) {
   return { authorization: `Bearer ${clerkToken}` };
 }
 

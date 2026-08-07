@@ -969,6 +969,8 @@ export type RelayOrganization = typeof RelayOrganization.Type;
 /** The caller's own standing: which organization they are in, and as what. */
 export const RelayOrganizationMembership = Schema.Struct({
   organization: RelayOrganization,
+  /** The subject the relay resolved the caller to; clients match it against the roster. */
+  userId: TrimmedNonEmptyString,
   role: RelayOrgRole,
   joinedAt: TrimmedNonEmptyString,
 });

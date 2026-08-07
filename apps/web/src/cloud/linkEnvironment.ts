@@ -128,7 +128,7 @@ const isEnvironmentCloudApiError = Schema.is(
   ]),
 );
 
-function relayProtectedErrorMessage(error: RelayProtectedErrorType): string {
+export function relayProtectedErrorMessage(error: RelayProtectedErrorType): string {
   switch (error._tag) {
     case "RelayAuthInvalidError":
       switch (error.reason) {
@@ -178,7 +178,7 @@ function relayProtectedErrorMessage(error: RelayProtectedErrorType): string {
   }
 }
 
-function decodedRelayClientError(message: string) {
+export function decodedRelayClientError(message: string) {
   return (cause: ManagedRelay.ManagedRelayClientError) => {
     const relayError =
       cause._tag === "ManagedRelayRequestFailedError" ? cause.relayError : undefined;

@@ -8,6 +8,8 @@ import { makeRelayClientTracingLayer } from "@t3tools/shared/relayTracing";
 import * as PrimaryEnvironmentHttpClient from "../environments/primary/httpClient";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 
+import { ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
+
 import { browserCryptoLayer } from "../cloud/dpop";
 import { managedRelayClientLayer } from "../cloud/managedRelayLayer";
 import { resolveCloudPublicConfig, resolveRelayTracingConfig } from "../cloud/publicConfig";
@@ -24,11 +26,16 @@ const relayTracingLayer = makeRelayClientTracingLayer(resolveRelayTracingConfig(
   client: typeof window !== "undefined" && window.desktopBridge ? "desktop" : "web",
 }).pipe(Layer.provide(httpClientLayer));
 
+const relayTenancyLayer = ManagedRelayTenancy.layer({ relayUrl: configuredRelayUrl() }).pipe(
+  Layer.provide(httpClientLayer),
+);
+
 type RuntimeLayerSource =
   | typeof httpClientLayer
   | typeof browserCryptoLayer
   | typeof Socket.layerWebSocketConstructorGlobal
   | typeof relayTracingLayer
+  | typeof relayTenancyLayer
   | ReturnType<typeof managedRelayClientLayer>;
 
 export const remoteHttpRuntime = ManagedRuntime.make(httpClientLayer);
@@ -59,6 +66,7 @@ const runtimeLayer = Layer.mergeAll(
   browserCryptoLayer,
   Socket.layerWebSocketConstructorGlobal,
   relayTracingLayer,
+  relayTenancyLayer,
   managedRelayClientLayer(configuredRelayUrl()).pipe(
     Layer.provide(Layer.mergeAll(httpClientLayer, browserCryptoLayer)),
   ),
