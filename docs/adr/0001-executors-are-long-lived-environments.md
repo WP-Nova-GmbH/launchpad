@@ -24,7 +24,7 @@ persists across runs.
 A T3 environment is durably stateful and every piece of that state is machine-local:
 
 - `<stateDir>/state.sqlite` is the orchestration **event store plus its projections** —
-  it *is* the thread history, not a cache of it.
+  it _is_ the thread history, not a cache of it.
 - Checkpoints are **git refs inside the workspace** (`refs/t3/checkpoints/<threadId>/turn/<n>`),
   so turn diffs and revert depend on that machine's git object store.
 - Provider homes (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, shadow homes) hold live provider auth.
@@ -33,7 +33,7 @@ Making executors stateless is therefore not a persistence swap. `OrchestrationEn
 serializes every command through a single fiber and commits event append, projection, and
 the command receipt inside one SQL transaction — a design that assumes a local
 single-writer SQLite. Relocating it to the relay turns orchestration into a distributed
-consensus problem, and checkpoints would *still* be lost unless every turn also pushed
+consensus problem, and checkpoints would _still_ be lost unless every turn also pushed
 `refs/t3/checkpoints/*` to a remote.
 
 The persistent-volume variant looked like a compromise but has the worse failure mode: a
@@ -44,11 +44,11 @@ racing for one disk corrupts SQLite and leaves a half-written worktree.
 
 - Executor cost is per-machine-lifetime, not per-run. Idle executors cost money, and reclamation
   needs an explicit policy rather than a timeout. Since
-  [ADR-0012](./0012-executors-mirror-their-event-log-to-the-relay.md) the *record* survives
+  [ADR-0012](./0012-executors-mirror-their-event-log-to-the-relay.md) the _record_ survives
   reclamation — what is still lost is the live worktree, checkpoint history, and the ability to
   continue a pinned work item in place.
-- "The relay provisions compute" stays a *provisioning* problem and does not become a
-  *state-architecture* problem.
+- "The relay provisions compute" stays a _provisioning_ problem and does not become a
+  _state-architecture_ problem.
 - If a later pipeline feature needs durability that outlives a machine, that state belongs
   in a pipeline model owned by the relay, **above** threads — not by relocating the
   environment's event store.

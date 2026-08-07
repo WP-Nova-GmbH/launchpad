@@ -13,11 +13,11 @@ which pins that work item to the [executor](../internals/glossary.md#executor) h
 
 Three shapes, and they are not variations of one thing:
 
-| trigger | shape | requires |
-|---|---|---|
-| a person acts in the app | imperative | nothing new |
+| trigger                         | shape                 | requires                                                                                     |
+| ------------------------------- | --------------------- | -------------------------------------------------------------------------------------------- |
+| a person acts in the app        | imperative            | nothing new                                                                                  |
 | an issue enters a watched state | external state change | an [integration](../internals/glossary.md#integration), inbound webhooks, **and write-back** |
-| a follow-up on completed work | continuation | knowing what was already implemented |
+| a follow-up on completed work   | continuation          | knowing what was already implemented                                                         |
 
 The third is why work items must be durable: "an issue that was implemented" is only meaningful
 if something outlived the job that implemented it.

@@ -9,11 +9,11 @@ being "run an agent." Deterministic operations that leave the workspace are `act
 executed by the job runner, which means **agents never push, never open pull requests, and never
 merge**.
 
-| kind | what it is |
-|---|---|
-| `agent` | create a thread, send instructions, wait for it to settle |
+| kind     | what it is                                                                                   |
+| -------- | -------------------------------------------------------------------------------------------- |
+| `agent`  | create a thread, send instructions, wait for it to settle                                    |
 | `action` | a defined deterministic operation: push, open a pull request, provision a review app, notify |
-| `gate` | wait for a condition: human sign-off, a check, a review verdict |
+| `gate`   | wait for a condition: human sign-off, a check, a review verdict                              |
 
 ## Why not let agents do the tail
 
@@ -23,7 +23,7 @@ description, or may decide to do something adjacent.
 
 More importantly it closes the risk left open by
 [ADR-0008](./0008-job-approvals-are-resolved-by-a-supervisor-model.md). Supervisor approval
-escalates on uncertainty, which gives no protection when the supervisor is *confident and wrong*
+escalates on uncertainty, which gives no protection when the supervisor is _confident and wrong_
 about an irreversible action. Removing those actions from agents entirely converts a judgement
 problem into a structural one:
 
@@ -36,7 +36,7 @@ legitimate workflow asks an agent for one, so the supervisor needs no judgement 
 
 A repository may override any part of its workflow ([ADR-0007](./0007-the-org-layer-is-defaults-not-enforcement.md)),
 including removing gates. When a gate is a step, removing it is a visible structural deviation —
-*"this repository dropped your review gate"* — rather than a boolean flipped somewhere inside a
+_"this repository dropped your review gate"_ — rather than a boolean flipped somewhere inside a
 nested config object. Since visibility is the only control we have, gates must be shaped so that
 their absence is obvious.
 

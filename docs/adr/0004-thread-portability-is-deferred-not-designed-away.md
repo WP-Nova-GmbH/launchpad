@@ -15,7 +15,7 @@ that it remains a feature we can build rather than a rewrite.
 Near-term the need is mostly served without moving anything: a client already connects to an
 environment over WebSocket, subscribes with `orchestration.subscribeThread`, and steers with
 `orchestration.dispatchCommand`. Pointed at an executor, that gives live viewing plus
-stop/restart/continue on a cloud thread. What a user usually wants is to *keep going*, not to
+stop/restart/continue on a cloud thread. What a user usually wants is to _keep going_, not to
 have the thread on their laptop. The genuine driver for a real migration is offline work.
 
 ## A second, independent argument for building it
@@ -45,7 +45,7 @@ so a future migration means moving **both** halves of it. Until it ships, do not
   what makes checkpoint history movable with `git fetch`. Moving checkpoints into a bespoke
   non-git store would strand every existing thread.
 - **Identity stays machine-independent.** A [repository](../internals/glossary.md#repository)
-  id is relay-minted and identical everywhere; `workspaceRoot` remains the *only*
+  id is relay-minted and identical everywhere; `workspaceRoot` remains the _only_
   machine-specific field on a project.
 - **Projects accept externally-supplied ids.** `ProjectCreateCommand` already takes `projectId`
   in the payload; a migrated thread must be able to land in a project whose id is chosen
@@ -53,6 +53,6 @@ so a future migration means moving **both** halves of it. Until it ships, do not
 
 ## Consequences
 
-- v1 answers "I want to take this over" with *attach to the executor and continue there*.
+- v1 answers "I want to take this over" with _attach to the executor and continue there_.
 - Anything that would violate an invariant above needs this ADR revisited first, not worked
   around.

@@ -5,7 +5,7 @@ status: accepted
 # A repository owns a set of canonical keys, and executors refuse unregistered ones
 
 A [repository](../internals/glossary.md#repository) is relay-minted and relay-owned, but a
-checkout has to be *recognised* as belonging to one without anyone binding it by hand. We
+checkout has to be _recognised_ as belonging to one without anyone binding it by hand. We
 derive a **canonical key** from the checkout's git remote and match it against the set of keys
 a repository owns. One repository has many keys; unmatched checkouts can be bound explicitly,
 which adds an alias.
@@ -43,7 +43,7 @@ Behaviour differs by machine, deliberately:
   returns `null` — so it is simply not org-governed. It gains identity naturally if a remote is
   added later. No special handling needed.
 - **Monorepo subdirectories share one repository**, because the canonical key derives from the
-  git toplevel. Access control at repository granularity is intended; targeting *part* of a
+  git toplevel. Access control at repository granularity is intended; targeting _part_ of a
   monorepo is a pipeline-scoping concern, to be solved there rather than by splitting identity.
 - Changing this later means re-binding every checkout, so the alias table should land with the
   repository table rather than being retrofitted.

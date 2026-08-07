@@ -5,7 +5,7 @@ status: accepted
 # Provider credentials are fetched by executors from Infisical, never pushed by the relay
 
 Organizations own the provider API keys their [executors](../internals/glossary.md#executor)
-run on. We store those secrets in **Infisical**, keep only *references* in the relay's
+run on. We store those secrets in **Infisical**, keep only _references_ in the relay's
 Postgres, and have each executor fetch the value itself using its own Infisical machine
 identity at provider session start. The relay never reads, holds, or transmits a provider
 secret.
@@ -28,7 +28,7 @@ request, because organization membership lives in its own database and resolving
 that has stopped listening. Under relay-mediated delivery, an executor that is unreachable, or
 whose config channel is degraded, keeps whatever secrets it was last handed. Under
 executor-direct, revoking that executor's Infisical machine identity cuts provider access at the
-*source*, independent of the relay link, the config channel, and whether the machine can be
+_source_, independent of the relay link, the config channel, and whether the machine can be
 contacted at all.
 
 Secondary benefits: the relay's Postgres holds nothing sensitive, so a database dump is
@@ -48,4 +48,4 @@ audit trail of which executor read which credential when.
   and can read `/proc/<pid>/environ`. Single-tenancy ([ADR-0002](./0002-executor-enrollment-and-tenancy.md))
   remains the only bound on that blast radius.
 - **Infisical's own "organization", "project", and "environment" nouns collide with ours.**
-  Always qualify them as *Infisical project* / *Infisical environment* in code and docs.
+  Always qualify them as _Infisical project_ / _Infisical environment_ in code and docs.

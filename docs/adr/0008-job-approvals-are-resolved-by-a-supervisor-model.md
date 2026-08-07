@@ -4,7 +4,7 @@ status: accepted
 
 # Job approvals are resolved by a supervisor model that escalates on uncertainty
 
-Pipeline steps run in `approval-required` runtime mode, so the provider genuinely *requests*
+Pipeline steps run in `approval-required` runtime mode, so the provider genuinely _requests_
 approval for its actions — but no human is at the keyboard. A **supervisor model**, configured
 per organization and typically stronger than the working model, answers those requests. When it
 is not confident, it escalates to a human instead of guessing.

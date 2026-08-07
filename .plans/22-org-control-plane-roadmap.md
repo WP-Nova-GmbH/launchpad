@@ -75,6 +75,14 @@ a **transactional email dependency** that does not exist yet.
 Executors refuse checkouts whose canonical key is not registered; personal machines derive freely
 and offer registration (ADR-0006).
 
+**As built.** Everything above except transactional email, which has no provider and was not
+chosen: an invitation's token is returned once to the admin who created it, who delivers the link.
+When a provider lands it sends that same token and nothing else about the flow changes. The
+executor half of ADR-0006 is also deferred — the relay cannot tell an executor from a personal
+machine until machines exist (M2), so there is nothing to key the refusal on. Its enforceable half
+did land: dispatching against a canonical key that **is** registered requires a role on that
+repository. Details in [docs/internals/tenancy.md](../docs/internals/tenancy.md).
+
 ---
 
 ## M2 — Machines

@@ -28,7 +28,7 @@ Three things fall out of one mechanism:
   the events half of a migration is solved and only checkpoints remain.
 
 Personal machines were originally excluded here on privacy grounds. That concern was right but the
-conclusion was too broad: the problem is *where the data lands and who can read it*, not mirroring
+conclusion was too broad: the problem is _where the data lands and who can read it_, not mirroring
 itself. ADR-0013 resolves it with a separate user-scoped store rather than by declining the
 feature.
 
@@ -67,7 +67,7 @@ main reason the personal-machine exclusion matters beyond privacy.
   organization, removing a repository, and honouring an erasure request all still need a delete
   path. Mirrored events contain message content and code, so this is the first place the design
   accumulates customer data at rest beyond connectivity metadata.
-- Executor reclamation becomes an ordinary operation for the *record*, though it still discards the
+- Executor reclamation becomes an ordinary operation for the _record_, though it still discards the
   live worktree, checkpoint history, and the ability to continue a pinned work item in place.
 - The relay can serve thread history for clients directly, which is a new read path distinct from
   the direct client↔executor connection and must not be confused with it.

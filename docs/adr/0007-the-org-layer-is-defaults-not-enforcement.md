@@ -14,7 +14,7 @@ who is allowed to change a thing, not from marking parts of it immutable.
 - **Personal machines.** Org config is opt-in per key. `settings.json` is a plain file on a
   machine its owner controls, reloaded by `fs.watch` within 100ms of any edit — anything pushed
   can be edited back, immediately and by design.
-- **Executors.** Org config is authoritative, but as *sole authorship* rather than enforcement:
+- **Executors.** Org config is authoritative, but as _sole authorship_ rather than enforcement:
   there is no competing editor on the machine, so nothing has to be locked.
 - **Workflows.** A repository may override any part of the org workflow, gates included.
 - **Provider credentials.** The exception that proves the rule — those are genuinely enforced,
@@ -33,8 +33,8 @@ misleads administrators into believing something is guaranteed when it is not.
 
 Every override layer is patch-shaped (`optionalKey` throughout, presence means intent), so an
 override **is** a diff against the layer above it. Deviation is therefore queryable without any
-extra modelling: administrators get *"these repositories deviate from your workflow, and here is
-how"* from a read, not from a permission system.
+extra modelling: administrators get _"these repositories deviate from your workflow, and here is
+how"_ from a read, not from a permission system.
 
 ## Consequences
 

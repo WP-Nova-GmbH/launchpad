@@ -12,15 +12,15 @@ thread**. The relay never models a turn.
 
 ## The seam
 
-| Relay | Environment |
-|---|---|
-| `queued → dispatched → running → awaiting_review → paused → done / failed` | turns, messages, tool calls, approvals, diffs, checkpoints |
-| which [executor](../internals/glossary.md#executor), which [repository](../internals/glossary.md#repository), which thread id | what an approval is actually asking |
-| which workflow the organization defined for this trigger | which agents run within a step, and in what order |
-| user intent: start, pause, continue, cancel, modify | the effect of that intent on thread state |
+| Relay                                                                                                                         | Environment                                                |
+| ----------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `queued → dispatched → running → awaiting_review → paused → done / failed`                                                    | turns, messages, tool calls, approvals, diffs, checkpoints |
+| which [executor](../internals/glossary.md#executor), which [repository](../internals/glossary.md#repository), which thread id | what an approval is actually asking                        |
+| which workflow the organization defined for this trigger                                                                      | which agents run within a step, and in what order          |
+| user intent: start, pause, continue, cancel, modify                                                                           | the effect of that intent on thread state                  |
 
-A pipeline step compiles down to: *create thread T in project P on executor E, with these
-instructions, this provider instance, this runtime mode — report when it settles.*
+A pipeline step compiles down to: _create thread T in project P on executor E, with these
+instructions, this provider instance, this runtime mode — report when it settles._
 
 ## Why the seam is coarse
 
@@ -41,7 +41,7 @@ from notification input to job-state input rather than duplicated by a second re
 
 - The relay cannot answer "what did the agent actually do in step 2." Clients get that from
   the environment.
-- Pipeline definitions live in the relay; the *execution* of a step — which agents, which
+- Pipeline definitions live in the relay; the _execution_ of a step — which agents, which
   order, which reviews — happens inside the job on the executor.
 - Awareness publishing stops being optional for executors: it is now load-bearing for job
   progress, not just for notifications.

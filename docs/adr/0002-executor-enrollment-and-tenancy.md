@@ -5,8 +5,8 @@ status: accepted
 # Executors enroll with a per-instance seeded identity and are single-tenant
 
 An [executor](../internals/glossary.md#executor) is a machine the relay provisions, so the
-existing environment-link flow does not apply to it: that flow is rooted in *a signed-in
-human who already has access to the machine*, and a freshly created VM has no human. We
+existing environment-link flow does not apply to it: that flow is rooted in _a signed-in
+human who already has access to the machine_, and a freshly created VM has no human. We
 seed a **per-instance** private key and registration secret into each executor at creation
 time, restrict the registration endpoint to our internal network, and make every executor
 **single-tenant to one organization**.
@@ -35,7 +35,7 @@ executor exposes one organization's credentials, not several.
 
 - Utilization is worse than a pooled fleet. Idle single-tenant executors cost money, and
   that is accepted as the price of isolation.
-- Network isolation protects the *registration endpoint* from outside callers. It does not
+- Network isolation protects the _registration endpoint_ from outside callers. It does not
   contain credentials, because the untrusted code runs on machines inside the perimeter.
 - The existing human-in-the-loop link flow stays in place for user-owned environments.
   Executor enrollment is a **second, parallel** trust path, not a replacement.

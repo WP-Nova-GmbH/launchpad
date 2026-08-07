@@ -12,12 +12,12 @@ ownership.
 
 ## Why separate from the executor mirror
 
-|  | executor mirror (ADR-0012) | personal mirror (this) |
-|---|---|---|
-| whose work | the organization's — it paid for the machine | the **user's** |
-| legitimate readers | org members with repository access | the subject, and nobody else |
-| on offboarding | stays with the organization | leaves with the user, or is deleted |
-| enabled | always, for executors | **opt-in per project** |
+|                    | executor mirror (ADR-0012)                   | personal mirror (this)              |
+| ------------------ | -------------------------------------------- | ----------------------------------- |
+| whose work         | the organization's — it paid for the machine | the **user's**                      |
+| legitimate readers | org members with repository access           | the subject, and nobody else        |
+| on offboarding     | stays with the organization                  | leaves with the user, or is deleted |
+| enabled            | always, for executors                        | **opt-in per project**              |
 
 A person has **one** T3 install. The organization's repository, a side project, and possibly work
 for another client all produce threads in the same `state.sqlite`. A shared store — or a rule that

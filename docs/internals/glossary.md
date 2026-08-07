@@ -188,6 +188,15 @@ Both roles, organization membership, and invitations live in the [relay](#relay)
 Clerk provides **authentication only** — a sign-in and a verified subject id. Nothing about
 tenancy is delegated to it.
 
+#### Invitation
+
+A single-use, expiring token that moves its holder into an [organization](#organization) at a
+stated [org role](#org-role). The [relay](#relay) stores only the token's hash, so the value
+exists exactly once — in the response that created it. Redeeming one needs the token _and_ a
+verified email address matching the invitation. Accepting means **leaving** the organization the
+holder is currently in, which is why it is refused while that one still holds members or
+repositories. See [tenancy.md](./tenancy.md).
+
 #### Repository
 
 The relay-owned identity of a codebase, spanning every machine that checks it out. One
@@ -349,11 +358,11 @@ Infisical's own containers for secrets. Always qualified, never bare: unqualifie
 #### Project config
 
 Not a settings scope. It means the fields on the [project](#project) aggregate that set defaults
-for things created *inside* that project — model selection, scripts, thread environment mode.
+for things created _inside_ that project — model selection, scripts, thread environment mode.
 `ServerSettings` has **no project dimension**: `BackgroundPolicy` publishes one snapshot per
 process, `observability` configures process-wide exporters, and `providerInstances` hydrate a
 registry of long-lived managed servers. The test for whether a key belongs on a project: does it
-influence what gets *created in* the project, or does it configure *the machine*?
+influence what gets _created in_ the project, or does it configure _the machine_?
 
 #### Workspace
 
@@ -398,6 +407,7 @@ a thread; the session is what churns underneath.
 - [Provider architecture][16]
 - [Permission modes][18]
 - [Workspace layout][2]
+- [Tenancy](./tenancy.md)
 
 [1]: ../../packages/contracts/src/orchestration.ts
 [2]: ./workspace-layout.md

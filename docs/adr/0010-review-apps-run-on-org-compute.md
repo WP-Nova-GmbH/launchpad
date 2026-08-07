@@ -21,7 +21,7 @@ environment".
 - **A `provision_review_app` action step** ([ADR-0009](./0009-workflow-steps-have-kinds-and-agents-never-push.md))
   with a **driver interface**. `compose` ships first; other manifest formats slot in behind the
   same action without changing the workflow schema.
-- **Roles, not machine kinds.** A provisioned machine is an *agent executor* or a *review host*.
+- **Roles, not machine kinds.** A provisioned machine is an _agent executor_ or a _review host_.
   Enrollment, tunnels, single-tenancy, and quota all inherit unchanged from
   [ADR-0002](./0002-executor-enrollment-and-tenancy.md). Adding a role costs a column; adding a
   machine kind would cost a subsystem.
@@ -30,8 +30,8 @@ environment".
   customer container that exhausts memory must not be able to take that with it.
 - **Routing reuses managed endpoints.** A per-review-app hostname is the existing
   `ManagedEndpointProvider` call with a different origin — no new reverse proxy, no new TLS story.
-- **The application's own config comes from Infisical**, in an *Infisical project separate from
-  the provider credential pool*. Same resolution mechanism as
+- **The application's own config comes from Infisical**, in an _Infisical project separate from
+  the provider credential pool_. Same resolution mechanism as
   [ADR-0003](./0003-provider-credentials-are-fetched-by-executors-not-pushed.md), different
   domain: `DATABASE_URL` and third-party keys are not provider credentials and must not share a
   namespace with them.
