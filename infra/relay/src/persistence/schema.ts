@@ -3,6 +3,8 @@ import type {
   RelayAgentActivityState,
   RelayAgentAwarenessPreferences,
   RelayJobStatus,
+  RelayOrgRole,
+  RelayRepositoryRole,
 } from "@t3tools/contracts/relay";
 import {
   boolean,
@@ -15,6 +17,108 @@ import {
   uniqueIndex,
   varchar,
 } from "drizzle-orm/pg-core";
+
+export const relayOrganizations = pgTable("relay_organizations", {
+  organizationId: varchar("organization_id", { length: 64 }).primaryKey(),
+  name: text("name").notNull(),
+  createdAt: varchar("created_at", { length: 64 }).notNull(),
+  updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+});
+
+export const relayOrganizationMembers = pgTable(
+  "relay_organization_members",
+  {
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    userId: varchar("user_id", { length: 191 }).notNull(),
+    role: varchar("role", { length: 16 }).notNull().$type<RelayOrgRole>(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.organizationId, table.userId] }),
+    // A user belongs to exactly one organization. The database says so rather
+    // than the service, because "which organization is this subject in" is
+    // resolved on every authorized path and must not have two answers.
+    uniqueIndex("idx_relay_organization_members_user").on(table.userId),
+    index("idx_relay_organization_members_role").on(table.organizationId, table.role),
+  ],
+);
+
+export const relayOrganizationInvitations = pgTable(
+  "relay_organization_invitations",
+  {
+    invitationId: varchar("invitation_id", { length: 64 }).primaryKey(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    // Lowercased on write; the address is matched against the accepting
+    // subject's verified Clerk address, never trusted from the client.
+    email: text("email").notNull(),
+    role: varchar("role", { length: 16 }).notNull().$type<RelayOrgRole>(),
+    invitedByUserId: varchar("invited_by_user_id", { length: 191 }).notNull(),
+    // Only the hash is stored: the token is a bearer secret and the relay has
+    // no reason to be able to reproduce one it already handed out.
+    tokenHash: varchar("token_hash", { length: 191 }).notNull(),
+    expiresAt: varchar("expires_at", { length: 64 }).notNull(),
+    acceptedAt: varchar("accepted_at", { length: 64 }),
+    acceptedByUserId: varchar("accepted_by_user_id", { length: 191 }),
+    revokedAt: varchar("revoked_at", { length: 64 }),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_relay_organization_invitations_token").on(table.tokenHash),
+    index("idx_relay_organization_invitations_organization").on(
+      table.organizationId,
+      table.createdAt,
+    ),
+    index("idx_relay_organization_invitations_email").on(table.email),
+  ],
+);
+
+export const relayRepositories = pgTable(
+  "relay_repositories",
+  {
+    repositoryId: varchar("repository_id", { length: 64 }).primaryKey(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    name: text("name").notNull(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [index("idx_relay_repositories_organization").on(table.organizationId, table.name)],
+);
+
+/**
+ * The canonical keys a repository answers to (ADR-0006). The key is the primary
+ * key, so one key can only ever belong to one repository — mirrors and forks
+ * add rows here rather than second repositories.
+ */
+export const relayRepositoryAliases = pgTable(
+  "relay_repository_aliases",
+  {
+    canonicalKey: text("canonical_key").primaryKey(),
+    repositoryId: varchar("repository_id", { length: 64 }).notNull(),
+    // Denormalized so a checkout can be resolved to its organization without a
+    // join, including on paths that hold no user token.
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+  },
+  (table) => [index("idx_relay_repository_aliases_repository").on(table.repositoryId)],
+);
+
+export const relayRepositoryAccess = pgTable(
+  "relay_repository_access",
+  {
+    repositoryId: varchar("repository_id", { length: 64 }).notNull(),
+    userId: varchar("user_id", { length: 191 }).notNull(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    role: varchar("role", { length: 16 }).notNull().$type<RelayRepositoryRole>(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.repositoryId, table.userId] }),
+    index("idx_relay_repository_access_user").on(table.userId),
+  ],
+);
 
 export const relayMobileDevices = pgTable(
   "relay_mobile_devices",

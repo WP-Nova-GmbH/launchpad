@@ -156,6 +156,12 @@ function relayProtectedErrorMessage(error: RelayProtectedErrorType): string {
       return "Relay rejected an expired agent activity publish proof.";
     case "RelayAgentActivityPublishProofInvalidError":
       return `Relay rejected the agent activity publish proof (${error.reason}).`;
+    case "RelayTenancyForbiddenError":
+      return `Relay refused the organization change (${error.reason}).`;
+    case "RelayTenancyNotFoundError":
+      return `Relay could not find the organization record (${error.reason}).`;
+    case "RelayTenancyConflictError":
+      return `Relay refused the organization change because it conflicts with existing state (${error.reason}).`;
     case "RelayInternalError":
       return `Relay encountered an internal error (${error.reason}).`;
   }

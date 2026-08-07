@@ -46,8 +46,18 @@ function relayProtectedError(error: RelayProtectedError): ConnectionAttemptError
     case "RelayEnvironmentConnectNotAuthorizedError":
     case "RelayEnvironmentLinkProofInvalidError":
     case "RelayEnvironmentLinkLimitExceededError":
+    case "RelayTenancyForbiddenError":
       return new ConnectionBlockedError({
         reason: "permission",
+        detail: error.message,
+        traceId: error.traceId,
+      });
+    // Tenancy answers are about organization records, never about reaching an
+    // environment. They only arrive here when a caller shares this mapper.
+    case "RelayTenancyNotFoundError":
+    case "RelayTenancyConflictError":
+      return new ConnectionBlockedError({
+        reason: "configuration",
         detail: error.message,
         traceId: error.traceId,
       });

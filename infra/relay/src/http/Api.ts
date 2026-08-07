@@ -61,8 +61,11 @@ import * as DpopProofs from "../auth/DpopProofs.ts";
 import * as RelayTokens from "../auth/RelayTokens.ts";
 import * as EnvironmentCredentials from "../environments/EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "../environments/EnvironmentLinks.ts";
+import * as Invitations from "../tenancy/Invitations.ts";
 import * as Jobs from "../jobs/Jobs.ts";
 import * as LiveActivities from "../agentActivity/LiveActivities.ts";
+import * as Organizations from "../tenancy/Organizations.ts";
+import * as Repositories from "../tenancy/Repositories.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as AgentActivityPublisher from "../agentActivity/AgentActivityPublisher.ts";
 import * as EnvironmentConnector from "../environments/EnvironmentConnector.ts";
@@ -71,7 +74,8 @@ import * as ManagedEndpointProvider from "../environments/ManagedEndpointProvide
 import * as ManagedEndpointAllocations from "../environments/ManagedEndpointAllocations.ts";
 import * as EnvironmentPublishSignatures from "../environments/EnvironmentPublishSignatures.ts";
 import * as MobileRegistrations from "../agentActivity/MobileRegistrations.ts";
-import { withSpanAttributes } from "../observability.ts";
+import { currentTraceId, withSpanAttributes } from "../observability.ts";
+import { tenancyForbidden } from "./tenancyErrors.ts";
 import * as RelayDb from "../db.ts";
 
 const relayCorsAllowedMethods = ["GET", "POST", "DELETE", "OPTIONS"] as const;
@@ -495,6 +499,35 @@ function dispatchFailureDetail(error: EnvironmentConnector.EnvironmentConnectorE
   }
 }
 
+/**
+ * A registered repository is governed, so a dispatch against one has to come
+ * from somebody the organization granted access to. An unregistered checkout
+ * stays dispatchable: on a personal machine a checkout nobody registered is
+ * simply not org-governed (ADR-0006). Refusing those is an executor's job, and
+ * executors do not exist until machines do.
+ */
+export const requireRepositoryAccessForDispatch = Effect.fn(
+  "relay.api.jobs.requireRepositoryAccessForDispatch",
+)(function* (input: { readonly userId: string; readonly canonicalKey: string }) {
+  const repositories = yield* Repositories.Repositories;
+  const registered = yield* repositories.findByCanonicalKey({ canonicalKey: input.canonicalKey });
+  if (!registered) {
+    return;
+  }
+  const organizations = yield* Organizations.Organizations;
+  const membership = yield* organizations.getMembershipForUser({ userId: input.userId });
+  if (!membership || membership.organization.organizationId !== registered.organizationId) {
+    return yield* tenancyForbidden("no_repository_access");
+  }
+  const role = yield* repositories.getAccess({
+    repositoryId: registered.repositoryId,
+    userId: input.userId,
+  });
+  if (role === null && membership.role !== "admin") {
+    return yield* tenancyForbidden("no_repository_access");
+  }
+});
+
 export const dispatchJobRecord = Effect.fn("relay.api.jobs.dispatchJobRecord")(function* (input: {
   readonly userId: string;
   readonly jobId: RelayJobId;
@@ -503,6 +536,11 @@ export const dispatchJobRecord = Effect.fn("relay.api.jobs.dispatchJobRecord")(f
   const links = yield* EnvironmentLinks.EnvironmentLinks;
   const jobs = yield* Jobs.Jobs;
   const connector = yield* EnvironmentConnector.EnvironmentConnector;
+
+  yield* requireRepositoryAccessForDispatch({
+    userId: input.userId,
+    canonicalKey: input.request.repositoryCanonicalKey,
+  });
 
   // Refused before a row exists: a job aimed at an environment this user has
   // not linked is not a failed job, it is not a job at all.
@@ -1175,11 +1213,6 @@ class ClerkTokenVerificationFailed extends Schema.TaggedErrorClass<ClerkTokenVer
 
 const isHttpUnauthorized = Schema.is(HttpApiError.Unauthorized);
 
-const currentTraceId = Effect.currentParentSpan.pipe(
-  Effect.map((span) => span.traceId),
-  Effect.orElseSucceed(() => "unavailable"),
-);
-
 const RelayCommonPersistenceError = Schema.Union([
   Devices.DeviceRegistrationPersistenceError,
   Devices.DeviceUnregistrationPersistenceError,
@@ -1201,6 +1234,9 @@ const RelayCommonPersistenceError = Schema.Union([
   AgentActivityRows.AgentActivityRowListPersistenceError,
   LiveActivities.LiveActivityDeliveryMarkPersistenceError,
   DeliveryAttempts.DeliveryAttemptRecordPersistenceError,
+  Organizations.OrganizationPersistenceError,
+  Invitations.InvitationPersistenceError,
+  Repositories.RepositoryPersistenceError,
 ]);
 type RelayCommonPersistenceError = typeof RelayCommonPersistenceError.Type;
 const isRelayCommonPersistenceError = Schema.is(RelayCommonPersistenceError);
@@ -1210,7 +1246,7 @@ type MapRelayCommonApiError<E> =
   | (Extract<E, HttpApiError.Unauthorized> extends never ? never : RelayAuthInvalidError)
   | (Extract<E, RelayCommonPersistenceError> extends never ? never : RelayInternalError);
 
-function relayInternalErrorResponse(reason: RelayInternalError["reason"]) {
+export function relayInternalErrorResponse(reason: RelayInternalError["reason"]) {
   return currentTraceId.pipe(
     Effect.flatMap((traceId) =>
       Effect.fail(new RelayInternalError({ code: "internal_error", reason, traceId })),
@@ -1218,7 +1254,7 @@ function relayInternalErrorResponse(reason: RelayInternalError["reason"]) {
   );
 }
 
-function mapRelayCommonApiErrors(authReason: RelayAuthInvalidReason) {
+export function mapRelayCommonApiErrors(authReason: RelayAuthInvalidReason) {
   const mapError = Effect.fnUntraced(function* <E>(error: E) {
     const traceId = yield* currentTraceId;
     if (isHttpUnauthorized(error)) {
@@ -1269,7 +1305,7 @@ type CatchTagCases<E, Cases> = {
   ) => Effect.Effect<never, MappedTagError<Cases>>;
 } & (unknown extends E ? {} : { readonly [K in Exclude<keyof Cases, TaggedErrorTag<E>>]: never });
 
-function mapErrorTags<
+export function mapErrorTags<
   E,
   Cases extends MapErrorTagCases<E> &
     (unknown extends E ? {} : { readonly [K in Exclude<keyof Cases, TaggedErrorTag<E>>]: never }),

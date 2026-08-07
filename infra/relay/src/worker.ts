@@ -33,6 +33,7 @@ import {
   tokenApi,
   withoutCapturedParentSpan,
 } from "./http/Api.ts";
+import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
 import { ManagedEndpointZone, RelayApiZone, RelayDeploymentConfig } from "./zone.ts";
 import { makeRelayTraceLayer, RelayObservability } from "./observability.ts";
 import * as DeliveryAttempts from "./agentActivity/DeliveryAttempts.ts";
@@ -59,6 +60,9 @@ import * as EnvironmentPublishSignatures from "./environments/EnvironmentPublish
 import * as ManagedEndpointProvider from "./environments/ManagedEndpointProvider.ts";
 import * as ManagedTunnelLimits from "./environments/ManagedTunnelLimits.ts";
 import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
+import * as Invitations from "./tenancy/Invitations.ts";
+import * as Organizations from "./tenancy/Organizations.ts";
+import * as Repositories from "./tenancy/Repositories.ts";
 
 const webcryptoLayer = Layer.succeed(
   Crypto.Crypto,
@@ -88,6 +92,8 @@ const relayApiLayer = Layer.mergeAll(
   metadataApi,
   mobileApi,
   clientApi,
+  organizationApi,
+  repositoriesApi,
   tokenApi,
   dpopClientApi,
   jobsApi,
@@ -213,7 +219,15 @@ export const ApiLive = Api.make(
         ApnsDeliveryQueue.layerCloudflareQueues(apnsDeliveryQueueSender, alchemyRuntimeContext),
       ),
       // Row stores that need nothing but RelayDb.
-      Layer.provideMerge(Layer.mergeAll(AgentActivityRows.layer, Jobs.layer)),
+      Layer.provideMerge(
+        Layer.mergeAll(
+          AgentActivityRows.layer,
+          Jobs.layer,
+          Organizations.layer,
+          Invitations.layer,
+          Repositories.layer,
+        ),
+      ),
       Layer.provideMerge(Devices.layer),
       Layer.provideMerge(EnvironmentCredentials.layer),
       Layer.provideMerge(

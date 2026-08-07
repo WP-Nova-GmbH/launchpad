@@ -39,6 +39,8 @@ import * as EnvironmentCredentials from "../environments/EnvironmentCredentials.
 import * as EnvironmentLinks from "../environments/EnvironmentLinks.ts";
 import * as Jobs from "../jobs/Jobs.ts";
 import * as ManagedEndpointProvider from "../environments/ManagedEndpointProvider.ts";
+import * as Organizations from "../tenancy/Organizations.ts";
+import * as Repositories from "../tenancy/Repositories.ts";
 
 vi.mock("@clerk/backend", () => ({
   createClerkClient: vi.fn(),
@@ -420,14 +422,57 @@ const createJobRequest = {
   instruction: "Fix the flaky login test.",
 } as const;
 
+const unregisteredRepositoriesLayer = (input?: {
+  readonly findByCanonicalKey?: Repositories.Repositories["Service"]["findByCanonicalKey"];
+  readonly getAccess?: Repositories.Repositories["Service"]["getAccess"];
+  readonly getMembershipForUser?: Organizations.Organizations["Service"]["getMembershipForUser"];
+}) =>
+  Layer.mergeAll(
+    Layer.succeed(
+      Repositories.Repositories,
+      Repositories.Repositories.of({
+        register: () => Effect.die("unused register"),
+        getById: () => Effect.die("unused getById"),
+        findByCanonicalKey: input?.findByCanonicalKey ?? (() => Effect.succeed(null)),
+        listForOrganization: () => Effect.die("unused listForOrganization"),
+        deleteRepository: () => Effect.die("unused deleteRepository"),
+        addAlias: () => Effect.die("unused addAlias"),
+        removeAlias: () => Effect.die("unused removeAlias"),
+        listAccess: () => Effect.die("unused listAccess"),
+        getAccess: input?.getAccess ?? (() => Effect.succeed(null)),
+        listAccessForUser: () => Effect.die("unused listAccessForUser"),
+        grantAccess: () => Effect.die("unused grantAccess"),
+        revokeAccess: () => Effect.die("unused revokeAccess"),
+        revokeAllAccessForUser: () => Effect.die("unused revokeAllAccessForUser"),
+      }),
+    ),
+    Layer.succeed(
+      Organizations.Organizations,
+      Organizations.Organizations.of({
+        ensureForUser: () => Effect.die("unused ensureForUser"),
+        getMembershipForUser: input?.getMembershipForUser ?? (() => Effect.succeed(null)),
+        listMembers: () => Effect.die("unused listMembers"),
+        countAdmins: () => Effect.die("unused countAdmins"),
+        countMembers: () => Effect.die("unused countMembers"),
+        updateMemberRole: () => Effect.die("unused updateMemberRole"),
+        removeMember: () => Effect.die("unused removeMember"),
+        addMember: () => Effect.die("unused addMember"),
+        rename: () => Effect.die("unused rename"),
+        deleteOrganization: () => Effect.die("unused deleteOrganization"),
+      }),
+    ),
+  );
+
 function relayJobsTestLayer(input?: {
   readonly getForUser?: EnvironmentLinks.EnvironmentLinks["Service"]["getForUser"];
   readonly create?: Jobs.Jobs["Service"]["create"];
   readonly getById?: Jobs.Jobs["Service"]["getById"];
   readonly updateStatus?: Jobs.Jobs["Service"]["updateStatus"];
   readonly dispatchJob?: EnvironmentConnector.EnvironmentConnector["Service"]["dispatchJob"];
+  readonly tenancy?: Layer.Layer<Repositories.Repositories | Organizations.Organizations>;
 }) {
   return Layer.mergeAll(
+    input?.tenancy ?? unregisteredRepositoriesLayer(),
     Layer.succeed(
       EnvironmentLinks.EnvironmentLinks,
       EnvironmentLinks.EnvironmentLinks.of({
@@ -613,6 +658,117 @@ describe("relay job dispatch", () => {
       ),
     );
   });
+
+  const registeredRepository: Repositories.RepositoryRecord = {
+    repositoryId: "repository-1",
+    organizationId: "organization-1",
+    name: "app",
+    canonicalKeys: [queuedJobRecord.repositoryCanonicalKey],
+    createdAt: "2026-08-05T00:00:00.000Z",
+  };
+
+  const membershipIn = (
+    organizationId: string,
+    role: "member" | "admin",
+  ): Organizations.OrganizationMembershipRecord => ({
+    organization: { organizationId, name: "Acme", createdAt: "2026-08-05T00:00:00.000Z" },
+    userId: "user-1",
+    role,
+    joinedAt: "2026-08-05T00:00:00.000Z",
+  });
+
+  it.effect("refuses a dispatch against a registered repository the caller has no role on", () =>
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        dispatchJobRecord({
+          userId: "user-1",
+          jobId: RelayJobId.make("job-1"),
+          request: createJobRequest,
+        }),
+      );
+
+      expect(error).toMatchObject({
+        _tag: "RelayTenancyForbiddenError",
+        reason: "no_repository_access",
+      });
+    }).pipe(
+      Effect.provide(
+        relayJobsTestLayer({
+          tenancy: unregisteredRepositoriesLayer({
+            findByCanonicalKey: () => Effect.succeed(registeredRepository),
+            getMembershipForUser: () => Effect.succeed(membershipIn("organization-1", "member")),
+            getAccess: () => Effect.succeed(null),
+          }),
+          create: () => Effect.die("must not record a job the caller may not dispatch"),
+          dispatchJob: () => Effect.die("must not dispatch without repository access"),
+        }),
+      ),
+    ),
+  );
+
+  it.effect("refuses a dispatch against another organization's repository", () =>
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        dispatchJobRecord({
+          userId: "user-1",
+          jobId: RelayJobId.make("job-1"),
+          request: createJobRequest,
+        }),
+      );
+
+      expect(error).toMatchObject({
+        _tag: "RelayTenancyForbiddenError",
+        reason: "no_repository_access",
+      });
+    }).pipe(
+      Effect.provide(
+        relayJobsTestLayer({
+          tenancy: unregisteredRepositoriesLayer({
+            findByCanonicalKey: () => Effect.succeed(registeredRepository),
+            // An admin, but of a different organization.
+            getMembershipForUser: () => Effect.succeed(membershipIn("organization-2", "admin")),
+            getAccess: () => Effect.die("must not consult access outside the organization"),
+          }),
+          create: () => Effect.die("must not record a job for another organization"),
+          dispatchJob: () => Effect.die("must not dispatch for another organization"),
+        }),
+      ),
+    ),
+  );
+
+  it.effect("allows a developer to dispatch against their registered repository", () =>
+    Effect.gen(function* () {
+      const job = yield* dispatchJobRecord({
+        userId: "user-1",
+        jobId: RelayJobId.make("job-1"),
+        request: createJobRequest,
+      });
+
+      expect(job).toMatchObject({ jobId: "job-1", status: "dispatched" });
+    }).pipe(
+      Effect.provide(
+        relayJobsTestLayer({
+          tenancy: unregisteredRepositoriesLayer({
+            findByCanonicalKey: () => Effect.succeed(registeredRepository),
+            getMembershipForUser: () => Effect.succeed(membershipIn("organization-1", "member")),
+            getAccess: () => Effect.succeed("developer"),
+          }),
+        }),
+      ),
+    ),
+  );
+
+  it.effect("leaves an unregistered checkout dispatchable on a personal machine", () =>
+    Effect.gen(function* () {
+      const job = yield* dispatchJobRecord({
+        userId: "user-1",
+        jobId: RelayJobId.make("job-1"),
+        request: createJobRequest,
+      });
+
+      expect(job).toMatchObject({ jobId: "job-1", status: "dispatched" });
+    }).pipe(Effect.provide(relayJobsTestLayer())),
+  );
 });
 
 describe("relay job reads", () => {

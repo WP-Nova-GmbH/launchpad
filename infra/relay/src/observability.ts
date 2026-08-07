@@ -68,6 +68,15 @@ export const RelayObservability = Effect.gen(function* () {
   return { traces, workerIngestToken, mobileIngestToken, clientIngestToken } as const;
 });
 
+/**
+ * The trace id carried back to the caller on every relay error, so a support
+ * report and a stored span can be lined up. "unavailable" outside a span.
+ */
+export const currentTraceId = Effect.currentParentSpan.pipe(
+  Effect.map((span) => span.traceId),
+  Effect.orElseSucceed(() => "unavailable"),
+);
+
 export const withSpanAttributes =
   (attributes: Record<string, unknown>) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>

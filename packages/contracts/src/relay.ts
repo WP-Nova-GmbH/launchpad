@@ -498,6 +498,75 @@ export class RelayAgentActivityPublishProofInvalidError extends Schema.TaggedErr
   }
 }
 
+export const RelayTenancyForbiddenReason = Schema.Literals([
+  "not_an_admin",
+  "not_a_maintainer",
+  "no_repository_access",
+  "last_admin",
+  "organization_not_empty",
+  "cannot_change_own_role",
+]);
+export type RelayTenancyForbiddenReason = typeof RelayTenancyForbiddenReason.Type;
+
+export const RelayTenancyNotFoundReason = Schema.Literals([
+  "member_not_found",
+  "repository_not_found",
+  "alias_not_found",
+  "invitation_not_found",
+]);
+export type RelayTenancyNotFoundReason = typeof RelayTenancyNotFoundReason.Type;
+
+export const RelayTenancyConflictReason = Schema.Literals([
+  "canonical_key_taken",
+  "last_alias",
+  "already_a_member",
+  "invitation_not_pending",
+  "invitation_email_mismatch",
+]);
+export type RelayTenancyConflictReason = typeof RelayTenancyConflictReason.Type;
+
+export class RelayTenancyForbiddenError extends Schema.TaggedErrorClass<RelayTenancyForbiddenError>()(
+  "RelayTenancyForbiddenError",
+  {
+    code: Schema.Literal("tenancy_forbidden"),
+    reason: RelayTenancyForbiddenReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 403 },
+) {
+  override get message(): string {
+    return `Relay tenancy operation is forbidden: ${this.reason}`;
+  }
+}
+
+export class RelayTenancyNotFoundError extends Schema.TaggedErrorClass<RelayTenancyNotFoundError>()(
+  "RelayTenancyNotFoundError",
+  {
+    code: Schema.Literal("tenancy_not_found"),
+    reason: RelayTenancyNotFoundReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 404 },
+) {
+  override get message(): string {
+    return `Relay tenancy record was not found: ${this.reason}`;
+  }
+}
+
+export class RelayTenancyConflictError extends Schema.TaggedErrorClass<RelayTenancyConflictError>()(
+  "RelayTenancyConflictError",
+  {
+    code: Schema.Literal("tenancy_conflict"),
+    reason: RelayTenancyConflictReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 409 },
+) {
+  override get message(): string {
+    return `Relay tenancy operation conflicts with existing state: ${this.reason}`;
+  }
+}
+
 export class RelayInternalError extends Schema.TaggedErrorClass<RelayInternalError>()(
   "RelayInternalError",
   {
@@ -524,6 +593,9 @@ export const RelayProtectedError = Schema.Union([
   RelayEnvironmentLinkLimitExceededError,
   RelayAgentActivityPublishProofExpiredError,
   RelayAgentActivityPublishProofInvalidError,
+  RelayTenancyForbiddenError,
+  RelayTenancyNotFoundError,
+  RelayTenancyConflictError,
   RelayInternalError,
 ]);
 export type RelayProtectedError = typeof RelayProtectedError.Type;
@@ -837,6 +909,192 @@ export const RelayEnvironmentMintResponse = Schema.Struct({
 export type RelayEnvironmentMintResponse = typeof RelayEnvironmentMintResponse.Type;
 
 // ---------------------------------------------------------------------------
+// Tenancy: organizations, members, invitations, repositories
+//
+// Clerk authenticates and nothing more. Membership, roles, and invitations are
+// relay-owned, so `subject -> organization -> role` is a local query on every
+// path — including ones that hold no user token at all.
+// ---------------------------------------------------------------------------
+
+export const RelayOrganizationId = TrimmedNonEmptyString.pipe(Schema.brand("RelayOrganizationId"));
+export type RelayOrganizationId = typeof RelayOrganizationId.Type;
+
+export const RelayRepositoryId = TrimmedNonEmptyString.pipe(Schema.brand("RelayRepositoryId"));
+export type RelayRepositoryId = typeof RelayRepositoryId.Type;
+
+export const RelayInvitationId = TrimmedNonEmptyString.pipe(Schema.brand("RelayInvitationId"));
+export type RelayInvitationId = typeof RelayInvitationId.Type;
+
+/** A member's standing in an organization. Admins own members and repositories. */
+export const RelayOrgRole = Schema.Literals(["member", "admin"]);
+export type RelayOrgRole = typeof RelayOrgRole.Type;
+
+/**
+ * A member's standing on one repository. Maintainers configure it, developers
+ * work in it, and having no role at all means having no access.
+ */
+export const RelayRepositoryRole = Schema.Literals(["maintainer", "developer"]);
+export type RelayRepositoryRole = typeof RelayRepositoryRole.Type;
+
+export const RELAY_ORGANIZATION_NAME_MAX_LENGTH = 128;
+export const RELAY_CANONICAL_KEY_MAX_LENGTH = 512;
+export const RELAY_EMAIL_MAX_LENGTH = 320;
+
+export const RelayOrganizationName = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(RELAY_ORGANIZATION_NAME_MAX_LENGTH),
+);
+
+/**
+ * `host/owner/repo` exactly as `normalizeGitRemoteUrl` produces it: lowercased,
+ * no scheme, no `.git`, no trailing slash. Anything else is a key the deriving
+ * side would never generate, so it could never match a checkout.
+ */
+export const RelayRepositoryCanonicalKey = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(RELAY_CANONICAL_KEY_MAX_LENGTH),
+  Schema.isPattern(/^[a-z0-9.-]+(?::\d+)?(?:\/[^\s/]+){2,}$/),
+);
+
+export const RelayEmailAddress = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(RELAY_EMAIL_MAX_LENGTH),
+  Schema.isPattern(/^[^\s@]+@[^\s@]+\.[^\s@]+$/),
+);
+
+export const RelayOrganization = Schema.Struct({
+  organizationId: RelayOrganizationId,
+  name: RelayOrganizationName,
+  createdAt: TrimmedNonEmptyString,
+});
+export type RelayOrganization = typeof RelayOrganization.Type;
+
+/** The caller's own standing: which organization they are in, and as what. */
+export const RelayOrganizationMembership = Schema.Struct({
+  organization: RelayOrganization,
+  role: RelayOrgRole,
+  joinedAt: TrimmedNonEmptyString,
+});
+export type RelayOrganizationMembership = typeof RelayOrganizationMembership.Type;
+
+export const RelayOrganizationMember = Schema.Struct({
+  userId: TrimmedNonEmptyString,
+  role: RelayOrgRole,
+  joinedAt: TrimmedNonEmptyString,
+});
+export type RelayOrganizationMember = typeof RelayOrganizationMember.Type;
+
+export const RelayListOrganizationMembersResponse = Schema.Struct({
+  members: Schema.Array(RelayOrganizationMember),
+});
+export type RelayListOrganizationMembersResponse = typeof RelayListOrganizationMembersResponse.Type;
+
+export const RelayRenameOrganizationRequest = Schema.Struct({
+  name: RelayOrganizationName,
+});
+export type RelayRenameOrganizationRequest = typeof RelayRenameOrganizationRequest.Type;
+
+export const RelayUpdateOrganizationMemberRequest = Schema.Struct({
+  role: RelayOrgRole,
+});
+export type RelayUpdateOrganizationMemberRequest = typeof RelayUpdateOrganizationMemberRequest.Type;
+
+export const RelayInvitation = Schema.Struct({
+  invitationId: RelayInvitationId,
+  email: RelayEmailAddress,
+  role: RelayOrgRole,
+  invitedByUserId: TrimmedNonEmptyString,
+  createdAt: TrimmedNonEmptyString,
+  expiresAt: TrimmedNonEmptyString,
+});
+export type RelayInvitation = typeof RelayInvitation.Type;
+
+export const RelayListInvitationsResponse = Schema.Struct({
+  invitations: Schema.Array(RelayInvitation),
+});
+export type RelayListInvitationsResponse = typeof RelayListInvitationsResponse.Type;
+
+export const RelayCreateInvitationRequest = Schema.Struct({
+  email: RelayEmailAddress,
+  role: RelayOrgRole,
+});
+export type RelayCreateInvitationRequest = typeof RelayCreateInvitationRequest.Type;
+
+/**
+ * The token comes back exactly once, at creation. There is no transactional
+ * email provider yet, so the admin delivers the link themselves; when one
+ * exists this field is what it sends, and nothing else about the flow changes.
+ */
+export const RelayCreateInvitationResponse = Schema.Struct({
+  invitation: RelayInvitation,
+  token: TrimmedNonEmptyString,
+});
+export type RelayCreateInvitationResponse = typeof RelayCreateInvitationResponse.Type;
+
+export const RelayAcceptInvitationRequest = Schema.Struct({
+  token: TrimmedNonEmptyString,
+});
+export type RelayAcceptInvitationRequest = typeof RelayAcceptInvitationRequest.Type;
+
+export const RelayRepository = Schema.Struct({
+  repositoryId: RelayRepositoryId,
+  organizationId: RelayOrganizationId,
+  name: TrimmedNonEmptyString,
+  /** Every key this repository answers to; mirrors and forks add to it (ADR-0006). */
+  canonicalKeys: Schema.Array(RelayRepositoryCanonicalKey),
+  createdAt: TrimmedNonEmptyString,
+});
+export type RelayRepository = typeof RelayRepository.Type;
+
+/** A repository plus the caller's own role on it; `null` for an admin with no grant. */
+export const RelayRepositorySummary = Schema.Struct({
+  repository: RelayRepository,
+  role: Schema.NullOr(RelayRepositoryRole),
+});
+export type RelayRepositorySummary = typeof RelayRepositorySummary.Type;
+
+export const RelayListRepositoriesResponse = Schema.Struct({
+  repositories: Schema.Array(RelayRepositorySummary),
+});
+export type RelayListRepositoriesResponse = typeof RelayListRepositoriesResponse.Type;
+
+export const RelayRegisterRepositoryRequest = Schema.Struct({
+  name: TrimmedNonEmptyString.check(Schema.isMaxLength(RELAY_ORGANIZATION_NAME_MAX_LENGTH)),
+  canonicalKey: RelayRepositoryCanonicalKey,
+});
+export type RelayRegisterRepositoryRequest = typeof RelayRegisterRepositoryRequest.Type;
+
+export const RelayAddRepositoryAliasRequest = Schema.Struct({
+  canonicalKey: RelayRepositoryCanonicalKey,
+});
+export type RelayAddRepositoryAliasRequest = typeof RelayAddRepositoryAliasRequest.Type;
+
+/**
+ * What a checkout gets back when it asks who owns its remote. A miss is a
+ * normal answer, not an error: on a personal machine an unregistered checkout
+ * simply is not org-governed (ADR-0006).
+ */
+export const RelayLookupRepositoryResponse = Schema.Struct({
+  match: Schema.NullOr(RelayRepositorySummary),
+});
+export type RelayLookupRepositoryResponse = typeof RelayLookupRepositoryResponse.Type;
+
+export const RelayRepositoryAccessEntry = Schema.Struct({
+  userId: TrimmedNonEmptyString,
+  role: RelayRepositoryRole,
+  grantedAt: TrimmedNonEmptyString,
+});
+export type RelayRepositoryAccessEntry = typeof RelayRepositoryAccessEntry.Type;
+
+export const RelayListRepositoryAccessResponse = Schema.Struct({
+  access: Schema.Array(RelayRepositoryAccessEntry),
+});
+export type RelayListRepositoryAccessResponse = typeof RelayListRepositoryAccessResponse.Type;
+
+export const RelayGrantRepositoryAccessRequest = Schema.Struct({
+  userId: TrimmedNonEmptyString,
+  role: RelayRepositoryRole,
+});
+export type RelayGrantRepositoryAccessRequest = typeof RelayGrantRepositoryAccessRequest.Type;
+
+// ---------------------------------------------------------------------------
 // Jobs
 //
 // The relay owns a job's coarse state and nothing finer (ADR-0005). What the
@@ -1148,6 +1406,8 @@ export const RelayGetEnvironmentStatusEndpoint = HttpApiEndpoint.post(
 
 const RelayJobErrors = [
   RelayAuthInvalidError,
+  // A dispatch against a registered repository the caller has no role on.
+  RelayTenancyForbiddenError,
   RelayEnvironmentConnectNotAuthorizedError,
   RelayEnvironmentEndpointUnavailableError,
   RelayEnvironmentEndpointTimedOutError,
@@ -1176,6 +1436,191 @@ export const RelayJobsGroup = HttpApiGroup.make("jobs")
   .add(RelayCreateJobEndpoint, RelayGetJobEndpoint)
   .annotate(OpenApi.Description, "Dispatching jobs to executors and reading their coarse state.")
   .middleware(RelayDpopClientAuth);
+
+const RelayTenancyErrors = [
+  RelayAuthInvalidError,
+  RelayTenancyForbiddenError,
+  RelayTenancyNotFoundError,
+  RelayTenancyConflictError,
+  RelayInternalError,
+] as const;
+
+const RelayOrganizationMemberParams = Schema.Struct({
+  userId: TrimmedNonEmptyString,
+});
+
+const RelayRepositoryParams = Schema.Struct({
+  repositoryId: RelayRepositoryId,
+});
+
+/**
+ * Organizations, membership, and invitations. Everything here is relay-owned:
+ * Clerk says who the caller is and this group decides what that means.
+ */
+export const RelayOrganizationGroup = HttpApiGroup.make("organization")
+  .add(
+    HttpApiEndpoint.get("getOrganization", "/v1/organization", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayOrganizationMembership,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Read the caller's organization and role")
+      .annotate(
+        OpenApi.Description,
+        "Creates the caller's organization on first sight. Signup is Clerk's event, not the relay's, so the first authorized request is where an organization comes into being.",
+      ),
+    HttpApiEndpoint.post("renameOrganization", "/v1/organization/name", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayRenameOrganizationRequest,
+      success: RelayOrganization,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "Rename the organization"),
+    HttpApiEndpoint.get("listOrganizationMembers", "/v1/organization/members", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListOrganizationMembersResponse,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "List organization members"),
+    HttpApiEndpoint.post("updateOrganizationMember", "/v1/organization/members/:userId/role", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayOrganizationMemberParams,
+      payload: RelayUpdateOrganizationMemberRequest,
+      success: RelayOrganizationMember,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "Change a member's organization role"),
+    HttpApiEndpoint.delete("removeOrganizationMember", "/v1/organization/members/:userId", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayOrganizationMemberParams,
+      success: RelayOkResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Remove a member from the organization")
+      .annotate(
+        OpenApi.Description,
+        "The removed member keeps their account and lands in a fresh organization of their own on their next request.",
+      ),
+    HttpApiEndpoint.get("listInvitations", "/v1/organization/invitations", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListInvitationsResponse,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "List pending invitations"),
+    HttpApiEndpoint.post("createInvitation", "/v1/organization/invitations", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayCreateInvitationRequest,
+      success: RelayCreateInvitationResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Invite someone to the organization")
+      .annotate(
+        OpenApi.Description,
+        "Returns the invitation token exactly once. There is no transactional email provider yet, so whoever invites delivers the link.",
+      ),
+    HttpApiEndpoint.delete("revokeInvitation", "/v1/organization/invitations/:invitationId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ invitationId: RelayInvitationId }),
+      success: RelayOkResponse,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "Revoke a pending invitation"),
+    HttpApiEndpoint.post("acceptInvitation", "/v1/invitations/accept", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayAcceptInvitationRequest,
+      success: RelayOrganizationMembership,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Accept an invitation")
+      .annotate(
+        OpenApi.Description,
+        "Moves the caller into the inviting organization. Refused while their current organization still holds other members or repositories, because accepting would abandon them.",
+      ),
+  )
+  .annotate(OpenApi.Description, "Relay-owned organizations, membership, and invitations.")
+  .middleware(RelayClientAuth);
+
+export const RelayRepositoriesGroup = HttpApiGroup.make("repositories")
+  .add(
+    HttpApiEndpoint.get("listRepositories", "/v1/repositories", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListRepositoriesResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "List the organization's repositories")
+      .annotate(
+        OpenApi.Description,
+        "Admins see every repository in the organization; members see the ones they hold a repository role on.",
+      ),
+    HttpApiEndpoint.post("registerRepository", "/v1/repositories", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayRegisterRepositoryRequest,
+      success: RelayRepository,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "Register a repository from a checkout"),
+    // A POST for a read: a canonical key contains slashes, and this stack has
+    // no query-parameter declaration, so the key travels in the body rather
+    // than being escaped into a path segment.
+    HttpApiEndpoint.post("lookupRepository", "/v1/repositories/lookup", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayAddRepositoryAliasRequest,
+      success: RelayLookupRepositoryResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Resolve a checkout's canonical key")
+      .annotate(
+        OpenApi.Description,
+        "A miss is a normal answer: on a personal machine an unregistered checkout is simply not governed by the organization.",
+      ),
+    HttpApiEndpoint.delete("deleteRepository", "/v1/repositories/:repositoryId", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: RelayOkResponse,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "Remove a repository and its keys"),
+    HttpApiEndpoint.post("addRepositoryAlias", "/v1/repositories/:repositoryId/aliases", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: RelayAddRepositoryAliasRequest,
+      success: RelayRepository,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Add a canonical key to a repository")
+      .annotate(
+        OpenApi.Description,
+        "How a mirror or a fork is bound to the repository it belongs to instead of becoming a second one.",
+      ),
+    HttpApiEndpoint.post("removeRepositoryAlias", "/v1/repositories/:repositoryId/aliases/remove", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: RelayAddRepositoryAliasRequest,
+      success: RelayRepository,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "Remove a canonical key from a repository"),
+    HttpApiEndpoint.get("listRepositoryAccess", "/v1/repositories/:repositoryId/access", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: RelayListRepositoryAccessResponse,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "List who can work in a repository"),
+    HttpApiEndpoint.post("grantRepositoryAccess", "/v1/repositories/:repositoryId/access", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: RelayGrantRepositoryAccessRequest,
+      success: RelayRepositoryAccessEntry,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "Grant or change repository access"),
+    HttpApiEndpoint.delete(
+      "revokeRepositoryAccess",
+      "/v1/repositories/:repositoryId/access/:userId",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({
+          repositoryId: RelayRepositoryId,
+          userId: TrimmedNonEmptyString,
+        }),
+        success: RelayOkResponse,
+        error: RelayTenancyErrors,
+      },
+    ).annotate(OpenApi.Summary, "Revoke repository access"),
+  )
+  .annotate(OpenApi.Description, "Repositories, their canonical keys, and who may work in them.")
+  .middleware(RelayClientAuth);
 
 export const RelayDpopClientGroup = HttpApiGroup.make("dpopClient")
   .add(RelayConnectEnvironmentEndpoint, RelayGetEnvironmentStatusEndpoint)
@@ -1207,6 +1652,8 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayMetadataGroup,
     RelayMobileGroup,
     RelayClientGroup,
+    RelayOrganizationGroup,
+    RelayRepositoriesGroup,
     RelayTokenGroup,
     RelayDpopClientGroup,
     RelayJobsGroup,
