@@ -465,11 +465,22 @@ export const repositoriesApi = HttpApiBuilder.group(
   "repositories",
   Effect.fnUntraced(function* (handlers) {
     const repositories = yield* Repositories.Repositories;
+    const transactions = yield* RelayDb.RelayTransactions;
     const crypto = yield* Crypto.Crypto;
 
     const newId = crypto.randomUUIDv4.pipe(
       Effect.catch(() => relayInternalErrorResponse("internal_error")),
     );
+
+    /**
+     * Registration and removal each write three tables. Half of either would
+     * leave an alias pointing at a repository that does not exist, and that
+     * key can then never be claimed by anything.
+     */
+    const atomically = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      transactions
+        .withTransaction(effect)
+        .pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
 
     return handlers
       .handle(
@@ -497,19 +508,19 @@ export const repositoriesApi = HttpApiBuilder.group(
         "registerRepository",
         Effect.fn("relay.api.repositories.register")(function* (args) {
           const membership = yield* requireCallerIsAdmin();
-          const registered = yield* repositories
-            .register({
+          const registered = yield* atomically(
+            repositories.register({
               repositoryId: yield* newId,
               organizationId: membership.organization.organizationId,
               name: args.payload.name,
               canonicalKey: args.payload.canonicalKey,
               createdByUserId: membership.userId,
-            })
-            .pipe(
-              Effect.catchTag("RepositoryCanonicalKeyTaken", () =>
-                tenancyConflict("canonical_key_taken"),
-              ),
-            );
+            }),
+          ).pipe(
+            Effect.catchTag("RepositoryCanonicalKeyTaken", () =>
+              tenancyConflict("canonical_key_taken"),
+            ),
+          );
           return toApiRepository(registered);
         }, mapRelayCommonApiErrors("not_authorized")),
       )
@@ -541,7 +552,9 @@ export const repositoriesApi = HttpApiBuilder.group(
             membership,
             repositoryId: args.params.repositoryId,
           });
-          yield* repositories.deleteRepository({ repositoryId: args.params.repositoryId });
+          yield* atomically(
+            repositories.deleteRepository({ repositoryId: args.params.repositoryId }),
+          );
           return { ok: true };
         }, mapRelayCommonApiErrors("not_authorized")),
       )

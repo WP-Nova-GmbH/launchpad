@@ -1,4 +1,5 @@
 import { ManagedRelay } from "@t3tools/client-runtime/relay";
+import { RelayDpopAccessTokenScope } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SecureStore from "expo-secure-store";
@@ -11,9 +12,9 @@ const ManagedRelayAccessTokenCacheEntrySchema = Schema.Struct({
   clientId: Schema.Literals(["t3-mobile", "t3-web"]),
   relayUrl: Schema.String,
   thumbprint: Schema.String,
-  scopes: Schema.Array(
-    Schema.Literals(["environment:connect", "environment:status", "mobile:registration"]),
-  ),
+  // The contract's own list, not a copy: a scope added there has to survive a
+  // round trip through this cache or the entry silently fails to decode.
+  scopes: Schema.Array(RelayDpopAccessTokenScope),
   accessToken: Schema.String,
   expiresAtMillis: Schema.Number,
 });
