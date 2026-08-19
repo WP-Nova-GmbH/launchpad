@@ -113,6 +113,10 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "list relay repository access",
   "grant relay repository access",
   "revoke relay repository access",
+  "read relay GitHub connection",
+  "connect relay GitHub",
+  "disconnect relay GitHub",
+  "list relay GitHub repositories",
 ]);
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
@@ -147,6 +151,10 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay repository access listing",
   "Relay repository access grant",
   "Relay repository access revocation",
+  "Relay GitHub connection read",
+  "Relay GitHub connection",
+  "Relay GitHub disconnection",
+  "Relay GitHub repository listing",
 ]);
 export type ManagedRelayRequestActivity = typeof ManagedRelayRequestActivity.Type;
 

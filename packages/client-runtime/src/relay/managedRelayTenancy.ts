@@ -11,6 +11,9 @@ import {
   RelayApi,
   type RelayCreateInvitationRequest,
   type RelayCreateInvitationResponse,
+  type RelayGithubConnection,
+  type RelayGithubConnectionResponse,
+  type RelayGithubRepository,
   type RelayGrantRepositoryAccessRequest,
   type RelayInvitation,
   type RelayInvitationId,
@@ -123,6 +126,19 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly repositoryId: RelayRepositoryId;
       readonly userId: string;
     }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
+    readonly getGithubConnection: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<RelayGithubConnectionResponse, ManagedRelayClientError>;
+    readonly connectGithub: (input: {
+      readonly clerkToken: string;
+      readonly installationId: string;
+    }) => Effect.Effect<RelayGithubConnection, ManagedRelayClientError>;
+    readonly disconnectGithub: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
+    readonly listGithubRepositories: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<ReadonlyArray<RelayGithubRepository>, ManagedRelayClientError>;
   }
 >()("@t3tools/client-runtime/relay/managedRelayTenancy/ManagedRelayTenancyClient") {}
 
@@ -151,6 +167,10 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     listAccess: unavailable("clientRuntime.managedRelayTenancy.listAccess"),
     grantAccess: unavailable("clientRuntime.managedRelayTenancy.grantAccess"),
     revokeAccess: unavailable("clientRuntime.managedRelayTenancy.revokeAccess"),
+    getGithubConnection: unavailable("clientRuntime.managedRelayTenancy.getGithubConnection"),
+    connectGithub: unavailable("clientRuntime.managedRelayTenancy.connectGithub"),
+    disconnectGithub: unavailable("clientRuntime.managedRelayTenancy.disconnectGithub"),
+    listGithubRepositories: unavailable("clientRuntime.managedRelayTenancy.listGithubRepositories"),
   });
 }
 
@@ -429,6 +449,58 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.revokeAccess"),
+      withRelayClientTracing,
+    ),
+    getGithubConnection: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .getGithubConnection({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.mapError(relayRequestError("read relay GitHub connection")),
+            timeoutRelayRequest("Relay GitHub connection read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getGithubConnection"),
+      withRelayClientTracing,
+    ),
+    connectGithub: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .connectGithub({
+            headers: bearerHeaders(input.clerkToken),
+            payload: { installationId: input.installationId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("connect relay GitHub")),
+            timeoutRelayRequest("Relay GitHub connection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.connectGithub"),
+      withRelayClientTracing,
+    ),
+    disconnectGithub: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .disconnectGithub({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.mapError(relayRequestError("disconnect relay GitHub")),
+            timeoutRelayRequest("Relay GitHub disconnection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.disconnectGithub"),
+      withRelayClientTracing,
+    ),
+    listGithubRepositories: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .listGithubRepositories({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.map((response) => response.repositories),
+            Effect.mapError(relayRequestError("list relay GitHub repositories")),
+            timeoutRelayRequest("Relay GitHub repository listing"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.listGithubRepositories"),
       withRelayClientTracing,
     ),
   });

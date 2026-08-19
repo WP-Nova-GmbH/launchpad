@@ -250,6 +250,11 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/organization",
   },
   {
+    id: "organization-github",
+    title: "GitHub",
+    to: "/settings/organization",
+  },
+  {
     id: "organization-repositories",
     title: "Repositories and access",
     to: "/settings/organization",

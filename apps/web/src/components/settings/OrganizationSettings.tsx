@@ -1,4 +1,5 @@
 import { BuildingIcon, CopyIcon, FolderGit2Icon, TrashIcon, UsersIcon } from "lucide-react";
+import { useEffect } from "react";
 import { useMemo, useState, type ReactNode } from "react";
 import type {
   RelayInvitation,
@@ -10,6 +11,7 @@ import type {
   RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
 
+import { GitHubIcon } from "../Icons";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useProjects } from "../../state/entities";
 import { useOrganizationAdmin, type OrganizationAdminState } from "../../cloud/organizationAdmin";
@@ -477,6 +479,127 @@ function useUnregisteredCheckouts(repositories: ReadonlyArray<RelayRepositorySum
   return useMemo(() => unregisteredCheckouts(projects, repositories), [projects, repositories]);
 }
 
+/**
+ * GitHub connection.
+ *
+ * The App is installed on GitHub, which redirects back here with an
+ * `installation_id`; claiming it is what ties that installation to this
+ * organization. Access then belongs to the organization rather than to whoever
+ * installed it — the relay mints tokens per request, so nobody holds a GitHub
+ * credential.
+ */
+function GithubSection({ state }: { state: OrganizationAdminState }) {
+  const snapshot = state.snapshot;
+  const isAdmin = snapshot?.membership.role === "admin";
+  const connection = snapshot?.github.connection ?? null;
+  const installUrl = snapshot?.github.installUrl ?? null;
+
+  // GitHub sends the id in the query string on its way back from the install.
+  useEffect(() => {
+    if (!isAdmin || connection) return;
+    const params = new URLSearchParams(window.location.search);
+    const installationId = params.get("installation_id");
+    if (!installationId) return;
+    void state.connectGithub(installationId).then(() => {
+      params.delete("installation_id");
+      params.delete("setup_action");
+      const query = params.toString();
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}${query ? `?${query}` : ""}`,
+      );
+    });
+  }, [connection, isAdmin, state]);
+
+  if (!snapshot) return null;
+  if (!installUrl && !connection) {
+    // No GitHub App configured on this relay; the surface has nothing to offer.
+    return null;
+  }
+
+  return (
+    <SettingsSection
+      id={searchableSetting("organization-github").id}
+      title={searchableSetting("organization-github").title}
+      icon={<GitHubIcon className="size-4 text-muted-foreground" />}
+    >
+      {connection ? (
+        <SettingsRow
+          title={connection.accountLogin}
+          description={`Connected ${connection.connectedAt.slice(0, 10)}. Every member of this organization reaches these repositories; nobody needs their own GitHub token.`}
+          control={
+            isAdmin ? (
+              <div className="flex items-center gap-2">
+                {installUrl ? (
+                  <Button size="sm" variant="outline" render={<a href={installUrl} />}>
+                    Change repositories
+                  </Button>
+                ) : null}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={state.busy}
+                  onClick={() => void state.disconnectGithub()}
+                >
+                  Disconnect
+                </Button>
+              </div>
+            ) : null
+          }
+        />
+      ) : (
+        <SettingsRow
+          title="Connect GitHub"
+          description="Install the app on a GitHub organization, or on just the repositories you choose. Access belongs to this organization afterwards, not to you."
+          control={
+            isAdmin && installUrl ? (
+              <Button size="sm" render={<a href={installUrl} />}>
+                Connect GitHub
+              </Button>
+            ) : (
+              <span className="text-xs text-muted-foreground">Ask an admin to connect it.</span>
+            )
+          }
+        />
+      )}
+
+      {connection && snapshot.githubRepositories.length > 0 ? (
+        <div className="space-y-1 px-3 pt-1 sm:px-4">
+          <p className="text-xs font-medium text-muted-foreground">
+            Repositories this installation can see
+          </p>
+          {snapshot.githubRepositories.map((repository) => (
+            <div key={repository.fullName} className="flex items-center justify-between gap-3 py-1">
+              <span className="min-w-0 truncate font-mono text-xs">{repository.fullName}</span>
+              {repository.registered ? (
+                <Badge variant="secondary" className="shrink-0 font-normal">
+                  Registered
+                </Badge>
+              ) : isAdmin ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="shrink-0"
+                  disabled={state.busy}
+                  onClick={() =>
+                    void state.registerRepository({
+                      name: repository.name,
+                      canonicalKey: repository.canonicalKey,
+                    })
+                  }
+                >
+                  Register
+                </Button>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </SettingsSection>
+  );
+}
+
 function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
   const [name, setName] = useState("");
@@ -645,6 +768,7 @@ function ConfiguredOrganizationSettings() {
         <>
           <OrganizationSection state={state} />
           <MembersSection state={state} />
+          <GithubSection state={state} />
           <RepositoriesSection state={state} />
         </>
       )}

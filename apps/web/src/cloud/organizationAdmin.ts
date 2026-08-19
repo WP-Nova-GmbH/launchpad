@@ -1,6 +1,8 @@
 import { useAuth } from "@clerk/react";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import type {
+  RelayGithubConnectionResponse,
+  RelayGithubRepository,
   RelayInvitation,
   RelayRepositoryAccessEntry,
   RelayInvitationId,
@@ -27,6 +29,9 @@ export interface OrganizationAdminSnapshot {
   readonly repositories: ReadonlyArray<RelayRepositorySummary>;
   /** Who can work in each repository, keyed by repository id. */
   readonly access: ReadonlyMap<string, ReadonlyArray<RelayRepositoryAccessEntry>>;
+  readonly github: RelayGithubConnectionResponse;
+  /** What the GitHub installation can see; empty until one is connected. */
+  readonly githubRepositories: ReadonlyArray<RelayGithubRepository>;
 }
 
 /**
@@ -81,6 +86,8 @@ export interface OrganizationAdminState {
     readonly repositoryId: RelayRepositoryId;
     readonly userId: string;
   }) => Promise<boolean>;
+  readonly connectGithub: (installationId: string) => Promise<boolean>;
+  readonly disconnectGithub: () => Promise<boolean>;
 }
 
 function failureMessage(cause: unknown): string {
@@ -167,7 +174,25 @@ export function useOrganizationAdmin(): OrganizationAdminState {
           }),
         ),
       );
-      setSnapshot({ membership, members, invitations, repositories, access });
+      const github = await call("Could not read the GitHub connection", (client, clerkToken) =>
+        client.getGithubConnection({ clerkToken }),
+      );
+      // Only meaningful once an installation exists; asking otherwise is a
+      // guaranteed not-found that would read as a failure.
+      const githubRepositories = github.connection
+        ? await call("Could not list GitHub repositories", (client, clerkToken) =>
+            client.listGithubRepositories({ clerkToken }),
+          )
+        : [];
+      setSnapshot({
+        membership,
+        members,
+        invitations,
+        repositories,
+        access,
+        github,
+        githubRepositories,
+      });
     } catch (cause) {
       setError(failureMessage(cause));
     } finally {
@@ -282,6 +307,18 @@ export function useOrganizationAdmin(): OrganizationAdminState {
             repositoryId: input.repositoryId,
             payload: { userId: input.userId, role: input.role },
           }),
+        ),
+      ),
+    connectGithub: (installationId) =>
+      mutate("Could not connect GitHub", () =>
+        call("Could not connect GitHub", (client, clerkToken) =>
+          client.connectGithub({ clerkToken, installationId }),
+        ),
+      ),
+    disconnectGithub: () =>
+      mutate("Could not disconnect GitHub", () =>
+        call("Could not disconnect GitHub", (client, clerkToken) =>
+          client.disconnectGithub({ clerkToken }),
         ),
       ),
     revokeAccess: (input) =>
