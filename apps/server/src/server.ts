@@ -94,6 +94,7 @@ import {
   reconcileDesiredCloudLink,
   releaseManagedTunnelOnShutdown,
 } from "./cloud/http.ts";
+import { reconcileMachineEnrollment } from "./cloud/machineEnrollment.ts";
 import { serverRelayBrokerTracingLayer } from "./cloud/relayTracing.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
@@ -584,6 +585,39 @@ export const makeServerLayer = Layer.unwrap(
       : Layer.empty;
     const cloudDesiredLinkReconcileLayer = Layer.effectDiscard(
       Effect.gen(function* () {
+        // Machine enrollment runs outside the hasCloudPublicConfig gate: an
+        // enrolling machine carries its relay in seeded environment variables
+        // and has no Clerk build configuration at all. The reconcile is a
+        // no-op on anything that is not a freshly provisioned machine.
+        yield* forkParked(
+          Effect.gen(function* () {
+            const server = yield* HttpServer.HttpServer;
+            const address = server.address;
+            if (typeof address === "string" || !("port" in address)) return;
+            yield* reconcileMachineEnrollment(`http://127.0.0.1:${address.port}`).pipe(
+              Effect.retry({
+                // A signed refusal — a consumed or expired seed — never heals
+                // by retrying; everything else is the relay or the network
+                // being briefly unavailable while the machine boots.
+                while: (error) => error._tag !== "MachineEnrollmentRejected",
+                schedule: Schedule.exponential("1 second").pipe(
+                  Schedule.modifyDelay(({ duration }) =>
+                    Effect.succeed(Duration.min(duration, Duration.seconds(30))),
+                  ),
+                  Schedule.upTo({ duration: "10 minutes" }),
+                ),
+              }),
+              Effect.tap((result) =>
+                result.outcome === "enrolled"
+                  ? Effect.logInfo("Machine enrollment reconciled on startup")
+                  : Effect.void,
+              ),
+              Effect.catch((cause) =>
+                Effect.logWarning("Failed to reconcile machine enrollment on startup", { cause }),
+              ),
+            );
+          }),
+        );
         if (!hasCloudPublicConfig) {
           yield* Deferred.succeed(cloudLinkParked, undefined).pipe(Effect.orDie);
           return;

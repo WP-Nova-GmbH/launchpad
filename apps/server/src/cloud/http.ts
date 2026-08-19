@@ -96,6 +96,7 @@ import {
   setCliDesiredCloudLink,
 } from "./CliState.ts";
 import * as CliTokenManager from "./CliTokenManager.ts";
+import { readInstalledMachineIdentity } from "./machineEnrollment.ts";
 import { getOrCreateEnvironmentKeyPairFromSecretStore } from "./environmentKeys.ts";
 import { traceRelayRequest } from "./traceRelayRequest.ts";
 
@@ -273,6 +274,56 @@ function readInstalledCloudUserId(
       Option.isSome(bytes)
         ? Effect.succeed(bytesToString(bytes.value))
         : Effect.fail(new EnvironmentAuth.ServerAuthLinkedCloudAccountMissingError({})),
+    ),
+  );
+}
+
+type InstalledCloudPrincipal =
+  | { readonly kind: "user"; readonly userId: string }
+  | { readonly kind: "machine" };
+
+/**
+ * Who the relay's signed proofs must be bound to. A personal environment
+ * belongs to one linked account, so every proof's `sub` has to match it. An
+ * enrolled machine belongs to an organization whose members all reach it —
+ * there is no single subject to pin, and the relay only signs a proof after
+ * resolving the caller's membership, so the signature itself carries the
+ * authorization (ADR-0002).
+ */
+function readInstalledCloudPrincipal(
+  secrets: ServerSecretStore.ServerSecretStore["Service"],
+): Effect.Effect<InstalledCloudPrincipal, EnvironmentAuth.ServerAuthInternalError> {
+  return readInstalledMachineIdentity(secrets).pipe(
+    Effect.mapError(
+      (cause) => new EnvironmentAuth.ServerAuthLinkedCloudAccountReadError({ cause }),
+    ),
+    Effect.flatMap(
+      (machine): Effect.Effect<InstalledCloudPrincipal, EnvironmentAuth.ServerAuthInternalError> =>
+        machine !== null
+          ? Effect.succeed({ kind: "machine" })
+          : readInstalledCloudUserId(secrets).pipe(
+              Effect.map((userId) => ({ kind: "user", userId })),
+            ),
+    ),
+  );
+}
+
+/**
+ * The link flow requires a signed-in human who owns the machine; an enrolled
+ * machine has neither, and linking one would hand a member a personal door
+ * into org compute. The relay refuses this too — failing here just answers
+ * before a proof gets minted.
+ */
+function refuseWhenMachine(
+  secrets: ServerSecretStore.ServerSecretStore["Service"],
+  message: string,
+): Effect.Effect<void, EnvironmentAuth.ServerAuthInternalError | EnvironmentHttpConflictError> {
+  return readInstalledMachineIdentity(secrets).pipe(
+    Effect.mapError(
+      (cause) => new EnvironmentAuth.ServerAuthLinkedCloudAccountReadError({ cause }),
+    ),
+    Effect.flatMap((machine) =>
+      machine === null ? Effect.void : Effect.fail(new EnvironmentHttpConflictError({ message })),
     ),
   );
 }
@@ -475,6 +526,10 @@ const makeCloudLinkProof = Effect.fn("environment.cloud.makeLinkProof")(function
 const cloudLinkProofHandler = Effect.fn("environment.cloud.linkProof")(
   function* (dependencies: CloudHttpDependencies, request: RelayLinkProofRequest) {
     yield* requireEnvironmentScope(AuthRelayWriteScope);
+    yield* refuseWhenMachine(
+      dependencies.secrets,
+      "This environment is an enrolled machine and cannot be linked to a personal account.",
+    );
     const httpRequest = yield* HttpServerRequest.HttpServerRequest;
     const requestUrl = requestAbsoluteUrl(httpRequest);
     if (requestUrl === null || hasForwardedAuthorityHeaders(httpRequest)) {
@@ -547,6 +602,10 @@ const applyCloudRelayConfig = Effect.fn("environment.cloud.applyRelayConfig")(fu
 const cloudRelayConfigHandler = Effect.fn("environment.cloud.relayConfig")(
   function* (dependencies: CloudHttpDependencies, payload: RelayEnvironmentConfigRequest) {
     yield* requireEnvironmentScope(AuthRelayWriteScope);
+    yield* refuseWhenMachine(
+      dependencies.secrets,
+      "This environment is an enrolled machine; its relay configuration is owned by enrollment.",
+    );
     return yield* applyCloudRelayConfig(dependencies, payload);
   },
   Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
@@ -837,6 +896,10 @@ const cloudLinkStateHandler = Effect.fn("environment.cloud.linkState")(
 const cloudUnlinkHandler = Effect.fn("environment.cloud.unlink")(
   function* (dependencies: CloudHttpDependencies) {
     yield* requireEnvironmentScope(AuthRelayWriteScope);
+    yield* refuseWhenMachine(
+      dependencies.secrets,
+      "This environment is an enrolled machine; deprovision it from the organization instead of unlinking.",
+    );
     const endpointRuntimeStatus = yield* dependencies.endpointRuntime.applyConfig(null);
     yield* Effect.all(
       [
@@ -853,6 +916,9 @@ const cloudUnlinkHandler = Effect.fn("environment.cloud.unlink")(
     yield* setCliDesiredCloudLink(false);
     return { ok: true, endpointRuntimeStatus } satisfies EnvironmentCloudRelayConfigResult;
   },
+  Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+    failEnvironmentCloudInternalError(error.message)(error),
+  ),
   Effect.catchIf(
     ServerSecretStore.isSecretStoreError,
     failEnvironmentCloudInternalError("Could not remove environment relay configuration."),
@@ -882,7 +948,7 @@ const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
     const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
     const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
     const environmentId = yield* dependencies.environment.getEnvironmentId;
-    const linkedCloudUserId = yield* readInstalledCloudUserId(dependencies.secrets);
+    const principal = yield* readInstalledCloudPrincipal(dependencies.secrets);
     const now = yield* DateTime.now;
     const nowSeconds = Math.floor(now.epochMilliseconds / 1_000);
     const proofOption = yield* verifyRelayJwt({
@@ -896,7 +962,7 @@ const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
     if (
       Option.isNone(proofOption) ||
       proofOption.value.environmentId !== environmentId ||
-      proofOption.value.sub !== linkedCloudUserId ||
+      (principal.kind === "user" && proofOption.value.sub !== principal.userId) ||
       !hasBoundedCloudProofLifetime({ ...proofOption.value, nowSeconds }) ||
       !hasExactScope({ scopes: proofOption.value.scope, expected: "environment:status" })
     ) {
@@ -976,7 +1042,7 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
     const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
     const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
     const environmentId = yield* dependencies.environment.getEnvironmentId;
-    const linkedCloudUserId = yield* readInstalledCloudUserId(dependencies.secrets);
+    const principal = yield* readInstalledCloudPrincipal(dependencies.secrets);
     const now = yield* DateTime.now;
     const nowSeconds = Math.floor(now.epochMilliseconds / 1_000);
     const proofOption = yield* verifyRelayJwt({
@@ -990,7 +1056,7 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
     if (
       Option.isNone(proofOption) ||
       proofOption.value.environmentId !== environmentId ||
-      proofOption.value.sub !== linkedCloudUserId ||
+      (principal.kind === "user" && proofOption.value.sub !== principal.userId) ||
       proofOption.value.cnf.jkt !== proofOption.value.clientProofKeyThumbprint ||
       !hasBoundedCloudProofLifetime({ ...proofOption.value, nowSeconds }) ||
       !hasExactScope({ scopes: proofOption.value.scope, expected: "environment:connect" })
@@ -1129,7 +1195,7 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
     const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
     const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
     const environmentId = yield* dependencies.environment.getEnvironmentId;
-    const linkedCloudUserId = yield* readInstalledCloudUserId(dependencies.secrets);
+    const principal = yield* readInstalledCloudPrincipal(dependencies.secrets);
     const now = yield* DateTime.now;
     const nowSeconds = Math.floor(now.epochMilliseconds / 1_000);
     const proofOption = yield* verifyRelayJwt({
@@ -1143,11 +1209,13 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
     if (
       Option.isNone(proofOption) ||
       proofOption.value.environmentId !== environmentId ||
-      // The relay signs `sub` with the user it dispatched on behalf of. Binding
-      // it to this install's linked account means a proof minted for someone
-      // else's link cannot drive this machine, matching what the mint and
-      // health legs already require.
-      proofOption.value.sub !== linkedCloudUserId ||
+      // The relay signs `sub` with the user it dispatched on behalf of. On a
+      // personal environment that subject must match the linked account, so a
+      // proof minted for someone else's link cannot drive this machine. On an
+      // enrolled machine every organization member may dispatch; the relay
+      // resolved that membership before signing, so the signature carries the
+      // authorization.
+      (principal.kind === "user" && proofOption.value.sub !== principal.userId) ||
       !hasBoundedCloudProofLifetime({ ...proofOption.value, nowSeconds })
     ) {
       return yield* new EnvironmentHttpUnauthorizedError({
