@@ -1,0 +1,10 @@
+# Keeps the executor-image build context small: dependencies install inside
+# the image, and machine-local state never ships in an image.
+.git
+node_modules
+**/node_modules
+.t3
+**/.t3
+dist
+**/dist
+.repos

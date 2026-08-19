@@ -62,6 +62,7 @@ import * as EnvironmentPublishSignatures from "./environments/EnvironmentPublish
 import * as ManagedEndpointProvider from "./environments/ManagedEndpointProvider.ts";
 import * as ManagedTunnelLimits from "./environments/ManagedTunnelLimits.ts";
 import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
+import * as HetznerComputeProvider from "./machines/HetznerComputeProvider.ts";
 import * as MachineComputeProvider from "./machines/MachineComputeProvider.ts";
 import * as MachineEnroller from "./machines/MachineEnroller.ts";
 import * as MachineLimits from "./machines/MachineLimits.ts";
@@ -168,6 +169,27 @@ export const ApiLive = Api.make(
       Config.option,
     );
 
+    // Optional: a deployment without a Hetzner token cannot create machine
+    // compute and says so instead of pretending.
+    const hetznerApiToken = yield* Config.redacted("HETZNER_API_TOKEN").pipe(Config.option);
+    const hetznerSettings: Omit<HetznerComputeProvider.HetznerComputeSettings, "apiToken"> = {
+      serverType: yield* Config.string("HETZNER_SERVER_TYPE").pipe(Config.withDefault("cx22")),
+      image: yield* Config.string("HETZNER_IMAGE").pipe(Config.withDefault("ubuntu-24.04")),
+      location: yield* Config.string("HETZNER_LOCATION").pipe(Config.withDefault("fsn1")),
+      sshKeys: (yield* Config.string("HETZNER_SSH_KEYS").pipe(Config.withDefault("")))
+        .split(",")
+        .map((key) => key.trim())
+        .filter((key) => key.length > 0),
+      bootstrapUrl: yield* Config.string("MACHINE_BOOTSTRAP_URL").pipe(
+        Config.withDefault(
+          "https://raw.githubusercontent.com/WP-Nova-GmbH/launchpad/main/infra/relay/scripts/machine-bootstrap.sh",
+        ),
+      ),
+      sourceGitUrl: yield* Config.string("MACHINE_SOURCE_GIT_URL").pipe(
+        Config.withDefault("https://github.com/WP-Nova-GmbH/launchpad.git"),
+      ),
+    };
+
     const clerkSecretKey = yield* Config.redacted("CLERK_SECRET_KEY");
     const clerkPublishableKey = yield* Config.string("CLERK_PUBLISHABLE_KEY");
     const clerkJwtAudience = yield* Config.string("CLERK_JWT_AUDIENCE");
@@ -234,9 +256,14 @@ export const ApiLive = Api.make(
         Layer.provideMerge(EnvironmentConnector.layer),
         Layer.provideMerge(EnvironmentLinker.layer),
         Layer.provideMerge(MachineEnroller.layer),
-        // Compute drivers land with the Docker (dev) and Hetzner (production)
-        // integrations; until then provisioning refuses honestly.
-        Layer.provideMerge(MachineComputeProvider.layerUnavailable),
+        Layer.provideMerge(
+          Option.isSome(hetznerApiToken)
+            ? HetznerComputeProvider.layerHetzner({
+                apiToken: hetznerApiToken.value,
+                ...hetznerSettings,
+              })
+            : MachineComputeProvider.layerUnavailable,
+        ),
         Layer.provideMerge(MachineLimits.layer),
         Layer.provideMerge(EnvironmentPublishSignatures.layer),
         Layer.provideMerge(

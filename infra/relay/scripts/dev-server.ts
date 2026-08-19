@@ -74,7 +74,7 @@ import * as LiveActivities from "../src/agentActivity/LiveActivities.ts";
 import * as ManagedEndpointAllocations from "../src/environments/ManagedEndpointAllocations.ts";
 import * as ManagedEndpointProvider from "../src/environments/ManagedEndpointProvider.ts";
 import * as ManagedTunnelLimits from "../src/environments/ManagedTunnelLimits.ts";
-import * as MachineComputeProvider from "../src/machines/MachineComputeProvider.ts";
+import * as DockerComputeProvider from "../src/machines/DockerComputeProvider.ts";
 import * as MachineEnroller from "../src/machines/MachineEnroller.ts";
 import * as MachineLimits from "../src/machines/MachineLimits.ts";
 import * as Machines from "../src/machines/Machines.ts";
@@ -184,8 +184,19 @@ const runtimeLayer = Layer.empty
     Layer.provideMerge(EnvironmentConnector.layer),
     Layer.provideMerge(EnvironmentLinker.layer),
     Layer.provideMerge(MachineEnroller.layer),
-    // The Docker driver replaces this when dev-mode machine provisioning lands.
-    Layer.provideMerge(MachineComputeProvider.layerUnavailable),
+    // Dev-mode machines are Docker containers on this host, running the
+    // executor image built from infra/executor-image/Dockerfile.
+    Layer.provideMerge(
+      DockerComputeProvider.layerDocker({
+        image:
+          process.env.DEV_MACHINE_DOCKER_IMAGE?.trim() ||
+          DockerComputeProvider.DEFAULT_DEV_MACHINE_DOCKER_IMAGE,
+        containerServerPort: Number(
+          process.env.DEV_MACHINE_DOCKER_SERVER_PORT ??
+            DockerComputeProvider.DEFAULT_DEV_MACHINE_SERVER_PORT,
+        ),
+      }),
+    ),
     Layer.provideMerge(MachineLimits.layer),
     Layer.provideMerge(EnvironmentPublishSignatures.layer),
     Layer.provideMerge(
