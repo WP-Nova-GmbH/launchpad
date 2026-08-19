@@ -87,6 +87,32 @@ re-inviting cannot leave two live tokens behind.
 **There is no transactional email provider yet.** The admin who creates an invitation delivers the
 link. When a provider lands, it sends the same token and nothing else about the flow changes.
 
+## GitHub connection
+
+An organization connects GitHub by installing the relay's GitHub App — on a whole GitHub
+organization, or on selected repositories. What is recorded is the **installation id**, which is not
+a secret; the App private key stays in relay configuration and access tokens are minted per request
+and never persisted. That is what keeps the "no secret in relay Postgres" rule intact.
+
+This is deliberately not "sign in with GitHub". An OAuth token belongs to one person and dies with
+their session, so access would not be the organization's. With an installation, **every member
+reaches the connected repositories** without holding a GitHub credential of their own.
+
+Creating the App is a one-time setup step, and does not require filling in GitHub's form:
+
+```sh
+node infra/relay/scripts/create-github-app.ts --setup-url https://<app-host>/settings/organization
+```
+
+That uses GitHub's manifest flow — the app is created with one click and its id, slug, and private
+key are written to `infra/relay/.env`. Add `--org <login>` to create it inside a GitHub
+organization. Installing it afterwards is the **Connect GitHub** button on the organization page.
+
+**Known gap.** The relay verifies that a claimed installation exists and refuses one another
+organization already claimed, but it cannot yet prove the caller administers that GitHub account —
+that would need a user OAuth leg. Claiming someone else's installation means guessing a numeric id
+before its owner claims it. Close this before the relay is multi-tenant.
+
 ## Tables
 
 All in `infra/relay/src/persistence/schema.ts`:
@@ -99,6 +125,7 @@ All in `infra/relay/src/persistence/schema.ts`:
 | `relay_repositories`             | scoped to an organization                                           |
 | `relay_repository_aliases`       | canonical key is the primary key; organization denormalized         |
 | `relay_repository_access`        | `(repository, user)`; organization denormalized                     |
+| `relay_github_installations`     | one per organization; unique on `installation_id`, holds no secret  |
 
 Organization ids are denormalized onto alias and access rows so a checkout can be resolved to its
 organization without a join, including on paths that hold no user token.
