@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
-import type { RelayRepositorySummary } from "@t3tools/contracts/relay";
+import type { RelayMachine, RelayRepositorySummary } from "@t3tools/contracts/relay";
 
 import {
+  machineStatusLabel,
   memberLabel,
   unregisteredCheckouts,
   type CheckoutLike,
@@ -97,5 +98,45 @@ describe("memberLabel", () => {
       primary: "user_1",
       secondary: null,
     });
+  });
+});
+
+describe("machineStatusLabel", () => {
+  const machine = (overrides: Partial<RelayMachine>): RelayMachine =>
+    ({
+      machineId: "machine-1",
+      organizationId: "organization-1",
+      role: "agent_executor",
+      label: "Executor 1",
+      status: "awaiting_enrollment",
+      computeKind: "docker",
+      environmentId: null,
+      endpoint: null,
+      createdByUserId: "user_1",
+      createdAt: "2026-08-19T00:00:00.000Z",
+      enrolledAt: null,
+      seedExpiresAt: "2026-08-20T00:00:00.000Z",
+      deprovisionedAt: null,
+      ...overrides,
+    }) as RelayMachine;
+  const now = Date.parse("2026-08-19T12:00:00.000Z");
+
+  it("labels the lifecycle states", () => {
+    expect(machineStatusLabel(machine({}), now)).toBe("Waiting to enroll");
+    expect(
+      machineStatusLabel(machine({ status: "ready", enrolledAt: "2026-08-19T01:00:00.000Z" }), now),
+    ).toBe("Ready");
+    expect(
+      machineStatusLabel(
+        machine({ status: "deprovisioned", deprovisionedAt: "2026-08-19T02:00:00.000Z" }),
+        now,
+      ),
+    ).toBe("Deprovisioned");
+  });
+
+  it("calls out a machine whose enrollment window already closed", () => {
+    expect(machineStatusLabel(machine({ seedExpiresAt: "2026-08-19T00:30:00.000Z" }), now)).toBe(
+      "Enrollment expired",
+    );
   });
 });

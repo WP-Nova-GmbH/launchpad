@@ -6,6 +6,9 @@ import type {
   RelayInvitation,
   RelayRepositoryAccessEntry,
   RelayInvitationId,
+  RelayMachine,
+  RelayMachineId,
+  RelayMachineRole,
   RelayOrgRole,
   RelayOrganizationMember,
   RelayOrganizationMembership,
@@ -29,6 +32,7 @@ export interface OrganizationAdminSnapshot {
   readonly repositories: ReadonlyArray<RelayRepositorySummary>;
   /** Who can work in each repository, keyed by repository id. */
   readonly access: ReadonlyMap<string, ReadonlyArray<RelayRepositoryAccessEntry>>;
+  readonly machines: ReadonlyArray<RelayMachine>;
   readonly github: RelayGithubConnectionResponse;
   /** What the GitHub installation can see; empty until one is connected. */
   readonly githubRepositories: ReadonlyArray<RelayGithubRepository>;
@@ -88,6 +92,11 @@ export interface OrganizationAdminState {
   }) => Promise<boolean>;
   readonly connectGithub: (installationId: string) => Promise<boolean>;
   readonly disconnectGithub: () => Promise<boolean>;
+  readonly provisionMachine: (input: {
+    readonly label: string;
+    readonly role: RelayMachineRole;
+  }) => Promise<boolean>;
+  readonly deprovisionMachine: (machineId: RelayMachineId) => Promise<boolean>;
 }
 
 function failureMessage(cause: unknown): string {
@@ -174,6 +183,9 @@ export function useOrganizationAdmin(): OrganizationAdminState {
           }),
         ),
       );
+      const machines = await call("Could not list machines", (client, clerkToken) =>
+        client.listMachines({ clerkToken }),
+      );
       const github = await call("Could not read the GitHub connection", (client, clerkToken) =>
         client.getGithubConnection({ clerkToken }),
       );
@@ -190,6 +202,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         invitations,
         repositories,
         access,
+        machines,
         github,
         githubRepositories,
       });
@@ -325,6 +338,18 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       mutate("Could not revoke access", () =>
         call("Could not revoke access", (client, clerkToken) =>
           client.revokeAccess({ clerkToken, ...input }),
+        ),
+      ),
+    provisionMachine: (input) =>
+      mutate("Could not provision the machine", () =>
+        call("Could not provision the machine", (client, clerkToken) =>
+          client.provisionMachine({ clerkToken, payload: input }),
+        ),
+      ),
+    deprovisionMachine: (machineId) =>
+      mutate("Could not deprovision the machine", () =>
+        call("Could not deprovision the machine", (client, clerkToken) =>
+          client.deprovisionMachine({ clerkToken, machineId }),
         ),
       ),
   };

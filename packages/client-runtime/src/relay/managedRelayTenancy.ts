@@ -18,11 +18,14 @@ import {
   type RelayInvitation,
   type RelayInvitationId,
   type RelayLookupRepositoryResponse,
+  type RelayMachine,
+  type RelayMachineId,
   type RelayOkResponse,
   type RelayOrgRole,
   type RelayOrganization,
   type RelayOrganizationMember,
   type RelayOrganizationMembership,
+  type RelayProvisionMachineRequest,
   type RelayRegisterRepositoryRequest,
   type RelayRepository,
   type RelayRepositoryAccessEntry,
@@ -126,6 +129,17 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly repositoryId: RelayRepositoryId;
       readonly userId: string;
     }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
+    readonly listMachines: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<ReadonlyArray<RelayMachine>, ManagedRelayClientError>;
+    readonly provisionMachine: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayProvisionMachineRequest;
+    }) => Effect.Effect<RelayMachine, ManagedRelayClientError>;
+    readonly deprovisionMachine: (input: {
+      readonly clerkToken: string;
+      readonly machineId: RelayMachineId;
+    }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
     readonly getGithubConnection: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<RelayGithubConnectionResponse, ManagedRelayClientError>;
@@ -167,6 +181,9 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     listAccess: unavailable("clientRuntime.managedRelayTenancy.listAccess"),
     grantAccess: unavailable("clientRuntime.managedRelayTenancy.grantAccess"),
     revokeAccess: unavailable("clientRuntime.managedRelayTenancy.revokeAccess"),
+    listMachines: unavailable("clientRuntime.managedRelayTenancy.listMachines"),
+    provisionMachine: unavailable("clientRuntime.managedRelayTenancy.provisionMachine"),
+    deprovisionMachine: unavailable("clientRuntime.managedRelayTenancy.deprovisionMachine"),
     getGithubConnection: unavailable("clientRuntime.managedRelayTenancy.getGithubConnection"),
     connectGithub: unavailable("clientRuntime.managedRelayTenancy.connectGithub"),
     disconnectGithub: unavailable("clientRuntime.managedRelayTenancy.disconnectGithub"),
@@ -449,6 +466,49 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.revokeAccess"),
+      withRelayClientTracing,
+    ),
+    listMachines: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.machines
+          .listMachines({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.map((response) => response.machines),
+            Effect.mapError(relayRequestError("list relay machines")),
+            timeoutRelayRequest("Relay machine listing"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.listMachines"),
+      withRelayClientTracing,
+    ),
+    provisionMachine: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.machines
+          .provisionMachine({
+            headers: bearerHeaders(input.clerkToken),
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("provision relay machine")),
+            timeoutRelayRequest("Relay machine provisioning"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.provisionMachine"),
+      withRelayClientTracing,
+    ),
+    deprovisionMachine: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.machines
+          .deprovisionMachine({
+            headers: bearerHeaders(input.clerkToken),
+            params: { machineId: input.machineId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("deprovision relay machine")),
+            timeoutRelayRequest("Relay machine deprovisioning"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.deprovisionMachine"),
       withRelayClientTracing,
     ),
     getGithubConnection: Effect.fnUntraced(

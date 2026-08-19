@@ -260,6 +260,11 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/organization",
   },
   {
+    id: "organization-machines",
+    title: "Machines",
+    to: "/settings/organization",
+  },
+  {
     id: "archive",
     title: "Archived threads",
     to: "/settings/archived",

@@ -173,6 +173,16 @@ export function relayProtectedErrorMessage(error: RelayProtectedErrorType): stri
       return `Relay could not find the organization record (${error.reason}).`;
     case "RelayTenancyConflictError":
       return `Relay refused the organization change because it conflicts with existing state (${error.reason}).`;
+    case "RelayMachineEnrollProofInvalidError":
+      return `Relay rejected the machine enrollment proof (${error.reason}).`;
+    case "RelayMachineEnrollFailedError":
+      return `Relay could not enroll the machine (${error.reason}).`;
+    case "RelayMachineEnrollUnavailableError":
+      return `Relay cannot provision the machine's managed endpoint (${error.reason}).`;
+    case "RelayMachineComputeUnavailableError":
+      return error.reason === "not_configured"
+        ? "Relay has no machine compute provider configured."
+        : "Relay could not reach the machine compute provider.";
     case "RelayInternalError":
       return `Relay encountered an internal error (${error.reason}).`;
   }

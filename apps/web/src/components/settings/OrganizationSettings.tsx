@@ -1,8 +1,17 @@
-import { BuildingIcon, CopyIcon, FolderGit2Icon, TrashIcon, UsersIcon } from "lucide-react";
+import {
+  BuildingIcon,
+  CopyIcon,
+  FolderGit2Icon,
+  ServerIcon,
+  TrashIcon,
+  UsersIcon,
+} from "lucide-react";
 import { useEffect } from "react";
 import { useMemo, useState, type ReactNode } from "react";
 import type {
   RelayInvitation,
+  RelayMachine,
+  RelayMachineRole,
   RelayOrgRole,
   RelayOrganizationMember,
   RelayRepositoryId,
@@ -22,7 +31,11 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "..
 import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Spinner } from "../ui/spinner";
-import { memberLabel, unregisteredCheckouts } from "./OrganizationSettings.logic";
+import {
+  machineStatusLabel,
+  memberLabel,
+  unregisteredCheckouts,
+} from "./OrganizationSettings.logic";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 
@@ -34,6 +47,11 @@ const ORG_ROLE_LABELS: Readonly<Record<RelayOrgRole, string>> = {
 const REPOSITORY_ROLE_LABELS: Readonly<Record<RelayRepositoryRole, string>> = {
   maintainer: "Maintainer",
   developer: "Developer",
+};
+
+const MACHINE_ROLE_LABELS: Readonly<Record<RelayMachineRole, string>> = {
+  agent_executor: "Agent executor",
+  review_host: "Review host",
 };
 
 /**
@@ -742,6 +760,156 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
   );
 }
 
+function MachineRow({ machine, state }: { machine: RelayMachine; state: OrganizationAdminState }) {
+  // Deprovisioning destroys thread history on the machine, so the trash icon
+  // arms a second, labeled click instead of acting immediately.
+  const [confirming, setConfirming] = useState(false);
+  const isAdmin = state.snapshot?.membership.role === "admin";
+  const status = machineStatusLabel(machine, Date.now());
+  const endpointHost = machine.endpoint ? new URL(machine.endpoint.httpBaseUrl).host : null;
+  const timeline =
+    machine.status === "ready" && machine.enrolledAt
+      ? `Enrolled ${machine.enrolledAt.slice(0, 10)}`
+      : `Provisioned ${machine.createdAt.slice(0, 10)}`;
+
+  return (
+    <SettingsRow
+      title={
+        <span className="flex items-baseline gap-2">
+          {machine.label}
+          <RoleBadge>{MACHINE_ROLE_LABELS[machine.role]}</RoleBadge>
+        </span>
+      }
+      description={endpointHost ? `${timeline} · ${endpointHost}` : timeline}
+      control={
+        <div className="flex items-center gap-2">
+          <Badge
+            variant={machine.status === "ready" ? "secondary" : "outline"}
+            className="font-normal"
+          >
+            {status}
+          </Badge>
+          {isAdmin && machine.status !== "deprovisioned" ? (
+            confirming ? (
+              <Button
+                size="sm"
+                variant="destructive"
+                disabled={state.busy}
+                onBlur={() => setConfirming(false)}
+                onClick={() => {
+                  setConfirming(false);
+                  void state.deprovisionMachine(machine.machineId);
+                }}
+              >
+                Destroy machine
+              </Button>
+            ) : (
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                aria-label={`Deprovision ${machine.label}`}
+                disabled={state.busy}
+                onClick={() => setConfirming(true)}
+              >
+                <TrashIcon className="size-3.5" />
+              </Button>
+            )
+          ) : null}
+        </div>
+      }
+    />
+  );
+}
+
+function MachinesSection({ state }: { state: OrganizationAdminState }) {
+  const snapshot = state.snapshot;
+  const [label, setLabel] = useState("");
+  const [role, setRole] = useState<RelayMachineRole>("agent_executor");
+
+  if (!snapshot) return null;
+  const isAdmin = snapshot.membership.role === "admin";
+
+  return (
+    <SettingsSection
+      id={searchableSetting("organization-machines").id}
+      title={searchableSetting("organization-machines").title}
+      icon={<ServerIcon className="size-4 text-muted-foreground" />}
+    >
+      <SectionNote>
+        Machines are compute this organization buys through the relay: agent executors run work,
+        review hosts will run review apps. A provisioned machine enrolls itself and then appears to
+        every member beside their own environments. Deprovisioning destroys the machine and any
+        thread history it holds.
+      </SectionNote>
+      {snapshot.machines.length === 0 ? (
+        <Empty className="min-h-48">
+          <EmptyMedia variant="icon">
+            <ServerIcon />
+          </EmptyMedia>
+          <EmptyHeader>
+            <EmptyTitle>No machines yet</EmptyTitle>
+            <EmptyDescription>
+              Provision one and it enrolls itself with this organization — nobody signs in on it,
+              and it can never be linked as somebody&apos;s personal environment.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : (
+        snapshot.machines.map((machine) => (
+          <MachineRow key={machine.machineId} machine={machine} state={state} />
+        ))
+      )}
+      {isAdmin ? (
+        <SettingsRow
+          title="Provision a machine"
+          description="Creates fresh compute with a single-use enrollment credential; it appears as ready once it calls home."
+          control={
+            <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+              <Input
+                nativeInput
+                value={label}
+                placeholder="Name"
+                aria-label="Machine name"
+                onChange={(event) => setLabel(event.currentTarget.value)}
+                className="w-full sm:w-48"
+              />
+              <Select
+                value={role}
+                onValueChange={(value) => {
+                  if (typeof value === "string") setRole(value as RelayMachineRole);
+                }}
+              >
+                <SelectTrigger className="w-40" aria-label="Machine role">
+                  <SelectValue>{MACHINE_ROLE_LABELS[role]}</SelectValue>
+                </SelectTrigger>
+                <SelectPopup align="end" alignItemWithTrigger={false}>
+                  <SelectItem hideIndicator value="agent_executor">
+                    Agent executor
+                  </SelectItem>
+                  <SelectItem hideIndicator value="review_host">
+                    Review host
+                  </SelectItem>
+                </SelectPopup>
+              </Select>
+              <Button
+                size="sm"
+                disabled={state.busy || label.trim().length === 0}
+                onClick={() => {
+                  void state.provisionMachine({ label: label.trim(), role }).then((ok) => {
+                    if (ok) setLabel("");
+                  });
+                }}
+              >
+                Provision
+              </Button>
+            </div>
+          }
+        />
+      ) : null}
+    </SettingsSection>
+  );
+}
+
 function OrganizationSettingsNotice({ title, children }: { title: string; children: ReactNode }) {
   return (
     <SettingsPageContainer>
@@ -796,6 +964,7 @@ function ConfiguredOrganizationSettings() {
           <MembersSection state={state} />
           <GithubSection state={state} />
           <RepositoriesSection state={state} />
+          <MachinesSection state={state} />
         </>
       )}
     </SettingsPageContainer>

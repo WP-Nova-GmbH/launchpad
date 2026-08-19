@@ -1,5 +1,5 @@
 import type { RepositoryIdentity } from "@t3tools/contracts";
-import type { RelayRepositorySummary } from "@t3tools/contracts/relay";
+import type { RelayMachine, RelayRepositorySummary } from "@t3tools/contracts/relay";
 
 export interface UnregisteredCheckout {
   readonly canonicalKey: string;
@@ -35,6 +35,25 @@ export function unregisteredCheckouts(
     byKey.set(identity.canonicalKey, identity.name ?? project.title);
   }
   return [...byKey].map(([canonicalKey, suggestedName]) => ({ canonicalKey, suggestedName }));
+}
+
+/**
+ * What a machine's status means to a person looking at the list. The relay
+ * derives the coarse status; the one nuance added here is that a machine
+ * still waiting past its seed's expiry can never enroll and needs to be
+ * deprovisioned and recreated.
+ */
+export function machineStatusLabel(machine: RelayMachine, nowMs: number): string {
+  switch (machine.status) {
+    case "deprovisioned":
+      return "Deprovisioned";
+    case "ready":
+      return "Ready";
+    case "awaiting_enrollment":
+      return Date.parse(machine.seedExpiresAt) <= nowMs
+        ? "Enrollment expired"
+        : "Waiting to enroll";
+  }
 }
 
 export interface IdentifiedUser {
