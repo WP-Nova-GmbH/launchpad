@@ -63,6 +63,7 @@ import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
 import * as Invitations from "./tenancy/Invitations.ts";
 import * as Organizations from "./tenancy/Organizations.ts";
 import * as Repositories from "./tenancy/Repositories.ts";
+import * as UserDirectory from "./tenancy/UserDirectory.ts";
 
 const webcryptoLayer = Layer.succeed(
   Crypto.Crypto,
@@ -226,6 +227,7 @@ export const ApiLive = Api.make(
           Organizations.layer,
           Invitations.layer,
           Repositories.layer,
+          UserDirectory.layer,
         ),
       ),
       Layer.provideMerge(Devices.layer),

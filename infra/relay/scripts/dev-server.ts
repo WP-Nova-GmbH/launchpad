@@ -79,6 +79,7 @@ import * as RelayConfiguration from "../src/Config.ts";
 import * as RelayDb from "../src/db.ts";
 import * as RelayTokens from "../src/auth/RelayTokens.ts";
 import * as Repositories from "../src/tenancy/Repositories.ts";
+import * as UserDirectory from "../src/tenancy/UserDirectory.ts";
 
 const DEFAULT_PORT = 8610;
 const DEFAULT_DATABASE_URL = "postgres://postgres:t3relay@127.0.0.1:5433/t3relay";
@@ -198,6 +199,7 @@ const runtimeLayer = Layer.empty
         Organizations.layer,
         Invitations.layer,
         Repositories.layer,
+        UserDirectory.layer,
       ),
     ),
     Layer.provideMerge(Devices.layer),

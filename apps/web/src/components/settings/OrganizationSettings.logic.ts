@@ -36,3 +36,31 @@ export function unregisteredCheckouts(
   }
   return [...byKey].map(([canonicalKey, suggestedName]) => ({ canonicalKey, suggestedName }));
 }
+
+export interface IdentifiedUser {
+  readonly userId: string;
+  readonly identity: {
+    readonly displayName: string | null;
+    readonly email: string | null;
+  } | null;
+}
+
+/**
+ * What to call somebody in a roster.
+ *
+ * The relay keys membership by subject id and resolves names from the identity
+ * provider on read, so the name can be missing — a fresh account with no
+ * profile, or a directory that did not answer. Falling back through email to
+ * the subject id keeps every row identifiable instead of blank.
+ */
+export function memberLabel(user: IdentifiedUser): {
+  readonly primary: string;
+  readonly secondary: string | null;
+} {
+  const name = user.identity?.displayName?.trim();
+  const email = user.identity?.email?.trim();
+  if (name && email) return { primary: name, secondary: email };
+  if (name) return { primary: name, secondary: null };
+  if (email) return { primary: email, secondary: null };
+  return { primary: user.userId, secondary: null };
+}

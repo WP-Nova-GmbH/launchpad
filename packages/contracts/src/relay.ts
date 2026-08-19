@@ -976,10 +976,25 @@ export const RelayOrganizationMembership = Schema.Struct({
 });
 export type RelayOrganizationMembership = typeof RelayOrganizationMembership.Type;
 
+/**
+ * Who a subject is, as far as the relay can tell. Resolved from the identity
+ * provider on read and never stored: the relay owns tenancy, not people, and a
+ * copied name goes stale the moment someone edits their profile. Null whenever
+ * the lookup is unavailable — a roster that renders subject ids is worse than
+ * a roster, but far better than an error.
+ */
+export const RelayUserIdentity = Schema.Struct({
+  displayName: Schema.NullOr(TrimmedNonEmptyString),
+  email: Schema.NullOr(TrimmedNonEmptyString),
+  imageUrl: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type RelayUserIdentity = typeof RelayUserIdentity.Type;
+
 export const RelayOrganizationMember = Schema.Struct({
   userId: TrimmedNonEmptyString,
   role: RelayOrgRole,
   joinedAt: TrimmedNonEmptyString,
+  identity: Schema.NullOr(RelayUserIdentity),
 });
 export type RelayOrganizationMember = typeof RelayOrganizationMember.Type;
 
@@ -1082,6 +1097,7 @@ export const RelayRepositoryAccessEntry = Schema.Struct({
   userId: TrimmedNonEmptyString,
   role: RelayRepositoryRole,
   grantedAt: TrimmedNonEmptyString,
+  identity: Schema.NullOr(RelayUserIdentity),
 });
 export type RelayRepositoryAccessEntry = typeof RelayRepositoryAccessEntry.Type;
 

@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { RelayRepositorySummary } from "@t3tools/contracts/relay";
 
-import { unregisteredCheckouts, type CheckoutLike } from "./OrganizationSettings.logic";
+import {
+  memberLabel,
+  unregisteredCheckouts,
+  type CheckoutLike,
+} from "./OrganizationSettings.logic";
 
 function repository(name: string, canonicalKeys: ReadonlyArray<string>): RelayRepositorySummary {
   return {
@@ -72,5 +76,26 @@ describe("unregisteredCheckouts", () => {
     expect(unregisteredCheckouts([checkout("Scratchpad", "github.com/acme/app")], [])).toEqual([
       { canonicalKey: "github.com/acme/app", suggestedName: "Scratchpad" },
     ]);
+  });
+});
+
+describe("memberLabel", () => {
+  it("prefers a name, keeping the address as the second line", () => {
+    expect(
+      memberLabel({ userId: "user_1", identity: { displayName: "Ada", email: "ada@example.com" } }),
+    ).toEqual({ primary: "Ada", secondary: "ada@example.com" });
+  });
+
+  it("falls back to the address when the profile has no name", () => {
+    expect(
+      memberLabel({ userId: "user_1", identity: { displayName: null, email: "ada@example.com" } }),
+    ).toEqual({ primary: "ada@example.com", secondary: null });
+  });
+
+  it("falls back to the subject id when the directory did not answer", () => {
+    expect(memberLabel({ userId: "user_1", identity: null })).toEqual({
+      primary: "user_1",
+      secondary: null,
+    });
   });
 });

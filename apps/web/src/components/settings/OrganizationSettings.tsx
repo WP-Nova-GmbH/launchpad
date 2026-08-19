@@ -3,6 +3,7 @@ import { useMemo, useState, type ReactNode } from "react";
 import type {
   RelayInvitation,
   RelayOrgRole,
+  RelayOrganizationMember,
   RelayRepositoryId,
   RelayRepositoryRole,
   RelayRepositorySummary,
@@ -18,7 +19,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "..
 import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Spinner } from "../ui/spinner";
-import { unregisteredCheckouts } from "./OrganizationSettings.logic";
+import { memberLabel, unregisteredCheckouts } from "./OrganizationSettings.logic";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 
@@ -138,11 +139,18 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
     >
       {snapshot.members.map((member) => {
         const isSelf = member.userId === snapshot.membership.userId;
+        const label = memberLabel(member);
+        const joined = `Joined ${member.joinedAt.slice(0, 10)}`;
         return (
           <SettingsRow
             key={member.userId}
-            title={<span className="font-mono text-xs">{member.userId}</span>}
-            description={isSelf ? "You" : `Joined ${member.joinedAt.slice(0, 10)}`}
+            title={
+              <span className="flex items-baseline gap-2">
+                {label.primary}
+                {isSelf ? <span className="text-xs text-muted-foreground">You</span> : null}
+              </span>
+            }
+            description={label.secondary ? `${label.secondary} · ${joined}` : joined}
             control={
               isAdmin && !isSelf ? (
                 <div className="flex items-center gap-2">
@@ -288,7 +296,7 @@ function RepositoryRow({
   entry: RelayRepositorySummary;
   state: OrganizationAdminState;
   canConfigure: boolean;
-  members: ReadonlyArray<{ readonly userId: string }>;
+  members: ReadonlyArray<RelayOrganizationMember>;
 }) {
   const [alias, setAlias] = useState("");
   const [grantUserId, setGrantUserId] = useState("");
@@ -371,12 +379,21 @@ function RepositoryRow({
                 className="w-full sm:w-64"
                 aria-label={`Grant access to ${entry.repository.name}`}
               >
-                <SelectValue>{grantUserId || "Choose a member"}</SelectValue>
+                <SelectValue>
+                  {grantUserId
+                    ? memberLabel(
+                        members.find((member) => member.userId === grantUserId) ?? {
+                          userId: grantUserId,
+                          identity: null,
+                        },
+                      ).primary
+                    : "Choose a member"}
+                </SelectValue>
               </SelectTrigger>
               <SelectPopup align="start" alignItemWithTrigger={false}>
                 {members.map((member) => (
                   <SelectItem hideIndicator key={member.userId} value={member.userId}>
-                    {member.userId}
+                    {memberLabel(member).primary}
                   </SelectItem>
                 ))}
               </SelectPopup>

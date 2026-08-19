@@ -26,6 +26,7 @@ import * as RelayDb from "../db.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
 import * as Repositories from "../tenancy/Repositories.ts";
+import * as UserDirectory from "../tenancy/UserDirectory.ts";
 
 function toApiOrganization(record: Organizations.OrganizationRecord): RelayOrganization {
   return {
@@ -302,6 +303,7 @@ export const organizationApi = HttpApiBuilder.group(
     const organizations = yield* Organizations.Organizations;
     const invitations = yield* Invitations.Invitations;
     const repositories = yield* Repositories.Repositories;
+    const directory = yield* UserDirectory.UserDirectory;
     const transactions = yield* RelayDb.RelayTransactions;
     const crypto = yield* Crypto.Crypto;
 
@@ -337,7 +339,15 @@ export const organizationApi = HttpApiBuilder.group(
           const members = yield* organizations.listMembers({
             organizationId: membership.organization.organizationId,
           });
-          return { members };
+          const identities = yield* directory.lookup({
+            userIds: members.map((member) => member.userId),
+          });
+          return {
+            members: members.map((member) => ({
+              ...member,
+              identity: identities.get(member.userId) ?? null,
+            })),
+          };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
@@ -361,7 +371,8 @@ export const organizationApi = HttpApiBuilder.group(
           if (!updated) {
             return yield* tenancyNotFound("member_not_found");
           }
-          return updated;
+          const identities = yield* directory.lookup({ userIds: [updated.userId] });
+          return { ...updated, identity: identities.get(updated.userId) ?? null };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
@@ -465,6 +476,7 @@ export const repositoriesApi = HttpApiBuilder.group(
   "repositories",
   Effect.fnUntraced(function* (handlers) {
     const repositories = yield* Repositories.Repositories;
+    const directory = yield* UserDirectory.UserDirectory;
     const transactions = yield* RelayDb.RelayTransactions;
     const crypto = yield* Crypto.Crypto;
 
@@ -618,7 +630,15 @@ export const repositoriesApi = HttpApiBuilder.group(
           const access = yield* repositories.listAccess({
             repositoryId: repository.repositoryId,
           });
-          return { access };
+          const identities = yield* directory.lookup({
+            userIds: access.map((entry) => entry.userId),
+          });
+          return {
+            access: access.map((entry) => ({
+              ...entry,
+              identity: identities.get(entry.userId) ?? null,
+            })),
+          };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
@@ -633,12 +653,14 @@ export const repositoriesApi = HttpApiBuilder.group(
             organizationId: repository.organizationId,
             userId: args.payload.userId,
           });
-          return yield* repositories.grantAccess({
+          const granted = yield* repositories.grantAccess({
             repositoryId: repository.repositoryId,
             organizationId: repository.organizationId,
             userId: args.payload.userId,
             role: args.payload.role,
           });
+          const identities = yield* directory.lookup({ userIds: [granted.userId] });
+          return { ...granted, identity: identities.get(granted.userId) ?? null };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
