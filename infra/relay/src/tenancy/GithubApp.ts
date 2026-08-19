@@ -76,7 +76,7 @@ function base64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function pemToPkcs8(pem: string): Uint8Array {
+function decodePemBody(pem: string): Uint8Array {
   const body = pem
     .replace(/-----BEGIN [^-]+-----/g, "")
     .replace(/-----END [^-]+-----/g, "")
@@ -85,6 +85,35 @@ function pemToPkcs8(pem: string): Uint8Array {
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
+}
+
+/** DER length octets: short form below 128, long form above. */
+function derLength(length: number): Array<number> {
+  if (length < 0x80) return [length];
+  const octets: Array<number> = [];
+  for (let rest = length; rest > 0; rest = Math.floor(rest / 256)) octets.unshift(rest % 256);
+  return [0x80 | octets.length, ...octets];
+}
+
+/**
+ * GitHub issues PKCS#1 keys (`BEGIN RSA PRIVATE KEY`) and WebCrypto only
+ * imports PKCS#8, so the PKCS#1 body is wrapped in the PKCS#8 envelope:
+ * version, the rsaEncryption algorithm identifier, then the key as an octet
+ * string. Keys already in PKCS#8 are passed through untouched.
+ */
+function toPkcs8(pem: string): Uint8Array {
+  const body = decodePemBody(pem);
+  if (!/BEGIN RSA PRIVATE KEY/.test(pem)) {
+    return body;
+  }
+  // SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }
+  const algorithm = [
+    0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+  ];
+  const version = [0x02, 0x01, 0x00];
+  const octetString = [0x04, ...derLength(body.length), ...body];
+  const contents = [...version, ...algorithm, ...octetString];
+  return new Uint8Array([0x30, ...derLength(contents.length), ...contents]);
 }
 
 /**
@@ -107,7 +136,7 @@ const appJwt = Effect.fn("relay.github.app_jwt")(function* (input: {
   const signature = yield* Effect.tryPromise(async () => {
     const key = await globalThis.crypto.subtle.importKey(
       "pkcs8",
-      pemToPkcs8(input.privateKeyPem).buffer as ArrayBuffer,
+      toPkcs8(input.privateKeyPem).buffer as ArrayBuffer,
       { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
       false,
       ["sign"],
