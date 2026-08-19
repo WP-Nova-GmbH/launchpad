@@ -687,26 +687,20 @@ export const clientApi = HttpApiBuilder.group(
               ? []
               : (yield* machines.listForOrganization({
                   organizationId: membership.organization.organizationId,
-                }))
-                  .filter(
-                    (machine) =>
-                      Machines.machineStatus(machine) === "ready" &&
-                      machine.environmentId !== null &&
-                      machine.endpointHttpBaseUrl !== null &&
-                      machine.endpointWsBaseUrl !== null &&
-                      machine.endpointProviderKind !== null,
-                  )
-                  .map((machine) => ({
-                    environmentId: EnvironmentId.make(machine.environmentId ?? ""),
-                    label: machine.label,
-                    endpoint: {
-                      httpBaseUrl: machine.endpointHttpBaseUrl ?? "",
-                      wsBaseUrl: machine.endpointWsBaseUrl ?? "",
-                      providerKind: (machine.endpointProviderKind ??
-                        "manual") as RelayClientEnvironmentRecord["endpoint"]["providerKind"],
+                })).flatMap((machine): Array<RelayClientEnvironmentRecord> => {
+                  const identity = Machines.enrolledMachineIdentity(machine);
+                  if (identity === null || Machines.machineStatus(machine) !== "ready") {
+                    return [];
+                  }
+                  return [
+                    {
+                      environmentId: EnvironmentId.make(identity.environmentId),
+                      label: machine.label,
+                      endpoint: identity.endpoint,
+                      linkedAt: machine.enrolledAt ?? machine.createdAt,
                     },
-                    linkedAt: machine.enrolledAt ?? machine.createdAt,
-                  }));
+                  ];
+                });
           return { environments: [...environments, ...executors] };
         }, mapRelayCommonApiErrors("not_authorized")),
       )

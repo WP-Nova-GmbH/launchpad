@@ -3,6 +3,7 @@ import type {
   RelayMachineRole,
   RelayMachineStatus,
   RelayManagedEndpoint,
+  RelayManagedEndpointProviderKind,
 } from "@t3tools/contracts/relay";
 import { and, eq, isNull, sql as drizzleSql } from "drizzle-orm";
 import * as Context from "effect/Context";
@@ -55,7 +56,7 @@ export interface MachineRecord {
   readonly environmentPublicKey: string | null;
   readonly endpointHttpBaseUrl: string | null;
   readonly endpointWsBaseUrl: string | null;
-  readonly endpointProviderKind: string | null;
+  readonly endpointProviderKind: RelayManagedEndpointProviderKind | null;
   readonly createdByUserId: string;
   readonly enrolledAt: string | null;
   readonly deprovisionedAt: string | null;
@@ -67,6 +68,39 @@ export function machineStatus(record: MachineRecord): RelayMachineStatus {
     return "deprovisioned";
   }
   return record.enrolledAt !== null ? "ready" : "awaiting_enrollment";
+}
+
+export interface EnrolledMachineIdentity {
+  readonly environmentId: string;
+  readonly environmentPublicKey: string;
+  readonly endpoint: RelayManagedEndpoint;
+}
+
+/**
+ * The environment identity a machine gained by enrolling, or null while it
+ * has not called home. The columns are individually nullable in the row; this
+ * is the one place that narrows them together, so callers never test five
+ * fields or cast the provider kind.
+ */
+export function enrolledMachineIdentity(record: MachineRecord): EnrolledMachineIdentity | null {
+  if (
+    record.environmentId === null ||
+    record.environmentPublicKey === null ||
+    record.endpointHttpBaseUrl === null ||
+    record.endpointWsBaseUrl === null ||
+    record.endpointProviderKind === null
+  ) {
+    return null;
+  }
+  return {
+    environmentId: record.environmentId,
+    environmentPublicKey: record.environmentPublicKey,
+    endpoint: {
+      httpBaseUrl: record.endpointHttpBaseUrl,
+      wsBaseUrl: record.endpointWsBaseUrl,
+      providerKind: record.endpointProviderKind,
+    },
+  };
 }
 
 export class MachinePersistenceError extends Schema.TaggedErrorClass<MachinePersistenceError>()(

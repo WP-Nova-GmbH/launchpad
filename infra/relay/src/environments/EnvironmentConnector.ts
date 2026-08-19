@@ -402,28 +402,17 @@ const make = Effect.gen(function* () {
     const machine = yield* machines.getActiveByEnvironmentId({
       environmentId: input.environmentId,
     });
-    if (
-      machine !== null &&
-      machine.environmentId !== null &&
-      machine.environmentPublicKey !== null &&
-      machine.endpointHttpBaseUrl !== null &&
-      machine.endpointWsBaseUrl !== null &&
-      machine.endpointProviderKind !== null
-    ) {
+    const identity = machine === null ? null : Machines.enrolledMachineIdentity(machine);
+    if (machine !== null && identity !== null) {
       const membership = yield* organizations.getMembershipForUser({ userId: input.userId });
       if (
         membership !== null &&
         membership.organization.organizationId === machine.organizationId
       ) {
         return {
-          environmentId: EnvironmentId.make(machine.environmentId),
-          environmentPublicKey: machine.environmentPublicKey,
-          endpoint: {
-            httpBaseUrl: machine.endpointHttpBaseUrl,
-            wsBaseUrl: machine.endpointWsBaseUrl,
-            providerKind:
-              machine.endpointProviderKind as EnvironmentLinks.RelayLinkedEnvironmentRecord["endpoint"]["providerKind"],
-          },
+          environmentId: EnvironmentId.make(identity.environmentId),
+          environmentPublicKey: identity.environmentPublicKey,
+          endpoint: identity.endpoint,
           allocationOwnerKey: Machines.machineEndpointOwnerKey(machine.organizationId),
         } satisfies EnvironmentAccess;
       }

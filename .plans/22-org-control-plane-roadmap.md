@@ -106,7 +106,10 @@ quota and the billing lever for "buy managed machines."
 organization across both roles; **no cross-org access** and no human linking of machines — the two
 trust paths refuse each other in both directions; reclamation is **admin-triggered deprovision
 only** until the M4 mirror makes automatic reclamation non-destructive. Compute is created by a
-driver seam: Hetzner Cloud in production, Docker containers on the developer's host in dev.
+driver seam: Hetzner Cloud in production, Docker containers on the developer's host in dev. "Receives
+a managed endpoint" holds fully in production only — the dev relay hands out no tunnels, so a dev
+machine's self-reported endpoint is recorded as `manual` and, like a publish-only link, is not
+relay-routable.
 ADR-0002's internal-network restriction on the registration endpoint cannot exist while the relay
 is a Cloudflare Worker; the single-use expiring seed inside a machine-signed proof is the control,
 recorded as an amendment on the ADR. The quota rides its own table rather than re-keying

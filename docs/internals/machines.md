@@ -93,7 +93,9 @@ The quota is **one shared per-organization machine limit** across both roles
 (`relay_organization_machine_limits`, default 5 in
 `infra/relay/src/machines/MachineLimits.ts`), enforced at machine creation. This is the
 billing lever for "buy managed machines"; splitting it per role later is a WHERE clause,
-not a migration.
+not a migration. The check is count-then-insert, same as the managed tunnel limit it is
+modeled on: two admins racing can land one machine over — a billing rounding error, not a
+security boundary.
 
 ## Tables
 

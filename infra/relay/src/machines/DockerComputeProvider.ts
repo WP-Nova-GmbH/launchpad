@@ -64,9 +64,17 @@ export function containerRelayUrl(relayUrl: string): string {
 export const makeDocker = (settings: DockerComputeSettings) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const docker = (subcommand: string, args: ReadonlyArray<string>) =>
+    const docker = (
+      subcommand: string,
+      args: ReadonlyArray<string>,
+      env?: Record<string, string>,
+    ) =>
       spawner
-        .string(ChildProcess.make("docker", [subcommand, ...args]))
+        .string(
+          env
+            ? ChildProcess.make("docker", [subcommand, ...args], { env, extendEnv: true })
+            : ChildProcess.make("docker", [subcommand, ...args]),
+        )
         .pipe(Effect.mapError((cause) => new DockerCommandFailed({ subcommand, cause })));
 
     return MachineComputeProvider.of({
@@ -89,26 +97,32 @@ export const makeDocker = (settings: DockerComputeSettings) =>
         const attemptRun = Effect.gen(function* () {
           const hostPort = yield* Random.nextIntBetween(20_000, 30_000);
           yield* docker("rm", ["--force", containerName]).pipe(Effect.ignore);
-          return yield* docker("run", [
-            "--detach",
-            "--name",
-            containerName,
-            "--add-host",
-            "host.docker.internal:host-gateway",
-            "--publish",
-            `127.0.0.1:${hostPort}:${settings.containerServerPort}`,
-            "--env",
-            `T3CODE_MACHINE_ENROLLMENT_SEED=${input.seed}`,
-            "--env",
-            `T3CODE_MACHINE_ENROLLMENT_RELAY_URL=${relayUrl}`,
-            "--env",
-            `T3CODE_MACHINE_ADVERTISED_ORIGIN=http://127.0.0.1:${hostPort}`,
-            "--env",
-            `T3CODE_MACHINE_ID=${input.machineId}`,
-            "--env",
-            `T3CODE_MACHINE_ROLE=${input.role}`,
-            settings.image,
-          ]);
+          return yield* docker(
+            "run",
+            [
+              "--detach",
+              "--name",
+              containerName,
+              "--add-host",
+              "host.docker.internal:host-gateway",
+              "--publish",
+              `127.0.0.1:${hostPort}:${settings.containerServerPort}`,
+              // A bare --env copies the value from docker's own environment,
+              // keeping the seed out of the host's process list.
+              "--env",
+              "T3CODE_MACHINE_ENROLLMENT_SEED",
+              "--env",
+              `T3CODE_MACHINE_ENROLLMENT_RELAY_URL=${relayUrl}`,
+              "--env",
+              `T3CODE_MACHINE_ADVERTISED_ORIGIN=http://127.0.0.1:${hostPort}`,
+              "--env",
+              `T3CODE_MACHINE_ID=${input.machineId}`,
+              "--env",
+              `T3CODE_MACHINE_ROLE=${input.role}`,
+              settings.image,
+            ],
+            { T3CODE_MACHINE_ENROLLMENT_SEED: input.seed },
+          );
         });
         const stdout = yield* attemptRun.pipe(
           Effect.retry({ times: 2 }),

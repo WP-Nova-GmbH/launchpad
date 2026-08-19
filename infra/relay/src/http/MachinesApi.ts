@@ -18,7 +18,6 @@ import {
   type RelayMachineEnrollFailedReason,
   type RelayMachineEnrollProofInvalidReason,
   type RelayMachineRole,
-  type RelayManagedEndpoint,
 } from "@t3tools/contracts/relay";
 import { normalizeRelayIssuer } from "@t3tools/shared/relayJwt";
 
@@ -34,21 +33,6 @@ import * as MachineEnroller from "../machines/MachineEnroller.ts";
 import * as MachineLimits from "../machines/MachineLimits.ts";
 import * as Machines from "../machines/Machines.ts";
 
-function machineEndpoint(record: Machines.MachineRecord): RelayManagedEndpoint | null {
-  if (
-    record.endpointHttpBaseUrl === null ||
-    record.endpointWsBaseUrl === null ||
-    record.endpointProviderKind === null
-  ) {
-    return null;
-  }
-  return {
-    httpBaseUrl: record.endpointHttpBaseUrl,
-    wsBaseUrl: record.endpointWsBaseUrl,
-    providerKind: record.endpointProviderKind as RelayManagedEndpoint["providerKind"],
-  };
-}
-
 export function toApiMachine(record: Machines.MachineRecord): RelayMachine {
   return {
     machineId: RelayMachineId.make(record.machineId),
@@ -58,7 +42,7 @@ export function toApiMachine(record: Machines.MachineRecord): RelayMachine {
     status: Machines.machineStatus(record),
     computeKind: record.computeKind,
     environmentId: record.environmentId === null ? null : EnvironmentId.make(record.environmentId),
-    endpoint: machineEndpoint(record),
+    endpoint: Machines.enrolledMachineIdentity(record)?.endpoint ?? null,
     createdByUserId: record.createdByUserId,
     createdAt: record.createdAt,
     enrolledAt: record.enrolledAt,

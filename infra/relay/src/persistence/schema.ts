@@ -5,6 +5,7 @@ import type {
   RelayJobStatus,
   RelayMachineComputeKind,
   RelayMachineRole,
+  RelayManagedEndpointProviderKind,
   RelayOrgRole,
   RelayRepositoryRole,
 } from "@t3tools/contracts/relay";
@@ -132,7 +133,9 @@ export const relayMachines = pgTable(
     environmentPublicKey: text("environment_public_key"),
     endpointHttpBaseUrl: text("endpoint_http_base_url"),
     endpointWsBaseUrl: text("endpoint_ws_base_url"),
-    endpointProviderKind: varchar("endpoint_provider_kind", { length: 32 }),
+    endpointProviderKind: varchar("endpoint_provider_kind", {
+      length: 32,
+    }).$type<RelayManagedEndpointProviderKind>(),
     createdByUserId: varchar("created_by_user_id", { length: 191 }).notNull(),
     enrolledAt: varchar("enrolled_at", { length: 64 }),
     deprovisionedAt: varchar("deprovisioned_at", { length: 64 }),

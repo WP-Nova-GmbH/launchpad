@@ -153,14 +153,18 @@ const make = Effect.gen(function* () {
         ),
       );
       const machine = yield* machines.getBySeedHash({ seedHash });
+      const seedExpiresAt = machine === null ? null : DateTime.make(machine.seedExpiresAt);
       // One answer for unknown, consumed, expired, and deprovisioned alike:
       // this endpoint is unauthenticated, and the seed's state is nothing an
-      // unauthenticated caller should be able to probe.
+      // unauthenticated caller should be able to probe. An unparseable expiry
+      // counts as expired rather than eternal.
       if (
         machine === null ||
         machine.enrolledAt !== null ||
         machine.deprovisionedAt !== null ||
-        Date.parse(machine.seedExpiresAt) <= now.epochMilliseconds
+        seedExpiresAt === null ||
+        seedExpiresAt._tag === "None" ||
+        seedExpiresAt.value.epochMilliseconds <= now.epochMilliseconds
       ) {
         return yield* new MachineEnrollProofInvalid({
           environmentId: verified.environmentId,
@@ -242,6 +246,26 @@ const make = Effect.gen(function* () {
         endpoint,
       });
       if (!claimed) {
+        // The losing side of a claim race must not leave the tunnel it just
+        // provisioned behind — the winner recorded its own endpoint, and an
+        // unrecorded tunnel is a bill nothing ever reaps. Best effort: a
+        // cleanup failure must not change the answer.
+        if (provisioned !== null) {
+          yield* managedEndpointProvider
+            .deprovision({
+              userId: Machines.machineEndpointOwnerKey(machine.organizationId),
+              environmentId: verified.environmentId,
+            })
+            .pipe(
+              Effect.tapError((error) =>
+                Effect.logWarning("managed endpoint cleanup after a lost enrollment claim failed", {
+                  environmentId: verified.environmentId,
+                  errorTag: error._tag,
+                }),
+              ),
+              Effect.ignore,
+            );
+        }
         return yield* new MachineEnrollProofInvalid({
           environmentId: verified.environmentId,
           reason: "seed_invalid",
