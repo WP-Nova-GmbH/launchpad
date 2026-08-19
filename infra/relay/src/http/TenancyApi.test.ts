@@ -39,6 +39,7 @@ const relaySettings: RelayConfiguration.RelayConfiguration["Service"] = {
   apnsDeliveryJobSigningSecret: Redacted.make("apns-delivery-secret"),
   cloudMintPrivateKey: Redacted.make("cloud-mint-private-key"),
   cloudMintPublicKey: "cloud-mint-public-key",
+  github: undefined,
   managedEndpointBaseDomain: undefined,
   managedEndpointNamespace: undefined,
 };

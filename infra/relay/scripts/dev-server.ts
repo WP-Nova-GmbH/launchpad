@@ -79,6 +79,8 @@ import * as RelayConfiguration from "../src/Config.ts";
 import * as RelayDb from "../src/db.ts";
 import * as RelayTokens from "../src/auth/RelayTokens.ts";
 import * as Repositories from "../src/tenancy/Repositories.ts";
+import * as GithubApp from "../src/tenancy/GithubApp.ts";
+import * as GithubInstallations from "../src/tenancy/GithubInstallations.ts";
 import * as UserDirectory from "../src/tenancy/UserDirectory.ts";
 
 const DEFAULT_PORT = 8610;
@@ -153,6 +155,14 @@ const relayConfigurationLayer = Layer.succeed(
     clerkJwtAudience: process.env.CLERK_JWT_AUDIENCE?.trim() || "t3-code-relay",
     cloudMintPrivateKey: Redacted.make("dev-cloud-mint-private-key"),
     cloudMintPublicKey: "dev-cloud-mint-public-key",
+    github:
+      process.env.GITHUB_APP_ID && process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_PRIVATE_KEY
+        ? {
+            appId: process.env.GITHUB_APP_ID.trim(),
+            appSlug: process.env.GITHUB_APP_SLUG.trim(),
+            privateKey: Redacted.make(process.env.GITHUB_APP_PRIVATE_KEY),
+          }
+        : undefined,
     managedEndpointBaseDomain: undefined,
     managedEndpointNamespace: undefined,
   }),
@@ -200,6 +210,8 @@ const runtimeLayer = Layer.empty
         Invitations.layer,
         Repositories.layer,
         UserDirectory.layer,
+        GithubApp.layer,
+        GithubInstallations.layer,
       ),
     ),
     Layer.provideMerge(Devices.layer),

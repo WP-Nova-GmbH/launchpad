@@ -513,12 +513,15 @@ export const RelayTenancyNotFoundReason = Schema.Literals([
   "repository_not_found",
   "alias_not_found",
   "invitation_not_found",
+  "github_installation_not_found",
+  "github_not_connected",
 ]);
 export type RelayTenancyNotFoundReason = typeof RelayTenancyNotFoundReason.Type;
 
 export const RelayTenancyConflictReason = Schema.Literals([
   "canonical_key_taken",
   "last_alias",
+  "github_installation_claimed",
   "already_a_member",
   "invitation_not_pending",
   "invitation_email_mismatch",
@@ -1113,6 +1116,53 @@ export const RelayGrantRepositoryAccessRequest = Schema.Struct({
 export type RelayGrantRepositoryAccessRequest = typeof RelayGrantRepositoryAccessRequest.Type;
 
 // ---------------------------------------------------------------------------
+// GitHub connection
+//
+// An organization connects GitHub by installing the relay's GitHub App. What
+// is recorded is the installation id — not a secret — so access tokens can be
+// minted per request and never persisted.
+// ---------------------------------------------------------------------------
+
+export const RelayGithubConnection = Schema.Struct({
+  installationId: TrimmedNonEmptyString,
+  /** The GitHub organization or user the App is installed on. */
+  accountLogin: TrimmedNonEmptyString,
+  accountType: TrimmedNonEmptyString,
+  connectedByUserId: TrimmedNonEmptyString,
+  connectedAt: TrimmedNonEmptyString,
+});
+export type RelayGithubConnection = typeof RelayGithubConnection.Type;
+
+export const RelayGithubConnectionResponse = Schema.Struct({
+  /** Null when this relay has no GitHub App; the surface hides itself. */
+  installUrl: Schema.NullOr(TrimmedNonEmptyString),
+  connection: Schema.NullOr(RelayGithubConnection),
+});
+export type RelayGithubConnectionResponse = typeof RelayGithubConnectionResponse.Type;
+
+export const RelayConnectGithubRequest = Schema.Struct({
+  /** Handed back by GitHub on the App's setup redirect. */
+  installationId: TrimmedNonEmptyString,
+});
+export type RelayConnectGithubRequest = typeof RelayConnectGithubRequest.Type;
+
+export const RelayGithubRepository = Schema.Struct({
+  fullName: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+  defaultBranch: TrimmedNonEmptyString,
+  isPrivate: Schema.Boolean,
+  canonicalKey: RelayRepositoryCanonicalKey,
+  /** True when this organization already registered the key. */
+  registered: Schema.Boolean,
+});
+export type RelayGithubRepository = typeof RelayGithubRepository.Type;
+
+export const RelayListGithubRepositoriesResponse = Schema.Struct({
+  repositories: Schema.Array(RelayGithubRepository),
+});
+export type RelayListGithubRepositoriesResponse = typeof RelayListGithubRepositoriesResponse.Type;
+
+// ---------------------------------------------------------------------------
 // Jobs
 //
 // The relay owns a job's coarse state and nothing finer (ADR-0005). What the
@@ -1538,6 +1588,37 @@ export const RelayOrganizationGroup = HttpApiGroup.make("organization")
       success: RelayOkResponse,
       error: RelayTenancyErrors,
     }).annotate(OpenApi.Summary, "Revoke a pending invitation"),
+    HttpApiEndpoint.get("getGithubConnection", "/v1/organization/github", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayGithubConnectionResponse,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "Read the organization's GitHub connection"),
+    HttpApiEndpoint.post("connectGithub", "/v1/organization/github", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayConnectGithubRequest,
+      success: RelayGithubConnection,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Claim a GitHub App installation")
+      .annotate(
+        OpenApi.Description,
+        "Called after GitHub redirects back from installing the App. The relay verifies the installation exists before recording its id; no GitHub credential is stored.",
+      ),
+    HttpApiEndpoint.delete("disconnectGithub", "/v1/organization/github", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayOkResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Disconnect GitHub")
+      .annotate(
+        OpenApi.Description,
+        "Forgets the installation. Uninstalling the App itself is done on GitHub.",
+      ),
+    HttpApiEndpoint.get("listGithubRepositories", "/v1/organization/github/repositories", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListGithubRepositoriesResponse,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "List repositories the installation can see"),
     HttpApiEndpoint.post("acceptInvitation", "/v1/invitations/accept", {
       headers: RelayBearerRequestHeaders,
       payload: RelayAcceptInvitationRequest,

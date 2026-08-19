@@ -14,6 +14,18 @@ export interface ApnsCredentials {
   readonly environment: ApnsEnvironment;
 }
 
+/**
+ * The relay's own GitHub App. One app serves every organization; what an
+ * organization owns is an *installation* of it, recorded by id alone. The
+ * private key stays here, in configuration, and never reaches the database.
+ */
+export interface GithubAppCredentials {
+  readonly appId: string;
+  /** The `github.com/apps/<slug>` handle, used to build the install link. */
+  readonly appSlug: string;
+  readonly privateKey: Redacted.Redacted<string>;
+}
+
 export class RelayConfiguration extends Context.Service<
   RelayConfiguration,
   {
@@ -25,6 +37,8 @@ export class RelayConfiguration extends Context.Service<
     readonly apnsDeliveryJobSigningSecret: Redacted.Redacted<string>;
     readonly cloudMintPrivateKey: Redacted.Redacted<string>;
     readonly cloudMintPublicKey: string;
+    /** Absent until a deployment configures a GitHub App; the surface hides itself. */
+    readonly github: GithubAppCredentials | undefined;
     readonly managedEndpointBaseDomain: string | undefined;
     readonly managedEndpointNamespace: string | undefined;
   }

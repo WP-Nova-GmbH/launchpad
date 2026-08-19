@@ -23,6 +23,8 @@ import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
 import { tenancyConflict, tenancyForbidden, tenancyNotFound } from "./tenancyErrors.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as RelayDb from "../db.ts";
+import * as GithubApp from "../tenancy/GithubApp.ts";
+import * as GithubInstallations from "../tenancy/GithubInstallations.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
 import * as Repositories from "../tenancy/Repositories.ts";
@@ -304,6 +306,8 @@ export const organizationApi = HttpApiBuilder.group(
     const invitations = yield* Invitations.Invitations;
     const repositories = yield* Repositories.Repositories;
     const directory = yield* UserDirectory.UserDirectory;
+    const githubApp = yield* GithubApp.GithubApp;
+    const githubInstallations = yield* GithubInstallations.GithubInstallations;
     const transactions = yield* RelayDb.RelayTransactions;
     const crypto = yield* Crypto.Crypto;
 
@@ -462,6 +466,97 @@ export const organizationApi = HttpApiBuilder.group(
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
+        "getGithubConnection",
+        Effect.fn("relay.api.organization.get_github_connection")(function* () {
+          const membership = yield* requireMembership();
+          const installUrl = yield* githubApp.installUrl;
+          const connection = yield* githubInstallations.getForOrganization({
+            organizationId: membership.organization.organizationId,
+          });
+          return {
+            installUrl,
+            connection: connection
+              ? {
+                  installationId: connection.installationId,
+                  accountLogin: connection.accountLogin,
+                  accountType: connection.accountType,
+                  connectedByUserId: connection.connectedByUserId,
+                  connectedAt: connection.createdAt,
+                }
+              : null,
+          };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "connectGithub",
+        Effect.fn("relay.api.organization.connect_github")(function* (args) {
+          const membership = yield* requireCallerIsAdmin();
+          // Verified against GitHub before it is recorded: an id alone proves
+          // nothing, and a claim on an installation that does not exist would
+          // leave the organization pointing at nothing.
+          const installation = yield* githubApp
+            .getInstallation({ installationId: args.payload.installationId })
+            .pipe(Effect.catch(() => relayInternalErrorResponse("internal_error")));
+          if (!installation) {
+            return yield* tenancyNotFound("github_installation_not_found");
+          }
+          const claimed = yield* githubInstallations
+            .claim({
+              organizationId: membership.organization.organizationId,
+              installationId: installation.installationId,
+              accountLogin: installation.accountLogin,
+              accountType: installation.accountType,
+              connectedByUserId: membership.userId,
+            })
+            .pipe(
+              Effect.catchTag("GithubInstallationAlreadyClaimed", () =>
+                tenancyConflict("github_installation_claimed"),
+              ),
+            );
+          return {
+            installationId: claimed.installationId,
+            accountLogin: claimed.accountLogin,
+            accountType: claimed.accountType,
+            connectedByUserId: claimed.connectedByUserId,
+            connectedAt: claimed.createdAt,
+          };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "disconnectGithub",
+        Effect.fn("relay.api.organization.disconnect_github")(function* () {
+          const membership = yield* requireCallerIsAdmin();
+          yield* githubInstallations.release({
+            organizationId: membership.organization.organizationId,
+          });
+          return { ok: true };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "listGithubRepositories",
+        Effect.fn("relay.api.organization.list_github_repositories")(function* () {
+          const membership = yield* requireMembership();
+          const organizationId = membership.organization.organizationId;
+          const connection = yield* githubInstallations.getForOrganization({ organizationId });
+          if (!connection) {
+            return yield* tenancyNotFound("github_not_connected");
+          }
+          const [candidates, registered] = yield* Effect.all([
+            githubApp
+              .listRepositories({ installationId: connection.installationId })
+              .pipe(Effect.catch(() => relayInternalErrorResponse("internal_error"))),
+            repositories.listForOrganization({ organizationId }),
+          ]);
+          const known = new Set(registered.flatMap((entry) => entry.canonicalKeys));
+          return {
+            repositories: candidates.map((candidate) => ({
+              ...candidate,
+              registered: known.has(candidate.canonicalKey),
+            })),
+          };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
         "acceptInvitation",
         Effect.fn("relay.api.organization.accept_invitation")(function* (args) {
           const { userId } = yield* RelayClientPrincipal;
@@ -477,6 +572,8 @@ export const repositoriesApi = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const repositories = yield* Repositories.Repositories;
     const directory = yield* UserDirectory.UserDirectory;
+    const githubApp = yield* GithubApp.GithubApp;
+    const githubInstallations = yield* GithubInstallations.GithubInstallations;
     const transactions = yield* RelayDb.RelayTransactions;
     const crypto = yield* Crypto.Crypto;
 

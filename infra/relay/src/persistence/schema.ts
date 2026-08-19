@@ -74,6 +74,32 @@ export const relayOrganizationInvitations = pgTable(
   ],
 );
 
+/**
+ * A GitHub App installation claimed by an organization.
+ *
+ * Holds no secret: the App private key lives in relay configuration and access
+ * tokens are minted per request and never persisted, so this table stays
+ * publishable-by-accident safe (see the "no secret in relay Postgres"
+ * invariant).
+ */
+export const relayGithubInstallations = pgTable(
+  "relay_github_installations",
+  {
+    organizationId: varchar("organization_id", { length: 64 }).primaryKey(),
+    installationId: varchar("installation_id", { length: 64 }).notNull(),
+    accountLogin: text("account_login").notNull(),
+    accountType: varchar("account_type", { length: 32 }).notNull(),
+    connectedByUserId: varchar("connected_by_user_id", { length: 191 }).notNull(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    // One installation belongs to one organization: a second claim on the same
+    // installation is a mistake or an attempt, never a legitimate state.
+    uniqueIndex("idx_relay_github_installations_installation").on(table.installationId),
+  ],
+);
+
 export const relayRepositories = pgTable(
   "relay_repositories",
   {

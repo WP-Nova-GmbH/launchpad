@@ -61,6 +61,7 @@ import * as DpopProofs from "../auth/DpopProofs.ts";
 import * as RelayTokens from "../auth/RelayTokens.ts";
 import * as EnvironmentCredentials from "../environments/EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "../environments/EnvironmentLinks.ts";
+import * as GithubInstallations from "../tenancy/GithubInstallations.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
 import * as Jobs from "../jobs/Jobs.ts";
 import * as LiveActivities from "../agentActivity/LiveActivities.ts";
@@ -1237,6 +1238,7 @@ const RelayCommonPersistenceError = Schema.Union([
   Organizations.OrganizationPersistenceError,
   Invitations.InvitationPersistenceError,
   Repositories.RepositoryPersistenceError,
+  GithubInstallations.GithubInstallationPersistenceError,
 ]);
 type RelayCommonPersistenceError = typeof RelayCommonPersistenceError.Type;
 const isRelayCommonPersistenceError = Schema.is(RelayCommonPersistenceError);

@@ -6,6 +6,7 @@ import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as Etag from "effect/unstable/http/Etag";
 import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
@@ -63,6 +64,8 @@ import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
 import * as Invitations from "./tenancy/Invitations.ts";
 import * as Organizations from "./tenancy/Organizations.ts";
 import * as Repositories from "./tenancy/Repositories.ts";
+import * as GithubApp from "./tenancy/GithubApp.ts";
+import * as GithubInstallations from "./tenancy/GithubInstallations.ts";
 import * as UserDirectory from "./tenancy/UserDirectory.ts";
 
 const webcryptoLayer = Layer.succeed(
@@ -151,6 +154,13 @@ export const ApiLive = Api.make(
     const axiomIngestToken = yield* observability.workerIngestToken.token;
     const axiomTracesEndpoint = yield* observability.traces.otelTracesEndpoint;
 
+    // Optional: a deployment without a GitHub App simply hides the surface.
+    const githubAppId = yield* Config.string("GITHUB_APP_ID").pipe(Config.option);
+    const githubAppSlug = yield* Config.string("GITHUB_APP_SLUG").pipe(Config.option);
+    const githubAppPrivateKey = yield* Config.redacted("GITHUB_APP_PRIVATE_KEY").pipe(
+      Config.option,
+    );
+
     const clerkSecretKey = yield* Config.redacted("CLERK_SECRET_KEY");
     const clerkPublishableKey = yield* Config.string("CLERK_PUBLISHABLE_KEY");
     const clerkJwtAudience = yield* Config.string("CLERK_JWT_AUDIENCE");
@@ -187,6 +197,16 @@ export const ApiLive = Api.make(
         clerkJwtAudience,
         cloudMintPrivateKey: yield* cloudMintPrivateKey,
         cloudMintPublicKey: yield* cloudMintPublicKey,
+        github:
+          Option.isSome(githubAppId) &&
+          Option.isSome(githubAppSlug) &&
+          Option.isSome(githubAppPrivateKey)
+            ? {
+                appId: githubAppId.value,
+                appSlug: githubAppSlug.value,
+                privateKey: githubAppPrivateKey.value,
+              }
+            : undefined,
         managedEndpointBaseDomain: yield* managedEndpointZoneName,
         managedEndpointNamespace: stage,
       });
@@ -228,6 +248,8 @@ export const ApiLive = Api.make(
           Invitations.layer,
           Repositories.layer,
           UserDirectory.layer,
+          GithubApp.layer,
+          GithubInstallations.layer,
         ),
       ),
       Layer.provideMerge(Devices.layer),
