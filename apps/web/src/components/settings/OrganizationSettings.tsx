@@ -5,6 +5,7 @@ import type {
   RelayOrgRole,
   RelayOrganizationMember,
   RelayRepositoryId,
+  RelayRepositoryAccessEntry,
   RelayRepositoryRole,
   RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
@@ -292,11 +293,13 @@ function RepositoryRow({
   state,
   canConfigure,
   members,
+  access,
 }: {
   entry: RelayRepositorySummary;
   state: OrganizationAdminState;
   canConfigure: boolean;
   members: ReadonlyArray<RelayOrganizationMember>;
+  access: ReadonlyArray<RelayRepositoryAccessEntry>;
 }) {
   const [alias, setAlias] = useState("");
   const [grantUserId, setGrantUserId] = useState("");
@@ -367,6 +370,38 @@ function RepositoryRow({
             </Button>
           </div>
         ) : null}
+        <div className="space-y-1">
+          <p className="text-xs font-medium text-muted-foreground">
+            Who can work in this repository
+          </p>
+          {access.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              Nobody yet. Admins reach every repository regardless.
+            </p>
+          ) : (
+            access.map((grant) => (
+              <div key={grant.userId} className="flex items-center justify-between gap-2 py-0.5">
+                <span className="min-w-0 truncate text-sm">{memberLabel(grant).primary}</span>
+                <span className="flex shrink-0 items-center gap-2">
+                  <RoleBadge>{REPOSITORY_ROLE_LABELS[grant.role]}</RoleBadge>
+                  {canConfigure ? (
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      aria-label={`Revoke ${memberLabel(grant).primary}'s access to ${entry.repository.name}`}
+                      disabled={state.busy}
+                      onClick={() =>
+                        void state.revokeAccess({ repositoryId, userId: grant.userId })
+                      }
+                    >
+                      <TrashIcon className="size-3.5" />
+                    </Button>
+                  ) : null}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
         {canConfigure ? (
           <div className="flex flex-wrap items-center gap-2">
             <Select
@@ -479,6 +514,7 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
             state={state}
             canConfigure={isAdmin || entry.role === "maintainer"}
             members={snapshot.members}
+            access={snapshot.access.get(entry.repository.repositoryId) ?? []}
           />
         ))
       )}

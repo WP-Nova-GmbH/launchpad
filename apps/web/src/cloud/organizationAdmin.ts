@@ -2,6 +2,7 @@ import { useAuth } from "@clerk/react";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import type {
   RelayInvitation,
+  RelayRepositoryAccessEntry,
   RelayInvitationId,
   RelayOrgRole,
   RelayOrganizationMember,
@@ -24,6 +25,8 @@ export interface OrganizationAdminSnapshot {
   readonly members: ReadonlyArray<RelayOrganizationMember>;
   readonly invitations: ReadonlyArray<RelayInvitation>;
   readonly repositories: ReadonlyArray<RelayRepositorySummary>;
+  /** Who can work in each repository, keyed by repository id. */
+  readonly access: ReadonlyMap<string, ReadonlyArray<RelayRepositoryAccessEntry>>;
 }
 
 /**
@@ -150,7 +153,21 @@ export function useOrganizationAdmin(): OrganizationAdminState {
               client.listInvitations({ clerkToken }),
             )
           : [];
-      setSnapshot({ membership, members, invitations, repositories });
+      // One request per repository. An organization has a handful, and the
+      // alternative — showing a grant form with no idea who already has access
+      // — is how the first version of this page shipped.
+      const access = new Map<string, ReadonlyArray<RelayRepositoryAccessEntry>>(
+        await Promise.all(
+          repositories.map(async (entry) => {
+            const repositoryId = entry.repository.repositoryId;
+            const entries = await call("Could not list repository access", (client, clerkToken) =>
+              client.listAccess({ clerkToken, repositoryId }),
+            );
+            return [repositoryId as string, entries] as const;
+          }),
+        ),
+      );
+      setSnapshot({ membership, members, invitations, repositories, access });
     } catch (cause) {
       setError(failureMessage(cause));
     } finally {
