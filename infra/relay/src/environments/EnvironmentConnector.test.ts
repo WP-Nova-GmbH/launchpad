@@ -37,6 +37,8 @@ import * as Tracer from "effect/Tracer";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 
 import * as EnvironmentLinks from "./EnvironmentLinks.ts";
+import * as Machines from "../machines/Machines.ts";
+import * as Organizations from "../tenancy/Organizations.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as EnvironmentConnector from "./EnvironmentConnector.ts";
 import * as ManagedEndpointAllocations from "./ManagedEndpointAllocations.ts";
@@ -202,8 +204,12 @@ function connectorTestLayer(
   options?: {
     readonly links?: EnvironmentLinks.EnvironmentLinks["Service"];
     readonly allocations?: ManagedEndpointAllocations.ManagedEndpointAllocations["Service"];
+    readonly machine?: Machines.MachineRecord | null;
+    readonly membershipOrganizationId?: string | null;
   },
 ) {
+  const unexpectedMachineCall = () => Effect.die("unexpected machine store call");
+  const unexpectedOrganizationCall = () => Effect.die("unexpected organization call");
   return EnvironmentConnector.layer.pipe(
     Layer.provide(NodeCryptoLayer.layer),
     Layer.provide(Layer.succeed(EnvironmentLinks.EnvironmentLinks, options?.links ?? makeLinks())),
@@ -211,6 +217,54 @@ function connectorTestLayer(
       Layer.succeed(
         ManagedEndpointAllocations.ManagedEndpointAllocations,
         options?.allocations ?? makeAllocations(),
+      ),
+    ),
+    Layer.provide(
+      Layer.succeed(
+        Machines.Machines,
+        Machines.Machines.of({
+          create: unexpectedMachineCall,
+          getById: unexpectedMachineCall,
+          listForOrganization: unexpectedMachineCall,
+          countActiveForOrganization: unexpectedMachineCall,
+          getBySeedHash: unexpectedMachineCall,
+          getActiveByEnvironmentId: () => Effect.succeed(options?.machine ?? null),
+          recordComputeRef: unexpectedMachineCall,
+          claimEnrollment: unexpectedMachineCall,
+          deprovision: unexpectedMachineCall,
+          remove: unexpectedMachineCall,
+        }),
+      ),
+    ),
+    Layer.provide(
+      Layer.succeed(
+        Organizations.Organizations,
+        Organizations.Organizations.of({
+          ensureForUser: unexpectedOrganizationCall,
+          getMembershipForUser: ({ userId }) =>
+            Effect.succeed(
+              options?.membershipOrganizationId == null
+                ? null
+                : {
+                    organization: {
+                      organizationId: options.membershipOrganizationId,
+                      name: "Acme",
+                      createdAt: "2026-08-19T00:00:00.000Z",
+                    },
+                    userId,
+                    role: "member" as const,
+                    joinedAt: "2026-08-19T00:00:00.000Z",
+                  },
+            ),
+          listMembers: unexpectedOrganizationCall,
+          countAdmins: unexpectedOrganizationCall,
+          countMembers: unexpectedOrganizationCall,
+          updateMemberRole: unexpectedOrganizationCall,
+          removeMember: unexpectedOrganizationCall,
+          addMember: unexpectedOrganizationCall,
+          rename: unexpectedOrganizationCall,
+          deleteOrganization: unexpectedOrganizationCall,
+        }),
       ),
     ),
     Layer.provide(RelayConfiguration.layer(settings)),
@@ -1073,4 +1127,129 @@ describe("EnvironmentConnector", () => {
       }
     }).pipe(Effect.provide(Layer.merge(TestClock.layer(), connectorTestLayer(execute))));
   });
+});
+
+describe("EnvironmentConnector.resolveAccess", () => {
+  const unusedExecute = () => Effect.die("resolveAccess never reaches an environment");
+  const noLinks = (): EnvironmentLinks.EnvironmentLinks["Service"] => ({
+    ...makeLinks(),
+    getForUser: () => Effect.succeed(null),
+  });
+  const enrolledMachine: Machines.MachineRecord = {
+    machineId: "machine-1",
+    organizationId: "organization-1",
+    role: "agent_executor",
+    label: "Executor 1",
+    computeKind: "docker",
+    computeRef: "container-1",
+    seedExpiresAt: "2100-01-01T00:00:00.000Z",
+    environmentId: "env-connector-test",
+    environmentPublicKey: environmentKeyPair.publicKey,
+    endpointHttpBaseUrl: "https://machine.example.test/",
+    endpointWsBaseUrl: "wss://machine.example.test/ws",
+    endpointProviderKind: "cloudflare_tunnel",
+    createdByUserId: "user_admin",
+    enrolledAt: "2026-08-19T01:00:00.000Z",
+    deprovisionedAt: null,
+    createdAt: "2026-08-19T00:00:00.000Z",
+  };
+
+  it.effect("resolves an enrolled machine for a member of its organization", () =>
+    Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const access = yield* connector.resolveAccess({
+        userId: "user_member",
+        environmentId: "env-connector-test",
+        operation: "connect",
+      });
+      expect(access).toEqual({
+        environmentId: "env-connector-test",
+        environmentPublicKey: environmentKeyPair.publicKey,
+        endpoint: {
+          httpBaseUrl: "https://machine.example.test/",
+          wsBaseUrl: "wss://machine.example.test/ws",
+          providerKind: "cloudflare_tunnel",
+        },
+        allocationOwnerKey: "org:organization-1",
+      });
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(unusedExecute, {
+          links: noLinks(),
+          machine: enrolledMachine,
+          membershipOrganizationId: "organization-1",
+        }),
+      ),
+    ),
+  );
+
+  it.effect("answers a non-member exactly like a missing link", () =>
+    Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const error = yield* Effect.flip(
+        connector.resolveAccess({
+          userId: "user_outsider",
+          environmentId: "env-connector-test",
+          operation: "connect",
+        }),
+      );
+      expect(error).toMatchObject({
+        _tag: "EnvironmentConnectNotAuthorized",
+        reason: "environment_link_not_found",
+      });
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(unusedExecute, {
+          links: noLinks(),
+          machine: enrolledMachine,
+          membershipOrganizationId: "organization-2",
+        }),
+      ),
+    ),
+  );
+
+  it.effect("never resolves a machine that has not enrolled", () =>
+    Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const error = yield* Effect.flip(
+        connector.resolveAccess({
+          userId: "user_member",
+          environmentId: "env-connector-test",
+          operation: "connect",
+        }),
+      );
+      expect(error).toMatchObject({
+        _tag: "EnvironmentConnectNotAuthorized",
+        reason: "environment_link_not_found",
+      });
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(unusedExecute, {
+          links: noLinks(),
+          machine: {
+            ...enrolledMachine,
+            environmentId: null,
+            environmentPublicKey: null,
+            endpointHttpBaseUrl: null,
+            endpointWsBaseUrl: null,
+            endpointProviderKind: null,
+            enrolledAt: null,
+          },
+          membershipOrganizationId: "organization-1",
+        }),
+      ),
+    ),
+  );
+
+  it.effect("prefers the caller's own link over the machine path", () =>
+    Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const access = yield* connector.resolveAccess({
+        userId: "user_123",
+        environmentId: "env-connector-test",
+        operation: "status",
+      });
+      expect(access.allocationOwnerKey).toBe("user_123");
+    }).pipe(Effect.provide(connectorTestLayer(unusedExecute))),
+  );
 });

@@ -47,11 +47,13 @@ import {
   RelayEnvironmentLinkUnavailableError,
   RelayEnvironmentLinkLimitExceededError,
   RelayEnvironmentPrincipal,
+  type RelayClientEnvironmentRecord,
   type RelayCreateJobRequest,
   type RelayEnvironmentConnectRequest,
   type RelayDpopAccessTokenScope,
   RelayInternalError,
 } from "@t3tools/contracts/relay";
+import { EnvironmentId } from "@t3tools/contracts";
 import { normalizeRelayIssuer } from "@t3tools/shared/relayJwt";
 
 import * as DeliveryAttempts from "../agentActivity/DeliveryAttempts.ts";
@@ -536,7 +538,6 @@ export const dispatchJobRecord = Effect.fn("relay.api.jobs.dispatchJobRecord")(f
   readonly jobId: RelayJobId;
   readonly request: RelayCreateJobRequest;
 }) {
-  const links = yield* EnvironmentLinks.EnvironmentLinks;
   const jobs = yield* Jobs.Jobs;
   const connector = yield* EnvironmentConnector.EnvironmentConnector;
 
@@ -545,19 +546,14 @@ export const dispatchJobRecord = Effect.fn("relay.api.jobs.dispatchJobRecord")(f
     canonicalKey: input.request.repositoryCanonicalKey,
   });
 
-  // Refused before a row exists: a job aimed at an environment this user has
-  // not linked is not a failed job, it is not a job at all.
-  const link = yield* links.getForUser({
+  // Refused before a row exists: a job aimed at an environment this user
+  // cannot reach — neither their own link nor an executor of their
+  // organization — is not a failed job, it is not a job at all.
+  const access = yield* connector.resolveAccess({
     userId: input.userId,
     environmentId: input.request.environmentId,
+    operation: "dispatch-job",
   });
-  if (!link) {
-    return yield* new EnvironmentConnector.EnvironmentConnectNotAuthorized({
-      environmentId: input.request.environmentId,
-      operation: "dispatch-job",
-      reason: "environment_link_not_found",
-    });
-  }
 
   const created = yield* jobs.create({
     jobId: input.jobId,
@@ -571,7 +567,7 @@ export const dispatchJobRecord = Effect.fn("relay.api.jobs.dispatchJobRecord")(f
   const dispatched = yield* connector
     .dispatchJob({
       userId: input.userId,
-      environmentId: link.environmentId,
+      environmentId: access.environmentId,
       jobId: input.jobId,
       repositoryCanonicalKey: input.request.repositoryCanonicalKey,
       baseBranch: input.request.baseBranch,
@@ -673,6 +669,8 @@ export const clientApi = HttpApiBuilder.group(
     const relayTokens = yield* RelayTokens.RelayTokens;
     const linker = yield* EnvironmentLinker.EnvironmentLinker;
     const links = yield* EnvironmentLinks.EnvironmentLinks;
+    const machines = yield* Machines.Machines;
+    const organizations = yield* Organizations.Organizations;
     const managedEndpointProvider = yield* ManagedEndpointProvider.ManagedEndpointProvider;
     const devices = yield* Devices.Devices;
     return handlers
@@ -681,7 +679,35 @@ export const clientApi = HttpApiBuilder.group(
         Effect.fn("relay.api.client.listEnvironments")(function* () {
           const { userId } = yield* RelayClientPrincipal;
           const environments = yield* links.listForUser({ userId });
-          return { environments };
+          // Executors sit beside personal links: reachable by every member of
+          // the organization that owns them, with no link row of their own.
+          const membership = yield* organizations.getMembershipForUser({ userId });
+          const executors =
+            membership === null
+              ? []
+              : (yield* machines.listForOrganization({
+                  organizationId: membership.organization.organizationId,
+                }))
+                  .filter(
+                    (machine) =>
+                      Machines.machineStatus(machine) === "ready" &&
+                      machine.environmentId !== null &&
+                      machine.endpointHttpBaseUrl !== null &&
+                      machine.endpointWsBaseUrl !== null &&
+                      machine.endpointProviderKind !== null,
+                  )
+                  .map((machine) => ({
+                    environmentId: EnvironmentId.make(machine.environmentId ?? ""),
+                    label: machine.label,
+                    endpoint: {
+                      httpBaseUrl: machine.endpointHttpBaseUrl ?? "",
+                      wsBaseUrl: machine.endpointWsBaseUrl ?? "",
+                      providerKind: (machine.endpointProviderKind ??
+                        "manual") as RelayClientEnvironmentRecord["endpoint"]["providerKind"],
+                    },
+                    linkedAt: machine.enrolledAt ?? machine.createdAt,
+                  }));
+          return { environments: [...environments, ...executors] };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(

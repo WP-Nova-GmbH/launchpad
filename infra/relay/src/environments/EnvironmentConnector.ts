@@ -4,6 +4,7 @@ import {
   EnvironmentHttpForbiddenError,
   EnvironmentHttpInternalServerError,
   EnvironmentHttpUnauthorizedError,
+  EnvironmentId,
 } from "@t3tools/contracts";
 import { makeEnvironmentHttpApiClient } from "@t3tools/client-runtime/rpc";
 import {
@@ -48,6 +49,8 @@ import * as HttpClientError from "effect/unstable/http/HttpClientError";
 
 import * as EnvironmentLinks from "./EnvironmentLinks.ts";
 import * as ManagedEndpointAllocations from "./ManagedEndpointAllocations.ts";
+import * as Machines from "../machines/Machines.ts";
+import * as Organizations from "../tenancy/Organizations.ts";
 import * as RelayConfiguration from "../Config.ts";
 import { isManagedEndpointHostname } from "../deploymentConfig.ts";
 
@@ -134,7 +137,23 @@ export type EnvironmentConnectorError =
   | EnvironmentMintRequestTimedOut
   | EnvironmentMintResponseInvalid
   | EnvironmentLinks.EnvironmentLinkLookupPersistenceError
+  | Machines.MachinePersistenceError
+  | Organizations.OrganizationPersistenceError
   | ManagedEndpointAllocations.ManagedEndpointAllocationPersistenceError;
+
+/**
+ * An environment the caller may reach, resolved from either trust path: their
+ * own link, or an enrolled machine of the organization they belong to
+ * (ADR-0002). The allocation owner key is whichever key the managed endpoint
+ * was provisioned under — the user id for personal links, the organization's
+ * synthetic owner key for machines.
+ */
+export interface EnvironmentAccess {
+  readonly environmentId: EnvironmentId;
+  readonly environmentPublicKey: string;
+  readonly endpoint: EnvironmentLinks.RelayLinkedEnvironmentRecord["endpoint"];
+  readonly allocationOwnerKey: string;
+}
 
 export const ENVIRONMENT_MINT_REQUEST_TIMEOUT_MS = 10_000;
 /**
@@ -153,6 +172,17 @@ export interface EnvironmentDispatchJobResult {
 export class EnvironmentConnector extends Context.Service<
   EnvironmentConnector,
   {
+    /**
+     * Who may reach which environment, without touching it: the caller's own
+     * link, or an enrolled machine of their organization. Job dispatch checks
+     * this before creating a row, so a job aimed at an environment the caller
+     * cannot reach is not a failed job — it is not a job at all.
+     */
+    readonly resolveAccess: (input: {
+      readonly userId: string;
+      readonly environmentId: string;
+      readonly operation: EnvironmentConnectorOperation;
+    }) => Effect.Effect<EnvironmentAccess, EnvironmentConnectorError>;
     readonly connect: (input: {
       readonly userId: string;
       readonly environmentId: string;
@@ -354,6 +384,8 @@ function verifyEnvironmentHealthResponse(input: {
 const make = Effect.gen(function* () {
   const links = yield* EnvironmentLinks.EnvironmentLinks;
   const allocations = yield* ManagedEndpointAllocations.ManagedEndpointAllocations;
+  const machines = yield* Machines.Machines;
+  const organizations = yield* Organizations.Organizations;
   const settings = yield* RelayConfiguration.RelayConfiguration;
   const httpClient = yield* HttpClient.HttpClient;
   const crypto = yield* Crypto.Crypto;
@@ -362,10 +394,103 @@ const make = Effect.gen(function* () {
     makeEnvironmentHttpApiClient(httpBaseUrl).pipe(
       Effect.provideService(HttpClient.HttpClient, httpClient),
     );
+  const machineAccess = Effect.fn("relay.environment_connector.machine_access")(function* (input: {
+    readonly userId: string;
+    readonly environmentId: string;
+    readonly operation: EnvironmentConnectorOperation;
+  }) {
+    const machine = yield* machines.getActiveByEnvironmentId({
+      environmentId: input.environmentId,
+    });
+    if (
+      machine !== null &&
+      machine.environmentId !== null &&
+      machine.environmentPublicKey !== null &&
+      machine.endpointHttpBaseUrl !== null &&
+      machine.endpointWsBaseUrl !== null &&
+      machine.endpointProviderKind !== null
+    ) {
+      const membership = yield* organizations.getMembershipForUser({ userId: input.userId });
+      if (
+        membership !== null &&
+        membership.organization.organizationId === machine.organizationId
+      ) {
+        return {
+          environmentId: EnvironmentId.make(machine.environmentId),
+          environmentPublicKey: machine.environmentPublicKey,
+          endpoint: {
+            httpBaseUrl: machine.endpointHttpBaseUrl,
+            wsBaseUrl: machine.endpointWsBaseUrl,
+            providerKind:
+              machine.endpointProviderKind as EnvironmentLinks.RelayLinkedEnvironmentRecord["endpoint"]["providerKind"],
+          },
+          allocationOwnerKey: Machines.machineEndpointOwnerKey(machine.organizationId),
+        } satisfies EnvironmentAccess;
+      }
+    }
+    // Someone else's machine reads exactly like no link at all: telling a
+    // non-member an executor exists would leak the fleet one 403 at a time.
+    return yield* new EnvironmentConnectNotAuthorized({
+      environmentId: input.environmentId,
+      operation: input.operation,
+      reason: "environment_link_not_found",
+    });
+  });
+
+  /**
+   * The link leg fetches its allocation concurrently because the owner key is
+   * the caller; the machine leg has to resolve the machine before it knows
+   * which organization's allocation to load.
+   */
+  const resolveAccessAndAllocation = Effect.fn(
+    "relay.environment_connector.resolve_access_and_allocation",
+  )(function* (input: {
+    readonly userId: string;
+    readonly environmentId: string;
+    readonly operation: EnvironmentConnectorOperation;
+  }) {
+    const { link, userAllocation } = yield* Effect.all(
+      {
+        link: links.getForUser({ userId: input.userId, environmentId: input.environmentId }),
+        userAllocation: allocations.get({
+          userId: input.userId,
+          environmentId: input.environmentId,
+        }),
+      },
+      { concurrency: 2 },
+    );
+    if (link) {
+      return {
+        access: {
+          environmentId: link.environmentId,
+          environmentPublicKey: link.environmentPublicKey,
+          endpoint: link.endpoint,
+          allocationOwnerKey: input.userId,
+        } satisfies EnvironmentAccess,
+        allocation: userAllocation,
+      };
+    }
+    const access = yield* machineAccess(input);
+    const allocation = yield* allocations.get({
+      userId: access.allocationOwnerKey,
+      environmentId: input.environmentId,
+    });
+    return { access, allocation };
+  });
+
+  const resolveAccess = Effect.fn("relay.environment_connector.resolve_access")(function* (input: {
+    readonly userId: string;
+    readonly environmentId: string;
+    readonly operation: EnvironmentConnectorOperation;
+  }) {
+    const { access } = yield* resolveAccessAndAllocation(input);
+    return access;
+  });
+
   const resolveManagedEndpoint = Effect.fn("relay.environment_connector.resolve_managed_endpoint")(
     function* (input: {
       readonly operation: EnvironmentConnectorOperation;
-      readonly link: EnvironmentLinks.RelayLinkedEnvironmentRecord;
+      readonly link: EnvironmentAccess;
       readonly allocation: ManagedEndpointAllocations.ManagedEndpointAllocation | null;
     }) {
       if (input.link.endpoint.providerKind !== "cloudflare_tunnel") {
@@ -455,25 +580,17 @@ const make = Effect.gen(function* () {
   );
 
   return EnvironmentConnector.of({
+    resolveAccess,
     status: Effect.fn("relay.environment_connector.status")(function* (input) {
       yield* Effect.annotateCurrentSpan({
         "relay.environment_id": input.environmentId,
         "relay.operation": "status",
       });
-      const { link, allocation } = yield* Effect.all(
-        {
-          link: links.getForUser(input),
-          allocation: allocations.get(input),
-        },
-        { concurrency: 2 },
-      );
-      if (!link) {
-        return yield* new EnvironmentConnectNotAuthorized({
-          environmentId: input.environmentId,
-          operation: "status",
-          reason: "environment_link_not_found",
-        });
-      }
+      const { access: link, allocation } = yield* resolveAccessAndAllocation({
+        userId: input.userId,
+        environmentId: input.environmentId,
+        operation: "status",
+      });
       const endpoint = yield* resolveManagedEndpoint({
         operation: "status",
         link,
@@ -615,20 +732,11 @@ const make = Effect.gen(function* () {
           reason: "client_proof_key_thumbprint_missing",
         });
       }
-      const { link, allocation } = yield* Effect.all(
-        {
-          link: links.getForUser(input),
-          allocation: allocations.get(input),
-        },
-        { concurrency: 2 },
-      );
-      if (!link) {
-        return yield* new EnvironmentConnectNotAuthorized({
-          environmentId: input.environmentId,
-          operation: "connect",
-          reason: "environment_link_not_found",
-        });
-      }
+      const { access: link, allocation } = yield* resolveAccessAndAllocation({
+        userId: input.userId,
+        environmentId: input.environmentId,
+        operation: "connect",
+      });
       const endpoint = yield* resolveManagedEndpoint({
         operation: "connect",
         link,
@@ -739,20 +847,11 @@ const make = Effect.gen(function* () {
         "relay.operation": "dispatch-job",
         "relay.job_id": input.jobId,
       });
-      const { link, allocation } = yield* Effect.all(
-        {
-          link: links.getForUser(input),
-          allocation: allocations.get(input),
-        },
-        { concurrency: 2 },
-      );
-      if (!link) {
-        return yield* new EnvironmentConnectNotAuthorized({
-          environmentId: input.environmentId,
-          operation: "dispatch-job",
-          reason: "environment_link_not_found",
-        });
-      }
+      const { access: link, allocation } = yield* resolveAccessAndAllocation({
+        userId: input.userId,
+        environmentId: input.environmentId,
+        operation: "dispatch-job",
+      });
       const endpoint = yield* resolveManagedEndpoint({
         operation: "dispatch-job",
         link,

@@ -514,6 +514,30 @@ function relayJobsTestLayer(input?: {
     Layer.succeed(
       EnvironmentConnector.EnvironmentConnector,
       EnvironmentConnector.EnvironmentConnector.of({
+        // Mirrors the live resolver's link leg so the harness's getForUser
+        // option keeps deciding who may dispatch.
+        resolveAccess: (accessInput) =>
+          (input?.getForUser ?? (() => Effect.succeed(linkedEnvironmentRecord)))({
+            userId: accessInput.userId,
+            environmentId: accessInput.environmentId,
+          }).pipe(
+            Effect.flatMap((link) =>
+              link === null
+                ? Effect.fail(
+                    new EnvironmentConnector.EnvironmentConnectNotAuthorized({
+                      environmentId: accessInput.environmentId,
+                      operation: accessInput.operation,
+                      reason: "environment_link_not_found",
+                    }),
+                  )
+                : Effect.succeed({
+                    environmentId: link.environmentId,
+                    environmentPublicKey: link.environmentPublicKey,
+                    endpoint: link.endpoint,
+                    allocationOwnerKey: accessInput.userId,
+                  }),
+            ),
+          ),
         connect: () => Effect.die("unused connect"),
         status: () => Effect.die("unused status"),
         dispatchJob: input?.dispatchJob ?? (() => Effect.succeed({ accepted: true })),
