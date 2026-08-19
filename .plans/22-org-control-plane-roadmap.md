@@ -102,6 +102,19 @@ quota and the billing lever for "buy managed machines."
 
 **Open:** whether review hosts share the executor quota or have their own.
 
+**As built.** Everything above, with the open questions settled: **one shared machine quota** per
+organization across both roles; **no cross-org access** and no human linking of machines — the two
+trust paths refuse each other in both directions; reclamation is **admin-triggered deprovision
+only** until the M4 mirror makes automatic reclamation non-destructive. Compute is created by a
+driver seam: Hetzner Cloud in production, Docker containers on the developer's host in dev.
+ADR-0002's internal-network restriction on the registration endpoint cannot exist while the relay
+is a Cloudflare Worker; the single-use expiring seed inside a machine-signed proof is the control,
+recorded as an amendment on the ADR. The quota rides its own table rather than re-keying
+`ManagedTunnelLimits`, whose user-keyed endpoint tables machines share under a synthetic
+`org:<id>` owner key. Deferred with reasons: ADR-0006's executor-side refusal (lands with M5's
+project materialization) and any user-facing docs. Details in
+[docs/internals/machines.md](../docs/internals/machines.md).
+
 ---
 
 ## M3 — Config and credentials
@@ -242,9 +255,9 @@ changes before M1 starts.
 |---|---|
 | Personal-mirror retention — does not inherit the organization mirror's indefinite default | M8 |
 | What "export my threads" produces on offboarding | M8 |
-| Cross-org linking: can a member of one organization link to another's executor? | M2 |
-| Review host quota: shared with executors or separate? | M2 |
+| ~~Cross-org linking~~ — settled in M2: no; executor access requires membership, and machines can never be human-linked | — |
+| ~~Review host quota~~ — settled in M2: one shared per-organization machine quota across both roles | — |
 | Dispatch latency budget | M4 |
 | Transactional email provider | M1 |
 | v1 `action` type list | M5 |
-| Executor reclamation policy — history survives (ADR-0012) but continuation breaks | M2 |
+| ~~Executor reclamation policy~~ — settled in M2: admin-triggered deprovision only until the M4 mirror; automatic reclamation revisited then | — |

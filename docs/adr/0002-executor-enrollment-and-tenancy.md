@@ -41,3 +41,20 @@ executor exposes one organization's credentials, not several.
   Executor enrollment is a **second, parallel** trust path, not a replacement.
 - Self-hosted executors (planned later) cannot use network restriction and will need their
   own enrollment story — most likely an org-scoped, revocable registration token.
+
+## Amendment: no network restriction while the relay runs on Cloudflare Workers
+
+As built in M2, the registration endpoint is **not** network-restricted. The relay is a
+Cloudflare Worker until the M4 platform move, and a Worker has no internal network to
+restrict to; the machines it creates (Hetzner Cloud servers in production, Docker
+containers on the developer's host in dev) reach it over the public internet like every
+other caller.
+
+The controls that stand in: the seed is **single-use** (consumed atomically at
+enrollment), **expiring** (24 hours), stored **only as a hash**, and presented inside a
+proof **signed by the machine's own fresh key**, which binds the registered public key to
+whoever holds the seed. An environment someone already linked can never enroll, and an
+enrolled machine can never be linked, so neither trust path can be laundered into the
+other. Revisit the network restriction when M4 puts the relay on a VM — though by then
+the seed mechanics will have carried the load alone, which is also what the self-hosted
+case (above) always required.

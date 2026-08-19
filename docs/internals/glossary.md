@@ -408,6 +408,7 @@ a thread; the session is what churns underneath.
 - [Permission modes][18]
 - [Workspace layout][2]
 - [Tenancy](./tenancy.md)
+- [Machines](./machines.md)
 
 [1]: ../../packages/contracts/src/orchestration.ts
 [2]: ./workspace-layout.md

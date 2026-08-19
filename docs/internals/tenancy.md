@@ -64,8 +64,10 @@ Behaviour differs by machine, deliberately:
 - **On a personal machine: derive freely.** A checkout nobody registered is simply not org-governed.
   Settings → Organization shows admins which visible checkouts are not part of the organization and
   offers to register them.
-- **On an executor: refuse.** Not yet implemented — executors arrive with machines in M2, and until
-  the relay can tell an executor from a personal machine there is nothing to key the refusal on.
+- **On an executor: refuse.** Still not enforced. Machines exist now (see
+  [machines.md](./machines.md)), so the relay can tell an executor from a personal machine — but the
+  refusal belongs in the executor's project-creation path, which the job runner's project
+  materialization (M5) reshapes; it lands there rather than being built twice.
 
 What _is_ enforced today is the other half: dispatching a job against a canonical key that **is**
 registered requires a role on that repository (`requireRepositoryAccessForDispatch` in
@@ -126,6 +128,9 @@ All in `infra/relay/src/persistence/schema.ts`:
 | `relay_repository_aliases`       | canonical key is the primary key; organization denormalized         |
 | `relay_repository_access`        | `(repository, user)`; organization denormalized                     |
 | `relay_github_installations`     | one per organization; unique on `installation_id`, holds no secret  |
+
+Machines — the organization's provisioned executors and review hosts — have their own tables and
+their own document: [machines.md](./machines.md).
 
 Organization ids are denormalized onto alias and access rows so a checkout can be resolved to its
 organization without a join, including on paths that hold no user token.
