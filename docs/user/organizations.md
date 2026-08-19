@@ -46,6 +46,23 @@ that remote is recognised. A repository always keeps at least one key.
 
 Admins see every repository in the organization. Everyone else sees the ones they have a role on.
 
+### What registering does, and what it does not
+
+Registering a repository records it. It does not put code anywhere.
+
+A **repository** is the organization's record of a codebase — its addresses, and who may work in
+it. A **project** is one checkout of that repository on one machine, with files on a disk. They are
+different things, and registering the first does not create the second.
+
+So a newly registered repository appears under Settings → Organization and nowhere else. It will
+not show up in Connections, which lists machines you can reach, or in Source Control, which is
+about the tools installed on this machine, or in your project sidebar, which lists checkouts that
+actually exist.
+
+What registering buys you: any checkout of that repository, on any machine, is recognised as the
+same repository; you decide who may work in it; and work the organization runs on your behalf is
+allowed only for people with a role on it.
+
 ### Checkouts that are not registered
 
 If you have a project open whose repository nobody has registered, admins see it listed with a

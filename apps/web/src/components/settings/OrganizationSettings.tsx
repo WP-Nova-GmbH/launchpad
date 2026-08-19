@@ -36,6 +36,18 @@ const REPOSITORY_ROLE_LABELS: Readonly<Record<RelayRepositoryRole, string>> = {
   developer: "Developer",
 };
 
+/**
+ * A line under a section heading saying what the section is for.
+ *
+ * Worth the space here: an organization is a set of records in the relay, and
+ * nothing on this page puts code on a disk or a machine on the network. Saying
+ * so is cheaper than someone looking for a registered repository under
+ * Connections, Source Control, and Projects in turn.
+ */
+function SectionNote({ children }: { children: ReactNode }) {
+  return <p className="px-3 pb-1 text-sm text-muted-foreground sm:px-4">{children}</p>;
+}
+
 function RoleBadge({ children }: { children: string }) {
   return (
     <Badge variant="secondary" className="font-normal">
@@ -140,6 +152,10 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
       title={searchableSetting("organization-members").title}
       icon={<UsersIcon className="size-4 text-muted-foreground" />}
     >
+      <SectionNote>
+        Everyone here shares this organization&apos;s repositories and connections. Admins manage
+        people and repositories; members work in what they are given access to.
+      </SectionNote>
       {snapshot.members.map((member) => {
         const isSelf = member.userId === snapshot.membership.userId;
         const label = memberLabel(member);
@@ -524,6 +540,11 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
       title={searchableSetting("organization-github").title}
       icon={<GitHubIcon className="size-4 text-muted-foreground" />}
     >
+      <SectionNote>
+        Connecting installs an app on GitHub, which lets this organization see those repositories
+        and register them without typing their addresses. The access belongs to the organization, so
+        members share it and nobody needs their own GitHub token.
+      </SectionNote>
       {connection ? (
         <SettingsRow
           title={connection.accountLogin}
@@ -615,6 +636,11 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
       title={searchableSetting("organization-repositories").title}
       icon={<FolderGit2Icon className="size-4 text-muted-foreground" />}
     >
+      <SectionNote>
+        A repository here is the organization&apos;s record of a codebase, recognised by its git
+        remote. Registering one does not check anything out — it decides who may work in it and lets
+        any checkout on any machine be recognised as the same repository.
+      </SectionNote>
       {snapshot.repositories.length === 0 ? (
         <Empty className="min-h-48">
           <EmptyMedia variant="icon">
