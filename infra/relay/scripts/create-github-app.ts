@@ -41,6 +41,11 @@ function flag(name: string): string | undefined {
 const setupUrl = flag("setup-url");
 const organization = flag("org");
 const appName = flag("name") ?? "T3 Code Launchpad";
+/**
+ * A vendor app that other organizations will install has to be public. Keep it
+ * private while only your own organization installs it.
+ */
+const isPublic = process.argv.includes("--public");
 
 const encodeManifest = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
@@ -59,7 +64,7 @@ const manifest = (redirectUrl: string, landing: string) => ({
   redirect_url: redirectUrl,
   setup_url: landing,
   setup_on_update: true,
-  public: false,
+  public: isPublic,
   default_permissions: { contents: "read", metadata: "read", pull_requests: "write" },
   default_events: [] as ReadonlyArray<string>,
 });
