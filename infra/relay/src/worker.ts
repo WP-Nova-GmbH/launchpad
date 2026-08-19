@@ -34,6 +34,7 @@ import {
   tokenApi,
   withoutCapturedParentSpan,
 } from "./http/Api.ts";
+import { machineEnrollmentApi, machinesApi } from "./http/MachinesApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
 import { ManagedEndpointZone, RelayApiZone, RelayDeploymentConfig } from "./zone.ts";
 import { makeRelayTraceLayer, RelayObservability } from "./observability.ts";
@@ -61,6 +62,10 @@ import * as EnvironmentPublishSignatures from "./environments/EnvironmentPublish
 import * as ManagedEndpointProvider from "./environments/ManagedEndpointProvider.ts";
 import * as ManagedTunnelLimits from "./environments/ManagedTunnelLimits.ts";
 import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
+import * as MachineComputeProvider from "./machines/MachineComputeProvider.ts";
+import * as MachineEnroller from "./machines/MachineEnroller.ts";
+import * as MachineLimits from "./machines/MachineLimits.ts";
+import * as Machines from "./machines/Machines.ts";
 import * as Invitations from "./tenancy/Invitations.ts";
 import * as Organizations from "./tenancy/Organizations.ts";
 import * as Repositories from "./tenancy/Repositories.ts";
@@ -98,6 +103,8 @@ const relayApiLayer = Layer.mergeAll(
   clientApi,
   organizationApi,
   repositoriesApi,
+  machinesApi,
+  machineEnrollmentApi,
   tokenApi,
   dpopClientApi,
   jobsApi,
@@ -220,58 +227,68 @@ export const ApiLive = Api.make(
       }).pipe(Effect.map(makeRelayTraceLayer)),
     );
 
-    const runtimeLayer = Layer.empty.pipe(
-      Layer.provideMerge(MobileRegistrations.layer),
-      Layer.provideMerge(AgentActivityPublisher.layer),
-      Layer.provideMerge(EnvironmentConnector.layer),
-      Layer.provideMerge(EnvironmentLinker.layer),
-      Layer.provideMerge(EnvironmentPublishSignatures.layer),
-      Layer.provideMerge(
-        ManagedEndpointProvider.layerCloudflareBindings(
-          managedEndpointTunnelBinding,
-          managedEndpointDnsBinding,
-          alchemyRuntimeContext,
+    const runtimeLayer = Layer.empty
+      .pipe(
+        Layer.provideMerge(MobileRegistrations.layer),
+        Layer.provideMerge(AgentActivityPublisher.layer),
+        Layer.provideMerge(EnvironmentConnector.layer),
+        Layer.provideMerge(EnvironmentLinker.layer),
+        Layer.provideMerge(MachineEnroller.layer),
+        // Compute drivers land with the Docker (dev) and Hetzner (production)
+        // integrations; until then provisioning refuses honestly.
+        Layer.provideMerge(MachineComputeProvider.layerUnavailable),
+        Layer.provideMerge(MachineLimits.layer),
+        Layer.provideMerge(EnvironmentPublishSignatures.layer),
+        Layer.provideMerge(
+          ManagedEndpointProvider.layerCloudflareBindings(
+            managedEndpointTunnelBinding,
+            managedEndpointDnsBinding,
+            alchemyRuntimeContext,
+          ),
         ),
-      ),
-      Layer.provideMerge(DpopProofs.layer),
-      Layer.provideMerge(ApnsDeliveries.layer),
-      Layer.provideMerge(ApnsClient.layer.pipe(Layer.provideMerge(ApnsProviderTokens.layer))),
-      Layer.provideMerge(
-        ApnsDeliveryQueue.layerCloudflareQueues(apnsDeliveryQueueSender, alchemyRuntimeContext),
-      ),
-      // Row stores that need nothing but RelayDb.
-      Layer.provideMerge(
-        Layer.mergeAll(
-          AgentActivityRows.layer,
-          Jobs.layer,
-          Organizations.layer,
-          Invitations.layer,
-          Repositories.layer,
-          UserDirectory.layer,
-          GithubApp.layer,
-          GithubInstallations.layer,
+        Layer.provideMerge(DpopProofs.layer),
+        Layer.provideMerge(ApnsDeliveries.layer),
+        Layer.provideMerge(ApnsClient.layer.pipe(Layer.provideMerge(ApnsProviderTokens.layer))),
+        Layer.provideMerge(
+          ApnsDeliveryQueue.layerCloudflareQueues(apnsDeliveryQueueSender, alchemyRuntimeContext),
         ),
-      ),
-      Layer.provideMerge(Devices.layer),
-      Layer.provideMerge(EnvironmentCredentials.layer),
-      Layer.provideMerge(
-        Layer.mergeAll(
-          EnvironmentLinks.layer,
-          ManagedEndpointAllocations.layer,
-          ManagedTunnelLimits.layer,
+        // Row stores that need nothing but RelayDb.
+        Layer.provideMerge(
+          Layer.mergeAll(
+            AgentActivityRows.layer,
+            Jobs.layer,
+            Organizations.layer,
+            Invitations.layer,
+            Repositories.layer,
+            UserDirectory.layer,
+            GithubApp.layer,
+            GithubInstallations.layer,
+            Machines.layer,
+          ),
         ),
-      ),
-      Layer.provideMerge(LiveActivities.layer),
-      Layer.provideMerge(DeliveryAttempts.layer),
-      Layer.provideMerge(RelayTokens.layer),
-      Layer.provideMerge(
-        RelayDb.RelayTransactions.layer.pipe(
-          Layer.provideMerge(Layer.succeed(RelayDb.RelayDb, db)),
+        Layer.provideMerge(Devices.layer),
+        Layer.provideMerge(EnvironmentCredentials.layer),
+        Layer.provideMerge(
+          Layer.mergeAll(
+            EnvironmentLinks.layer,
+            ManagedEndpointAllocations.layer,
+            ManagedTunnelLimits.layer,
+          ),
         ),
-      ),
-      Layer.provideMerge(Layer.effect(RelayConfiguration.RelayConfiguration, loadSettings)),
-      Layer.provideMerge(webcryptoLayer),
-    );
+        Layer.provideMerge(LiveActivities.layer),
+        Layer.provideMerge(DeliveryAttempts.layer),
+      )
+      .pipe(
+        // Split only because `pipe` takes at most twenty arguments.
+        Layer.provideMerge(RelayTokens.layer),
+        Layer.provideMerge(
+          RelayDb.RelayTransactions.layer.pipe(
+            Layer.provideMerge(Layer.succeed(RelayDb.RelayDb, db)),
+          ),
+        ),
+        Layer.provideMerge(Layer.effect(RelayConfiguration.RelayConfiguration, loadSettings)),
+        Layer.provideMerge(webcryptoLayer),
+      );
 
     const appLayer = relayApiLayer.pipe(
       Layer.provideMerge(relayClientAuthLayer),

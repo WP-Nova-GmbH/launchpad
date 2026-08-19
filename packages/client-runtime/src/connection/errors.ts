@@ -46,6 +46,7 @@ function relayProtectedError(error: RelayProtectedError): ConnectionAttemptError
     case "RelayEnvironmentConnectNotAuthorizedError":
     case "RelayEnvironmentLinkProofInvalidError":
     case "RelayEnvironmentLinkLimitExceededError":
+    case "RelayMachineEnrollProofInvalidError":
     case "RelayTenancyForbiddenError":
       return new ConnectionBlockedError({
         reason: "permission",
@@ -75,6 +76,9 @@ function relayProtectedError(error: RelayProtectedError): ConnectionAttemptError
         traceId: error.traceId,
       });
     case "RelayEnvironmentLinkFailedError":
+    case "RelayMachineEnrollFailedError":
+    case "RelayMachineEnrollUnavailableError":
+    case "RelayMachineComputeUnavailableError":
     case "RelayInternalError":
       return new ConnectionTransientError({
         reason: "relay-unavailable",

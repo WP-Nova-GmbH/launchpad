@@ -281,6 +281,11 @@ export const RelayEnvironmentLinkProofInvalidReason = Schema.Literals([
   "challenge_invalid",
   "origin_not_allowed",
   "endpoint_not_secure",
+  // The environment is an enrolled machine. Machines are org-owned and
+  // single-tenant (ADR-0002); linking one as a personal environment would give
+  // one member a private door into org compute, so the two trust paths stay
+  // disjoint in both directions.
+  "environment_is_machine",
 ]);
 export type RelayEnvironmentLinkProofInvalidReason =
   typeof RelayEnvironmentLinkProofInvalidReason.Type;
@@ -515,6 +520,7 @@ export const RelayTenancyNotFoundReason = Schema.Literals([
   "invitation_not_found",
   "github_installation_not_found",
   "github_not_connected",
+  "machine_not_found",
 ]);
 export type RelayTenancyNotFoundReason = typeof RelayTenancyNotFoundReason.Type;
 
@@ -525,6 +531,8 @@ export const RelayTenancyConflictReason = Schema.Literals([
   "already_a_member",
   "invitation_not_pending",
   "invitation_email_mismatch",
+  "machine_limit_reached",
+  "machine_deprovisioned",
 ]);
 export type RelayTenancyConflictReason = typeof RelayTenancyConflictReason.Type;
 
@@ -570,6 +578,89 @@ export class RelayTenancyConflictError extends Schema.TaggedErrorClass<RelayTena
   }
 }
 
+export const RelayMachineEnrollProofInvalidReason = Schema.Literals([
+  "invalid_signature_or_scope",
+  // Covers an unknown seed, an expired seed, and a seed that was already
+  // consumed alike: an unauthenticated caller learns nothing about which.
+  "seed_invalid",
+  "replayed_nonce",
+  "origin_not_allowed",
+  "endpoint_not_secure",
+  "environment_already_linked",
+]);
+export type RelayMachineEnrollProofInvalidReason = typeof RelayMachineEnrollProofInvalidReason.Type;
+
+export class RelayMachineEnrollProofInvalidError extends Schema.TaggedErrorClass<RelayMachineEnrollProofInvalidError>()(
+  "RelayMachineEnrollProofInvalidError",
+  {
+    code: Schema.Literal("machine_enroll_proof_invalid"),
+    reason: RelayMachineEnrollProofInvalidReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 400 },
+) {
+  override get message(): string {
+    return `Relay machine enrollment proof is invalid: ${this.reason}`;
+  }
+}
+
+export const RelayMachineEnrollFailedReason = Schema.Literals([
+  "enrollment_persistence_failed",
+  "credential_persistence_failed",
+  "replay_persistence_failed",
+  "internal_error",
+]);
+export type RelayMachineEnrollFailedReason = typeof RelayMachineEnrollFailedReason.Type;
+
+export class RelayMachineEnrollFailedError extends Schema.TaggedErrorClass<RelayMachineEnrollFailedError>()(
+  "RelayMachineEnrollFailedError",
+  {
+    code: Schema.Literal("machine_enroll_failed"),
+    reason: RelayMachineEnrollFailedReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 500 },
+) {
+  override get message(): string {
+    return `Relay machine enrollment failed: ${this.reason}`;
+  }
+}
+
+export class RelayMachineEnrollUnavailableError extends Schema.TaggedErrorClass<RelayMachineEnrollUnavailableError>()(
+  "RelayMachineEnrollUnavailableError",
+  {
+    code: Schema.Literal("machine_enroll_unavailable"),
+    reason: Schema.Literals(["managed_endpoint_provisioning_failed"]),
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 503 },
+) {
+  override get message(): string {
+    return `Relay machine enrollment is unavailable: ${this.reason}`;
+  }
+}
+
+export const RelayMachineComputeUnavailableReason = Schema.Literals([
+  "not_configured",
+  "request_failed",
+]);
+export type RelayMachineComputeUnavailableReason = typeof RelayMachineComputeUnavailableReason.Type;
+
+/** The compute driver could not create or destroy the machine's compute. */
+export class RelayMachineComputeUnavailableError extends Schema.TaggedErrorClass<RelayMachineComputeUnavailableError>()(
+  "RelayMachineComputeUnavailableError",
+  {
+    code: Schema.Literal("machine_compute_unavailable"),
+    reason: RelayMachineComputeUnavailableReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 502 },
+) {
+  override get message(): string {
+    return `Relay machine compute provider is unavailable: ${this.reason}`;
+  }
+}
+
 export class RelayInternalError extends Schema.TaggedErrorClass<RelayInternalError>()(
   "RelayInternalError",
   {
@@ -599,6 +690,10 @@ export const RelayProtectedError = Schema.Union([
   RelayTenancyForbiddenError,
   RelayTenancyNotFoundError,
   RelayTenancyConflictError,
+  RelayMachineEnrollProofInvalidError,
+  RelayMachineEnrollFailedError,
+  RelayMachineEnrollUnavailableError,
+  RelayMachineComputeUnavailableError,
   RelayInternalError,
 ]);
 export type RelayProtectedError = typeof RelayProtectedError.Type;
@@ -1163,6 +1258,116 @@ export const RelayListGithubRepositoriesResponse = Schema.Struct({
 export type RelayListGithubRepositoriesResponse = typeof RelayListGithubRepositoriesResponse.Type;
 
 // ---------------------------------------------------------------------------
+// Machines
+//
+// A machine is compute the relay provisions for exactly one organization
+// (ADR-0002): an agent executor or a review host — roles, not machine kinds
+// (ADR-0010). A machine proves it is the one the relay just created with a
+// per-instance seeded credential, exchanged once for a durable environment
+// credential. Enrollment is a second, parallel trust path beside the
+// human-driven link flow, never a replacement for it.
+// ---------------------------------------------------------------------------
+
+export const RelayMachineId = TrimmedNonEmptyString.pipe(Schema.brand("RelayMachineId"));
+export type RelayMachineId = typeof RelayMachineId.Type;
+
+/** What a provisioned machine is for. One provisioning path, one enrollment story, two roles. */
+export const RelayMachineRole = Schema.Literals(["agent_executor", "review_host"]);
+export type RelayMachineRole = typeof RelayMachineRole.Type;
+
+/** Which compute driver created the machine: a Docker container in dev, a Hetzner Cloud server in production. */
+export const RelayMachineComputeKind = Schema.Literals(["docker", "hetzner"]);
+export type RelayMachineComputeKind = typeof RelayMachineComputeKind.Type;
+
+/**
+ * Derived, not stored: deprovisioned when tombstoned, ready once enrolled,
+ * awaiting enrollment from creation until the machine calls home.
+ */
+export const RelayMachineStatus = Schema.Literals([
+  "awaiting_enrollment",
+  "ready",
+  "deprovisioned",
+]);
+export type RelayMachineStatus = typeof RelayMachineStatus.Type;
+
+export const RELAY_MACHINE_LABEL_MAX_LENGTH = 128;
+
+export const RelayMachineLabel = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(RELAY_MACHINE_LABEL_MAX_LENGTH),
+);
+
+export const RelayMachine = Schema.Struct({
+  machineId: RelayMachineId,
+  organizationId: RelayOrganizationId,
+  role: RelayMachineRole,
+  label: RelayMachineLabel,
+  status: RelayMachineStatus,
+  computeKind: RelayMachineComputeKind,
+  /** Set at enrollment; null while the machine has not called home. */
+  environmentId: Schema.NullOr(EnvironmentId),
+  endpoint: Schema.NullOr(RelayManagedEndpoint),
+  createdByUserId: TrimmedNonEmptyString,
+  createdAt: TrimmedNonEmptyString,
+  enrolledAt: Schema.NullOr(TrimmedNonEmptyString),
+  /** After this instant an unenrolled machine can only be deprovisioned and recreated. */
+  seedExpiresAt: TrimmedNonEmptyString,
+  deprovisionedAt: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type RelayMachine = typeof RelayMachine.Type;
+
+export const RelayListMachinesResponse = Schema.Struct({
+  machines: Schema.Array(RelayMachine),
+});
+export type RelayListMachinesResponse = typeof RelayListMachinesResponse.Type;
+
+export const RelayProvisionMachineRequest = Schema.Struct({
+  label: RelayMachineLabel,
+  role: RelayMachineRole,
+});
+export type RelayProvisionMachineRequest = typeof RelayProvisionMachineRequest.Type;
+
+/**
+ * Signed by the machine's own freshly generated environment key. The seed
+ * authenticates the machine to the relay; the signature binds the registered
+ * public key to whoever holds the seed, so the response's credential can only
+ * be used by the key pair that enrolled.
+ */
+export const RelayMachineEnrollProofPayload = Schema.Struct({
+  ...RelaySignedJwtRegisteredClaims,
+  seed: TrimmedNonEmptyString,
+  descriptor: ExecutionEnvironmentDescriptor,
+  environmentId: EnvironmentId,
+  environmentPublicKey: TrimmedNonEmptyString,
+  endpoint: RelayManagedEndpoint,
+  origin: RelayManagedEndpointOrigin,
+});
+export type RelayMachineEnrollProofPayload = typeof RelayMachineEnrollProofPayload.Type;
+
+export const RelayMachineEnrollRequest = Schema.Struct({
+  proof: TrimmedNonEmptyString.annotate({
+    description: "Machine-signed JWT carrying the per-instance enrollment seed.",
+  }),
+}).annotate({
+  description:
+    "Exchanges a provisioned machine's single-use seed for a durable environment credential.",
+});
+export type RelayMachineEnrollRequest = typeof RelayMachineEnrollRequest.Type;
+
+export const RelayMachineEnrollResponse = Schema.Struct({
+  ok: Schema.Boolean,
+  machineId: RelayMachineId,
+  organizationId: RelayOrganizationId,
+  role: RelayMachineRole,
+  environmentId: EnvironmentId,
+  endpoint: RelayManagedEndpoint,
+  endpointRuntime: Schema.NullOr(RelayManagedEndpointRuntimeConfig),
+  relayIssuer: TrimmedNonEmptyString,
+  environmentCredential: TrimmedNonEmptyString,
+  cloudMintPublicKey: TrimmedNonEmptyString,
+});
+export type RelayMachineEnrollResponse = typeof RelayMachineEnrollResponse.Type;
+
+// ---------------------------------------------------------------------------
 // Jobs
 //
 // The relay owns a job's coarse state and nothing finer (ADR-0005). What the
@@ -1721,6 +1926,81 @@ export const RelayRepositoriesGroup = HttpApiGroup.make("repositories")
   .annotate(OpenApi.Description, "Repositories, their canonical keys, and who may work in them.")
   .middleware(RelayClientAuth);
 
+const RelayMachineParams = Schema.Struct({
+  machineId: RelayMachineId,
+});
+
+/**
+ * Machines the organization owns: agent executors and review hosts. Admin
+ * surface — provisioning buys compute and deprovisioning destroys it, so both
+ * require the organization role that owns quota and billing.
+ */
+export const RelayMachinesGroup = HttpApiGroup.make("machines")
+  .add(
+    HttpApiEndpoint.get("listMachines", "/v1/machines", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListMachinesResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "List the organization's machines")
+      .annotate(
+        OpenApi.Description,
+        "Every machine the organization owns, including ones still waiting to enroll and deprovisioned tombstones.",
+      ),
+    HttpApiEndpoint.post("provisionMachine", "/v1/machines", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayProvisionMachineRequest,
+      success: RelayMachine,
+      error: [...RelayTenancyErrors, RelayMachineComputeUnavailableError],
+    })
+      .annotate(OpenApi.Summary, "Provision a machine")
+      .annotate(
+        OpenApi.Description,
+        "Creates the machine record, seeds a single-use enrollment credential into fresh compute, and returns immediately; the machine appears as ready once it enrolls itself.",
+      ),
+    HttpApiEndpoint.delete("deprovisionMachine", "/v1/machines/:machineId", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayMachineParams,
+      success: RelayOkResponse,
+      error: [...RelayTenancyErrors, RelayMachineComputeUnavailableError],
+    })
+      .annotate(OpenApi.Summary, "Deprovision a machine")
+      .annotate(
+        OpenApi.Description,
+        "Revokes the machine's credentials, releases its managed endpoint, and destroys its compute. Until the event mirror exists, thread history held on the machine is destroyed with it.",
+      ),
+  )
+  .annotate(OpenApi.Description, "Relay-provisioned machines: agent executors and review hosts.")
+  .middleware(RelayClientAuth);
+
+const RelayMachineEnrollErrors = [
+  RelayMachineEnrollProofInvalidError,
+  RelayMachineEnrollFailedError,
+  RelayMachineEnrollUnavailableError,
+  RelayInternalError,
+] as const;
+
+/**
+ * Deliberately unauthenticated as a group: the caller is a machine that owns
+ * nothing but its seed, and the seed is the credential (ADR-0002). While the
+ * relay runs on Cloudflare Workers this endpoint cannot be network-restricted;
+ * the single-use, expiring seed plus the machine-signed proof is the control.
+ */
+export const RelayMachineEnrollmentGroup = HttpApiGroup.make("machineEnrollment")
+  .add(
+    HttpApiEndpoint.post("enrollMachine", "/v1/machines/enroll", {
+      payload: RelayMachineEnrollRequest,
+      success: RelayMachineEnrollResponse,
+      error: RelayMachineEnrollErrors,
+    })
+      .annotate(OpenApi.Summary, "Enroll a provisioned machine")
+      .annotate(
+        OpenApi.Description,
+        "A freshly provisioned machine presents its seeded credential exactly once and receives its durable environment credential and managed endpoint.",
+      ),
+  )
+  .annotate(OpenApi.Description, "Seeded enrollment for relay-provisioned machines.");
+
 export const RelayDpopClientGroup = HttpApiGroup.make("dpopClient")
   .add(RelayConnectEnvironmentEndpoint, RelayGetEnvironmentStatusEndpoint)
   .annotate(OpenApi.Description, "DPoP-authenticated client access to linked environments.")
@@ -1753,6 +2033,8 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayClientGroup,
     RelayOrganizationGroup,
     RelayRepositoriesGroup,
+    RelayMachinesGroup,
+    RelayMachineEnrollmentGroup,
     RelayTokenGroup,
     RelayDpopClientGroup,
     RelayJobsGroup,

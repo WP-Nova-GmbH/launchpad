@@ -18,6 +18,7 @@ import * as EnvironmentCredentials from "./EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "./EnvironmentLinks.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as EnvironmentLinker from "./EnvironmentLinker.ts";
+import * as Machines from "../machines/Machines.ts";
 import * as ManagedEndpointProvider from "./ManagedEndpointProvider.ts";
 
 const relayKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
@@ -107,16 +108,31 @@ const makeRequest = Effect.gen(function* () {
   };
 });
 
+const unexpectedMachineCall = () => Effect.die("unexpected machine store call");
+
 function testLayer(input?: {
   readonly upsert?: EnvironmentLinks.EnvironmentLinks["Service"]["upsert"];
   readonly consume?: DpopProofs.DpopProofReplay["Service"]["consume"];
   readonly deprovision?: ManagedEndpointProvider.ManagedEndpointProvider["Service"]["deprovision"];
+  readonly getActiveByEnvironmentId?: Machines.Machines["Service"]["getActiveByEnvironmentId"];
 }) {
   return EnvironmentLinker.layer.pipe(
     Layer.provideMerge(RelayTokens.layer),
     Layer.provide(
       Layer.mergeAll(
         RelayConfiguration.layer(config),
+        Layer.succeed(Machines.Machines, {
+          create: unexpectedMachineCall,
+          getById: unexpectedMachineCall,
+          listForOrganization: unexpectedMachineCall,
+          countActiveForOrganization: unexpectedMachineCall,
+          getBySeedHash: unexpectedMachineCall,
+          getActiveByEnvironmentId: input?.getActiveByEnvironmentId ?? (() => Effect.succeed(null)),
+          recordComputeRef: unexpectedMachineCall,
+          claimEnrollment: unexpectedMachineCall,
+          deprovision: unexpectedMachineCall,
+          remove: unexpectedMachineCall,
+        }),
         Layer.succeed(DpopProofs.DpopProofReplay, {
           verifyAndConsume: () => Effect.die("unexpected DPoP proof verification"),
           consume: input?.consume ?? (() => Effect.succeed(true)),
@@ -176,6 +192,40 @@ describe("EnvironmentLinker", () => {
       ),
     );
   });
+
+  it.effect("refuses to link an environment that is an enrolled machine", () =>
+    Effect.gen(function* () {
+      const { request } = yield* makeRequest;
+      const linker = yield* EnvironmentLinker.EnvironmentLinker;
+      const error = yield* Effect.flip(linker.link({ userId: "user_123", request }));
+      expect(isEnvironmentLinkProofInvalid(error)).toBe(true);
+      expect(isEnvironmentLinkProofInvalid(error) && error.reason).toBe("environment_is_machine");
+    }).pipe(
+      Effect.provide(
+        testLayer({
+          getActiveByEnvironmentId: ({ environmentId }) =>
+            Effect.succeed({
+              machineId: "machine-1",
+              organizationId: "organization-1",
+              role: "agent_executor" as const,
+              label: "Executor 1",
+              computeKind: "docker" as const,
+              computeRef: "container-1",
+              seedExpiresAt: "2100-01-01T00:00:00.000Z",
+              environmentId,
+              environmentPublicKey: environmentKeyPair.publicKey.trim(),
+              endpointHttpBaseUrl: null,
+              endpointWsBaseUrl: null,
+              endpointProviderKind: null,
+              createdByUserId: "user_admin",
+              enrolledAt: "2026-08-19T00:00:00.000Z",
+              deprovisionedAt: null,
+              createdAt: "2026-08-19T00:00:00.000Z",
+            }),
+        }),
+      ),
+    ),
+  );
 
   it.effect("links a publish-only environment with a non-secure nominal endpoint", () => {
     let persistedEndpoint: string | null = null;

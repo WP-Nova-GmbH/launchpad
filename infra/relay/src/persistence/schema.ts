@@ -3,6 +3,8 @@ import type {
   RelayAgentActivityState,
   RelayAgentAwarenessPreferences,
   RelayJobStatus,
+  RelayMachineComputeKind,
+  RelayMachineRole,
   RelayOrgRole,
   RelayRepositoryRole,
 } from "@t3tools/contracts/relay";
@@ -99,6 +101,62 @@ export const relayGithubInstallations = pgTable(
     uniqueIndex("idx_relay_github_installations_installation").on(table.installationId),
   ],
 );
+
+/**
+ * A machine the relay provisioned for one organization (ADR-0002): an agent
+ * executor or a review host — a role column, not a machine kind (ADR-0010).
+ *
+ * Only the enrollment seed's hash is stored, like invitation tokens: the seed
+ * is injected into the machine's compute at creation and the relay has no
+ * reason to reproduce it. Status is derived, never stored: `deprovisioned_at`
+ * set means deprovisioned, `enrolled_at` set means ready, neither means the
+ * machine has not called home yet.
+ */
+export const relayMachines = pgTable(
+  "relay_machines",
+  {
+    machineId: varchar("machine_id", { length: 64 }).primaryKey(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    role: varchar("role", { length: 32 }).notNull().$type<RelayMachineRole>(),
+    label: text("label").notNull(),
+    computeKind: varchar("compute_kind", { length: 32 }).notNull().$type<RelayMachineComputeKind>(),
+    // The driver's handle on the compute (container id, Hetzner server id).
+    // Null only in the window between record creation and driver success.
+    computeRef: varchar("compute_ref", { length: 191 }),
+    seedHash: varchar("seed_hash", { length: 191 }).notNull(),
+    seedExpiresAt: varchar("seed_expires_at", { length: 64 }).notNull(),
+    // The environment identity the machine generated for itself, recorded at
+    // enrollment. These anchor the machine's environment credential exactly as
+    // an active link row anchors a personal one.
+    environmentId: varchar("environment_id", { length: 191 }),
+    environmentPublicKey: text("environment_public_key"),
+    endpointHttpBaseUrl: text("endpoint_http_base_url"),
+    endpointWsBaseUrl: text("endpoint_ws_base_url"),
+    endpointProviderKind: varchar("endpoint_provider_kind", { length: 32 }),
+    createdByUserId: varchar("created_by_user_id", { length: 191 }).notNull(),
+    enrolledAt: varchar("enrolled_at", { length: 64 }),
+    deprovisionedAt: varchar("deprovisioned_at", { length: 64 }),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_relay_machines_seed_hash").on(table.seedHash),
+    index("idx_relay_machines_organization").on(table.organizationId, table.createdAt),
+    index("idx_relay_machines_environment").on(table.environmentId, table.deprovisionedAt),
+  ],
+);
+
+/**
+ * One shared per-organization machine quota across both roles, the billing
+ * lever for "buy managed machines". A row overrides the default; splitting the
+ * quota per role later is a WHERE clause, not a migration.
+ */
+export const relayOrganizationMachineLimits = pgTable("relay_organization_machine_limits", {
+  organizationId: varchar("organization_id", { length: 64 }).primaryKey(),
+  maxMachines: integer("max_machines").notNull(),
+  createdAt: varchar("created_at", { length: 64 }).notNull(),
+  updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+});
 
 export const relayRepositories = pgTable(
   "relay_repositories",

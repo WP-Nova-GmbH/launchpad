@@ -17,6 +17,7 @@ import * as Schema from "effect/Schema";
 
 import * as DpopProofs from "../auth/DpopProofs.ts";
 import * as RelayTokens from "../auth/RelayTokens.ts";
+import * as Machines from "../machines/Machines.ts";
 import * as EnvironmentCredentials from "./EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "./EnvironmentLinks.ts";
 import * as ManagedEndpointProvider from "./ManagedEndpointProvider.ts";
@@ -51,6 +52,7 @@ export class EnvironmentLinkProofInvalid extends Schema.TaggedErrorClass<Environ
       "validate_expiration",
       "consume_proof_nonce",
       "consume_challenge_nonce",
+      "verify_environment_not_machine",
       "validate_origin",
       "validate_endpoint",
     ]),
@@ -68,6 +70,7 @@ export type EnvironmentLinkError =
   | DpopProofs.DpopProofReplayPersistenceError
   | EnvironmentLinks.EnvironmentLinkUpsertPersistenceError
   | EnvironmentCredentials.EnvironmentCredentialCreatePersistenceError
+  | Machines.MachinePersistenceError
   | ManagedEndpointProvider.ManagedEndpointProviderError;
 
 export class EnvironmentLinker extends Context.Service<
@@ -138,6 +141,7 @@ function isLoopbackManagedTunnelOrigin(
 const make = Effect.gen(function* () {
   const links = yield* EnvironmentLinks.EnvironmentLinks;
   const credentials = yield* EnvironmentCredentials.EnvironmentCredentials;
+  const machines = yield* Machines.Machines;
   const managedEndpointProvider = yield* ManagedEndpointProvider.ManagedEndpointProvider;
   const proofReplay = yield* DpopProofs.DpopProofReplay;
   const relayTokens = yield* RelayTokens.RelayTokens;
@@ -277,6 +281,21 @@ const make = Effect.gen(function* () {
           environmentId: verified.environmentId,
           reason: "challenge_invalid",
           stage: "consume_challenge_nonce",
+        });
+      }
+      // An enrolled machine is org-owned, single-tenant compute (ADR-0002).
+      // Linking one as a personal environment would hand a member a private
+      // door into it, so the two trust paths stay disjoint in both directions
+      // — the enroller refuses linked environments the same way.
+      const enrolledMachine = yield* machines.getActiveByEnvironmentId({
+        environmentId: verified.environmentId,
+      });
+      if (enrolledMachine !== null) {
+        return yield* new EnvironmentLinkProofInvalid({
+          userId: input.userId,
+          environmentId: verified.environmentId,
+          reason: "environment_is_machine",
+          stage: "verify_environment_not_machine",
         });
       }
       if (input.request.managedTunnelsEnabled && !isLoopbackManagedTunnelOrigin(verified.origin)) {

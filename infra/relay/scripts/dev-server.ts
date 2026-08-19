@@ -52,6 +52,7 @@ import {
   serverApi,
   tokenApi,
 } from "../src/http/Api.ts";
+import { machineEnrollmentApi, machinesApi } from "../src/http/MachinesApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
 import * as AgentActivityRows from "../src/agentActivity/AgentActivityRows.ts";
@@ -73,6 +74,10 @@ import * as LiveActivities from "../src/agentActivity/LiveActivities.ts";
 import * as ManagedEndpointAllocations from "../src/environments/ManagedEndpointAllocations.ts";
 import * as ManagedEndpointProvider from "../src/environments/ManagedEndpointProvider.ts";
 import * as ManagedTunnelLimits from "../src/environments/ManagedTunnelLimits.ts";
+import * as MachineComputeProvider from "../src/machines/MachineComputeProvider.ts";
+import * as MachineEnroller from "../src/machines/MachineEnroller.ts";
+import * as MachineLimits from "../src/machines/MachineLimits.ts";
+import * as Machines from "../src/machines/Machines.ts";
 import * as MobileRegistrations from "../src/agentActivity/MobileRegistrations.ts";
 import * as Organizations from "../src/tenancy/Organizations.ts";
 import * as RelayConfiguration from "../src/Config.ts";
@@ -178,6 +183,10 @@ const runtimeLayer = Layer.empty
     Layer.provideMerge(AgentActivityPublisher.layer),
     Layer.provideMerge(EnvironmentConnector.layer),
     Layer.provideMerge(EnvironmentLinker.layer),
+    Layer.provideMerge(MachineEnroller.layer),
+    // The Docker driver replaces this when dev-mode machine provisioning lands.
+    Layer.provideMerge(MachineComputeProvider.layerUnavailable),
+    Layer.provideMerge(MachineLimits.layer),
     Layer.provideMerge(EnvironmentPublishSignatures.layer),
     Layer.provideMerge(
       ManagedEndpointProvider.layer.pipe(
@@ -212,6 +221,7 @@ const runtimeLayer = Layer.empty
         UserDirectory.layer,
         GithubApp.layer,
         GithubInstallations.layer,
+        Machines.layer,
       ),
     ),
     Layer.provideMerge(Devices.layer),
@@ -242,6 +252,8 @@ const relayApiLayer = Layer.mergeAll(
   clientApi,
   organizationApi,
   repositoriesApi,
+  machinesApi,
+  machineEnrollmentApi,
   tokenApi,
   dpopClientApi,
   jobsApi,

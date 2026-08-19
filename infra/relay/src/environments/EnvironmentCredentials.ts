@@ -6,11 +6,15 @@ import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { and, eq, exists, isNull, ne, notExists } from "drizzle-orm";
+import { and, eq, exists, isNull, ne, notExists, or } from "drizzle-orm";
 import { QueryBuilder } from "drizzle-orm/pg-core";
 
 import * as RelayDb from "../db.ts";
-import { relayEnvironmentCredentials, relayEnvironmentLinks } from "../persistence/schema.ts";
+import {
+  relayEnvironmentCredentials,
+  relayEnvironmentLinks,
+  relayMachines,
+} from "../persistence/schema.ts";
 
 export class EnvironmentCredentialCreatePersistenceError extends Schema.TaggedErrorClass<EnvironmentCredentialCreatePersistenceError>()(
   "EnvironmentCredentialCreatePersistenceError",
@@ -197,23 +201,44 @@ const make = Effect.gen(function* () {
           and(
             eq(relayEnvironmentCredentials.credentialHash, credentialHash),
             isNull(relayEnvironmentCredentials.revokedAt),
-            exists(
-              new QueryBuilder()
-                .select({ userId: relayEnvironmentLinks.userId })
-                .from(relayEnvironmentLinks)
-                .where(
-                  and(
-                    eq(
-                      relayEnvironmentLinks.environmentId,
-                      relayEnvironmentCredentials.environmentId,
+            // A credential is only as alive as what anchors it: an active link
+            // for a personal environment, or an active machine for an enrolled
+            // one. Revoking the anchor kills the credential without a second
+            // write.
+            or(
+              exists(
+                new QueryBuilder()
+                  .select({ userId: relayEnvironmentLinks.userId })
+                  .from(relayEnvironmentLinks)
+                  .where(
+                    and(
+                      eq(
+                        relayEnvironmentLinks.environmentId,
+                        relayEnvironmentCredentials.environmentId,
+                      ),
+                      eq(
+                        relayEnvironmentLinks.environmentPublicKey,
+                        relayEnvironmentCredentials.environmentPublicKey,
+                      ),
+                      isNull(relayEnvironmentLinks.revokedAt),
                     ),
-                    eq(
-                      relayEnvironmentLinks.environmentPublicKey,
-                      relayEnvironmentCredentials.environmentPublicKey,
-                    ),
-                    isNull(relayEnvironmentLinks.revokedAt),
                   ),
-                ),
+              ),
+              exists(
+                new QueryBuilder()
+                  .select({ machineId: relayMachines.machineId })
+                  .from(relayMachines)
+                  .where(
+                    and(
+                      eq(relayMachines.environmentId, relayEnvironmentCredentials.environmentId),
+                      eq(
+                        relayMachines.environmentPublicKey,
+                        relayEnvironmentCredentials.environmentPublicKey,
+                      ),
+                      isNull(relayMachines.deprovisionedAt),
+                    ),
+                  ),
+              ),
             ),
           ),
         )
@@ -265,6 +290,21 @@ const make = Effect.gen(function* () {
                     eq(relayEnvironmentLinks.environmentId, input.environmentId),
                     eq(relayEnvironmentLinks.environmentPublicKey, input.environmentPublicKey),
                     isNull(relayEnvironmentLinks.revokedAt),
+                  ),
+                ),
+            ),
+            // An active machine keeps its credential exactly like an active
+            // link does; machine deprovision tombstones the machine before
+            // calling this, at which point the guard no longer holds it back.
+            notExists(
+              new QueryBuilder()
+                .select({ machineId: relayMachines.machineId })
+                .from(relayMachines)
+                .where(
+                  and(
+                    eq(relayMachines.environmentId, input.environmentId),
+                    eq(relayMachines.environmentPublicKey, input.environmentPublicKey),
+                    isNull(relayMachines.deprovisionedAt),
                   ),
                 ),
             ),

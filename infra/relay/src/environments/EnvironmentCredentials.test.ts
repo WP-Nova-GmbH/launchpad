@@ -232,7 +232,13 @@ describe("EnvironmentCredentials", () => {
       expect(query.sql).toContain('"relay_environment_links"."environment_id" = $3');
       expect(query.sql).toContain('"relay_environment_links"."environment_public_key" = $4');
       expect(query.sql).toContain('"relay_environment_links"."revoked_at" is null');
+      // An active machine anchors a credential exactly like an active link.
+      expect(query.sql).toContain('"relay_machines"."environment_id" = $5');
+      expect(query.sql).toContain('"relay_machines"."environment_public_key" = $6');
+      expect(query.sql).toContain('"relay_machines"."deprovisioned_at" is null');
       expect(query.params).toEqual([
+        "env_test",
+        "environment-public-key",
         "env_test",
         "environment-public-key",
         "env_test",
