@@ -2,9 +2,11 @@ import { describe, expect, it } from "vite-plus/test";
 import type { RelayMachine, RelayRepositorySummary } from "@t3tools/contracts/relay";
 
 import {
-  machineStatusLabel,
+  hasMachineSettingUp,
+  machineStatusPresentation,
   memberLabel,
   unregisteredCheckouts,
+  visibleMachines,
   type CheckoutLike,
 } from "./OrganizationSettings.logic";
 
@@ -101,7 +103,7 @@ describe("memberLabel", () => {
   });
 });
 
-describe("machineStatusLabel", () => {
+describe("machineStatusPresentation", () => {
   const machine = (overrides: Partial<RelayMachine>): RelayMachine =>
     ({
       machineId: "machine-1",
@@ -121,22 +123,57 @@ describe("machineStatusLabel", () => {
     }) as RelayMachine;
   const now = Date.parse("2026-08-19T12:00:00.000Z");
 
-  it("labels the lifecycle states", () => {
-    expect(machineStatusLabel(machine({}), now)).toBe("Waiting to enroll");
+  it("labels the lifecycle states in the app's status-dot vocabulary", () => {
+    const settingUp = machineStatusPresentation(machine({}), now);
+    expect(settingUp.label).toBe("Setting up");
+    expect(settingUp.dotClassName).toBe("bg-warning");
+    expect(settingUp.pingClassName).not.toBeNull();
+
+    const ready = machineStatusPresentation(
+      machine({ status: "ready", enrolledAt: "2026-08-19T01:00:00.000Z" }),
+      now,
+    );
+    expect(ready.label).toBe("Ready");
+    expect(ready.dotClassName).toBe("bg-success");
+    expect(ready.pingClassName).toBeNull();
+
     expect(
-      machineStatusLabel(machine({ status: "ready", enrolledAt: "2026-08-19T01:00:00.000Z" }), now),
-    ).toBe("Ready");
-    expect(
-      machineStatusLabel(
+      machineStatusPresentation(
         machine({ status: "deprovisioned", deprovisionedAt: "2026-08-19T02:00:00.000Z" }),
         now,
-      ),
-    ).toBe("Deprovisioned");
+      ).label,
+    ).toBe("Destroyed");
   });
 
-  it("calls out a machine whose enrollment window already closed", () => {
-    expect(machineStatusLabel(machine({ seedExpiresAt: "2026-08-19T00:30:00.000Z" }), now)).toBe(
-      "Enrollment expired",
+  it("marks an expired enrollment as a failure and says what to do", () => {
+    const expired = machineStatusPresentation(
+      machine({ seedExpiresAt: "2026-08-19T00:30:00.000Z" }),
+      now,
     );
+    expect(expired.label).toBe("Enrollment expired");
+    expect(expired.dotClassName).toBe("bg-destructive");
+    expect(expired.pingClassName).toBeNull();
+    expect(expired.guidance).toContain("Destroy it");
+  });
+
+  it("hides destroyed machines from the visible list", () => {
+    const destroyed = machine({
+      status: "deprovisioned",
+      deprovisionedAt: "2026-08-19T02:00:00.000Z",
+    });
+    expect(visibleMachines([machine({}), destroyed])).toHaveLength(1);
+  });
+
+  it("reports a machine still inside its enrollment window as setting up", () => {
+    expect(hasMachineSettingUp([machine({})], now)).toBe(true);
+    expect(hasMachineSettingUp([machine({ seedExpiresAt: "2026-08-19T00:30:00.000Z" })], now)).toBe(
+      false,
+    );
+    expect(
+      hasMachineSettingUp(
+        [machine({ status: "ready", enrolledAt: "2026-08-19T01:00:00.000Z" })],
+        now,
+      ),
+    ).toBe(false);
   });
 });

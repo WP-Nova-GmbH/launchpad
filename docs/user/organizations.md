@@ -80,13 +80,14 @@ in a later release. Only admins provision and remove them; every member can see 
 
 Provisioning takes a name and a role. The machine sets itself up and reports in on its own —
 nobody signs in on it, and it can never be linked as somebody's personal environment. Until it
-does, it shows as **Waiting to enroll**; if it never manages to within a day, it shows as
-**Enrollment expired** and the only fix is to remove it and provision a fresh one.
+does, it shows as **Setting up** and the list refreshes itself; if it never manages to report in
+within a day, it shows as **Enrollment expired** and the only fix is to destroy it and provision a
+fresh one.
 
 Once a machine is **Ready**, it appears to every member of the organization alongside their own
 environments, so you can open projects and threads on it from any client, exactly as you would on
 a machine of your own.
 
-Removing a machine destroys it, including any projects and thread history it holds — which is why
-the trash can asks for a second, labelled click. The organization has a limit on how many machines
-it can hold at once; ask us to raise it when you hit it.
+Destroying a machine destroys everything on it, including any projects and thread history it
+holds — which is why the trash can asks for a second, labelled click. The organization has a limit
+on how many machines it can hold at once; ask us to raise it when you hit it.

@@ -6,8 +6,7 @@ import {
   TrashIcon,
   UsersIcon,
 } from "lucide-react";
-import { useEffect } from "react";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   RelayInvitation,
   RelayMachine,
@@ -21,6 +20,7 @@ import type {
 } from "@t3tools/contracts/relay";
 
 import { GitHubIcon } from "../Icons";
+import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useProjects } from "../../state/entities";
 import { useOrganizationAdmin, type OrganizationAdminState } from "../../cloud/organizationAdmin";
@@ -32,11 +32,18 @@ import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Spinner } from "../ui/spinner";
 import {
-  machineStatusLabel,
+  hasMachineSettingUp,
+  machineStatusPresentation,
   memberLabel,
   unregisteredCheckouts,
+  visibleMachines,
 } from "./OrganizationSettings.logic";
-import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
+import {
+  SettingsPageContainer,
+  SettingsRow,
+  SettingsSection,
+  useRelativeTimeTick,
+} from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 
 const ORG_ROLE_LABELS: Readonly<Record<RelayOrgRole, string>> = {
@@ -201,7 +208,7 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
                       });
                     }}
                   >
-                    <SelectTrigger className="w-32" aria-label={`Role for ${member.userId}`}>
+                    <SelectTrigger className="w-32" aria-label={`Role for ${label.primary}`}>
                       <SelectValue>{ORG_ROLE_LABELS[member.role]}</SelectValue>
                     </SelectTrigger>
                     <SelectPopup align="end" alignItemWithTrigger={false}>
@@ -216,7 +223,7 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
                   <Button
                     size="icon-sm"
                     variant="ghost"
-                    aria-label={`Remove ${member.userId}`}
+                    aria-label={`Remove ${label.primary}`}
                     disabled={state.busy}
                     onClick={() => void state.removeMember(member.userId)}
                   >
@@ -760,12 +767,20 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
   );
 }
 
-function MachineRow({ machine, state }: { machine: RelayMachine; state: OrganizationAdminState }) {
-  // Deprovisioning destroys thread history on the machine, so the trash icon
+function MachineRow({
+  machine,
+  state,
+  nowMs,
+}: {
+  machine: RelayMachine;
+  state: OrganizationAdminState;
+  nowMs: number;
+}) {
+  // Destroying a machine destroys thread history on it, so the trash icon
   // arms a second, labeled click instead of acting immediately.
   const [confirming, setConfirming] = useState(false);
   const isAdmin = state.snapshot?.membership.role === "admin";
-  const status = machineStatusLabel(machine, Date.now());
+  const status = machineStatusPresentation(machine, nowMs);
   const endpointHost = machine.endpoint ? new URL(machine.endpoint.httpBaseUrl).host : null;
   const timeline =
     machine.status === "ready" && machine.enrolledAt
@@ -781,14 +796,18 @@ function MachineRow({ machine, state }: { machine: RelayMachine; state: Organiza
         </span>
       }
       description={endpointHost ? `${timeline} · ${endpointHost}` : timeline}
+      status={
+        status.guidance ? <span className="block text-destructive">{status.guidance}</span> : null
+      }
       control={
         <div className="flex items-center gap-2">
-          <Badge
-            variant={machine.status === "ready" ? "secondary" : "outline"}
-            className="font-normal"
-          >
-            {status}
-          </Badge>
+          <span className="flex items-center gap-1.5 text-[13px] text-muted-foreground">
+            <ConnectionStatusDot
+              dotClassName={status.dotClassName}
+              pingClassName={status.pingClassName}
+            />
+            {status.label}
+          </span>
           {isAdmin && machine.status !== "deprovisioned" ? (
             confirming ? (
               <Button
@@ -807,7 +826,7 @@ function MachineRow({ machine, state }: { machine: RelayMachine; state: Organiza
               <Button
                 size="icon-sm"
                 variant="ghost"
-                aria-label={`Deprovision ${machine.label}`}
+                aria-label={`Destroy ${machine.label}`}
                 disabled={state.busy}
                 onClick={() => setConfirming(true)}
               >
@@ -825,6 +844,21 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
   const [label, setLabel] = useState("");
   const [role, setRole] = useState<RelayMachineRole>("agent_executor");
+  // A machine flips to ready on its own within a couple of minutes of being
+  // provisioned. While one is in that window, the list keeps itself fresh —
+  // asking the admin to reload the page would make the product look stuck.
+  const nowMs = useRelativeTimeTick(30_000);
+  const machines = visibleMachines(snapshot?.machines ?? []);
+  const settingUp = hasMachineSettingUp(machines, nowMs);
+  const { busy, loading, refresh } = state;
+  useEffect(() => {
+    if (!settingUp) return;
+    const id = setInterval(() => {
+      if (busy || loading) return;
+      void refresh();
+    }, 10_000);
+    return () => clearInterval(id);
+  }, [busy, loading, refresh, settingUp]);
 
   if (!snapshot) return null;
   const isAdmin = snapshot.membership.role === "admin";
@@ -836,12 +870,12 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
       icon={<ServerIcon className="size-4 text-muted-foreground" />}
     >
       <SectionNote>
-        Machines are compute this organization buys through the relay: agent executors run work,
-        review hosts will run review apps. A provisioned machine enrolls itself and then appears to
-        every member beside their own environments. Deprovisioning destroys the machine and any
-        thread history it holds.
+        Machines are computers this organization buys through T3 Connect: agent executors run work,
+        review hosts will run review apps. A provisioned machine sets itself up and then appears to
+        every member beside their own environments. Destroying one also destroys any thread history
+        it holds.
       </SectionNote>
-      {snapshot.machines.length === 0 ? (
+      {machines.length === 0 ? (
         <Empty className="min-h-48">
           <EmptyMedia variant="icon">
             <ServerIcon />
@@ -849,20 +883,20 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
           <EmptyHeader>
             <EmptyTitle>No machines yet</EmptyTitle>
             <EmptyDescription>
-              Provision one and it enrolls itself with this organization — nobody signs in on it,
-              and it can never be linked as somebody&apos;s personal environment.
+              Provision one and it joins this organization on its own — nobody signs in on it, and
+              it can never be linked as somebody&apos;s personal environment.
             </EmptyDescription>
           </EmptyHeader>
         </Empty>
       ) : (
-        snapshot.machines.map((machine) => (
-          <MachineRow key={machine.machineId} machine={machine} state={state} />
+        machines.map((machine) => (
+          <MachineRow key={machine.machineId} machine={machine} state={state} nowMs={nowMs} />
         ))
       )}
       {isAdmin ? (
         <SettingsRow
           title="Provision a machine"
-          description="Creates fresh compute with a single-use enrollment credential; it appears as ready once it calls home."
+          description="Creates a fresh machine that sets itself up and calls home on its own — usually within a couple of minutes. Review hosts sit idle until review apps ship."
           control={
             <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
               <Input
@@ -938,6 +972,14 @@ function OrganizationSettingsNotice({ title, children }: { title: string; childr
  */
 function ConfiguredOrganizationSettings() {
   const state = useOrganizationAdmin();
+  // The alert sits at the top of a long page while the action that failed may
+  // be at the bottom. Bring the message to the person instead of hoping they
+  // scroll up to look for one.
+  const error = state.error;
+  const errorRef = useRef<HTMLParagraphElement | null>(null);
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView({ block: "nearest" });
+  }, [error]);
 
   if (!state.isSignedIn) {
     return (
@@ -950,7 +992,7 @@ function ConfiguredOrganizationSettings() {
   return (
     <SettingsPageContainer>
       {state.error ? (
-        <p role="alert" className="px-3 text-sm text-destructive sm:px-4">
+        <p ref={errorRef} role="alert" className="px-3 text-sm text-destructive sm:px-4">
           {state.error}
         </p>
       ) : null}

@@ -172,7 +172,16 @@ export function relayProtectedErrorMessage(error: RelayProtectedErrorType): stri
     case "RelayTenancyNotFoundError":
       return `Relay could not find the organization record (${error.reason}).`;
     case "RelayTenancyConflictError":
-      return `Relay refused the organization change because it conflicts with existing state (${error.reason}).`;
+      // The reason codes a person can act on get plain sentences; the rest
+      // keep the code so a report stays diagnosable.
+      switch (error.reason) {
+        case "machine_limit_reached":
+          return "This organization already holds its maximum number of machines. Destroy one to free a slot, or ask us to raise the limit.";
+        case "machine_deprovisioned":
+          return "That machine was already destroyed.";
+        default:
+          return `Relay refused the organization change because it conflicts with existing state (${error.reason}).`;
+      }
     case "RelayMachineEnrollProofInvalidError":
       return `Relay rejected the machine enrollment proof (${error.reason}).`;
     case "RelayMachineEnrollFailedError":

@@ -37,23 +37,75 @@ export function unregisteredCheckouts(
   return [...byKey].map(([canonicalKey, suggestedName]) => ({ canonicalKey, suggestedName }));
 }
 
+export interface MachineStatusPresentation {
+  readonly label: string;
+  /** Dot color, in the same vocabulary `ConnectionStatusDot` uses everywhere else. */
+  readonly dotClassName: string;
+  /** Ping halo for the one transitional state; null renders no ping. */
+  readonly pingClassName: string | null;
+  /** What to do about it, when the status is a dead end rather than a phase. */
+  readonly guidance: string | null;
+}
+
 /**
  * What a machine's status means to a person looking at the list. The relay
  * derives the coarse status; the one nuance added here is that a machine
  * still waiting past its seed's expiry can never enroll and needs to be
- * deprovisioned and recreated.
+ * destroyed and recreated — which is why that state gets guidance and the
+ * failure color, not another neutral label.
  */
-export function machineStatusLabel(machine: RelayMachine, nowMs: number): string {
+export function machineStatusPresentation(
+  machine: RelayMachine,
+  nowMs: number,
+): MachineStatusPresentation {
   switch (machine.status) {
     case "deprovisioned":
-      return "Deprovisioned";
+      return {
+        label: "Destroyed",
+        dotClassName: "bg-muted-foreground/40",
+        pingClassName: null,
+        guidance: null,
+      };
     case "ready":
-      return "Ready";
+      return { label: "Ready", dotClassName: "bg-success", pingClassName: null, guidance: null };
     case "awaiting_enrollment":
       return Date.parse(machine.seedExpiresAt) <= nowMs
-        ? "Enrollment expired"
-        : "Waiting to enroll";
+        ? {
+            label: "Enrollment expired",
+            dotClassName: "bg-destructive",
+            pingClassName: null,
+            guidance:
+              "This machine never called home and no longer can. Destroy it and provision a fresh one.",
+          }
+        : {
+            label: "Setting up",
+            dotClassName: "bg-warning",
+            pingClassName: "bg-warning/60 duration-2000",
+            guidance: null,
+          };
   }
+}
+
+/**
+ * The machines worth a row. A destroyed machine is gone — its record survives
+ * in the relay, but a settings list that only ever grows would bury the
+ * machines that exist under the ones that no longer do.
+ */
+export function visibleMachines(
+  machines: ReadonlyArray<RelayMachine>,
+): ReadonlyArray<RelayMachine> {
+  return machines.filter((machine) => machine.status !== "deprovisioned");
+}
+
+/**
+ * Whether any machine may still flip to ready on its own — the condition for
+ * the list refreshing itself instead of asking the admin to reload.
+ */
+export function hasMachineSettingUp(machines: ReadonlyArray<RelayMachine>, nowMs: number): boolean {
+  return machines.some(
+    (machine) =>
+      machine.status === "awaiting_enrollment" && Date.parse(machine.seedExpiresAt) > nowMs,
+  );
 }
 
 export interface IdentifiedUser {
