@@ -14,7 +14,7 @@ describe("Pierre file icons", () => {
     assert.equal(resolvePierreIconForEntry("vite.config.ts", "file")?.token, "vite");
   });
 
-  it("extends Pierre with T3-specific exact filename icons", () => {
+  it("extends Pierre with Launchpad-specific exact filename icons", () => {
     assert.equal(
       resolvePierreIconForEntry("package.json", "file")?.name,
       "t3-file-icon-package-json",

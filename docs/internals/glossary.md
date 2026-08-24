@@ -1,8 +1,8 @@
 # Glossary
 
-> For maintainers. Using T3 Code? See [docs/user](../user/).
+> For maintainers. Using Launchpad? See [docs/user](../user/).
 
-This is a living glossary for T3 Code. It explains what common terms mean in this codebase.
+This is a living glossary for Launchpad. It explains what common terms mean in this codebase.
 
 ## Table of contents
 
@@ -149,7 +149,7 @@ environment, which owns execution.
 
 #### Relay
 
-The cloud control plane, in `infra/relay`. Users know it as **T3 Connect**. It brokers
+The cloud control plane, in `infra/relay`. Users know it as **Launchpad Connect**. It brokers
 connectivity between clients and environments, and is becoming the owner of
 organization-scoped data. _Avoid_: "the backend", "the server" — [server](#server) already
 means something else.

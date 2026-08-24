@@ -130,7 +130,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     ): Promise<A> => {
       const clerkToken = await getToken(resolveRelayClerkTokenOptions());
       if (!clerkToken) {
-        throw new Error("Sign in to T3 Connect first.");
+        throw new Error("Sign in to Launchpad Connect first.");
       }
       return runtime.runPromise(
         ManagedRelayTenancy.ManagedRelayTenancyClient.pipe(

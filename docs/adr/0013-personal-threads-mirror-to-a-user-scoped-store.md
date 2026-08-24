@@ -19,7 +19,7 @@ ownership.
 | on offboarding     | stays with the organization                  | leaves with the user, or is deleted |
 | enabled            | always, for executors                        | **opt-in per project**              |
 
-A person has **one** T3 install. The organization's repository, a side project, and possibly work
+A person has **one** Launchpad install. The organization's repository, a side project, and possibly work
 for another client all produce threads in the same `state.sqlite`. A shared store — or a rule that
 classifies visibility by whether the repository happens to be registered — puts that material in
 front of their employer. Registration state is also the worst possible basis for a privacy

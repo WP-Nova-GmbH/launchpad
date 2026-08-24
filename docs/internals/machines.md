@@ -1,6 +1,6 @@
 # Machines
 
-> For maintainers. Using T3 Code? See [docs/user](../user/).
+> For maintainers. Using Launchpad? See [docs/user](../user/).
 
 A machine is compute the relay provisions for exactly one organization: an **agent
 executor** that runs work, or a **review host** that will run review apps — one

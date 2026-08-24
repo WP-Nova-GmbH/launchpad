@@ -1,6 +1,6 @@
 # Tenancy
 
-> For maintainers. Using T3 Code? See [docs/user](../user/).
+> For maintainers. Using Launchpad? See [docs/user](../user/).
 
 Organizations, membership, roles, repositories, and invitations live in the relay's own database.
 Clerk provides **authentication only** — a sign-in and a verified subject id. Nothing about tenancy

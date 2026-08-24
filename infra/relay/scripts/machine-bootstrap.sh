@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Bootstraps a freshly provisioned machine (ADR-0002) into a running T3 Code
+# Bootstraps a freshly provisioned machine (ADR-0002) into a running Launchpad
 # executor. The Hetzner compute driver's cloud-init writes the enrollment env
 # file and pipes this script through bash; it installs Node, clones the
 # source, and starts the server as a systemd service. The server then enrolls
@@ -48,7 +48,7 @@ pnpm install --frozen-lockfile
 echo "machine-bootstrap: installing the ${SERVICE_NAME} service"
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<UNIT
 [Unit]
-Description=T3 Code executor server
+Description=Launchpad executor server
 After=network-online.target
 Wants=network-online.target
 

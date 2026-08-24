@@ -870,10 +870,10 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
       icon={<ServerIcon className="size-4 text-muted-foreground" />}
     >
       <SectionNote>
-        Machines are computers this organization buys through T3 Connect: agent executors run work,
-        review hosts will run review apps. A provisioned machine sets itself up and then appears to
-        every member beside their own environments. Destroying one also destroys any thread history
-        it holds.
+        Machines are computers this organization buys through Launchpad Connect: agent executors run
+        work, review hosts will run review apps. A provisioned machine sets itself up and then
+        appears to every member beside their own environments. Destroying one also destroys any
+        thread history it holds.
       </SectionNote>
       {machines.length === 0 ? (
         <Empty className="min-h-48">
@@ -967,7 +967,7 @@ function OrganizationSettingsNotice({ title, children }: { title: string; childr
 
 /**
  * Split from `OrganizationSettings` because the state hook reads Clerk, and
- * `ClerkProvider` is only mounted when T3 Connect is configured. Calling the
+ * `ClerkProvider` is only mounted when Launchpad Connect is configured. Calling the
  * hook above that check would crash the app on a build without it.
  */
 function ConfiguredOrganizationSettings() {
@@ -983,7 +983,7 @@ function ConfiguredOrganizationSettings() {
 
   if (!state.isSignedIn) {
     return (
-      <OrganizationSettingsNotice title="Sign in to T3 Connect">
+      <OrganizationSettingsNotice title="Sign in to Launchpad Connect">
         Your organization is created the first time you ask for it, so signing in is all it takes.
       </OrganizationSettingsNotice>
     );
@@ -1016,9 +1016,9 @@ function ConfiguredOrganizationSettings() {
 export function OrganizationSettings() {
   if (!hasCloudPublicConfig()) {
     return (
-      <OrganizationSettingsNotice title="T3 Connect is not configured">
-        Organizations live in the relay, so this build needs T3 Connect&apos;s keys and a relay URL
-        before it can show one.
+      <OrganizationSettingsNotice title="Launchpad Connect is not configured">
+        Organizations live in the relay, so this build needs Launchpad Connect&apos;s keys and a
+        relay URL before it can show one.
       </OrganizationSettingsNotice>
     );
   }

@@ -1,4 +1,4 @@
-name: Deploy T3 Connect relay
+name: Deploy Launchpad Connect relay
 
 on:
   push:

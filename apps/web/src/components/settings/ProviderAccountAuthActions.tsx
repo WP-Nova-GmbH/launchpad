@@ -176,7 +176,7 @@ export function ProviderAccountAuthActions({
             <AlertDialogTitle>Sign out of {providerName}?</AlertDialogTitle>
             <AlertDialogDescription>
               This removes the account session from {environmentLabel}. It does not sign out other
-              T3 Code environments.
+              Launchpad environments.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

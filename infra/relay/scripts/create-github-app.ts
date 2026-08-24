@@ -40,7 +40,7 @@ function flag(name: string): string | undefined {
 
 const setupUrl = flag("setup-url");
 const organization = flag("org");
-const appName = flag("name") ?? "T3 Code Launchpad";
+const appName = flag("name") ?? "Launchpad";
 /**
  * A vendor app that other organizations will install has to be public. Keep it
  * private while only your own organization installs it.

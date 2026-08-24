@@ -1,8 +1,8 @@
 # Organizations
 
-An organization is the unit T3 Connect governs: who your teammates are, which repositories the
+An organization is the unit Launchpad Connect governs: who your teammates are, which repositories the
 organization owns, and who may work in each one. You can find it under **Settings → Organization**
-once you are signed in to T3 Connect.
+once you are signed in to Launchpad Connect.
 
 You always belong to exactly one organization. If nobody has invited you into theirs, one is created
 for you the first time you open the page, with you as its admin.
@@ -23,7 +23,7 @@ last admin cannot be removed.
 
 Admins can invite someone by email address and choose the role they will join with.
 
-T3 Code does not send the email yet. When you create an invitation you get a **token** back — copy
+Launchpad does not send the email yet. When you create an invitation you get a **token** back — copy
 it and send it to the person yourself, however you normally would. They paste it into
 **Settings → Organization → Join another organization**.
 
@@ -74,7 +74,7 @@ _is_ registered requires a role on that repository.
 
 ## Machines
 
-Machines are computers the organization buys through T3 Connect. An **agent executor** runs work
+Machines are computers the organization buys through Launchpad Connect. An **agent executor** runs work
 for the organization; a **review host** is reserved for running review builds of your application
 in a later release. Only admins provision and remove them; every member can see the list.
 

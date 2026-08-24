@@ -21,7 +21,7 @@ persists across runs.
 
 ## Why
 
-A T3 environment is durably stateful and every piece of that state is machine-local:
+A Launchpad environment is durably stateful and every piece of that state is machine-local:
 
 - `<stateDir>/state.sqlite` is the orchestration **event store plus its projections** —
   it _is_ the thread history, not a cache of it.

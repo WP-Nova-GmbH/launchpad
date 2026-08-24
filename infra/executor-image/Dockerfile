@@ -1,4 +1,4 @@
-# The dev-mode executor image: a T3 Code server that enrolls itself with the
+# The dev-mode executor image: a Launchpad server that enrolls itself with the
 # relay on startup using the seeded credentials the Docker compute driver
 # passes as environment variables (T3CODE_MACHINE_ENROLLMENT_*).
 #

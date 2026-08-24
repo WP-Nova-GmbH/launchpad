@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
-// `main.tsx` mounts `ClerkProvider` only when T3 Connect is configured, and
+// `main.tsx` mounts `ClerkProvider` only when Launchpad Connect is configured, and
 // this is what Clerk really does outside one.
 vi.mock("@clerk/react", () => ({
   useAuth: () => {
@@ -17,7 +17,7 @@ vi.mock("../../cloud/publicConfig", async (importOriginal) => ({
 
 import { OrganizationSettings } from "./OrganizationSettings";
 
-describe("OrganizationSettings without T3 Connect configured", () => {
+describe("OrganizationSettings without Launchpad Connect configured", () => {
   it("renders the notice instead of reading Clerk", () => {
     expect(() => OrganizationSettings()).not.toThrow();
   });
