@@ -6,6 +6,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import type { HttpClientRequest } from "effect/unstable/http";
 
@@ -16,6 +17,7 @@ import {
   CLOUD_LINKED_USER_ID,
   CLOUD_MACHINE_IDENTITY,
   CLOUD_MINT_PUBLIC_KEY,
+  decodeCloudMachineIdentity,
   PUBLISH_AGENT_ACTIVITY_SECRET,
   RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
   RELAY_ISSUER_SECRET,
@@ -88,7 +90,34 @@ const descriptor = {
   platform: { os: "linux", arch: "arm64" },
   serverVersion: "0.0.0-test",
   capabilities: { repositoryIdentity: true },
-};
+} as const;
+
+const EnrollmentRequestBody = Schema.fromJsonString(
+  Schema.Struct({
+    proof: Schema.String,
+  }),
+);
+const decodeEnrollmentRequestBody = Schema.decodeUnknownSync(EnrollmentRequestBody);
+
+const EnrollmentProofClaims = Schema.fromJsonString(
+  Schema.Struct({
+    seed: Schema.optional(Schema.String),
+    environmentId: Schema.optional(Schema.String),
+    aud: Schema.optional(Schema.String),
+    endpoint: Schema.optional(
+      Schema.Struct({
+        httpBaseUrl: Schema.String,
+      }),
+    ),
+    origin: Schema.optional(
+      Schema.Struct({
+        localHttpHost: Schema.String,
+        localHttpPort: Schema.Number,
+      }),
+    ),
+  }),
+);
+const decodeEnrollmentProofClaims = Schema.decodeUnknownSync(EnrollmentProofClaims);
 
 interface EnrollmentHarness {
   readonly store: ServerSecretStore.ServerSecretStore["Service"];
@@ -119,40 +148,45 @@ const provideEnrollmentHarness =
   (harness: EnrollmentHarness) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(
-      Effect.provideService(ServerSecretStore.ServerSecretStore, harness.store),
-      Effect.provideService(
-        ServerEnvironment.ServerEnvironment,
-        ServerEnvironment.ServerEnvironment.of({
-          getEnvironmentId: Effect.succeed(descriptor.environmentId),
-          getDescriptor: Effect.succeed(descriptor),
-        }),
-      ),
-      Effect.provideService(
-        ManagedEndpointRuntime.CloudManagedEndpointRuntime,
-        ManagedEndpointRuntime.CloudManagedEndpointRuntime.of({
-          applyConfig: (config) =>
-            Effect.sync(() => {
-              harness.applyConfigCalls.push(config);
-              return {
-                status: "disabled",
-              } satisfies ManagedEndpointRuntime.CloudManagedEndpointRuntimeStatus;
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(ServerSecretStore.ServerSecretStore, harness.store),
+          Layer.succeed(
+            ServerEnvironment.ServerEnvironment,
+            ServerEnvironment.ServerEnvironment.of({
+              getEnvironmentId: Effect.succeed(descriptor.environmentId),
+              getDescriptor: Effect.succeed(descriptor),
             }),
-        }),
-      ),
-      Effect.provideService(
-        HttpClient.HttpClient,
-        HttpClient.make((request) =>
-          Effect.sync(() => {
-            harness.requests.push(request);
-            return HttpClientResponse.fromWeb(
-              request,
-              (harness.respond ?? (() => Response.json(enrollResponseBody)))(request),
-            );
-          }),
+          ),
+          Layer.succeed(
+            ManagedEndpointRuntime.CloudManagedEndpointRuntime,
+            ManagedEndpointRuntime.CloudManagedEndpointRuntime.of({
+              applyConfig: (config) =>
+                Effect.sync(() => {
+                  harness.applyConfigCalls.push(config);
+                  return {
+                    status: "disabled",
+                  } satisfies ManagedEndpointRuntime.CloudManagedEndpointRuntimeStatus;
+                }),
+            }),
+          ),
+          Layer.succeed(
+            HttpClient.HttpClient,
+            HttpClient.make((request) =>
+              Effect.sync(() => {
+                harness.requests.push(request);
+                return HttpClientResponse.fromWeb(
+                  request,
+                  (harness.respond ?? (() => Response.json(enrollResponseBody)))(request),
+                );
+              }),
+            ),
+          ),
+          cryptoLayer,
+          NodeServices.layer,
+          ConfigProvider.layer(ConfigProvider.fromEnv({ env: harness.env ?? {} })),
         ),
       ),
-      Effect.provide(Layer.mergeAll(cryptoLayer, NodeServices.layer)),
-      Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: harness.env ?? {} }))),
     );
 
 const machineEnv = {
@@ -161,12 +195,24 @@ const machineEnv = {
   T3CODE_MACHINE_ADVERTISED_ORIGIN: "http://127.0.0.1:24123",
 };
 
-function requestBodyJson(request: HttpClientRequest.HttpClientRequest): unknown {
+const dockerMachineEnv = {
+  ...machineEnv,
+  T3CODE_MACHINE_ENROLLMENT_RELAY_URL: "http://host.docker.internal:8610",
+  T3CODE_MACHINE_ENROLLMENT_RELAY_ISSUER: "http://127.0.0.1:8610",
+};
+
+function requestBodyJson(request: HttpClientRequest.HttpClientRequest) {
   const body = request.body as { readonly _tag?: string; readonly body?: Uint8Array };
   if (body._tag !== "Uint8Array" || body.body === undefined) {
     throw new Error(`unexpected request body tag: ${body._tag}`);
   }
-  return JSON.parse(decoder.decode(body.body));
+  return decodeEnrollmentRequestBody(decoder.decode(body.body));
+}
+
+function enrollmentProofClaims(proof: string) {
+  return decodeEnrollmentProofClaims(
+    Buffer.from(proof.split(".")[1] ?? "", "base64url").toString(),
+  );
 }
 
 describe("reconcileMachineEnrollment", () => {
@@ -234,10 +280,8 @@ describe("reconcileMachineEnrollment", () => {
       expect(harness.requests).toHaveLength(1);
       const request = harness.requests[0]!;
       expect(request.url).toBe("http://127.0.0.1:8610/v1/machines/enroll");
-      const body = requestBodyJson(request) as { readonly proof: string };
-      const claims = JSON.parse(
-        Buffer.from(body.proof.split(".")[1] ?? "", "base64url").toString(),
-      ) as Record<string, unknown>;
+      const body = requestBodyJson(request);
+      const claims = enrollmentProofClaims(body.proof);
       expect(claims.seed).toBe("t3mseed_test_seed");
       expect(claims.environmentId).toBe("env-machine-test");
       // The advertised origin, not the loopback bind, is what other parties
@@ -253,12 +297,36 @@ describe("reconcileMachineEnrollment", () => {
       expect(memory.read(CLOUD_MINT_PUBLIC_KEY)).toBe(relayMintKeyPair.publicKey.trim());
       expect(memory.read(PUBLISH_AGENT_ACTIVITY_SECRET)).toBe("true");
       expect(memory.read(CLOUD_ENDPOINT_RUNTIME_CONFIG)).toBeNull();
-      expect(JSON.parse(memory.read(CLOUD_MACHINE_IDENTITY) ?? "{}")).toEqual({
+      expect(
+        Option.getOrNull(decodeCloudMachineIdentity(memory.read(CLOUD_MACHINE_IDENTITY) ?? "")),
+      ).toEqual({
         machineId: "machine-1",
         organizationId: "organization-1",
         role: "agent_executor",
       });
       expect(harness.applyConfigCalls).toEqual([null]);
+    }).pipe(provideEnrollmentHarness(harness));
+  });
+
+  it.effect("signs for the relay issuer when Docker uses a different transport origin", () => {
+    const memory = makeMemorySecretStore();
+    const harness: EnrollmentHarness = {
+      store: memory.store,
+      requests: [],
+      applyConfigCalls: [],
+      env: dockerMachineEnv,
+    };
+    return Effect.gen(function* () {
+      const result = yield* reconcileMachineEnrollment("http://127.0.0.1:4483");
+      expect(result.outcome).toBe("enrolled");
+
+      const request = harness.requests[0]!;
+      expect(request.url).toBe("http://host.docker.internal:8610/v1/machines/enroll");
+      const body = requestBodyJson(request);
+      const claims = enrollmentProofClaims(body.proof);
+      expect(claims.aud).toBe("http://127.0.0.1:8610");
+      expect(memory.read(RELAY_URL_SECRET)).toBe("http://host.docker.internal:8610");
+      expect(memory.read(RELAY_ISSUER_SECRET)).toBe("http://127.0.0.1:8610");
     }).pipe(provideEnrollmentHarness(harness));
   });
 

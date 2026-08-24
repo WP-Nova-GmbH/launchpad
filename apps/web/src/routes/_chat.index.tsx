@@ -1,6 +1,6 @@
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { LinkIcon, PlusIcon, RotateCcwIcon } from "lucide-react";
+import { FolderGit2Icon, LinkIcon, PlusIcon, RotateCcwIcon, ServerOffIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { openCommandPalette } from "../commandPaletteBus";
@@ -16,19 +16,33 @@ import {
 } from "../state/entities";
 import { useEnvironments } from "../state/environments";
 import { APP_DISPLAY_NAME } from "~/branding";
+import { useManagedRelayOrganizationCatalog } from "~/cloud/managedRelayState";
 import { hasCloudPublicConfig } from "~/cloud/publicConfig";
 import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
+import { resolveStartRouteMode } from "./_chat.index.logic";
 
 function ChatIndexRouteView() {
   const { authGateState } = Route.useRouteContext();
   const { environments } = useEnvironments();
+  const organizationCatalog = useManagedRelayOrganizationCatalog();
+  const startMode = resolveStartRouteMode({
+    isHostedStatic: authGateState.status === "hosted-static",
+    environmentCount: environments.length,
+    organizationRepositoryCount: organizationCatalog.data?.repositories.length ?? 0,
+    organizationProjectCount: organizationCatalog.data?.projects.length ?? 0,
+    organizationCatalogPending: organizationCatalog.isPending,
+    organizationCatalogError: organizationCatalog.error,
+  });
 
-  if (authGateState.status === "hosted-static" && environments.length === 0) {
+  if (startMode === "pending") {
+    return null;
+  }
+  if (startMode === "onboarding") {
     return <HostedStaticOnboardingState />;
   }
 
-  return <IndexDraftLanding />;
+  return <IndexDraftLanding organizationCatalog={organizationCatalog} />;
 }
 
 /**
@@ -36,7 +50,11 @@ function ChatIndexRouteView() {
  * recently active project, so the first screen is a prompt instead of a dead
  * end. Falls back to an add-project hero when no project exists yet.
  */
-function IndexDraftLanding() {
+function IndexDraftLanding({
+  organizationCatalog,
+}: {
+  readonly organizationCatalog: ReturnType<typeof useManagedRelayOrganizationCatalog>;
+}) {
   const projects = useProjects();
   const threads = useThreadShells();
   const bootstrapped = useAllEnvironmentShellsBootstrapped();
@@ -80,7 +98,7 @@ function IndexDraftLanding() {
       />
     ) : null;
   }
-  return <NoProjectsHero />;
+  return <NoProjectsHero organizationCatalog={organizationCatalog} />;
 }
 
 function DraftStartError({ onRetry }: { readonly onRetry: () => void }) {
@@ -104,20 +122,40 @@ function DraftStartError({ onRetry }: { readonly onRetry: () => void }) {
   );
 }
 
-function NoProjectsHero() {
+function NoProjectsHero({
+  organizationCatalog,
+}: {
+  readonly organizationCatalog: ReturnType<typeof useManagedRelayOrganizationCatalog>;
+}) {
   const openAddProject = useCallback(() => openCommandPalette({ open: "add-project" }), []);
+  const { environments } = useEnvironments();
+  const connectionByEnvironmentId = useMemo(
+    () =>
+      new Map(
+        environments.map((environment) => [
+          environment.environmentId,
+          environment.connection.phase,
+        ]),
+      ),
+    [environments],
+  );
+  const repositories = organizationCatalog.data?.repositories ?? [];
+  const organizationProjects = organizationCatalog.data?.projects ?? [];
+  const hasOrganizationCatalog = repositories.length > 0 || organizationProjects.length > 0;
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden bg-background">
-        <Empty className="flex-1">
-          <div className="w-full max-w-lg px-8 py-12">
+        <Empty className="flex-1 overflow-y-auto">
+          <div className="w-full max-w-2xl px-8 py-12">
             <EmptyHeader className="max-w-none">
               <EmptyTitle className="text-foreground text-2xl sm:text-3xl">
                 What should we work on?
               </EmptyTitle>
               <EmptyDescription className="mt-2 text-sm text-muted-foreground/78">
-                Add a project to start your first thread.
+                {hasOrganizationCatalog
+                  ? "Your organization work remains visible even when its machines are offline."
+                  : "Add a project to start your first thread."}
               </EmptyDescription>
               <div className="mt-6 flex justify-center">
                 <Button size="sm" onClick={openAddProject}>
@@ -126,6 +164,98 @@ function NoProjectsHero() {
                 </Button>
               </div>
             </EmptyHeader>
+
+            {organizationProjects.length > 0 ? (
+              <section className="mt-10 text-left" aria-labelledby="organization-projects-title">
+                <h2
+                  id="organization-projects-title"
+                  className="mb-2 text-xs font-medium tracking-wide text-muted-foreground uppercase"
+                >
+                  Organization projects
+                </h2>
+                <div className="overflow-hidden rounded-xl border border-border/65 bg-card/25">
+                  {organizationProjects.map((project) => {
+                    const isOnline =
+                      connectionByEnvironmentId.get(project.environmentId) === "connected";
+                    return (
+                      <div
+                        key={`${project.environmentId}:${project.projectId}`}
+                        className="flex min-w-0 items-center gap-3 border-b border-border/50 px-3.5 py-3 last:border-b-0"
+                      >
+                        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-background/70 text-muted-foreground">
+                          {isOnline ? (
+                            <FolderGit2Icon className="size-4" />
+                          ) : (
+                            <ServerOffIcon className="size-4" />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-medium text-foreground">
+                            {project.title}
+                          </div>
+                          <div className="truncate text-xs text-muted-foreground/75">
+                            {project.repositoryCanonicalKey ?? "Local project"} ·{" "}
+                            {project.machineLabel}
+                          </div>
+                        </div>
+                        <span
+                          className={cn(
+                            "shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                            isOnline
+                              ? "border-success/25 bg-success/8 text-success"
+                              : "border-border/60 bg-muted/35 text-muted-foreground",
+                          )}
+                        >
+                          {isOnline ? "Available" : "Offline"}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            ) : null}
+
+            {repositories.length > 0 ? (
+              <section className="mt-7 text-left" aria-labelledby="organization-repositories-title">
+                <h2
+                  id="organization-repositories-title"
+                  className="mb-2 text-xs font-medium tracking-wide text-muted-foreground uppercase"
+                >
+                  Organization repositories
+                </h2>
+                <div className="overflow-hidden rounded-xl border border-border/65 bg-card/25">
+                  {repositories.map(({ repository, role }) => (
+                    <div
+                      key={repository.repositoryId}
+                      className="flex min-w-0 items-center gap-3 border-b border-border/50 px-3.5 py-3 last:border-b-0"
+                    >
+                      <FolderGit2Icon className="size-4 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium text-foreground">
+                          {repository.name}
+                        </div>
+                        <div className="truncate text-xs text-muted-foreground/75">
+                          {repository.canonicalKeys.join(" · ")}
+                        </div>
+                      </div>
+                      <span className="shrink-0 text-[10px] font-medium text-muted-foreground uppercase">
+                        {role ?? organizationCatalog.data?.membership.role ?? "member"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+
+            {organizationCatalog.error ? (
+              <div className="mt-7 flex items-center justify-center gap-2 text-xs text-muted-foreground">
+                <span>Couldn’t refresh organization work.</span>
+                <Button variant="ghost" size="xs" onClick={organizationCatalog.refresh}>
+                  <RotateCcwIcon className="size-3" />
+                  Retry
+                </Button>
+              </div>
+            ) : null}
           </div>
         </Empty>
       </div>

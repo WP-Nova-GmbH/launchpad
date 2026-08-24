@@ -4,9 +4,9 @@
  * This is not a mock. The HTTP surface, the schemas, the authorization, the
  * services and the SQL are the deployed ones — only the three Cloudflare
  * bindings are replaced, because Tunnel, DNS, and Queues have no local
- * equivalent and nothing in the organization surface touches them:
+ * equivalent:
  *
- *   - managed endpoints  → refuse to provision (a local relay hands out no tunnels)
+ *   - managed endpoints  → Docker machines use validated host-loopback endpoints
  *   - APNs delivery queue → drop, so publishing activity does not need a queue
  *
  * Clerk verification is real, using CLERK_SECRET_KEY from infra/relay/.env, so
@@ -16,12 +16,14 @@
  *
  *   node infra/relay/scripts/dev-server.ts
  *
- * Reads DEV_RELAY_PORT (default 8610), DEV_RELAY_DATABASE_URL, and
- * DEV_RELAY_ISSUER (the public origin clients reach it on).
+ * Reads DEV_RELAY_PORT (default 8610), DEV_RELAY_DATABASE_URL,
+ * DEV_RELAY_ISSUER (the public origin clients reach it on), and optionally
+ * DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH (default .t3/relay-dev-cloud-mint-private.pem).
  */
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeURL from "node:url";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -35,6 +37,8 @@ import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import * as PgClient from "@effect/sql-pg/PgClient";
 
 import { RelayApi } from "@t3tools/contracts/relay";
+
+import { loadOrCreateDevCloudMintKeyPair } from "./dev-cloud-mint-key-pair.ts";
 
 import {
   clientApi,
@@ -53,6 +57,7 @@ import {
   tokenApi,
 } from "../src/http/Api.ts";
 import { machineEnrollmentApi, machinesApi } from "../src/http/MachinesApi.ts";
+import { organizationProjectsApi, projectCatalogServerApi } from "../src/http/ProjectCatalogApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
 import * as AgentActivityRows from "../src/agentActivity/AgentActivityRows.ts";
@@ -68,6 +73,7 @@ import * as EnvironmentCredentials from "../src/environments/EnvironmentCredenti
 import * as EnvironmentLinker from "../src/environments/EnvironmentLinker.ts";
 import * as EnvironmentLinks from "../src/environments/EnvironmentLinks.ts";
 import * as EnvironmentPublishSignatures from "../src/environments/EnvironmentPublishSignatures.ts";
+import * as EnvironmentProjectCatalogSignatures from "../src/environments/EnvironmentProjectCatalogSignatures.ts";
 import * as Invitations from "../src/tenancy/Invitations.ts";
 import * as Jobs from "../src/jobs/Jobs.ts";
 import * as LiveActivities from "../src/agentActivity/LiveActivities.ts";
@@ -78,6 +84,7 @@ import * as DockerComputeProvider from "../src/machines/DockerComputeProvider.ts
 import * as MachineEnroller from "../src/machines/MachineEnroller.ts";
 import * as MachineLimits from "../src/machines/MachineLimits.ts";
 import * as Machines from "../src/machines/Machines.ts";
+import * as OrganizationProjectCatalog from "../src/projects/OrganizationProjectCatalog.ts";
 import * as MobileRegistrations from "../src/agentActivity/MobileRegistrations.ts";
 import * as Organizations from "../src/tenancy/Organizations.ts";
 import * as RelayConfiguration from "../src/Config.ts";
@@ -140,6 +147,12 @@ function required(name: string): string {
 const port = Number(process.env.DEV_RELAY_PORT ?? DEFAULT_PORT);
 const databaseUrl = process.env.DEV_RELAY_DATABASE_URL?.trim() || DEFAULT_DATABASE_URL;
 const relayIssuer = process.env.DEV_RELAY_ISSUER?.trim() || `http://127.0.0.1:${port}`;
+const cloudMintKeyPair = loadOrCreateDevCloudMintKeyPair(
+  process.env.DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH?.trim() ||
+    NodeURL.fileURLToPath(
+      new URL("../../../.t3/relay-dev-cloud-mint-private.pem", import.meta.url),
+    ),
+);
 
 const relayConfigurationLayer = Layer.succeed(
   RelayConfiguration.RelayConfiguration,
@@ -158,8 +171,8 @@ const relayConfigurationLayer = Layer.succeed(
     clerkSecretKey: Redacted.make(required("CLERK_SECRET_KEY")),
     clerkPublishableKey: required("CLERK_PUBLISHABLE_KEY"),
     clerkJwtAudience: process.env.CLERK_JWT_AUDIENCE?.trim() || "t3-code-relay",
-    cloudMintPrivateKey: Redacted.make("dev-cloud-mint-private-key"),
-    cloudMintPublicKey: "dev-cloud-mint-public-key",
+    cloudMintPrivateKey: Redacted.make(cloudMintKeyPair.privateKey),
+    cloudMintPublicKey: cloudMintKeyPair.publicKey,
     github:
       process.env.GITHUB_APP_ID && process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_PRIVATE_KEY
         ? {
@@ -170,6 +183,7 @@ const relayConfigurationLayer = Layer.succeed(
         : undefined,
     managedEndpointBaseDomain: undefined,
     managedEndpointNamespace: undefined,
+    allowLocalMachineEndpoints: true,
   }),
 );
 
@@ -199,6 +213,7 @@ const runtimeLayer = Layer.empty
     ),
     Layer.provideMerge(MachineLimits.layer),
     Layer.provideMerge(EnvironmentPublishSignatures.layer),
+    Layer.provideMerge(EnvironmentProjectCatalogSignatures.layer),
     Layer.provideMerge(
       ManagedEndpointProvider.layer.pipe(
         Layer.provide(ManagedEndpointProvider.layerTunnelClient(tunnelClientStub)),
@@ -233,6 +248,7 @@ const runtimeLayer = Layer.empty
         GithubApp.layer,
         GithubInstallations.layer,
         Machines.layer,
+        OrganizationProjectCatalog.layer,
       ),
     ),
     Layer.provideMerge(Devices.layer),
@@ -263,12 +279,14 @@ const relayApiLayer = Layer.mergeAll(
   clientApi,
   organizationApi,
   repositoriesApi,
+  organizationProjectsApi,
   machinesApi,
   machineEnrollmentApi,
   tokenApi,
   dpopClientApi,
   jobsApi,
   serverApi,
+  projectCatalogServerApi,
 );
 
 const appLayer = relayApiLayer.pipe(

@@ -49,3 +49,22 @@ audit trail of which executor read which credential when.
   remains the only bound on that blast radius.
 - **Infisical's own "organization", "project", and "environment" nouns collide with ours.**
   Always qualify them as _Infisical project_ / _Infisical environment_ in code and docs.
+
+## Amendment: subscription account sessions are environment-local
+
+The credential pool above is for non-human provider credentials used by unattended organization
+work. Codex, Claude, and Cursor also support signing their CLIs into a person's subscription. Those
+sessions are a different kind of credential: the provider CLI owns a renewable OAuth cache rather
+than accepting one secret value at process spawn.
+
+For a long-lived executor, an administrator may therefore complete the provider's native account
+login against that executor. The provider CLI persists the resulting session in its own auth store
+on the executor's durable volume. The relay neither receives nor stores the session, and the
+session is never represented as an Infisical secret reference. It is available to provider
+processes on that executor and consequently to organization work placed there.
+
+Account sessions are deliberately **not replicated between executors**. Logging into one executor
+does not create an organization-wide credential pool entry, and deprovisioning that executor
+destroys its copy. Logout is performed by the same provider CLI on the same executor. This keeps
+opaque, provider-specific refresh state at the boundary that understands it while the original
+executor-direct API-key design remains the path for fleet-wide unattended credentials.

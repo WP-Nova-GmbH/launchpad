@@ -42,6 +42,7 @@ import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import type { ProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { makeProviderAccountAuth } from "../ProviderAccountAuth.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
   makePackageManagedProviderMaintenanceResolver,
@@ -144,6 +145,17 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         enabled,
         homePath: homeLayout.effectiveHomePath ?? "",
       } satisfies CodexSettings;
+      const accountAuthEnvironment = {
+        ...processEnv,
+        ...(effectiveConfig.homePath ? { CODEX_HOME: effectiveConfig.homePath } : {}),
+      };
+      const accountAuth = makeProviderAccountAuth({
+        instanceId,
+        binaryPath: effectiveConfig.binaryPath,
+        login: { args: ["login", "--device-auth"], environment: accountAuthEnvironment },
+        logout: { args: ["logout"], environment: accountAuthEnvironment },
+        spawner,
+      });
       const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
         binaryPath: effectiveConfig.binaryPath,
         env: processEnv,
@@ -208,6 +220,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         snapshot,
         adapter,
         textGeneration,
+        accountAuth,
       } satisfies ProviderInstance;
     }),
 };

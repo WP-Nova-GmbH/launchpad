@@ -154,6 +154,9 @@ import {
 import {
   ServerConfigStreamEvent,
   ServerConfig,
+  ServerProviderAccountAuthError,
+  ServerProviderAccountAuthEvent,
+  ServerProviderAccountAuthInput,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
   ServerLifecycleStreamEvent,
@@ -255,6 +258,8 @@ export const WS_METHODS = {
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
   serverRefreshProviders: "server.refreshProviders",
+  serverAuthenticateProvider: "server.authenticateProvider",
+  serverLogoutProvider: "server.logoutProvider",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
   serverUpdateServerWithProgress: "server.updateServerWithProgress",
@@ -351,6 +356,19 @@ export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProv
   }),
   success: ServerProviderUpdatedPayload,
   error: EnvironmentAuthorizationError,
+});
+
+export const WsServerAuthenticateProviderRpc = Rpc.make(WS_METHODS.serverAuthenticateProvider, {
+  payload: ServerProviderAccountAuthInput,
+  success: ServerProviderAccountAuthEvent,
+  error: Schema.Union([ServerProviderAccountAuthError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+export const WsServerLogoutProviderRpc = Rpc.make(WS_METHODS.serverLogoutProvider, {
+  payload: ServerProviderAccountAuthInput,
+  success: ServerProviderUpdatedPayload,
+  error: Schema.Union([ServerProviderAccountAuthError, EnvironmentAuthorizationError]),
 });
 
 export const WsServerUpdateProviderRpc = Rpc.make(WS_METHODS.serverUpdateProvider, {
@@ -986,6 +1004,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
+  WsServerAuthenticateProviderRpc,
+  WsServerLogoutProviderRpc,
   WsServerUpdateProviderRpc,
   WsServerUpdateServerRpc,
   WsServerUpdateServerWithProgressRpc,

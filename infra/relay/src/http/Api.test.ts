@@ -535,6 +535,7 @@ function relayJobsTestLayer(input?: {
                     environmentPublicKey: link.environmentPublicKey,
                     endpoint: link.endpoint,
                     allocationOwnerKey: accessInput.userId,
+                    source: "link" as const,
                   }),
             ),
           ),

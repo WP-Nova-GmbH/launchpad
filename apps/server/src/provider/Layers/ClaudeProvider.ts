@@ -11,6 +11,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import {
   createModelCapabilities,
@@ -57,6 +58,17 @@ const MINIMUM_CLAUDE_OPUS_4_8_VERSION = "2.1.154";
 const MINIMUM_CLAUDE_OPUS_4_7_VERSION = "2.1.111";
 
 const CURRENT_CLAUDE_MODELS = new Set(["claude-fable-5", "claude-opus-5", "claude-sonnet-5"]);
+
+const ClaudeAuthStatusOutput = Schema.fromJsonString(
+  Schema.Struct({
+    loggedIn: Schema.Boolean,
+  }),
+);
+const decodeClaudeAuthStatusOutput = Schema.decodeUnknownOption(ClaudeAuthStatusOutput);
+
+function parseClaudeLoggedIn(output: string): boolean | undefined {
+  return Option.getOrUndefined(decodeClaudeAuthStatusOutput(output))?.loggedIn;
+}
 
 export function isLegacyClaudeModel(model: string): boolean {
   return !CURRENT_CLAUDE_MODELS.has(model);
@@ -922,6 +934,32 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
         : supportsClaudeOpus47(parsedVersion)
           ? formatClaudeOpus48UpgradeMessage(parsedVersion)
           : formatClaudeOpus47UpgradeMessage(parsedVersion);
+
+  const authProbe = yield* runClaudeCommand(
+    claudeSettings,
+    ["auth", "status"],
+    resolvedEnvironment,
+  ).pipe(Effect.timeoutOption(DEFAULT_TIMEOUT_MS), Effect.result);
+  const loggedIn =
+    Result.isSuccess(authProbe) && Option.isSome(authProbe.success)
+      ? parseClaudeLoggedIn(authProbe.success.value.stdout)
+      : undefined;
+
+  if (loggedIn === false) {
+    return buildServerProvider({
+      presentation: CLAUDE_PRESENTATION,
+      enabled: claudeSettings.enabled,
+      checkedAt,
+      models,
+      probe: {
+        installed: true,
+        version: parsedVersion,
+        status: "error",
+        auth: { status: "unauthenticated" },
+        message: "Claude Agent CLI is not authenticated. Run `claude auth login` and try again.",
+      },
+    });
+  }
 
   const capabilities = resolveCapabilities
     ? yield* resolveCapabilities(claudeSettings).pipe(Effect.orElseSucceed(() => undefined))

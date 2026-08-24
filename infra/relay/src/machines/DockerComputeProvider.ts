@@ -114,6 +114,8 @@ export const makeDocker = (settings: DockerComputeSettings) =>
               "--env",
               `T3CODE_MACHINE_ENROLLMENT_RELAY_URL=${relayUrl}`,
               "--env",
+              `T3CODE_MACHINE_ENROLLMENT_RELAY_ISSUER=${input.relayUrl}`,
+              "--env",
               `T3CODE_MACHINE_ADVERTISED_ORIGIN=http://127.0.0.1:${hostPort}`,
               "--env",
               `T3CODE_MACHINE_ID=${input.machineId}`,

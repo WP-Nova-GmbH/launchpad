@@ -48,6 +48,9 @@ const machineEnrollmentSeedConfig = Config.nonEmptyString("T3CODE_MACHINE_ENROLL
 const machineEnrollmentRelayUrlConfig = Config.nonEmptyString(
   "T3CODE_MACHINE_ENROLLMENT_RELAY_URL",
 ).pipe(Config.option);
+const machineEnrollmentRelayIssuerConfig = Config.nonEmptyString(
+  "T3CODE_MACHINE_ENROLLMENT_RELAY_ISSUER",
+).pipe(Config.option);
 /**
  * The origin other parties can reach this machine on, when it differs from the
  * loopback origin the server binds — a Docker driver maps the container port
@@ -200,9 +203,10 @@ export const reconcileMachineEnrollment = Effect.fn("environment.machine.reconci
         identity: installed,
       } satisfies MachineEnrollmentOutcome;
     }
-    const [seed, relayUrlRaw] = yield* Effect.all([
+    const [seed, relayUrlRaw, relayIssuerRaw] = yield* Effect.all([
       machineEnrollmentSeedConfig,
       machineEnrollmentRelayUrlConfig,
+      machineEnrollmentRelayIssuerConfig,
     ]).pipe(
       Effect.mapError(
         (cause) => new MachineEnrollmentFailed({ stage: "read-configuration", cause }),
@@ -221,7 +225,10 @@ export const reconcileMachineEnrollment = Effect.fn("environment.machine.reconci
       return { outcome: "linked-environment" } satisfies MachineEnrollmentOutcome;
     }
     const relayUrl = normalizeMachineRelayUrl(relayUrlRaw.value);
-    if (relayUrl === null) {
+    const relayIssuer = normalizeMachineRelayUrl(
+      Option.isSome(relayIssuerRaw) ? relayIssuerRaw.value : relayUrlRaw.value,
+    );
+    if (relayUrl === null || relayIssuer === null) {
       return yield* new MachineEnrollmentFailed({ stage: "validate-relay-url" });
     }
     if (relayUrl.startsWith("http:")) {
@@ -249,7 +256,7 @@ export const reconcileMachineEnrollment = Effect.fn("environment.machine.reconci
     const expiresAt = DateTime.add(now, { minutes: 5 });
     const payload = {
       iss: `t3-env:${descriptor.environmentId}`,
-      aud: normalizeRelayIssuer(relayUrl),
+      aud: normalizeRelayIssuer(relayIssuer),
       sub: descriptor.environmentId,
       jti: yield* Crypto.Crypto.pipe(
         Effect.flatMap((crypto) => crypto.randomUUIDv4),

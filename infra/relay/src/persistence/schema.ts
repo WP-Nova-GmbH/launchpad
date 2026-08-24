@@ -207,6 +207,51 @@ export const relayRepositoryAccess = pgTable(
   ],
 );
 
+/**
+ * Cursor for the latest redacted project snapshot accepted from one managed
+ * environment. It is separate from the rows so an empty snapshot still has a
+ * revision and cannot be overwritten by a delayed older publish.
+ */
+export const relayOrganizationProjectCatalogs = pgTable(
+  "relay_organization_project_catalogs",
+  {
+    environmentId: varchar("environment_id", { length: 191 }).primaryKey(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    machineId: varchar("machine_id", { length: 64 }).notNull(),
+    revision: integer("revision").notNull(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    index("idx_relay_org_project_catalogs_organization").on(table.organizationId, table.updatedAt),
+  ],
+);
+
+/**
+ * Non-sensitive project discovery only. The authoritative project and its
+ * workspace path remain on the environment; chat history belongs to the
+ * organization event mirror rather than this table.
+ */
+export const relayOrganizationProjects = pgTable(
+  "relay_organization_projects",
+  {
+    environmentId: varchar("environment_id", { length: 191 }).notNull(),
+    projectId: varchar("project_id", { length: 191 }).notNull(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    machineId: varchar("machine_id", { length: 64 }).notNull(),
+    title: text("title").notNull(),
+    repositoryCanonicalKey: text("repository_canonical_key"),
+    projectCreatedAt: varchar("project_created_at", { length: 64 }).notNull(),
+    projectUpdatedAt: varchar("project_updated_at", { length: 64 }).notNull(),
+    catalogUpdatedAt: varchar("catalog_updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.environmentId, table.projectId] }),
+    index("idx_relay_org_projects_organization").on(table.organizationId, table.projectUpdatedAt),
+    index("idx_relay_org_projects_repository").on(table.repositoryCanonicalKey),
+  ],
+);
+
 export const relayMobileDevices = pgTable(
   "relay_mobile_devices",
   {

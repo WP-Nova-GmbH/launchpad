@@ -592,6 +592,52 @@ export const ServerProviderUpdatedPayload = Schema.Struct({
 });
 export type ServerProviderUpdatedPayload = typeof ServerProviderUpdatedPayload.Type;
 
+export const ServerProviderAccountAuthInput = Schema.Struct({
+  instanceId: ProviderInstanceId,
+});
+export type ServerProviderAccountAuthInput = typeof ServerProviderAccountAuthInput.Type;
+
+export const ServerProviderAccountAuthOutputEvent = Schema.Struct({
+  type: Schema.Literal("output"),
+  stream: Schema.Literals(["stdout", "stderr"]),
+  text: Schema.String.check(Schema.isMaxLength(16 * 1024)),
+});
+export type ServerProviderAccountAuthOutputEvent = typeof ServerProviderAccountAuthOutputEvent.Type;
+
+export const ServerProviderAccountAuthCompleteEvent = Schema.Struct({
+  type: Schema.Literal("complete"),
+  providers: ServerProviders,
+});
+export type ServerProviderAccountAuthCompleteEvent =
+  typeof ServerProviderAccountAuthCompleteEvent.Type;
+
+export const ServerProviderAccountAuthEvent = Schema.Union([
+  ServerProviderAccountAuthOutputEvent,
+  ServerProviderAccountAuthCompleteEvent,
+]);
+export type ServerProviderAccountAuthEvent = typeof ServerProviderAccountAuthEvent.Type;
+
+export class ServerProviderAccountAuthError extends Schema.TaggedErrorClass<ServerProviderAccountAuthError>()(
+  "ServerProviderAccountAuthError",
+  {
+    instanceId: ProviderInstanceId,
+    reason: Schema.Literals([
+      "instance_not_found",
+      "unsupported",
+      "command_unavailable",
+      "command_failed",
+    ]),
+    detail: Schema.optionalKey(TrimmedNonEmptyString),
+    exitCode: Schema.optionalKey(Schema.Int),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    const detail = this.detail ? `: ${this.detail}` : "";
+    return `Provider account authentication failed for ${this.instanceId} (${this.reason})${detail}`;
+  }
+}
+
 export const ServerProviderUpdateInput = Schema.Struct({
   provider: ProviderDriverKind,
   instanceId: Schema.optionalKey(ProviderInstanceId),

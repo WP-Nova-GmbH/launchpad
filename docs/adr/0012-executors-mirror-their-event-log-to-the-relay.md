@@ -13,6 +13,10 @@ Machines a person owns are covered separately by
 and into a **user-scoped** store the organization cannot read. The two stores share a transport and
 nothing else.
 
+[ADR-0014](./0014-managed-projects-publish-a-redacted-organization-catalog.md) allows a much smaller,
+redacted project-discovery projection to precede this mirror. That catalog does not contain or
+replace thread history.
+
 ## Why
 
 Three things fall out of one mechanism:

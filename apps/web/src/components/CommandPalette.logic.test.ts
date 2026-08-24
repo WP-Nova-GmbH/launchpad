@@ -9,8 +9,30 @@ import {
   filterPinnedBrowseEntries,
   filterCommandPaletteGroups,
   reduceCommandPaletteUiState,
+  resolveOrganizationRepositoryCloneTarget,
   type CommandPaletteGroup,
 } from "./CommandPalette.logic";
+
+describe("resolveOrganizationRepositoryCloneTarget", () => {
+  it("opens directly when exactly one environment is connected", () => {
+    expect(
+      resolveOrganizationRepositoryCloneTarget([
+        { environmentId: "online", isConnected: true },
+        { environmentId: "offline", isConnected: false },
+      ]),
+    ).toEqual({ kind: "direct", environmentId: "online" });
+  });
+
+  it("keeps offline environments visible as target choices", () => {
+    expect(
+      resolveOrganizationRepositoryCloneTarget([{ environmentId: "offline", isConnected: false }]),
+    ).toEqual({ kind: "choose" });
+  });
+
+  it("reports that cloning is unavailable only when there is no environment", () => {
+    expect(resolveOrganizationRepositoryCloneTarget([])).toEqual({ kind: "unavailable" });
+  });
+});
 
 describe("browseInputEndPaddingClass", () => {
   it("reserves the widest space for the create action", () => {

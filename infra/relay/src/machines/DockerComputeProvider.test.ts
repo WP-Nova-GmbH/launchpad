@@ -93,6 +93,7 @@ describe("DockerComputeProvider", () => {
       expect(run?.args).toContain(
         "T3CODE_MACHINE_ENROLLMENT_RELAY_URL=http://host.docker.internal:8610",
       );
+      expect(run?.args).toContain("T3CODE_MACHINE_ENROLLMENT_RELAY_ISSUER=http://127.0.0.1:8610");
       expect(run?.args.at(-1)).toBe("t3code-executor-dev");
     }).pipe(
       Effect.provide(

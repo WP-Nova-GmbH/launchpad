@@ -37,6 +37,15 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.cloudInstallRelayClient)).toBe(AuthRelayWriteScope);
   });
 
+  it("treats provider account login and logout as environment operations", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.serverAuthenticateProvider)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+    expect(requiredScopeForRpcMethod(WS_METHODS.serverLogoutProvider)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+  });
+
   it("reads the reviewer menu under the same scope as the pull request it belongs to", () => {
     // The candidate list is a read like the detail beside it, and asking somebody for a review is
     // a write like every other pull request operation.

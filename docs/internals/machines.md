@@ -77,7 +77,10 @@ seam between machine records and infrastructure:
   `docker build -t t3code-executor-dev -f infra/executor-image/Dockerfile .`. The
   loopback relay origin is rewritten to `host.docker.internal` and the host-mapped port
   is advertised as the machine's endpoint. The dev relay hands out no tunnels, so the
-  endpoint is recorded as `manual`, exactly like a publish-only link.
+  endpoint is recorded as `manual`, exactly like a publish-only link. The development
+  connector accepts that endpoint only for a relay-provisioned organization machine and
+  only when its HTTP and WebSocket URLs are matching loopback origins. Manual personal
+  links remain ineligible for relay routing, and production keeps this escape hatch off.
 
 Neither driver destroys compute the other created.
 

@@ -44,6 +44,7 @@ import {
   type RelayClientInstallProgressEvent,
   type ServerSelfUpdateError,
   type ServerSelfUpdateProgressEvent,
+  ServerProviderAccountAuthError,
   type FilesystemBrowseFailure,
   FilesystemBrowseError,
   AssetWorkspaceContextNotFoundError,
@@ -79,6 +80,7 @@ import {
   observeRpcStreamEffect as instrumentRpcStreamEffect,
 } from "./observability/RpcInstrumentation.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import * as ProviderInstanceRegistry from "./provider/Services/ProviderInstanceRegistry.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -371,6 +373,7 @@ const makeWsRpcLayer = (
       const previewManager = yield* PreviewManager.PreviewManager;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+      const providerInstanceRegistry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
       const config = yield* ServerConfig.ServerConfig;
@@ -1452,6 +1455,54 @@ const makeWsRpcLayer = (
               ? providerRegistry.refreshInstance(input.instanceId)
               : providerRegistry.refresh()
             ).pipe(Effect.map((providers) => ({ providers }))),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.serverAuthenticateProvider]: (input) =>
+          observeRpcStream(
+            WS_METHODS.serverAuthenticateProvider,
+            Stream.unwrap(
+              Effect.gen(function* () {
+                const instance = yield* providerInstanceRegistry.getInstance(input.instanceId);
+                if (!instance) {
+                  return yield* new ServerProviderAccountAuthError({
+                    instanceId: input.instanceId,
+                    reason: "instance_not_found",
+                  });
+                }
+                if (!instance.accountAuth) {
+                  return yield* new ServerProviderAccountAuthError({
+                    instanceId: input.instanceId,
+                    reason: "unsupported",
+                  });
+                }
+                const complete = Stream.fromEffect(
+                  providerRegistry.refreshInstance(input.instanceId),
+                ).pipe(Stream.map((providers) => ({ type: "complete" as const, providers })));
+                return Stream.concat(instance.accountAuth.login, complete);
+              }),
+            ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.serverLogoutProvider]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverLogoutProvider,
+            Effect.gen(function* () {
+              const instance = yield* providerInstanceRegistry.getInstance(input.instanceId);
+              if (!instance) {
+                return yield* new ServerProviderAccountAuthError({
+                  instanceId: input.instanceId,
+                  reason: "instance_not_found",
+                });
+              }
+              if (!instance.accountAuth) {
+                return yield* new ServerProviderAccountAuthError({
+                  instanceId: input.instanceId,
+                  reason: "unsupported",
+                });
+              }
+              yield* instance.accountAuth.logout;
+              return { providers: yield* providerRegistry.refreshInstance(input.instanceId) };
+            }),
             { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.serverUpdateProvider]: (input) =>

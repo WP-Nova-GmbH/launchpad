@@ -40,6 +40,7 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { makeProviderAccountAuth } from "../ProviderAccountAuth.ts";
 import {
   makeProviderMaintenanceCapabilities,
   type ProviderMaintenanceCapabilitiesResolver,
@@ -120,6 +121,17 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies CursorSettings;
+      const accountAuthEnvironment = { ...processEnv, NO_OPEN_BROWSER: "1" };
+      const endpointArgs = effectiveConfig.apiEndpoint
+        ? (["-e", effectiveConfig.apiEndpoint] as const)
+        : [];
+      const accountAuth = makeProviderAccountAuth({
+        instanceId,
+        binaryPath: effectiveConfig.binaryPath,
+        login: { args: [...endpointArgs, "login"], environment: accountAuthEnvironment },
+        logout: { args: [...endpointArgs, "logout"], environment: accountAuthEnvironment },
+        spawner,
+      });
       const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
         binaryPath: effectiveConfig.binaryPath,
         env: processEnv,
@@ -183,6 +195,7 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
         snapshot,
         adapter,
         textGeneration,
+        accountAuth,
       } satisfies ProviderInstance;
     }),
 };

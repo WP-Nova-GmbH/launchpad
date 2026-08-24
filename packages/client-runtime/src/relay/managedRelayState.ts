@@ -1,6 +1,9 @@
 import type {
   RelayClientEnvironmentRecord,
   RelayEnvironmentStatusResponse,
+  RelayOrganizationMembership,
+  RelayOrganizationProject,
+  RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
 import type { EnvironmentId } from "@t3tools/contracts";
 import {
@@ -18,6 +21,7 @@ import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import { findErrorTraceId } from "../errors/errorTrace.ts";
 import * as ManagedRelay from "./managedRelay.ts";
+import * as ManagedRelayTenancy from "./managedRelayTenancy.ts";
 
 const DEFAULT_STALE_TIME_MS = 15_000;
 const DEFAULT_IDLE_TTL_MS = 5 * 60_000;
@@ -464,6 +468,54 @@ export function createManagedRelayQueryManager(
       },
     ): void {
       registry.refresh(environmentStatusAtom(statusKey(input)));
+    },
+  };
+}
+
+export interface ManagedRelayOrganizationCatalogSnapshot {
+  readonly membership: RelayOrganizationMembership;
+  readonly repositories: ReadonlyArray<RelayRepositorySummary>;
+  readonly projects: ReadonlyArray<RelayOrganizationProject>;
+}
+
+/**
+ * One shared SWR query for Start, Add Project, and future organization
+ * navigation. Keeping these relay-owned records together prevents each
+ * surface from issuing its own membership/repository/project waterfall.
+ */
+export function createManagedRelayOrganizationCatalogQueryManager(
+  runtime: Atom.AtomRuntime<ManagedRelayTenancy.ManagedRelayTenancyClient>,
+  options?: { readonly staleTimeMs?: number; readonly idleTtlMs?: number },
+) {
+  const staleTime = options?.staleTimeMs ?? DEFAULT_STALE_TIME_MS;
+  const idleTtl = options?.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
+  const catalogAtom = Atom.family((accountId: string) =>
+    runtime
+      .atom((get) =>
+        Effect.gen(function* () {
+          const clerkToken = yield* requireClerkToken(get, accountId);
+          const relay = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+          return yield* Effect.all(
+            {
+              membership: relay.getOrganization({ clerkToken }),
+              repositories: relay.listRepositories({ clerkToken }),
+              projects: relay.listOrganizationProjects({ clerkToken }),
+            },
+            { concurrency: "unbounded" },
+          );
+        }),
+      )
+      .pipe(
+        Atom.swr({ staleTime, revalidateOnMount: true }),
+        Atom.setIdleTTL(idleTtl),
+        Atom.withLabel(`managed-relay:organization-catalog:${accountId}`),
+      ),
+  );
+
+  return {
+    catalogAtom,
+    refresh(registry: AtomRegistry.AtomRegistry, accountId: string): void {
+      registry.refresh(catalogAtom(accountId));
     },
   };
 }

@@ -35,6 +35,7 @@ import {
   withoutCapturedParentSpan,
 } from "./http/Api.ts";
 import { machineEnrollmentApi, machinesApi } from "./http/MachinesApi.ts";
+import { organizationProjectsApi, projectCatalogServerApi } from "./http/ProjectCatalogApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
 import { ManagedEndpointZone, RelayApiZone, RelayDeploymentConfig } from "./zone.ts";
 import { makeRelayTraceLayer, RelayObservability } from "./observability.ts";
@@ -59,6 +60,7 @@ import * as ApnsDeliveries from "./agentActivity/ApnsDeliveries.ts";
 import * as EnvironmentConnector from "./environments/EnvironmentConnector.ts";
 import * as EnvironmentLinker from "./environments/EnvironmentLinker.ts";
 import * as EnvironmentPublishSignatures from "./environments/EnvironmentPublishSignatures.ts";
+import * as EnvironmentProjectCatalogSignatures from "./environments/EnvironmentProjectCatalogSignatures.ts";
 import * as ManagedEndpointProvider from "./environments/ManagedEndpointProvider.ts";
 import * as ManagedTunnelLimits from "./environments/ManagedTunnelLimits.ts";
 import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
@@ -67,6 +69,7 @@ import * as MachineComputeProvider from "./machines/MachineComputeProvider.ts";
 import * as MachineEnroller from "./machines/MachineEnroller.ts";
 import * as MachineLimits from "./machines/MachineLimits.ts";
 import * as Machines from "./machines/Machines.ts";
+import * as OrganizationProjectCatalog from "./projects/OrganizationProjectCatalog.ts";
 import * as Invitations from "./tenancy/Invitations.ts";
 import * as Organizations from "./tenancy/Organizations.ts";
 import * as Repositories from "./tenancy/Repositories.ts";
@@ -104,12 +107,14 @@ const relayApiLayer = Layer.mergeAll(
   clientApi,
   organizationApi,
   repositoriesApi,
+  organizationProjectsApi,
   machinesApi,
   machineEnrollmentApi,
   tokenApi,
   dpopClientApi,
   jobsApi,
   serverApi,
+  projectCatalogServerApi,
 );
 
 const CloudMintKeyPair = Alchemy.KeyPair("CloudMintKeyPair");
@@ -266,6 +271,7 @@ export const ApiLive = Api.make(
         ),
         Layer.provideMerge(MachineLimits.layer),
         Layer.provideMerge(EnvironmentPublishSignatures.layer),
+        Layer.provideMerge(EnvironmentProjectCatalogSignatures.layer),
         Layer.provideMerge(
           ManagedEndpointProvider.layerCloudflareBindings(
             managedEndpointTunnelBinding,
@@ -291,6 +297,7 @@ export const ApiLive = Api.make(
             GithubApp.layer,
             GithubInstallations.layer,
             Machines.layer,
+            OrganizationProjectCatalog.layer,
           ),
         ),
         Layer.provideMerge(Devices.layer),

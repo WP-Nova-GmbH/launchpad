@@ -342,6 +342,7 @@ interface ProviderInstanceCardProps {
    * omit it.
    */
   readonly headerAction?: ReactNode | undefined;
+  readonly accountAuthAction?: ReactNode | undefined;
   readonly hiddenModels: ReadonlyArray<string>;
   readonly favoriteModels: ReadonlyArray<string>;
   readonly modelOrder: ReadonlyArray<string>;
@@ -384,6 +385,7 @@ export function ProviderInstanceCard({
   onUpdate,
   onDelete,
   headerAction,
+  accountAuthAction,
   hiddenModels,
   favoriteModels,
   modelOrder,
@@ -706,6 +708,7 @@ export function ProviderInstanceCard({
             {authRowNode}
           </div>
           <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
+            {accountAuthAction}
             <Button
               size="compact"
               variant="ghost-muted"

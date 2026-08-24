@@ -3,6 +3,9 @@ import {
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
+  type ServerProviderAccountAuthCompleteEvent,
+  type ServerProviderAccountAuthEvent,
+  type ProviderInstanceId,
   type ServerLifecycleStreamReadyEvent,
   type ServerSelfUpdateProgressEvent,
   type ServerSelfUpdateResult,
@@ -63,6 +66,47 @@ export type ServerUpdateState =
 export interface ServerUpdateTarget {
   readonly environmentId: EnvironmentId;
   readonly input: EnvironmentRpcInput<typeof WS_METHODS.serverUpdateServer>;
+}
+
+export type ProviderAccountAuthState =
+  | { readonly status: "idle" }
+  | { readonly status: "running"; readonly output: string }
+  | { readonly status: "succeeded"; readonly output: string }
+  | { readonly status: "failed"; readonly output: string; readonly message: string };
+
+export interface ProviderAccountAuthTarget {
+  readonly environmentId: EnvironmentId;
+  readonly input: { readonly instanceId: ProviderInstanceId };
+}
+
+const MAX_PROVIDER_ACCOUNT_AUTH_OUTPUT_LENGTH = 64 * 1024;
+const IDLE_PROVIDER_ACCOUNT_AUTH_STATE: ProviderAccountAuthState = { status: "idle" };
+
+function appendProviderAccountAuthOutput(current: string, text: string): string {
+  if (current.length >= MAX_PROVIDER_ACCOUNT_AUTH_OUTPUT_LENGTH) return current;
+  return `${current}${text}`.slice(0, MAX_PROVIDER_ACCOUNT_AUTH_OUTPUT_LENGTH);
+}
+
+const providerAccountAuthStateFamily = Atom.family((key: string) =>
+  Atom.make<ProviderAccountAuthState>(IDLE_PROVIDER_ACCOUNT_AUTH_STATE).pipe(
+    Atom.withLabel(`environment-data:server:provider-account-auth:${key}`),
+  ),
+);
+
+function providerAccountAuthStateKey(
+  environmentId: EnvironmentId,
+  instanceId: ProviderInstanceId,
+): string {
+  return JSON.stringify([environmentId, instanceId]);
+}
+
+export class ProviderAccountAuthIncompleteError extends Schema.TaggedErrorClass<ProviderAccountAuthIncompleteError>()(
+  "ProviderAccountAuthIncompleteError",
+  { instanceId: Schema.String },
+) {
+  override get message(): string {
+    return `Provider login for ${this.instanceId} ended without a completion event.`;
+  }
 }
 
 const IDLE_SERVER_UPDATE_STATE: ServerUpdateState = { status: "idle" };
@@ -669,6 +713,68 @@ export function createServerEnvironmentAtoms<R, E>(
       );
     },
   });
+  const authenticateProvider = createRuntimeCommand<
+    EnvironmentRegistry | EnvironmentCacheStore | R,
+    E,
+    ProviderAccountAuthTarget,
+    ServerProviderAccountAuthCompleteEvent,
+    unknown
+  >(runtime, {
+    label: "environment-data:server:authenticate-provider",
+    concurrency: {
+      mode: "singleFlight",
+      key: ({ environmentId, input }) =>
+        providerAccountAuthStateKey(environmentId, input.instanceId),
+    },
+    execute: (target, atomRegistry) => {
+      const stateAtom = providerAccountAuthStateFamily(
+        providerAccountAuthStateKey(target.environmentId, target.input.instanceId),
+      );
+      let output = "";
+      atomRegistry.set(stateAtom, { status: "running", output });
+
+      return Effect.gen(function* () {
+        const environmentRegistry = yield* EnvironmentRegistry;
+        let complete: ServerProviderAccountAuthCompleteEvent | null = null;
+        yield* environmentRegistry
+          .runStream(
+            target.environmentId,
+            runStream(WS_METHODS.serverAuthenticateProvider, target.input),
+          )
+          .pipe(
+            Stream.runForEach((event: ServerProviderAccountAuthEvent) =>
+              Effect.sync(() => {
+                if (event.type === "output") {
+                  output = appendProviderAccountAuthOutput(output, event.text);
+                  atomRegistry.set(stateAtom, { status: "running", output });
+                  return;
+                }
+                complete = event;
+              }),
+            ),
+          );
+        if (complete === null) {
+          return yield* new ProviderAccountAuthIncompleteError({
+            instanceId: target.input.instanceId,
+          });
+        }
+        atomRegistry.set(stateAtom, { status: "succeeded", output });
+        return complete;
+      }).pipe(
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) return;
+            const error = Cause.squash(exit.cause);
+            atomRegistry.set(stateAtom, {
+              status: "failed",
+              output,
+              message: error instanceof Error ? error.message : "Provider login failed.",
+            });
+          }),
+        ),
+      );
+    },
+  });
   const settingsValueAtom = Atom.family((environmentId: EnvironmentId) =>
     Atom.make((get) => get(configValueAtom(environmentId))?.settings ?? null).pipe(
       Atom.withLabel(`environment-data:server:settings:${environmentId}`),
@@ -729,6 +835,18 @@ export function createServerEnvironmentAtoms<R, E>(
       concurrency: {
         mode: "singleFlight",
         key: ({ environmentId }) => environmentId,
+      },
+    }),
+    authenticateProvider,
+    providerAccountAuthStateAtom: (environmentId: EnvironmentId, instanceId: ProviderInstanceId) =>
+      providerAccountAuthStateFamily(providerAccountAuthStateKey(environmentId, instanceId)),
+    logoutProvider: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:logout-provider",
+      tag: WS_METHODS.serverLogoutProvider,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) =>
+          providerAccountAuthStateKey(environmentId, input.instanceId),
       },
     }),
     updateProvider: createEnvironmentRpcCommand(runtime, {

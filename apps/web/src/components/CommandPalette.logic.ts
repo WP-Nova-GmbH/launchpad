@@ -16,6 +16,24 @@ export const RECENT_THREAD_LIMIT = 12;
 export const ITEM_ICON_CLASS = "size-4 text-icon-muted";
 export const ADDON_ICON_CLASS = "size-4";
 
+export type OrganizationRepositoryCloneTarget<TEnvironmentId> =
+  | { readonly kind: "direct"; readonly environmentId: TEnvironmentId }
+  | { readonly kind: "choose" }
+  | { readonly kind: "unavailable" };
+
+export function resolveOrganizationRepositoryCloneTarget<TEnvironmentId>(
+  environments: ReadonlyArray<{
+    readonly environmentId: TEnvironmentId;
+    readonly isConnected: boolean;
+  }>,
+): OrganizationRepositoryCloneTarget<TEnvironmentId> {
+  const connected = environments.filter((environment) => environment.isConnected);
+  if (connected.length === 1) {
+    return { kind: "direct", environmentId: connected[0]!.environmentId };
+  }
+  return environments.length === 0 ? { kind: "unavailable" } : { kind: "choose" };
+}
+
 export function browseInputEndPaddingClass(input: {
   readonly willCreateProjectPath: boolean;
   readonly hasHighlightedBrowseItem: boolean;

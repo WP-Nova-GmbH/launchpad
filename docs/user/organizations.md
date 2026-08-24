@@ -54,10 +54,10 @@ A **repository** is the organization's record of a codebase — its addresses, a
 it. A **project** is one checkout of that repository on one machine, with files on a disk. They are
 different things, and registering the first does not create the second.
 
-So a newly registered repository appears under Settings → Organization and nowhere else. It will
-not show up in Connections, which lists machines you can reach, or in Source Control, which is
-about the tools installed on this machine, or in your project sidebar, which lists checkouts that
-actually exist.
+So a newly registered repository appears under Settings → Organization, on Start, and in Add
+Project's **Organization repositories** list. It will not show up in Connections, which lists
+machines you can reach, or turn into a project by itself. Choosing it in Add Project still needs a
+connected target machine on which to create the checkout.
 
 What registering buys you: any checkout of that repository, on any machine, is recognised as the
 same repository; you decide who may work in it; and work the organization runs on your behalf is
@@ -87,6 +87,19 @@ fresh one.
 Once a machine is **Ready**, it appears to every member of the organization alongside their own
 environments, so you can open projects and threads on it from any client, exactly as you would on
 a machine of your own.
+
+Its projects remain listed on Start when the machine is offline. They are labelled **Offline** and
+cannot be opened until that machine reconnects. This retained catalog contains only project and
+repository names plus the machine association; it does not sync files or chat history. Admins see
+every cataloged project without a separate repository grant. Members see projects for repositories
+on which they hold a role.
+
+Provider account sessions belong to the machine, not to the member who opened the sign-in page.
+From **Settings → Providers**, select the organization machine and sign in to Codex, Claude, or
+Cursor there. Teammates who can operate that environment then use the same machine-local provider
+session; the credentials themselves are never copied to their clients or to another machine. Use an
+organization-owned provider account when access and billing should be shared, and provision a
+separate environment when they should not be.
 
 Destroying a machine destroys everything on it, including any projects and thread history it
 holds — which is why the trash can asks for a second, labelled click. The organization has a limit

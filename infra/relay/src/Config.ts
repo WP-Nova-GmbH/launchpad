@@ -41,6 +41,12 @@ export class RelayConfiguration extends Context.Service<
     readonly github: GithubAppCredentials | undefined;
     readonly managedEndpointBaseDomain: string | undefined;
     readonly managedEndpointNamespace: string | undefined;
+    /**
+     * Development-only escape hatch for relay-provisioned Docker machines.
+     * When enabled, the connector may call a machine's loopback-only manual
+     * endpoint. Personal links and non-loopback endpoints remain rejected.
+     */
+    readonly allowLocalMachineEndpoints?: boolean;
   }
 >()("t3code-relay/Config/RelayConfiguration") {}
 

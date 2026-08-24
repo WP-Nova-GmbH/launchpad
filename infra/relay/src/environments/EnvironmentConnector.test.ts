@@ -206,6 +206,7 @@ function connectorTestLayer(
     readonly allocations?: ManagedEndpointAllocations.ManagedEndpointAllocations["Service"];
     readonly machine?: Machines.MachineRecord | null;
     readonly membershipOrganizationId?: string | null;
+    readonly allowLocalMachineEndpoints?: boolean;
   },
 ) {
   const unexpectedMachineCall = () => Effect.die("unexpected machine store call");
@@ -267,7 +268,14 @@ function connectorTestLayer(
         }),
       ),
     ),
-    Layer.provide(RelayConfiguration.layer(settings)),
+    Layer.provide(
+      RelayConfiguration.layer({
+        ...settings,
+        ...(options?.allowLocalMachineEndpoints === undefined
+          ? {}
+          : { allowLocalMachineEndpoints: options.allowLocalMachineEndpoints }),
+      }),
+    ),
     Layer.provide(Layer.succeed(HttpClient.HttpClient, HttpClient.make(execute))),
   );
 }
@@ -454,6 +462,128 @@ describe("EnvironmentConnector", () => {
               providerKind: "manual",
             },
           }),
+        }),
+      ),
+    );
+  });
+
+  it.effect("checks a relay-provisioned Docker machine through its local endpoint in dev", () => {
+    const seenUrls: Array<string> = [];
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const healthRequest = decodeHealthRequestBody(requestBodyText(request));
+        seenUrls.push(request.url);
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(signHealthResponse(healthRequest), { status: 200 }),
+        );
+      });
+    const machine: Machines.MachineRecord = {
+      machineId: "machine-local",
+      organizationId: "organization-1",
+      role: "agent_executor",
+      label: "Local Docker Executor",
+      computeKind: "docker",
+      computeRef: "container-local",
+      seedExpiresAt: "2100-01-01T00:00:00.000Z",
+      environmentId: "env-connector-test",
+      environmentPublicKey: environmentKeyPair.publicKey,
+      endpointHttpBaseUrl: "http://127.0.0.1:23000",
+      endpointWsBaseUrl: "ws://127.0.0.1:23000",
+      endpointProviderKind: "manual",
+      createdByUserId: "user_admin",
+      enrolledAt: "2026-08-19T01:00:00.000Z",
+      deprovisionedAt: null,
+      createdAt: "2026-08-19T00:00:00.000Z",
+    };
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* connector.status({
+        userId: "user_member",
+        environmentId: "env-connector-test",
+      });
+
+      expect(seenUrls).toEqual(["http://127.0.0.1:23000/api/t3-connect/health"]);
+      expect(result).toMatchObject({
+        environmentId: "env-connector-test",
+        endpoint: {
+          httpBaseUrl: "http://127.0.0.1:23000",
+          wsBaseUrl: "ws://127.0.0.1:23000",
+          providerKind: "manual",
+        },
+        status: "online",
+      });
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(execute, {
+          links: {
+            ...makeLinks(),
+            getForUser: () => Effect.succeed(null),
+          },
+          allocations: makeAllocations(null),
+          machine,
+          membershipOrganizationId: "organization-1",
+          allowLocalMachineEndpoints: true,
+        }),
+      ),
+    );
+  });
+
+  it.effect("rejects a non-loopback manual endpoint from a machine in dev", () => {
+    let requestCount = 0;
+    const execute = () =>
+      Effect.sync(() => {
+        requestCount += 1;
+        throw new Error("unexpected request");
+      });
+    const machine: Machines.MachineRecord = {
+      machineId: "machine-local",
+      organizationId: "organization-1",
+      role: "agent_executor",
+      label: "Local Docker Executor",
+      computeKind: "docker",
+      computeRef: "container-local",
+      seedExpiresAt: "2100-01-01T00:00:00.000Z",
+      environmentId: "env-connector-test",
+      environmentPublicKey: environmentKeyPair.publicKey,
+      endpointHttpBaseUrl: "http://attacker.example.test:23000",
+      endpointWsBaseUrl: "ws://attacker.example.test:23000",
+      endpointProviderKind: "manual",
+      createdByUserId: "user_admin",
+      enrolledAt: "2026-08-19T01:00:00.000Z",
+      deprovisionedAt: null,
+      createdAt: "2026-08-19T00:00:00.000Z",
+    };
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* Effect.result(
+        connector.status({
+          userId: "user_member",
+          environmentId: "env-connector-test",
+        }),
+      );
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toMatchObject({
+          operation: "status",
+          reason: "endpoint_provider_not_managed",
+        });
+      }
+      expect(requestCount).toBe(0);
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(execute, {
+          links: {
+            ...makeLinks(),
+            getForUser: () => Effect.succeed(null),
+          },
+          allocations: makeAllocations(null),
+          machine,
+          membershipOrganizationId: "organization-1",
+          allowLocalMachineEndpoints: true,
         }),
       ),
     );
@@ -1171,6 +1301,7 @@ describe("EnvironmentConnector.resolveAccess", () => {
           providerKind: "cloudflare_tunnel",
         },
         allocationOwnerKey: "org:organization-1",
+        source: "machine",
       });
     }).pipe(
       Effect.provide(
@@ -1250,6 +1381,7 @@ describe("EnvironmentConnector.resolveAccess", () => {
         operation: "status",
       });
       expect(access.allocationOwnerKey).toBe("user_123");
+      expect(access.source).toBe("link");
     }).pipe(Effect.provide(connectorTestLayer(unusedExecute))),
   );
 });

@@ -82,6 +82,7 @@ import { VcsStatusBroadcaster } from "../src/vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../src/git/GitWorkflowService.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
+import * as OrganizationProjectCatalogRelay from "../src/relay/OrganizationProjectCatalogRelay.ts";
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
@@ -378,6 +379,12 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(
         Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
           publishThread: () => Effect.void,
+          start: () => Effect.void,
+        }),
+      ),
+      Layer.provideMerge(
+        Layer.succeed(OrganizationProjectCatalogRelay.OrganizationProjectCatalogRelay, {
+          publishSnapshot: () => Effect.succeed(true),
           start: () => Effect.void,
         }),
       ),

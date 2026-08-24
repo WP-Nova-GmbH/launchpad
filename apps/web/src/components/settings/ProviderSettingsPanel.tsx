@@ -73,6 +73,8 @@ import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { AddProviderInstanceDialog } from "./AddProviderInstanceDialog";
 import { ProviderInstanceCard } from "./ProviderInstanceCard";
+import { ProviderAccountAuthActions } from "./ProviderAccountAuthActions";
+import { supportsProviderAccountAuth } from "./ProviderAccountAuthActions.logic";
 import { DRIVER_OPTIONS, getDriverOption } from "./providerDriverMeta";
 import { searchableSetting } from "./settingsSearch";
 import {
@@ -861,6 +863,18 @@ export function EnvironmentProviderSettings({
                 }}
                 onDelete={row.isDefault ? undefined : () => deleteProviderInstance(row.instanceId)}
                 headerAction={headerAction}
+                accountAuthAction={
+                  driverOption && supportsProviderAccountAuth(row.driver) ? (
+                    <ProviderAccountAuthActions
+                      environmentId={environmentId}
+                      environmentLabel={environmentLabel}
+                      instanceId={row.instanceId}
+                      providerName={driverOption.label}
+                      driver={row.driver}
+                      liveProvider={liveProvider}
+                    />
+                  ) : undefined
+                }
                 hiddenModels={modelPreferences.hiddenModels}
                 favoriteModels={favoriteModels}
                 modelOrder={modelPreferences.modelOrder}

@@ -8,7 +8,7 @@ import * as HttpApiSchema from "effect/unstable/httpapi/HttpApiSchema";
 import * as HttpApiSecurity from "effect/unstable/httpapi/HttpApiSecurity";
 import * as OpenApi from "effect/unstable/httpapi/OpenApi";
 
-import { EnvironmentId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { EnvironmentId, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 
 export const RelayAgentAwarenessPlatform = Schema.Literal("ios");
@@ -319,6 +319,13 @@ export const RelayAgentActivityPublishProofInvalidReason = Schema.Literals([
 export type RelayAgentActivityPublishProofInvalidReason =
   typeof RelayAgentActivityPublishProofInvalidReason.Type;
 
+export const RelayProjectCatalogPublishProofInvalidReason = Schema.Literals([
+  "invalid_signature_or_payload",
+  "replayed_nonce",
+]);
+export type RelayProjectCatalogPublishProofInvalidReason =
+  typeof RelayProjectCatalogPublishProofInvalidReason.Type;
+
 export const RelayAuthInvalidReason = Schema.Literals([
   "missing_bearer",
   "invalid_bearer",
@@ -500,6 +507,33 @@ export class RelayAgentActivityPublishProofInvalidError extends Schema.TaggedErr
 ) {
   override get message(): string {
     return `Relay agent activity publish proof is invalid: ${this.reason}`;
+  }
+}
+
+export class RelayProjectCatalogPublishProofExpiredError extends Schema.TaggedErrorClass<RelayProjectCatalogPublishProofExpiredError>()(
+  "RelayProjectCatalogPublishProofExpiredError",
+  {
+    code: Schema.Literal("project_catalog_publish_proof_expired"),
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 401 },
+) {
+  override get message(): string {
+    return "Relay project catalog publish proof expired";
+  }
+}
+
+export class RelayProjectCatalogPublishProofInvalidError extends Schema.TaggedErrorClass<RelayProjectCatalogPublishProofInvalidError>()(
+  "RelayProjectCatalogPublishProofInvalidError",
+  {
+    code: Schema.Literal("project_catalog_publish_proof_invalid"),
+    reason: RelayProjectCatalogPublishProofInvalidReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 401 },
+) {
+  override get message(): string {
+    return `Relay project catalog publish proof is invalid: ${this.reason}`;
   }
 }
 
@@ -687,6 +721,8 @@ export const RelayProtectedError = Schema.Union([
   RelayEnvironmentLinkLimitExceededError,
   RelayAgentActivityPublishProofExpiredError,
   RelayAgentActivityPublishProofInvalidError,
+  RelayProjectCatalogPublishProofExpiredError,
+  RelayProjectCatalogPublishProofInvalidError,
   RelayTenancyForbiddenError,
   RelayTenancyNotFoundError,
   RelayTenancyConflictError,
@@ -722,6 +758,13 @@ const RelayAgentActivityPublishErrors = [
   RelayAuthInvalidError,
   RelayAgentActivityPublishProofExpiredError,
   RelayAgentActivityPublishProofInvalidError,
+  RelayInternalError,
+] as const;
+
+const RelayProjectCatalogPublishErrors = [
+  RelayAuthInvalidError,
+  RelayProjectCatalogPublishProofExpiredError,
+  RelayProjectCatalogPublishProofInvalidError,
   RelayInternalError,
 ] as const;
 
@@ -1020,6 +1063,9 @@ export type RelayOrganizationId = typeof RelayOrganizationId.Type;
 export const RelayRepositoryId = TrimmedNonEmptyString.pipe(Schema.brand("RelayRepositoryId"));
 export type RelayRepositoryId = typeof RelayRepositoryId.Type;
 
+export const RelayMachineId = TrimmedNonEmptyString.pipe(Schema.brand("RelayMachineId"));
+export type RelayMachineId = typeof RelayMachineId.Type;
+
 export const RelayInvitationId = TrimmedNonEmptyString.pipe(Schema.brand("RelayInvitationId"));
 export type RelayInvitationId = typeof RelayInvitationId.Type;
 
@@ -1170,6 +1216,65 @@ export const RelayListRepositoriesResponse = Schema.Struct({
 });
 export type RelayListRepositoriesResponse = typeof RelayListRepositoriesResponse.Type;
 
+/**
+ * The non-sensitive part of one environment-local project that an organization
+ * may retain while the machine is offline. Workspace paths and thread content
+ * deliberately never enter this catalog.
+ */
+export const RelayProjectCatalogEntry = Schema.Struct({
+  projectId: ProjectId,
+  title: TrimmedNonEmptyString,
+  repositoryCanonicalKey: Schema.NullOr(RelayRepositoryCanonicalKey),
+  createdAt: TrimmedNonEmptyString,
+  updatedAt: TrimmedNonEmptyString,
+});
+export type RelayProjectCatalogEntry = typeof RelayProjectCatalogEntry.Type;
+
+export const RelayProjectCatalogRevision = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+
+export const RelayProjectCatalogPublishProofPayload = Schema.Struct({
+  ...RelaySignedJwtRegisteredClaims,
+  environmentId: EnvironmentId,
+  revision: RelayProjectCatalogRevision,
+  projects: Schema.Array(RelayProjectCatalogEntry),
+});
+export type RelayProjectCatalogPublishProofPayload =
+  typeof RelayProjectCatalogPublishProofPayload.Type;
+
+export const RelayProjectCatalogPublishRequest = Schema.Struct({
+  revision: RelayProjectCatalogRevision,
+  projects: Schema.Array(RelayProjectCatalogEntry),
+  proof: TrimmedNonEmptyString.annotate({
+    description: "Environment-signed JWT covering this redacted project catalog snapshot.",
+  }),
+});
+export type RelayProjectCatalogPublishRequest = typeof RelayProjectCatalogPublishRequest.Type;
+
+export const RelayOrganizationProject = Schema.Struct({
+  environmentId: EnvironmentId,
+  machineId: RelayMachineId,
+  machineLabel: TrimmedNonEmptyString,
+  projectId: ProjectId,
+  title: TrimmedNonEmptyString,
+  repositoryCanonicalKey: Schema.NullOr(RelayRepositoryCanonicalKey),
+  createdAt: TrimmedNonEmptyString,
+  updatedAt: TrimmedNonEmptyString,
+  catalogUpdatedAt: TrimmedNonEmptyString,
+});
+export type RelayOrganizationProject = typeof RelayOrganizationProject.Type;
+
+export const RelayListOrganizationProjectsResponse = Schema.Struct({
+  projects: Schema.Array(RelayOrganizationProject),
+});
+export type RelayListOrganizationProjectsResponse =
+  typeof RelayListOrganizationProjectsResponse.Type;
+
+export const RelayProjectCatalogPublishResponse = Schema.Struct({
+  ok: Schema.Boolean,
+  acceptedRevision: RelayProjectCatalogRevision,
+});
+export type RelayProjectCatalogPublishResponse = typeof RelayProjectCatalogPublishResponse.Type;
+
 export const RelayRegisterRepositoryRequest = Schema.Struct({
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(RELAY_ORGANIZATION_NAME_MAX_LENGTH)),
   canonicalKey: RelayRepositoryCanonicalKey,
@@ -1267,9 +1372,6 @@ export type RelayListGithubRepositoriesResponse = typeof RelayListGithubReposito
 // credential. Enrollment is a second, parallel trust path beside the
 // human-driven link flow, never a replacement for it.
 // ---------------------------------------------------------------------------
-
-export const RelayMachineId = TrimmedNonEmptyString.pipe(Schema.brand("RelayMachineId"));
-export type RelayMachineId = typeof RelayMachineId.Type;
 
 /** What a provisioned machine is for. One provisioning path, one enrollment story, two roles. */
 export const RelayMachineRole = Schema.Literals(["agent_executor", "review_host"]);
@@ -1926,6 +2028,22 @@ export const RelayRepositoriesGroup = HttpApiGroup.make("repositories")
   .annotate(OpenApi.Description, "Repositories, their canonical keys, and who may work in them.")
   .middleware(RelayClientAuth);
 
+/**
+ * Read-only organization project discovery. The authoritative project remains
+ * on its environment; this redacted relay projection keeps it discoverable
+ * while that environment is offline.
+ */
+export const RelayOrganizationProjectsGroup = HttpApiGroup.make("organizationProjects")
+  .add(
+    HttpApiEndpoint.get("listOrganizationProjects", "/v1/organization/projects", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListOrganizationProjectsResponse,
+      error: RelayTenancyErrors,
+    }).annotate(OpenApi.Summary, "List projects visible to the organization member"),
+  )
+  .annotate(OpenApi.Description, "Redacted organization project discovery across machines.")
+  .middleware(RelayClientAuth);
+
 const RelayMachineParams = Schema.Struct({
   machineId: RelayMachineId,
 });
@@ -2025,6 +2143,22 @@ export const RelayServerGroup = HttpApiGroup.make("server")
   .annotate(OpenApi.Description, "Environment-authenticated activity publication.")
   .middleware(RelayEnvironmentAuth);
 
+export const RelayProjectCatalogServerGroup = HttpApiGroup.make("projectCatalogServer")
+  .add(
+    HttpApiEndpoint.post(
+      "publishProjectCatalog",
+      "/v1/environments/:environmentId/project-catalog",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayProjectCatalogPublishRequest,
+        success: RelayProjectCatalogPublishResponse,
+        error: RelayProjectCatalogPublishErrors,
+      },
+    ).annotate(OpenApi.Summary, "Publish a managed environment's project catalog"),
+  )
+  .annotate(OpenApi.Description, "Environment-authenticated project catalog publication.")
+  .middleware(RelayEnvironmentAuth);
+
 export const RelayApi = HttpApi.make("RelayApi")
   .add(
     RelayHealthGroup,
@@ -2033,12 +2167,14 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayClientGroup,
     RelayOrganizationGroup,
     RelayRepositoriesGroup,
+    RelayOrganizationProjectsGroup,
     RelayMachinesGroup,
     RelayMachineEnrollmentGroup,
     RelayTokenGroup,
     RelayDpopClientGroup,
     RelayJobsGroup,
     RelayServerGroup,
+    RelayProjectCatalogServerGroup,
   )
   .annotate(OpenApi.Title, "T3 Code Relay API")
   .annotate(OpenApi.Version, "1.0.0")

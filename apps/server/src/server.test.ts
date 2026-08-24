@@ -56,6 +56,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -114,6 +115,8 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import * as ProviderInstanceRegistry from "./provider/Services/ProviderInstanceRegistry.ts";
+import type { ProviderInstance } from "./provider/ProviderDriver.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/providerMaintenance.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -387,6 +390,9 @@ const buildAppUnderTest = (options?: {
   layers?: {
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
+    providerInstanceRegistry?: Partial<
+      ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]
+    >;
     serverSettings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
     externalLauncher?: Partial<ExternalLauncher.ExternalLauncher["Service"]>;
     vcsDriver?: Partial<VcsDriver.VcsDriver["Service"]>;
@@ -629,18 +635,30 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provide(
-        Layer.mock(ProviderRegistry.ProviderRegistry)({
-          getProviders: Effect.succeed([]),
-          refresh: () => Effect.succeed([]),
-          refreshInstance: () => Effect.succeed([]),
-          getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
-            Effect.succeed(
-              makeManualOnlyProviderMaintenanceCapabilities({ provider, packageName: null }),
+        Layer.mergeAll(
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([]),
+            refresh: () => Effect.succeed([]),
+            refreshInstance: () => Effect.succeed([]),
+            getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
+              Effect.succeed(
+                makeManualOnlyProviderMaintenanceCapabilities({ provider, packageName: null }),
+              ),
+            setProviderMaintenanceActionState: () => Effect.succeed([]),
+            streamChanges: Stream.empty,
+            ...options?.layers?.providerRegistry,
+          }),
+          Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+            getInstance: () => Effect.sync((): ProviderInstance | undefined => undefined),
+            listInstances: Effect.succeed([]),
+            listUnavailable: Effect.succeed([]),
+            streamChanges: Stream.empty,
+            subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), (pubsub) =>
+              PubSub.subscribe(pubsub),
             ),
-          setProviderMaintenanceActionState: () => Effect.succeed([]),
-          streamChanges: Stream.empty,
-          ...options?.layers?.providerRegistry,
-        }),
+            ...options?.layers?.providerInstanceRegistry,
+          }),
+        ),
       ),
       Layer.provide(
         Layer.mock(ServerSettings.ServerSettingsService)({
@@ -4377,6 +4395,58 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.equal(record.resourceAttributes["service.name"], "t3-web");
         assert.equal(record.status?.code, String(span.status.code));
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("routes provider account login output and logout to the selected instance", () =>
+    Effect.gen(function* () {
+      const instanceId = ProviderInstanceId.make("codex_work");
+      const loggedOut = yield* Ref.make(false);
+      const refreshes = yield* Ref.make(0);
+      const providerInstance = {
+        accountAuth: {
+          login: Stream.make({
+            type: "output" as const,
+            stream: "stdout" as const,
+            text: "Open https://auth.openai.com/codex/device\n",
+          }),
+          logout: Ref.set(loggedOut, true),
+        },
+      } as unknown as ProviderInstance;
+
+      yield* buildAppUnderTest({
+        layers: {
+          providerInstanceRegistry: {
+            getInstance: (candidate) =>
+              Effect.succeed(candidate === instanceId ? providerInstance : undefined),
+          },
+          providerRegistry: {
+            refreshInstance: () => Ref.update(refreshes, (count) => count + 1).pipe(Effect.as([])),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const loginEvents = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.serverAuthenticateProvider]({ instanceId }).pipe(Stream.runCollect),
+        ),
+      );
+      const logoutResult = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) => client[WS_METHODS.serverLogoutProvider]({ instanceId })),
+      );
+
+      assert.deepEqual(Array.from(loginEvents), [
+        {
+          type: "output",
+          stream: "stdout",
+          text: "Open https://auth.openai.com/codex/device\n",
+        },
+        { type: "complete", providers: [] },
+      ]);
+      assert.deepEqual(logoutResult.providers, []);
+      assert.isTrue(yield* Ref.get(loggedOut));
+      assert.equal(yield* Ref.get(refreshes), 2);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("routes websocket rpc server.upsertKeybinding", () =>

@@ -68,8 +68,15 @@ them on in **Settings** → the provider's card when you want to use them.
 Cursor is the one to watch: install Cursor CLI, which provides the `cursor-agent` binary that
 T3 Code looks for, but authenticate with `agent login`, not `cursor-agent login`.
 
-Run the login command on the machine running the T3 Code server, not on the device you browse
-from.
+After the CLI is installed, open **Settings** → **Providers** and choose **Sign in** on its card.
+T3 Code runs that provider's own account-login command on the selected environment and shows the
+browser link or device code it returns. You can still run the command from the table yourself; run
+it on the machine hosting that environment, not on the phone or laptop you happen to browse from.
+
+Account sessions stay on the environment where you created them. Signing in to one remote machine
+does not copy the session to another machine, and **Sign out** removes only that environment's
+provider session. API keys and external provider credentials remain separate from this account-login
+flow.
 
 ### Binary Discovery
 

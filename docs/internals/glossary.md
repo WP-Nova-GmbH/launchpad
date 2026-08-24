@@ -205,6 +205,15 @@ own machines alike — and owns a set of [canonical keys](#canonical-key) by whi
 checkouts recognise it ([ADR-0006][adr6]). Access control lives here: users are granted access
 to a repository, not to an individual checkout. _Avoid_: "global project", "cloud project".
 
+#### Organization project catalog
+
+A redacted, relay-owned discovery projection of the last project snapshot published by each
+managed agent executor ([ADR-0014][adr14]). It keeps project titles, repository identity, and
+machine association visible while an executor is offline, but carries no workspace path or thread
+content. The project on its [environment](#environment) remains authoritative; catalog entries are
+never command targets. The full event mirror in [ADR-0012][adr12] separately makes thread history
+readable offline.
+
 #### Canonical key
 
 A git remote reduced to `host/owner/repo` by `normalizeGitRemoteUrl`. The natural key that
@@ -446,3 +455,4 @@ a thread; the session is what churns underneath.
 [adr10]: ../adr/0010-review-apps-run-on-org-compute.md
 [adr12]: ../adr/0012-executors-mirror-their-event-log-to-the-relay.md
 [adr13]: ../adr/0013-personal-threads-mirror-to-a-user-scoped-store.md
+[adr14]: ../adr/0014-managed-projects-publish-a-redacted-organization-catalog.md

@@ -30,6 +30,7 @@ import {
   type SourceControlRepositoryInfo,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@t3tools/contracts";
+import type { RelayRepositorySummary } from "@t3tools/contracts/relay";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import * as Option from "effect/Option";
 import {
@@ -37,6 +38,7 @@ import {
   CornerLeftUpIcon,
   FileSearchIcon,
   FolderIcon,
+  FolderGit2Icon,
   FolderPlusIcon,
   LinkIcon,
   MessageSquareIcon,
@@ -62,6 +64,7 @@ import { useAtomValue } from "@effect/atom-react";
 
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
+import { useManagedRelayOrganizationCatalog } from "../cloud/managedRelayState";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useClientSettings } from "../hooks/useSettings";
 import { useTheme } from "../hooks/useTheme";
@@ -121,6 +124,7 @@ import {
   ITEM_ICON_CLASS,
   RECENT_THREAD_LIMIT,
   reduceCommandPaletteUiState,
+  resolveOrganizationRepositoryCloneTarget,
   type SearchOverlayMode,
 } from "./CommandPalette.logic";
 import { orderItemsByPreferredIds, sortLogicalProjectsForSidebar } from "./Sidebar.logic";
@@ -209,6 +213,19 @@ type AddProjectRemoteProviderKind = Extract<
   "github" | "gitlab" | "bitbucket" | "azure-devops"
 >;
 type AddProjectRemoteSource = AddProjectRemoteProviderKind | "url";
+
+function organizationRepositoryRemoteSource(canonicalKey: string): AddProjectRemoteSource {
+  const host = canonicalKey.split("/")[0]?.toLowerCase();
+  if (host === "github.com") return "github";
+  if (host === "gitlab.com") return "gitlab";
+  if (host === "bitbucket.org") return "bitbucket";
+  if (host?.includes("dev.azure.com") || host?.includes("visualstudio.com")) return "azure-devops";
+  return "url";
+}
+
+function organizationRepositoryRemoteUrl(canonicalKey: string): string {
+  return `https://${canonicalKey}.git`;
+}
 
 type AddProjectCloneFlow =
   | {
@@ -565,6 +582,7 @@ function OpenCommandPaletteDialog(props: {
   readonly clearOpenIntent: () => void;
 }) {
   const navigate = useNavigate();
+  const organizationCatalog = useManagedRelayOrganizationCatalog();
   const { clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
@@ -1243,6 +1261,44 @@ function OpenCommandPaletteDialog(props: {
     [pushPaletteView],
   );
 
+  const startAddProjectOrganizationRepository = useCallback(
+    (environmentId: EnvironmentId, entry: RelayRepositorySummary): void => {
+      const canonicalKey = entry.repository.canonicalKeys[0];
+      if (!canonicalKey) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Repository unavailable",
+            description: `${entry.repository.name} has no clone address.`,
+          }),
+        );
+        return;
+      }
+      const source = organizationRepositoryRemoteSource(canonicalKey);
+      const remoteUrl = organizationRepositoryRemoteUrl(canonicalKey);
+      const destinationPath = getCloneDestinationPath(
+        getAddProjectInitialQueryForEnvironment(environmentId),
+        getCloneDirectoryName(canonicalKey),
+      );
+      setAddProjectEnvironmentId(environmentId);
+      setAddProjectCloneFlow({
+        step: "confirm",
+        environmentId,
+        source,
+        repositoryInput: entry.repository.name,
+        repository: null,
+        remoteUrl,
+      });
+      pushPaletteView({
+        addonIcon: remoteProjectSourceIcon(source, ADDON_ICON_CLASS),
+        groups: [],
+        initialQuery: destinationPath,
+      });
+      setBrowseGeneration((generation) => generation + 1);
+    },
+    [getAddProjectInitialQueryForEnvironment, pushPaletteView],
+  );
+
   const openSourceControlSettings = useCallback(() => {
     setOpen(false);
     void navigate({ to: "/settings/source-control" });
@@ -1337,9 +1393,50 @@ function OpenCommandPaletteDialog(props: {
         });
       }
 
-      return [{ value: `sources:${environmentId}`, label: "Sources", items: sourceItems }];
+      const organizationRepositoryItems: CommandPaletteActionItem[] =
+        organizationCatalog.data?.repositories.map((entry) => {
+          const canonicalKey = entry.repository.canonicalKeys[0] ?? "";
+          return {
+            kind: "action",
+            value: `action:add-project:${environmentId}:organization:${entry.repository.repositoryId}`,
+            searchTerms: [
+              "organization",
+              "repository",
+              "repo",
+              entry.repository.name,
+              ...entry.repository.canonicalKeys,
+            ],
+            title: entry.repository.name,
+            description: canonicalKey || "No clone address",
+            disabled: canonicalKey.length === 0,
+            icon: <FolderGit2Icon className={ITEM_ICON_CLASS} />,
+            keepOpen: true,
+            run: async () => {
+              startAddProjectOrganizationRepository(environmentId, entry);
+            },
+          } satisfies CommandPaletteActionItem;
+        }) ?? [];
+
+      return [
+        ...(organizationRepositoryItems.length > 0
+          ? [
+              {
+                value: `organization-repositories:${environmentId}`,
+                label: "Organization repositories",
+                items: organizationRepositoryItems,
+              },
+            ]
+          : []),
+        { value: `sources:${environmentId}`, label: "Other sources", items: sourceItems },
+      ];
     },
-    [openSourceControlSettings, startAddProjectBrowse, startAddProjectClone],
+    [
+      openSourceControlSettings,
+      organizationCatalog.data?.repositories,
+      startAddProjectBrowse,
+      startAddProjectClone,
+      startAddProjectOrganizationRepository,
+    ],
   );
 
   const startAddProjectSourceSelection = useCallback(
@@ -1398,15 +1495,93 @@ function OpenCommandPaletteDialog(props: {
     }),
   );
 
+  const selectOrganizationRepositoryTarget = useCallback(
+    (entry: RelayRepositorySummary): void => {
+      const target = resolveOrganizationRepositoryCloneTarget(addProjectEnvironmentOptions);
+      if (target.kind === "direct") {
+        startAddProjectOrganizationRepository(target.environmentId, entry);
+        return;
+      }
+      if (target.kind === "unavailable") {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "No environment available",
+            description: "Connect a machine before cloning this organization repository.",
+          }),
+        );
+        return;
+      }
+      pushPaletteView({
+        addonIcon: <FolderGit2Icon className={ADDON_ICON_CLASS} />,
+        groups: [
+          {
+            value: `organization-repository-targets:${entry.repository.repositoryId}`,
+            label: `Clone ${entry.repository.name} to`,
+            items: addProjectEnvironmentOptions.map(
+              (option): CommandPaletteActionItem => ({
+                kind: "action",
+                value: `action:add-project:organization:${entry.repository.repositoryId}:${option.environmentId}`,
+                searchTerms: [option.label, option.environmentId, entry.repository.name],
+                title: option.label,
+                description: option.isConnected ? "Available" : option.status,
+                disabled: !option.isConnected,
+                icon: <ServerIcon className={ITEM_ICON_CLASS} />,
+                keepOpen: true,
+                run: async () => {
+                  startAddProjectOrganizationRepository(option.environmentId, entry);
+                },
+              }),
+            ),
+          },
+        ],
+      });
+    },
+    [addProjectEnvironmentOptions, pushPaletteView, startAddProjectOrganizationRepository],
+  );
+
+  const addProjectOrganizationRepositoryItems = useMemo<CommandPaletteActionItem[]>(
+    () =>
+      organizationCatalog.data?.repositories.map((entry) => ({
+        kind: "action",
+        value: `action:add-project:organization:${entry.repository.repositoryId}`,
+        searchTerms: [
+          "organization",
+          "repository",
+          "repo",
+          entry.repository.name,
+          ...entry.repository.canonicalKeys,
+        ],
+        title: entry.repository.name,
+        description: entry.repository.canonicalKeys[0] ?? "No clone address",
+        disabled: entry.repository.canonicalKeys.length === 0,
+        icon: <FolderGit2Icon className={ITEM_ICON_CLASS} />,
+        keepOpen: true,
+        run: async () => {
+          selectOrganizationRepositoryTarget(entry);
+        },
+      })) ?? [],
+    [organizationCatalog.data?.repositories, selectOrganizationRepositoryTarget],
+  );
+
   const addProjectEnvironmentGroups = useMemo<CommandPaletteView["groups"]>(
     () => [
+      ...(addProjectOrganizationRepositoryItems.length > 0
+        ? [
+            {
+              value: "organization-repositories",
+              label: "Organization repositories",
+              items: addProjectOrganizationRepositoryItems,
+            },
+          ]
+        : []),
       {
         value: "environments",
-        label: "Environments",
+        label: "Browse an environment",
         items: addProjectEnvironmentItems,
       },
     ],
-    [addProjectEnvironmentItems],
+    [addProjectEnvironmentItems, addProjectOrganizationRepositoryItems],
   );
 
   const openAddProjectFlow = useCallback(() => {
@@ -1575,7 +1750,8 @@ function OpenCommandPaletteDialog(props: {
       "environment",
     ],
     title: "Add project",
-    disabled: defaultAddProjectEnvironmentId === null,
+    disabled:
+      defaultAddProjectEnvironmentId === null && addProjectOrganizationRepositoryItems.length === 0,
     icon: <FolderPlusIcon className={ITEM_ICON_CLASS} />,
     keepOpen: true,
     run: async () => {
@@ -1658,12 +1834,14 @@ function OpenCommandPaletteDialog(props: {
   const activeGroups =
     addProjectEnvironmentId !== null &&
     currentView !== null &&
-    currentView.groups[0]?.value === sourceSelectionViewValue
+    currentView.groups.some((group) => group.value === sourceSelectionViewValue)
       ? buildAddProjectSourceGroups(
           addProjectEnvironmentId,
           buildAddProjectRemoteSourceReadiness(sourceControlDiscovery.data),
         )
-      : (currentView?.groups ?? rootGroups);
+      : currentView?.groups.some((group) => group.value === "environments")
+        ? addProjectEnvironmentGroups
+        : (currentView?.groups ?? rootGroups);
 
   const filteredGroups = filterCommandPaletteGroups({
     activeGroups,

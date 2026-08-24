@@ -25,6 +25,7 @@ import {
   type RelayOrganization,
   type RelayOrganizationMember,
   type RelayOrganizationMembership,
+  type RelayOrganizationProject,
   type RelayProvisionMachineRequest,
   type RelayRegisterRepositoryRequest,
   type RelayRepository,
@@ -93,6 +94,9 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly listRepositories: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayRepositorySummary>, ManagedRelayClientError>;
+    readonly listOrganizationProjects: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<ReadonlyArray<RelayOrganizationProject>, ManagedRelayClientError>;
     readonly registerRepository: (input: {
       readonly clerkToken: string;
       readonly payload: RelayRegisterRepositoryRequest;
@@ -173,6 +177,9 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     revokeInvitation: unavailable("clientRuntime.managedRelayTenancy.revokeInvitation"),
     acceptInvitation: unavailable("clientRuntime.managedRelayTenancy.acceptInvitation"),
     listRepositories: unavailable("clientRuntime.managedRelayTenancy.listRepositories"),
+    listOrganizationProjects: unavailable(
+      "clientRuntime.managedRelayTenancy.listOrganizationProjects",
+    ),
     registerRepository: unavailable("clientRuntime.managedRelayTenancy.registerRepository"),
     lookupRepository: unavailable("clientRuntime.managedRelayTenancy.lookupRepository"),
     deleteRepository: unavailable("clientRuntime.managedRelayTenancy.deleteRepository"),
@@ -342,6 +349,19 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.listRepositories"),
+      withRelayClientTracing,
+    ),
+    listOrganizationProjects: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organizationProjects
+          .listOrganizationProjects({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.map((response) => response.projects),
+            Effect.mapError(relayRequestError("list relay organization projects")),
+            timeoutRelayRequest("Relay organization project listing"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.listOrganizationProjects"),
       withRelayClientTracing,
     ),
     registerRepository: Effect.fnUntraced(

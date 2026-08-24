@@ -1814,6 +1814,9 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             mockSpawnerLayer((args) => {
               const joined = args.join(" ");
               if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+              if (joined === "auth status") {
+                return { stdout: '{"loggedIn":true}\n', stderr: "", code: 0 };
+              }
               throw new Error(`Unexpected args: ${joined}`);
             }),
           ),
@@ -2049,6 +2052,9 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             mockSpawnerLayer((args) => {
               const joined = args.join(" ");
               if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+              if (joined === "auth status") {
+                return { stdout: '{"loggedIn":true}\n', stderr: "", code: 0 };
+              }
               throw new Error(`Unexpected args: ${joined}`);
             }),
           ),
@@ -2071,6 +2077,9 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             mockSpawnerLayer((args) => {
               const joined = args.join(" ");
               if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+              if (joined === "auth status") {
+                return { stdout: '{"loggedIn":true}\n', stderr: "", code: 0 };
+              }
               throw new Error(`Unexpected args: ${joined}`);
             }),
           ),
@@ -2128,7 +2137,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           assert.strictEqual(status.status, "ready");
           assert.deepStrictEqual(
             recorded.commands.map((command) => command.env?.CLAUDE_CONFIG_DIR),
-            [claudeConfigDir],
+            [claudeConfigDir, claudeConfigDir],
           );
         }).pipe(Effect.provide(recorded.layer));
       });
@@ -2259,6 +2268,37 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         }).pipe(Effect.provide(failingSpawnerLayer("spawn claude ENOENT"))),
       );
 
+      it.effect("returns unauthenticated when Claude reports that no account is logged in", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities({ apiProvider: "firstParty" }),
+          );
+          assert.strictEqual(status.status, "error");
+          assert.strictEqual(status.installed, true);
+          assert.strictEqual(status.auth.status, "unauthenticated");
+          assert.strictEqual(
+            status.message,
+            "Claude Agent CLI is not authenticated. Run `claude auth login` and try again.",
+          );
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+              if (joined === "auth status") {
+                return {
+                  stdout: '{"loggedIn":false,"authMethod":"none"}\n',
+                  stderr: "",
+                  code: 1,
+                };
+              }
+              throw new Error(`Unexpected args: ${joined}`);
+            }),
+          ),
+        ),
+      );
+
       it.effect("returns error when version check fails with non-zero exit code", () => {
         const secretStderr = "Something went wrong: secret-token-value";
         return Effect.gen(function* () {
@@ -2286,7 +2326,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         );
       });
 
-      it.effect("returns warning when the Claude initialization result is unavailable", () =>
+      it.effect("returns warning when Claude auth and initialization results are unavailable", () =>
         Effect.gen(function* () {
           const status = yield* checkClaudeProviderStatus(
             defaultClaudeSettings,
@@ -2306,7 +2346,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
               if (joined === "auth status")
                 return {
-                  stdout: '{"loggedIn":false}\n',
+                  stdout: "not-json\n",
                   stderr: "",
                   code: 1,
                 };

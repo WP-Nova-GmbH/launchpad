@@ -1,8 +1,11 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
   createManagedRelayQueryManager,
+  createManagedRelayOrganizationCatalogQueryManager,
   deregisterManagedRelayEnvironment,
+  type ManagedRelayOrganizationCatalogSnapshot,
   ManagedRelay,
+  ManagedRelayTenancy,
   managedRelaySessionAtom,
   readManagedRelaySnapshotState,
 } from "@t3tools/client-runtime/relay";
@@ -33,7 +36,18 @@ const managedRelayAtomRuntime = Atom.runtime(
   ),
 );
 
+const managedRelayTenancyAtomRuntime = Atom.runtime(
+  Layer.effect(
+    ManagedRelayTenancy.ManagedRelayTenancyClient,
+    runtime.contextEffect.pipe(
+      Effect.map((context) => Context.get(context, ManagedRelayTenancy.ManagedRelayTenancyClient)),
+    ),
+  ),
+);
+
 export const managedRelayQueryManager = createManagedRelayQueryManager(managedRelayAtomRuntime);
+export const managedRelayOrganizationCatalogQueryManager =
+  createManagedRelayOrganizationCatalogQueryManager(managedRelayTenancyAtomRuntime);
 
 const managedRelayMutationScheduler = createAtomCommandScheduler();
 
@@ -58,6 +72,10 @@ const EMPTY_ENVIRONMENTS_ATOM = Atom.make(
 const EMPTY_DEVICES_ATOM = Atom.make(
   AsyncResult.success<ReadonlyArray<RelayClientDeviceRecord>>([]),
 ).pipe(Atom.keepAlive, Atom.withLabel("managed-relay:web:devices:null"));
+
+const EMPTY_ORGANIZATION_CATALOG_ATOM = Atom.make(
+  AsyncResult.initial<ManagedRelayOrganizationCatalogSnapshot, never>(false),
+).pipe(Atom.keepAlive, Atom.withLabel("managed-relay:web:organization-catalog:null"));
 
 export function useManagedRelayEnvironments() {
   const session = useAtomValue(managedRelaySessionAtom);
@@ -105,6 +123,35 @@ export function useManagedRelayDevices() {
   const refresh = useCallback(() => {
     if (accountId) {
       managedRelayQueryManager.refreshDevices(appAtomRegistry, accountId);
+    }
+  }, [accountId]);
+
+  return {
+    ...snapshot,
+    accountId,
+    refresh,
+  };
+}
+
+export function useManagedRelayOrganizationCatalog() {
+  const session = useAtomValue(managedRelaySessionAtom);
+  const accountId = session?.accountId ?? null;
+  const atom = accountId
+    ? managedRelayOrganizationCatalogQueryManager.catalogAtom(accountId)
+    : EMPTY_ORGANIZATION_CATALOG_ATOM;
+  const result = useAtomValue(atom);
+  const snapshot = readManagedRelaySnapshotState(result);
+  useEffect(() => {
+    if (snapshot.error) {
+      console.error("[t3-cloud] Relay organization catalog listing failed", {
+        message: snapshot.error,
+        traceId: snapshot.errorTraceId,
+      });
+    }
+  }, [snapshot.error, snapshot.errorTraceId]);
+  const refresh = useCallback(() => {
+    if (accountId) {
+      managedRelayOrganizationCatalogQueryManager.refresh(appAtomRegistry, accountId);
     }
   }, [accountId]);
 

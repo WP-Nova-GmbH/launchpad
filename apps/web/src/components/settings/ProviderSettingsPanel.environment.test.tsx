@@ -66,6 +66,10 @@ vi.mock("../../state/use-atom-command", () => ({
     atom === atoms.refreshProviders ? commands.refresh : commands.updateProvider,
 }));
 
+vi.mock("./ProviderAccountAuthActions", () => ({
+  ProviderAccountAuthActions: () => <span data-testid="provider-account-auth" />,
+}));
+
 vi.mock("../../hooks/useSettings", () => ({
   useEnvironmentSettings: (environmentId: EnvironmentId) => {
     settingsState.readEnvironmentIds.push(environmentId);
