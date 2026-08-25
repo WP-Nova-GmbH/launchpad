@@ -80,6 +80,19 @@ const MODE_ARGS = {
     "--parallel",
     "dev",
   ],
+  // `dev` plus the local relay (infra/relay dev-server, port 8610). The relay
+  // is a separate long-lived process that nothing else supervises, so bundling
+  // it here is what keeps Launchpad Connect environments reachable after a
+  // reboot without remembering to start it by hand.
+  "dev:full": [
+    "run",
+    "--filter=@t3tools/contracts",
+    "--filter=@t3tools/web",
+    "--filter=t3",
+    "--filter=t3code-relay",
+    "--parallel",
+    "dev",
+  ],
   "dev:server": ["run", "--filter=t3", "dev"],
   "dev:web": ["run", "--filter=@t3tools/web", "dev"],
   "dev:desktop": ["run", "--filter=@t3tools/desktop", "--filter=@t3tools/web", "dev"],
@@ -151,7 +164,7 @@ export class DevRunnerProcessError extends Schema.TaggedErrorClass<DevRunnerProc
   "DevRunnerProcessError",
   {
     operation: Schema.Literals(["spawn", "wait-for-exit"]),
-    mode: Schema.Literals(["dev", "dev:server", "dev:web", "dev:desktop"]),
+    mode: Schema.Literals(["dev", "dev:full", "dev:server", "dev:web", "dev:desktop"]),
     executable: Schema.Literal("vp"),
     argumentCount: Schema.Number,
     shell: Schema.Boolean,
@@ -166,7 +179,7 @@ export class DevRunnerProcessError extends Schema.TaggedErrorClass<DevRunnerProc
 export class DevRunnerProcessExitError extends Schema.TaggedErrorClass<DevRunnerProcessExitError>()(
   "DevRunnerProcessExitError",
   {
-    mode: Schema.Literals(["dev", "dev:server", "dev:web", "dev:desktop"]),
+    mode: Schema.Literals(["dev", "dev:full", "dev:server", "dev:web", "dev:desktop"]),
     executable: Schema.Literal("vp"),
     argumentCount: Schema.Number,
     shell: Schema.Boolean,
@@ -181,7 +194,7 @@ export class DevRunnerProcessExitError extends Schema.TaggedErrorClass<DevRunner
 export class DevRunnerHostNotProxiableError extends Schema.TaggedErrorClass<DevRunnerHostNotProxiableError>()(
   "DevRunnerHostNotProxiableError",
   {
-    mode: Schema.Literals(["dev", "dev:web"]),
+    mode: Schema.Literals(["dev", "dev:full", "dev:web"]),
     host: Schema.String,
   },
 ) {
@@ -357,7 +370,7 @@ export function createDevRunnerEnv({
       // apps/web/vite.config.ts. Over a shared origin that is invisible: the
       // page loads and only HMR quietly dials the wrong machine.
       delete output.HOST;
-      if (mode === "dev" || mode === "dev:web") {
+      if (mode === "dev" || mode === "dev:full" || mode === "dev:web") {
         // Browser dev is single-origin: everything (including /ws) is proxied
         // through Vite, so the client must resolve its backend from
         // window.location.origin rather than a baked-in localhost URL. See
@@ -410,7 +423,7 @@ export function createDevRunnerEnv({
       delete output.T3CODE_LOG_WS_EVENTS;
     }
 
-    if (mode === "dev") {
+    if (mode === "dev" || mode === "dev:full") {
       output.T3CODE_MODE = "web";
       delete output.T3CODE_DESKTOP_WS_URL;
     }
@@ -648,7 +661,7 @@ export function runDevRunnerWithInput(input: DevRunnerCliInput) {
     // broken" rather than "flag combination is unsupported". Reject it up
     // front instead. (dev:server and dev:desktop don't proxy — untouched.)
     if (
-      (input.mode === "dev" || input.mode === "dev:web") &&
+      (input.mode === "dev" || input.mode === "dev:full" || input.mode === "dev:web") &&
       input.host !== undefined &&
       !isProxiableBindHost(input.host)
     ) {

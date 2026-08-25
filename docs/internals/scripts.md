@@ -22,6 +22,11 @@ authenticated.
 ## Dev
 
 - `vp run dev`: Starts contracts, server, and web in watch mode.
+- `vp run dev:full`: `dev` plus the local relay dev server (`infra/relay/scripts/dev-server.ts`,
+  port 8610, env from `infra/relay/.env`). Use this when working with Launchpad Connect
+  environments: the relay is a separate long-lived process nothing else supervises, and a
+  cloudflared tunnel pointing at a dead 8610 answers every relay request with a 502. The relay
+  needs its dev Postgres (the `t3-relay-dev-postgres` container on 5433) already running.
 - `vp run dev --share`: Also publishes the web port over HTTPS on this machine's tailnet. The
   startup pairing URL is built against the shared origin, and the mapping is removed on exit.
   Shared runs default to Vite's bundled dev mode (`T3CODE_BUNDLED_DEV=1`): a remote browser pays a

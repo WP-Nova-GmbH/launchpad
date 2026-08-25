@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "node --env-file-if-exists=.env scripts/dev-server.ts",
     "deploy": "node -- scripts/deploy.ts",
     "destroy": "alchemy destroy",
     "test": "vp test run",

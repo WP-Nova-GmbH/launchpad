@@ -86,6 +86,20 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
       }),
     );
 
+    it.effect("adds the relay to the full-stack dev task graph", () =>
+      Effect.sync(() => {
+        assert.deepStrictEqual(getDevRunnerModeArgs("dev:full"), [
+          "run",
+          "--filter=@t3tools/contracts",
+          "--filter=@t3tools/web",
+          "--filter=t3",
+          "--filter=t3code-relay",
+          "--parallel",
+          "dev",
+        ]);
+      }),
+    );
+
     it.effect("places Vite+ run flags before the task name", () =>
       Effect.sync(() => {
         assert.deepStrictEqual(getDevRunnerModeArgs("dev"), [
@@ -379,7 +393,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
     // Browser dev is single-origin: Vite proxies the backend, and the client
     // resolves it from window.location.origin. Baking a localhost URL here is
     // what breaks sharing a dev server to another device.
-    for (const mode of ["dev", "dev:web"] as const) {
+    for (const mode of ["dev", "dev:full", "dev:web"] as const) {
       it.effect(`leaves the client backend URLs unset in ${mode} mode`, () =>
         Effect.gen(function* () {
           const env = yield* createDevRunnerEnv({
@@ -457,7 +471,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
     // HOST is Vite's bind address and gates the HMR pin in vite.config.ts. An
     // inherited one would survive into browser dev and point HMR at the wrong
     // interface — invisible over a shared origin, since the page still loads.
-    for (const mode of ["dev", "dev:web"] as const) {
+    for (const mode of ["dev", "dev:full", "dev:web"] as const) {
       it.effect(`drops an inherited HOST in ${mode} mode`, () =>
         Effect.gen(function* () {
           const env = yield* createDevRunnerEnv({
