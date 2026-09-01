@@ -76,6 +76,10 @@ dependencies represented at their boundary rather than mocking internal behavior
 
 ## Deployment
 
+For WP Nova's self-hosted relay — a single Hetzner Cloud machine running the Node relay entry —
+see [`infra/hetzner`](../hetzner/README.md). The rest of this section describes the upstream
+Cloudflare deployment.
+
 The relay deploys through Alchemy:
 
 ```sh
