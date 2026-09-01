@@ -12,7 +12,6 @@ import {
   type RelayConnectMachineResponse,
   type RelayCreateInvitationRequest,
   type RelayCreateInvitationResponse,
-  type RelayGithubAppSetupResponse,
   type RelayGithubInstallResponse,
   type RelayGithubInstallationCandidate,
   type RelayGithubConnection,
@@ -31,11 +30,8 @@ import {
   type RelayOrganizationMembership,
   type RelayOrganizationProject,
   type RelayProvisionMachineRequest,
-  type RelayRegisterGithubAppRequest,
-  type RelayRegisteredGithubApp,
   type RelayRegisterRepositoryRequest,
   type RelayRepository,
-  type RelayStartGithubAppSetupRequest,
   type RelayStartGithubInstallRequest,
   type RelayRepositoryAccessEntry,
   type RelayRepositoryId,
@@ -163,18 +159,10 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly installationId: string;
     }) => Effect.Effect<RelayGithubConnection, ManagedRelayClientError>;
-    readonly startGithubAppSetup: (input: {
-      readonly clerkToken: string;
-      readonly payload: RelayStartGithubAppSetupRequest;
-    }) => Effect.Effect<RelayGithubAppSetupResponse, ManagedRelayClientError>;
     readonly startGithubInstall: (input: {
       readonly clerkToken: string;
       readonly payload: RelayStartGithubInstallRequest;
     }) => Effect.Effect<RelayGithubInstallResponse, ManagedRelayClientError>;
-    readonly registerGithubApp: (input: {
-      readonly clerkToken: string;
-      readonly payload: RelayRegisterGithubAppRequest;
-    }) => Effect.Effect<RelayRegisteredGithubApp, ManagedRelayClientError>;
     readonly listGithubInstallations: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayGithubInstallationCandidate>, ManagedRelayClientError>;
@@ -221,9 +209,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     deprovisionMachine: unavailable("clientRuntime.managedRelayTenancy.deprovisionMachine"),
     getGithubConnection: unavailable("clientRuntime.managedRelayTenancy.getGithubConnection"),
     connectGithub: unavailable("clientRuntime.managedRelayTenancy.connectGithub"),
-    startGithubAppSetup: unavailable("clientRuntime.managedRelayTenancy.startGithubAppSetup"),
     startGithubInstall: unavailable("clientRuntime.managedRelayTenancy.startGithubInstall"),
-    registerGithubApp: unavailable("clientRuntime.managedRelayTenancy.registerGithubApp"),
     listGithubInstallations: unavailable(
       "clientRuntime.managedRelayTenancy.listGithubInstallations",
     ),
@@ -607,21 +593,6 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       Effect.withSpan("clientRuntime.managedRelayTenancy.connectGithub"),
       withRelayClientTracing,
     ),
-    startGithubAppSetup: Effect.fnUntraced(
-      function* (input) {
-        return yield* client.organization
-          .startGithubAppSetup({
-            headers: bearerHeaders(input.clerkToken),
-            payload: input.payload,
-          })
-          .pipe(
-            Effect.mapError(relayRequestError("start relay GitHub App setup")),
-            timeoutRelayRequest("Relay GitHub App setup"),
-          );
-      },
-      Effect.withSpan("clientRuntime.managedRelayTenancy.startGithubAppSetup"),
-      withRelayClientTracing,
-    ),
     startGithubInstall: Effect.fnUntraced(
       function* (input) {
         return yield* client.organization
@@ -635,21 +606,6 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.startGithubInstall"),
-      withRelayClientTracing,
-    ),
-    registerGithubApp: Effect.fnUntraced(
-      function* (input) {
-        return yield* client.organization
-          .registerGithubApp({
-            headers: bearerHeaders(input.clerkToken),
-            payload: input.payload,
-          })
-          .pipe(
-            Effect.mapError(relayRequestError("register relay GitHub App")),
-            timeoutRelayRequest("Relay GitHub App registration"),
-          );
-      },
-      Effect.withSpan("clientRuntime.managedRelayTenancy.registerGithubApp"),
       withRelayClientTracing,
     ),
     listGithubInstallations: Effect.fnUntraced(

@@ -11,6 +11,12 @@ name: Deploy Launchpad relay
 #   vars.RELAY_DEPLOY_HOST         e.g. root@46.224.12.144
 #   vars.RELAY_DEPLOY_KNOWN_HOSTS  the host's ssh-keyscan line, pinned
 #   secrets.RELAY_DEPLOY_SSH_KEY   private key authorized on the host
+#
+# Optional, to configure the relay's GitHub App without touching the host —
+# the deploy writes them into /etc/launchpad-relay/relay.env:
+#   secrets.RELAY_GITHUB_APP_ID           the App's numeric id
+#   secrets.RELAY_GITHUB_APP_SLUG         the App's slug (github.com/apps/<slug>)
+#   secrets.RELAY_GITHUB_APP_PRIVATE_KEY  a private key PEM generated on the App's settings page
 
 on:
   push:
@@ -49,4 +55,7 @@ jobs:
       - name: Deploy
         env:
           RELAY_DEPLOY_HOST: ${{ vars.RELAY_DEPLOY_HOST }}
+          RELAY_GITHUB_APP_ID: ${{ secrets.RELAY_GITHUB_APP_ID }}
+          RELAY_GITHUB_APP_SLUG: ${{ secrets.RELAY_GITHUB_APP_SLUG }}
+          RELAY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.RELAY_GITHUB_APP_PRIVATE_KEY }}
         run: infra/hetzner/deploy.sh "$RELAY_DEPLOY_HOST"

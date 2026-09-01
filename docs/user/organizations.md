@@ -38,24 +38,11 @@ abandon other people's work.
 ## GitHub
 
 Connecting GitHub gives the whole organization — its members and its executors — access to your
-repositories without anyone holding a GitHub token. It takes two clicks, both in **Settings →
-Organization**, and both only once:
-
-1. **Create the GitHub App.** Launchpad needs a GitHub App of its own. Press **Create on GitHub**
-   (optionally naming the GitHub organization it should belong to); your browser opens, you
-   confirm on GitHub, and you are taken straight on to installing it. This happens once per
-   Launchpad installation.
-2. **Connect GitHub.** Install that App on your GitHub organization, or on just the repositories
-   you choose. When GitHub says it is connected, switch back to Launchpad — the connection appears
-   with the repositories it can see.
-
-**Already have a GitHub App?** Instead of creating one, register it: paste its App ID and choose
-a private key downloaded from the App's settings page on GitHub (_Private keys → Generate a
-private key_). To let other organizations install the same App and connect on their own, set the
-App's _Setup URL_ on GitHub to the address Launchpad shows under the GitHub section, enable
-_Redirect on update_, and make the App public. An organization that installed the App straight
-from GitHub can also connect afterwards: the GitHub section lists the App's installations, and an
-admin picks theirs.
+repositories without anyone holding a GitHub token. It is one click, once, in **Settings →
+Organization**: press **Connect GitHub**, install the Launchpad app on your GitHub organization
+(or on just the repositories you choose), and switch back — the connection appears with the
+repositories it can see. If you installed the app from GitHub directly instead, the GitHub section
+lists the app's installations and you pick your organization's.
 
 From then on, executors clone, push, and open pull requests with the organization's connection.
 Work they do is authored by the App, and reaches exactly the repositories you installed it on.

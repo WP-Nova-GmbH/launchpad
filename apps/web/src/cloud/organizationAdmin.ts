@@ -1,7 +1,6 @@
 import { useAuth } from "@clerk/react";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import type {
-  RelayGithubAppSetupResponse,
   RelayGithubConnectionResponse,
   RelayGithubInstallResponse,
   RelayGithubInstallationCandidate,
@@ -106,21 +105,8 @@ export interface OrganizationAdminState {
     readonly userId: string;
   }) => Promise<boolean>;
   readonly connectGithub: (installationId: string) => Promise<boolean>;
-  /**
-   * Begins creating this relay's GitHub App: a relay-hosted page to open in a
-   * browser. GitHub's callbacks finish the job on the relay; refresh when the
-   * admin comes back.
-   */
-  readonly startGithubAppSetup: (input: {
-    readonly githubOrganization?: string | undefined;
-  }) => Promise<RelayGithubAppSetupResponse | null>;
   /** GitHub's install page for the App; the relay claims the installation on GitHub's callback. */
   readonly startGithubInstall: () => Promise<RelayGithubInstallResponse | null>;
-  /** Registers an App that already exists on GitHub, by its id and private key. */
-  readonly registerGithubApp: (input: {
-    readonly appId: string;
-    readonly privateKey: string;
-  }) => Promise<boolean>;
   /** Installations of the App as GitHub reports them, for picking one that was installed directly. */
   readonly listGithubInstallations: () => Promise<ReadonlyArray<RelayGithubInstallationCandidate> | null>;
   readonly disconnectGithub: () => Promise<boolean>;
@@ -368,26 +354,6 @@ export function useOrganizationAdmin(): OrganizationAdminState {
           client.connectGithub({ clerkToken, installationId }),
         ),
       ),
-    startGithubAppSetup: async (input) => {
-      setBusy(true);
-      setError(null);
-      try {
-        return await call("Could not start the GitHub App setup", (client, clerkToken) =>
-          client.startGithubAppSetup({
-            clerkToken,
-            payload: {
-              returnUrl: `${window.location.origin}/settings/organization`,
-              ...(input.githubOrganization ? { githubOrganization: input.githubOrganization } : {}),
-            },
-          }),
-        );
-      } catch (cause) {
-        setError(failureMessage(cause));
-        return null;
-      } finally {
-        setBusy(false);
-      }
-    },
     startGithubInstall: async () => {
       setBusy(true);
       setError(null);
@@ -405,12 +371,6 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         setBusy(false);
       }
     },
-    registerGithubApp: (input) =>
-      mutate("Could not register the GitHub App", () =>
-        call("Could not register the GitHub App", (client, clerkToken) =>
-          client.registerGithubApp({ clerkToken, payload: input }),
-        ),
-      ),
     listGithubInstallations: async () => {
       try {
         return await call("Could not list GitHub installations", (client, clerkToken) =>

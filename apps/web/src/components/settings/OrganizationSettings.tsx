@@ -562,10 +562,6 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
   const isAdmin = snapshot?.membership.role === "admin";
   const connection = snapshot?.github.connection ?? null;
   const installUrl = snapshot?.github.installUrl ?? null;
-  const [githubOrganization, setGithubOrganization] = useState("");
-  const [existingAppId, setExistingAppId] = useState("");
-  const [existingAppKey, setExistingAppKey] = useState("");
-  const privateKeyFileInput = useRef<HTMLInputElement | null>(null);
   const [installations, setInstallations] =
     useState<ReadonlyArray<RelayGithubInstallationCandidate> | null>(null);
 
@@ -608,7 +604,7 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
 
   if (!snapshot) return null;
   if (!installUrl && !connection) {
-    // No GitHub App on this relay yet. An admin creates it from here, once.
+    // No GitHub App on this relay: nothing an organization can do about it here.
     return (
       <SettingsSection
         id={searchableSetting("organization-github").id}
@@ -616,104 +612,9 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
         icon={<GitHubIcon className="size-4 text-muted-foreground" />}
       >
         <SectionNote>
-          Launchpad needs a GitHub App of its own before an organization can connect GitHub.
-          Creating it is one click on GitHub and happens once for this Launchpad. After that,
-          connecting is one more click, and every executor&apos;s access follows automatically.
+          GitHub is not set up on this Launchpad yet. Its operator configures the Launchpad GitHub
+          app on the relay; connecting becomes one click here afterwards.
         </SectionNote>
-        {isAdmin ? (
-          <SettingsRow
-            title="Create the GitHub App"
-            description="GitHub shows you the App and asks you to confirm. Leave the organization empty to create it under your own GitHub account."
-            control={
-              <div className="flex items-center gap-2">
-                <Input
-                  value={githubOrganization}
-                  onChange={(event) => setGithubOrganization(event.target.value)}
-                  placeholder="GitHub organization (optional)"
-                  className="h-8 w-56"
-                  disabled={state.busy}
-                />
-                <Button
-                  size="sm"
-                  disabled={state.busy}
-                  onClick={() => {
-                    void state
-                      .startGithubAppSetup({
-                        githubOrganization: githubOrganization.trim() || undefined,
-                      })
-                      .then((setup) => {
-                        if (setup) openGithubJourney(setup.startUrl);
-                      });
-                  }}
-                >
-                  Create on GitHub
-                </Button>
-              </div>
-            }
-          />
-        ) : (
-          <SettingsRow
-            title="Connect GitHub"
-            description="This Launchpad has no GitHub App yet. An admin creates it once, then connects it."
-            control={
-              <span className="text-xs text-muted-foreground">Ask an admin to set it up.</span>
-            }
-          />
-        )}
-        {isAdmin ? (
-          <SettingsRow
-            title="Use a GitHub App you already have"
-            description="Paste the App's ID from its settings page on GitHub, and choose a private key downloaded from the same page (Private keys → Generate). Launchpad checks the key with GitHub and keeps it sealed."
-            control={
-              <div className="flex flex-col items-end gap-2">
-                <div className="flex items-center gap-2">
-                  <Input
-                    value={existingAppId}
-                    onChange={(event) => setExistingAppId(event.target.value)}
-                    placeholder="App ID"
-                    className="h-8 w-28"
-                    disabled={state.busy}
-                  />
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={state.busy}
-                    onClick={() => privateKeyFileInput.current?.click()}
-                  >
-                    {existingAppKey ? "Key chosen" : "Choose .pem"}
-                  </Button>
-                  <input
-                    ref={privateKeyFileInput}
-                    type="file"
-                    accept=".pem,application/x-pem-file,text/plain"
-                    className="hidden"
-                    onChange={(event) => {
-                      const file = event.target.files?.[0];
-                      if (!file) return;
-                      void file.text().then((text) => setExistingAppKey(text));
-                    }}
-                  />
-                  <Button
-                    size="sm"
-                    disabled={state.busy || !existingAppId.trim() || !existingAppKey.trim()}
-                    onClick={() =>
-                      void state
-                        .registerGithubApp({
-                          appId: existingAppId.trim(),
-                          privateKey: existingAppKey,
-                        })
-                        .then((ok) => {
-                          if (ok) setExistingAppKey("");
-                        })
-                    }
-                  >
-                    Use this App
-                  </Button>
-                </div>
-              </div>
-            }
-          />
-        ) : null}
       </SettingsSection>
     );
   }
@@ -811,14 +712,6 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
             </div>
           ))}
         </div>
-      ) : null}
-      {isAdmin && !connection && snapshot.github.setupCallbackUrl ? (
-        <p className="px-3 pb-2 text-xs text-muted-foreground sm:px-4">
-          For installs to connect themselves, the App&apos;s <em>Setup URL</em> on GitHub should be{" "}
-          <span className="font-mono">{snapshot.github.setupCallbackUrl}</span> with{" "}
-          <em>Redirect on update</em> enabled. Make the App public on GitHub to let other
-          organizations install it.
-        </p>
       ) : null}
 
       {connection && snapshot.githubRepositories.length > 0 ? (

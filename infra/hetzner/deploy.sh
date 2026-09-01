@@ -18,6 +18,26 @@ rsync -az --delete --delete-excluded \
   --filter=':- .gitignore' \
   "${repo_root}/" "${host}:/opt/launchpad/"
 
+# The relay's GitHub App is operator configuration (GITHUB_APP_* in
+# relay.env). When the caller — CI, from repository secrets — has it, write it
+# there so nobody has to edit the host by hand. The PEM is stored on one line
+# with `\n` escapes, which the relay unescapes; Docker's --env-file does not.
+if [[ -n "${RELAY_GITHUB_APP_ID:-}" && -n "${RELAY_GITHUB_APP_SLUG:-}" && -n "${RELAY_GITHUB_APP_PRIVATE_KEY:-}" ]]; then
+  echo "deploy: configuring the relay's GitHub App"
+  escaped_key="${RELAY_GITHUB_APP_PRIVATE_KEY//$'\n'/\\n}"
+  printf 'GITHUB_APP_ID=%s\nGITHUB_APP_SLUG=%s\nGITHUB_APP_PRIVATE_KEY="%s"\n' \
+    "${RELAY_GITHUB_APP_ID}" "${RELAY_GITHUB_APP_SLUG}" "${escaped_key}" |
+    ssh "${host}" bash -s <<'REMOTE_ENV'
+set -euo pipefail
+umask 077
+current=/etc/launchpad-relay/relay.env
+next="$(mktemp)"
+{ grep -v '^GITHUB_APP_' "${current}" 2>/dev/null || true; cat; } > "${next}"
+install -m 0600 "${next}" "${current}"
+rm -f "${next}"
+REMOTE_ENV
+fi
+
 ssh "${host}" bash -s <<'REMOTE'
 set -euo pipefail
 cd /opt/launchpad

@@ -64,11 +64,14 @@ from [`../relay/.env.example`](../relay/.env.example) — Clerk keys and audienc
 `GITHUB_APP_*` and `HETZNER_API_TOKEN` (same Launchpad project) if those features are in use —
 then `systemctl restart launchpad-relay`.
 
-`GITHUB_APP_*` is optional: without it, an organization admin creates the relay's GitHub App from
-Organization settings in the app (one click on GitHub; the key is stored sealed in the relay
-database). Set the variables only to pin an App created elsewhere — copy the three lines
-`infra/relay/scripts/create-github-app.ts` writes exactly as written; the relay unescapes the
-quoted, `\n`-encoded private key itself, because Docker's `--env-file` does not.
+`GITHUB_APP_*` is the relay's GitHub App — the one every organization's **Connect GitHub**
+installs. Set it without touching the host: in the GitHub repository, under _Settings → Secrets
+and variables → Actions_, add `RELAY_GITHUB_APP_ID`, `RELAY_GITHUB_APP_SLUG`, and
+`RELAY_GITHUB_APP_PRIVATE_KEY` (a key generated on the App's settings page) to the `production`
+environment, then run the deploy workflow; `deploy.sh` writes them into `relay.env`. The PEM is
+stored on one line with `\n` escapes, which the relay unescapes because Docker's `--env-file`
+does not. Without an App configured, the GitHub section in Organization settings says so and
+offers nothing.
 
 `DEV_RELAY_DATABASE_URL`, `DEV_RELAY_ISSUER`, and `DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH` are
 already set in `/etc/launchpad-relay/provisioned.env`; do not repeat them.
