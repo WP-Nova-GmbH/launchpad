@@ -4,6 +4,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import {
   SourceControlProviderError,
   type SourceControlProviderDiscoveryItem,
@@ -17,11 +18,13 @@ import * as GitHubSourceControlProvider from "./GitHubSourceControlProvider.ts";
 import * as GitLabSourceControlProvider from "./GitLabSourceControlProvider.ts";
 import * as SourceControlProvider from "./SourceControlProvider.ts";
 import {
+  applyOrganizationGithubAuth,
   probeSourceControlProvider,
   refineUnknownRemoteProvider,
   type SourceControlProviderDiscoverySpec,
 } from "./SourceControlProviderDiscovery.ts";
 import { ServerConfig } from "../config.ts";
+import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 
@@ -199,6 +202,10 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
     const config = yield* ServerConfig;
     const process = yield* VcsProcess.VcsProcess;
     const vcsRegistry = yield* VcsDriverRegistry.VcsDriverRegistry;
+    // Present on a managed executor only; see applyOrganizationGithubAuth.
+    const organizationCredentials = yield* Effect.serviceOption(
+      OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+    );
     const providers = new Map<
       SourceControlProviderKind,
       SourceControlProvider.SourceControlProvider["Service"]
@@ -287,6 +294,14 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
           }),
         ),
         { concurrency: "unbounded" },
+      ).pipe(
+        Effect.flatMap((items) =>
+          Option.isNone(organizationCredentials)
+            ? Effect.succeed(items)
+            : Effect.map(organizationCredentials.value.github, (credential) =>
+                applyOrganizationGithubAuth(items, credential),
+              ),
+        ),
       ),
     });
   },

@@ -273,6 +273,14 @@ The catalogue of [provider credentials](#provider-credential) an organization ho
 pool happens at provider session start, because provider secrets reach a provider as
 process environment variables and are fixed at spawn.
 
+#### Installation token
+
+A short-lived GitHub App token the [relay](#relay) mints from an
+[organization's](#organization) connected installation, on request, for an enrolled
+[executor](#executor). Stored by neither side; it is what the executor's own git and `gh`
+subprocesses authenticate with. Not a [provider credential](#provider-credential). See
+[ADR-0015][adr15].
+
 #### Workflow
 
 An ordered set of [steps](#step) describing how work gets implemented and reviewed. Layered:
@@ -462,3 +470,4 @@ a thread; the session is what churns underneath.
 [adr12]: ../adr/0012-executors-mirror-their-event-log-to-the-relay.md
 [adr13]: ../adr/0013-personal-threads-mirror-to-a-user-scoped-store.md
 [adr14]: ../adr/0014-managed-projects-publish-a-redacted-organization-catalog.md
+[adr15]: ../adr/0015-executors-borrow-the-organizations-github-installation.md

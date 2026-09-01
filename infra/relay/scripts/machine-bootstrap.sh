@@ -35,6 +35,19 @@ curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y nodejs git
 corepack enable
 
+# The GitHub CLI is how git learns the organization's installation token the
+# server hands to its subprocesses (ADR-0015): `gh auth git-credential` serves
+# it as a credential helper. Ubuntu's own package lags; use GitHub's.
+echo "machine-bootstrap: installing the GitHub CLI"
+mkdir -p -m 755 /etc/apt/keyrings
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+  -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+  > /etc/apt/sources.list.d/github-cli.list
+apt-get update
+apt-get install -y gh
+
 if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
   echo "machine-bootstrap: cloning ${T3CODE_MACHINE_SOURCE_GIT_URL}"
   git clone --depth 1 "${T3CODE_MACHINE_SOURCE_GIT_URL}" "${INSTALL_DIR}"

@@ -15,6 +15,7 @@
  */
 import {
   captureRunnerCredentials,
+  withOrganizationGithubToken,
   withRunnerSourceControlCredentials,
 } from "@t3tools/shared/runnerCredentials";
 
@@ -23,9 +24,20 @@ const capturedRunnerCredentials = captureRunnerCredentials(globalThis.process.en
 /**
  * The environment a runner-initiated source-control subprocess should run
  * with, or `null` to leave the inherited environment untouched.
+ *
+ * A runner token the operator configured on this machine always wins. The
+ * organization's GitHub installation token, when a managed executor has one
+ * (ADR-0015), fills the slot only when no such token exists.
  */
-export function runnerSourceControlEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv | null {
-  return withRunnerSourceControlCredentials(baseEnv, capturedRunnerCredentials);
+export function runnerSourceControlEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  organizationGithubToken: string | null = null,
+): NodeJS.ProcessEnv | null {
+  const local = withRunnerSourceControlCredentials(baseEnv, capturedRunnerCredentials);
+  if (local !== null || organizationGithubToken === null) {
+    return local;
+  }
+  return withOrganizationGithubToken(baseEnv, organizationGithubToken);
 }
 
 /** Whether a runner credential was configured on this machine. */

@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -12,6 +13,7 @@ import {
   VcsProcessTimeoutError,
 } from "@t3tools/contracts";
 import * as ProcessRunner from "../processRunner.ts";
+import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 
 const run = (input: VcsProcess.VcsProcessInput) =>
@@ -313,5 +315,51 @@ describe("VcsProcess.run", () => {
 
       expect(error).toBeInstanceOf(VcsProcessTimeoutError);
     }).pipe(provideLive),
+  );
+});
+
+describe("VcsProcess.run on a managed executor", () => {
+  const organizationLayer = Layer.succeed(
+    OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+    OrganizationSourceControlCredentials.OrganizationSourceControlCredentials.of({
+      github: Effect.succeed({
+        token: "ghs_organization",
+        expiresAt: DateTime.makeUnsafe(0),
+        accountLogin: "acme",
+      }),
+    }),
+  );
+  const provideExecutor = <A, E, R>(effect: Effect.Effect<A, E, R | VcsProcess.VcsProcess>) =>
+    effect.pipe(
+      Effect.provide(
+        VcsProcess.layer.pipe(Layer.provide(NodeServices.layer), Layer.provide(organizationLayer)),
+      ),
+    );
+  const printGhToken = {
+    operation: "test.organization-token",
+    command: "node",
+    args: ["-e", "process.stdout.write(process.env.GH_TOKEN ?? '<none>')"],
+    cwd: process.cwd(),
+  } satisfies VcsProcess.VcsProcessInput;
+
+  it.effect("hands the organization's installation token to the child as GH_TOKEN", () =>
+    run(printGhToken).pipe(
+      Effect.map((result) => expect(result.stdout).toBe("ghs_organization")),
+      provideExecutor,
+    ),
+  );
+
+  it.effect("leaves an explicitly provided environment alone", () =>
+    run({ ...printGhToken, env: { PATH: process.env.PATH ?? "" } }).pipe(
+      Effect.map((result) => expect(result.stdout).toBe("<none>")),
+      provideExecutor,
+    ),
+  );
+
+  it.effect("grants nothing where no organization credential service exists", () =>
+    run(printGhToken).pipe(
+      Effect.map((result) => expect(result.stdout).not.toBe("ghs_organization")),
+      provideLive,
+    ),
   );
 });

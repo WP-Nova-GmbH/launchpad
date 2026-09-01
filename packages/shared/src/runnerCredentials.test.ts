@@ -3,6 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   captureRunnerCredentials,
   RUNNER_CREDENTIAL_ENV_PREFIX,
+  withOrganizationGithubToken,
   withoutRunnerCredentials,
   withRunnerSourceControlCredentials,
 } from "./runnerCredentials.ts";
@@ -92,5 +93,25 @@ describe("withRunnerSourceControlCredentials", () => {
     expect(
       withRunnerSourceControlCredentials({ PATH: "/usr/bin" }, new Map([[RUNNER_GH_TOKEN, ""]])),
     ).toBeNull();
+  });
+});
+
+describe("withOrganizationGithubToken", () => {
+  it("fills the GH_TOKEN slot for one child without touching the input", () => {
+    const env = { PATH: "/usr/bin" };
+    expect(withOrganizationGithubToken(env, "ghs_installation")).toEqual({
+      PATH: "/usr/bin",
+      GH_TOKEN: "ghs_installation",
+    });
+    expect(env).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("keeps runner-prefixed variables out of the child, like a runner grant does", () => {
+    expect(
+      withOrganizationGithubToken(
+        { PATH: "/usr/bin", [`${RUNNER_CREDENTIAL_ENV_PREFIX}FUTURE_SECRET`]: "x" },
+        "ghs_installation",
+      ),
+    ).toEqual({ PATH: "/usr/bin", GH_TOKEN: "ghs_installation" });
   });
 });

@@ -112,3 +112,16 @@ export function withRunnerSourceControlCredentials(
   // inherited by anything it spawns, so they come back out here too.
   return withoutRunnerCredentials(granted);
 }
+
+/**
+ * Grant an organization's GitHub App installation token to a runner-initiated
+ * source-control subprocess. Fills the same `GH_TOKEN` slot as a runner-held
+ * token would, and like it never enters the server's own environment — the
+ * caller hands it to one child and lets it go.
+ */
+export function withOrganizationGithubToken(
+  env: NodeJS.ProcessEnv,
+  token: string,
+): NodeJS.ProcessEnv {
+  return withoutRunnerCredentials({ ...env, GH_TOKEN: token });
+}

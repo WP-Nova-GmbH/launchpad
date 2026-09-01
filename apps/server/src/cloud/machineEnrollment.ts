@@ -127,6 +127,40 @@ export function readInstalledMachineIdentity(
     );
 }
 
+export interface ManagedExecutorRelayConfig {
+  readonly url: string;
+  readonly issuer: string;
+  readonly environmentCredential: string;
+}
+
+/**
+ * The relay this environment answers to as an enrolled agent executor, with
+ * the credential enrollment left behind. Null on a personal machine, on a
+ * review host, and until enrollment has completed — the one check every
+ * executor-only relay call makes before it does anything.
+ */
+export function readManagedExecutorRelayConfig(
+  secrets: ServerSecretStore.ServerSecretStore["Service"],
+): Effect.Effect<ManagedExecutorRelayConfig | null> {
+  const readSecretString = (name: string) =>
+    secrets
+      .get(name)
+      .pipe(Effect.map((bytes) => (Option.isSome(bytes) ? bytesToString(bytes.value) : null)));
+  return Effect.all([
+    readSecretString(RELAY_URL_SECRET),
+    readSecretString(RELAY_ISSUER_SECRET),
+    readSecretString(RELAY_ENVIRONMENT_CREDENTIAL_SECRET),
+    readInstalledMachineIdentity(secrets),
+  ]).pipe(
+    Effect.map(([url, issuer, environmentCredential, machineIdentity]) =>
+      url && environmentCredential && machineIdentity?.role === "agent_executor"
+        ? { url, issuer: issuer ?? url, environmentCredential }
+        : null,
+    ),
+    Effect.orElseSucceed(() => null),
+  );
+}
+
 /**
  * Unlike a personal environment's relay URL, a machine's may be plain HTTP:
  * the dev relay lives on the developer's own host and the Docker driver hands

@@ -80,6 +80,12 @@ Run a quick **Rescan** after setting up a new machine or changing credentials.
 
 You can now clone, publish, and create pull requests.
 
+None of this is needed on an organization's managed executors. Once an admin has connected
+GitHub in **Settings → Organization**, executors clone, push, and open pull requests with the
+organization's GitHub App installation, and Source Control shows GitHub as authenticated through
+it. Work done that way is authored by the App, and it reaches exactly the repositories the App was
+installed on.
+
 ### For GitLab
 
 1. Install the GitLab CLI:
@@ -144,6 +150,7 @@ Control settings**.
 - **Bitbucket not connecting** – Double-check your environment variables are set in the correct shell profile and the server was restarted
 - **Can't push to a remote** – Verify your Git remote URL matches the provider you've authenticated with (SSH vs HTTPS remotes may need different credentials)
 - **Clone says the remote rejected this machine's credentials** – The machine running Launchpad is the one doing the cloning. For GitHub, sign in with `gh auth login` there; for a pasted SSH URL, that machine needs an SSH key registered with the host
+- **Clone fails on an organization executor** – Executors use the organization's GitHub App installation, not a personal sign-in. Check that GitHub is connected in **Settings → Organization** and that the App has access to that repository with at least read permission on its contents
 
 **Need more help?** Check your provider's CLI documentation:
 

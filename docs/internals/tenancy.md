@@ -98,7 +98,10 @@ and never persisted. That is what keeps the "no secret in relay Postgres" rule i
 
 This is deliberately not "sign in with GitHub". An OAuth token belongs to one person and dies with
 their session, so access would not be the organization's. With an installation, **every member
-reaches the connected repositories** without holding a GitHub credential of their own.
+reaches the connected repositories** without holding a GitHub credential of their own — and so do
+the organization's managed executors, which clone and push with tokens the relay mints from the
+same installation
+([ADR-0015](../adr/0015-executors-borrow-the-organizations-github-installation.md)).
 
 Creating the App is a one-time setup step, and does not require filling in GitHub's form:
 

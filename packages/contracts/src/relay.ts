@@ -768,6 +768,12 @@ const RelayProjectCatalogPublishErrors = [
   RelayInternalError,
 ] as const;
 
+const RelayGithubInstallationTokenErrors = [
+  RelayAuthInvalidError,
+  RelayTenancyNotFoundError,
+  RelayInternalError,
+] as const;
+
 export class RelayClientPrincipal extends Context.Service<
   RelayClientPrincipal,
   {
@@ -1274,6 +1280,18 @@ export const RelayProjectCatalogPublishResponse = Schema.Struct({
   acceptedRevision: RelayProjectCatalogRevision,
 });
 export type RelayProjectCatalogPublishResponse = typeof RelayProjectCatalogPublishResponse.Type;
+
+export const RelayGithubInstallationTokenResponse = Schema.Struct({
+  token: TrimmedNonEmptyString.annotate({
+    description:
+      "A GitHub App installation access token for the organization's connected installation. Expires within the hour; the relay never stores it.",
+  }),
+  expiresAt: TrimmedNonEmptyString.annotate({ description: "ISO-8601 expiry from GitHub." }),
+  accountLogin: TrimmedNonEmptyString.annotate({
+    description: "The GitHub account the installation belongs to.",
+  }),
+});
+export type RelayGithubInstallationTokenResponse = typeof RelayGithubInstallationTokenResponse.Type;
 
 export const RelayRegisterRepositoryRequest = Schema.Struct({
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(RELAY_ORGANIZATION_NAME_MAX_LENGTH)),
@@ -2191,6 +2209,29 @@ export const RelayProjectCatalogServerGroup = HttpApiGroup.make("projectCatalogS
   .annotate(OpenApi.Description, "Environment-authenticated project catalog publication.")
   .middleware(RelayEnvironmentAuth);
 
+export const RelaySourceControlServerGroup = HttpApiGroup.make("sourceControlServer")
+  .add(
+    HttpApiEndpoint.post(
+      "mintGithubInstallationToken",
+      "/v1/environments/:environmentId/source-control/github/installation-token",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        success: RelayGithubInstallationTokenResponse,
+        error: RelayGithubInstallationTokenErrors,
+      },
+    )
+      .annotate(OpenApi.Summary, "Mint a GitHub installation token for a managed executor")
+      .annotate(
+        OpenApi.Description,
+        "Answers only for an enrolled agent executor whose organization has connected GitHub. The token is minted from the organization's App installation on each call and is never persisted by the relay.",
+      ),
+  )
+  .annotate(
+    OpenApi.Description,
+    "Environment-authenticated source-control credentials for managed executors.",
+  )
+  .middleware(RelayEnvironmentAuth);
+
 export const RelayApi = HttpApi.make("RelayApi")
   .add(
     RelayHealthGroup,
@@ -2207,6 +2248,7 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayJobsGroup,
     RelayServerGroup,
     RelayProjectCatalogServerGroup,
+    RelaySourceControlServerGroup,
   )
   .annotate(OpenApi.Title, "Launchpad Relay API")
   .annotate(OpenApi.Version, "1.0.0")

@@ -17,7 +17,6 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -27,13 +26,8 @@ import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
-import {
-  RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
-  RELAY_ISSUER_SECRET,
-  RELAY_URL_SECRET,
-} from "../cloud/config.ts";
 import { getOrCreateEnvironmentKeyPairFromSecretStore } from "../cloud/environmentKeys.ts";
-import { readInstalledMachineIdentity } from "../cloud/machineEnrollment.ts";
+import { readManagedExecutorRelayConfig } from "../cloud/machineEnrollment.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -83,29 +77,8 @@ export const make = Effect.gen(function* () {
   const environmentKeyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(secrets);
   const publishedRevisionRef = yield* Ref.make(-1);
 
-  const readSecretString = (name: string) =>
-    secrets
-      .get(name)
-      .pipe(
-        Effect.map((bytes) =>
-          Option.isSome(bytes) ? new TextDecoder().decode(bytes.value) : null,
-        ),
-      );
-
-  const readRelayConfig = Effect.gen(function* () {
-    const [url, issuer, environmentCredential, machineIdentity] = yield* Effect.all([
-      readSecretString(RELAY_URL_SECRET),
-      readSecretString(RELAY_ISSUER_SECRET),
-      readSecretString(RELAY_ENVIRONMENT_CREDENTIAL_SECRET),
-      readInstalledMachineIdentity(secrets),
-    ]);
-    return url && environmentCredential && machineIdentity?.role === "agent_executor"
-      ? { url, issuer: issuer ?? url, environmentCredential }
-      : null;
-  });
-
   const publishSnapshotUnsafe = Effect.fn("publishOrganizationProjectCatalogUnsafe")(function* () {
-    const relayConfig = yield* readRelayConfig.pipe(Effect.orElseSucceed(() => null));
+    const relayConfig = yield* readManagedExecutorRelayConfig(secrets);
     if (relayConfig === null) {
       yield* Effect.logDebug(
         "organization project catalog publish skipped; managed machine credentials unavailable",

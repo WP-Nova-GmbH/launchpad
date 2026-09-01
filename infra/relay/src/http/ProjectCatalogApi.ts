@@ -9,14 +9,13 @@ import {
   RelayProjectCatalogPublishProofInvalidError,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
-import * as HttpApiError from "effect/unstable/httpapi/HttpApiError";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import * as EnvironmentProjectCatalogSignatures from "../environments/EnvironmentProjectCatalogSignatures.ts";
-import * as Machines from "../machines/Machines.ts";
 import * as OrganizationProjectCatalog from "../projects/OrganizationProjectCatalog.ts";
 import * as Repositories from "../tenancy/Repositories.ts";
 import { mapErrorTags, mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
+import { requireEnrolledExecutor } from "./enrolledExecutor.ts";
 import { resolveMembership } from "./TenancyApi.ts";
 
 export function visibleOrganizationProjectRecords(input: {
@@ -97,7 +96,6 @@ export const projectCatalogServerApi = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const signatures =
       yield* EnvironmentProjectCatalogSignatures.EnvironmentProjectCatalogSignatures;
-    const machines = yield* Machines.Machines;
     const catalog = yield* OrganizationProjectCatalog.OrganizationProjectCatalog;
 
     return handlers.handle(
@@ -106,24 +104,12 @@ export const projectCatalogServerApi = HttpApiBuilder.group(
         function* (args) {
           const { params, payload } = args;
           const principal = yield* RelayEnvironmentPrincipal;
-          if (principal.environmentId !== params.environmentId) {
-            return yield* new HttpApiError.Unauthorized({});
-          }
+          const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
           yield* signatures.verify({
             environmentId: params.environmentId,
             environmentPublicKey: principal.environmentPublicKey,
             request: payload,
           });
-          const machine = yield* machines.getActiveByEnvironmentId({
-            environmentId: params.environmentId,
-          });
-          if (
-            machine === null ||
-            machine.role !== "agent_executor" ||
-            machine.environmentPublicKey !== principal.environmentPublicKey
-          ) {
-            return yield* new HttpApiError.Unauthorized({});
-          }
           const acceptedRevision = yield* catalog.replace({
             organizationId: machine.organizationId,
             machineId: machine.machineId,

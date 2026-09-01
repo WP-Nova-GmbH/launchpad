@@ -17,6 +17,12 @@ export interface GithubInstallationAccount {
   readonly createdAt: string;
 }
 
+export interface GithubInstallationToken {
+  readonly token: string;
+  /** ISO-8601, as GitHub reports it; tokens live about an hour. */
+  readonly expiresAt: string;
+}
+
 export interface GithubRepository {
   readonly fullName: string;
   readonly name: string;
@@ -65,6 +71,13 @@ export class GithubApp extends Context.Service<
       ReadonlyArray<GithubRepository>,
       GithubAppNotConfigured | GithubRequestFailed
     >;
+    /**
+     * A fresh installation access token for an executor to clone and push
+     * with (ADR-0015). Minted on every call and returned, never stored.
+     */
+    readonly mintInstallationToken: (input: {
+      readonly installationId: string;
+    }) => Effect.Effect<GithubInstallationToken, GithubAppNotConfigured | GithubRequestFailed>;
   }
 >()("t3code-relay/tenancy/GithubApp") {}
 
@@ -214,8 +227,8 @@ export const make = Effect.gen(function* () {
       token: jwt,
       operation: "mint-token",
     });
-    const token = (body as { readonly token?: string }).token;
-    if (!token) {
+    const parsed = body as { readonly token?: string; readonly expires_at?: string };
+    if (!parsed.token) {
       return yield* new GithubRequestFailed({
         operation: "mint-token",
         cause: "GitHub returned no token",
@@ -223,7 +236,9 @@ export const make = Effect.gen(function* () {
     }
     // Deliberately returned, never stored: it expires within the hour and the
     // relay can always mint another.
-    return token;
+    const expiresAt =
+      parsed.expires_at ?? DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 1 }));
+    return { token: parsed.token, expiresAt } satisfies GithubInstallationToken;
   });
 
   return GithubApp.of({
@@ -267,8 +282,10 @@ export const make = Effect.gen(function* () {
       };
     }),
 
+    mintInstallationToken: installationToken,
+
     listRepositories: Effect.fn("relay.github.list_repositories")(function* (input) {
-      const token = yield* installationToken({ installationId: input.installationId });
+      const { token } = yield* installationToken({ installationId: input.installationId });
       const collected: Array<GithubRepository> = [];
       for (let page = 1; page <= 10; page += 1) {
         const body = yield* request({

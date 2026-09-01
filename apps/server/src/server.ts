@@ -62,6 +62,7 @@ import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as OrganizationProjectCatalogRelay from "./relay/OrganizationProjectCatalogRelay.ts";
+import * as OrganizationSourceControlCredentials from "./relay/OrganizationSourceControlCredentials.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
 import * as ServerSettings from "./serverSettings.ts";
@@ -725,6 +726,14 @@ export const makeServerLayer = Layer.unwrap(
       Layer.provide(ApplicationObservabilityLive),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provideMerge(VcsProcess.layer),
+      // Below VcsProcess on purpose: it is what VcsProcess picks up when this
+      // environment is a managed executor.
+      Layer.provideMerge(
+        OrganizationSourceControlCredentials.layer.pipe(
+          Layer.provide(ServerEnvironment.layer),
+          Layer.provide(ServerSecretStore.layer),
+        ),
+      ),
       Layer.provideMerge(PlatformServicesLive),
     );
   }),

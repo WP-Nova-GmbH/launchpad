@@ -36,6 +36,7 @@ import {
 } from "./http/Api.ts";
 import { machineEnrollmentApi, machinesApi } from "./http/MachinesApi.ts";
 import { organizationProjectsApi, projectCatalogServerApi } from "./http/ProjectCatalogApi.ts";
+import { sourceControlServerApi } from "./http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
 import { ManagedEndpointZone, RelayApiZone, RelayDeploymentConfig } from "./zone.ts";
 import { makeRelayTraceLayer, RelayObservability } from "./observability.ts";
@@ -115,6 +116,7 @@ const relayApiLayer = Layer.mergeAll(
   jobsApi,
   serverApi,
   projectCatalogServerApi,
+  sourceControlServerApi,
 );
 
 const CloudMintKeyPair = Alchemy.KeyPair("CloudMintKeyPair");

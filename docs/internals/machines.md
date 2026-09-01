@@ -111,6 +111,21 @@ not a migration. The check is count-then-insert, same as the managed tunnel limi
 modeled on: two admins racing can land one machine over — a billing rounding error, not a
 security boundary.
 
+## Source-control credentials
+
+An executor never holds a GitHub login of its own. When one of its server-initiated git or `gh`
+subprocesses needs GitHub, the executor asks the relay for an installation token minted from the
+organization's connected GitHub App (`mintGithubInstallationToken` in
+`infra/relay/src/http/SourceControlApi.ts`, consumed by
+`apps/server/src/relay/OrganizationSourceControlCredentials.ts`). The relay answers only for an
+active enrolled agent executor whose key matches, and only while the organization is connected.
+On the executor the token stays in memory, is refreshed before it expires, and reaches child
+processes through `VcsProcess` exactly as a runner token would — never through `process.env`, so
+provider processes cannot inherit it. The executor image and bootstrap install `gh` because git
+learns the token through its credential helper.
+[ADR-0015](../adr/0015-executors-borrow-the-organizations-github-installation.md) has the
+reasoning and the limits (GitHub only; the App's permissions bound what executors can do).
+
 ## Tables
 
 In `infra/relay/src/persistence/schema.ts`:

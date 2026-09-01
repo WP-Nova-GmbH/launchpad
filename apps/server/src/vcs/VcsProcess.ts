@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Match from "effect/Match";
+import * as Option from "effect/Option";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
@@ -16,7 +17,8 @@ import {
   VcsProcessTimeoutError,
 } from "@t3tools/contracts";
 import * as ProcessRunner from "../processRunner.ts";
-import { runnerSourceControlEnv } from "./runnerCredentials.ts";
+import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
+import { hasRunnerSourceControlCredential, runnerSourceControlEnv } from "./runnerCredentials.ts";
 
 export interface VcsProcessInput {
   readonly operation: string;
@@ -102,6 +104,18 @@ const classifyNonZeroExit = (command: string, stderr: string): VcsProcessExitFai
 
 export const make = Effect.gen(function* () {
   const processRunner = yield* ProcessRunner.ProcessRunner;
+  // Provided on a managed executor, where the organization's GitHub
+  // installation stands in for a runner token nobody configured by hand
+  // (ADR-0015). Absent on personal machines, which keep their ambient logins.
+  const organizationCredentials = yield* Effect.serviceOption(
+    OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+  );
+  const resolveRunnerEnv: Effect.Effect<NodeJS.ProcessEnv | null> =
+    hasRunnerSourceControlCredential() || Option.isNone(organizationCredentials)
+      ? Effect.sync(() => runnerSourceControlEnv(globalThis.process.env))
+      : Effect.map(organizationCredentials.value.github, (credential) =>
+          runnerSourceControlEnv(globalThis.process.env, credential?.token ?? null),
+        );
 
   const run = Effect.fn("VcsProcess.run")(function* (input: VcsProcessInput) {
     const baseError = {
@@ -116,7 +130,7 @@ export const make = Effect.gen(function* () {
     // runner's push credential is granted (ADR-0009). It resolves to null when
     // no runner credential is configured, leaving the inherited environment
     // exactly as it was.
-    const resolvedEnv = input.env ?? runnerSourceControlEnv(globalThis.process.env) ?? null;
+    const resolvedEnv = input.env ?? (yield* resolveRunnerEnv);
 
     const result = yield* processRunner
       .run({

@@ -119,6 +119,35 @@ export function unknownAuth(detail?: string): SourceControlProviderAuth {
   return providerAuth({ status: "unknown", detail });
 }
 
+/**
+ * Report GitHub as authenticated through the organization's App installation
+ * on a managed executor. `gh auth status` cannot say so itself: an
+ * installation token has no user behind it, so the CLI reports an error even
+ * while every clone, push, and pull request it runs with that token succeeds.
+ * A missing `gh` is still reported as missing — the install hint is the fix.
+ */
+export function applyOrganizationGithubAuth(
+  items: ReadonlyArray<SourceControlProviderDiscoveryItem>,
+  credential: { readonly accountLogin: string } | null,
+): ReadonlyArray<SourceControlProviderDiscoveryItem> {
+  if (credential === null) {
+    return items;
+  }
+  return items.map((item) =>
+    item.kind === "github" && item.status === "available"
+      ? {
+          ...item,
+          auth: providerAuth({
+            status: "authenticated",
+            account: credential.accountLogin,
+            host: "github.com",
+            detail: "Organization GitHub App installation",
+          }),
+        }
+      : item,
+  );
+}
+
 export function combinedAuthOutput(input: SourceControlAuthProbeInput): string {
   const parts: string[] = [];
   for (const entry of [input.stdout, input.stderr]) {

@@ -58,6 +58,7 @@ import {
 } from "../src/http/Api.ts";
 import { machineEnrollmentApi, machinesApi } from "../src/http/MachinesApi.ts";
 import { organizationProjectsApi, projectCatalogServerApi } from "../src/http/ProjectCatalogApi.ts";
+import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
 import * as AgentActivityRows from "../src/agentActivity/AgentActivityRows.ts";
@@ -339,6 +340,7 @@ const relayApiLayer = Layer.mergeAll(
   jobsApi,
   serverApi,
   projectCatalogServerApi,
+  sourceControlServerApi,
 );
 
 const appLayer = relayApiLayer.pipe(
