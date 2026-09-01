@@ -23,8 +23,13 @@ import { GitHubIcon } from "../Icons";
 import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useProjects } from "../../state/entities";
-import { useOrganizationAdmin, type OrganizationAdminState } from "../../cloud/organizationAdmin";
+import {
+  useOrganizationAdmin,
+  type IssuedMachineEnrollment,
+  type OrganizationAdminState,
+} from "../../cloud/organizationAdmin";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
+import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../ui/empty";
@@ -33,6 +38,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 import { Spinner } from "../ui/spinner";
 import {
   hasMachineSettingUp,
+  machineEnrollmentCommand,
   machineStatusPresentation,
   memberLabel,
   unregisteredCheckouts,
@@ -771,21 +777,37 @@ function MachineRow({
   machine,
   state,
   nowMs,
+  enrollment,
 }: {
   machine: RelayMachine;
   state: OrganizationAdminState;
   nowMs: number;
+  enrollment: IssuedMachineEnrollment | undefined;
 }) {
   // Destroying a machine destroys thread history on it, so the trash icon
   // arms a second, labeled click instead of acting immediately.
   const [confirming, setConfirming] = useState(false);
+  const { copyToClipboard } = useCopyToClipboard({ target: "setup command" });
   const isAdmin = state.snapshot?.membership.role === "admin";
   const status = machineStatusPresentation(machine, nowMs);
   const endpointHost = machine.endpoint ? new URL(machine.endpoint.httpBaseUrl).host : null;
+  const selfHosted = machine.computeKind === "self_hosted";
   const timeline =
     machine.status === "ready" && machine.enrolledAt
       ? `Enrolled ${machine.enrolledAt.slice(0, 10)}`
-      : `Provisioned ${machine.createdAt.slice(0, 10)}`;
+      : `${selfHosted ? "Added" : "Provisioned"} ${machine.createdAt.slice(0, 10)}`;
+  // The seed exists only in the response that created the machine, so once
+  // the page is left the command is gone — say so instead of looking broken.
+  const awaitingSetup =
+    machine.status === "awaiting_enrollment" && Date.parse(machine.seedExpiresAt) > nowMs;
+  const description = [
+    endpointHost ? `${timeline} · ${endpointHost}` : timeline,
+    selfHosted && awaitingSetup && !enrollment
+      ? "the setup command was only shown when the machine was created"
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <SettingsRow
@@ -793,9 +815,10 @@ function MachineRow({
         <span className="flex items-baseline gap-2">
           {machine.label}
           <RoleBadge>{MACHINE_ROLE_LABELS[machine.role]}</RoleBadge>
+          {selfHosted ? <RoleBadge>Self-hosted</RoleBadge> : null}
         </span>
       }
-      description={endpointHost ? `${timeline} · ${endpointHost}` : timeline}
+      description={description}
       status={
         status.guidance ? <span className="block text-destructive">{status.guidance}</span> : null
       }
@@ -808,6 +831,16 @@ function MachineRow({
             />
             {status.label}
           </span>
+          {enrollment && awaitingSetup ? (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => copyToClipboard(machineEnrollmentCommand(enrollment), undefined)}
+            >
+              <CopyIcon className="size-3.5" />
+              Copy setup command
+            </Button>
+          ) : null}
           {isAdmin && machine.status !== "deprovisioned" ? (
             confirming ? (
               <Button
@@ -842,8 +875,6 @@ function MachineRow({
 
 function MachinesSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
-  const [label, setLabel] = useState("");
-  const [role, setRole] = useState<RelayMachineRole>("agent_executor");
   // A machine flips to ready on its own within a couple of minutes of being
   // provisioned. While one is in that window, the list keeps itself fresh —
   // asking the admin to reload the page would make the product look stuck.
@@ -870,10 +901,10 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
       icon={<ServerIcon className="size-4 text-muted-foreground" />}
     >
       <SectionNote>
-        Machines are computers this organization buys through Launchpad Connect: agent executors run
-        work, review hosts will run review apps. A provisioned machine sets itself up and then
-        appears to every member beside their own environments. Destroying one also destroys any
-        thread history it holds.
+        Machines are computers this organization works through — bought via Launchpad Connect or its
+        own, connected by hand. Agent executors run work, review hosts will run review apps. A ready
+        machine appears to every member beside their own environments. Destroying one also destroys
+        any thread history it holds.
       </SectionNote>
       {machines.length === 0 ? (
         <Empty className="min-h-48">
@@ -890,61 +921,116 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
         </Empty>
       ) : (
         machines.map((machine) => (
-          <MachineRow key={machine.machineId} machine={machine} state={state} nowMs={nowMs} />
+          <MachineRow
+            key={machine.machineId}
+            machine={machine}
+            state={state}
+            nowMs={nowMs}
+            enrollment={state.issuedMachineEnrollments.find(
+              (entry) => entry.machineId === machine.machineId,
+            )}
+          />
         ))
       )}
       {isAdmin ? (
-        <SettingsRow
-          title="Provision a machine"
-          description="Creates a fresh machine that sets itself up and calls home on its own — usually within a couple of minutes. Review hosts sit idle until review apps ship."
-          control={
-            <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
-              <Input
-                nativeInput
-                value={label}
-                placeholder="Name"
-                aria-label="Machine name"
-                onChange={(event) => setLabel(event.currentTarget.value)}
-                className="w-full sm:w-48"
-              />
-              <Select
-                value={role}
-                onValueChange={(value) => {
-                  if (typeof value === "string") setRole(value as RelayMachineRole);
-                }}
-              >
-                <SelectTrigger className="w-40" aria-label="Machine role">
-                  <SelectValue>{MACHINE_ROLE_LABELS[role]}</SelectValue>
-                </SelectTrigger>
-                <SelectPopup align="end" alignItemWithTrigger={false}>
-                  <SelectItem hideIndicator value="agent_executor">
-                    Agent executor
-                  </SelectItem>
-                  <SelectItem hideIndicator value="review_host">
-                    Review host
-                  </SelectItem>
-                </SelectPopup>
-              </Select>
-              <Button
-                size="sm"
-                disabled={state.busy || label.trim().length === 0}
-                onClick={() => {
-                  void state.provisionMachine({ label: label.trim(), role }).then((ok) => {
-                    if (ok) setLabel("");
-                  });
-                }}
-              >
-                Provision
-              </Button>
-            </div>
-          }
-        />
+        <>
+          <MachineCreateRow
+            title="Provision a machine"
+            description="Creates a fresh machine that sets itself up and calls home on its own — usually within a couple of minutes. Review hosts sit idle until review apps ship."
+            actionLabel="Provision"
+            busy={state.busy}
+            onCreate={(input) => state.provisionMachine(input)}
+          />
+          <MachineCreateRow
+            title="Connect your own machine"
+            description="Registers a computer this organization already runs. Copy the setup command it hands back and run it on that computer within 24 hours — the machine enrolls itself from there."
+            actionLabel="Connect"
+            busy={state.busy}
+            onCreate={(input) => state.connectMachine(input)}
+          />
+        </>
       ) : null}
     </SettingsSection>
   );
 }
 
-function OrganizationSettingsNotice({ title, children }: { title: string; children: ReactNode }) {
+/**
+ * One machine-creation row: name, role, and the verb that decides who gets
+ * the enrollment seed — a compute driver (Provision) or the admin (Connect).
+ */
+function MachineCreateRow({
+  title,
+  description,
+  actionLabel,
+  busy,
+  onCreate,
+}: {
+  title: string;
+  description: string;
+  actionLabel: string;
+  busy: boolean;
+  onCreate: (input: { label: string; role: RelayMachineRole }) => Promise<boolean>;
+}) {
+  const [label, setLabel] = useState("");
+  const [role, setRole] = useState<RelayMachineRole>("agent_executor");
+  return (
+    <SettingsRow
+      title={title}
+      description={description}
+      control={
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+          <Input
+            nativeInput
+            value={label}
+            placeholder="Name"
+            aria-label={`${title} — name`}
+            onChange={(event) => setLabel(event.currentTarget.value)}
+            className="w-full sm:w-48"
+          />
+          <Select
+            value={role}
+            onValueChange={(value) => {
+              if (typeof value === "string") setRole(value as RelayMachineRole);
+            }}
+          >
+            <SelectTrigger className="w-40" aria-label={`${title} — role`}>
+              <SelectValue>{MACHINE_ROLE_LABELS[role]}</SelectValue>
+            </SelectTrigger>
+            <SelectPopup align="end" alignItemWithTrigger={false}>
+              <SelectItem hideIndicator value="agent_executor">
+                Agent executor
+              </SelectItem>
+              <SelectItem hideIndicator value="review_host">
+                Review host
+              </SelectItem>
+            </SelectPopup>
+          </Select>
+          <Button
+            size="sm"
+            disabled={busy || label.trim().length === 0}
+            onClick={() => {
+              void onCreate({ label: label.trim(), role }).then((ok) => {
+                if (ok) setLabel("");
+              });
+            }}
+          >
+            {actionLabel}
+          </Button>
+        </div>
+      }
+    />
+  );
+}
+
+function OrganizationSettingsNotice({
+  title,
+  children,
+  action,
+}: {
+  title: string;
+  children: ReactNode;
+  action?: ReactNode;
+}) {
   return (
     <SettingsPageContainer>
       <SettingsSection
@@ -959,10 +1045,21 @@ function OrganizationSettingsNotice({ title, children }: { title: string; childr
             <EmptyTitle>{title}</EmptyTitle>
             <EmptyDescription>{children}</EmptyDescription>
           </EmptyHeader>
+          {action}
         </Empty>
       </SettingsSection>
     </SettingsPageContainer>
   );
+}
+
+/**
+ * Signing in from the page that told you to. The sidebar carries the same
+ * action, but a person who opened Organization settings is already here.
+ */
+function OrganizationSignInButton() {
+  const { openAuthPrompt } = useT3ConnectAuthPrompt();
+
+  return <Button onClick={openAuthPrompt}>Sign in</Button>;
 }
 
 /**
@@ -983,7 +1080,10 @@ function ConfiguredOrganizationSettings() {
 
   if (!state.isSignedIn) {
     return (
-      <OrganizationSettingsNotice title="Sign in to Launchpad Connect">
+      <OrganizationSettingsNotice
+        title="Sign in to Launchpad Connect"
+        action={<OrganizationSignInButton />}
+      >
         Your organization is created the first time you ask for it, so signing in is all it takes.
       </OrganizationSettingsNotice>
     );
