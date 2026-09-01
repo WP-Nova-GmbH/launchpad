@@ -28,6 +28,29 @@ docker build -t t3code-executor-dev -f infra/executor-image/Dockerfile .
 docker image prune -f >/dev/null
 echo "deploy: applying migrations"
 launchpad-relay-migrate
+
+# The relay's signing key must outlive its container: enrolled machines and
+# linked environments pin its public half, and a key regenerated on each
+# deploy strands all of them. Boxes provisioned before cloud-init mounted the
+# key directory get the mount and the path here, idempotently.
+unit=/etc/systemd/system/launchpad-relay.service
+install -m 0700 -d /var/lib/launchpad-relay
+if ! grep -q -- '-v /var/lib/launchpad-relay:/var/lib/launchpad-relay' "${unit}"; then
+  echo "deploy: mounting the persistent signing key directory into the relay"
+  sed -i 's#^\(\s*\)-v /var/run/docker.sock:/var/run/docker.sock \\$#&\n\1-v /var/lib/launchpad-relay:/var/lib/launchpad-relay \\#' "${unit}"
+  systemctl daemon-reload
+fi
+if ! grep -q '^DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH=' /etc/launchpad-relay/provisioned.env; then
+  echo "DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH=/var/lib/launchpad-relay/cloud-mint-private.pem" \
+    >> /etc/launchpad-relay/provisioned.env
+fi
+if [[ ! -f /var/lib/launchpad-relay/cloud-mint-private.pem ]] \
+  && docker cp launchpad-relay:/opt/launchpad/.t3/relay-dev-cloud-mint-private.pem \
+    /var/lib/launchpad-relay/cloud-mint-private.pem 2>/dev/null; then
+  echo "deploy: kept the running relay's signing key"
+fi
+chmod 600 /var/lib/launchpad-relay/cloud-mint-private.pem 2>/dev/null || true
+
 echo "deploy: restarting relay"
 systemctl restart launchpad-relay
 for _ in $(seq 30); do

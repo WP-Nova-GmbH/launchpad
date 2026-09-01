@@ -37,6 +37,7 @@ write_files:
         --env-file /etc/launchpad-relay/provisioned.env \
         --env-file /etc/launchpad-relay/relay.env \
         -v /var/run/docker.sock:/var/run/docker.sock \
+        -v /var/lib/launchpad-relay:/var/lib/launchpad-relay \
         launchpad-relay
       ExecStop=/usr/bin/docker stop launchpad-relay
       Restart=always
@@ -106,8 +107,13 @@ write_files:
         cat > /etc/launchpad-relay/provisioned.env <<EOF
       DEV_RELAY_DATABASE_URL=postgres://launchpad_relay:$${password}@127.0.0.1:5432/launchpad_relay
       DEV_RELAY_ISSUER=https://${relay_domain}
+      DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH=/var/lib/launchpad-relay/cloud-mint-private.pem
       EOF
       fi
+      # The relay's signing key must outlive its container: every enrolled
+      # machine and linked environment pins the public half, so a key that
+      # regenerates on each deploy strands all of them ("endpoint unavailable").
+      install -m 0700 -d /var/lib/launchpad-relay
       # Present-but-empty until the operator fills it, so the relay unit's
       # --env-file never refuses to start.
       touch /etc/launchpad-relay/relay.env

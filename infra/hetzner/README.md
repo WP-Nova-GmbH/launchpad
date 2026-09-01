@@ -70,8 +70,17 @@ database). Set the variables only to pin an App created elsewhere — copy the t
 `infra/relay/scripts/create-github-app.ts` writes exactly as written; the relay unescapes the
 quoted, `\n`-encoded private key itself, because Docker's `--env-file` does not.
 
-`DEV_RELAY_DATABASE_URL` and `DEV_RELAY_ISSUER` are already set in
-`/etc/launchpad-relay/provisioned.env`; do not repeat them.
+`DEV_RELAY_DATABASE_URL`, `DEV_RELAY_ISSUER`, and `DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH` are
+already set in `/etc/launchpad-relay/provisioned.env`; do not repeat them.
+
+The signing key at `/var/lib/launchpad-relay/cloud-mint-private.pem` is mounted into the
+container and must never be lost or regenerated: every enrolled machine and linked environment
+pins its public half at enrollment, and a relay with a new key is rejected by all of them as
+"Relay environment endpoint is unavailable". A box provisioned before this mount existed needs the
+volume line in `/etc/systemd/system/launchpad-relay.service`, the env line in `provisioned.env`,
+and — because the old key is gone — every machine re-pinned (write the new public key, from
+`openssl pkey -in <key> -pubout`, into the machine's
+`userdata/secrets/cloud-mint-ed25519-public-key.bin` and restart it, or re-enroll it).
 
 ## Operate
 
