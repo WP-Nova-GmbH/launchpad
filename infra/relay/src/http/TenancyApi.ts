@@ -24,6 +24,7 @@ import { tenancyConflict, tenancyForbidden, tenancyNotFound } from "./tenancyErr
 import * as RelayConfiguration from "../Config.ts";
 import * as RelayDb from "../db.ts";
 import * as GithubApp from "../tenancy/GithubApp.ts";
+import * as GithubAppSetup from "../tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "../tenancy/GithubInstallations.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
@@ -307,6 +308,7 @@ export const organizationApi = HttpApiBuilder.group(
     const repositories = yield* Repositories.Repositories;
     const directory = yield* UserDirectory.UserDirectory;
     const githubApp = yield* GithubApp.GithubApp;
+    const githubAppSetup = yield* GithubAppSetup.GithubAppSetup;
     const githubInstallations = yield* GithubInstallations.GithubInstallations;
     const transactions = yield* RelayDb.RelayTransactions;
     const crypto = yield* Crypto.Crypto;
@@ -520,6 +522,26 @@ export const organizationApi = HttpApiBuilder.group(
             connectedByUserId: claimed.connectedByUserId,
             connectedAt: claimed.createdAt,
           };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "startGithubAppSetup",
+        Effect.fn("relay.api.organization.start_github_app_setup")(function* (args) {
+          const membership = yield* requireCallerIsAdmin();
+          // One App serves every organization on this relay; the first admin
+          // to need it creates it, everyone after that just connects.
+          if ((yield* githubApp.installUrl) !== null) {
+            return yield* tenancyConflict("github_app_configured");
+          }
+          return yield* githubAppSetup
+            .begin({
+              userId: membership.userId,
+              organizationId: membership.organization.organizationId,
+              returnUrl: args.payload.returnUrl,
+              githubOrganization: args.payload.githubOrganization,
+              name: args.payload.name,
+            })
+            .pipe(Effect.catch(() => relayInternalErrorResponse("internal_error")));
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(

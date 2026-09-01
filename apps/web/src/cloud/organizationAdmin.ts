@@ -1,6 +1,7 @@
 import { useAuth } from "@clerk/react";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import type {
+  RelayGithubAppSetupResponse,
   RelayGithubConnectionResponse,
   RelayGithubRepository,
   RelayInvitation,
@@ -103,6 +104,14 @@ export interface OrganizationAdminState {
     readonly userId: string;
   }) => Promise<boolean>;
   readonly connectGithub: (installationId: string) => Promise<boolean>;
+  /**
+   * Begins creating this relay's GitHub App. The result is a manifest the
+   * browser posts to GitHub; the page is left for GitHub and comes back with
+   * `github_app=created` (or `github_app_error`) in the query string.
+   */
+  readonly startGithubAppSetup: (input: {
+    readonly githubOrganization?: string | undefined;
+  }) => Promise<RelayGithubAppSetupResponse | null>;
   readonly disconnectGithub: () => Promise<boolean>;
   readonly provisionMachine: (input: {
     readonly label: string;
@@ -348,6 +357,26 @@ export function useOrganizationAdmin(): OrganizationAdminState {
           client.connectGithub({ clerkToken, installationId }),
         ),
       ),
+    startGithubAppSetup: async (input) => {
+      setBusy(true);
+      setError(null);
+      try {
+        return await call("Could not start the GitHub App setup", (client, clerkToken) =>
+          client.startGithubAppSetup({
+            clerkToken,
+            payload: {
+              returnUrl: `${window.location.origin}/settings/organization`,
+              ...(input.githubOrganization ? { githubOrganization: input.githubOrganization } : {}),
+            },
+          }),
+        );
+      } catch (cause) {
+        setError(failureMessage(cause));
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    },
     disconnectGithub: () =>
       mutate("Could not disconnect GitHub", () =>
         call("Could not disconnect GitHub", (client, clerkToken) =>

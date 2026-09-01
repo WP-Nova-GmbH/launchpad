@@ -7,7 +7,9 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 
+import * as RelaySecretBox from "../auth/SecretBox.ts";
 import * as RelayConfiguration from "../Config.ts";
+import * as GithubAppRecords from "./GithubAppRecords.ts";
 
 export interface GithubInstallationAccount {
   readonly installationId: string;
@@ -44,7 +46,12 @@ export class GithubAppNotConfigured extends Schema.TaggedErrorClass<GithubAppNot
 export class GithubRequestFailed extends Schema.TaggedErrorClass<GithubRequestFailed>()(
   "GithubRequestFailed",
   {
-    operation: Schema.Literals(["read-installation", "mint-token", "list-repositories"]),
+    operation: Schema.Literals([
+      "read-app",
+      "read-installation",
+      "mint-token",
+      "list-repositories",
+    ]),
     status: Schema.optionalKey(Schema.Number),
     cause: Schema.Defect(),
   },
@@ -168,9 +175,39 @@ const appJwt = Effect.fn("relay.github.app_jwt")(function* (input: {
 export const make = Effect.gen(function* () {
   const config = yield* RelayConfiguration.RelayConfiguration;
   const httpClient = yield* HttpClient.HttpClient;
+  const records = yield* GithubAppRecords.GithubAppRecords;
+  const secretBox = yield* RelaySecretBox.RelaySecretBox;
 
-  const credentials = Effect.suspend(() =>
-    config.github ? Effect.succeed(config.github) : Effect.fail(new GithubAppNotConfigured()),
+  // Configuration wins; an App created from Organization settings is what a
+  // relay without one falls back to. Read per use rather than cached, so the
+  // App becomes usable the moment its record lands.
+  const credentials: Effect.Effect<
+    RelayConfiguration.GithubAppCredentials,
+    GithubAppNotConfigured | GithubRequestFailed
+  > = Effect.suspend(() =>
+    config.github
+      ? Effect.succeed(config.github)
+      : records.get.pipe(
+          Effect.flatMap((record) =>
+            record === null
+              ? Effect.fail(new GithubAppNotConfigured())
+              : secretBox.open(record.privateKeySealed).pipe(
+                  Effect.map(
+                    (pem): RelayConfiguration.GithubAppCredentials => ({
+                      appId: record.appId,
+                      appSlug: record.appSlug,
+                      privateKey: Redacted.make(pem),
+                    }),
+                  ),
+                ),
+          ),
+          Effect.catchTags({
+            GithubAppPersistenceError: (cause) =>
+              Effect.fail(new GithubRequestFailed({ operation: "read-app", cause })),
+            SecretBoxError: (cause) =>
+              Effect.fail(new GithubRequestFailed({ operation: "read-app", cause })),
+          }),
+        ),
   );
 
   const request = Effect.fn("relay.github.request")(function* (input: {
@@ -242,8 +279,14 @@ export const make = Effect.gen(function* () {
   });
 
   return GithubApp.of({
-    installUrl: Effect.sync(() =>
-      config.github ? `https://github.com/apps/${config.github.appSlug}/installations/new` : null,
+    installUrl: credentials.pipe(
+      Effect.map((app) => `https://github.com/apps/${app.appSlug}/installations/new`),
+      Effect.catchTag("GithubAppNotConfigured", () => Effect.succeed(null)),
+      Effect.catchTag("GithubRequestFailed", (error) =>
+        Effect.logWarning("github app record unreadable", { cause: error.cause }).pipe(
+          Effect.as(null),
+        ),
+      ),
     ),
 
     getInstallation: Effect.fn("relay.github.get_installation")(function* (input) {

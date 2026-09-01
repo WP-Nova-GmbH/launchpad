@@ -567,6 +567,7 @@ export const RelayTenancyConflictReason = Schema.Literals([
   "invitation_email_mismatch",
   "machine_limit_reached",
   "machine_deprovisioned",
+  "github_app_configured",
 ]);
 export type RelayTenancyConflictReason = typeof RelayTenancyConflictReason.Type;
 
@@ -1364,6 +1365,27 @@ export const RelayConnectGithubRequest = Schema.Struct({
 });
 export type RelayConnectGithubRequest = typeof RelayConnectGithubRequest.Type;
 
+export const RelayStartGithubAppSetupRequest = Schema.Struct({
+  returnUrl: TrimmedNonEmptyString.annotate({
+    description:
+      "Where GitHub sends the admin back after creating the App, and later after installing it: the web app's organization settings page.",
+  }),
+  /** Create the App under this GitHub organization instead of the admin's personal account. */
+  githubOrganization: Schema.optional(TrimmedNonEmptyString),
+  name: Schema.optional(TrimmedNonEmptyString),
+});
+export type RelayStartGithubAppSetupRequest = typeof RelayStartGithubAppSetupRequest.Type;
+
+/**
+ * GitHub creates an App from a manifest delivered as a form POST, so the
+ * client submits `manifest` to `action` from the admin's browser.
+ */
+export const RelayGithubAppSetupResponse = Schema.Struct({
+  action: TrimmedNonEmptyString,
+  manifest: TrimmedNonEmptyString,
+});
+export type RelayGithubAppSetupResponse = typeof RelayGithubAppSetupResponse.Type;
+
 export const RelayGithubRepository = Schema.Struct({
   fullName: TrimmedNonEmptyString,
   name: TrimmedNonEmptyString,
@@ -1946,6 +1968,17 @@ export const RelayOrganizationGroup = HttpApiGroup.make("organization")
       .annotate(
         OpenApi.Description,
         "Called after GitHub redirects back from installing the App. The relay verifies the installation exists before recording its id; no GitHub credential is stored.",
+      ),
+    HttpApiEndpoint.post("startGithubAppSetup", "/v1/organization/github-app/setup", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayStartGithubAppSetupRequest,
+      success: RelayGithubAppSetupResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Start creating this relay's GitHub App")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only, and only while the relay has no GitHub App. Returns the manifest for GitHub's one-click App creation; GitHub then calls back to the relay, which stores the App and sends the admin back to the return URL.",
       ),
     HttpApiEndpoint.delete("disconnectGithub", "/v1/organization/github", {
       headers: RelayBearerRequestHeaders,

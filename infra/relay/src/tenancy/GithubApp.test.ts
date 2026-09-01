@@ -9,8 +9,10 @@ import * as HttpClient from "effect/unstable/http/HttpClient";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
+import * as RelaySecretBox from "../auth/SecretBox.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as GithubApp from "./GithubApp.ts";
+import * as GithubAppRecords from "./GithubAppRecords.ts";
 
 // PKCS#1, the format GitHub hands out, so the PKCS#8 wrapping is exercised.
 const keyPair = NodeCrypto.generateKeyPairSync("rsa", {
@@ -47,10 +49,35 @@ const decodeJwtClaims = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ iss: Schema.String })),
 );
 
-function makeApp(respond: (request: HttpClientRequest.HttpClientRequest) => Response) {
+function makeApp(
+  respond: (request: HttpClientRequest.HttpClientRequest) => Response,
+  options?: {
+    readonly settings?: RelayConfiguration.RelayConfiguration["Service"];
+    readonly record?: (
+      secretBox: RelaySecretBox.RelaySecretBox["Service"],
+    ) => Effect.Effect<GithubAppRecords.GithubAppRecord | null>;
+  },
+) {
   const requests: Array<HttpClientRequest.HttpClientRequest> = [];
-  const app = GithubApp.make.pipe(
-    Effect.provide(Layer.succeed(RelayConfiguration.RelayConfiguration, relaySettings)),
+  const configLayer = Layer.succeed(
+    RelayConfiguration.RelayConfiguration,
+    options?.settings ?? relaySettings,
+  );
+  const app = Effect.gen(function* () {
+    const secretBox = yield* RelaySecretBox.make;
+    const record = yield* options?.record?.(secretBox) ?? Effect.succeed(null);
+    return yield* GithubApp.make.pipe(
+      Effect.provideService(RelaySecretBox.RelaySecretBox, secretBox),
+      Effect.provideService(
+        GithubAppRecords.GithubAppRecords,
+        GithubAppRecords.GithubAppRecords.of({
+          get: Effect.succeed(record),
+          save: () => Effect.die("unexpected save"),
+        }),
+      ),
+    );
+  }).pipe(
+    Effect.provide(configLayer),
     Effect.provideService(
       HttpClient.HttpClient,
       HttpClient.make((request) =>
@@ -96,6 +123,53 @@ describe("GithubApp.mintInstallationToken", () => {
       ).toBe(true);
       const claims = yield* decodeJwtClaims(Buffer.from(payload ?? "", "base64url").toString());
       expect(claims.iss).toBe("12345");
+    }),
+  );
+
+  it.effect("uses an App created from Organization settings when configuration has none", () =>
+    Effect.gen(function* () {
+      const { requests, app } = makeApp(
+        () =>
+          new Response(JSON.stringify({ token: "ghs_from_record" }), {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          }),
+        {
+          settings: { ...relaySettings, github: undefined },
+          record: (secretBox) =>
+            Effect.map(secretBox.seal(keyPair.privateKey), (privateKeySealed) => ({
+              appId: "777",
+              appSlug: "launchpad-from-settings",
+              privateKeySealed,
+              createdByUserId: "user-1",
+              createdAt: "2026-09-01T00:00:00.000Z",
+            })),
+        },
+      );
+      const github = yield* app;
+
+      expect(yield* github.installUrl).toBe(
+        "https://github.com/apps/launchpad-from-settings/installations/new",
+      );
+      const minted = yield* github.mintInstallationToken({ installationId: "42" });
+      expect(minted.token).toBe("ghs_from_record");
+      const [, payload] = (requests[0]?.headers.authorization ?? "")
+        .slice("Bearer ".length)
+        .split(".");
+      expect((yield* decodeJwtClaims(Buffer.from(payload ?? "", "base64url").toString())).iss).toBe(
+        "777",
+      );
+    }),
+  );
+
+  it.effect("reports no install link when nothing is configured or stored", () =>
+    Effect.gen(function* () {
+      const { app } = makeApp(() => new Response(null, { status: 500 }), {
+        settings: { ...relaySettings, github: undefined },
+      });
+      const github = yield* app;
+
+      expect(yield* github.installUrl).toBeNull();
     }),
   );
 

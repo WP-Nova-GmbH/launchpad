@@ -93,8 +93,11 @@ link. When a provider lands, it sends the same token and nothing else about the 
 
 An organization connects GitHub by installing the relay's GitHub App — on a whole GitHub
 organization, or on selected repositories. What is recorded is the **installation id**, which is not
-a secret; the App private key stays in relay configuration and access tokens are minted per request
-and never persisted. That is what keeps the "no secret in relay Postgres" rule intact.
+a secret; access tokens are minted per request and never persisted. The App's private key lives in
+relay configuration (`GITHUB_APP_*`) or, when the App was created from Organization settings, in
+`relay_github_apps` sealed with AES-GCM under a key derived from the relay's cloud mint key
+(`auth/SecretBox.ts`) — so the "no secret in relay Postgres" rule holds in spirit: a database copy
+on its own is inert. Configuration wins when both exist.
 
 This is deliberately not "sign in with GitHub". An OAuth token belongs to one person and dies with
 their session, so access would not be the organization's. With an installation, **every member
@@ -103,15 +106,15 @@ the organization's managed executors, which clone and push with tokens the relay
 same installation
 ([ADR-0015](../adr/0015-executors-borrow-the-organizations-github-installation.md)).
 
-Creating the App is a one-time setup step, and does not require filling in GitHub's form:
-
-```sh
-node infra/relay/scripts/create-github-app.ts --setup-url https://<app-host>/settings/organization
-```
-
-That uses GitHub's manifest flow — the app is created with one click and its id, slug, and private
-key are written to `infra/relay/.env`. Add `--org <login>` to create it inside a GitHub
-organization. Installing it afterwards is the **Connect GitHub** button on the organization page.
+Creating the App is a one-time step per relay, done from the organization page: while the relay
+has no App, an admin sees **Create the GitHub App** instead of **Connect GitHub**. The browser
+posts a manifest to GitHub (`startGithubAppSetup` returns it, with a state JWT signed by the cloud
+mint key), the admin presses Create once, GitHub redirects to
+`/v1/organization/github-app/created` on the relay (`http/GithubAppSetupRoute.ts`), and the relay
+converts the code, seals the key, stores the App, and sends the admin back to the page — where
+**Connect GitHub** now installs it. `tenancy/GithubAppSetup.ts` owns the flow;
+`infra/relay/scripts/create-github-app.ts` is the same manifest for operators who prefer to
+configure `GITHUB_APP_*` by hand.
 
 **Known gap.** The relay verifies that a claimed installation exists and refuses one another
 organization already claimed, but it cannot yet prove the caller administers that GitHub account —

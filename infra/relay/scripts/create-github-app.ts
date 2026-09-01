@@ -31,6 +31,8 @@ import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 
+import { githubAppCreateUrl, githubAppManifest } from "../src/tenancy/GithubAppSetup.ts";
+
 const PORT = Number(process.env.GITHUB_APP_SETUP_PORT ?? 8620);
 
 function flag(name: string): string | undefined {
@@ -49,25 +51,12 @@ const isPublic = process.argv.includes("--public");
 
 const encodeManifest = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
-const createUrl = organization
-  ? `https://github.com/organizations/${organization}/settings/apps/new`
-  : "https://github.com/settings/apps/new";
+const createUrl = githubAppCreateUrl(organization);
 
-/**
- * What the app may do. Contents and metadata are what listing and cloning
- * need; pull requests are what the job runner will need in M5, and asking now
- * avoids a second trip through GitHub's approval later.
- */
-const manifest = (redirectUrl: string, landing: string) => ({
-  name: appName,
-  url: landing,
-  redirect_url: redirectUrl,
-  setup_url: landing,
-  setup_on_update: true,
-  public: isPublic,
-  default_permissions: { contents: "write", metadata: "read", pull_requests: "write" },
-  default_events: [] as ReadonlyArray<string>,
-});
+// The same definition Organization settings uses, so the two paths cannot
+// drift apart in permissions.
+const manifest = (redirectUrl: string, landing: string) =>
+  githubAppManifest({ name: appName, redirectUrl, setupUrl: landing, isPublic });
 
 class GithubAppSetupFailed extends Schema.TaggedErrorClass<GithubAppSetupFailed>()(
   "GithubAppSetupFailed",

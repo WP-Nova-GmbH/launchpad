@@ -75,7 +75,11 @@ import * as Invitations from "./tenancy/Invitations.ts";
 import * as Organizations from "./tenancy/Organizations.ts";
 import * as Repositories from "./tenancy/Repositories.ts";
 import * as GithubApp from "./tenancy/GithubApp.ts";
+import * as GithubAppRecords from "./tenancy/GithubAppRecords.ts";
+import * as GithubAppSetup from "./tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "./tenancy/GithubInstallations.ts";
+import * as RelaySecretBox from "./auth/SecretBox.ts";
+import { githubAppCreatedRoute } from "./http/GithubAppSetupRoute.ts";
 import * as UserDirectory from "./tenancy/UserDirectory.ts";
 
 const webcryptoLayer = Layer.succeed(
@@ -287,6 +291,7 @@ export const ApiLive = Api.make(
         Layer.provideMerge(
           ApnsDeliveryQueue.layerCloudflareQueues(apnsDeliveryQueueSender, alchemyRuntimeContext),
         ),
+        Layer.provideMerge(GithubAppSetup.layer),
         // Row stores that need nothing but RelayDb.
         Layer.provideMerge(
           Layer.mergeAll(
@@ -302,6 +307,8 @@ export const ApiLive = Api.make(
             OrganizationProjectCatalog.layer,
           ),
         ),
+        // Below GithubApp: the App created from settings is what it reads.
+        Layer.provideMerge(Layer.mergeAll(GithubAppRecords.layer, RelaySecretBox.layer)),
         Layer.provideMerge(Devices.layer),
         Layer.provideMerge(EnvironmentCredentials.layer),
         Layer.provideMerge(
@@ -381,6 +388,7 @@ export const ApiLive = Api.make(
         ),
         HttpApiScalar.layer(RelayApi, { path: "/docs" }),
         relayDocsRedirectRoute,
+        githubAppCreatedRoute.pipe(Layer.provide(runtimeLayer)),
       ).pipe(Layer.provide([Etag.layerWeak, httpPlatformNotSupportedLayer, relayCors])),
       relayNotFoundRoute,
     ).pipe(

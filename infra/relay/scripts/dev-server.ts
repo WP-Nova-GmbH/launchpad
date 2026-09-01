@@ -94,7 +94,11 @@ import * as RelayDb from "../src/db.ts";
 import * as RelayTokens from "../src/auth/RelayTokens.ts";
 import * as Repositories from "../src/tenancy/Repositories.ts";
 import * as GithubApp from "../src/tenancy/GithubApp.ts";
+import * as GithubAppRecords from "../src/tenancy/GithubAppRecords.ts";
+import * as GithubAppSetup from "../src/tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "../src/tenancy/GithubInstallations.ts";
+import * as RelaySecretBox from "../src/auth/SecretBox.ts";
+import { githubAppCreatedRoute } from "../src/http/GithubAppSetupRoute.ts";
 import * as UserDirectory from "../src/tenancy/UserDirectory.ts";
 
 const DEFAULT_PORT = 8610;
@@ -295,6 +299,7 @@ const runtimeLayer = Layer.empty
         ),
       ),
     ),
+    Layer.provideMerge(GithubAppSetup.layer),
     Layer.provideMerge(
       Layer.mergeAll(
         AgentActivityRows.layer,
@@ -309,6 +314,7 @@ const runtimeLayer = Layer.empty
         OrganizationProjectCatalog.layer,
       ),
     ),
+    Layer.provideMerge(Layer.mergeAll(GithubAppRecords.layer, RelaySecretBox.layer)),
     Layer.provideMerge(Devices.layer),
     Layer.provideMerge(EnvironmentCredentials.layer),
     Layer.provideMerge(
@@ -360,6 +366,7 @@ const routerLayer = Layer.merge(
     HttpApiBuilder.layer(RelayApi, { openapiPath: "/openapi.json" }).pipe(Layer.provide(appLayer)),
     HttpApiScalar.layer(RelayApi, { path: "/docs" }),
     relayDocsRedirectRoute,
+    githubAppCreatedRoute.pipe(Layer.provide(runtimeLayer)),
   ).pipe(Layer.provide([Etag.layerWeak, relayCors])),
   relayNotFoundRoute,
 );

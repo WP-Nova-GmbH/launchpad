@@ -71,3 +71,15 @@ database still holds only the installation id.
 - **Settings reports what is true.** `gh auth status` cannot vouch for an installation token — it
   has no user behind it — so discovery on an executor reports GitHub as authenticated through the
   organization's installation instead of repeating the CLI's answer.
+
+## Amendment: the App itself is created from the app
+
+The whole point is that nobody runs anything by hand, so the relay's GitHub App must not require a
+terminal either. An organization admin creates it from Organization settings through GitHub's
+manifest flow; the relay receives the App's private key on GitHub's callback and stores it sealed
+(AES-GCM under a key derived from the relay's own cloud mint key) in `relay_github_apps`.
+
+This is the one secret the relay keeps in Postgres, and it is the relay's own identity rather than
+an organization's credential — which is why ADR-0003's reasoning does not apply: there is nothing
+to revoke per executor, and the sealed value is inert without the relay's configuration. Operators
+who prefer to hold the key themselves can still configure `GITHUB_APP_*`, which wins when set.

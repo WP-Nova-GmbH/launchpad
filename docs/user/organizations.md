@@ -35,6 +35,22 @@ Joining an organization means leaving the one you are in. That only works while 
 are leaving is empty — no other members, no repositories — so accepting an invitation can never
 abandon other people's work.
 
+## GitHub
+
+Connecting GitHub gives the whole organization — its members and its executors — access to your
+repositories without anyone holding a GitHub token. It takes two clicks, both in **Settings →
+Organization**, and both only once:
+
+1. **Create the GitHub App.** Launchpad needs a GitHub App of its own. Press **Create on GitHub**
+   (optionally naming the GitHub organization it should belong to), confirm on GitHub, and you are
+   sent straight back. This happens once per Launchpad installation.
+2. **Connect GitHub.** Install that App on your GitHub organization, or on just the repositories
+   you choose. GitHub sends you back, and the connection appears with the repositories it can see.
+
+From then on, executors clone, push, and open pull requests with the organization's connection.
+Work they do is authored by the App, and reaches exactly the repositories you installed it on.
+**Disconnect** forgets the installation; uninstalling the App on GitHub revokes access outright.
+
 ## Repositories
 
 A repository is recognised by the git remote of a checkout, reduced to `host/owner/repo`. Every

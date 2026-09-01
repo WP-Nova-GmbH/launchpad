@@ -78,6 +78,23 @@ export const relayOrganizationInvitations = pgTable(
 );
 
 /**
+ * The relay's own GitHub App, when it was created from Organization settings
+ * rather than configured through `GITHUB_APP_*`. One relay has one App; the
+ * environment configuration wins when both exist.
+ *
+ * The private key is stored sealed (AES-GCM under a key derived from the
+ * relay's cloud mint key, see `auth/SecretBox.ts`), so a copy of this table
+ * on its own is inert.
+ */
+export const relayGithubApps = pgTable("relay_github_apps", {
+  appId: varchar("app_id", { length: 64 }).primaryKey(),
+  appSlug: text("app_slug").notNull(),
+  privateKeySealed: text("private_key_sealed").notNull(),
+  createdByUserId: varchar("created_by_user_id", { length: 191 }).notNull(),
+  createdAt: varchar("created_at", { length: 64 }).notNull(),
+});
+
+/**
  * A GitHub App installation claimed by an organization.
  *
  * Holds no secret: the App private key lives in relay configuration and access

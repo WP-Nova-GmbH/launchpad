@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
+  RelayGithubAppSetupResponse,
   RelayInvitation,
   RelayMachine,
   RelayMachineRole,
@@ -526,20 +527,65 @@ function useUnregisteredCheckouts(repositories: ReadonlyArray<RelayRepositorySum
   return useMemo(() => unregisteredCheckouts(projects, repositories), [projects, repositories]);
 }
 
+/** GitHub creates an App from a manifest posted as a form field, so the browser submits one. */
+function submitGithubAppManifest(setup: RelayGithubAppSetupResponse): void {
+  const form = document.createElement("form");
+  form.method = "post";
+  form.action = setup.action;
+  const field = document.createElement("input");
+  field.type = "hidden";
+  field.name = "manifest";
+  field.value = setup.manifest;
+  form.append(field);
+  document.body.append(form);
+  form.submit();
+}
+
+function stripQueryParams(names: ReadonlyArray<string>): URLSearchParams {
+  const params = new URLSearchParams(window.location.search);
+  for (const name of names) params.delete(name);
+  const query = params.toString();
+  window.history.replaceState(null, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+  return params;
+}
+
 /**
  * GitHub connection.
  *
- * The App is installed on GitHub, which redirects back here with an
+ * Two one-time steps, both from here. First the relay needs a GitHub App of
+ * its own, created through GitHub's one-click manifest flow: the browser
+ * posts the manifest, GitHub calls the relay back, and the relay stores the
+ * App. Then the App is installed on GitHub, which redirects back here with an
  * `installation_id`; claiming it is what ties that installation to this
  * organization. Access then belongs to the organization rather than to whoever
  * installed it — the relay mints tokens per request, so nobody holds a GitHub
- * credential.
+ * credential, executors included.
  */
 function GithubSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
   const isAdmin = snapshot?.membership.role === "admin";
   const connection = snapshot?.github.connection ?? null;
   const installUrl = snapshot?.github.installUrl ?? null;
+  const [githubOrganization, setGithubOrganization] = useState("");
+  const [setupNotice, setSetupNotice] = useState<string | null>(null);
+
+  // GitHub sends a result in the query string on its way back from creating the App.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const created = params.get("github_app");
+    const failure = params.get("github_app_error");
+    if (!created && !failure) return;
+    stripQueryParams(["github_app", "github_app_slug", "github_app_error"]);
+    if (created) {
+      void state.refresh();
+    } else {
+      setSetupNotice(
+        failure === "missing_code"
+          ? "GitHub did not finish creating the App. Try again."
+          : "Creating the GitHub App failed. Try again, or check the relay's log.",
+      );
+    }
+  }, [state]);
 
   // GitHub sends the id in the query string on its way back from the install.
   useEffect(() => {
@@ -548,21 +594,70 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
     const installationId = params.get("installation_id");
     if (!installationId) return;
     void state.connectGithub(installationId).then(() => {
-      params.delete("installation_id");
-      params.delete("setup_action");
-      const query = params.toString();
-      window.history.replaceState(
-        null,
-        "",
-        `${window.location.pathname}${query ? `?${query}` : ""}`,
-      );
+      stripQueryParams(["installation_id", "setup_action"]);
     });
   }, [connection, isAdmin, state]);
 
   if (!snapshot) return null;
   if (!installUrl && !connection) {
-    // No GitHub App configured on this relay; the surface has nothing to offer.
-    return null;
+    // No GitHub App on this relay yet. An admin creates it from here, once.
+    return (
+      <SettingsSection
+        id={searchableSetting("organization-github").id}
+        title={searchableSetting("organization-github").title}
+        icon={<GitHubIcon className="size-4 text-muted-foreground" />}
+      >
+        <SectionNote>
+          Launchpad needs a GitHub App of its own before an organization can connect GitHub.
+          Creating it is one click on GitHub and happens once for this Launchpad. After that,
+          connecting is one more click, and every executor&apos;s access follows automatically.
+        </SectionNote>
+        {isAdmin ? (
+          <SettingsRow
+            title="Create the GitHub App"
+            description="GitHub shows you the App and asks you to confirm. Leave the organization empty to create it under your own GitHub account."
+            control={
+              <div className="flex items-center gap-2">
+                <Input
+                  value={githubOrganization}
+                  onChange={(event) => setGithubOrganization(event.target.value)}
+                  placeholder="GitHub organization (optional)"
+                  className="h-8 w-56"
+                  disabled={state.busy}
+                />
+                <Button
+                  size="sm"
+                  disabled={state.busy}
+                  onClick={() => {
+                    setSetupNotice(null);
+                    void state
+                      .startGithubAppSetup({
+                        githubOrganization: githubOrganization.trim() || undefined,
+                      })
+                      .then((setup) => {
+                        if (setup) submitGithubAppManifest(setup);
+                      });
+                  }}
+                >
+                  Create on GitHub
+                </Button>
+              </div>
+            }
+          />
+        ) : (
+          <SettingsRow
+            title="Connect GitHub"
+            description="This Launchpad has no GitHub App yet. An admin creates it once, then connects it."
+            control={
+              <span className="text-xs text-muted-foreground">Ask an admin to set it up.</span>
+            }
+          />
+        )}
+        {setupNotice ? (
+          <p className="px-3 pb-2 text-xs text-destructive sm:px-4">{setupNotice}</p>
+        ) : null}
+      </SettingsSection>
+    );
   }
 
   return (
