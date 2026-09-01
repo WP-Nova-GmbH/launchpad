@@ -48,6 +48,15 @@ The host defaults to `root@<relay_public_ip>` from this module's Terraform state
 `user@host` to override. The first build is slow (full dependency install in both images);
 afterwards the pnpm store is cached by lockfile and deploys are mostly rsync plus a rebuild.
 
+### Deployment CI
+
+`.github/workflows/deploy-relay.yml` runs the same `deploy.sh` against the relay host on every
+push to `main` (and on manual dispatch). CI ships the pushed tree, so the local script remains
+the path for deploying work that is not on GitHub yet. The `production` GitHub environment must
+define `RELAY_DEPLOY_HOST` and `RELAY_DEPLOY_KNOWN_HOSTS` as variables and
+`RELAY_DEPLOY_SSH_KEY` as a secret — a dedicated deploy keypair authorized on the host, not a
+personal key.
+
 ## Finish: operator secrets
 
 The relay restarts until its secrets exist. Fill `/etc/launchpad-relay/relay.env` on the server
