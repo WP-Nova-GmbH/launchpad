@@ -24,9 +24,3 @@ variable "relay_domain" {
   description = "Public hostname the relay serves, e.g. relay.wp-nova.ai. Point its A record at relay_public_ip."
   type        = string
 }
-
-variable "source_git_url" {
-  description = "Repository the relay host clones and runs the relay from"
-  type        = string
-  default     = "https://github.com/WP-Nova-GmbH/launchpad.git"
-}

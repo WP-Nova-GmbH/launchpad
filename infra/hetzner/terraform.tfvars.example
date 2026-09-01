@@ -3,7 +3,6 @@
 hcloud_token = "..."
 relay_domain = "relay.example.com"
 
-# ssh_keys       = ["id_ed25519"]
-# location       = "fsn1"
-# server_type    = "cx32"
-# source_git_url = "https://github.com/WP-Nova-GmbH/launchpad.git"
+# ssh_keys    = ["id_ed25519"]
+# location    = "fsn1"
+# server_type = "cpx32"

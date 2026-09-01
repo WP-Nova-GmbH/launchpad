@@ -57,8 +57,7 @@ resource "hcloud_server" "relay_01" {
   firewall_ids = [hcloud_firewall.relay.id]
 
   user_data = templatefile("${path.module}/cloud-init.yaml.tftpl", {
-    relay_domain   = var.relay_domain
-    source_git_url = var.source_git_url
+    relay_domain = var.relay_domain
   })
 
   labels = {
