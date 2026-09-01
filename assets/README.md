@@ -27,7 +27,7 @@ Save the three exports to:
 
 - `dev/app-icon.icon` -> `dev/blueprint-macos-1024.png`
 - `nightly/app-icon.icon` -> `nightly/nightly-macos-1024.png`
-- `prod/app-icon.icon` -> `prod/black-macos-1024.png`
+- `prod/app-icon.icon` -> `prod/launchpad-macos-1024.png`
 
 The result must be a 1024×1024 PNG with the classic macOS safe area: the opaque icon body is 824×824, inset 100 pixels on every side, with only the native Icon Composer shadow extending into the surrounding transparent canvas.
 
@@ -40,7 +40,7 @@ For each project below, use Platform: macOS pre-Tahoe, Appearance: Default, Size
 
 - assets/dev/app-icon.icon -> assets/dev/blueprint-macos-1024.png
 - assets/nightly/app-icon.icon -> assets/nightly/nightly-macos-1024.png
-- assets/prod/app-icon.icon -> assets/prod/black-macos-1024.png
+- assets/prod/app-icon.icon -> assets/prod/launchpad-macos-1024.png
 
 Do not resize, composite, or otherwise post-process the exported PNGs.
 
