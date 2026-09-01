@@ -201,7 +201,12 @@ const relayConfigurationLayer = Layer.succeed(
         ? {
             appId: process.env.GITHUB_APP_ID.trim(),
             appSlug: process.env.GITHUB_APP_SLUG.trim(),
-            privateKey: Redacted.make(process.env.GITHUB_APP_PRIVATE_KEY),
+            // create-github-app.ts writes the PEM quoted with `\n` escapes.
+            // Node's --env-file expands that; Docker's --env-file (production)
+            // hands it over verbatim, so undo it here for both.
+            privateKey: Redacted.make(
+              process.env.GITHUB_APP_PRIVATE_KEY.trim().replace(/^"|"$/g, "").replace(/\\n/g, "\n"),
+            ),
           }
         : undefined,
     managedEndpointBaseDomain: cloudflareEndpointEnv?.zoneName,

@@ -65,7 +65,7 @@ const manifest = (redirectUrl: string, landing: string) => ({
   setup_url: landing,
   setup_on_update: true,
   public: isPublic,
-  default_permissions: { contents: "read", metadata: "read", pull_requests: "write" },
+  default_permissions: { contents: "write", metadata: "read", pull_requests: "write" },
   default_events: [] as ReadonlyArray<string>,
 });
 

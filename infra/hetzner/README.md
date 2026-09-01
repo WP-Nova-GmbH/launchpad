@@ -64,6 +64,13 @@ from [`../relay/.env.example`](../relay/.env.example) — Clerk keys and audienc
 `GITHUB_APP_*` and `HETZNER_API_TOKEN` (same Launchpad project) if those features are in use —
 then `systemctl restart launchpad-relay`.
 
+Without `GITHUB_APP_*`, Organization settings shows no **Connect GitHub** button at all and
+executors cannot clone private repositories. Create the App once from your machine with
+`node infra/relay/scripts/create-github-app.ts --setup-url <web app URL>/settings/organization`,
+then copy the three `GITHUB_APP_*` lines it wrote to `infra/relay/.env` into `relay.env` exactly
+as written — the relay unescapes the quoted, `\n`-encoded private key itself, because Docker's
+`--env-file` does not.
+
 `DEV_RELAY_DATABASE_URL` and `DEV_RELAY_ISSUER` are already set in
 `/etc/launchpad-relay/provisioned.env`; do not repeat them.
 
