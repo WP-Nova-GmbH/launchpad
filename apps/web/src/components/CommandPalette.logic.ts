@@ -140,6 +140,11 @@ export interface CommandPaletteView {
   readonly addonIcon: ReactNode;
   readonly groups: ReadonlyArray<CommandPaletteGroup>;
   readonly initialQuery?: string;
+  /**
+   * Names a view whose groups depend on data that may still be loading when
+   * it is pushed, so the palette can rebuild them in place once it arrives.
+   */
+  readonly key?: string;
 }
 
 export function enumerateCommandPaletteItems(

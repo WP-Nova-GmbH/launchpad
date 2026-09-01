@@ -227,6 +227,18 @@ function organizationRepositoryRemoteUrl(canonicalKey: string): string {
   return `https://${canonicalKey}.git`;
 }
 
+const ADD_PROJECT_SOURCES_VIEW_KEY_PREFIX = "add-project-sources:";
+
+function addProjectSourcesViewKey(environmentId: EnvironmentId): string {
+  return `${ADD_PROJECT_SOURCES_VIEW_KEY_PREFIX}${environmentId}`;
+}
+
+function addProjectSourcesViewEnvironmentId(key: string): EnvironmentId | null {
+  return key.startsWith(ADD_PROJECT_SOURCES_VIEW_KEY_PREFIX)
+    ? (key.slice(ADD_PROJECT_SOURCES_VIEW_KEY_PREFIX.length) as EnvironmentId)
+    : null;
+}
+
 type AddProjectCloneFlow =
   | {
       readonly step: "repository";
@@ -1180,6 +1192,7 @@ function OpenCommandPaletteDialog(props: {
           addonIcon: view.addonIcon,
           groups: view.groups,
           ...(view.initialQuery ? { initialQuery: view.initialQuery } : {}),
+          ...(view.key ? { key: view.key } : {}),
         },
       ]);
       setHighlightedItemValue(null);
@@ -1457,6 +1470,7 @@ function OpenCommandPaletteDialog(props: {
       setAddProjectEnvironmentId(environmentId);
       setAddProjectCloneFlow(null);
       pushPaletteView({
+        key: addProjectSourcesViewKey(environmentId),
         addonIcon: <FolderPlusIcon className={ADDON_ICON_CLASS} />,
         groups: buildAddProjectSourceGroups(
           environmentId,
@@ -1474,6 +1488,29 @@ function OpenCommandPaletteDialog(props: {
       sourceControlDiscovery.data,
     ],
   );
+
+  // The organization catalog and source-control discovery load on their own
+  // schedule; a source view pushed before they arrive would otherwise never
+  // show the organization's repositories or a provider's readiness.
+  useEffect(() => {
+    setViewStack((views) => {
+      const top = views.at(-1);
+      const environmentId = top?.key ? addProjectSourcesViewEnvironmentId(top.key) : null;
+      if (!top || environmentId === null) return views;
+      return [
+        ...views.slice(0, -1),
+        {
+          ...top,
+          groups: buildAddProjectSourceGroups(
+            environmentId,
+            buildAddProjectRemoteSourceReadiness(
+              browseEnvironmentId === environmentId ? sourceControlDiscovery.data : null,
+            ),
+          ),
+        },
+      ];
+    });
+  }, [browseEnvironmentId, buildAddProjectSourceGroups, sourceControlDiscovery.data]);
 
   const addProjectEnvironmentItems: CommandPaletteActionItem[] = addProjectEnvironmentOptions.map(
     (option) => ({
