@@ -8,3 +8,10 @@ node_modules
 dist
 **/dist
 .repos
+# Local credentials and Terraform state never enter a build context.
+.env
+**/.env
+infra/hetzner/.terraform
+infra/hetzner/terraform.tfstate*
+infra/hetzner/terraform.tfvars
+infra/hetzner/tfplan

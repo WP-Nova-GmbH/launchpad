@@ -25,6 +25,7 @@ echo "deploy: building relay image"
 docker build -t launchpad-relay -f infra/relay/Dockerfile .
 echo "deploy: building executor image"
 docker build -t t3code-executor-dev -f infra/executor-image/Dockerfile .
+docker image prune -f >/dev/null
 echo "deploy: applying migrations"
 launchpad-relay-migrate
 echo "deploy: restarting relay"

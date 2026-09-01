@@ -25,13 +25,17 @@ RUN apt-get update \
 
 WORKDIR /opt/launchpad
 
-# Fetch by lockfile first so the package store survives source-only deploys.
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY patches ./patches
-RUN corepack install && pnpm fetch
+COPY package.json ./
+RUN corepack install
 
+# Only the relay's workspace subtree, plus the root for its prepare hook — a
+# full-lockfile install drags React Native, Expo, and Electron into an image
+# that never loads them. The store lives in a build cache mount, so it is
+# reused across builds without ever occupying an image layer.
 COPY . .
-RUN pnpm install --frozen-lockfile --prefer-offline
+RUN --mount=type=cache,target=/pnpm-store \
+  pnpm install --frozen-lockfile --store-dir /pnpm-store \
+    --filter @t3tools/monorepo --filter "t3code-relay..."
 
 EXPOSE 8610
 CMD ["node", "infra/relay/scripts/dev-server.ts"]
