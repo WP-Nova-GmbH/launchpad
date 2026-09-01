@@ -25,17 +25,11 @@ rsync -az --delete --delete-excluded \
 if [[ -n "${RELAY_GITHUB_APP_ID:-}" && -n "${RELAY_GITHUB_APP_SLUG:-}" && -n "${RELAY_GITHUB_APP_PRIVATE_KEY:-}" ]]; then
   echo "deploy: configuring the relay's GitHub App"
   escaped_key="${RELAY_GITHUB_APP_PRIVATE_KEY//$'\n'/\\n}"
+  # The values travel on stdin, so the remote script is an argument, not a
+  # heredoc — both would otherwise compete for the same stream.
   printf 'GITHUB_APP_ID=%s\nGITHUB_APP_SLUG=%s\nGITHUB_APP_PRIVATE_KEY="%s"\n' \
     "${RELAY_GITHUB_APP_ID}" "${RELAY_GITHUB_APP_SLUG}" "${escaped_key}" |
-    ssh "${host}" bash -s <<'REMOTE_ENV'
-set -euo pipefail
-umask 077
-current=/etc/launchpad-relay/relay.env
-next="$(mktemp)"
-{ grep -v '^GITHUB_APP_' "${current}" 2>/dev/null || true; cat; } > "${next}"
-install -m 0600 "${next}" "${current}"
-rm -f "${next}"
-REMOTE_ENV
+    ssh "${host}" 'set -euo pipefail; umask 077; current=/etc/launchpad-relay/relay.env; next="$(mktemp)"; { grep -v "^GITHUB_APP_" "$current" 2>/dev/null || true; cat; } > "$next"; grep -q "^GITHUB_APP_PRIVATE_KEY=" "$next"; install -m 0600 "$next" "$current"; rm -f "$next"'
 fi
 
 ssh "${host}" bash -s <<'REMOTE'
