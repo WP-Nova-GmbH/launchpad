@@ -35,6 +35,9 @@ const CLONE_NONINTERACTIVE_ENV = Object.freeze({
   GIT_TERMINAL_PROMPT: "0",
   SSH_ASKPASS: "",
   SSH_ASKPASS_REQUIRE: "never",
+  // cloneFailureDetail classifies stderr by English phrases; a machine with a
+  // German (or any other) locale would otherwise slip to the generic detail.
+  LC_ALL: "C",
 } satisfies NodeJS.ProcessEnv);
 
 /**
