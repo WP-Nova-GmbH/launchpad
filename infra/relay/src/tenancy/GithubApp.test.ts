@@ -53,9 +53,9 @@ function makeApp(
   respond: (request: HttpClientRequest.HttpClientRequest) => Response,
   options?: {
     readonly settings?: RelayConfiguration.RelayConfiguration["Service"];
-    readonly record?: (
-      secretBox: RelaySecretBox.RelaySecretBox["Service"],
-    ) => Effect.Effect<GithubAppRecords.GithubAppRecord | null>;
+    readonly record?: (seal: {
+      readonly seal: (plaintext: string) => Effect.Effect<string, RelaySecretBox.SecretBoxError>;
+    }) => Effect.Effect<GithubAppRecords.GithubAppRecord | null, RelaySecretBox.SecretBoxError>;
   },
 ) {
   const requests: Array<HttpClientRequest.HttpClientRequest> = [];

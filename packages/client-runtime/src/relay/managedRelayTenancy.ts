@@ -13,6 +13,7 @@ import {
   type RelayCreateInvitationRequest,
   type RelayCreateInvitationResponse,
   type RelayGithubAppSetupResponse,
+  type RelayGithubInstallResponse,
   type RelayGithubConnection,
   type RelayGithubConnectionResponse,
   type RelayGithubRepository,
@@ -32,6 +33,7 @@ import {
   type RelayRegisterRepositoryRequest,
   type RelayRepository,
   type RelayStartGithubAppSetupRequest,
+  type RelayStartGithubInstallRequest,
   type RelayRepositoryAccessEntry,
   type RelayRepositoryId,
   type RelayRepositorySummary,
@@ -162,6 +164,10 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly payload: RelayStartGithubAppSetupRequest;
     }) => Effect.Effect<RelayGithubAppSetupResponse, ManagedRelayClientError>;
+    readonly startGithubInstall: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayStartGithubInstallRequest;
+    }) => Effect.Effect<RelayGithubInstallResponse, ManagedRelayClientError>;
     readonly disconnectGithub: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
@@ -206,6 +212,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     getGithubConnection: unavailable("clientRuntime.managedRelayTenancy.getGithubConnection"),
     connectGithub: unavailable("clientRuntime.managedRelayTenancy.connectGithub"),
     startGithubAppSetup: unavailable("clientRuntime.managedRelayTenancy.startGithubAppSetup"),
+    startGithubInstall: unavailable("clientRuntime.managedRelayTenancy.startGithubInstall"),
     disconnectGithub: unavailable("clientRuntime.managedRelayTenancy.disconnectGithub"),
     listGithubRepositories: unavailable("clientRuntime.managedRelayTenancy.listGithubRepositories"),
   });
@@ -599,6 +606,21 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.startGithubAppSetup"),
+      withRelayClientTracing,
+    ),
+    startGithubInstall: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .startGithubInstall({
+            headers: bearerHeaders(input.clerkToken),
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("start relay GitHub install")),
+            timeoutRelayRequest("Relay GitHub install"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.startGithubInstall"),
       withRelayClientTracing,
     ),
     disconnectGithub: Effect.fnUntraced(

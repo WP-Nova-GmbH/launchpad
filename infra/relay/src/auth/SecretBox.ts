@@ -28,7 +28,7 @@ export class RelaySecretBox extends Context.Service<
     readonly seal: (plaintext: string) => Effect.Effect<string, SecretBoxError>;
     readonly open: (sealed: string) => Effect.Effect<string, SecretBoxError>;
   }
->()("t3code-relay/auth/RelaySecretBox") {}
+>()("t3code-relay/auth/SecretBox/RelaySecretBox") {}
 
 const VERSION = "v1";
 const NONCE_BYTES = 12;
@@ -39,10 +39,10 @@ function toBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function fromBase64Url(text: string): Uint8Array {
+function fromBase64Url(text: string): Uint8Array<ArrayBuffer> {
   const padded = text.replace(/-/g, "+").replace(/_/g, "/");
   const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
-  const bytes = new Uint8Array(binary.length);
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
 }

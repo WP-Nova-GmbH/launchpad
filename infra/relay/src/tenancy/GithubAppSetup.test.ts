@@ -59,6 +59,7 @@ const decodeManifest = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
     Schema.Struct({
       name: Schema.String,
+      url: Schema.String,
       redirect_url: Schema.String,
       setup_url: Schema.String,
       default_permissions: Schema.Struct({ contents: Schema.String, pull_requests: Schema.String }),
@@ -98,6 +99,8 @@ function harness(respond: (request: HttpClientRequest.HttpClientRequest) => Resp
   return { requests, saved, setup };
 }
 
+const noGithub = () => new Response(null, { status: 500 });
+
 const beginInput = {
   userId: "user-1",
   organizationId: "organization-1",
@@ -105,50 +108,71 @@ const beginInput = {
   githubOrganization: "acme",
 };
 
+const stateOf = (url: string) => new URL(url).searchParams.get("state") ?? "";
+
 describe("GithubAppSetup", () => {
-  it.effect("hands the browser a manifest that points GitHub back at the relay", () =>
+  it.effect("starts on a relay page whose manifest points GitHub back at the relay", () =>
     Effect.gen(function* () {
-      const { setup } = harness(() => new Response(null, { status: 500 }));
+      const { setup } = harness(noGithub);
       const { service } = yield* setup;
 
       const begun = yield* service.begin(beginInput);
-
       expect(
-        begun.action.startsWith("https://github.com/organizations/acme/settings/apps/new?state="),
+        begun.startUrl.startsWith(
+          "https://relay.example.test/v1/organization/github-app/start?state=",
+        ),
       ).toBe(true);
-      const manifest = yield* decodeManifest(begun.manifest);
+
+      const start = yield* service.renderStart(stateOf(begun.startUrl));
+      expect(
+        start.action.startsWith("https://github.com/organizations/acme/settings/apps/new?state="),
+      ).toBe(true);
+      expect(start.claims).toEqual({
+        userId: "user-1",
+        organizationId: "organization-1",
+        returnUrl: beginInput.returnUrl,
+      });
+      const manifest = yield* decodeManifest(start.manifest);
       expect(manifest.name).toBe("Launchpad");
       expect(manifest.redirect_url).toBe(
         "https://relay.example.test/v1/organization/github-app/created",
       );
-      expect(manifest.setup_url).toBe(beginInput.returnUrl);
+      // GitHub needs an https setup URL; the desktop app has none, so the relay is it.
+      expect(manifest.setup_url).toBe(
+        "https://relay.example.test/v1/organization/github-app/installed",
+      );
       expect(manifest.default_permissions).toEqual({ contents: "write", pull_requests: "write" });
     }),
   );
 
-  it.effect("reads back the claims it signed into the state, and nothing else", () =>
+  it.effect("reads back the claims it signed, and refuses a forged or mistyped state", () =>
     Effect.gen(function* () {
-      const { setup } = harness(() => new Response(null, { status: 500 }));
+      const { setup } = harness(noGithub);
       const { service } = yield* setup;
-      const begun = yield* service.begin(beginInput);
-      const state = new URL(begun.action).searchParams.get("state") ?? "";
+      const state = stateOf((yield* service.begin(beginInput)).startUrl);
 
       expect(yield* service.readState(state)).toEqual({
         userId: "user-1",
         organizationId: "organization-1",
         returnUrl: beginInput.returnUrl,
       });
-
-      const forged = `${state.slice(0, -3)}xyz`;
-      const error = yield* service.readState(forged).pipe(Effect.flip);
-      expect(error).toBeInstanceOf(GithubAppSetup.GithubAppSetupStateInvalid);
+      const forged = yield* service.readState(`${state.slice(0, -3)}xyz`).pipe(Effect.flip);
+      expect(forged).toBeInstanceOf(GithubAppSetup.GithubAppSetupStateInvalid);
+      // A setup state is not an install state, however valid its signature.
+      const mistyped = yield* service.readInstallState(state).pipe(Effect.flip);
+      expect(mistyped).toBeInstanceOf(GithubAppSetup.GithubAppSetupStateInvalid);
     }),
   );
 
-  it.effect("refuses a return URL that is not plain http(s)", () =>
+  it.effect("accepts the desktop app as a return address but nothing exotic", () =>
     Effect.gen(function* () {
-      const { setup } = harness(() => new Response(null, { status: 500 }));
+      const { setup } = harness(noGithub);
       const { service } = yield* setup;
+
+      const desktop = yield* service.begin({ ...beginInput, returnUrl: "t3code://app/settings" });
+      expect(desktop.startUrl).toContain("state=");
+      expect(GithubAppSetup.isDesktopReturnUrl("t3code://app/settings")).toBe(true);
+      expect(GithubAppSetup.isDesktopReturnUrl(beginInput.returnUrl)).toBe(false);
 
       for (const returnUrl of [
         "javascript:alert(1)",
@@ -161,7 +185,7 @@ describe("GithubAppSetup", () => {
     }),
   );
 
-  it.effect("converts GitHub's code and stores the App with its key sealed", () =>
+  it.effect("converts GitHub's code, stores the App sealed, and hands on the install page", () =>
     Effect.gen(function* () {
       const { requests, saved, setup } = harness(
         () =>
@@ -179,7 +203,13 @@ describe("GithubAppSetup", () => {
 
       const created = yield* service.complete({ code: "code-123", claims });
 
-      expect(created).toEqual({ appSlug: "launchpad-acme" });
+      expect(created.appSlug).toBe("launchpad-acme");
+      expect(
+        created.installUrl.startsWith(
+          "https://github.com/apps/launchpad-acme/installations/new?state=",
+        ),
+      ).toBe(true);
+      expect(yield* service.readInstallState(stateOf(created.installUrl))).toEqual(claims);
       expect(requests[0]?.method).toBe("POST");
       expect(requests[0]?.url).toBe("https://api.github.com/app-manifests/code-123/conversions");
       expect(saved).toHaveLength(1);
@@ -190,6 +220,39 @@ describe("GithubAppSetup", () => {
       });
       expect(saved[0]?.privateKeySealed).not.toContain("PEM-BODY");
       expect(yield* secretBox.open(saved[0]?.privateKeySealed ?? "")).toBe("PEM-BODY");
+    }),
+  );
+
+  it.effect("offers the install page for a stored App, and nothing when there is none", () =>
+    Effect.gen(function* () {
+      const { saved, setup } = harness(noGithub);
+      const { service } = yield* setup;
+      const input = {
+        userId: "user-1",
+        organizationId: "organization-1",
+        returnUrl: "t3code://app",
+      };
+
+      const missing = yield* service.beginInstall(input).pipe(Effect.flip);
+      expect(missing).toBeInstanceOf(GithubAppSetup.GithubAppNotAvailable);
+
+      saved.push({
+        appId: "77",
+        appSlug: "launchpad-acme",
+        privateKeySealed: "sealed",
+        createdByUserId: "user-1",
+        createdAt: "2026-09-01T00:00:00.000Z",
+      });
+      const install = yield* service.beginInstall(input);
+      expect(
+        install.installUrl.startsWith(
+          "https://github.com/apps/launchpad-acme/installations/new?state=",
+        ),
+      ).toBe(true);
+      expect(yield* service.readInstallState(stateOf(install.installUrl))).toEqual({
+        ...input,
+        returnUrl: "t3code://app",
+      });
     }),
   );
 

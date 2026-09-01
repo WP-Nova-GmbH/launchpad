@@ -8,7 +8,6 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
-  RelayGithubAppSetupResponse,
   RelayInvitation,
   RelayMachine,
   RelayMachineRole,
@@ -527,18 +526,14 @@ function useUnregisteredCheckouts(repositories: ReadonlyArray<RelayRepositorySum
   return useMemo(() => unregisteredCheckouts(projects, repositories), [projects, repositories]);
 }
 
-/** GitHub creates an App from a manifest posted as a form field, so the browser submits one. */
-function submitGithubAppManifest(setup: RelayGithubAppSetupResponse): void {
-  const form = document.createElement("form");
-  form.method = "post";
-  form.action = setup.action;
-  const field = document.createElement("input");
-  field.type = "hidden";
-  field.name = "manifest";
-  field.value = setup.manifest;
-  form.append(field);
-  document.body.append(form);
-  form.submit();
+/**
+ * The GitHub steps run on relay-hosted pages in a browser: a new tab on the
+ * web, the system browser from the desktop app (which hands every external
+ * URL there). The relay finishes the work on GitHub's callbacks, so this page
+ * only has to look again when the admin comes back.
+ */
+function openGithubJourney(url: string): void {
+  window.open(url, "_blank", "noopener,noreferrer");
 }
 
 function stripQueryParams(names: ReadonlyArray<string>): URLSearchParams {
@@ -552,14 +547,14 @@ function stripQueryParams(names: ReadonlyArray<string>): URLSearchParams {
 /**
  * GitHub connection.
  *
- * Two one-time steps, both from here. First the relay needs a GitHub App of
- * its own, created through GitHub's one-click manifest flow: the browser
- * posts the manifest, GitHub calls the relay back, and the relay stores the
- * App. Then the App is installed on GitHub, which redirects back here with an
- * `installation_id`; claiming it is what ties that installation to this
- * organization. Access then belongs to the organization rather than to whoever
- * installed it — the relay mints tokens per request, so nobody holds a GitHub
- * credential, executors included.
+ * Two one-time steps, both started from here and finished in a browser. First
+ * the relay needs a GitHub App of its own, created through GitHub's one-click
+ * manifest flow; then the App is installed on GitHub. GitHub's callbacks land
+ * on the relay, which stores the App and claims the installation for this
+ * organization itself — nothing comes back through this page but a refresh.
+ * Access then belongs to the organization rather than to whoever installed
+ * it: the relay mints tokens per request, so nobody holds a GitHub credential,
+ * executors included.
  */
 function GithubSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
@@ -567,25 +562,16 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
   const connection = snapshot?.github.connection ?? null;
   const installUrl = snapshot?.github.installUrl ?? null;
   const [githubOrganization, setGithubOrganization] = useState("");
-  const [setupNotice, setSetupNotice] = useState<string | null>(null);
 
-  // GitHub sends a result in the query string on its way back from creating the App.
+  // The GitHub steps finish in a browser tab, and the relay has the result by
+  // the time the admin comes back — so regaining focus is the moment to look.
+  const refresh = state.refresh;
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const created = params.get("github_app");
-    const failure = params.get("github_app_error");
-    if (!created && !failure) return;
-    stripQueryParams(["github_app", "github_app_slug", "github_app_error"]);
-    if (created) {
-      void state.refresh();
-    } else {
-      setSetupNotice(
-        failure === "missing_code"
-          ? "GitHub did not finish creating the App. Try again."
-          : "Creating the GitHub App failed. Try again, or check the relay's log.",
-      );
-    }
-  }, [state]);
+    if (!isAdmin) return;
+    const onFocus = () => void refresh();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [isAdmin, refresh]);
 
   // GitHub sends the id in the query string on its way back from the install.
   useEffect(() => {
@@ -629,13 +615,12 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
                   size="sm"
                   disabled={state.busy}
                   onClick={() => {
-                    setSetupNotice(null);
                     void state
                       .startGithubAppSetup({
                         githubOrganization: githubOrganization.trim() || undefined,
                       })
                       .then((setup) => {
-                        if (setup) submitGithubAppManifest(setup);
+                        if (setup) openGithubJourney(setup.startUrl);
                       });
                   }}
                 >
@@ -653,9 +638,6 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
             }
           />
         )}
-        {setupNotice ? (
-          <p className="px-3 pb-2 text-xs text-destructive sm:px-4">{setupNotice}</p>
-        ) : null}
       </SettingsSection>
     );
   }
@@ -679,7 +661,16 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
             isAdmin ? (
               <div className="flex items-center gap-2">
                 {installUrl ? (
-                  <Button size="sm" variant="outline" render={<a href={installUrl} />}>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={state.busy}
+                    onClick={() =>
+                      void state.startGithubInstall().then((install) => {
+                        if (install) openGithubJourney(install.installUrl);
+                      })
+                    }
+                  >
                     Change repositories
                   </Button>
                 ) : null}
@@ -701,7 +692,15 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
           description="Install the app on a GitHub organization, or on just the repositories you choose. Access belongs to this organization afterwards, not to you."
           control={
             isAdmin && installUrl ? (
-              <Button size="sm" render={<a href={installUrl} />}>
+              <Button
+                size="sm"
+                disabled={state.busy}
+                onClick={() =>
+                  void state.startGithubInstall().then((install) => {
+                    if (install) openGithubJourney(install.installUrl);
+                  })
+                }
+              >
                 Connect GitHub
               </Button>
             ) : (

@@ -545,6 +545,28 @@ export const organizationApi = HttpApiBuilder.group(
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
+        "startGithubInstall",
+        Effect.fn("relay.api.organization.start_github_install")(function* (args) {
+          const membership = yield* requireCallerIsAdmin();
+          return yield* githubAppSetup
+            .beginInstall({
+              userId: membership.userId,
+              organizationId: membership.organization.organizationId,
+              returnUrl: args.payload.returnUrl,
+            })
+            .pipe(
+              Effect.catchTag("GithubAppNotAvailable", () =>
+                tenancyNotFound("github_app_not_configured"),
+              ),
+              Effect.catchTags({
+                GithubAppSetupReturnUrlInvalid: () => relayInternalErrorResponse("internal_error"),
+                GithubAppSetupStateInvalid: () => relayInternalErrorResponse("internal_error"),
+                GithubAppPersistenceError: () => relayInternalErrorResponse("persistence_failed"),
+              }),
+            );
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
         "disconnectGithub",
         Effect.fn("relay.api.organization.disconnect_github")(function* () {
           const membership = yield* requireCallerIsAdmin();

@@ -107,12 +107,16 @@ same installation
 ([ADR-0015](../adr/0015-executors-borrow-the-organizations-github-installation.md)).
 
 Creating the App is a one-time step per relay, done from the organization page: while the relay
-has no App, an admin sees **Create the GitHub App** instead of **Connect GitHub**. The browser
-posts a manifest to GitHub (`startGithubAppSetup` returns it, with a state JWT signed by the cloud
-mint key), the admin presses Create once, GitHub redirects to
-`/v1/organization/github-app/created` on the relay (`http/GithubAppSetupRoute.ts`), and the relay
-converts the code, seals the key, stores the App, and sends the admin back to the page — where
-**Connect GitHub** now installs it. `tenancy/GithubAppSetup.ts` owns the flow;
+has no App, an admin sees **Create the GitHub App** instead of **Connect GitHub**. Both buttons
+open a browser journey on relay-hosted pages (`http/GithubAppSetupRoute.ts`), because the desktop
+app cannot be a GitHub redirect target and hands every external URL to the system browser:
+`/github-app/start` posts the manifest to GitHub; GitHub's `/github-app/created` callback converts
+the code, seals the key, stores the App, and sends the admin straight on to GitHub's install page;
+GitHub's `/github-app/installed` setup callback claims the installation for the organization. Each
+hop carries a state JWT signed by the cloud mint key naming the admin, the organization, and the
+return address, so the callbacks trust only the relay's own signature. The client refreshes when
+it regains focus; a web return address is redirected to, a desktop one (`t3code://`) gets a page
+linking back to the app. `tenancy/GithubAppSetup.ts` owns the flow;
 `infra/relay/scripts/create-github-app.ts` is the same manifest for operators who prefer to
 configure `GITHUB_APP_*` by hand.
 

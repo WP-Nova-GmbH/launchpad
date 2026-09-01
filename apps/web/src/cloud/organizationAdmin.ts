@@ -3,6 +3,7 @@ import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay
 import type {
   RelayGithubAppSetupResponse,
   RelayGithubConnectionResponse,
+  RelayGithubInstallResponse,
   RelayGithubRepository,
   RelayInvitation,
   RelayRepositoryAccessEntry,
@@ -105,13 +106,15 @@ export interface OrganizationAdminState {
   }) => Promise<boolean>;
   readonly connectGithub: (installationId: string) => Promise<boolean>;
   /**
-   * Begins creating this relay's GitHub App. The result is a manifest the
-   * browser posts to GitHub; the page is left for GitHub and comes back with
-   * `github_app=created` (or `github_app_error`) in the query string.
+   * Begins creating this relay's GitHub App: a relay-hosted page to open in a
+   * browser. GitHub's callbacks finish the job on the relay; refresh when the
+   * admin comes back.
    */
   readonly startGithubAppSetup: (input: {
     readonly githubOrganization?: string | undefined;
   }) => Promise<RelayGithubAppSetupResponse | null>;
+  /** GitHub's install page for the App; the relay claims the installation on GitHub's callback. */
+  readonly startGithubInstall: () => Promise<RelayGithubInstallResponse | null>;
   readonly disconnectGithub: () => Promise<boolean>;
   readonly provisionMachine: (input: {
     readonly label: string;
@@ -368,6 +371,23 @@ export function useOrganizationAdmin(): OrganizationAdminState {
               returnUrl: `${window.location.origin}/settings/organization`,
               ...(input.githubOrganization ? { githubOrganization: input.githubOrganization } : {}),
             },
+          }),
+        );
+      } catch (cause) {
+        setError(failureMessage(cause));
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    },
+    startGithubInstall: async () => {
+      setBusy(true);
+      setError(null);
+      try {
+        return await call("Could not start connecting GitHub", (client, clerkToken) =>
+          client.startGithubInstall({
+            clerkToken,
+            payload: { returnUrl: `${window.location.origin}/settings/organization` },
           }),
         );
       } catch (cause) {

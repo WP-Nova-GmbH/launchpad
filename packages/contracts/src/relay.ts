@@ -554,6 +554,7 @@ export const RelayTenancyNotFoundReason = Schema.Literals([
   "invitation_not_found",
   "github_installation_not_found",
   "github_not_connected",
+  "github_app_not_configured",
   "machine_not_found",
 ]);
 export type RelayTenancyNotFoundReason = typeof RelayTenancyNotFoundReason.Type;
@@ -1377,14 +1378,28 @@ export const RelayStartGithubAppSetupRequest = Schema.Struct({
 export type RelayStartGithubAppSetupRequest = typeof RelayStartGithubAppSetupRequest.Type;
 
 /**
- * GitHub creates an App from a manifest delivered as a form POST, so the
- * client submits `manifest` to `action` from the admin's browser.
+ * A relay-hosted page to open in a browser. It posts the App manifest to
+ * GitHub, and GitHub's callbacks bring the admin through installing the App
+ * and back — the client only refreshes when it regains focus.
  */
 export const RelayGithubAppSetupResponse = Schema.Struct({
-  action: TrimmedNonEmptyString,
-  manifest: TrimmedNonEmptyString,
+  startUrl: TrimmedNonEmptyString,
 });
 export type RelayGithubAppSetupResponse = typeof RelayGithubAppSetupResponse.Type;
+
+export const RelayStartGithubInstallRequest = Schema.Struct({
+  returnUrl: TrimmedNonEmptyString.annotate({
+    description:
+      "Where the admin is sent once the installation is connected: the web app's organization settings page, or the desktop app's own URL.",
+  }),
+});
+export type RelayStartGithubInstallRequest = typeof RelayStartGithubInstallRequest.Type;
+
+/** GitHub's install page for the relay's App; the relay claims the installation on GitHub's callback. */
+export const RelayGithubInstallResponse = Schema.Struct({
+  installUrl: TrimmedNonEmptyString,
+});
+export type RelayGithubInstallResponse = typeof RelayGithubInstallResponse.Type;
 
 export const RelayGithubRepository = Schema.Struct({
   fullName: TrimmedNonEmptyString,
@@ -1978,7 +1993,18 @@ export const RelayOrganizationGroup = HttpApiGroup.make("organization")
       .annotate(OpenApi.Summary, "Start creating this relay's GitHub App")
       .annotate(
         OpenApi.Description,
-        "Admin-only, and only while the relay has no GitHub App. Returns the manifest for GitHub's one-click App creation; GitHub then calls back to the relay, which stores the App and sends the admin back to the return URL.",
+        "Admin-only, and only while the relay has no GitHub App. Returns a relay-hosted page for the admin's browser that posts the manifest for GitHub's one-click App creation; GitHub's callbacks then store the App, take the admin through installing it, and connect the installation.",
+      ),
+    HttpApiEndpoint.post("startGithubInstall", "/v1/organization/github/install", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayStartGithubInstallRequest,
+      success: RelayGithubInstallResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Start installing the relay's GitHub App for this organization")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only. Returns GitHub's install page for the App with a signed state; on GitHub's setup callback the relay claims the installation for the organization itself.",
       ),
     HttpApiEndpoint.delete("disconnectGithub", "/v1/organization/github", {
       headers: RelayBearerRequestHeaders,

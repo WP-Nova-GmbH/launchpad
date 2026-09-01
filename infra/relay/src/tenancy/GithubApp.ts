@@ -181,34 +181,35 @@ export const make = Effect.gen(function* () {
   // Configuration wins; an App created from Organization settings is what a
   // relay without one falls back to. Read per use rather than cached, so the
   // App becomes usable the moment its record lands.
+  const unreadable = (cause: unknown) => new GithubRequestFailed({ operation: "read-app", cause });
+  const storedCredentials: Effect.Effect<
+    RelayConfiguration.GithubAppCredentials,
+    GithubAppNotConfigured | GithubRequestFailed
+  > = records.get.pipe(
+    Effect.mapError(unreadable),
+    Effect.flatMap(
+      (
+        record,
+      ): Effect.Effect<
+        RelayConfiguration.GithubAppCredentials,
+        GithubAppNotConfigured | GithubRequestFailed
+      > =>
+        record === null
+          ? Effect.fail(new GithubAppNotConfigured())
+          : secretBox.open(record.privateKeySealed).pipe(
+              Effect.mapError(unreadable),
+              Effect.map((pem) => ({
+                appId: record.appId,
+                appSlug: record.appSlug,
+                privateKey: Redacted.make(pem),
+              })),
+            ),
+    ),
+  );
   const credentials: Effect.Effect<
     RelayConfiguration.GithubAppCredentials,
     GithubAppNotConfigured | GithubRequestFailed
-  > = Effect.suspend(() =>
-    config.github
-      ? Effect.succeed(config.github)
-      : records.get.pipe(
-          Effect.flatMap((record) =>
-            record === null
-              ? Effect.fail(new GithubAppNotConfigured())
-              : secretBox.open(record.privateKeySealed).pipe(
-                  Effect.map(
-                    (pem): RelayConfiguration.GithubAppCredentials => ({
-                      appId: record.appId,
-                      appSlug: record.appSlug,
-                      privateKey: Redacted.make(pem),
-                    }),
-                  ),
-                ),
-          ),
-          Effect.catchTags({
-            GithubAppPersistenceError: (cause) =>
-              Effect.fail(new GithubRequestFailed({ operation: "read-app", cause })),
-            SecretBoxError: (cause) =>
-              Effect.fail(new GithubRequestFailed({ operation: "read-app", cause })),
-          }),
-        ),
-  );
+  > = Effect.suspend(() => (config.github ? Effect.succeed(config.github) : storedCredentials));
 
   const request = Effect.fn("relay.github.request")(function* (input: {
     readonly path: string;
