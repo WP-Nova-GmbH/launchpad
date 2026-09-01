@@ -11,7 +11,11 @@ import * as ManagedEndpointProvider from "../environments/ManagedEndpointProvide
 import * as MachineComputeProvider from "../machines/MachineComputeProvider.ts";
 import * as MachineLimits from "../machines/MachineLimits.ts";
 import * as Machines from "../machines/Machines.ts";
-import { deprovisionMachineRecord, provisionMachineRecord } from "./MachinesApi.ts";
+import {
+  connectMachineRecord,
+  deprovisionMachineRecord,
+  provisionMachineRecord,
+} from "./MachinesApi.ts";
 
 const relaySettings: RelayConfiguration.RelayConfiguration["Service"] = {
   relayIssuer: "https://relay.example.test",
@@ -311,6 +315,91 @@ describe("provisionMachineRecord", () => {
   });
 });
 
+describe("connectMachineRecord", () => {
+  it.effect("returns the seed exactly once and never touches a compute driver", () => {
+    let storedSeedHash: string | null = null;
+    return Effect.gen(function* () {
+      const result = yield* connectMachineRecord({
+        organizationId: "organization-1",
+        createdByUserId: "user_admin",
+        label: "Laptop",
+        role: "agent_executor",
+      });
+      expect(result.seed).toMatch(/^t3mseed_[0-9a-f]{64}$/);
+      expect(storedSeedHash).toBe(seedHashOf(result.seed));
+      expect(result.relayUrl).toBe("https://relay.example.test");
+      expect(result.machine.computeKind).toBe("self_hosted");
+      expect(result.machine.status).toBe("awaiting_enrollment");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          baseLayer,
+          limitsLayer(),
+          credentialsLayer(),
+          endpointLayer(),
+          machinesLayer({
+            create: (input) =>
+              Effect.sync(() => {
+                storedSeedHash = input.seedHash;
+                return {
+                  ...input,
+                  computeRef: null,
+                  environmentId: null,
+                  environmentPublicKey: null,
+                  endpointHttpBaseUrl: null,
+                  endpointWsBaseUrl: null,
+                  endpointProviderKind: null,
+                  enrolledAt: null,
+                  deprovisionedAt: null,
+                  createdAt: "2026-08-31T00:00:00.000Z",
+                };
+              }),
+          }),
+          // Every compute call is `unexpected`: a self-hosted machine has no driver.
+          computeLayer(),
+        ),
+      ),
+    );
+  });
+
+  it.effect("refuses connecting past the organization quota", () =>
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        connectMachineRecord({
+          organizationId: "organization-1",
+          createdByUserId: "user_admin",
+          label: "Laptop",
+          role: "agent_executor",
+        }),
+      );
+      expect(error).toMatchObject({
+        _tag: "RelayTenancyConflictError",
+        reason: "machine_limit_reached",
+      });
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          baseLayer,
+          limitsLayer({
+            ensureCapacity: (input) =>
+              Effect.fail(
+                new MachineLimits.MachineLimitExceeded({
+                  organizationId: input.organizationId,
+                  maxMachines: 5,
+                  activeMachines: 5,
+                }),
+              ),
+          }),
+          credentialsLayer(),
+          endpointLayer(),
+          machinesLayer({}),
+          computeLayer(),
+        ),
+      ),
+    ),
+  );
+});
+
 describe("deprovisionMachineRecord", () => {
   it.effect("answers not-found for machines of other organizations", () =>
     Effect.gen(function* () {
@@ -395,6 +484,59 @@ describe("deprovisionMachineRecord", () => {
                 expect(input).toEqual({ computeKind: "docker", computeRef: "container-1" });
               }),
           }),
+        ),
+      ),
+    );
+  });
+
+  it.effect("tears down an enrolled self-hosted machine without a compute call", () => {
+    const calls: Array<string> = [];
+    return Effect.gen(function* () {
+      const result = yield* deprovisionMachineRecord({
+        organizationId: "organization-1",
+        machineId: "machine-1",
+      });
+      expect(result).toEqual({ ok: true });
+      expect(calls).toEqual([
+        "prepare-deprovision",
+        "tombstone",
+        "revoke-credentials",
+        "deprovision-endpoint",
+      ]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          baseLayer,
+          limitsLayer(),
+          credentialsLayer({
+            revokeForEnvironmentPublicKey: () =>
+              Effect.sync(() => {
+                calls.push("revoke-credentials");
+                return true;
+              }),
+          }),
+          endpointLayer({
+            prepareDeprovision: () =>
+              Effect.sync(() => {
+                calls.push("prepare-deprovision");
+                return null;
+              }),
+            deprovision: () =>
+              Effect.sync(() => {
+                calls.push("deprovision-endpoint");
+              }),
+          }),
+          machinesLayer({
+            getById: () =>
+              Effect.succeed(enrolledMachine({ computeKind: "self_hosted", computeRef: null })),
+            deprovision: () =>
+              Effect.sync(() => {
+                calls.push("tombstone");
+                return true;
+              }),
+          }),
+          // A self-hosted machine has no compute ref, so destroy stays `unexpected`.
+          computeLayer(),
         ),
       ),
     );

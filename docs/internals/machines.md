@@ -2,9 +2,9 @@
 
 > For maintainers. Using Launchpad? See [docs/user](../user/).
 
-A machine is compute the relay provisions for exactly one organization: an **agent
-executor** that runs work, or a **review host** that will run review apps — one
-provisioning path and one enrollment story, with the difference costing a role column
+A machine is compute bound to exactly one organization — provisioned by the relay or
+self-hosted: an **agent executor** that runs work, or a **review host** that will run
+review apps — one enrollment story, with the role difference costing a role column
 ([ADR-0010](../adr/0010-review-apps-run-on-org-compute.md)). Machines are long-lived
 environments, not ephemeral workers ([ADR-0001](../adr/0001-executors-are-long-lived-environments.md)),
 and single-tenant to the organization that bought them
@@ -18,6 +18,15 @@ organization's quota, creates the record with a single-use enrollment seed (stor
 as a hash, expiring after 24 hours), and hands the seed to the compute driver — the
 record exists before the compute so enrollment can never race an unknown seed, and a
 driver failure removes the never-enrolled record.
+
+A **self-hosted machine** takes the same path minus the driver: the admin connects it
+from the same settings section (`connectMachine`, compute kind `self_hosted`), and the
+seed comes back exactly once in that response — the invitation-token delivery story. The
+UI turns it into a one-line setup command (`T3CODE_MACHINE_ENROLLMENT_SEED`,
+`T3CODE_MACHINE_ENROLLMENT_RELAY_URL`, `npx t3 serve` under a dedicated `T3CODE_HOME`)
+that the admin runs on their own hardware within the seed's 24 hours. From the enroll
+call onward nothing distinguishes the two: same proof, same endpoint provisioning, same
+quota, same teardown — minus the compute destroy, since `compute_ref` stays null.
 
 The machine boots, and its server presents the seed inside a proof signed with its own
 freshly generated environment key (`reconcileMachineEnrollment` in
@@ -82,7 +91,9 @@ seam between machine records and infrastructure:
   only when its HTTP and WebSocket URLs are matching loopback origins. Manual personal
   links remain ineligible for relay routing, and production keeps this escape hatch off.
 
-Neither driver destroys compute the other created.
+Neither driver destroys compute the other created, and a self-hosted machine belongs to
+no driver at all — its compute is the organization's own, so deprovisioning tombstones
+the record, revokes the credential, and releases the endpoint, but destroys nothing.
 
 ## Endpoints and quota
 

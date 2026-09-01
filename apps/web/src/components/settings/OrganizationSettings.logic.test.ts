@@ -3,6 +3,7 @@ import type { RelayMachine, RelayRepositorySummary } from "@t3tools/contracts/re
 
 import {
   hasMachineSettingUp,
+  machineEnrollmentCommand,
   machineStatusPresentation,
   memberLabel,
   unregisteredCheckouts,
@@ -164,6 +165,17 @@ describe("machineStatusPresentation", () => {
     expect(visibleMachines([machine({}), destroyed])).toHaveLength(1);
   });
 
+  it("speaks to the admin for a self-hosted machine, whose setup is theirs to run", () => {
+    const waiting = machineStatusPresentation(machine({ computeKind: "self_hosted" }), now);
+    expect(waiting.label).toBe("Waiting for setup");
+
+    const expired = machineStatusPresentation(
+      machine({ computeKind: "self_hosted", seedExpiresAt: "2026-08-19T00:30:00.000Z" }),
+      now,
+    );
+    expect(expired.guidance).toContain("connect a fresh one");
+  });
+
   it("reports a machine still inside its enrollment window as setting up", () => {
     expect(hasMachineSettingUp([machine({})], now)).toBe(true);
     expect(hasMachineSettingUp([machine({ seedExpiresAt: "2026-08-19T00:30:00.000Z" })], now)).toBe(
@@ -175,5 +187,21 @@ describe("machineStatusPresentation", () => {
         now,
       ),
     ).toBe(false);
+  });
+});
+
+describe("machineEnrollmentCommand", () => {
+  it("is one pasteable line pointing at a dedicated home directory", () => {
+    const command = machineEnrollmentCommand({
+      seed: "t3mseed_abc123",
+      relayUrl: "https://relay.example.test",
+    });
+    expect(command).toBe(
+      'T3CODE_HOME="$HOME/.t3/machine" ' +
+        'T3CODE_MACHINE_ENROLLMENT_SEED="t3mseed_abc123" ' +
+        'T3CODE_MACHINE_ENROLLMENT_RELAY_URL="https://relay.example.test" ' +
+        "npx t3 serve",
+    );
+    expect(command).not.toContain("\n");
   });
 });

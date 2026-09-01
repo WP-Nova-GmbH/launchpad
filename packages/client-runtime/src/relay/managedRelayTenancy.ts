@@ -9,6 +9,7 @@
  */
 import {
   RelayApi,
+  type RelayConnectMachineResponse,
   type RelayCreateInvitationRequest,
   type RelayCreateInvitationResponse,
   type RelayGithubConnection,
@@ -140,6 +141,10 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly payload: RelayProvisionMachineRequest;
     }) => Effect.Effect<RelayMachine, ManagedRelayClientError>;
+    readonly connectMachine: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayProvisionMachineRequest;
+    }) => Effect.Effect<RelayConnectMachineResponse, ManagedRelayClientError>;
     readonly deprovisionMachine: (input: {
       readonly clerkToken: string;
       readonly machineId: RelayMachineId;
@@ -190,6 +195,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     revokeAccess: unavailable("clientRuntime.managedRelayTenancy.revokeAccess"),
     listMachines: unavailable("clientRuntime.managedRelayTenancy.listMachines"),
     provisionMachine: unavailable("clientRuntime.managedRelayTenancy.provisionMachine"),
+    connectMachine: unavailable("clientRuntime.managedRelayTenancy.connectMachine"),
     deprovisionMachine: unavailable("clientRuntime.managedRelayTenancy.deprovisionMachine"),
     getGithubConnection: unavailable("clientRuntime.managedRelayTenancy.getGithubConnection"),
     connectGithub: unavailable("clientRuntime.managedRelayTenancy.connectGithub"),
@@ -514,6 +520,21 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.provisionMachine"),
+      withRelayClientTracing,
+    ),
+    connectMachine: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.machines
+          .connectMachine({
+            headers: bearerHeaders(input.clerkToken),
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("connect relay machine")),
+            timeoutRelayRequest("Relay machine connection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.connectMachine"),
       withRelayClientTracing,
     ),
     deprovisionMachine: Effect.fnUntraced(

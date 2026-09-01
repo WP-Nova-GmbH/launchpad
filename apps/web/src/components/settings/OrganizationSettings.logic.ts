@@ -75,15 +75,35 @@ export function machineStatusPresentation(
             dotClassName: "bg-destructive",
             pingClassName: null,
             guidance:
-              "This machine never called home and no longer can. Destroy it and provision a fresh one.",
+              machine.computeKind === "self_hosted"
+                ? "This machine never called home and no longer can. Destroy it and connect a fresh one."
+                : "This machine never called home and no longer can. Destroy it and provision a fresh one.",
           }
         : {
-            label: "Setting up",
+            label: machine.computeKind === "self_hosted" ? "Waiting for setup" : "Setting up",
             dotClassName: "bg-warning",
             pingClassName: "bg-warning/60 duration-2000",
             guidance: null,
           };
   }
+}
+
+/**
+ * The one command an admin runs on their own computer to turn it into this
+ * machine. A dedicated home directory keeps the executor's state out of any
+ * Launchpad the person already runs there — an environment somebody linked
+ * can never enroll, so pointing at an existing install would only fail.
+ */
+export function machineEnrollmentCommand(enrollment: {
+  readonly seed: string;
+  readonly relayUrl: string;
+}): string {
+  return [
+    'T3CODE_HOME="$HOME/.t3/machine"',
+    `T3CODE_MACHINE_ENROLLMENT_SEED="${enrollment.seed}"`,
+    `T3CODE_MACHINE_ENROLLMENT_RELAY_URL="${enrollment.relayUrl}"`,
+    "npx t3 serve",
+  ].join(" ");
 }
 
 /**

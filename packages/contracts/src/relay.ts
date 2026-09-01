@@ -1377,8 +1377,13 @@ export type RelayListGithubRepositoriesResponse = typeof RelayListGithubReposito
 export const RelayMachineRole = Schema.Literals(["agent_executor", "review_host"]);
 export type RelayMachineRole = typeof RelayMachineRole.Type;
 
-/** Which compute driver created the machine: a Docker container in dev, a Hetzner Cloud server in production. */
-export const RelayMachineComputeKind = Schema.Literals(["docker", "hetzner"]);
+/**
+ * Which compute driver created the machine: a Docker container in dev, a
+ * Hetzner Cloud server in production. `self_hosted` means no driver at all —
+ * the organization runs its own compute and the admin delivers the enrollment
+ * seed by hand (ADR-0002's self-hosted case).
+ */
+export const RelayMachineComputeKind = Schema.Literals(["docker", "hetzner", "self_hosted"]);
 export type RelayMachineComputeKind = typeof RelayMachineComputeKind.Type;
 
 /**
@@ -1427,6 +1432,19 @@ export const RelayProvisionMachineRequest = Schema.Struct({
   role: RelayMachineRole,
 });
 export type RelayProvisionMachineRequest = typeof RelayProvisionMachineRequest.Type;
+
+/**
+ * Returns the enrollment seed exactly once, like an invitation token: the
+ * relay keeps only its hash, and with no compute driver to inject it, the
+ * admin carries the seed to the machine themselves.
+ */
+export const RelayConnectMachineResponse = Schema.Struct({
+  machine: RelayMachine,
+  seed: TrimmedNonEmptyString,
+  /** Where the machine enrolls: the relay's own normalized origin. */
+  relayUrl: TrimmedNonEmptyString,
+});
+export type RelayConnectMachineResponse = typeof RelayConnectMachineResponse.Type;
 
 /**
  * Signed by the machine's own freshly generated environment key. The seed
@@ -2076,6 +2094,17 @@ export const RelayMachinesGroup = HttpApiGroup.make("machines")
         OpenApi.Description,
         "Creates the machine record, seeds a single-use enrollment credential into fresh compute, and returns immediately; the machine appears as ready once it enrolls itself.",
       ),
+    HttpApiEndpoint.post("connectMachine", "/v1/machines/self-hosted", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayProvisionMachineRequest,
+      success: RelayConnectMachineResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Connect a self-hosted machine")
+      .annotate(
+        OpenApi.Description,
+        "Creates the machine record and returns the enrollment seed exactly once. The organization boots its own compute with the seed; the machine appears as ready once it enrolls itself.",
+      ),
     HttpApiEndpoint.delete("deprovisionMachine", "/v1/machines/:machineId", {
       headers: RelayBearerRequestHeaders,
       params: RelayMachineParams,
@@ -2088,7 +2117,10 @@ export const RelayMachinesGroup = HttpApiGroup.make("machines")
         "Revokes the machine's credentials, releases its managed endpoint, and destroys its compute. Until the event mirror exists, thread history held on the machine is destroyed with it.",
       ),
   )
-  .annotate(OpenApi.Description, "Relay-provisioned machines: agent executors and review hosts.")
+  .annotate(
+    OpenApi.Description,
+    "Organization machines — agent executors and review hosts — provisioned by the relay or self-hosted.",
+  )
   .middleware(RelayClientAuth);
 
 const RelayMachineEnrollErrors = [

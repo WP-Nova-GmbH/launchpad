@@ -48,6 +48,17 @@ export interface IssuedInvitation {
   readonly token: string;
 }
 
+/**
+ * The enrollment seed for a self-hosted machine, delivered by hand exactly
+ * like an invitation token: it exists only in the response that created the
+ * machine, so it lives in component state until the page is left.
+ */
+export interface IssuedMachineEnrollment {
+  readonly machineId: RelayMachineId;
+  readonly seed: string;
+  readonly relayUrl: string;
+}
+
 export interface OrganizationAdminState {
   readonly isSignedIn: boolean;
   readonly snapshot: OrganizationAdminSnapshot | null;
@@ -55,6 +66,7 @@ export interface OrganizationAdminState {
   readonly error: string | null;
   readonly busy: boolean;
   readonly issuedInvitations: ReadonlyArray<IssuedInvitation>;
+  readonly issuedMachineEnrollments: ReadonlyArray<IssuedMachineEnrollment>;
   readonly refresh: () => Promise<void>;
   readonly renameOrganization: (name: string) => Promise<boolean>;
   readonly updateMemberRole: (input: {
@@ -96,6 +108,10 @@ export interface OrganizationAdminState {
     readonly label: string;
     readonly role: RelayMachineRole;
   }) => Promise<boolean>;
+  readonly connectMachine: (input: {
+    readonly label: string;
+    readonly role: RelayMachineRole;
+  }) => Promise<boolean>;
   readonly deprovisionMachine: (machineId: RelayMachineId) => Promise<boolean>;
 }
 
@@ -119,6 +135,9 @@ export function useOrganizationAdmin(): OrganizationAdminState {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [issuedInvitations, setIssuedInvitations] = useState<ReadonlyArray<IssuedInvitation>>([]);
+  const [issuedMachineEnrollments, setIssuedMachineEnrollments] = useState<
+    ReadonlyArray<IssuedMachineEnrollment>
+  >([]);
 
   const call = useCallback(
     async <A>(
@@ -242,6 +261,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     error,
     busy,
     issuedInvitations,
+    issuedMachineEnrollments,
     refresh: load,
     renameOrganization: (name) =>
       mutate("Could not rename the organization", () =>
@@ -346,11 +366,24 @@ export function useOrganizationAdmin(): OrganizationAdminState {
           client.provisionMachine({ clerkToken, payload: input }),
         ),
       ),
+    connectMachine: (input) =>
+      mutate("Could not connect the machine", async () => {
+        const issued = await call("Could not connect the machine", (client, clerkToken) =>
+          client.connectMachine({ clerkToken, payload: input }),
+        );
+        setIssuedMachineEnrollments((current) => [
+          { machineId: issued.machine.machineId, seed: issued.seed, relayUrl: issued.relayUrl },
+          ...current.filter((entry) => entry.machineId !== issued.machine.machineId),
+        ]);
+      }),
     deprovisionMachine: (machineId) =>
-      mutate("Could not deprovision the machine", () =>
-        call("Could not deprovision the machine", (client, clerkToken) =>
+      mutate("Could not deprovision the machine", async () => {
+        await call("Could not deprovision the machine", (client, clerkToken) =>
           client.deprovisionMachine({ clerkToken, machineId }),
-        ),
-      ),
+        );
+        setIssuedMachineEnrollments((current) =>
+          current.filter((entry) => entry.machineId !== machineId),
+        );
+      }),
   };
 }

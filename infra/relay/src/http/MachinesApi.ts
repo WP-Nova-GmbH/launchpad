@@ -14,6 +14,7 @@ import {
   RelayMachineId,
   RelayOrganizationId,
   type RelayMachine,
+  type RelayMachineComputeKind,
   type RelayMachineComputeUnavailableReason,
   type RelayMachineEnrollFailedReason,
   type RelayMachineEnrollProofInvalidReason,
@@ -91,6 +92,51 @@ const machineEnrollUnavailable = Effect.fnUntraced(function* () {
   });
 });
 
+/**
+ * The shared front half of both machine-creation paths: quota, a fresh seed
+ * stored only as its hash, and the record. What happens to the seed afterwards
+ * is what distinguishes them — a compute driver receives it, or the admin does.
+ */
+const mintMachineRecord = Effect.fnUntraced(function* (input: {
+  readonly organizationId: string;
+  readonly createdByUserId: string;
+  readonly label: string;
+  readonly role: RelayMachineRole;
+  readonly computeKind: RelayMachineComputeKind;
+}) {
+  const machines = yield* Machines.Machines;
+  const machineLimits = yield* MachineLimits.MachineLimits;
+  const crypto = yield* Crypto.Crypto;
+  const { organizationId } = input;
+
+  yield* machineLimits
+    .ensureCapacity({ organizationId })
+    .pipe(Effect.catchTag("MachineLimitExceeded", () => tenancyConflict("machine_limit_reached")));
+  const machineId = yield* crypto.randomUUIDv4.pipe(
+    Effect.catch(() => relayInternalErrorResponse("internal_error")),
+  );
+  const seed = yield* Machines.makeMachineSeed(crypto).pipe(
+    Effect.catch(() => relayInternalErrorResponse("internal_error")),
+  );
+  const seedHash = yield* Machines.hashMachineSeed(crypto, seed).pipe(
+    Effect.catch(() => relayInternalErrorResponse("internal_error")),
+  );
+  const now = yield* DateTime.now;
+  const created = yield* machines.create({
+    machineId,
+    organizationId,
+    role: input.role,
+    label: input.label,
+    computeKind: input.computeKind,
+    seedHash,
+    seedExpiresAt: DateTime.formatIso(
+      DateTime.add(now, { hours: Machines.MACHINE_SEED_EXPIRY_HOURS }),
+    ),
+    createdByUserId: input.createdByUserId,
+  });
+  return { created, seed };
+});
+
 export const provisionMachineRecord = Effect.fn("relay.api.machines.provisionMachineRecord")(
   function* (input: {
     readonly organizationId: string;
@@ -99,46 +145,20 @@ export const provisionMachineRecord = Effect.fn("relay.api.machines.provisionMac
     readonly role: RelayMachineRole;
   }) {
     const machines = yield* Machines.Machines;
-    const machineLimits = yield* MachineLimits.MachineLimits;
     const computeProvider = yield* MachineComputeProvider.MachineComputeProvider;
     const config = yield* RelayConfiguration.RelayConfiguration;
-    const crypto = yield* Crypto.Crypto;
-    const { organizationId } = input;
-
-    yield* machineLimits
-      .ensureCapacity({ organizationId })
-      .pipe(
-        Effect.catchTag("MachineLimitExceeded", () => tenancyConflict("machine_limit_reached")),
-      );
-    const machineId = yield* crypto.randomUUIDv4.pipe(
-      Effect.catch(() => relayInternalErrorResponse("internal_error")),
-    );
-    const seed = yield* Machines.makeMachineSeed(crypto).pipe(
-      Effect.catch(() => relayInternalErrorResponse("internal_error")),
-    );
-    const seedHash = yield* Machines.hashMachineSeed(crypto, seed).pipe(
-      Effect.catch(() => relayInternalErrorResponse("internal_error")),
-    );
-    const now = yield* DateTime.now;
-    const created = yield* machines.create({
-      machineId,
-      organizationId,
-      role: input.role,
-      label: input.label,
+    const { created, seed } = yield* mintMachineRecord({
+      ...input,
       computeKind: computeProvider.kind,
-      seedHash,
-      seedExpiresAt: DateTime.formatIso(
-        DateTime.add(now, { hours: Machines.MACHINE_SEED_EXPIRY_HOURS }),
-      ),
-      createdByUserId: input.createdByUserId,
     });
+    const machineId = created.machineId;
     // The record exists before the compute so enrollment can never race an
     // unknown seed; a driver failure removes the never-enrolled record rather
     // than leaving a machine that can never call home.
     const compute = yield* computeProvider
       .create({
         machineId,
-        organizationId,
+        organizationId: input.organizationId,
         role: input.role,
         label: input.label,
         relayUrl: normalizeRelayIssuer(config.relayIssuer),
@@ -159,6 +179,29 @@ export const provisionMachineRecord = Effect.fn("relay.api.machines.provisionMac
     yield* machines.recordComputeRef({ machineId, computeRef: compute.computeRef });
     const settled = yield* machines.getById({ machineId });
     return toApiMachine(settled ?? { ...created, computeRef: compute.computeRef });
+  },
+);
+
+/**
+ * The self-hosted variant of provisioning: same record, same seed mechanics,
+ * no compute driver. The seed leaves the relay exactly once, in this response
+ * — like an invitation token, the admin delivers it to the machine themselves
+ * (ADR-0002's self-hosted case).
+ */
+export const connectMachineRecord = Effect.fn("relay.api.machines.connectMachineRecord")(
+  function* (input: {
+    readonly organizationId: string;
+    readonly createdByUserId: string;
+    readonly label: string;
+    readonly role: RelayMachineRole;
+  }) {
+    const config = yield* RelayConfiguration.RelayConfiguration;
+    const { created, seed } = yield* mintMachineRecord({ ...input, computeKind: "self_hosted" });
+    return {
+      machine: toApiMachine(created),
+      seed,
+      relayUrl: normalizeRelayIssuer(config.relayIssuer),
+    };
   },
 );
 
@@ -250,6 +293,19 @@ export const machinesApi = HttpApiBuilder.group(
           const { userId } = yield* RelayClientPrincipal;
           const membership = yield* requireAdmin({ userId });
           return yield* provisionMachineRecord({
+            organizationId: membership.organization.organizationId,
+            createdByUserId: membership.userId,
+            label: args.payload.label,
+            role: args.payload.role,
+          });
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "connectMachine",
+        Effect.fn("relay.api.machines.connect")(function* (args) {
+          const { userId } = yield* RelayClientPrincipal;
+          const membership = yield* requireAdmin({ userId });
+          return yield* connectMachineRecord({
             organizationId: membership.organization.organizationId,
             createdByUserId: membership.userId,
             label: args.payload.label,

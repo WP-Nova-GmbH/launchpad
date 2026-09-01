@@ -238,14 +238,20 @@ _Avoid_: "runner", "worker", "agent machine".
 #### Managed executor
 
 An [executor](#executor) whose machine an organization buys through the product and the
-relay provisions. Contrast **self-hosted executor**: a machine the organization runs itself
-and registers with the relay. Only managed executors exist today.
+relay provisions. Contrast **self-hosted machine**: compute the organization runs itself
+and connects to the relay by hand — same record, same [enrollment](#enrollment), no compute
+driver (`self_hosted` compute kind, either [machine role](#machine-role)). An admin creates
+it in Settings → Organization, receives the enrollment seed exactly once, and runs the
+setup command on the machine themselves. _Avoid_: "manual machine" — `manual` already
+names a self-reported, non-routable endpoint.
 
 #### Enrollment
 
-How a newly provisioned [executor](#executor) proves to the [relay](#relay) that it is the
-machine the relay just created. Distinct from **linking**, the human-driven flow by which a
-user connects their own [environment](#environment). See [ADR-0002][adr2].
+How a newly created machine proves to the [relay](#relay) that it is the machine the relay
+just created: presenting a single-use seed inside a proof signed with its own fresh key.
+The seed travels via the compute driver for a [managed executor](#managed-executor) and via
+the admin for a self-hosted machine. Distinct from **linking**, the human-driven flow by
+which a user connects their own [environment](#environment). See [ADR-0002][adr2].
 
 #### Environment credential
 
