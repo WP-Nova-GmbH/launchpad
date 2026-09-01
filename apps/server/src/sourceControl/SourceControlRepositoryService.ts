@@ -21,8 +21,29 @@ import {
 
 import { ServerConfig } from "../config.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import { runnerSourceControlEnv } from "../vcs/runnerCredentials.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 const isSourceControlRepositoryError = Schema.is(SourceControlRepositoryError);
+
+/**
+ * Clones run headless — on a remote executor there is nobody at a prompt — so
+ * every interactive credential path is off and failures surface immediately
+ * instead of hanging out the timeout.
+ */
+const CLONE_NONINTERACTIVE_ENV = Object.freeze({
+  GCM_INTERACTIVE: "never",
+  GIT_TERMINAL_PROMPT: "0",
+  SSH_ASKPASS: "",
+  SSH_ASKPASS_REQUIRE: "never",
+} satisfies NodeJS.ProcessEnv);
+
+/**
+ * The same helper `gh auth setup-git` would configure. Persisted into the
+ * cloned repository via `git clone --config`, so the fetches that follow —
+ * checkpointing, status refresh — keep working wherever `gh` is authenticated,
+ * including a runner-held token (ADR-0009) surfaced as `GH_TOKEN`.
+ */
+const GITHUB_CREDENTIAL_HELPER = "!gh auth git-credential";
 
 export class SourceControlRepositoryService extends Context.Service<
   SourceControlRepositoryService,
@@ -67,14 +88,70 @@ function toRepositoryInfo(
 function selectRemoteUrl(
   urls: SourceControlRepositoryCloneUrls,
   protocol: SourceControlCloneProtocol | undefined,
+  options?: { readonly preferHttpsOnAuto?: boolean },
 ): string {
   switch (protocol ?? "auto") {
     case "https":
       return urls.url;
     case "ssh":
-    case "auto":
       return urls.sshUrl;
+    case "auto":
+      return options?.preferHttpsOnAuto ? urls.url : urls.sshUrl;
   }
+}
+
+/**
+ * GitHub clones ride the `gh` CLI's authentication: the lookup that produced
+ * the URL already proved `gh` works on this machine, while an SSH key or a
+ * plain-git HTTPS credential may not exist at all (a provisioned executor has
+ * neither). Matching by host as well covers organization-catalog clone URLs,
+ * which arrive without a provider.
+ */
+function useGitHubCredentialHelper(
+  provider: SourceControlProviderKind,
+  remoteUrl: string,
+): boolean {
+  if (!remoteUrl.startsWith("https://")) {
+    return false;
+  }
+  if (provider === "github") {
+    return true;
+  }
+  try {
+    return new URL(remoteUrl).host === "github.com";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A safe sentence for the clone toast. Never quotes stderr — remote URLs and
+ * credential responses can carry tokens — but stderr is classified locally so
+ * the user learns which kind of failure this was instead of the generic
+ * "could not be completed".
+ */
+function cloneFailureDetail(stderr: string, exitCode: number): string {
+  const normalized = stderr.toLowerCase();
+  if (
+    normalized.includes("permission denied (publickey)") ||
+    normalized.includes("authentication failed") ||
+    normalized.includes("could not read username") ||
+    normalized.includes("could not read password") ||
+    normalized.includes("invalid credentials") ||
+    normalized.includes("access denied")
+  ) {
+    return "The remote rejected this machine's credentials.";
+  }
+  if (normalized.includes("host key verification failed")) {
+    return "SSH host key verification failed on this machine.";
+  }
+  if (normalized.includes("could not resolve host")) {
+    return "The remote host could not be resolved.";
+  }
+  if (normalized.includes("repository not found") || normalized.includes("not found")) {
+    return "The remote repository was not found or is not accessible.";
+  }
+  return `git clone exited with status ${String(exitCode)}.`;
 }
 
 function expandHomePath(input: string, path: Path.Path): string {
@@ -191,7 +268,9 @@ export const make = Effect.gen(function* () {
         repository: input.repository,
         cwd: preparedDestination.parentPath,
       });
-      remoteUrl = selectRemoteUrl(repository, input.protocol);
+      remoteUrl = selectRemoteUrl(repository, input.protocol, {
+        preferHttpsOnAuto: input.provider === "github",
+      });
       provider = input.provider;
     }
 
@@ -203,13 +282,37 @@ export const make = Effect.gen(function* () {
       });
     }
 
-    yield* git.execute({
-      operation: "SourceControlRepositoryService.cloneRepository",
-      cwd: preparedDestination.parentPath,
-      args: ["clone", remoteUrl, preparedDestination.directoryName],
-      timeoutMs: 120_000,
-      maxOutputBytes: 256 * 1024,
-    });
+    const cloneArgs = useGitHubCredentialHelper(provider, remoteUrl)
+      ? ["clone", "--config", `credential.helper=${GITHUB_CREDENTIAL_HELPER}`]
+      : ["clone"];
+    const cloneResult = yield* git
+      .execute({
+        operation: "SourceControlRepositoryService.cloneRepository",
+        cwd: preparedDestination.parentPath,
+        args: [...cloneArgs, remoteUrl, preparedDestination.directoryName],
+        env: runnerSourceControlEnv(CLONE_NONINTERACTIVE_ENV) ?? CLONE_NONINTERACTIVE_ENV,
+        allowNonZeroExit: true,
+        timeoutMs: 120_000,
+        maxOutputBytes: 256 * 1024,
+      })
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new SourceControlRepositoryError({
+              operation: "cloneRepository",
+              provider,
+              detail: cause.detail,
+              cause,
+            }),
+        ),
+      );
+    if (cloneResult.exitCode !== 0) {
+      return yield* new SourceControlRepositoryError({
+        operation: "cloneRepository",
+        provider,
+        detail: cloneFailureDetail(cloneResult.stderr, cloneResult.exitCode),
+      });
+    }
 
     return {
       cwd: preparedDestination.destinationPath,

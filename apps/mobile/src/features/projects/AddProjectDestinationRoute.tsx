@@ -4,6 +4,7 @@ import { AddProjectDestinationScreen } from "./AddProjectScreen";
 type AddProjectDestinationRouteParams = {
   readonly environmentId?: string | string[];
   readonly source?: string | string[];
+  readonly repository?: string | string[];
   readonly remoteUrl?: string | string[];
   readonly repositoryTitle?: string | string[];
   readonly repositoryName?: string | string[];

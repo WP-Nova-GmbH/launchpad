@@ -20,6 +20,7 @@ Launchpad works with the platforms your team already uses:
 - Open the Command Palette (`Cmd/Ctrl + K`) → **Add Project**
 - Choose **GitHub repository**, **GitLab repository**, **Bitbucket repository**, **Azure DevOps repository**, or paste any **Git URL**
 - Enter the repository path (`owner/repo`, `group/project`, `workspace/repository`, or `project/repository`) or a full Git URL, pick a destination, and start coding
+- GitHub clones use HTTPS with the GitHub CLI's sign-in for credentials, so `gh auth login` on the machine running Launchpad is all a clone needs — no SSH key required. A pasted Git URL is cloned exactly as written.
 
 **Publish local projects to the cloud**
 
@@ -142,6 +143,7 @@ Control settings**.
 - **Provider shows "Not authenticated"** – Run the login command for that provider (e.g., `gh auth login`) in a terminal on the server, then rescan in Settings
 - **Bitbucket not connecting** – Double-check your environment variables are set in the correct shell profile and the server was restarted
 - **Can't push to a remote** – Verify your Git remote URL matches the provider you've authenticated with (SSH vs HTTPS remotes may need different credentials)
+- **Clone says the remote rejected this machine's credentials** – The machine running Launchpad is the one doing the cloning. For GitHub, sign in with `gh auth login` there; for a pasted SSH URL, that machine needs an SSH key registered with the host
 
 **Need more help?** Check your provider's CLI documentation:
 

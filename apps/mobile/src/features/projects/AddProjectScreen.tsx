@@ -691,6 +691,7 @@ export function AddProjectRepositoryScreen(props: {
         StackActions.push("AddProjectDestination", {
           environmentId: environment.environmentId,
           source,
+          repository: repository.nameWithOwner,
           remoteUrl: repository.sshUrl,
           repositoryTitle: repository.nameWithOwner,
           repositoryName: getCloneDirectoryName(repository.nameWithOwner),
@@ -885,6 +886,8 @@ export function AddProjectLocalFolderScreen(props: { readonly environmentId?: st
 
 export function AddProjectDestinationScreen(props: {
   readonly environmentId?: string | string[];
+  readonly source?: string | string[];
+  readonly repository?: string | string[];
   readonly remoteUrl?: string | string[];
   readonly repositoryTitle?: string | string[];
   readonly repositoryName?: string | string[];
@@ -894,6 +897,11 @@ export function AddProjectDestinationScreen(props: {
   });
   const environment = useEnvironmentFromParam(props.environmentId);
   const createProject = useCreateProject(environment);
+  // A looked-up repository clones by provider + name so the server picks the
+  // URL and the credentials that go with it (gh for GitHub); only a pasted
+  // URL is cloned verbatim.
+  const provider = addProjectRemoteSourceProvider(sourceFromParam(props.source));
+  const repository = stringParam(props.repository);
   const remoteUrl = stringParam(props.remoteUrl);
   const repositoryTitle = stringParam(props.repositoryTitle);
   // A lookup derives this from "owner/repo", a pasted clone URL from its own
@@ -924,10 +932,10 @@ export function AddProjectDestinationScreen(props: {
     setIsSubmitting(true);
     const cloneResult = await cloneRepository({
       environmentId: environment.environmentId,
-      input: {
-        remoteUrl,
-        destinationPath: resolved.path,
-      },
+      input:
+        provider && repository
+          ? { provider, repository, destinationPath: resolved.path }
+          : { remoteUrl, destinationPath: resolved.path },
     });
     if (AsyncResult.isFailure(cloneResult)) {
       setError(errorMessage(Cause.squash(cloneResult.cause)));
@@ -945,7 +953,9 @@ export function AddProjectDestinationScreen(props: {
     isBrowseNavigating,
     isSubmitting,
     pathInput,
+    provider,
     remoteUrl,
+    repository,
   ]);
 
   return (

@@ -2136,12 +2136,23 @@ function OpenCommandPaletteDialog(props: {
     }
 
     setIsRemoteProjectCloning(true);
+    // A looked-up repository clones by provider + name so the server picks the
+    // URL and the credentials that go with it (gh for GitHub); only a pasted
+    // URL is cloned verbatim.
+    const cloneProvider = remoteProjectSourceProvider(addProjectCloneFlow.source);
     const cloneResult = await cloneRepository({
       environmentId: addProjectCloneFlow.environmentId,
-      input: {
-        remoteUrl: addProjectCloneFlow.remoteUrl,
-        destinationPath,
-      },
+      input:
+        cloneProvider && addProjectCloneFlow.repository
+          ? {
+              provider: cloneProvider,
+              repository: addProjectCloneFlow.repository.nameWithOwner,
+              destinationPath,
+            }
+          : {
+              remoteUrl: addProjectCloneFlow.remoteUrl,
+              destinationPath,
+            },
     });
     setIsRemoteProjectCloning(false);
     if (cloneResult._tag === "Failure") {

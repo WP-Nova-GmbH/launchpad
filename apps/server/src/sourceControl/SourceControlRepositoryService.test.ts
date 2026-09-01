@@ -157,7 +157,11 @@ it.effect("clones a looked-up repository into the requested destination", () =>
       prefix: "t3-source-control-clone-parent-",
     });
     const destinationPath = `${parent}/t3code`;
-    const cloneCalls: Array<{ cwd: string; args: ReadonlyArray<string> }> = [];
+    const cloneCalls: Array<{
+      cwd: string;
+      args: ReadonlyArray<string>;
+      env: NodeJS.ProcessEnv | undefined;
+    }> = [];
 
     yield* Effect.gen(function* () {
       const service = yield* SourceControlRepositoryService.SourceControlRepositoryService;
@@ -173,11 +177,54 @@ it.effect("clones a looked-up repository into the requested destination", () =>
         remoteUrl: CLONE_URLS.url,
         repository: { provider: "github", ...CLONE_URLS },
       });
-      assert.deepStrictEqual(cloneCalls, [
-        {
-          cwd: parent,
-          args: ["clone", CLONE_URLS.url, "t3code"],
-        },
+      assert.strictEqual(cloneCalls.length, 1);
+      assert.strictEqual(cloneCalls[0]?.cwd, parent);
+      assert.deepStrictEqual(cloneCalls[0]?.args, [
+        "clone",
+        "--config",
+        "credential.helper=!gh auth git-credential",
+        CLONE_URLS.url,
+        "t3code",
+      ]);
+      assert.strictEqual(cloneCalls[0]?.env?.GIT_TERMINAL_PROMPT, "0");
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          git: {
+            execute: (input) =>
+              Effect.sync(() => {
+                cloneCalls.push({ cwd: input.cwd, args: input.args, env: input.env });
+                return processOutput();
+              }),
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("prefers HTTPS with the gh credential helper for GitHub auto-protocol clones", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const parent = yield* fs.makeTempDirectoryScoped({
+      prefix: "t3-source-control-clone-auto-",
+    });
+    const destinationPath = `${parent}/t3code`;
+    const cloneCalls: Array<{ args: ReadonlyArray<string> }> = [];
+
+    yield* Effect.gen(function* () {
+      const service = yield* SourceControlRepositoryService.SourceControlRepositoryService;
+      const result = yield* service.cloneRepository({
+        provider: "github",
+        repository: "octocat/t3code",
+        destinationPath,
+      });
+
+      assert.strictEqual(result.remoteUrl, CLONE_URLS.url);
+      assert.deepStrictEqual(cloneCalls[0]?.args.slice(0, 3), [
+        "clone",
+        "--config",
+        "credential.helper=!gh auth git-credential",
       ]);
     }).pipe(
       Effect.provide(
@@ -185,8 +232,85 @@ it.effect("clones a looked-up repository into the requested destination", () =>
           git: {
             execute: (input) =>
               Effect.sync(() => {
-                cloneCalls.push({ cwd: input.cwd, args: input.args });
+                cloneCalls.push({ args: input.args });
                 return processOutput();
+              }),
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("clones an explicit SSH remote without the gh credential helper", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const parent = yield* fs.makeTempDirectoryScoped({
+      prefix: "t3-source-control-clone-ssh-",
+    });
+    const destinationPath = `${parent}/t3code`;
+    const cloneCalls: Array<{ args: ReadonlyArray<string> }> = [];
+
+    yield* Effect.gen(function* () {
+      const service = yield* SourceControlRepositoryService.SourceControlRepositoryService;
+      const result = yield* service.cloneRepository({
+        provider: "github",
+        repository: "octocat/t3code",
+        destinationPath,
+        protocol: "ssh",
+      });
+
+      assert.strictEqual(result.remoteUrl, CLONE_URLS.sshUrl);
+      assert.deepStrictEqual(cloneCalls[0]?.args, ["clone", CLONE_URLS.sshUrl, "t3code"]);
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          git: {
+            execute: (input) =>
+              Effect.sync(() => {
+                cloneCalls.push({ args: input.args });
+                return processOutput();
+              }),
+          },
+        }),
+      ),
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("classifies clone authentication failures without quoting stderr", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const parent = yield* fs.makeTempDirectoryScoped({
+      prefix: "t3-source-control-clone-auth-",
+    });
+    const destinationPath = `${parent}/t3code`;
+    const secretStderr =
+      "fatal: Authentication failed for 'https://x-access-token:super-secret@github.com/octocat/t3code'";
+
+    yield* Effect.gen(function* () {
+      const service = yield* SourceControlRepositoryService.SourceControlRepositoryService;
+      const error = yield* Effect.flip(
+        service.cloneRepository({
+          provider: "github",
+          repository: "octocat/t3code",
+          destinationPath,
+        }),
+      );
+
+      assert.strictEqual(error.provider, "github");
+      assert.strictEqual(error.operation, "cloneRepository");
+      assert.strictEqual(error.detail, "The remote rejected this machine's credentials.");
+      assert.notInclude(error.message, "super-secret");
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          git: {
+            execute: () =>
+              Effect.succeed({
+                ...processOutput(),
+                exitCode: ChildProcessSpawner.ExitCode(128),
+                stderr: secretStderr,
               }),
           },
         }),
