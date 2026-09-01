@@ -85,8 +85,45 @@ export class GithubApp extends Context.Service<
     readonly mintInstallationToken: (input: {
       readonly installationId: string;
     }) => Effect.Effect<GithubInstallationToken, GithubAppNotConfigured | GithubRequestFailed>;
+    /** Every account the App is installed on, as GitHub reports it. */
+    readonly listInstallations: Effect.Effect<
+      ReadonlyArray<GithubInstallationAccount>,
+      GithubAppNotConfigured | GithubRequestFailed
+    >;
+    /**
+     * Proves a key belongs to an App by asking GitHub who the key is: the
+     * answer's id must match. Used to register an existing App without
+     * trusting the pasted id or slug.
+     */
+    readonly describe: (input: {
+      readonly appId: string;
+      readonly privateKey: string;
+    }) => Effect.Effect<GithubAppDescription, GithubRequestFailed>;
   }
 >()("t3code-relay/tenancy/GithubApp") {}
+
+export interface GithubAppDescription {
+  readonly appId: string;
+  readonly appSlug: string;
+  readonly name: string;
+}
+
+function toInstallationAccount(raw: unknown): GithubInstallationAccount | null {
+  const parsed = raw as {
+    readonly id?: number;
+    readonly created_at?: string;
+    readonly account?: { readonly login?: string; readonly type?: string };
+  };
+  if (!parsed.id || !parsed.account?.login) {
+    return null;
+  }
+  return {
+    installationId: String(parsed.id),
+    accountLogin: parsed.account.login,
+    accountType: parsed.account.type ?? "Organization",
+    createdAt: parsed.created_at ?? "",
+  };
+}
 
 const GITHUB_API = "https://api.github.com";
 
@@ -327,6 +364,46 @@ export const make = Effect.gen(function* () {
     }),
 
     mintInstallationToken: installationToken,
+
+    listInstallations: Effect.gen(function* () {
+      const app = yield* credentials;
+      const jwt = yield* appJwt({
+        appId: app.appId,
+        privateKeyPem: Redacted.value(app.privateKey),
+      });
+      const collected: Array<GithubInstallationAccount> = [];
+      for (let page = 1; page <= 10; page += 1) {
+        const body = yield* request({
+          path: `/app/installations?per_page=100&page=${page}`,
+          token: jwt,
+          operation: "read-installation",
+        });
+        const rows = Array.isArray(body) ? (body as ReadonlyArray<unknown>) : [];
+        for (const row of rows) {
+          const account = toInstallationAccount(row);
+          if (account) collected.push(account);
+        }
+        if (rows.length < 100) break;
+      }
+      return collected;
+    }).pipe(Effect.withSpan("relay.github.list_installations")),
+
+    describe: Effect.fn("relay.github.describe")(function* (input) {
+      const jwt = yield* appJwt({ appId: input.appId, privateKeyPem: input.privateKey });
+      const body = yield* request({ path: "/app", token: jwt, operation: "read-app" });
+      const parsed = body as {
+        readonly id?: number;
+        readonly slug?: string;
+        readonly name?: string;
+      };
+      if (!parsed.id || !parsed.slug || String(parsed.id) !== input.appId) {
+        return yield* new GithubRequestFailed({
+          operation: "read-app",
+          cause: "GitHub answered for a different App, or none",
+        });
+      }
+      return { appId: String(parsed.id), appSlug: parsed.slug, name: parsed.name ?? parsed.slug };
+    }),
 
     listRepositories: Effect.fn("relay.github.list_repositories")(function* (input) {
       const { token } = yield* installationToken({ installationId: input.installationId });

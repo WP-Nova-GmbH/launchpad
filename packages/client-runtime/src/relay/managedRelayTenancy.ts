@@ -14,6 +14,7 @@ import {
   type RelayCreateInvitationResponse,
   type RelayGithubAppSetupResponse,
   type RelayGithubInstallResponse,
+  type RelayGithubInstallationCandidate,
   type RelayGithubConnection,
   type RelayGithubConnectionResponse,
   type RelayGithubRepository,
@@ -30,6 +31,8 @@ import {
   type RelayOrganizationMembership,
   type RelayOrganizationProject,
   type RelayProvisionMachineRequest,
+  type RelayRegisterGithubAppRequest,
+  type RelayRegisteredGithubApp,
   type RelayRegisterRepositoryRequest,
   type RelayRepository,
   type RelayStartGithubAppSetupRequest,
@@ -168,6 +171,13 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly payload: RelayStartGithubInstallRequest;
     }) => Effect.Effect<RelayGithubInstallResponse, ManagedRelayClientError>;
+    readonly registerGithubApp: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayRegisterGithubAppRequest;
+    }) => Effect.Effect<RelayRegisteredGithubApp, ManagedRelayClientError>;
+    readonly listGithubInstallations: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<ReadonlyArray<RelayGithubInstallationCandidate>, ManagedRelayClientError>;
     readonly disconnectGithub: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
@@ -213,6 +223,10 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     connectGithub: unavailable("clientRuntime.managedRelayTenancy.connectGithub"),
     startGithubAppSetup: unavailable("clientRuntime.managedRelayTenancy.startGithubAppSetup"),
     startGithubInstall: unavailable("clientRuntime.managedRelayTenancy.startGithubInstall"),
+    registerGithubApp: unavailable("clientRuntime.managedRelayTenancy.registerGithubApp"),
+    listGithubInstallations: unavailable(
+      "clientRuntime.managedRelayTenancy.listGithubInstallations",
+    ),
     disconnectGithub: unavailable("clientRuntime.managedRelayTenancy.disconnectGithub"),
     listGithubRepositories: unavailable("clientRuntime.managedRelayTenancy.listGithubRepositories"),
   });
@@ -621,6 +635,34 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.startGithubInstall"),
+      withRelayClientTracing,
+    ),
+    registerGithubApp: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .registerGithubApp({
+            headers: bearerHeaders(input.clerkToken),
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("register relay GitHub App")),
+            timeoutRelayRequest("Relay GitHub App registration"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.registerGithubApp"),
+      withRelayClientTracing,
+    ),
+    listGithubInstallations: Effect.fnUntraced(
+      function* (input) {
+        const response = yield* client.organization
+          .listGithubInstallations({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.mapError(relayRequestError("list relay GitHub installations")),
+            timeoutRelayRequest("Relay GitHub installation listing"),
+          );
+        return response.installations;
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.listGithubInstallations"),
       withRelayClientTracing,
     ),
     disconnectGithub: Effect.fnUntraced(

@@ -122,6 +122,8 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "connect relay GitHub",
   "start relay GitHub App setup",
   "start relay GitHub install",
+  "register relay GitHub App",
+  "list relay GitHub installations",
   "disconnect relay GitHub",
   "list relay GitHub repositories",
 ]);
@@ -167,6 +169,8 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay GitHub connection",
   "Relay GitHub App setup",
   "Relay GitHub install",
+  "Relay GitHub App registration",
+  "Relay GitHub installation listing",
   "Relay GitHub disconnection",
   "Relay GitHub repository listing",
 ]);

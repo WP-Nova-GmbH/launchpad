@@ -49,6 +49,14 @@ Organization**, and both only once:
    you choose. When GitHub says it is connected, switch back to Launchpad — the connection appears
    with the repositories it can see.
 
+**Already have a GitHub App?** Instead of creating one, register it: paste its App ID and choose
+a private key downloaded from the App's settings page on GitHub (_Private keys → Generate a
+private key_). To let other organizations install the same App and connect on their own, set the
+App's _Setup URL_ on GitHub to the address Launchpad shows under the GitHub section, enable
+_Redirect on update_, and make the App public. An organization that installed the App straight
+from GitHub can also connect afterwards: the GitHub section lists the App's installations, and an
+admin picks theirs.
+
 From then on, executors clone, push, and open pull requests with the organization's connection.
 Work they do is authored by the App, and reaches exactly the repositories you installed it on.
 **Disconnect** forgets the installation; uninstalling the App on GitHub revokes access outright.

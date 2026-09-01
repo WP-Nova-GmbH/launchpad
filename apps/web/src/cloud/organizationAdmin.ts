@@ -4,6 +4,7 @@ import type {
   RelayGithubAppSetupResponse,
   RelayGithubConnectionResponse,
   RelayGithubInstallResponse,
+  RelayGithubInstallationCandidate,
   RelayGithubRepository,
   RelayInvitation,
   RelayRepositoryAccessEntry,
@@ -115,6 +116,13 @@ export interface OrganizationAdminState {
   }) => Promise<RelayGithubAppSetupResponse | null>;
   /** GitHub's install page for the App; the relay claims the installation on GitHub's callback. */
   readonly startGithubInstall: () => Promise<RelayGithubInstallResponse | null>;
+  /** Registers an App that already exists on GitHub, by its id and private key. */
+  readonly registerGithubApp: (input: {
+    readonly appId: string;
+    readonly privateKey: string;
+  }) => Promise<boolean>;
+  /** Installations of the App as GitHub reports them, for picking one that was installed directly. */
+  readonly listGithubInstallations: () => Promise<ReadonlyArray<RelayGithubInstallationCandidate> | null>;
   readonly disconnectGithub: () => Promise<boolean>;
   readonly provisionMachine: (input: {
     readonly label: string;
@@ -395,6 +403,22 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         return null;
       } finally {
         setBusy(false);
+      }
+    },
+    registerGithubApp: (input) =>
+      mutate("Could not register the GitHub App", () =>
+        call("Could not register the GitHub App", (client, clerkToken) =>
+          client.registerGithubApp({ clerkToken, payload: input }),
+        ),
+      ),
+    listGithubInstallations: async () => {
+      try {
+        return await call("Could not list GitHub installations", (client, clerkToken) =>
+          client.listGithubInstallations({ clerkToken }),
+        );
+      } catch (cause) {
+        setError(failureMessage(cause));
+        return null;
       }
     },
     disconnectGithub: () =>

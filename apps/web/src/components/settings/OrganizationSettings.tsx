@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
+  RelayGithubInstallationCandidate,
   RelayInvitation,
   RelayMachine,
   RelayMachineRole,
@@ -562,16 +563,37 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
   const connection = snapshot?.github.connection ?? null;
   const installUrl = snapshot?.github.installUrl ?? null;
   const [githubOrganization, setGithubOrganization] = useState("");
+  const [existingAppId, setExistingAppId] = useState("");
+  const [existingAppKey, setExistingAppKey] = useState("");
+  const privateKeyFileInput = useRef<HTMLInputElement | null>(null);
+  const [installations, setInstallations] =
+    useState<ReadonlyArray<RelayGithubInstallationCandidate> | null>(null);
+
+  // An App installed straight from GitHub — by this organization or by a
+  // customer's — never comes back through the relay's callback, so GitHub is
+  // asked which installations exist and the admin picks theirs.
+  const listInstallations = state.listGithubInstallations;
+  const canPickInstallation = isAdmin && installUrl !== null && connection === null;
+  useEffect(() => {
+    if (!canPickInstallation) {
+      setInstallations(null);
+      return;
+    }
+    void listInstallations().then(setInstallations);
+  }, [canPickInstallation, listInstallations]);
 
   // The GitHub steps finish in a browser tab, and the relay has the result by
   // the time the admin comes back — so regaining focus is the moment to look.
   const refresh = state.refresh;
   useEffect(() => {
     if (!isAdmin) return;
-    const onFocus = () => void refresh();
+    const onFocus = () => {
+      void refresh();
+      if (canPickInstallation) void listInstallations().then(setInstallations);
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [isAdmin, refresh]);
+  }, [canPickInstallation, isAdmin, listInstallations, refresh]);
 
   // GitHub sends the id in the query string on its way back from the install.
   useEffect(() => {
@@ -638,6 +660,60 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
             }
           />
         )}
+        {isAdmin ? (
+          <SettingsRow
+            title="Use a GitHub App you already have"
+            description="Paste the App's ID from its settings page on GitHub, and choose a private key downloaded from the same page (Private keys → Generate). Launchpad checks the key with GitHub and keeps it sealed."
+            control={
+              <div className="flex flex-col items-end gap-2">
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={existingAppId}
+                    onChange={(event) => setExistingAppId(event.target.value)}
+                    placeholder="App ID"
+                    className="h-8 w-28"
+                    disabled={state.busy}
+                  />
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={state.busy}
+                    onClick={() => privateKeyFileInput.current?.click()}
+                  >
+                    {existingAppKey ? "Key chosen" : "Choose .pem"}
+                  </Button>
+                  <input
+                    ref={privateKeyFileInput}
+                    type="file"
+                    accept=".pem,application/x-pem-file,text/plain"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (!file) return;
+                      void file.text().then((text) => setExistingAppKey(text));
+                    }}
+                  />
+                  <Button
+                    size="sm"
+                    disabled={state.busy || !existingAppId.trim() || !existingAppKey.trim()}
+                    onClick={() =>
+                      void state
+                        .registerGithubApp({
+                          appId: existingAppId.trim(),
+                          privateKey: existingAppKey,
+                        })
+                        .then((ok) => {
+                          if (ok) setExistingAppKey("");
+                        })
+                    }
+                  >
+                    Use this App
+                  </Button>
+                </div>
+              </div>
+            }
+          />
+        ) : null}
       </SettingsSection>
     );
   }
@@ -709,6 +785,41 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
           }
         />
       )}
+      {canPickInstallation && installations && installations.length > 0 ? (
+        <div className="space-y-1 px-3 pt-1 sm:px-4">
+          <p className="text-xs font-medium text-muted-foreground">
+            Already installed on GitHub — pick this organization&apos;s installation
+          </p>
+          {installations.map((installation) => (
+            <div
+              key={installation.installationId}
+              className="flex items-center justify-between gap-3 py-1"
+            >
+              <span className="min-w-0 truncate text-xs">
+                <span className="font-medium">{installation.accountLogin}</span>
+                <span className="text-muted-foreground"> · {installation.accountType}</span>
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="shrink-0"
+                disabled={state.busy}
+                onClick={() => void state.connectGithub(installation.installationId)}
+              >
+                Connect
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {isAdmin && !connection && snapshot.github.setupCallbackUrl ? (
+        <p className="px-3 pb-2 text-xs text-muted-foreground sm:px-4">
+          For installs to connect themselves, the App&apos;s <em>Setup URL</em> on GitHub should be{" "}
+          <span className="font-mono">{snapshot.github.setupCallbackUrl}</span> with{" "}
+          <em>Redirect on update</em> enabled. Make the App public on GitHub to let other
+          organizations install it.
+        </p>
+      ) : null}
 
       {connection && snapshot.githubRepositories.length > 0 ? (
         <div className="space-y-1 px-3 pt-1 sm:px-4">

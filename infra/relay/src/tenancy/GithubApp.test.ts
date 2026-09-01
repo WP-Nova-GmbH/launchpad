@@ -173,6 +173,78 @@ describe("GithubApp.mintInstallationToken", () => {
     }),
   );
 
+  it.effect("describes an App by its key and refuses a key for a different App", () =>
+    Effect.gen(function* () {
+      const { requests, app } = makeApp(
+        () =>
+          new Response(
+            JSON.stringify({ id: 4648576, slug: "launchpad-code", name: "Launchpad Code" }),
+            {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            },
+          ),
+      );
+      const github = yield* app;
+
+      const described = yield* github.describe({
+        appId: "4648576",
+        privateKey: keyPair.privateKey,
+      });
+      expect(described).toEqual({
+        appId: "4648576",
+        appSlug: "launchpad-code",
+        name: "Launchpad Code",
+      });
+      expect(requests[0]?.url).toBe("https://api.github.com/app");
+
+      const mismatch = yield* github
+        .describe({ appId: "1", privateKey: keyPair.privateKey })
+        .pipe(Effect.flip);
+      expect(mismatch).toMatchObject({ operation: "read-app" });
+    }),
+  );
+
+  it.effect("lists every account the App is installed on", () =>
+    Effect.gen(function* () {
+      const { app } = makeApp(
+        () =>
+          new Response(
+            JSON.stringify([
+              {
+                id: 11,
+                created_at: "2026-09-01T10:00:00Z",
+                account: { login: "wp-nova-gmbh", type: "Organization" },
+              },
+              {
+                id: 12,
+                created_at: "2026-09-01T11:00:00Z",
+                account: { login: "customer", type: "Organization" },
+              },
+              { id: 13 },
+            ]),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+      );
+      const github = yield* app;
+
+      expect(yield* github.listInstallations).toEqual([
+        {
+          installationId: "11",
+          accountLogin: "wp-nova-gmbh",
+          accountType: "Organization",
+          createdAt: "2026-09-01T10:00:00Z",
+        },
+        {
+          installationId: "12",
+          accountLogin: "customer",
+          accountType: "Organization",
+          createdAt: "2026-09-01T11:00:00Z",
+        },
+      ]);
+    }),
+  );
+
   it.effect("fails when GitHub answers without a token", () =>
     Effect.gen(function* () {
       const { app } = makeApp(

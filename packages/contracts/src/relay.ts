@@ -569,6 +569,7 @@ export const RelayTenancyConflictReason = Schema.Literals([
   "machine_limit_reached",
   "machine_deprovisioned",
   "github_app_configured",
+  "github_app_credentials_rejected",
 ]);
 export type RelayTenancyConflictReason = typeof RelayTenancyConflictReason.Type;
 
@@ -1354,11 +1355,51 @@ export const RelayGithubConnection = Schema.Struct({
 export type RelayGithubConnection = typeof RelayGithubConnection.Type;
 
 export const RelayGithubConnectionResponse = Schema.Struct({
-  /** Null when this relay has no GitHub App; the surface hides itself. */
+  /** Null when this relay has no GitHub App; the surface offers to create or register one. */
   installUrl: Schema.NullOr(TrimmedNonEmptyString),
+  /** The App's slug on GitHub, null without an App. */
+  appSlug: Schema.NullOr(TrimmedNonEmptyString),
+  /**
+   * What the App's Setup URL on GitHub should be so installs connect
+   * themselves. Null without an App.
+   */
+  setupCallbackUrl: Schema.NullOr(TrimmedNonEmptyString),
   connection: Schema.NullOr(RelayGithubConnection),
 });
 export type RelayGithubConnectionResponse = typeof RelayGithubConnectionResponse.Type;
+
+/** An existing GitHub App, registered by its credentials rather than created. */
+export const RelayRegisterGithubAppRequest = Schema.Struct({
+  appId: TrimmedNonEmptyString,
+  privateKey: TrimmedNonEmptyString.annotate({
+    description:
+      "The App's private key PEM as downloaded from GitHub. Sealed by the relay, never echoed back.",
+  }),
+});
+export type RelayRegisterGithubAppRequest = typeof RelayRegisterGithubAppRequest.Type;
+
+export const RelayRegisteredGithubApp = Schema.Struct({
+  appId: TrimmedNonEmptyString,
+  appSlug: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+});
+export type RelayRegisteredGithubApp = typeof RelayRegisteredGithubApp.Type;
+
+/** An installation of the relay's App that GitHub reports, connected or not. */
+export const RelayGithubInstallationCandidate = Schema.Struct({
+  installationId: TrimmedNonEmptyString,
+  accountLogin: TrimmedNonEmptyString,
+  accountType: TrimmedNonEmptyString,
+  createdAt: Schema.String,
+  /** True when this organization already holds it. */
+  connected: Schema.Boolean,
+});
+export type RelayGithubInstallationCandidate = typeof RelayGithubInstallationCandidate.Type;
+
+export const RelayListGithubInstallationsResponse = Schema.Struct({
+  installations: Schema.Array(RelayGithubInstallationCandidate),
+});
+export type RelayListGithubInstallationsResponse = typeof RelayListGithubInstallationsResponse.Type;
 
 export const RelayConnectGithubRequest = Schema.Struct({
   /** Handed back by GitHub on the App's setup redirect. */
@@ -1994,6 +2035,27 @@ export const RelayOrganizationGroup = HttpApiGroup.make("organization")
       .annotate(
         OpenApi.Description,
         "Admin-only, and only while the relay has no GitHub App. Returns a relay-hosted page for the admin's browser that posts the manifest for GitHub's one-click App creation; GitHub's callbacks then store the App, take the admin through installing it, and connect the installation.",
+      ),
+    HttpApiEndpoint.post("registerGithubApp", "/v1/organization/github-app", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayRegisterGithubAppRequest,
+      success: RelayRegisteredGithubApp,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Register an existing GitHub App with this relay")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only, and only while the relay has no GitHub App. The relay verifies the key against GitHub, takes the slug and name from GitHub's answer, and stores the key sealed.",
+      ),
+    HttpApiEndpoint.get("listGithubInstallations", "/v1/organization/github/installations", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListGithubInstallationsResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "List installations of the relay's GitHub App")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only. Every account the App is installed on, as GitHub reports it, so an organization that installed the App straight from GitHub can pick its installation and connect it.",
       ),
     HttpApiEndpoint.post("startGithubInstall", "/v1/organization/github/install", {
       headers: RelayBearerRequestHeaders,

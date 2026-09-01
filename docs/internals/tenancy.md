@@ -120,6 +120,13 @@ linking back to the app. `tenancy/GithubAppSetup.ts` owns the flow;
 `infra/relay/scripts/create-github-app.ts` is the same manifest for operators who prefer to
 configure `GITHUB_APP_*` by hand.
 
+An App that already exists is registered instead (`registerGithubApp`): the admin supplies its id
+and a private key, the relay asks GitHub `GET /app` with a JWT from that key and stores the App
+only if GitHub's answer names the same id — GitHub is the authority on slug and name. One App
+serves every organization: as a **public** App it is installable by other GitHub organizations,
+and `listGithubInstallations` (`GET /app/installations`) lets an organization that installed it
+straight from GitHub pick its installation and claim it through the existing `connectGithub`.
+
 **Known gap.** The relay verifies that a claimed installation exists and refuses one another
 organization already claimed, but it cannot yet prove the caller administers that GitHub account —
 that would need a user OAuth leg. Claiming someone else's installation means guessing a numeric id

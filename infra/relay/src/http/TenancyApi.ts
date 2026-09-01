@@ -4,6 +4,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+import { normalizeRelayIssuer } from "@t3tools/shared/relayJwt";
 
 import {
   RelayApi,
@@ -23,7 +24,9 @@ import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
 import { tenancyConflict, tenancyForbidden, tenancyNotFound } from "./tenancyErrors.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as RelayDb from "../db.ts";
+import * as RelaySecretBox from "../auth/SecretBox.ts";
 import * as GithubApp from "../tenancy/GithubApp.ts";
+import * as GithubAppRecords from "../tenancy/GithubAppRecords.ts";
 import * as GithubAppSetup from "../tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "../tenancy/GithubInstallations.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
@@ -299,6 +302,12 @@ export const acceptInvitationRecord = Effect.fn("relay.api.tenancy.accept_invita
   },
 );
 
+/** `https://github.com/apps/<slug>/installations/new` → `<slug>`. */
+function githubAppSlugFromInstallUrl(installUrl: string): string | null {
+  const match = /\/apps\/([^/]+)\/installations\/new/.exec(installUrl);
+  return match?.[1] ? decodeURIComponent(match[1]) : null;
+}
+
 export const organizationApi = HttpApiBuilder.group(
   RelayApi,
   "organization",
@@ -309,9 +318,13 @@ export const organizationApi = HttpApiBuilder.group(
     const directory = yield* UserDirectory.UserDirectory;
     const githubApp = yield* GithubApp.GithubApp;
     const githubAppSetup = yield* GithubAppSetup.GithubAppSetup;
+    const githubAppRecords = yield* GithubAppRecords.GithubAppRecords;
     const githubInstallations = yield* GithubInstallations.GithubInstallations;
+    const secretBox = yield* RelaySecretBox.RelaySecretBox;
+    const relayConfig = yield* RelayConfiguration.RelayConfiguration;
     const transactions = yield* RelayDb.RelayTransactions;
     const crypto = yield* Crypto.Crypto;
+    const setupCallbackUrl = `${normalizeRelayIssuer(relayConfig.relayIssuer)}${GithubAppSetup.GITHUB_APP_INSTALLED_PATH}`;
 
     const newId = crypto.randomUUIDv4.pipe(
       Effect.catch(() => relayInternalErrorResponse("internal_error")),
@@ -477,6 +490,8 @@ export const organizationApi = HttpApiBuilder.group(
           });
           return {
             installUrl,
+            appSlug: installUrl === null ? null : githubAppSlugFromInstallUrl(installUrl),
+            setupCallbackUrl: installUrl === null ? null : setupCallbackUrl,
             connection: connection
               ? {
                   installationId: connection.installationId,
@@ -542,6 +557,62 @@ export const organizationApi = HttpApiBuilder.group(
               name: args.payload.name,
             })
             .pipe(Effect.catch(() => relayInternalErrorResponse("internal_error")));
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "registerGithubApp",
+        Effect.fn("relay.api.organization.register_github_app")(function* (args) {
+          const membership = yield* requireCallerIsAdmin();
+          if ((yield* githubApp.installUrl) !== null) {
+            return yield* tenancyConflict("github_app_configured");
+          }
+          // GitHub is the authority on what the key opens; the pasted id only
+          // has to agree with GitHub's answer.
+          const described = yield* githubApp
+            .describe({ appId: args.payload.appId.trim(), privateKey: args.payload.privateKey })
+            .pipe(
+              Effect.catchTag("GithubRequestFailed", () =>
+                tenancyConflict("github_app_credentials_rejected"),
+              ),
+            );
+          const privateKeySealed = yield* secretBox
+            .seal(args.payload.privateKey)
+            .pipe(Effect.catch(() => relayInternalErrorResponse("internal_error")));
+          const record = yield* githubAppRecords
+            .save({
+              appId: described.appId,
+              appSlug: described.appSlug,
+              privateKeySealed,
+              createdByUserId: membership.userId,
+            })
+            .pipe(Effect.catch(() => relayInternalErrorResponse("persistence_failed")));
+          yield* Effect.logInfo("github app registered from organization settings", {
+            appSlug: record.appSlug,
+            organizationId: membership.organization.organizationId,
+          });
+          return { appId: record.appId, appSlug: record.appSlug, name: described.name };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "listGithubInstallations",
+        Effect.fn("relay.api.organization.list_github_installations")(function* () {
+          const membership = yield* requireCallerIsAdmin();
+          const organizationId = membership.organization.organizationId;
+          const installations = yield* githubApp.listInstallations.pipe(
+            Effect.catchTag("GithubAppNotConfigured", () =>
+              tenancyNotFound("github_app_not_configured"),
+            ),
+            Effect.catchTag("GithubRequestFailed", () =>
+              relayInternalErrorResponse("upstream_unavailable"),
+            ),
+          );
+          const connection = yield* githubInstallations.getForOrganization({ organizationId });
+          return {
+            installations: installations.map((installation) => ({
+              ...installation,
+              connected: connection?.installationId === installation.installationId,
+            })),
+          };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
