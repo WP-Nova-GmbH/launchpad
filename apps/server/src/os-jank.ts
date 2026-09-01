@@ -102,10 +102,25 @@ export const expandHomePath = Effect.fn(function* (input: string) {
   return input;
 });
 
-export const resolveBaseDir = Effect.fn(function* (raw: string | undefined) {
+/**
+ * The default data directory, `~/.launchpad`. An install that predates the
+ * rebrand keeps using its existing `~/.t3` rather than waking up to an empty
+ * app: the old directory wins only when it exists and the new one does not,
+ * so a fresh install is never dragged back to the old name.
+ */
+export const resolveBaseDir = Effect.fn(function* (
+  raw: string | undefined,
+  homeDir: () => string = NodeOS.homedir,
+) {
   const { join, resolve } = yield* Path.Path;
   if (!raw || raw.trim().length === 0) {
-    return join(NodeOS.homedir(), ".t3");
+    const fs = yield* FileSystem.FileSystem;
+    const launchpadHome = join(homeDir(), ".launchpad");
+    if (yield* fs.exists(launchpadHome)) {
+      return launchpadHome;
+    }
+    const legacyHome = join(homeDir(), ".t3");
+    return (yield* fs.exists(legacyHome)) ? legacyHome : launchpadHome;
   }
   return resolve(yield* expandHomePath(raw.trim()));
 });
