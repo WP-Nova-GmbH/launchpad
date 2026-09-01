@@ -78,6 +78,7 @@ import * as Invitations from "../src/tenancy/Invitations.ts";
 import * as Jobs from "../src/jobs/Jobs.ts";
 import * as LiveActivities from "../src/agentActivity/LiveActivities.ts";
 import * as ManagedEndpointAllocations from "../src/environments/ManagedEndpointAllocations.ts";
+import * as CloudflareApiEndpointClients from "../src/environments/CloudflareApiEndpointClients.ts";
 import * as ManagedEndpointProvider from "../src/environments/ManagedEndpointProvider.ts";
 import * as ManagedTunnelLimits from "../src/environments/ManagedTunnelLimits.ts";
 import * as DockerComputeProvider from "../src/machines/DockerComputeProvider.ts";
@@ -112,12 +113,14 @@ const nodeCryptoLayer = Layer.succeed(
 );
 
 /**
- * A local relay provisions no tunnels. Refusing is the honest answer — the
- * hostname it would hand out could not resolve to anything. Reads report
- * "nothing there" and deletes succeed, so teardown paths stay usable.
+ * Without Cloudflare credentials the relay provisions no tunnels. Refusing is
+ * the honest answer — the hostname it would hand out could not resolve to
+ * anything. Reads report "nothing there" and deletes succeed, so teardown
+ * paths stay usable. Set CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, and
+ * RELAY_TUNNEL_ZONE_NAME (see infra/hetzner) to provision real endpoints.
  */
 const unsupported = (operation: string) =>
-  Effect.die(`The development relay does not ${operation}.`);
+  Effect.die(`This relay is not configured to ${operation}.`);
 
 const tunnelClientStub: ManagedEndpointProvider.ManagedEndpointTunnelClient["Service"] = {
   list: () => Effect.succeed({ result: [] }),
@@ -143,6 +146,25 @@ function required(name: string): string {
   }
   return value;
 }
+
+/**
+ * Managed endpoints need all three: an account-scoped token to create tunnels,
+ * the account they live in, and the zone whose hostnames point at them. With
+ * none of them set the relay refuses to provision, which is how a local dev
+ * relay runs.
+ */
+const cloudflareEndpointEnv = (() => {
+  const apiToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  const zoneName = process.env.RELAY_TUNNEL_ZONE_NAME?.trim();
+  if (!apiToken && !accountId && !zoneName) return undefined;
+  if (!apiToken || !accountId || !zoneName) {
+    throw new Error(
+      "Managed endpoints need CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, and RELAY_TUNNEL_ZONE_NAME together. Set all three, or none to run without tunnels.",
+    );
+  }
+  return { apiToken: Redacted.make(apiToken), accountId, zoneName };
+})();
 
 const port = Number(process.env.DEV_RELAY_PORT ?? DEFAULT_PORT);
 const databaseUrl = process.env.DEV_RELAY_DATABASE_URL?.trim() || DEFAULT_DATABASE_URL;
@@ -181,15 +203,48 @@ const relayConfigurationLayer = Layer.succeed(
             privateKey: Redacted.make(process.env.GITHUB_APP_PRIVATE_KEY),
           }
         : undefined,
-    managedEndpointBaseDomain: undefined,
-    managedEndpointNamespace: undefined,
-    allowLocalMachineEndpoints: true,
+    managedEndpointBaseDomain: cloudflareEndpointEnv?.zoneName,
+    managedEndpointNamespace: cloudflareEndpointEnv
+      ? process.env.MANAGED_ENDPOINT_NAMESPACE?.trim() || "prod"
+      : undefined,
+    // Loopback machine endpoints are only reachable from the relay's own host,
+    // so they are a local-development affordance. A relay that can provision
+    // real tunnels hands out reachable hostnames instead.
+    allowLocalMachineEndpoints: cloudflareEndpointEnv === undefined,
   }),
 );
 
 const relayDbLayer = Layer.effect(RelayDb.RelayDb, PgDrizzle.makeWithDefaults()).pipe(
   Layer.provide(PgClient.layer({ url: Redacted.make(databaseUrl) })),
 );
+
+/**
+ * Real Cloudflare clients when credentials are configured, refusing stubs
+ * otherwise. The zone id is resolved from its name at startup, so operators
+ * configure the hostname they already know.
+ */
+const managedEndpointClientsLayer =
+  cloudflareEndpointEnv === undefined
+    ? Layer.merge(
+        ManagedEndpointProvider.layerTunnelClient(tunnelClientStub),
+        ManagedEndpointProvider.layerDnsClient(dnsClientStub),
+      )
+    : Layer.unwrap(
+        Effect.gen(function* () {
+          const zoneId = yield* CloudflareApiEndpointClients.resolveZoneId({
+            apiToken: cloudflareEndpointEnv.apiToken,
+            zoneName: cloudflareEndpointEnv.zoneName,
+          });
+          yield* Effect.logInfo("Managed endpoints enabled", {
+            zone: cloudflareEndpointEnv.zoneName,
+          });
+          return CloudflareApiEndpointClients.layerCloudflareApi({
+            apiToken: cloudflareEndpointEnv.apiToken,
+            accountId: cloudflareEndpointEnv.accountId,
+            zoneId,
+          });
+        }),
+      ).pipe(Layer.provide(FetchHttpClient.layer));
 
 const runtimeLayer = Layer.empty
   .pipe(
@@ -215,10 +270,7 @@ const runtimeLayer = Layer.empty
     Layer.provideMerge(EnvironmentPublishSignatures.layer),
     Layer.provideMerge(EnvironmentProjectCatalogSignatures.layer),
     Layer.provideMerge(
-      ManagedEndpointProvider.layer.pipe(
-        Layer.provide(ManagedEndpointProvider.layerTunnelClient(tunnelClientStub)),
-        Layer.provide(ManagedEndpointProvider.layerDnsClient(dnsClientStub)),
-      ),
+      ManagedEndpointProvider.layer.pipe(Layer.provide(managedEndpointClientsLayer)),
     ),
     Layer.provideMerge(DpopProofs.layer),
     Layer.provideMerge(ApnsDeliveries.layer),

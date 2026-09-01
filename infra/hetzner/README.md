@@ -80,10 +80,28 @@ boot and Terraform is told to ignore `user_data` drift so an edit cannot silentl
 machine (and its database). Apply host-level changes by hand or by re-running an updated
 `/opt/provision/provision.sh`, and keep the template as the record for the next machine.
 
+## Managed endpoints
+
+Clients reach published environments and org machines through a Cloudflare tunnel the relay
+provisions per environment. Set these in `/etc/launchpad-relay/relay.env` to turn it on:
+
+```
+CLOUDFLARE_API_TOKEN=...
+CLOUDFLARE_ACCOUNT_ID=...
+RELAY_TUNNEL_ZONE_NAME=tunnels.example.com
+MANAGED_ENDPOINT_NAMESPACE=prod
+```
+
+The token needs **Account → Cloudflare Tunnel → Edit** and **Zone → DNS → Edit** on that zone.
+All three of token, account, and zone must be set together; the relay refuses to start with a
+partial set rather than half-provisioning. The zone id is looked up from the name at startup.
+
+Without them the relay refuses to provision endpoints, machines record their self-reported
+endpoint as `manual`, and nothing routes to them — which is the right behavior for a local dev
+relay but not for a hosted one.
+
 ## Current limits
 
 The Node relay entry does not yet replace every Cloudflare binding (that is the rest of M4):
-managed Cloudflare tunnels are refused, APNs delivery is dropped rather than queued, and org
-machines run as Docker containers on this host rather than as separate Hetzner servers. Those
-containers advertise loopback endpoints (`127.0.0.1:<port>`), which clients elsewhere cannot
-reach — publicly reachable machine endpoints arrive with the rest of the platform move.
+APNs delivery is dropped rather than queued, and org machines run as Docker containers on this
+host rather than as separate Hetzner servers.
