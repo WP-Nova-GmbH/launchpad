@@ -133,12 +133,23 @@ export const ensureExecutorProviderToolchain = Effect.fn("ensureExecutorProvider
       path.join(NodeOS.homedir(), ".local", "bin"),
       ...(npmBin === null ? [] : [npmBin]),
     ]);
-    const missing = missingInstallableProviders(yield* registry.refresh());
+    const before = yield* registry.refresh();
+    const missing = missingInstallableProviders(before);
     if (missing.length === 0) {
       return NOTHING;
     }
     yield* Effect.logInfo("executor provider toolchain incomplete; installing", {
       providers: missing,
+      // What the provider check itself said, so a CLI that is present but
+      // failing its check is not mistaken for one that is absent.
+      reasons: before
+        .filter((provider) => missing.includes(provider.driver))
+        .map((provider) => ({
+          instanceId: provider.instanceId,
+          status: provider.status,
+          version: provider.version,
+          message: provider.message ?? null,
+        })),
     });
 
     const installed: Array<ProviderDriverKind> = [];
@@ -162,7 +173,16 @@ export const ensureExecutorProviderToolchain = Effect.fn("ensureExecutorProvider
       );
       if (outcome === "installed") {
         installed.push(provider);
-        yield* Effect.logInfo("executor provider installed", { provider });
+        const after = (yield* registry.refresh(provider)).find(
+          (candidate) => candidate.driver === provider,
+        );
+        yield* Effect.logInfo("executor provider installed", {
+          provider,
+          resolved: after?.installed ?? null,
+          status: after?.status ?? null,
+          version: after?.version ?? null,
+          message: after?.message ?? null,
+        });
       } else {
         failed.push(provider);
       }
