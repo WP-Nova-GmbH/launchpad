@@ -97,6 +97,7 @@ import {
   reconcileDesiredCloudLink,
   releaseManagedTunnelOnShutdown,
 } from "./cloud/http.ts";
+import { ensureExecutorSourceCurrent } from "./cloud/executorSelfUpdate.ts";
 import { reconcileMachineEnrollment } from "./cloud/machineEnrollment.ts";
 import { ensureExecutorProviderToolchain } from "./provider/executorProviderToolchain.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
@@ -644,6 +645,16 @@ export const makeServerLayer = Layer.unwrap(
               Effect.catchCause((cause) =>
                 Effect.logWarning("Failed to check the executor provider toolchain", { cause }),
               ),
+            );
+            // An executor keeps its own source current with the ref the relay
+            // names: a push that deploys the relay reaches machines too. The
+            // process exits after an update and the service manager restarts it.
+            yield* ensureExecutorSourceCurrent().pipe(
+              Effect.provide(FetchHttpClient.layer),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Failed to check the executor source", { cause }),
+              ),
+              Effect.repeat(Schedule.spaced("30 minutes")),
             );
           }),
         );

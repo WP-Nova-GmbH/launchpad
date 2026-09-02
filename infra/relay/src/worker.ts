@@ -36,6 +36,7 @@ import {
 } from "./http/Api.ts";
 import { machineEnrollmentApi, machinesApi } from "./http/MachinesApi.ts";
 import { organizationProjectsApi, projectCatalogServerApi } from "./http/ProjectCatalogApi.ts";
+import { executorReleaseServerApi } from "./http/ExecutorReleaseApi.ts";
 import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
 import { sourceControlServerApi } from "./http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
@@ -124,6 +125,7 @@ const relayApiLayer = Layer.mergeAll(
   projectCatalogServerApi,
   sourceControlServerApi,
   providerAccountsServerApi,
+  executorReleaseServerApi,
 );
 
 const CloudMintKeyPair = Alchemy.KeyPair("CloudMintKeyPair");
@@ -203,6 +205,10 @@ export const ApiLive = Api.make(
         Config.withDefault("https://github.com/WP-Nova-GmbH/launchpad.git"),
       ),
     };
+    // Executors follow this ref of the same source they were bootstrapped from.
+    const executorSourceRef = yield* Config.string("MACHINE_SOURCE_GIT_REF").pipe(
+      Config.withDefault("main"),
+    );
 
     const clerkSecretKey = yield* Config.redacted("CLERK_SECRET_KEY");
     const clerkPublishableKey = yield* Config.string("CLERK_PUBLISHABLE_KEY");
@@ -252,6 +258,7 @@ export const ApiLive = Api.make(
             : undefined,
         managedEndpointBaseDomain: yield* managedEndpointZoneName,
         managedEndpointNamespace: stage,
+        executorSource: { gitUrl: hetznerSettings.sourceGitUrl, ref: executorSourceRef },
       });
     });
 

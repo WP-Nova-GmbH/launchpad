@@ -47,8 +47,19 @@ export class RelayConfiguration extends Context.Service<
      * endpoint. Personal links and non-loopback endpoints remain rejected.
      */
     readonly allowLocalMachineEndpoints?: boolean;
+    /**
+     * The source enrolled executors keep themselves current with. Absent on a
+     * relay that does not want machines updating themselves; executors then
+     * stay on whatever they were started with.
+     */
+    readonly executorSource?: ExecutorSourceRelease | undefined;
   }
 >()("t3code-relay/Config/RelayConfiguration") {}
+
+export interface ExecutorSourceRelease {
+  readonly gitUrl: string;
+  readonly ref: string;
+}
 
 export const make = (configuration: RelayConfiguration["Service"]) =>
   RelayConfiguration.of(configuration);

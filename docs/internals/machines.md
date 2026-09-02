@@ -145,6 +145,20 @@ update action, Cursor through its own installer into `~/.local/bin`, which the s
 PATH). A failed install is logged and shows on the provider settings page like any other missing
 CLI.
 
+## Executors update themselves
+
+A push to the branch that deploys the relay reaches machines too. The relay names the source and
+ref executors follow (`executorReleaseServer.getExecutorRelease`, from `MACHINE_SOURCE_GIT_URL`
+and `MACHINE_SOURCE_GIT_REF`, default the GitHub repository's `main`). An enrolled agent executor
+running from a source checkout asks on start and every thirty minutes
+(`apps/server/src/cloud/executorSelfUpdate.ts`): it fetches the ref through the organization's
+GitHub credential — the same `gh auth git-credential` helper clones use — and when the head has
+moved resets the checkout to it, runs `pnpm install --frozen-lockfile`, and exits so the service
+unit's `Restart=always` brings it back on the new code. A snapshot shipped without `.git` is
+turned into a checkout in place the first time. The Docker executor image sets
+`T3CODE_EXECUTOR_SELF_UPDATE=0`, because a container updates by being rebuilt; bundled installs
+and personal machines never run this at all.
+
 ## Tables
 
 In `infra/relay/src/persistence/schema.ts`:

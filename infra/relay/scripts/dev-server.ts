@@ -58,6 +58,7 @@ import {
 } from "../src/http/Api.ts";
 import { machineEnrollmentApi, machinesApi } from "../src/http/MachinesApi.ts";
 import { organizationProjectsApi, projectCatalogServerApi } from "../src/http/ProjectCatalogApi.ts";
+import { executorReleaseServerApi } from "../src/http/ExecutorReleaseApi.ts";
 import { providerAccountsServerApi } from "../src/http/ProviderAccountsApi.ts";
 import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
@@ -223,6 +224,14 @@ const relayConfigurationLayer = Layer.succeed(
     // so they are a local-development affordance. A relay that can provision
     // real tunnels hands out reachable hostnames instead.
     allowLocalMachineEndpoints: cloudflareEndpointEnv === undefined,
+    // What enrolled executors keep themselves current with: the same
+    // repository and branch a push deploys this relay from.
+    executorSource: {
+      gitUrl:
+        process.env.MACHINE_SOURCE_GIT_URL?.trim() ||
+        "https://github.com/WP-Nova-GmbH/launchpad.git",
+      ref: process.env.MACHINE_SOURCE_GIT_REF?.trim() || "main",
+    },
   }),
 );
 
@@ -356,6 +365,7 @@ const relayApiLayer = Layer.mergeAll(
   projectCatalogServerApi,
   sourceControlServerApi,
   providerAccountsServerApi,
+  executorReleaseServerApi,
 );
 
 const appLayer = relayApiLayer.pipe(

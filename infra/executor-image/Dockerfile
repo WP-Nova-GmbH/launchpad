@@ -67,6 +67,9 @@ RUN corepack install && pnpm install --frozen-lockfile
 # them through the relay.
 ENV T3CODE_HOME=/data/t3code
 ENV HOME=/data/t3code/home
+# The image is the release: a container updates by being rebuilt, not by
+# resetting its own copy of the source and exiting.
+ENV T3CODE_EXECUTOR_SELF_UPDATE=0
 VOLUME /data/t3code
 
 EXPOSE 4483

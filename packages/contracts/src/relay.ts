@@ -563,6 +563,7 @@ export const RelayTenancyNotFoundReason = Schema.Literals([
   "github_app_not_configured",
   "machine_not_found",
   "provider_account_not_found",
+  "executor_source_not_configured",
 ]);
 export type RelayTenancyNotFoundReason = typeof RelayTenancyNotFoundReason.Type;
 
@@ -785,6 +786,23 @@ const RelayGithubInstallationTokenErrors = [
 ] as const;
 
 const RelayProviderAccountsServerErrors = [RelayAuthInvalidError, RelayInternalError] as const;
+
+const RelayExecutorReleaseErrors = [
+  RelayAuthInvalidError,
+  RelayTenancyNotFoundError,
+  RelayInternalError,
+] as const;
+
+/** Which source an executor keeps itself current with. */
+export const RelayExecutorReleaseResponse = Schema.Struct({
+  gitUrl: TrimmedNonEmptyString.annotate({
+    description: "The git URL executors fetch Launchpad's own source from.",
+  }),
+  ref: TrimmedNonEmptyString.annotate({
+    description: "The branch or tag executors follow; they update when its head moves.",
+  }),
+});
+export type RelayExecutorReleaseResponse = typeof RelayExecutorReleaseResponse.Type;
 
 export class RelayClientPrincipal extends Context.Service<
   RelayClientPrincipal,
@@ -2472,6 +2490,22 @@ export const RelayProviderAccountsServerGroup = HttpApiGroup.make("providerAccou
   )
   .middleware(RelayEnvironmentAuth);
 
+export const RelayExecutorReleaseServerGroup = HttpApiGroup.make("executorReleaseServer")
+  .add(
+    HttpApiEndpoint.get("getExecutorRelease", "/v1/environments/:environmentId/executor-release", {
+      params: Schema.Struct({ environmentId: EnvironmentId }),
+      success: RelayExecutorReleaseResponse,
+      error: RelayExecutorReleaseErrors,
+    })
+      .annotate(OpenApi.Summary, "Which source and ref an executor should be running")
+      .annotate(
+        OpenApi.Description,
+        "Answers only for an enrolled agent executor. Executors fetch this ref on a timer and restart themselves when its head moves, so a push deploys machines the same way it deploys the relay.",
+      ),
+  )
+  .annotate(OpenApi.Description, "Environment-authenticated executor release tracking.")
+  .middleware(RelayEnvironmentAuth);
+
 export const RelayApi = HttpApi.make("RelayApi")
   .add(
     RelayHealthGroup,
@@ -2490,6 +2524,7 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayProjectCatalogServerGroup,
     RelaySourceControlServerGroup,
     RelayProviderAccountsServerGroup,
+    RelayExecutorReleaseServerGroup,
   )
   .annotate(OpenApi.Title, "Launchpad Relay API")
   .annotate(OpenApi.Version, "1.0.0")

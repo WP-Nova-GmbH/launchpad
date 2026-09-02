@@ -127,7 +127,9 @@ on which they hold a role.
 
 Machines come with the provider tools installed, and they sign in with the organization's
 [provider accounts](#provider-accounts) — nobody signs in on a machine. A machine you connect
-yourself installs any provider tool it is missing the first time it starts. Signing in to a
+yourself installs any provider tool it is missing the first time it starts, and every machine
+keeps its own Launchpad up to date: when a new version is released, machines fetch it and restart
+themselves within half an hour, with no one logging in. Signing in to a
 provider on a machine directly (**Settings → Providers**, with the machine selected) still works
 and stays on that machine until the organization shares a new account for that provider.
 
