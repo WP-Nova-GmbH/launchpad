@@ -5,11 +5,17 @@ import { describe, expect, it } from "@effect/vitest";
 
 import { missingInstallableProviders, withBinDirectories } from "./executorProviderToolchain.ts";
 
-function provider(driver: string, installed: boolean, instanceId = driver): ServerProvider {
+function provider(
+  driver: string,
+  installed: boolean,
+  instanceId = driver,
+  enabled = true,
+): ServerProvider {
   return {
     instanceId,
     driver: ProviderDriverKind.make(driver),
     installed,
+    enabled,
   } as unknown as ServerProvider;
 }
 
@@ -27,6 +33,16 @@ describe("missingInstallableProviders", () => {
         ]),
       ].sort(),
     ).toEqual(["codex", "cursor", "opencode"]);
+  });
+
+  it("leaves a provider alone when it is switched off in settings", () => {
+    expect(
+      missingInstallableProviders([
+        provider("cursor", false, "cursor", false),
+        provider("opencode", false, "opencode", false),
+        provider("codex", false),
+      ]),
+    ).toEqual(["codex"]);
   });
 
   it("is empty when everything installable is present", () => {

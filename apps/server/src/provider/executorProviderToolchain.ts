@@ -43,14 +43,17 @@ export interface ExecutorToolchainReport {
 
 const NOTHING: ExecutorToolchainReport = { installed: [], failed: [] };
 
-/** The providers whose CLI is not on this machine, among those Launchpad can install. */
+/**
+ * The providers whose CLI is not on this machine, among those Launchpad can
+ * install. A provider switched off in settings is not missing, it is off.
+ */
 export function missingInstallableProviders(
   providers: ReadonlyArray<ServerProvider>,
 ): ReadonlyArray<ProviderDriverKind> {
   const installable = new Set<ProviderDriverKind>([...NPM_INSTALLED_PROVIDERS, CURSOR_PROVIDER]);
   const missing = new Set<ProviderDriverKind>();
   for (const provider of providers) {
-    if (!provider.installed && installable.has(provider.driver)) {
+    if (provider.enabled && !provider.installed && installable.has(provider.driver)) {
       missing.add(provider.driver);
     }
   }
