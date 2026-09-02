@@ -156,7 +156,7 @@ function OrganizationSection({ state }: { state: OrganizationAdminState }) {
       ) : null}
       <SettingsRow
         title="Join another organization"
-        description="Paste an invitation link's token. Joining means leaving this organization, so it only works while this one is empty."
+        description="An invitation for your email takes effect by itself when you sign in. Paste its token only if it did not: joining means leaving this organization, so it only works while this one is empty."
         control={
           <div className="flex w-full items-center gap-2 sm:w-auto">
             <Input
@@ -266,7 +266,7 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
         <>
           <SettingsRow
             title="Invite someone"
-            description="There is no email delivery yet, so the link comes back here for you to send."
+            description="They join the moment they sign in to Launchpad with this email. There is no email delivery yet, so let them know yourself."
             control={
               <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
                 <Input
@@ -320,8 +320,10 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
               <SettingsRow
                 key={invitation.invitationId}
                 title={invitation.email}
-                description={`Invited as ${ORG_ROLE_LABELS[invitation.role].toLowerCase()} · expires ${invitation.expiresAt.slice(0, 10)}${
-                  issued ? "" : " · the token was only shown when it was created"
+                description={`Invited as ${ORG_ROLE_LABELS[invitation.role].toLowerCase()} · expires ${invitation.expiresAt.slice(0, 10)} · joins on sign-in${
+                  issued
+                    ? "; the token is only needed if they already have an organization of their own"
+                    : ""
                 }`}
                 control={
                   <div className="flex items-center gap-2">

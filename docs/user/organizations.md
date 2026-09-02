@@ -21,19 +21,20 @@ last admin cannot be removed.
 
 ## Inviting people
 
-Admins can invite someone by email address and choose the role they will join with.
+Admins can invite someone by email address and choose the role they will join with. That is the
+whole job: the invited person installs Launchpad, signs in to Launchpad Connect with that email
+address, and lands in your organization the first time they open it. Nothing to paste.
 
-Launchpad does not send the email yet. When you create an invitation you get a **token** back — copy
-it and send it to the person yourself, however you normally would. They paste it into
-**Settings → Organization → Join another organization**.
+Launchpad does not send an email yet, so tell them yourself that the invitation is waiting. The
+invitation expires after a week, works once, and only takes effect for an account signed in with the
+address you invited. Inviting the same address again replaces the earlier invitation, and you can
+revoke a pending one at any time.
 
-The token works once, expires after a week, and can only be redeemed by someone signed in with the
-email address you invited. Inviting the same address again replaces the earlier invitation, and you
-can revoke a pending one at any time.
-
-Joining an organization means leaving the one you are in. That only works while the organization you
-are leaving is empty — no other members, no repositories — so accepting an invitation can never
-abandon other people's work.
+Joining an organization means leaving the one you are in, so it happens automatically only while
+the organization being left is empty — a fresh sign-up, in other words. Someone who already
+registered repositories or invited people into an organization of their own keeps it. For them,
+the invitation also comes with a **token** you can send; pasting it into **Settings → Organization →
+Join another organization** performs the same move once their organization is emptied.
 
 ## GitHub
 

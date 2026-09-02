@@ -1,5 +1,5 @@
 import type { RelayOrgRole } from "@t3tools/contracts/relay";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -87,6 +87,10 @@ export class Invitations extends Context.Service<
     readonly getPendingByTokenHash: (input: {
       readonly tokenHash: string;
     }) => Effect.Effect<InvitationRecord | null, InvitationPersistenceError>;
+    /** Pending invitations addressed to any of the given (normalized) addresses, newest first. */
+    readonly getPendingByEmails: (input: {
+      readonly emails: ReadonlyArray<string>;
+    }) => Effect.Effect<ReadonlyArray<InvitationRecord>, InvitationPersistenceError>;
     readonly revoke: (input: {
       readonly organizationId: string;
       readonly invitationId: string;
@@ -220,6 +224,22 @@ export const make = Effect.gen(function* () {
         return rows[0] ?? null;
       },
     ),
+
+    getPendingByEmails: Effect.fn("relay.invitations.get_pending_by_emails")(function* (input) {
+      if (input.emails.length === 0) return [];
+      return yield* db
+        .select(invitationColumns)
+        .from(relayOrganizationInvitations)
+        .where(
+          and(inArray(relayOrganizationInvitations.email, [...input.emails]), pendingCondition),
+        )
+        .orderBy(desc(relayOrganizationInvitations.createdAt))
+        .pipe(
+          Effect.mapError(
+            (cause) => new InvitationPersistenceError({ operation: "load-invitation", cause }),
+          ),
+        );
+    }),
 
     revoke: Effect.fn("relay.invitations.revoke")(function* (input) {
       yield* Effect.annotateCurrentSpan({

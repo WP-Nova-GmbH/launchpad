@@ -13,6 +13,7 @@ import * as Organizations from "../tenancy/Organizations.ts";
 import * as Repositories from "../tenancy/Repositories.ts";
 import {
   acceptInvitationRecord,
+  joinPendingInvitationAutomatically,
   requireAdmin,
   requireMaintainableRepository,
   requireVisibleRepository,
@@ -129,6 +130,7 @@ function invitationsLayer(overrides: Partial<Invitations.Invitations["Service"]>
       create: () => Effect.die("unused create"),
       listPending: () => Effect.die("unused listPending"),
       getPendingByTokenHash: () => Effect.die("unused getPendingByTokenHash"),
+      getPendingByEmails: () => Effect.die("unused getPendingByEmails"),
       revoke: () => Effect.die("unused revoke"),
       markAccepted: () => Effect.die("unused markAccepted"),
       ...overrides,
@@ -341,6 +343,7 @@ describe("invitation acceptance", () => {
     readonly markAccepted?: boolean;
     readonly memberCount?: number;
     readonly ownedRepositories?: ReadonlyArray<Repositories.RepositoryRecord>;
+    readonly pendingByEmails?: ReadonlyArray<Invitations.InvitationRecord>;
     readonly writes?: Array<string>;
   }) =>
     Layer.mergeAll(
@@ -368,6 +371,7 @@ describe("invitation acceptance", () => {
       invitationsLayer({
         getPendingByTokenHash: () =>
           Effect.succeed(input.invitation === undefined ? pendingInvitation : input.invitation),
+        getPendingByEmails: () => Effect.succeed(input.pendingByEmails ?? []),
         markAccepted: () =>
           Effect.sync(() => {
             input.writes?.push("mark-accepted");
@@ -539,4 +543,83 @@ describe("invitation acceptance", () => {
       });
     }).pipe(Effect.provide(acceptanceLayer({ invitation: null }))),
   );
+
+  describe("automatic joining", () => {
+    const joinedMembership = Organizations.Organizations.of({
+      ensureForUser: () => Effect.die("unused ensureForUser"),
+      getMembershipForUser: () =>
+        Effect.succeed(
+          membership({ organizationId: "organization-2", userId: "user-1", role: "member" }),
+        ),
+      listMembers: () => Effect.die("unused listMembers"),
+      countAdmins: () => Effect.die("unused countAdmins"),
+      countMembers: () => Effect.succeed(1),
+      updateMemberRole: () => Effect.die("unused updateMemberRole"),
+      removeMember: () => Effect.succeed(true),
+      addMember: () =>
+        Effect.succeed({ userId: "user-1", role: "member" as const, joinedAt: "2026-08-05" }),
+      rename: () => Effect.die("unused rename"),
+      deleteOrganization: () => Effect.void,
+    });
+
+    it.effect("moves a newcomer whose address an invitation names, without a token", () => {
+      clerkUserWithEmails(["ada@example.com"]);
+      const writes: Array<string> = [];
+      return Effect.gen(function* () {
+        const joined = yield* joinPendingInvitationAutomatically({
+          userId: "user-1",
+          currentOrganizationId: "organization-1",
+        }).pipe(Effect.provideService(Organizations.Organizations, joinedMembership));
+        expect(joined?.organization.organizationId).toBe("organization-2");
+        expect(joined?.role).toBe("member");
+        expect(writes).toEqual(["mark-accepted"]);
+      }).pipe(
+        Effect.provide(acceptanceLayer({ writes, pendingByEmails: [pendingInvitation] })),
+        Effect.ensuring(Effect.sync(() => vi.mocked(createClerkClient).mockReset())),
+      );
+    });
+
+    it.effect("leaves someone alone whose organization has other members", () =>
+      Effect.gen(function* () {
+        const joined = yield* joinPendingInvitationAutomatically({
+          userId: "user-1",
+          currentOrganizationId: "organization-1",
+        });
+        expect(joined).toBeNull();
+        // Established members never cost a Clerk lookup.
+        expect(vi.mocked(createClerkClient)).not.toHaveBeenCalled();
+      }).pipe(
+        Effect.provide(acceptanceLayer({ memberCount: 2, pendingByEmails: [pendingInvitation] })),
+        Effect.ensuring(Effect.sync(() => vi.mocked(createClerkClient).mockReset())),
+      ),
+    );
+
+    it.effect("ignores an invitation into the organization they are already in", () => {
+      clerkUserWithEmails(["ada@example.com"]);
+      return Effect.gen(function* () {
+        const joined = yield* joinPendingInvitationAutomatically({
+          userId: "user-1",
+          currentOrganizationId: "organization-2",
+        });
+        expect(joined).toBeNull();
+      }).pipe(
+        Effect.provide(acceptanceLayer({ pendingByEmails: [pendingInvitation] })),
+        Effect.ensuring(Effect.sync(() => vi.mocked(createClerkClient).mockReset())),
+      );
+    });
+
+    it.effect("does nothing for an address nobody invited", () => {
+      clerkUserWithEmails(["nobody@example.com"]);
+      return Effect.gen(function* () {
+        const joined = yield* joinPendingInvitationAutomatically({
+          userId: "user-1",
+          currentOrganizationId: "organization-1",
+        });
+        expect(joined).toBeNull();
+      }).pipe(
+        Effect.provide(acceptanceLayer({ pendingByEmails: [] })),
+        Effect.ensuring(Effect.sync(() => vi.mocked(createClerkClient).mockReset())),
+      );
+    });
+  });
 });

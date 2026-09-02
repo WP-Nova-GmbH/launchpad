@@ -1,4 +1,5 @@
 import { createClerkClient } from "@clerk/backend";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -235,7 +236,6 @@ export const acceptInvitationRecord = Effect.fn("relay.api.tenancy.accept_invita
     const organizations = yield* Organizations.Organizations;
     const invitations = yield* Invitations.Invitations;
     const repositories = yield* Repositories.Repositories;
-    const transactions = yield* RelayDb.RelayTransactions;
 
     const membership = yield* resolveMembership({ userId: input.userId });
     const tokenHash = yield* hashInvitationToken(input.token);
@@ -271,38 +271,114 @@ export const acceptInvitationRecord = Effect.fn("relay.api.tenancy.accept_invita
       return yield* tenancyForbidden("organization_not_empty");
     }
 
-    return yield* transactions
-      .withTransaction(
-        Effect.gen(function* () {
-          // Claiming the invitation first is what makes the token single use: a
-          // second request finds nothing left to accept.
-          const claimed = yield* invitations.markAccepted({
-            invitationId: invitation.invitationId,
-            acceptedByUserId: input.userId,
-          });
-          if (!claimed) {
-            return yield* tenancyConflict("invitation_not_pending");
-          }
-          yield* organizations.removeMember({
-            organizationId: currentOrganizationId,
-            userId: input.userId,
-          });
-          yield* organizations.addMember({
-            organizationId: invitation.organizationId,
-            userId: input.userId,
-            role: invitation.role satisfies RelayOrgRole,
-          });
-          yield* organizations.deleteOrganization({ organizationId: currentOrganizationId });
-          const settled = yield* organizations.getMembershipForUser({ userId: input.userId });
-          if (!settled) {
-            return yield* relayInternalErrorResponse("persistence_failed");
-          }
-          return toApiMembership(settled);
-        }),
-      )
-      .pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
+    return yield* moveMemberIntoInvitedOrganization({
+      userId: input.userId,
+      invitation,
+      currentOrganizationId,
+    });
   },
 );
+
+/** The move itself: claim the invitation, leave the old organization, join the new one. */
+const moveMemberIntoInvitedOrganization = Effect.fn(
+  "relay.api.tenancy.move_member_into_invited_organization",
+)(function* (input: {
+  readonly userId: string;
+  readonly invitation: Invitations.InvitationRecord;
+  readonly currentOrganizationId: string;
+}) {
+  const organizations = yield* Organizations.Organizations;
+  const invitations = yield* Invitations.Invitations;
+  const transactions = yield* RelayDb.RelayTransactions;
+  return yield* transactions
+    .withTransaction(
+      Effect.gen(function* () {
+        // Claiming the invitation first is what makes it single use: a second
+        // request finds nothing left to accept.
+        const claimed = yield* invitations.markAccepted({
+          invitationId: input.invitation.invitationId,
+          acceptedByUserId: input.userId,
+        });
+        if (!claimed) {
+          return yield* tenancyConflict("invitation_not_pending");
+        }
+        yield* organizations.removeMember({
+          organizationId: input.currentOrganizationId,
+          userId: input.userId,
+        });
+        yield* organizations.addMember({
+          organizationId: input.invitation.organizationId,
+          userId: input.userId,
+          role: input.invitation.role satisfies RelayOrgRole,
+        });
+        yield* organizations.deleteOrganization({ organizationId: input.currentOrganizationId });
+        const settled = yield* organizations.getMembershipForUser({ userId: input.userId });
+        if (!settled) {
+          return yield* relayInternalErrorResponse("persistence_failed");
+        }
+        return toApiMembership(settled);
+      }),
+    )
+    .pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
+});
+
+/**
+ * An invited person joins the moment they show up. The invitation names an
+ * email and Clerk vouches for the caller's addresses, which is the same proof
+ * the token flow demands — the token only ever added a paste. Only a caller
+ * whose own organization is empty besides them is moved; anyone who has built
+ * something keeps it and can still redeem the token deliberately. Clerk is
+ * asked for addresses only in that empty case, so established members cost
+ * nothing here.
+ */
+export const joinPendingInvitationAutomatically = Effect.fn(
+  "relay.api.tenancy.join_pending_invitation",
+)(function* (input: { readonly userId: string; readonly currentOrganizationId: string }) {
+  const organizations = yield* Organizations.Organizations;
+  const invitations = yield* Invitations.Invitations;
+  const repositories = yield* Repositories.Repositories;
+
+  const members = yield* organizations.countMembers({
+    organizationId: input.currentOrganizationId,
+  });
+  if (members > 1) return null;
+  const owned = yield* repositories.listForOrganization({
+    organizationId: input.currentOrganizationId,
+  });
+  if (owned.length > 0) return null;
+
+  const verifiedEmails = yield* fetchVerifiedEmailAddresses(input.userId).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("could not read the caller's addresses for automatic joining", {
+        cause: Cause.pretty(cause),
+      }).pipe(Effect.as([] as ReadonlyArray<string>)),
+    ),
+  );
+  const now = yield* DateTime.now;
+  const invitation = (yield* invitations.getPendingByEmails({ emails: verifiedEmails })).find(
+    (candidate) =>
+      candidate.organizationId !== input.currentOrganizationId &&
+      Date.parse(candidate.expiresAt) > now.epochMilliseconds,
+  );
+  if (!invitation) return null;
+
+  const moved = yield* moveMemberIntoInvitedOrganization({
+    userId: input.userId,
+    invitation,
+    currentOrganizationId: input.currentOrganizationId,
+  }).pipe(
+    // Lost a race with the same person redeeming the token: they are where
+    // they wanted to be either way.
+    Effect.catchTag("RelayTenancyConflictError", () => Effect.succeed(null)),
+  );
+  if (moved) {
+    yield* Effect.logInfo("invited member joined automatically", {
+      organizationId: invitation.organizationId,
+      invitationId: invitation.invitationId,
+    });
+  }
+  return moved;
+});
 
 /** `https://github.com/apps/<slug>/installations/new` → `<slug>`. */
 function githubAppSlugFromInstallUrl(installUrl: string): string | null {
@@ -337,7 +413,14 @@ export const organizationApi = HttpApiBuilder.group(
       .handle(
         "getOrganization",
         Effect.fn("relay.api.organization.get")(function* () {
-          return toApiMembership(yield* requireMembership());
+          const membership = yield* requireMembership();
+          // Reading one's organization is the first thing every client does
+          // after sign-in, which makes it the moment an invitation takes effect.
+          const joined = yield* joinPendingInvitationAutomatically({
+            userId: membership.userId,
+            currentOrganizationId: membership.organization.organizationId,
+          });
+          return joined ?? toApiMembership(membership);
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
