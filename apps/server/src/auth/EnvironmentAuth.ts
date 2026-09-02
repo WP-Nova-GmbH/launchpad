@@ -16,6 +16,7 @@ import {
   type ServerAuthDescriptor,
   type ServerAuthSessionMethod,
   type AuthWebSocketTicketResult,
+  type AuthSessionUser,
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Context from "effect/Context";
@@ -65,6 +66,8 @@ export interface AuthenticatedSession {
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly proofKeyThumbprint?: string;
   readonly expiresAt?: DateTime.DateTime;
+  /** The signed-in person, known only for sessions minted through Launchpad Connect. */
+  readonly user?: AuthSessionUser;
 }
 
 const serverAuthInternalErrorContext = {
@@ -438,6 +441,7 @@ export class EnvironmentAuth extends Context.Service<
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
       readonly subject?: string;
       readonly proofKeyThumbprint?: string;
+      readonly user?: AuthSessionUser;
       readonly purpose?: "startup";
     }) => Effect.Effect<IssuedPairingLink, ServerAuthInternalError>;
     readonly issuePairingCredential: (
@@ -585,6 +589,7 @@ export const make = Effect.gen(function* () {
         scopes: session.scopes,
         ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
         ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
+        ...(session.user ? { user: session.user } : {}),
       })),
       mapSessionVerificationErrors,
     );
@@ -668,6 +673,7 @@ export const make = Effect.gen(function* () {
               ...requestMetadata,
               ...(grant.label ? { label: grant.label } : {}),
             },
+            ...(grant.user ? { user: grant.user } : {}),
           })
           .pipe(
             Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
@@ -713,6 +719,7 @@ export const make = Effect.gen(function* () {
                   ...requestMetadata,
                   ...(grant.label ? { label: grant.label } : {}),
                 },
+                ...(grant.user ? { user: grant.user } : {}),
               })
               .pipe(
                 Effect.mapError(
@@ -777,6 +784,7 @@ export const make = Effect.gen(function* () {
         ...(input?.ttl ? { ttl: input.ttl } : {}),
         ...(input?.label ? { label: input.label } : {}),
         ...(input?.proofKeyThumbprint ? { proofKeyThumbprint: input.proofKeyThumbprint } : {}),
+        ...(input?.user ? { user: input.user } : {}),
         ...(input?.purpose ? { purpose: input.purpose } : {}),
       });
       return {
@@ -951,6 +959,7 @@ export const make = Effect.gen(function* () {
               method: session.method,
               scopes: session.scopes,
               ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
+              ...(session.user ? { user: session.user } : {}),
             })),
             mapSessionVerificationErrors,
           );

@@ -172,6 +172,7 @@ function listedEnvironment(environmentId: string) {
       providerKind: "cloudflare_tunnel" as const,
     },
     linkedAt: "2026-05-25T00:00:00.000Z",
+    source: "link" as const,
   };
 }
 
@@ -216,6 +217,7 @@ describe("mobile cloud link environment client", () => {
                     providerKind: "cloudflare_tunnel",
                   },
                   linkedAt: "2026-05-25T00:00:00.000Z",
+                  source: "link" as const,
                 },
               ],
             }),
@@ -236,6 +238,7 @@ describe("mobile cloud link environment client", () => {
             providerKind: "cloudflare_tunnel",
           },
           linkedAt: "2026-05-25T00:00:00.000Z",
+          source: "link" as const,
         },
       ]);
     }),
@@ -258,6 +261,7 @@ describe("mobile cloud link environment client", () => {
                     providerKind: "cloudflare_tunnel",
                   },
                   linkedAt: "2026-05-25T00:00:00.000Z",
+                  source: "link" as const,
                 },
               ],
             }),
@@ -291,6 +295,7 @@ describe("mobile cloud link environment client", () => {
                     providerKind: "cloudflare_tunnel",
                   },
                   linkedAt: "2026-05-25T00:00:00.000Z",
+                  source: "link" as const,
                 },
               ],
             }),
@@ -510,6 +515,7 @@ describe("mobile cloud link environment client", () => {
                       providerKind: "cloudflare_tunnel",
                     },
                     linkedAt: "2026-05-25T00:00:00.000Z",
+                    source: "link" as const,
                   },
                 ],
               }),
@@ -556,6 +562,7 @@ describe("mobile cloud link environment client", () => {
                       providerKind: "cloudflare_tunnel",
                     },
                     linkedAt: "2026-05-25T00:00:00.000Z",
+                    source: "link" as const,
                   },
                 ],
               }),
@@ -892,6 +899,7 @@ describe("mobile cloud link environment client", () => {
                 providerKind: "cloudflare_tunnel",
               },
               linkedAt: "2026-05-25T00:00:00.000Z",
+              source: "link" as const,
             },
           }),
         );
@@ -1028,6 +1036,7 @@ describe("mobile cloud link environment client", () => {
               providerKind: "cloudflare_tunnel",
             },
             linkedAt: "2026-05-25T00:00:00.000Z",
+            source: "link" as const,
           },
         }),
       ).pipe(Effect.flip);
@@ -1071,6 +1080,7 @@ describe("mobile cloud link environment client", () => {
               providerKind: "cloudflare_tunnel",
             },
             linkedAt: "2026-05-25T00:00:00.000Z",
+            source: "link" as const,
           },
         }),
       ).pipe(Effect.flip);
@@ -1117,6 +1127,7 @@ describe("mobile cloud link environment client", () => {
               providerKind: "cloudflare_tunnel",
             },
             linkedAt: "2026-05-25T00:00:00.000Z",
+            source: "link" as const,
           },
         }),
       ).pipe(Effect.flip);
@@ -1171,6 +1182,7 @@ describe("mobile cloud link environment client", () => {
                 providerKind: "cloudflare_tunnel",
               },
               linkedAt: "2026-05-25T00:00:00.000Z",
+              source: "link" as const,
             },
           }),
         ).pipe(Effect.flip);

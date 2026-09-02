@@ -1412,7 +1412,11 @@ function SavedBackendListRow({
       : null;
   const metadataBits = [
     sshTarget ? `SSH ${formatDesktopSshTarget(sshTarget)}` : null,
-    environment.relayManaged ? "Launchpad Connect" : null,
+    environment.organizationMachine
+      ? "Organization machine"
+      : environment.relayManaged
+        ? "Launchpad Connect"
+        : null,
   ].filter((value): value is string => value !== null);
 
   // The WSL backend is a desktop-managed local backend (it surfaces as a bearer
@@ -1499,6 +1503,20 @@ function SavedBackendListRow({
               />
               <TooltipPopup side="top" className="max-w-80 whitespace-pre-wrap leading-tight">
                 The WSL backend is managed by the WSL setting above — turn it on or off there.
+              </TooltipPopup>
+            </Tooltip>
+          ) : environment.organizationMachine ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button size="xs" variant="outline" disabled>
+                    Organization
+                  </Button>
+                }
+              />
+              <TooltipPopup side="top" className="max-w-80 whitespace-pre-wrap leading-tight">
+                This machine belongs to your organization and stays connected on every member&apos;s
+                devices. Admins remove it under Settings → Organization.
               </TooltipPopup>
             </Tooltip>
           ) : (

@@ -14,6 +14,7 @@ const environment: RelayClientEnvironmentRecord = {
     providerKind: "cloudflare_tunnel",
   },
   linkedAt: "2026-08-12T12:00:00.000Z",
+  source: "link",
 };
 
 function renderRow({

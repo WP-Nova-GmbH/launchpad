@@ -1081,12 +1081,19 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
     }
 
     const keyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(dependencies.secrets);
+    // The relay vouched for `sub`; carrying the person into the session is
+    // what lets a shared executor say who wrote what.
     const issued = yield* dependencies.environmentAuth.createPairingLink({
       scopes: AuthStandardClientScopes,
       subject: "cloud-connect",
       ttl: Duration.minutes(2),
       label: "Launchpad Connect connect",
       proofKeyThumbprint: proof.clientProofKeyThumbprint,
+      user: {
+        userId: proof.sub,
+        displayName: proof.name ?? null,
+        imageUrl: proof.picture ?? null,
+      },
     });
     const responsePayload = {
       iss: `t3-env:${environmentId}`,

@@ -6,6 +6,7 @@ import {
   type AuthClientSession,
   type AuthEnvironmentScope,
   type ServerAuthSessionMethod,
+  AuthSessionUser,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -49,6 +50,7 @@ export interface VerifiedSession {
   readonly subject: string;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly proofKeyThumbprint?: string;
+  readonly user?: AuthSessionUser;
 }
 
 export type SessionCredentialChange =
@@ -366,6 +368,7 @@ export class SessionStore extends Context.Service<
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
       readonly client?: AuthClientMetadata;
       readonly proofKeyThumbprint?: string;
+      readonly user?: AuthSessionUser;
     }) => Effect.Effect<IssuedSession, SessionCredentialInternalError>;
     readonly verify: (token: string) => Effect.Effect<VerifiedSession, SessionCredentialError>;
     readonly issueWebSocketToken: (
@@ -502,6 +505,7 @@ export const make = Effect.gen(function* () {
           scopes: row.value.scopes,
           method: row.value.method,
           client: toClientMetadata(row.value.client),
+          ...(row.value.user ? { user: row.value.user } : {}),
           issuedAt: row.value.issuedAt,
           expiresAt: row.value.expiresAt,
           lastConnectedAt: row.value.lastConnectedAt,
@@ -624,6 +628,7 @@ export const make = Effect.gen(function* () {
             os: client.os ?? null,
             browser: client.browser ?? null,
           },
+          user: input?.user ?? null,
           issuedAt,
           expiresAt,
         })
@@ -635,6 +640,7 @@ export const make = Effect.gen(function* () {
           scopes: claims.scopes,
           method: claims.method,
           client,
+          ...(input?.user ? { user: input.user } : {}),
           issuedAt,
           expiresAt,
           lastConnectedAt: null,
@@ -712,6 +718,7 @@ export const make = Effect.gen(function* () {
         subject: claims.sub,
         scopes: claims.scopes,
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
+        ...(row.value.user ? { user: row.value.user } : {}),
       } satisfies VerifiedSession;
     },
   );
@@ -817,6 +824,7 @@ export const make = Effect.gen(function* () {
       expiresAt: row.value.expiresAt,
       subject: row.value.subject,
       scopes: row.value.scopes,
+      ...(row.value.user ? { user: row.value.user } : {}),
     } satisfies VerifiedSession;
   });
 
@@ -833,6 +841,7 @@ export const make = Effect.gen(function* () {
           scopes: row.scopes,
           method: row.method,
           client: toClientMetadata(row.client),
+          ...(row.user ? { user: row.user } : {}),
           issuedAt: row.issuedAt,
           expiresAt: row.expiresAt,
           lastConnectedAt: row.lastConnectedAt,

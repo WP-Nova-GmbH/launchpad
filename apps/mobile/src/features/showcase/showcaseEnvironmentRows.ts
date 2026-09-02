@@ -43,6 +43,7 @@ export const SHOWCASE_CONNECTED_CLOUD_ENVIRONMENTS: ReadonlyArray<ConnectedEnvir
     environmentLabel: "Aurora GPU Pod",
     displayUrl: "https://aurora-gpu.t3.sh",
     isRelayManaged: true,
+    isOrganizationMachine: false,
     connectionState: "connected",
     connectionError: null,
     connectionErrorTraceId: null,
@@ -56,6 +57,7 @@ export const SHOWCASE_AVAILABLE_CLOUD_ENVIRONMENTS: ReadonlyArray<RelayEnvironme
       label: "Pocket Pi",
       endpoint: pocketPiEndpoint,
       linkedAt: "2026-07-16T08:00:00.000Z",
+      source: "link",
     },
     availability: "online",
     status: {

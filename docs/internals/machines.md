@@ -64,8 +64,19 @@ token claim. `EnvironmentConnector.resolveAccess`
 first and falls back to an enrolled machine of their organization; a machine outside
 their organization answers exactly like a missing link, so a non-member cannot enumerate
 another organization's fleet. Ready machines appear in the client environment list beside
-personal links, which is how the existing web, desktop, and mobile clients reach them
-without machine-specific code.
+personal links, tagged `source: "machine"` (`RelayClientEnvironmentRecord`), which is how
+the existing web, desktop, and mobile clients reach them without machine-specific
+transport code.
+
+Clients keep machines saved on their own. Relay discovery
+(`packages/client-runtime/src/relay/discovery.ts`) marks a state `listed` once it holds a
+complete listing for a signed-in account, and the machine sync
+(`packages/client-runtime/src/relay/machineSync.ts`, started with the connection layer)
+registers every listed machine that is not in the catalog as a `RelayConnectionTarget` with
+`source: "machine"` and removes saved machine targets the listing no longer names. Personal
+links are never touched: they are the user's to add with Connect and to remove. A machine
+target's `source` is what lets Connections settings hide Disconnect and Remove for it —
+the only way off a device is the admin destroying the machine.
 
 On the machine itself, the relay's signed proofs (mint, health, job dispatch) are no
 longer pinned to a single linked account — the relay resolves the caller's membership

@@ -1,4 +1,5 @@
 import { EnvironmentId } from "@t3tools/contracts";
+import { RelayClientEnvironmentSource } from "@t3tools/contracts/relay";
 import * as Schema from "effect/Schema";
 
 const ConnectionTargetBase = {
@@ -27,8 +28,19 @@ export class RelayConnectionTarget extends Schema.TaggedClass<RelayConnectionTar
   "RelayConnectionTarget",
   {
     ...ConnectionTargetBase,
+    /**
+     * Where the environment came from. Organization machines are kept in
+     * sync from relay discovery rather than added by hand; entries saved
+     * before the field existed count as the user's own links.
+     */
+    source: Schema.optional(RelayClientEnvironmentSource),
   },
 ) {}
+
+/** True for a saved environment that the organization owns, not the user. */
+export function isOrganizationMachineTarget(target: ConnectionTarget): boolean {
+  return target._tag === "RelayConnectionTarget" && target.source === "machine";
+}
 
 export class SshConnectionTarget extends Schema.TaggedClass<SshConnectionTarget>()(
   "SshConnectionTarget",

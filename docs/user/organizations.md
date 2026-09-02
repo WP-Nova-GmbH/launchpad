@@ -118,7 +118,11 @@ fresh one.
 
 Once a machine is **Ready**, it appears to every member of the organization alongside their own
 environments, so you can open projects and threads on it from any client, exactly as you would on
-a machine of your own.
+a machine of your own. Nobody presses Connect for it: each device you sign in on picks the
+organization's machines up on its own, including a device you sign in on for the first time, and
+drops a machine once an admin destroys it. In **Settings → Connections** such a machine is
+labelled **Organization machine** and has no Disconnect or Remove; it comes and goes with the
+organization, not with your device.
 
 Its projects remain listed on Start when the machine is offline. They are labelled **Offline** and
 cannot be opened until that machine reconnects. This retained catalog contains only project and

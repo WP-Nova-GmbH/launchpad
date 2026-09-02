@@ -4,6 +4,7 @@ import {
   type AuthEnvironmentScope,
   type AuthPairingLink,
   type ServerAuthBootstrapMethod,
+  AuthSessionUser,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -26,6 +27,8 @@ export interface BootstrapGrant {
   readonly subject: string;
   readonly label?: string;
   readonly proofKeyThumbprint?: string;
+  /** Who this credential was minted for, when the relay vouched for a person. */
+  readonly user?: AuthSessionUser;
   readonly expiresAt: DateTime.DateTime;
 }
 
@@ -202,6 +205,7 @@ export class PairingGrantStore extends Context.Service<
       readonly subject?: string;
       readonly label?: string;
       readonly proofKeyThumbprint?: string;
+      readonly user?: AuthSessionUser;
       /**
        * "startup" marks the credential the server mints for itself at boot,
        * which gets the long dev TTL when a dev URL is configured.
@@ -408,6 +412,7 @@ export const make = Effect.gen(function* () {
         subject,
         label: input?.label ?? null,
         proofKeyThumbprint: input?.proofKeyThumbprint ?? null,
+        user: input?.user ?? null,
         createdAt: now,
         expiresAt: expiresAt,
       })
@@ -499,6 +504,7 @@ export const make = Effect.gen(function* () {
                 ...(grant.proofKeyThumbprint
                   ? { proofKeyThumbprint: grant.proofKeyThumbprint }
                   : {}),
+                ...(grant.user ? { user: grant.user } : {}),
                 expiresAt: grant.expiresAt,
               } satisfies BootstrapGrant,
             },
@@ -533,6 +539,7 @@ export const make = Effect.gen(function* () {
           ...(consumed.value.proofKeyThumbprint
             ? { proofKeyThumbprint: consumed.value.proofKeyThumbprint }
             : {}),
+          ...(consumed.value.user ? { user: consumed.value.user } : {}),
           expiresAt: consumed.value.expiresAt,
         } satisfies BootstrapGrant;
       }

@@ -21,6 +21,7 @@ function environment(
     label: "Julius's MacBook Pro",
     displayUrl: "https://environment.example.test",
     relayManaged: false,
+    organizationMachine: false,
     entry: {
       target: new BearerConnectionTarget({
         environmentId: ENVIRONMENT_ID,

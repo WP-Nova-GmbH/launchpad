@@ -15,6 +15,7 @@ function connectedEnvironment(
     environmentLabel: input.environmentLabel ?? input.environmentId,
     displayUrl: input.displayUrl ?? `https://${input.environmentId}.example.test/`,
     isRelayManaged: input.isRelayManaged,
+    isOrganizationMachine: false,
     connectionState: input.connectionState ?? "connected",
     connectionError: input.connectionError ?? null,
     connectionErrorTraceId: input.connectionErrorTraceId ?? null,
@@ -31,6 +32,7 @@ function cloudEnvironment(environmentId: string): RelayClientEnvironmentRecord {
       providerKind: "cloudflare_tunnel",
     },
     linkedAt: "2026-01-01T00:00:00.000Z",
+    source: "link",
   };
 }
 

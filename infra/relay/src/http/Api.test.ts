@@ -226,6 +226,7 @@ const linkedEnvironmentRecord = {
   },
   environmentPublicKey: "public-key",
   linkedAt: "2026-07-28T00:00:00.000Z",
+  source: "link",
 } as const;
 
 describe("relay environment unlink", () => {

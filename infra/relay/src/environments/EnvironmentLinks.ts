@@ -329,6 +329,7 @@ const make = Effect.gen(function* () {
                   row.endpointProviderKind as RelayClientEnvironmentRecord["endpoint"]["providerKind"],
               },
               linkedAt: row.createdAt,
+              source: "link" as const,
             })),
           ),
           Effect.mapError(
@@ -382,6 +383,7 @@ const make = Effect.gen(function* () {
                   },
                   environmentPublicKey: row.environmentPublicKey,
                   linkedAt: row.createdAt,
+                  source: "link" as const,
                 }
               : null;
           }),

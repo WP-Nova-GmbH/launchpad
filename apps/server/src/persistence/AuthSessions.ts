@@ -11,6 +11,7 @@ import {
   AuthEnvironmentScopes,
   AuthSessionId,
   ServerAuthSessionMethod,
+  AuthSessionUser,
 } from "@t3tools/contracts";
 
 import {
@@ -36,6 +37,7 @@ export const AuthSessionRecord = Schema.Struct({
   scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
   client: AuthSessionClientMetadataRecord,
+  user: Schema.NullOr(AuthSessionUser),
   issuedAt: Schema.DateTimeUtcFromString,
   expiresAt: Schema.DateTimeUtcFromString,
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
@@ -49,6 +51,7 @@ export const CreateAuthSessionInput = Schema.Struct({
   scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
   client: AuthSessionClientMetadataRecord,
+  user: Schema.NullOr(AuthSessionUser),
   issuedAt: Schema.DateTimeUtcFromString,
   expiresAt: Schema.DateTimeUtcFromString,
 });
@@ -117,6 +120,7 @@ const AuthSessionDbRow = Schema.Struct({
   clientDeviceType: Schema.Literals(["desktop", "mobile", "tablet", "bot", "unknown"]),
   clientOs: Schema.NullOr(Schema.String),
   clientBrowser: Schema.NullOr(Schema.String),
+  user: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
   issuedAt: Schema.DateTimeUtcFromString,
   expiresAt: Schema.DateTimeUtcFromString,
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
@@ -134,6 +138,7 @@ const AuthSessionRawDbRow = Schema.Struct({
   clientDeviceType: Schema.Unknown,
   clientOs: Schema.Unknown,
   clientBrowser: Schema.Unknown,
+  user: Schema.Unknown,
   issuedAt: Schema.Unknown,
   expiresAt: Schema.Unknown,
   lastConnectedAt: Schema.Unknown,
@@ -156,6 +161,7 @@ function toAuthSessionRecord(row: typeof AuthSessionDbRow.Type): AuthSessionReco
       os: row.clientOs,
       browser: row.clientBrowser,
     },
+    user: row.user,
     issuedAt: row.issuedAt,
     expiresAt: row.expiresAt,
     lastConnectedAt: row.lastConnectedAt,
@@ -196,6 +202,7 @@ export const make = Effect.gen(function* () {
           client_device_type,
           client_os,
           client_browser,
+          user_json,
           issued_at,
           expires_at,
           revoked_at
@@ -211,6 +218,7 @@ export const make = Effect.gen(function* () {
           ${input.client.deviceType},
           ${input.client.os},
           ${input.client.browser},
+          ${input.user === null ? null : JSON.stringify(input.user)},
           ${input.issuedAt},
           ${input.expiresAt},
           NULL
@@ -234,6 +242,7 @@ export const make = Effect.gen(function* () {
           client_device_type AS "clientDeviceType",
           client_os AS "clientOs",
           client_browser AS "clientBrowser",
+          user_json AS "user",
           issued_at AS "issuedAt",
           expires_at AS "expiresAt",
           last_connected_at AS "lastConnectedAt",
@@ -259,6 +268,7 @@ export const make = Effect.gen(function* () {
           client_device_type AS "clientDeviceType",
           client_os AS "clientOs",
           client_browser AS "clientBrowser",
+          user_json AS "user",
           issued_at AS "issuedAt",
           expires_at AS "expiresAt",
           last_connected_at AS "lastConnectedAt",

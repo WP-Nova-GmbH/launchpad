@@ -1,6 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
   connectionCatalogDisplayUrl,
+  isOrganizationMachineTarget,
   type EnvironmentPresentation as BaseEnvironmentPresentation,
 } from "@t3tools/client-runtime/connection";
 import { Discovery } from "@t3tools/client-runtime/relay";
@@ -20,6 +21,8 @@ export interface EnvironmentPresentation extends BaseEnvironmentPresentation {
   readonly label: string;
   readonly displayUrl: string | null;
   readonly relayManaged: boolean;
+  /** Saved and removed by the organization, not by this device. */
+  readonly organizationMachine: boolean;
 }
 
 function projectEnvironmentPresentation(
@@ -32,6 +35,7 @@ function projectEnvironmentPresentation(
     label: presentation.entry.target.label,
     displayUrl: connectionCatalogDisplayUrl(presentation.entry),
     relayManaged: presentation.entry.target._tag === "RelayConnectionTarget",
+    organizationMachine: isOrganizationMachineTarget(presentation.entry.target),
   };
 }
 

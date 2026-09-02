@@ -39,6 +39,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstab
 import * as EnvironmentLinks from "./EnvironmentLinks.ts";
 import * as Machines from "../machines/Machines.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
+import * as UserDirectory from "../tenancy/UserDirectory.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as EnvironmentConnector from "./EnvironmentConnector.ts";
 import * as ManagedEndpointAllocations from "./ManagedEndpointAllocations.ts";
@@ -269,6 +270,14 @@ function connectorTestLayer(
       ),
     ),
     Layer.provide(
+      Layer.succeed(
+        UserDirectory.UserDirectory,
+        UserDirectory.UserDirectory.of({
+          lookup: () => Effect.succeed(new Map()),
+        }),
+      ),
+    ),
+    Layer.provide(
       RelayConfiguration.layer({
         ...settings,
         ...(options?.allowLocalMachineEndpoints === undefined
@@ -324,6 +333,7 @@ function makeLinks(
           providerKind: "cloudflare_tunnel",
         },
         linkedAt: "2026-05-25T00:00:00.000Z",
+        source: "link" as const,
         environmentPublicKey: environmentKeyPair.publicKey,
         ...overrides,
       }),

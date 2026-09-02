@@ -65,6 +65,8 @@ import {
   OrchestrationGetTurnDiffInput,
   OrchestrationRpcSchemas,
   OrchestrationGetWorkflowScriptError,
+  ThreadPresenceReportInput,
+  ThreadPresenceSnapshot,
 } from "./orchestration.ts";
 import {
   ServerProviderAccountExport,
@@ -907,6 +909,24 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
   },
 );
 
+export const WsOrchestrationReportThreadPresenceRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.reportThreadPresence,
+  {
+    payload: ThreadPresenceReportInput,
+    error: EnvironmentAuthorizationError,
+  },
+);
+
+export const WsOrchestrationSubscribeThreadPresenceRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.subscribeThreadPresence,
+  {
+    payload: Schema.Struct({}),
+    success: ThreadPresenceSnapshot,
+    error: EnvironmentAuthorizationError,
+    stream: true,
+  },
+);
+
 export const WsOrchestrationGetWorkflowScriptRpc = Rpc.make(
   ORCHESTRATION_WS_METHODS.getWorkflowScript,
   {
@@ -1106,6 +1126,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
   WsSubscribeBackgroundPolicyRpc,
+  WsOrchestrationReportThreadPresenceRpc,
+  WsOrchestrationSubscribeThreadPresenceRpc,
   WsSubscribeResourceTelemetryRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetWorkflowScriptRpc,

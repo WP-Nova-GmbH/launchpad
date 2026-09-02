@@ -181,6 +181,7 @@ describe("web cloud link environment client", () => {
                 providerKind: "cloudflare_tunnel",
               },
               linkedAt: "2026-06-06T00:00:00.000Z",
+              source: "link",
             },
           ],
         }),

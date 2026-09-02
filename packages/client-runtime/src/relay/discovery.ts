@@ -37,6 +37,12 @@ export interface RelayEnvironmentDiscoveryState {
   readonly refreshing: boolean;
   readonly offline: boolean;
   readonly error: Option.Option<ConnectionAttemptError>;
+  /**
+   * True once `environments` is a complete listing for a signed-in account.
+   * Consumers that act on absence (machine sync) must not act on the empty
+   * map a signed-out or failed refresh leaves behind.
+   */
+  readonly listed: boolean;
 }
 
 export class RelayEnvironmentDiscovery extends Context.Service<
@@ -52,6 +58,7 @@ export const EMPTY_RELAY_ENVIRONMENT_DISCOVERY_STATE: RelayEnvironmentDiscoveryS
   refreshing: false,
   offline: false,
   error: Option.none(),
+  listed: false,
 };
 
 function validateStatus(
@@ -220,6 +227,7 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
         refreshing: true,
         offline: false,
         error: Option.none(),
+        listed: false,
       });
 
       // Signed out is the idle state, not a failure: the proactive refresh on
@@ -275,6 +283,7 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
       yield* SubscriptionRef.update(state, (current) => ({
         ...current,
         environments: next,
+        listed: true,
       }));
 
       yield* Effect.forEach(

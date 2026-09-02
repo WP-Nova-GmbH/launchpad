@@ -51,6 +51,7 @@ import * as EnvironmentLinks from "./EnvironmentLinks.ts";
 import * as ManagedEndpointAllocations from "./ManagedEndpointAllocations.ts";
 import * as Machines from "../machines/Machines.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
+import * as UserDirectory from "../tenancy/UserDirectory.ts";
 import * as RelayConfiguration from "../Config.ts";
 import { isManagedEndpointHostname } from "../deploymentConfig.ts";
 
@@ -433,6 +434,7 @@ const make = Effect.gen(function* () {
   const allocations = yield* ManagedEndpointAllocations.ManagedEndpointAllocations;
   const machines = yield* Machines.Machines;
   const organizations = yield* Organizations.Organizations;
+  const userDirectory = yield* UserDirectory.UserDirectory;
   const settings = yield* RelayConfiguration.RelayConfiguration;
   const httpClient = yield* HttpClient.HttpClient;
   const crypto = yield* Crypto.Crypto;
@@ -791,6 +793,10 @@ const make = Effect.gen(function* () {
         link,
         allocation,
       });
+      // Resolved per connect rather than stored: the environment keeps the
+      // name for the life of the session it mints, and the next connect
+      // picks up a renamed profile. Lookup failures degrade to no name.
+      const identity = (yield* userDirectory.lookup({ userIds: [input.userId] })).get(input.userId);
       const now = yield* DateTime.now;
       const expiresAt = DateTime.add(now, { minutes: 2 });
       const nonce = yield* crypto.randomUUIDv4.pipe(
@@ -823,6 +829,8 @@ const make = Effect.gen(function* () {
         clientProofKeyThumbprint: input.clientProofKeyThumbprint,
         cnf: { jkt: input.clientProofKeyThumbprint },
         ...(input.deviceId ? { deviceId: input.deviceId } : {}),
+        ...(identity?.displayName ? { name: identity.displayName } : {}),
+        ...(identity?.imageUrl ? { picture: identity.imageUrl } : {}),
         nonce,
         scope: ["environment:connect"],
       } satisfies RelayCloudMintCredentialProofPayload;

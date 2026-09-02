@@ -5,8 +5,10 @@ import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Struct from "effect/Struct";
 import { ProviderOptionSelections } from "./model.ts";
 import { RepositoryIdentity, ThreadEnvMode } from "./environment.ts";
+import { AuthSessionUser } from "./auth.ts";
 import {
   ApprovalRequestId,
+  AuthSessionId,
   CheckpointRef,
   CommandId,
   EventId,
@@ -32,6 +34,8 @@ export const ORCHESTRATION_WS_METHODS = {
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
+  reportThreadPresence: "orchestration.reportThreadPresence",
+  subscribeThreadPresence: "orchestration.subscribeThreadPresence",
 } as const;
 
 export const ProviderApprovalPolicy = Schema.Literals([
@@ -259,10 +263,41 @@ export const OrchestrationMessage = Schema.Struct({
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
+  /** Who sent a user message. Absent when the session had no signed-in user. */
+  author: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
 export type OrchestrationMessage = typeof OrchestrationMessage.Type;
+
+/**
+ * One connected client looking at one thread. Ephemeral: lives in server
+ * memory for as long as the reporting connection does and never enters the
+ * event log. `user` is null for locally paired sessions, which the UI shows
+ * by device label instead.
+ */
+export const ThreadPresenceParticipant = Schema.Struct({
+  sessionId: AuthSessionId,
+  threadId: ThreadId,
+  user: Schema.NullOr(AuthSessionUser),
+  clientLabel: Schema.NullOr(TrimmedNonEmptyString),
+  typing: Schema.Boolean,
+  updatedAt: IsoDateTime,
+});
+export type ThreadPresenceParticipant = typeof ThreadPresenceParticipant.Type;
+
+/** Everyone present on any thread of this environment except the receiving session. */
+export const ThreadPresenceSnapshot = Schema.Struct({
+  participants: Schema.Array(ThreadPresenceParticipant),
+});
+export type ThreadPresenceSnapshot = typeof ThreadPresenceSnapshot.Type;
+
+/** A null thread means the client left every thread view. */
+export const ThreadPresenceReportInput = Schema.Struct({
+  threadId: Schema.NullOr(ThreadId),
+  typing: Schema.Boolean,
+});
+export type ThreadPresenceReportInput = typeof ThreadPresenceReportInput.Type;
 
 export const OrchestrationProposedPlanId = TrimmedNonEmptyString;
 export type OrchestrationProposedPlanId = typeof OrchestrationProposedPlanId.Type;
@@ -840,6 +875,8 @@ export const ThreadTurnStartCommand = Schema.Struct({
   ),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  /** Stamped by the server from the dispatching session; never client-supplied. */
+  author: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,
 });
 
@@ -1240,6 +1277,7 @@ export const ThreadMessageSentPayload = Schema.Struct({
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
+  author: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });

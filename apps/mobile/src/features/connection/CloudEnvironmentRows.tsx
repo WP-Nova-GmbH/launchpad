@@ -216,6 +216,10 @@ function ConnectedCloudEnvironmentRow(props: {
       connectionErrorTraceId={props.environment.connectionErrorTraceId}
       connectionState={props.environment.connectionState}
       errorExpanded={props.errorExpanded}
+      // An organization machine is kept on every member's device by the
+      // organization itself; the switch would only lie, since discovery
+      // restores it on the next refresh. Admins remove it in Organization.
+      disabled={props.environment.isOrganizationMachine}
       label={props.environment.environmentLabel}
       onValueChange={(enabled) => {
         if (enabled) {

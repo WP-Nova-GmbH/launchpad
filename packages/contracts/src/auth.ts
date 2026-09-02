@@ -228,12 +228,25 @@ export const AuthClientMetadata = Schema.Struct({
 });
 export type AuthClientMetadata = typeof AuthClientMetadata.Type;
 
+/**
+ * The signed-in person behind a session, when the environment learned one.
+ * Set only for sessions minted through Launchpad Connect, whose relay vouches
+ * for the identity; a locally paired session has no user.
+ */
+export const AuthSessionUser = Schema.Struct({
+  userId: TrimmedNonEmptyString,
+  displayName: Schema.NullOr(TrimmedNonEmptyString),
+  imageUrl: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type AuthSessionUser = typeof AuthSessionUser.Type;
+
 export const AuthClientSession = Schema.Struct({
   sessionId: AuthSessionId,
   subject: TrimmedNonEmptyString,
   scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
   client: AuthClientMetadata,
+  user: Schema.optionalKey(AuthSessionUser),
   issuedAt: Schema.DateTimeUtc,
   expiresAt: Schema.DateTimeUtc,
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtc),

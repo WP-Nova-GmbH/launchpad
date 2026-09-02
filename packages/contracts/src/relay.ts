@@ -867,11 +867,20 @@ export class RelayDpopClientAuth extends HttpApiMiddleware.Service<
   security: { relayDpop: RelayDpopAuthorization },
 }) {}
 
+/**
+ * How the caller reaches an environment: through their own link, or because
+ * it is a machine of the organization they belong to. Clients keep machines
+ * saved on their own; links are the user's to add and remove.
+ */
+export const RelayClientEnvironmentSource = Schema.Literals(["link", "machine"]);
+export type RelayClientEnvironmentSource = typeof RelayClientEnvironmentSource.Type;
+
 export const RelayClientEnvironmentRecord = Schema.Struct({
   environmentId: EnvironmentId,
   label: TrimmedNonEmptyString,
   endpoint: RelayManagedEndpoint,
   linkedAt: TrimmedNonEmptyString,
+  source: RelayClientEnvironmentSource,
 });
 export type RelayClientEnvironmentRecord = typeof RelayClientEnvironmentRecord.Type;
 
@@ -1018,6 +1027,12 @@ export const RelayCloudMintCredentialProofPayload = Schema.Struct({
     jkt: TrimmedNonEmptyString,
   }),
   deviceId: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * OIDC-style profile claims for the connecting user, so the environment can
+   * attribute what this session does. Absent when the directory lookup failed.
+   */
+  name: Schema.optional(TrimmedNonEmptyString),
+  picture: Schema.optional(TrimmedNonEmptyString),
   nonce: TrimmedNonEmptyString,
   scope: Schema.Array(Schema.Literal("environment:connect")),
 });

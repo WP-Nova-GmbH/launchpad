@@ -699,6 +699,7 @@ export const clientApi = HttpApiBuilder.group(
                       label: machine.label,
                       endpoint: identity.endpoint,
                       linkedAt: machine.enrolledAt ?? machine.createdAt,
+                      source: "machine",
                     },
                   ];
                 });

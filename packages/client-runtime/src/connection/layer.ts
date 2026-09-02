@@ -8,6 +8,7 @@ import * as EnvironmentRegistry from "./registry.ts";
 import * as ConnectionOnboarding from "./onboarding.ts";
 import * as PlatformConnectionSource from "../platform/source.ts";
 import * as RelayEnvironmentDiscovery from "../relay/discovery.ts";
+import { syncOrganizationMachines } from "../relay/machineSync.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as RpcSession from "../rpc/session.ts";
 
@@ -33,11 +34,13 @@ const connectionStartupLayer = Layer.effectDiscard(
   Effect.gen(function* () {
     const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
     const platformSource = yield* PlatformConnectionSource.PlatformConnectionSource;
+    const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
     yield* registry.start;
     yield* platformSource.registrations.pipe(
       Stream.runForEach(registry.reconcilePlatform),
       Effect.forkScoped,
     );
+    yield* syncOrganizationMachines(discovery.state, registry).pipe(Effect.forkScoped);
   }).pipe(Effect.withSpan("clientRuntime.connection.application.start")),
 );
 

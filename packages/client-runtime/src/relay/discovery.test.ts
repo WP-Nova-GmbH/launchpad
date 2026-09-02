@@ -30,6 +30,7 @@ const environments = [
       providerKind: "cloudflare_tunnel",
     },
     linkedAt: "2026-06-01T00:00:00.000Z",
+    source: "link",
   },
   {
     environmentId: EnvironmentId.make("environment-2"),
@@ -40,6 +41,7 @@ const environments = [
       providerKind: "cloudflare_tunnel",
     },
     linkedAt: "2026-06-01T00:00:00.000Z",
+    source: "link",
   },
 ] satisfies ReadonlyArray<RelayClientEnvironmentRecord>;
 
