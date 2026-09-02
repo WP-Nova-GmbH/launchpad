@@ -84,7 +84,7 @@ import { currentTraceId, withSpanAttributes } from "../observability.ts";
 import { tenancyForbidden } from "./tenancyErrors.ts";
 import * as RelayDb from "../db.ts";
 
-const relayCorsAllowedMethods = ["GET", "POST", "DELETE", "OPTIONS"] as const;
+const relayCorsAllowedMethods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"] as const;
 const relayCorsAllowedHeaders = [
   "authorization",
   "b3",
