@@ -19,8 +19,12 @@ import {
   type SourceControlRepositoryLookupInput,
 } from "@t3tools/contracts";
 
+import { withOrganizationGithubToken } from "@t3tools/shared/runnerCredentials";
+
 import { ServerConfig } from "../config.ts";
+import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import { hasRunnerSourceControlCredential } from "../vcs/runnerCredentials.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 const isSourceControlRepositoryError = Schema.is(SourceControlRepositoryError);
 
@@ -172,6 +176,8 @@ export const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const path = yield* Path.Path;
   const providers = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
+  const organizationCredentials =
+    yield* OrganizationSourceControlCredentials.OrganizationSourceControlCredentials;
 
   const ensureConcreteProvider = (input: {
     readonly operation: string;
@@ -284,15 +290,33 @@ export const make = Effect.gen(function* () {
       });
     }
 
-    const cloneArgs = useGitHubCredentialHelper(provider, remoteUrl)
+    const withHelper = useGitHubCredentialHelper(provider, remoteUrl);
+    const cloneArgs = withHelper
       ? ["clone", "--config", `credential.helper=${GITHUB_CREDENTIAL_HELPER}`]
       : ["clone"];
+    // The organization's installation token, granted right here rather than
+    // left to the VcsProcess credential seam — the clone must carry GH_TOKEN
+    // for `gh auth git-credential` to answer git (ADR-0015). An operator's own
+    // runner token, if any, still wins downstream.
+    const organizationToken =
+      withHelper && !hasRunnerSourceControlCredential()
+        ? ((yield* organizationCredentials.github)?.token ?? null)
+        : null;
+    const cloneEnv =
+      organizationToken === null
+        ? CLONE_NONINTERACTIVE_ENV
+        : withOrganizationGithubToken(CLONE_NONINTERACTIVE_ENV, organizationToken);
+    yield* Effect.logInfo("cloning repository", {
+      remoteUrl,
+      credentialHelper: withHelper,
+      organizationToken: organizationToken !== null,
+    });
     const cloneResult = yield* git
       .execute({
         operation: "SourceControlRepositoryService.cloneRepository",
         cwd: preparedDestination.parentPath,
         args: [...cloneArgs, remoteUrl, preparedDestination.directoryName],
-        env: CLONE_NONINTERACTIVE_ENV,
+        env: cloneEnv,
         allowNonZeroExit: true,
         timeoutMs: 120_000,
         maxOutputBytes: 256 * 1024,

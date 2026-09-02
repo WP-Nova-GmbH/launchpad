@@ -10,6 +10,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { GitCommandError, SourceControlProviderError } from "@t3tools/contracts";
 
 import * as ServerConfig from "../config.ts";
+import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import type * as SourceControlProvider from "./SourceControlProvider.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
@@ -59,6 +60,7 @@ function makeLayer(input: {
   readonly fileSystem?: FileSystem.FileSystem;
 }) {
   const serviceLayer = SourceControlRepositoryService.layer.pipe(
+    Layer.provide(OrganizationSourceControlCredentials.layerNone),
     Layer.provide(
       Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
         get: () => Effect.succeed(input.provider ?? makeProvider()),
