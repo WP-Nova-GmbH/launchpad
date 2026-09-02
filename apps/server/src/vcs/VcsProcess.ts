@@ -2,7 +2,6 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Match from "effect/Match";
-import * as Option from "effect/Option";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
@@ -104,12 +103,12 @@ const classifyNonZeroExit = (command: string, stderr: string): VcsProcessExitFai
 
 export const make = Effect.gen(function* () {
   const processRunner = yield* ProcessRunner.ProcessRunner;
-  // Provided on a managed executor, where the organization's GitHub
-  // installation stands in for a runner token nobody configured by hand
-  // (ADR-0015). Absent on personal machines, which keep their ambient logins.
-  const organizationCredentials = yield* Effect.serviceOption(
-    OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
-  );
+  // On a managed executor the organization's GitHub installation stands in
+  // for a runner token nobody configured by hand (ADR-0015); everywhere else
+  // it answers null and ambient logins apply. A hard dependency on purpose:
+  // an optional lookup silently missed the per-connection VcsProcess.
+  const organizationCredentials =
+    yield* OrganizationSourceControlCredentials.OrganizationSourceControlCredentials;
   // Applied on top of whatever environment the caller asks for: a caller
   // setting GIT_TERMINAL_PROMPT for a clone must not lose the credential.
   const resolveRunnerEnv = (
@@ -118,9 +117,9 @@ export const make = Effect.gen(function* () {
     const baseEnv = requested ?? globalThis.process.env;
     const withCredential = (organizationToken: string | null) =>
       runnerSourceControlEnv(baseEnv, organizationToken) ?? requested ?? null;
-    return hasRunnerSourceControlCredential() || Option.isNone(organizationCredentials)
+    return hasRunnerSourceControlCredential()
       ? Effect.sync(() => withCredential(null))
-      : Effect.map(organizationCredentials.value.github, (credential) =>
+      : Effect.map(organizationCredentials.github, (credential) =>
           withCredential(credential?.token ?? null),
         );
   };
@@ -215,3 +214,6 @@ export const make = Effect.gen(function* () {
 });
 
 export const layer = Layer.effect(VcsProcess, make).pipe(Layer.provide(ProcessRunner.layer));
+
+/** VcsProcess with no organization behind it: tests and non-executor tooling. */
+export const layerLocal = layer.pipe(Layer.provide(OrganizationSourceControlCredentials.layerNone));

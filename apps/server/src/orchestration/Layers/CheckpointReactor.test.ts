@@ -348,7 +348,7 @@ describe("CheckpointReactor", () => {
         ),
       ),
       Layer.provideMerge(WorkspacePaths.layer),
-      Layer.provideMerge(VcsProcess.layer),
+      Layer.provideMerge(VcsProcess.layerLocal),
       Layer.provideMerge(ServerConfigLayer),
       Layer.provideMerge(NodeServices.layer),
     );

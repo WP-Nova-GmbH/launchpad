@@ -32,7 +32,7 @@ const PrTemplateDetectionTestLayer = GitVcsDriver.layer.pipe(
       prefix: "t3-pr-template-test-",
     }),
   ),
-  Layer.provideMerge(VcsProcess.layer),
+  Layer.provideMerge(VcsProcess.layerLocal),
   Layer.provideMerge(NodeServices.layer),
 );
 

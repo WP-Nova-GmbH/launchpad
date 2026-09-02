@@ -18,7 +18,7 @@ const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
 });
 const GitContractLayer = Layer.mergeAll(GitVcsDriver.vcsLayer, GitVcsDriver.layer).pipe(
   Layer.provide(ServerConfigLayer),
-  Layer.provideMerge(VcsProcess.layer),
+  Layer.provideMerge(VcsProcess.layerLocal),
   Layer.provideMerge(NodeServices.layer),
 );
 

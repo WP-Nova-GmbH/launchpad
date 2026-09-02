@@ -160,3 +160,9 @@ export const make = Effect.gen(function* () {
 export const layer = Layer.effect(OrganizationSourceControlCredentials, make).pipe(
   Layer.provide(FetchHttpClient.layer),
 );
+
+/** No organization behind this process: tests, and tooling that never runs as an executor. */
+export const layerNone = Layer.succeed(
+  OrganizationSourceControlCredentials,
+  OrganizationSourceControlCredentials.of({ github: Effect.succeed(null) }),
+);

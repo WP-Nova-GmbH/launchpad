@@ -83,6 +83,7 @@ import { GitWorkflowService } from "../src/git/GitWorkflowService.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as OrganizationProjectCatalogRelay from "../src/relay/OrganizationProjectCatalogRelay.ts";
+import * as OrganizationSourceControlCredentials from "../src/relay/OrganizationSourceControlCredentials.ts";
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
@@ -388,6 +389,7 @@ export const makeOrchestrationIntegrationHarness = (
           start: () => Effect.void,
         }),
       ),
+      Layer.provideMerge(OrganizationSourceControlCredentials.layerNone),
     );
     const layer = Layer.empty.pipe(
       Layer.provideMerge(runtimeServicesLayer),

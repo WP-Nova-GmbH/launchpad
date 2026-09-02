@@ -22,7 +22,7 @@ const run = (input: VcsProcess.VcsProcessInput) =>
     return yield* process.run(input);
   });
 
-const liveLayer = VcsProcess.layer.pipe(Layer.provide(NodeServices.layer));
+const liveLayer = VcsProcess.layerLocal.pipe(Layer.provide(NodeServices.layer));
 
 const provideLive = <A, E, R>(effect: Effect.Effect<A, E, R | VcsProcess.VcsProcess>) =>
   effect.pipe(Effect.provide(liveLayer));
@@ -42,6 +42,7 @@ const captureProcessResult = (
       ProcessRunner.ProcessRunner,
       ProcessRunner.ProcessRunner.of({ run: () => result }),
     ),
+    Effect.provide(OrganizationSourceControlCredentials.layerNone),
     Effect.flatMap((service) => service.run(baseInput)),
     Effect.flip,
   );

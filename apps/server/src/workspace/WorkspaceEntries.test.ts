@@ -24,7 +24,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 const TestLayer = Layer.empty.pipe(
   Layer.provideMerge(WorkspaceEntries.layer.pipe(Layer.provide(WorkspacePaths.layer))),
   Layer.provideMerge(WorkspacePaths.layer),
-  Layer.provideMerge(VcsProcess.layer),
+  Layer.provideMerge(VcsProcess.layerLocal),
   Layer.provide(
     ServerConfig.ServerConfig.layerTest(process.cwd(), {
       prefix: "t3-workspace-entries-test-",

@@ -21,7 +21,7 @@ const TestLayer = Layer.empty.pipe(
   Layer.provideMerge(ProjectLayer),
   Layer.provideMerge(WorkspaceEntries.layer.pipe(Layer.provide(WorkspacePaths.layer))),
   Layer.provideMerge(WorkspacePaths.layer),
-  Layer.provideMerge(VcsDriverRegistry.layer.pipe(Layer.provide(VcsProcess.layer))),
+  Layer.provideMerge(VcsDriverRegistry.layer.pipe(Layer.provide(VcsProcess.layerLocal))),
   Layer.provide(
     ServerConfig.ServerConfig.layerTest(process.cwd(), {
       prefix: "t3-workspace-files-test-",
