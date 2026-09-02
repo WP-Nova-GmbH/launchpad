@@ -1430,13 +1430,34 @@ function OpenCommandPaletteDialog(props: {
           } satisfies CommandPaletteActionItem;
         }) ?? [];
 
+      // A catalog that failed to load must say so here, not only in the
+      // console: an empty section is indistinguishable from "no repositories".
+      const organizationGroupItems: CommandPaletteActionItem[] =
+        organizationRepositoryItems.length > 0
+          ? organizationRepositoryItems
+          : organizationCatalog.error
+            ? [
+                {
+                  kind: "action",
+                  value: `action:add-project:${environmentId}:organization:unavailable`,
+                  searchTerms: ["organization", "repository"],
+                  title: "Organization repositories unavailable",
+                  description: organizationCatalog.error,
+                  disabled: true,
+                  icon: <FolderGit2Icon className={ITEM_ICON_CLASS} />,
+                  keepOpen: true,
+                  run: async () => {},
+                },
+              ]
+            : [];
+
       return [
-        ...(organizationRepositoryItems.length > 0
+        ...(organizationGroupItems.length > 0
           ? [
               {
                 value: `organization-repositories:${environmentId}`,
                 label: "Organization repositories",
-                items: organizationRepositoryItems,
+                items: organizationGroupItems,
               },
             ]
           : []),
@@ -1446,6 +1467,7 @@ function OpenCommandPaletteDialog(props: {
     [
       openSourceControlSettings,
       organizationCatalog.data?.repositories,
+      organizationCatalog.error,
       startAddProjectBrowse,
       startAddProjectClone,
       startAddProjectOrganizationRepository,
@@ -1469,6 +1491,9 @@ function OpenCommandPaletteDialog(props: {
       }
       setAddProjectEnvironmentId(environmentId);
       setAddProjectCloneFlow(null);
+      // The organization's repositories belong on this view; make sure they
+      // are current rather than whatever the last visit left behind.
+      organizationCatalog.refresh();
       pushPaletteView({
         key: addProjectSourcesViewKey(environmentId),
         addonIcon: <FolderPlusIcon className={ADDON_ICON_CLASS} />,
@@ -1484,6 +1509,7 @@ function OpenCommandPaletteDialog(props: {
       browseEnvironmentId,
       buildAddProjectSourceGroups,
       environments,
+      organizationCatalog.refresh,
       pushPaletteView,
       sourceControlDiscovery.data,
     ],
