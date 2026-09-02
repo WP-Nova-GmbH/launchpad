@@ -138,15 +138,6 @@ export const make = Effect.gen(function* () {
     // no runner credential is configured, leaving the inherited environment
     // exactly as it was.
     const resolvedEnv = yield* resolveRunnerEnv(input.env);
-    if (input.command === "git" && input.args.includes("clone")) {
-      const credential = yield* organizationCredentials.github;
-      yield* Effect.logInfo("vcs clone spawning", {
-        hasGithubToken: Boolean(resolvedEnv?.GH_TOKEN),
-        organizationTokenPresent: Boolean(credential?.token),
-        organizationAccount: credential?.accountLogin ?? null,
-        hasRunner: hasRunnerSourceControlCredential(),
-      });
-    }
 
     const result = yield* processRunner
       .run({
