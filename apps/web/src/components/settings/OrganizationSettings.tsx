@@ -2,6 +2,7 @@ import {
   BuildingIcon,
   CopyIcon,
   FolderGit2Icon,
+  KeyRoundIcon,
   ServerIcon,
   TrashIcon,
   UsersIcon,
@@ -14,6 +15,8 @@ import type {
   RelayMachineRole,
   RelayOrgRole,
   RelayOrganizationMember,
+  RelayProviderAccount,
+  RelayProviderAccountProvider,
   RelayRepositoryId,
   RelayRepositoryAccessEntry,
   RelayRepositoryRole,
@@ -37,13 +40,27 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "..
 import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Spinner } from "../ui/spinner";
+import { useAtomValue } from "@effect/atom-react";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+import { defaultInstanceIdForDriver, ProviderDriverKind } from "@t3tools/contracts";
+
+import { usePrimaryEnvironmentId } from "../../state/environments";
+import { EMPTY_SERVER_PROVIDERS, serverEnvironment } from "../../state/server";
+import { useAtomCommand } from "../../state/use-atom-command";
+import { toastManager } from "../ui/toast";
 import {
   hasMachineSettingUp,
   machineEnrollmentCommand,
   machineStatusPresentation,
   memberLabel,
+  PROVIDER_ACCOUNT_PRESENTATIONS,
+  providerAccountDescription,
   unregisteredCheckouts,
   visibleMachines,
+  type ProviderAccountPresentation,
 } from "./OrganizationSettings.logic";
 import {
   SettingsPageContainer,
@@ -557,6 +574,216 @@ function stripQueryParams(names: ReadonlyArray<string>): URLSearchParams {
  * it: the relay mints tokens per request, so nobody holds a GitHub credential,
  * executors included.
  */
+function ProviderAccountRow({
+  presentation,
+  account,
+  isAdmin,
+  state,
+}: {
+  presentation: ProviderAccountPresentation;
+  account: RelayProviderAccount | null;
+  isAdmin: boolean;
+  state: OrganizationAdminState;
+}) {
+  const { provider, name, shareable, keyNames } = presentation;
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const liveProviders =
+    useAtomValue(
+      primaryEnvironmentId
+        ? serverEnvironment.providersValueAtom(primaryEnvironmentId)
+        : serverEnvironment.providersValueAtom("" as never),
+    ) ?? EMPTY_SERVER_PROVIDERS;
+  const driver = ProviderDriverKind.make(provider);
+  const localInstance = liveProviders.find(
+    (candidate) =>
+      candidate.driver === driver && candidate.instanceId === defaultInstanceIdForDriver(driver),
+  );
+  const exportAccount = useAtomCommand(serverEnvironment.exportProviderAccount, {
+    reportFailure: false,
+  });
+  const [sharing, setSharing] = useState(false);
+  const [keyName, setKeyName] = useState<string>(keyNames[0] ?? "");
+  const [keyValue, setKeyValue] = useState("");
+  const [keyFormOpen, setKeyFormOpen] = useState(false);
+
+  const shareFromThisDevice = async () => {
+    if (!primaryEnvironmentId || sharing) return;
+    setSharing(true);
+    try {
+      const result = await exportAccount({
+        environmentId: primaryEnvironmentId,
+        input: { instanceId: defaultInstanceIdForDriver(driver) },
+      });
+      if (result._tag === "Failure") {
+        if (isAtomCommandInterrupted(result)) return;
+        const error = squashAtomCommandFailure(result);
+        toastManager.add({
+          type: "error",
+          title: `Could not read the ${name} sign-in on this device`,
+          description: error instanceof Error ? error.message : "The export failed.",
+        });
+        return;
+      }
+      const exported = result.value;
+      const saved = await state.saveProviderAccount({
+        provider,
+        payload: { label: exported.label, payload: exported.payload },
+      });
+      if (saved) {
+        toastManager.add({
+          type: "success",
+          title: `${name} sign-in shared with the organization`,
+          description: "Executors pick it up within a few minutes.",
+        });
+      }
+    } finally {
+      setSharing(false);
+    }
+  };
+
+  const saveKey = async () => {
+    const value = keyValue.trim();
+    if (!value || !keyName) return;
+    const saved = await state.saveProviderAccount({
+      provider,
+      payload: { label: keyName, payload: { kind: "env", name: keyName, value } },
+    });
+    if (saved) {
+      setKeyValue("");
+      setKeyFormOpen(false);
+    }
+  };
+
+  return (
+    <SettingsRow
+      title={name}
+      description={providerAccountDescription(account)}
+      control={
+        isAdmin ? (
+          <div className="flex items-center gap-2">
+            {shareable ? (
+              <Button
+                size="sm"
+                variant={account ? "outline" : "default"}
+                disabled={
+                  state.busy || sharing || !primaryEnvironmentId || !localInstance?.installed
+                }
+                title={
+                  localInstance?.installed
+                    ? `Copy the ${name} sign-in from this device to the organization`
+                    : `${name} is not installed on this device`
+                }
+                onClick={() => void shareFromThisDevice()}
+              >
+                {sharing ? <Spinner /> : null}
+                {account ? "Share again" : "Share this device's sign-in"}
+              </Button>
+            ) : null}
+            <Button
+              size="sm"
+              variant={shareable || account ? "ghost" : "default"}
+              disabled={state.busy}
+              onClick={() => setKeyFormOpen((open) => !open)}
+            >
+              {keyFormOpen ? "Cancel" : "Use a key"}
+            </Button>
+            {account ? (
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                aria-label={`Remove the ${name} account`}
+                disabled={state.busy}
+                onClick={() => void state.removeProviderAccount(provider)}
+              >
+                <TrashIcon className="size-4" />
+              </Button>
+            ) : null}
+          </div>
+        ) : null
+      }
+    >
+      {isAdmin && keyFormOpen ? (
+        <form
+          className="flex flex-wrap items-center gap-2 px-3 pb-3 sm:px-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void saveKey();
+          }}
+        >
+          {keyNames.length > 1 ? (
+            <Select
+              value={keyName}
+              onValueChange={(value) => {
+                if (typeof value === "string") setKeyName(value);
+              }}
+            >
+              <SelectTrigger className="w-56" aria-label={`Key kind for ${name}`}>
+                <SelectValue>{keyName}</SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="start" alignItemWithTrigger={false}>
+                {keyNames.map((candidate) => (
+                  <SelectItem key={candidate} hideIndicator value={candidate}>
+                    {candidate}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+          ) : (
+            <span className="font-mono text-xs text-muted-foreground">{keyName}</span>
+          )}
+          <Input
+            nativeInput
+            type="password"
+            autoComplete="off"
+            className="w-64"
+            placeholder="Paste the key or token"
+            aria-label={`${name} key`}
+            value={keyValue}
+            onChange={(event) => setKeyValue(event.currentTarget.value)}
+          />
+          <Button type="submit" size="sm" disabled={state.busy || keyValue.trim().length === 0}>
+            Share key
+          </Button>
+        </form>
+      ) : null}
+    </SettingsRow>
+  );
+}
+
+function ProviderAccountsSection({ state }: { state: OrganizationAdminState }) {
+  const snapshot = state.snapshot;
+  if (!snapshot) return null;
+  const isAdmin = snapshot.membership.role === "admin";
+  const byProvider = new Map<RelayProviderAccountProvider, RelayProviderAccount>(
+    snapshot.providerAccounts.map((account) => [account.provider, account]),
+  );
+  return (
+    <SettingsSection
+      id={searchableSetting("organization-provider-accounts").id}
+      title={searchableSetting("organization-provider-accounts").title}
+      icon={<KeyRoundIcon className="size-4 text-muted-foreground" />}
+    >
+      <SectionNote>
+        Sign in once, here, and every executor of this organization uses that account. Sharing a
+        sign-in copies the provider&apos;s session from this device; a key works for providers you
+        bill through an API key. Nobody signs in on a machine.
+      </SectionNote>
+      {isAdmin ? null : (
+        <SectionNote>Only admins can see and change what the organization shares.</SectionNote>
+      )}
+      {PROVIDER_ACCOUNT_PRESENTATIONS.map((presentation) => (
+        <ProviderAccountRow
+          key={presentation.provider}
+          presentation={presentation}
+          account={byProvider.get(presentation.provider) ?? null}
+          isAdmin={isAdmin}
+          state={state}
+        />
+      ))}
+    </SettingsSection>
+  );
+}
+
 function GithubSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
   const isAdmin = snapshot?.membership.role === "admin";
@@ -1203,6 +1430,7 @@ function ConfiguredOrganizationSettings() {
           <OrganizationSection state={state} />
           <MembersSection state={state} />
           <GithubSection state={state} />
+          <ProviderAccountsSection state={state} />
           <RepositoriesSection state={state} />
           <MachinesSection state={state} />
         </>

@@ -48,6 +48,24 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubc
 apt-get update
 apt-get install -y gh
 
+# The provider CLIs the executor runs work with. Signing them in is the
+# organization's job (provider accounts arrive from the relay); installing
+# them is this script's, so the machine is ready the moment it enrolls. The
+# server re-checks on every start and fills in anything missing.
+echo "machine-bootstrap: installing provider CLIs"
+npm install --global \
+  "@openai/codex@${T3CODE_MACHINE_CODEX_VERSION:-latest}" \
+  "@anthropic-ai/claude-code@${T3CODE_MACHINE_CLAUDE_CODE_VERSION:-latest}" \
+  "opencode-ai@${T3CODE_MACHINE_OPENCODE_VERSION:-latest}"
+# Cursor's agent is not on npm; its installer lands in ~/.local/bin, which is
+# not on a service unit's PATH, so link it where one is.
+if curl -fsS https://cursor.com/install | bash; then
+  ln -sf "${HOME}/.local/bin/cursor-agent" /usr/local/bin/cursor-agent
+  ln -sf "${HOME}/.local/bin/cursor-agent" /usr/local/bin/agent
+else
+  echo "machine-bootstrap: Cursor's installer failed; the server retries on start" >&2
+fi
+
 if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
   echo "machine-bootstrap: cloning ${T3CODE_MACHINE_SOURCE_GIT_URL}"
   git clone --depth 1 "${T3CODE_MACHINE_SOURCE_GIT_URL}" "${INSTALL_DIR}"

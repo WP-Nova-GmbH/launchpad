@@ -42,6 +42,12 @@ import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import type { ProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { applyOrganizationProviderAccount } from "../organizationProviderAccount.ts";
+import {
+  CODEX_AUTH_FILE,
+  describeCodexAuthStore,
+  exportAuthStoreFile,
+} from "../ProviderAccountExport.ts";
 import { makeProviderAccountAuth } from "../ProviderAccountAuth.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
@@ -117,10 +123,12 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
   create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
-      const processEnv = mergeProviderInstanceEnvironment(environment);
+      const inheritedEnv = mergeProviderInstanceEnvironment(environment);
       const homeLayout = yield* resolveCodexHomeLayout(config);
       const continuationIdentity = codexContinuationIdentity(homeLayout);
       const stampIdentity = withInstanceIdentity({
@@ -139,6 +147,26 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
               cause,
             }),
         ),
+      );
+      // The organization's Codex sign-in lands in the home the CLI will read;
+      // with a shadow home that is the private auth overlay, never the
+      // shared one another instance may be signed in to.
+      const authStoreDirectory = homeLayout.effectiveHomePath ?? homeLayout.sharedHomePath;
+      const { environment: processEnv } = yield* applyOrganizationProviderAccount({
+        provider: "codex",
+        environment: inheritedEnv,
+        authStoreDirectory,
+      });
+      const accountExport = exportAuthStoreFile({
+        instanceId,
+        provider: "codex",
+        directory: authStoreDirectory,
+        fileName: CODEX_AUTH_FILE,
+        describe: describeCodexAuthStore,
+        signInHint: "Sign in to Codex on this device first.",
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
       );
       const effectiveConfig = {
         ...config,
@@ -221,6 +249,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         adapter,
         textGeneration,
         accountAuth,
+        accountExport,
       } satisfies ProviderInstance;
     }),
 };

@@ -12,6 +12,7 @@ FROM node:24-bookworm
 
 ARG CODEX_VERSION=0.149.0
 ARG CLAUDE_CODE_VERSION=2.1.238
+ARG OPENCODE_VERSION=1.18.21
 ARG CURSOR_AGENT_VERSION=2026.08.11-e8db854
 ARG TARGETARCH
 
@@ -32,7 +33,8 @@ RUN apt-get update \
   && corepack enable \
   && npm install --global \
     "@openai/codex@${CODEX_VERSION}" \
-    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    "opencode-ai@${OPENCODE_VERSION}"
 
 # Cursor publishes one archive per Linux architecture rather than an npm
 # package. Pin both the release and checksum so rebuilding an executor cannot

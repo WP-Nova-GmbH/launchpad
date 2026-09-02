@@ -40,6 +40,7 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { applyOrganizationProviderAccount } from "../organizationProviderAccount.ts";
 import { makeProviderAccountAuth } from "../ProviderAccountAuth.ts";
 import {
   makeProviderMaintenanceCapabilities,
@@ -109,7 +110,13 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
-      const processEnv = mergeProviderInstanceEnvironment(environment);
+      // Cursor's agent has no auth store Launchpad knows how to place, so an
+      // organization account for it can only be a CURSOR_API_KEY.
+      const { environment: processEnv } = yield* applyOrganizationProviderAccount({
+        provider: "cursor",
+        environment: mergeProviderInstanceEnvironment(environment),
+        authStoreDirectory: null,
+      });
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
         instanceId,

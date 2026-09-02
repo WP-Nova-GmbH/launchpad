@@ -21,6 +21,7 @@ import {
 } from "@t3tools/contracts/relay";
 
 import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
+import { sealProviderAccountPayload, toApiProviderAccount } from "./ProviderAccountsApi.ts";
 import { tenancyConflict, tenancyForbidden, tenancyNotFound } from "./tenancyErrors.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as RelayDb from "../db.ts";
@@ -31,6 +32,7 @@ import * as GithubAppSetup from "../tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "../tenancy/GithubInstallations.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
+import * as ProviderAccounts from "../tenancy/ProviderAccounts.ts";
 import * as Repositories from "../tenancy/Repositories.ts";
 import * as UserDirectory from "../tenancy/UserDirectory.ts";
 
@@ -320,6 +322,7 @@ export const organizationApi = HttpApiBuilder.group(
     const githubAppSetup = yield* GithubAppSetup.GithubAppSetup;
     const githubAppRecords = yield* GithubAppRecords.GithubAppRecords;
     const githubInstallations = yield* GithubInstallations.GithubInstallations;
+    const providerAccounts = yield* ProviderAccounts.ProviderAccounts;
     const secretBox = yield* RelaySecretBox.RelaySecretBox;
     const relayConfig = yield* RelayConfiguration.RelayConfiguration;
     const transactions = yield* RelayDb.RelayTransactions;
@@ -669,6 +672,57 @@ export const organizationApi = HttpApiBuilder.group(
               registered: known.has(candidate.canonicalKey),
             })),
           };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "listProviderAccounts",
+        Effect.fn("relay.api.organization.list_provider_accounts")(function* () {
+          const membership = yield* requireCallerIsAdmin();
+          const records = yield* providerAccounts.listForOrganization({
+            organizationId: membership.organization.organizationId,
+          });
+          return { accounts: records.map(toApiProviderAccount) };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "saveProviderAccount",
+        Effect.fn("relay.api.organization.save_provider_account")(function* (args) {
+          const membership = yield* requireCallerIsAdmin();
+          const payloadSealed = yield* sealProviderAccountPayload(args.payload.payload).pipe(
+            Effect.catch(() => relayInternalErrorResponse("internal_error")),
+          );
+          const record = yield* providerAccounts.save({
+            organizationId: membership.organization.organizationId,
+            provider: args.params.provider,
+            kind: args.payload.payload.kind,
+            label: args.payload.label,
+            payloadSealed,
+            userId: membership.userId,
+          });
+          yield* Effect.logInfo("organization provider account saved", {
+            organizationId: membership.organization.organizationId,
+            provider: record.provider,
+            kind: record.kind,
+          });
+          return toApiProviderAccount(record);
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "deleteProviderAccount",
+        Effect.fn("relay.api.organization.delete_provider_account")(function* (args) {
+          const membership = yield* requireCallerIsAdmin();
+          const removed = yield* providerAccounts.delete({
+            organizationId: membership.organization.organizationId,
+            provider: args.params.provider,
+          });
+          if (!removed) {
+            return yield* tenancyNotFound("provider_account_not_found");
+          }
+          yield* Effect.logInfo("organization provider account removed", {
+            organizationId: membership.organization.organizationId,
+            provider: args.params.provider,
+          });
+          return { ok: true };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(

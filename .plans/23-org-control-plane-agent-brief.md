@@ -69,9 +69,12 @@ design discussion; none is obvious from the code.
 
 **Secrets and identity**
 
-9. **No secret ever lands in relay Postgres.** References only; executors resolve them from
-   Infisical at provider session spawn and never persist the value
-   ([ADR-0003](../docs/adr/0003-provider-credentials-are-fetched-by-executors-not-pushed.md)).
+9. **No plaintext secret ever lands in relay Postgres.** Provider accounts and the GitHub App key
+   are stored sealed under the cloud mint key (`auth/SecretBox.ts`) and opened only for the
+   enrolled executor that asks; the key itself never enters the database
+   ([ADR-0003](../docs/adr/0003-provider-credentials-are-fetched-by-executors-not-pushed.md),
+   organization provider accounts amendment). Executors keep what they fetch in memory and in
+   the provider CLI's own store, never in `ServerSecretStore`.
 10. **Clerk is authentication only.** Organizations, membership, roles, and invitations are
     relay-owned. Never read tenancy from a Clerk claim, and never bake `org_id` into a DPoP token —
     resolve `subject → organization → role` locally, so a 30-minute token never carries 30-minute

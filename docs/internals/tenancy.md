@@ -132,19 +132,43 @@ organization already claimed, but it cannot yet prove the caller administers tha
 that would need a user OAuth leg. Claiming someone else's installation means guessing a numeric id
 before its owner claims it. Close this before the relay is multi-tenant.
 
+## Provider accounts
+
+An organization holds at most one **provider account** per provider — Codex, Claude, Cursor,
+OpenCode — so its executors sign in to nothing themselves
+([ADR-0003](../adr/0003-provider-credentials-are-fetched-by-executors-not-pushed.md), organization
+provider accounts amendment). An account is either one environment variable (an API key or
+long-lived token) or the provider CLI's own auth store, copied file for file from the device an
+admin signed in on. The admin's client asks its own server to read the store
+(`server.exportProviderAccount`, implemented per driver as `accountExport`) and stores the result
+at the relay (`saveProviderAccount`, admin-only). The payload lives sealed in
+`relay_organization_provider_accounts` under the same `auth/SecretBox.ts` that guards a GitHub
+App key; `version` changes on every save.
+
+Executors pull, the relay never pushes: an enrolled agent executor fetches the set over its
+environment credential (`providerAccountsServer.fetchProviderAccounts`,
+`http/ProviderAccountsApi.ts`), keeps it in memory
+(`apps/server/src/relay/OrganizationProviderAccounts.ts`), and re-fetches every five minutes. A
+changed version rebuilds the affected provider instances, and each driver places the account while
+building: a variable into the instance environment, an auth store into the directory that CLI reads
+(`~/.codex/auth.json`, `~/.claude/.credentials.json`, OpenCode's `auth.json`) with a marker file
+recording the version, so a session the CLI refreshed on its own is kept until an admin shares a
+new one. The list endpoint returns no secret; only the executor endpoint opens the payload.
+
 ## Tables
 
 All in `infra/relay/src/persistence/schema.ts`:
 
-| table                            | notes                                                               |
-| -------------------------------- | ------------------------------------------------------------------- |
-| `relay_organizations`            | id and name                                                         |
-| `relay_organization_members`     | unique on `user_id` — the "exactly one organization" rule           |
-| `relay_organization_invitations` | unique on `token_hash`; `accepted_at` / `revoked_at` decide pending |
-| `relay_repositories`             | scoped to an organization                                           |
-| `relay_repository_aliases`       | canonical key is the primary key; organization denormalized         |
-| `relay_repository_access`        | `(repository, user)`; organization denormalized                     |
-| `relay_github_installations`     | one per organization; unique on `installation_id`, holds no secret  |
+| table                                  | notes                                                               |
+| -------------------------------------- | ------------------------------------------------------------------- |
+| `relay_organizations`                  | id and name                                                         |
+| `relay_organization_members`           | unique on `user_id` — the "exactly one organization" rule           |
+| `relay_organization_invitations`       | unique on `token_hash`; `accepted_at` / `revoked_at` decide pending |
+| `relay_repositories`                   | scoped to an organization                                           |
+| `relay_repository_aliases`             | canonical key is the primary key; organization denormalized         |
+| `relay_repository_access`              | `(repository, user)`; organization denormalized                     |
+| `relay_github_installations`           | one per organization; unique on `installation_id`, holds no secret  |
+| `relay_organization_provider_accounts` | `(organization, provider)`; payload sealed, `version` bumps on save |
 
 Machines — the organization's provisioned executors and review hosts — have their own tables and
 their own document: [machines.md](./machines.md).

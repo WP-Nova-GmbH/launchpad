@@ -28,7 +28,7 @@
  *
  * @module provider/Services/ProviderInstanceRegistryMutator
  */
-import type { ProviderInstanceConfigMap } from "@t3tools/contracts";
+import type { ProviderDriverKind, ProviderInstanceConfigMap } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 
@@ -43,7 +43,19 @@ export interface ProviderInstanceRegistryMutatorShape {
    * `makeProviderInstanceRegistry`. This keeps settings-watcher loops from
    * erroring out on a single bad entry.
    */
-  readonly reconcile: (configMap: ProviderInstanceConfigMap) => Effect.Effect<void>;
+  readonly reconcile: (
+    configMap: ProviderInstanceConfigMap,
+    options?: ProviderInstanceReconcileOptions,
+  ) => Effect.Effect<void>;
+}
+
+export interface ProviderInstanceReconcileOptions {
+  /**
+   * Drivers whose instances must be rebuilt even though their config is
+   * unchanged — something they read at `create` time, such as the
+   * organization's provider account, has changed underneath them.
+   */
+  readonly rebuildDrivers?: ReadonlySet<ProviderDriverKind> | undefined;
 }
 
 export class ProviderInstanceRegistryMutator extends Context.Service<

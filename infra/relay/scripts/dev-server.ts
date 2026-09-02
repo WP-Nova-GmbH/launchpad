@@ -58,6 +58,7 @@ import {
 } from "../src/http/Api.ts";
 import { machineEnrollmentApi, machinesApi } from "../src/http/MachinesApi.ts";
 import { organizationProjectsApi, projectCatalogServerApi } from "../src/http/ProjectCatalogApi.ts";
+import { providerAccountsServerApi } from "../src/http/ProviderAccountsApi.ts";
 import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
@@ -97,6 +98,7 @@ import * as GithubApp from "../src/tenancy/GithubApp.ts";
 import * as GithubAppRecords from "../src/tenancy/GithubAppRecords.ts";
 import * as GithubAppSetup from "../src/tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "../src/tenancy/GithubInstallations.ts";
+import * as ProviderAccounts from "../src/tenancy/ProviderAccounts.ts";
 import * as RelaySecretBox from "../src/auth/SecretBox.ts";
 import { githubAppSetupRoutes } from "../src/http/GithubAppSetupRoute.ts";
 import * as UserDirectory from "../src/tenancy/UserDirectory.ts";
@@ -309,6 +311,7 @@ const runtimeLayer = Layer.empty
         UserDirectory.layer,
         GithubApp.layer,
         GithubInstallations.layer,
+        ProviderAccounts.layer,
         Machines.layer,
         OrganizationProjectCatalog.layer,
       ),
@@ -352,6 +355,7 @@ const relayApiLayer = Layer.mergeAll(
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
+  providerAccountsServerApi,
 );
 
 const appLayer = relayApiLayer.pipe(

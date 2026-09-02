@@ -35,6 +35,7 @@ import type { ProviderAdapterError, ProviderDriverError } from "./Errors.ts";
 import type { ProviderAdapterShape } from "./Services/ProviderAdapter.ts";
 import type { ServerProviderShape } from "./Services/ServerProvider.ts";
 import type { ProviderAccountAuthShape } from "./ProviderAccountAuth.ts";
+import type { ProviderAccountExporter } from "./ProviderAccountExport.ts";
 
 /**
  * Static metadata advertised by a driver. Used for default presentation
@@ -73,6 +74,12 @@ export interface ProviderInstance {
   readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
   readonly textGeneration: TextGeneration.TextGeneration["Service"];
   readonly accountAuth?: ProviderAccountAuthShape | undefined;
+  /**
+   * Reads this instance's sign-in off the machine so an admin can share it
+   * with their organization. Absent for providers whose session Launchpad
+   * cannot capture.
+   */
+  readonly accountExport?: ProviderAccountExporter | undefined;
 }
 
 export interface ProviderContinuationIdentity {

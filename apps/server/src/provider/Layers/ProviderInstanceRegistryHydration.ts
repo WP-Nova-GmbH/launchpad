@@ -43,6 +43,7 @@
  */
 import {
   defaultInstanceIdForDriver,
+  ProviderDriverKind,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
   ServerSettings,
@@ -51,6 +52,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 
+import { OrganizationProviderAccounts } from "../../relay/OrganizationProviderAccounts.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "../builtInDrivers.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
@@ -118,6 +120,7 @@ const SettingsWatcherLive = Layer.effectDiscard(
   Effect.gen(function* () {
     const mutator = yield* ProviderInstanceRegistryMutator;
     const serverSettings = yield* ServerSettingsService;
+    const organizationAccounts = yield* OrganizationProviderAccounts;
     yield* serverSettings.streamChanges.pipe(
       Stream.runForEach((next) =>
         mutator
@@ -130,6 +133,27 @@ const SettingsWatcherLive = Layer.effectDiscard(
       ),
       Effect.forkScoped,
     );
+    // Drivers read the organization's provider accounts while building an
+    // instance, so a changed account means the affected instances are stale.
+    // On a personal machine the reference is its default and never emits.
+    yield* organizationAccounts.changes.pipe(
+      Stream.runForEach((providers) =>
+        serverSettings.getSettings.pipe(
+          Effect.flatMap((settings) =>
+            mutator.reconcile(deriveProviderInstanceConfigMap(settings), {
+              rebuildDrivers: new Set(
+                [...providers].map((provider) => ProviderDriverKind.make(provider)),
+              ),
+            }),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logError("ProviderInstanceRegistry rebuild for provider accounts failed", cause),
+          ),
+        ),
+      ),
+      Effect.forkScoped,
+    );
+    yield* organizationAccounts.start();
   }),
 );
 

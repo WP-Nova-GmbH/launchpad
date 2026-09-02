@@ -66,6 +66,11 @@ import {
   OrchestrationRpcSchemas,
   OrchestrationGetWorkflowScriptError,
 } from "./orchestration.ts";
+import {
+  ServerProviderAccountExport,
+  ServerProviderAccountExportError,
+  ServerProviderAccountExportInput,
+} from "./providerAccount.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   PullRequestActionInput,
@@ -260,6 +265,7 @@ export const WS_METHODS = {
   serverRefreshProviders: "server.refreshProviders",
   serverAuthenticateProvider: "server.authenticateProvider",
   serverLogoutProvider: "server.logoutProvider",
+  serverExportProviderAccount: "server.exportProviderAccount",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
   serverUpdateServerWithProgress: "server.updateServerWithProgress",
@@ -369,6 +375,12 @@ export const WsServerLogoutProviderRpc = Rpc.make(WS_METHODS.serverLogoutProvide
   payload: ServerProviderAccountAuthInput,
   success: ServerProviderUpdatedPayload,
   error: Schema.Union([ServerProviderAccountAuthError, EnvironmentAuthorizationError]),
+});
+
+export const WsServerExportProviderAccountRpc = Rpc.make(WS_METHODS.serverExportProviderAccount, {
+  payload: ServerProviderAccountExportInput,
+  success: ServerProviderAccountExport,
+  error: Schema.Union([ServerProviderAccountExportError, EnvironmentAuthorizationError]),
 });
 
 export const WsServerUpdateProviderRpc = Rpc.make(WS_METHODS.serverUpdateProvider, {
@@ -1006,6 +1018,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerRefreshProvidersRpc,
   WsServerAuthenticateProviderRpc,
   WsServerLogoutProviderRpc,
+  WsServerExportProviderAccountRpc,
   WsServerUpdateProviderRpc,
   WsServerUpdateServerRpc,
   WsServerUpdateServerWithProgressRpc,

@@ -45,6 +45,7 @@ import {
   type ServerSelfUpdateError,
   type ServerSelfUpdateProgressEvent,
   ServerProviderAccountAuthError,
+  ServerProviderAccountExportError,
   type FilesystemBrowseFailure,
   FilesystemBrowseError,
   AssetWorkspaceContextNotFoundError,
@@ -1502,6 +1503,39 @@ const makeWsRpcLayer = (
               }
               yield* instance.accountAuth.logout;
               return { providers: yield* providerRegistry.refreshInstance(input.instanceId) };
+            }),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.serverExportProviderAccount]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverExportProviderAccount,
+            Effect.gen(function* () {
+              const instance = yield* providerInstanceRegistry.getInstance(input.instanceId);
+              if (!instance) {
+                return yield* new ServerProviderAccountExportError({
+                  instanceId: input.instanceId,
+                  reason: "instance_not_found",
+                });
+              }
+              if (!instance.accountExport) {
+                return yield* new ServerProviderAccountExportError({
+                  instanceId: input.instanceId,
+                  reason: "unsupported",
+                });
+              }
+              const exported = yield* instance.accountExport;
+              // The live snapshot knows who is signed in better than the
+              // store's bytes do; prefer its email for the label.
+              const live = (yield* providerRegistry.getProviders).find(
+                (provider) => provider.instanceId === input.instanceId,
+              );
+              const label = live?.auth.email ?? exported.label;
+              yield* Effect.logInfo("provider account exported for the organization", {
+                instanceId: input.instanceId,
+                driver: instance.driverKind,
+                kind: exported.payload.kind,
+              });
+              return { provider: exported.provider, label, payload: exported.payload };
             }),
             { "rpc.aggregate": "server" },
           ),

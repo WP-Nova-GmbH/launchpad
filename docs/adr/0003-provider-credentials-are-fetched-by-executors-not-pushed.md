@@ -68,3 +68,48 @@ does not create an organization-wide credential pool entry, and deprovisioning t
 destroys its copy. Logout is performed by the same provider CLI on the same executor. This keeps
 opaque, provider-specific refresh state at the boundary that understands it while the original
 executor-direct API-key design remains the path for fleet-wide unattended credentials.
+
+## Amendment: organization provider accounts are held sealed by the relay and delivered to executors
+
+_Supersedes the decision above and the previous amendment. 2026-09-02._
+
+The requirement that surfaced once executors existed is simpler than the design above: an admin
+signs in to Codex, Claude, Cursor, or OpenCode **once**, and every executor of the organization
+works with that sign-in. Nobody signs in on a machine, and a machine that joins later needs nothing
+done to it. The credential people actually hold is a subscription session, not an API key, so a
+design that only distributes keys does not meet it, and one that keeps sessions machine-local
+(the previous amendment) makes every new executor a chore.
+
+**Decision.** The relay holds one **provider account** per provider per organization, in
+`relay_organization_provider_accounts`, as either one environment variable (an API key or a
+long-lived token) or the provider CLI's own auth store copied file for file. The payload is sealed
+with `auth/SecretBox.ts` under the relay's cloud mint key, exactly like a GitHub App private key
+created from Organization settings. Admins capture an account from their own device
+(`server.exportProviderAccount` reads the CLI's store; the admin's client stores it at the relay)
+or paste a key. Enrolled agent executors **pull** the set over their environment credential
+(`providerAccountsServer.fetchProviderAccounts`), keep it in memory, re-fetch on a timer, and place
+it before each provider instance is built: a variable into the instance's environment, an auth
+store into the directory that CLI reads. Infisical is not introduced.
+
+**Why this and not the original.** The revocation argument for Infisical assumed a relay that could
+not reach its executors; the relay now holds a persistent path to every enrolled machine, and an
+account removed at the relay is gone from executors on their next fetch. What Infisical bought
+(per-machine identities, a per-read audit trail) was never built and would have been a second
+secrets system to run for a handful of rows. Sealing in Postgres keeps the "database dump is inert"
+property; the trade is that the cloud mint key now also guards these rows, so rotating it means
+re-sealing them.
+
+**Consequences.**
+
+- Invariant 9 of the agent brief becomes: no **plaintext** secret in relay Postgres. Sealed rows
+  are allowed; the key never is.
+- Provider CLIs refresh OAuth sessions on their own. Executors keep their refreshed copy and the
+  relay's version marker beside it; a copy is replaced only when an admin shares a new sign-in. If a
+  provider revokes the older refresh token when a newer one is issued, executors can drift out of
+  sign-in and the fix is to share again. This is accepted rather than solved.
+- The set of providers is closed: Codex, Claude, and OpenCode take a sign-in or a key; Cursor's
+  agent keeps no session Launchpad can read and takes a key only; Grok is not covered.
+- On-machine exposure is unchanged from the original decision, and an executor still holds the
+  account only in memory and in the provider's own store.
+- Personal machines are untouched: the executor service is provided only to enrolled agent
+  executors, and everywhere else reads as "no accounts".

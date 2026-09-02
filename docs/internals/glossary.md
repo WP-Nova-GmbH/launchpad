@@ -259,19 +259,24 @@ The secret that authenticates an [environment](#environment) to the [relay](#rel
 by the relay as a hash in `relay_environment_credentials`. Never a provider secret — see
 [provider credential](#provider-credential).
 
+#### Provider account
+
+An [organization](#organization)-owned sign-in or key for one [provider](#provider): either
+an environment variable the provider CLI reads, or the CLI's own auth store copied from the
+device an admin signed in on. Held **sealed** by the [relay](#relay), one per provider per
+organization; enrolled agent [executors](#executor) fetch the set over their environment
+credential and place it before building each provider instance. See [ADR-0003][adr3],
+organization provider accounts amendment.
+
 #### Provider credential
 
-An [organization](#organization)-owned secret (an API key) for a [provider](#provider),
-stored in Infisical. The [relay](#relay) holds only a reference to it; the
-[executor](#executor) resolves that reference itself at provider session start. See
-[ADR-0003][adr3].
+Former name for a [provider account](#provider-account) when the design held API keys in
+Infisical and references at the relay. That design was superseded before it was built.
 
 #### Credential pool
 
-The catalogue of [provider credentials](#provider-credential) an organization holds. A
-**scoped set** that admins bind to executors — not a rotation mechanism. Selection from the
-pool happens at provider session start, because provider secrets reach a provider as
-process environment variables and are fixed at spawn.
+Former name for the organization's set of [provider accounts](#provider-account). There is
+no pool to select from: an organization holds at most one account per provider.
 
 #### Installation token
 

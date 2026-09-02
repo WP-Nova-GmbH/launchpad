@@ -41,6 +41,13 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { applyOrganizationProviderAccount } from "../organizationProviderAccount.ts";
+import {
+  OPENCODE_AUTH_FILE,
+  describeOpenCodeAuthStore,
+  exportAuthStoreFile,
+  resolveOpenCodeDataDirectory,
+} from "../ProviderAccountExport.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
   makePackageManagedProviderMaintenanceResolver,
@@ -119,7 +126,26 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
-      const processEnv = mergeProviderInstanceEnvironment(environment);
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const inheritedEnv = mergeProviderInstanceEnvironment(environment);
+      const authStoreDirectory = resolveOpenCodeDataDirectory(path, inheritedEnv);
+      const { environment: processEnv } = yield* applyOrganizationProviderAccount({
+        provider: "opencode",
+        environment: inheritedEnv,
+        authStoreDirectory,
+      });
+      const accountExport = exportAuthStoreFile({
+        instanceId,
+        provider: "opencode",
+        directory: authStoreDirectory,
+        fileName: OPENCODE_AUTH_FILE,
+        describe: describeOpenCodeAuthStore,
+        signInHint: "Run `opencode auth login` on this device first.",
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+      );
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
         instanceId,
@@ -189,6 +215,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         snapshot,
         adapter,
         textGeneration,
+        accountExport,
       } satisfies ProviderInstance;
     }),
 };

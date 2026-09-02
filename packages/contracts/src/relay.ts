@@ -10,6 +10,12 @@ import * as OpenApi from "effect/unstable/httpapi/OpenApi";
 
 import { EnvironmentId, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
+import {
+  PROVIDER_ACCOUNT_LABEL_MAX_LENGTH,
+  ProviderAccountKind,
+  ProviderAccountPayload,
+  ProviderAccountProvider,
+} from "./providerAccount.ts";
 
 export const RelayAgentAwarenessPlatform = Schema.Literal("ios");
 export type RelayAgentAwarenessPlatform = typeof RelayAgentAwarenessPlatform.Type;
@@ -556,6 +562,7 @@ export const RelayTenancyNotFoundReason = Schema.Literals([
   "github_not_connected",
   "github_app_not_configured",
   "machine_not_found",
+  "provider_account_not_found",
 ]);
 export type RelayTenancyNotFoundReason = typeof RelayTenancyNotFoundReason.Type;
 
@@ -776,6 +783,8 @@ const RelayGithubInstallationTokenErrors = [
   RelayTenancyNotFoundError,
   RelayInternalError,
 ] as const;
+
+const RelayProviderAccountsServerErrors = [RelayAuthInvalidError, RelayInternalError] as const;
 
 export class RelayClientPrincipal extends Context.Service<
   RelayClientPrincipal,
@@ -1295,6 +1304,56 @@ export const RelayGithubInstallationTokenResponse = Schema.Struct({
   }),
 });
 export type RelayGithubInstallationTokenResponse = typeof RelayGithubInstallationTokenResponse.Type;
+
+// The payload shapes are shared with the server's export RPC, so the thing an
+// admin captures on their own machine is exactly the thing the relay stores.
+export const RelayProviderAccountProvider = ProviderAccountProvider;
+export type RelayProviderAccountProvider = typeof RelayProviderAccountProvider.Type;
+export const RelayProviderAccountPayload = ProviderAccountPayload;
+export type RelayProviderAccountPayload = typeof RelayProviderAccountPayload.Type;
+export const RelayProviderAccountKind = ProviderAccountKind;
+export type RelayProviderAccountKind = typeof RelayProviderAccountKind.Type;
+export const RELAY_PROVIDER_ACCOUNT_LABEL_MAX_LENGTH = PROVIDER_ACCOUNT_LABEL_MAX_LENGTH;
+
+/** An organization's account for one provider, without its secret. */
+export const RelayProviderAccount = Schema.Struct({
+  provider: RelayProviderAccountProvider,
+  kind: RelayProviderAccountKind,
+  /** Who the account is, as far as the capturing side could tell: an email, a key name. */
+  label: TrimmedNonEmptyString,
+  /** Changes on every save; executors compare it to what they materialized. */
+  version: TrimmedNonEmptyString,
+  updatedByUserId: TrimmedNonEmptyString,
+  createdAt: TrimmedNonEmptyString,
+  updatedAt: TrimmedNonEmptyString,
+});
+export type RelayProviderAccount = typeof RelayProviderAccount.Type;
+
+export const RelayListProviderAccountsResponse = Schema.Struct({
+  accounts: Schema.Array(RelayProviderAccount),
+});
+export type RelayListProviderAccountsResponse = typeof RelayListProviderAccountsResponse.Type;
+
+export const RelaySaveProviderAccountRequest = Schema.Struct({
+  label: TrimmedNonEmptyString.check(Schema.isMaxLength(RELAY_PROVIDER_ACCOUNT_LABEL_MAX_LENGTH)),
+  payload: RelayProviderAccountPayload,
+});
+export type RelaySaveProviderAccountRequest = typeof RelaySaveProviderAccountRequest.Type;
+
+/** What an executor receives: the account with its secret opened. */
+export const RelayExecutorProviderAccount = Schema.Struct({
+  provider: RelayProviderAccountProvider,
+  label: TrimmedNonEmptyString,
+  version: TrimmedNonEmptyString,
+  payload: RelayProviderAccountPayload,
+});
+export type RelayExecutorProviderAccount = typeof RelayExecutorProviderAccount.Type;
+
+export const RelayExecutorProviderAccountsResponse = Schema.Struct({
+  accounts: Schema.Array(RelayExecutorProviderAccount),
+});
+export type RelayExecutorProviderAccountsResponse =
+  typeof RelayExecutorProviderAccountsResponse.Type;
 
 export const RelayRegisterRepositoryRequest = Schema.Struct({
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(RELAY_ORGANIZATION_NAME_MAX_LENGTH)),
@@ -2083,6 +2142,43 @@ export const RelayOrganizationGroup = HttpApiGroup.make("organization")
       success: RelayListGithubRepositoriesResponse,
       error: RelayTenancyErrors,
     }).annotate(OpenApi.Summary, "List repositories the installation can see"),
+    HttpApiEndpoint.get("listProviderAccounts", "/v1/organization/provider-accounts", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListProviderAccountsResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "List the organization's provider accounts")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only. One entry per provider the organization signed in to, without the secret.",
+      ),
+    HttpApiEndpoint.put("saveProviderAccount", "/v1/organization/provider-accounts/:provider", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ provider: RelayProviderAccountProvider }),
+      payload: RelaySaveProviderAccountRequest,
+      success: RelayProviderAccount,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Store or replace the organization's account for a provider")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only. The secret is sealed at rest and handed only to the organization's enrolled agent executors, which pick it up on their next check.",
+      ),
+    HttpApiEndpoint.delete(
+      "deleteProviderAccount",
+      "/v1/organization/provider-accounts/:provider",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({ provider: RelayProviderAccountProvider }),
+        success: RelayOkResponse,
+        error: RelayTenancyErrors,
+      },
+    )
+      .annotate(OpenApi.Summary, "Forget the organization's account for a provider")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only. Executors stop using the account on their next check; the provider's own sign-out is done on the provider.",
+      ),
     HttpApiEndpoint.post("acceptInvitation", "/v1/invitations/accept", {
       headers: RelayBearerRequestHeaders,
       payload: RelayAcceptInvitationRequest,
@@ -2353,6 +2449,29 @@ export const RelaySourceControlServerGroup = HttpApiGroup.make("sourceControlSer
   )
   .middleware(RelayEnvironmentAuth);
 
+export const RelayProviderAccountsServerGroup = HttpApiGroup.make("providerAccountsServer")
+  .add(
+    HttpApiEndpoint.get(
+      "fetchProviderAccounts",
+      "/v1/environments/:environmentId/provider-accounts",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        success: RelayExecutorProviderAccountsResponse,
+        error: RelayProviderAccountsServerErrors,
+      },
+    )
+      .annotate(OpenApi.Summary, "Fetch the organization's provider accounts for an executor")
+      .annotate(
+        OpenApi.Description,
+        "Answers only for an enrolled agent executor. Returns every provider account the organization holds, secrets opened, so the executor can sign its provider CLIs in with them.",
+      ),
+  )
+  .annotate(
+    OpenApi.Description,
+    "Environment-authenticated provider accounts for managed executors.",
+  )
+  .middleware(RelayEnvironmentAuth);
+
 export const RelayApi = HttpApi.make("RelayApi")
   .add(
     RelayHealthGroup,
@@ -2370,6 +2489,7 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayServerGroup,
     RelayProjectCatalogServerGroup,
     RelaySourceControlServerGroup,
+    RelayProviderAccountsServerGroup,
   )
   .annotate(OpenApi.Title, "Launchpad Relay API")
   .annotate(OpenApi.Version, "1.0.0")

@@ -36,6 +36,7 @@ import {
 } from "./http/Api.ts";
 import { machineEnrollmentApi, machinesApi } from "./http/MachinesApi.ts";
 import { organizationProjectsApi, projectCatalogServerApi } from "./http/ProjectCatalogApi.ts";
+import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
 import { sourceControlServerApi } from "./http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
 import { ManagedEndpointZone, RelayApiZone, RelayDeploymentConfig } from "./zone.ts";
@@ -78,6 +79,7 @@ import * as GithubApp from "./tenancy/GithubApp.ts";
 import * as GithubAppRecords from "./tenancy/GithubAppRecords.ts";
 import * as GithubAppSetup from "./tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "./tenancy/GithubInstallations.ts";
+import * as ProviderAccounts from "./tenancy/ProviderAccounts.ts";
 import * as RelaySecretBox from "./auth/SecretBox.ts";
 import { githubAppSetupRoutes } from "./http/GithubAppSetupRoute.ts";
 import * as UserDirectory from "./tenancy/UserDirectory.ts";
@@ -121,6 +123,7 @@ const relayApiLayer = Layer.mergeAll(
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
+  providerAccountsServerApi,
 );
 
 const CloudMintKeyPair = Alchemy.KeyPair("CloudMintKeyPair");
@@ -302,6 +305,7 @@ export const ApiLive = Api.make(
             UserDirectory.layer,
             GithubApp.layer,
             GithubInstallations.layer,
+            ProviderAccounts.layer,
             Machines.layer,
             OrganizationProjectCatalog.layer,
           ),

@@ -126,6 +126,25 @@ learns the token through its credential helper.
 [ADR-0015](../adr/0015-executors-borrow-the-organizations-github-installation.md) has the
 reasoning and the limits (GitHub only; the App's permissions bound what executors can do).
 
+## Provider accounts and CLIs
+
+An executor signs in to no provider either. It fetches the organization's provider accounts
+from the relay and places them before building each provider instance — see
+[tenancy.md](./tenancy.md#provider-accounts) for the flow and
+[ADR-0003](../adr/0003-provider-credentials-are-fetched-by-executors-not-pushed.md) for the
+decision. The service behind it (`apps/server/src/relay/OrganizationProviderAccounts.ts`) is a
+reference with an empty default, provided only to the provider instance registry, so a personal
+machine never consults the relay for accounts.
+
+The provider CLIs themselves come with the machine. The executor image and the Hetzner bootstrap
+install Codex, Claude Code, OpenCode, and Cursor's agent up front; a self-hosted machine, which
+starts from nothing but Node and git, gets them on first start: once enrolled, the server checks
+which provider CLIs resolve and installs the missing ones
+(`apps/server/src/provider/executorProviderToolchain.ts` — npm packages through the provider
+update action, Cursor through its own installer into `~/.local/bin`, which the server adds to its
+PATH). A failed install is logged and shows on the provider settings page like any other missing
+CLI.
+
 ## Tables
 
 In `infra/relay/src/persistence/schema.ts`:

@@ -95,6 +95,34 @@ export const relayGithubApps = pgTable("relay_github_apps", {
 });
 
 /**
+ * An organization's account for one provider: the provider CLI's own auth
+ * store or an API-style token, captured once by an admin and handed to the
+ * organization's agent executors so nobody signs in on a machine (ADR-0003,
+ * "organization provider accounts" amendment).
+ *
+ * The payload is stored sealed (AES-GCM under a key derived from the relay's
+ * cloud mint key, see `auth/SecretBox.ts`), so a copy of this table on its
+ * own is inert. One row per provider per organization; `version` changes on
+ * every save so executors can tell a re-sign-in from a repeat.
+ */
+export const relayOrganizationProviderAccounts = pgTable(
+  "relay_organization_provider_accounts",
+  {
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    provider: varchar("provider", { length: 32 }).notNull(),
+    kind: varchar("kind", { length: 32 }).notNull(),
+    label: text("label").notNull(),
+    payloadSealed: text("payload_sealed").notNull(),
+    version: varchar("version", { length: 64 }).notNull(),
+    createdByUserId: varchar("created_by_user_id", { length: 191 }).notNull(),
+    updatedByUserId: varchar("updated_by_user_id", { length: 191 }).notNull(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.organizationId, table.provider] })],
+);
+
+/**
  * A GitHub App installation claimed by an organization.
  *
  * Holds no secret: the App private key lives in relay configuration and access

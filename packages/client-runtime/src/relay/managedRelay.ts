@@ -124,6 +124,9 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "list relay GitHub installations",
   "disconnect relay GitHub",
   "list relay GitHub repositories",
+  "list relay provider accounts",
+  "save relay provider account",
+  "delete relay provider account",
 ]);
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
@@ -169,6 +172,9 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay GitHub installation listing",
   "Relay GitHub disconnection",
   "Relay GitHub repository listing",
+  "Relay provider account listing",
+  "Relay provider account save",
+  "Relay provider account removal",
 ]);
 export type ManagedRelayRequestActivity = typeof ManagedRelayRequestActivity.Type;
 

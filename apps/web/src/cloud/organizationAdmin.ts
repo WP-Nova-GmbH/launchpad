@@ -14,7 +14,10 @@ import type {
   RelayOrgRole,
   RelayOrganizationMember,
   RelayOrganizationMembership,
+  RelayProviderAccount,
+  RelayProviderAccountProvider,
   RelayRepositoryId,
+  RelaySaveProviderAccountRequest,
   RelayRepositoryRole,
   RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
@@ -38,6 +41,8 @@ export interface OrganizationAdminSnapshot {
   readonly github: RelayGithubConnectionResponse;
   /** What the GitHub installation can see; empty until one is connected. */
   readonly githubRepositories: ReadonlyArray<RelayGithubRepository>;
+  /** The provider sign-ins the organization shares with its executors; admins only. */
+  readonly providerAccounts: ReadonlyArray<RelayProviderAccount>;
 }
 
 /**
@@ -119,6 +124,12 @@ export interface OrganizationAdminState {
     readonly role: RelayMachineRole;
   }) => Promise<boolean>;
   readonly deprovisionMachine: (machineId: RelayMachineId) => Promise<boolean>;
+  /** Store a provider sign-in or key for the organization; replaces the previous one. */
+  readonly saveProviderAccount: (input: {
+    readonly provider: RelayProviderAccountProvider;
+    readonly payload: RelaySaveProviderAccountRequest;
+  }) => Promise<boolean>;
+  readonly removeProviderAccount: (provider: RelayProviderAccountProvider) => Promise<boolean>;
 }
 
 function failureMessage(cause: unknown): string {
@@ -194,6 +205,14 @@ export function useOrganizationAdmin(): OrganizationAdminState {
               client.listInvitations({ clerkToken }),
             )
           : [];
+      // Admin-only for the same reason: what the organization shares with its
+      // executors is administration, not something every member reads.
+      const providerAccounts =
+        membership.role === "admin"
+          ? await call("Could not list provider accounts", (client, clerkToken) =>
+              client.listProviderAccounts({ clerkToken }),
+            )
+          : [];
       // One request per repository. An organization has a handful, and the
       // alternative — showing a grant form with no idea who already has access
       // — is how the first version of this page shipped.
@@ -230,6 +249,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         machines,
         github,
         githubRepositories,
+        providerAccounts,
       });
     } catch (cause) {
       setError(failureMessage(cause));
@@ -269,6 +289,22 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     issuedInvitations,
     issuedMachineEnrollments,
     refresh: load,
+    saveProviderAccount: (input) =>
+      mutate("Could not store the provider account", () =>
+        call("Could not store the provider account", (client, clerkToken) =>
+          client.saveProviderAccount({
+            clerkToken,
+            provider: input.provider,
+            payload: input.payload,
+          }),
+        ),
+      ),
+    removeProviderAccount: (provider) =>
+      mutate("Could not remove the provider account", () =>
+        call("Could not remove the provider account", (client, clerkToken) =>
+          client.deleteProviderAccount({ clerkToken, provider }),
+        ),
+      ),
     renameOrganization: (name) =>
       mutate("Could not rename the organization", () =>
         call("Could not rename the organization", (client, clerkToken) =>

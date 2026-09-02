@@ -849,6 +849,15 @@ export function createServerEnvironmentAtoms<R, E>(
           providerAccountAuthStateKey(environmentId, input.instanceId),
       },
     }),
+    exportProviderAccount: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:export-provider-account",
+      tag: WS_METHODS.serverExportProviderAccount,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) =>
+          providerAccountAuthStateKey(environmentId, input.instanceId),
+      },
+    }),
     updateProvider: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:update-provider",
       tag: WS_METHODS.serverUpdateProvider,

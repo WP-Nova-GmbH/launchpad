@@ -48,6 +48,24 @@ From then on, executors clone, push, and open pull requests with the organizatio
 Work they do is authored by the App, and reaches exactly the repositories you installed it on.
 **Disconnect** forgets the installation; uninstalling the App on GitHub revokes access outright.
 
+## Provider accounts
+
+Your executors need to be signed in to Codex, Claude, Cursor, or OpenCode to do anything, and
+nobody should have to sign in on a machine. So you sign in **once**, on your own device, and share
+that sign-in with the organization: under **Settings → Organization → Provider accounts**, press
+**Share this device's sign-in** next to a provider. Launchpad copies the provider's session from
+this device to the organization, and every executor picks it up within a few minutes, including
+executors you add later. Sign in on this device first if you have not (**Settings → Providers**).
+
+If you bill a provider through an API key instead, press **Use a key** and paste it; Cursor's
+agent only works this way. Each provider holds one account for the organization at a time —
+sharing again replaces it, and **Remove** takes it away from every executor on their next check.
+Sharing a sign-in shares its usage and billing; use a key or a separate account when they should
+not be shared.
+
+Providers refresh their own sessions over time. If executors ever fall out of sign-in for a
+provider, share it again from a signed-in device.
+
 ## Repositories
 
 A repository is recognised by the git remote of a checkout, reduced to `host/owner/repo`. Every
@@ -107,12 +125,11 @@ repository names plus the machine association; it does not sync files or chat hi
 every cataloged project without a separate repository grant. Members see projects for repositories
 on which they hold a role.
 
-Provider account sessions belong to the machine, not to the member who opened the sign-in page.
-From **Settings → Providers**, select the organization machine and sign in to Codex, Claude, or
-Cursor there. Teammates who can operate that environment then use the same machine-local provider
-session; the credentials themselves are never copied to their clients or to another machine. Use an
-organization-owned provider account when access and billing should be shared, and provision a
-separate environment when they should not be.
+Machines come with the provider tools installed, and they sign in with the organization's
+[provider accounts](#provider-accounts) — nobody signs in on a machine. A machine you connect
+yourself installs any provider tool it is missing the first time it starts. Signing in to a
+provider on a machine directly (**Settings → Providers**, with the machine selected) still works
+and stays on that machine until the organization shares a new account for that provider.
 
 Destroying a machine destroys everything on it, including any projects and thread history it
 holds — which is why the trash can asks for a second, labelled click. The organization has a limit

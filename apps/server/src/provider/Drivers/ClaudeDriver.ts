@@ -12,6 +12,8 @@
  *
  * @module provider/Drivers/ClaudeDriver
  */
+import * as NodeOS from "node:os";
+
 import { ClaudeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
@@ -43,6 +45,8 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { applyOrganizationProviderAccount } from "../organizationProviderAccount.ts";
+import { exportClaudeCredentials } from "../ProviderAccountExport.ts";
 import { makeProviderAccountAuth } from "../ProviderAccountAuth.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
@@ -55,7 +59,11 @@ import {
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
 } from "../providerUpdateSettings.ts";
-import { makeClaudeCapabilitiesCacheKey, makeClaudeContinuationGroupKey } from "./ClaudeHome.ts";
+import {
+  makeClaudeCapabilitiesCacheKey,
+  makeClaudeContinuationGroupKey,
+  resolveClaudeHomePath,
+} from "./ClaudeHome.ts";
 import { makeClaudeEnvironment } from "./ClaudeHome.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -127,12 +135,34 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
-      const processEnv = mergeProviderInstanceEnvironment(environment);
+      const inheritedEnv = mergeProviderInstanceEnvironment(environment);
       const fallbackContinuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
         instanceId,
       });
       const effectiveConfig = { ...config, enabled } satisfies ClaudeSettings;
+      // Claude Code reads `.credentials.json` from CLAUDE_CONFIG_DIR when set
+      // and from `~/.claude` otherwise; the organization's sign-in goes
+      // wherever this instance will look.
+      const claudeConfigDirectory =
+        effectiveConfig.homePath.trim().length > 0
+          ? yield* resolveClaudeHomePath(effectiveConfig).pipe(
+              Effect.provideService(Path.Path, path),
+            )
+          : path.join(NodeOS.homedir(), ".claude");
+      const { environment: processEnv } = yield* applyOrganizationProviderAccount({
+        provider: "claudeAgent",
+        environment: inheritedEnv,
+        authStoreDirectory: claudeConfigDirectory,
+      });
+      const accountExport = exportClaudeCredentials({
+        instanceId,
+        configDirectory: claudeConfigDirectory,
+        spawner,
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+      );
       const accountAuthEnvironment = yield* makeClaudeEnvironment(effectiveConfig, processEnv).pipe(
         Effect.provideService(Path.Path, path),
       );
@@ -232,6 +262,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         adapter,
         textGeneration,
         accountAuth,
+        accountExport,
       } satisfies ProviderInstance;
     }),
 };

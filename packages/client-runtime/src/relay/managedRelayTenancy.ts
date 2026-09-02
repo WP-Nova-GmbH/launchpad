@@ -29,7 +29,10 @@ import {
   type RelayOrganizationMember,
   type RelayOrganizationMembership,
   type RelayOrganizationProject,
+  type RelayProviderAccount,
+  type RelayProviderAccountProvider,
   type RelayProvisionMachineRequest,
+  type RelaySaveProviderAccountRequest,
   type RelayRegisterRepositoryRequest,
   type RelayRepository,
   type RelayStartGithubInstallRequest,
@@ -172,6 +175,18 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly listGithubRepositories: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayGithubRepository>, ManagedRelayClientError>;
+    readonly listProviderAccounts: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<ReadonlyArray<RelayProviderAccount>, ManagedRelayClientError>;
+    readonly saveProviderAccount: (input: {
+      readonly clerkToken: string;
+      readonly provider: RelayProviderAccountProvider;
+      readonly payload: RelaySaveProviderAccountRequest;
+    }) => Effect.Effect<RelayProviderAccount, ManagedRelayClientError>;
+    readonly deleteProviderAccount: (input: {
+      readonly clerkToken: string;
+      readonly provider: RelayProviderAccountProvider;
+    }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
   }
 >()("@t3tools/client-runtime/relay/managedRelayTenancy/ManagedRelayTenancyClient") {}
 
@@ -215,6 +230,9 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     ),
     disconnectGithub: unavailable("clientRuntime.managedRelayTenancy.disconnectGithub"),
     listGithubRepositories: unavailable("clientRuntime.managedRelayTenancy.listGithubRepositories"),
+    listProviderAccounts: unavailable("clientRuntime.managedRelayTenancy.listProviderAccounts"),
+    saveProviderAccount: unavailable("clientRuntime.managedRelayTenancy.saveProviderAccount"),
+    deleteProviderAccount: unavailable("clientRuntime.managedRelayTenancy.deleteProviderAccount"),
   });
 }
 
@@ -644,6 +662,50 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.listGithubRepositories"),
+      withRelayClientTracing,
+    ),
+    listProviderAccounts: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .listProviderAccounts({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.map((response) => response.accounts),
+            Effect.mapError(relayRequestError("list relay provider accounts")),
+            timeoutRelayRequest("Relay provider account listing"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.listProviderAccounts"),
+      withRelayClientTracing,
+    ),
+    saveProviderAccount: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .saveProviderAccount({
+            headers: bearerHeaders(input.clerkToken),
+            params: { provider: input.provider },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("save relay provider account")),
+            timeoutRelayRequest("Relay provider account save"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.saveProviderAccount"),
+      withRelayClientTracing,
+    ),
+    deleteProviderAccount: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .deleteProviderAccount({
+            headers: bearerHeaders(input.clerkToken),
+            params: { provider: input.provider },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("delete relay provider account")),
+            timeoutRelayRequest("Relay provider account removal"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.deleteProviderAccount"),
       withRelayClientTracing,
     ),
   });

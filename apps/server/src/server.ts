@@ -62,6 +62,7 @@ import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as OrganizationProjectCatalogRelay from "./relay/OrganizationProjectCatalogRelay.ts";
+import * as OrganizationProviderAccounts from "./relay/OrganizationProviderAccounts.ts";
 import * as OrganizationSourceControlCredentials from "./relay/OrganizationSourceControlCredentials.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -97,6 +98,8 @@ import {
   releaseManagedTunnelOnShutdown,
 } from "./cloud/http.ts";
 import { reconcileMachineEnrollment } from "./cloud/machineEnrollment.ts";
+import { ensureExecutorProviderToolchain } from "./provider/executorProviderToolchain.ts";
+import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import { serverRelayBrokerTracingLayer } from "./cloud/relayTracing.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
@@ -396,7 +399,20 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(ReactorLayerLive, JobRunnerLi
   // through this layer. Built-in drivers come from `BUILT_IN_DRIVERS`;
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
-  Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+  // The organization's provider accounts are provided to the registry alone:
+  // drivers read them while building instances and hydration rebuilds those
+  // instances when the accounts change. Everywhere else the reference keeps
+  // its default and reads as "no accounts".
+  Layer.provideMerge(
+    ProviderInstanceRegistryHydrationLive.pipe(
+      Layer.provide(
+        OrganizationProviderAccounts.layer.pipe(
+          Layer.provide(ServerEnvironment.layer),
+          Layer.provide(ServerSecretStore.layer),
+        ),
+      ),
+    ),
+  ),
   // Shared native/canonical NDJSON writers used by both the per-instance
   // drivers (native stream, written from inside each `<X>Adapter`) and
   // `ProviderService` (canonical stream, written after event normalization).
@@ -619,6 +635,14 @@ export const makeServerLayer = Layer.unwrap(
               ),
               Effect.catch((cause) =>
                 Effect.logWarning("Failed to reconcile machine enrollment on startup", { cause }),
+              ),
+            );
+            // Once enrolled, an executor brings its own provider CLIs up; on
+            // anything else this returns immediately.
+            yield* ensureExecutorProviderToolchain().pipe(
+              Effect.provide(ProviderMaintenanceRunner.layer),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Failed to check the executor provider toolchain", { cause }),
               ),
             );
           }),

@@ -1,5 +1,50 @@
 import type { RepositoryIdentity } from "@t3tools/contracts";
-import type { RelayMachine, RelayRepositorySummary } from "@t3tools/contracts/relay";
+import type {
+  RelayMachine,
+  RelayProviderAccount,
+  RelayProviderAccountProvider,
+  RelayRepositorySummary,
+} from "@t3tools/contracts/relay";
+
+export interface ProviderAccountPresentation {
+  readonly provider: RelayProviderAccountProvider;
+  readonly name: string;
+  /** Whether the app can lift this provider's sign-in off the admin's own device. */
+  readonly shareable: boolean;
+  /** The environment variables the provider CLI accepts a key or token through. */
+  readonly keyNames: ReadonlyArray<string>;
+}
+
+/**
+ * The providers an organization can share an account for, in the order the
+ * page lists them. Cursor's agent keeps no session Launchpad can read, so it
+ * takes a key only; the others take either.
+ */
+export const PROVIDER_ACCOUNT_PRESENTATIONS: ReadonlyArray<ProviderAccountPresentation> = [
+  { provider: "codex", name: "Codex", shareable: true, keyNames: ["OPENAI_API_KEY"] },
+  {
+    provider: "claudeAgent",
+    name: "Claude",
+    shareable: true,
+    keyNames: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+  },
+  { provider: "cursor", name: "Cursor", shareable: false, keyNames: ["CURSOR_API_KEY"] },
+  {
+    provider: "opencode",
+    name: "OpenCode",
+    shareable: true,
+    keyNames: ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"],
+  },
+];
+
+/** One line saying what the organization holds for a provider, for the row under its name. */
+export function providerAccountDescription(account: RelayProviderAccount | null): string {
+  if (account === null) {
+    return "Not shared. Executors have no account for this provider until an admin shares one.";
+  }
+  const what = account.kind === "env" ? "Key" : "Sign-in";
+  return `${what} shared ${account.updatedAt.slice(0, 10)}: ${account.label}. Executors pick up changes within a few minutes.`;
+}
 
 export interface UnregisteredCheckout {
   readonly canonicalKey: string;

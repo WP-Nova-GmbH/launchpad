@@ -78,6 +78,7 @@ import * as ManagedEndpointAllocations from "../environments/ManagedEndpointAllo
 import * as EnvironmentPublishSignatures from "../environments/EnvironmentPublishSignatures.ts";
 import * as MachineLimits from "../machines/MachineLimits.ts";
 import * as Machines from "../machines/Machines.ts";
+import * as ProviderAccounts from "../tenancy/ProviderAccounts.ts";
 import * as MobileRegistrations from "../agentActivity/MobileRegistrations.ts";
 import { currentTraceId, withSpanAttributes } from "../observability.ts";
 import { tenancyForbidden } from "./tenancyErrors.ts";
@@ -1263,6 +1264,7 @@ const RelayCommonPersistenceError = Schema.Union([
   GithubInstallations.GithubInstallationPersistenceError,
   Machines.MachinePersistenceError,
   MachineLimits.MachineLimitPersistenceError,
+  ProviderAccounts.ProviderAccountPersistenceError,
 ]);
 type RelayCommonPersistenceError = typeof RelayCommonPersistenceError.Type;
 const isRelayCommonPersistenceError = Schema.is(RelayCommonPersistenceError);

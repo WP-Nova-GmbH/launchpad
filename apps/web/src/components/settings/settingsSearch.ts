@@ -255,6 +255,11 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/organization",
   },
   {
+    id: "organization-provider-accounts",
+    title: "Provider accounts",
+    to: "/settings/organization",
+  },
+  {
     id: "organization-repositories",
     title: "Repositories and access",
     to: "/settings/organization",
