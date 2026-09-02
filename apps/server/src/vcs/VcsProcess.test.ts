@@ -349,9 +349,18 @@ describe("VcsProcess.run on a managed executor", () => {
     ),
   );
 
-  it.effect("leaves an explicitly provided environment alone", () =>
-    run({ ...printGhToken, env: { PATH: process.env.PATH ?? "" } }).pipe(
-      Effect.map((result) => expect(result.stdout).toBe("<none>")),
+  it.effect("adds the token on top of an environment the caller asked for", () =>
+    // A clone sets GIT_TERMINAL_PROMPT and the like; that must not cost it
+    // the credential, which is exactly what stranded the first executor clone.
+    run({
+      ...printGhToken,
+      args: [
+        "-e",
+        "process.stdout.write((process.env.GH_TOKEN ?? '<none>') + ' ' + (process.env.GIT_TERMINAL_PROMPT ?? '<unset>'))",
+      ],
+      env: { PATH: process.env.PATH ?? "", GIT_TERMINAL_PROMPT: "0" },
+    }).pipe(
+      Effect.map((result) => expect(result.stdout).toBe("ghs_organization 0")),
       provideExecutor,
     ),
   );

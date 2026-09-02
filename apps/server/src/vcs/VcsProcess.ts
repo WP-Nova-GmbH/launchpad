@@ -110,12 +110,20 @@ export const make = Effect.gen(function* () {
   const organizationCredentials = yield* Effect.serviceOption(
     OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
   );
-  const resolveRunnerEnv: Effect.Effect<NodeJS.ProcessEnv | null> =
-    hasRunnerSourceControlCredential() || Option.isNone(organizationCredentials)
-      ? Effect.sync(() => runnerSourceControlEnv(globalThis.process.env))
+  // Applied on top of whatever environment the caller asks for: a caller
+  // setting GIT_TERMINAL_PROMPT for a clone must not lose the credential.
+  const resolveRunnerEnv = (
+    requested: NodeJS.ProcessEnv | undefined,
+  ): Effect.Effect<NodeJS.ProcessEnv | null> => {
+    const baseEnv = requested ?? globalThis.process.env;
+    const withCredential = (organizationToken: string | null) =>
+      runnerSourceControlEnv(baseEnv, organizationToken) ?? requested ?? null;
+    return hasRunnerSourceControlCredential() || Option.isNone(organizationCredentials)
+      ? Effect.sync(() => withCredential(null))
       : Effect.map(organizationCredentials.value.github, (credential) =>
-          runnerSourceControlEnv(globalThis.process.env, credential?.token ?? null),
+          withCredential(credential?.token ?? null),
         );
+  };
 
   const run = Effect.fn("VcsProcess.run")(function* (input: VcsProcessInput) {
     const baseError = {
@@ -130,7 +138,7 @@ export const make = Effect.gen(function* () {
     // runner's push credential is granted (ADR-0009). It resolves to null when
     // no runner credential is configured, leaving the inherited environment
     // exactly as it was.
-    const resolvedEnv = input.env ?? (yield* resolveRunnerEnv);
+    const resolvedEnv = yield* resolveRunnerEnv(input.env);
 
     const result = yield* processRunner
       .run({

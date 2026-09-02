@@ -21,7 +21,6 @@ import {
 
 import { ServerConfig } from "../config.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
-import { runnerSourceControlEnv } from "../vcs/runnerCredentials.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 const isSourceControlRepositoryError = Schema.is(SourceControlRepositoryError);
 
@@ -293,7 +292,7 @@ export const make = Effect.gen(function* () {
         operation: "SourceControlRepositoryService.cloneRepository",
         cwd: preparedDestination.parentPath,
         args: [...cloneArgs, remoteUrl, preparedDestination.directoryName],
-        env: runnerSourceControlEnv(CLONE_NONINTERACTIVE_ENV) ?? CLONE_NONINTERACTIVE_ENV,
+        env: CLONE_NONINTERACTIVE_ENV,
         allowNonZeroExit: true,
         timeoutMs: 120_000,
         maxOutputBytes: 256 * 1024,
