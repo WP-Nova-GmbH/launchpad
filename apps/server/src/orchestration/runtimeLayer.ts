@@ -7,6 +7,7 @@ import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline
 import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery.ts";
 import * as ThreadBackgroundLiveness from "./ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "./ThreadPlanProgress.ts";
+import * as ThreadPresence from "./ThreadPresence.ts";
 
 export const OrchestrationEventInfrastructureLayerLive = Layer.mergeAll(
   OrchestrationEventStoreLive,
@@ -28,6 +29,9 @@ export const OrchestrationInfrastructureLayerLive = Layer.mergeAll(
 ).pipe(
   Layer.provideMerge(ThreadBackgroundLiveness.layer),
   Layer.provideMerge(ThreadPlanProgress.layer),
+  // Presence is written and read by WebSocket connections only; it lives here
+  // so one registry serves every connection.
+  Layer.provideMerge(ThreadPresence.layer),
 );
 
 export const OrchestrationLayerLive = Layer.mergeAll(

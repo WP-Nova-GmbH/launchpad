@@ -57,6 +57,7 @@ import {
   useComposerThreadDraft,
   useEffectiveComposerModelState,
 } from "../../composerDraftStore";
+import { useThreadPresenceReporter } from "../../state/threadPresence";
 import {
   MAX_STASH_ENTRIES,
   partitionStashAttachments,
@@ -684,6 +685,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   const composerDraft = useComposerThreadDraft(composerDraftTarget);
   const prompt = composerDraft.prompt;
+  // Presence rides the draft: a real thread target is the thread being viewed,
+  // and prompt edits are what "typing" means to everyone else on it.
+  useThreadPresenceReporter(
+    typeof composerDraftTarget === "object" ? composerDraftTarget : null,
+    prompt,
+  );
   const composerImages = composerDraft.images;
   const composerTerminalContexts = composerDraft.terminalContexts;
   const composerElementContexts = composerDraft.elementContexts;

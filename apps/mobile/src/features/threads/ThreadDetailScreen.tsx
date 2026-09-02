@@ -1,5 +1,8 @@
 import { type EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
 import type { EnvironmentThreadStatus } from "@t3tools/client-runtime/state/threads";
+import { threadPresenceLabel } from "@t3tools/client-runtime/state/threadPresence";
+import { AppText as Text } from "../../components/AppText";
+import { useThreadPresencePeople, useThreadPresenceReporter } from "../../state/thread-presence";
 import { useKeyboardChatComposerInset, useKeyboardScrollToEnd } from "@legendapp/list/keyboard";
 import type { LegendListRef } from "@legendapp/list/react-native";
 import { HeaderHeightContext } from "@react-navigation/elements";
@@ -289,6 +292,10 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     }
   })();
   const selectedThreadFeed = props.selectedThreadFeed;
+  useThreadPresenceReporter(props.environmentId, props.selectedThread.id, props.draftMessage);
+  const presenceLabel = threadPresenceLabel(
+    useThreadPresencePeople(props.environmentId, props.selectedThread.id),
+  );
   const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;
   const composerOverlapHeight = composerChrome + composerBottomInset;
   // While a user-input request is pending, the questionnaire owns the
@@ -711,6 +718,13 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               ) : null}
             </View>
 
+            {presenceLabel !== null ? (
+              <View className="items-center pb-1">
+                <Text className="font-t3-medium text-xs text-neutral-600 dark:text-neutral-400">
+                  {presenceLabel}
+                </Text>
+              </View>
+            ) : null}
             {/* Hidden (not unmounted) while a user-input request owns the
                 composer slot, so composer drafts and editor state survive. */}
             <View style={activeUserInputRequestId !== null ? { display: "none" } : undefined}>

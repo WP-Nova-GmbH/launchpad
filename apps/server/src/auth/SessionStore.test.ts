@@ -84,6 +84,26 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       expect(verified.expiresAt?.toString()).toBe(issued.expiresAt.toString());
     }).pipe(Effect.provide(makeSessionStoreLayer())),
   );
+  it.effect("remembers the signed-in user on every verification path", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const user = { userId: "user_alice", displayName: "Alice", imageUrl: "https://img/a.png" };
+      const issued = yield* sessions.issue({ subject: "cloud-connect", user });
+      const verified = yield* sessions.verify(issued.token);
+      expect(verified.user).toEqual(user);
+
+      const ticket = yield* sessions.issueWebSocketToken(issued.sessionId);
+      const socketSession = yield* sessions.verifyWebSocketToken(ticket.token);
+      expect(socketSession.user).toEqual(user);
+
+      const listed = yield* sessions.listActive();
+      expect(listed.find((entry) => entry.sessionId === issued.sessionId)?.user).toEqual(user);
+
+      const anonymous = yield* sessions.issue({ subject: "one-time-token" });
+      expect((yield* sessions.verify(anonymous.token)).user).toBeUndefined();
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
   it.effect("rejects malformed session tokens", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;

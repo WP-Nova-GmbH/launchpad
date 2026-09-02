@@ -302,6 +302,70 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("keeps the author of a user message from the command to the read model", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const createdAt = now();
+    const author = { userId: "user_alice", displayName: "Alice", imageUrl: null };
+
+    await system.run(
+      engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-project-author"),
+        projectId: asProjectId("project-author"),
+        title: "Project Author",
+        workspaceRoot: "/tmp/project-author",
+        defaultModelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-author"),
+        threadId: ThreadId.make("thread-author"),
+        projectId: asProjectId("project-author"),
+        title: "Who wrote this",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-author"),
+        threadId: ThreadId.make("thread-author"),
+        message: {
+          messageId: asMessageId("msg-author"),
+          role: "user",
+          text: "hello from Alice",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        author,
+        createdAt,
+      }),
+    );
+
+    const readModel = await system.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-author"));
+    expect(thread?.messages.map((message) => [message.text, message.author])).toEqual([
+      ["hello from Alice", author],
+    ]);
+    await system.dispose();
+  });
+
   it("archives and unarchives threads through orchestration commands", async () => {
     const system = await createOrchestrationSystem();
     const { engine } = system;

@@ -139,3 +139,21 @@ capabilities.
 Relay-managed tunnels use their own tokens and keys. The relay can reuse scope
 parsing and token-exchange conventions, but an environment access token is not a
 relay token and cannot be presented to the relay.
+
+### Session user
+
+A session minted through the relay carries an `AuthSessionUser` (`userId`,
+`displayName`, `imageUrl`). The relay puts `sub`, `name`, and `picture` claims on
+the signed mint proof, resolved from the identity provider per connect
+(`EnvironmentConnector.connect` → `UserDirectory`). The environment copies them
+onto the pairing link it mints (`cloud/http.ts`), the link carries them into the
+session it becomes (`auth_pairing_links.user_json` → `auth_sessions.user_json`),
+and every verification path exposes them as `AuthenticatedSession.user`. Locally
+paired, CLI-issued, and desktop-bootstrap sessions have no user.
+
+Two things read it: the WebSocket dispatch handler stamps it as the `author` of a
+`thread.turn.start` command, which the decider copies onto `thread.message-sent`
+and the projector onto `OrchestrationMessage.author`; and thread presence
+(`orchestration/ThreadPresence.ts`) attaches it to whichever thread the
+connection reports being on. The identity is authenticated data — clients cannot
+supply an author over the wire.

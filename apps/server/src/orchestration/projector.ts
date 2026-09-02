@@ -510,6 +510,7 @@ export function projectEvent(
             ...(payload.attachments !== undefined ? { attachments: payload.attachments } : {}),
             turnId: payload.turnId,
             streaming: payload.streaming,
+            ...(payload.author !== undefined ? { author: payload.author } : {}),
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
           },

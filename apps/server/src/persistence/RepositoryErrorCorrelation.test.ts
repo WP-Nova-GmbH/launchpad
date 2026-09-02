@@ -46,6 +46,7 @@ describe("persistence error correlation", () => {
           os: null,
           browser: null,
         },
+        user: null,
         issuedAt,
         expiresAt,
       });
@@ -81,6 +82,7 @@ describe("persistence error correlation", () => {
             os: null,
             browser: null,
           },
+          user: null,
           issuedAt,
           expiresAt,
         }),
@@ -164,6 +166,7 @@ describe("persistence error correlation", () => {
           subject,
           label: null,
           proofKeyThumbprint: null,
+          user: null,
           createdAt: issuedAt,
           expiresAt,
         }),

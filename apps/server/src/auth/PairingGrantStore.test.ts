@@ -89,6 +89,23 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
     }).pipe(Effect.provide(makePairingGrantStoreLayer())),
   );
 
+  it.effect("carries the vouched-for user from the pairing link into the grant", () =>
+    Effect.gen(function* () {
+      const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
+      const user = { userId: "user_alice", displayName: "Alice", imageUrl: null };
+      const issued = yield* bootstrapCredentials.issueOneTimeToken({
+        subject: "cloud-connect",
+        user,
+      });
+      const grant = yield* bootstrapCredentials.consume(issued.credential);
+      expect(grant.user).toEqual(user);
+
+      const anonymous = yield* bootstrapCredentials.issueOneTimeToken();
+      const anonymousGrant = yield* bootstrapCredentials.consume(anonymous.credential);
+      expect(anonymousGrant.user).toBeUndefined();
+    }).pipe(Effect.provide(makePairingGrantStoreLayer())),
+  );
+
   it.effect("atomically consumes a one-time token when multiple requests race", () =>
     Effect.gen(function* () {
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;

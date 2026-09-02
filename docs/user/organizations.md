@@ -130,6 +130,21 @@ repository names plus the machine association; it does not sync files or chat hi
 every cataloged project without a separate repository grant. Members see projects for repositories
 on which they hold a role.
 
+### Working on a machine together
+
+A machine is shared, so a thread on it can have several people in it at once. Every prompt
+someone sends shows their name and picture above it, the way a chat does, so nobody has to
+guess who asked for what. Nothing is attributed on your own machine, where the only person
+is you.
+
+While you have a thread open on a machine, everyone else looking at that thread sees a small
+note above the composer saying you are there, and while you are writing a prompt it says you
+are typing. The note disappears when you leave the thread, close the app, or stop typing for a
+few seconds. Your own devices never show you to yourself. The mobile app does the same.
+
+Names come from your Launchpad Connect profile. Change your name or picture there and new
+sessions pick it up; prompts you already sent keep the name you had when you sent them.
+
 Machines come with the provider tools installed, and they sign in with the organization's
 [provider accounts](#provider-accounts) — nobody signs in on a machine. A machine you connect
 yourself installs any provider tool it is missing the first time it starts, and every machine

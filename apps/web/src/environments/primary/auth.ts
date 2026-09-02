@@ -7,7 +7,11 @@ import type {
   AuthSessionId,
   AuthSessionState,
 } from "@t3tools/contracts";
-import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
+import {
+  type AuthSessionUser,
+  EnvironmentHttpCommonError,
+  PRIMARY_LOCAL_ENVIRONMENT_ID,
+} from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -133,6 +137,7 @@ export interface ServerClientSessionRecord {
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
+  readonly user?: AuthSessionUser;
   readonly issuedAt: string;
   readonly expiresAt: string;
   readonly lastConnectedAt: string | null;
@@ -456,6 +461,7 @@ export async function listServerClientSessions(): Promise<
       scopes: clientSession.scopes,
       method: clientSession.method,
       client: clientSession.client,
+      ...(clientSession.user ? { user: clientSession.user } : {}),
       issuedAt: DateTime.formatIso(clientSession.issuedAt),
       expiresAt: DateTime.formatIso(clientSession.expiresAt),
       lastConnectedAt:

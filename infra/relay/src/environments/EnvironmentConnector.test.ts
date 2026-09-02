@@ -15,6 +15,7 @@ import {
   RelayEnvironmentMintResponse,
   RelayEnvironmentMintResponseProofPayload,
   RelayJobId,
+  type RelayUserIdentity,
 } from "@t3tools/contracts/relay";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
@@ -208,6 +209,7 @@ function connectorTestLayer(
     readonly machine?: Machines.MachineRecord | null;
     readonly membershipOrganizationId?: string | null;
     readonly allowLocalMachineEndpoints?: boolean;
+    readonly identities?: ReadonlyMap<string, RelayUserIdentity>;
   },
 ) {
   const unexpectedMachineCall = () => Effect.die("unexpected machine store call");
@@ -273,7 +275,7 @@ function connectorTestLayer(
       Layer.succeed(
         UserDirectory.UserDirectory,
         UserDirectory.UserDirectory.of({
-          lookup: () => Effect.succeed(new Map()),
+          lookup: () => Effect.succeed(options?.identities ?? new Map()),
         }),
       ),
     ),
@@ -922,6 +924,48 @@ describe("EnvironmentConnector", () => {
         },
       });
     }).pipe(Effect.provide(connectorTestLayer(execute)));
+  });
+
+  it.effect("names the connecting user in the mint proof when the directory knows them", () => {
+    const seenProofs: Array<RelayCloudMintCredentialProofPayload> = [];
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const mintRequest = decodeMintRequestBody(requestBodyText(request));
+        seenProofs.push(decodeRequestProof(mintRequest.proof));
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(signMintResponse(mintRequest), { status: 200 }),
+        );
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      yield* connector.connect({
+        userId: "user_123",
+        environmentId: "env-connector-test",
+        clientProofKeyThumbprint: "client-proof-key-thumbprint",
+      });
+      expect(seenProofs[0]).toMatchObject({
+        sub: "user_123",
+        name: "Alice Example",
+        picture: "https://img.example.test/alice.png",
+      });
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(execute, {
+          identities: new Map([
+            [
+              "user_123",
+              {
+                displayName: "Alice Example",
+                email: "alice@example.test",
+                imageUrl: "https://img.example.test/alice.png",
+              },
+            ],
+          ]),
+        }),
+      ),
+    );
   });
 
   it.effect("only accepts mint responses signed by the user's linked environment key", () => {

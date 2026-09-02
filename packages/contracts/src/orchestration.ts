@@ -8,7 +8,6 @@ import { RepositoryIdentity, ThreadEnvMode } from "./environment.ts";
 import { AuthSessionUser } from "./auth.ts";
 import {
   ApprovalRequestId,
-  AuthSessionId,
   CheckpointRef,
   CommandId,
   EventId,
@@ -277,7 +276,8 @@ export type OrchestrationMessage = typeof OrchestrationMessage.Type;
  * by device label instead.
  */
 export const ThreadPresenceParticipant = Schema.Struct({
-  sessionId: AuthSessionId,
+  /** Opaque per-WebSocket id; two tabs of one browser are two participants. */
+  connectionId: TrimmedNonEmptyString,
   threadId: ThreadId,
   user: Schema.NullOr(AuthSessionUser),
   clientLabel: Schema.NullOr(TrimmedNonEmptyString),

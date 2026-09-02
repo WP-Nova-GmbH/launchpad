@@ -884,6 +884,11 @@ function renderFeedEntry(
           className="mb-5 items-end"
           {...(enterAnimated ? { entering: FadeInUp.duration(220) } : {})}
         >
+          {message.author ? (
+            <Text className="mb-1 pr-0.5 font-t3-medium text-xs text-neutral-600 dark:text-neutral-400">
+              {message.author.displayName ?? "Teammate"}
+            </Text>
+          ) : null}
           <View
             className="min-w-0 gap-2 rounded-[20px] px-3.5 py-2.5"
             style={{

@@ -66,6 +66,7 @@ import {
   ZapIcon,
 } from "lucide-react";
 import { Button } from "../ui/button";
+import { UserAvatar } from "./UserAvatar";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesCard } from "./ChangedFilesTree";
@@ -974,9 +975,20 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
   const previewImages = userImages.filter((image) => image.name.startsWith("preview-annotation-"));
   const regularImages = userImages.filter((image) => !image.name.startsWith("preview-annotation-"));
   const canRevertAgentWork = typeof row.revertTurnCount === "number";
+  const author = row.message.author ?? null;
 
   return (
     <div className="group flex flex-col items-end gap-1">
+      {author ? (
+        <div className="flex items-center gap-1.5 pr-1 text-[11px] text-muted-foreground">
+          <span className="truncate">{author.displayName ?? "Teammate"}</span>
+          <UserAvatar
+            displayName={author.displayName}
+            imageUrl={author.imageUrl}
+            className="size-4"
+          />
+        </div>
+      ) : null}
       <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
         {regularImages.length > 0 && (
           <div className="mb-2 grid max-w-[420px] grid-cols-2 gap-2">

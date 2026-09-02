@@ -7,6 +7,7 @@
  * @module ProjectionThreadMessageRepository
  */
 import {
+  AuthSessionUser,
   ChatAttachment,
   MessageId,
   OrchestrationMessageRole,
@@ -29,6 +30,7 @@ export const ProjectionThreadMessage = Schema.Struct({
   text: Schema.String,
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
   isStreaming: Schema.Boolean,
+  author: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });

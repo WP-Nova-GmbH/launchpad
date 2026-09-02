@@ -414,6 +414,21 @@ Activity, an in-app provider-update notice, and a message posted to a team chann
 [job event](#job-event) (the fact), [subscription](#subscription) (the routing rule), or
 [delivery](#delivery) (the attempt, device alert or channel message).
 
+#### Author
+
+The person who sent a user message, stamped on `thread.message-sent` from the
+authenticated session's `AuthSessionUser` (see [environment-auth.md](./environment-auth.md#session-user)).
+Present only for sessions minted through the [relay](#relay); a local session has none. A
+snapshot of the name at send time, never re-resolved.
+
+#### Thread presence
+
+Which connections are viewing a thread and whether they are typing. In-memory on the
+[server](#server) (`orchestration/ThreadPresence.ts`), keyed by WebSocket connection, gone
+with the connection; typing is a lease that lapses on its own. Streamed to clients through
+`orchestration.subscribeThreadPresence`, never written to the event log. _Avoid_: "online
+status" — it says nothing about a person, only about an open thread view.
+
 #### Session
 
 Means the **live provider-backed runtime** attached to a thread — it dies and restarts many

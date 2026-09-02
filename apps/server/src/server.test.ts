@@ -101,6 +101,7 @@ const collectQueueUntil = Effect.fn("TransferBudget.collectQueueUntil")(function
 });
 
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
+import * as ThreadPresence from "./orchestration/ThreadPresence.ts";
 import * as ServerConfig from "./config.ts";
 import { makeRoutesLayer } from "./server.ts";
 import * as OrganizationSourceControlCredentials from "./relay/OrganizationSourceControlCredentials.ts";
@@ -876,6 +877,7 @@ const buildAppUnderTest = (options?: {
           ...options?.layers?.serverRuntimeStartup,
         }),
       ),
+      Layer.provide(ThreadPresence.layer),
       Layer.provide(
         Layer.mock(BackgroundPolicy.BackgroundPolicy)({
           reportClientActivity: () => Effect.void,

@@ -104,6 +104,7 @@ import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
+import * as ThreadPresence from "./orchestration/ThreadPresence.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
@@ -354,11 +355,19 @@ function toAuthAccessStreamEvent(
 
 const makeWsRpcLayer = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
+  connectionId: string,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
+      const threadPresence = yield* ThreadPresence.ThreadPresenceService;
+      // Authorship comes from the authenticated session, never from the wire:
+      // a client cannot claim to be someone else.
+      const stampCommandAuthor = (command: OrchestrationCommand): OrchestrationCommand =>
+        command.type === "thread.turn.start" && currentSession.user !== undefined
+          ? { ...command, author: currentSession.user }
+          : command;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1048,7 +1057,9 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
-              const normalizedCommand = yield* normalizeDispatchCommand(command);
+              const normalizedCommand = stampCommandAuthor(
+                yield* normalizeDispatchCommand(command),
+              );
               // Archive and settle both mean "done with this thread", so a
               // live provider session must not keep running background work
               // (PR monitors, dev servers, subagent fleets) after either
@@ -2369,6 +2380,36 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "server" },
           ),
+        [ORCHESTRATION_WS_METHODS.reportThreadPresence]: (input) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.reportThreadPresence,
+            threadPresence.report({
+              connectionId,
+              user: currentSession.user ?? null,
+              clientLabel: null,
+              threadId: input.threadId,
+              typing: input.typing,
+            }),
+            { "rpc.aggregate": "thread" },
+          ),
+        [ORCHESTRATION_WS_METHODS.subscribeThreadPresence]: (_input) =>
+          observeRpcStream(
+            ORCHESTRATION_WS_METHODS.subscribeThreadPresence,
+            Stream.unwrap(
+              Effect.map(threadPresence.subscribe, ({ latest, changes }) =>
+                Stream.concat(Stream.make(latest), changes).pipe(
+                  // Your own connection is never "someone else"; the client
+                  // still filters its own user so a second device stays quiet.
+                  Stream.map((snapshot) => ({
+                    participants: snapshot.participants.filter(
+                      (participant) => participant.connectionId !== connectionId,
+                    ),
+                  })),
+                ),
+              ),
+            ),
+            { "rpc.aggregate": "thread" },
+          ),
         [WS_METHODS.subscribeResourceTelemetry]: (_input) =>
           observeRpcStream(
             WS_METHODS.subscribeResourceTelemetry,
@@ -2395,6 +2436,8 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         const request = yield* HttpServerRequest.HttpServerRequest;
         const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
         const sessions = yield* SessionStore.SessionStore;
+        const threadPresence = yield* ThreadPresence.ThreadPresenceService;
+        const connectionId = globalThis.crypto.randomUUID();
         const session = yield* serverAuth.authenticateWebSocketUpgrade(request).pipe(
           Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
             failEnvironmentAuthInvalid(EnvironmentAuth.serverAuthCredentialReason(error)),
@@ -2407,7 +2450,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           disableTracing: true,
         }).pipe(
           Effect.provide(
-            makeWsRpcLayer(session, previewAutomationBroker).pipe(
+            makeWsRpcLayer(session, connectionId, previewAutomationBroker).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),
@@ -2441,7 +2484,10 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         return yield* Effect.acquireUseRelease(
           sessions.markConnected(session.sessionId),
           () => rpcWebSocketHttpEffect,
-          () => sessions.markDisconnected(session.sessionId),
+          () =>
+            sessions
+              .markDisconnected(session.sessionId)
+              .pipe(Effect.andThen(threadPresence.clear(connectionId))),
         );
       }).pipe(
         Effect.catchTags({
