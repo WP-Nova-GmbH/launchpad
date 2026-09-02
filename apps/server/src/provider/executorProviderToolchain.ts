@@ -58,18 +58,39 @@ export function missingInstallableProviders(
 }
 
 /**
- * User-level installs land in `~/.local/bin` (Cursor's installer, and npm
- * when its prefix is under the home directory). A service unit's PATH does
- * not include it, so make sure this process and everything it spawns can
- * find what was just installed.
+ * A PATH that also covers the given directories, each prepended once. Installs
+ * land where a service unit's PATH does not look — `~/.local/bin` for Cursor's
+ * installer, npm's global prefix for the npm packages — so this process and
+ * everything it spawns must be told.
  */
-export function withUserLocalBin(path: Path.Path, environment: NodeJS.ProcessEnv): string {
-  const localBin = path.join(NodeOS.homedir(), ".local", "bin");
+export function withBinDirectories(
+  environment: NodeJS.ProcessEnv,
+  directories: ReadonlyArray<string>,
+): string {
   const current = environment.PATH ?? "";
-  return current.split(NodePath.delimiter).includes(localBin)
+  const present = new Set(current.split(NodePath.delimiter));
+  const missing = directories.filter((directory) => !present.has(directory));
+  return missing.length === 0
     ? current
-    : `${localBin}${NodePath.delimiter}${current}`;
+    : [...missing, current].filter((entry) => entry.length > 0).join(NodePath.delimiter);
 }
+
+/** Where `npm install --global` puts executables: `<npm prefix -g>/bin`, or null when npm cannot say. */
+const npmGlobalBinDirectory = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  path: Path.Path,
+): Effect.Effect<string | null> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const child = yield* spawner.spawn(ChildProcess.make("npm", ["prefix", "-g"]));
+      const [stdout, exitCode] = yield* Effect.all([
+        child.stdout.pipe(Stream.decodeText(), Stream.mkString),
+        child.exitCode,
+      ]);
+      const prefix = stdout.trim();
+      return Number(exitCode) === 0 && prefix.length > 0 ? path.join(prefix, "bin") : null;
+    }),
+  ).pipe(Effect.orElseSucceed(() => null));
 
 const installCursorAgent = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
@@ -107,7 +128,11 @@ export const ensureExecutorProviderToolchain = Effect.fn("ensureExecutorProvider
     const runner = yield* ProviderMaintenanceRunner;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 
-    process.env.PATH = withUserLocalBin(path, process.env);
+    const npmBin = yield* npmGlobalBinDirectory(spawner, path);
+    process.env.PATH = withBinDirectories(process.env, [
+      path.join(NodeOS.homedir(), ".local", "bin"),
+      ...(npmBin === null ? [] : [npmBin]),
+    ]);
     const missing = missingInstallableProviders(yield* registry.refresh());
     if (missing.length === 0) {
       return NOTHING;

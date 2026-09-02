@@ -2,11 +2,8 @@ import * as NodePath from "node:path";
 
 import { ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
-import * as NodeServices from "@effect/platform-node/NodeServices";
-import * as Effect from "effect/Effect";
-import * as Path from "effect/Path";
 
-import { missingInstallableProviders, withUserLocalBin } from "./executorProviderToolchain.ts";
+import { missingInstallableProviders, withBinDirectories } from "./executorProviderToolchain.ts";
 
 function provider(driver: string, installed: boolean, instanceId = driver): ServerProvider {
   return {
@@ -39,13 +36,15 @@ describe("missingInstallableProviders", () => {
   });
 });
 
-describe("withUserLocalBin", () => {
-  it("prepends ~/.local/bin once", () =>
-    Effect.gen(function* () {
-      const path = yield* Path.Path;
-      const once = withUserLocalBin(path, { PATH: "/usr/bin" });
-      expect(once.endsWith(`${NodePath.delimiter}/usr/bin`)).toBe(true);
-      expect(once).toMatch(/\.local[\\/]bin/);
-      expect(withUserLocalBin(path, { PATH: once })).toBe(once);
-    }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+describe("withBinDirectories", () => {
+  it("prepends each missing directory once, in order", () => {
+    const d = NodePath.delimiter;
+    const once = withBinDirectories({ PATH: "/usr/bin" }, ["/home/x/.local/bin", "/opt/node/bin"]);
+    expect(once).toBe(`/home/x/.local/bin${d}/opt/node/bin${d}/usr/bin`);
+    expect(withBinDirectories({ PATH: once }, ["/opt/node/bin", "/home/x/.local/bin"])).toBe(once);
+  });
+
+  it("copes with an empty PATH", () => {
+    expect(withBinDirectories({}, ["/opt/node/bin"])).toBe("/opt/node/bin");
+  });
 });
