@@ -309,6 +309,18 @@ export const make = Effect.gen(function* () {
         ),
       );
     if (cloneResult.exitCode !== 0) {
+      // The client gets the classified detail; the operator's log gets what
+      // git actually said, with any embedded credential scrubbed.
+      yield* Effect.logWarning("repository clone failed", {
+        remoteUrl,
+        exitCode: cloneResult.exitCode,
+        credentialHelper: cloneArgs.length > 1,
+        stderr: cloneResult.stderr
+          .replace(/\/\/[^/@\s]+@/g, "//<redacted>@")
+          .split(/\r?\n/)
+          .filter((line) => line.trim().length > 0)
+          .slice(0, 6),
+      });
       return yield* new SourceControlRepositoryError({
         operation: "cloneRepository",
         provider,
