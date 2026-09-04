@@ -38,6 +38,8 @@ function relayProtectedError(error: RelayProtectedError): ConnectionAttemptError
     case "RelayEnvironmentLinkProofExpiredError":
     case "RelayAgentActivityPublishProofExpiredError":
     case "RelayAgentActivityPublishProofInvalidError":
+    case "RelayProjectCatalogPublishProofExpiredError":
+    case "RelayProjectCatalogPublishProofInvalidError":
       return new ConnectionBlockedError({
         reason: "authentication",
         detail: error.message,
