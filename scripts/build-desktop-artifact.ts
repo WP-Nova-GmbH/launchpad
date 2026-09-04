@@ -2841,10 +2841,18 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const stageProdResourcesDir = path.join(stageAppDir, "apps/desktop/prod-resources");
   yield* fs.copy(stageResourcesDir, stageProdResourcesDir);
 
+  // A signed macOS build only needs a Developer ID certificate (and API key
+  // for notarization); electron-builder then applies its default hardened
+  // runtime entitlements. Passkey sign-in additionally needs the Associated
+  // Domains entitlement, which macOS only honors with an embedded provisioning
+  // profile, so that path is opted into by providing the profile.
+  const repoEnv = loadRepoEnv({ repoRoot });
   const configuredMacPasskeySigning =
-    options.platform === "mac" && options.signed
+    options.platform === "mac" &&
+    options.signed &&
+    (repoEnv.T3CODE_MACOS_PROVISIONING_PROFILE?.trim() ?? "").length > 0
       ? yield* Effect.try({
-          try: () => resolveMacPasskeySigningConfiguration(loadRepoEnv({ repoRoot })),
+          try: () => resolveMacPasskeySigningConfiguration(repoEnv),
           catch: MacPasskeySigningConfigurationResolutionError.fromCause,
         })
       : undefined;

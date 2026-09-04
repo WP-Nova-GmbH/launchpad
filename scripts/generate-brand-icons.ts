@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @effect-diagnostics nodeBuiltinImport:off globalConsole:off - One-off asset generator run by hand, not an Effect runtime.
 /**
  * Regenerates the production brand icon set from the Launchpad mascot artwork.
  *

@@ -70,6 +70,17 @@ If a step fails:
 3. For a command-line server, relaunch it with `npx t3@<client-version>`, replacing
    `<client-version>` with the client version shown in the warning.
 
+## The Desktop App
+
+The desktop app checks for new releases shortly after it starts and again while it stays open.
+When one is available, a rocket button appears in the sidebar. Select it once to download the
+update, then select it again to restart into the new version. Nothing installs without those two
+clicks, so you can finish what you are doing first.
+
+On macOS, automatic updates require a signed release. If the app finds an update but cannot
+install it, download the latest release by hand and replace the app once; later updates then
+install normally.
+
 ## The Mobile App
 
 The mobile app keeps itself current on its own. When it finds a new version, it downloads it in the

@@ -16,9 +16,9 @@ pushes to `main`:
   release breakage surfaces on PRs rather than at tag time.
 
 `.github/workflows/release.yml` builds macOS (`arm64` and `x64`), Linux (`x64`), and Windows (`x64`)
-desktop artifacts from a single `v*.*.*` tag and publishes one GitHub release. It auto-enables
-signing only when platform credentials are present. macOS passkey builds additionally require
-`APPLE_TEAM_ID` and the `MACOS_PROVISIONING_PROFILE` secret; Windows uses Azure Trusted Signing.
-Without the core signing credentials, it still releases unsigned artifacts.
+desktop artifacts from a single `v*.*.*` tag on GitHub-hosted runners and publishes one GitHub
+release, which installed apps use as their auto-update feed. A manual dry run builds every platform
+without publishing. Signing is auto-enabled only when the platform credentials are present; without
+them the workflow still releases unsigned artifacts, but unsigned macOS builds cannot auto-update.
 
 See [Release Checklist](../operations/release.md) for the full release/signing setup checklist.

@@ -19,35 +19,15 @@ This starts the Launchpad server on your machine and opens the local web app. Us
 
 ## Desktop App
 
-Download the latest release from
-[GitHub Releases](https://github.com/pingdotgg/t3code/releases), or install from a package
-registry.
+Download the installer for your platform from the latest
+[GitHub Release](https://github.com/WP-Nova-GmbH/launchpad/releases/latest):
 
-Windows:
+- macOS: the `.dmg` for Apple Silicon (`arm64`) or Intel (`x64`)
+- Windows: the `.exe` installer
+- Linux: the `.AppImage`
 
-```bash
-winget install T3Tools.T3Code
-```
-
-macOS:
-
-```bash
-brew install --cask t3-code
-```
-
-Arch Linux:
-
-Stable:
-
-```bash
-yay -S t3code-bin
-```
-
-Nightly:
-
-```bash
-yay -S t3code-nightly-bin
-```
+The desktop app checks for new releases on its own and shows an update button when one is
+available. See [Keeping Launchpad in Sync](./updating.md).
 
 ## Providers
 

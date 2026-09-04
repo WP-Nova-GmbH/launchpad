@@ -1000,6 +1000,25 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
 
+  it.effect("signs macOS builds without passkey entitlements when no profile is provided", () =>
+    Effect.gen(function* () {
+      const config = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "1.2.3",
+        true,
+        false,
+        undefined,
+        undefined,
+      );
+
+      const mac = config.mac as Record<string, unknown>;
+      assert.notProperty(mac, "entitlements");
+      assert.notProperty(mac, "provisioningProfile");
+      assert.deepStrictEqual(mac.target, ["dmg", "zip"]);
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
+  );
+
   it.effect("uses the nightly DMG background for nightly macOS builds", () =>
     Effect.gen(function* () {
       const config = yield* createBuildConfig(
