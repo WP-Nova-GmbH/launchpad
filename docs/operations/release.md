@@ -34,21 +34,27 @@ the pipeline after changing the build script or the workflow.
 
 ## Cutting a release
 
-1. Make sure `main` is green in CI.
-2. Pick the next version. Package manifests are aligned to the tag at build time, so nothing needs
-   to be bumped in the repository.
-3. Tag and push:
+1. Make sure `main` is green in CI and your checkout is on `main`, up to date with `origin/main`.
+2. Run the release script with a bump keyword or an explicit version:
 
    ```sh
-   git tag v0.2.0
-   git push origin v0.2.0
+   vp run release patch          # 0.1.8 -> 0.1.9
+   vp run release minor          # 0.1.8 -> 0.2.0
+   vp run release 0.2.0-beta.1   # a prerelease installed apps ignore
+   vp run release patch --dry-run
    ```
 
-4. Watch the workflow: preflight passes, all four builds pass, the release job uploads the
-   expected files.
-5. Smoke test a downloaded artifact.
+   It bumps the version in `apps/server`, `apps/desktop`, `apps/web`, and `packages/contracts`,
+   refreshes the lockfile, commits `chore(release): vX.Y.Z`, tags `vX.Y.Z`, and pushes the commit
+   and tag together. It refuses to run off `main`, behind `origin/main`, with staged changes, or
+   for a tag that already exists.
 
-Installed apps on the previous version see the new release on their next update check.
+3. Watch the workflow: preflight passes, all four builds pass, the release job uploads the
+   expected files.
+4. Smoke test a downloaded artifact.
+
+Installed apps on the previous version see the new release on their next update check. Pushing a
+`vX.Y.Z` tag by hand also works; the script only adds the version commit and the safety checks.
 
 ## Client configuration (`production` environment)
 
