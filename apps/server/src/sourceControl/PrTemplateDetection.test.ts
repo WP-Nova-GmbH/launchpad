@@ -54,6 +54,11 @@ const runWithTempDirectory = <A, E, R>(
       const fileSystem = yield* FileSystem.FileSystem;
       const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-pr-template-" });
       yield* runGit(cwd, ["init", "--initial-branch=main"]);
+      // A commit can kick off git's background maintenance, which keeps
+      // writing pack files after the test has finished and makes removing
+      // the scoped temp directory race with it (ENOTEMPTY on objects/pack).
+      yield* runGit(cwd, ["config", "gc.auto", "0"]);
+      yield* runGit(cwd, ["config", "maintenance.auto", "false"]);
       yield* runGit(cwd, ["config", "user.email", "test@example.com"]);
       yield* runGit(cwd, ["config", "user.name", "Test User"]);
       return yield* test(cwd);
