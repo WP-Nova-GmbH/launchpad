@@ -156,6 +156,20 @@ function relayProtectedErrorMessage(error: RelayProtectedErrorType): string {
       return "Relay rejected an expired agent activity publish proof.";
     case "RelayAgentActivityPublishProofInvalidError":
       return `Relay rejected the agent activity publish proof (${error.reason}).`;
+    case "RelayProjectCatalogPublishProofExpiredError":
+      return "Relay rejected an expired project catalog publish proof.";
+    case "RelayProjectCatalogPublishProofInvalidError":
+      return `Relay rejected the project catalog publish proof (${error.reason}).`;
+    case "RelayMachineEnrollProofInvalidError":
+      return `Relay rejected the machine enrollment proof (${error.reason}).`;
+    case "RelayMachineEnrollFailedError":
+      return `Relay could not enroll the machine (${error.reason}).`;
+    case "RelayMachineEnrollUnavailableError":
+      return `Relay cannot provision the machine's managed endpoint (${error.reason}).`;
+    case "RelayMachineComputeUnavailableError":
+      return error.reason === "not_configured"
+        ? "Relay has no machine compute provider configured."
+        : "Relay could not reach the machine compute provider.";
     case "RelayTenancyForbiddenError":
       return `Relay refused the organization change (${error.reason}).`;
     case "RelayTenancyNotFoundError":

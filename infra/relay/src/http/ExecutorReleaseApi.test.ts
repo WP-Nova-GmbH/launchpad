@@ -104,7 +104,7 @@ describe("resolveExecutorRelease", () => {
     Effect.gen(function* () {
       const error = yield* Effect.flip(resolveExecutorRelease({ environmentId: "environment-1" }));
       expect(error).toBeInstanceOf(RelayTenancyNotFoundError);
-      expect((error as RelayTenancyNotFoundError).reason).toBe("executor_source_not_configured");
+      expect(error).toHaveProperty("reason", "executor_source_not_configured");
     }).pipe(
       Effect.provideService(RelayEnvironmentPrincipal, principal),
       Effect.provide(layers(machine(), undefined)),
