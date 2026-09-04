@@ -11,6 +11,7 @@
 import * as Migrator from "effect/unstable/sql/Migrator";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 // Import all migrations statically
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -133,6 +134,53 @@ export interface RunMigrationsOptions {
 }
 
 /**
+ * A migration id that a database already recorded under a different name means
+ * the id was reused for a different change. The migrator compares ids only, so
+ * it would silently skip the new migration on that database and the schema it
+ * creates never appears — surfacing later as per-request failures. Refuse to
+ * run migrations instead, naming both sides of the mismatch. Recorded ids this
+ * build does not define are tolerated: they are what running older code
+ * against a newer database looks like.
+ */
+const verifyMigrationHistory = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const tableExists = yield* sql.onDialectOrElse({
+    pg: () =>
+      sql`SELECT 1 AS "one" FROM information_schema.tables WHERE table_name = 'effect_sql_migrations'`,
+    orElse: () =>
+      sql`SELECT 1 AS "one" FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'`,
+  });
+  if (tableExists.length === 0) {
+    return;
+  }
+  const recorded = yield* sql<{ migration_id: number; name: string }>`
+    SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
+  `.withoutTransform;
+  const namesById = new Map<number, string>(
+    migrationEntries.map(([id, name]) => [id, name] as const),
+  );
+  const mismatches: Array<string> = [];
+  for (const { migration_id, name } of recorded) {
+    const expected = namesById.get(migration_id);
+    if (expected !== undefined && expected !== name) {
+      mismatches.push(
+        `migration ${migration_id}: database recorded "${name}", this build defines "${expected}"`,
+      );
+    }
+  }
+  if (mismatches.length > 0) {
+    return yield* new Migrator.MigrationError({
+      kind: "BadState",
+      message: [
+        "Recorded migrations do not match this build:",
+        ...mismatches.map((mismatch) => `  - ${mismatch}`),
+        "Refusing to run migrations. A migration id was reused for a different change, so a database that recorded the old id silently skips the new one and never receives its schema changes. Reconcile the database history with this build (or run the matching code) before starting.",
+      ].join("\n"),
+    });
+  }
+});
+
+/**
  * Run all pending migrations.
  *
  * Creates the migrations tracking table (effect_sql_migrations) if it doesn't exist,
@@ -145,6 +193,7 @@ export interface RunMigrationsOptions {
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
 }: RunMigrationsOptions = {}) {
+  yield* verifyMigrationHistory;
   const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
   yield* migrations.length === 0

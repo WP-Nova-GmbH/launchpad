@@ -12,11 +12,11 @@
  *      threads are skipped so the dev server never adopts live work.
  *      Auth sessions, pairing links, command receipts, and provider
  *      runtime rows are dropped — pair a fresh browser against dev.
- *   3. Runs migrations on the result. Because the clone carries the real
- *      `effect_sql_migrations` table, this proves a new migration applies
- *      on top of the real applied set, and the slot check below catches
- *      the silent failure where two branches claim the same
- *      `Migrations/NNN_` id (the second one's CREATE TABLE is skipped).
+ *   3. Checks the clone's `effect_sql_migrations` against this checkout's
+ *      registry, then runs migrations. Because the clone carries the real
+ *      applied set, this proves a new migration applies on top of it, and the
+ *      slot check catches the silent failure where two branches claim the
+ *      same `Migrations/NNN_` id (the second one's CREATE TABLE is skipped).
  *
  * The event log (`orchestration_events`) is pruned per stream while
  * `sqlite_sequence` and `projection_state` carry over untouched, so new
@@ -427,6 +427,18 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
       wrapPhase("snapshot", sourcePath),
     );
 
+    // The slot check runs before migrations: a collision must abort with the
+    // precise error, and runMigrations itself refuses such a database.
+    yield* verifyMigrationSlots().pipe(
+      Effect.provide(NodeSqliteClient.layer({ filename: snapshotPath })),
+      Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new MigrateDevDbPhaseError({ phase: "verify", databasePath: snapshotPath, cause }),
+          ),
+      }),
+    );
+
     // Migrate before pruning: a source older than this checkout would
     // otherwise crash the prune queries on columns that don't exist yet.
     // Running against the full snapshot also exercises new migrations on the
@@ -440,19 +452,6 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
     }).pipe(
       Effect.provide(NodeSqliteClient.layer({ filename: snapshotPath })),
       wrapPhase("migrate", snapshotPath),
-    );
-
-    // Verify while the snapshot is still the only thing touched: a slot
-    // collision must abort before the old worktree db gets replaced with a
-    // schema whose colliding migration was silently skipped.
-    yield* verifyMigrationSlots().pipe(
-      Effect.provide(NodeSqliteClient.layer({ filename: snapshotPath })),
-      Effect.catchTags({
-        SqlError: (cause) =>
-          Effect.fail(
-            new MigrateDevDbPhaseError({ phase: "verify", databasePath: snapshotPath, cause }),
-          ),
-      }),
     );
 
     yield* Console.log(
