@@ -227,7 +227,7 @@ export const ensureExecutorSourceCurrent = Effect.fn("ensureExecutorSourceCurren
         gitUrl: release.gitUrl,
         ref: release.ref,
       });
-      yield* Effect.sync(() => process.exit(0));
+      return yield* Effect.sync(() => process.exit(0));
     }
     return outcome;
   },

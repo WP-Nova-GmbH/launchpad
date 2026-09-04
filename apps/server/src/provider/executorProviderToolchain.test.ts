@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - PATH assembly is checked against the host path delimiter.
 import * as NodePath from "node:path";
 
 import { ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";

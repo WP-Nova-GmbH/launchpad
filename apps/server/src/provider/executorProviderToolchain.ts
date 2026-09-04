@@ -12,12 +12,14 @@
  * @module provider/executorProviderToolchain
  */
 import * as NodeOS from "node:os";
+// @effect-diagnostics-next-line nodeBuiltinImport:off - PATH entries join with the host delimiter outside any Effect runtime.
 import * as NodePath from "node:path";
 
 import { ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
@@ -35,6 +37,18 @@ export const NPM_INSTALLED_PROVIDERS: ReadonlyArray<ProviderDriverKind> = [
 
 export const CURSOR_PROVIDER = ProviderDriverKind.make("cursor");
 const CURSOR_INSTALL_SCRIPT_URL = "https://cursor.com/install";
+
+export class CursorInstallerFailedError extends Schema.TaggedErrorClass<CursorInstallerFailedError>()(
+  "CursorInstallerFailedError",
+  {
+    exitCode: Schema.Number,
+    stderr: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Cursor's installer exited with code ${this.exitCode}: ${this.stderr}`;
+  }
+}
 
 export interface ExecutorToolchainReport {
   readonly installed: ReadonlyArray<ProviderDriverKind>;
@@ -95,9 +109,7 @@ const npmGlobalBinDirectory = (
     }),
   ).pipe(Effect.orElseSucceed(() => null));
 
-const installCursorAgent = (
-  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
-): Effect.Effect<void, unknown> =>
+const installCursorAgent = (spawner: ChildProcessSpawner.ChildProcessSpawner["Service"]) =>
   Effect.scoped(
     Effect.gen(function* () {
       const child = yield* spawner.spawn(
@@ -108,12 +120,25 @@ const installCursorAgent = (
         child.exitCode,
       ]);
       if (Number(exitCode) !== 0) {
-        return yield* Effect.fail(
-          new Error(`Cursor's installer exited with code ${exitCode}: ${stderr.trim()}`),
-        );
+        return yield* new CursorInstallerFailedError({
+          exitCode: Number(exitCode),
+          stderr: stderr.trim(),
+        });
       }
     }),
   ).pipe(Effect.withSpan("installCursorAgent"));
+
+/** Runs one install and turns any failure into a logged "failed" outcome. */
+const attemptInstall = <E, R>(provider: ProviderDriverKind, install: Effect.Effect<void, E, R>) =>
+  install.pipe(
+    Effect.as("installed" as const),
+    Effect.catchCause((cause) =>
+      Effect.logWarning("executor provider install failed", {
+        provider,
+        cause: Cause.pretty(cause),
+      }).pipe(Effect.as("failed" as const)),
+    ),
+  );
 
 /**
  * Bring the executor's provider CLIs up. Idempotent and never failing: a
@@ -158,22 +183,16 @@ export const ensureExecutorProviderToolchain = Effect.fn("ensureExecutorProvider
     const installed: Array<ProviderDriverKind> = [];
     const failed: Array<ProviderDriverKind> = [];
     for (const provider of missing) {
-      const install: Effect.Effect<void, unknown> =
+      const outcome =
         provider === CURSOR_PROVIDER
-          ? installCursorAgent(spawner).pipe(
-              Effect.andThen(registry.refresh(provider)),
-              Effect.asVoid,
+          ? yield* attemptInstall(
+              provider,
+              installCursorAgent(spawner).pipe(
+                Effect.andThen(registry.refresh(provider)),
+                Effect.asVoid,
+              ),
             )
-          : runner.updateProvider(provider).pipe(Effect.asVoid);
-      const outcome = yield* install.pipe(
-        Effect.as("installed" as const),
-        Effect.catchCause((cause) =>
-          Effect.logWarning("executor provider install failed", {
-            provider,
-            cause: Cause.pretty(cause),
-          }).pipe(Effect.as("failed" as const)),
-        ),
-      );
+          : yield* attemptInstall(provider, runner.updateProvider(provider).pipe(Effect.asVoid));
       if (outcome === "installed") {
         installed.push(provider);
         const after = (yield* registry.refresh(provider)).find(

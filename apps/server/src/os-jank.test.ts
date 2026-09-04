@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - Builds the real on-disk layout the jank probe walks.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";

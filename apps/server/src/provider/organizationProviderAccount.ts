@@ -18,11 +18,26 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import type { PlatformError } from "effect/PlatformError";
+import * as Schema from "effect/Schema";
 
 import { OrganizationProviderAccounts } from "../relay/OrganizationProviderAccounts.ts";
 
 /** Sits beside the placed files and records which relay version they came from. */
 export const ORGANIZATION_ACCOUNT_MARKER_FILE = ".launchpad-organization-account";
+
+/** A file in the shared account would land outside the provider's auth store. */
+export class OrganizationProviderAccountFileEscapesError extends Schema.TaggedErrorClass<OrganizationProviderAccountFileEscapesError>()(
+  "OrganizationProviderAccountFileEscapesError",
+  {
+    filePath: Schema.String,
+    directory: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Refusing to place '${this.filePath}' outside '${this.directory}'`;
+  }
+}
 
 export interface AppliedOrganizationProviderAccount {
   readonly label: string;
@@ -40,7 +55,11 @@ export const materializeAuthStore = Effect.fn("materializeOrganizationAuthStore"
     readonly directory: string;
     readonly files: ReadonlyArray<ProviderAccountFile>;
     readonly version: string;
-  }): Effect.fn.Return<"written" | "unchanged", unknown, FileSystem.FileSystem | Path.Path> {
+  }): Effect.fn.Return<
+    "written" | "unchanged",
+    PlatformError | OrganizationProviderAccountFileEscapesError,
+    FileSystem.FileSystem | Path.Path
+  > {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const directory = path.resolve(input.directory);
@@ -54,9 +73,10 @@ export const materializeAuthStore = Effect.fn("materializeOrganizationAuthStore"
       const target = path.resolve(directory, file.path);
       // The contract already forbids `..`; this is the belt to that suspender.
       if (target !== directory && !target.startsWith(`${directory}${path.sep}`)) {
-        return yield* Effect.fail(
-          new Error(`Refusing to place '${file.path}' outside '${directory}'`),
-        );
+        return yield* new OrganizationProviderAccountFileEscapesError({
+          filePath: file.path,
+          directory,
+        });
       }
       yield* fileSystem.makeDirectory(path.dirname(target), { recursive: true });
       yield* fileSystem.writeFileString(target, file.content);

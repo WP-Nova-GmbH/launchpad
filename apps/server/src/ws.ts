@@ -2437,7 +2437,8 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
         const sessions = yield* SessionStore.SessionStore;
         const threadPresence = yield* ThreadPresence.ThreadPresenceService;
-        const connectionId = globalThis.crypto.randomUUID();
+        const crypto = yield* Crypto.Crypto;
+        const connectionId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
         const session = yield* serverAuth.authenticateWebSocketUpgrade(request).pipe(
           Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
             failEnvironmentAuthInvalid(EnvironmentAuth.serverAuthCredentialReason(error)),
