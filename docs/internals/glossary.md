@@ -278,6 +278,14 @@ Infisical and references at the relay. That design was superseded before it was 
 Former name for the organization's set of [provider accounts](#provider-account). There is
 no pool to select from: an organization holds at most one account per provider.
 
+#### Skill
+
+A directory with a `SKILL.md` at its root that teaches an agent one thing — the
+shape Claude Code, Codex, Cursor, and OpenCode all load. An **organization skill** is one the
+[relay](#relay) holds for an [organization](#organization) and every enrolled agent
+[executor](#executor) places for each provider CLI; a **project skill** lives in the repository
+checkout and is not the relay's business. See [ADR-0016][adr16].
+
 #### Installation token
 
 A short-lived GitHub App token the [relay](#relay) mints from an
@@ -491,3 +499,4 @@ a thread; the session is what churns underneath.
 [adr13]: ../adr/0013-personal-threads-mirror-to-a-user-scoped-store.md
 [adr14]: ../adr/0014-managed-projects-publish-a-redacted-organization-catalog.md
 [adr15]: ../adr/0015-executors-borrow-the-organizations-github-installation.md
+[adr16]: ../adr/0016-organization-skills-are-held-by-the-relay-and-placed-by-executors.md

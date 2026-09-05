@@ -147,6 +147,11 @@ decision. The service behind it (`apps/server/src/relay/OrganizationProviderAcco
 reference with an empty default, provided only to the provider instance registry, so a personal
 machine never consults the relay for accounts.
 
+The organization's skills travel the same road: `apps/server/src/relay/OrganizationSkills.ts`
+pulls them, each driver places them where its CLI reads user-level skills, and a change rebuilds
+the instances — see [tenancy.md](./tenancy.md#organization-skills) and
+[ADR-0016](../adr/0016-organization-skills-are-held-by-the-relay-and-placed-by-executors.md).
+
 The provider CLIs themselves come with the machine. The executor image and the Hetzner bootstrap
 install Codex, Claude Code, OpenCode, and Cursor's agent up front; a self-hosted machine, which
 starts from nothing but Node and git, gets them on first start: once enrolled, the server checks

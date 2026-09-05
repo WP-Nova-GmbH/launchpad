@@ -155,20 +155,45 @@ building: a variable into the instance environment, an auth store into the direc
 recording the version, so a session the CLI refreshed on its own is kept until an admin shares a
 new one. The list endpoint returns no secret; only the executor endpoint opens the payload.
 
+## Organization skills
+
+An organization holds any number of **skills** — one directory each, `SKILL.md` at the root — for
+the agents on its executors
+([ADR-0016](../adr/0016-organization-skills-are-held-by-the-relay-and-placed-by-executors.md)).
+Admins upload one from Settings → Organization → Skills as a folder pick or a lone manifest;
+`buildSkillUpload` in `OrganizationSettings.logic.ts` strips the picked folder from the paths,
+settles the name from the frontmatter or the folder, and refuses on the device what the relay
+would refuse. The relay stores the files as plain JSON in `relay_organization_skills` (nothing
+secret, nothing sealed), re-reads the manifest's frontmatter with
+`@t3tools/shared/skillFrontmatter`, and answers a name mismatch or malformed frontmatter with
+`RelayTenancyInvalidError` (422). Any member may list; save and delete are admin-only. `version`
+changes on every save.
+
+Executors pull, as with accounts: `organizationSkillsServer.fetchOrganizationSkills`
+(`http/OrganizationSkillsApi.ts`) answers enrolled agent executors with the files;
+`apps/server/src/relay/OrganizationSkills.ts` keeps them in memory and re-fetches every five
+minutes; a change rebuilds the four skill-placing drivers, and each places the set while building
+(`apps/server/src/provider/organizationSkills.ts`) in the directory its CLI reads user-level skills
+from — Claude's config dir, Codex's shared home, OpenCode's config dir, `~/.cursor` — as
+`<dir>/skills/<name>/` with a `.launchpad-organization-skill` marker holding the version. An
+unchanged skill is left alone, a changed one replaced wholesale, a dropped one removed; a
+same-named directory without the marker is somebody's own and is skipped with a warning.
+
 ## Tables
 
 All in `infra/relay/src/persistence/schema.ts`:
 
-| table                                  | notes                                                               |
-| -------------------------------------- | ------------------------------------------------------------------- |
-| `relay_organizations`                  | id and name                                                         |
-| `relay_organization_members`           | unique on `user_id` — the "exactly one organization" rule           |
-| `relay_organization_invitations`       | unique on `token_hash`; `accepted_at` / `revoked_at` decide pending |
-| `relay_repositories`                   | scoped to an organization                                           |
-| `relay_repository_aliases`             | canonical key is the primary key; organization denormalized         |
-| `relay_repository_access`              | `(repository, user)`; organization denormalized                     |
-| `relay_github_installations`           | one per organization; unique on `installation_id`, holds no secret  |
-| `relay_organization_provider_accounts` | `(organization, provider)`; payload sealed, `version` bumps on save |
+| table                                  | notes                                                                |
+| -------------------------------------- | -------------------------------------------------------------------- |
+| `relay_organizations`                  | id and name                                                          |
+| `relay_organization_members`           | unique on `user_id` — the "exactly one organization" rule            |
+| `relay_organization_invitations`       | unique on `token_hash`; `accepted_at` / `revoked_at` decide pending  |
+| `relay_repositories`                   | scoped to an organization                                            |
+| `relay_repository_aliases`             | canonical key is the primary key; organization denormalized          |
+| `relay_repository_access`              | `(repository, user)`; organization denormalized                      |
+| `relay_github_installations`           | one per organization; unique on `installation_id`, holds no secret   |
+| `relay_organization_provider_accounts` | `(organization, provider)`; payload sealed, `version` bumps on save  |
+| `relay_organization_skills`            | `(organization, name)`; files as plain JSON, `version` bumps on save |
 
 Machines — the organization's provisioned executors and review hosts — have their own tables and
 their own document: [machines.md](./machines.md).

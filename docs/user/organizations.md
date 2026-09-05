@@ -67,6 +67,25 @@ not be shared.
 Providers refresh their own sessions over time. If executors ever fall out of sign-in for a
 provider, share it again from a signed-in device.
 
+## Skills
+
+A skill is a folder with a `SKILL.md` inside that teaches an agent how to do one thing well — how
+you review, how you release, what a good commit looks like here. Skills you upload under
+**Settings → Organization → Skills** reach every executor of this organization, for Codex,
+Claude, Cursor, and OpenCode alike, and agents there use them exactly as they would a skill
+installed by hand. Executors you add later get them too.
+
+Press **Upload a skill folder** and pick the folder. Launchpad reads the `SKILL.md` and every text
+file beside it (up to 64 files and 1 MiB; images and other binaries are left out). The skill's name
+is the `name` in the `SKILL.md` frontmatter, or the folder's name when there is none — lowercase
+letters, digits, and hyphens. If your skill is that one file, **Upload a SKILL.md only** does the
+same. Uploading a skill whose name already exists replaces it, and the trash can takes it away from
+every executor on their next check, within a few minutes.
+
+Skills that belong to one repository still belong in that repository (`.claude/skills` or
+`.agents/skills` in the checkout); organization skills are for what applies everywhere. Your own
+devices keep their own skills — nothing here changes what is installed on your laptop.
+
 ## Repositories
 
 A repository is recognised by the git remote of a checkout, reduced to `host/owner/repo`. Every
