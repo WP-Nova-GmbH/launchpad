@@ -15,7 +15,6 @@
  * @module relay/OrganizationProviderAccounts
  */
 import type { ProviderAccountPayload, ProviderAccountProvider } from "@t3tools/contracts";
-import { RelayApi } from "@t3tools/contracts/relay";
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -28,13 +27,12 @@ import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import * as HttpClient from "effect/unstable/http/HttpClient";
-import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
-import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { readManagedExecutorRelayConfig } from "../cloud/machineEnrollment.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { forkParked } from "../serverActivation.ts";
+import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 
 export interface OrganizationProviderAccount {
   readonly provider: ProviderAccountProvider;
@@ -111,15 +109,9 @@ export const make = Effect.gen(function* () {
         return false;
       }
       const environmentId = yield* serverEnvironment.getEnvironmentId;
-      const relayClient = yield* HttpApiClient.make(RelayApi, {
-        baseUrl: relayConfig.url,
-        transformClient: HttpClient.mapRequest(
-          HttpClientRequest.setHeader(
-            "authorization",
-            `Bearer ${relayConfig.environmentCredential}`,
-          ),
-        ),
-      }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient));
+      const relayClient = yield* makeExecutorRelayApiClient(relayConfig).pipe(
+        Effect.provideService(HttpClient.HttpClient, httpClient),
+      );
       const response = yield* relayClient.providerAccountsServer.fetchProviderAccounts({
         params: { environmentId },
       });

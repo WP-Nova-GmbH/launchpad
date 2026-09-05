@@ -12,6 +12,8 @@
  *
  * @module provider/Drivers/OpenCodeDriver
  */
+import * as NodeOS from "node:os";
+
 import { OpenCodeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -42,6 +44,7 @@ import {
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { applyOrganizationProviderAccount } from "../organizationProviderAccount.ts";
+import { applyOrganizationSkills } from "../organizationSkills.ts";
 import {
   OPENCODE_AUTH_FILE,
   describeOpenCodeAuthStore,
@@ -111,6 +114,14 @@ const withInstanceIdentity =
     continuation: { groupKey: input.continuationGroupKey },
   });
 
+function resolveOpenCodeConfigDirectory(path: Path.Path, environment: NodeJS.ProcessEnv): string {
+  const configHome =
+    environment.XDG_CONFIG_HOME && environment.XDG_CONFIG_HOME.trim().length > 0
+      ? environment.XDG_CONFIG_HOME
+      : path.join(NodeOS.homedir(), ".config");
+  return path.join(configHome, "opencode");
+}
+
 export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv> = {
   driverKind: DRIVER_KIND,
   metadata: {
@@ -134,6 +145,12 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         provider: "opencode",
         environment: inheritedEnv,
         authStoreDirectory,
+      });
+      // OpenCode loads user-level skills from `~/.config/opencode/skills`
+      // (under XDG_CONFIG_HOME when set), separate from its data directory.
+      yield* applyOrganizationSkills({
+        provider: "opencode",
+        directory: path.join(resolveOpenCodeConfigDirectory(path, inheritedEnv), "skills"),
       });
       const accountExport = exportAuthStoreFile({
         instanceId,

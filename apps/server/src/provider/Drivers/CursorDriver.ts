@@ -11,6 +11,8 @@
  *
  * @module provider/Drivers/CursorDriver
  */
+import * as NodeOS from "node:os";
+
 import { CursorSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -41,6 +43,7 @@ import {
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { applyOrganizationProviderAccount } from "../organizationProviderAccount.ts";
+import { applyOrganizationSkills } from "../organizationSkills.ts";
 import { makeProviderAccountAuth } from "../ProviderAccountAuth.ts";
 import {
   makeProviderMaintenanceCapabilities,
@@ -116,6 +119,11 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
         provider: "cursor",
         environment: mergeProviderInstanceEnvironment(environment),
         authStoreDirectory: null,
+      });
+      // Cursor's agent loads user-level skills from `~/.cursor/skills`.
+      yield* applyOrganizationSkills({
+        provider: "cursor",
+        directory: path.join(NodeOS.homedir(), ".cursor", "skills"),
       });
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,

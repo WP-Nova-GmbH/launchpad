@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
+import { ORGANIZATION_SKILL_MARKER_FILE } from "../organizationSkills.ts";
 import { discoverClaudeSkills } from "./ClaudeSkills.ts";
 
 const writeSkill = Effect.fn(function* (
@@ -63,6 +64,40 @@ it.layer(NodeServices.layer)("discoverClaudeSkills", (it) => {
           description: "Deploy the app.",
         },
       ]);
+    }),
+  );
+
+  it.effect("reports a user skill the organization placed under its own scope", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-claude-skills-" });
+      const configDir = path.join(tempDir, "claude-home");
+
+      yield* writeSkill(
+        path.join(configDir, "skills"),
+        "review",
+        ["---", "name: review", "description: Review the change.", "---"].join("\n"),
+      );
+      yield* fs.writeFileString(
+        path.join(configDir, "skills", "review", ORGANIZATION_SKILL_MARKER_FILE),
+        "v1",
+      );
+      yield* writeSkill(
+        path.join(configDir, "skills"),
+        "mine",
+        ["---", "name: mine", "---"].join("\n"),
+      );
+
+      const skills = yield* discoverClaudeSkills({ homePath: configDir });
+
+      assert.deepEqual(
+        skills.map((skill) => [skill.name, skill.scope]),
+        [
+          ["mine", "user"],
+          ["review", "organization"],
+        ],
+      );
     }),
   );
 

@@ -46,6 +46,7 @@ import {
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { applyOrganizationProviderAccount } from "../organizationProviderAccount.ts";
+import { applyOrganizationSkills } from "../organizationSkills.ts";
 import { exportClaudeCredentials } from "../ProviderAccountExport.ts";
 import { makeProviderAccountAuth } from "../ProviderAccountAuth.ts";
 import {
@@ -154,6 +155,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         provider: "claudeAgent",
         environment: inheritedEnv,
         authStoreDirectory: claudeConfigDirectory,
+      });
+      // Claude Code loads user-level skills from `<config dir>/skills`, the
+      // same root `discoverClaudeSkills` scans for the picker.
+      yield* applyOrganizationSkills({
+        provider: "claudeAgent",
+        directory: path.join(claudeConfigDirectory, "skills"),
       });
       const accountExport = exportClaudeCredentials({
         instanceId,

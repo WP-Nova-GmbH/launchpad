@@ -53,6 +53,7 @@ import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 
 import { OrganizationProviderAccounts } from "../../relay/OrganizationProviderAccounts.ts";
+import { OrganizationSkills } from "../../relay/OrganizationSkills.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "../builtInDrivers.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
@@ -121,6 +122,7 @@ const SettingsWatcherLive = Layer.effectDiscard(
     const mutator = yield* ProviderInstanceRegistryMutator;
     const serverSettings = yield* ServerSettingsService;
     const organizationAccounts = yield* OrganizationProviderAccounts;
+    const organizationSkills = yield* OrganizationSkills;
     yield* serverSettings.streamChanges.pipe(
       Stream.runForEach((next) =>
         mutator
@@ -153,8 +155,36 @@ const SettingsWatcherLive = Layer.effectDiscard(
       ),
       Effect.forkScoped,
     );
+    // Skills are placed the same way, for every driver that places them, so
+    // any change rebuilds all of those at once.
+    yield* organizationSkills.changes.pipe(
+      Stream.runForEach(() =>
+        serverSettings.getSettings.pipe(
+          Effect.flatMap((settings) =>
+            mutator.reconcile(deriveProviderInstanceConfigMap(settings), {
+              rebuildDrivers: SKILL_PLACING_DRIVERS,
+            }),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logError(
+              "ProviderInstanceRegistry rebuild for organization skills failed",
+              cause,
+            ),
+          ),
+        ),
+      ),
+      Effect.forkScoped,
+    );
     yield* organizationAccounts.start();
+    yield* organizationSkills.start();
   }),
+);
+
+/** The drivers whose `create` places organization skills; Grok has no skills. */
+const SKILL_PLACING_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set(
+  (["codex", "claudeAgent", "cursor", "opencode"] as const).map((kind) =>
+    ProviderDriverKind.make(kind),
+  ),
 );
 
 /**

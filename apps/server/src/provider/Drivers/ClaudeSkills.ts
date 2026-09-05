@@ -14,47 +14,16 @@
 import * as NodeOS from "node:os";
 
 import type { ClaudeSettings, ServerProviderSkill } from "@t3tools/contracts";
+import { parseSkillFrontmatter } from "@t3tools/shared/skillFrontmatter";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
-import { parse as parseYamlDocument } from "yaml";
 
 import { expandHomePath } from "../../pathExpansion.ts";
+import { ORGANIZATION_SKILL_MARKER_FILE } from "../organizationSkills.ts";
 
-type ClaudeSkillScope = "user" | "project";
-
-const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
-
-type SkillFrontmatter =
-  | { readonly kind: "missing" }
-  | { readonly kind: "malformed" }
-  | { readonly kind: "parsed"; readonly name?: string; readonly description?: string };
-
-function parseSkillFrontmatter(contents: string): SkillFrontmatter {
-  const match = FRONTMATTER_PATTERN.exec(contents);
-  if (!match) {
-    return { kind: "missing" };
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = parseYamlDocument(match[1] ?? "");
-  } catch {
-    return { kind: "malformed" };
-  }
-  if (typeof parsed !== "object" || parsed === null) {
-    return { kind: "malformed" };
-  }
-
-  const record = parsed as Record<string, unknown>;
-  const name = typeof record.name === "string" ? record.name.trim() : "";
-  const description = typeof record.description === "string" ? record.description.trim() : "";
-  return {
-    kind: "parsed",
-    ...(name ? { name } : {}),
-    ...(description ? { description } : {}),
-  };
-}
+/** `organization` is a user-scope skill the organization placed (see `organizationSkills.ts`). */
+type ClaudeSkillScope = "user" | "project" | "organization";
 
 /**
  * Resolve the Claude config directory the CLI would use, matching the
@@ -138,12 +107,19 @@ export const discoverClaudeSkills = Effect.fn("discoverClaudeSkills")(function* 
       if (!name) {
         continue;
       }
+      const scope: ClaudeSkillScope =
+        root.scope === "user" &&
+        (yield* fileSystem
+          .exists(path.join(root.directory, entry, ORGANIZATION_SKILL_MARKER_FILE))
+          .pipe(Effect.orElseSucceed(() => false)))
+          ? "organization"
+          : root.scope;
 
       skillsByName.set(name, {
         name,
         path: skillPath,
         enabled: true,
-        scope: root.scope,
+        scope,
         ...(frontmatter.kind === "parsed" && frontmatter.description
           ? { description: frontmatter.description }
           : {}),

@@ -43,6 +43,7 @@ import type { ProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { applyOrganizationProviderAccount } from "../organizationProviderAccount.ts";
+import { applyOrganizationSkills } from "../organizationSkills.ts";
 import {
   CODEX_AUTH_FILE,
   describeCodexAuthStore,
@@ -156,6 +157,13 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         provider: "codex",
         environment: inheritedEnv,
         authStoreDirectory,
+      });
+      // Codex loads user-level skills from `$CODEX_HOME/skills`. That is a
+      // shared directory: a shadow home reaches it through a symlink, so the
+      // one placement serves every instance on this home.
+      yield* applyOrganizationSkills({
+        provider: "codex",
+        directory: path.join(homeLayout.sharedHomePath, "skills"),
       });
       const accountExport = exportAuthStoreFile({
         instanceId,

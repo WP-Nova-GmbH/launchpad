@@ -63,6 +63,7 @@ import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletion
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as OrganizationProjectCatalogRelay from "./relay/OrganizationProjectCatalogRelay.ts";
 import * as OrganizationProviderAccounts from "./relay/OrganizationProviderAccounts.ts";
+import * as OrganizationSkills from "./relay/OrganizationSkills.ts";
 import * as OrganizationSourceControlCredentials from "./relay/OrganizationSourceControlCredentials.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -400,14 +401,14 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(ReactorLayerLive, JobRunnerLi
   // through this layer. Built-in drivers come from `BUILT_IN_DRIVERS`;
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
-  // The organization's provider accounts are provided to the registry alone:
-  // drivers read them while building instances and hydration rebuilds those
-  // instances when the accounts change. Everywhere else the reference keeps
-  // its default and reads as "no accounts".
+  // The organization's provider accounts and skills are provided to the
+  // registry alone: drivers read them while building instances and hydration
+  // rebuilds those instances when either changes. Everywhere else the
+  // references keep their defaults and read as "no accounts, no skills".
   Layer.provideMerge(
     ProviderInstanceRegistryHydrationLive.pipe(
       Layer.provide(
-        OrganizationProviderAccounts.layer.pipe(
+        Layer.mergeAll(OrganizationProviderAccounts.layer, OrganizationSkills.layer).pipe(
           Layer.provide(ServerEnvironment.layer),
           Layer.provide(ServerSecretStore.layer),
         ),
