@@ -22,6 +22,11 @@ import {
 } from "@t3tools/contracts/relay";
 
 import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
+import {
+  describeOrganizationSkillUpload,
+  encodeOrganizationSkillFiles,
+  toApiOrganizationSkill,
+} from "./OrganizationSkillsApi.ts";
 import { sealProviderAccountPayload, toApiProviderAccount } from "./ProviderAccountsApi.ts";
 import { tenancyConflict, tenancyForbidden, tenancyNotFound } from "./tenancyErrors.ts";
 import * as RelayConfiguration from "../Config.ts";
@@ -33,6 +38,7 @@ import * as GithubAppSetup from "../tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "../tenancy/GithubInstallations.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
+import * as OrganizationSkills from "../tenancy/OrganizationSkills.ts";
 import * as ProviderAccounts from "../tenancy/ProviderAccounts.ts";
 import * as Repositories from "../tenancy/Repositories.ts";
 import * as UserDirectory from "../tenancy/UserDirectory.ts";
@@ -399,6 +405,7 @@ export const organizationApi = HttpApiBuilder.group(
     const githubAppRecords = yield* GithubAppRecords.GithubAppRecords;
     const githubInstallations = yield* GithubInstallations.GithubInstallations;
     const providerAccounts = yield* ProviderAccounts.ProviderAccounts;
+    const organizationSkills = yield* OrganizationSkills.OrganizationSkills;
     const secretBox = yield* RelaySecretBox.RelaySecretBox;
     const relayConfig = yield* RelayConfiguration.RelayConfiguration;
     const transactions = yield* RelayDb.RelayTransactions;
@@ -804,6 +811,72 @@ export const organizationApi = HttpApiBuilder.group(
           yield* Effect.logInfo("organization provider account removed", {
             organizationId: membership.organization.organizationId,
             provider: args.params.provider,
+          });
+          return { ok: true };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "listSkills",
+        Effect.fn("relay.api.organization.list_skills")(
+          function* () {
+            const membership = yield* requireMembership();
+            const records = yield* organizationSkills.listForOrganization({
+              organizationId: membership.organization.organizationId,
+            });
+            return { skills: yield* Effect.forEach(records, toApiOrganizationSkill) };
+          },
+          Effect.catchTag("OrganizationSkillFilesUnreadable", () =>
+            relayInternalErrorResponse("internal_error"),
+          ),
+          mapRelayCommonApiErrors("not_authorized"),
+        ),
+      )
+      .handle(
+        "saveSkill",
+        Effect.fn("relay.api.organization.save_skill")(
+          function* (args) {
+            const membership = yield* requireCallerIsAdmin();
+            const { description } = yield* describeOrganizationSkillUpload({
+              name: args.params.name,
+              files: args.payload.files,
+            });
+            const filesJson = yield* encodeOrganizationSkillFiles(args.payload.files).pipe(
+              Effect.catch(() => relayInternalErrorResponse("internal_error")),
+            );
+            const record = yield* organizationSkills.save({
+              organizationId: membership.organization.organizationId,
+              name: args.params.name,
+              description,
+              filesJson,
+              userId: membership.userId,
+            });
+            yield* Effect.logInfo("organization skill saved", {
+              organizationId: membership.organization.organizationId,
+              name: record.name,
+              files: args.payload.files.length,
+            });
+            return yield* toApiOrganizationSkill(record);
+          },
+          Effect.catchTag("OrganizationSkillFilesUnreadable", () =>
+            relayInternalErrorResponse("internal_error"),
+          ),
+          mapRelayCommonApiErrors("not_authorized"),
+        ),
+      )
+      .handle(
+        "deleteSkill",
+        Effect.fn("relay.api.organization.delete_skill")(function* (args) {
+          const membership = yield* requireCallerIsAdmin();
+          const removed = yield* organizationSkills.delete({
+            organizationId: membership.organization.organizationId,
+            name: args.params.name,
+          });
+          if (!removed) {
+            return yield* tenancyNotFound("skill_not_found");
+          }
+          yield* Effect.logInfo("organization skill removed", {
+            organizationId: membership.organization.organizationId,
+            name: args.params.name,
           });
           return { ok: true };
         }, mapRelayCommonApiErrors("not_authorized")),

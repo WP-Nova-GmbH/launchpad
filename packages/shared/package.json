@@ -79,6 +79,10 @@
       "types": "./src/schemaYaml.ts",
       "import": "./src/schemaYaml.ts"
     },
+    "./skillFrontmatter": {
+      "types": "./src/skillFrontmatter.ts",
+      "import": "./src/skillFrontmatter.ts"
+    },
     "./toolActivity": {
       "types": "./src/toolActivity.ts",
       "import": "./src/toolActivity.ts"

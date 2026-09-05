@@ -10,6 +10,7 @@ export * from "./ipc.ts";
 export * from "./terminal.ts";
 export * from "./provider.ts";
 export * from "./providerAccount.ts";
+export * from "./organizationSkill.ts";
 export * from "./providerInstance.ts";
 export * from "./providerRuntime.ts";
 export * from "./model.ts";

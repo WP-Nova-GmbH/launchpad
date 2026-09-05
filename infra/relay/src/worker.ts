@@ -37,6 +37,7 @@ import {
 import { machineEnrollmentApi, machinesApi } from "./http/MachinesApi.ts";
 import { organizationProjectsApi, projectCatalogServerApi } from "./http/ProjectCatalogApi.ts";
 import { executorReleaseServerApi } from "./http/ExecutorReleaseApi.ts";
+import { organizationSkillsServerApi } from "./http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
 import { sourceControlServerApi } from "./http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
@@ -80,6 +81,7 @@ import * as GithubApp from "./tenancy/GithubApp.ts";
 import * as GithubAppRecords from "./tenancy/GithubAppRecords.ts";
 import * as GithubAppSetup from "./tenancy/GithubAppSetup.ts";
 import * as GithubInstallations from "./tenancy/GithubInstallations.ts";
+import * as OrganizationSkills from "./tenancy/OrganizationSkills.ts";
 import * as ProviderAccounts from "./tenancy/ProviderAccounts.ts";
 import * as RelaySecretBox from "./auth/SecretBox.ts";
 import { githubAppSetupRoutes } from "./http/GithubAppSetupRoute.ts";
@@ -125,6 +127,7 @@ const relayApiLayer = Layer.mergeAll(
   projectCatalogServerApi,
   sourceControlServerApi,
   providerAccountsServerApi,
+  organizationSkillsServerApi,
   executorReleaseServerApi,
 );
 
@@ -313,6 +316,7 @@ export const ApiLive = Api.make(
             GithubApp.layer,
             GithubInstallations.layer,
             ProviderAccounts.layer,
+            OrganizationSkills.layer,
             Machines.layer,
             OrganizationProjectCatalog.layer,
           ),

@@ -59,6 +59,7 @@ function relayProtectedError(error: RelayProtectedError): ConnectionAttemptError
     // environment. They only arrive here when a caller shares this mapper.
     case "RelayTenancyNotFoundError":
     case "RelayTenancyConflictError":
+    case "RelayTenancyInvalidError":
       return new ConnectionBlockedError({
         reason: "configuration",
         detail: error.message,

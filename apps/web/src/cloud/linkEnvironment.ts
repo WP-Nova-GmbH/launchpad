@@ -186,6 +186,10 @@ export function relayProtectedErrorMessage(error: RelayProtectedErrorType): stri
         default:
           return `Relay refused the organization change because it conflicts with existing state (${error.reason}).`;
       }
+    case "RelayTenancyInvalidError":
+      return error.reason === "skill_manifest_malformed"
+        ? "The skill's SKILL.md frontmatter could not be read. Check that it is a YAML block with a name and description."
+        : "The name in the skill's SKILL.md frontmatter does not match the skill being saved.";
     case "RelayMachineEnrollProofInvalidError":
       return `Relay rejected the machine enrollment proof (${error.reason}).`;
     case "RelayMachineEnrollFailedError":

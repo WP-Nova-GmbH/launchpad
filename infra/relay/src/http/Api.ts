@@ -78,6 +78,7 @@ import * as ManagedEndpointAllocations from "../environments/ManagedEndpointAllo
 import * as EnvironmentPublishSignatures from "../environments/EnvironmentPublishSignatures.ts";
 import * as MachineLimits from "../machines/MachineLimits.ts";
 import * as Machines from "../machines/Machines.ts";
+import * as OrganizationSkills from "../tenancy/OrganizationSkills.ts";
 import * as ProviderAccounts from "../tenancy/ProviderAccounts.ts";
 import * as MobileRegistrations from "../agentActivity/MobileRegistrations.ts";
 import { currentTraceId, withSpanAttributes } from "../observability.ts";
@@ -1266,6 +1267,7 @@ const RelayCommonPersistenceError = Schema.Union([
   Machines.MachinePersistenceError,
   MachineLimits.MachineLimitPersistenceError,
   ProviderAccounts.ProviderAccountPersistenceError,
+  OrganizationSkills.OrganizationSkillPersistenceError,
 ]);
 type RelayCommonPersistenceError = typeof RelayCommonPersistenceError.Type;
 const isRelayCommonPersistenceError = Schema.is(RelayCommonPersistenceError);

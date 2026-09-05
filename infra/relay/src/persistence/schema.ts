@@ -123,6 +123,31 @@ export const relayOrganizationProviderAccounts = pgTable(
 );
 
 /**
+ * A skill an organization gives its agents: a directory of text files with a
+ * `SKILL.md` at its root, uploaded by an admin and placed by every agent
+ * executor where each provider CLI looks for user-level skills (ADR-0016).
+ *
+ * Holds no secret, so the files are stored as plain JSON. One row per skill
+ * name per organization; `version` changes on every save so executors can
+ * tell a changed skill from a repeat.
+ */
+export const relayOrganizationSkills = pgTable(
+  "relay_organization_skills",
+  {
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    name: varchar("name", { length: 64 }).notNull(),
+    description: text("description").notNull(),
+    filesJson: text("files_json").notNull(),
+    version: varchar("version", { length: 64 }).notNull(),
+    createdByUserId: varchar("created_by_user_id", { length: 191 }).notNull(),
+    updatedByUserId: varchar("updated_by_user_id", { length: 191 }).notNull(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.organizationId, table.name] })],
+);
+
+/**
  * A GitHub App installation claimed by an organization.
  *
  * Holds no secret: the App private key lives in relay configuration and access

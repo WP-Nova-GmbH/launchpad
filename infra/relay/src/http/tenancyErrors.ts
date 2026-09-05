@@ -5,6 +5,8 @@ import {
   type RelayTenancyConflictReason,
   RelayTenancyForbiddenError,
   type RelayTenancyForbiddenReason,
+  RelayTenancyInvalidError,
+  type RelayTenancyInvalidReason,
   RelayTenancyNotFoundError,
   type RelayTenancyNotFoundReason,
 } from "@t3tools/contracts/relay";
@@ -28,4 +30,9 @@ export const tenancyNotFound = Effect.fnUntraced(function* (reason: RelayTenancy
 export const tenancyConflict = Effect.fnUntraced(function* (reason: RelayTenancyConflictReason) {
   const traceId = yield* currentTraceId;
   return yield* new RelayTenancyConflictError({ code: "tenancy_conflict", reason, traceId });
+});
+
+export const tenancyInvalid = Effect.fnUntraced(function* (reason: RelayTenancyInvalidReason) {
+  const traceId = yield* currentTraceId;
+  return yield* new RelayTenancyInvalidError({ code: "tenancy_invalid", reason, traceId });
 });

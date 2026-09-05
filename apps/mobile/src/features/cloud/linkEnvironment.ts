@@ -176,6 +176,8 @@ function relayProtectedErrorMessage(error: RelayProtectedErrorType): string {
       return `Relay could not find the organization record (${error.reason}).`;
     case "RelayTenancyConflictError":
       return `Relay refused the organization change because it conflicts with existing state (${error.reason}).`;
+    case "RelayTenancyInvalidError":
+      return `Relay refused the organization record as invalid (${error.reason}).`;
     case "RelayInternalError":
       return `Relay encountered an internal error (${error.reason}).`;
   }

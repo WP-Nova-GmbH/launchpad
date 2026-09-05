@@ -16,6 +16,12 @@ import {
   ProviderAccountPayload,
   ProviderAccountProvider,
 } from "./providerAccount.ts";
+import {
+  ORGANIZATION_SKILL_DESCRIPTION_MAX_LENGTH,
+  OrganizationSkillFilePath,
+  OrganizationSkillFiles,
+  OrganizationSkillName,
+} from "./organizationSkill.ts";
 
 export const RelayAgentAwarenessPlatform = Schema.Literal("ios");
 export type RelayAgentAwarenessPlatform = typeof RelayAgentAwarenessPlatform.Type;
@@ -563,6 +569,7 @@ export const RelayTenancyNotFoundReason = Schema.Literals([
   "github_app_not_configured",
   "machine_not_found",
   "provider_account_not_found",
+  "skill_not_found",
   "executor_source_not_configured",
 ]);
 export type RelayTenancyNotFoundReason = typeof RelayTenancyNotFoundReason.Type;
@@ -620,6 +627,27 @@ export class RelayTenancyConflictError extends Schema.TaggedErrorClass<RelayTena
 ) {
   override get message(): string {
     return `Relay tenancy operation conflicts with existing state: ${this.reason}`;
+  }
+}
+
+/** Why an uploaded organization record was refused as it stands, before any state was touched. */
+export const RelayTenancyInvalidReason = Schema.Literals([
+  "skill_manifest_malformed",
+  "skill_name_mismatch",
+]);
+export type RelayTenancyInvalidReason = typeof RelayTenancyInvalidReason.Type;
+
+export class RelayTenancyInvalidError extends Schema.TaggedErrorClass<RelayTenancyInvalidError>()(
+  "RelayTenancyInvalidError",
+  {
+    code: Schema.Literal("tenancy_invalid"),
+    reason: RelayTenancyInvalidReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 422 },
+) {
+  override get message(): string {
+    return `Relay refused the organization record as invalid: ${this.reason}`;
   }
 }
 
@@ -737,6 +765,7 @@ export const RelayProtectedError = Schema.Union([
   RelayTenancyForbiddenError,
   RelayTenancyNotFoundError,
   RelayTenancyConflictError,
+  RelayTenancyInvalidError,
   RelayMachineEnrollProofInvalidError,
   RelayMachineEnrollFailedError,
   RelayMachineEnrollUnavailableError,
@@ -786,6 +815,8 @@ const RelayGithubInstallationTokenErrors = [
 ] as const;
 
 const RelayProviderAccountsServerErrors = [RelayAuthInvalidError, RelayInternalError] as const;
+
+const RelayOrganizationSkillsServerErrors = [RelayAuthInvalidError, RelayInternalError] as const;
 
 const RelayExecutorReleaseErrors = [
   RelayAuthInvalidError,
@@ -1387,6 +1418,52 @@ export const RelayExecutorProviderAccountsResponse = Schema.Struct({
 });
 export type RelayExecutorProviderAccountsResponse =
   typeof RelayExecutorProviderAccountsResponse.Type;
+
+// Skills share their file shape with what executors place on disk, so an
+// upload is exactly what every provider CLI on an executor ends up reading.
+export const RelayOrganizationSkillName = OrganizationSkillName;
+export type RelayOrganizationSkillName = typeof RelayOrganizationSkillName.Type;
+export const RelayOrganizationSkillFiles = OrganizationSkillFiles;
+export type RelayOrganizationSkillFiles = typeof RelayOrganizationSkillFiles.Type;
+
+/** One of an organization's skills, without its files. */
+export const RelayOrganizationSkill = Schema.Struct({
+  name: RelayOrganizationSkillName,
+  /** From the manifest's frontmatter; empty when it carries none. */
+  description: Schema.String.check(Schema.isMaxLength(ORGANIZATION_SKILL_DESCRIPTION_MAX_LENGTH)),
+  filePaths: Schema.Array(OrganizationSkillFilePath),
+  /** Changes on every save; executors compare it to what they placed. */
+  version: TrimmedNonEmptyString,
+  updatedByUserId: TrimmedNonEmptyString,
+  createdAt: TrimmedNonEmptyString,
+  updatedAt: TrimmedNonEmptyString,
+});
+export type RelayOrganizationSkill = typeof RelayOrganizationSkill.Type;
+
+export const RelayListOrganizationSkillsResponse = Schema.Struct({
+  skills: Schema.Array(RelayOrganizationSkill),
+});
+export type RelayListOrganizationSkillsResponse = typeof RelayListOrganizationSkillsResponse.Type;
+
+export const RelaySaveOrganizationSkillRequest = Schema.Struct({
+  files: RelayOrganizationSkillFiles,
+});
+export type RelaySaveOrganizationSkillRequest = typeof RelaySaveOrganizationSkillRequest.Type;
+
+/** What an executor receives: the skill with its files. */
+export const RelayExecutorOrganizationSkill = Schema.Struct({
+  name: RelayOrganizationSkillName,
+  description: Schema.String,
+  version: TrimmedNonEmptyString,
+  files: RelayOrganizationSkillFiles,
+});
+export type RelayExecutorOrganizationSkill = typeof RelayExecutorOrganizationSkill.Type;
+
+export const RelayExecutorOrganizationSkillsResponse = Schema.Struct({
+  skills: Schema.Array(RelayExecutorOrganizationSkill),
+});
+export type RelayExecutorOrganizationSkillsResponse =
+  typeof RelayExecutorOrganizationSkillsResponse.Type;
 
 export const RelayRegisterRepositoryRequest = Schema.Struct({
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(RELAY_ORGANIZATION_NAME_MAX_LENGTH)),
@@ -2023,6 +2100,7 @@ const RelayTenancyErrors = [
   RelayTenancyForbiddenError,
   RelayTenancyNotFoundError,
   RelayTenancyConflictError,
+  RelayTenancyInvalidError,
   RelayInternalError,
 ] as const;
 
@@ -2211,6 +2289,39 @@ export const RelayOrganizationGroup = HttpApiGroup.make("organization")
       .annotate(
         OpenApi.Description,
         "Admin-only. Executors stop using the account on their next check; the provider's own sign-out is done on the provider.",
+      ),
+    HttpApiEndpoint.get("listSkills", "/v1/organization/skills", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayListOrganizationSkillsResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "List the organization's skills")
+      .annotate(
+        OpenApi.Description,
+        "Every member. One entry per skill the organization holds, without its files.",
+      ),
+    HttpApiEndpoint.put("saveSkill", "/v1/organization/skills/:name", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ name: RelayOrganizationSkillName }),
+      payload: RelaySaveOrganizationSkillRequest,
+      success: RelayOrganizationSkill,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Store or replace one of the organization's skills")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only. The files must include a SKILL.md whose frontmatter name, when present, matches. Executors place the skill for every provider CLI on their next check.",
+      ),
+    HttpApiEndpoint.delete("deleteSkill", "/v1/organization/skills/:name", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ name: RelayOrganizationSkillName }),
+      success: RelayOkResponse,
+      error: RelayTenancyErrors,
+    })
+      .annotate(OpenApi.Summary, "Remove one of the organization's skills")
+      .annotate(
+        OpenApi.Description,
+        "Admin-only. Executors remove their copies on their next check.",
       ),
     HttpApiEndpoint.post("acceptInvitation", "/v1/invitations/accept", {
       headers: RelayBearerRequestHeaders,
@@ -2505,6 +2616,25 @@ export const RelayProviderAccountsServerGroup = HttpApiGroup.make("providerAccou
   )
   .middleware(RelayEnvironmentAuth);
 
+export const RelayOrganizationSkillsServerGroup = HttpApiGroup.make("organizationSkillsServer")
+  .add(
+    HttpApiEndpoint.get("fetchOrganizationSkills", "/v1/environments/:environmentId/skills", {
+      params: Schema.Struct({ environmentId: EnvironmentId }),
+      success: RelayExecutorOrganizationSkillsResponse,
+      error: RelayOrganizationSkillsServerErrors,
+    })
+      .annotate(OpenApi.Summary, "Fetch the organization's skills for an executor")
+      .annotate(
+        OpenApi.Description,
+        "Answers only for an enrolled agent executor. Returns every skill the organization holds, files included, so the executor can place them for its provider CLIs.",
+      ),
+  )
+  .annotate(
+    OpenApi.Description,
+    "Environment-authenticated organization skills for managed executors.",
+  )
+  .middleware(RelayEnvironmentAuth);
+
 export const RelayExecutorReleaseServerGroup = HttpApiGroup.make("executorReleaseServer")
   .add(
     HttpApiEndpoint.get("getExecutorRelease", "/v1/environments/:environmentId/executor-release", {
@@ -2539,6 +2669,7 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayProjectCatalogServerGroup,
     RelaySourceControlServerGroup,
     RelayProviderAccountsServerGroup,
+    RelayOrganizationSkillsServerGroup,
     RelayExecutorReleaseServerGroup,
   )
   .annotate(OpenApi.Title, "Launchpad Relay API")
