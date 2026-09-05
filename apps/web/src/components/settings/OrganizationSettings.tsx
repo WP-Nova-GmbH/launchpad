@@ -4,7 +4,9 @@ import {
   FolderGit2Icon,
   KeyRoundIcon,
   ServerIcon,
+  SparklesIcon,
   TrashIcon,
+  UploadIcon,
   UsersIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -15,6 +17,7 @@ import type {
   RelayMachineRole,
   RelayOrgRole,
   RelayOrganizationMember,
+  RelayOrganizationSkill,
   RelayProviderAccount,
   RelayProviderAccountProvider,
   RelayRepositoryId,
@@ -52,15 +55,18 @@ import { EMPTY_SERVER_PROVIDERS, serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { toastManager } from "../ui/toast";
 import {
+  buildSkillUpload,
   hasMachineSettingUp,
   machineEnrollmentCommand,
   machineStatusPresentation,
   memberLabel,
+  organizationSkillDescription,
   PROVIDER_ACCOUNT_PRESENTATIONS,
   providerAccountDescription,
   unregisteredCheckouts,
   visibleMachines,
   type ProviderAccountPresentation,
+  type SkillUploadEntry,
 } from "./OrganizationSettings.logic";
 import {
   SettingsPageContainer,
@@ -786,6 +792,175 @@ function ProviderAccountsSection({ state }: { state: OrganizationAdminState }) {
   );
 }
 
+function SkillRow({
+  skill,
+  isAdmin,
+  state,
+}: {
+  skill: RelayOrganizationSkill;
+  isAdmin: boolean;
+  state: OrganizationAdminState;
+}) {
+  const fileCount = skill.filePaths.length;
+  return (
+    <SettingsRow
+      title={
+        <span className="flex items-baseline gap-2">
+          {skill.name}
+          <RoleBadge>{fileCount === 1 ? "1 file" : `${fileCount} files`}</RoleBadge>
+        </span>
+      }
+      description={organizationSkillDescription(skill)}
+      control={
+        isAdmin ? (
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`Remove the ${skill.name} skill`}
+            disabled={state.busy}
+            onClick={() => void state.removeSkill(skill.name)}
+          >
+            <TrashIcon className="size-4" />
+          </Button>
+        ) : null
+      }
+    />
+  );
+}
+
+/**
+ * Skills the organization gives its agents.
+ *
+ * An upload is a folder pick — the browser hands over every file inside with
+ * its path — or a single SKILL.md. The files are read here and the skill's
+ * name is settled here (`buildSkillUpload`) so the admin hears about a
+ * problem before anything leaves the device; the relay checks the same
+ * things again.
+ */
+function SkillsSection({ state }: { state: OrganizationAdminState }) {
+  const snapshot = state.snapshot;
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [reading, setReading] = useState(false);
+
+  const upload = async (list: FileList | null) => {
+    if (!list || list.length === 0 || reading) return;
+    setReading(true);
+    try {
+      const entries: Array<SkillUploadEntry> = [];
+      for (const file of Array.from(list)) {
+        entries.push({
+          relativePath: file.webkitRelativePath || file.name,
+          content: await file.text(),
+        });
+      }
+      const built = buildSkillUpload(entries);
+      if (!built.ok) {
+        toastManager.add({
+          type: "error",
+          title: "Could not read the skill",
+          description: built.reason,
+        });
+        return;
+      }
+      const saved = await state.saveSkill({ name: built.name, files: built.files });
+      if (saved) {
+        toastManager.add({
+          type: "success",
+          title: `Skill ${built.name} saved`,
+          description: "Executors pick it up within a few minutes.",
+        });
+      }
+    } finally {
+      setReading(false);
+    }
+  };
+
+  if (!snapshot) return null;
+  const isAdmin = snapshot.membership.role === "admin";
+  const skills = snapshot.skills;
+
+  return (
+    <SettingsSection
+      id={searchableSetting("organization-skills").id}
+      title={searchableSetting("organization-skills").title}
+      icon={<SparklesIcon className="size-4 text-muted-foreground" />}
+    >
+      <SectionNote>
+        A skill is a folder with a SKILL.md that tells an agent how to do one thing well. Skills
+        uploaded here reach every executor of this organization, for Codex, Claude, Cursor, and
+        OpenCode alike, and agents there use them like any other skill. Uploading a skill with the
+        same name replaces it.
+      </SectionNote>
+      {skills.length === 0 ? (
+        <Empty className="min-h-40">
+          <EmptyMedia variant="icon">
+            <SparklesIcon />
+          </EmptyMedia>
+          <EmptyHeader>
+            <EmptyTitle>No skills yet</EmptyTitle>
+            <EmptyDescription>
+              {isAdmin
+                ? "Upload a skill folder and every executor places it for its agents."
+                : "An admin can upload skills for the organization's agents."}
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : (
+        skills.map((skill) => (
+          <SkillRow key={skill.name} skill={skill} isAdmin={isAdmin} state={state} />
+        ))
+      )}
+      {isAdmin ? (
+        <div className="flex flex-wrap items-center gap-2 px-3 pb-3 sm:px-4">
+          <input
+            ref={(node) => {
+              folderInputRef.current = node;
+              // Not in React's attribute list; it is what makes the picker choose a folder.
+              node?.setAttribute("webkitdirectory", "");
+            }}
+            className="sr-only"
+            type="file"
+            multiple
+            aria-label="Choose a skill folder"
+            onChange={(event) => {
+              void upload(event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
+          />
+          <input
+            ref={fileInputRef}
+            className="sr-only"
+            type="file"
+            accept=".md,text/markdown"
+            aria-label="Choose a SKILL.md"
+            onChange={(event) => {
+              void upload(event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
+          />
+          <Button
+            size="sm"
+            disabled={state.busy || reading}
+            onClick={() => folderInputRef.current?.click()}
+          >
+            {reading ? <Spinner /> : <UploadIcon />}
+            Upload a skill folder
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={state.busy || reading}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            Upload a SKILL.md only
+          </Button>
+        </div>
+      ) : null}
+    </SettingsSection>
+  );
+}
+
 function GithubSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
   const isAdmin = snapshot?.membership.role === "admin";
@@ -1433,6 +1608,7 @@ function ConfiguredOrganizationSettings() {
           <MembersSection state={state} />
           <GithubSection state={state} />
           <ProviderAccountsSection state={state} />
+          <SkillsSection state={state} />
           <RepositoriesSection state={state} />
           <MachinesSection state={state} />
         </>

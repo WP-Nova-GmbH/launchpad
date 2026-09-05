@@ -1,10 +1,23 @@
-import type { RepositoryIdentity } from "@t3tools/contracts";
+import {
+  ORGANIZATION_SKILL_FILE_MAX_LENGTH,
+  ORGANIZATION_SKILL_MANIFEST_FILE,
+  ORGANIZATION_SKILL_MAX_FILES,
+  ORGANIZATION_SKILL_MAX_TOTAL_LENGTH,
+  ORGANIZATION_SKILL_NAME_MAX_LENGTH,
+  OrganizationSkillFilePath,
+  OrganizationSkillName,
+  type OrganizationSkillFile,
+  type RepositoryIdentity,
+} from "@t3tools/contracts";
 import type {
   RelayMachine,
+  RelayOrganizationSkill,
   RelayProviderAccount,
   RelayProviderAccountProvider,
   RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
+import { parseSkillFrontmatter } from "@t3tools/shared/skillFrontmatter";
+import * as Schema from "effect/Schema";
 
 export interface ProviderAccountPresentation {
   readonly provider: RelayProviderAccountProvider;
@@ -199,4 +212,132 @@ export function memberLabel(user: IdentifiedUser): {
   if (name) return { primary: name, secondary: null };
   if (email) return { primary: email, secondary: null };
   return { primary: user.userId, secondary: null };
+}
+
+/** One line saying what a skill is and when it last changed, for the row under its name. */
+export function organizationSkillDescription(skill: RelayOrganizationSkill): string {
+  const what = skill.description || `No description in ${ORGANIZATION_SKILL_MANIFEST_FILE}.`;
+  return `${what} Updated ${skill.updatedAt.slice(0, 10)}.`;
+}
+
+/** A file as the browser hands it over: its path within the chosen folder, and its text. */
+export interface SkillUploadEntry {
+  /** As reported by the file picker; a folder pick prefixes every path with the folder's name. */
+  readonly relativePath: string;
+  readonly content: string;
+}
+
+export type SkillUpload =
+  | {
+      readonly ok: true;
+      readonly name: OrganizationSkillName;
+      readonly files: ReadonlyArray<OrganizationSkillFile>;
+    }
+  | { readonly ok: false; readonly reason: string };
+
+const isSkillName = Schema.is(OrganizationSkillName);
+const isSkillFilePath = Schema.is(OrganizationSkillFilePath);
+
+// Finder and Explorer leave these behind; nobody means to upload them.
+const JUNK_ENTRY_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+const JUNK_DIRECTORIES = new Set(["__MACOSX", ".git"]);
+
+function looksBinary(content: string): boolean {
+  return content.includes("\u0000") || content.includes("\uFFFD");
+}
+
+/**
+ * Turn what the file picker returned into one skill the relay accepts, or
+ * say why it cannot. A picked folder arrives with its own name on every
+ * path, so that first segment is stripped and doubles as the skill's name
+ * when the manifest's frontmatter carries none.
+ */
+export function buildSkillUpload(entries: ReadonlyArray<SkillUploadEntry>): SkillUpload {
+  const split = entries
+    .map((entry) => ({
+      segments: entry.relativePath.replaceAll("\\", "/").split("/").filter(Boolean),
+      content: entry.content,
+    }))
+    .filter(
+      (entry) =>
+        entry.segments.length > 0 &&
+        !JUNK_ENTRY_NAMES.has(entry.segments.at(-1) ?? "") &&
+        !entry.segments.some((segment) => JUNK_DIRECTORIES.has(segment)),
+    );
+  if (split.length === 0) {
+    return { ok: false, reason: "Nothing to upload: the selection holds no files." };
+  }
+
+  // Everything came from one picked folder when every path starts with the
+  // same segment and at least one path goes deeper than it.
+  const firstSegment = split[0]?.segments[0] ?? "";
+  const fromFolder =
+    split.every((entry) => entry.segments[0] === firstSegment) &&
+    split.some((entry) => entry.segments.length > 1);
+  const folderName = fromFolder ? firstSegment : null;
+  const files = split.map((entry) => ({
+    path: (fromFolder ? entry.segments.slice(1) : entry.segments).join("/"),
+    content: entry.content,
+  }));
+
+  const manifest = files.find((file) => file.path === ORGANIZATION_SKILL_MANIFEST_FILE);
+  if (!manifest) {
+    return {
+      ok: false,
+      reason: `A skill needs a ${ORGANIZATION_SKILL_MANIFEST_FILE} at the top of its folder.`,
+    };
+  }
+  const frontmatter = parseSkillFrontmatter(manifest.content);
+  if (frontmatter.kind === "malformed") {
+    return {
+      ok: false,
+      reason: `The frontmatter in ${ORGANIZATION_SKILL_MANIFEST_FILE} could not be read. It should be a YAML block with a name and a description.`,
+    };
+  }
+  const name = (frontmatter.kind === "parsed" ? frontmatter.name : undefined) ?? folderName;
+  if (name === null || name === undefined) {
+    return {
+      ok: false,
+      reason: `Name the skill: add a name to the ${ORGANIZATION_SKILL_MANIFEST_FILE} frontmatter, or upload a folder named after it.`,
+    };
+  }
+  if (!isSkillName(name)) {
+    return {
+      ok: false,
+      reason: `'${name}' is not a skill name the agents accept: use lowercase letters, digits, and single hyphens, at most ${ORGANIZATION_SKILL_NAME_MAX_LENGTH} characters.`,
+    };
+  }
+
+  if (files.length > ORGANIZATION_SKILL_MAX_FILES) {
+    return {
+      ok: false,
+      reason: `A skill can hold at most ${ORGANIZATION_SKILL_MAX_FILES} files; this one has ${files.length}.`,
+    };
+  }
+  let total = 0;
+  for (const file of files) {
+    if (!isSkillFilePath(file.path)) {
+      return {
+        ok: false,
+        reason: `'${file.path}' cannot be part of a skill: paths may only use letters, digits, dots, hyphens, and underscores.`,
+      };
+    }
+    if (looksBinary(file.content)) {
+      return { ok: false, reason: `'${file.path}' is not a text file. Skills carry text only.` };
+    }
+    if (file.content.length > ORGANIZATION_SKILL_FILE_MAX_LENGTH) {
+      return {
+        ok: false,
+        reason: `'${file.path}' is too large: each file may hold at most ${Math.floor(ORGANIZATION_SKILL_FILE_MAX_LENGTH / 1024)} KiB.`,
+      };
+    }
+    total += file.content.length;
+  }
+  if (total > ORGANIZATION_SKILL_MAX_TOTAL_LENGTH) {
+    return {
+      ok: false,
+      reason: `The skill is too large: all files together may hold at most ${Math.floor(ORGANIZATION_SKILL_MAX_TOTAL_LENGTH / 1024)} KiB.`,
+    };
+  }
+  return { ok: true, name, files };
 }

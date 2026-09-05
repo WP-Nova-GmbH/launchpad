@@ -33,6 +33,9 @@ import {
   type RelayProviderAccountProvider,
   type RelayProvisionMachineRequest,
   type RelaySaveProviderAccountRequest,
+  type RelayOrganizationSkill,
+  type RelayOrganizationSkillName,
+  type RelaySaveOrganizationSkillRequest,
   type RelayRegisterRepositoryRequest,
   type RelayRepository,
   type RelayStartGithubInstallRequest,
@@ -187,6 +190,18 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly provider: RelayProviderAccountProvider;
     }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
+    readonly listSkills: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<ReadonlyArray<RelayOrganizationSkill>, ManagedRelayClientError>;
+    readonly saveSkill: (input: {
+      readonly clerkToken: string;
+      readonly name: RelayOrganizationSkillName;
+      readonly payload: RelaySaveOrganizationSkillRequest;
+    }) => Effect.Effect<RelayOrganizationSkill, ManagedRelayClientError>;
+    readonly deleteSkill: (input: {
+      readonly clerkToken: string;
+      readonly name: RelayOrganizationSkillName;
+    }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
   }
 >()("@t3tools/client-runtime/relay/managedRelayTenancy/ManagedRelayTenancyClient") {}
 
@@ -233,6 +248,9 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     listProviderAccounts: unavailable("clientRuntime.managedRelayTenancy.listProviderAccounts"),
     saveProviderAccount: unavailable("clientRuntime.managedRelayTenancy.saveProviderAccount"),
     deleteProviderAccount: unavailable("clientRuntime.managedRelayTenancy.deleteProviderAccount"),
+    listSkills: unavailable("clientRuntime.managedRelayTenancy.listSkills"),
+    saveSkill: unavailable("clientRuntime.managedRelayTenancy.saveSkill"),
+    deleteSkill: unavailable("clientRuntime.managedRelayTenancy.deleteSkill"),
   });
 }
 
@@ -706,6 +724,50 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.deleteProviderAccount"),
+      withRelayClientTracing,
+    ),
+    listSkills: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .listSkills({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.map((response) => response.skills),
+            Effect.mapError(relayRequestError("list relay organization skills")),
+            timeoutRelayRequest("Relay organization skill listing"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.listSkills"),
+      withRelayClientTracing,
+    ),
+    saveSkill: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .saveSkill({
+            headers: bearerHeaders(input.clerkToken),
+            params: { name: input.name },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("save relay organization skill")),
+            timeoutRelayRequest("Relay organization skill save"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.saveSkill"),
+      withRelayClientTracing,
+    ),
+    deleteSkill: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .deleteSkill({
+            headers: bearerHeaders(input.clerkToken),
+            params: { name: input.name },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("delete relay organization skill")),
+            timeoutRelayRequest("Relay organization skill removal"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.deleteSkill"),
       withRelayClientTracing,
     ),
   });

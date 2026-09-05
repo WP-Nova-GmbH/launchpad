@@ -14,6 +14,9 @@ import type {
   RelayOrgRole,
   RelayOrganizationMember,
   RelayOrganizationMembership,
+  RelayOrganizationSkill,
+  RelayOrganizationSkillFiles,
+  RelayOrganizationSkillName,
   RelayProviderAccount,
   RelayProviderAccountProvider,
   RelayRepositoryId,
@@ -43,6 +46,8 @@ export interface OrganizationAdminSnapshot {
   readonly githubRepositories: ReadonlyArray<RelayGithubRepository>;
   /** The provider sign-ins the organization shares with its executors; admins only. */
   readonly providerAccounts: ReadonlyArray<RelayProviderAccount>;
+  /** The skills the organization gives its agents on executors. */
+  readonly skills: ReadonlyArray<RelayOrganizationSkill>;
 }
 
 /**
@@ -130,6 +135,12 @@ export interface OrganizationAdminState {
     readonly payload: RelaySaveProviderAccountRequest;
   }) => Promise<boolean>;
   readonly removeProviderAccount: (provider: RelayProviderAccountProvider) => Promise<boolean>;
+  /** Store a skill for the organization; a skill of the same name is replaced. */
+  readonly saveSkill: (input: {
+    readonly name: RelayOrganizationSkillName;
+    readonly files: RelayOrganizationSkillFiles;
+  }) => Promise<boolean>;
+  readonly removeSkill: (name: RelayOrganizationSkillName) => Promise<boolean>;
 }
 
 function failureMessage(cause: unknown): string {
@@ -230,6 +241,9 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       const machines = await call("Could not list machines", (client, clerkToken) =>
         client.listMachines({ clerkToken }),
       );
+      const skills = await call("Could not list skills", (client, clerkToken) =>
+        client.listSkills({ clerkToken }),
+      );
       const github = await call("Could not read the GitHub connection", (client, clerkToken) =>
         client.getGithubConnection({ clerkToken }),
       );
@@ -250,6 +264,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         github,
         githubRepositories,
         providerAccounts,
+        skills,
       });
     } catch (cause) {
       setError(failureMessage(cause));
@@ -303,6 +318,18 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       mutate("Could not remove the provider account", () =>
         call("Could not remove the provider account", (client, clerkToken) =>
           client.deleteProviderAccount({ clerkToken, provider }),
+        ),
+      ),
+    saveSkill: (input) =>
+      mutate("Could not store the skill", () =>
+        call("Could not store the skill", (client, clerkToken) =>
+          client.saveSkill({ clerkToken, name: input.name, payload: { files: input.files } }),
+        ),
+      ),
+    removeSkill: (name) =>
+      mutate("Could not remove the skill", () =>
+        call("Could not remove the skill", (client, clerkToken) =>
+          client.deleteSkill({ clerkToken, name }),
         ),
       ),
     renameOrganization: (name) =>

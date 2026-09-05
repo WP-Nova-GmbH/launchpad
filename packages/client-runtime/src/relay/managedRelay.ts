@@ -127,6 +127,9 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "list relay provider accounts",
   "save relay provider account",
   "delete relay provider account",
+  "list relay organization skills",
+  "save relay organization skill",
+  "delete relay organization skill",
 ]);
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
@@ -175,6 +178,9 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay provider account listing",
   "Relay provider account save",
   "Relay provider account removal",
+  "Relay organization skill listing",
+  "Relay organization skill save",
+  "Relay organization skill removal",
 ]);
 export type ManagedRelayRequestActivity = typeof ManagedRelayRequestActivity.Type;
 
