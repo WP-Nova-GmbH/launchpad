@@ -516,6 +516,7 @@ export const make = Effect.gen(function* () {
           os: null,
           browser: null,
         },
+        user: null,
         issuedAt: yield* DateTime.now,
         expiresAt: REUSABLE_DEV_SESSION_EXPIRES_AT,
       })

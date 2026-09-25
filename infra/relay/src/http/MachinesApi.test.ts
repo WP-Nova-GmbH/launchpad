@@ -127,9 +127,10 @@ function endpointLayer(
     ManagedEndpointProvider.ManagedEndpointProvider,
     ManagedEndpointProvider.ManagedEndpointProvider.of({
       prepareDeprovision: () => Effect.succeed(null),
-      deprovision: () => Effect.void,
+      deprovision: () => Effect.succeed(true),
       release: () => Effect.succeed(true),
       provision: unexpected("endpoint provision"),
+      reconcileOrigin: unexpected("endpoint reconcile"),
       ...overrides,
     }),
   );
@@ -467,6 +468,7 @@ describe("deprovisionMachineRecord", () => {
               Effect.sync(() => {
                 calls.push("deprovision-endpoint");
                 endpointOwner = input.userId;
+                return true;
               }),
           }),
           machinesLayer({
@@ -524,6 +526,7 @@ describe("deprovisionMachineRecord", () => {
             deprovision: () =>
               Effect.sync(() => {
                 calls.push("deprovision-endpoint");
+                return true;
               }),
           }),
           machinesLayer({

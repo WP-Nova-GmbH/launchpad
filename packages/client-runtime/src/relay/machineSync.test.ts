@@ -68,6 +68,7 @@ function relayEntry(
       ...(source === undefined ? {} : { source }),
     }),
     profile: Option.none(),
+    enabled: true,
   };
 }
 
@@ -102,6 +103,7 @@ const makeRegistry = Effect.fn("MachineSyncTest.makeRegistry")(function* (
           new Map(current).set(registration.target.environmentId, {
             target: registration.target,
             profile: Option.none(),
+            enabled: true,
           }),
         );
         yield* SubscriptionRef.update(registered, (current) => [...current, registration]);
@@ -154,6 +156,7 @@ describe("organization machine sync", () => {
             connectionId: "bearer:bearer-1",
           }),
           profile: Option.none(),
+          enabled: true,
         },
       ]);
 

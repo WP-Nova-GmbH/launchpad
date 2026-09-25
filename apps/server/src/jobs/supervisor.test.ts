@@ -99,10 +99,14 @@ const makeHarness = (options: SupervisorHarnessOptions = {}): Effect.Effect<Supe
 
     const engine: OrchestrationEngineShape = {
       readEvents: () => Stream.empty,
+      readThreadEvents: () => Stream.die("readThreadEvents should not be called by the supervisor"),
+      getThreadReplayStats: () =>
+        Effect.die("getThreadReplayStats should not be called by the supervisor"),
       latestSequence: Effect.succeed(0),
       get streamDomainEvents() {
         return Stream.fromPubSub(pubSub);
       },
+      subscribeDomainEvents: Effect.sync(() => Stream.fromPubSub(pubSub)),
       dispatch: (command) =>
         Ref.update(dispatched, (all) => [...all, command]).pipe(
           Effect.andThen(Queue.offer(dispatchSignals, command)),

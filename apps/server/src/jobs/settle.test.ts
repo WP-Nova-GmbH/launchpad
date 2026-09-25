@@ -65,10 +65,14 @@ const makeEngineHarness = Effect.gen(function* () {
   const pubSub = yield* PubSub.unbounded<OrchestrationEvent>();
   const engine: OrchestrationEngineShape = {
     readEvents: () => Stream.empty,
+    readThreadEvents: () => Stream.die("readThreadEvents should not be called by the settle watch"),
+    getThreadReplayStats: () =>
+      Effect.die("getThreadReplayStats should not be called by the settle watch"),
     dispatch: () => Effect.die("dispatch should not be called by the settle watch"),
     get streamDomainEvents() {
       return Stream.fromPubSub(pubSub);
     },
+    subscribeDomainEvents: Effect.sync(() => Stream.fromPubSub(pubSub)),
     latestSequence: Effect.succeed(0),
   };
   const emit = (event: OrchestrationEvent) => PubSub.publish(pubSub, event).pipe(Effect.asVoid);

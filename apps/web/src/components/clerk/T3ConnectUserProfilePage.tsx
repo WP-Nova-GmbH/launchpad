@@ -241,8 +241,8 @@ export function T3ConnectUserProfilePage() {
               <EmptyHeader>
                 <EmptyTitle>No Launchpad Connect environments</EmptyTitle>
                 <EmptyDescription>
-                  Link an environment from its local Settings to make it available through
-                  Launchpad Connect.
+                  Link an environment from its local Settings to make it available through Launchpad
+                  Connect.
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>

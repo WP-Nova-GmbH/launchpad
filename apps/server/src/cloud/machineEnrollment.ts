@@ -42,13 +42,13 @@ import { getOrCreateEnvironmentKeyPairFromSecretStore } from "./environmentKeys.
  * injects these into the instance; the seed is single-use and dead the moment
  * enrollment succeeds, so a restart re-reading it is harmless.
  */
-const machineEnrollmentSeedConfig = Config.nonEmptyString("T3CODE_MACHINE_ENROLLMENT_SEED").pipe(
+const machineEnrollmentSeedConfig = Config.NonEmptyString("T3CODE_MACHINE_ENROLLMENT_SEED").pipe(
   Config.option,
 );
-const machineEnrollmentRelayUrlConfig = Config.nonEmptyString(
+const machineEnrollmentRelayUrlConfig = Config.NonEmptyString(
   "T3CODE_MACHINE_ENROLLMENT_RELAY_URL",
 ).pipe(Config.option);
-const machineEnrollmentRelayIssuerConfig = Config.nonEmptyString(
+const machineEnrollmentRelayIssuerConfig = Config.NonEmptyString(
   "T3CODE_MACHINE_ENROLLMENT_RELAY_ISSUER",
 ).pipe(Config.option);
 /**
@@ -56,7 +56,7 @@ const machineEnrollmentRelayIssuerConfig = Config.nonEmptyString(
  * loopback origin the server binds — a Docker driver maps the container port
  * onto the host and passes the host-side origin here.
  */
-const machineAdvertisedOriginConfig = Config.nonEmptyString(
+const machineAdvertisedOriginConfig = Config.NonEmptyString(
   "T3CODE_MACHINE_ADVERTISED_ORIGIN",
 ).pipe(Config.option);
 /**
@@ -64,7 +64,7 @@ const machineAdvertisedOriginConfig = Config.nonEmptyString(
  * scrubbed after use. The seed is single-use server-side either way; wiping
  * the file just stops a dead secret from lingering on disk.
  */
-const machineEnrollmentEnvFileConfig = Config.nonEmptyString(
+const machineEnrollmentEnvFileConfig = Config.NonEmptyString(
   "T3CODE_MACHINE_ENROLLMENT_ENV_FILE",
 ).pipe(Config.option);
 

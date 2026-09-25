@@ -119,6 +119,9 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         ),
       );
       const profileDirectory = directories.profile;
+      // Organization provider accounts and skills are not placed here: the
+      // relay holds neither for Antigravity (`ProviderAccountProvider`), whose
+      // Google login lives in the per-instance profile above.
       // No process of this instance exists yet, so every runtime temp
       // directory it owns is an orphan from a killed server. Older builds
       // unpacked inside the profile.

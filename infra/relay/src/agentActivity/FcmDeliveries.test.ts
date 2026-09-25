@@ -162,6 +162,7 @@ function harness() {
     }),
     Layer.succeed(EnvironmentLinks, {
       upsert: () => Effect.void,
+      listPublicKeysForEnvironment: () => Effect.succeed([]),
       listDeliveryUsersForEnvironment: (input) =>
         Effect.sync(() =>
           current.linked && !current.revokedEnvironments.includes(input.environmentId)
@@ -186,6 +187,7 @@ function harness() {
                 label: "Desktop",
                 environmentPublicKey: "key",
                 linkedAt: state.updatedAt,
+                source: "link" as const,
                 endpoint: {
                   httpBaseUrl: "https://env.test",
                   wsBaseUrl: "wss://env.test",

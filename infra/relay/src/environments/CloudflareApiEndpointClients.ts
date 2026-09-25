@@ -19,7 +19,9 @@ import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
 import {
   ManagedEndpointDnsClientError,
+  type ManagedEndpointTunnel,
   ManagedEndpointTunnelClientError,
+  type ManagedEndpointTunnelListRequest,
   layerDnsClient,
   layerTunnelClient,
 } from "./ManagedEndpointProvider.ts";
@@ -45,11 +47,49 @@ export interface CloudflareEndpointSettings {
 const TunnelResult = Schema.Struct({
   id: Schema.optionalKey(Schema.NullOr(Schema.String)),
   name: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  status: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  created_at: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  conns_inactive_at: Schema.optionalKey(Schema.NullOr(Schema.String)),
+});
+
+const toTunnel = (result: typeof TunnelResult.Type): ManagedEndpointTunnel => ({
+  id: result.id ?? null,
+  name: result.name ?? null,
+  status: result.status ?? null,
+  createdAt: result.created_at ?? null,
+  connsInactiveAt: result.conns_inactive_at ?? null,
 });
 
 const decodeTunnelList = HttpClientResponse.schemaBodyJson(
-  Schema.Struct({ result: Schema.NullOr(Schema.Array(TunnelResult)) }),
+  Schema.Struct({
+    result: Schema.NullOr(Schema.Array(TunnelResult)),
+    result_info: Schema.optionalKey(
+      Schema.NullOr(
+        Schema.Struct({
+          page: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+          per_page: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+          total_count: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+        }),
+      ),
+    ),
+  }),
 );
+
+/** The same filters the Worker passes to its binding, spelled as Cloudflare's query string. */
+const tunnelListQuery = (request: ManagedEndpointTunnelListRequest): string => {
+  const params = new URLSearchParams({ is_deleted: "false" });
+  const set = (key: string, value: string | number | undefined) => {
+    if (value !== undefined) params.set(key, String(value));
+  };
+  set("name", request.name);
+  set("include_prefix", request.includePrefix);
+  set("status", request.status);
+  set("existed_at", request.existedAt);
+  set("was_inactive_at", request.wasInactiveAt);
+  set("page", request.page);
+  set("per_page", request.perPage);
+  return params.toString();
+};
 const decodeTunnel = HttpClientResponse.schemaBodyJson(Schema.Struct({ result: TunnelResult }));
 const decodeTunnelToken = HttpClientResponse.schemaBodyJson(
   Schema.Struct({ result: Schema.String }),
@@ -101,7 +141,7 @@ export const layerCloudflareApi = (settings: CloudflareEndpointSettings) => {
     const tunnelError =
       (
         operation: ManagedEndpointTunnelClientError["operation"],
-        target: { name?: string; id?: string },
+        target: { name?: string | undefined; id?: string | undefined },
       ) =>
       (cause: unknown) =>
         new ManagedEndpointTunnelClientError({
@@ -112,15 +152,32 @@ export const layerCloudflareApi = (settings: CloudflareEndpointSettings) => {
         });
 
     return layerTunnelClient({
+      get: (tunnelId) =>
+        HttpClientRequest.get(`${accountBase}/${encodeURIComponent(tunnelId)}`).pipe(
+          authorized,
+          httpClient.execute,
+          Effect.flatMap(HttpClientResponse.filterStatusOk),
+          Effect.flatMap(decodeTunnel),
+          Effect.map((response) => toTunnel(response.result)),
+          Effect.mapError(tunnelError("get", { id: tunnelId })),
+        ),
       list: (request) =>
-        HttpClientRequest.get(
-          `${accountBase}?name=${encodeURIComponent(request.name)}&is_deleted=false`,
-        ).pipe(
+        HttpClientRequest.get(`${accountBase}?${tunnelListQuery(request)}`).pipe(
           authorized,
           httpClient.execute,
           Effect.flatMap(HttpClientResponse.filterStatusOk),
           Effect.flatMap(decodeTunnelList),
-          Effect.map((response) => ({ result: response.result ?? [] })),
+          Effect.map((response) => ({
+            result: (response.result ?? []).map(toTunnel),
+            resultInfo:
+              response.result_info == null
+                ? null
+                : {
+                    page: response.result_info.page ?? null,
+                    perPage: response.result_info.per_page ?? null,
+                    totalCount: response.result_info.total_count ?? null,
+                  },
+          })),
           Effect.mapError(tunnelError("list", { name: request.name })),
         ),
       create: (request) =>
@@ -130,7 +187,7 @@ export const layerCloudflareApi = (settings: CloudflareEndpointSettings) => {
           Effect.flatMap(httpClient.execute),
           Effect.flatMap(HttpClientResponse.filterStatusOk),
           Effect.flatMap(decodeTunnel),
-          Effect.map((response) => response.result),
+          Effect.map((response) => toTunnel(response.result)),
           Effect.mapError(tunnelError("create", { name: request.name })),
         ),
       putConfiguration: (tunnelId, config) =>

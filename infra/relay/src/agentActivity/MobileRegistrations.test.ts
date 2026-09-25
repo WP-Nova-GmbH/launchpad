@@ -106,6 +106,7 @@ function makeEnvironmentLinks(
 ): EnvironmentLinks.EnvironmentLinks["Service"] {
   return {
     upsert: () => Effect.void,
+    listPublicKeysForEnvironment: () => Effect.succeed([]),
     listDeliveryUsersForEnvironment: () =>
       Effect.succeed([
         {

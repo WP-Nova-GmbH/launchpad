@@ -3,8 +3,11 @@ import * as Effect from "effect/Effect";
 import * as Migrator from "effect/unstable/sql/Migrator";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { SqlitePersistenceMemory } from "./Layers/Sqlite.ts";
 import { runMigrations } from "./Migrations.ts";
+import MigrationAuthSessionUser from "./Migrations/055_AuthSessionUser.ts";
+import MigrationProjectionThreadMessageAuthor from "./Migrations/056_ProjectionThreadMessageAuthor.ts";
 
 describe("migration history guard", () => {
   it.effect("refuses to run when a recorded id names a different change", () =>
@@ -35,9 +38,11 @@ describe("migration history guard", () => {
   it.effect("reruns from a renumbered migration's old id", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      // A database migrated before upstream took ids 41 and 42: it recorded the
+      // A database migrated before upstream took ids 41 and 42: it ran the
       // fork's migrations under those ids and never saw 41–56 as they are now.
-      yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id > 40`;
+      yield* runMigrations({ toMigrationInclusive: 40 });
+      yield* MigrationAuthSessionUser;
+      yield* MigrationProjectionThreadMessageAuthor;
       yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (41, 'AuthSessionUser'), (42, 'ProjectionThreadMessageAuthor')`;
 
       const executed = yield* runMigrations();
@@ -54,7 +59,7 @@ describe("migration history guard", () => {
         { migration_id: 41, name: "AuthSessionClientConnection" },
         { migration_id: 55, name: "AuthSessionUser" },
       ]);
-    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
   it.effect("passes when recorded names match the manifest", () =>

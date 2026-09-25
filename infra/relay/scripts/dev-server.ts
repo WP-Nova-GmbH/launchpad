@@ -7,7 +7,7 @@
  * equivalent:
  *
  *   - managed endpoints  → Docker machines use validated host-loopback endpoints
- *   - APNs delivery queue → drop, so publishing activity does not need a queue
+ *   - APNs/FCM delivery queues → drop, so publishing activity does not need a queue
  *
  * Clerk verification is real, using CLERK_SECRET_KEY from infra/relay/.env, so
  * tokens minted by the browser are checked exactly as production checks them.
@@ -29,6 +29,8 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
+import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as HttpApiScalar from "effect/unstable/httpapi/HttpApiScalar";
@@ -41,6 +43,7 @@ import { RelayApi } from "@t3tools/contracts/relay";
 import { loadOrCreateDevCloudMintKeyPair } from "./dev-cloud-mint-key-pair.ts";
 
 import {
+  RELAY_HTTP_ROUTER_CONFIG,
   clientApi,
   dpopClientApi,
   healthApi,
@@ -71,6 +74,10 @@ import * as ApnsDeliveryQueue from "../src/agentActivity/ApnsDeliveryQueue.ts";
 import * as ApnsProviderTokens from "../src/agentActivity/ApnsProviderTokens.ts";
 import * as DeliveryAttempts from "../src/agentActivity/DeliveryAttempts.ts";
 import * as Devices from "../src/agentActivity/Devices.ts";
+import * as FcmAssertionSigner from "../src/agentActivity/FcmAssertionSigner.ts";
+import * as FcmClient from "../src/agentActivity/FcmClient.ts";
+import * as FcmDeliveries from "../src/agentActivity/FcmDeliveries.ts";
+import * as FcmDeliveryQueueSender from "../src/agentActivity/FcmDeliveryQueueSender.ts";
 import * as DpopProofs from "../src/auth/DpopProofs.ts";
 import * as EnvironmentConnector from "../src/environments/EnvironmentConnector.ts";
 import * as EnvironmentCredentials from "../src/environments/EnvironmentCredentials.ts";
@@ -84,6 +91,7 @@ import * as LiveActivities from "../src/agentActivity/LiveActivities.ts";
 import * as ManagedEndpointAllocations from "../src/environments/ManagedEndpointAllocations.ts";
 import * as CloudflareApiEndpointClients from "../src/environments/CloudflareApiEndpointClients.ts";
 import * as ManagedEndpointProvider from "../src/environments/ManagedEndpointProvider.ts";
+import * as ManagedEndpointReaper from "../src/environments/ManagedEndpointReaper.ts";
 import * as ManagedTunnelLimits from "../src/environments/ManagedTunnelLimits.ts";
 import * as DockerComputeProvider from "../src/machines/DockerComputeProvider.ts";
 import * as MachineEnroller from "../src/machines/MachineEnroller.ts";
@@ -105,6 +113,7 @@ import * as ProviderAccounts from "../src/tenancy/ProviderAccounts.ts";
 import * as RelaySecretBox from "../src/auth/SecretBox.ts";
 import { githubAppSetupRoutes } from "../src/http/GithubAppSetupRoute.ts";
 import * as UserDirectory from "../src/tenancy/UserDirectory.ts";
+import * as WebCrypto from "../src/WebCrypto.ts";
 
 const DEFAULT_PORT = 8610;
 const DEFAULT_DATABASE_URL = "postgres://postgres:t3relay@127.0.0.1:5433/t3relay";
@@ -133,6 +142,7 @@ const unsupported = (operation: string) =>
   Effect.die(`This relay is not configured to ${operation}.`);
 
 const tunnelClientStub: ManagedEndpointProvider.ManagedEndpointTunnelClient["Service"] = {
+  get: () => unsupported("read Cloudflare tunnels"),
   list: () => Effect.succeed({ result: [] }),
   create: () => unsupported("provision Cloudflare tunnels"),
   putConfiguration: () => unsupported("configure Cloudflare tunnels"),
@@ -176,6 +186,15 @@ const cloudflareEndpointEnv = (() => {
   return { apiToken: Redacted.make(apiToken), accountId, zoneName };
 })();
 
+/**
+ * Inactive tunnel cleanup, same switch as the Worker (RELAY_TUNNEL_CLEANUP_MODE:
+ * off, dry-run, enabled). Off by default; a relay without Cloudflare
+ * credentials has nothing to sweep either way.
+ */
+const managedEndpointCleanupMode = Schema.decodeUnknownSync(
+  RelayConfiguration.ManagedEndpointCleanupMode,
+)(process.env.RELAY_TUNNEL_CLEANUP_MODE?.trim() || "off");
+
 const port = Number(process.env.DEV_RELAY_PORT ?? DEFAULT_PORT);
 const databaseUrl = process.env.DEV_RELAY_DATABASE_URL?.trim() || DEFAULT_DATABASE_URL;
 const relayIssuer = process.env.DEV_RELAY_ISSUER?.trim() || `http://127.0.0.1:${port}`;
@@ -191,13 +210,20 @@ const relayConfigurationLayer = Layer.succeed(
   RelayConfiguration.RelayConfiguration.of({
     relayIssuer,
     // Never exercised: nothing in the organization surface sends a push.
-    apns: {
-      environment: "sandbox",
-      teamId: process.env.APNS_TEAM_ID ?? "dev-team",
-      keyId: process.env.APNS_KEY_ID ?? "dev-key",
-      bundleId: process.env.APNS_BUNDLE_ID ?? "dev.bundle",
-      privateKey: Redacted.make("dev-apns-private-key"),
-    },
+    // APNS_ENABLED=false turns Apple delivery off outright, as on the Worker.
+    apns:
+      process.env.APNS_ENABLED?.trim() === "false"
+        ? null
+        : {
+            environment: "sandbox",
+            teamId: process.env.APNS_TEAM_ID ?? "dev-team",
+            keyId: process.env.APNS_KEY_ID ?? "dev-key",
+            bundleId: process.env.APNS_BUNDLE_ID ?? "dev.bundle",
+            privateKey: Redacted.make("dev-apns-private-key"),
+          },
+    ...(process.env.FCM_SERVICE_ACCOUNT?.trim()
+      ? { fcmServiceAccount: Redacted.make(process.env.FCM_SERVICE_ACCOUNT.trim()) }
+      : {}),
     apnsDeliveryJobSigningSecret: Redacted.make("dev-apns-delivery-secret"),
     // The real key, so tokens are verified exactly as production verifies them.
     clerkSecretKey: Redacted.make(required("CLERK_SECRET_KEY")),
@@ -234,6 +260,7 @@ const relayConfigurationLayer = Layer.succeed(
         "https://github.com/WP-Nova-GmbH/launchpad.git",
       ref: process.env.MACHINE_SOURCE_GIT_REF?.trim() || "main",
     },
+    managedEndpointCleanupMode,
   }),
 );
 
@@ -290,13 +317,31 @@ const runtimeLayer = Layer.empty
       }),
     ),
     Layer.provideMerge(MachineLimits.layer),
-    Layer.provideMerge(EnvironmentPublishSignatures.layer),
-    Layer.provideMerge(EnvironmentProjectCatalogSignatures.layer),
     Layer.provideMerge(
-      ManagedEndpointProvider.layer.pipe(Layer.provide(managedEndpointClientsLayer)),
+      Layer.merge(EnvironmentPublishSignatures.layer, ManagedEndpointReaper.layer),
     ),
+    Layer.provideMerge(EnvironmentProjectCatalogSignatures.layer),
+    Layer.provideMerge(ManagedEndpointProvider.layer),
+    // Shared by the provider and the reaper, so the zone is resolved once.
+    Layer.provideMerge(managedEndpointClientsLayer),
     Layer.provideMerge(DpopProofs.layer),
     Layer.provideMerge(ApnsDeliveries.layer),
+    Layer.provideMerge(
+      FcmDeliveries.layer.pipe(
+        Layer.provide(
+          Layer.succeed(FcmDeliveryQueueSender.FcmDeliveryQueueSender, {
+            // Dropped like the APNs job: no queue locally, nobody to push to.
+            send: () => Effect.void,
+          }),
+        ),
+        Layer.provideMerge(
+          FcmClient.layer.pipe(
+            Layer.provide(FcmAssertionSigner.layer),
+            Layer.provide(Layer.succeed(WebCrypto.WebCrypto, { subtle: globalThis.crypto.subtle })),
+          ),
+        ),
+      ),
+    ),
     Layer.provideMerge(ApnsClient.layer.pipe(Layer.provideMerge(ApnsProviderTokens.layer))),
     Layer.provideMerge(
       ApnsDeliveryQueue.layer.pipe(
@@ -337,11 +382,11 @@ const runtimeLayer = Layer.empty
         ManagedTunnelLimits.layer,
       ),
     ),
-    Layer.provideMerge(LiveActivities.layer),
-    Layer.provideMerge(DeliveryAttempts.layer),
   )
   .pipe(
     // Split only because `pipe` takes at most twenty arguments.
+    Layer.provideMerge(LiveActivities.layer),
+    Layer.provideMerge(DeliveryAttempts.layer),
     Layer.provideMerge(RelayTokens.layer),
     Layer.provideMerge(GithubAppSetup.layer),
     Layer.provideMerge(Layer.mergeAll(GithubAppRecords.layer, RelaySecretBox.layer)),
@@ -389,14 +434,40 @@ const routerLayer = Layer.merge(
   relayNotFoundRoute,
 );
 
+/**
+ * The Worker sweeps inactive tunnels from a cron; here a fiber does the same
+ * every five minutes for the life of the server, and only when cleanup is
+ * switched on — off means no sweep, not a sweep that does nothing.
+ */
+const managedEndpointSweepLayer =
+  managedEndpointCleanupMode === "off"
+    ? Layer.empty
+    : Layer.effectDiscard(
+        ManagedEndpointReaper.ManagedEndpointReaper.pipe(
+          Effect.flatMap((reaper) => reaper.sweep.pipe(Effect.timeout("2 minutes"))),
+          Effect.tap((result) =>
+            result.scanned > 0
+              ? Effect.logInfo("Finished managed tunnel cleanup", result)
+              : Effect.void,
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Failed to clean up inactive managed tunnels", { cause }),
+          ),
+          Effect.repeat(Schedule.spaced("5 minutes")),
+          Effect.forkScoped,
+        ),
+      );
+
 const main = Effect.gen(function* () {
   const nodeHttp = yield* Effect.promise(() => import("node:http"));
   yield* Effect.logInfo("Development relay listening", { port, issuer: relayIssuer, databaseUrl });
   // Handler requirements are deferred to the serve step rather than discharged
   // by the group layers, so this is where the runtime has to be supplied.
   return yield* Layer.launch(
-    HttpRouter.serve(routerLayer).pipe(
+    Layer.merge(HttpRouter.serve(routerLayer), managedEndpointSweepLayer).pipe(
       Layer.provide(NodeHttpServer.layer(nodeHttp.createServer, { host: "127.0.0.1", port })),
+      // Delegated thread ids exceed the router's default path parameter limit.
+      Layer.provide(Layer.succeed(HttpRouter.RouterConfig, RELAY_HTTP_ROUTER_CONFIG)),
       Layer.provide(runtimeLayer),
       Layer.provide(NodeServices.layer),
     ),

@@ -28,6 +28,7 @@ import * as GitLabCli from "../src/sourceControl/GitLabCli.ts";
 import * as ForgejoCli from "../src/sourceControl/ForgejoCli.ts";
 import * as AzureDevOpsCli from "../src/sourceControl/AzureDevOpsCli.ts";
 import * as BitbucketApi from "../src/sourceControl/BitbucketApi.ts";
+import * as OrganizationSourceControlCredentials from "../src/relay/OrganizationSourceControlCredentials.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as VcsDriverRegistry from "../src/vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "../src/vcs/VcsProjectConfig.ts";
@@ -160,10 +161,11 @@ await Effect.runPromise(
           ),
           Layer.provide(VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer))),
           Layer.provide(GitVcsDriver.layer),
-          Layer.provide(VcsProcess.layer),
+          Layer.provide(VcsProcess.layerLocal),
           Layer.provide(FetchHttpClient.layer),
         ),
       ).pipe(
+        Layer.provide(OrganizationSourceControlCredentials.layerNone),
         Layer.provideMerge(
           ServerConfig.layerTest(process.cwd(), { prefix: "t3-title-evaluation-state-" }),
         ),

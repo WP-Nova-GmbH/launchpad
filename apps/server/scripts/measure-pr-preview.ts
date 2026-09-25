@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema";
 import * as GitHubPullRequestCli from "../src/pullRequest/GitHubPullRequestCli.ts";
 import * as GitHubPullRequestProvider from "../src/pullRequest/GitHubPullRequestProvider.ts";
 import * as GitHubCli from "../src/sourceControl/GitHubCli.ts";
+import * as OrganizationSourceControlCredentials from "../src/relay/OrganizationSourceControlCredentials.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 
 const [repository, ...numbers] = process.argv.slice(2);
@@ -45,7 +46,11 @@ const measuredProcess = Layer.effect(
         ),
     });
   }),
-).pipe(Layer.provide(VcsProcess.layer), Layer.provide(NodeServices.layer));
+).pipe(
+  Layer.provide(VcsProcess.layerLocal),
+  Layer.provide(OrganizationSourceControlCredentials.layerNone),
+  Layer.provide(NodeServices.layer),
+);
 
 const services = GitHubPullRequestCli.layer.pipe(
   Layer.provide(GitHubCli.layer),

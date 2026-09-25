@@ -22,6 +22,7 @@ import { removeAntigravitySessionFiles } from "../provider/acp/AntigravitySessio
 import type { AcpSessionRuntime } from "../provider/acp/AcpSessionRuntime.ts";
 import type * as TextGeneration from "./TextGeneration.ts";
 import {
+  buildApprovalVerdictPrompt,
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
   buildPrContentPrompt,
@@ -405,10 +406,32 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
       };
     });
 
+  // The verdict never needs the workspace: the request detail carries what
+  // the model judges, so `input.cwd` stays out of the helper's sandbox.
+  const generateApprovalVerdict: TextGeneration.TextGeneration["Service"]["generateApprovalVerdict"] =
+    Effect.fn("AntigravityTextGeneration.generateApprovalVerdict")(function* (input) {
+      const generated = yield* runAntigravityJson({
+        operation: "generateApprovalVerdict",
+        ...buildApprovalVerdictPrompt({
+          toolKind: input.toolKind,
+          requestType: input.requestType,
+          requestDetail: input.requestDetail,
+          stepInstruction: input.stepInstruction,
+          policy: input.policy,
+        }),
+        modelSelection: input.modelSelection,
+      });
+      return {
+        verdict: generated.verdict,
+        reasoning: generated.reasoning,
+      } satisfies TextGeneration.ApprovalVerdictGenerationResult;
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
+    generateApprovalVerdict,
   } satisfies TextGeneration.TextGeneration["Service"];
 });

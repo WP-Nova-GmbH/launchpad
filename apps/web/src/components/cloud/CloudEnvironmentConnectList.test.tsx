@@ -149,7 +149,13 @@ beforeEach(() => {
       listed: false,
     });
     const environments = await discovery.listEnvironments();
-    publish({ environments, refreshing: false, offline: false, error: Option.none(), listed: true });
+    publish({
+      environments,
+      refreshing: false,
+      offline: false,
+      error: Option.none(),
+      listed: true,
+    });
     return AsyncResult.success(undefined);
   });
 });

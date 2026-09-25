@@ -84,6 +84,7 @@ function makeEnvironmentLinks(
 ): EnvironmentLinks.EnvironmentLinks["Service"] {
   return {
     upsert: () => Effect.void,
+    listPublicKeysForEnvironment: () => Effect.succeed([]),
     listDeliveryUsersForEnvironment: () =>
       Effect.succeed([
         {
@@ -311,6 +312,7 @@ describe("AgentActivityPublisher", () => {
                 Layer.succeed(
                   EnvironmentLinks.EnvironmentLinks,
                   makeEnvironmentLinks({
+                    listPublicKeysForEnvironment: () => Effect.succeed([]),
                     listDeliveryUsersForEnvironment: (input) =>
                       Effect.sync(() => {
                         deliveryLookups.push(input);
@@ -508,6 +510,7 @@ describe("AgentActivityPublisher", () => {
                 Layer.succeed(
                   EnvironmentLinks.EnvironmentLinks,
                   makeEnvironmentLinks({
+                    listPublicKeysForEnvironment: () => Effect.succeed([]),
                     listDeliveryUsersForEnvironment: () =>
                       Effect.succeed([
                         {
@@ -621,6 +624,7 @@ describe("AgentActivityPublisher", () => {
                   Layer.succeed(
                     EnvironmentLinks.EnvironmentLinks,
                     makeEnvironmentLinks({
+                      listPublicKeysForEnvironment: () => Effect.succeed([]),
                       listDeliveryUsersForEnvironment: () =>
                         Effect.succeed([
                           {

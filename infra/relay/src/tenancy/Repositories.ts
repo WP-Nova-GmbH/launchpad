@@ -194,12 +194,10 @@ export const make = Effect.gen(function* () {
     rows: ReadonlyArray<RepositoryRow>,
   ) {
     const aliases = yield* loadAliases({ repositoryIds: rows.map((row) => row.repositoryId) });
-    return rows.map(
-      (row): RepositoryRecord => ({
-        ...row,
-        canonicalKeys: aliases.get(row.repositoryId) ?? [],
-      }),
-    );
+    return rows.map((row): RepositoryRecord => ({
+      ...row,
+      canonicalKeys: aliases.get(row.repositoryId) ?? [],
+    }));
   });
 
   const insertAlias = Effect.fn("relay.repositories.insert_alias")(function* (input: {

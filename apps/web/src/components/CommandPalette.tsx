@@ -1830,21 +1830,19 @@ function OpenCommandPaletteDialog(props: {
           {
             value: `organization-repository-targets:${entry.repository.repositoryId}`,
             label: `Clone ${entry.repository.name} to`,
-            items: addProjectEnvironmentOptions.map(
-              (option): CommandPaletteActionItem => ({
-                kind: "action",
-                value: `action:add-project:organization:${entry.repository.repositoryId}:${option.environmentId}`,
-                searchTerms: [option.label, option.environmentId, entry.repository.name],
-                title: option.label,
-                description: option.isConnected ? "Available" : option.status,
-                disabled: !option.isConnected,
-                icon: <ServerIcon className={ITEM_ICON_CLASS} />,
-                keepOpen: true,
-                run: async () => {
-                  startAddProjectOrganizationRepository(option.environmentId, entry);
-                },
-              }),
-            ),
+            items: addProjectEnvironmentOptions.map((option): CommandPaletteActionItem => ({
+              kind: "action",
+              value: `action:add-project:organization:${entry.repository.repositoryId}:${option.environmentId}`,
+              searchTerms: [option.label, option.environmentId, entry.repository.name],
+              title: option.label,
+              description: option.isConnected ? "Available" : option.status,
+              disabled: !option.isConnected,
+              icon: <ServerIcon className={ITEM_ICON_CLASS} />,
+              keepOpen: true,
+              run: async () => {
+                startAddProjectOrganizationRepository(option.environmentId, entry);
+              },
+            })),
           },
         ],
       });

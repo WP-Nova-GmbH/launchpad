@@ -28,7 +28,11 @@ import { readManagedExecutorRelayConfig } from "../cloud/machineEnrollment.ts";
 import { ProviderMaintenanceRunner } from "./providerMaintenanceRunner.ts";
 import * as ProviderRegistry from "./Services/ProviderRegistry.ts";
 
-/** Providers whose CLI ships on npm; the maintenance runner's update action installs them. */
+/**
+ * Providers whose CLI ships on npm; the maintenance runner's update action
+ * installs them. Antigravity is absent on purpose: its driver downloads its
+ * own release (`AntigravityInstallation`), and Grok has no installable CLI.
+ */
 export const NPM_INSTALLED_PROVIDERS: ReadonlyArray<ProviderDriverKind> = [
   ProviderDriverKind.make("codex"),
   ProviderDriverKind.make("claudeAgent"),

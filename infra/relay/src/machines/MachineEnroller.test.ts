@@ -194,7 +194,6 @@ function testLayer(input?: {
         ),
         Layer.succeed(EnvironmentLinks.EnvironmentLinks, {
           upsert: () => Effect.die("unexpected link upsert"),
-          listUsersForEnvironment: () => Effect.succeed([]),
           listDeliveryUsersForEnvironment: () => Effect.succeed([]),
           listPublicKeysForEnvironment: () => Effect.succeed(input?.linkedPublicKeys ?? []),
           listForUser: () => Effect.succeed([]),
@@ -208,8 +207,9 @@ function testLayer(input?: {
         }),
         Layer.succeed(ManagedEndpointProvider.ManagedEndpointProvider, {
           prepareDeprovision: () => Effect.succeed(null),
-          deprovision: () => Effect.void,
+          deprovision: () => Effect.succeed(true),
           release: () => Effect.succeed(true),
+          reconcileOrigin: () => Effect.die("unexpected endpoint reconcile"),
           provision: (provisionInput) => {
             input?.onProvision?.(provisionInput);
             return Effect.succeed({

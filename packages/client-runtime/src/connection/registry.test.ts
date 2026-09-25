@@ -707,6 +707,7 @@ describe("EnvironmentRegistry", () => {
             providerKind: "manual" as const,
           },
           linkedAt: "2026-09-15T00:00:00Z",
+          source: "link" as const,
         };
         const status: RelayEnvironmentStatusResponse = {
           environmentId: value.environmentId,
@@ -842,6 +843,7 @@ describe("EnvironmentRegistry", () => {
             label: "Preview server",
             endpoint,
             linkedAt: "2026-09-25T00:00:00Z",
+            source: "link" as const,
           },
           availability: "online" as const,
           status: Option.some<RelayEnvironmentStatusResponse>({

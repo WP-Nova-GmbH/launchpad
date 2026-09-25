@@ -1315,8 +1315,8 @@ function BrowserKeybindingNotice() {
     <div className="flex items-center gap-2 px-3 py-2.5 text-xs leading-normal text-muted-foreground sm:px-4">
       <TriangleAlertIcon className="size-3.5 shrink-0 text-warning" aria-hidden />
       <span>
-        Some shortcuts may be claimed by the browser before Launchpad sees them. Use the desktop
-        app for better keybinding support.
+        Some shortcuts may be claimed by the browser before Launchpad sees them. Use the desktop app
+        for better keybinding support.
       </span>
     </div>
   );

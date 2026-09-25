@@ -1623,6 +1623,6 @@ it.effect(
       assert.deepStrictEqual(fetched, [source, source, "git@forgejo.test:reviewer/project.git"]);
     }).pipe(
       Effect.scoped,
-      Effect.provide(VcsProcess.layer.pipe(Layer.provideMerge(NodeServices.layer))),
+      Effect.provide(VcsProcess.layerLocal.pipe(Layer.provideMerge(NodeServices.layer))),
     ),
 );
