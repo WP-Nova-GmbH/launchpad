@@ -20,14 +20,7 @@ import {
 } from "../../vscodeThemeImport";
 import { Alert } from "../ui/alert";
 import { Button } from "../ui/button";
-import {
-  Dialog,
-  DialogFooter,
-  DialogHeader,
-  DialogPanel,
-  DialogPopup,
-  DialogTitle,
-} from "../ui/dialog";
+import { Dialog, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "../ui/dialog";
 import { ThemeSearchSection } from "./ThemeSearchSection";
 
 /**
@@ -118,12 +111,12 @@ function ThemeJsonEditor({
   }, []);
 
   return (
-    <div className="relative overflow-hidden rounded-xl border border-input bg-background shadow-xs/5 focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/24">
+    <div className="relative overflow-hidden rounded-xl border border-input bg-background shadow-xs/5 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/24">
       {isPlainText ? null : (
         <pre
           ref={highlightRef}
           aria-hidden
-          className="pointer-events-none absolute inset-0 m-0 overflow-hidden whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-5 text-foreground"
+          className="pointer-events-none absolute inset-0 m-0 overflow-hidden whitespace-pre-wrap break-words p-3 font-mono text-xs leading-5 text-foreground"
         >
           <code dangerouslySetInnerHTML={{ __html: highlightedJson }} />
         </pre>
@@ -131,8 +124,8 @@ function ThemeJsonEditor({
       <textarea
         aria-label="Theme JSON"
         className={cn(
-          "relative z-10 block min-h-72 w-full resize-y overflow-auto bg-transparent p-3 font-mono text-[12px] leading-5 caret-foreground outline-none placeholder:text-muted-foreground selection:bg-accent/30",
-          isPlainText ? "text-foreground" : "text-transparent selection:text-transparent",
+          "relative z-10 block min-h-44 w-full resize-y overflow-auto bg-transparent p-3 font-mono text-xs leading-5 caret-foreground outline-none placeholder:text-muted-foreground selection:bg-primary selection:text-primary-foreground",
+          isPlainText ? "text-foreground" : "text-transparent",
         )}
         id={id}
         onChange={(event) => onChange(event.currentTarget.value)}
@@ -434,7 +427,7 @@ export function ThemeImportDialog({
         <DialogHeader>
           <DialogTitle>Add a theme</DialogTitle>
         </DialogHeader>
-        <DialogPanel className="space-y-5">
+        <DialogPanel>
           <ThemeSearchSection
             onInstalled={(themes, context) => {
               onImportedMany(themes, context);
@@ -445,7 +438,7 @@ export function ThemeImportDialog({
 
           <div className="flex items-center gap-3" aria-hidden>
             <div className="h-px flex-1 bg-border" />
-            <span className="text-muted-foreground text-[11px] uppercase tracking-wider">
+            <span className="text-muted-foreground text-2xs uppercase tracking-wider">
               or import a file
             </span>
             <div className="h-px flex-1 bg-border" />
@@ -513,6 +506,9 @@ export function ThemeImportDialog({
                     <Button size="sm" variant="ghost" onClick={() => setConflicts(null)}>
                       Back
                     </Button>
+                    <Button size="sm" variant="ghost" onClick={() => onOpenChange(false)}>
+                      Cancel
+                    </Button>
                   </div>
                 </div>
               );
@@ -536,6 +532,19 @@ export function ThemeImportDialog({
                   {fileInput}
                 </div>
                 {editorSection()}
+                {/* The actions live with the import section, not in a DialogFooter,
+                    because Add theme only applies to the file in this section. Pinning
+                    them at the modal bottom would read as a modal-scoped action when
+                    the dialog also has the search and conflict views. */}
+                <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                  <Button variant="ghost" onClick={() => onOpenChange(false)}>
+                    Cancel
+                  </Button>
+                  <Button disabled={!json.trim() || isReading} onClick={handleSubmit}>
+                    <PlusIcon />
+                    Add theme
+                  </Button>
+                </div>
               </div>
             );
           })()}
@@ -546,15 +555,6 @@ export function ThemeImportDialog({
             </Alert>
           ) : null}
         </DialogPanel>
-        <DialogFooter>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button disabled={!json.trim() || isReading} onClick={handleSubmit}>
-            <PlusIcon />
-            Add theme
-          </Button>
-        </DialogFooter>
       </DialogPopup>
     </Dialog>
   );

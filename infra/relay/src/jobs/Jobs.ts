@@ -17,7 +17,7 @@ export interface RelayJobRecord extends RelayJob {
   readonly ownerUserId: string;
 }
 
-export class JobPersistenceError extends Schema.TaggedErrorClass<JobPersistenceError>()(
+export class JobPersistenceError extends Schema.TaggedError<JobPersistenceError>()(
   "JobPersistenceError",
   {
     operation: Schema.Literals(["create-job", "load-job", "update-status"]),

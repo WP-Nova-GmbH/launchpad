@@ -26,7 +26,7 @@ export interface DockerComputeSettings {
 export const DEFAULT_DEV_MACHINE_DOCKER_IMAGE = "t3code-executor-dev";
 export const DEFAULT_DEV_MACHINE_SERVER_PORT = 4483;
 
-export class DockerCommandFailed extends Schema.TaggedErrorClass<DockerCommandFailed>()(
+export class DockerCommandFailed extends Schema.TaggedError<DockerCommandFailed>()(
   "DockerCommandFailed",
   {
     subcommand: Schema.String,

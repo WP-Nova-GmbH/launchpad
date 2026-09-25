@@ -27,7 +27,7 @@ export interface RepositoryAccessRecord {
   readonly grantedAt: string;
 }
 
-export class RepositoryPersistenceError extends Schema.TaggedErrorClass<RepositoryPersistenceError>()(
+export class RepositoryPersistenceError extends Schema.TaggedError<RepositoryPersistenceError>()(
   "RepositoryPersistenceError",
   {
     operation: Schema.Literals([
@@ -58,7 +58,7 @@ export class RepositoryPersistenceError extends Schema.TaggedErrorClass<Reposito
  * clash is a normal answer to "register this checkout", not a fault, so it is
  * its own error rather than a persistence failure.
  */
-export class RepositoryCanonicalKeyTaken extends Schema.TaggedErrorClass<RepositoryCanonicalKeyTaken>()(
+export class RepositoryCanonicalKeyTaken extends Schema.TaggedError<RepositoryCanonicalKeyTaken>()(
   "RepositoryCanonicalKeyTaken",
   {
     canonicalKey: Schema.String,

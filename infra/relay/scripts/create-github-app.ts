@@ -58,7 +58,7 @@ const createUrl = githubAppCreateUrl(organization);
 const manifest = (redirectUrl: string, landing: string) =>
   githubAppManifest({ name: appName, redirectUrl, setupUrl: landing, isPublic });
 
-class GithubAppSetupFailed extends Schema.TaggedErrorClass<GithubAppSetupFailed>()(
+class GithubAppSetupFailed extends Schema.TaggedError<GithubAppSetupFailed>()(
   "GithubAppSetupFailed",
   { status: Schema.optionalKey(Schema.Number), detail: Schema.String },
 ) {

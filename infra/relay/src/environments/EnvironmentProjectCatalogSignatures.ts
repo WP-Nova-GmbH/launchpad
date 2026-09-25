@@ -21,7 +21,7 @@ import * as Schema from "effect/Schema";
 import * as DpopProofs from "../auth/DpopProofs.ts";
 import * as RelayConfiguration from "../Config.ts";
 
-export class ProjectCatalogPublishSignatureExpired extends Schema.TaggedErrorClass<ProjectCatalogPublishSignatureExpired>()(
+export class ProjectCatalogPublishSignatureExpired extends Schema.TaggedError<ProjectCatalogPublishSignatureExpired>()(
   "ProjectCatalogPublishSignatureExpired",
   {
     environmentId: Schema.String,
@@ -29,7 +29,7 @@ export class ProjectCatalogPublishSignatureExpired extends Schema.TaggedErrorCla
   },
 ) {}
 
-export class ProjectCatalogPublishSignatureInvalid extends Schema.TaggedErrorClass<ProjectCatalogPublishSignatureInvalid>()(
+export class ProjectCatalogPublishSignatureInvalid extends Schema.TaggedError<ProjectCatalogPublishSignatureInvalid>()(
   "ProjectCatalogPublishSignatureInvalid",
   {
     environmentId: Schema.String,

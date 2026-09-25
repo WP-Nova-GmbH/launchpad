@@ -24,7 +24,7 @@ const decodeFilesJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(RelayOrganizationSkillFiles),
 );
 
-export class OrganizationSkillFilesUnreadable extends Schema.TaggedErrorClass<OrganizationSkillFilesUnreadable>()(
+export class OrganizationSkillFilesUnreadable extends Schema.TaggedError<OrganizationSkillFilesUnreadable>()(
   "OrganizationSkillFilesUnreadable",
   { name: Schema.String, cause: Schema.Defect() },
 ) {

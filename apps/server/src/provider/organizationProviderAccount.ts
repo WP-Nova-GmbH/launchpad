@@ -27,7 +27,7 @@ import { OrganizationProviderAccounts } from "../relay/OrganizationProviderAccou
 export const ORGANIZATION_ACCOUNT_MARKER_FILE = ".launchpad-organization-account";
 
 /** A file in the shared account would land outside the provider's auth store. */
-export class OrganizationProviderAccountFileEscapesError extends Schema.TaggedErrorClass<OrganizationProviderAccountFileEscapesError>()(
+export class OrganizationProviderAccountFileEscapesError extends Schema.TaggedError<OrganizationProviderAccountFileEscapesError>()(
   "OrganizationProviderAccountFileEscapesError",
   {
     filePath: Schema.String,

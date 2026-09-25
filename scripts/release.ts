@@ -39,7 +39,7 @@ export const ReleaseBump = Schema.Literals(["patch", "minor", "major"]);
 export type ReleaseBump = typeof ReleaseBump.Type;
 const isReleaseBump = Schema.is(ReleaseBump);
 
-export class InvalidReleaseVersionError extends Schema.TaggedErrorClass<InvalidReleaseVersionError>()(
+export class InvalidReleaseVersionError extends Schema.TaggedError<InvalidReleaseVersionError>()(
   "InvalidReleaseVersionError",
   { input: Schema.String },
 ) {
@@ -48,7 +48,7 @@ export class InvalidReleaseVersionError extends Schema.TaggedErrorClass<InvalidR
   }
 }
 
-export class ReleaseNotAnIncreaseError extends Schema.TaggedErrorClass<ReleaseNotAnIncreaseError>()(
+export class ReleaseNotAnIncreaseError extends Schema.TaggedError<ReleaseNotAnIncreaseError>()(
   "ReleaseNotAnIncreaseError",
   { current: Schema.String, requested: Schema.String },
 ) {
@@ -57,7 +57,7 @@ export class ReleaseNotAnIncreaseError extends Schema.TaggedErrorClass<ReleaseNo
   }
 }
 
-export class ReleasePreconditionError extends Schema.TaggedErrorClass<ReleasePreconditionError>()(
+export class ReleasePreconditionError extends Schema.TaggedError<ReleasePreconditionError>()(
   "ReleasePreconditionError",
   { reason: Schema.String },
 ) {
@@ -66,7 +66,7 @@ export class ReleasePreconditionError extends Schema.TaggedErrorClass<ReleasePre
   }
 }
 
-export class ReleaseCommandError extends Schema.TaggedErrorClass<ReleaseCommandError>()(
+export class ReleaseCommandError extends Schema.TaggedError<ReleaseCommandError>()(
   "ReleaseCommandError",
   {
     command: Schema.String,
@@ -79,7 +79,7 @@ export class ReleaseCommandError extends Schema.TaggedErrorClass<ReleaseCommandE
   }
 }
 
-export class ReleaseCommandSpawnError extends Schema.TaggedErrorClass<ReleaseCommandSpawnError>()(
+export class ReleaseCommandSpawnError extends Schema.TaggedError<ReleaseCommandSpawnError>()(
   "ReleaseCommandSpawnError",
   { command: Schema.String, cause: Schema.Defect() },
 ) {
@@ -290,10 +290,10 @@ export const cutRelease = Effect.fn("release.cutRelease")(function* (options: {
 const command = Command.make(
   "release",
   {
-    version: Argument.string("version").pipe(
+    version: Argument.String("version").pipe(
       Argument.withDescription("patch, minor, major, or an explicit version such as 0.2.0-beta.1."),
     ),
-    dryRun: Flag.boolean("dry-run").pipe(
+    dryRun: Flag.Boolean("dry-run").pipe(
       Flag.withDescription("Check preconditions and print the plan without changing anything."),
       Flag.withDefault(false),
     ),

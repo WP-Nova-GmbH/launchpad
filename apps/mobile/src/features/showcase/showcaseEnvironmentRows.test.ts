@@ -18,6 +18,7 @@ function environment(
     displayUrl,
     isRelayManaged: false,
     isOrganizationMachine: false,
+    isEnabled: true,
     connectionState: "connected",
     connectionError: null,
     connectionErrorTraceId: null,

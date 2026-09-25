@@ -27,7 +27,7 @@ export interface ProviderAccountRecord {
   readonly updatedAt: string;
 }
 
-export class ProviderAccountPersistenceError extends Schema.TaggedErrorClass<ProviderAccountPersistenceError>()(
+export class ProviderAccountPersistenceError extends Schema.TaggedError<ProviderAccountPersistenceError>()(
   "ProviderAccountPersistenceError",
   {
     operation: Schema.Literals(["list", "save", "delete"]),

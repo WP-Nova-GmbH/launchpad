@@ -68,7 +68,7 @@ const machineEnrollmentEnvFileConfig = Config.nonEmptyString(
   "T3CODE_MACHINE_ENROLLMENT_ENV_FILE",
 ).pipe(Config.option);
 
-export class MachineEnrollmentRejected extends Schema.TaggedErrorClass<MachineEnrollmentRejected>()(
+export class MachineEnrollmentRejected extends Schema.TaggedError<MachineEnrollmentRejected>()(
   "MachineEnrollmentRejected",
   {
     status: Schema.Number,
@@ -80,7 +80,7 @@ export class MachineEnrollmentRejected extends Schema.TaggedErrorClass<MachineEn
   }
 }
 
-export class MachineEnrollmentFailed extends Schema.TaggedErrorClass<MachineEnrollmentFailed>()(
+export class MachineEnrollmentFailed extends Schema.TaggedError<MachineEnrollmentFailed>()(
   "MachineEnrollmentFailed",
   {
     stage: Schema.Literals([

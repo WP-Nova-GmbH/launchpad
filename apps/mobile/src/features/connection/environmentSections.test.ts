@@ -2,7 +2,7 @@ import { EnvironmentId } from "@t3tools/contracts";
 import type { RelayClientEnvironmentRecord } from "@t3tools/contracts/relay";
 import { describe, expect, it } from "vite-plus/test";
 import type { ConnectedEnvironmentSummary } from "../../state/remote-runtime-types";
-import { splitEnvironmentSections } from "./environmentSections";
+import { relayManagedEnvironmentIds, splitEnvironmentSections } from "./environmentSections";
 
 function connectedEnvironment(
   input: Omit<Partial<ConnectedEnvironmentSummary>, "environmentId"> & {
@@ -16,6 +16,7 @@ function connectedEnvironment(
     displayUrl: input.displayUrl ?? `https://${input.environmentId}.example.test/`,
     isRelayManaged: input.isRelayManaged,
     isOrganizationMachine: false,
+    isEnabled: input.isEnabled ?? true,
     connectionState: input.connectionState ?? "connected",
     connectionError: input.connectionError ?? null,
     connectionErrorTraceId: input.connectionErrorTraceId ?? null,
@@ -35,6 +36,17 @@ function cloudEnvironment(environmentId: string): RelayClientEnvironmentRecord {
     source: "link",
   };
 }
+
+describe("relayManagedEnvironmentIds", () => {
+  it("leaves out a backend that was saved directly", () => {
+    const ids = relayManagedEnvironmentIds([
+      connectedEnvironment({ environmentId: "environment-local", isRelayManaged: false }),
+      connectedEnvironment({ environmentId: "environment-cloud", isRelayManaged: true }),
+    ]);
+
+    expect([...ids]).toEqual([EnvironmentId.make("environment-cloud")]);
+  });
+});
 
 describe("mobile environment settings sections", () => {
   it("keeps saved relay-managed connections under Launchpad Connect", () => {
@@ -111,6 +123,24 @@ describe("mobile environment settings sections", () => {
 
     expect(sections.connectedCloudEnvironments).toEqual([cloud]);
     expect(sections.availableCloudEnvironments).toEqual([]);
+  });
+
+  it("still offers a cloud environment saved directly as a local backend", () => {
+    const local = connectedEnvironment({
+      environmentId: "environment-cloud",
+      isRelayManaged: false,
+    });
+
+    const sections = splitEnvironmentSections({
+      connectedEnvironments: [local],
+      cloudEnvironments: [cloudEnvironment("environment-cloud")],
+    });
+
+    expect(sections.localEnvironments).toEqual([local]);
+    expect(sections.connectedCloudEnvironments).toEqual([]);
+    expect(
+      sections.availableCloudEnvironments.map((environment) => environment.environmentId),
+    ).toEqual([EnvironmentId.make("environment-cloud")]);
   });
 
   it("keeps failed relay environments in the local connection row", () => {

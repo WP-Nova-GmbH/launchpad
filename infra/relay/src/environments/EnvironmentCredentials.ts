@@ -16,7 +16,7 @@ import {
   relayMachines,
 } from "../persistence/schema.ts";
 
-export class EnvironmentCredentialCreatePersistenceError extends Schema.TaggedErrorClass<EnvironmentCredentialCreatePersistenceError>()(
+export class EnvironmentCredentialCreatePersistenceError extends Schema.TaggedError<EnvironmentCredentialCreatePersistenceError>()(
   "EnvironmentCredentialCreatePersistenceError",
   {
     stage: Schema.Literals([
@@ -35,7 +35,7 @@ export class EnvironmentCredentialCreatePersistenceError extends Schema.TaggedEr
   }
 }
 
-export class EnvironmentCredentialAuthenticatePersistenceError extends Schema.TaggedErrorClass<EnvironmentCredentialAuthenticatePersistenceError>()(
+export class EnvironmentCredentialAuthenticatePersistenceError extends Schema.TaggedError<EnvironmentCredentialAuthenticatePersistenceError>()(
   "EnvironmentCredentialAuthenticatePersistenceError",
   {
     stage: Schema.Literals(["hash-token", "lookup-credential"]),
@@ -47,7 +47,7 @@ export class EnvironmentCredentialAuthenticatePersistenceError extends Schema.Ta
   }
 }
 
-export class EnvironmentCredentialRevokePersistenceError extends Schema.TaggedErrorClass<EnvironmentCredentialRevokePersistenceError>()(
+export class EnvironmentCredentialRevokePersistenceError extends Schema.TaggedError<EnvironmentCredentialRevokePersistenceError>()(
   "EnvironmentCredentialRevokePersistenceError",
   {
     environmentId: Schema.String,

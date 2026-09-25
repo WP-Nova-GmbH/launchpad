@@ -73,7 +73,7 @@ export const ServerProviderAccountExportInput = Schema.Struct({
 });
 export type ServerProviderAccountExportInput = typeof ServerProviderAccountExportInput.Type;
 
-export class ServerProviderAccountExportError extends Schema.TaggedErrorClass<ServerProviderAccountExportError>()(
+export class ServerProviderAccountExportError extends Schema.TaggedError<ServerProviderAccountExportError>()(
   "ServerProviderAccountExportError",
   {
     instanceId: ProviderInstanceId,

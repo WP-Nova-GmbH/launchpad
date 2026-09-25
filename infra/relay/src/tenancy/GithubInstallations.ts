@@ -17,7 +17,7 @@ export interface GithubInstallationRecord {
   readonly createdAt: string;
 }
 
-export class GithubInstallationPersistenceError extends Schema.TaggedErrorClass<GithubInstallationPersistenceError>()(
+export class GithubInstallationPersistenceError extends Schema.TaggedError<GithubInstallationPersistenceError>()(
   "GithubInstallationPersistenceError",
   {
     operation: Schema.Literals(["load", "claim", "release"]),
@@ -31,7 +31,7 @@ export class GithubInstallationPersistenceError extends Schema.TaggedErrorClass<
 }
 
 /** Another organization already claimed this installation. */
-export class GithubInstallationAlreadyClaimed extends Schema.TaggedErrorClass<GithubInstallationAlreadyClaimed>()(
+export class GithubInstallationAlreadyClaimed extends Schema.TaggedError<GithubInstallationAlreadyClaimed>()(
   "GithubInstallationAlreadyClaimed",
   { installationId: Schema.String },
 ) {

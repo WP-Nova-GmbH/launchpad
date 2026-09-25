@@ -24,7 +24,7 @@ import * as EnvironmentLinks from "../environments/EnvironmentLinks.ts";
 import * as ManagedEndpointProvider from "../environments/ManagedEndpointProvider.ts";
 import * as Machines from "./Machines.ts";
 
-export class MachineEnrollProofInvalid extends Schema.TaggedErrorClass<MachineEnrollProofInvalid>()(
+export class MachineEnrollProofInvalid extends Schema.TaggedError<MachineEnrollProofInvalid>()(
   "MachineEnrollProofInvalid",
   {
     environmentId: Schema.String,

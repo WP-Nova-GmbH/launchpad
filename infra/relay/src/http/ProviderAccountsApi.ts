@@ -19,7 +19,7 @@ const decodePayloadJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(RelayProviderAccountPayload),
 );
 
-export class ProviderAccountPayloadUnreadable extends Schema.TaggedErrorClass<ProviderAccountPayloadUnreadable>()(
+export class ProviderAccountPayloadUnreadable extends Schema.TaggedError<ProviderAccountPayloadUnreadable>()(
   "ProviderAccountPayloadUnreadable",
   { provider: Schema.String, cause: Schema.Defect() },
 ) {

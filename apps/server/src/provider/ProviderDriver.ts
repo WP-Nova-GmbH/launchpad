@@ -22,9 +22,11 @@
  * @module provider/ProviderDriver
  */
 import type {
+  ProviderConsumeResetCreditOutcome,
   ProviderDriverKind,
   ProviderInstanceEnvironment,
   ProviderInstanceId,
+  ServerProvider,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Schema from "effect/Schema";
@@ -36,6 +38,7 @@ import type { ProviderAdapterShape } from "./Services/ProviderAdapter.ts";
 import type { ServerProviderShape } from "./Services/ServerProvider.ts";
 import type { ProviderAccountAuthShape } from "./ProviderAccountAuth.ts";
 import type { ProviderAccountExporter } from "./ProviderAccountExport.ts";
+import type { ProviderAuthController } from "./Services/ProviderAuthService.ts";
 
 /**
  * Static metadata advertised by a driver. Used for default presentation
@@ -71,6 +74,19 @@ export interface ProviderInstance {
   readonly accentColor?: string | undefined;
   readonly enabled: boolean;
   readonly snapshot: ServerProviderShape;
+  readonly snapshotForCwd?: (cwd: string) => Effect.Effect<ServerProvider, ProviderDriverError>;
+  readonly refreshModels?: () => Effect.Effect<void, ProviderDriverError>;
+  /** Invalidate T3-owned discovery caches before an explicit provider refresh. */
+  readonly invalidateCaches?: Effect.Effect<void>;
+  /**
+   * Redeem one banked rate-limit reset credit on the signed-in account, then
+   * re-probe so the snapshot reflects the cleared windows. Account-level,
+   * not thread-level, which is why it lives here rather than on the adapter.
+   */
+  readonly consumeResetCredit?: () => Effect.Effect<
+    ProviderConsumeResetCreditOutcome,
+    ProviderDriverError
+  >;
   readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
   readonly textGeneration: TextGeneration.TextGeneration["Service"];
   readonly accountAuth?: ProviderAccountAuthShape | undefined;
@@ -80,6 +96,7 @@ export interface ProviderInstance {
    * cannot capture.
    */
   readonly accountExport?: ProviderAccountExporter | undefined;
+  readonly auth?: ProviderAuthController;
 }
 
 export interface ProviderContinuationIdentity {

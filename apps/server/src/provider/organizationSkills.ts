@@ -26,7 +26,7 @@ import { OrganizationSkills } from "../relay/OrganizationSkills.ts";
 export const ORGANIZATION_SKILL_MARKER_FILE = ".launchpad-organization-skill";
 
 /** A file in the skill would land outside the skill's own directory. */
-export class OrganizationSkillFileEscapesError extends Schema.TaggedErrorClass<OrganizationSkillFileEscapesError>()(
+export class OrganizationSkillFileEscapesError extends Schema.TaggedError<OrganizationSkillFileEscapesError>()(
   "OrganizationSkillFileEscapesError",
   {
     skill: Schema.String,

@@ -1,9 +1,9 @@
-import * as NodeOS from "node:os";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 
 import {
@@ -23,25 +23,15 @@ import { withOrganizationGithubToken } from "@t3tools/shared/runnerCredentials";
 
 import { ServerConfig } from "../config.ts";
 import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
+import { expandHomePathWith } from "../pathExpansion.ts";
+import {
+  parseGitCloneProgressLine,
+  type GitCloneProgressLine,
+} from "../project/gitCloneProgress.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { hasRunnerSourceControlCredential } from "../vcs/runnerCredentials.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 const isSourceControlRepositoryError = Schema.is(SourceControlRepositoryError);
-
-/**
- * Clones run headless — on a remote executor there is nobody at a prompt — so
- * every interactive credential path is off and failures surface immediately
- * instead of hanging out the timeout.
- */
-const CLONE_NONINTERACTIVE_ENV = Object.freeze({
-  GCM_INTERACTIVE: "never",
-  GIT_TERMINAL_PROMPT: "0",
-  SSH_ASKPASS: "",
-  SSH_ASKPASS_REQUIRE: "never",
-  // cloneFailureDetail classifies stderr by English phrases; a machine with a
-  // German (or any other) locale would otherwise slip to the generic detail.
-  LC_ALL: "C",
-} satisfies NodeJS.ProcessEnv);
 
 /**
  * The same helper `gh auth setup-git` would configure. Persisted into the
@@ -57,14 +47,62 @@ export class SourceControlRepositoryService extends Context.Service<
     readonly lookupRepository: (
       input: SourceControlRepositoryLookupInput,
     ) => Effect.Effect<SourceControlRepositoryInfo, SourceControlRepositoryError>;
+    /**
+     * Everything `cloneRepository` checks before running git: the resolved
+     * remote, the normalized destination, and that the destination is empty.
+     * Lets a caller create the project first and clone afterwards.
+     */
+    readonly prepareClone: (
+      input: SourceControlCloneRepositoryInput,
+    ) => Effect.Effect<SourceControlPreparedClone, SourceControlRepositoryError>;
     readonly cloneRepository: (
       input: SourceControlCloneRepositoryInput,
+      options?: SourceControlCloneOptions,
     ) => Effect.Effect<SourceControlCloneRepositoryResult, SourceControlRepositoryError>;
+    /** Removes a partial or failed clone so the destination is empty again. */
+    readonly discardClone: (
+      destinationPath: string,
+    ) => Effect.Effect<void, SourceControlRepositoryError>;
     readonly publishRepository: (
       input: SourceControlPublishRepositoryInput,
     ) => Effect.Effect<SourceControlPublishRepositoryResult, SourceControlRepositoryError>;
   }
 >()("t3/sourceControl/SourceControlRepositoryService") {}
+
+export interface SourceControlPreparedClone {
+  readonly destinationPath: string;
+  /** Credential-free; safe to show and to store in snapshots. */
+  readonly remoteUrl: string;
+  /** What git is given; may carry embedded credentials. */
+  readonly cloneUrl: string;
+  readonly repository: SourceControlRepositoryInfo | null;
+}
+
+export interface SourceControlCloneOptions {
+  readonly onProgress?: (line: GitCloneProgressLine) => Effect.Effect<void>;
+  /** Overrides the default clone budget; `null` disables the deadline. */
+  readonly timeoutMs?: number | null;
+}
+
+// The synchronous RPC (older clients, mobile) keeps a deadline: nothing else
+// tells the user a clone stalled. The tracked path passes null and relies on
+// progress and Cancel instead.
+const CLONE_TIMEOUT_MS = 120_000;
+const CLONE_ENV = {
+  // `--progress` forces the transfer counters through the pipe; the delay env
+  // makes the checkout counter start immediately.
+  GIT_PROGRESS_DELAY: "0",
+  // Clones run headless — on a remote executor there is nobody at a prompt — so
+  // every interactive credential path is off and failures surface immediately
+  // instead of hanging out the timeout.
+  GCM_INTERACTIVE: "never",
+  GIT_TERMINAL_PROMPT: "0",
+  SSH_ASKPASS: "",
+  SSH_ASKPASS_REQUIRE: "never",
+  // classifyCloneFailure reads stderr by English phrases; a machine with a
+  // German (or any other) locale would otherwise slip to git's raw text.
+  LC_ALL: "C",
+} satisfies NodeJS.ProcessEnv;
 
 function mapRepositoryError(operation: string, provider: SourceControlProviderKind) {
   return Effect.mapError((cause: unknown) =>
@@ -89,6 +127,36 @@ function toRepositoryInfo(
     url: urls.url,
     sshUrl: urls.sshUrl,
   };
+}
+
+/**
+ * The URL clients see. A pasted `https://user:token@host/…` must not travel
+ * back over `subscribeProjectClones` to every reader; git still gets the
+ * original.
+ */
+function redactRemoteUrl(remoteUrl: string): string {
+  try {
+    const url = new URL(remoteUrl);
+    // Clone URLs have no legitimate query; when one is present it is a token.
+    if (url.username.length === 0 && url.password.length === 0 && url.search.length === 0) {
+      return remoteUrl;
+    }
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    return url.toString();
+  } catch {
+    return remoteUrl;
+  }
+}
+
+// Userinfo may itself contain `@`; everything up to the last one before the
+// host boundary goes.
+const URL_WITH_USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/]+@/gi;
+
+/** Drops `user:token@` from any URL embedded in free text. */
+function redactUrlCredentials(text: string): string {
+  return text.replace(URL_WITH_USERINFO, "$1");
 }
 
 function selectRemoteUrl(
@@ -131,13 +199,13 @@ function useGitHubCredentialHelper(
 }
 
 /**
- * A safe sentence for the clone toast. Never quotes stderr — remote URLs and
- * credential responses can carry tokens — but stderr is classified locally so
- * the user learns which kind of failure this was instead of the generic
- * "could not be completed".
+ * A safe sentence for the clone toast when git's stderr says which kind of
+ * failure this was. Credential responses can carry tokens, so a recognised
+ * failure is described in our own words rather than git's; anything else
+ * falls back to git's last (credential-redacted) lines.
  */
-function cloneFailureDetail(stderr: string, exitCode: number): string {
-  const normalized = stderr.toLowerCase();
+function classifyCloneFailure(stderrLines: ReadonlyArray<string>): string | null {
+  const normalized = stderrLines.join("\n").toLowerCase();
   if (
     normalized.includes("permission denied (publickey)") ||
     normalized.includes("authentication failed") ||
@@ -157,19 +225,10 @@ function cloneFailureDetail(stderr: string, exitCode: number): string {
   if (normalized.includes("repository not found") || normalized.includes("not found")) {
     return "The remote repository was not found or is not accessible.";
   }
-  return `git clone exited with status ${String(exitCode)}.`;
+  return null;
 }
 
-function expandHomePath(input: string, path: Path.Path): string {
-  if (input === "~") {
-    return NodeOS.homedir();
-  }
-  if (input.startsWith("~/") || input.startsWith("~\\")) {
-    return path.join(NodeOS.homedir(), input.slice(2));
-  }
-  return input;
-}
-
+/** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const config = yield* ServerConfig;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -222,7 +281,7 @@ export const make = Effect.gen(function* () {
         });
       }
 
-      return path.resolve(expandHomePath(trimmed, path));
+      return path.resolve(expandHomePathWith(trimmed, path));
     },
   );
 
@@ -262,7 +321,7 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  const cloneRepository = Effect.fn("SourceControlRepositoryService.cloneRepository")(function* (
+  const prepareClone = Effect.fn("SourceControlRepositoryService.prepareClone")(function* (
     input: SourceControlCloneRepositoryInput,
   ) {
     const preparedDestination = yield* prepareDestination(input.destinationPath);
@@ -290,10 +349,21 @@ export const make = Effect.gen(function* () {
       });
     }
 
-    const withHelper = useGitHubCredentialHelper(provider, remoteUrl);
-    const cloneArgs = withHelper
-      ? ["clone", "--config", `credential.helper=${GITHUB_CREDENTIAL_HELPER}`]
-      : ["clone"];
+    return {
+      destinationPath: preparedDestination.destinationPath,
+      remoteUrl: redactRemoteUrl(remoteUrl),
+      cloneUrl: remoteUrl,
+      repository,
+    } satisfies SourceControlPreparedClone;
+  });
+
+  const cloneRepository = Effect.fn("SourceControlRepositoryService.cloneRepository")(function* (
+    input: SourceControlCloneRepositoryInput,
+    options?: SourceControlCloneOptions,
+  ) {
+    const prepared = yield* prepareClone(input);
+    const provider = prepared.repository?.provider ?? input.provider ?? "unknown";
+    const withHelper = useGitHubCredentialHelper(provider, prepared.cloneUrl);
     // The organization's installation token, granted right here rather than
     // left to the VcsProcess credential seam — the clone must carry GH_TOKEN
     // for `gh auth git-credential` to answer git (ADR-0015). An operator's own
@@ -304,59 +374,129 @@ export const make = Effect.gen(function* () {
         : null;
     const cloneEnv =
       organizationToken === null
-        ? CLONE_NONINTERACTIVE_ENV
-        : withOrganizationGithubToken(CLONE_NONINTERACTIVE_ENV, organizationToken);
+        ? CLONE_ENV
+        : withOrganizationGithubToken(CLONE_ENV, organizationToken);
     yield* Effect.logInfo("cloning repository", {
-      remoteUrl,
+      remoteUrl: prepared.remoteUrl,
       credentialHelper: withHelper,
       organizationToken: organizationToken !== null,
     });
-    const cloneResult = yield* git
+    const onProgress = options?.onProgress;
+    // Git interleaves progress redraws with its real messages on stderr. The
+    // last non-progress lines are what explain a failure ("Repository not
+    // found", "Permission denied"), so keep them for the error detail.
+    const stderrTail: Array<string> = [];
+    const onStderrLine = (line: string) => {
+      const parsed = parseGitCloneProgressLine(line);
+      if (parsed) return onProgress ? onProgress(parsed) : Effect.void;
+      return Effect.sync(() => {
+        const trimmed = line.trim();
+        if (trimmed.length === 0 || trimmed.startsWith("Cloning into")) return;
+        // Git echoes the remote in some failures; the tail becomes user-facing text.
+        stderrTail.push(redactUrlCredentials(trimmed));
+        if (stderrTail.length > 4) stderrTail.shift();
+      });
+    };
+    yield* git
       .execute({
         operation: "SourceControlRepositoryService.cloneRepository",
-        cwd: preparedDestination.parentPath,
-        args: [...cloneArgs, remoteUrl, preparedDestination.directoryName],
-        env: cloneEnv,
-        allowNonZeroExit: true,
-        timeoutMs: 120_000,
+        cwd: path.dirname(prepared.destinationPath),
+        args: [
+          "clone",
+          "--progress",
+          ...(withHelper ? ["--config", `credential.helper=${GITHUB_CREDENTIAL_HELPER}`] : []),
+          prepared.cloneUrl,
+          path.basename(prepared.destinationPath),
+        ],
+        timeoutMs: options?.timeoutMs === undefined ? CLONE_TIMEOUT_MS : options.timeoutMs,
+        // Progress redraws add up on a slow multi-GB clone. The buffered copy
+        // is never read (the tail is kept by hand above), so keep it small
+        // and let the line callbacks keep flowing past the cap.
         maxOutputBytes: 256 * 1024,
+        appendTruncationMarker: true,
+        keepLineCallbacksAfterTruncation: true,
+        env: cloneEnv,
+        progress: { onStderrLine },
       })
       .pipe(
+        // The client gets a safe detail; the operator's log gets what git
+        // actually said, with any embedded credential already scrubbed.
+        Effect.tapError(() =>
+          Effect.logWarning("repository clone failed", {
+            remoteUrl: prepared.remoteUrl,
+            credentialHelper: withHelper,
+            stderr: stderrTail,
+          }),
+        ),
         Effect.mapError(
           (cause) =>
             new SourceControlRepositoryError({
               operation: "cloneRepository",
               provider,
-              detail: cause.detail,
+              detail:
+                classifyCloneFailure(stderrTail) ??
+                (stderrTail.length > 0
+                  ? stderrTail.join(" ")
+                  : "The repository could not be cloned."),
               cause,
             }),
         ),
       );
-    if (cloneResult.exitCode !== 0) {
-      // The client gets the classified detail; the operator's log gets what
-      // git actually said, with any embedded credential scrubbed.
-      yield* Effect.logWarning("repository clone failed", {
-        remoteUrl,
-        exitCode: cloneResult.exitCode,
-        credentialHelper: cloneArgs.length > 1,
-        stderr: cloneResult.stderr
-          .replace(/\/\/[^/@\s]+@/g, "//<redacted>@")
-          .split(/\r?\n/)
-          .filter((line) => line.trim().length > 0)
-          .slice(0, 6),
-      });
-      return yield* new SourceControlRepositoryError({
-        operation: "cloneRepository",
-        provider,
-        detail: cloneFailureDetail(cloneResult.stderr, cloneResult.exitCode),
-      });
-    }
 
     return {
-      cwd: preparedDestination.destinationPath,
-      remoteUrl,
-      repository,
+      cwd: prepared.destinationPath,
+      remoteUrl: prepared.remoteUrl,
+      repository: prepared.repository,
     };
+  });
+
+  const discardClone = Effect.fn("SourceControlRepositoryService.discardClone")(function* (
+    destinationPath: string,
+  ) {
+    const normalized = yield* normalizeDestinationPath(destinationPath);
+    // Only what git left behind may go. The destination was empty when the
+    // clone started, so anything without a `.git` inside was put there by
+    // someone else since; refuse rather than delete their files.
+    // A missing destination is already discarded; any other read failure
+    // (a file in its place, permissions) is not something to remove through.
+    const entries = yield* fileSystem.readDirectory(normalized).pipe(
+      Effect.catchIf(
+        (cause) => cause.reason._tag === "NotFound",
+        () => Effect.succeed<ReadonlyArray<string>>([]),
+      ),
+      Effect.mapError(
+        (cause) =>
+          new SourceControlRepositoryError({
+            operation: "discardClone",
+            provider: "unknown",
+            detail: "The clone destination could not be inspected.",
+            cause,
+          }),
+      ),
+    );
+    if (entries.length > 0 && !entries.includes(".git")) {
+      return yield* new SourceControlRepositoryError({
+        operation: "discardClone",
+        provider: "unknown",
+        detail: "Destination path contains files that are not from the clone.",
+      });
+    }
+    // The directory itself is the project's workspace root and must stay;
+    // only git's partial contents go. An interrupted git may still be closing
+    // files, so removal retries briefly.
+    yield* fileSystem.remove(normalized, { recursive: true, force: true }).pipe(
+      Effect.andThen(fileSystem.makeDirectory(normalized, { recursive: true })),
+      Effect.retry({ schedule: Schedule.spaced("200 millis"), times: 5 }),
+      Effect.mapError(
+        (cause) =>
+          new SourceControlRepositoryError({
+            operation: "discardClone",
+            provider: "unknown",
+            detail: "The partial clone could not be removed.",
+            cause,
+          }),
+      ),
+    );
   });
 
   const publishRepository = Effect.fn("SourceControlRepositoryService.publishRepository")(
@@ -419,10 +559,14 @@ export const make = Effect.gen(function* () {
   return SourceControlRepositoryService.of({
     lookupRepository: (input) =>
       lookupRepository(input).pipe(mapRepositoryError("lookupRepository", input.provider)),
-    cloneRepository: (input) =>
-      cloneRepository(input).pipe(
+    prepareClone: (input) =>
+      prepareClone(input).pipe(mapRepositoryError("cloneRepository", input.provider ?? "unknown")),
+    cloneRepository: (input, options) =>
+      cloneRepository(input, options).pipe(
         mapRepositoryError("cloneRepository", input.provider ?? "unknown"),
       ),
+    discardClone: (destinationPath) =>
+      discardClone(destinationPath).pipe(mapRepositoryError("discardClone", "unknown")),
     publishRepository: (input) =>
       publishRepository(input).pipe(mapRepositoryError("publishRepository", input.provider)),
   });

@@ -1,13 +1,17 @@
+import { RefreshIcon } from "~/components/ui/refresh-icon";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { FolderGit2Icon, LinkIcon, PlusIcon, RotateCcwIcon, ServerOffIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { openCommandPalette } from "../commandPaletteBus";
+import { isLocalEnvironmentDisabled } from "../localEnvironment";
+import { isElectron } from "../env";
+import { NoProjectsHero } from "../components/NoProjectsHero";
 import { sortScopedProjectsForSidebar } from "../components/Sidebar.logic";
 import { Button } from "../components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../components/ui/empty";
 import { SidebarInset } from "../components/ui/sidebar";
+import { WorkspacePageHeader } from "../components/WorkspacePageHeader";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import {
   useAllEnvironmentShellsBootstrapped,
@@ -19,12 +23,12 @@ import { APP_DISPLAY_NAME } from "~/branding";
 import { useManagedRelayOrganizationCatalog } from "~/cloud/managedRelayState";
 import { hasCloudPublicConfig } from "~/cloud/publicConfig";
 import { cn } from "~/lib/utils";
-import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
+import { openCommandPalette } from "../commandPaletteBus";
 import { resolveStartRouteMode } from "./_chat.index.logic";
 
 function ChatIndexRouteView() {
   const { authGateState } = Route.useRouteContext();
-  const { environments } = useEnvironments();
+  const { environments, isReady } = useEnvironments();
   const organizationCatalog = useManagedRelayOrganizationCatalog();
   const startMode = resolveStartRouteMode({
     isHostedStatic: authGateState.status === "hosted-static",
@@ -35,6 +39,9 @@ function ChatIndexRouteView() {
     organizationCatalogError: organizationCatalog.error,
   });
 
+  if (authGateState.status === "hosted-static" && !isReady) {
+    return null;
+  }
   if (startMode === "pending") {
     return null;
   }
@@ -98,21 +105,23 @@ function IndexDraftLanding({
       />
     ) : null;
   }
-  return <NoProjectsHero organizationCatalog={organizationCatalog} />;
+  // First-run routing to the welcome wizard happens in FirstRunGate at the
+  // root, before this route ever renders.
+  return <OrganizationNoProjectsHero organizationCatalog={organizationCatalog} />;
 }
 
 function DraftStartError({ onRetry }: { readonly onRetry: () => void }) {
   return (
-    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
+    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
       <Empty className="flex-1">
         <EmptyHeader className="max-w-md">
-          <EmptyTitle className="text-foreground text-xl">Couldn’t start a new thread</EmptyTitle>
-          <EmptyDescription className="mt-2 text-sm text-muted-foreground/78">
+          <EmptyTitle>Couldn’t start a new thread</EmptyTitle>
+          <EmptyDescription>
             The project is still available. Try opening the draft again.
           </EmptyDescription>
           <div className="mt-5 flex justify-center">
             <Button size="sm" onClick={onRetry}>
-              <RotateCcwIcon className="size-4" />
+              <RefreshIcon size="md" />
               Try again
             </Button>
           </div>
@@ -122,7 +131,13 @@ function DraftStartError({ onRetry }: { readonly onRetry: () => void }) {
   );
 }
 
-function NoProjectsHero({
+/**
+ * The add-project hero, extended with the organization's projects and
+ * repositories so its work stays visible even while the machines holding it
+ * are offline. With nothing organization-scoped to show it defers to the
+ * stock hero.
+ */
+function OrganizationNoProjectsHero({
   organizationCatalog,
 }: {
   readonly organizationCatalog: ReturnType<typeof useManagedRelayOrganizationCatalog>;
@@ -143,16 +158,18 @@ function NoProjectsHero({
   const organizationProjects = organizationCatalog.data?.projects ?? [];
   const hasOrganizationCatalog = repositories.length > 0 || organizationProjects.length > 0;
 
+  if (!hasOrganizationCatalog && !organizationCatalog.error) {
+    return <NoProjectsHero />;
+  }
+
   return (
-    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
+    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden bg-background">
-        <Empty className="flex-1 overflow-y-auto">
+        <Empty size="hero" className="flex-1 overflow-y-auto">
           <div className="w-full max-w-2xl px-8 py-12">
             <EmptyHeader className="max-w-none">
-              <EmptyTitle className="text-foreground text-2xl sm:text-3xl">
-                What should we work on?
-              </EmptyTitle>
-              <EmptyDescription className="mt-2 text-sm text-muted-foreground/78">
+              <EmptyTitle>What should we work on?</EmptyTitle>
+              <EmptyDescription>
                 {hasOrganizationCatalog
                   ? "Your organization work remains visible even when its machines are offline."
                   : "Add a project to start your first thread."}
@@ -269,22 +286,23 @@ export const Route = createFileRoute("/_chat/")({
 
 function HostedStaticOnboardingState() {
   const cloudEnabled = hasCloudPublicConfig();
+  const localEnvironmentOff = isLocalEnvironmentDisabled();
+  const description = localEnvironmentOff
+    ? "The local environment is turned off. Connect a remote environment, or turn the local environment back on in Connections."
+    : cloudEnabled
+      ? "Enable Launchpad Connect on that machine, then open Connections here to sign in with the same account. You can also add the machine using a pairing link."
+      : "Open Connections and add that machine using its pairing link. This app must be able to reach it.";
 
   return (
-    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
+    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden bg-background">
-        <header
-          className={cn(
-            "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center border-b border-border px-3 transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none sm:px-5",
-            COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
-          )}
-        >
+        <WorkspacePageHeader electron={isElectron} className="border-b border-border">
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium text-foreground md:text-muted-foreground/60">
               {APP_DISPLAY_NAME}
             </span>
           </div>
-        </header>
+        </WorkspacePageHeader>
 
         <Empty className="flex-1">
           <div className="w-full max-w-xl rounded-3xl border border-border/55 bg-card/20 px-8 py-12 shadow-sm/5">
@@ -292,18 +310,16 @@ function HostedStaticOnboardingState() {
               <div className="mx-auto mb-5 flex size-11 items-center justify-center rounded-xl border border-border/70 bg-background/70 text-muted-foreground">
                 <LinkIcon className="size-5" />
               </div>
-              <EmptyTitle className="text-foreground text-xl">
-                Connect an environment to get started
-              </EmptyTitle>
-              <EmptyDescription className="mt-2 text-sm leading-relaxed text-muted-foreground/78">
-                {cloudEnabled
-                  ? "Sign in to Launchpad Connect to connect a linked environment through its managed tunnel, or add a reachable backend manually."
-                  : "Add a reachable backend manually to start working from this browser."}
+              <EmptyTitle>Connect to a computer running Launchpad</EmptyTitle>
+              <EmptyDescription>
+                This app connects to Launchpad running on your computer or a server. Start the
+                Launchpad desktop app or command-line server on that machine and keep it running.
               </EmptyDescription>
+              <EmptyDescription>{description}</EmptyDescription>
               <div className="mt-6 flex justify-center">
                 <Button render={<Link to="/settings/connections" />} size="sm">
                   <PlusIcon className="size-4" />
-                  {cloudEnabled ? "Open Connections" : "Add environment"}
+                  Open Connections
                 </Button>
               </div>
             </EmptyHeader>

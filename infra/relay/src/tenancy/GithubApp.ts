@@ -34,7 +34,7 @@ export interface GithubRepository {
   readonly canonicalKey: string;
 }
 
-export class GithubAppNotConfigured extends Schema.TaggedErrorClass<GithubAppNotConfigured>()(
+export class GithubAppNotConfigured extends Schema.TaggedError<GithubAppNotConfigured>()(
   "GithubAppNotConfigured",
   {},
 ) {
@@ -43,7 +43,7 @@ export class GithubAppNotConfigured extends Schema.TaggedErrorClass<GithubAppNot
   }
 }
 
-export class GithubRequestFailed extends Schema.TaggedErrorClass<GithubRequestFailed>()(
+export class GithubRequestFailed extends Schema.TaggedError<GithubRequestFailed>()(
   "GithubRequestFailed",
   {
     operation: Schema.Literals([

@@ -25,7 +25,7 @@ export interface OrganizationProjectRecord {
   readonly catalogUpdatedAt: string;
 }
 
-export class OrganizationProjectCatalogPersistenceError extends Schema.TaggedErrorClass<OrganizationProjectCatalogPersistenceError>()(
+export class OrganizationProjectCatalogPersistenceError extends Schema.TaggedError<OrganizationProjectCatalogPersistenceError>()(
   "OrganizationProjectCatalogPersistenceError",
   {
     operation: Schema.Literals(["replace-catalog", "list-projects", "read-revision"]),

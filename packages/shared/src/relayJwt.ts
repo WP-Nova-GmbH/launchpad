@@ -14,8 +14,9 @@ export const RELAY_PROJECT_CATALOG_PUBLISH_TYP = "t3-env-project-catalog+jwt";
 export const RELAY_DISPATCH_JOB_REQUEST_TYP = "t3-cloud-dispatch-job+jwt";
 export const RELAY_DISPATCH_JOB_RESPONSE_TYP = "t3-env-dispatch-job+jwt";
 export const RELAY_MACHINE_ENROLL_PROOF_TYP = "t3-machine-enroll+jwt";
+export const RELAY_MANAGED_TUNNEL_RECOVERY_TYP = "t3-env-managed-tunnel-recovery+jwt";
 
-export class RelayJwtError extends Schema.TaggedErrorClass<RelayJwtError>()("RelayJwtError", {
+export class RelayJwtError extends Schema.TaggedError<RelayJwtError>()("RelayJwtError", {
   operation: Schema.Literals(["sign", "verify"]),
   typ: Schema.String,
   issuer: Schema.optional(Schema.String),

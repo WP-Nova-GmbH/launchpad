@@ -26,7 +26,7 @@ import {
 
 const CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4";
 
-export class CloudflareZoneNotFound extends Schema.TaggedErrorClass<CloudflareZoneNotFound>()(
+export class CloudflareZoneNotFound extends Schema.TaggedError<CloudflareZoneNotFound>()(
   "CloudflareZoneNotFound",
   { zoneName: Schema.String },
 ) {

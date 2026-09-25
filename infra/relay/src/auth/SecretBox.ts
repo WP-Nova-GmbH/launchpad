@@ -6,7 +6,7 @@ import * as Schema from "effect/Schema";
 
 import * as RelayConfiguration from "../Config.ts";
 
-export class SecretBoxError extends Schema.TaggedErrorClass<SecretBoxError>()("SecretBoxError", {
+export class SecretBoxError extends Schema.TaggedError<SecretBoxError>()("SecretBoxError", {
   operation: Schema.Literals(["seal", "open"]),
   cause: Schema.Defect(),
 }) {

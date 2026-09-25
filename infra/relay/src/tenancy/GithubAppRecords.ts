@@ -17,7 +17,7 @@ export interface GithubAppRecord {
   readonly createdAt: string;
 }
 
-export class GithubAppPersistenceError extends Schema.TaggedErrorClass<GithubAppPersistenceError>()(
+export class GithubAppPersistenceError extends Schema.TaggedError<GithubAppPersistenceError>()(
   "GithubAppPersistenceError",
   {
     operation: Schema.Literals(["load", "save"]),

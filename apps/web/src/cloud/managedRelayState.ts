@@ -45,8 +45,8 @@ const managedRelayTenancyAtomRuntime = Atom.runtime(
   ),
 );
 
-export const managedRelayQueryManager = createManagedRelayQueryManager(managedRelayAtomRuntime);
-export const managedRelayOrganizationCatalogQueryManager =
+const managedRelayQueryManager = createManagedRelayQueryManager(managedRelayAtomRuntime);
+const managedRelayOrganizationCatalogQueryManager =
   createManagedRelayOrganizationCatalogQueryManager(managedRelayTenancyAtomRuntime);
 
 const managedRelayMutationScheduler = createAtomCommandScheduler();
@@ -160,11 +160,4 @@ export function useManagedRelayOrganizationCatalog() {
     accountId,
     refresh,
   };
-}
-
-export function refreshManagedRelayEnvironments(): void {
-  const session = appAtomRegistry.get(managedRelaySessionAtom);
-  if (session) {
-    managedRelayQueryManager.refreshEnvironments(appAtomRegistry, session.accountId);
-  }
 }

@@ -31,7 +31,7 @@ export interface OrganizationMembershipRecord extends OrganizationMemberRecord {
   readonly organization: OrganizationRecord;
 }
 
-export class OrganizationPersistenceError extends Schema.TaggedErrorClass<OrganizationPersistenceError>()(
+export class OrganizationPersistenceError extends Schema.TaggedError<OrganizationPersistenceError>()(
   "OrganizationPersistenceError",
   {
     operation: Schema.Literals([

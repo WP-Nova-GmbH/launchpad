@@ -22,7 +22,7 @@ export interface OrganizationSkillRecord {
   readonly updatedAt: string;
 }
 
-export class OrganizationSkillPersistenceError extends Schema.TaggedErrorClass<OrganizationSkillPersistenceError>()(
+export class OrganizationSkillPersistenceError extends Schema.TaggedError<OrganizationSkillPersistenceError>()(
   "OrganizationSkillPersistenceError",
   {
     operation: Schema.Literals(["list", "save", "delete"]),

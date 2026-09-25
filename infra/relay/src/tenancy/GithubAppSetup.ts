@@ -75,7 +75,7 @@ export function githubAppCreateUrl(organization: string | undefined): string {
     : "https://github.com/settings/apps/new";
 }
 
-export class GithubAppSetupReturnUrlInvalid extends Schema.TaggedErrorClass<GithubAppSetupReturnUrlInvalid>()(
+export class GithubAppSetupReturnUrlInvalid extends Schema.TaggedError<GithubAppSetupReturnUrlInvalid>()(
   "GithubAppSetupReturnUrlInvalid",
   {},
 ) {
@@ -84,7 +84,7 @@ export class GithubAppSetupReturnUrlInvalid extends Schema.TaggedErrorClass<Gith
   }
 }
 
-export class GithubAppSetupStateInvalid extends Schema.TaggedErrorClass<GithubAppSetupStateInvalid>()(
+export class GithubAppSetupStateInvalid extends Schema.TaggedError<GithubAppSetupStateInvalid>()(
   "GithubAppSetupStateInvalid",
   { cause: Schema.Defect() },
 ) {
@@ -93,7 +93,7 @@ export class GithubAppSetupStateInvalid extends Schema.TaggedErrorClass<GithubAp
   }
 }
 
-export class GithubAppSetupConversionFailed extends Schema.TaggedErrorClass<GithubAppSetupConversionFailed>()(
+export class GithubAppSetupConversionFailed extends Schema.TaggedError<GithubAppSetupConversionFailed>()(
   "GithubAppSetupConversionFailed",
   { status: Schema.optionalKey(Schema.Number), cause: Schema.Defect() },
 ) {
@@ -102,7 +102,7 @@ export class GithubAppSetupConversionFailed extends Schema.TaggedErrorClass<Gith
   }
 }
 
-export class GithubAppNotAvailable extends Schema.TaggedErrorClass<GithubAppNotAvailable>()(
+export class GithubAppNotAvailable extends Schema.TaggedError<GithubAppNotAvailable>()(
   "GithubAppNotAvailable",
   {},
 ) {

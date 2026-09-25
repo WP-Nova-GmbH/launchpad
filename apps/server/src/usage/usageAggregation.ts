@@ -23,7 +23,7 @@ import { cacheSavingsUsd, priceUsage, type RateTable } from "./usagePricing.ts";
  * `en-CA` yields ISO-ordered parts, which is why it is used here rather than
  * assembling the day from `Date` getters (those are host-local only).
  */
-export function makeDayFormatter(timeZone: string): (timestampMs: number) => string {
+function makeDayFormatter(timeZone: string): (timestampMs: number) => string {
   let format: Intl.DateTimeFormat;
   try {
     format = new Intl.DateTimeFormat("en-CA", {
@@ -61,6 +61,7 @@ export interface AggregateOptions {
   readonly sinceDay: string;
   readonly untilDay: string;
   readonly rates: RateTable;
+  readonly priceOverrides?: RateTable;
   readonly resolution?: UsageResolution;
   readonly sinceTimeMs?: number;
   readonly untilTimeMs?: number;
@@ -160,16 +161,15 @@ export class UsageAggregator {
       this.#buckets.set(key, bucket);
     }
 
-    const priced = priceUsage(
-      this.#options.rates,
-      record.model,
-      record.totals,
-      record.reportedCostUsd,
-    );
+    const priced = priceUsage(this.#options.rates, record, this.#options.priceOverrides);
 
     bucket.totals = addTotals(bucket.totals, record.totals);
     bucket.costUsd += priced.costUsd;
-    bucket.cacheSavingsUsd += cacheSavingsUsd(this.#options.rates, record.model, record.totals);
+    bucket.cacheSavingsUsd += cacheSavingsUsd(
+      this.#options.rates,
+      record,
+      this.#options.priceOverrides,
+    );
     bucket.records += 1;
     if (priced.costSource === "unpriced") bucket.unpricedRecords += 1;
     if (priced.costSource === "providerReported") bucket.providerReportedRecords += 1;

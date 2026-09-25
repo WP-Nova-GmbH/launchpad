@@ -38,7 +38,7 @@ export const NPM_INSTALLED_PROVIDERS: ReadonlyArray<ProviderDriverKind> = [
 export const CURSOR_PROVIDER = ProviderDriverKind.make("cursor");
 const CURSOR_INSTALL_SCRIPT_URL = "https://cursor.com/install";
 
-export class CursorInstallerFailedError extends Schema.TaggedErrorClass<CursorInstallerFailedError>()(
+export class CursorInstallerFailedError extends Schema.TaggedError<CursorInstallerFailedError>()(
   "CursorInstallerFailedError",
   {
     exitCode: Schema.Number,

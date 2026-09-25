@@ -16,7 +16,7 @@ import * as Machines from "./Machines.ts";
  */
 export const DEFAULT_ORGANIZATION_MACHINE_LIMIT = 5;
 
-export class MachineLimitPersistenceError extends Schema.TaggedErrorClass<MachineLimitPersistenceError>()(
+export class MachineLimitPersistenceError extends Schema.TaggedError<MachineLimitPersistenceError>()(
   "MachineLimitPersistenceError",
   {
     operation: Schema.Literals(["load-limit", "count-machines"]),
@@ -29,7 +29,7 @@ export class MachineLimitPersistenceError extends Schema.TaggedErrorClass<Machin
   }
 }
 
-export class MachineLimitExceeded extends Schema.TaggedErrorClass<MachineLimitExceeded>()(
+export class MachineLimitExceeded extends Schema.TaggedError<MachineLimitExceeded>()(
   "MachineLimitExceeded",
   {
     organizationId: Schema.String,

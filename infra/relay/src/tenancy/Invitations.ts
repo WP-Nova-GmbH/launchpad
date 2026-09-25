@@ -26,7 +26,7 @@ export interface InvitationRecord {
   readonly expiresAt: string;
 }
 
-export class InvitationPersistenceError extends Schema.TaggedErrorClass<InvitationPersistenceError>()(
+export class InvitationPersistenceError extends Schema.TaggedError<InvitationPersistenceError>()(
   "InvitationPersistenceError",
   {
     operation: Schema.Literals([

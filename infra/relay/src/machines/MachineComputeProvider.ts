@@ -24,7 +24,7 @@ export interface MachineComputeCreateResult {
   readonly computeRef: string;
 }
 
-export class MachineComputeNotConfigured extends Schema.TaggedErrorClass<MachineComputeNotConfigured>()(
+export class MachineComputeNotConfigured extends Schema.TaggedError<MachineComputeNotConfigured>()(
   "MachineComputeNotConfigured",
   {
     machineId: Schema.String,
@@ -35,7 +35,7 @@ export class MachineComputeNotConfigured extends Schema.TaggedErrorClass<Machine
   }
 }
 
-export class MachineComputeRequestFailed extends Schema.TaggedErrorClass<MachineComputeRequestFailed>()(
+export class MachineComputeRequestFailed extends Schema.TaggedError<MachineComputeRequestFailed>()(
   "MachineComputeRequestFailed",
   {
     operation: Schema.Literals(["create", "destroy"]),

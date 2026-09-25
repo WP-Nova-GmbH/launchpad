@@ -1,16 +1,15 @@
 /**
- * MigrationsLive - Migration runner with inline loader
+ * Migration runner with an inline loader.
  *
  * Uses Migrator.make with fromRecord to define migrations inline.
  * All migrations are statically imported - no dynamic file system loading.
  *
- * Migrations run automatically when the MigrationLayer is provided,
- * ensuring the database schema is always up-to-date before the application starts.
+ * `runMigrations` is called by the SQLite persistence layer at startup, so the
+ * schema is always up to date before the application starts.
  */
 
 import * as Migrator from "effect/unstable/sql/Migrator";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 // Import all migrations statically
@@ -54,8 +53,22 @@ import Migration0037 from "./Migrations/037_ProjectionTurnsKeysetIndex.ts";
 import Migration0038 from "./Migrations/038_ProjectionThreadsPinOrderKey.ts";
 import Migration0039 from "./Migrations/039_ProjectionProjectsDefaultThreadEnvMode.ts";
 import Migration0040 from "./Migrations/040_ProjectionProjectFaviconPath.ts";
-import Migration0041 from "./Migrations/041_AuthSessionUser.ts";
-import Migration0042 from "./Migrations/042_ProjectionThreadMessageAuthor.ts";
+import Migration0041 from "./Migrations/041_AuthSessionClientConnection.ts";
+import Migration0042 from "./Migrations/042_ProjectionThreadLinkedPullRequest.ts";
+import Migration0043 from "./Migrations/043_ProjectionThreadsUnsettledAt.ts";
+import Migration0044 from "./Migrations/044_ClearAutomaticProjectModelDefaults.ts";
+import Migration0045 from "./Migrations/045_ProjectionProjectsAutoPull.ts";
+import Migration0046 from "./Migrations/046_RepairAutomaticSettlementTimestamps.ts";
+import Migration0047 from "./Migrations/047_ProjectionProjectIcon.ts";
+import Migration0048 from "./Migrations/048_ProjectionThreadBranchPullRequest.ts";
+import Migration0049 from "./Migrations/049_ProjectionThreadsActiveOrderKey.ts";
+import Migration0050 from "./Migrations/050_ProjectionThreadPullRequests.ts";
+import Migration0051 from "./Migrations/051_ProjectionThreadMessageContext.ts";
+import Migration0052 from "./Migrations/052_ProjectionThreadTitleState.ts";
+import Migration0053 from "./Migrations/053_PullRequestFilesViewed.ts";
+import Migration0054 from "./Migrations/054_ProjectionThreadsAutoSettleDisabledAt.ts";
+import Migration0055 from "./Migrations/055_AuthSessionUser.ts";
+import Migration0056 from "./Migrations/056_ProjectionThreadMessageAuthor.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -67,7 +80,7 @@ import Migration0042 from "./Migrations/042_ProjectionThreadMessageAuthor.ts";
  * Uses Migrator.fromRecord which parses the key format and
  * returns migrations sorted by ID.
  */
-export const migrationEntries = [
+const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
   [2, "OrchestrationCommandReceipts", Migration0002],
   [3, "CheckpointDiffBlobs", Migration0003],
@@ -108,13 +121,27 @@ export const migrationEntries = [
   [38, "ProjectionThreadsPinOrderKey", Migration0038],
   [39, "ProjectionProjectsDefaultThreadEnvMode", Migration0039],
   [40, "ProjectionProjectFaviconPath", Migration0040],
-  [41, "AuthSessionUser", Migration0041],
-  [42, "ProjectionThreadMessageAuthor", Migration0042],
+  [41, "AuthSessionClientConnection", Migration0041],
+  [42, "ProjectionThreadLinkedPullRequest", Migration0042],
+  [43, "ProjectionThreadsUnsettledAt", Migration0043],
+  [44, "ClearAutomaticProjectModelDefaults", Migration0044],
+  [45, "ProjectionProjectsAutoPull", Migration0045],
+  [46, "RepairAutomaticSettlementTimestamps", Migration0046],
+  [47, "ProjectionProjectIcon", Migration0047],
+  [48, "ProjectionThreadBranchPullRequest", Migration0048],
+  [49, "ProjectionThreadsActiveOrderKey", Migration0049],
+  [50, "ProjectionThreadPullRequests", Migration0050],
+  [51, "ProjectionThreadMessageContext", Migration0051],
+  [52, "ProjectionThreadTitleState", Migration0052],
+  [53, "PullRequestFilesViewed", Migration0053],
+  [54, "ProjectionThreadsAutoSettleDisabledAt", Migration0054],
+  [55, "AuthSessionUser", Migration0055],
+  [56, "ProjectionThreadMessageAuthor", Migration0056],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
 
-export const makeMigrationLoader = (throughId?: number) =>
+const makeMigrationLoader = (throughId?: number) =>
   Migrator.fromRecord(
     Object.fromEntries(
       migrationEntries
@@ -132,6 +159,36 @@ const run = Migrator.make({});
 export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
 }
+
+/**
+ * Migrations this build moved to a higher id after upstream took their old ids.
+ * A database that ran them under the old id has the schema but the wrong
+ * record. The migrator only runs ids above the highest recorded one, so the
+ * stale record is dropped rather than moved: the upstream migrations that now
+ * own the old ids run, and the moved migration reruns under its new id. Every
+ * migration listed here must therefore be safe to run twice.
+ */
+const renumberedMigrations: ReadonlyArray<{ readonly oldId: number; readonly name: string }> = [
+  { oldId: 41, name: "AuthSessionUser" },
+  { oldId: 42, name: "ProjectionThreadMessageAuthor" },
+];
+
+const forgetRenumberedMigrations = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  for (const { oldId, name } of renumberedMigrations) {
+    const stale = yield* sql<{ migration_id: number }>`
+      SELECT migration_id FROM effect_sql_migrations
+      WHERE migration_id = ${oldId} AND name = ${name}
+    `.withoutTransform;
+    if (stale.length === 0) {
+      continue;
+    }
+    yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = ${oldId} AND name = ${name}`;
+    yield* Effect.log("Forgot a renumbered migration so its successors run").pipe(
+      Effect.annotateLogs({ migration: `${oldId}_${name}` }),
+    );
+  }
+});
 
 /**
  * A migration id that a database already recorded under a different name means
@@ -153,6 +210,7 @@ const verifyMigrationHistory = Effect.gen(function* () {
   if (tableExists.length === 0) {
     return;
   }
+  yield* forgetRenumberedMigrations;
   const recorded = yield* sql<{ migration_id: number; name: string }>`
     SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
   `.withoutTransform;
@@ -201,22 +259,3 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
     : Effect.log("Migrations ran successfully").pipe(Effect.annotateLogs({ migrations }));
   return executedMigrations;
 });
-
-/**
- * Layer that runs migrations when the layer is built.
- *
- * Use this to ensure migrations run before your application starts.
- * Migrations are run automatically - no separate script is needed.
- *
- * @example
- * ```typescript
- * import { MigrationsLive } from "@acme/db/Migrations"
- * import * as SqliteClient from "@acme/db/SqliteClient"
- *
- * // Migrations run automatically when SqliteClient is provided
- * const AppLayer = MigrationsLive.pipe(
- *   Layer.provideMerge(SqliteClient.layer({ filename: "database.sqlite" }))
- * )
- * ```
- */
-export const MigrationsLive = Layer.effectDiscard(runMigrations());

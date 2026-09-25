@@ -5,7 +5,7 @@ import * as Schema from "effect/Schema";
  * not be materialized. Distinct from a job that ran and failed a step, which is
  * an ordinary `JobOutcome` with `status: "failed"`.
  */
-export class JobRunnerError extends Schema.TaggedErrorClass<JobRunnerError>()("JobRunnerError", {
+export class JobRunnerError extends Schema.TaggedError<JobRunnerError>()("JobRunnerError", {
   jobId: Schema.String,
   operation: Schema.Literals(["resolve-project", "prepare-worktree", "create-thread", "run-step"]),
   detail: Schema.String,

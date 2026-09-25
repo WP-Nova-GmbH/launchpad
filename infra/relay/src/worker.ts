@@ -1,12 +1,14 @@
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
-import * as Drizzle from "alchemy/Drizzle";
+import * as Drizzle from "alchemy/Drizzle/Postgres";
 import * as Config from "effect/Config";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Redacted from "effect/Redacted";
 import * as Stream from "effect/Stream";
 import * as Etag from "effect/unstable/http/Etag";
 import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
@@ -23,6 +25,7 @@ import {
   jobsApi,
   metadataApi,
   mobileApi,
+  RELAY_HTTP_ROUTER_CONFIG,
   relayClientAuthLayer,
   relayDpopClientAuthLayer,
   relayCors,
@@ -54,7 +57,18 @@ import * as Jobs from "./jobs/Jobs.ts";
 import * as ManagedEndpointAllocations from "./environments/ManagedEndpointAllocations.ts";
 import * as LiveActivities from "./agentActivity/LiveActivities.ts";
 import * as RelayDb from "./db.ts";
-import { RelayApnsDeliveryDeadLetterQueue, RelayApnsDeliveryQueue } from "./queues.ts";
+import {
+  RelayApnsDeliveryDeadLetterQueue,
+  RelayApnsDeliveryQueue,
+  RelayFcmDeliveryQueue,
+  RelayFcmDeliveryDeadLetterQueue,
+} from "./queues.ts";
+import * as WebCrypto from "./WebCrypto.ts";
+import * as FcmAssertionSigner from "./agentActivity/FcmAssertionSigner.ts";
+import * as FcmClient from "./agentActivity/FcmClient.ts";
+import * as FcmDeliveryQueueSender from "./agentActivity/FcmDeliveryQueueSender.ts";
+import * as FcmDeliveries from "./agentActivity/FcmDeliveries.ts";
+import * as FcmDeliveryQueueConsumer from "./agentActivity/FcmDeliveryQueueConsumer.ts";
 import * as RelayConfiguration from "./Config.ts";
 import * as AgentActivityPublisher from "./agentActivity/AgentActivityPublisher.ts";
 import * as ApnsClient from "./agentActivity/ApnsClient.ts";
@@ -66,6 +80,7 @@ import * as EnvironmentLinker from "./environments/EnvironmentLinker.ts";
 import * as EnvironmentPublishSignatures from "./environments/EnvironmentPublishSignatures.ts";
 import * as EnvironmentProjectCatalogSignatures from "./environments/EnvironmentProjectCatalogSignatures.ts";
 import * as ManagedEndpointProvider from "./environments/ManagedEndpointProvider.ts";
+import * as ManagedEndpointReaper from "./environments/ManagedEndpointReaper.ts";
 import * as ManagedTunnelLimits from "./environments/ManagedTunnelLimits.ts";
 import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
 import * as HetznerComputeProvider from "./machines/HetznerComputeProvider.ts";
@@ -157,6 +172,8 @@ export const ApiLive = Api.make(
     const { relayPublicOrigin, stage } = yield* RelayDeploymentConfig;
     const apnsDeliveryQueue = yield* RelayApnsDeliveryQueue;
     const apnsDeliveryDeadLetterQueue = yield* RelayApnsDeliveryDeadLetterQueue;
+    const fcmDeliveryQueue = yield* RelayFcmDeliveryQueue;
+    const fcmDeliveryDeadLetterQueue = yield* RelayFcmDeliveryDeadLetterQueue;
     const cloudMintKeyPair = yield* CloudMintKeyPair;
     const relayApiZone = yield* RelayApiZone;
     const managedEndpointZone = yield* ManagedEndpointZone;
@@ -166,56 +183,65 @@ export const ApiLive = Api.make(
     //
     // 2. Create bindings
     //
-    const environment = yield* Config.schema(
-      RelayConfiguration.ApnsEnvironment,
-      "APNS_ENVIRONMENT",
+    const apnsEnabled = yield* Config.Boolean("APNS_ENABLED").pipe(Config.withDefault(true));
+    const apnsCredentials = apnsEnabled
+      ? {
+          environment: yield* Config.schema(RelayConfiguration.ApnsEnvironment, "APNS_ENVIRONMENT"),
+          teamId: yield* Config.String("APNS_TEAM_ID"),
+          keyId: yield* Config.String("APNS_KEY_ID"),
+          bundleId: yield* Config.String("APNS_BUNDLE_ID"),
+          privateKey: yield* Config.Redacted("APNS_PRIVATE_KEY"),
+        }
+      : null;
+    const fcmServiceAccount = Option.getOrUndefined(
+      Option.filter(
+        yield* Config.option(Config.Redacted("FCM_SERVICE_ACCOUNT")),
+        (value) => Redacted.value(value).trim().length > 0,
+      ),
     );
-    const apnsTeamId = yield* Config.string("APNS_TEAM_ID");
-    const apnsKeyId = yield* Config.string("APNS_KEY_ID");
-    const apnsBundleId = yield* Config.string("APNS_BUNDLE_ID");
-    const apnsPrivateKey = yield* Config.redacted("APNS_PRIVATE_KEY");
     const apnsDeliveryJobSigningSecret = yield* randomApnsDeliveryJobSigningSecret;
     const apnsDeliveryQueueSender = yield* Cloudflare.Queues.WriteQueue(apnsDeliveryQueue);
+    const fcmDeliveryQueueSender = yield* Cloudflare.Queues.WriteQueue(fcmDeliveryQueue);
 
     const axiomDatasetName = yield* observability.traces.name;
     const axiomIngestToken = yield* observability.workerIngestToken.token;
     const axiomTracesEndpoint = yield* observability.traces.otelTracesEndpoint;
 
     // Optional: a deployment without a GitHub App simply hides the surface.
-    const githubAppId = yield* Config.string("GITHUB_APP_ID").pipe(Config.option);
-    const githubAppSlug = yield* Config.string("GITHUB_APP_SLUG").pipe(Config.option);
-    const githubAppPrivateKey = yield* Config.redacted("GITHUB_APP_PRIVATE_KEY").pipe(
+    const githubAppId = yield* Config.String("GITHUB_APP_ID").pipe(Config.option);
+    const githubAppSlug = yield* Config.String("GITHUB_APP_SLUG").pipe(Config.option);
+    const githubAppPrivateKey = yield* Config.Redacted("GITHUB_APP_PRIVATE_KEY").pipe(
       Config.option,
     );
 
     // Optional: a deployment without a Hetzner token cannot create machine
     // compute and says so instead of pretending.
-    const hetznerApiToken = yield* Config.redacted("HETZNER_API_TOKEN").pipe(Config.option);
+    const hetznerApiToken = yield* Config.Redacted("HETZNER_API_TOKEN").pipe(Config.option);
     const hetznerSettings: Omit<HetznerComputeProvider.HetznerComputeSettings, "apiToken"> = {
-      serverType: yield* Config.string("HETZNER_SERVER_TYPE").pipe(Config.withDefault("cx22")),
-      image: yield* Config.string("HETZNER_IMAGE").pipe(Config.withDefault("ubuntu-24.04")),
-      location: yield* Config.string("HETZNER_LOCATION").pipe(Config.withDefault("fsn1")),
-      sshKeys: (yield* Config.string("HETZNER_SSH_KEYS").pipe(Config.withDefault("")))
+      serverType: yield* Config.String("HETZNER_SERVER_TYPE").pipe(Config.withDefault("cx22")),
+      image: yield* Config.String("HETZNER_IMAGE").pipe(Config.withDefault("ubuntu-24.04")),
+      location: yield* Config.String("HETZNER_LOCATION").pipe(Config.withDefault("fsn1")),
+      sshKeys: (yield* Config.String("HETZNER_SSH_KEYS").pipe(Config.withDefault("")))
         .split(",")
         .map((key) => key.trim())
         .filter((key) => key.length > 0),
-      bootstrapUrl: yield* Config.string("MACHINE_BOOTSTRAP_URL").pipe(
+      bootstrapUrl: yield* Config.String("MACHINE_BOOTSTRAP_URL").pipe(
         Config.withDefault(
           "https://raw.githubusercontent.com/WP-Nova-GmbH/launchpad/main/infra/relay/scripts/machine-bootstrap.sh",
         ),
       ),
-      sourceGitUrl: yield* Config.string("MACHINE_SOURCE_GIT_URL").pipe(
+      sourceGitUrl: yield* Config.String("MACHINE_SOURCE_GIT_URL").pipe(
         Config.withDefault("https://github.com/WP-Nova-GmbH/launchpad.git"),
       ),
     };
     // Executors follow this ref of the same source they were bootstrapped from.
-    const executorSourceRef = yield* Config.string("MACHINE_SOURCE_GIT_REF").pipe(
+    const executorSourceRef = yield* Config.String("MACHINE_SOURCE_GIT_REF").pipe(
       Config.withDefault("main"),
     );
 
-    const clerkSecretKey = yield* Config.redacted("CLERK_SECRET_KEY");
-    const clerkPublishableKey = yield* Config.string("CLERK_PUBLISHABLE_KEY");
-    const clerkJwtAudience = yield* Config.string("CLERK_JWT_AUDIENCE");
+    const clerkSecretKey = yield* Config.Redacted("CLERK_SECRET_KEY");
+    const clerkPublishableKey = yield* Config.String("CLERK_PUBLISHABLE_KEY");
+    const clerkJwtAudience = yield* Config.String("CLERK_JWT_AUDIENCE");
 
     const cloudMintPrivateKey = yield* cloudMintKeyPair.privateKey;
     const cloudMintPublicKey = yield* cloudMintKeyPair.publicKey;
@@ -227,6 +253,7 @@ export const ApiLive = Api.make(
     yield* yield* relayApiZone.zoneId;
     const managedEndpointDnsBinding = yield* Cloudflare.DNS.ReadWriteDns(managedEndpointZone);
     const managedEndpointZoneName = yield* managedEndpointZone.name;
+    const managedEndpointCleanupMode = yield* RelayConfiguration.managedEndpointCleanupModeConfig;
 
     //
     // 3. Runtime layers and app construction
@@ -236,13 +263,8 @@ export const ApiLive = Api.make(
     const loadSettings = Effect.gen(function* () {
       return RelayConfiguration.RelayConfiguration.of({
         relayIssuer: relayPublicOrigin,
-        apns: {
-          environment,
-          teamId: apnsTeamId,
-          keyId: apnsKeyId,
-          bundleId: apnsBundleId,
-          privateKey: apnsPrivateKey,
-        },
+        ...(fcmServiceAccount ? { fcmServiceAccount } : {}),
+        apns: apnsCredentials,
         apnsDeliveryJobSigningSecret: yield* apnsDeliveryJobSigningSecret,
         clerkSecretKey,
         clerkPublishableKey,
@@ -262,6 +284,7 @@ export const ApiLive = Api.make(
         managedEndpointBaseDomain: yield* managedEndpointZoneName,
         managedEndpointNamespace: stage,
         executorSource: { gitUrl: hetznerSettings.sourceGitUrl, ref: executorSourceRef },
+        managedEndpointCleanupMode,
       });
     });
 
@@ -289,7 +312,9 @@ export const ApiLive = Api.make(
             : MachineComputeProvider.layerUnavailable,
         ),
         Layer.provideMerge(MachineLimits.layer),
-        Layer.provideMerge(EnvironmentPublishSignatures.layer),
+        Layer.provideMerge(
+          Layer.merge(EnvironmentPublishSignatures.layer, ManagedEndpointReaper.layer),
+        ),
         Layer.provideMerge(EnvironmentProjectCatalogSignatures.layer),
         Layer.provideMerge(
           ManagedEndpointProvider.layerCloudflareBindings(
@@ -300,6 +325,26 @@ export const ApiLive = Api.make(
         ),
         Layer.provideMerge(DpopProofs.layer),
         Layer.provideMerge(ApnsDeliveries.layer),
+        Layer.provideMerge(
+          FcmDeliveries.layer.pipe(
+            Layer.provide(
+              Layer.succeed(FcmDeliveryQueueSender.FcmDeliveryQueueSender, {
+                send: (body) =>
+                  fcmDeliveryQueueSender
+                    .send(body)
+                    .pipe(Effect.provideService(Alchemy.RuntimeContext, alchemyRuntimeContext)),
+              }),
+            ),
+            Layer.provideMerge(
+              FcmClient.layer.pipe(
+                Layer.provide(FcmAssertionSigner.layer),
+                Layer.provide(
+                  Layer.succeed(WebCrypto.WebCrypto, { subtle: globalThis.crypto.subtle }),
+                ),
+              ),
+            ),
+          ),
+        ),
         Layer.provideMerge(ApnsClient.layer.pipe(Layer.provideMerge(ApnsProviderTokens.layer))),
         Layer.provideMerge(
           ApnsDeliveryQueue.layerCloudflareQueues(apnsDeliveryQueueSender, alchemyRuntimeContext),
@@ -330,11 +375,11 @@ export const ApiLive = Api.make(
             ManagedTunnelLimits.layer,
           ),
         ),
-        Layer.provideMerge(LiveActivities.layer),
-        Layer.provideMerge(DeliveryAttempts.layer),
       )
       .pipe(
         // Split only because `pipe` takes at most twenty arguments.
+        Layer.provideMerge(LiveActivities.layer),
+        Layer.provideMerge(DeliveryAttempts.layer),
         Layer.provideMerge(RelayTokens.layer),
         Layer.provideMerge(GithubAppSetup.layer),
         // Below GithubApp and the setup: the App created from settings is what they read.
@@ -377,22 +422,63 @@ export const ApiLive = Api.make(
         ),
     );
 
+    yield* Cloudflare.Queues.consumeQueueMessages<unknown>(
+      fcmDeliveryQueue,
+      {
+        batchSize: 10,
+        maxRetries: 5,
+        maxWaitTime: "1 second",
+        retryDelay: "30 seconds",
+        deadLetterQueue: fcmDeliveryDeadLetterQueue.queueName as unknown as string,
+      },
+      (stream) =>
+        stream.pipe(
+          Stream.withSpan("relay.fcm_delivery_queue.process_batch"),
+          Stream.runForEach(FcmDeliveryQueueConsumer.processMessage),
+          Effect.provide(runtimeLayer),
+        ),
+    );
+
     yield* Cloudflare.Workers.cron("*/5 * * * *", () =>
-      DpopProofs.DpopProofReplay.pipe(
-        Effect.flatMap((dpopProofs) => dpopProofs.pruneExpired),
-        // Terminal thread rows are kept briefly so finished agents show as
-        // Done/Failed in the Live Activity; sweep them once they age out.
-        Effect.andThen(
-          Effect.all([AgentActivityRows.AgentActivityRows, DateTime.now]).pipe(
-            Effect.flatMap(([activityRows, now]) =>
-              activityRows.pruneTerminal({
-                updatedBefore: DateTime.formatIso(DateTime.subtract(now, { minutes: 30 })),
-              }),
+      Effect.all(
+        [
+          DpopProofs.DpopProofReplay.pipe(
+            Effect.flatMap((dpopProofs) => dpopProofs.pruneExpired),
+            // Keep completed thread rows long enough to show their final state.
+            Effect.andThen(
+              Effect.all([AgentActivityRows.AgentActivityRows, DateTime.now]).pipe(
+                Effect.flatMap(([activityRows, now]) =>
+                  activityRows.pruneTerminal({
+                    updatedBefore: DateTime.formatIso(DateTime.subtract(now, { minutes: 30 })),
+                  }),
+                ),
+              ),
+            ),
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause)
+                ? Effect.interrupt
+                : Effect.logWarning("Failed to prune expired relay state", { cause }),
             ),
           ),
-        ),
+          ManagedEndpointReaper.ManagedEndpointReaper.pipe(
+            Effect.flatMap((reaper) => reaper.sweep.pipe(Effect.timeout("2 minutes"))),
+            Effect.tap((result) =>
+              result.scanned > 0
+                ? Effect.logInfo("Finished managed tunnel cleanup", result)
+                : Effect.void,
+            ),
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause)
+                ? Effect.interrupt
+                : Effect.logWarning("Failed to clean up inactive managed tunnels", { cause }),
+            ),
+          ),
+        ],
+        { concurrency: 2, discard: true },
+      ).pipe(
         Effect.withSpan("relay.cron.prune_expired_state"),
-        Effect.provide(runtimeLayer),
+        // Export cron spans to Axiom like HTTP spans; the scope flushes them before the run ends.
+        Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
       ),
     );
 
@@ -408,6 +494,7 @@ export const ApiLive = Api.make(
       relayNotFoundRoute,
     ).pipe(
       HttpRouter.toHttpEffect,
+      Effect.provideService(HttpRouter.RouterConfig, RELAY_HTTP_ROUTER_CONFIG),
       withoutCapturedParentSpan,
       Effect.flatMap((httpEffect) => traceRelayHttpRequestWith(httpEffect, relayTraceLayer)),
     );

@@ -10,16 +10,13 @@ describe("migration history guard", () => {
   it.effect("refuses to run when a recorded id names a different change", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* sql`UPDATE effect_sql_migrations SET name = 'AuthSessionClientConnection' WHERE migration_id = 41`;
+      yield* sql`UPDATE effect_sql_migrations SET name = 'SomethingElse' WHERE migration_id = 55`;
 
       const error = yield* Effect.flip(runMigrations());
 
       assert.instanceOf(error, Migrator.MigrationError);
       assert.equal(error.kind, "BadState");
-      assert.include(
-        error.message,
-        'migration 41: database recorded "AuthSessionClientConnection"',
-      );
+      assert.include(error.message, 'migration 55: database recorded "SomethingElse"');
       assert.include(error.message, 'this build defines "AuthSessionUser"');
     }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
@@ -27,11 +24,36 @@ describe("migration history guard", () => {
   it.effect("tolerates recorded ids this build does not define", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (43, 'ProjectionThreadsUnsettledAt')`;
+      yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (99, 'FromTheFuture')`;
 
       const executed = yield* runMigrations();
 
       assert.deepStrictEqual(executed, []);
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
+  it.effect("reruns from a renumbered migration's old id", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      // A database migrated before upstream took ids 41 and 42: it recorded the
+      // fork's migrations under those ids and never saw 41–56 as they are now.
+      yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id > 40`;
+      yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (41, 'AuthSessionUser'), (42, 'ProjectionThreadMessageAuthor')`;
+
+      const executed = yield* runMigrations();
+
+      assert.deepStrictEqual(
+        executed.map(([id]) => id),
+        Array.from({ length: 16 }, (_, index) => 41 + index),
+      );
+      const recorded = yield* sql<{ migration_id: number; name: string }>`
+        SELECT migration_id, name FROM effect_sql_migrations WHERE migration_id IN (41, 55)
+        ORDER BY migration_id
+      `.withoutTransform;
+      assert.deepStrictEqual(recorded, [
+        { migration_id: 41, name: "AuthSessionClientConnection" },
+        { migration_id: 55, name: "AuthSessionUser" },
+      ]);
     }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
 

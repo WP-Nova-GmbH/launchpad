@@ -103,7 +103,7 @@ export function enrolledMachineIdentity(record: MachineRecord): EnrolledMachineI
   };
 }
 
-export class MachinePersistenceError extends Schema.TaggedErrorClass<MachinePersistenceError>()(
+export class MachinePersistenceError extends Schema.TaggedError<MachinePersistenceError>()(
   "MachinePersistenceError",
   {
     operation: Schema.Literals([
