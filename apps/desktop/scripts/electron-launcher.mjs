@@ -21,18 +21,7 @@ const APP_BUNDLE_ID = isDevelopment
   : "com.t3tools.t3code";
 const APP_PROTOCOL_SCHEMES = isDevelopment ? ["t3code-dev"] : ["t3code"];
 const LAUNCHER_VERSION = 19;
-const developmentMacIconPngPath = NodePath.join(
-  repoRoot,
-  "assets",
-  "dev",
-  "blueprint-macos-1024.png",
-);
-const productionMacIconPngPath = NodePath.join(
-  repoRoot,
-  "assets",
-  "prod",
-  "launchpad-macos-1024.png",
-);
+const macIconPngPath = NodePath.join(repoRoot, "assets", "prod", "launchpad-macos-1024.png");
 // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone launcher script has no Effect runtime.
 const hostPlatform = NodeOS.platform();
 
@@ -208,13 +197,11 @@ function registerMacLauncherBundle(appBundlePath) {
 }
 
 // Bundle-internal paths are macOS paths whatever host builds them.
-export function resolveMacLauncherIconPaths(runtimeDir, development = isDevelopment) {
+export function resolveMacLauncherIconPaths(runtimeDir) {
   return {
-    sourceIconPath: development ? developmentMacIconPngPath : productionMacIconPngPath,
-    generatedIconPath: NodePath.posix.join(
-      runtimeDir,
-      development ? "icon-dev.icns" : "icon-prod.icns",
-    ),
+    sourceIconPath: macIconPngPath,
+    // A fresh name avoids reusing the old T3 icon when its cache is newer than the artwork.
+    generatedIconPath: NodePath.posix.join(runtimeDir, "launchpad-icon.icns"),
   };
 }
 

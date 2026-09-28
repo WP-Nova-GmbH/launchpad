@@ -141,14 +141,10 @@ describe("electron development launcher", () => {
     }
   });
 
-  it("derives launcher icons from canonical development and production assets", () => {
-    const development = resolveMacLauncherIconPaths("/runtime", true);
-    const production = resolveMacLauncherIconPaths("/runtime", false);
+  it("uses Launchpad artwork with a fresh cache path for the macOS launcher", () => {
+    const iconPaths = resolveMacLauncherIconPaths("/runtime");
 
-    // The source icons are real repo paths, joined for the host.
-    assert.match(development.sourceIconPath, /assets[\\/]dev[\\/]blueprint-macos-1024\.png$/);
-    assert.equal(development.generatedIconPath, "/runtime/icon-dev.icns");
-    assert.match(production.sourceIconPath, /assets[\\/]prod[\\/]launchpad-macos-1024\.png$/);
-    assert.equal(production.generatedIconPath, "/runtime/icon-prod.icns");
+    assert.match(iconPaths.sourceIconPath, /assets[\\/]prod[\\/]launchpad-macos-1024\.png$/);
+    assert.equal(iconPaths.generatedIconPath, "/runtime/launchpad-icon.icns");
   });
 });
