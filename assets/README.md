@@ -1,14 +1,15 @@
 # Brand icons
 
-The three Icon Composer projects are the source of truth for full application icons:
+Launchpad production icons are generated from the mascot artwork with `node scripts/generate-brand-icons.ts <source-1024.png>`. This writes the `prod/launchpad-*` assets, including the macOS icon. Development web and desktop use these Launchpad assets too.
+
+The two legacy Icon Composer projects remain the source for development mobile and nightly application icons:
 
 - `dev/app-icon.icon`
 - `nightly/app-icon.icon`
-- `prod/app-icon.icon`
 
 Each project uses `text.svg` for the T3 mark and `background.svg` when the background is a vector layer. Additional layers use semantic names that describe their role and placement.
 
-Run `vp run icons:export` from the repository root to regenerate the tracked iOS, Linux, Windows, and web assets. The development web exports are also copied to `apps/web/public` for the browser favicon and splash screen. Run `vp run icons:check` to verify that the generated assets and public copies match their sources without changing files.
+Run `vp run icons:export` from the repository root to regenerate the legacy iOS, Linux, Windows, and web assets and copy the existing Launchpad web assets to `apps/web/public` for the browser favicon and splash screen. Run `vp run icons:check` to verify those generated assets and public copies without changing files. Neither command regenerates the Launchpad production artwork; the legacy `prod/app-icon.icon` still contains the T3 mark and must not overwrite the Launchpad files.
 
 Exporting requires Icon Composer 2 or newer on macOS. The script selects the newest compatible exporter from Xcode or a standalone Icon Composer installation and pins design generation 26. Set `ICON_COMPOSER_TOOL` to the full path of `Icon Composer.app/Contents/Executables/ictool` to override automatic discovery.
 
@@ -23,24 +24,22 @@ After changing an Icon Composer project, open it in Icon Composer and export the
 - Size: `1024pt`
 - Scale: `1×`
 
-Save the three exports to:
+Save the two legacy exports to:
 
 - `dev/app-icon.icon` -> `dev/blueprint-macos-1024.png`
 - `nightly/app-icon.icon` -> `nightly/nightly-macos-1024.png`
-- `prod/app-icon.icon` -> `prod/launchpad-macos-1024.png`
 
 The result must be a 1024×1024 PNG with the classic macOS safe area: the opaque icon body is 824×824, inset 100 pixels on every side, with only the native Icon Composer shadow extending into the surrounding transparent canvas.
 
 To have Codex perform the native exports, paste this prompt into a task opened at the repository root:
 
 ```text
-Use [@Computer](plugin://computer-use@openai-bundled) and the Icon Composer app to export the three macOS app icons in this repository.
+Use [@Computer](plugin://computer-use@openai-bundled) and the Icon Composer app to export the two legacy macOS app icons in this repository.
 
 For each project below, use Platform: macOS pre-Tahoe, Appearance: Default, Size: 1024pt, and Scale: 1×, then save the PNG to the exact destination:
 
 - assets/dev/app-icon.icon -> assets/dev/blueprint-macos-1024.png
 - assets/nightly/app-icon.icon -> assets/nightly/nightly-macos-1024.png
-- assets/prod/app-icon.icon -> assets/prod/launchpad-macos-1024.png
 
 Do not resize, composite, or otherwise post-process the exported PNGs.
 

@@ -59,10 +59,10 @@ const WEB_ICON_TARGET_FILENAMES = {
 
 const WEB_ICON_SOURCE_PATHS_BY_BRAND = {
   development: {
-    faviconIco: BRAND_ASSET_PATHS.developmentWebFaviconIco,
-    favicon16Png: BRAND_ASSET_PATHS.developmentWebFavicon16Png,
-    favicon32Png: BRAND_ASSET_PATHS.developmentWebFavicon32Png,
-    appleTouchIconPng: BRAND_ASSET_PATHS.developmentWebAppleTouchIconPng,
+    faviconIco: BRAND_ASSET_PATHS.productionWebFaviconIco,
+    favicon16Png: BRAND_ASSET_PATHS.productionWebFavicon16Png,
+    favicon32Png: BRAND_ASSET_PATHS.productionWebFavicon32Png,
+    appleTouchIconPng: BRAND_ASSET_PATHS.productionWebAppleTouchIconPng,
   },
   nightly: {
     faviconIco: BRAND_ASSET_PATHS.nightlyWebFaviconIco,
