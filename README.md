@@ -1,124 +1,41 @@
 # Launchpad
 
-Launchpad is an "agent harness control surface". It enables control of the agents on your machine with a best-in-class mobile app ([iOS](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824), [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)), [web app](https://app.t3.codes) and [Electron-based desktop app](https://t3.codes).
+Launchpad runs coding agents on your machine and lets you control them from a desktop,
+web, or mobile app. It works with Claude Code, Codex, Cursor, Grok Build, OpenCode, and
+Google Antigravity using your existing provider accounts.
 
-Works with your subscriptions on Claude Code, Codex, Cursor, Grok Build, OpenCode, and Google Antigravity. If they're set up on your computer, Launchpad can control them.
+To install a released app, follow the [installation guide](./docs/user/install.md).
+To work on this repository, start below.
 
-## "Wait, what are you selling me?"
+## Run from source
 
-Nothing. We built Launchpad because we wanted the best possible development experience with agents. We were inspired by existing solutions like the Codex desktop app, Conductor, Claude Desktop and Cursor Glass, but none met our bar.
-
-We wanted something performant, remote-ready, and truly open. If we ever go the wrong direction, we want you to have everything you need to fork and build the editor that you want.
-
-## Installation
-
-> [!WARNING]
-> Launchpad currently supports Codex, Claude, Cursor, Grok Build, OpenCode, and Antigravity. Install and authenticate at least one provider before use:
->
-> - Codex: install [Codex CLI](https://developers.openai.com/codex/cli) and run `codex login`
-> - Claude: install [Claude Code](https://claude.com/product/claude-code) and run `claude auth login`
-> - Cursor: install [Cursor CLI](https://cursor.com/cli) and run `agent login`
-> - Grok Build: install [Grok Build CLI](https://x.ai/cli) and run `grok login`
-> - OpenCode: install [OpenCode](https://opencode.ai) and run `opencode auth login`
-> - Antigravity: enable it in Settings, then use **Install Antigravity** and **Sign in with Google**. No CLI is required.
-
-### Command line
-
-```bash
-curl -fsSL https://t3.codes/install.sh | sh
-```
-
-On Windows, in PowerShell:
-
-```powershell
-irm https://t3.codes/install.ps1 | iex
-```
-
-Then run `t3` to start the server and open the local web app. `t3 service install` keeps it running in the background, `t3 update` moves to a newer release, and `t3 --help` has the full reference.
-
-To try it once without installing, run `npx t3@latest` instead.
-
-### Desktop app
-
-Install the latest version of the desktop app from [GitHub Releases](https://github.com/pingdotgg/t3code/releases), or from your favorite package registry:
-
-#### Windows (`winget`)
-
-```bash
-winget install T3Tools.T3Code
-```
-
-#### macOS (Homebrew)
-
-```bash
-brew install --cask t3-code
-```
-
-#### Debian, Ubuntu (`.deb`)
-
-Download the `.deb` from [GitHub Releases](https://github.com/pingdotgg/t3code/releases), then:
-
-```bash
-sudo apt install ./T3-Code-*.deb
-```
-
-#### Arch Linux (AUR)
-
-Stable:
-
-```bash
-yay -S t3code-bin
-```
-
-Nightly:
-
-```bash
-yay -S t3code-nightly-bin
-```
-
-The AUR packaging is maintained in this repository under [`packaging/aur`](./packaging/aur).
-
-## Some notes
-
-We are very very early in this project. Expect bugs.
-
-We are (mostly) not accepting contributions yet. Small fixes may be considered. Big features will not be.
-
-## Documentation
-
-Full docs live in [docs/](./docs). There's no docs site yet.
-
-- [Install and first run](./docs/user/install.md)
-- [Permission modes](./docs/user/permission-modes.md)
-- [Keyboard shortcuts](./docs/user/keybindings.md)
-- [Project settings](./docs/user/project-settings.md)
-- [Remote access from a phone or another machine](./docs/user/remote-access.md)
-- [Keeping app and server in sync](./docs/user/updating.md)
-- [Source control integrations](./docs/user/source-control.md)
-- Multiple accounts: [Codex](./docs/user/providers-codex.md) · [Claude](./docs/user/providers-claude.md)
-- [Run Launchpad as a background service](./docs/user/background-service.md)
-
-Building from source? Start at [docs/internals/overview.md](./docs/internals/overview.md).
-
-## If you REALLY want to contribute still.... read this first
+Run the following commands from the repository root. The checkout requires Node.js
+24 (`^24.13.1`) and uses Vite+ (`vp`) with pnpm. `vp` manages the Node.js and package
+manager versions configured in [package.json](./package.json).
 
 ### Install `vp`
 
-Launchpad uses Vite+ so you'll need to install the global `vp` command-line tool.
-
-#### macOS / Linux
+macOS / Linux:
 
 ```bash
 curl -fsSL https://vite.plus | bash
 ```
 
-#### Windows
+Windows PowerShell:
 
-```bash
+```powershell
 irm https://vite.plus/ps1 | iex
 ```
 
-Checkout their getting started guide for more information: https://viteplus.dev/guide/
+Reopen your terminal, return to the repository root, and check the installation:
+
+```bash
+vp --version
+vp env exec node --version
+```
+
+The second command should report Node 24, even if your system's `node` command uses
+another version.
 
 ### Install dependencies
 
@@ -126,8 +43,136 @@ Checkout their getting started guide for more information: https://viteplus.dev/
 vp i
 ```
 
-Read [CONTRIBUTING.md](./CONTRIBUTING.md) before reporting a bug or opening a PR.
+Run this on the first checkout and after pulling dependency changes.
 
-Have a feature request? Start an [Ideas discussion](https://github.com/pingdotgg/t3code/discussions/categories/ideas).
+### Start the desktop app
 
-Need support? Join the [Discord](https://discord.gg/jn4EGJjrvv).
+```bash
+vp run dev:desktop
+```
+
+This builds the backend, starts the web development server, and opens Electron.
+Allow the initial build to finish before expecting a window. The desktop app starts
+its own backend, so this command is sufficient for local desktop development.
+
+Keep the terminal running while you work. Stop it with `Ctrl+C`.
+
+On Linux, desktop development also needs a C/C++ toolchain, `pkg-config`, and libsecret
+headers. See the [platform prerequisites](./docs/operations/development.md#linux-appimage-prerequisites)
+for installation commands.
+
+### Start the browser app
+
+For browser development, use:
+
+```bash
+vp run dev
+```
+
+This starts the backend and web development server. Open the complete **pairing URL**
+printed in the terminal, including its token, to authenticate a new browser.
+Use the printed URL and ports; occupied ports can change the selected values.
+Add `--browser` to open the browser automatically: `vp run dev --browser`.
+
+### Run your first agent
+
+Open **Settings → Providers** to configure and authenticate a provider, then add a
+project directory and start a thread. Launchpad can open before a provider is ready;
+running an agent requires an installed, authenticated provider in that environment.
+See [provider setup](./docs/user/install.md#providers) for installation and login details.
+
+## Development commands
+
+These commands run from the repository root:
+
+| Command                | What it starts                                                                                                                    |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `vp run dev:desktop`   | Electron, the web development server, and a desktop-managed backend.                                                              |
+| `vp run dev`           | The browser app and backend.                                                                                                      |
+| `vp run dev:share`     | The browser app and backend, shared over Tailscale. Requires Tailscale setup; give the printed pairing URL to the remote browser. |
+| `vp run dev:full`      | The browser app, backend, and a local Connect relay. Requires the relay configuration and database described below.               |
+| `vp run dev:marketing` | The marketing website.                                                                                                            |
+| `vp run dev:mobile`    | Metro for an installed Expo development client. Requires a separately running Launchpad backend; see mobile setup below.          |
+
+`dev:server` and `dev:web` start individual processes for specialized workflows.
+Use `dev` for a complete browser environment. Flags go directly after the task name,
+for example `vp run dev --home-dir /tmp/launchpad-dev`.
+
+The dev runner selects development state and ports. Leave `VITE_HTTP_URL` and
+`VITE_WS_URL` unset, and never point a dev server at the live `~/.t3/userdata` directory.
+See the [development runbook](./docs/operations/development.md) for state locations,
+remote sharing, reusable browser authentication, and focused checks.
+
+## Optional services and clients
+
+### Launchpad Connect
+
+Local desktop and browser development work without an `.env` file. Connect is
+disabled in a fresh clone.
+
+The `T3CODE_*` variables are Launchpad settings with names inherited from T3 Code.
+They do not require a separate T3 Code installation or environment.
+
+To use the hosted deployment configured by this repository, copy the public example
+to `.env` in a fresh checkout, before starting or building:
+
+```bash
+cp .env.example .env
+```
+
+If you already have an `.env`, merge the required settings from
+[.env.example](./.env.example). Restart development after changing the configuration.
+Hosted Connect uses the existing relay service.
+
+To develop the relay itself, `vp run dev:full` starts it alongside the browser app
+and backend. It requires Clerk credentials in `infra/relay/.env` and the development
+PostgreSQL database running on port 5433. Desktop and mobile are separate processes.
+Set `T3CODE_RELAY_URL` in the root `.env` to that relay's reachable URL and use
+matching Clerk configuration for the clients.
+See [Connect setup](./docs/operations/connect-setup.md) and the
+[relay documentation](./infra/relay/README.md) for configuration.
+
+### Mobile
+
+Mobile uses an Expo development client with native modules. Follow the
+[mobile setup guide](./apps/mobile/README.md#development) to build and install a
+matching client on an iOS simulator or Android emulator; Expo Go is unsupported.
+
+Keep a Launchpad backend running, then start Metro in a second terminal from the
+repository root:
+
+```bash
+vp run dev:mobile
+```
+
+Connect the mobile client to your environment using the
+[remote access guide](./docs/user/remote-access.md).
+
+## Build and run compiled apps
+
+The `start` commands require existing build output. They use normal application
+data defaults rather than the dev runner's isolated setup; use the `dev` commands
+above for everyday development.
+
+| App                         | Build first              | Run the build            |
+| --------------------------- | ------------------------ | ------------------------ |
+| Server with bundled web app | `vp run build:server`    | `vp run start`           |
+| Desktop                     | `vp run build:desktop`   | `vp run start:desktop`   |
+| Marketing website           | `vp run build:marketing` | `vp run start:marketing` |
+
+Use `vp run build:web` to compile only the frontend assets.
+
+`vp run build` builds the server/web app, desktop app, and marketing website. Mobile
+native builds follow the mobile guide. For desktop installers such as a macOS DMG,
+see [desktop artifacts and platform prerequisites](./docs/operations/development.md#desktop-artifacts).
+
+## Documentation and contributing
+
+- [Development runbook](./docs/operations/development.md): local setup, state, sharing, checks, and packaging.
+- [Dev container](./docs/internals/devcontainer.md): VS Code and Codespaces setup.
+- [User guides](./docs/README.md#using-launchpad): providers, projects, permissions, remote access, and updates.
+- [Architecture overview](./docs/internals/overview.md): how the clients and server fit together.
+- [Contribution policy](./CONTRIBUTING.md): read before reporting a bug or opening a pull request.
+
+Launchpad is early software. Expect bugs; small fixes may be considered, while large
+contributions are generally not being accepted. See the contribution policy for details.

@@ -2,38 +2,84 @@
 
 ## First checkout
 
-Install `vp` using the [root README](../../README.md#install-vp). The checkout requires Node 24;
-Bun is optional. From the repository root:
+Install `vp` using the [root README](../../README.md#install-vp). The checkout requires
+Node 24 (`^24.13.1`); `vp` selects the Node.js and pnpm versions configured by the project.
+Bun is optional. Run commands from the repository root unless noted otherwise:
 
 ```sh
+vp env exec node --version
 vp i
-vp run dev
 ```
 
-Open the pairing URL printed by the dev runner. The bare origin does not authenticate
-a new browser.
+The version check should report Node 24 even if your system's `node` uses another version.
+Run `vp i` again after pulling dependency changes.
+
+Local desktop and browser development work without an `.env` file. The `T3CODE_*`
+settings retain names inherited from T3 Code; they configure Launchpad and require no
+separate T3 Code installation or environment.
 
 Prefer a container? See [Dev container](../internals/devcontainer.md) for VS Code and Codespaces setup.
 
 ## Choosing a dev process
 
-Use `vp run dev` for server and web, or `vp run dev:desktop` for the Electron client.
-`dev:server` and `dev:web` start those processes separately.
+Choose the command for the surface you are working on:
 
-`vp run dev:full` is `dev` plus the local relay dev server (`infra/relay/scripts/dev-server.ts`,
-port 8610, env from `infra/relay/.env`). Use it when working with Launchpad Connect environments:
-the relay is a separate long-lived process nothing else supervises, and a cloudflared tunnel
-pointing at a dead 8610 answers every relay request with a 502. The relay needs its dev Postgres
-(the `t3-relay-dev-postgres` container on 5433) already running.
-See the [mobile README](../../apps/mobile/README.md) for native builds and Metro.
+| Command                | What it starts                                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------------------------- |
+| `vp run dev:desktop`   | Electron, the web development server, and a desktop-managed backend.                            |
+| `vp run dev`           | The browser app and backend.                                                                    |
+| `vp run dev:share`     | The browser app and backend shared over Tailscale; see sharing below.                           |
+| `vp run dev:mobile`    | Metro for an installed Expo development client; requires a separate reachable backend.          |
+| `vp run dev:full`      | The browser app, backend, and local Connect relay; requires relay configuration and PostgreSQL. |
+| `vp run dev:marketing` | The marketing website.                                                                          |
 
-Flags go directly after the task name, for example `vp run dev --home-dir /tmp/t3code-dev`.
-Add `--browser` to open a browser automatically.
+Desktop development builds the backend before opening Electron; allow the initial build to
+finish. The desktop app starts its own backend, so `dev:desktop` is sufficient for that surface.
+Linux also needs the [native desktop prerequisites](#linux-appimage-prerequisites).
+
+For browser development, open the complete pairing URL printed by the dev runner, including
+its token. The bare origin does not authenticate a new browser. Keep the terminal running
+while you work; `Ctrl+C` stops the processes it started.
+
+`dev:server` and `dev:web` start individual processes for specialized workflows. Use `dev`
+for a complete browser environment.
+
+Dev-runner flags go directly after the task name, for example
+`vp run dev --home-dir /tmp/launchpad-dev`. Use `vp run dev --browser` to open a browser automatically.
+
+Before running an agent, configure and authenticate a provider in **Settings → Providers**,
+then add a project and start a thread. See [provider setup](../user/install.md#providers).
+
+### Mobile development
+
+Follow the [mobile setup guide](../../apps/mobile/README.md#development) to build and install
+a native client matching this checkout. Expo Go is unsupported. Keep a Launchpad backend
+running, then start `vp run dev:mobile` in a second terminal from the repository root.
+This starts Metro for the development client; native builds and device selection follow the
+mobile guide. Connect the client using the [remote access guide](../user/remote-access.md).
+
+### Launchpad Connect
+
+Connect is optional and disabled in a fresh clone. To use the hosted deployment configured
+by this repository, copy `.env.example` to `.env` before starting or building. If `.env`
+already exists, merge the required public settings instead. Restart development after changing
+the configuration. Hosted Connect uses the existing relay service.
+
+To develop the relay itself, `vp run dev:full` adds the local relay to the browser app and
+backend. It requires `CLERK_SECRET_KEY` and `CLERK_PUBLISHABLE_KEY` in `infra/relay/.env`
+and a running PostgreSQL database. The relay defaults to HTTP port 8610 and a database on
+port 5433; use `DEV_RELAY_PORT` and `DEV_RELAY_DATABASE_URL` to override those defaults.
+Set `T3CODE_RELAY_URL` in the root `.env` to the relay's reachable URL and use matching Clerk
+configuration for the clients. When exposing the relay through a tunnel, set `DEV_RELAY_ISSUER`
+in `infra/relay/.env` to the same public origin. Desktop and mobile are separate processes.
+See [Connect setup](./connect-setup.md) and the [relay documentation](../../infra/relay/README.md).
 
 ### State and ports
 
 Linked worktrees default to their own `.t3/userdata`, even when `T3CODE_HOME` is set.
-The main checkout defaults to `~/.t3/dev/userdata`. An explicit `--home-dir` wins in both cases.
+Without a home override, the main checkout defaults to `~/.t3/dev`.
+In the main checkout, `T3CODE_HOME` selects a different home; an explicit `--home-dir` wins
+in both cases. An explicitly selected home's runtime state lives under `<home>/userdata`.
 Never run a development server against the live `~/.t3/userdata`.
 See [test data](../../AGENTS.md#test-data) for copying a consistent database snapshot.
 
@@ -43,7 +89,7 @@ different preference when needed.
 
 ### Sharing and remote debugging
 
-`vp run dev --share` publishes the web port over the machine's tailnet and prints a pairing URL
+`vp run dev:share` (equivalent to `vp run dev --share`) publishes the web port over the machine's tailnet and prints a pairing URL
 for that origin. Give the tester the complete URL, including its token. The dev runner removes
 its mapping on exit.
 
@@ -91,7 +137,7 @@ For a manual worktree or launcher without that link, export the same fixed value
 export T3CODE_DEV_AUTH_TOKEN="<the value generated above>"
 ```
 
-Do not generate a new value at startup. Start or restart `vp run dev --share` after configuration,
+Do not generate a new value at startup. Start or restart `vp run dev:share` after configuration,
 then open its printed startup pairing URL once per browser profile on that hostname. Later web dev
 servers on the same hostname accept the shared cookie across ports. The cookie expires after 30
 days. Reload an old tab if its URL now serves a replacement environment.
@@ -101,6 +147,21 @@ commit, pull request, or public output. Every server still seeds its own auth da
 startup and keeps its own SQLite data, signing key, and revocation state. Desktop and non-dev
 servers ignore the value. See [environment authentication](../internals/environment-auth.md#reusable-dev-credential)
 for the security model.
+
+## Build and run compiled apps
+
+The `start` commands require existing build output and use normal application data defaults
+rather than the dev runner's isolated setup. Use the `dev` commands for everyday development.
+
+| App                         | Build first              | Run the build            |
+| --------------------------- | ------------------------ | ------------------------ |
+| Server with bundled web app | `vp run build:server`    | `vp run start`           |
+| Desktop                     | `vp run build:desktop`   | `vp run start:desktop`   |
+| Marketing website           | `vp run build:marketing` | `vp run start:marketing` |
+
+`vp run build:web` compiles only the frontend assets. `vp run build` builds the server/web app,
+desktop app, and marketing website. Native mobile builds follow the mobile guide; desktop
+installers and their platform prerequisites are covered under [Desktop artifacts](#desktop-artifacts).
 
 ## Checks
 
