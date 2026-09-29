@@ -50,7 +50,7 @@ it("maps current Codex model capability fields", () => {
         {
           id: "priority",
           label: "Fast",
-          description: "Lower latency responses.",
+          description: "Faster responses · increased usage",
         },
         {
           id: "flex",
@@ -95,12 +95,39 @@ it("uses standard routing when the catalog has no default service tier", () => {
         {
           id: "priority",
           label: "Fast",
-          description: "1.5x speed, increased usage",
+          description: "Faster responses · increased usage",
         },
       ],
       currentValue: "default",
     },
   ]);
+});
+
+it.each([false, true])("uses generic Fast copy with legacy catalog: %s", (legacy) => {
+  const capabilities = mapCodexModelCapabilities({
+    additionalSpeedTiers: ["fast"],
+    defaultReasoningEffort: "medium",
+    defaultServiceTier: legacy ? "fast" : "priority",
+    description: "Test model",
+    displayName: "GPT Test",
+    hidden: false,
+    id: "gpt-test",
+    isDefault: true,
+    model: "gpt-test",
+    serviceTiers: legacy
+      ? []
+      : [{ id: "priority", name: "Fast", description: "2x speed, 2x usage" }],
+    supportedReasoningEfforts: [],
+  });
+  const tier = capabilities.optionDescriptors?.find((option) => option.id === "serviceTier");
+  if (tier?.type !== "select") throw new Error("Missing service tier options");
+  assert.equal(tier.currentValue, legacy ? "fast" : "priority");
+  assert.deepStrictEqual(tier.options[1], {
+    id: legacy ? "fast" : "priority",
+    label: "Fast",
+    description: "Faster responses · increased usage",
+    isDefault: true,
+  });
 });
 
 it("marks the most preferred available model as default", () => {

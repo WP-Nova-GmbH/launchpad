@@ -195,12 +195,19 @@ export function mapCodexModelCapabilities(
           label: "Standard",
           ...(defaultServiceTier === DEFAULT_SERVICE_TIER_ID ? { isDefault: true } : {}),
         },
-        ...serviceTiers.map((tier) => ({
-          id: tier.id,
-          label: tier.name,
-          ...(tier.description ? { description: tier.description } : {}),
-          ...(defaultServiceTier === tier.id ? { isDefault: true } : {}),
-        })),
+        ...serviceTiers.map((tier) => {
+          // Speed and billing multipliers vary by model and authentication type.
+          const description =
+            tier.id === "priority" || tier.id === "fast"
+              ? "Faster responses · increased usage"
+              : tier.description;
+          return {
+            id: tier.id,
+            label: tier.name,
+            ...(description ? { description } : {}),
+            ...(defaultServiceTier === tier.id ? { isDefault: true } : {}),
+          };
+        }),
       ],
       currentValue: defaultServiceTier,
     });
