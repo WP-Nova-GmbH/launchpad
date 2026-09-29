@@ -1,6 +1,6 @@
 import { ArrowLeftIcon, ChartNoAxesColumnIcon, SettingsIcon } from "lucide-react";
 import type { ReactNode } from "react";
-import { memo, useCallback } from "react";
+import { lazy, memo, Suspense, useCallback } from "react";
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 
 import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
@@ -28,6 +28,17 @@ import { SidebarThreadUndoNotice } from "./SidebarThreadUndoNotice";
 import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
 import { SidebarUpdateArchitectureWarning, SidebarUpdatePill } from "./SidebarUpdatePill";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
+
+const T3ConnectSidebarSignIn = lazy(() =>
+  import("../clerk/T3ConnectSidebarSignIn").then((module) => ({
+    default: module.T3ConnectSidebarSignIn,
+  })),
+);
+const T3ConnectSidebarAvatar = lazy(() =>
+  import("../clerk/T3ConnectSidebarSignIn").then((module) => ({
+    default: module.T3ConnectSidebarAvatar,
+  })),
+);
 
 export const SidebarChromeHeader = memo(function SidebarChromeHeader({
   isElectron,
@@ -191,13 +202,31 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   );
 });
 
+export function SidebarFooterNavigation() {
+  return (
+    <>
+      <Suspense fallback={null}>
+        <T3ConnectSidebarSignIn />
+      </Suspense>
+      <div className="flex items-center gap-1">
+        <div className="min-w-0 flex-1">
+          <SidebarUtilityMenu />
+        </div>
+        <Suspense fallback={null}>
+          <T3ConnectSidebarAvatar />
+        </Suspense>
+      </div>
+    </>
+  );
+}
+
 export const SidebarChromeFooter = memo(function SidebarChromeFooter() {
   return (
     <SidebarFooter>
       <SidebarThreadUndoNotice />
       <SidebarProviderUpdatePill />
       <SidebarUpdateArchitectureWarning />
-      <SidebarUtilityMenu />
+      <SidebarFooterNavigation />
     </SidebarFooter>
   );
 });
