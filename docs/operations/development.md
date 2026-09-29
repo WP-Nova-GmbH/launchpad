@@ -86,8 +86,10 @@ environment values take precedence over the `.env` file.
 the relay, use `vp run --filter launchpad-relay dev` from the repository root. The relay
 defaults to HTTP port 8610 and a database on port 5433; use `DEV_RELAY_PORT` and
 `DEV_RELAY_DATABASE_URL` to override those defaults.
-Set `T3CODE_RELAY_URL` in the root `.env` to the relay's reachable URL and use matching Clerk
-configuration for the clients. When exposing the relay through a tunnel, set `DEV_RELAY_ISSUER`
+For clients running on the same computer, set `T3CODE_RELAY_URL=http://127.0.0.1:8610` in the
+root `.env` and use matching Clerk configuration. Restart the client dev process after changing
+these values. HTTP is accepted only for loopback relay addresses; clients on other devices need
+a reachable HTTPS relay URL. When exposing the relay through a tunnel, set `DEV_RELAY_ISSUER`
 in `infra/relay/.env` to the same public origin. Desktop and mobile are separate processes.
 See [Connect setup](./connect-setup.md) and the [relay documentation](../../infra/relay/README.md).
 

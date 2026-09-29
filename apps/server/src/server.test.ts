@@ -3598,14 +3598,20 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(insecureRelayUrl.status, 400);
-      assert.equal(insecureRelayUrlBody.message, "Relay URL must be a secure absolute HTTPS URL.");
+      assert.equal(
+        insecureRelayUrlBody.message,
+        "Relay URL must be an absolute HTTPS origin (or HTTP loopback origin).",
+      );
       assert.equal(insecureRelayIssuer.status, 400);
       assert.equal(
         insecureRelayIssuerBody.message,
-        "Relay issuer must be a secure absolute HTTPS URL.",
+        "Relay issuer must be an absolute HTTPS origin (or HTTP loopback origin).",
       );
       assert.equal(nonOriginRelayUrl.status, 400);
-      assert.equal(nonOriginRelayUrlBody.message, "Relay URL must be a secure absolute HTTPS URL.");
+      assert.equal(
+        nonOriginRelayUrlBody.message,
+        "Relay URL must be an absolute HTTPS origin (or HTTP loopback origin).",
+      );
       assert.equal(emptyCredential.status, 400);
       assert.equal(emptyCredentialBody.message, "Relay environment credential is required.");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),

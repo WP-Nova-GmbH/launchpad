@@ -210,7 +210,7 @@ export class ManagedRelayUrlInvalidError extends Schema.TaggedError<ManagedRelay
   },
 ) {
   override get message(): string {
-    return "Relay URL must be a secure absolute HTTPS origin.";
+    return "Relay URL must be an absolute HTTPS origin (or HTTP loopback origin).";
   }
 }
 

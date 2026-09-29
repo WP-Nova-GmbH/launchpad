@@ -66,6 +66,15 @@ describe("resolveCloudPublicConfig", () => {
     });
   });
 
+  it("accepts a loopback relay for local development", () => {
+    expect(
+      resolveCloudPublicConfig({
+        clerk: { publishableKey: "pk_test_example", jwtTemplate: "t3-relay" },
+        relay: { url: "http://127.0.0.1:8610/" },
+      }).relay.url,
+    ).toBe("http://127.0.0.1:8610");
+  });
+
   it("rejects an insecure relay URL", () => {
     expect(
       resolveCloudPublicConfig({

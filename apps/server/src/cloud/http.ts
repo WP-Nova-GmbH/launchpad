@@ -223,14 +223,14 @@ function validateRelayConfigPayload(
   if (!isSecureRelayUrl(payload.relayUrl)) {
     return Effect.fail(
       new EnvironmentHttpBadRequestError({
-        message: "Relay URL must be a secure absolute HTTPS URL.",
+        message: "Relay URL must be an absolute HTTPS origin (or HTTP loopback origin).",
       }),
     );
   }
   if (payload.relayIssuer !== undefined && !isSecureRelayUrl(payload.relayIssuer)) {
     return Effect.fail(
       new EnvironmentHttpBadRequestError({
-        message: "Relay issuer must be a secure absolute HTTPS URL.",
+        message: "Relay issuer must be an absolute HTTPS origin (or HTTP loopback origin).",
       }),
     );
   }

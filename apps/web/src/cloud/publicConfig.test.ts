@@ -27,6 +27,14 @@ describe("hasCloudPublicConfig", () => {
     expect(hasCloudPublicConfig()).toBe(true);
   });
 
+  it("enables Connect for a local development relay", () => {
+    vi.stubEnv("VITE_CLERK_PUBLISHABLE_KEY", "pk_test_example");
+    vi.stubEnv("VITE_CLERK_JWT_TEMPLATE", "t3-relay");
+    vi.stubEnv("VITE_T3CODE_RELAY_URL", "http://127.0.0.1:8610");
+
+    expect(hasCloudPublicConfig()).toBe(true);
+  });
+
   it("rejects an insecure relay URL", () => {
     vi.stubEnv("VITE_CLERK_PUBLISHABLE_KEY", "pk_test_example");
     vi.stubEnv("VITE_CLERK_JWT_TEMPLATE", "t3-relay");

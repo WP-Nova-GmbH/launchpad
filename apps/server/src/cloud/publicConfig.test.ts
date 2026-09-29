@@ -33,6 +33,15 @@ it.effect("prefers a runtime relay URL override over the statically injected val
   }),
 );
 
+it.effect("accepts a loopback relay for local development", () =>
+  Effect.gen(function* () {
+    const relayUrl = yield* makeRelayUrlConfig("").pipe(
+      provideEnv({ T3CODE_RELAY_URL: "http://127.0.0.1:8610/" }),
+    );
+    assert.equal(relayUrl, "http://127.0.0.1:8610");
+  }),
+);
+
 it.effect("requires a relay URL when the server bundle has no injected value", () =>
   makeRelayUrlConfig("").pipe(provideEnv({}), Effect.flip),
 );

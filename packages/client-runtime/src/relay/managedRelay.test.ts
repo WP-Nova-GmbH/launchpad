@@ -133,10 +133,25 @@ describe("ManagedRelayClient", () => {
       expect(error).toMatchObject({
         _tag: "ManagedRelayUrlInvalidError",
         relayUrl: "http://relay.example.test",
-        message: "Relay URL must be a secure absolute HTTPS origin.",
+        message: "Relay URL must be an absolute HTTPS origin (or HTTP loopback origin).",
       });
       expect(requestCount).toBe(0);
     }).pipe(Effect.provide(managedRelayTestLayer(fetchFn, "http://relay.example.test")));
+  });
+
+  it.effect("sends requests to the local development relay", () => {
+    const requests: string[] = [];
+    const fetchFn = ((input) => {
+      requests.push(String(input));
+      return Promise.resolve(Response.json({ environments: [] }));
+    }) satisfies typeof globalThis.fetch;
+
+    return Effect.gen(function* () {
+      const relayClient = yield* ManagedRelay.ManagedRelayClient;
+      const result = yield* relayClient.listEnvironments({ clerkToken: "clerk-token" });
+      expect(result).toEqual([]);
+      expect(requests).toEqual(["http://127.0.0.1:8610/v1/environments"]);
+    }).pipe(Effect.provide(managedRelayTestLayer(fetchFn, "http://127.0.0.1:8610")));
   });
 
   it.effect("reuses usable DPoP tokens and refreshes cleared or expiring cache entries", () => {
