@@ -80,11 +80,11 @@ For WP Nova's self-hosted relay — a single Hetzner Cloud machine running the N
 see [`infra/hetzner`](../hetzner/README.md). The rest of this section describes the upstream
 Cloudflare deployment.
 
-The relay deploys with the Alchemy CLI (`vp run --filter t3code-relay deploy` is `alchemy deploy`
+The relay deploys with the Alchemy CLI (`vp run --filter launchpad-relay deploy` is `alchemy deploy`
 in this directory):
 
 ```sh
-vp run --filter t3code-relay deploy
+vp run --filter launchpad-relay deploy
 ```
 
 The stack provisions the Cloudflare Worker and queues, managed endpoint resources, database
@@ -101,8 +101,8 @@ PlanetScale branch and runtime role for local development, so deploy `prod` befo
 developer stages:
 
 ```sh
-vp run --filter t3code-relay deploy -- --stage prod
-vp run --filter t3code-relay deploy -- --env-file .env.local
+vp run --filter launchpad-relay deploy -- --stage prod
+vp run --filter launchpad-relay deploy -- --env-file .env.local
 ```
 
 Alchemy defaults personal deployments to the `dev_$USER` stage. Relay custom domains apply the same

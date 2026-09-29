@@ -35,7 +35,7 @@ RUN corepack install
 COPY . .
 RUN --mount=type=cache,target=/pnpm-store \
   pnpm install --frozen-lockfile --store-dir /pnpm-store \
-    --filter @t3tools/monorepo --filter "t3code-relay..."
+    --filter @t3tools/monorepo --filter "launchpad-relay..."
 
 EXPOSE 8610
 CMD ["node", "infra/relay/scripts/dev-server.ts"]

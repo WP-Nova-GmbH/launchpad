@@ -89,7 +89,7 @@ const MODE_ARGS = {
     "--filter=@t3tools/contracts",
     "--filter=@t3tools/web",
     "--filter=t3",
-    "--filter=t3code-relay",
+    "--filter=launchpad-relay",
     "--parallel",
     "dev",
   ],

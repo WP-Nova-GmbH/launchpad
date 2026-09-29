@@ -107,7 +107,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           "--filter=@t3tools/contracts",
           "--filter=@t3tools/web",
           "--filter=t3",
-          "--filter=t3code-relay",
+          "--filter=launchpad-relay",
           "--parallel",
           "dev",
         ]);

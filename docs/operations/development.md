@@ -82,7 +82,8 @@ The development credentials above match the relay's defaults. Run migrations aga
 pulling schema changes; Compose does not apply them. `RELAY_DATABASE_URL` selects the
 migration database; `DEV_RELAY_DATABASE_URL` selects the running relay's database.
 
-`vp run dev:full` runs the browser app, backend, and local relay on the host. The relay
+`vp run dev:full` runs the browser app, backend, and local relay on the host. To run only
+the relay, use `vp run --filter launchpad-relay dev` from the repository root. The relay
 defaults to HTTP port 8610 and a database on port 5433; use `DEV_RELAY_PORT` and
 `DEV_RELAY_DATABASE_URL` to override those defaults.
 Set `T3CODE_RELAY_URL` in the root `.env` to the relay's reachable URL and use matching Clerk
