@@ -230,7 +230,7 @@ export class CloudCliAuthorizationDeniedError extends Schema.TaggedError<CloudCl
   {},
 ) {
   override get message(): string {
-    return "T3 Connect authorization was denied in the browser.";
+    return "Launchpad Connect authorization was denied in the browser.";
   }
 }
 

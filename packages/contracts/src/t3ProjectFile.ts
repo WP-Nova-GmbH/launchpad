@@ -90,7 +90,7 @@ export const T3ProjectFile = Schema.Struct({
   worktreeSubmodules: Schema.optionalKey(
     WorktreeSubmodules.annotate({
       description:
-        'How new worktrees populate git submodules: "recursive" (the default) initializes nested submodules too, "top-level" initializes only those declared by this repository, and "none" leaves every submodule empty for a setup script to handle. A project or environment setting in T3 Code overrides this.',
+        'How new worktrees populate git submodules: "recursive" (the default) initializes nested submodules too, "top-level" initializes only those declared by this repository, and "none" leaves every submodule empty for a setup script to handle. A project or environment setting in Launchpad overrides this.',
     }),
   ),
   scripts: Schema.optionalKey(
@@ -101,7 +101,7 @@ export const T3ProjectFile = Schema.Struct({
       .check(Schema.isMaxLength(T3_PROJECT_FILE_MAX_SCRIPTS)),
   ),
 }).annotate({
-  title: "T3 project file",
+  title: "Launchpad project file",
   description:
     "Checked-in project configuration for Launchpad (t3.json at the repository root). See https://t3.codes for documentation.",
 });

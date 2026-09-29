@@ -60,7 +60,7 @@ export function agentDeviceQuickStart(
     `  ${executable} install <app> <path-to-.app-or-.apk> ${target}`,
     `Prefer snapshot refs over coordinates. Run ${executable} help for workflow guides and ${executable} <command> --help for flags.`,
     "Do not call simctl, adb, xcrun, or serve-sim directly while these tools are attached; use agent-device.",
-    "For remote hosts, arrange builds, app installation, and any Metro reverse forwarding yourself. T3 provides discovery, streaming, and control only.",
+    "For remote hosts, arrange builds, app installation, and any Metro reverse forwarding yourself. Launchpad provides discovery, streaming, and control only.",
     "Keep the returned --config and --session flags on every command. Other hosts can be used concurrently; opening one does not switch these commands.",
     platformNotes,
   ].join("\n");
