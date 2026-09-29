@@ -132,6 +132,7 @@ import {
   ZapIcon,
 } from "lucide-react";
 import type {
+  AuthSessionUser,
   ComposerContextId,
   ComposerContextRecord,
   KnownComposerContextRecord,
@@ -139,6 +140,7 @@ import type {
 import { Button } from "../ui/button";
 import type { QueuedComposerMessage } from "../../queuedMessageStore";
 import { promptAttributionLabel } from "@t3tools/client-runtime/state/threads";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { useAssetUrlRefresh, useAssetUrls, useAssetUrlState } from "../../assets/assetUrls";
 import { MediaVideoPlayer } from "../media/MediaVideoPlayer";
 import { getVirtualizedScrollFadeClassName } from "../ui/scroll-area";
@@ -1929,6 +1931,17 @@ function MessageAuthorHeading({ children }: { children: string }) {
   return <h3 className="sr-only select-none">{children}</h3>;
 }
 
+function UserMessageAuthorSignature({ author }: { author: AuthSessionUser }) {
+  const account = useAtomValue(managedRelaySessionAtom);
+  return (
+    <div className="mt-0.5 flex max-w-[80%] items-center gap-1.5 pe-1 text-2xs text-muted-foreground">
+      <UserAvatar displayName={author.displayName} imageUrl={author.imageUrl} className="size-4" />
+      <span className="truncate">{author.displayName ?? "Teammate"}</span>
+      {account?.accountId === author.userId ? <span className="shrink-0">· You</span> : null}
+    </div>
+  );
+}
+
 function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
   const { onImageExpand, onFileOpen } = ctx;
@@ -1978,6 +1991,10 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
   );
   const regularImages = userImages.filter((image) => !image.name.startsWith("preview-annotation-"));
   const author = row.message.author ?? null;
+  const modificationAttribution = promptAttributionLabel({
+    editedBy: row.message.editedBy,
+    steeredBy: row.message.steeredBy,
+  });
   const unchippedFiles = otherUserFiles.filter((file) => !chippedAttachmentIds.has(file.id));
   const annotationRecordIds = useMemo(
     () =>
@@ -2088,16 +2105,6 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
   return (
     <div className="group flex flex-col items-end gap-1">
-      {author ? (
-        <div className="flex items-center gap-1.5 pr-1 text-[11px] text-muted-foreground">
-          <span className="truncate">{promptAttributionLabel(row.message)}</span>
-          <UserAvatar
-            displayName={author.displayName}
-            imageUrl={author.imageUrl}
-            className="size-4"
-          />
-        </div>
-      ) : null}
       <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
         <MessageAuthorHeading>
           {author?.displayName ?? (author ? "Teammate" : "You")}
@@ -2213,6 +2220,12 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           />
         </div>
       </div>
+      {author ? <UserMessageAuthorSignature author={author} /> : null}
+      {modificationAttribution ? (
+        <p className="max-w-[80%] pe-1 text-right text-2xs text-muted-foreground">
+          {modificationAttribution}
+        </p>
+      ) : null}
       <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums opacity-0 transition-opacity duration-200 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover:opacity-100">
         <div className="flex shrink-0 items-center gap-2">
           <Tooltip>
