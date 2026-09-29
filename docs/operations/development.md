@@ -65,14 +65,45 @@ by this repository, copy `.env.example` to `.env` before starting or building. I
 already exists, merge the required public settings instead. Restart development after changing
 the configuration. Hosted Connect uses the existing relay service.
 
-To develop the relay itself, `vp run dev:full` adds the local relay to the browser app and
-backend. It requires `CLERK_SECRET_KEY` and `CLERK_PUBLISHABLE_KEY` in `infra/relay/.env`
-and a running PostgreSQL database. The relay defaults to HTTP port 8610 and a database on
-port 5433; use `DEV_RELAY_PORT` and `DEV_RELAY_DATABASE_URL` to override those defaults.
+To develop the relay itself, configure `CLERK_SECRET_KEY` and `CLERK_PUBLISHABLE_KEY` in
+`infra/relay/.env`. Start PostgreSQL with Docker Compose, apply the relay migrations from
+the host, then start the apps:
+
+```sh
+docker compose up -d --wait
+cd infra/relay
+RELAY_DATABASE_URL=postgres://postgres:t3relay@127.0.0.1:5433/t3relay vp exec drizzle-kit migrate
+cd ../..
+vp run dev:full
+```
+
+Compose starts only PostgreSQL, binds it to loopback, and keeps its data in a named volume.
+The development credentials above match the relay's defaults. Run migrations again after
+pulling schema changes; Compose does not apply them. `RELAY_DATABASE_URL` selects the
+migration database; `DEV_RELAY_DATABASE_URL` selects the running relay's database.
+
+`vp run dev:full` runs the browser app, backend, and local relay on the host. The relay
+defaults to HTTP port 8610 and a database on port 5433; use `DEV_RELAY_PORT` and
+`DEV_RELAY_DATABASE_URL` to override those defaults.
 Set `T3CODE_RELAY_URL` in the root `.env` to the relay's reachable URL and use matching Clerk
 configuration for the clients. When exposing the relay through a tunnel, set `DEV_RELAY_ISSUER`
 in `infra/relay/.env` to the same public origin. Desktop and mobile are separate processes.
 See [Connect setup](./connect-setup.md) and the [relay documentation](../../infra/relay/README.md).
+
+Stop PostgreSQL with `docker compose down`; its data survives the next startup.
+To explicitly reset the development database, use `docker compose down -v`, then start it
+and apply the migrations again. This deletes the Compose project's database volume.
+
+For concurrent worktrees, choose a separate Compose project name and host port:
+
+```sh
+DEV_POSTGRES_PORT=5434 docker compose -p launchpad-feature up -d --wait
+```
+
+Use that same port in both database URLs, and use the same `-p launchpad-feature` on later
+Compose commands, including shutdown and reset. The project name isolates containers and
+volumes; the port must also be free. Each running relay needs its own `DEV_RELAY_PORT`, with
+the corresponding `T3CODE_RELAY_URL` in that worktree's root `.env`.
 
 ### State and ports
 
