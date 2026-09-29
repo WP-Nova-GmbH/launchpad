@@ -11,5 +11,10 @@ export default defineConfig({
   schema: "./src/persistence/schema.ts",
   out: "./migrations/postgres",
   migrations: { table: "relay_migrations" },
-  dbCredentials: { url: process.env.RELAY_DATABASE_URL ?? "" },
+  dbCredentials: {
+    url:
+      process.env.RELAY_DATABASE_URL?.trim() ||
+      process.env.DEV_RELAY_DATABASE_URL?.trim() ||
+      "postgres://postgres:t3relay@127.0.0.1:5433/t3relay",
+  },
 });

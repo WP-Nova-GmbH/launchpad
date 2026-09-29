@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --env-file-if-exists=.env scripts/dev-server.ts",
+    "db:migrate": "node --env-file-if-exists=.env node_modules/drizzle-kit/bin.cjs migrate",
     "deploy": "alchemy deploy",
     "push:android:smoke": "node scripts/android-push-smoke.ts",
     "push:android:watch": "node scripts/android-push-watch.ts",

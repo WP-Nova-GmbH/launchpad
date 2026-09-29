@@ -71,16 +71,16 @@ the host, then start the apps:
 
 ```sh
 docker compose up -d --wait
-cd infra/relay
-RELAY_DATABASE_URL=postgres://postgres:t3relay@127.0.0.1:5433/t3relay vp exec drizzle-kit migrate
-cd ../..
+vp run --filter launchpad-relay db:migrate
 vp run dev:full
 ```
 
 Compose starts only PostgreSQL, binds it to loopback, and keeps its data in a named volume.
 The development credentials above match the relay's defaults. Run migrations again after
-pulling schema changes; Compose does not apply them. `RELAY_DATABASE_URL` selects the
-migration database; `DEV_RELAY_DATABASE_URL` selects the running relay's database.
+pulling schema changes; Compose does not apply them. `db:migrate` loads `infra/relay/.env`
+and uses `DEV_RELAY_DATABASE_URL`, falling back to the Compose database above.
+Set `RELAY_DATABASE_URL` to explicitly override the migration target. Existing process
+environment values take precedence over the `.env` file.
 
 `vp run dev:full` runs the browser app, backend, and local relay on the host. To run only
 the relay, use `vp run --filter launchpad-relay dev` from the repository root. The relay
@@ -101,8 +101,9 @@ For concurrent worktrees, choose a separate Compose project name and host port:
 DEV_POSTGRES_PORT=5434 docker compose -p launchpad-feature up -d --wait
 ```
 
-Use that same port in both database URLs, and use the same `-p launchpad-feature` on later
-Compose commands, including shutdown and reset. The project name isolates containers and
+Set `DEV_RELAY_DATABASE_URL` in `infra/relay/.env` to use that port; update any explicit
+`RELAY_DATABASE_URL` override too. Use the same `-p launchpad-feature` on later Compose
+commands, including shutdown and reset. The project name isolates containers and
 volumes; the port must also be free. Each running relay needs its own `DEV_RELAY_PORT`, with
 the corresponding `T3CODE_RELAY_URL` in that worktree's root `.env`.
 
