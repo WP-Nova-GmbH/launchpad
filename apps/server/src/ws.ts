@@ -4784,6 +4784,15 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         yield* Effect.addFinalizer(() =>
           Effect.sync(unregister).pipe(Effect.andThen(Deferred.succeed(policyDrained, undefined))),
         );
+        const unregisterSession = yield* sessions
+          .registerConnection(
+            session.sessionId,
+            Deferred.succeed(policyClosed, undefined).pipe(
+              Effect.andThen(Deferred.await(policyDrained)),
+            ),
+          )
+          .pipe(Effect.catch(() => failEnvironmentAuthInvalid("invalid_credential")));
+        yield* Effect.addFinalizer(() => Effect.sync(unregisterSession));
         const clientOrigin = readClientConnectionOrigin(request);
         const clientAnalyticsProps = readClientAnalyticsProps(request);
         yield* sessions.recordClientConnection(session.sessionId, clientOrigin);

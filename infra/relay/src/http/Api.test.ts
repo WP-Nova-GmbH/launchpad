@@ -1,3 +1,4 @@
+import * as UserDirectory from "../tenancy/UserDirectory.ts";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import {
   RelayClientAuth,
@@ -128,6 +129,16 @@ describe("device listing compatibility", () => {
       androidApiLevel: 36,
     };
     const handlers = clientApi.pipe(
+      Layer.provide(
+        Layer.succeed(UserDirectory.UserDirectory, {
+          lookup: ({ userIds }) => {
+            expect(userIds).toEqual(["user-1"]);
+            return Effect.succeed(
+              new Map([["user-1", { displayName: "Stefan", imageUrl: null, email: null }]]),
+            );
+          },
+        }),
+      ),
       HttpRouter.provideRequest(
         Layer.mergeAll(
           Layer.mock(EnvironmentCredentials.EnvironmentCredentials, {}),
@@ -177,6 +188,19 @@ describe("device listing compatibility", () => {
         ),
         (app) => Effect.promise(() => app.dispose()),
       );
+      const identityResponse = yield* Effect.promise(() =>
+        app.handler(
+          new Request("https://relay.example.test/v1/client/identity?userId=someone-else", {
+            headers: { authorization: "Bearer test-token" },
+          }),
+        ),
+      );
+      expect(identityResponse.status).toBe(200);
+      expect(yield* Effect.promise(() => identityResponse.json())).toEqual({
+        userId: "user-1",
+        displayName: "Stefan",
+        imageUrl: null,
+      });
       for (const [version, devices] of [
         ["v1", [iphone]],
         ["v2", [iphone, android]],

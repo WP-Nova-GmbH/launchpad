@@ -1,5 +1,6 @@
 import {
   AuthAccessTokenType,
+  type AuthDesktopIdentityRequest,
   type AuthClientPresentationMetadata,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
@@ -135,6 +136,24 @@ export const bootstrapRemoteBearerSession = Effect.fn(
         ...(input.scopes ? { scope: encodeOAuthScope(input.scopes) } : {}),
         ...clientMetadataTokenExchangeFields(input.clientMetadata),
       },
+    }),
+  );
+});
+
+export const replaceDesktopSessionIdentity = Effect.fn(
+  "clientRuntime.authorization.replaceDesktopSessionIdentity",
+)(function* (input: {
+  readonly httpBaseUrl: string;
+  readonly bearerToken: string;
+  readonly identity: AuthDesktopIdentityRequest["identity"];
+}) {
+  const client = yield* makeEnvironmentHttpApiGroupClient(input.httpBaseUrl, "auth");
+  return yield* executeEnvironmentHttpRequest(
+    environmentEndpointUrl(input.httpBaseUrl, "/api/auth/desktop-identity"),
+    DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
+    client.desktopIdentity({
+      headers: { authorization: `Bearer ${input.bearerToken}` },
+      payload: { identity: input.identity },
     }),
   );
 });

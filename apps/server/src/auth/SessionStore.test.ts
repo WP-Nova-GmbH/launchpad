@@ -3,6 +3,8 @@ import { EnvironmentId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -403,6 +405,95 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       ).toHaveLength(1);
       expect(bearerVerification.filter(Option.isSome)).toHaveLength(1);
     }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect(
+    "replaces only the expected desktop session, preserving scopes and retiring its sockets",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const original = yield* sessions.issue({
+          subject: "desktop-bootstrap",
+          method: "bearer-access-token",
+          scopes: ["access:write", "orchestration:operate"],
+          client: { deviceType: "desktop", label: "My desktop" },
+        });
+        const unrelated = yield* sessions.issue({
+          subject: "desktop-bootstrap",
+          method: "bearer-access-token",
+        });
+        const closing = yield* Deferred.make<void>();
+        const drained = yield* Deferred.make<void>();
+        yield* sessions.registerConnection(
+          original.sessionId,
+          Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(drained))),
+        );
+        const user = { userId: "user-a", displayName: "Alice", imageUrl: null };
+        const replacement = yield* sessions
+          .replaceDesktopIdentity(original.sessionId, user)
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(closing);
+        expect(yield* sessions.verify(original.token).pipe(Effect.flip)).toMatchObject({
+          _tag: "SessionTokenRevokedError",
+        });
+        yield* Deferred.succeed(drained, undefined);
+        const next = yield* Fiber.join(replacement);
+        expect(yield* sessions.verify(next.token)).toMatchObject({
+          user,
+          scopes: original.scopes,
+          client: original.client,
+        });
+        expect((yield* sessions.verify(unrelated.token)).sessionId).toBe(unrelated.sessionId);
+        expect(
+          yield* sessions.replaceDesktopIdentity(original.sessionId, user).pipe(Effect.flip),
+        ).toMatchObject({ _tag: "SessionTokenRevokedError" });
+        expect(
+          yield* sessions.registerConnection(original.sessionId, Effect.void).pipe(Effect.flip),
+        ).toMatchObject({ _tag: "SessionTokenRevokedError" });
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TRIGGER reject_identity_replace BEFORE INSERT ON auth_sessions
+          BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END`;
+        expect(
+          yield* sessions.replaceDesktopIdentity(next.sessionId, null).pipe(Effect.flip),
+        ).toMatchObject({ _tag: "SessionCredentialIssueError" });
+        expect((yield* sessions.verify(next.token)).user).toEqual(user);
+        yield* sql`DROP TRIGGER reject_identity_replace`;
+        const anonymous = yield* sessions.replaceDesktopIdentity(next.sessionId, null);
+        expect((yield* sessions.verify(anonymous.token)).user).toBeUndefined();
+      }).pipe(Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), SqlitePersistenceMemory))),
+  );
+
+  it.effect(
+    "permits only one concurrent identity replacement and rejects ordinary paired sessions",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const original = yield* sessions.issue({
+          subject: "desktop-bootstrap",
+          method: "bearer-access-token",
+        });
+        const results = yield* Effect.forEach(
+          ["alice", "bob"],
+          (userId) =>
+            sessions
+              .replaceDesktopIdentity(original.sessionId, {
+                userId,
+                displayName: userId,
+                imageUrl: null,
+              })
+              .pipe(Effect.option),
+          { concurrency: "unbounded" },
+        );
+        expect(results.filter(Option.isSome)).toHaveLength(1);
+        expect(yield* sessions.listActive()).toHaveLength(1);
+        const paired = yield* sessions.issue({
+          subject: "one-time-token",
+          method: "bearer-access-token",
+        });
+        expect(
+          yield* sessions.replaceDesktopIdentity(paired.sessionId, null).pipe(Effect.flip),
+        ).toMatchObject({ _tag: "UnknownSessionTokenError" });
+      }).pipe(Effect.provide(makeSessionStoreLayer())),
   );
 
   it.effect("keeps the previous desktop session valid when replacement fails", () =>

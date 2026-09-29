@@ -60,6 +60,7 @@ export type CreateAuthSessionInput = typeof CreateAuthSessionInput.Type;
 
 export const CreateReplacingActiveAuthSessionInput = Schema.Struct({
   session: CreateAuthSessionInput,
+  replaceSessionId: Schema.optionalKey(AuthSessionId),
   revokedAt: Schema.DateTimeUtcFromString,
 });
 export type CreateReplacingActiveAuthSessionInput =
@@ -282,17 +283,21 @@ export const make = Effect.gen(function* () {
       `,
   });
 
+  // Expired credentials can still own open sockets. Bootstrap recovery must
+  // retire those sessions too, not only credentials valid for a new connection.
   const revokeActiveSessionsForReplacement = SqlSchema.findAll({
     Request: CreateReplacingActiveAuthSessionInput,
     Result: Schema.Struct({ sessionId: AuthSessionId }),
-    execute: ({ session, revokedAt }) =>
+    execute: ({ session, revokedAt, replaceSessionId }) =>
       sql`
         UPDATE auth_sessions
         SET revoked_at = ${revokedAt}
-        WHERE subject = ${session.subject}
-          AND method = ${session.method}
+        WHERE ${
+          replaceSessionId === undefined
+            ? sql`subject = ${session.subject} AND method = ${session.method}`
+            : sql`session_id = ${replaceSessionId}`
+        }
           AND revoked_at IS NULL
-          AND expires_at > ${revokedAt}
         RETURNING session_id AS "sessionId"
       `,
   });
@@ -393,10 +398,17 @@ export const make = Effect.gen(function* () {
     sql
       .withTransaction(
         revokeActiveSessionsForReplacement(input).pipe(
-          Effect.flatMap((revokedRows) =>
-            createSessionRow(input.session).pipe(
-              Effect.as(revokedRows.map((row) => row.sessionId)),
-            ),
+          Effect.flatMap(
+            Effect.fnUntraced(function* (revokedRows) {
+              if (input.replaceSessionId !== undefined && revokedRows.length !== 1) {
+                return yield* new PersistenceSqlError({
+                  operation: "AuthSessionRepository.createReplacingActive",
+                  detail: "The session was already replaced or revoked.",
+                });
+              }
+              yield* createSessionRow(input.session);
+              return revokedRows.map((row) => row.sessionId);
+            }),
           ),
         ),
       )

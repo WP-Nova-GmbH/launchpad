@@ -264,8 +264,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     yield* Queue.offer(signals, next);
   });
 
-  const logManagedRelayAccountChange = Effect.logInfo(
-    "Managed relay account changed; restarting the environment connection.",
+  const logCredentialChange = Effect.logInfo(
+    "Environment credentials changed; restarting the environment connection.",
   ).pipe(
     Effect.annotateLogs({
       "environment.id": target.environmentId,
@@ -383,8 +383,12 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           if (next.reason === "application-active-reconnect") {
             return true;
           }
-          if (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") {
-            yield* logManagedRelayAccountChange;
+          if (
+            (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") ||
+            (next.reason === "primary-credentials-changed" &&
+              target._tag === "PrimaryConnectionTarget")
+          ) {
+            yield* logCredentialChange;
             return false;
           }
           break;
@@ -407,8 +411,12 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }
           break;
         case "Wakeup":
-          if (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") {
-            yield* logManagedRelayAccountChange;
+          if (
+            (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") ||
+            (next.reason === "primary-credentials-changed" &&
+              target._tag === "PrimaryConnectionTarget")
+          ) {
+            yield* logCredentialChange;
             return false;
           }
           if (next.reason === "application-active-reconnect") {
@@ -467,8 +475,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
                     return true;
                   }
                   if (
-                    probeEvent.signal.reason === "credentials-changed" &&
-                    target._tag === "RelayConnectionTarget"
+                    (probeEvent.signal.reason === "credentials-changed" &&
+                      target._tag === "RelayConnectionTarget") ||
+                    (probeEvent.signal.reason === "primary-credentials-changed" &&
+                      target._tag === "PrimaryConnectionTarget")
                   ) {
                     yield* Fiber.interrupt(probe);
                     return false;

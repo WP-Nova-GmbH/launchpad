@@ -1,3 +1,5 @@
+import { setDesktopLocalAccount } from "../environments/primary/desktopAuth";
+import { toastManager } from "../components/ui/toast";
 import { useAuth } from "@clerk/react";
 import { ManagedRelay, setManagedRelaySession } from "@t3tools/client-runtime/relay";
 import {
@@ -41,6 +43,30 @@ export function ManagedRelayAuthProvider({ children }: { readonly children: Reac
   });
   const observedAccountRef = useRef<string | null | undefined>(undefined);
   const accountTransitionRef = useRef<Promise<void> | null>(null);
+  const localIdentityWarningRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+    const id = isSignedIn && userId ? userId : null;
+    setDesktopLocalAccount(
+      id === null
+        ? null
+        : {
+            id,
+            readToken: () => getToken(resolveRelayClerkTokenOptions()),
+          },
+      () => {
+        if (localIdentityWarningRef.current === id) return;
+        localIdentityWarningRef.current = id;
+        toastManager.add({
+          type: "warning",
+          title: "Message names are unavailable",
+          description:
+            "Launchpad Connect could not verify your account. Local messages will remain anonymous until verification succeeds.",
+        });
+      },
+    );
+  }, [getToken, isLoaded, isSignedIn, userId]);
 
   useEffect(() => {
     if (!isLoaded) {

@@ -33,21 +33,14 @@
 //     picker that shows up when the toggle is on. Default-off, so
 //     users who never opted in see the same surface as before.
 //
-// Renderer-side wiring (apps/web/src/environments/local/):
-//   - reconcileLocalSecondaryEnvironments() runs at app boot and after
-//     WSL settings changes. It reads getLocalEnvironmentBootstraps(),
-//     skips the primary (which the existing primary/ runtime owns),
-//     and for every other entry POSTs the shared bootstrap token to
-//     /api/auth/bootstrap/bearer on that backend's URL, fetches the
-//     descriptor, builds a SavedEnvironmentRecord marked desktopLocal,
-//     writes the bearer to the secret store, and opens a connection
-//     through the same saved-env path remote envs use.
-//   - The desktopLocal marker filters records out of saved-env
-//     persistence, so toggling WSL off or switching distros doesn't
-//     pollute the user's settings file. The sidebar, CommandPalette,
-//     env switcher, and project-id routing all read the saved-env
-//     registry, so the WSL backend shows up there without any
-//     per-surface changes.
+// Renderer-side wiring:
+//   - The connection platform polls the pool's bootstrap topology. Electron's
+//     DesktopLocalEnvironmentAuth owns bearer credentials for every local
+//     backend, including identity attachment and account changes.
+//   - The renderer registers secondary backends with the shared connection
+//     registry. Credential replacement reconnects that registration while
+//     retaining projects, drafts, and subscriptions.
+//   - Local registrations are not persisted as user-added remote environments.
 //
 // Browser validation (2026-05-17, dev:desktop with wslBackendEnabled=true,
 // wslDistro="Ubuntu"):

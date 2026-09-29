@@ -382,7 +382,16 @@ export class SessionStore extends Context.Service<
        * before storing this session.
        */
       readonly replaceActiveForSubjectAndMethod?: boolean;
+      readonly replaceSessionId?: AuthSessionId;
     }) => Effect.Effect<IssuedSession, SessionCredentialInternalError>;
+    readonly replaceDesktopIdentity: (
+      sessionId: AuthSessionId,
+      user: AuthSessionUser | null,
+    ) => Effect.Effect<IssuedSession, SessionCredentialError>;
+    readonly registerConnection: (
+      sessionId: AuthSessionId,
+      close: Effect.Effect<void>,
+    ) => Effect.Effect<() => void, SessionCredentialError>;
     readonly verify: (token: string) => Effect.Effect<VerifiedSession, SessionCredentialError>;
     readonly issueWebSocketToken: (
       sessionId: AuthSessionId,
@@ -533,11 +542,47 @@ export const make = Effect.gen(function* () {
       clientSession,
     }).pipe(Effect.asVoid);
 
+  // Revocation is complete only after existing sockets have stopped accepting
+  // commands. Removing a database row alone does not retire their captured actor.
+  const connections = new Map<AuthSessionId, Set<Effect.Effect<void>>>();
   const emitRemoved = (sessionId: AuthSessionId) =>
-    PubSub.publish(changesPubSub, {
-      type: "clientRemoved",
-      sessionId,
-    }).pipe(Effect.asVoid);
+    Effect.gen(function* () {
+      const closing = connections.get(sessionId) ?? [];
+      connections.delete(sessionId);
+      yield* Effect.forEach(closing, (close) => close, {
+        concurrency: "unbounded",
+        discard: true,
+      });
+      yield* PubSub.publish(changesPubSub, { type: "clientRemoved", sessionId });
+    });
+
+  const registerConnection: SessionStore["Service"]["registerConnection"] = Effect.fn(
+    "SessionStore.registerConnection",
+  )(function* (sessionId, close) {
+    const callbacks = connections.get(sessionId) ?? new Set<Effect.Effect<void>>();
+    callbacks.add(close);
+    connections.set(sessionId, callbacks);
+    const unregister = () => {
+      callbacks.delete(close);
+      if (callbacks.size === 0) connections.delete(sessionId);
+    };
+    // Register before reading: a revocation racing the read must also close us.
+    yield* authSessions.getById({ sessionId }).pipe(
+      Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId, cause })),
+      Effect.flatMap(
+        Effect.fnUntraced(function* (row) {
+          if (Option.isNone(row)) return yield* new UnknownSessionTokenError({ sessionId });
+          if (row.value.revokedAt !== null)
+            return yield* new SessionTokenRevokedError({
+              sessionId,
+              revokedAt: row.value.revokedAt,
+            });
+        }),
+      ),
+      Effect.onError(() => Effect.sync(unregister)),
+    );
+    return unregister;
+  });
 
   const loadActiveSession = (sessionId: AuthSessionId) =>
     Effect.gen(function* () {
@@ -651,106 +696,112 @@ export const make = Effect.gen(function* () {
     );
 
   const encodeClaims = Schema.encodeEffect(Schema.fromJsonString(SessionClaims));
-  const issue: SessionStore["Service"]["issue"] = Effect.fn("SessionStore.issue")(
-    function* (input) {
-      const sessionId = AuthSessionId.make(
-        yield* crypto.randomUUIDv4.pipe(
-          Effect.mapError((cause) => new SessionCredentialIssueError({ cause })),
-        ),
-      );
-      const issuedAt = yield* DateTime.now;
-      const expiresAt = DateTime.add(issuedAt, {
-        milliseconds: Duration.toMillis(input?.ttl ?? DEFAULT_SESSION_TTL),
-      });
-      const claims: SessionClaims = {
-        v: 1,
-        kind: "session",
-        sid: sessionId,
-        sub: input?.subject ?? "browser",
-        scopes: input?.scopes ?? AuthStandardClientScopes,
-        method: input?.method ?? "browser-session-cookie",
-        ...(input?.proofKeyThumbprint ? { jkt: input.proofKeyThumbprint } : {}),
-        iat: issuedAt.epochMilliseconds,
-        exp: expiresAt.epochMilliseconds,
-      };
+  const issue: SessionStore["Service"]["issue"] = Effect.fn("SessionStore.issue")(function* (
+    input,
+  ) {
+    const sessionId = AuthSessionId.make(
+      yield* crypto.randomUUIDv4.pipe(
+        Effect.mapError((cause) => new SessionCredentialIssueError({ cause })),
+      ),
+    );
+    const issuedAt = yield* DateTime.now;
+    const expiresAt = DateTime.add(issuedAt, {
+      milliseconds: Duration.toMillis(input?.ttl ?? DEFAULT_SESSION_TTL),
+    });
+    const claims: SessionClaims = {
+      v: 1,
+      kind: "session",
+      sid: sessionId,
+      sub: input?.subject ?? "browser",
+      scopes: input?.scopes ?? AuthStandardClientScopes,
+      method: input?.method ?? "browser-session-cookie",
+      ...(input?.proofKeyThumbprint ? { jkt: input.proofKeyThumbprint } : {}),
+      iat: issuedAt.epochMilliseconds,
+      exp: expiresAt.epochMilliseconds,
+    };
 
-      const encodedPayload = yield* encodeClaims(claims).pipe(
-        Effect.map(base64UrlEncode),
-        Effect.mapError(
-          (cause) =>
-            new SessionCredentialIssueError({
+    const encodedPayload = yield* encodeClaims(claims).pipe(
+      Effect.map(base64UrlEncode),
+      Effect.mapError(
+        (cause) =>
+          new SessionCredentialIssueError({
+            sessionId,
+            cause: new SessionClaimsEncodingError({
               sessionId,
-              cause: new SessionClaimsEncodingError({
-                sessionId,
-                operation: "encode_session_claims",
-                cause,
-              }),
+              operation: "encode_session_claims",
+              cause,
             }),
-        ),
-      );
-      const signature = signPayload(encodedPayload, signingSecret);
-      const client = input?.client ?? createDefaultClientMetadata();
-      const sessionRecord = {
+          }),
+      ),
+    );
+    const signature = signPayload(encodedPayload, signingSecret);
+    const client = input?.client ?? createDefaultClientMetadata();
+    const sessionRecord = {
+      sessionId,
+      subject: claims.sub,
+      scopes: claims.scopes,
+      method: claims.method,
+      client: {
+        label: client.label ?? null,
+        ipAddress: client.ipAddress ?? null,
+        userAgent: client.userAgent ?? null,
+        deviceType: client.deviceType,
+        os: client.os ?? null,
+        browser: client.browser ?? null,
+      },
+      user: input?.user ?? null,
+      issuedAt,
+      expiresAt,
+    } satisfies AuthSessions.CreateAuthSessionInput;
+    const replacedSessionIds = yield* (
+      input?.replaceActiveForSubjectAndMethod || input?.replaceSessionId !== undefined
+        ? authSessions.createReplacingActive({
+            session: sessionRecord,
+            revokedAt: issuedAt,
+            ...(input?.replaceSessionId === undefined
+              ? {}
+              : { replaceSessionId: input.replaceSessionId }),
+          })
+        : authSessions.create(sessionRecord).pipe(Effect.as([] as ReadonlyArray<AuthSessionId>))
+    ).pipe(Effect.mapError((cause) => new SessionCredentialIssueError({ sessionId, cause })));
+    if (replacedSessionIds.length > 0) {
+      yield* Ref.update(connectedSessionsRef, (current) => {
+        const next = new Map(current);
+        for (const replacedSessionId of replacedSessionIds) {
+          next.delete(replacedSessionId);
+        }
+        return next;
+      });
+      yield* Effect.forEach(replacedSessionIds, emitRemoved, {
+        concurrency: "unbounded",
+        discard: true,
+      });
+    }
+    yield* emitUpsert(
+      toAuthClientSession({
         sessionId,
         subject: claims.sub,
         scopes: claims.scopes,
         method: claims.method,
-        client: {
-          label: client.label ?? null,
-          ipAddress: client.ipAddress ?? null,
-          userAgent: client.userAgent ?? null,
-          deviceType: client.deviceType,
-          os: client.os ?? null,
-          browser: client.browser ?? null,
-        },
-        user: input?.user ?? null,
+        client,
+        ...(input?.user ? { user: input.user } : {}),
         issuedAt,
         expiresAt,
-      } satisfies AuthSessions.CreateAuthSessionInput;
-      const replacedSessionIds = yield* (
-        input?.replaceActiveForSubjectAndMethod
-          ? authSessions.createReplacingActive({ session: sessionRecord, revokedAt: issuedAt })
-          : authSessions.create(sessionRecord).pipe(Effect.as([] as ReadonlyArray<AuthSessionId>))
-      ).pipe(Effect.mapError((cause) => new SessionCredentialIssueError({ sessionId, cause })));
-      if (replacedSessionIds.length > 0) {
-        yield* Ref.update(connectedSessionsRef, (current) => {
-          const next = new Map(current);
-          for (const replacedSessionId of replacedSessionIds) {
-            next.delete(replacedSessionId);
-          }
-          return next;
-        });
-        yield* Effect.forEach(replacedSessionIds, emitRemoved, {
-          concurrency: "unbounded",
-          discard: true,
-        });
-      }
-      yield* emitUpsert(
-        toAuthClientSession({
-          sessionId,
-          subject: claims.sub,
-          scopes: claims.scopes,
-          method: claims.method,
-          client,
-          ...(input?.user ? { user: input.user } : {}),
-          issuedAt,
-          expiresAt,
-          lastConnectedAt: null,
-          connected: false,
-        }),
-      );
+        lastConnectedAt: null,
+        connected: false,
+      }),
+    );
 
-      return {
-        sessionId,
-        token: `${encodedPayload}.${signature}`,
-        method: claims.method,
-        client,
-        expiresAt: expiresAt,
-        scopes: claims.scopes,
-        ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
-      } satisfies IssuedSession;
-    },
-  );
+    return {
+      sessionId,
+      token: `${encodedPayload}.${signature}`,
+      method: claims.method,
+      client,
+      expiresAt: expiresAt,
+      scopes: claims.scopes,
+      ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
+    } satisfies IssuedSession;
+  }, Effect.uninterruptible);
 
   const verify: SessionStore["Service"]["verify"] = Effect.fn("SessionStore.verify")(
     function* (token) {
@@ -986,6 +1037,44 @@ export const make = Effect.gen(function* () {
     Effect.mapError((cause) => new ActiveSessionsListError({ cause })),
   );
 
+  const replaceDesktopIdentity: SessionStore["Service"]["replaceDesktopIdentity"] = Effect.fn(
+    "SessionStore.replaceDesktopIdentity",
+  )(function* (sessionId, user) {
+    const row = yield* authSessions
+      .getById({ sessionId })
+      .pipe(
+        Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId, cause })),
+      );
+    if (
+      Option.isNone(row) ||
+      row.value.subject !== "desktop-bootstrap" ||
+      row.value.method !== "bearer-access-token"
+    ) {
+      return yield* new UnknownSessionTokenError({ sessionId });
+    }
+    const previous = row.value;
+    if (previous.revokedAt !== null) {
+      return yield* new SessionTokenRevokedError({ sessionId, revokedAt: previous.revokedAt });
+    }
+    const now = yield* DateTime.now;
+    if (previous.expiresAt.epochMilliseconds <= now.epochMilliseconds) {
+      return yield* new SessionTokenExpiredError({
+        sessionId,
+        expiresAt: previous.expiresAt,
+        observedAt: now,
+      });
+    }
+    return yield* issue({
+      subject: previous.subject,
+      method: previous.method,
+      scopes: previous.scopes,
+      client: toClientMetadata(previous.client),
+      ttl: Duration.millis(previous.expiresAt.epochMilliseconds - now.epochMilliseconds),
+      replaceSessionId: sessionId,
+      ...(user === null ? {} : { user }),
+    });
+  });
+
   const revoke: SessionStore["Service"]["revoke"] = Effect.fn("SessionStore.revoke")(
     function* (sessionId) {
       const revokedAt = yield* DateTime.now;
@@ -1045,6 +1134,8 @@ export const make = Effect.gen(function* () {
     cookieName,
     legacyCookieName,
     issue,
+    replaceDesktopIdentity,
+    registerConnection,
     verify,
     issueWebSocketToken,
     verifyWebSocketToken,

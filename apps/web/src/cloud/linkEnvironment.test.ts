@@ -199,8 +199,17 @@ describe("web cloud link environment client", () => {
       vi.stubGlobal("fetch", fetchMock);
       vi.stubGlobal("window", {
         location: { origin: "t3code://app" },
+        dispatchEvent: vi.fn(),
         desktopBridge: {
-          getLocalEnvironmentBearerToken: vi.fn().mockResolvedValue("desktop-bearer-token"),
+          getLocalEnvironmentSession: vi.fn().mockResolvedValue({
+            token: "desktop-bearer-token",
+            user: null,
+            accountId: null,
+            generation: 0,
+            expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+          }),
+          setLocalEnvironmentAccount: vi.fn().mockResolvedValue(undefined),
+          getLocalEnvironmentBootstraps: () => [],
         } as unknown as DesktopBridge,
       });
 

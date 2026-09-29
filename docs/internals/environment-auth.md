@@ -86,14 +86,23 @@ validators would turn native-player seeks into full downloads.
 
 ## Session user
 
-A session minted through the relay carries an `AuthSessionUser` (`userId`,
-`displayName`, `imageUrl`). The relay puts `sub`, `name`, and `picture` claims on
-the signed mint proof, resolved from the identity provider per connect
-(`EnvironmentConnector.connect` → `UserDirectory`). The environment copies them
-onto the pairing link it mints (`cloud/http.ts`), the link carries them into the
-session it becomes (`auth_pairing_links.user_json` → `auth_sessions.user_json`),
-and every verification path exposes them as `AuthenticatedSession.user`. Locally
-paired, CLI-issued, and desktop-bootstrap sessions have no user.
+A session can carry a relay-verified `AuthSessionUser`. Remote connections receive
+it through the signed mint proof. Personal desktop environments can also attach
+it to a desktop-bootstrap session by verifying the current account with the
+server-configured relay. This does not require publishing or linking the environment.
+Ordinary paired and CLI-issued sessions remain anonymous.
+
+Identity attachment preserves the local session's permissions. It is unavailable
+on organization environments, where identity participates in repository access.
+Replacement revokes exactly the previous session and drains its open sockets;
+a socket captures its actor at upgrade, so changing stored credentials alone
+would leave it submitting as the previous person. A failed database replacement
+keeps the previous session valid.
+
+Signing out detaches identity locally without contacting the relay. A temporary
+relay outage leaves an already verified local session unchanged; new or renewed
+sessions remain anonymous until verification succeeds. Historical messages and
+accepted queued prompts retain their original author.
 
 Two things read it: the WebSocket dispatch handler stamps it as the `author` of a
 `thread.turn.start` command, which the decider copies onto `thread.message-sent`

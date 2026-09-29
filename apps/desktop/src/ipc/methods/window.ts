@@ -2,6 +2,7 @@ import {
   ContextMenuItemSchema,
   DesktopAppBrandingSchema,
   DesktopEnvironmentBootstrapSchema,
+  DesktopLocalSessionSchema,
   DesktopThemeSchema,
   EDITORS,
   EditorId,
@@ -170,6 +171,41 @@ export const getLocalEnvironmentBearerToken = DesktopIpc.makeIpcMethod({
   handler: Effect.fn("desktop.ipc.window.getLocalEnvironmentBearerToken")(function* () {
     const localAuth = yield* DesktopLocalEnvironmentAuth.DesktopLocalEnvironmentAuth;
     return yield* localAuth.getBearerToken;
+  }),
+});
+
+export const getLocalEnvironmentSession = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.GET_LOCAL_ENVIRONMENT_SESSION_CHANNEL,
+  payload: Schema.String,
+  result: DesktopLocalSessionSchema,
+  handler: Effect.fn("desktop.ipc.getLocalEnvironmentSession")(function* (backendId) {
+    return yield* (yield* DesktopLocalEnvironmentAuth.DesktopLocalEnvironmentAuth).getSession(
+      backendId,
+    );
+  }),
+});
+
+export const setLocalEnvironmentAccount = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.SET_LOCAL_ENVIRONMENT_ACCOUNT_CHANNEL,
+  payload: Schema.NullOr(Schema.String),
+  result: Schema.Void,
+  handler: Effect.fn("desktop.ipc.setLocalEnvironmentAccount")(function* (accountId) {
+    yield* (yield* DesktopLocalEnvironmentAuth.DesktopLocalEnvironmentAuth).setAccount(accountId);
+  }),
+});
+
+export const attachLocalEnvironmentIdentity = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.ATTACH_LOCAL_ENVIRONMENT_IDENTITY_CHANNEL,
+  payload: Schema.Struct({
+    backendId: Schema.String,
+    generation: Schema.Number,
+    token: Schema.String,
+  }),
+  result: Schema.NullOr(DesktopLocalSessionSchema),
+  handler: Effect.fn("desktop.ipc.attachLocalEnvironmentIdentity")(function* (input) {
+    return yield* (yield* DesktopLocalEnvironmentAuth.DesktopLocalEnvironmentAuth).attachIdentity(
+      input,
+    );
   }),
 });
 

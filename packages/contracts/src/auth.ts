@@ -241,8 +241,8 @@ export type AuthClientMetadata = typeof AuthClientMetadata.Type;
 
 /**
  * The signed-in person behind a session, when the environment learned one.
- * Set only for sessions minted through Launchpad Connect, whose relay vouches
- * for the identity; a locally paired session has no user.
+ * Launchpad Connect's relay vouches for this identity, including identities
+ * attached to trusted desktop-local sessions. Ordinary pairing stays anonymous.
  */
 export const AuthSessionUser = Schema.Struct({
   userId: TrimmedNonEmptyString,
@@ -250,6 +250,22 @@ export const AuthSessionUser = Schema.Struct({
   imageUrl: Schema.NullOr(TrimmedNonEmptyString),
 });
 export type AuthSessionUser = typeof AuthSessionUser.Type;
+
+export const AuthDesktopIdentityRequest = Schema.Struct({
+  identity: Schema.NullOr(
+    Schema.Struct({
+      accountId: TrimmedNonEmptyString,
+      token: TrimmedNonEmptyString,
+    }),
+  ),
+});
+export type AuthDesktopIdentityRequest = typeof AuthDesktopIdentityRequest.Type;
+
+export const AuthDesktopIdentityResult = Schema.Struct({
+  ...AuthAccessTokenResult.fields,
+  user: Schema.NullOr(AuthSessionUser),
+});
+export type AuthDesktopIdentityResult = typeof AuthDesktopIdentityResult.Type;
 
 export const AuthClientSession = Schema.Struct({
   sessionId: AuthSessionId,

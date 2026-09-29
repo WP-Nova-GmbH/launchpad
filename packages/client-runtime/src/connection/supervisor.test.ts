@@ -1119,6 +1119,28 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
+  it.effect(
+    "reconnects the primary after desktop identity changes without touching relay sessions",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        const primary = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+          initiallyDesired: true,
+        }).pipe(Effect.provide(harness.dependencies));
+        const relay = yield* EnvironmentSupervisor.make(RELAY_ENTRY, {
+          initiallyDesired: true,
+        }).pipe(Effect.provide(harness.dependencies));
+        yield* awaitState(primary.state, (state) => state.phase === "connected");
+        yield* awaitState(relay.state, (state) => state.phase === "connected");
+        yield* harness.wake("primary-credentials-changed");
+        yield* awaitState(
+          primary.state,
+          (state) => state.phase === "connected" && state.generation === 2,
+        );
+        expect((yield* SubscriptionRef.get(relay.state)).generation).toBe(1);
+      }),
+  );
+
   it.effect("releases and reconnects a relay session when credentials change", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();

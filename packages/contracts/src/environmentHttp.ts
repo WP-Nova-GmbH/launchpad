@@ -11,6 +11,8 @@ import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 
 import {
   AuthAccessTokenResult,
+  AuthDesktopIdentityRequest,
+  AuthDesktopIdentityResult,
   AuthSessionUser,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
@@ -82,6 +84,7 @@ export type EnvironmentAuthInvalidReason = typeof EnvironmentAuthInvalidReason.T
 
 export const EnvironmentOperationForbiddenReason = Schema.Literals([
   "current_session_revoke_not_allowed",
+  "desktop_session_required",
 ]);
 export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationForbiddenReason.Type;
 
@@ -90,6 +93,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "browser_session_issuance_failed",
   "browser_session_cookie_failed",
   "access_token_issuance_failed",
+  "identity_verification_failed",
   "websocket_ticket_issuance_failed",
   "pairing_credential_issuance_failed",
   "pairing_links_load_failed",
@@ -423,6 +427,14 @@ class EnvironmentMetadataHttpApi extends HttpApiGroup.make("metadata").add(
 ) {}
 
 class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
+  .add(
+    HttpApiEndpoint.post("desktopIdentity", "/api/auth/desktop-identity", {
+      headers: OptionalBearerHeaders,
+      payload: AuthDesktopIdentityRequest,
+      success: AuthDesktopIdentityResult,
+      error: [EnvironmentInternalError, EnvironmentOperationForbiddenError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
   .add(
     HttpApiEndpoint.get("session", "/api/auth/session", {
       headers: OptionalBearerHeaders,

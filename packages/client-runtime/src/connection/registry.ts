@@ -528,7 +528,14 @@ export const make = Effect.gen(function* () {
           // on their own loopback origin, so they authenticate with a bearer
           // token instead of the primary's same-origin cookie. Stash it where
           // the resolver's bearer broker looks it up.
+          let credentialChanged = false;
           if (registration._tag === "BearerConnectionRegistration") {
+            const previousCredential = yield* credentials
+              .get(registration.target.connectionId)
+              .pipe(Effect.orElseSucceed(() => Option.none()));
+            credentialChanged =
+              Option.isSome(previousCredential) &&
+              !Equal.equals(previousCredential.value, registration.credential);
             yield* credentials.put(registration.target.connectionId, registration.credential).pipe(
               Effect.catch((error) =>
                 Effect.logWarning("Could not store the platform bearer credential.", {
@@ -561,6 +568,10 @@ export const make = Effect.gen(function* () {
           }
 
           yield* installEntryLocked(entry, { retainEquivalentRuntime: true });
+          if (credentialChanged) {
+            const lease = (yield* SubscriptionRef.get(serviceScopes)).get(target.environmentId);
+            if (lease !== undefined) yield* lease.supervisor.retryNow;
+          }
         }),
       );
     },

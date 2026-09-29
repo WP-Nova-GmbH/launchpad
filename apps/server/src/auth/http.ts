@@ -1,5 +1,6 @@
 import {
   AuthAccessReadScope,
+  AuthAccessTokenType,
   AuthAccessWriteScope,
   AuthStandardClientScopes,
   AuthOrchestrationOperateScope,
@@ -23,7 +24,9 @@ import {
   EnvironmentAuthenticatedPrincipal,
 } from "@t3tools/contracts";
 import type { AuthEnvironmentScope, DpopFailureReason } from "@t3tools/contracts";
-import { parseAllowedOAuthScope } from "@t3tools/shared/oauthScope";
+import { parseAllowedOAuthScope, encodeOAuthScope } from "@t3tools/shared/oauthScope";
+import * as HttpClient from "effect/unstable/http/HttpClient";
+import { verifyDesktopIdentity } from "./DesktopIdentity.ts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -137,7 +140,9 @@ export function failEnvironmentScopeRequired(requiredScope: AuthEnvironmentScope
   );
 }
 
-function failEnvironmentOperationForbidden(reason: "current_session_revoke_not_allowed") {
+function failEnvironmentOperationForbidden(
+  reason: "current_session_revoke_not_allowed" | "desktop_session_required",
+) {
   return currentEnvironmentTraceId.pipe(
     Effect.flatMap((traceId) =>
       Effect.fail(
@@ -250,8 +255,60 @@ export const authHttpApiLayer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
     const sessions = yield* SessionStore.SessionStore;
+    const httpClient = yield* HttpClient.HttpClient;
 
     return handlers
+      .handle(
+        "desktopIdentity",
+        Effect.fn("environment.auth.desktopIdentity")(function* ({ payload, endpoint }) {
+          yield* annotateEnvironmentRequest(endpoint.name);
+          yield* appendCredentialResponseHeaders;
+          const session = yield* EnvironmentAuthenticatedPrincipal;
+          const access = yield* RepositoryAccess;
+          if (
+            session.subject !== "desktop-bootstrap" ||
+            session.method !== "bearer-access-token" ||
+            (yield* access.status).enabled
+          ) {
+            return yield* failEnvironmentOperationForbidden("desktop_session_required");
+          }
+          const user =
+            payload.identity === null
+              ? null
+              : yield* verifyDesktopIdentity(payload.identity).pipe(
+                  Effect.provideService(HttpClient.HttpClient, httpClient),
+                  // Do not log the request or token when the configured relay is unavailable.
+                  Effect.catch(() => failEnvironmentInternal("identity_verification_failed")),
+                );
+          const issued = yield* access.withFence(
+            Effect.gen(function* () {
+              if ((yield* access.status).enabled)
+                return yield* failEnvironmentOperationForbidden("desktop_session_required");
+              return yield* sessions.replaceDesktopIdentity(session.sessionId, user).pipe(
+                Effect.catch(
+                  Effect.fnUntraced(function* (error) {
+                    if (SessionStore.isSessionCredentialInvalidError(error))
+                      return yield* failEnvironmentAuthInvalid("invalid_credential");
+                    return yield* failEnvironmentInternal("access_token_issuance_failed");
+                  }),
+                ),
+              );
+            }),
+          );
+          const now = yield* DateTime.now;
+          return {
+            access_token: issued.token,
+            issued_token_type: AuthAccessTokenType,
+            token_type: "Bearer" as const,
+            expires_in: Math.max(
+              0,
+              Math.floor((issued.expiresAt.epochMilliseconds - now.epochMilliseconds) / 1000),
+            ),
+            scope: encodeOAuthScope(issued.scopes),
+            user,
+          };
+        }),
+      )
       .handle(
         "session",
         Effect.fn("environment.auth.session")(

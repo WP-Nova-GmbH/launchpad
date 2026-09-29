@@ -116,3 +116,8 @@ export const MAC_PERMISSION_HELPER_CHANNEL = "desktop:mac-permission-helper";
 export const CHECK_SYSTEM_PERMISSION_CHANNEL = "desktop:check-system-permission";
 
 export const PREVIEW_RECORDING_INPUT_CHANNEL = "desktop:preview-recording-input";
+
+export const GET_LOCAL_ENVIRONMENT_SESSION_CHANNEL = "desktop:get-local-environment-session";
+export const SET_LOCAL_ENVIRONMENT_ACCOUNT_CHANNEL = "desktop:set-local-environment-account";
+export const ATTACH_LOCAL_ENVIRONMENT_IDENTITY_CHANNEL =
+  "desktop:attach-local-environment-identity";

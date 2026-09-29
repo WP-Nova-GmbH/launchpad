@@ -3,6 +3,7 @@ import {
   RepositoryPolicyAcknowledgement,
   RepositoryAccessRemovalStatus,
 } from "./repositoryAccess.ts";
+import { AuthSessionUser } from "./auth.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -2052,6 +2053,11 @@ const RelayMobileGroup = HttpApiGroup.make("mobile")
 
 const RelayClientGroup = HttpApiGroup.make("client")
   .add(
+    HttpApiEndpoint.get("identity", "/v1/client/identity", {
+      headers: RelayBearerRequestHeaders,
+      success: AuthSessionUser,
+      error: RelayAuthAndInternalErrors,
+    }),
     HttpApiEndpoint.get("listEnvironments", "/v1/environments", {
       headers: RelayBearerRequestHeaders,
       success: RelayListEnvironmentsResponse,

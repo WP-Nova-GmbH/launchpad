@@ -21,7 +21,6 @@ import {
   PrimaryConnectionTarget,
   Wakeups,
 } from "@t3tools/client-runtime/connection";
-import { bootstrapRemoteBearerSession } from "@t3tools/client-runtime/authorization";
 import { fetchRemoteEnvironmentDescriptor } from "@t3tools/client-runtime/environment";
 import { managedRelayAccountChanges, managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { EnvironmentRpcRequestObserver } from "@t3tools/client-runtime/rpc";
@@ -43,7 +42,12 @@ import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/unstable/http";
 
 import { APP_VERSION } from "../branding";
-import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAuth";
+import {
+  readDesktopPrimaryBearerToken,
+  readDesktopLocalSession,
+  desktopAuthRevision,
+  DESKTOP_PRIMARY_AUTH_CHANGED,
+} from "../environments/primary/desktopAuth";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 import {
   readPrimaryEnvironmentTarget,
@@ -110,8 +114,21 @@ const wakeupsLayer = Wakeups.layer({
           }),
       ).pipe(Effect.asVoid),
     ),
-    managedRelayAccountChanges(appAtomRegistry).pipe(
-      Stream.map(() => "credentials-changed" as const),
+    Stream.merge(
+      managedRelayAccountChanges(appAtomRegistry).pipe(
+        Stream.map(() => "credentials-changed" as const),
+      ),
+      Stream.callback<"primary-credentials-changed">((queue) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            const listener = () => Queue.offerUnsafe(queue, "primary-credentials-changed");
+            window.addEventListener(DESKTOP_PRIMARY_AUTH_CHANGED, listener);
+            return listener;
+          }),
+          (listener) =>
+            Effect.sync(() => window.removeEventListener(DESKTOP_PRIMARY_AUTH_CHANGED, listener)),
+        ).pipe(Effect.asVoid),
+      ),
     ),
   ),
 });
@@ -330,12 +347,14 @@ const loadSecondaryConnectionRegistration = Effect.fn(
     Effect.mapError(mapRemoteEnvironmentError),
   );
   const issuedAtEpochMs = yield* Clock.currentTimeMillis;
-  const access = yield* bootstrapRemoteBearerSession({
-    httpBaseUrl,
-    credential: entry.bootstrapToken,
-    scopes: AuthStandardClientScopes,
-    clientMetadata: clientMetadata(),
-  }).pipe(Effect.mapError(mapRemoteEnvironmentError));
+  const access = yield* Effect.tryPromise({
+    try: () => readDesktopLocalSession(entry.id),
+    catch: () =>
+      new ConnectionTransientError({
+        reason: "remote-unavailable",
+        detail: "Could not load the local environment session.",
+      }),
+  });
   // Keep the desktop pool's stable backend id in the connection id. The
   // descriptor environment id still scopes projects and RPC state, while the
   // backend id lets desktop-only operations (notably the WSL folder picker)
@@ -359,10 +378,13 @@ const loadSecondaryConnectionRegistration = Effect.fn(
         httpBaseUrl,
         wsBaseUrl,
       }),
-      credential: new BearerConnectionCredential({ token: access.access_token }),
+      credential: new BearerConnectionCredential({ token: access.token }),
     }),
-    expiresAtEpochMs: secondaryBearerExpiresAtEpochMs(issuedAtEpochMs, access.expires_in),
-    refreshAtEpochMs: secondaryBearerRefreshAtEpochMs(issuedAtEpochMs, access.expires_in),
+    expiresAtEpochMs: access.expiresAtEpochMs,
+    refreshAtEpochMs: Math.max(
+      issuedAtEpochMs,
+      access.expiresAtEpochMs - SECONDARY_BEARER_REFRESH_SKEW_MS,
+    ),
   };
 });
 
@@ -477,6 +499,11 @@ const platformConnectionSourceLayer = Layer.effect(
     // backends running alongside it (bearer auth). Reused registrations come
     // from the cache; a failed entry is skipped and retried on the next poll.
     const buildPlatformRegistrations = Effect.gen(function* () {
+      // This is a cached IPC read. It also attaches identity after a renderer or
+      // backend restart, without making existing sessions depend on the relay.
+      if (window.desktopBridge && !isLocalEnvironmentDisabled()) {
+        yield* Effect.tryPromise(readDesktopPrimaryBearerToken).pipe(Effect.ignore);
+      }
       const previous = yield* Ref.get(cacheRef);
       const nowEpochMs = yield* Clock.currentTimeMillis;
       const next = new Map<string, CachedPlatformRegistration>();
@@ -537,7 +564,12 @@ const platformConnectionSourceLayer = Layer.effect(
         });
       } else {
         for (const bootstrap of topologyRead.bootstraps) {
-          const signature = `${bootstrap.httpBaseUrl}|${bootstrap.wsBaseUrl}|${bootstrap.bootstrapToken ?? ""}`;
+          if (bootstrap.httpBaseUrl !== null) {
+            yield* Effect.tryPromise(() => readDesktopLocalSession(bootstrap.id)).pipe(
+              Effect.ignore,
+            );
+          }
+          const signature = `${bootstrap.httpBaseUrl}|${bootstrap.wsBaseUrl}|${bootstrap.bootstrapToken ?? ""}|${desktopAuthRevision()}`;
           const cached = previous.get(bootstrap.id);
           if (
             cached !== undefined &&

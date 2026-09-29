@@ -71,7 +71,7 @@ export interface AuthenticatedSession {
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly proofKeyThumbprint?: string;
   readonly expiresAt?: DateTime.DateTime;
-  /** The signed-in person, known only for sessions minted through Launchpad Connect. */
+  /** The signed-in person, verified by Launchpad Connect for remote or trusted local sessions. */
   readonly user?: AuthSessionUser;
 }
 

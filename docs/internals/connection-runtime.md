@@ -24,8 +24,12 @@ treating every resume as harmless leaves suspended sockets stuck.
 The [registry](../../packages/client-runtime/src/connection/registry.ts) scopes
 connections by environment. An involuntary disconnect retains the registration
 and cached data. Explicit removal closes the scope and clears credentials,
-projections, and platform-owned state such as drafts. Cloud-account changes apply
-to relay registrations; they must not discard directly paired environments.
+projections, and platform-owned state such as drafts. Cloud-account changes remove
+relay registrations and replace desktop-local identity credentials; they must not
+discard local drafts or directly paired environments. Electron owns credentials
+for both the primary and secondary local backends. Identity changes reconnect
+through the existing supervisor after replacing credentials, without removing
+those registrations.
 
 ## HTTP authorization
 
@@ -39,7 +43,8 @@ does not close the socket, and refresh failure belongs to the HTTP operation.
 Session listings must retain unrevoked connected sessions after credential expiry
 so an open connection does not disappear from connection management. This does
 not extend the credential's lifetime. New HTTP requests and socket upgrades still
-require valid credentials.
+require valid credentials. Explicit revocation and identity replacement do close
+existing sockets; their captured actor must not survive a change of account.
 
 ## Transport health and data freshness are separate
 

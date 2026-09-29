@@ -1,3 +1,4 @@
+import * as UserDirectory from "../tenancy/UserDirectory.ts";
 import { createClerkClient, verifyToken } from "@clerk/backend";
 import { sql as drizzleSql } from "drizzle-orm";
 import * as Crypto from "effect/Crypto";
@@ -884,7 +885,20 @@ export const clientApi = HttpApiBuilder.group(
     const organizations = yield* Organizations.Organizations;
     const managedEndpointProvider = yield* ManagedEndpointProvider.ManagedEndpointProvider;
     const devices = yield* Devices.Devices;
+    const directory = yield* UserDirectory.UserDirectory;
     return handlers
+      .handle(
+        "identity",
+        Effect.fn("relay.api.client.identity")(function* () {
+          const { userId } = yield* RelayClientPrincipal;
+          const profile = (yield* directory.lookup({ userIds: [userId] })).get(userId);
+          return {
+            userId,
+            displayName: profile?.displayName ?? null,
+            imageUrl: profile?.imageUrl ?? null,
+          };
+        }),
+      )
       .handle(
         "listEnvironments",
         Effect.fn("relay.api.client.listEnvironments")(function* () {

@@ -59,6 +59,7 @@ import { assert, it } from "@effect/vitest";
 import { assertFailure, assertInclude, assertTrue } from "@effect/vitest/utils";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -2809,6 +2810,109 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         "access:write",
         "relay:write",
       ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "desktop identity replacement retires the open socket and preserves local permissions",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest({
+          layers: {
+            httpClient: HttpClient.make((request) => {
+              assert.equal(request.url, "https://relay.example.test/v1/client/identity");
+              assert.equal(request.headers.authorization, "Bearer clerk-alice");
+              return Effect.succeed(
+                HttpClientResponse.fromWeb(
+                  request,
+                  Response.json({
+                    userId: "alice",
+                    displayName: "Alice",
+                    imageUrl: null,
+                  }),
+                ),
+              );
+            }),
+          },
+        });
+        const original = yield* exchangeAccessToken();
+        const ticketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+          headers: { authorization: `Bearer ${original.body.access_token}` },
+        });
+        const { ticket } = (yield* ticketResponse.json) as { ticket: string };
+        const socketUrl = new URL(yield* getWsServerUrl("/ws", { authenticated: false }));
+        socketUrl.searchParams.set("wsTicket", ticket);
+        const closed = yield* Deferred.make<void>();
+        yield* Effect.acquireRelease(
+          Effect.callback<NodeSocket.NodeWS.WebSocket, Error>((resume) => {
+            const socket = new NodeSocket.NodeWS.WebSocket(socketUrl);
+            socket.on("close", () => Deferred.doneUnsafe(closed, Effect.void));
+            socket.on("error", (error) => resume(Effect.fail(error)));
+            socket.on("open", () => resume(Effect.succeed(socket)));
+          }),
+          (socket) => Effect.sync(() => socket.close()),
+        );
+        const replacement = yield* HttpClient.post("/api/auth/desktop-identity", {
+          headers: { authorization: `Bearer ${original.body.access_token}` },
+          body: yield* HttpBody.json({ identity: { accountId: "alice", token: "clerk-alice" } }),
+        });
+        assert.equal(replacement.status, 200);
+        yield* Deferred.await(closed);
+        const named = (yield* replacement.json) as {
+          access_token: string;
+          scope: string;
+          user: { userId: string };
+        };
+        assert.equal(named.user.userId, "alice");
+        assert.equal(named.scope, original.body.scope);
+        const oldTicket = yield* HttpClient.post("/api/auth/websocket-ticket", {
+          headers: { authorization: `Bearer ${original.body.access_token}` },
+        });
+        assert.equal(oldTicket.status, 401);
+        const detached = yield* HttpClient.post("/api/auth/desktop-identity", {
+          headers: { authorization: `Bearer ${named.access_token}` },
+          body: yield* HttpBody.json({ identity: null }),
+        });
+        assert.equal(detached.status, 200);
+        assert.isNull(((yield* detached.json) as { user: unknown }).user);
+        const browser = yield* bootstrapBrowserSession();
+        const forbidden = yield* HttpClient.post("/api/auth/desktop-identity", {
+          headers: { cookie: browser.cookie?.split(";")[0] ?? "" },
+          body: yield* HttpBody.json({ identity: { accountId: "alice", token: "clerk-alice" } }),
+        });
+        assert.equal(forbidden.status, 403);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            NodeHttpServer.layerTest,
+            ConfigProvider.layer(
+              ConfigProvider.fromEnv({ env: { T3CODE_RELAY_URL: "https://relay.example.test" } }),
+            ),
+          ),
+        ),
+      ),
+  );
+
+  it.effect("desktop identity cannot replace organization access with anonymous local access", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: {
+            status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+          },
+        },
+      });
+      const original = yield* exchangeAccessToken();
+      const response = yield* HttpClient.post("/api/auth/desktop-identity", {
+        headers: { authorization: `Bearer ${original.body.access_token}` },
+        body: yield* HttpBody.json({ identity: null }),
+      });
+      assert.equal(response.status, 403);
+      const state = yield* HttpClient.get("/api/auth/session", {
+        headers: { authorization: `Bearer ${original.body.access_token}` },
+      });
+      assert.isTrue(((yield* state.json) as { authenticated: boolean }).authenticated);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

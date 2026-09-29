@@ -1446,6 +1446,47 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect(
+    "reconnects a desktop-local bearer registration when its identity credential changes, retaining drafts",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness([]);
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const registration = new BearerConnectionRegistration({
+            target: BEARER_TARGET,
+            profile: BEARER_PROFILE,
+            credential: BEARER_CREDENTIAL,
+          });
+          yield* registry.reconcilePlatform([registration]);
+          yield* awaitConnectionState(
+            registry,
+            BEARER_TARGET.environmentId,
+            (state) => state.phase === "connected",
+          );
+          yield* registry.reconcilePlatform([
+            new BearerConnectionRegistration({
+              ...registration,
+              credential: new BearerConnectionCredential({ token: "new-identity" }),
+            }),
+          ]);
+          yield* awaitConnectionState(
+            registry,
+            BEARER_TARGET.environmentId,
+            (state) => state.phase === "connected" && state.generation === 2,
+          );
+          expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+          yield* registry.reconcilePlatform([
+            new BearerConnectionRegistration({
+              ...registration,
+              credential: new BearerConnectionCredential({ token: "new-identity" }),
+            }),
+          ]);
+          expect(yield* Ref.get(harness.sessions)).toHaveLength(2);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+  );
+
   it.effect("retains a healthy runtime when the platform repeats an identical registration", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness([]);

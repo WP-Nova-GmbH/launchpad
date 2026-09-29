@@ -9,7 +9,12 @@ import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { HttpEffect, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import {
+  FetchHttpClient,
+  HttpEffect,
+  HttpServerRequest,
+  HttpServerResponse,
+} from "effect/unstable/http";
 import * as Etag from "effect/unstable/http/Etag";
 import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
@@ -49,6 +54,7 @@ const environmentAuthLayer = EnvironmentAuth.layer.pipe(
 );
 const routesLayer = HttpApiBuilder.layer(AuthTestApi).pipe(
   Layer.provide(authHttpApiLayer),
+  Layer.provide(FetchHttpClient.layer),
   Layer.provide(environmentAuthenticatedAuthLayer),
   Layer.provideMerge(environmentAuthLayer),
   Layer.provide(configLayer),

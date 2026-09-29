@@ -18,7 +18,12 @@ import type {
   BrowserImportSource,
   BrowserImportSourceId,
 } from "./browserImport.ts";
-import { AuthAccessTokenResult, AuthSessionState, AuthWebSocketTicketResult } from "./auth.ts";
+import {
+  AuthAccessTokenResult,
+  AuthSessionUser,
+  AuthSessionState,
+  AuthWebSocketTicketResult,
+} from "./auth.ts";
 import { AdvertisedEndpoint } from "./remoteAccess.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import { type ClientSettings, type QuitConfirmationMode, SnapShotShortcut } from "./settings.ts";
@@ -1121,6 +1126,15 @@ export const DesktopPreviewAutomationWaitForInputSchema = Schema.Struct({
 export const SystemSettingsPaneSchema = Schema.Literals(["full-disk-access"]);
 export type SystemSettingsPane = typeof SystemSettingsPaneSchema.Type;
 
+export const DesktopLocalSessionSchema = Schema.Struct({
+  token: Schema.String,
+  expiresAtEpochMs: Schema.Number,
+  user: Schema.NullOr(AuthSessionUser),
+  accountId: Schema.NullOr(Schema.String),
+  generation: Schema.Number,
+});
+export type DesktopLocalSession = typeof DesktopLocalSessionSchema.Type;
+
 export interface DesktopBridge {
   getAppBranding: () => DesktopAppBranding | null;
   /** Absolute path of a dropped or picked file; absent on desktop builds predating it. */
@@ -1144,6 +1158,13 @@ export interface DesktopBridge {
   getLocalEnvironmentEnabled?: () => boolean;
   setLocalEnvironmentEnabled?: (enabled: boolean) => Promise<void>;
   getLocalEnvironmentBearerToken: () => Promise<string>;
+  getLocalEnvironmentSession: (backendId: string) => Promise<DesktopLocalSession>;
+  setLocalEnvironmentAccount: (accountId: string | null) => Promise<void>;
+  attachLocalEnvironmentIdentity: (input: {
+    backendId: string;
+    generation: number;
+    token: string;
+  }) => Promise<DesktopLocalSession | null>;
   getClientSettings: () => Promise<ClientSettings | null>;
   setClientSettings: (settings: ClientSettings) => Promise<void>;
   getConnectionCatalog?: () => Promise<string | null>;

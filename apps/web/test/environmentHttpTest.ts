@@ -83,6 +83,9 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
         ),
         HttpApiBuilder.group(EnvironmentHttpApi, "auth", (handlers) =>
           handlers
+            .handle("desktopIdentity", () =>
+              Effect.die("Desktop identity is not used by this fixture"),
+            )
             .handle(
               "session",
               Effect.fn("test.environment.auth.session")(function* () {
