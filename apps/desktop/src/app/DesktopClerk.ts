@@ -1,5 +1,6 @@
 import { createClerkBridge } from "@clerk/electron";
 import { storage } from "@clerk/electron/storage";
+import * as Electron from "electron";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -13,6 +14,7 @@ import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import { installDesktopClerkRequestHeaders } from "./DesktopClerkRequests.ts";
 
 declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
 
@@ -71,6 +73,24 @@ export const desktopClerkFrontendApiHostname = resolveDesktopClerkFrontendApiHos
     ? undefined
     : __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__,
 );
+
+/** Install once after app readiness, before loading the desktop renderer. */
+export const configureRequestHeaders = Effect.gen(function* () {
+  if (!desktopClerkFrontendApiHostname) return;
+  const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  const electronWindow = yield* ElectronWindow.ElectronWindow;
+  const runSync = Effect.runSyncWith(yield* Effect.context<ElectronWindow.ElectronWindow>());
+  yield* Effect.acquireRelease(
+    Effect.sync(() =>
+      installDesktopClerkRequestHeaders(Electron.session.defaultSession.webRequest, {
+        hostname: desktopClerkFrontendApiHostname,
+        rendererOrigin: `${ElectronProtocol.getDesktopScheme(environment.isDevelopment)}://${ElectronProtocol.DESKTOP_HOST}`,
+        getMainWebContents: () => Option.getOrUndefined(runSync(electronWindow.main))?.webContents,
+      }),
+    ),
+    (cleanup) => Effect.sync(cleanup),
+  );
+});
 
 function createDesktopClerkBridge(stateDir: string, isDevelopment: boolean) {
   return createClerkBridge({

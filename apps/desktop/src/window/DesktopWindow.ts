@@ -828,6 +828,8 @@ export const make = Effect.gen(function* () {
       void runPromise(Effect.andThen(electronWindow.reveal(window), dismissConnectingSplash));
     });
 
+    // Clerk's request hook must recognize this window before its first request.
+    yield* electronWindow.setMain(window);
     loadApplication();
     if (environment.isDevelopment) {
       window.webContents.openDevTools({ mode: "detach" });
@@ -844,7 +846,6 @@ export const make = Effect.gen(function* () {
 
   const createMain = Effect.gen(function* () {
     const window = yield* createWindow();
-    yield* electronWindow.setMain(window);
     yield* logWindowInfo("main window created");
     return window;
   }).pipe(Effect.withSpan("desktop.window.createMain"));

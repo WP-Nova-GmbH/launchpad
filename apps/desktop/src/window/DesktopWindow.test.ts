@@ -607,6 +607,10 @@ describe("DesktopWindow", () => {
       const createCount = yield* Ref.make(0);
       const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
       const createdWindowOptions: Electron.BrowserWindowConstructorOptions[] = [];
+      fakeWindow.loadURL.mockImplementation(() => {
+        assert.strictEqual(Option.getOrUndefined(Ref.getUnsafe(mainWindow)), fakeWindow.window);
+        return Promise.resolve();
+      });
       const layer = makeTestLayer({
         window: fakeWindow.window,
         createCount,

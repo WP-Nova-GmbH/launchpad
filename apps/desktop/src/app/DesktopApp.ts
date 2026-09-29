@@ -177,6 +177,7 @@ const bootstrap = Effect.gen(function* () {
       : { assetDirectory: environment.clientAssetsDir }),
     clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
   });
+  yield* DesktopClerk.configureRequestHeaders;
   yield* installDesktopIpcHandlers();
   yield* logBootstrapInfo("bootstrap ipc handlers registered");
 
