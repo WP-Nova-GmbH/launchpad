@@ -521,6 +521,69 @@ describe("CheckpointReactor", () => {
     };
   }
 
+  effectIt.effect.each(["completed", "failed"] as const)(
+    "finalizes a shared queue in a non-git project after %s",
+    (state) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            initializeGit: false,
+            seedFilesystemCheckpoints: false,
+            hasSession: false,
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const createdAt = "2026-01-01T00:00:00.000Z";
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.enqueue",
+          commandId: CommandId.make("non-git-enqueue"),
+          threadId,
+          message: { messageId: MessageId.make("non-git-message"), text: "work", attachments: [] },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt,
+        });
+        const attemptId = CommandId.make("non-git-claim");
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.claim",
+          commandId: attemptId,
+          threadId,
+          messageId: MessageId.make("non-git-message"),
+          expectedRevision: 1,
+          expectedControlRevision: 0,
+          createdAt,
+        });
+        const turnId = asTurnId("non-git-turn");
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.admit",
+          commandId: CommandId.make("non-git-admit"),
+          threadId,
+          attemptId,
+          turnId,
+          evidence: "provider-ack",
+          createdAt,
+        });
+        harness.provider.emit({
+          type: "turn.completed",
+          eventId: EventId.make("non-git-completed"),
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          turnId,
+          createdAt,
+          payload: {
+            state,
+            ...(state === "failed" ? { errorMessage: "usage limit exceeded" } : {}),
+          },
+        });
+        yield* Effect.promise(() => harness.drain());
+        const thread = (yield* Effect.promise(() => harness.readModel())).threads[0]!;
+        expect(thread.promptQueue?.awaitingTurnId).toBe(null);
+        expect(thread.promptQueue?.finalizedTurnId).toBe(turnId);
+        expect(thread.promptQueue?.enabled).toBe(state === "completed");
+        if (state === "failed") expect(thread.promptQueue?.pauseReason?.code).toBe("usage-limit");
+      }),
+  );
+
   effectIt.effect.each([
     "active",
     "archived",

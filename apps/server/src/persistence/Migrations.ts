@@ -69,6 +69,9 @@ import Migration0053 from "./Migrations/053_PullRequestFilesViewed.ts";
 import Migration0054 from "./Migrations/054_ProjectionThreadsAutoSettleDisabledAt.ts";
 import Migration0055 from "./Migrations/055_AuthSessionUser.ts";
 import Migration0056 from "./Migrations/056_ProjectionThreadMessageAuthor.ts";
+import Migration0057 from "./Migrations/057_SharedPromptQueue.ts";
+import Migration0058 from "./Migrations/058_CommandReceiptProjectScope.ts";
+import Migration0059 from "./Migrations/059_ThreadCleanupFences.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -137,9 +140,22 @@ const migrationEntries = [
   [54, "ProjectionThreadsAutoSettleDisabledAt", Migration0054],
   [55, "AuthSessionUser", Migration0055],
   [56, "ProjectionThreadMessageAuthor", Migration0056],
+  [57, "SharedPromptQueue", Migration0057],
+  [58, "CommandReceiptProjectScope", Migration0058],
+  [59, "ThreadCleanupFences", Migration0059],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
+
+// Previous builds ignore newer migration ids but reject changed names of known
+// migrations. Keep this reader barrier after activation: downgrading would lose
+// both repository enforcement and the durable queue without warning.
+export const sharedThreadReaderMarker = "OrchestrationEvents_SharedThreadReaderV2";
+export const markSharedThreadDatabase = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`UPDATE effect_sql_migrations SET name = ${sharedThreadReaderMarker}
+    WHERE migration_id = 1 AND name IN ('OrchestrationEvents', 'OrchestrationEvents_SharedThreadReaderV1')`;
+});
 
 const makeMigrationLoader = (throughId?: number) =>
   Migrator.fromRecord(
@@ -219,6 +235,27 @@ const verifyMigrationHistory = Effect.gen(function* () {
   );
   const mismatches: Array<string> = [];
   for (const { migration_id, name } of recorded) {
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_ThreadCleanupReaderV1" &&
+      recorded.some(
+        (migration) => migration.migration_id === 59 && migration.name === "ThreadCleanupFences",
+      )
+    )
+      continue;
+    if (
+      migration_id === 1 &&
+      (name === "OrchestrationEvents_SharedThreadReaderV1" ||
+        (name === sharedThreadReaderMarker &&
+          recorded.some(
+            (migration) =>
+              migration.migration_id === 58 && migration.name === "CommandReceiptProjectScope",
+          ))) &&
+      recorded.some(
+        (migration) => migration.migration_id === 57 && migration.name === "SharedPromptQueue",
+      )
+    )
+      continue;
     const expected = namesById.get(migration_id);
     if (expected !== undefined && expected !== name) {
       mismatches.push(

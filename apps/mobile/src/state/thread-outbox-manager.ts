@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { Atom, type AtomRegistry } from "effect/unstable/reactivity";
 
 import {
+  acceptedQueuedThreadMessage,
   flattenQueuedThreadMessages,
   groupQueuedThreadMessages,
   type QueuedThreadMessage,
@@ -177,6 +178,15 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
           (revisions.get(message.messageId) ?? 0) !== expectedRevision);
       if (staleOrMissing()) {
         return false;
+      }
+      // Receipt ownership survives an editor that captured its payload before
+      // the acknowledgement. Saving that draft cannot make it sendable again.
+      if (
+        currentMessages().some(
+          (candidate) => candidate.messageId === message.messageId && candidate.acceptedWithEdits,
+        )
+      ) {
+        message = acceptedQueuedThreadMessage({ ...message, acceptedWithEdits: true });
       }
       try {
         await options.storage.write(message);

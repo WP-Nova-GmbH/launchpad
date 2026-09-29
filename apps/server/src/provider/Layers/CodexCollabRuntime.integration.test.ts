@@ -870,6 +870,87 @@ describe("CodexSessionRuntime collab integration", () => {
 });
 
 describe("CodexSessionRuntime compaction", () => {
+  for (const stage of ["mcp", "models", "compact"] as const) {
+    it.effect(`Stop before a turn exists prevents dispatch after ${stage} preparation`, () =>
+      Effect.gen(function* () {
+        NodeFS.writeFileSync(
+          scriptPath,
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          JSON.stringify({
+            rootThreadId: ROOT,
+            notifications: [],
+            holdMcpReload: stage === "mcp",
+            recordDispatches: true,
+          }),
+          "utf8",
+        );
+        const dispatchesPath = `${scriptPath}.dispatches`;
+        NodeFS.rmSync(dispatchesPath, { force: true });
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            NodeFS.rmSync(scriptPath, { force: true });
+            NodeFS.rmSync(dispatchesPath, { force: true });
+          }),
+        );
+        const preparing = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        const runtime = yield* makeCodexSessionRuntime({
+          threadId: ThreadId.make(`stop-${stage}`),
+          binaryPath: peerPath,
+          cwd: NodeOS.tmpdir(),
+          runtimeMode: "full-access",
+          environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+          ...(stage === "mcp"
+            ? { appServerArgs: ["-c", 'mcp_servers.test.url="http://example.invalid"'] }
+            : {}),
+          ...(stage === "models"
+            ? {
+                models: Deferred.succeed(preparing, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as([]),
+                ),
+              }
+            : {}),
+        });
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) =>
+            event.method === "serverRequest/resolved"
+              ? Deferred.succeed(preparing, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* runtime.start();
+        const sending = yield* (
+          stage === "compact"
+            ? runtime.compactThread(
+                Deferred.succeed(preparing, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                ),
+              )
+            : runtime.sendTurn({ input: "must not start" })
+        ).pipe(Effect.result, Effect.forkScoped);
+        yield* Deferred.await(preparing);
+        yield* runtime.interruptTurn();
+        yield* runtime.interruptTurn();
+        if (stage === "mcp") yield* runtime.compactThread();
+        else yield* Deferred.succeed(release, undefined);
+        const result = yield* Fiber.join(sending);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure")
+          assert.equal(result.failure._tag, "ProviderAdapterValidationError");
+        const dispatches = NodeFS.existsSync(dispatchesPath)
+          ? NodeFS.readFileSync(dispatchesPath, "utf8")
+          : "";
+        assert.notInclude(dispatches, "turn/start");
+        assert.notInclude(dispatches, "turn/steer");
+        if (stage === "compact") assert.equal(dispatches, "");
+        yield* runtime.close;
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+
   it.effect("restores T3 context after the root thread compacts", () =>
     Effect.gen(function* () {
       const compacted = (threadId: string) => ({

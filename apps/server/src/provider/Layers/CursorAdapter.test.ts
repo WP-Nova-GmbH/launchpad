@@ -10,6 +10,7 @@ import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -18,13 +19,16 @@ import { createModelSelection } from "@t3tools/shared/model";
 
 import {
   ApprovalRequestId,
+  CommandId,
   CursorSettings,
   ProviderDriverKind,
   type ProviderRuntimeEvent,
   ThreadId,
+  TurnId,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 
+import { ProviderAdapterValidationError } from "../Errors.ts";
 import { ServerConfig } from "../../config.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -162,6 +166,226 @@ const cursorAdapterTestLayer = it.layer(
 );
 
 cursorAdapterTestLayer("CursorAdapterLive", (it) => {
+  it.effect("validates at ACP dispatch and can retry a rejected prompt", () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "dispatch-test-")),
+      );
+      const logPath = NodePath.join(directory, "requests.jsonl");
+      const wrapper = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_REQUEST_LOG_PATH: logPath }),
+      );
+      const adapter = yield* makeCursorAdapter(decodeCursorSettings({ binaryPath: wrapper }));
+      const threadId = ThreadId.make("cursor-dispatch-validator");
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      let admitted = false;
+      const rejection = new ProviderAdapterValidationError({
+        provider: "cursor",
+        operation: "sendTurn",
+        issue: "Stopped before dispatch",
+      });
+      const result = yield* adapter
+        .sendTurn(
+          { threadId, input: "rejected", delivery: { attemptId: "rejected", mode: "next-turn" } },
+          {
+            beforeDispatch: Effect.fail(rejection),
+            onAdmitted: () =>
+              Effect.sync(() => {
+                admitted = true;
+              }),
+          },
+        )
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure, rejection);
+      assert.isFalse(admitted);
+      yield* adapter.sendTurn({
+        threadId,
+        input: "accepted",
+        delivery: { attemptId: "accepted", mode: "next-turn" },
+      });
+      const requests = yield* Effect.promise(() => readJsonLines(logPath));
+      assert.equal(requests.filter((request) => request.method === "session/prompt").length, 1);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  for (const outcome of ["completed", "stopped"] as const) {
+    it.effect(`rejects a shared steer when the original turn ${outcome} during preparation`, () =>
+      Effect.gen(function* () {
+        const threadId = ThreadId.make(`cursor-prepared-steer-${outcome}`);
+        const preparing = yield* Deferred.make<void>();
+        const releasePreparation = yield* Deferred.make<void>();
+        const fileSystem = yield* FileSystem.FileSystem;
+        const wrapperPath = yield* Effect.promise(() =>
+          makeMockAgentWrapper({ T3_ACP_EMIT_ASK_QUESTION: "1" }),
+        );
+        const adapter = yield* makeCursorAdapter(
+          decodeCursorSettings({ binaryPath: wrapperPath }),
+        ).pipe(
+          Effect.provideService(FileSystem.FileSystem, {
+            ...fileSystem,
+            readFile: (path) =>
+              path.endsWith(".png")
+                ? Effect.gen(function* () {
+                    yield* Deferred.succeed(preparing, undefined);
+                    yield* Deferred.await(releasePreparation);
+                    return new Uint8Array([1]);
+                  })
+                : fileSystem.readFile(path),
+          }),
+        );
+        const question = yield* Deferred.make<ApprovalRequestId>();
+        const completed = yield* Deferred.make<ProviderRuntimeEvent>();
+        const events: ProviderRuntimeEvent[] = [];
+        yield* adapter.streamEvents.pipe(
+          Stream.runForEach((event) =>
+            Effect.gen(function* () {
+              events.push(event);
+              if (event.type === "user-input.requested" && event.requestId)
+                yield* Deferred.succeed(question, ApprovalRequestId.make(String(event.requestId)));
+              if (event.type === "turn.completed") yield* Deferred.succeed(completed, event);
+            }),
+          ),
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+        const firstAdmitted = yield* Deferred.make<TurnId>();
+        const first = yield* adapter
+          .sendTurn(
+            { threadId, input: "Ask a question" },
+            {
+              onAdmitted: (result) =>
+                Deferred.succeed(firstAdmitted, result.turnId).pipe(Effect.asVoid),
+            },
+          )
+          .pipe(Effect.forkChild);
+        const turnId = yield* Deferred.await(firstAdmitted);
+        const requestId = yield* Deferred.await(question);
+        let admitted = false;
+        const steer = yield* adapter
+          .sendTurn(
+            {
+              threadId,
+              input: "Prepare an image",
+              attachments: [
+                {
+                  type: "image",
+                  id: "pending-00000000-0000-4000-8000-000000000001",
+                  name: "image.png",
+                  mimeType: "image/png",
+                  sizeBytes: 1,
+                },
+              ],
+              delivery: {
+                attemptId: CommandId.make(`prepared-${outcome}`),
+                mode: "steer",
+                expectedTurnId: turnId,
+              },
+            },
+            {
+              onAdmitted: () =>
+                Effect.sync(() => {
+                  admitted = true;
+                }),
+            },
+          )
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(preparing);
+        if (outcome === "completed")
+          yield* adapter.respondToUserInput(threadId, requestId, { scope: "workspace" });
+        else yield* adapter.interruptTurn(threadId, turnId);
+        yield* Fiber.join(first);
+        const terminal = yield* Deferred.await(completed);
+        yield* Deferred.succeed(releasePreparation, undefined);
+        const result = yield* Fiber.join(steer);
+        assert.isTrue(result._tag === "Failure");
+        if (result._tag === "Failure")
+          assert.equal(result.failure._tag, "ProviderAdapterValidationError");
+        assert.isFalse(admitted);
+        assert.lengthOf(
+          events.filter((event) => event.type === "turn.started"),
+          1,
+        );
+        assert.lengthOf(
+          events.filter((event) => event.type === "turn.completed"),
+          1,
+        );
+        if (terminal.type === "turn.completed")
+          assert.equal(terminal.payload.state, outcome === "completed" ? "completed" : "cancelled");
+        assert.isUndefined(
+          (yield* adapter.listSessions()).find((session) => session.threadId === threadId)
+            ?.activeTurnId,
+        );
+        yield* adapter.stopSession(threadId);
+      }),
+    );
+  }
+
+  it.effect("cancels the live ACP prompt before dispatching an admitted shared steer", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-shared-steer");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1" }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      const events = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const firstAdmitted = yield* Deferred.make<TurnId>();
+      const first = yield* adapter
+        .sendTurn(
+          { threadId, input: "Keep working until cancelled" },
+          {
+            onAdmitted: (result) =>
+              Deferred.succeed(firstAdmitted, result.turnId).pipe(Effect.asVoid),
+          },
+        )
+        .pipe(Effect.forkChild);
+      const turnId = yield* Deferred.await(firstAdmitted);
+      const admissions: string[] = [];
+      const steered = yield* adapter.sendTurn(
+        {
+          threadId,
+          input: "Use the teammate's correction",
+          delivery: {
+            attemptId: CommandId.make("cursor-steer-attempt"),
+            mode: "steer",
+            expectedTurnId: turnId,
+          },
+        },
+        {
+          onAdmitted: (result, evidence) =>
+            Effect.sync(() => {
+              admissions.push(`${result.turnId}:${evidence}`);
+            }),
+        },
+      );
+      assert.equal(steered.turnId, turnId);
+      assert.equal((yield* Fiber.join(first)).turnId, turnId);
+      assert.deepStrictEqual(admissions, [`${turnId}:harness-dispatch`]);
+      const runtimeEvents = Array.from(yield* Fiber.join(events));
+      assert.lengthOf(
+        runtimeEvents.filter((event) => event.type === "turn.started"),
+        1,
+      );
+      const completed = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.lengthOf(completed, 1);
+      assert.equal(completed[0]?.payload.state, "completed");
+      assert.isUndefined(
+        (yield* adapter.listSessions()).find((session) => session.threadId === threadId)
+          ?.activeTurnId,
+      );
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("rejects rollback without discarding the provider conversation", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

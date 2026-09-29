@@ -230,6 +230,7 @@ export const makeThreadLiveEventCoalescer = Effect.fn("makeThreadLiveEventCoales
     );
 
     return {
+      close,
       offer: (input: ThreadLiveInput) => offerAll([input]),
       offerAll,
       stream: budget.deliver(Stream.fromQueue(output)),

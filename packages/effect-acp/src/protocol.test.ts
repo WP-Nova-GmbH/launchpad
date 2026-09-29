@@ -727,7 +727,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
   );
 
   for (const operation of ["request", "notification"] as const) {
-    it.effect(`rejects a ${operation} if the connection ends while its logger is running`, () =>
+    it.effect(`reports ${operation} termination after dispatch while its logger is running`, () =>
       Effect.gen(function* () {
         const { stdio, input, output } = yield* makeInMemoryStdio();
         const writeStarted = yield* Deferred.make<void>();
@@ -752,6 +752,8 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         ).pipe(Effect.forkScoped);
 
         yield* Deferred.await(writeStarted);
+        const dispatched = yield* Queue.take(output);
+        assert.include(dispatched, operation === "request" ? "x/test" : "session/cancel");
         yield* Queue.end(input);
         const error = yield* Deferred.await(terminated);
         yield* Deferred.succeed(releaseWrite, undefined);

@@ -57,10 +57,14 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderUnsupportedError,
   ProviderValidationError,
+  ProviderAdapterValidationError,
   ProviderWorkspaceMissingError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterShape,
+  ProviderSendTurnCallbacks,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -142,6 +146,7 @@ function makeFakeCodexAdapter(
 ) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  const subscribed = Deferred.makeUnsafe<void>();
 
   const startSession = vi.fn((input: ProviderSessionStartInput) =>
     Effect.sync(() => {
@@ -169,6 +174,7 @@ function makeFakeCodexAdapter(
   const sendTurn = vi.fn(
     (
       input: ProviderSendTurnInput,
+      _callbacks?: ProviderSendTurnCallbacks,
     ): Effect.Effect<ProviderTurnStartResult, ProviderAdapterError> => {
       if (!sessions.has(input.threadId)) {
         return Effect.fail(
@@ -297,7 +303,13 @@ function makeFakeCodexAdapter(
     ...(provider === CODEX_DRIVER ? { uploadFeedback } : {}),
     stopAll,
     get streamEvents() {
-      return Stream.fromPubSub(runtimeEventPubSub);
+      return Stream.unwrap(
+        Effect.gen(function* () {
+          const subscription = yield* PubSub.subscribe(runtimeEventPubSub);
+          yield* Deferred.succeed(subscribed, undefined);
+          return Stream.fromSubscription(subscription);
+        }),
+      );
     },
   };
 
@@ -318,6 +330,7 @@ function makeFakeCodexAdapter(
 
   return {
     adapter,
+    whenSubscribed: Deferred.await(subscribed),
     emit,
     updateSession,
     startSession,
@@ -474,6 +487,145 @@ function makeProviderServiceLayer(
     layer,
   };
 }
+
+const sharedDelivery = makeProviderServiceLayer();
+sharedDelivery.layer("ProviderService shared delivery", (it) => {
+  it.effect("revalidates after common service preparation and releases a rejected admission", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("stopped-service-preparation");
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+      });
+      const preparing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+      const getBinding = directory.getBinding;
+      const spy = vi
+        .spyOn(directory, "getBinding")
+        .mockImplementationOnce((input) =>
+          Deferred.succeed(preparing, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(getBinding(input)),
+          ),
+        );
+      let allowed = true;
+      const beforeDispatch = Effect.suspend(() =>
+        allowed
+          ? Effect.void
+          : Effect.fail(
+              new ProviderAdapterValidationError({
+                provider: "codex",
+                operation: "sendTurn",
+                issue: "Stopped before dispatch",
+              }),
+            ),
+      );
+      sharedDelivery.codex.sendTurn.mockClear();
+      const sending = yield* provider
+        .sendTurn(
+          { threadId, input: "stopped", delivery: { attemptId: "stopped", mode: "next-turn" } },
+          { beforeDispatch, onAdmitted: () => Effect.void },
+        )
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(preparing);
+      allowed = false;
+      yield* provider.interruptTurn({ threadId });
+      yield* Deferred.succeed(release, undefined);
+      const result = yield* Fiber.join(sending);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure")
+        assert.instanceOf(result.failure, ProviderAdapterValidationError);
+      assert.equal(sharedDelivery.codex.sendTurn.mock.calls.length, 0);
+      spy.mockRestore();
+      allowed = true;
+      sharedDelivery.codex.sendTurn.mockImplementationOnce((input, callbacks) =>
+        Effect.gen(function* () {
+          const turn = { threadId: input.threadId, turnId: asTurnId("after-rejected") };
+          yield* callbacks?.onAdmitted(turn, "provider-ack") ?? Effect.void;
+          return turn;
+        }),
+      );
+      yield* provider.sendTurn(
+        { threadId, input: "retry", delivery: { attemptId: "retry", mode: "next-turn" } },
+        { beforeDispatch, onAdmitted: () => Effect.void },
+      );
+      yield* provider.stopSession({ threadId });
+      sharedDelivery.codex.sendTurn.mockClear();
+    }),
+  );
+  it.effect(
+    "promotes a harness handoff before streaming while the provider call is still running",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const threadId = asThreadId("shared-delivery");
+        const turnId = asTurnId("shared-turn");
+        const handedOff = yield* Deferred.make<void>();
+        const finish = yield* Deferred.make<void>();
+        let promoted = false;
+        let returned = false;
+        yield* provider.startSession(threadId, {
+          threadId,
+          providerInstanceId: codexInstanceId,
+          runtimeMode: "full-access",
+        });
+        sharedDelivery.codex.sendTurn.mockImplementationOnce((_input, callbacks) =>
+          Effect.gen(function* () {
+            assert(callbacks);
+            yield* callbacks.onAdmitted({ threadId, turnId }, "harness-dispatch");
+            yield* Deferred.succeed(handedOff, undefined);
+            yield* Deferred.await(finish);
+            returned = true;
+            return { threadId, turnId };
+          }),
+        );
+        const output = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId && event.type === "turn.started"),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const sending = yield* provider
+          .sendTurn(
+            {
+              threadId,
+              input: "Shared work",
+              delivery: { attemptId: "delivery", mode: "next-turn" },
+            },
+            {
+              onAdmitted: (_result, evidence) =>
+                Effect.sync(() => {
+                  assert.equal(evidence, "harness-dispatch");
+                  promoted = true;
+                }),
+            },
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(handedOff);
+        assert.equal(promoted, true);
+        assert.equal(returned, false);
+        const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        assert.propertyVal(binding.runtimePayload, "activeTurnId", turnId);
+        sharedDelivery.codex.emit({
+          type: "turn.started",
+          threadId,
+          turnId,
+          provider: CODEX_DRIVER,
+          eventId: asEventId("shared-started"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          payload: {},
+        });
+        assert(Option.isSome(yield* Fiber.join(output)));
+        assert.equal(returned, false);
+        yield* Deferred.succeed(finish, undefined);
+        yield* Fiber.join(sending);
+      }),
+  );
+});
 
 for (const [enabled, completed] of [
   [false, false],
@@ -1016,6 +1168,147 @@ const declaredCompaction = makeProviderServiceLayer({
 });
 
 declaredCompaction.layer("ProviderService declared compaction", (it) => {
+  it.effect.each([
+    "failed",
+    "cancelled",
+    "interrupted",
+    "aborted",
+    "failed-after-send-error",
+    "failed-before-admission-send-error",
+  ] as const)("retains a known %s fallback outcome before the send acknowledgement", (outcome) =>
+    Effect.gen(function* () {
+      const terminalOutcome =
+        outcome === "failed-after-send-error" || outcome === "failed-before-admission-send-error"
+          ? "failed"
+          : outcome;
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId(`known-compact-${outcome}`);
+      const turnId = asTurnId(`known-turn-${outcome}`);
+      yield* customSlashCompaction.whenSubscribed;
+      yield* provider.startSession(threadId, {
+        providerInstanceId: slashCompactionInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const emitted = yield* Deferred.make<void>();
+      const terminal = yield* provider.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.threadId === threadId &&
+            (event.type === "turn.completed" || event.type === "turn.aborted"),
+        ),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      customSlashCompaction.sendTurn.mockImplementationOnce((input, callbacks) =>
+        Effect.gen(function* () {
+          const result = { threadId: input.threadId, turnId };
+          const beforeAdmission = outcome === "failed-before-admission-send-error";
+          if (!beforeAdmission) {
+            yield* callbacks?.onAdmitted(result, "harness-dispatch") ?? Effect.void;
+          }
+          customSlashCompaction.emit({
+            eventId: asEventId(`known-${outcome}`),
+            provider: customCompactionDriver,
+            threadId,
+            turnId,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            ...(terminalOutcome === "aborted"
+              ? { type: "turn.aborted" as const, payload: { reason: "stopped" } }
+              : { type: "turn.completed" as const, payload: { state: terminalOutcome } }),
+          });
+          if (beforeAdmission) {
+            const barrierId = asEventId(`early-terminal-barrier-${outcome}`);
+            const barrier = yield* provider.streamEvents.pipe(
+              Stream.filter((event) => event.eventId === barrierId),
+              Stream.runHead,
+              Effect.forkChild({ startImmediately: true }),
+            );
+            customSlashCompaction.emit({
+              eventId: barrierId,
+              provider: customCompactionDriver,
+              threadId,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              type: "runtime.warning",
+              payload: { message: "Earlier terminal event has been processed." },
+            });
+            yield* Fiber.join(barrier);
+            yield* callbacks?.onAdmitted(result, "harness-dispatch") ?? Effect.void;
+          }
+          yield* Deferred.succeed(emitted, undefined);
+          yield* Fiber.join(terminal);
+          if (outcome.includes("send-error"))
+            return yield* new ProviderAdapterRequestError({
+              provider: customCompactionDriver,
+              method: "turn/start",
+              detail: "Transport failed after the terminal event",
+            });
+          return result;
+        }),
+      );
+      const result = yield* provider.compactThread(
+        threadId,
+        undefined,
+        MessageId.make(`compact-${outcome}`),
+        { onAdmitted: () => Effect.void },
+      );
+      yield* Deferred.await(emitted);
+      assert.deepEqual(result, {
+        type: "turn",
+        turnId,
+        outcome: terminalOutcome === "aborted" ? "interrupted" : terminalOutcome,
+      });
+      yield* provider.stopSession({ threadId });
+      customSlashCompaction.sendTurn.mockClear();
+    }),
+  );
+
+  it.effect("admits queued native compaction after acknowledgement and waits for completion", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("queued-native-compaction");
+      const requestId = MessageId.make("queued-native-request");
+      yield* provider.startSession(threadId, {
+        providerInstanceId: nativeCompactionInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const entered = yield* Deferred.make<void>();
+      const acknowledged = yield* Deferred.make<void>();
+      const admitted = yield* Deferred.make<ProviderTurnStartResult>();
+      customNativeCompaction.compactThread.mockImplementationOnce(() =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(acknowledged))),
+      );
+      let didAdmit = false;
+      const compact = yield* provider
+        .compactThread(threadId, undefined, requestId, {
+          onAdmitted: (turn, evidence) =>
+            Effect.gen(function* () {
+              assert.equal(evidence, "provider-ack");
+              didAdmit = true;
+              yield* Deferred.succeed(admitted, turn);
+            }),
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      assert.isFalse(didAdmit);
+      yield* Deferred.succeed(acknowledged, undefined);
+      const turn = yield* Deferred.await(admitted);
+      assert.equal(turn.turnId, `compaction:${requestId}`);
+      customNativeCompaction.emit({
+        type: "thread.state.changed",
+        eventId: asEventId("queued-native-completed"),
+        provider: customCompactionDriver,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        payload: { state: "compacted" },
+      });
+      assert.deepEqual(yield* Fiber.join(compact), { type: "native" });
+      yield* provider.stopSession({ threadId });
+      customNativeCompaction.compactThread.mockClear();
+    }),
+  );
+
   it.effect("starts declared native compaction instead of sending a prompt", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1074,7 +1367,11 @@ declaredCompaction.layer("ProviderService declared compaction", (it) => {
         turnId: asTurnId(`turn-${threadId}`),
         payload: { state: "completed" },
       });
-      yield* Fiber.join(compactFiber);
+      assert.deepEqual(yield* Fiber.join(compactFiber), {
+        type: "turn",
+        turnId: asTurnId(`turn-${threadId}`),
+        outcome: "completed",
+      });
       const compacted = Option.getOrThrow(yield* Fiber.join(compactedEventFiber));
       assert.equal(compacted.requestId, String(requestId));
       assert.equal(customSlashCompaction.compactThread.mock.calls.length, 0);
@@ -4963,6 +5260,7 @@ describe("agent browser access", () => {
       const projectionLayer = Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
         getTurnStartMessage: () => Effect.die("unused"),
         getImportedAgentSessionSources: () => Effect.die("unused"),
+        getThreadSubscriptionAnchor: () => Effect.die("unused"),
         getUserInputActivity: () => Effect.die("unused"),
         listActivitiesByKind: () => Effect.die("unused"),
         getCommandReadModel: () => Effect.die("unused"),

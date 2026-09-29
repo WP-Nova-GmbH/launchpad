@@ -1,4 +1,9 @@
-import type { EnvironmentId, ThreadId, WorktreeSetupSnapshot } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  ThreadId,
+  ThreadPreparation,
+  WorktreeSetupSnapshot,
+} from "@t3tools/contracts";
 import {
   findRecordedWorktreeSetup,
   resolveVisibleWorktreeSetup,
@@ -15,8 +20,9 @@ export function useWorktreeSetup(input: {
   preparing: boolean;
   turnStarted: boolean;
   followUpSent: boolean;
+  preparation?: ThreadPreparation | undefined;
 }) {
-  const key = JSON.stringify([input.environmentId, input.threadId]);
+  const key = JSON.stringify([input.environmentId, input.threadId, input.preparation?.attemptId]);
   const [held, setHeld] = useState<{ key: string; snapshot: WorktreeSetupSnapshot } | null>(null);
   const live = held?.key === key ? held.snapshot : null;
   const recorded = input.threadId
@@ -46,5 +52,6 @@ export function useWorktreeSetup(input: {
     recorded,
     turnStarted: input.turnStarted,
     followUpSent: input.followUpSent,
+    preparation: input.preparation,
   });
 }

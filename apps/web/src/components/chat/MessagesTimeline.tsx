@@ -138,6 +138,7 @@ import type {
 } from "@t3tools/contracts";
 import { Button } from "../ui/button";
 import type { QueuedComposerMessage } from "../../queuedMessageStore";
+import { promptAttributionLabel } from "@t3tools/client-runtime/state/threads";
 import { useAssetUrlRefresh, useAssetUrls, useAssetUrlState } from "../../assets/assetUrls";
 import { MediaVideoPlayer } from "../media/MediaVideoPlayer";
 import { getVirtualizedScrollFadeClassName } from "../ui/scroll-area";
@@ -2089,7 +2090,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
     <div className="group flex flex-col items-end gap-1">
       {author ? (
         <div className="flex items-center gap-1.5 pr-1 text-[11px] text-muted-foreground">
-          <span className="truncate">{author.displayName ?? "Teammate"}</span>
+          <span className="truncate">{promptAttributionLabel(row.message)}</span>
           <UserAvatar
             displayName={author.displayName}
             imageUrl={author.imageUrl}
@@ -2098,7 +2099,9 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         </div>
       ) : null}
       <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
-        <MessageAuthorHeading>You</MessageAuthorHeading>
+        <MessageAuthorHeading>
+          {author?.displayName ?? (author ? "Teammate" : "You")}
+        </MessageAuthorHeading>
         {(regularImages.length > 0 || userVideos.length > 0) && (
           <div className="mb-2 grid max-w-[210px] grid-cols-2 gap-2">
             {regularImages.map((image) => (

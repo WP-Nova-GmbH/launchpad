@@ -1,3 +1,4 @@
+import { validateTurnDelivery } from "../turnDelivery.ts";
 import {
   ApprovalRequestId,
   EventId,
@@ -106,6 +107,7 @@ type Runtime = Pick<
   | "getConfigOptions"
   | "getEvents"
   | "drainEvents"
+  | "hasActivePrompt"
   | "prompt"
   | "cancel"
 >;
@@ -206,8 +208,14 @@ interface SessionContext {
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   session: ProviderSession;
   activeTurnId: TurnId | undefined;
-  promptFiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
+  promptFiber:
+    | Fiber.Fiber<
+        EffectAcpSchema.PromptResponse,
+        EffectAcpErrors.AcpError | ProviderAdapterValidationError
+      >
+    | undefined;
   generation: number;
+  interruptEpoch: number;
   stopped: boolean;
   closed: boolean;
   disconnected: boolean;
@@ -880,6 +888,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 activeTurnId: undefined,
                 promptFiber: undefined,
                 generation: 0,
+                interruptEpoch: 0,
                 stopped: false,
                 closed: false,
                 disconnected: false,
@@ -971,200 +980,254 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       }),
     );
 
-  const sendTurn: Adapter["sendTurn"] = Effect.fn("AntigravityAdapter.sendTurn")(function* (input) {
-    const context = yield* requireSession(input.threadId);
-    if (input.modelSelection && input.modelSelection.instanceId !== options.instanceId) {
-      return yield* new ProviderAdapterValidationError({
-        provider: PROVIDER,
-        operation: "sendTurn",
-        issue: "The selected model belongs to another provider instance.",
-      });
-    }
-    const prompt = yield* buildAntigravityPrompt({
-      input: input.input,
-      attachments: input.attachments,
-      attachmentsDir: serverConfig.attachmentsDir,
-    }).pipe(
-      Effect.provideService(FileSystem.FileSystem, fileSystem),
-      Effect.provideService(Path.Path, path),
-      Effect.mapError((cause) => mapAntigravityError(input.threadId, "session/prompt", cause)),
-    );
-    let intent: TurnIntent | undefined;
-    // The caller holds promptLock while it changes or settles the active turn.
-    const finishTurn = (turn: TurnIntent, payload: TurnCompletedPayload) =>
-      Effect.gen(function* () {
-        if (turn.settled || context.stopped || context.generation !== turn.generation) return;
-        turn.settled = true;
-        yield* promoteBackgroundCommands(context);
-        yield* finishSubagents(
-          context,
-          payload.state === "cancelled"
-            ? "cancelled"
-            : payload.state === "failed"
-              ? "failed"
-              : "idle",
-          payload.errorMessage,
-        );
-        context.activeTurnId = undefined;
-        context.promptFiber = undefined;
-        context.session = {
-          ...context.session,
-          status: payload.state === "failed" ? "error" : "ready",
-          activeTurnId: undefined,
-          updatedAt: yield* nowIso,
-          ...(payload.errorMessage
-            ? { lastError: payload.errorMessage }
-            : { lastError: undefined }),
-        };
-        yield* emit({
-          type: "turn.completed",
-          ...(yield* stamp),
-          provider: PROVIDER,
-          threadId: input.threadId,
-          turnId: turn.turnId,
-          payload,
-        });
-      }).pipe(Effect.uninterruptible);
-
-    return yield* Effect.gen(function* () {
-      const launch = yield* context.promptLock.withPermit(
-        Effect.gen(function* () {
-          yield* requireSession(input.threadId);
-          const requestedModel = input.modelSelection?.model ?? context.session.model;
-          const configOptions = yield* context.runtime.getConfigOptions;
-          const model = resolveAntigravityModel({
-            configOptions,
-            model: requestedModel,
-            defaultModel: yield* options.defaultModel ?? Effect.undefined,
-          });
-          const availableModels = antigravityModelOptions(configOptions);
-          if (model && !availableModels.some((option) => option.value === model)) {
-            return yield* EffectAcpErrors.AcpRequestError.invalidParams(
-              `Antigravity model '${model}' is unavailable for this Google account. Select an available model.`,
-            );
-          }
-          const turnId = context.activeTurnId ?? TurnId.make(yield* randomId);
-          const steering = context.activeTurnId !== undefined;
-          const turn: TurnIntent = { turnId, generation: ++context.generation, settled: false };
-          intent = turn;
-          context.activeTurnId = turnId;
-          if (!steering) {
-            yield* emit({
-              type: "turn.started",
-              ...(yield* stamp),
-              provider: PROVIDER,
-              threadId: input.threadId,
-              turnId,
-              payload: model ? { model } : {},
-            });
-          }
-          if (context.promptFiber) {
-            yield* cancelRequests(context);
-            yield* context.runtime.cancel;
-            yield* Fiber.await(context.promptFiber);
-            yield* finishSubagents(context, "cancelled");
-          }
-          yield* applyAntigravityAcpModelSelection({
-            runtime: context.runtime,
-            model,
-            mapError: (cause) => cause,
-          });
-          yield* context.runtime.setMode(antigravityPermissionMode(context.session.runtimeMode));
-          context.session = {
-            ...context.session,
-            status: "running",
-            activeTurnId: turnId,
-            ...(model ? { model } : {}),
-            updatedAt: yield* nowIso,
-          };
-          const dispatched = yield* Deferred.make<void>();
-          const fiber = yield* context.runtime
-            .prompt(
-              {
-                prompt: [
-                  ...prompt,
-                  {
-                    type: "text",
-                    text: buildRuntimeInstructions({ harness: "Antigravity", model }),
-                  },
-                ],
-              },
-              { dispatched },
+  const sendTurn: Adapter["sendTurn"] = Effect.fn("AntigravityAdapter.sendTurn")(
+    function* (input, hooks) {
+      const context = yield* requireSession(input.threadId);
+      const interruptEpoch = context.interruptEpoch;
+      const checkInterrupted = Effect.suspend(() =>
+        context.interruptEpoch !== interruptEpoch ||
+        context.stopped ||
+        sessions.get(input.threadId) !== context
+          ? Effect.fail(
+              new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "sendTurn",
+                issue: "The prompt was stopped before native dispatch. It remains queued.",
+              }),
             )
-            .pipe(Effect.forkIn(context.scope));
-          context.promptFiber = fiber;
-          // Fiber.join can skip a scope-close waiter when the child is interrupted.
-          // Unwrap the Exit after Fiber.await returns.
-          yield* Effect.raceFirst(
-            Deferred.await(dispatched),
-            Fiber.await(fiber).pipe(
-              Effect.flatMap((exit) => exit),
-              Effect.asVoid,
-            ),
-          );
-          return { turn, fiber };
-        }),
+          : Effect.void,
       );
-      const result = yield* Fiber.await(launch.fiber).pipe(Effect.flatMap((exit) => exit));
-      yield* context.runtime.drainEvents;
-      if (context.stopped) {
-        return yield* new ProviderAdapterSessionClosedError({
+      if (input.modelSelection && input.modelSelection.instanceId !== options.instanceId) {
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          threadId: input.threadId,
+          operation: "sendTurn",
+          issue: "The selected model belongs to another provider instance.",
         });
       }
-      const record = context.turns.find((turn) => turn.id === launch.turn.turnId);
-      if (record) record.items.push(result);
-      else context.turns.push({ id: launch.turn.turnId, items: [result] });
-      yield* context.promptLock.withPermit(
-        finishTurn(launch.turn, {
-          state: result.stopReason === "cancelled" ? "cancelled" : "completed",
-          stopReason: result.stopReason,
-        }),
+      const prompt = yield* buildAntigravityPrompt({
+        input: input.input,
+        attachments: input.attachments,
+        attachmentsDir: serverConfig.attachmentsDir,
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+        Effect.mapError((cause) => mapAntigravityError(input.threadId, "session/prompt", cause)),
       );
-      return {
-        threadId: input.threadId,
-        turnId: launch.turn.turnId,
-        resumeCursor: context.session.resumeCursor,
-      };
-    }).pipe(
-      Effect.tapError((cause) =>
-        isAntigravitySignInRequiredError(cause)
-          ? (options.onAuthRequired ?? Effect.void)
-          : Effect.void,
-      ),
-      Effect.mapError((cause) =>
-        isAcpError(cause) ? mapAntigravityError(input.threadId, "session/prompt", cause) : cause,
-      ),
-      Effect.tapError((cause) =>
-        Effect.suspend(() =>
-          intent
-            ? context.promptLock.withPermit(
-                finishTurn(intent, { state: "failed", errorMessage: cause.message }),
+      let intent: TurnIntent | undefined;
+      // The caller holds promptLock while it changes or settles the active turn.
+      const finishTurn = (turn: TurnIntent, payload: TurnCompletedPayload) =>
+        Effect.gen(function* () {
+          if (turn.settled || context.stopped || context.generation !== turn.generation) return;
+          turn.settled = true;
+          yield* promoteBackgroundCommands(context);
+          yield* finishSubagents(
+            context,
+            payload.state === "cancelled"
+              ? "cancelled"
+              : payload.state === "failed"
+                ? "failed"
+                : "idle",
+            payload.errorMessage,
+          );
+          context.activeTurnId = undefined;
+          context.promptFiber = undefined;
+          context.session = {
+            ...context.session,
+            status: payload.state === "failed" ? "error" : "ready",
+            activeTurnId: undefined,
+            updatedAt: yield* nowIso,
+            ...(payload.errorMessage
+              ? { lastError: payload.errorMessage }
+              : { lastError: undefined }),
+          };
+          yield* emit({
+            type: "turn.completed",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            turnId: turn.turnId,
+            payload,
+          });
+        }).pipe(Effect.uninterruptible);
+
+      return yield* Effect.gen(function* () {
+        const launch = yield* context.promptLock.withPermit(
+          Effect.gen(function* () {
+            yield* requireSession(input.threadId);
+            yield* checkInterrupted;
+            yield* validateTurnDelivery(PROVIDER, input, context.activeTurnId);
+            const requestedModel = input.modelSelection?.model ?? context.session.model;
+            const configOptions = yield* context.runtime.getConfigOptions;
+            const model = resolveAntigravityModel({
+              configOptions,
+              model: requestedModel,
+              defaultModel: yield* options.defaultModel ?? Effect.undefined,
+            });
+            const availableModels = antigravityModelOptions(configOptions);
+            if (model && !availableModels.some((option) => option.value === model)) {
+              return yield* EffectAcpErrors.AcpRequestError.invalidParams(
+                `Antigravity model '${model}' is unavailable for this Google account. Select an available model.`,
+              );
+            }
+            yield* checkInterrupted;
+            if (input.delivery?.mode === "steer") {
+              // Completion may be waiting for this lock after model preparation.
+              yield* validateTurnDelivery(
+                PROVIDER,
+                input,
+                (yield* context.runtime.hasActivePrompt) ? context.activeTurnId : undefined,
+              );
+            }
+            if (context.promptFiber) {
+              yield* cancelRequests(context);
+              yield* context.runtime.cancel;
+              yield* Fiber.await(context.promptFiber);
+              yield* finishSubagents(context, "cancelled");
+            }
+            yield* checkInterrupted;
+            yield* applyAntigravityAcpModelSelection({
+              runtime: context.runtime,
+              model,
+              mapError: (cause) => cause,
+            });
+            yield* context.runtime.setMode(antigravityPermissionMode(context.session.runtimeMode));
+            // Keep the original generation until replacement preparation succeeds.
+            // If Stop wins, its caller can still publish the original terminal event.
+            const turnId = context.activeTurnId ?? TurnId.make(yield* randomId);
+            const steering = context.activeTurnId !== undefined;
+            const updatedAt = yield* nowIso;
+            const dispatched = yield* Deferred.make<void>();
+            yield* checkInterrupted;
+            const turn: TurnIntent = { turnId, generation: ++context.generation, settled: false };
+            intent = turn;
+            context.activeTurnId = turnId;
+            context.session = {
+              ...context.session,
+              status: "running",
+              activeTurnId: turnId,
+              ...(model ? { model } : {}),
+              updatedAt,
+            };
+            const fiber = yield* context.runtime
+              .prompt(
+                {
+                  prompt: [
+                    ...prompt,
+                    {
+                      type: "text",
+                      text: buildRuntimeInstructions({ harness: "Antigravity", model }),
+                    },
+                  ],
+                },
+                {
+                  dispatched,
+                  beforeDispatch: (hooks?.beforeDispatch ?? Effect.void).pipe(
+                    Effect.andThen(checkInterrupted),
+                  ),
+                  onDispatched: Effect.gen(function* () {
+                    if (!steering)
+                      yield* emit({
+                        type: "turn.started",
+                        ...(yield* stamp),
+                        provider: PROVIDER,
+                        threadId: input.threadId,
+                        turnId,
+                        payload: model ? { model } : {},
+                      });
+                    yield* (
+                      hooks?.onAdmitted(
+                        {
+                          threadId: input.threadId,
+                          turnId,
+                          resumeCursor: context.session.resumeCursor,
+                        },
+                        "harness-dispatch",
+                      ) ?? Effect.void
+                    );
+                  }).pipe(Effect.orDie),
+                },
               )
+              .pipe(Effect.forkIn(context.scope));
+            context.promptFiber = fiber;
+            // Fiber.join can skip a scope-close waiter when the child is interrupted.
+            // Unwrap the Exit after Fiber.await returns.
+            yield* Effect.raceFirst(
+              Deferred.await(dispatched),
+              Fiber.await(fiber).pipe(
+                Effect.flatMap((exit) => exit),
+                Effect.asVoid,
+              ),
+            );
+            return { turn, fiber };
+          }),
+        );
+        const result = yield* Fiber.await(launch.fiber).pipe(Effect.flatMap((exit) => exit));
+        yield* context.runtime.drainEvents;
+        if (context.stopped) {
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
+        const record = context.turns.find((turn) => turn.id === launch.turn.turnId);
+        if (record) record.items.push(result);
+        else context.turns.push({ id: launch.turn.turnId, items: [result] });
+        yield* context.promptLock.withPermit(
+          finishTurn(launch.turn, {
+            state: result.stopReason === "cancelled" ? "cancelled" : "completed",
+            stopReason: result.stopReason,
+          }),
+        );
+        return {
+          threadId: input.threadId,
+          turnId: launch.turn.turnId,
+          resumeCursor: context.session.resumeCursor,
+        };
+      }).pipe(
+        Effect.tapError((cause) =>
+          isAntigravitySignInRequiredError(cause)
+            ? (options.onAuthRequired ?? Effect.void)
             : Effect.void,
         ),
-      ),
-      Effect.onInterrupt(() =>
-        context.promptLock.withPermit(
-          Effect.gen(function* () {
-            const turn = intent;
-            if (!turn || turn.settled || context.stopped || context.generation !== turn.generation)
-              return;
-            const promptFiber = context.promptFiber;
-            yield* cancelRequests(context);
-            yield* Effect.ignore(context.runtime.cancel);
-            if (promptFiber) yield* Fiber.interrupt(promptFiber);
-            yield* finishTurn(turn, { state: "cancelled", stopReason: "cancelled" });
-          }),
+        Effect.mapError((cause) =>
+          isAcpError(cause) ? mapAntigravityError(input.threadId, "session/prompt", cause) : cause,
         ),
-      ),
-    );
-  });
+        Effect.tapError((cause) =>
+          Effect.suspend(() =>
+            intent
+              ? context.promptLock.withPermit(
+                  finishTurn(intent, { state: "failed", errorMessage: cause.message }),
+                )
+              : Effect.void,
+          ),
+        ),
+        Effect.onInterrupt(() =>
+          context.promptLock.withPermit(
+            Effect.gen(function* () {
+              const turn = intent;
+              if (
+                !turn ||
+                turn.settled ||
+                context.stopped ||
+                context.generation !== turn.generation
+              )
+                return;
+              const promptFiber = context.promptFiber;
+              yield* cancelRequests(context);
+              yield* Effect.ignore(context.runtime.cancel);
+              if (promptFiber) yield* Fiber.interrupt(promptFiber);
+              yield* finishTurn(turn, { state: "cancelled", stopReason: "cancelled" });
+            }),
+          ),
+        ),
+      );
+    },
+  );
 
   const interruptTurn: Adapter["interruptTurn"] = (threadId) =>
     Effect.gen(function* () {
       const context = yield* requireSession(threadId);
+      context.interruptEpoch += 1;
       // A command that outlived its turn keeps running in the agent, and
       // session/cancel only stops a prompt. The agent kills its background
       // commands when its session closes, so Stop with nothing else running

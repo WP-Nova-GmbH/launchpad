@@ -7,6 +7,7 @@
  *
  * @module CodexAdapterLive
  */
+import { validateTurnDelivery } from "../turnDelivery.ts";
 import {
   EventId,
   type CanonicalItemType,
@@ -58,6 +59,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import type { ProviderSendTurnCallbacks } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -67,7 +69,6 @@ import {
   makeCodexSessionRuntime,
   type CodexSessionRuntimeError,
   type CodexSessionRuntimeOptions,
-  type CodexSessionRuntimeSendTurnInput,
   type CodexSessionRuntimeShape,
 } from "./CodexSessionRuntime.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -141,6 +142,7 @@ function mapCodexRuntimeError(
   method: string,
   error: CodexSessionRuntimeError,
 ): ProviderAdapterError {
+  if (error._tag === "ProviderAdapterValidationError") return error;
   if (isCodexAppServerProcessExitedError(error) || isCodexAppServerTransportError(error)) {
     return new ProviderAdapterSessionClosedError({
       provider: PROVIDER,
@@ -2518,7 +2520,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     };
   });
 
-  const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
+  const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input, hooks) {
     // Codex ingests images only. Anything else would be inlined as an image
     // and rejected or misread; generic files reach the agent through the path
     // line ProviderService puts in the prompt. Images are passed by path
@@ -2531,6 +2533,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
 
     const session = yield* requireSession(input.threadId);
+    yield* validateTurnDelivery(PROVIDER, input, (yield* session.runtime.getSession).activeTurnId);
     const reasoningEffort =
       input.modelSelection?.instanceId === boundInstanceId
         ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
@@ -2541,6 +2544,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         : undefined;
     return yield* session.runtime
       .sendTurn({
+        ...(hooks?.beforeDispatch ? { beforeDispatch: hooks.beforeDispatch } : {}),
+        ...(input.delivery?.mode === "next-turn" ? { requireIdle: true } : {}),
+        ...(input.delivery?.mode === "steer" && input.delivery.expectedTurnId !== undefined
+          ? {
+              steer: {
+                expectedTurnId: input.delivery.expectedTurnId,
+                messageId: input.delivery.attemptId,
+              },
+            }
+          : {}),
         ...(input.input !== undefined ? { input: input.input } : {}),
         ...(input.modelSelection?.instanceId === boundInstanceId
           ? { model: input.modelSelection.model }
@@ -2554,7 +2567,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
         ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
       })
-      .pipe(Effect.mapError((cause) => mapCodexRuntimeError(input.threadId, "turn/start", cause)));
+      .pipe(
+        Effect.mapError((cause) =>
+          mapCodexRuntimeError(
+            input.threadId,
+            input.delivery?.mode === "steer" ? "turn/steer" : "turn/start",
+            cause,
+          ),
+        ),
+        Effect.tap((result) => hooks?.onAdmitted(result, "provider-ack") ?? Effect.void),
+      );
   });
 
   const requireSession = Effect.fn("requireSession")(function* (threadId: ThreadId) {
@@ -2578,11 +2600,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       ),
     );
 
-  const compactThread = Effect.fn("compactThread")(function* (threadId: ThreadId) {
+  const compactThread = Effect.fn("compactThread")(function* (
+    threadId: ThreadId,
+    _modelSelection?: ProviderSendTurnInput["modelSelection"],
+    beforeDispatch?: ProviderSendTurnCallbacks["beforeDispatch"],
+  ) {
     const session = yield* requireSession(threadId);
-    yield* session.runtime.compactThread.pipe(
-      Effect.mapError((cause) => mapCodexRuntimeError(threadId, "thread/compact/start", cause)),
-    );
+    yield* session.runtime
+      .compactThread(beforeDispatch)
+      .pipe(
+        Effect.mapError((cause) => mapCodexRuntimeError(threadId, "thread/compact/start", cause)),
+      );
   });
 
   const readThread: CodexAdapterShape["readThread"] = (threadId) =>

@@ -1,3 +1,13 @@
+import { RepositoryAccess, type RepositoryActor } from "../auth/RepositoryAccess.ts";
+import { AuthSessionRepository } from "../persistence/AuthSessions.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
+import { AuthSessionId, ThreadId } from "@t3tools/contracts";
+import {
+  parseThreadSegmentFromAttachmentId,
+  toSafeThreadAttachmentSegment,
+  PENDING_ATTACHMENT_THREAD_SEGMENT,
+} from "../attachmentStore.ts";
 import type { AssetResource } from "@t3tools/contracts";
 import {
   AssetAttachmentNotFoundError,
@@ -82,8 +92,16 @@ const PREVIEW_ASSET_EXTENSIONS = new Set([
   ".woff2",
 ]);
 
+export const AssetActorClaims = Schema.Struct({
+  sessionId: AuthSessionId,
+  userId: Schema.String,
+  environmentId: Schema.String,
+  threadId: Schema.optionalKey(ThreadId),
+});
+const assetActorFields = { access: Schema.optionalKey(AssetActorClaims) };
 const AssetClaimsSchema = Schema.Union([
   Schema.Struct({
+    ...assetActorFields,
     version: Schema.Literal(1),
     kind: Schema.Literal("workspace-file"),
     workspaceRoot: Schema.String,
@@ -91,6 +109,7 @@ const AssetClaimsSchema = Schema.Union([
     expiresAt: Schema.Number,
   }),
   Schema.Struct({
+    ...assetActorFields,
     version: Schema.Literal(1),
     kind: Schema.Literal("workspace-file-exact"),
     workspaceRoot: Schema.String,
@@ -98,6 +117,7 @@ const AssetClaimsSchema = Schema.Union([
     expiresAt: Schema.Number,
   }),
   Schema.Struct({
+    ...assetActorFields,
     version: Schema.Literal(1),
     kind: Schema.Literal("media-file-exact"),
     filePath: Schema.String,
@@ -106,6 +126,7 @@ const AssetClaimsSchema = Schema.Union([
     expiresAt: Schema.Number,
   }),
   Schema.Struct({
+    ...assetActorFields,
     version: Schema.Literal(1),
     kind: Schema.Literal("attachment"),
     attachmentId: Schema.String,
@@ -119,6 +140,7 @@ const AssetClaimsSchema = Schema.Union([
     expiresAt: Schema.Number,
   }),
   Schema.Struct({
+    ...assetActorFields,
     version: Schema.Literal(1),
     kind: Schema.Literal("project-favicon"),
     workspaceRoot: Schema.String,
@@ -126,18 +148,21 @@ const AssetClaimsSchema = Schema.Union([
     expiresAt: Schema.Number,
   }),
   Schema.Struct({
+    ...assetActorFields,
     version: Schema.Literal(1),
     kind: Schema.Literal("project-favicon-external"),
     filePath: Schema.String,
     expiresAt: Schema.Number,
   }),
   Schema.Struct({
+    ...assetActorFields,
     version: Schema.Literal(1),
     kind: Schema.Literal("native-app-icon"),
     app: ToolActivityNativeAppReference,
     expiresAt: Schema.Number,
   }),
   Schema.Struct({
+    ...assetActorFields,
     version: Schema.Literal(1),
     kind: Schema.Literal("github-media"),
     /** Already narrowed to a GitHub media host at mint time; the signature is what keeps it there. */
@@ -417,9 +442,43 @@ const finalizeWorkspaceFileAsset = Effect.fn("AssetAccess.finalizeWorkspaceFileA
 
 export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (input: {
   readonly resource: AssetResource;
+  readonly actor?: RepositoryActor & { readonly sessionId: AuthSessionId };
   readonly workspaceRoot?: string;
   readonly projectFaviconPath?: string;
 }) {
+  const repositoryAccess = yield* RepositoryAccess;
+  let accessClaims: typeof AssetActorClaims.Type | undefined;
+  if ((yield* repositoryAccess.status).enabled) {
+    if (!input.actor?.user)
+      return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
+    yield* repositoryAccess.requireMember(input.actor);
+    let threadId = "threadId" in input.resource ? input.resource.threadId : undefined;
+    if (input.resource._tag === "attachment") {
+      const segment = parseThreadSegmentFromAttachmentId(input.resource.attachmentId);
+      if (segment !== PENDING_ATTACHMENT_THREAD_SEGMENT) {
+        const query = yield* Effect.serviceOption(ProjectionSnapshotQuery);
+        if (Option.isNone(query))
+          return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
+        const snapshot = yield* query.value.getCommandReadModel().pipe(Effect.orDie);
+        const matches = snapshot.threads.filter(
+          (thread) => toSafeThreadAttachmentSegment(thread.id) === segment,
+        );
+        if (matches.length !== 1)
+          return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
+        threadId = matches[0]!.id;
+      }
+    }
+    if (threadId) yield* repositoryAccess.requireThread(input.actor, threadId);
+    const environment = yield* Effect.serviceOption(ServerEnvironment);
+    if (Option.isNone(environment))
+      return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
+    accessClaims = {
+      sessionId: input.actor.sessionId,
+      userId: input.actor.user.userId,
+      environmentId: yield* environment.value.getEnvironmentId,
+      ...(threadId ? { threadId } : {}),
+    };
+  }
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
@@ -693,6 +752,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
     }
   }
 
+  if (accessClaims) claims = { ...claims, access: accessClaims };
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const signingSecret = yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32).pipe(
     Effect.mapError(
@@ -720,6 +780,46 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
   };
 });
 
+export const validateAssetActorClaims = Effect.fn("AssetAccess.validateActor")(function* (
+  accessClaims: typeof AssetActorClaims.Type | undefined,
+) {
+  const repositoryAccess = yield* RepositoryAccess;
+  if ((yield* repositoryAccess.status).enabled) {
+    // Old transferable media URLs are invalid once this environment enforces policy.
+    if (!accessClaims) return false;
+    const environment = yield* Effect.serviceOption(ServerEnvironment);
+    if (
+      Option.isNone(environment) ||
+      accessClaims.environmentId !== (yield* environment.value.getEnvironmentId)
+    )
+      return false;
+    const sessions = yield* Effect.serviceOption(AuthSessionRepository);
+    if (Option.isNone(sessions)) return false;
+    const session = yield* sessions.value
+      .getById({ sessionId: accessClaims.sessionId })
+      .pipe(Effect.orElseSucceed(() => Option.none()));
+    if (
+      Option.isNone(session) ||
+      session.value.revokedAt !== null ||
+      session.value.expiresAt.epochMilliseconds <= (yield* Clock.currentTimeMillis) ||
+      session.value.user?.userId !== accessClaims.userId
+    )
+      return false;
+    const actor = { user: session.value.user };
+    const allowed = yield* (
+      accessClaims.threadId
+        ? repositoryAccess.requireThread(actor, accessClaims.threadId)
+        : repositoryAccess.requireMember(actor)
+    ).pipe(
+      Effect.as(true),
+      Effect.orElseSucceed(() => false),
+    );
+    if (!allowed) return false;
+  }
+
+  return true;
+});
+
 export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   token: string,
   relativePath: string,
@@ -737,6 +837,7 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
 
   const claims = decodeClaims(encodedPayload);
   if (!claims || claims.expiresAt <= (yield* Clock.currentTimeMillis)) return null;
+  if (!(yield* validateAssetActorClaims(claims.access))) return null;
 
   if (claims.kind === "attachment") {
     const config = yield* ServerConfig.ServerConfig;

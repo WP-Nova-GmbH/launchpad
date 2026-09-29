@@ -34,6 +34,8 @@ export const ProjectionThreadMessage = Schema.Struct({
   context: Schema.optional(OrchestrationMessageContext),
   isStreaming: Schema.Boolean,
   author: Schema.optional(AuthSessionUser),
+  editedBy: Schema.optional(AuthSessionUser),
+  steeredBy: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });

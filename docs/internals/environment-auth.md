@@ -58,14 +58,20 @@ after 30 days.
 
 ## The environment is the filesystem boundary
 
+Organization machines retain this shared filesystem boundary under
+[ADR-0017](../adr/0017-shared-machines-remain-trusted-environments.md). Repository-scoped thread
+permissions do not introduce per-repository agent sandboxes.
+
 Projects are organizational boundaries, not filesystem sandboxes.
 `orchestration:read` permits reading files the server account can read, including
 absolute paths outside a project. This lets clients display artifacts that an
 agent writes in a temporary directory. Relative paths and writes still follow
 the [workspace path rules](../../apps/server/src/workspace/WorkspaceFileSystem.ts).
 
-Signed asset URLs are bearer credentials. A URL for media on the host grants
-access to one canonical file and its device/inode identity, not its containing directory.
+On personal environments, signed asset URLs are bearer credentials. Organization environments
+also bind them to the issuing session and recheck current repository access; removing a grant or
+revoking that session invalidates subsequent access through the URL. A URL for media on the host
+grants access to one canonical file and its device/inode identity, not its containing directory.
 [Asset access](../../apps/server/src/assets/AssetAccess.ts) rechecks the opened
 file's identity when serving it, so atomic replacement requires a new URL while
 editing the same file in place does not. An HTML file authorized this way cannot

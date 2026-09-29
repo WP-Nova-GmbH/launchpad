@@ -4,7 +4,6 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import type * as EffectAcpErrors from "effect-acp/errors";
 
 import { type GrokSettings, type ModelSelection } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
@@ -121,7 +120,7 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
             onSome: (value) => Effect.succeed(value),
           }),
         ),
-        Effect.mapError((cause: EffectAcpErrors.AcpError | TextGenerationError) =>
+        Effect.mapError((cause) =>
           isTextGenerationError(cause)
             ? cause
             : new TextGenerationError({

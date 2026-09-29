@@ -44,6 +44,7 @@ import {
   requireThreadAbsent,
   requireThreadNotArchived,
 } from "./commandInvariants.ts";
+import { decidePromptQueueCommand } from "./promptQueueDecider.ts";
 import { projectEvent } from "./projector.ts";
 import { threadHasQueuedTurnStart } from "./ThreadSettlementPolicy.ts";
 
@@ -221,7 +222,173 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   OrchestrationCommandRejection | PlatformError.PlatformError,
   Crypto.Crypto
 > {
+  if (command.type === "thread.prompt.enqueue" && command.bootstrap) {
+    const { bootstrap, ...enqueue } = command;
+    const existing = readModel.threads.find(
+      (thread) => thread.id === command.threadId && thread.deletedAt === null,
+    );
+    const projectId = bootstrap.createThread?.projectId ?? existing?.projectId;
+    if (!projectId)
+      return yield* new OrchestrationCommandInvariantError({
+        commandType: command.type,
+        detail: "A bootstrap must identify its project.",
+      });
+    const project = yield* requireProject({ readModel, command, projectId });
+    if (bootstrap.prepareWorktree && bootstrap.prepareWorktree.projectCwd !== project.workspaceRoot)
+      return yield* new OrchestrationCommandInvariantError({
+        commandType: command.type,
+        detail: "Preparation must use the thread's project checkout.",
+      });
+    if (
+      existing &&
+      (existing.projectId !== projectId ||
+        existing.messages.length > 0 ||
+        existing.latestTurn ||
+        existing.session ||
+        existing.promptQueue?.preparation ||
+        (existing.promptQueue?.entries.length ?? 0) > 0)
+    )
+      return yield* new OrchestrationCommandInvariantError({
+        commandType: command.type,
+        detail: "Preparation cannot replace an existing conversation's workspace.",
+      });
+    return yield* decideCommandSequence({
+      readModel,
+      commands: [
+        ...(bootstrap.createThread
+          ? [
+              {
+                type: "thread.create" as const,
+                commandId: command.commandId,
+                threadId: command.threadId,
+                ...bootstrap.createThread,
+              },
+            ]
+          : []),
+        ...(bootstrap.prepareWorktree || bootstrap.runSetupScript
+          ? [
+              {
+                type: "thread.preparation.update" as const,
+                commandId: command.commandId,
+                threadId: command.threadId,
+                createdAt: command.createdAt,
+                expectedRevision: null,
+                preparation: {
+                  originalCommandId: command.commandId,
+                  attemptId: command.commandId,
+                  revision: 0,
+                  state: "pending" as const,
+                  settled: true,
+                  recipe: {
+                    projectCwd: project.workspaceRoot,
+                    ...(bootstrap.prepareWorktree
+                      ? { prepareWorktree: bootstrap.prepareWorktree }
+                      : {}),
+                    runSetupScript: bootstrap.runSetupScript === true,
+                  },
+                  ...(!bootstrap.prepareWorktree
+                    ? {
+                        target: {
+                          branch: bootstrap.createThread?.branch ?? existing?.branch ?? null,
+                          worktreePath:
+                            bootstrap.createThread?.worktreePath ?? existing?.worktreePath ?? null,
+                        },
+                      }
+                    : {}),
+                },
+              },
+            ]
+          : []),
+        enqueue,
+      ],
+    });
+  }
+  if (
+    "threadId" in command &&
+    [
+      "thread.archive",
+      "thread.settle",
+      "thread.auto-settle",
+      "thread.snooze",
+      "thread.checkpoint.revert",
+      "thread.conversation.revert",
+    ].includes(command.type)
+  ) {
+    const thread = readModel.threads.find((entry) => entry.id === command.threadId);
+    if (
+      thread?.promptQueue &&
+      (thread.promptQueue.entries.length > 0 ||
+        thread.promptQueue.handoff !== null ||
+        thread.promptQueue.awaitingTurnId !== null ||
+        (thread.promptQueue.preparation !== undefined &&
+          (thread.promptQueue.preparation.state !== "ready" ||
+            !thread.promptQueue.preparation.settled)))
+    ) {
+      return yield* new OrchestrationCommandInvariantError({
+        commandType: command.type,
+        detail: "Finish or remove accepted prompts before changing this thread's lifecycle.",
+      });
+    }
+  }
   switch (command.type) {
+    case "thread.preparation.update":
+    case "thread.preparation.retry":
+    case "thread.prompt.enqueue":
+    case "thread.prompt.edit":
+    case "thread.prompt.remove":
+    case "thread.prompt.steer":
+    case "thread.prompt.claim":
+    case "thread.prompt.admit":
+    case "thread.prompt.release":
+    case "thread.prompt.unknown":
+    case "thread.queue.pause":
+    case "thread.queue.resume":
+    case "thread.queue.resolve":
+    case "thread.queue.finalize": {
+      const thread = yield* requireThread({ readModel, command, threadId: command.threadId });
+      if (command.type === "thread.prompt.enqueue" && command.sourceProposedPlan) {
+        const source = readModel.threads.find(
+          (candidate) => candidate.id === command.sourceProposedPlan?.threadId,
+        );
+        if (
+          !source ||
+          source.projectId !== thread.projectId ||
+          !source.proposedPlans.some((plan) => plan.id === command.sourceProposedPlan?.planId)
+        )
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: "The proposed plan is missing or belongs to another project.",
+          });
+      }
+      const blocked = [...openRequests(thread).values()].some(
+        (activity) =>
+          activity.kind === "approval.requested" ||
+          !Predicate.isObject(activity.payload) ||
+          activity.payload.responseMode !== "message",
+      );
+      if (
+        command.type === "thread.preparation.retry" &&
+        command.target === "project" &&
+        thread.promptQueue?.preparation?.recipe === null
+      ) {
+        const project = yield* requireProject({ readModel, command, projectId: thread.projectId });
+        return yield* decidePromptQueueCommand(
+          {
+            ...thread,
+            promptQueue: {
+              ...thread.promptQueue,
+              preparation: {
+                ...thread.promptQueue.preparation,
+                recipe: { projectCwd: project.workspaceRoot, runSetupScript: false },
+              },
+            },
+          },
+          command,
+          blocked,
+        );
+      }
+      return yield* decidePromptQueueCommand(thread, command, blocked);
+    }
     case "project.create": {
       yield* requireProjectAbsent({
         readModel,
@@ -411,11 +578,22 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.delete": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
       });
+      const preparation = thread.promptQueue?.preparation;
+      if (
+        preparation &&
+        (preparation.state === "pending" || preparation.state === "running" || !preparation.settled)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail:
+            "Setup must finish stopping before this task can be deleted. Choose Stop setup and try Delete again.",
+        });
+      }
       const occurredAt = yield* nowIso;
       return {
         ...(yield* withEventBase({
@@ -926,6 +1104,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (
+        thread.promptQueue?.preparation &&
+        thread.promptQueue.preparation.state !== "ready" &&
+        (command.branch !== undefined || command.worktreePath !== undefined)
+      )
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Use the shared preparation recovery controls to change this workspace.",
+        });
       // Old clients only see the derived single link. Unlink that request through
       // the same command path as modern clients, including stack dismissal, while
       // retaining other links they cannot see. Historical metadata events still replay unchanged.
@@ -1555,6 +1742,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           threadId: command.threadId,
           messageId: command.message.messageId,
           role: "user",
+          ...(command.author ? { author: command.author } : {}),
           text: command.message.text,
           attachments: command.message.attachments,
           ...(command.message.context !== undefined ? { context: command.message.context } : {}),
@@ -1567,11 +1755,17 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.turn.interrupt": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
       });
+      if (thread.promptQueue)
+        return yield* decidePromptQueueCommand(
+          thread,
+          { ...command, type: "thread.queue.pause" },
+          false,
+        );
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
@@ -1621,20 +1815,22 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         threadId: command.threadId,
       });
       const request = userInputActivity;
+      if (request?.kind !== "user-input.requested") {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: request
+            ? "This question has already been answered."
+            : "This question is no longer pending.",
+        });
+      }
       const attachments = Object.values(command.attachmentsByQuestionId ?? {}).flat();
       let questionTextById: Record<string, string> = {};
       if (attachments.length > 0) {
-        const payload =
-          request?.kind === "user-input.requested"
-            ? decodeUserInputRequestedPayload(request.payload)
-            : Option.none();
+        const payload = decodeUserInputRequestedPayload(request.payload);
         if (Option.isNone(payload)) {
           return yield* new OrchestrationCommandInvariantError({
             commandType: command.type,
-            detail:
-              request?.kind === "user-input.resolved"
-                ? "This question has already been answered."
-                : "This question is no longer pending.",
+            detail: "This question is no longer pending.",
           });
         }
         questionTextById = Object.fromEntries(
@@ -1703,6 +1899,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
                   requestId: command.requestId,
                   responseMode: "message",
                   answers: command.answers,
+                  ...(command.author ? { author: command.author } : {}),
                   ...(command.attachmentsByQuestionId
                     ? { attachmentsByQuestionId: command.attachmentsByQuestionId }
                     : {}),
@@ -1716,6 +1913,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
               createdAt: command.createdAt,
               runtimeMode: thread.runtimeMode,
               interactionMode: thread.interactionMode,
+              ...(command.author ? { author: command.author } : {}),
               message: {
                 messageId: MessageId.make(`async-answer:${command.requestId}`),
                 role: "user",
@@ -1745,7 +1943,6 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           createdAt: command.createdAt,
         },
       };
-      if (attachments.length === 0) return responseEvent;
       const historyEvent = yield* decideOrchestrationCommand({
         readModel,
         command: {
@@ -1763,9 +1960,14 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             payload: {
               requestId: command.requestId,
               answers: command.answers,
+              ...(command.author ? { author: command.author } : {}),
               questionTextById,
-              attachmentsByQuestionId: command.attachmentsByQuestionId,
-              detail: attachments.map((attachment) => attachment.name).join("\n"),
+              ...(command.attachmentsByQuestionId
+                ? { attachmentsByQuestionId: command.attachmentsByQuestionId }
+                : {}),
+              ...(attachments.length > 0
+                ? { detail: attachments.map((attachment) => attachment.name).join("\n") }
+                : {}),
             },
           },
         },
@@ -1867,7 +2069,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           });
         }
       }
-      return {
+      const stoppedEvent: Omit<OrchestrationEvent, "sequence"> = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
@@ -1880,6 +2082,16 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           createdAt: command.createdAt,
         },
       };
+      if (!thread.promptQueue || command.onlyIfSettled) return stoppedEvent;
+      const pauseEvents = yield* decidePromptQueueCommand(
+        thread,
+        { ...command, type: "thread.queue.pause" },
+        false,
+      );
+      return [
+        ...pauseEvents.filter((event) => event.type === "thread.prompt-queue-changed"),
+        stoppedEvent,
+      ];
     }
 
     case "thread.session.set": {
@@ -1888,6 +2100,25 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (command.expectedPromptTurnId !== undefined) {
+        const queue = thread.promptQueue;
+        // A delayed delivery/compaction result cannot rewrite a successor's
+        // session, including while it is claimed but not yet admitted.
+        const ownsBoundary =
+          queue?.awaitingTurnId === command.expectedPromptTurnId ||
+          (queue?.finalizedTurnId === command.expectedPromptTurnId &&
+            queue.awaitingTurnId === null &&
+            queue.handoff === null);
+        if (
+          !ownsBoundary ||
+          (thread.session?.activeTurnId != null &&
+            thread.session.activeTurnId !== command.expectedPromptTurnId)
+        )
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: "The queued turn no longer owns this session.",
+          });
+      }
       const sessionSetEvent: Omit<OrchestrationEvent, "sequence"> = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
@@ -1902,6 +2133,29 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           session: command.session,
         },
       };
+      const queueBarrierEvents: Omit<OrchestrationEvent, "sequence">[] =
+        thread.promptQueue &&
+        thread.promptQueue.awaitingTurnId === null &&
+        !thread.promptQueue.handoff &&
+        command.session.status === "running" &&
+        command.session.activeTurnId !== null
+          ? [
+              {
+                ...(yield* withEventBase({
+                  aggregateKind: "thread",
+                  aggregateId: thread.id,
+                  occurredAt: command.createdAt,
+                  commandId: command.commandId,
+                })),
+                type: "thread.prompt-queue-changed",
+                payload: {
+                  threadId: thread.id,
+                  awaitingTurnId: command.session.activeTurnId,
+                  updatedAt: command.createdAt,
+                },
+              },
+            ]
+          : [];
       // Only a session coming alive is activity worth waking a settled thread
       // for — status writes like ready/stopped/error arrive after the fact and
       // must not fight a user's explicit settle. Snooze is deliberately NOT
@@ -1914,7 +2168,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command.session.status === "starting" || command.session.status === "running";
       // Real activity resets ANY override (settled wakes, active unpins).
       if (thread.settledOverride === null || !isSessionActivity) {
-        return sessionSetEvent;
+        return [sessionSetEvent, ...queueBarrierEvents];
       }
       const unsettledEvent: Omit<OrchestrationEvent, "sequence"> = {
         ...(yield* withEventBase({
@@ -1930,7 +2184,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           updatedAt: command.createdAt,
         },
       };
-      return [unsettledEvent, sessionSetEvent];
+      return [unsettledEvent, sessionSetEvent, ...queueBarrierEvents];
     }
 
     case "thread.message.assistant.delta":
@@ -2167,6 +2421,14 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (
+        command.preparationAttemptId !== undefined &&
+        thread.promptQueue?.preparation?.attemptId !== command.preparationAttemptId
+      )
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "This setup progress belongs to an older thread preparation.",
+        });
       const requestId =
         typeof command.activity.payload === "object" &&
         command.activity.payload !== null &&

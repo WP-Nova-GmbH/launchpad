@@ -151,6 +151,18 @@ on which they hold a role.
 
 ### Working on a machine together
 
+Your repository access determines which projects and threads you can open. Organization admins
+can access every repository. Machines share their filesystem and agent tools, so people using
+the same machine must trust one another with the files and capabilities available on it.
+
+Prompts use a [shared queue](composer.md#shared-threads-on-organization-machines). Anyone with
+access to the thread can edit or remove pending prompts, steer the running turn, and stop or
+resume the queue. Removing a person's access keeps work the machine already accepted.
+
+Access removal can show **Pending** while a machine is offline or cannot reach Launchpad Connect.
+That machine may continue honoring its last confirmed permissions until it receives the change.
+Removal completes once all affected machines confirm enforcement.
+
 A machine is shared, so a thread on it can have several people in it at once. Every prompt
 someone sends shows their name and picture above it, the way a chat does, so nobody has to
 guess who asked for what. Nothing is attributed on your own machine, where the only person

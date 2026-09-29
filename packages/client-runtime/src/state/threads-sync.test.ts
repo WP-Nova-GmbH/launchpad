@@ -40,6 +40,7 @@ import {
   ThreadSnapshotLoader,
   type EnvironmentThreadState,
 } from "./threads.ts";
+import { reconcileThreadVisibility, revokeThreadVisibility } from "./threadVisibility.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -142,6 +143,8 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   readonly resumeCache?: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]>;
   readonly loadCached?: Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>>;
   readonly saveThread?: Persistence.EnvironmentCacheStore["Service"]["saveThread"];
+  readonly loadSnapshot?: ThreadSnapshotLoader["Service"]["load"];
+  readonly removeThread?: Persistence.EnvironmentCacheStore["Service"]["removeThread"];
 }) {
   const inputs = yield* Queue.unbounded<TestThreadInput>();
   const observed = yield* Queue.unbounded<EnvironmentThreadState>();
@@ -149,6 +152,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const stateChangeCount = yield* Ref.make(0);
   const retryCount = yield* Ref.make(0);
   const subscriptionCount = yield* Ref.make(0);
+  const subscriptions = yield* Queue.unbounded<{ readonly afterSequence?: number }>();
   const loaderCalls = yield* Ref.make(0);
   const lastSubscribeAfterSequence = yield* Ref.make<number | undefined>(undefined);
   const lastRequestCompletionMarker = yield* Ref.make<boolean | undefined>(undefined);
@@ -181,6 +185,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
         Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
           Effect.andThen(Ref.set(lastSubscribeAfterSequence, input.afterSequence)),
           Effect.andThen(Ref.set(lastRequestCompletionMarker, input.requestCompletionMarker)),
+          Effect.andThen(Queue.offer(subscriptions, input)),
           Effect.as(streamFrom(inputs)),
         ),
       ),
@@ -197,14 +202,16 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     Option.some(PREPARED),
   );
   const snapshotLoader = ThreadSnapshotLoader.of({
-    load: (_prepared, threadId) =>
-      Ref.update(loaderCalls, (count) => count + 1).pipe(
-        Effect.as(
-          threadId === THREAD_ID
-            ? (options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>())
-            : Option.none<OrchestrationThreadDetailSnapshot>(),
-        ),
-      ),
+    load:
+      options?.loadSnapshot ??
+      ((_prepared, threadId) =>
+        Ref.update(loaderCalls, (count) => count + 1).pipe(
+          Effect.as(
+            threadId === THREAD_ID
+              ? (options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>())
+              : Option.none<OrchestrationThreadDetailSnapshot>(),
+          ),
+        )),
   });
   const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
     target: TARGET,
@@ -232,8 +239,10 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       Ref.update(savedThreads, (current) => [...current, thread]).pipe(
         Effect.andThen(options?.saveThread?.(environmentId, thread) ?? Effect.void),
       ),
-    removeThread: (_environmentId, threadId) =>
-      Ref.update(removedThreads, (current) => [...current, threadId]),
+    removeThread: (environmentId, threadId) =>
+      Ref.update(removedThreads, (current) => [...current, threadId]).pipe(
+        Effect.andThen(options?.removeThread?.(environmentId, threadId) ?? Effect.void),
+      ),
     loadServerConfig: () => Effect.succeedNone,
     saveServerConfig: () => Effect.void,
     loadVcsRefs: () => Effect.succeedNone,
@@ -269,6 +278,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     stateChangeCount,
     retryCount,
     subscriptionCount,
+    subscriptions,
     loaderCalls,
     lastSubscribeAfterSequence,
     lastRequestCompletionMarker,
@@ -1065,5 +1075,209 @@ describe("EnvironmentThreads", () => {
         expect(saved?.thread.session?.status).toBe("ready");
         expect(saved?.snapshotSequence).toBe(CACHED_SNAPSHOT_SEQUENCE + 1);
       }),
+  );
+
+  it.effect(
+    "recovers denied archived detail from a fresh authorized subscription without a shell entry",
+    () =>
+      Effect.gen(function* () {
+        revokeThreadVisibility(TARGET.environmentId, THREAD_ID);
+        const harness = yield* makeHarness();
+        expect((yield* Queue.take(harness.subscriptions)).afterSequence).toBeUndefined();
+        const archived = {
+          ...BASE_THREAD,
+          title: "Authorized archive",
+          archivedAt: "2026-09-28T00:00:00Z",
+        };
+        yield* Queue.offer(harness.inputs, snapshot(archived));
+        // Authorization restores visibility and starts a fresh subscription. The
+        // confirming snapshot must come from that new revision, never the old body.
+        expect((yield* Queue.take(harness.subscriptions)).afterSequence).toBeUndefined();
+        yield* Queue.offer(harness.inputs, snapshot(archived));
+        const restored = yield* awaitThreadState(harness.observed, (value) =>
+          Option.exists(value.data, (thread) => thread.title === archived.title),
+        );
+        expect(restored.status).toBe("live");
+      }),
+  );
+
+  it.effect("reloads archived detail when the active shell omits it but keeps its project", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_THREAD });
+      yield* Queue.take(harness.subscriptions);
+      reconcileThreadVisibility(
+        TARGET.environmentId,
+        [BASE_THREAD],
+        [],
+        [{ id: BASE_THREAD.projectId }],
+      );
+      const input = yield* Queue.take(harness.subscriptions);
+      expect(input.afterSequence).toBeUndefined();
+      expect(yield* Ref.get(harness.removedThreads)).toContain(THREAD_ID);
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot({ ...BASE_THREAD, archivedAt: "2026-09-28T00:00:00Z" }),
+      );
+      const restored = yield* awaitThreadState(harness.observed, (value) =>
+        Option.exists(value.data, (thread) => thread.archivedAt !== null),
+      );
+      expect(restored.status).toBe("live");
+
+      // This archived thread is now absent from both active lists. Its known
+      // project still lets a later policy revoke and regrant fence its detail.
+      reconcileThreadVisibility(TARGET.environmentId, [], [], []);
+      yield* awaitThreadState(harness.observed, (value) => value.status === "deleted");
+      reconcileThreadVisibility(TARGET.environmentId, [], [], [{ id: BASE_THREAD.projectId }]);
+      expect((yield* Queue.take(harness.subscriptions)).afterSequence).toBeUndefined();
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot({ ...BASE_THREAD, title: "Restored archive", archivedAt: "2026-09-28T00:00:00Z" }),
+      );
+      yield* awaitThreadState(harness.observed, (value) =>
+        Option.exists(value.data, (thread) => thread.title === "Restored archive"),
+      );
+    }),
+  );
+
+  for (const detailFirst of [true, false]) {
+    it.effect(`reloads restored access with ${detailFirst ? "detail" : "shell"} first`, () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({ cached: BASE_THREAD });
+        yield* Queue.take(harness.subscriptions);
+        revokeThreadVisibility(TARGET.environmentId, THREAD_ID);
+        yield* awaitThreadState(harness.observed, (value) => value.status === "deleted");
+        if (detailFirst) {
+          yield* Queue.offer(harness.inputs, snapshot({ ...BASE_THREAD, title: "Early detail" }));
+        }
+        reconcileThreadVisibility(
+          TARGET.environmentId,
+          [],
+          [BASE_THREAD],
+          [{ id: BASE_THREAD.projectId }],
+        );
+        const input = yield* Queue.take(harness.subscriptions);
+        expect(input.afterSequence).toBeUndefined();
+        yield* Queue.offer(harness.inputs, snapshot({ ...BASE_THREAD, title: "Restored" }));
+        const restored = yield* awaitThreadState(harness.observed, (value) =>
+          Option.exists(value.data, (thread) => thread.title === "Restored"),
+        );
+        expect(restored.status).toBe("live");
+        expect(yield* Ref.get(harness.removedThreads)).toContain(THREAD_ID);
+      }),
+    );
+  }
+
+  it.effect("a renewed revoke rejects an in-flight restoration snapshot", () =>
+    Effect.gen(function* () {
+      const loadStarted = yield* Deferred.make<void>();
+      const loadResult = yield* Deferred.make<Option.Option<OrchestrationThreadDetailSnapshot>>();
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        loadSnapshot: () =>
+          Deferred.succeed(loadStarted, undefined).pipe(Effect.andThen(Deferred.await(loadResult))),
+      });
+      yield* Queue.take(harness.subscriptions);
+      revokeThreadVisibility(TARGET.environmentId, THREAD_ID);
+      yield* awaitThreadState(harness.observed, (value) => value.status === "deleted");
+      reconcileThreadVisibility(
+        TARGET.environmentId,
+        [],
+        [BASE_THREAD],
+        [{ id: BASE_THREAD.projectId }],
+      );
+      yield* Deferred.await(loadStarted);
+      revokeThreadVisibility(TARGET.environmentId, THREAD_ID);
+      yield* awaitThreadState(harness.observed, (value) => value.status === "deleted");
+      yield* Deferred.succeed(
+        loadResult,
+        Option.some({
+          snapshotSequence: 20,
+          thread: { ...BASE_THREAD, title: "Stale restoration" },
+        }),
+      );
+      yield* Queue.take(harness.subscriptions);
+      expect(Option.isNone((yield* SubscriptionRef.get(harness.threadState)).data)).toBe(true);
+      reconcileThreadVisibility(
+        TARGET.environmentId,
+        [],
+        [BASE_THREAD],
+        [{ id: BASE_THREAD.projectId }],
+      );
+      yield* Queue.take(harness.subscriptions);
+      yield* Queue.offer(harness.inputs, snapshot({ ...BASE_THREAD, title: "Latest grant" }));
+      yield* awaitThreadState(harness.observed, (value) =>
+        Option.exists(value.data, (thread) => thread.title === "Latest grant"),
+      );
+    }),
+  );
+
+  it.effect("does not warm-resume a body revoked while its atom was inactive", () =>
+    Effect.gen(function* () {
+      const resumeCache: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]> = {
+        snapshot: undefined,
+        owner: undefined,
+      };
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const first = yield* makeHarness({ cached: BASE_THREAD, resumeCache });
+          yield* Queue.take(first.subscriptions);
+          yield* awaitThreadState(first.observed, (value) => value.status === "live");
+        }),
+      );
+      revokeThreadVisibility(TARGET.environmentId, THREAD_ID);
+      reconcileThreadVisibility(
+        TARGET.environmentId,
+        [],
+        [BASE_THREAD],
+        [{ id: BASE_THREAD.projectId }],
+      );
+      const reopened = yield* makeHarness({ resumeCache });
+      const request = yield* Queue.take(reopened.subscriptions);
+      expect(request.afterSequence).toBeUndefined();
+      expect(Option.isNone((yield* SubscriptionRef.get(reopened.threadState)).data)).toBe(true);
+      yield* Queue.offer(reopened.inputs, snapshot({ ...BASE_THREAD, title: "Authorized again" }));
+      yield* awaitThreadState(reopened.observed, (value) =>
+        Option.exists(value.data, (thread) => thread.title === "Authorized again"),
+      );
+    }),
+  );
+
+  it.effect("removes an old cache write that finishes after revoke and regrant", () =>
+    Effect.gen(function* () {
+      const writeStarted = yield* Deferred.make<void>();
+      const releaseWrite = yield* Deferred.make<void>();
+      const removals = yield* Queue.unbounded<void>();
+      const disk = yield* Ref.make<OrchestrationThreadDetailSnapshot | null>(null);
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        saveThread: (_environmentId, value) =>
+          Deferred.succeed(writeStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseWrite)),
+            Effect.andThen(Ref.set(disk, value)),
+          ),
+        removeThread: () =>
+          Ref.set(disk, null).pipe(Effect.andThen(Queue.offer(removals, undefined))),
+      });
+      yield* Queue.take(harness.subscriptions);
+      yield* Queue.offer(harness.inputs, titleUpdated("Before revocation", 8));
+      yield* awaitThreadState(harness.observed, (value) =>
+        Option.exists(value.data, (thread) => thread.title === "Before revocation"),
+      );
+      yield* TestClock.adjust("500 millis");
+      yield* Deferred.await(writeStarted);
+      revokeThreadVisibility(TARGET.environmentId, THREAD_ID);
+      yield* Queue.take(removals);
+      reconcileThreadVisibility(
+        TARGET.environmentId,
+        [],
+        [BASE_THREAD],
+        [{ id: BASE_THREAD.projectId }],
+      );
+      yield* Queue.take(removals);
+      yield* Queue.take(harness.subscriptions);
+      yield* Deferred.succeed(releaseWrite, undefined);
+      yield* Queue.take(removals);
+      expect(yield* Ref.get(disk)).toBeNull();
+    }),
   );
 });

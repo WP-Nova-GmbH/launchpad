@@ -1555,6 +1555,125 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("validates when the SDK consumes a prompt and leaves a rejected turn retryable", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({ threadId: THREAD_ID, runtimeMode: "full-access" });
+      let admitted = false;
+      const rejection = new ProviderAdapterValidationError({
+        provider: "claudeAgent",
+        operation: "sendTurn",
+        issue: "Stopped before SDK consumption",
+      });
+      const send = yield* adapter
+        .sendTurn(
+          {
+            threadId: THREAD_ID,
+            input: "rejected",
+            delivery: { attemptId: "rejected", mode: "next-turn" },
+          },
+          {
+            beforeDispatch: Effect.fail(rejection),
+            onAdmitted: () =>
+              Effect.sync(() => {
+                admitted = true;
+              }),
+          },
+        )
+        .pipe(Effect.result, Effect.forkChild);
+      const message = yield* Effect.promise(() =>
+        readFirstPromptText(harness.getLastCreateQueryInput()),
+      ).pipe(Effect.forkChild);
+      const result = yield* Fiber.join(send);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure, rejection);
+      assert.isFalse(admitted);
+      yield* adapter.sendTurn(
+        {
+          threadId: THREAD_ID,
+          input: "accepted",
+          delivery: { attemptId: "accepted", mode: "next-turn" },
+        },
+        { onAdmitted: () => Effect.void },
+      );
+      assert.equal(yield* Fiber.join(message), "accepted");
+      yield* adapter.stopSession(THREAD_ID);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("admits a shared prompt only when the SDK consumes it", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({ threadId: THREAD_ID, runtimeMode: "full-access" });
+      const started = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.started"),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      const admissions: string[] = [];
+      const send = yield* adapter
+        .sendTurn(
+          {
+            threadId: THREAD_ID,
+            input: "queued instruction",
+            delivery: { attemptId: "shared-admission", mode: "next-turn" },
+          },
+          {
+            onAdmitted: (_turn, evidence) =>
+              Effect.sync(() => {
+                admissions.push(evidence);
+              }),
+          },
+        )
+        .pipe(Effect.forkChild);
+      yield* Fiber.join(started);
+      assert.deepEqual(admissions, []);
+      const message = yield* Effect.promise(() =>
+        readFirstPromptText(harness.getLastCreateQueryInput()),
+      );
+      yield* Fiber.join(send);
+      assert.equal(message, "queued instruction");
+      assert.deepEqual(admissions, ["harness-dispatch"]);
+      yield* adapter.stopSession(THREAD_ID);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("rejects an unconsumed shared prompt when its provider exits", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({ threadId: THREAD_ID, runtimeMode: "full-access" });
+      const started = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.started"),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      let admitted = false;
+      const send = yield* adapter
+        .sendTurn(
+          {
+            threadId: THREAD_ID,
+            input: "never consumed",
+            delivery: { attemptId: "shared-exit", mode: "next-turn" },
+          },
+          {
+            onAdmitted: () =>
+              Effect.sync(() => {
+                admitted = true;
+              }),
+          },
+        )
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Fiber.join(started);
+      harness.query.finish();
+      const failure = yield* Fiber.join(send);
+      assert.instanceOf(failure, ProviderAdapterValidationError);
+      assert.isFalse(admitted);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
   it.effect("steers a running turn instead of opening a new one on mid-turn sendTurn", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

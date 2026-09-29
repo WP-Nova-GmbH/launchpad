@@ -3,6 +3,7 @@ import {
   RelayManagedEndpointRuntimeConfig,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import * as Config from "effect/Config";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
@@ -39,6 +40,42 @@ export const encodeCloudMachineIdentityJson = Schema.encodeEffect(
 export const decodeCloudMachineIdentity = Schema.decodeUnknownOption(
   Schema.fromJsonString(CloudMachineIdentity),
 );
+
+export function readInstalledMachineIdentity(
+  secrets: ServerSecretStore.ServerSecretStore["Service"],
+) {
+  return secrets
+    .get(CLOUD_MACHINE_IDENTITY)
+    .pipe(
+      Effect.map((bytes) =>
+        Option.isSome(bytes)
+          ? Option.getOrNull(decodeCloudMachineIdentity(new TextDecoder().decode(bytes.value)))
+          : null,
+      ),
+    );
+}
+
+/** Enrollment and access gating must agree about seeds ignored by personal environments. */
+export const readMachineEnrollmentConfiguration = Effect.fn(
+  "environment.machine.readEnrollmentConfiguration",
+)(function* (secrets: ServerSecretStore.ServerSecretStore["Service"]) {
+  const identity = yield* readInstalledMachineIdentity(secrets);
+  if (identity !== null) return { outcome: "already-enrolled", identity } as const;
+  const [seed, relayUrl, relayIssuer] = yield* Effect.all([
+    Config.NonEmptyString("T3CODE_MACHINE_ENROLLMENT_SEED").pipe(Config.option),
+    Config.NonEmptyString("T3CODE_MACHINE_ENROLLMENT_RELAY_URL").pipe(Config.option),
+    Config.NonEmptyString("T3CODE_MACHINE_ENROLLMENT_RELAY_ISSUER").pipe(Config.option),
+  ]);
+  if (Option.isNone(seed) || Option.isNone(relayUrl)) return { outcome: "not-a-machine" } as const;
+  if (Option.isSome(yield* secrets.get(CLOUD_LINKED_USER_ID)))
+    return { outcome: "linked-environment" } as const;
+  return {
+    outcome: "pending-enrollment",
+    seed: seed.value,
+    relayUrl: relayUrl.value,
+    relayIssuer: Option.getOrElse(relayIssuer, () => relayUrl.value),
+  } as const;
+});
 
 export const encodeEndpointRuntimeConfigJson = Schema.encodeEffect(
   Schema.fromJsonString(RelayManagedEndpointRuntimeConfig),

@@ -9,6 +9,7 @@
  *
  * @module ProviderServiceLive
  */
+import * as NodeUtil from "node:util";
 import {
   EventId,
   MessageId,
@@ -32,7 +33,9 @@ import {
   type ProviderInstanceId,
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
+  type RuntimeTurnState,
   type ProviderSession,
+  type ProviderTurnStartResult,
   type ServerSettings as ServerSettingsValue,
 } from "@t3tools/contracts";
 import { expandAssistantCitationsForProvider } from "@t3tools/shared/assistantCitations";
@@ -72,10 +75,14 @@ import {
 import {
   ProviderAdapterRequestError,
   type ProviderAdapterError,
+  type ProviderServiceError,
   ProviderValidationError,
   ProviderWorkspaceMissingError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterShape,
+  ProviderSendTurnCallbacks,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -240,6 +247,7 @@ interface PendingCompaction {
   readonly earlyEvents: ProviderRuntimeEvent[];
   compactedEventObserved: boolean;
   expectedTurnId: TurnId | undefined;
+  terminalTurnOutcome?: RuntimeTurnState;
 }
 
 /**
@@ -962,7 +970,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
     );
 
-  const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
+  const pendingDeliveries = new Map<
+    ThreadId,
+    { events: ProviderRuntimeEvent[]; buffer: boolean }
+  >();
+  const publishAdmittedRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Effect.succeed(event).pipe(
       Effect.tap((canonicalEvent) =>
         canonicalEventLogger
@@ -972,6 +984,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.flatMap((canonicalEvent) => PubSub.publish(runtimeEventPubSub, canonicalEvent)),
       Effect.asVoid,
     );
+
+  // Adapters may emit turn.started before their send call acknowledges. Keep
+  // those events behind the durable queue-to-message promotion.
+  const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      const pending = pendingDeliveries.get(event.threadId);
+      if (pending?.buffer && event.turnId !== undefined) {
+        pending.events.push(event);
+        return Effect.void;
+      }
+      return publishAdmittedRuntimeEvent(event);
+    });
 
   const isCompactedEvent = (
     event: ProviderRuntimeEvent,
@@ -1008,9 +1032,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         yield* publishRuntimeEvent(withCompactionRequestId(event, pending));
         return;
       }
-      yield* publishRuntimeEvent(event);
       const terminal = compactionTerminal(event);
+      if (matchesTurn && event.type === "turn.completed")
+        pending.terminalTurnOutcome = event.payload.state;
+      else if (matchesTurn && event.type === "turn.aborted")
+        pending.terminalTurnOutcome = "interrupted";
+      yield* publishRuntimeEvent(event);
       if (!matchesTurn || terminal === null) return;
+      // A runtime error can precede a terminal notification. It alone says
+      // nothing about whether this admitted turn has stopped.
+      if (event.type === "runtime.error") return;
       const settled = yield* settleCompaction(event.threadId, pending, terminal);
       if (!settled || terminal !== "completed" || pending.compactedEventObserved) return;
       const compactedEvent = {
@@ -1566,11 +1597,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
-  const sendTurn: ProviderServiceMethod<"sendTurn"> = Effect.fn("sendTurn")(function* (rawInput) {
+  const sendTurn: ProviderServiceMethod<"sendTurn"> = Effect.fn("sendTurn")(function* (raw, hooks) {
     const parsed = yield* decodeInputOrValidationError({
       operation: "ProviderService.sendTurn",
       schema: ProviderSendTurnInput,
-      payload: rawInput,
+      payload: raw,
     });
 
     const attachments = parsed.attachments ?? [];
@@ -1689,6 +1720,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         operation: "ProviderService.sendTurn",
         allowRecovery: false,
       });
+      if (input.delivery?.mode === "steer" && !routed.isActive) {
+        return yield* toValidationError(
+          "ProviderService.sendTurn",
+          "The target turn is no longer running. The prompt remains queued.",
+        );
+      }
       if (
         input.continuation === true &&
         !input.input &&
@@ -1721,6 +1758,44 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
       const analyticsModelSelection =
         input.modelSelection?.instanceId === routed.instanceId ? input.modelSelection : undefined;
+      if (input.delivery?.mode === "steer" && input.modelSelection !== undefined) {
+        const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+        const current = binding ? readPersistedModelSelection(binding.runtimePayload) : undefined;
+        if (
+          input.modelSelection.instanceId !== routed.instanceId ||
+          current === undefined ||
+          current.model !== input.modelSelection.model ||
+          !NodeUtil.isDeepStrictEqual(current.options ?? {}, input.modelSelection.options ?? {})
+        ) {
+          return yield* toValidationError(
+            "ProviderService.sendTurn",
+            "Steer cannot replace the running provider, model, or model options. The prompt remains queued.",
+          );
+        }
+      }
+      if (hooks && pendingDeliveries.has(input.threadId)) {
+        return yield* toValidationError(
+          "ProviderService.sendTurn",
+          "Another prompt is still being admitted for this thread.",
+        );
+      }
+      const persistAdmission = Effect.fnUntraced(function* (turn: ProviderTurnStartResult) {
+        yield* directory.upsert({
+          threadId: input.threadId,
+          provider: routed.adapter.provider,
+          providerInstanceId: routed.instanceId,
+          status: "running",
+          ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
+          runtimePayload: {
+            ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+            activeTurnId: turn.turnId,
+            continueAfterServerUpdate: null,
+            continueAfterServerUpdatePrepared: null,
+            lastRuntimeEvent: "provider.sendTurn",
+            lastRuntimeEventAt: yield* nowIso,
+          },
+        });
+      });
       const turn = yield* Effect.acquireUseRelease(
         beginTurnAnalytics({
           providerInstanceId: routed.instanceId,
@@ -1732,14 +1807,60 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }),
         (turnMetadata) =>
           Effect.gen(function* () {
-            const turn = yield* routed.adapter.sendTurn(input);
-            yield* associateTurnAnalytics({
-              providerInstanceId: routed.instanceId,
-              threadId: input.threadId,
-              turnId: String(turn.turnId),
-              metadata: turnMetadata,
-            });
-            return turn;
+            const associate = (turn: ProviderTurnStartResult) =>
+              associateTurnAnalytics({
+                providerInstanceId: routed.instanceId,
+                threadId: input.threadId,
+                turnId: String(turn.turnId),
+                metadata: turnMetadata,
+              });
+            if (!hooks) {
+              const turn = yield* routed.adapter.sendTurn(input);
+              yield* associate(turn);
+              yield* persistAdmission(turn);
+              return turn;
+            }
+            const pending = {
+              events: [] as ProviderRuntimeEvent[],
+              buffer: input.delivery?.mode !== "steer",
+            };
+            pendingDeliveries.set(input.threadId, pending);
+            let admitted = false;
+            const admissionCallbacks: ProviderSendTurnCallbacks = {
+              ...(hooks.beforeDispatch ? { beforeDispatch: hooks.beforeDispatch } : {}),
+              onAdmitted: (turn, evidence) =>
+                Effect.gen(function* () {
+                  if (admitted) return;
+                  yield* persistAdmission(turn).pipe(Effect.orDie);
+                  yield* associate(turn);
+                  yield* hooks.onAdmitted(turn, evidence);
+                  // Keep buffering until the entire early sequence is published;
+                  // new events cannot overtake turn.started while this yields.
+                  while (pending.events.length > 0) {
+                    const events = pending.events.splice(0);
+                    yield* Effect.forEach(events, publishAdmittedRuntimeEvent, { discard: true });
+                  }
+                  admitted = true;
+                  pendingDeliveries.delete(input.threadId);
+                }),
+            };
+            return yield* (hooks.beforeDispatch ?? Effect.void).pipe(
+              Effect.andThen(() => routed.adapter.sendTurn(input, admissionCallbacks)),
+              Effect.tap(() =>
+                admitted
+                  ? Effect.void
+                  : toValidationError(
+                      "ProviderService.sendTurn",
+                      "The provider did not admit this prompt. It remains queued.",
+                    ),
+              ),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  if (pendingDeliveries.get(input.threadId) === pending)
+                    pendingDeliveries.delete(input.threadId);
+                }),
+              ),
+            );
           }),
         (turnMetadata) =>
           clearPendingTurnAnalytics({
@@ -1748,22 +1869,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             requestId: turnMetadata.requestId,
           }),
       );
-      yield* directory.upsert({
-        threadId: input.threadId,
-        provider: routed.adapter.provider,
-        providerInstanceId: routed.instanceId,
-        status: "running",
-        ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
-        runtimePayload: {
-          ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-          activeTurnId: turn.turnId,
-          // Admission and marker consumption must survive the same restart.
-          continueAfterServerUpdate: null,
-          continueAfterServerUpdatePrepared: null,
-          lastRuntimeEvent: "provider.sendTurn",
-          lastRuntimeEventAt: yield* nowIso,
-        },
-      });
       yield* analytics.record("provider.turn.sent", {
         provider: routed.adapter.provider,
         model: input.modelSelection?.model,
@@ -1793,7 +1898,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   });
 
   const compactThread: ProviderServiceMethod<"compactThread"> = Effect.fn("compactThread")(
-    function* (threadId, modelSelection, requestId) {
+    function* (threadId, modelSelection, requestId, hooks) {
+      if (hooks && requestId === undefined) {
+        return yield* toValidationError(
+          "ProviderService.compactThread",
+          "Queued compaction requires a message id.",
+        );
+      }
       const routed = yield* resolveRoutableSession({
         threadId,
         operation: "ProviderService.compactThread",
@@ -1880,15 +1991,55 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             }),
         ),
       );
-      const terminal = yield* (
+      const completionWork: Effect.Effect<
+        { terminal: string; result: ProviderService.ProviderCompactionResult },
+        ProviderServiceError
+      > =
         compaction.type === "native"
-          ? awaitNativeCompaction(compaction.start(routed.threadId, modelSelection))
+          ? awaitNativeCompaction(
+              compaction
+                .start(routed.threadId, modelSelection, hooks?.beforeDispatch)
+                .pipe(
+                  Effect.tap(
+                    () =>
+                      hooks?.onAdmitted(
+                        { threadId, turnId: TurnId.make(`compaction:${requestId}`) },
+                        "provider-ack",
+                      ) ?? Effect.void,
+                  ),
+                ),
+            ).pipe(Effect.map((terminal) => ({ terminal, result: { type: "native" as const } })))
           : Effect.gen(function* () {
-              const turn = yield* sendTurn({
-                threadId,
-                input: compaction.command,
-                ...(modelSelection !== undefined ? { modelSelection } : {}),
-              }).pipe(
+              let admittedTurn: ProviderTurnStartResult | undefined;
+              const turn = yield* sendTurn(
+                {
+                  threadId,
+                  input: compaction.command,
+                  ...(modelSelection !== undefined ? { modelSelection } : {}),
+                  ...(hooks && requestId
+                    ? { delivery: { attemptId: requestId, mode: "next-turn" as const } }
+                    : {}),
+                },
+                hooks
+                  ? {
+                      ...hooks,
+                      onAdmitted: (turn, evidence) =>
+                        Effect.gen(function* () {
+                          admittedTurn = turn;
+                          pending.expectedTurnId = turn.turnId;
+                          yield* hooks.onAdmitted(turn, evidence);
+                          for (const event of pending.earlyEvents.splice(0)) {
+                            yield* processFallbackCompactionEvent(pending, event);
+                          }
+                        }),
+                    }
+                  : undefined,
+              ).pipe(
+                Effect.catch((error) =>
+                  admittedTurn !== undefined && pending.terminalTurnOutcome !== undefined
+                    ? Effect.succeed(admittedTurn)
+                    : Effect.fail(error),
+                ),
                 Effect.onError(() =>
                   Effect.forEach(pending.earlyEvents.splice(0), publishRuntimeEvent, {
                     discard: true,
@@ -1900,19 +2051,38 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               for (const earlyEvent of earlyEvents) {
                 yield* processFallbackCompactionEvent(pending, earlyEvent);
               }
-              return yield* awaitFallbackCompaction;
-            })
-      ).pipe(Effect.ensuring(clearPending));
-      if (terminal !== "completed") {
+              const terminal = yield* awaitFallbackCompaction;
+              if (pending.terminalTurnOutcome === undefined) {
+                return yield* new ProviderAdapterRequestError({
+                  provider: routed.adapter.provider,
+                  method: "turn/start",
+                  detail: `Context compaction ended without a confirmed turn outcome: ${terminal}.`,
+                });
+              }
+              return {
+                terminal,
+                result: {
+                  type: "turn" as const,
+                  turnId: turn.turnId,
+                  outcome: pending.terminalTurnOutcome,
+                },
+              };
+            });
+      const { terminal, result } = yield* completionWork.pipe(Effect.ensuring(clearPending));
+      if (result.type === "native" && terminal !== "completed") {
         return yield* new ProviderAdapterRequestError({
           provider: routed.adapter.provider,
           method: compaction.type === "native" ? "thread/compact" : "turn/start",
           detail: `Context compaction ended with ${terminal}.`,
         });
       }
-      yield* analytics.record("provider.thread.compacted", {
-        provider: routed.adapter.provider,
-      });
+      if (terminal === "completed")
+        yield* analytics
+          .record("provider.thread.compacted", {
+            provider: routed.adapter.provider,
+          })
+          .pipe(Effect.ignoreCause({ log: true }));
+      return result;
     },
   );
 

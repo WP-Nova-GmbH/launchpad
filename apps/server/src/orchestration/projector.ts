@@ -20,6 +20,7 @@ import {
   legacyThreadPullRequestKey,
   threadPullRequestKeysEqual,
 } from "@t3tools/shared/threadPullRequests";
+import { applyThreadPromptQueueChange } from "@t3tools/shared/threadPromptQueue";
 import { compareDateTimeStrings } from "@t3tools/shared/dateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -759,6 +760,25 @@ export function projectEvent(
         })),
       );
 
+    case "thread.prompt-queue-changed": {
+      const thread = nextBase.threads.find((entry) => entry.id === event.payload.threadId);
+      return Effect.succeed(
+        thread
+          ? {
+              ...nextBase,
+              threads: updateThread(nextBase.threads, thread.id, {
+                promptQueue: applyThreadPromptQueueChange(
+                  thread.promptQueue,
+                  event.payload,
+                  event.sequence,
+                ),
+                updatedAt: event.occurredAt,
+              }),
+            }
+          : nextBase,
+      );
+    }
+
     case "thread.message-sent":
       return Effect.gen(function* () {
         const payload = yield* decodeForEvent(
@@ -783,6 +803,8 @@ export function projectEvent(
             turnId: payload.turnId,
             streaming: payload.streaming,
             ...(payload.author !== undefined ? { author: payload.author } : {}),
+            ...(payload.editedBy !== undefined ? { editedBy: payload.editedBy } : {}),
+            ...(payload.steeredBy !== undefined ? { steeredBy: payload.steeredBy } : {}),
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
           },
@@ -808,6 +830,9 @@ export function projectEvent(
                       ? { attachments: message.attachments }
                       : {}),
                     ...(message.context !== undefined ? { context: message.context } : {}),
+                    ...(message.author ? { author: message.author } : {}),
+                    ...(message.editedBy ? { editedBy: message.editedBy } : {}),
+                    ...(message.steeredBy ? { steeredBy: message.steeredBy } : {}),
                   }
                 : entry,
             )

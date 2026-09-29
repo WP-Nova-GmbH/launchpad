@@ -527,3 +527,25 @@ export const relayDpopProofs = pgTable(
     index("idx_relay_dpop_proofs_expires_at").on(table.expiresAt),
   ],
 );
+
+// Updated in the same database transaction as membership/grant/enrollment changes.
+export const relayRepositoryPolicyRevisions = pgTable("relay_repository_policy_revisions", {
+  organizationId: varchar("organization_id", { length: 64 }).primaryKey(),
+  revision: integer("revision").notNull(),
+});
+// Retained even after deprovisioning: old credentials on an offline machine are not an ACK.
+export const relayRepositoryPolicyAcknowledgements = pgTable(
+  "relay_repository_policy_acknowledgements",
+  {
+    environmentId: varchar("environment_id", { length: 191 }).notNull(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    environmentPublicKey: text("environment_public_key").notNull(),
+    endpointHttpBaseUrl: text("endpoint_http_base_url"),
+    appliedRevision: integer("applied_revision").notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.organizationId, table.environmentId, table.environmentPublicKey],
+    }),
+  ],
+);

@@ -54,6 +54,10 @@ import { OrchestrationProjectionPipelineLive } from "../src/orchestration/Layers
 import { OrchestrationProjectionSnapshotQueryLive } from "../src/orchestration/Layers/ProjectionSnapshotQuery.ts";
 import * as ThreadBackgroundLiveness from "../src/orchestration/ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "../src/orchestration/ThreadPlanProgress.ts";
+import * as ThreadPreparationReactor from "../src/orchestration/ThreadPreparationReactor.ts";
+import * as WorktreeSetupTracker from "../src/project/WorktreeSetupTracker.ts";
+import { ProjectSetupScriptRunner } from "../src/project/ProjectSetupScriptRunner.ts";
+import { TerminalManager } from "../src/terminal/Manager.ts";
 import { RuntimeReceiptBusTest } from "../src/orchestration/Layers/RuntimeReceiptBus.ts";
 import { OrchestrationReactorLive } from "../src/orchestration/Layers/OrchestrationReactor.ts";
 import { ProviderCommandReactorLive } from "../src/orchestration/Layers/ProviderCommandReactor.ts";
@@ -383,6 +387,20 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(VcsProcess.layer),
     );
     const orchestrationReactorLayer = OrchestrationReactorLive.pipe(
+      Layer.provideMerge(
+        ThreadPreparationReactor.layer.pipe(
+          Layer.provideMerge(runtimeServicesLayer),
+          Layer.provideMerge(gitWorkflowLayer),
+          Layer.provideMerge(serverSettingsLayer),
+          Layer.provideMerge(WorktreeSetupTracker.layer),
+          Layer.provide(
+            Layer.mock(ProjectSetupScriptRunner, {
+              runForThread: () => Effect.succeed({ status: "no-script" as const }),
+            }),
+          ),
+          Layer.provide(Layer.mock(TerminalManager, { close: () => Effect.void })),
+        ),
+      ),
       Layer.provideMerge(
         Layer.succeed(StorageCleanup.StorageCleanup, {
           start: () => Effect.void,

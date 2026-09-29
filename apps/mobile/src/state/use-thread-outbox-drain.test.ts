@@ -137,13 +137,15 @@ import { appAtomRegistry } from "./atom-registry";
 import {
   clearPendingThreadCreationOutcome,
   pendingThreadCreationOutcomesAtom,
+  resolvePendingThreadCreation,
 } from "./pending-thread-creation";
 import type { QueuedThreadMessage } from "./thread-outbox-model";
 import * as composerDrafts from "./use-composer-drafts";
-import { recoverFailedThreadDraft } from "./recover-failed-thread-draft";
+import { copyUncertainThreadDraft, recoverFailedThreadDraft } from "./recover-failed-thread-draft";
 import { editingQueuedMessageIdsAtom } from "./use-thread-outbox";
 import {
   completeQueuedMessageDelivery,
+  completeQueuedMessageReceipt,
   prepareQueuedMessageAttachments,
   recoverEditedCreationAfterDelivery,
   removeAcknowledgedExistingThreadMessage,
@@ -330,6 +332,111 @@ describe("thread outbox attachment preparation", () => {
 });
 
 describe("thread outbox drain delivery cleanup", () => {
+  it("preserves edits made while an accepted receipt is outstanding", async () => {
+    const message = {
+      ...queuedMessage({ messageId: "receipt-edit", text: "Original" }),
+      acceptanceUncertain: true,
+      submissionProtocol: "review-required" as const,
+      creation: {
+        projectId: ProjectId.make("project-1"),
+        workspaceMode: "local" as const,
+        branch: null,
+        worktreePath: null,
+      },
+    };
+    await harness.manager.enqueue(message);
+    const revision = harness.manager.revisionOf(message.messageId);
+    const receipt = Promise.withResolvers<void>();
+    const reconciliation = receipt.promise.then(() =>
+      completeQueuedMessageReceipt(message, revision),
+    );
+    appAtomRegistry.set(editingQueuedMessageIdsAtom, { [message.messageId]: true });
+    await composerDrafts.mergeComposerDraftContent(`pending-task:${message.messageId}`, {
+      text: "Keep my new edit",
+      attachments: [],
+    });
+    receipt.resolve();
+    await expect(reconciliation).resolves.toBe(true);
+    expect(remainingMessages()[0]?.acceptedWithEdits).toBe(true);
+    expect(remainingMessages()[0]?.acceptanceUncertain).toBe(false);
+    expect(remainingMessages()[0]?.submissionProtocol).not.toBe("review-required");
+    // A trailing editor save cannot remove the durable acceptance marker.
+    await harness.manager.update({ ...message, text: "Keep my new edit" });
+    expect(remainingMessages()[0]?.acceptedWithEdits).toBe(true);
+    expect(remainingMessages()[0]?.acceptanceUncertain).toBe(false);
+    expect(remainingMessages()[0]?.submissionProtocol).not.toBe("review-required");
+    appAtomRegistry.set(editingQueuedMessageIdsAtom, {});
+    await expect(recoverEditedCreationAfterDelivery(message)).resolves.toBe(true);
+    expect(composerDrafts.getComposerDraftSnapshot("environment-1:thread-1").text).toBe(
+      "Keep my new edit",
+    );
+    expect(remainingMessages()).toEqual([]);
+  });
+
+  it("releases an uncertain creation after acceptance even when outcome cleanup precedes detail", async () => {
+    const message: QueuedThreadMessage = {
+      ...queuedMessage({ messageId: "receipt-uncertain", text: "Accepted later" }),
+      acceptanceUncertain: true,
+      submissionProtocol: "review-required",
+      creation: {
+        projectId: ProjectId.make("project-1"),
+        workspaceMode: "local",
+        branch: null,
+        worktreePath: null,
+      },
+    };
+    await harness.manager.enqueue(message);
+    const threadKey = "environment-1:thread-1";
+    const previous = resolvePendingThreadCreation({
+      threadKey,
+      pending: { message, outcome: null },
+      previous: null,
+      detail: null,
+    });
+    await expect(
+      completeQueuedMessageReceipt(message, harness.manager.revisionOf(message.messageId)),
+    ).resolves.toBe(true);
+    const outcome = appAtomRegistry.get(pendingThreadCreationOutcomesAtom)[threadKey]!;
+    expect(outcome.kind).toBe("delivered");
+    expect(outcome.message.acceptanceUncertain).toBe(false);
+    expect(outcome.message.submissionProtocol).not.toBe("review-required");
+    const accepted = resolvePendingThreadCreation({
+      threadKey,
+      pending: { message: outcome.message, outcome },
+      previous,
+      detail: null,
+    });
+    clearPendingThreadCreationOutcome(threadKey);
+    expect(remainingMessages()).toEqual([]);
+    expect(
+      resolvePendingThreadCreation({
+        threadKey,
+        pending: null,
+        previous: accepted,
+        detail: {
+          messages: [{ id: message.messageId }],
+          latestTurn: { turnId: "accepted-turn" },
+          session: { status: "running" },
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("copies an uncertain prompt without removing or duplicating its original", async () => {
+    const message = queuedMessage({
+      messageId: "uncertain-copy",
+      text: "Maybe delivered",
+      fileUri: "file:///documents/t3-composer-attachments/uncertain.pdf",
+    });
+    await harness.manager.enqueue(message);
+    await copyUncertainThreadDraft(message);
+    await copyUncertainThreadDraft(message);
+    expect(remainingMessages()).toEqual([message]);
+    const draft = composerDrafts.getComposerDraftSnapshot(`new-task:restored-${message.messageId}`);
+    expect(draft.text).toBe("Maybe delivered");
+    expect(draft.attachments).toHaveLength(1);
+    expect(harness.removePersistedFile).not.toHaveBeenCalled();
+  });
   it("removes an acknowledged outbox item even when the sign-out archive write fails", async () => {
     const message = queuedMessage({ messageId: "archive-write-failure", text: "Delivered" });
     await harness.manager.enqueue(message);

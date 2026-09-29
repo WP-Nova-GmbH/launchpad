@@ -48,6 +48,7 @@ import { ThreadBackgroundLivenessService } from "../ThreadBackgroundLiveness.ts"
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
+  type OrchestrationDispatchOptions,
 } from "../Services/OrchestrationEngine.ts";
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
@@ -57,6 +58,7 @@ const isOrchestrationCommandIdConflictError = Schema.is(OrchestrationCommandIdCo
 interface CommandEnvelope {
   command: OrchestrationCommand;
   origin: OrchestrationClientOrigin | undefined;
+  options: OrchestrationDispatchOptions | undefined;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
@@ -79,6 +81,15 @@ function commandToAggregateRef(command: OrchestrationCommand): {
         aggregateId: command.threadId,
       };
   }
+}
+
+function commandProjectScope(command: OrchestrationCommand, readModel: OrchestrationReadModel) {
+  if ("projectId" in command) return command.projectId;
+  const thread = readModel.threads.find((thread) => thread.id === command.threadId);
+  if (thread?.deletedAt === null) return thread.projectId;
+  if (command.type === "thread.prompt.enqueue" && command.bootstrap?.createThread)
+    return command.bootstrap.createThread.projectId;
+  return thread?.projectId ?? null;
 }
 
 const makeOrchestrationEngine = Effect.gen(function* () {
@@ -171,6 +182,74 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
+        if (envelope.options?.rejection) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: envelope.command.type,
+            detail: envelope.options.rejection.detail,
+          });
+        }
+        if (
+          envelope.command.type === "thread.create" ||
+          (envelope.command.type === "thread.prompt.enqueue" &&
+            envelope.command.bootstrap?.createThread)
+        ) {
+          const fences = yield* sql`SELECT 1 FROM thread_cleanup_fences
+            WHERE thread_id = ${envelope.command.threadId} LIMIT 1`.pipe(
+            Effect.mapError(toPersistenceSqlError("OrchestrationEngine.threadCleanupFence")),
+          );
+          if (fences.length > 0)
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail:
+                "Previous task processes have not been confirmed stopped. Retry after they exit.",
+            });
+        }
+        const deletion = envelope.options?.deletionPreconditions;
+        if (deletion) {
+          const changed = () =>
+            new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail:
+                "The task or its setup changed during deletion. Review it and choose Delete again.",
+            });
+          if (
+            yield* eventStore.hasEventAfter({
+              aggregateKind: "project",
+              aggregateId: deletion.projectId,
+              type: "project.created",
+              sequenceExclusive: deletion.snapshotSequence,
+            })
+          )
+            return yield* changed();
+          for (const captured of deletion.threads) {
+            const thread = commandReadModel.threads.find((t) => t.id === captured.threadId);
+            if (
+              !thread ||
+              thread.deletedAt !== null ||
+              thread.projectId !== deletion.projectId ||
+              (thread.promptQueue?.preparation?.attemptId ?? null) !==
+                captured.preparationAttemptId ||
+              (yield* eventStore.hasEventAfter({
+                aggregateKind: "thread",
+                aggregateId: captured.threadId,
+                type: "thread.created",
+                sequenceExclusive: deletion.snapshotSequence,
+              }))
+            )
+              return yield* changed();
+          }
+          if (
+            envelope.command.type === "project.delete" &&
+            commandReadModel.threads.some(
+              (thread) =>
+                thread.deletedAt === null &&
+                thread.projectId === deletion.projectId &&
+                !deletion.threads.some((captured) => captured.threadId === thread.id),
+            )
+          )
+            return yield* changed();
+        }
+
         if (
           envelope.command.type === "thread.auto-settle" &&
           (yield* eventStore.hasEventAfter({
@@ -235,6 +314,23 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           }
         }
 
+        // Shared admission depends on durable request state, including after restart.
+        if (
+          envelope.command.type === "thread.prompt.claim" ||
+          envelope.command.type === "thread.prompt.steer"
+        ) {
+          const detailed = yield* projectionSnapshotQuery.getThreadDetailById(
+            envelope.command.threadId,
+          );
+          if (Option.isSome(detailed))
+            commandReadModel = {
+              ...commandReadModel,
+              threads: commandReadModel.threads.map((thread) =>
+                thread.id === detailed.value.id ? detailed.value : thread,
+              ),
+            };
+        }
+
         // Command snapshots omit activities at startup and cap them while running.
         // Read this request's durable state before deciding how to send the answer.
         const userInputActivity =
@@ -297,6 +393,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 commandId: envelope.command.commandId,
                 aggregateKind: lastSavedEvent.aggregateKind,
                 aggregateId: lastSavedEvent.aggregateId,
+                projectId: commandProjectScope(envelope.command, nextCommandReadModel),
                 acceptedAt: lastSavedEvent.occurredAt,
                 resultSequence: lastSavedEvent.sequence,
                 status: "accepted",
@@ -371,7 +468,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             return;
           }
 
-          const error = Cause.squash(exit.cause) as OrchestrationDispatchError;
+          let error = Cause.squash(exit.cause) as OrchestrationDispatchError;
           if (
             !isOrchestrationCommandPreviouslyRejectedError(error) &&
             !isOrchestrationCommandIdConflictError(error)
@@ -390,17 +487,23 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             );
 
             if (isOrchestrationCommandRejection(error)) {
-              yield* commandReceiptRepository
+              const saved = yield* commandReceiptRepository
                 .upsert({
                   commandId: envelope.command.commandId,
                   aggregateKind: aggregateRef.aggregateKind,
                   aggregateId: aggregateRef.aggregateId,
+                  projectId:
+                    envelope.options?.rejection?.projectId ??
+                    envelope.options?.deletionPreconditions?.projectId ??
+                    commandProjectScope(envelope.command, commandReadModel),
                   acceptedAt: yield* nowIso,
                   resultSequence: commandReadModel.snapshotSequence,
                   status: "rejected",
                   error: error.message,
                 })
-                .pipe(Effect.ignore);
+                .pipe(Effect.result);
+              // A failed receipt write is unresolved, not a durable rejection.
+              if (saved._tag === "Failure") error = saved.failure;
             }
           }
 
@@ -441,6 +544,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       yield* Queue.offer(commandQueue, {
         command,
         origin: options?.origin,
+        options,
         result,
         startedAtMs: yield* Clock.currentTimeMillis,
       });

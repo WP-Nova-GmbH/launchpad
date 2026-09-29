@@ -1,3 +1,5 @@
+import { applyRepositoryPolicyProof } from "./repositoryPolicy.ts";
+import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   AuthRelayReadScope,
@@ -1493,7 +1495,6 @@ const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
       });
     }
     const proof = proofOption.value;
-
     const jtiSecretName = `${CLOUD_HEALTH_JTI_PREFIX}${proof.jti}`;
     const nonceSecretName = `${CLOUD_HEALTH_NONCE_PREFIX}${proof.nonce}`;
     const consumedReplayGuards = yield* consumeCloudReplayGuards({
@@ -1588,6 +1589,23 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
       });
     }
     const proof = proofOption.value;
+    const repositoryAccess = yield* RepositoryAccess;
+    yield* repositoryAccess
+      .requireMember({
+        user: {
+          userId: proof.sub,
+          displayName: proof.name ?? null,
+          imageUrl: proof.picture ?? null,
+        },
+      })
+      .pipe(
+        Effect.mapError(
+          () =>
+            new EnvironmentHttpUnauthorizedError({
+              message: "Repository policy is unavailable or access was removed.",
+            }),
+        ),
+      );
 
     const jtiSecretName = `${CLOUD_MINT_JTI_PREFIX}${proof.jti}`;
     const nonceSecretName = `${CLOUD_MINT_NONCE_PREFIX}${proof.nonce}`;
@@ -1838,11 +1856,7 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
     failEnvironmentCloudInternalError("Could not answer the cloud job dispatch request."),
   ),
   Effect.catchTag(
-    "RelayJwtError",
-    failEnvironmentCloudInternalError("Could not answer the cloud job dispatch request."),
-  ),
-  Effect.catchTag(
-    "PlatformError",
+    ["RelayJwtError", "PlatformError"],
     failEnvironmentCloudInternalError("Could not answer the cloud job dispatch request."),
   ),
 );
@@ -1857,6 +1871,7 @@ export const connectHttpApiLayer = HttpApiBuilder.group(
     // into this layer's scope — the request scope closes with the response.
     const jobScope = yield* Effect.scope;
     return handlers
+      .handle("repositoryPolicy", ({ payload }) => applyRepositoryPolicyProof(payload))
       .handle("linkProof", ({ payload }) => cloudLinkProofHandler(dependencies, payload))
       .handle("relayConfig", ({ payload }) => cloudRelayConfigHandler(dependencies, payload))
       .handle("linkState", () => cloudLinkStateHandler(dependencies))

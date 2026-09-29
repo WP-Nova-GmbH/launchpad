@@ -23,10 +23,10 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ManagedEndpointRuntime from "./ManagedEndpointRuntime.ts";
 import {
   CLOUD_ENDPOINT_RUNTIME_CONFIG,
-  CLOUD_LINKED_USER_ID,
   CLOUD_MACHINE_IDENTITY,
   CLOUD_MINT_PUBLIC_KEY,
-  decodeCloudMachineIdentity,
+  readInstalledMachineIdentity,
+  readMachineEnrollmentConfiguration,
   encodeCloudMachineIdentityJson,
   encodeEndpointRuntimeConfigJson,
   PUBLISH_AGENT_ACTIVITY_SECRET,
@@ -37,20 +37,7 @@ import {
 } from "./config.ts";
 import { getOrCreateEnvironmentKeyPairFromSecretStore } from "./environmentKeys.ts";
 
-/**
- * How a provisioned machine finds its way home (ADR-0002). The compute driver
- * injects these into the instance; the seed is single-use and dead the moment
- * enrollment succeeds, so a restart re-reading it is harmless.
- */
-const machineEnrollmentSeedConfig = Config.NonEmptyString("T3CODE_MACHINE_ENROLLMENT_SEED").pipe(
-  Config.option,
-);
-const machineEnrollmentRelayUrlConfig = Config.NonEmptyString(
-  "T3CODE_MACHINE_ENROLLMENT_RELAY_URL",
-).pipe(Config.option);
-const machineEnrollmentRelayIssuerConfig = Config.NonEmptyString(
-  "T3CODE_MACHINE_ENROLLMENT_RELAY_ISSUER",
-).pipe(Config.option);
+export { readInstalledMachineIdentity } from "./config.ts";
 /**
  * The origin other parties can reach this machine on, when it differs from the
  * loopback origin the server binds — a Docker driver maps the container port
@@ -111,20 +98,6 @@ function bytesToString(bytes: Uint8Array): string {
 
 function stringToBytes(value: string): Uint8Array {
   return new TextEncoder().encode(value);
-}
-
-export function readInstalledMachineIdentity(
-  secrets: ServerSecretStore.ServerSecretStore["Service"],
-) {
-  return secrets
-    .get(CLOUD_MACHINE_IDENTITY)
-    .pipe(
-      Effect.map((bytes) =>
-        Option.isSome(bytes)
-          ? Option.getOrNull(decodeCloudMachineIdentity(bytesToString(bytes.value)))
-          : null,
-      ),
-    );
 }
 
 export interface ManagedExecutorRelayConfig {
@@ -230,38 +203,21 @@ export const reconcileMachineEnrollment = Effect.fn("environment.machine.reconci
     const endpointRuntime = yield* ManagedEndpointRuntime.CloudManagedEndpointRuntime;
     const httpClient = yield* HttpClient.HttpClient;
 
-    const installed = yield* readInstalledMachineIdentity(secrets);
-    if (installed !== null) {
-      return {
-        outcome: "already-enrolled",
-        identity: installed,
-      } satisfies MachineEnrollmentOutcome;
-    }
-    const [seed, relayUrlRaw, relayIssuerRaw] = yield* Effect.all([
-      machineEnrollmentSeedConfig,
-      machineEnrollmentRelayUrlConfig,
-      machineEnrollmentRelayIssuerConfig,
-    ]).pipe(
+    const configuration = yield* readMachineEnrollmentConfiguration(secrets).pipe(
       Effect.mapError(
         (cause) => new MachineEnrollmentFailed({ stage: "read-configuration", cause }),
       ),
     );
-    if (Option.isNone(seed) || Option.isNone(relayUrlRaw)) {
-      return { outcome: "not-a-machine" } satisfies MachineEnrollmentOutcome;
-    }
     // An environment someone already linked can never become a machine; the
     // relay refuses this too, but failing fast keeps the seed unconsumed.
-    const linkedUser = yield* secrets.get(CLOUD_LINKED_USER_ID);
-    if (Option.isSome(linkedUser)) {
+    if (configuration.outcome === "linked-environment") {
       yield* Effect.logWarning(
         "Ignoring the machine enrollment seed: this environment is already linked to a cloud account",
       );
-      return { outcome: "linked-environment" } satisfies MachineEnrollmentOutcome;
     }
-    const relayUrl = normalizeMachineRelayUrl(relayUrlRaw.value);
-    const relayIssuer = normalizeMachineRelayUrl(
-      Option.isSome(relayIssuerRaw) ? relayIssuerRaw.value : relayUrlRaw.value,
-    );
+    if (configuration.outcome !== "pending-enrollment") return configuration;
+    const relayUrl = normalizeMachineRelayUrl(configuration.relayUrl);
+    const relayIssuer = normalizeMachineRelayUrl(configuration.relayIssuer);
     if (relayUrl === null || relayIssuer === null) {
       return yield* new MachineEnrollmentFailed({ stage: "validate-relay-url" });
     }
@@ -298,7 +254,7 @@ export const reconcileMachineEnrollment = Effect.fn("environment.machine.reconci
       ),
       iat: Math.floor(now.epochMilliseconds / 1_000),
       exp: Math.floor(expiresAt.epochMilliseconds / 1_000),
-      seed: seed.value,
+      seed: configuration.seed,
       descriptor,
       environmentId: descriptor.environmentId,
       environmentPublicKey: keyPair.publicKey.trim(),

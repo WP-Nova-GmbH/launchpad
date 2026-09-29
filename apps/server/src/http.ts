@@ -1,3 +1,5 @@
+import { RepositoryAccess } from "./auth/RepositoryAccess.ts";
+import * as Fiber from "effect/Fiber";
 import * as Mime from "effect/unstable/http/Mime";
 import {
   AuthOrchestrationOperateScope,
@@ -168,6 +170,8 @@ export const assetFileResponse = Effect.fn("assetFileResponse")(function* (
   method: "GET" | "HEAD" = "GET",
 ) {
   const headers = assetResponseHeaders(asset.path, asset);
+  const repositoryAccess = yield* RepositoryAccess;
+  if ((yield* repositoryAccess.status).enabled) headers["Cache-Control"] = "private, no-store";
   const mediaFile = asset.file;
   const mediaInfo = mediaFile ? yield* statMediaFile(asset.path, mediaFile) : undefined;
   const isMedia = /^(?:audio|video)\//i.test(headers["Content-Type"] ?? "");
@@ -388,9 +392,22 @@ export const assetRouteLayer = HttpRouter.add(
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
 
-    const asset = yield* resolveAsset(
-      suffix.slice(0, separatorIndex),
-      suffix.slice(separatorIndex + 1),
+    const repositoryAccess = yield* RepositoryAccess;
+    const requestFiber = yield* Effect.fiber;
+    const asset = yield* repositoryAccess.withFence(
+      Effect.gen(function* () {
+        const resolved = yield* resolveAsset(
+          suffix.slice(0, separatorIndex),
+          suffix.slice(separatorIndex + 1),
+        );
+        if (resolved && (yield* repositoryAccess.status).enabled) {
+          const unregister = yield* repositoryAccess.registerConnection(
+            Fiber.interrupt(requestFiber),
+          );
+          yield* Effect.addFinalizer(() => Effect.sync(unregister));
+        }
+        return resolved;
+      }),
     );
     if (!asset) {
       return HttpServerResponse.text("Not Found", { status: 404 });
@@ -433,7 +450,20 @@ export const attachmentUploadRouteLayer = HttpRouter.add(
     if (!token) {
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
-    const claims = yield* validateAttachmentUploadToken(token);
+    const repositoryAccess = yield* RepositoryAccess;
+    const requestFiber = yield* Effect.fiber;
+    const claims = yield* repositoryAccess.withFence(
+      Effect.gen(function* () {
+        const value = yield* validateAttachmentUploadToken(token);
+        if (value && (yield* repositoryAccess.status).enabled) {
+          const unregister = yield* repositoryAccess.registerConnection(
+            Fiber.interrupt(requestFiber),
+          );
+          yield* Effect.addFinalizer(() => Effect.sync(unregister));
+        }
+        return value;
+      }),
+    );
     if (!claims) {
       return HttpServerResponse.text("Not Found", { status: 404 });
     }

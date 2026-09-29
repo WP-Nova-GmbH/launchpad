@@ -5,7 +5,7 @@ import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Struct from "effect/Struct";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import { ProviderOptionSelections } from "./model.ts";
-import { RepositoryIdentity, ThreadEnvMode } from "./environment.ts";
+import { RepositoryIdentity, ThreadEnvMode, WorktreeSubmodules } from "./environment.ts";
 import { AuthSessionUser } from "./auth.ts";
 import {
   ApprovalRequestId,
@@ -35,6 +35,7 @@ import {
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
+  getCommandReceipt: "orchestration.getCommandReceipt",
   getWorkflowScript: "orchestration.getWorkflowScript",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",
@@ -584,6 +585,8 @@ export const OrchestrationMessage = Schema.Struct({
   streaming: Schema.Boolean,
   /** Who sent a user message. Absent when the session had no signed-in user. */
   author: Schema.optional(AuthSessionUser),
+  editedBy: Schema.optional(AuthSessionUser),
+  steeredBy: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -825,7 +828,165 @@ export const ThreadPullRequestLink = Schema.Struct({
 });
 export type ThreadPullRequestLink = typeof ThreadPullRequestLink.Type;
 
+const ThreadTurnStartBootstrapCreateThread = Schema.Struct({
+  projectId: ProjectId,
+  title: TrimmedNonEmptyString,
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  branch: Schema.NullOr(TrimmedNonEmptyString),
+  worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+  createdAt: IsoDateTime,
+});
+
+const ThreadTurnStartBootstrapPrepareWorktree = Schema.Struct({
+  projectCwd: TrimmedNonEmptyString,
+  baseBranch: TrimmedNonEmptyString,
+  branch: Schema.optional(TrimmedNonEmptyString),
+  startFromOrigin: Schema.optional(Schema.Boolean),
+  requireWorktree: Schema.optional(Schema.Boolean),
+});
+
+const ThreadTurnStartBootstrap = Schema.Struct({
+  createThread: Schema.optional(ThreadTurnStartBootstrapCreateThread),
+  prepareWorktree: Schema.optional(ThreadTurnStartBootstrapPrepareWorktree),
+  runSetupScript: Schema.optional(Schema.Boolean),
+});
+
+export type ThreadTurnStartBootstrap = typeof ThreadTurnStartBootstrap.Type;
+
+/** Durable ownership of preparation is independent of the first queued prompt. */
+export const ThreadPreparation = Schema.Struct({
+  originalCommandId: CommandId,
+  attemptId: CommandId,
+  revision: NonNegativeInt,
+  state: Schema.Literals(["pending", "running", "ready", "failed"]),
+  settled: Schema.Boolean,
+  recipe: Schema.NullOr(
+    Schema.Struct({
+      projectCwd: TrimmedNonEmptyString,
+      prepareWorktree: Schema.optional(ThreadTurnStartBootstrapPrepareWorktree),
+      runSetupScript: Schema.Boolean,
+    }),
+  ),
+  target: Schema.optional(
+    Schema.Struct({
+      branch: Schema.NullOr(TrimmedNonEmptyString),
+      worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+      baseRef: Schema.optional(TrimmedNonEmptyString),
+      submodules: Schema.optional(Schema.NullOr(WorktreeSubmodules)),
+    }),
+  ),
+  script: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        id: TrimmedNonEmptyString,
+        name: TrimmedNonEmptyString,
+        command: TrimmedNonEmptyString,
+        async: Schema.Boolean,
+      }),
+    ),
+  ),
+  failure: Schema.optional(
+    Schema.Struct({
+      reason: Schema.Literals(["failed", "interrupted", "cancelled", "legacy-needs-review"]),
+      detail: Schema.String,
+    }),
+  ),
+});
+export type ThreadPreparation = typeof ThreadPreparation.Type;
+export const ThreadPreparationSummary = Schema.Struct({
+  state: ThreadPreparation.fields.state,
+  settled: Schema.Boolean,
+  revision: NonNegativeInt,
+});
+
+export const ThreadPromptPauseReason = Schema.Struct({
+  code: Schema.Literals([
+    "stopped",
+    "failed",
+    "usage-limit",
+    "checkpoint-error",
+    "delivery-unknown",
+  ]),
+  detail: Schema.String,
+});
+export type ThreadPromptPauseReason = typeof ThreadPromptPauseReason.Type;
+
+export const ThreadPromptQueueEntry = Schema.Struct({
+  messageId: MessageId,
+  text: Schema.String,
+  attachments: Schema.Array(ChatAttachment),
+  context: Schema.optional(OrchestrationMessageContext),
+  modelSelection: Schema.optional(ModelSelection),
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  titleSeed: Schema.optional(TrimmedNonEmptyString),
+  sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  author: Schema.optional(AuthSessionUser),
+  editedBy: Schema.optional(AuthSessionUser),
+  steeredBy: Schema.optional(AuthSessionUser),
+  revision: NonNegativeInt,
+  acceptedSequence: NonNegativeInt,
+  createdAt: IsoDateTime,
+  state: Schema.Literals(["pending", "delivering", "unknown"]),
+});
+export type ThreadPromptQueueEntry = typeof ThreadPromptQueueEntry.Type;
+export const ThreadPromptHandoff = Schema.Struct({
+  attemptId: CommandId,
+  messageId: MessageId,
+  revision: NonNegativeInt,
+  controlRevision: NonNegativeInt,
+  mode: Schema.Literals(["next-turn", "steer"]),
+  expectedTurnId: Schema.optional(TurnId),
+  steeredBy: Schema.optional(AuthSessionUser),
+});
+export type ThreadPromptHandoff = typeof ThreadPromptHandoff.Type;
+export const ThreadPromptQueueControl = Schema.Struct({
+  enabled: Schema.Boolean,
+  revision: NonNegativeInt,
+  pauseReason: Schema.NullOr(ThreadPromptPauseReason),
+});
+export const ThreadPromptAdmission = Schema.Struct({
+  prompt: Schema.optional(ThreadPromptQueueEntry),
+  handoff: Schema.optional(ThreadPromptHandoff),
+  attemptId: CommandId,
+  messageId: MessageId,
+  turnId: TurnId,
+  evidence: Schema.Literals(["provider-ack", "harness-dispatch", "local-command"]),
+});
+export const ThreadPromptQueue = Schema.Struct({
+  preparation: Schema.optional(ThreadPreparation),
+  ...ThreadPromptQueueControl.fields,
+  entries: Schema.Array(ThreadPromptQueueEntry),
+  handoff: Schema.NullOr(ThreadPromptHandoff),
+  awaitingTurnId: Schema.NullOr(TurnId),
+  admissions: Schema.Array(ThreadPromptAdmission),
+  finalizedTurnId: Schema.NullOr(TurnId),
+});
+export type ThreadPromptQueue = typeof ThreadPromptQueue.Type;
+export const ThreadPromptQueueSummary = Schema.Struct({
+  preparation: Schema.optional(ThreadPreparationSummary),
+  count: NonNegativeInt,
+  enabled: Schema.Boolean,
+  pauseReason: Schema.NullOr(ThreadPromptPauseReason),
+});
+export const ThreadPromptQueueChangedPayload = Schema.Struct({
+  preparation: Schema.optional(ThreadPreparation),
+  threadId: ThreadId,
+  entry: Schema.optional(ThreadPromptQueueEntry),
+  removedMessageId: Schema.optional(MessageId),
+  control: Schema.optional(ThreadPromptQueueControl),
+  handoff: Schema.optional(Schema.NullOr(ThreadPromptHandoff)),
+  awaitingTurnId: Schema.optional(Schema.NullOr(TurnId)),
+  admission: Schema.optional(ThreadPromptAdmission),
+  finalizedTurnId: Schema.optional(Schema.NullOr(TurnId)),
+  updatedAt: IsoDateTime,
+});
+export type ThreadPromptQueueChangedPayload = typeof ThreadPromptQueueChangedPayload.Type;
+
 export const OrchestrationThread = Schema.Struct({
+  promptQueue: Schema.optional(ThreadPromptQueue),
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
@@ -917,6 +1078,7 @@ export const OrchestrationProjectShell = Schema.Struct({
 export type OrchestrationProjectShell = typeof OrchestrationProjectShell.Type;
 
 export const OrchestrationThreadShell = Schema.Struct({
+  promptQueueSummary: Schema.optional(ThreadPromptQueueSummary),
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
@@ -1042,6 +1204,8 @@ export type OrchestrationSubscribeShellInput = typeof OrchestrationSubscribeShel
 
 export const OrchestrationSubscribeThreadInput = Schema.Struct({
   threadId: ThreadId,
+  sharedPromptQueue: Schema.optionalKey(Schema.Boolean),
+  sharedPreparation: Schema.optionalKey(Schema.Boolean),
   /** Opt in to reasoning roles; older clients receive system messages instead. */
   reasoningMessages: Schema.optionalKey(Schema.Boolean),
   /**
@@ -1324,32 +1488,134 @@ const ThreadInteractionModeSetCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
-const ThreadTurnStartBootstrapCreateThread = Schema.Struct({
-  projectId: ProjectId,
-  title: TrimmedNonEmptyString,
-  modelSelection: ModelSelection,
+const PromptCommandFields = { commandId: CommandId, threadId: ThreadId, createdAt: IsoDateTime };
+const PromptMessage = Schema.Struct({
+  text: Schema.String,
+  attachments: Schema.Array(ChatAttachment),
+  context: Schema.optional(OrchestrationMessageContext),
+});
+const ClientPromptMessage = Schema.Struct({
+  text: Schema.String,
+  attachments: Schema.Array(Schema.Union([UploadChatAttachment, ChatAttachment])),
+  context: Schema.optional(OrchestrationMessageContext),
+});
+const PromptEnqueueFields = {
+  ...PromptCommandFields,
+  modelSelection: Schema.optional(ModelSelection),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
-  branch: Schema.NullOr(TrimmedNonEmptyString),
-  worktreePath: Schema.NullOr(TrimmedNonEmptyString),
-  createdAt: IsoDateTime,
+  titleSeed: Schema.optional(TrimmedNonEmptyString),
+  sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  bootstrap: Schema.optional(ThreadTurnStartBootstrap),
+};
+const ThreadPromptEnqueueCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.enqueue"),
+  ...PromptEnqueueFields,
+  message: Schema.Struct({ messageId: MessageId, ...PromptMessage.fields }),
+  author: Schema.optional(AuthSessionUser),
 });
-
-const ThreadTurnStartBootstrapPrepareWorktree = Schema.Struct({
-  projectCwd: TrimmedNonEmptyString,
-  baseBranch: TrimmedNonEmptyString,
-  branch: Schema.optional(TrimmedNonEmptyString),
-  startFromOrigin: Schema.optional(Schema.Boolean),
-  requireWorktree: Schema.optional(Schema.Boolean),
+const ClientThreadPromptEnqueueCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.enqueue"),
+  ...PromptEnqueueFields,
+  message: Schema.Struct({ messageId: MessageId, ...ClientPromptMessage.fields }),
 });
-
-const ThreadTurnStartBootstrap = Schema.Struct({
-  createThread: Schema.optional(ThreadTurnStartBootstrapCreateThread),
-  prepareWorktree: Schema.optional(ThreadTurnStartBootstrapPrepareWorktree),
-  runSetupScript: Schema.optional(Schema.Boolean),
+const ThreadPromptEditCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.edit"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  message: PromptMessage,
+  author: Schema.optional(AuthSessionUser),
 });
-
-export type ThreadTurnStartBootstrap = typeof ThreadTurnStartBootstrap.Type;
+const ClientThreadPromptEditCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.edit"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  message: ClientPromptMessage,
+});
+const ThreadPromptRemoveCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.remove"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  author: Schema.optional(AuthSessionUser),
+});
+const ThreadPromptSteerCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.steer"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  expectedTurnId: TurnId,
+  author: Schema.optional(AuthSessionUser),
+});
+const ThreadQueuePauseCommand = Schema.Struct({
+  type: Schema.Literal("thread.queue.pause"),
+  ...PromptCommandFields,
+  author: Schema.optional(AuthSessionUser),
+});
+const ThreadQueueResumeCommand = Schema.Struct({
+  type: Schema.Literal("thread.queue.resume"),
+  ...PromptCommandFields,
+  expectedRevision: NonNegativeInt,
+  author: Schema.optional(AuthSessionUser),
+});
+const ThreadQueueResolveCommand = Schema.Struct({
+  type: Schema.Literal("thread.queue.resolve"),
+  ...PromptCommandFields,
+  expectedRevision: NonNegativeInt,
+  resolution: Schema.Literals(["retry", "dismiss"]),
+  author: Schema.optional(AuthSessionUser),
+});
+const ThreadPreparationRetryCommand = Schema.Struct({
+  type: Schema.Literal("thread.preparation.retry"),
+  ...PromptCommandFields,
+  expectedRevision: NonNegativeInt,
+  expectedControlRevision: NonNegativeInt,
+  target: Schema.optional(Schema.Literal("project")),
+});
+// Internal, revision-fenced milestones. Clients can only request retry/target changes.
+const ThreadPreparationUpdateCommand = Schema.Struct({
+  type: Schema.Literal("thread.preparation.update"),
+  ...PromptCommandFields,
+  expectedRevision: Schema.NullOr(NonNegativeInt),
+  preparation: ThreadPreparation,
+});
+const ThreadPromptClaimCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.claim"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  expectedControlRevision: NonNegativeInt,
+});
+const ThreadPromptAdmitCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.admit"),
+  ...PromptCommandFields,
+  attemptId: CommandId,
+  turnId: TurnId,
+  evidence: Schema.Literals(["provider-ack", "harness-dispatch", "local-command"]),
+});
+const ThreadPromptReleaseCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.release"),
+  pause: Schema.optional(Schema.Boolean),
+  ...PromptCommandFields,
+  attemptId: CommandId,
+  detail: Schema.String,
+});
+const ThreadPromptUnknownCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.unknown"),
+  ...PromptCommandFields,
+  attemptId: CommandId,
+  detail: Schema.String,
+});
+const ThreadQueueFinalizeCommand = Schema.Struct({
+  type: Schema.Literal("thread.queue.finalize"),
+  ...PromptCommandFields,
+  turnId: TurnId,
+  outcome: Schema.Literals(["completed", "failed", "interrupted"]),
+  checkpoint: Schema.Literals(["ready", "skipped", "error"]),
+  detail: Schema.optional(Schema.String),
+});
 
 export const ThreadTurnStartCommand = Schema.Struct({
   type: Schema.Literal("thread.turn.start"),
@@ -1372,6 +1638,8 @@ export const ThreadTurnStartCommand = Schema.Struct({
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   /** Stamped by the server from the dispatching session; never client-supplied. */
   author: Schema.optional(AuthSessionUser),
+  editedBy: Schema.optional(AuthSessionUser),
+  steeredBy: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,
 });
 
@@ -1413,6 +1681,7 @@ const ThreadApprovalRespondCommand = Schema.Struct({
 });
 
 const ThreadUserInputRespondCommand = Schema.Struct({
+  author: Schema.optional(AuthSessionUser),
   type: Schema.Literal("thread.user-input.respond"),
   commandId: CommandId,
   threadId: ThreadId,
@@ -1462,6 +1731,15 @@ const ThreadSessionStopCommand = Schema.Struct({
 });
 
 const DispatchableClientOrchestrationCommand = Schema.Union([
+  ThreadPromptEnqueueCommand,
+  ThreadPromptEditCommand,
+  ThreadPromptRemoveCommand,
+  ThreadPromptSteerCommand,
+  ThreadQueuePauseCommand,
+  ThreadQueueResumeCommand,
+  ThreadQueueResolveCommand,
+  ThreadPreparationRetryCommand,
+
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
@@ -1496,6 +1774,15 @@ export type DispatchableClientOrchestrationCommand =
   typeof DispatchableClientOrchestrationCommand.Type;
 
 export const ClientOrchestrationCommand = Schema.Union([
+  ClientThreadPromptEnqueueCommand,
+  ClientThreadPromptEditCommand,
+  ThreadPromptRemoveCommand,
+  ThreadPromptSteerCommand,
+  ThreadQueuePauseCommand,
+  ThreadQueueResumeCommand,
+  ThreadQueueResolveCommand,
+  ThreadPreparationRetryCommand,
+
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
@@ -1534,6 +1821,7 @@ const ThreadSessionSetCommand = Schema.Struct({
   threadId: ThreadId,
   session: OrchestrationSession,
   createdAt: IsoDateTime,
+  expectedPromptTurnId: Schema.optional(TurnId),
 });
 
 const ThreadMessageAssistantDeltaCommand = Schema.Struct({
@@ -1594,6 +1882,7 @@ const ThreadHistoryImportCommand = Schema.Struct({
  * turn that follows references the same message id.
  */
 const ThreadMessageUserAppendCommand = Schema.Struct({
+  author: Schema.optional(AuthSessionUser),
   type: Schema.Literal("thread.message.user.append"),
   commandId: CommandId,
   threadId: ThreadId,
@@ -1630,6 +1919,7 @@ const ThreadTurnDiffCompleteCommand = Schema.Struct({
 
 const ThreadActivityAppendCommand = Schema.Struct({
   type: Schema.Literal("thread.activity.append"),
+  preparationAttemptId: Schema.optional(CommandId),
   commandId: CommandId,
   threadId: ThreadId,
   activity: OrchestrationThreadActivity,
@@ -1696,6 +1986,12 @@ const ThreadPullRequestLinkSyncCommand = Schema.Struct({
 });
 
 const InternalOrchestrationCommand = Schema.Union([
+  ThreadPreparationUpdateCommand,
+  ThreadPromptClaimCommand,
+  ThreadPromptAdmitCommand,
+  ThreadPromptReleaseCommand,
+  ThreadPromptUnknownCommand,
+  ThreadQueueFinalizeCommand,
   ThreadAutoSettleCommand,
   ThreadPullRequestSyncCommand,
   ThreadPullRequestLinkSyncCommand,
@@ -1725,6 +2021,7 @@ export const OrchestrationCommand = Schema.Union([
 export type OrchestrationCommand = typeof OrchestrationCommand.Type;
 
 export const OrchestrationEventType = Schema.Literals([
+  "thread.prompt-queue-changed",
   "project.created",
   "project.meta-updated",
   "project.deleted",
@@ -1957,6 +2254,8 @@ export const ThreadMessageSentPayload = Schema.Struct({
   turnId: Schema.NullOr(TurnId).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   streaming: Schema.Boolean,
   author: Schema.optional(AuthSessionUser),
+  editedBy: Schema.optional(AuthSessionUser),
+  steeredBy: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -2063,6 +2362,7 @@ export const OrchestrationEventMetadata = Schema.Struct({
    * turn-start event instead.
    */
   deferredTurn: Schema.optional(Schema.Boolean),
+  queueAdmission: Schema.optional(Schema.Boolean),
   origin: Schema.optional(OrchestrationClientOrigin),
 });
 export type OrchestrationEventMetadata = typeof OrchestrationEventMetadata.Type;
@@ -2080,6 +2380,11 @@ const EventBaseFields = {
 } as const;
 
 export const OrchestrationEvent = Schema.Union([
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.prompt-queue-changed"),
+    payload: ThreadPromptQueueChangedPayload,
+  }),
   Schema.Struct({
     ...EventBaseFields,
     type: Schema.Literal("project.created"),
@@ -2477,3 +2782,14 @@ export class OrchestrationSearchThreadsError extends Schema.TaggedError<Orchestr
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
+
+export const OrchestrationGetCommandReceiptInput = Schema.Struct({
+  projectId: Schema.optional(ProjectId),
+  commandId: CommandId,
+  threadId: ThreadId,
+});
+export const OrchestrationGetCommandReceiptResult = Schema.Struct({
+  status: Schema.Literals(["accepted", "rejected", "unknown"]),
+  sequence: Schema.optional(NonNegativeInt),
+  detail: Schema.optional(Schema.String),
+});

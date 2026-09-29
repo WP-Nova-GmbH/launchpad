@@ -8,6 +8,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
 
 import {
   isPendingThreadCreationVisible,
@@ -49,6 +50,70 @@ describe("resolvePendingThreadCreation", () => {
   const threadKey = `${creation.environmentId}:${creation.threadId}`;
   const pending: PendingThreadCreation = { message: creation, outcome: null };
   const prompt = { id: creation.messageId };
+
+  it("hands accepted setup presentation to the durable shared queue before a turn exists", () => {
+    expect(
+      resolvePendingThreadCreation({
+        threadKey,
+        pending: null,
+        previous: { message: creation, outcome: { kind: "delivered", message: creation } },
+        detail: {
+          messages: [],
+          latestTurn: null,
+          session: null,
+          promptQueue: emptyThreadPromptQueue(),
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps an uncertain submission visible even when the old bootstrap session stopped", () => {
+    const uncertain = { message: { ...creation, acceptanceUncertain: true }, outcome: null };
+    expect(
+      resolvePendingThreadCreation({
+        threadKey,
+        pending: uncertain,
+        previous: null,
+        detail: { messages: [], latestTurn: null, session: { status: "stopped" } },
+      }),
+    ).toBe(uncertain);
+  });
+
+  it("lets authoritative delivery replace stale uncertainty retained after outcome cleanup", () => {
+    const previous = {
+      message: {
+        ...creation,
+        acceptanceUncertain: true,
+        submissionProtocol: "review-required" as const,
+      },
+      outcome: null,
+    };
+    expect(
+      resolvePendingThreadCreation({
+        threadKey,
+        pending: null,
+        previous,
+        detail: {
+          messages: [prompt],
+          latestTurn: { turnId: "accepted-turn" },
+          session: { status: "running" },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      resolvePendingThreadCreation({
+        threadKey,
+        pending: null,
+        previous: { ...previous, outcome: { kind: "delivered", message: previous.message } },
+        detail: {
+          messages: [],
+          latestTurn: null,
+          session: null,
+          promptQueue: emptyThreadPromptQueue(),
+        },
+      }),
+    ).toBeNull();
+  });
 
   it("keeps setup visible through the prompt echo and shell cleanup until detail has a turn", () => {
     let previous = resolvePendingThreadCreation({

@@ -35,7 +35,11 @@ export const canonicalizeClientCommandTimestamps = (
         }
       : command;
 
-  if (canonicalCommand.type !== "thread.turn.start" || !canonicalCommand.bootstrap?.createThread) {
+  if (
+    (canonicalCommand.type !== "thread.turn.start" &&
+      canonicalCommand.type !== "thread.prompt.enqueue") ||
+    !canonicalCommand.bootstrap?.createThread
+  ) {
     return canonicalCommand;
   }
 
@@ -133,20 +137,22 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
 
     if (
       canonicalCommand.type !== "thread.turn.start" &&
+      canonicalCommand.type !== "thread.prompt.enqueue" &&
+      canonicalCommand.type !== "thread.prompt.edit" &&
       canonicalCommand.type !== "thread.user-input.respond"
     ) {
       return canonicalCommand as OrchestrationCommand;
     }
 
     const attachments =
-      canonicalCommand.type === "thread.turn.start"
+      canonicalCommand.type !== "thread.user-input.respond"
         ? canonicalCommand.message.attachments
         : Object.values(canonicalCommand.attachmentsByQuestionId ?? {}).flat();
     const attachmentLimitError = getProviderAttachmentLimitError(attachments);
     if (attachmentLimitError) {
       return yield* new OrchestrationDispatchCommandError({ message: attachmentLimitError });
     }
-    if (canonicalCommand.type === "thread.turn.start") {
+    if (canonicalCommand.type !== "thread.user-input.respond") {
       const clientAttachmentIds = new Set<string>();
       for (const attachment of attachments) {
         if (attachment.id === undefined) continue;
@@ -333,27 +339,44 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
                 : record,
             ),
           };
-    return {
-      ...canonicalCommand,
-      message: {
-        ...canonicalCommand.message,
-        attachments: normalizedAttachments,
-        ...(normalizedContext !== undefined ? { context: normalizedContext } : {}),
-      },
-    } satisfies OrchestrationCommand;
+    const normalizedFields = {
+      attachments: normalizedAttachments,
+      ...(normalizedContext !== undefined ? { context: normalizedContext } : {}),
+    };
+    switch (canonicalCommand.type) {
+      case "thread.turn.start":
+        return {
+          ...canonicalCommand,
+          message: { ...canonicalCommand.message, ...normalizedFields },
+        } satisfies OrchestrationCommand;
+      case "thread.prompt.enqueue":
+        return {
+          ...canonicalCommand,
+          message: { ...canonicalCommand.message, ...normalizedFields },
+        } satisfies OrchestrationCommand;
+      case "thread.prompt.edit":
+        return {
+          ...canonicalCommand,
+          message: { ...canonicalCommand.message, ...normalizedFields },
+        } satisfies OrchestrationCommand;
+    }
   });
 
 export const cleanupFailedUploadedAttachments = Effect.fn(
   "Normalizer.cleanupFailedUploadedAttachments",
 )(function* (command: ClientOrchestrationCommand, normalizedCommand: OrchestrationCommand) {
   const originalAttachments =
-    command.type === "thread.turn.start"
+    command.type === "thread.turn.start" ||
+    command.type === "thread.prompt.enqueue" ||
+    command.type === "thread.prompt.edit"
       ? command.message.attachments
       : command.type === "thread.user-input.respond"
         ? Object.values(command.attachmentsByQuestionId ?? {}).flat()
         : [];
   const normalizedAttachments =
-    normalizedCommand.type === "thread.turn.start"
+    normalizedCommand.type === "thread.turn.start" ||
+    normalizedCommand.type === "thread.prompt.enqueue" ||
+    normalizedCommand.type === "thread.prompt.edit"
       ? normalizedCommand.message.attachments
       : normalizedCommand.type === "thread.user-input.respond"
         ? Object.values(normalizedCommand.attachmentsByQuestionId ?? {}).flat()

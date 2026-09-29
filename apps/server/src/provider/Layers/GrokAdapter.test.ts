@@ -14,6 +14,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import type * as AcpSchema from "effect-acp/schema";
 
 import {
   ApprovalRequestId,
@@ -26,8 +27,10 @@ import {
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
+import { ProviderAdapterValidationError } from "../Errors.ts";
 import { ServerConfig } from "../../config.ts";
 import { execScriptSource, writeFakeCli } from "../../testUtils/fakeCli.ts";
+import { makeGrokAcpRuntime } from "../acp/GrokAcpSupport.ts";
 import {
   grokPromptSettlementBelongsToContext,
   isGrokEnterPlanModeToolCall,
@@ -213,6 +216,50 @@ it("requires a settlement to match the live Grok turn", () => {
 });
 
 it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
+  it.effect("validates at ACP dispatch and can retry a rejected prompt", () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "dispatch-test-")),
+      );
+      const logPath = NodePath.join(directory, "requests.jsonl");
+      const wrapper = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_REQUEST_LOG_PATH: logPath }),
+      );
+      const adapter = yield* makeTestAdapter(wrapper);
+      const threadId = ThreadId.make("grok-dispatch-validator");
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      let admitted = false;
+      const rejection = new ProviderAdapterValidationError({
+        provider: "grok",
+        operation: "sendTurn",
+        issue: "Stopped before dispatch",
+      });
+      const result = yield* adapter
+        .sendTurn(
+          { threadId, input: "rejected", delivery: { attemptId: "rejected", mode: "next-turn" } },
+          {
+            beforeDispatch: Effect.fail(rejection),
+            onAdmitted: () =>
+              Effect.sync(() => {
+                admitted = true;
+              }),
+          },
+        )
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure, rejection);
+      assert.isFalse(admitted);
+      yield* adapter.sendTurn({
+        threadId,
+        input: "accepted",
+        delivery: { attemptId: "accepted", mode: "next-turn" },
+      });
+      const requests = yield* Effect.promise(() => readJsonLines(logPath));
+      assert.equal(requests.filter((request) => request.method === "session/prompt").length, 1);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("rejects rollback without discarding the provider conversation", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-unsupported-rollback");
@@ -1469,6 +1516,104 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
         yield* Fiber.interrupt(runtimeEventsFiber);
         yield* adapter.stopSession(threadId);
       }).pipe(TestClock.withLive),
+  );
+
+  it.effect("rejects selected steering after natural completion during preparation", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-selected-steer-stale-during-preparation");
+      const wrapperPath = yield* Effect.promise(() => makeMockGrokWrapper());
+      const promptStarted = yield* Deferred.make<void>();
+      const promptResult = yield* Deferred.make<AcpSchema.PromptResponse>();
+      const preparing = yield* Deferred.make<void>();
+      const preparationRelease = yield* Deferred.make<void>();
+      const firstTurnStarted = yield* Deferred.make<TurnId>();
+      const turnCompleted = yield* Deferred.make<ProviderRuntimeEvent>();
+      let promptCalls = 0;
+      let cancellations = 0;
+      let admissions = 0;
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        makeRuntime: (options) =>
+          makeGrokAcpRuntime(options).pipe(
+            Effect.map((runtime) => ({
+              ...runtime,
+              hasActivePrompt: Deferred.isDone(promptResult).pipe(Effect.map((done) => !done)),
+              setSessionModel: () =>
+                Deferred.succeed(preparing, undefined).pipe(
+                  Effect.andThen(Deferred.await(preparationRelease)),
+                  Effect.as({}),
+                ),
+              cancel: Effect.sync(() => {
+                cancellations += 1;
+              }),
+              prompt: (_payload, options) =>
+                Effect.gen(function* () {
+                  promptCalls += 1;
+                  if (options?.onDispatched) yield* options.onDispatched;
+                  if (options?.dispatched) yield* Deferred.succeed(options.dispatched, undefined);
+                  yield* Deferred.succeed(promptStarted, undefined);
+                  return yield* Deferred.await(promptResult);
+                }),
+            })),
+          ),
+      });
+      const events = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (event.threadId !== threadId) return;
+          if (event.type === "turn.started" && event.turnId) {
+            yield* Deferred.succeed(firstTurnStarted, event.turnId);
+          }
+          if (event.type === "turn.completed") yield* Deferred.succeed(turnCompleted, event);
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const first = yield* adapter
+        .sendTurn({ threadId, input: "First prompt" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(promptStarted);
+      const turnId = yield* Deferred.await(firstTurnStarted);
+      const steer = yield* adapter
+        .sendTurn(
+          {
+            threadId,
+            input: "Selected steer",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("grok"),
+              model: "grok-test-changed",
+            },
+            delivery: { attemptId: "selected-steer", mode: "steer", expectedTurnId: turnId },
+          },
+          {
+            onAdmitted: () =>
+              Effect.sync(() => {
+                admissions += 1;
+              }),
+          },
+        )
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(preparing);
+      yield* Deferred.succeed(promptResult, { stopReason: "end_turn" });
+      yield* Deferred.succeed(preparationRelease, undefined);
+      const rejection = yield* Fiber.join(steer);
+      assert.equal(rejection._tag, "Failure");
+      if (rejection._tag === "Failure")
+        assert.equal(rejection.failure._tag, "ProviderAdapterValidationError");
+      yield* Fiber.join(first);
+      const completed = yield* Deferred.await(turnCompleted);
+      assert.equal(completed.type, "turn.completed");
+      if (completed.type === "turn.completed") assert.equal(completed.payload.state, "completed");
+      assert.equal(promptCalls, 1);
+      assert.equal(cancellations, 0);
+      assert.equal(admissions, 0);
+      const sessions = yield* adapter.listSessions();
+      assert.equal(sessions.find((session) => session.threadId === threadId)?.status, "ready");
+      yield* Fiber.interrupt(events);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("keeps the original prompt running when a steer fails during preparation", () =>

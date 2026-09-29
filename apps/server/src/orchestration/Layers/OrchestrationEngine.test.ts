@@ -26,6 +26,7 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { TestClock } from "effect/testing";
 import { describe, expect, it, vi } from "vite-plus/test";
 
@@ -63,6 +64,7 @@ const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(val
 function makeOrchestrationLayer(
   databasePath?: string,
   repositoryIdentityResolver?: RepositoryIdentityResolver.RepositoryIdentityResolver["Service"],
+  rejectProjection?: (event: OrchestrationEvent) => boolean,
 ) {
   const persistence = databasePath
     ? makeSqlitePersistenceLive(databasePath)
@@ -70,10 +72,30 @@ function makeOrchestrationLayer(
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
   });
+  const pipeline = rejectProjection
+    ? Layer.effect(
+        OrchestrationProjectionPipeline,
+        Effect.gen(function* () {
+          const inner = yield* OrchestrationProjectionPipeline;
+          return {
+            ...inner,
+            projectEventDeferred: (event: OrchestrationEvent) =>
+              rejectProjection(event)
+                ? Effect.fail(
+                    new PersistenceSqlError({
+                      operation: "test.preparation",
+                      detail: "Injected preparation projection failure",
+                    }),
+                  )
+                : inner.projectEventDeferred(event),
+          };
+        }),
+      ).pipe(Layer.provide(OrchestrationProjectionPipelineLive))
+    : OrchestrationProjectionPipelineLive;
   return Layer.mergeAll(
     OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
-      Layer.provide(OrchestrationProjectionPipelineLive),
+      Layer.provide(pipeline),
     ),
     OrchestrationProjectionSnapshotQueryLive,
   ).pipe(
@@ -89,7 +111,7 @@ function makeOrchestrationLayer(
           )
         : RepositoryIdentityResolver.layer,
     ),
-    Layer.provide(persistence),
+    Layer.provideMerge(persistence),
     Layer.provideMerge(ServerConfigLayer),
     Layer.provideMerge(NodeServices.layer),
   );
@@ -98,18 +120,34 @@ function makeOrchestrationLayer(
 async function createOrchestrationSystem(
   databasePath?: string,
   repositoryIdentityResolver?: RepositoryIdentityResolver.RepositoryIdentityResolver["Service"],
+  rejectProjection?: (event: OrchestrationEvent) => boolean,
 ) {
   const runtime = ManagedRuntime.make(
-    makeOrchestrationLayer(databasePath, repositoryIdentityResolver),
+    makeOrchestrationLayer(databasePath, repositoryIdentityResolver, rejectProjection),
   );
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
   return {
     engine,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
+    readShell: () => runtime.runPromise(snapshotQuery.getShellSnapshot()),
     readThread: (threadId: ThreadId) =>
       runtime.runPromise(snapshotQuery.getThreadDetailById(threadId)),
+    receipt: (commandId: CommandId) =>
+      runtime.runPromise(
+        Effect.flatMap(
+          OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository,
+          (receipts) => receipts.getByCommandId({ commandId }),
+        ),
+      ),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
+    confirmDeletedThreadCleanup: (threadId: ThreadId) =>
+      runtime.runPromise(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`DELETE FROM thread_cleanup_fences WHERE thread_id = ${threadId}`;
+        }),
+      ),
     dispose: () => runtime.dispose(),
   };
 }
@@ -130,6 +168,213 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("accepts one native answer while preserving the shared queue pause", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = ProjectId.make("native-question-project");
+    const threadId = ThreadId.make("native-question-thread");
+    const requestId = ApprovalRequestId.make("native-question");
+    try {
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("native-project"),
+          projectId,
+          title: "Questions",
+          workspaceRoot: "/tmp/native-questions",
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("native-thread"),
+          threadId,
+          projectId,
+          title: "Questions",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.queue.pause",
+          commandId: CommandId.make("native-pause"),
+          threadId,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.make("native-request"),
+          threadId,
+          createdAt: now(),
+          activity: {
+            id: EventId.make("native-request"),
+            kind: "user-input.requested",
+            summary: "Question",
+            tone: "info",
+            turnId: null,
+            createdAt: now(),
+            payload: {
+              requestId,
+              questions: [{ id: "q", header: "Name", question: "What name?", options: [] }],
+            },
+          },
+        }),
+      );
+      const answers = ["Alice", "Bob"].map((name) => ({
+        type: "thread.user-input.respond" as const,
+        commandId: CommandId.make(`native-answer-${name}`),
+        threadId,
+        requestId,
+        answers: { q: name },
+        author: { userId: name, displayName: name, imageUrl: null },
+        createdAt: now(),
+      }));
+      const results = await Promise.allSettled(
+        answers.map((answer) => system.run(system.engine.dispatch(answer))),
+      );
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+      const thread = Option.getOrThrow(await system.readThread(threadId));
+      expect(thread.promptQueue?.enabled).toBe(false);
+      expect(thread.promptQueue?.pauseReason?.code).toBe("stopped");
+      expect(thread.messages).toHaveLength(0);
+      const claims = thread.activities.filter(
+        (activity) => activity.kind === "user-input.answer-submitted",
+      );
+      expect(claims).toHaveLength(1);
+      const winner = answers[results.findIndex((result) => result.status === "fulfilled")]!;
+      expect(claims[0]?.payload).toMatchObject({ answers: winner.answers, author: winner.author });
+      const events = Array.from(await system.run(Stream.runCollect(system.engine.readEvents(0))));
+      expect(
+        events.filter((event) => event.type === "thread.user-input-response-requested"),
+      ).toHaveLength(1);
+      await expect(system.run(system.engine.dispatch(winner))).resolves.toBeDefined();
+    } finally {
+      await system.dispose();
+    }
+  });
+
+  it("persists shared queue order, receipts, staged delivery and provenance across restart", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-shared-queue-"));
+    const databasePath = NodePath.join(directory, "state.sqlite");
+    let system = await createOrchestrationSystem(databasePath);
+    const projectId = ProjectId.make("shared-project");
+    const threadId = ThreadId.make("shared-thread");
+    const author = { userId: "alice", displayName: "Alice", imageUrl: null };
+    const editor = { userId: "bob", displayName: "Bob", imageUrl: null };
+    const enqueue = {
+      type: "thread.prompt.enqueue" as const,
+      commandId: CommandId.make("shared-enqueue"),
+      threadId,
+      message: { messageId: MessageId.make("shared-message"), text: "accepted", attachments: [] },
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      author,
+      createdAt: now(),
+    };
+    try {
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("shared-project"),
+          projectId,
+          title: "Shared",
+          workspaceRoot: directory,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("shared-thread"),
+          threadId,
+          projectId,
+          title: "Shared",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      const accepted = await system.run(system.engine.dispatch(enqueue));
+      await system.run(
+        system.engine.dispatch({
+          ...enqueue,
+          type: "thread.prompt.edit",
+          commandId: CommandId.make("shared-edit"),
+          messageId: enqueue.message.messageId,
+          expectedRevision: 1,
+          message: { text: "edited", attachments: [] },
+          author: editor,
+        }),
+      );
+      await system.dispose();
+      system = await createOrchestrationSystem(databasePath);
+      expect(await system.run(system.engine.dispatch(enqueue))).toEqual(accepted);
+      let thread = (await system.readModel()).threads[0]!;
+      expect(thread.messages).toHaveLength(0);
+      expect(thread.promptQueue?.entries).toHaveLength(1);
+      expect(thread.promptQueue?.entries[0]).toMatchObject({
+        author,
+        editedBy: editor,
+        text: "edited",
+        revision: 2,
+        acceptedSequence: accepted.sequence,
+      });
+      const attemptId = CommandId.make("shared-claim");
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.prompt.claim",
+          commandId: attemptId,
+          threadId,
+          messageId: enqueue.message.messageId,
+          expectedRevision: 2,
+          expectedControlRevision: 0,
+          createdAt: now(),
+        }),
+      );
+      await system.dispose();
+      system = await createOrchestrationSystem(databasePath);
+      thread = (await system.readModel()).threads[0]!;
+      expect(thread.promptQueue?.handoff?.attemptId).toBe(attemptId);
+      expect(thread.messages).toHaveLength(0);
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.prompt.admit",
+          commandId: CommandId.make("shared-admit"),
+          threadId,
+          attemptId,
+          turnId: TurnId.make("shared-turn"),
+          evidence: "provider-ack",
+          createdAt: now(),
+        }),
+      );
+      const detail = await system.readThread(threadId);
+      expect(Option.getOrThrow(detail).messages[0]).toMatchObject({
+        author,
+        editedBy: editor,
+        text: "edited",
+      });
+      await system.dispose();
+      system = await createOrchestrationSystem(databasePath);
+      thread = (await system.readModel()).threads[0]!;
+      expect(thread.promptQueue?.awaitingTurnId).toBe("shared-turn");
+      expect(thread.messages[0]).toMatchObject({ author, editedBy: editor, text: "edited" });
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each(["running", "stopped"] as const)(
     "sends async answers with a %s session and rejects old duplicate replies",
     async (status) => {
@@ -419,6 +664,7 @@ describe("OrchestrationEngine", () => {
     const layer = OrchestrationEngineLive.pipe(
       Layer.provide(
         Layer.succeed(ProjectionSnapshotQuery, {
+          getThreadSubscriptionAnchor: () => Effect.succeedNone,
           getUserInputActivity: () => Effect.die("unused"),
           listActivitiesByKind: () => Effect.die("unused"),
           getCommandReadModel: () => Effect.succeed(commandReadModel),
@@ -560,6 +806,7 @@ describe("OrchestrationEngine", () => {
         aggregateKind: "thread",
         aggregateId: threadId,
         status: "rejected",
+        projectId,
         error: message,
         resultSequence: sequence,
       });
@@ -2189,5 +2436,362 @@ describe("OrchestrationEngine", () => {
     expect(withoutOrigin?.metadata.origin).toBeUndefined();
 
     await system.dispose();
+  });
+});
+
+describe("atomic shared preparation acceptance", () => {
+  const projectId = ProjectId.make("shared-preparation-project");
+  const threadId = ThreadId.make("shared-preparation-thread");
+  const first = {
+    type: "thread.prompt.enqueue" as const,
+    commandId: CommandId.make("shared-first"),
+    threadId,
+    createdAt: now(),
+    runtimeMode: "full-access" as const,
+    interactionMode: "default" as const,
+    message: { messageId: MessageId.make("shared-first-message"), text: "First", attachments: [] },
+    bootstrap: {
+      createThread: {
+        projectId,
+        title: "Shared setup",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      },
+      prepareWorktree: {
+        projectCwd: "/tmp/shared-preparation",
+        baseBranch: "main",
+        branch: "feature/shared",
+      },
+      runSetupScript: true,
+    },
+  };
+  const createProject = {
+    type: "project.create" as const,
+    commandId: CommandId.make("shared-project"),
+    projectId,
+    title: "Shared",
+    workspaceRoot: "/tmp/shared-preparation",
+    createdAt: now(),
+  };
+  it("rejects deletion atomically until required preparation has stopped", async () => {
+    const system = await createOrchestrationSystem();
+    try {
+      await system.run(system.engine.dispatch(createProject));
+      await system.run(system.engine.dispatch(first));
+      const before = await system.run(system.engine.latestSequence);
+      await expect(
+        system.run(
+          system.engine.dispatch({
+            type: "project.delete",
+            projectId,
+            force: true,
+            commandId: CommandId.make("delete-project-pending"),
+          }),
+        ),
+      ).rejects.toThrow("Setup must finish stopping");
+      expect(await system.run(system.engine.latestSequence)).toBe(before);
+      expect(Option.isSome(await system.readThread(threadId))).toBe(true);
+      const setup = Option.getOrThrow(await system.readThread(threadId)).promptQueue!.preparation!;
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.preparation.update",
+          commandId: CommandId.make("running-for-delete"),
+          threadId,
+          createdAt: now(),
+          expectedRevision: setup.revision,
+          preparation: { ...setup, revision: setup.revision + 1, state: "running", settled: false },
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.queue.pause",
+          commandId: CommandId.make("pause-for-delete"),
+          threadId,
+          createdAt: now(),
+        }),
+      );
+      await expect(
+        system.run(
+          system.engine.dispatch({
+            type: "thread.delete",
+            threadId,
+            commandId: CommandId.make("delete-unsettled"),
+          }),
+        ),
+      ).rejects.toThrow("Setup must finish stopping");
+    } finally {
+      await system.dispose();
+    }
+  });
+  it("orders preflight rejection with duplicate deletes and keeps the original project scope", async () => {
+    const system = await createOrchestrationSystem();
+    try {
+      await system.run(system.engine.dispatch(createProject));
+      await system.run(system.engine.dispatch(first));
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.queue.pause",
+          commandId: CommandId.make("stop-pending"),
+          threadId,
+          createdAt: now(),
+        }),
+      );
+      const command = {
+        type: "thread.delete" as const,
+        threadId,
+        commandId: CommandId.make("rejected-delete"),
+      };
+      await expect(
+        system.run(
+          system.engine.dispatch(command, {
+            rejection: { projectId, detail: "Process exit was not confirmed" },
+          }),
+        ),
+      ).rejects.toThrow("Process exit was not confirmed");
+      await expect(system.run(system.engine.dispatch(command))).rejects.toThrow(
+        "Process exit was not confirmed",
+      );
+      expect(Option.isSome(await system.readThread(threadId))).toBe(true);
+      expect(Option.getOrThrow(await system.receipt(command.commandId)).projectId).toBe(projectId);
+      const acceptedCommand = { ...command, commandId: CommandId.make("fresh-delete") };
+      const accepted = await system.run(system.engine.dispatch(acceptedCommand));
+      expect(
+        await system.run(
+          system.engine.dispatch(acceptedCommand, {
+            rejection: { projectId, detail: "A late duplicate failed" },
+          }),
+        ),
+      ).toEqual(accepted);
+    } finally {
+      await system.dispose();
+    }
+  });
+  it("fences both preparatory Stop and final Delete from a retried preparation", async () => {
+    const system = await createOrchestrationSystem();
+    try {
+      await system.run(system.engine.dispatch(createProject));
+      await system.run(system.engine.dispatch(first));
+      const options = {
+        deletionPreconditions: {
+          projectId,
+          snapshotSequence: await system.run(system.engine.latestSequence),
+          threads: [{ threadId, preparationAttemptId: first.commandId }],
+        },
+      };
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.queue.pause",
+          threadId,
+          commandId: CommandId.make("pause-retry"),
+          createdAt: now(),
+        }),
+      );
+      const queue = Option.getOrThrow(await system.readThread(threadId)).promptQueue!;
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.preparation.retry",
+          threadId,
+          commandId: CommandId.make("retry-before-delete"),
+          createdAt: now(),
+          expectedRevision: queue.preparation!.revision,
+          expectedControlRevision: queue.revision,
+        }),
+      );
+      for (const command of [
+        {
+          type: "thread.queue.pause" as const,
+          threadId,
+          commandId: CommandId.make("late-delete-stop"),
+          createdAt: now(),
+        },
+        {
+          type: "thread.delete" as const,
+          threadId,
+          commandId: CommandId.make("late-final-delete"),
+        },
+      ])
+        await expect(system.run(system.engine.dispatch(command, options))).rejects.toThrow(
+          "changed during deletion",
+        );
+      expect(
+        Option.getOrThrow(await system.readThread(threadId)).promptQueue!.preparation!.state,
+      ).toBe("pending");
+    } finally {
+      await system.dispose();
+    }
+  });
+  it.each([false, true])(
+    "does not retarget a recreated thread or its rejected receipt (different project: %s)",
+    async (differentProject) => {
+      const system = await createOrchestrationSystem();
+      try {
+        await system.run(system.engine.dispatch(createProject));
+        const create = {
+          type: "thread.create" as const,
+          ...first.bootstrap.createThread,
+          threadId,
+          commandId: CommandId.make("old-create"),
+        };
+        await system.run(system.engine.dispatch(create));
+        const options = {
+          deletionPreconditions: {
+            projectId,
+            snapshotSequence: await system.run(system.engine.latestSequence),
+            threads: [{ threadId, preparationAttemptId: null }],
+          },
+        };
+        await system.run(
+          system.engine.dispatch({
+            type: "thread.delete",
+            threadId,
+            commandId: CommandId.make("other-delete"),
+          }),
+        );
+        const replacementProject = differentProject
+          ? ProjectId.make("replacement-project")
+          : projectId;
+        if (differentProject)
+          await system.run(
+            system.engine.dispatch({
+              ...createProject,
+              projectId: replacementProject,
+              commandId: CommandId.make("replacement-project-create"),
+              workspaceRoot: "/tmp/replacement-project",
+            }),
+          );
+        const blockedCreate = {
+          ...create,
+          projectId: replacementProject,
+          commandId: CommandId.make("blocked-replacement-create"),
+        };
+        await expect(system.run(system.engine.dispatch(blockedCreate))).rejects.toThrow(
+          "not been confirmed stopped",
+        );
+        await system.run(
+          system.engine.dispatch({
+            ...create,
+            threadId: ThreadId.make("unrelated-replacement"),
+            commandId: CommandId.make("unrelated-replacement-create"),
+          }),
+        );
+        await system.confirmDeletedThreadCleanup(threadId);
+        await expect(system.run(system.engine.dispatch(blockedCreate))).rejects.toThrow(
+          "not been confirmed stopped",
+        );
+        await system.run(
+          system.engine.dispatch({
+            ...create,
+            projectId: replacementProject,
+            commandId: CommandId.make("replacement-create"),
+          }),
+        );
+        const stale = {
+          type: "thread.delete" as const,
+          threadId,
+          commandId: CommandId.make("stale-delete"),
+        };
+        await expect(system.run(system.engine.dispatch(stale, options))).rejects.toThrow(
+          "changed during deletion",
+        );
+        expect(Option.getOrThrow(await system.receipt(stale.commandId)).projectId).toBe(projectId);
+        expect(Option.isSome(await system.readThread(threadId))).toBe(true);
+      } finally {
+        await system.dispose();
+      }
+    },
+  );
+  it("saves one receipt for creation, first prompt and setup, and replay cannot reorder teammate work", async () => {
+    const system = await createOrchestrationSystem();
+    try {
+      await system.run(system.engine.dispatch(createProject));
+      const accepted = await system.run(system.engine.dispatch(first));
+      await system.run(
+        system.engine.dispatch({
+          ...first,
+          commandId: CommandId.make("teammate"),
+          bootstrap: undefined,
+          message: {
+            ...first.message,
+            messageId: MessageId.make("teammate-message"),
+            text: "Second",
+          },
+        }),
+      );
+      expect(await system.run(system.engine.dispatch(first))).toEqual(accepted);
+      const thread = Option.getOrThrow(await system.readThread(threadId));
+      expect(thread.messages).toHaveLength(0);
+      expect(thread.promptQueue?.preparation?.state).toBe("pending");
+      expect((await system.readShell()).threads[0]?.promptQueueSummary?.preparation).toEqual({
+        state: "pending",
+        revision: 0,
+        settled: true,
+      });
+      expect(thread.promptQueue?.entries.map((entry) => entry.messageId)).toEqual([
+        "shared-first-message",
+        "teammate-message",
+      ]);
+      const receipt = Option.getOrThrow(await system.receipt(first.commandId));
+      expect(receipt.status).toBe("accepted");
+      expect(receipt.projectId).toBe(projectId);
+      expect(receipt.aggregateId).toBe(threadId);
+      const events = await system.run(Stream.runCollect(system.engine.readEvents(0)));
+      expect(
+        events.filter((event) => event.commandId === first.commandId).map((event) => event.type),
+      ).toEqual(["thread.created", "thread.prompt-queue-changed", "thread.prompt-queue-changed"]);
+    } finally {
+      await system.dispose();
+    }
+  });
+  it("rolls back the thread, intent and queue together if the first prompt projection fails", async () => {
+    let failed = false;
+    const system = await createOrchestrationSystem(undefined, undefined, (event) => {
+      if (
+        !failed &&
+        event.commandId === first.commandId &&
+        event.type === "thread.prompt-queue-changed" &&
+        event.payload.entry
+      ) {
+        failed = true;
+        return true;
+      }
+      return false;
+    });
+    try {
+      await system.run(system.engine.dispatch(createProject));
+      await expect(system.run(system.engine.dispatch(first))).rejects.toThrow(
+        "Injected preparation projection failure",
+      );
+      expect(Option.isNone(await system.readThread(threadId))).toBe(true);
+      expect(Option.isNone(await system.receipt(first.commandId))).toBe(true);
+      expect(
+        (await system.run(Stream.runCollect(system.engine.readEvents(0)))).map(
+          (event) => event.type,
+        ),
+      ).toEqual(["project.created"]);
+      await system.run(system.engine.dispatch(first));
+      expect(
+        Option.getOrThrow(await system.readThread(threadId)).promptQueue?.entries,
+      ).toHaveLength(1);
+    } finally {
+      await system.dispose();
+    }
+  });
+  it("rejects invalid first prompts without creating a thread and retains an authorized receipt scope", async () => {
+    const system = await createOrchestrationSystem();
+    try {
+      await system.run(system.engine.dispatch(createProject));
+      const rejected = { ...first, message: { ...first.message, text: "" } };
+      await expect(system.run(system.engine.dispatch(rejected))).rejects.toThrow("A prompt needs");
+      expect(Option.isNone(await system.readThread(threadId))).toBe(true);
+      const receipt = Option.getOrThrow(await system.receipt(first.commandId));
+      expect(receipt.status).toBe("rejected");
+      expect(receipt.projectId).toBe(projectId);
+    } finally {
+      await system.dispose();
+    }
   });
 });

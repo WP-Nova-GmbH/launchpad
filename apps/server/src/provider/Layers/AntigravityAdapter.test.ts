@@ -3,6 +3,7 @@ import { expect, it } from "@effect/vitest";
 import {
   AntigravitySettings,
   ApprovalRequestId,
+  CommandId,
   ProviderInstanceId,
   ThreadId,
   type ProviderRuntimeEvent,
@@ -23,6 +24,7 @@ import * as AcpErrors from "effect-acp/errors";
 import type * as AcpSchema from "effect-acp/schema";
 
 import { ServerConfig } from "../../config.ts";
+import { ProviderAdapterValidationError } from "../Errors.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../antigravityAuthSupport.ts";
 import type { AcpSessionRuntimeEvent } from "../acp/AcpSessionRuntime.ts";
 import { makeAntigravityAcpRuntime } from "../acp/AntigravityAcpSupport.ts";
@@ -74,6 +76,10 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
   readonly holdCancel?: boolean;
   readonly holdClose?: boolean;
   readonly holdDispatch?: boolean;
+  readonly defaultModel?: Effect.Effect<string | undefined>;
+  readonly beforeConfig?: Effect.Effect<void>;
+  readonly beforeModel?: Effect.Effect<void>;
+  readonly beforeMode?: Effect.Effect<void>;
 }) {
   const runtimeEvents = yield* Queue.unbounded<AcpSessionRuntimeEvent>();
   const canonicalEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
@@ -163,10 +169,13 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
           modelConfigId: "model",
         };
       }),
-    getConfigOptions: Effect.sync(configOptions),
+    getConfigOptions: (options?.beforeConfig ?? Effect.void).pipe(
+      Effect.andThen(Effect.sync(configOptions)),
+    ),
     setModel: (model) =>
       Effect.gen(function* () {
         calls.push(`model:${model}`);
+        yield* options?.beforeModel ?? Effect.void;
         if (controls.failModel) {
           controls.failModel = false;
           return yield* AcpErrors.AcpRequestError.invalidParams("Native model selection failed.");
@@ -174,16 +183,23 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
         currentModel = model;
       }),
     setMode: (mode) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         calls.push(`mode:${mode}`);
+        yield* options?.beforeMode ?? Effect.void;
         return {};
       }),
     getEvents: () => Stream.fromQueue(runtimeEvents),
     drainEvents,
+    hasActivePrompt: Effect.suspend(() =>
+      active
+        ? Deferred.isDone(active.result).pipe(Effect.map((done) => !done))
+        : Effect.succeed(false),
+    ),
     prompt: (payload, promptOptions) =>
       Effect.gen(function* () {
         yield* Deferred.succeed(dispatchStarted, undefined);
         if (options?.holdDispatch) yield* Deferred.await(dispatchRelease);
+        yield* promptOptions?.beforeDispatch ?? Effect.void;
         const prompt: NativePrompt = {
           index: ++promptIndex,
           content: payload.prompt,
@@ -191,6 +207,7 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
         };
         active = prompt;
         calls.push(`prompt:${prompt.index}`);
+        yield* promptOptions?.onDispatched ?? Effect.void;
         if (promptOptions?.dispatched) yield* Deferred.succeed(promptOptions.dispatched, undefined);
         yield* Queue.offer(prompts, prompt);
         return yield* Deferred.await(prompt.result).pipe(
@@ -218,6 +235,7 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
     decodeSettings({ enabled: options?.enabled ?? true }),
     {
       instanceId,
+      ...(options?.defaultModel ? { defaultModel: options.defaultModel } : {}),
       makeRuntime: (input) =>
         Effect.gen(function* () {
           launches.push(input);
@@ -589,6 +607,262 @@ it.layer(layer)("AntigravityAdapter", (it) => {
     }),
   );
 
+  it.effect.each(["config", "default-model", "model", "mode"] as const)(
+    "normal Stop fences a queued prompt during %s preparation",
+    (stage) =>
+      Effect.gen(function* () {
+        const preparing = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        let hold = false;
+        const preparation = Effect.suspend(() =>
+          hold
+            ? Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void,
+        );
+        const h = yield* makeHarness({
+          ...(stage === "config" ? { beforeConfig: preparation } : {}),
+          ...(stage === "default-model"
+            ? { defaultModel: preparation.pipe(Effect.as(undefined)) }
+            : {}),
+          ...(stage === "model" ? { beforeModel: preparation } : {}),
+          ...(stage === "mode" ? { beforeMode: preparation } : {}),
+        });
+        yield* h.adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+        hold = true;
+        let admitted = false;
+        const sending = yield* h.adapter
+          .sendTurn(
+            {
+              threadId,
+              input: "Stopped prompt",
+              modelSelection: { instanceId, model: nativeAlternative },
+              delivery: { attemptId: CommandId.make(`stop-${stage}`), mode: "next-turn" },
+            },
+            {
+              onAdmitted: () =>
+                Effect.sync(() => {
+                  admitted = true;
+                }),
+            },
+          )
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(preparing);
+        const stopping = yield* h.adapter
+          .interruptTurn(threadId)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        const repeatedStop = yield* h.adapter
+          .interruptTurn(threadId)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.succeed(release, undefined);
+        const rejected = yield* Fiber.join(sending);
+        expect(rejected._tag).toBe("Failure");
+        if (rejected._tag === "Failure")
+          expect(rejected.failure._tag).toBe("ProviderAdapterValidationError");
+        yield* Effect.all([Fiber.join(stopping), Fiber.join(repeatedStop)]);
+        expect(admitted).toBe(false);
+        expect(h.calls.some((call) => call.startsWith("prompt:"))).toBe(false);
+        expect(h.seen.some((event) => event.type.startsWith("turn."))).toBe(false);
+        hold = false;
+        const retry = yield* h.adapter
+          .sendTurn({ threadId, input: "Explicit retry" })
+          .pipe(Effect.forkChild);
+        const prompt = yield* h.nextPrompt;
+        yield* Deferred.succeed(prompt.result, { stopReason: "end_turn" });
+        yield* Fiber.join(retry);
+      }),
+  );
+
+  it.effect.each(["cancel", "mode"] as const)(
+    "normal Stop during steering %s keeps the original terminal event",
+    (stage) =>
+      Effect.gen(function* () {
+        const preparing = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        let hold = false;
+        const h = yield* makeHarness({
+          holdCancel: stage === "cancel",
+          beforeMode: Effect.suspend(() =>
+            stage === "mode" && hold
+              ? Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(release)))
+              : Effect.void,
+          ),
+        });
+        yield* h.adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+        const original = yield* h.adapter
+          .sendTurn({ threadId, input: "Original" })
+          .pipe(Effect.forkChild);
+        yield* h.nextPrompt;
+        const started = yield* h.waitForEvent((event) => event.type === "turn.started");
+        hold = true;
+        let admitted = false;
+        const steering = yield* h.adapter
+          .sendTurn(
+            {
+              threadId,
+              input: "Replacement",
+              delivery: {
+                attemptId: CommandId.make(`stop-steering-${stage}`),
+                mode: "steer",
+                expectedTurnId: started.turnId!,
+              },
+            },
+            {
+              onAdmitted: () =>
+                Effect.sync(() => {
+                  admitted = true;
+                }),
+            },
+          )
+          .pipe(Effect.result, Effect.forkChild);
+        if (stage === "cancel") yield* h.nextCancellation;
+        else yield* Deferred.await(preparing);
+        const stopping = yield* h.adapter
+          .interruptTurn(threadId)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.succeed(h.cancelRelease, undefined);
+        yield* Deferred.succeed(release, undefined);
+        const rejected = yield* Fiber.join(steering);
+        expect(rejected._tag).toBe("Failure");
+        if (rejected._tag === "Failure")
+          expect(rejected.failure._tag).toBe("ProviderAdapterValidationError");
+        yield* Effect.all([Fiber.join(original), Fiber.join(stopping)]);
+        const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+        expect(completed.turnId).toBe(started.turnId);
+        expect(completed.payload.state).toBe("cancelled");
+        expect(h.seen.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+        expect(h.seen.filter((event) => event.type === "turn.started")).toHaveLength(1);
+        expect(admitted).toBe(false);
+        expect(h.calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:1"]);
+        expect((yield* h.adapter.listSessions())[0]?.activeTurnId).toBeUndefined();
+      }),
+  );
+
+  it.effect("validates after native preparation before admitting a prompt", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ holdDispatch: true });
+      yield* h.adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      let admitted = false;
+      const rejection = new ProviderAdapterValidationError({
+        provider: "antigravity",
+        operation: "sendTurn",
+        issue: "Stopped before dispatch",
+      });
+      const sending = yield* h.adapter
+        .sendTurn(
+          { threadId, input: "rejected", delivery: { attemptId: "rejected", mode: "next-turn" } },
+          {
+            beforeDispatch: Effect.fail(rejection),
+            onAdmitted: () =>
+              Effect.sync(() => {
+                admitted = true;
+              }),
+          },
+        )
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(h.dispatchStarted);
+      yield* Deferred.succeed(h.dispatchRelease, undefined);
+      const result = yield* Fiber.join(sending);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") expect(result.failure).toBe(rejection);
+      expect(admitted).toBe(false);
+      expect(h.calls.filter((call) => call.startsWith("prompt:"))).toEqual([]);
+    }),
+  );
+
+  it.effect("normal Stop interrupts a queued prompt after admission", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* h.adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      let admissions = 0;
+      const sending = yield* h.adapter
+        .sendTurn(
+          {
+            threadId,
+            input: "Already admitted",
+            delivery: { attemptId: CommandId.make("admitted-stop"), mode: "next-turn" },
+          },
+          {
+            onAdmitted: () =>
+              Effect.sync(() => {
+                admissions++;
+              }),
+          },
+        )
+        .pipe(Effect.forkChild);
+      yield* h.nextPrompt;
+      yield* h.adapter.interruptTurn(threadId);
+      yield* Fiber.join(sending);
+      const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+      expect(completed.payload.state).toBe("cancelled");
+      expect(admissions).toBe(1);
+      expect(h.calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:1"]);
+    }),
+  );
+
+  it.effect("rejects selected steering when the native prompt ends during preparation", () =>
+    Effect.gen(function* () {
+      const preparing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let holdPreparation = false;
+      const h = yield* makeHarness({
+        defaultModel: Effect.suspend(() =>
+          holdPreparation
+            ? Deferred.succeed(preparing, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as(undefined),
+              )
+            : Effect.undefined,
+        ),
+      });
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      const first = yield* h.adapter
+        .sendTurn({ threadId, input: "First prompt" })
+        .pipe(Effect.forkChild);
+      const prompt = yield* h.nextPrompt;
+      const started = yield* h.waitForEvent((event) => event.type === "turn.started");
+      holdPreparation = true;
+      let admitted = false;
+      const steering = yield* h.adapter
+        .sendTurn(
+          {
+            threadId,
+            input: "Steer this turn",
+            delivery: {
+              mode: "steer",
+              attemptId: CommandId.make("stale-antigravity-steer"),
+              expectedTurnId: started.turnId!,
+            },
+          },
+          {
+            onAdmitted: () =>
+              Effect.sync(() => {
+                admitted = true;
+              }),
+          },
+        )
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(preparing);
+      yield* Deferred.succeed(prompt.result, { stopReason: "end_turn" });
+      yield* Deferred.succeed(release, undefined);
+      const rejected = yield* Fiber.join(steering);
+      expect(rejected._tag).toBe("Failure");
+      if (rejected._tag === "Failure")
+        expect(rejected.failure._tag).toBe("ProviderAdapterValidationError");
+      yield* Fiber.join(first);
+      const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+      expect(completed.payload.state).toBe("completed");
+      expect(admitted).toBe(false);
+      expect(h.calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:1"]);
+      expect(h.calls.some((call) => call.startsWith("cancel:"))).toBe(false);
+    }),
+  );
+
   it.effect("waits for native cancellation before a steer changes the model", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness({ holdCancel: true });
@@ -676,7 +950,7 @@ it.layer(layer)("AntigravityAdapter", (it) => {
     }),
   );
 
-  it.effect("settles a failed steer configuration and allows a later turn", () =>
+  it.effect("preserves the original cancellation when steer configuration fails", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness();
       yield* h.adapter.startSession({
@@ -697,9 +971,9 @@ it.layer(layer)("AntigravityAdapter", (it) => {
       expect(Exit.isFailure(failed)).toBe(true);
       yield* Fiber.join(first);
       const ended = yield* h.waitForEvent((event) => event.type === "turn.completed");
-      expect(ended.payload.state).toBe("failed");
+      expect(ended.payload.state).toBe("cancelled");
       expect((yield* h.adapter.listSessions())[0]).toMatchObject({
-        status: "error",
+        status: "ready",
         activeTurnId: undefined,
       });
       const later = yield* h.adapter

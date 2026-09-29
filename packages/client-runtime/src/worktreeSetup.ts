@@ -2,6 +2,7 @@ import {
   WORKTREE_SETUP_ACTIVITY_KIND,
   WorktreeSetupSnapshot,
   type ThreadId,
+  type ThreadPreparation,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -46,6 +47,7 @@ export function resolveVisibleWorktreeSetup(input: {
   turnStarted: boolean;
   /** The user sent a message after the one that created the worktree. */
   followUpSent: boolean;
+  preparation?: Pick<ThreadPreparation, "state"> | undefined;
 }): WorktreeSetupSnapshot | null {
   const snapshot =
     input.live && (!input.recorded || input.live.sequence >= input.recorded.sequence)
@@ -53,6 +55,7 @@ export function resolveVisibleWorktreeSetup(input: {
       : input.recorded;
   if (!snapshot) return null;
   if (snapshot.phase === "running") return snapshot;
+  if (input.preparation && input.preparation.state !== "ready") return snapshot;
   if (input.followUpSent) return null;
   if (snapshot.phase !== "done") return snapshot;
   if (!input.turnStarted) return snapshot;

@@ -1,16 +1,20 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { EnvironmentHttpApi } from "@t3tools/contracts";
+import { EnvironmentAuthenticatedAuth, EnvironmentHttpApi } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import { HttpEffect, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import * as Etag from "effect/unstable/http/Etag";
 import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
+import * as HttpApiGroup from "effect/unstable/httpapi/HttpApiGroup";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 
 import * as ServerConfig from "../config.ts";
@@ -18,6 +22,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
+import { RepositoryAccess } from "./RepositoryAccess.ts";
 import { authHttpApiLayer, environmentAuthenticatedAuthLayer } from "./http.ts";
 
 const DEV_TOKEN = "reusable-dev-auth-token-that-is-long-enough";
@@ -63,6 +68,80 @@ const postJson = (path: string, body: unknown, headers?: Readonly<Record<string,
     headers: { "content-type": "application/json", ...headers },
     body: encodeJson(body),
   });
+
+it.effect(
+  "repository revocation drains an authenticated response body before acknowledgement",
+  () =>
+    Effect.gen(function* () {
+      const middleware = yield* EnvironmentAuthenticatedAuth;
+      const personalAccess = yield* RepositoryAccess;
+      const closing = yield* Deferred.make<Effect.Effect<void>>();
+      const bodyStarted = yield* Deferred.make<void>();
+      let unregistered = false;
+      let bodyDrained = false;
+      const access = RepositoryAccess.of({
+        ...personalAccess,
+        status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+        registerConnection: (close) =>
+          Deferred.succeed(closing, close).pipe(
+            Effect.as(() => {
+              unregistered = true;
+            }),
+          ),
+      });
+      const response = HttpServerResponse.stream(
+        Stream.fromEffect(
+          Deferred.succeed(bodyStarted, undefined).pipe(Effect.andThen(Effect.never)),
+        ).pipe(
+          Stream.onExit(() =>
+            Effect.sync(() => {
+              bodyDrained = true;
+            }),
+          ),
+        ),
+      );
+      const app = yield* HttpRouter.toHttpEffect(
+        HttpRouter.add(
+          "GET",
+          "/protected",
+          middleware(Effect.succeed(response), {
+            // Match HttpApiBuilder's erased group metadata at the middleware boundary.
+            group: EnvironmentHttpApi.groups.auth as unknown as HttpApiGroup.Top,
+            endpoint: EnvironmentHttpApi.groups.auth.endpoints.webSocketTicket,
+          }),
+        ),
+      );
+      yield* HttpEffect.toHandled(app, (_request, result) =>
+        result.body._tag === "Stream"
+          ? Stream.runDrain(Stream.orDie(result.body.stream)).pipe(Effect.interruptible)
+          : Effect.void,
+      ).pipe(
+        Effect.provideService(RepositoryAccess, access),
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          HttpServerRequest.fromWeb(
+            new Request("http://127.0.0.1/protected", {
+              headers: { authorization: `Bearer ${DEV_TOKEN}` },
+            }),
+          ),
+        ),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(bodyStarted);
+      expect(unregistered).toBe(false);
+      const close = yield* Deferred.await(closing);
+      yield* close;
+      expect(bodyDrained).toBe(true);
+      expect(unregistered).toBe(true);
+    }).pipe(
+      Effect.provide(
+        environmentAuthenticatedAuthLayer.pipe(
+          Layer.provide(environmentAuthLayer),
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+);
 
 it.effect("sets the selected browser session cookies through the HTTP route", () =>
   Effect.gen(function* () {

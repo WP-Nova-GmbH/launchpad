@@ -15,6 +15,7 @@ import * as Schema from "effect/Schema";
 
 import packageJson from "../../package.json" with { type: "json" };
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import { readAgentActivityPublishingActive } from "../cloud/config.ts";
 import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
@@ -258,12 +259,22 @@ export const make = Effect.gen(function* () {
     // The publish opt-in and relay link change at runtime (`t3 connect
     // publish`, the client settings toggle), so the capability is read per
     // descriptor request rather than baked in at startup.
-    getDescriptor: readAgentActivityPublishingActive(secrets).pipe(
-      Effect.map((agentActivityPublishing) => ({
+    getDescriptor: Effect.gen(function* () {
+      const agentActivityPublishing = yield* readAgentActivityPublishingActive(secrets);
+      const repositoryAccess = yield* RepositoryAccess;
+      const policy = yield* repositoryAccess.status;
+      return {
         ...descriptor,
-        capabilities: { ...descriptor.capabilities, agentActivityPublishing },
-      })),
-    ),
+        capabilities: {
+          ...descriptor.capabilities,
+          agentActivityPublishing,
+          sharedPromptQueue: policy.enabled,
+          sharedPreparation: policy.enabled,
+          organizationRepositoryAccess: policy.enabled,
+          repositoryPolicyReady: policy.ready,
+        },
+      };
+    }),
   });
 });
 

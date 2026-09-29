@@ -33,6 +33,7 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
+import { ProviderAdapterValidationError } from "../Errors.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
@@ -667,6 +668,56 @@ const questionRequest = (id: string, sessionID: string): QuestionRequest => ({
 });
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
+  it.effect.each(["prompt", "command", "compact"] as const)(
+    "validates at native %s dispatch before sending anything",
+    (operation) =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId(`opencode-dispatch-${operation}`);
+        yield* adapter.startSession({
+          threadId,
+          runtimeMode: "full-access",
+          modelSelection: createModelSelection(ProviderInstanceId.make("opencode"), "openai/gpt-5"),
+        });
+        const rejection = new ProviderAdapterValidationError({
+          provider: "opencode",
+          operation: "sendTurn",
+          issue: "Stopped before dispatch",
+        });
+        let admitted = false;
+        const validation = Effect.fail(rejection);
+        const result = yield* (
+          operation === "compact" && adapter.compaction?.type === "native"
+            ? adapter.compaction.start(threadId, undefined, validation)
+            : adapter.sendTurn(
+                {
+                  threadId,
+                  input: operation === "command" ? "/review" : "rejected",
+                  delivery: { attemptId: "rejected", mode: "next-turn" },
+                },
+                {
+                  beforeDispatch: validation,
+                  onAdmitted: () =>
+                    Effect.sync(() => {
+                      admitted = true;
+                    }),
+                },
+              )
+        ).pipe(Effect.result);
+        NodeAssert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") NodeAssert.equal(result.failure, rejection);
+        NodeAssert.equal(admitted, false);
+        NodeAssert.equal(runtimeMock.state.promptCalls.length, 0);
+        NodeAssert.equal(runtimeMock.state.commandCalls.length, 0);
+        NodeAssert.equal(runtimeMock.state.summarizeCalls.length, 0);
+        yield* adapter.sendTurn({
+          threadId,
+          input: "accepted",
+          delivery: { attemptId: "accepted", mode: "next-turn" },
+        });
+        NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
+      }),
+  );
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -3656,6 +3707,78 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal(completed?.turnId, activeTurn.turnId);
       NodeAssert.equal(runtimeMock.state.sessionStatusCalls, 2);
     }),
+  );
+
+  it.effect(
+    "rejects selected steering when its target becomes idle during the dispatch guard",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("stale-selected-steer");
+        const idle = promiseWithResolvers<unknown>();
+        const marker = promiseWithResolvers<unknown>();
+        runtimeMock.state.subscribedEvents = [idle.promise, marker.promise];
+        runtimeMock.state.sessionStatusImplementation = async () => ({ data: {} });
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "opencode/kimi-k3",
+          ),
+        });
+        const active = yield* adapter.sendTurn({ threadId, input: "Start" });
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const observed = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) => event.threadId === threadId && event.type === "thread.metadata.updated",
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        let admitted = false;
+        const steer = yield* adapter
+          .sendTurn(
+            {
+              threadId,
+              input: "Steer",
+              delivery: {
+                attemptId: "stale-steer",
+                mode: "steer",
+                expectedTurnId: active.turnId,
+              },
+            },
+            {
+              beforeDispatch: Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+              ),
+              onAdmitted: () =>
+                Effect.sync(() => {
+                  admitted = true;
+                }),
+            },
+          )
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(entered);
+        idle.resolve({
+          type: "session.status",
+          properties: { sessionID: "http://127.0.0.1:9999/session", status: { type: "idle" } },
+        });
+        marker.resolve({
+          type: "session.updated",
+          properties: { info: { id: "http://127.0.0.1:9999/session", title: "dispatch barrier" } },
+        });
+        yield* Fiber.join(observed);
+        yield* Deferred.succeed(release, undefined);
+        const result = yield* Fiber.join(steer);
+        NodeAssert.equal(result._tag, "Failure");
+        if (result._tag === "Failure")
+          NodeAssert.equal(result.failure._tag, "ProviderAdapterValidationError");
+        NodeAssert.equal(admitted, false);
+        NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
+      }),
   );
 
   it.effect("accepts the only idle event after a steer fails before creating its message", () =>

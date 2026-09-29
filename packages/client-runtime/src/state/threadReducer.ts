@@ -16,6 +16,7 @@ import type {
 import { threadPullRequestKeysEqual } from "@t3tools/shared/threadPullRequests";
 import { isImportedAgentSessionMessageId } from "@t3tools/contracts";
 import { compareDateTimeStrings } from "@t3tools/shared/dateTime";
+import { applyThreadPromptQueueChange } from "@t3tools/shared/threadPromptQueue";
 
 export type ThreadDetailReducerResult =
   | { readonly kind: "updated"; readonly thread: OrchestrationThread }
@@ -385,6 +386,20 @@ export function applyThreadDetailEvent(
       };
     }
 
+    case "thread.prompt-queue-changed":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          promptQueue: applyThreadPromptQueueChange(
+            thread.promptQueue,
+            event.payload,
+            event.sequence,
+          ),
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
     // ── Messages ────────────────────────────────────────────────────
     case "thread.message-sent": {
       const message: OrchestrationMessage = {
@@ -395,6 +410,9 @@ export function applyThreadDetailEvent(
           ? { attachments: event.payload.attachments }
           : {}),
         ...(event.payload.context !== undefined ? { context: event.payload.context } : {}),
+        ...(event.payload.author !== undefined ? { author: event.payload.author } : {}),
+        ...(event.payload.editedBy !== undefined ? { editedBy: event.payload.editedBy } : {}),
+        ...(event.payload.steeredBy !== undefined ? { steeredBy: event.payload.steeredBy } : {}),
         turnId: event.payload.turnId,
         streaming: event.payload.streaming,
         createdAt: event.payload.createdAt,
@@ -417,6 +435,9 @@ export function applyThreadDetailEvent(
           ...(message.streaming ? {} : { updatedAt: message.updatedAt }),
           ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
           ...(message.context !== undefined ? { context: message.context } : {}),
+          ...(message.author !== undefined ? { author: message.author } : {}),
+          ...(message.editedBy !== undefined ? { editedBy: message.editedBy } : {}),
+          ...(message.steeredBy !== undefined ? { steeredBy: message.steeredBy } : {}),
         };
       });
       if (!found) messages.push(message);

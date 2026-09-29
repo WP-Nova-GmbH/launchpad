@@ -84,7 +84,7 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
       }),
   );
 
-  public readonly compactThread = Effect.void;
+  public readonly compactThread = () => Effect.void;
 
   public readonly interruptTurnImpl = vi.fn((_turnId?: TurnId): Promise<void> =>
     Promise.resolve(undefined),
@@ -130,7 +130,7 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     return Effect.promise(() => this.startImpl());
   }
 
-  getSession = Effect.promise(() => this.startImpl());
+  getSession: Effect.Effect<ProviderSession> = Effect.promise(() => this.startImpl());
 
   sendTurn(input: CodexSessionRuntimeSendTurnInput) {
     return Effect.promise(() => this.sendTurnImpl(input));
@@ -319,6 +319,42 @@ const sessionErrorLayer = it.layer(
 );
 
 sessionErrorLayer("CodexAdapterLive session errors", (it) => {
+  it.effect("targets native steering and rejects a finished target before dispatch", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("shared-steer");
+      const turnId = asTurnId("turn-1");
+      yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+      const runtime = sessionRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      const ready = yield* runtime.getSession;
+      runtime.getSession = Effect.succeed({ ...ready, status: "running", activeTurnId: turnId });
+      const input = {
+        threadId,
+        input: "Use the other design",
+        delivery: { attemptId: "shared-attempt", mode: "steer" as const, expectedTurnId: turnId },
+      };
+      let admitted = false;
+      yield* adapter.sendTurn(input, {
+        onAdmitted: (result, evidence) =>
+          Effect.sync(() => {
+            NodeAssert.equal(result.turnId, turnId);
+            NodeAssert.equal(evidence, "provider-ack");
+            admitted = true;
+          }),
+      });
+      NodeAssert.equal(admitted, true);
+      NodeAssert.deepEqual(runtime.sendTurnImpl.mock.calls[0]?.[0].steer, {
+        expectedTurnId: turnId,
+        messageId: "shared-attempt",
+      });
+      runtime.getSession = Effect.succeed(ready);
+      const rejected = yield* Effect.flip(adapter.sendTurn(input));
+      NodeAssert.equal(rejected._tag, "ProviderAdapterValidationError");
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 1);
+    }),
+  );
+
   it.effect("maps missing adapter sessions to ProviderAdapterSessionNotFoundError", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;

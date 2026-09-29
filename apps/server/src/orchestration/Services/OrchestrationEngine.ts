@@ -14,6 +14,8 @@ import type {
   OrchestrationClientOrigin,
   OrchestrationCommand,
   OrchestrationEvent,
+  CommandId,
+  ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -29,6 +31,23 @@ export interface OrchestrationThreadReplayRange {
   readonly threadId: ThreadId;
   readonly fromSequenceExclusive: number;
   readonly toSequenceInclusive: number;
+}
+
+/** Internal preconditions for a delete and its preparatory Stop commands. */
+export interface DeletionPreconditions {
+  readonly snapshotSequence: number;
+  readonly projectId: ProjectId;
+  readonly threads: ReadonlyArray<{
+    readonly threadId: ThreadId;
+    readonly preparationAttemptId: CommandId | null;
+  }>;
+}
+
+export interface OrchestrationDispatchOptions {
+  readonly origin?: OrchestrationClientOrigin;
+  readonly deletionPreconditions?: DeletionPreconditions;
+  /** Serialize a preflight rejection with duplicate commands and their receipts. */
+  readonly rejection?: { readonly detail: string; readonly projectId: ProjectId };
 }
 
 /**
@@ -72,7 +91,7 @@ export interface OrchestrationEngineShape {
    */
   readonly dispatch: (
     command: OrchestrationCommand,
-    options?: { readonly origin?: OrchestrationClientOrigin },
+    options?: OrchestrationDispatchOptions,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**

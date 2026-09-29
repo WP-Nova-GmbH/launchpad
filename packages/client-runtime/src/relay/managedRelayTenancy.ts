@@ -7,6 +7,7 @@
  * bearer, and they are used by administrative surfaces rather than by the
  * connection machinery.
  */
+import type { RepositoryAccessRemovalStatus } from "@t3tools/contracts";
 import {
   RelayApi,
   type RelayConnectMachineResponse,
@@ -82,6 +83,10 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly userId: string;
       readonly role: RelayOrgRole;
     }) => Effect.Effect<RelayOrganizationMember, ManagedRelayClientError>;
+    readonly getAccessRemoval: (input: {
+      readonly clerkToken: string;
+      readonly revision?: number;
+    }) => Effect.Effect<RepositoryAccessRemovalStatus, ManagedRelayClientError>;
     readonly removeMember: (input: {
       readonly clerkToken: string;
       readonly userId: string;
@@ -216,6 +221,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     renameOrganization: unavailable("clientRuntime.managedRelayTenancy.renameOrganization"),
     listMembers: unavailable("clientRuntime.managedRelayTenancy.listMembers"),
     updateMemberRole: unavailable("clientRuntime.managedRelayTenancy.updateMemberRole"),
+    getAccessRemoval: unavailable("clientRuntime.managedRelayTenancy.getAccessRemoval"),
     removeMember: unavailable("clientRuntime.managedRelayTenancy.removeMember"),
     listInvitations: unavailable("clientRuntime.managedRelayTenancy.listInvitations"),
     createInvitation: unavailable("clientRuntime.managedRelayTenancy.createInvitation"),
@@ -319,6 +325,21 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.updateMemberRole"),
+      withRelayClientTracing,
+    ),
+    getAccessRemoval: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.organization
+          .getRepositoryAccessRemoval({
+            headers: bearerHeaders(input.clerkToken),
+            query: input.revision === undefined ? {} : { revision: input.revision },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read access removal status")),
+            timeoutRelayRequest("Access removal status"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getAccessRemoval"),
       withRelayClientTracing,
     ),
     removeMember: Effect.fnUntraced(

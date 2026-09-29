@@ -1,4 +1,10 @@
 import {
+  getPromptQueue,
+  listPromptQueues,
+  getPromptQueueSummary,
+  listPromptQueueSummaries,
+} from "../../persistence/ProjectionPromptQueues.ts";
+import {
   AgentSessionImportSource,
   ApprovalRequestId,
   ChatAttachment,
@@ -116,6 +122,8 @@ const ProjectionThreadMessageDbRowSchema = ProjectionThreadMessage.mapFields(
     attachments: Schema.NullOr(Schema.fromJsonString(Schema.Array(ChatAttachment))),
     context: Schema.NullOr(Schema.fromJsonString(OrchestrationMessageContext)),
     author: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
+    editedBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
+    steeredBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
   }),
 );
 const ProjectionTurnStartMessageDbRowSchema = ProjectionThreadMessageDbRowSchema.mapFields(
@@ -188,6 +196,7 @@ const EventReplayStatsRowSchema = Schema.Struct({
   payloadBytes: Schema.Number,
 });
 const ProjectionThreadSearchRequest = Schema.Struct({
+  allowedProjectIds: Schema.optionalKey(Schema.Array(ProjectId)),
   pattern: Schema.String,
   limit: Schema.Int,
 });
@@ -734,6 +743,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          edited_by_json AS "editedBy",
+          steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
@@ -1061,7 +1072,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
   const searchActiveThreadRows = SqlSchema.findAll({
     Request: ProjectionThreadSearchRequest,
     Result: ProjectionThreadSearchRow,
-    execute: ({ pattern, limit }) =>
+    execute: ({ pattern, limit, allowedProjectIds }) =>
       sql`
         WITH ranked AS (
           SELECT
@@ -1096,6 +1107,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           WHERE threads.deleted_at IS NULL
             AND threads.archived_at IS NULL
             AND projects.deleted_at IS NULL
+            AND ${allowedProjectIds === undefined ? sql`1 = 1` : sql.in("threads.project_id", allowedProjectIds)}
             AND messages.is_streaming = 0
             -- Only these two roles are searchable, and the CASE above depends
             -- on it: reasoning is deliberately excluded so a thinking trace
@@ -1244,9 +1256,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
   });
 
   const getActiveThreadRowById = SqlSchema.findOneOption({
-    Request: ThreadIdLookupInput,
+    Request: Schema.Struct({
+      threadId: ThreadId,
+      includeArchived: Schema.optional(Schema.Boolean),
+    }),
     Result: ProjectionThreadDbRowSchema,
-    execute: ({ threadId }) =>
+    execute: ({ threadId, includeArchived }) =>
       sql`
         SELECT
           thread_id AS "threadId",
@@ -1283,7 +1298,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         FROM projection_threads
         WHERE thread_id = ${threadId}
           AND deleted_at IS NULL
-          AND archived_at IS NULL
+          AND ${includeArchived ? sql`1 = 1` : sql`archived_at IS NULL`}
         LIMIT 1
       `,
   });
@@ -1339,6 +1354,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         attachments_json AS "attachments",
         context_json AS "context",
         author_json AS "author",
+          edited_by_json AS "editedBy",
+          steered_by_json AS "steeredBy",
         is_streaming AS "isStreaming",
         created_at AS "createdAt",
         updated_at AS "updatedAt",
@@ -1373,6 +1390,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          edited_by_json AS "editedBy",
+          steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
@@ -1480,7 +1499,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         created_at AS "createdAt"
       FROM projection_thread_activities
       WHERE thread_id = ${threadId}
-        AND kind IN ('user-input.requested', 'user-input.resolved')
+        AND kind IN ('user-input.requested', 'user-input.answer-submitted', 'user-input.resolved')
         AND json_extract(payload_json, '$.requestId') = ${requestId}
       ORDER BY sequence DESC, created_at DESC, activity_id DESC
       LIMIT 1
@@ -1787,6 +1806,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          edited_by_json AS "editedBy",
+          steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
@@ -2197,9 +2218,14 @@ pending_approval_requests AS (
                   text: row.text,
                   ...(row.attachments !== null ? { attachments: row.attachments } : {}),
                   ...(row.context !== null ? { context: row.context } : {}),
+                  ...(row.author !== null ? { author: row.author } : {}),
+                  ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
+                  ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
                   turnId: row.turnId,
                   streaming: row.isStreaming === 1,
                   ...(row.author !== null ? { author: row.author } : {}),
+                  ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
+                  ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
                   createdAt: row.createdAt,
                   updatedAt: row.updatedAt,
                 });
@@ -2325,7 +2351,11 @@ pending_approval_requests AS (
                 deletedAt: row.deletedAt,
               }));
 
+              const promptQueues = yield* listPromptQueues(sql);
               const threads: ReadonlyArray<OrchestrationThread> = threadRows.map((row) => ({
+                ...(promptQueues.has(row.threadId)
+                  ? { promptQueue: promptQueues.get(row.threadId) }
+                  : {}),
                 id: row.threadId,
                 projectId: row.projectId,
                 title: row.title,
@@ -2471,6 +2501,7 @@ pending_approval_requests AS (
               let updatedAt: string | null = null;
               const projects: OrchestrationProject[] = [];
               const threads: OrchestrationThread[] = [];
+              const promptQueues = yield* listPromptQueues(sql);
 
               for (let index = 0; index < projectRows.length; index += 1) {
                 const row = projectRows[index];
@@ -2572,6 +2603,9 @@ pending_approval_requests AS (
                   continue;
                 }
                 threads.push({
+                  ...(promptQueues.has(row.threadId)
+                    ? { promptQueue: promptQueues.get(row.threadId) }
+                    : {}),
                   id: row.threadId,
                   projectId: row.projectId,
                   title: row.title,
@@ -2717,6 +2751,7 @@ pending_approval_requests AS (
               );
               const pullRequestsByThread = groupPullRequestRowsByThread(pullRequestRows);
 
+              const queueSummaries = yield* listPromptQueueSummaries(sql);
               const snapshot = {
                 snapshotSequence: computeSnapshotSequence(stateRows),
                 projects: Arr.filterMap(projectRows, (row) =>
@@ -2729,6 +2764,9 @@ pending_approval_requests AS (
                 threads: Arr.filterMap(threadRows, (row) =>
                   row.deletedAt === null
                     ? Result.succeed({
+                        ...(queueSummaries.has(row.threadId)
+                          ? { promptQueueSummary: queueSummaries.get(row.threadId) }
+                          : {}),
                         id: row.threadId,
                         projectId: row.projectId,
                         title: row.title,
@@ -2883,6 +2921,7 @@ pending_approval_requests AS (
                 sessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
               );
 
+              const queueSummaries = yield* listPromptQueueSummaries(sql);
               const snapshot = {
                 snapshotSequence: computeSnapshotSequence(stateRows),
                 projects: Arr.filterMap(projectRows, (row) =>
@@ -2893,6 +2932,9 @@ pending_approval_requests AS (
                     : Result.failVoid,
                 ),
                 threads: threadRows.map((row): OrchestrationThreadShell => ({
+                  ...(queueSummaries.has(row.threadId)
+                    ? { promptQueueSummary: queueSummaries.get(row.threadId) }
+                    : {}),
                   id: row.threadId,
                   projectId: row.projectId,
                   title: row.title,
@@ -2967,6 +3009,38 @@ pending_approval_requests AS (
       })),
     );
 
+  const readThreadSubscriptionAnchor = SqlSchema.findOneOption({
+    Request: ThreadIdLookupInput,
+    Result: Schema.Struct({ projectId: ProjectId, creationSequence: NonNegativeInt }),
+    execute: ({ threadId }) => sql`
+      SELECT t.project_id AS "projectId", COALESCE((
+        SELECT MAX(e.sequence) FROM orchestration_events e
+        WHERE e.aggregate_kind = 'thread' AND e.stream_id = t.thread_id
+          AND e.event_type = 'thread.created'
+      ), 0) AS "creationSequence"
+      FROM projection_threads t WHERE t.thread_id = ${threadId} AND t.deleted_at IS NULL
+    `,
+  });
+  const getThreadSubscriptionAnchor: ProjectionSnapshotQueryShape["getThreadSubscriptionAnchor"] = (
+    threadId,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const thread = yield* readThreadSubscriptionAnchor({ threadId });
+          if (Option.isNone(thread)) return Option.none();
+          const { snapshotSequence } = yield* getSnapshotSequence();
+          return Option.some({ ...thread.value, snapshotSequence });
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          isPersistenceError(error)
+            ? error
+            : toPersistenceSqlError("ProjectionSnapshotQuery.getThreadSubscriptionAnchor")(error),
+        ),
+      );
+
   const getCounts: ProjectionSnapshotQueryShape["getCounts"] = () =>
     readProjectionCounts(undefined).pipe(
       Effect.mapError(
@@ -2997,9 +3071,11 @@ pending_approval_requests AS (
 
   const searchThreads: ProjectionSnapshotQueryShape["searchThreads"] = Effect.fn(
     "ProjectionSnapshotQuery.searchThreads",
-  )(function* (input) {
+  )(function* (input, allowedProjectIds) {
+    if (allowedProjectIds?.length === 0) return { matches: [] };
     const escapedQuery = escapeLikePattern(input.query);
     const rows = yield* searchActiveThreadRows({
+      ...(allowedProjectIds === undefined ? {} : { allowedProjectIds }),
       pattern: `%${escapedQuery}%`,
       limit: input.limit ?? 50,
     }).pipe(
@@ -3246,7 +3322,9 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThreadShell>();
       }
 
+      const promptQueueSummary = yield* getPromptQueueSummary(sql, threadId);
       return Option.some({
+        ...(promptQueueSummary ? { promptQueueSummary } : {}),
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,
         title: threadRow.value.title,
@@ -3332,6 +3410,9 @@ pending_approval_requests AS (
         updatedAt: row.updatedAt,
         ...(row.attachments !== null ? { attachments: row.attachments } : {}),
         ...(row.context !== null ? { context: row.context } : {}),
+        ...(row.author !== null ? { author: row.author } : {}),
+        ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
+        ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
       },
       hasOtherUserMessages: row.hasOtherUserMessages === 1,
     }));
@@ -3482,7 +3563,11 @@ pending_approval_requests AS (
         latestTurnRow,
         sessionRow,
       ] = yield* Effect.all([
-        getActiveThreadRowById({ threadId }).pipe(
+        getActiveThreadRowById({
+          threadId,
+          includeArchived:
+            activityRead.mode === "client" || activityRead.query?.includeArchived === true,
+        }).pipe(
           Effect.mapError(
             toPersistenceSqlOrDecodeError(
               "ProjectionSnapshotQuery.getThreadDetailById:getThread:query",
@@ -3548,7 +3633,9 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThread>();
       }
 
+      const promptQueue = yield* getPromptQueue(sql, threadId);
       const thread = {
+        ...(promptQueue ? { promptQueue } : {}),
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,
         title: threadRow.value.title,
@@ -3590,6 +3677,8 @@ pending_approval_requests AS (
             turnId: row.turnId,
             streaming: row.isStreaming === 1,
             ...(row.author !== null ? { author: row.author } : {}),
+            ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
+            ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
             createdAt: row.createdAt,
             updatedAt: row.updatedAt,
           };
@@ -3644,6 +3733,7 @@ pending_approval_requests AS (
   const getThreadDetailSnapshot: ProjectionSnapshotQueryShape["getThreadDetailSnapshot"] = (
     threadId,
     window,
+    expectedCreationSequence,
   ) =>
     // Read the thread detail and the snapshot sequence within a single
     // transaction so the sequence is consistent with the returned state; a
@@ -3654,6 +3744,11 @@ pending_approval_requests AS (
     sql
       .withTransaction(
         Effect.gen(function* () {
+          if (expectedCreationSequence !== undefined) {
+            const anchor = yield* readThreadSubscriptionAnchor({ threadId });
+            if (Option.isNone(anchor) || anchor.value.creationSequence !== expectedCreationSequence)
+              return Option.none<OrchestrationThreadDetailSnapshot>();
+          }
           if (window?.turnLimit === undefined) {
             const thread = yield* getThreadDetailByIdBounded(threadId, undefined, {
               mode: "client",
@@ -3781,6 +3876,7 @@ pending_approval_requests AS (
       );
 
   return {
+    getThreadSubscriptionAnchor,
     getCommandReadModel,
     getUserInputActivity,
     listActivitiesByKind,

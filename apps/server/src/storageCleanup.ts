@@ -86,6 +86,11 @@ function storageCleanupThreadIdle(thread: OrchestrationThreadShell, now: number)
     (thread.session === null || thread.session.status === "stopped") &&
     thread.latestTurn?.state !== "running" &&
     thread.backgroundLiveness == null &&
+    (thread.promptQueueSummary?.count ?? 0) === 0 &&
+    (thread.promptQueueSummary?.preparation === undefined ||
+      (thread.promptQueueSummary.preparation.state === "ready" &&
+        thread.promptQueueSummary.preparation.settled)) &&
+    thread.promptQueueSummary?.pauseReason?.code !== "delivery-unknown" &&
     !thread.hasPendingApprovals &&
     !thread.hasPendingUserInput &&
     !threadHasQueuedTurnStart(thread, DateTime.formatIso(DateTime.makeUnsafe(now)))
@@ -170,6 +175,18 @@ export const make = Effect.gen(function* () {
     return false;
   });
 
+  const confirmWorktreeDeletions = Effect.fn("StorageCleanup.confirmWorktreeDeletions")(function* (
+    worktreePath: string,
+  ) {
+    // A different task (or policy) may nominate the same directory. Every
+    // deletion owning that path must settle before any candidate can remove it.
+    const deleted = yield* snapshots.getDeletedWorktreeThreads();
+    const { snapshotSequence } = yield* snapshots.getSnapshotSequence();
+    for (const thread of deleted)
+      if (path.resolve(thread.worktreePath) === worktreePath)
+        yield* threadDeletion.drainThrough(snapshotSequence, thread.id);
+  });
+
   const cleanWorktrees = Effect.fn("StorageCleanup.cleanWorktrees")(function* (
     serverSettings: ServerSettings,
     now: number,
@@ -182,12 +199,6 @@ export const make = Effect.gen(function* () {
           (thread) => resolveWorktreeCleanup(serverSettings, thread.projectId).worktreeOnDelete,
         )
       : [];
-    if (deletedThreads.length > 0) {
-      // Read tombstones before taking this fence. A later deletion waits for the
-      // next sweep; every captured deletion must finish stopping its resources.
-      const { snapshotSequence } = yield* snapshots.getSnapshotSequence();
-      yield* threadDeletion.drainThrough(snapshotSequence);
-    }
     const snapshot = yield* readThreads();
     const root = yield* fs.realPath(config.worktreesDir);
     const refreshedDefaultRefs = new Map<string, Set<string>>();
@@ -214,6 +225,7 @@ export const make = Effect.gen(function* () {
       )
         continue;
       yield* Effect.gen(function* () {
+        yield* confirmWorktreeDeletions(worktreePath);
         if (!inside(root, worktreePath) || !(yield* fs.exists(worktreePath))) return;
         if ((yield* fs.realPath(worktreePath)) !== worktreePath) return;
         if (yield* containsProjectRoot(worktreePath, [project, ...snapshot.projects])) return;
@@ -352,6 +364,7 @@ export const make = Effect.gen(function* () {
           )
         )
           return;
+        yield* confirmWorktreeDeletions(worktreePath);
         yield* git.removeWorktree({ cwd: project.workspaceRoot, path: worktreePath, force: false });
         yield* gitManager.invalidateStatus(project.workspaceRoot);
         // Preserve branch and path: ProviderCommandReactor recreates the checkout

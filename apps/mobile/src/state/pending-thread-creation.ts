@@ -6,7 +6,7 @@ import { Atom } from "effect/unstable/reactivity";
 import { deriveThreadTitleFromPrompt } from "../lib/projectThreadStartTurn";
 import { scopedThreadKey } from "../lib/scopedEntities";
 import { appAtomRegistry } from "./atom-registry";
-import type { QueuedThreadMessage } from "./thread-outbox-model";
+import { acceptedQueuedThreadMessage, type QueuedThreadMessage } from "./thread-outbox-model";
 
 /**
  * A new task navigates to its thread screen the moment it is queued, before the
@@ -34,9 +34,10 @@ export function resolvePendingThreadCreation(input: {
     readonly messages: ReadonlyArray<{ readonly id: string }>;
     readonly latestTurn: { readonly turnId: string } | null;
     readonly session: { readonly status: string } | null;
+    readonly promptQueue?: OrchestrationThread["promptQueue"];
   } | null;
 }): PendingThreadCreation | null {
-  const creation = input.pending ?? input.previous;
+  let creation = input.pending ?? input.previous;
   if (
     creation === null ||
     scopedThreadKey(creation.message.environmentId, creation.message.threadId) !== input.threadKey
@@ -45,6 +46,23 @@ export function resolvePendingThreadCreation(input: {
   }
   if (creation.outcome?.kind === "failed") return creation;
   const detail = input.detail;
+  const messageId = creation.message.messageId;
+  const accepted = creation.outcome?.kind === "delivered" || creation.message.acceptedWithEdits;
+  if (
+    detail?.promptQueue &&
+    (accepted || detail.promptQueue.entries.some((entry) => entry.messageId === messageId))
+  )
+    return null;
+  const hasPrompt = detail?.messages.some((message) => message.id === messageId);
+  if (accepted || hasPrompt) {
+    const message = acceptedQueuedThreadMessage(creation.message);
+    if (message !== creation.message) creation = { ...creation, message };
+  }
+  if (
+    creation.message.acceptanceUncertain ||
+    creation.message.submissionProtocol === "review-required"
+  )
+    return creation;
   if (
     detail?.session?.status === "error" ||
     detail?.session?.status === "stopped" ||
@@ -72,6 +90,8 @@ export const pendingThreadCreationOutcomesAtom = Atom.make<
 >({}).pipe(Atom.keepAlive, Atom.withLabel("mobile:pending-thread-creation:outcomes"));
 
 export function recordPendingThreadCreationOutcome(outcome: PendingThreadCreationOutcome): void {
+  if (outcome.kind === "delivered")
+    outcome = { ...outcome, message: acceptedQueuedThreadMessage(outcome.message) };
   const key = scopedThreadKey(outcome.message.environmentId, outcome.message.threadId);
   appAtomRegistry.set(pendingThreadCreationOutcomesAtom, {
     ...appAtomRegistry.get(pendingThreadCreationOutcomesAtom),

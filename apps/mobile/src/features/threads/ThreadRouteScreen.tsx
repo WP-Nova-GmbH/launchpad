@@ -41,7 +41,10 @@ import { useWorkspaceState } from "../../state/workspace";
 import { useEnvironmentShellState } from "../../state/shell";
 import { restoredNewTaskDraftKey } from "../../state/new-task-draft-key";
 import { clearPendingThreadCreationOutcome } from "../../state/pending-thread-creation";
-import { recoverFailedThreadDraft } from "../../state/recover-failed-thread-draft";
+import {
+  copyUncertainThreadDraft,
+  recoverFailedThreadDraft,
+} from "../../state/recover-failed-thread-draft";
 import { useEnvironmentQuery } from "../../state/query";
 import { dismissGitActionResult, useGitActionProgress } from "../../state/use-vcs-action-state";
 import { vcsEnvironment } from "../../state/vcs";
@@ -356,6 +359,7 @@ function ThreadRouteContent(
   const gitActions = useSelectedThreadGitActions();
   const requests = useSelectedThreadRequests();
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, "thread interrupt");
+  const pauseSharedQueue = useAtomCommand(threadEnvironment.pauseQueue, "pause shared queue");
   const navigation = useNavigation();
   const params = props.route.params;
   const environmentIdRaw = firstRouteParam(params.environmentId);
@@ -630,6 +634,12 @@ function ThreadRouteContent(
     void navigation.navigate("Connections");
   }, [navigation]);
   const handleStopThread = useCallback(() => {
+    if (selectedThread && selectedThreadDetail?.promptQueue) {
+      return pauseSharedQueue({
+        environmentId: selectedThread.environmentId,
+        input: { threadId: selectedThread.id },
+      });
+    }
     if (
       !selectedThread ||
       (selectedThread.session?.status !== "running" &&
@@ -646,7 +656,7 @@ function ThreadRouteContent(
           : {}),
       },
     });
-  }, [interruptThreadTurn, selectedThread]);
+  }, [interruptThreadTurn, selectedThread, selectedThreadDetail?.promptQueue, pauseSharedQueue]);
 
   const handleOpenTerminal = useCallback(
     (nextTerminalId?: string | null) => {
@@ -800,7 +810,11 @@ function ThreadRouteContent(
     // the rejected creation owns. Open that draft by id: without it the sheet
     // mints a fresh empty one and the restored content is unreachable.
     try {
-      await recoverFailedThreadDraft(creation);
+      if (creation.acceptanceUncertain || creation.submissionProtocol === "review-required") {
+        await copyUncertainThreadDraft(creation);
+      } else {
+        await recoverFailedThreadDraft(creation);
+      }
     } catch (error) {
       Alert.alert(
         "Could not restore draft",
@@ -808,7 +822,8 @@ function ThreadRouteContent(
       );
       return;
     }
-    clearPendingThreadCreationOutcome(routeThreadIdentity);
+    if (!creation.acceptanceUncertain && creation.submissionProtocol !== "review-required")
+      clearPendingThreadCreationOutcome(routeThreadIdentity);
     navigation.dispatch(
       StackActions.replace("NewTaskSheet", {
         screen: "NewTaskDraft",
@@ -825,6 +840,7 @@ function ThreadRouteContent(
     environmentId: selectedThread?.environmentId ?? null,
     threadId: selectedThread?.id ?? null,
     activities: selectedThreadDetail?.activities ?? [],
+    preparation: selectedThreadDetail?.promptQueue?.preparation,
     preparing:
       selectedThreadCreation?.message.creation?.workspaceMode === "worktree" &&
       selectedThreadCreation.outcome == null,
@@ -841,11 +857,23 @@ function ThreadRouteContent(
   const cancelWorktreeSetup = useAtomCommand(vcsEnvironment.cancelWorktreeSetup);
   const handleCancelWorktreeSetup = useCallback(() => {
     if (!selectedThread) return;
+    if (selectedThreadDetail?.promptQueue?.preparation) {
+      void pauseSharedQueue({
+        environmentId: selectedThread.environmentId,
+        input: { threadId: selectedThread.id },
+      });
+      return;
+    }
     void cancelWorktreeSetup({
       environmentId: selectedThread.environmentId,
       input: { threadId: selectedThread.id },
     });
-  }, [cancelWorktreeSetup, selectedThread]);
+  }, [
+    cancelWorktreeSetup,
+    pauseSharedQueue,
+    selectedThread,
+    selectedThreadDetail?.promptQueue?.preparation,
+  ]);
   const [localResendMessageId, setLocalResendMessageId] = useState<string | null>(null);
   const handleWorkLocally = useCallback(async () => {
     if (!selectedThread || !selectedThreadCreation) return;
@@ -919,6 +947,17 @@ function ThreadRouteContent(
     if (selectedThreadCreation === null) {
       return awaitingBootstrapTurn ? { kind: "preparing", preparingWorktree: true } : null;
     }
+    if (
+      selectedThreadCreation.message.acceptanceUncertain ||
+      selectedThreadCreation.message.submissionProtocol === "review-required"
+    ) {
+      return {
+        kind: "unknown",
+        reason:
+          "The server has not confirmed whether this prompt was accepted. It will be checked again when connected; setup will not be repeated automatically.",
+        onEditTask: handleEditFailedCreation,
+      };
+    }
     if (selectedThreadCreation.outcome?.kind === "failed") {
       return {
         kind: "failed",
@@ -958,6 +997,7 @@ function ThreadRouteContent(
 
       <View className="flex-1 bg-screen android:overflow-hidden android:rounded-t-[28px] android:bg-thread-canvas">
         <ThreadDetailScreen
+          promptQueue={selectedThreadDetail?.promptQueue}
           selectedThread={selectedThreadWithDraftSettings ?? selectedThread}
           contentPresentation={contentPresentation}
           screenTone={connectionTone(routeConnectionState)}
@@ -989,7 +1029,9 @@ function ThreadRouteContent(
                   turnStarted: selectedThreadDetail?.latestTurn?.startedAt != null,
                   onCancel: handleCancelWorktreeSetup,
                   onWorkLocally:
-                    selectedThreadCreation?.outcome == null && selectedThreadCreation
+                    !selectedThreadDetail?.promptQueue?.preparation &&
+                    selectedThreadCreation?.outcome == null &&
+                    selectedThreadCreation
                       ? handleWorkLocally
                       : null,
                 }

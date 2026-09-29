@@ -89,6 +89,8 @@ import {
 import { KeybindingsConfigError } from "./keybindings.ts";
 import {
   ClientOrchestrationCommand,
+  OrchestrationGetCommandReceiptInput,
+  OrchestrationGetCommandReceiptResult,
   ORCHESTRATION_WS_METHODS,
   OrchestrationDispatchCommandError,
   OrchestrationGetFullThreadDiffError,
@@ -1060,14 +1062,14 @@ const WsVcsRefreshStatusRpc = Rpc.make(WS_METHODS.vcsRefreshStatus, {
 const WsSubscribeWorktreeSetupRpc = Rpc.make(WS_METHODS.subscribeWorktreeSetup, {
   payload: WorktreeSetupSubscribeInput,
   success: WorktreeSetupStreamEvent,
-  error: EnvironmentAuthorizationError,
+  error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
   stream: true,
 });
 
 const WsWorktreeSetupCancelRpc = Rpc.make(WS_METHODS.worktreeSetupCancel, {
   payload: WorktreeSetupCancelInput,
   success: WorktreeSetupCancelResult,
-  error: EnvironmentAuthorizationError,
+  error: Schema.Union([OrchestrationDispatchCommandError, EnvironmentAuthorizationError]),
 });
 
 const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
@@ -1149,7 +1151,11 @@ const WsTerminalOpenRpc = Rpc.make(WS_METHODS.terminalOpen, {
 const WsTerminalAttachRpc = Rpc.make(WS_METHODS.terminalAttach, {
   payload: TerminalAttachInput,
   success: TerminalAttachStreamEvent,
-  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    TerminalError,
+    OrchestrationGetSnapshotError,
+    EnvironmentAuthorizationError,
+  ]),
   stream: true,
 });
 
@@ -1320,6 +1326,12 @@ const WsSubscribeDeviceStateRpc = Rpc.make(WS_METHODS.subscribeDeviceState, {
   success: DeviceServiceState,
   error: EnvironmentAuthorizationError,
   stream: true,
+});
+
+const WsOrchestrationGetCommandReceiptRpc = Rpc.make(ORCHESTRATION_WS_METHODS.getCommandReceipt, {
+  payload: OrchestrationGetCommandReceiptInput,
+  success: OrchestrationGetCommandReceiptResult,
+  error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
 });
 
 const WsOrchestrationDispatchCommandRpc = Rpc.make(ORCHESTRATION_WS_METHODS.dispatchCommand, {
@@ -1583,6 +1595,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationReportThreadPresenceRpc,
   WsOrchestrationSubscribeThreadPresenceRpc,
   WsSubscribeResourceTelemetryRpc,
+  WsOrchestrationGetCommandReceiptRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetWorkflowScriptRpc,
   WsOrchestrationGetTurnDiffRpc,

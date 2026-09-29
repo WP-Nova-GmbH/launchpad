@@ -165,16 +165,19 @@ export function useThreadComposerState() {
   const selectedThreadKey = selectedThreadShell
     ? scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id)
     : null;
+  const sharedQueueEntries = selectedThreadDetail?.promptQueue?.entries;
   // The creation entry is the thread itself (rendered as the first message),
   // not a follow-up waiting behind it.
   const selectedThreadQueuedMessages = useMemo(
     () =>
       selectedThreadKey
         ? (queuedMessagesByThreadKey[selectedThreadKey] ?? []).filter(
-            (message) => message.creation === undefined,
+            (message) =>
+              message.creation === undefined &&
+              !sharedQueueEntries?.some((entry) => entry.messageId === message.messageId),
           )
         : [],
-    [queuedMessagesByThreadKey, selectedThreadKey],
+    [queuedMessagesByThreadKey, selectedThreadKey, sharedQueueEntries],
   );
   const feedbackSubmissions = useMemo(
     () => (selectedThreadKey ? (feedbackSubmissionsByThreadKey[selectedThreadKey] ?? []) : []),
@@ -204,6 +207,9 @@ export function useThreadComposerState() {
         ? buildThreadFeed({
             messages:
               pendingCreationMessage !== null &&
+              !sharedQueueEntries?.some(
+                (entry) => entry.messageId === pendingCreationMessage.messageId,
+              ) &&
               !loadedMessages.some((message) => message.id === pendingCreationMessage.messageId)
                 ? [...loadedMessages, pendingThreadCreationMessage(pendingCreationMessage)]
                 : loadedMessages,
@@ -213,6 +219,7 @@ export function useThreadComposerState() {
     const pendingAcknowledgments = acknowledgedMessages.filter(
       (message) =>
         scopedThreadKey(message.environmentId, message.threadId) === selectedThreadKey &&
+        !sharedQueueEntries?.some((entry) => entry.messageId === message.messageId) &&
         !selectedThreadQueuedMessages.some((queued) => queued.messageId === message.messageId),
     );
     if (pendingAcknowledgments.length === 0) return feed;
@@ -226,9 +233,13 @@ export function useThreadComposerState() {
     selectedThreadKey,
     selectedThreadQueuedMessages,
     acknowledgedMessages,
+    sharedQueueEntries,
   ]);
   useEffect(() => {
-    const echoedIds = new Set(selectedThreadMessages?.map((message) => message.id));
+    const echoedIds = new Set([
+      ...(selectedThreadMessages?.map((message) => message.id) ?? []),
+      ...(sharedQueueEntries?.map((entry) => entry.messageId) ?? []),
+    ]);
     if (acknowledgedMessages.some((message) => echoedIds.has(message.messageId))) {
       appAtomRegistry.set(
         acknowledgedThreadMessagesAtom,
@@ -237,12 +248,13 @@ export function useThreadComposerState() {
           .filter((message) => !echoedIds.has(message.messageId)),
       );
     }
-  }, [acknowledgedMessages, selectedThreadMessages]);
+  }, [acknowledgedMessages, selectedThreadMessages, sharedQueueEntries]);
 
   const selectedDraft = selectedThreadKey ? composerDrafts[selectedThreadKey] : null;
   const draftMessage = selectedDraft?.text ?? "";
   const draftAttachments = selectedDraft?.attachments ?? [];
-  const selectedThreadQueueCount = selectedThreadQueuedMessages.length;
+  const selectedThreadQueueCount =
+    selectedThreadQueuedMessages.length + (sharedQueueEntries?.length ?? 0);
   const selectedThread = selectedThreadDetail ?? selectedThreadShell;
   const modelSelection = selectedDraft?.modelSelection ?? selectedThread?.modelSelection ?? null;
   const runtimeMode = selectedDraft?.runtimeMode ?? selectedThread?.runtimeMode ?? null;

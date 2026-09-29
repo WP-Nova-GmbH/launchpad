@@ -12,6 +12,7 @@ import type {
 import { threadPresenceLabel } from "@t3tools/client-runtime/state/threadPresence";
 import { AppText as Text } from "../../components/AppText";
 import { useThreadPresencePeople, useThreadPresenceReporter } from "../../state/thread-presence";
+import { SharedPromptQueue } from "./SharedPromptQueue";
 import { useKeyboardChatComposerInset, useKeyboardScrollToEnd } from "@legendapp/list/keyboard";
 import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSkills";
 import type { LegendListRef } from "@legendapp/list/react-native";
@@ -28,6 +29,7 @@ import type {
   RuntimeMode,
   ServerConfig as T3ServerConfig,
   ThreadId,
+  ThreadPromptQueue,
   UsageLimitsReport,
   UserInputQuestion,
 } from "@t3tools/contracts";
@@ -116,6 +118,7 @@ import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-live-follow";
 
 export interface ThreadDetailScreenProps {
+  readonly promptQueue?: ThreadPromptQueue;
   readonly worktreeSetup?: WorktreeSetupCardProps | null;
   readonly setupWorkingStartedAt?: string | null;
   readonly selectedThread: OrchestrationThreadShell;
@@ -136,6 +139,7 @@ export interface ThreadDetailScreenProps {
   readonly creationState:
     | { readonly kind: "preparing"; readonly preparingWorktree: boolean }
     | { readonly kind: "failed"; readonly reason: string; readonly onEditTask: () => void }
+    | { readonly kind: "unknown"; readonly reason: string; readonly onEditTask: () => void }
     | null;
   readonly activePendingApproval: PendingApproval | null;
   readonly respondingApprovalId: ApprovalRequestId | null;
@@ -398,7 +402,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
         label: props.creationState.preparingWorktree ? "Setting up worktree…" : "Starting…",
       };
     }
-    if (props.creationState?.kind === "failed") {
+    if (props.creationState?.kind === "failed" || props.creationState?.kind === "unknown") {
       return null;
     }
     if (threadSyncLabel !== null) {
@@ -1009,7 +1013,8 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                     />
                   </Animated.View>
                 ) : null}
-                {props.creationState?.kind === "failed" ? (
+                {props.creationState?.kind === "failed" ||
+                props.creationState?.kind === "unknown" ? (
                   <Animated.View
                     className="shrink-0 px-4"
                     style={{ paddingBottom: composerBottomInset }}
@@ -1019,6 +1024,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                     <ThreadCreationFailedCard
                       reason={props.creationState.reason}
                       onEditTask={props.creationState.onEditTask}
+                      uncertain={props.creationState.kind === "unknown"}
                     />
                   </Animated.View>
                 ) : null}
@@ -1072,13 +1078,35 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                   </Text>
                 </View>
               ) : null}
+              {props.promptQueue ? (
+                <SharedPromptQueue
+                  key={`${props.environmentId}:${props.selectedThread.id}`}
+                  environmentId={props.environmentId}
+                  threadId={props.selectedThread.id}
+                  queue={props.promptQueue}
+                  supportsPreparation={
+                    props.serverConfig?.environment.capabilities.sharedPreparation === true
+                  }
+                  hasStartedTurn={props.selectedThread.latestTurn !== null}
+                  activeTurnId={
+                    props.selectedThread.session?.status === "running"
+                      ? props.selectedThread.session.activeTurnId
+                      : null
+                  }
+                  unavailable={
+                    props.connectionStateLabel !== "connected" || props.threadSyncStatus !== "live"
+                  }
+                />
+              ) : null}
               {/* Hidden (not unmounted) while a user-input request owns the
                 composer slot, so composer drafts and editor state survive.
                 A rejected creation has no thread to send to; the failure card
                 owns the slot instead. */}
               <View
                 style={
-                  activeUserInputRequestId !== null || props.creationState?.kind === "failed"
+                  activeUserInputRequestId !== null ||
+                  props.creationState?.kind === "failed" ||
+                  props.creationState?.kind === "unknown"
                     ? { display: "none" }
                     : undefined
                 }

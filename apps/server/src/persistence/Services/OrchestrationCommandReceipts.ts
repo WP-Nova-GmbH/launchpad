@@ -26,6 +26,8 @@ export const OrchestrationCommandReceipt = Schema.Struct({
   commandId: CommandId,
   aggregateKind: OrchestrationAggregateKind,
   aggregateId: Schema.Union([ProjectId, ThreadId]),
+  // Null on legacy receipts; rejected bootstrap commands may never have a thread row.
+  projectId: Schema.optional(Schema.NullOr(ProjectId)),
   acceptedAt: IsoDateTime,
   resultSequence: NonNegativeInt,
   status: OrchestrationCommandReceiptStatus,

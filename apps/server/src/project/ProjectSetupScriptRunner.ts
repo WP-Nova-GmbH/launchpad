@@ -1,4 +1,4 @@
-import { ProjectId } from "@t3tools/contracts";
+import { ProjectId, type ThreadPreparation } from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import {
   projectScriptRuntimeEnv,
@@ -59,6 +59,8 @@ export interface ProjectSetupScriptRunnerInput {
   readonly projectCwd?: string;
   readonly worktreePath: string;
   readonly preferredTerminalId?: string;
+  /** A durable preparation executes the script selected before the attempt began. */
+  readonly resolvedScript?: ThreadPreparation["script"];
   /**
    * Wrap the command so the shell reports its exit code back through the
    * terminal stream, and forward cleaned output lines while it runs. The
@@ -77,6 +79,7 @@ export class ProjectSetupScriptOperationError extends Schema.TaggedError<Project
     projectCwd: Schema.optional(Schema.String),
     worktreePath: Schema.String,
     operation: Schema.Literals(["resolveProject", "readSettings", "openTerminal", "writeCommand"]),
+    waitForCompletion: Schema.optional(Schema.Boolean),
     cause: Schema.Defect(),
   },
 ) {
@@ -220,6 +223,7 @@ export const make = Effect.gen(function* () {
       const done = yield* Deferred.make<ProjectSetupScriptCompletion>();
       let lineBuffer = "";
       let settled = false;
+      let unsubscribe = () => {};
 
       const settle = (exitCode: number | null) =>
         Effect.suspend(() => {
@@ -229,6 +233,7 @@ export const make = Effect.gen(function* () {
             Effect.flatMap((nowMs) =>
               Deferred.succeed(done, { exitCode, durationMs: nowMs - startedAtMs }),
             ),
+            Effect.tap(() => Effect.sync(() => unsubscribe())),
             Effect.asVoid,
           );
         });
@@ -252,7 +257,7 @@ export const make = Effect.gen(function* () {
           return input.onOutputLine(cleaned.slice(0, OUTPUT_LINE_MAX_LENGTH));
         });
 
-      const unsubscribe = yield* terminalManager.subscribe((event) => {
+      unsubscribe = yield* terminalManager.subscribe((event) => {
         if (event.threadId !== input.threadId || event.terminalId !== input.terminalId) {
           return Effect.void;
         }
@@ -279,6 +284,7 @@ export const make = Effect.gen(function* () {
         return Effect.void;
       });
 
+      if (settled) unsubscribe();
       const completion = Deferred.await(done).pipe(
         Effect.ensuring(Effect.sync(() => unsubscribe())),
       );
@@ -337,7 +343,10 @@ export const make = Effect.gen(function* () {
           }),
       ),
     );
-    const script = setupProjectScript(resolveProjectScripts(settings, project));
+    const script =
+      input.resolvedScript === undefined
+        ? setupProjectScript(resolveProjectScripts(settings, project))
+        : input.resolvedScript;
     if (!script) {
       return {
         status: "no-script",
@@ -367,6 +376,7 @@ export const make = Effect.gen(function* () {
         terminalId,
         cwd,
         worktreePath: input.worktreePath,
+        ...(script.async === false ? { waitForProcessExitOnClose: true } : {}),
         // Setup may run before a terminal client attaches to answer color probes.
         env: { ...env, NO_COLOR: "1", FORCE_COLOR: "0" },
       })
@@ -376,6 +386,7 @@ export const make = Effect.gen(function* () {
             new ProjectSetupScriptOperationError({
               ...errorContext,
               operation: "openTerminal",
+              waitForCompletion: script.async === false,
               cause,
             }),
         ),
@@ -405,11 +416,14 @@ export const make = Effect.gen(function* () {
             new ProjectSetupScriptOperationError({
               ...errorContext,
               operation: "writeCommand",
+              waitForCompletion: script.async === false,
               cause,
             }),
         ),
         // Nothing will ever settle the completion if the command never ran.
-        Effect.tapError(() => Effect.sync(() => observed?.unsubscribe())),
+        Effect.onExit((exit) =>
+          exit._tag === "Failure" ? Effect.sync(() => observed?.unsubscribe()) : Effect.void,
+        ),
       );
 
     return {

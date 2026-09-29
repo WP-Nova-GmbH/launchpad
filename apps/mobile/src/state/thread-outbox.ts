@@ -22,7 +22,7 @@ export async function flushThreadOutbox(): Promise<void> {
 }
 
 export function enqueueThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {
-  return threadOutboxManager.enqueue(message);
+  return threadOutboxManager.enqueue({ ...message, submissionProtocol: "unattempted" });
 }
 
 /** Waits for pending writes to settle; false if the message was rolled back. */

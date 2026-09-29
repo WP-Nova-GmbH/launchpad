@@ -18,6 +18,7 @@ const script = JSON.parse(NodeFS.readFileSync(process.env.T3_CODEX_COLLAB_SCRIPT
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 let turnStartCount = 0;
 let activeTurn;
+let heldMcpReload;
 // Server->client requests the runtime must answer (approval prompts), keyed
 // by the numeric JSON-RPC id this peer allocated for them.
 const openServerRequests = new Map();
@@ -30,6 +31,27 @@ rl.on("line", (line) => {
     return;
   }
   const { id, method } = message;
+  if (
+    script.recordDispatches &&
+    ["turn/start", "turn/steer", "thread/compact/start"].includes(method)
+  ) {
+    NodeFS.appendFileSync(`${process.env.T3_CODEX_COLLAB_SCRIPT}.dispatches`, `${method}\n`);
+  }
+  if (method === "config/mcpServer/reload" && script.holdMcpReload) {
+    heldMcpReload = id;
+    write({
+      jsonrpc: "2.0",
+      method: "serverRequest/resolved",
+      params: { threadId: script.rootThreadId, requestId: "mcp-reload-held" },
+    });
+    return;
+  }
+  if (method === "thread/compact/start" && heldMcpReload !== undefined) {
+    write({ id: heldMcpReload, result: {} });
+    heldMcpReload = undefined;
+    write({ id, result: {} });
+    return;
+  }
   if (openServerRequests.has(id)) {
     // The runtime answered an approval request. Record the response so tests
     // can assert settlement behavior, then emit serverRequest/resolved as a

@@ -1,3 +1,4 @@
+import { RepositoryPolicyControl } from "../tenancy/RepositoryPolicies.ts";
 import * as NodeCrypto from "node:crypto";
 import * as NodeCryptoLayer from "@effect/platform-node/NodeCrypto";
 
@@ -204,6 +205,7 @@ function connectorTestLayer(
     request: HttpClientRequest.HttpClientRequest,
   ) => Effect.Effect<HttpClientResponse.HttpClientResponse>,
   options?: {
+    readonly policySync?: () => Effect.Effect<void, Error>;
     readonly links?: EnvironmentLinks.EnvironmentLinks["Service"];
     readonly allocations?: ManagedEndpointAllocations.ManagedEndpointAllocations["Service"];
     readonly machine?: Machines.MachineRecord | null;
@@ -215,6 +217,11 @@ function connectorTestLayer(
   const unexpectedMachineCall = () => Effect.die("unexpected machine store call");
   const unexpectedOrganizationCall = () => Effect.die("unexpected organization call");
   return EnvironmentConnector.layer.pipe(
+    Layer.provide(
+      Layer.succeed(RepositoryPolicyControl, {
+        synchronize: options?.policySync ?? (() => Effect.void),
+      }),
+    ),
     Layer.provide(NodeCryptoLayer.layer),
     Layer.provide(Layer.succeed(EnvironmentLinks.EnvironmentLinks, options?.links ?? makeLinks())),
     Layer.provide(
@@ -1430,6 +1437,46 @@ describe("EnvironmentConnector.resolveAccess", () => {
         }),
       ),
     ),
+  );
+
+  it.effect("requires the shared policy handshake even through a preexisting personal link", () =>
+    Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const error = yield* Effect.flip(
+        connector.connect({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+          clientProofKeyThumbprint: "client-thumbprint",
+        }),
+      );
+      expect(error._tag).toBe("EnvironmentMintRequestFailed");
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(unusedExecute, {
+          machine: enrolledMachine,
+          membershipOrganizationId: "organization-1",
+          policySync: () =>
+            Effect.fail(new Error("Old server does not support repository policy.")),
+        }),
+      ),
+    ),
+  );
+
+  it.effect("a preexisting personal link does not bypass organization removal", () =>
+    Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const error = yield* Effect.flip(
+        connector.connect({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+          clientProofKeyThumbprint: "client-thumbprint",
+        }),
+      );
+      expect(error).toMatchObject({
+        _tag: "EnvironmentConnectNotAuthorized",
+        reason: "environment_link_not_found",
+      });
+    }).pipe(Effect.provide(connectorTestLayer(unusedExecute, { machine: enrolledMachine }))),
   );
 
   it.effect("prefers the caller's own link over the machine path", () =>

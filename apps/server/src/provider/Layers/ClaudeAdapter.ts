@@ -8,6 +8,7 @@
  * @module ClaudeAdapterLive
  */
 
+import { validateTurnDelivery } from "../turnDelivery.ts";
 import * as NodeUtil from "node:util";
 import {
   type CanUseTool,
@@ -244,6 +245,7 @@ type PromptQueueItem =
   | {
       readonly type: "message";
       readonly message: SDKUserMessage;
+      readonly admit?: Effect.Effect<boolean>;
     }
   | {
       readonly type: "terminate";
@@ -4428,6 +4430,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const promptQueue = yield* Queue.unbounded<PromptQueueItem>();
       const prompt = Stream.fromQueue(promptQueue).pipe(
         Stream.filter((item) => item.type === "message"),
+        Stream.filterEffect((item) => item.admit ?? Effect.succeed(true)),
         Stream.map((item) => item.message),
         Stream.catchCause((cause) =>
           Cause.hasInterruptsOnly(cause) ? Stream.empty : Stream.failCause(cause),
@@ -5136,8 +5139,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     },
   );
 
-  const sendTurn: ClaudeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
+  const sendTurn: ClaudeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input, hooks) {
     const context = yield* requireSession(input.threadId);
+    yield* validateTurnDelivery(
+      PROVIDER,
+      input,
+      context.turnState?.synthetic === true ? undefined : context.turnState?.turnId,
+    );
     const modelCatalog = yield* modelCatalogEffect;
     const selectedModel =
       input.modelSelection !== undefined && input.modelSelection.instanceId === boundInstanceId
@@ -5201,6 +5209,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     const turnId = steeringTurnState?.turnId ?? TurnId.make(yield* randomUUIDv4);
+    yield* validateTurnDelivery(
+      PROVIDER,
+      input,
+      context.turnState?.synthetic === true ? undefined : context.turnState?.turnId,
+    );
     if (steeringTurnState === null) {
       const turnState: ClaudeTurnState = {
         turnId,
@@ -5269,13 +5282,76 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     if (steeringTurnState === null) context.turnStartMessageIds.push(turnId);
     yield* updateResumeCursor(context);
+    const admission = hooks
+      ? yield* Deferred.make<void, ProviderAdapterValidationError>()
+      : undefined;
+    const streamFiber = context.streamFiber;
     yield* Queue.offer(context.promptQueue, {
       type: "message",
+      ...(hooks && admission
+        ? {
+            admit: Effect.gen(function* () {
+              const validation = yield* (hooks.beforeDispatch ?? Effect.void).pipe(Effect.result);
+              if (validation._tag === "Failure") {
+                if (steeringTurnState === null && context.turnState?.turnId === turnId) {
+                  context.turnState = undefined;
+                  context.session = {
+                    ...context.session,
+                    status: "ready",
+                    activeTurnId: undefined,
+                  };
+                  const index = context.turnStartMessageIds.indexOf(turnId);
+                  if (index >= 0) context.turnStartMessageIds.splice(index, 1);
+                  yield* updateResumeCursor(context);
+                }
+                yield* Deferred.fail(admission, validation.failure);
+                return false;
+              }
+              // The SDK may pull later than Queue.offer. A steer must still
+              // target the same running turn at that actual handoff boundary.
+              if (context.stopped || context.turnState?.turnId !== turnId) {
+                yield* Deferred.fail(
+                  admission,
+                  new ProviderAdapterValidationError({
+                    provider: PROVIDER,
+                    operation: "sendTurn",
+                    issue: "The target turn is no longer running. The prompt remains queued.",
+                  }),
+                );
+                return false;
+              }
+              yield* hooks.onAdmitted(
+                {
+                  threadId: input.threadId,
+                  turnId,
+                  resumeCursor: context.session.resumeCursor,
+                },
+                "harness-dispatch",
+              );
+              yield* Deferred.succeed(admission, undefined);
+              return true;
+            }),
+          }
+        : {}),
       message:
         steeringTurnState === null
           ? { ...message, uuid: turnId as NonNullable<SDKUserMessage["uuid"]> }
           : message,
     }).pipe(Effect.mapError((cause) => toRequestError(input.threadId, "turn/start", cause)));
+    if (admission) {
+      const streamEnded = (streamFiber ? Fiber.await(streamFiber) : Effect.void).pipe(
+        Effect.andThen(
+          Effect.fail(
+            new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue: "The provider stopped before accepting this prompt. It remains queued.",
+            }),
+          ),
+        ),
+      );
+      yield* Effect.raceFirst(Deferred.await(admission), streamEnded);
+    }
 
     return {
       threadId: context.session.threadId,

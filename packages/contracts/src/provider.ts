@@ -68,6 +68,14 @@ export type ProviderSessionStartInput = typeof ProviderSessionStartInput.Type;
 
 export const ProviderSendTurnInput = Schema.Struct({
   threadId: ThreadId,
+  /** Environment-owned queue delivery. Omitted for legacy and control responses. */
+  delivery: Schema.optional(
+    Schema.Struct({
+      attemptId: TrimmedNonEmptyString,
+      mode: Schema.Literals(["next-turn", "steer"]),
+      expectedTurnId: Schema.optional(TurnId),
+    }),
+  ),
   /** Internal recovery signal. Allows an empty turn only for adapters that
       explicitly support promptless continuation. */
   continuation: Schema.optional(Schema.Boolean),

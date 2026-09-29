@@ -1,3 +1,8 @@
+import {
+  RepositoryPolicyProof,
+  RepositoryPolicyAcknowledgement,
+  RepositoryAccessRemovalStatus,
+} from "./repositoryAccess.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -1298,6 +1303,7 @@ export const RelayUserIdentity = Schema.Struct({
 export type RelayUserIdentity = typeof RelayUserIdentity.Type;
 
 export const RelayOrganizationMember = Schema.Struct({
+  accessRemoval: Schema.optionalKey(RepositoryAccessRemovalStatus),
   userId: TrimmedNonEmptyString,
   role: RelayOrgRole,
   joinedAt: TrimmedNonEmptyString,
@@ -1947,6 +1953,7 @@ export type RelayDeliveryResult = typeof RelayDeliveryResult.Type;
 
 export const RelayOkResponse = Schema.Struct({
   ok: Schema.Boolean,
+  accessRemoval: Schema.optionalKey(RepositoryAccessRemovalStatus),
 });
 export type RelayOkResponse = typeof RelayOkResponse.Type;
 
@@ -2204,6 +2211,12 @@ const RelayRepositoryParams = Schema.Struct({
  */
 export const RelayOrganizationGroup = HttpApiGroup.make("organization")
   .add(
+    HttpApiEndpoint.get("getRepositoryAccessRemoval", "/v1/organization/access-removal", {
+      headers: RelayBearerRequestHeaders,
+      query: Schema.Struct({ revision: Schema.optionalKey(Schema.NumberFromString) }),
+      success: RepositoryAccessRemovalStatus,
+      error: RelayTenancyErrors,
+    }),
     HttpApiEndpoint.get("getOrganization", "/v1/organization", {
       headers: RelayBearerRequestHeaders,
       success: RelayOrganizationMembership,
@@ -2757,6 +2770,26 @@ export const RelayExecutorReleaseServerGroup = HttpApiGroup.make("executorReleas
   .annotate(OpenApi.Description, "Environment-authenticated executor release tracking.")
   .middleware(RelayEnvironmentAuth);
 
+const RelayRepositoryAccessServerGroup = HttpApiGroup.make("repositoryAccessServer")
+  .add(
+    HttpApiEndpoint.get("getPolicy", "/v1/environments/:environmentId/repository-policy", {
+      params: Schema.Struct({ environmentId: EnvironmentId }),
+      success: RepositoryPolicyProof,
+      error: RelayAuthAndInternalErrors,
+    }),
+    HttpApiEndpoint.post(
+      "acknowledgePolicy",
+      "/v1/environments/:environmentId/repository-policy/ack",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RepositoryPolicyAcknowledgement,
+        success: RelayOkResponse,
+        error: RelayAuthAndInternalErrors,
+      },
+    ),
+  )
+  .middleware(RelayEnvironmentAuth);
+
 export const RelayApi = HttpApi.make("RelayApi")
   .add(
     RelayHealthGroup,
@@ -2777,6 +2810,7 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayProviderAccountsServerGroup,
     RelayOrganizationSkillsServerGroup,
     RelayExecutorReleaseServerGroup,
+    RelayRepositoryAccessServerGroup,
   )
   .annotate(OpenApi.Title, "Launchpad Relay API")
   .annotate(OpenApi.Version, "1.0.0")

@@ -35,6 +35,7 @@ import { OrchestrationEngineLive } from "../orchestration/Layers/OrchestrationEn
 import { OrchestrationProjectionPipelineLive } from "../orchestration/Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "../orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { ProviderCommandReactorLive } from "../orchestration/Layers/ProviderCommandReactor.ts";
+import { ThreadDeletionReactor } from "../orchestration/Services/ThreadDeletionReactor.ts";
 import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
 import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
@@ -905,6 +906,7 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
           Layer.provide(AnalyticsService.layerTest),
         );
         const reactorLayer = ProviderCommandReactorLive.pipe(
+          Layer.provide(Layer.mock(ThreadDeletionReactor, { drainThrough: () => Effect.void })),
           Layer.provideMerge(providerLayer),
           Layer.provide(
             Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {

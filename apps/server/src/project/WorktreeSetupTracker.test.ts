@@ -14,6 +14,50 @@ import * as WorktreeSetupTracker from "./WorktreeSetupTracker.ts";
 const threadId = ThreadId.make("thread-1");
 
 describe("WorktreeSetupTracker", () => {
+  it.effect("scoped progress never follows a reused thread ID", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const tracker = yield* WorktreeSetupTracker.make;
+        const input = {
+          threadId,
+          branch: "allowed",
+          baseRef: "main",
+          stages: ["checkout"] as const,
+          fiber: null,
+        };
+        yield* tracker.begin({ ...input, creationSequence: 1 });
+        const first = yield* Deferred.make<void>();
+        const end = yield* Deferred.make<void>();
+        const seen: Array<WorktreeSetupSnapshot | null> = [];
+        const running = yield* tracker.stream(threadId, 1).pipe(
+          Stream.tap((snapshot) =>
+            Effect.sync(() => {
+              seen.push(snapshot);
+            }).pipe(Effect.andThen(Deferred.succeed(first, undefined))),
+          ),
+          Stream.interruptWhen(Deferred.await(end)),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(first);
+        yield* tracker.begin({ ...input, branch: "secret", creationSequence: 20 });
+        yield* tracker.appendTail(threadId, "checkout", "secret output");
+        // Receiving the new owner's latest snapshot proves its changes were published.
+        const replacement = yield* tracker
+          .stream(threadId, 20)
+          .pipe(Stream.take(1), Stream.runCollect);
+        expect(replacement[0]?.branch).toBe("secret");
+        const staleInitial = yield* tracker
+          .stream(threadId, 1)
+          .pipe(Stream.take(1), Stream.runCollect);
+        expect(staleInitial).toEqual([null]);
+        yield* Deferred.succeed(end, undefined);
+        yield* Fiber.join(running);
+        expect(seen.every((snapshot) => snapshot?.branch !== "secret")).toBe(true);
+      }),
+    ),
+  );
+
   it.effect("records stage transitions, checkout progress, and the final phase", () =>
     Effect.gen(function* () {
       const tracker = yield* WorktreeSetupTracker.make;

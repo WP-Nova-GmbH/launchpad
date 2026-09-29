@@ -1,3 +1,4 @@
+import * as RepositoryPolicies from "../tenancy/RepositoryPolicies.ts";
 import {
   EnvironmentHttpBadRequestError,
   EnvironmentHttpConflictError,
@@ -430,6 +431,7 @@ function verifyEnvironmentHealthResponse(input: {
 }
 
 const make = Effect.gen(function* () {
+  const repositoryPolicies = yield* RepositoryPolicies.RepositoryPolicyControl;
   const links = yield* EnvironmentLinks.EnvironmentLinks;
   const allocations = yield* ManagedEndpointAllocations.ManagedEndpointAllocations;
   const machines = yield* Machines.Machines;
@@ -793,6 +795,32 @@ const make = Effect.gen(function* () {
         link,
         allocation,
       });
+      // A personal link may predate organization enrollment. It cannot bypass
+      // membership or the policy handshake required before minting shared access.
+      const machine = yield* machines.getActiveByEnvironmentId({
+        environmentId: input.environmentId,
+      });
+      if (machine !== null) {
+        yield* machineAccess({ ...input, operation: "connect" });
+        yield* repositoryPolicies
+          .synchronize({
+            organizationId: machine.organizationId,
+            environmentId: input.environmentId,
+            publicKey: link.environmentPublicKey,
+            url: endpoint.httpBaseUrl,
+          })
+          .pipe(
+            Effect.timeout(Duration.millis(ENVIRONMENT_MINT_REQUEST_TIMEOUT_MS)),
+            Effect.mapError(
+              (cause) =>
+                new EnvironmentMintRequestFailed({
+                  environmentId: input.environmentId,
+                  operation: "connect",
+                  cause,
+                }),
+            ),
+          );
+      }
       // Resolved per connect rather than stored: the environment keeps the
       // name for the life of the session it mints, and the next connect
       // picks up a renamed profile. Lookup failures degrade to no name.

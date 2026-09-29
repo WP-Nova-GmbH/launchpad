@@ -1,5 +1,6 @@
 import {
   ORCHESTRATION_WS_METHODS,
+  EnvironmentAuthorizationError,
   type EnvironmentId as EnvironmentIdType,
   type OrchestrationThread,
   type OrchestrationThreadDetailPage,
@@ -14,6 +15,15 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
+import * as Schema from "effect/Schema";
+import {
+  isThreadRevoked,
+  onThreadVisibilityChanged,
+  rememberThreadProject,
+  restoreThreadVisibility,
+  revokeThreadVisibility,
+  threadVisibilityRevision,
+} from "./threadVisibility.ts";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom } from "effect/unstable/reactivity";
@@ -23,7 +33,7 @@ import { connectionProjectionPhase } from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import * as ConnectionWakeups from "../connection/wakeups.ts";
 import { EnvironmentCacheStore } from "../platform/persistence.ts";
-import { subscribeDynamic } from "../rpc/client.ts";
+import { subscribeDynamicMapped } from "../rpc/client.ts";
 import { ThreadSnapshotLoader, type ThreadSnapshotWindow } from "./threadSnapshotHttp.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { applyThreadDetailEvent } from "./threadReducer.ts";
@@ -35,6 +45,8 @@ import {
   type EnvironmentThreadState,
   type EnvironmentThreadStatus,
 } from "./threadState.ts";
+
+const isAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 
 function statusWithoutLiveData(data: Option.Option<OrchestrationThread>): EnvironmentThreadStatus {
   return Option.isSome(data) ? "cached" : "empty";
@@ -142,6 +154,7 @@ interface ThreadResumeSnapshot {
   readonly state: EnvironmentThreadState;
   readonly sequence: number;
   readonly persisted: boolean;
+  readonly visibilityRevision?: number;
 }
 
 interface ThreadResumeCache {
@@ -191,11 +204,16 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const snapshotLoader = yield* ThreadSnapshotLoader;
   const wakeups = yield* Effect.serviceOption(ConnectionWakeups.ConnectionWakeups);
   const environmentId = supervisor.target.environmentId;
-  const retained = resumeCache?.snapshot;
+  let visibilityRevision = threadVisibilityRevision(environmentId, threadId);
+  const retained =
+    isThreadRevoked(environmentId, threadId) ||
+    (resumeCache?.snapshot?.visibilityRevision ?? 0) !== visibilityRevision
+      ? undefined
+      : resumeCache?.snapshot;
   const owner = {};
   if (resumeCache) resumeCache.owner = owner;
-  const cached =
-    retained === undefined
+  const loadedCache =
+    retained === undefined && !isThreadRevoked(environmentId, threadId)
       ? yield* cache.loadThread(environmentId, threadId).pipe(
           Effect.catch((error) =>
             Effect.logWarning("Could not load cached thread.").pipe(
@@ -209,6 +227,11 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           ),
         )
       : Option.none<OrchestrationThreadDetailSnapshot>();
+  const cached =
+    isThreadRevoked(environmentId, threadId) ||
+    threadVisibilityRevision(environmentId, threadId) !== visibilityRevision
+      ? Option.none<OrchestrationThreadDetailSnapshot>()
+      : loadedCache;
   const cachedThread = Option.map(cached, (snapshot) => snapshot.thread);
   const initialState: EnvironmentThreadState = retained
     ? cachedThreadState(retained.state)
@@ -221,6 +244,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         page: Option.flatMap(cached, (snapshot) => pageStateFromSnapshot(snapshot.page)),
       };
   const state = yield* SubscriptionRef.make(initialState);
+  if (Option.isSome(initialState.data)) {
+    rememberThreadProject(environmentId, initialState.data.value);
+  }
   // Seed the resume cursor from the cached snapshot so a warm cache can catch up
   // via `afterSequence` instead of re-downloading the full thread body.
   const initialSequence =
@@ -231,6 +257,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     state: initialState,
     sequence: initialSequence,
     persisted: retained?.persisted ?? Option.isSome(cached),
+    visibilityRevision,
   };
   if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
   const awaitingCompletion = yield* Ref.make(false);
@@ -250,6 +277,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     committed = {
       state: current,
       sequence,
+      visibilityRevision,
       persisted:
         committed.persisted &&
         matchesThreadSnapshot(
@@ -273,12 +301,21 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     readonly snapshot: OrchestrationThreadDetailSnapshot;
     readonly epoch: number;
   } | null>(null);
-  const persistence = yield* Queue.sliding<OrchestrationThreadDetailSnapshot>(1);
+  const persistence = yield* Queue.sliding<{
+    snapshot: OrchestrationThreadDetailSnapshot;
+    visibilityRevision: number;
+  }>(1);
 
   const persist = Effect.fn("EnvironmentThreadState.persist")(function* (
     snapshot: OrchestrationThreadDetailSnapshot,
+    revision: number,
   ) {
     if (resumeCache !== undefined && resumeCache.owner !== owner) return;
+    if (
+      isThreadRevoked(environmentId, threadId) ||
+      revision !== threadVisibilityRevision(environmentId, threadId)
+    )
+      return;
     if (
       committed.persisted &&
       matchesThreadSnapshot(committed, snapshot.thread, snapshot.snapshotSequence, snapshot.page)
@@ -286,8 +323,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       return;
     yield* cache.saveThread(environmentId, snapshot).pipe(
       Effect.tap(() =>
+        isThreadRevoked(environmentId, threadId) ||
+        revision !== threadVisibilityRevision(environmentId, threadId)
+          ? cache.removeThread(environmentId, threadId)
+          : Effect.void,
+      ),
+      Effect.tap(() =>
         Effect.sync(() => {
           if (
+            revision !== threadVisibilityRevision(environmentId, threadId) ||
             !matchesThreadSnapshot(
               committed,
               snapshot.thread,
@@ -314,7 +358,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 
   yield* Stream.fromQueue(persistence).pipe(
     Stream.debounce("500 millis"),
-    Stream.runForEach(persist),
+    Stream.runForEach((entry) => persist(entry.snapshot, entry.visibilityRevision)),
     Effect.forkScoped,
   );
 
@@ -366,21 +410,24 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     function* (thread: OrchestrationThread, snapshotSequence: number) {
       const currentPage = yield* SubscriptionRef.get(state).pipe(Effect.map((value) => value.page));
       yield* Queue.offer(persistence, {
-        snapshotSequence,
-        thread,
-        // Persist the window boundary with the window's content so a cache
-        // restore can keep paging from where the loaded history ends.
-        ...Option.match(currentPage, {
-          onNone: () => ({}),
-          onSome: (value) =>
-            ({
-              page: {
-                beforeCursor: value.beforeCursor,
-                hasMore: value.hasMore,
-                snapshotSequence,
-              },
-            }) as const,
-        }),
+        visibilityRevision,
+        snapshot: {
+          snapshotSequence,
+          thread,
+          // Persist the window boundary with the window's content so a cache
+          // restore can keep paging from where the loaded history ends.
+          ...Option.match(currentPage, {
+            onNone: () => ({}),
+            onSome: (value) =>
+              ({
+                page: {
+                  beforeCursor: value.beforeCursor,
+                  hasMore: value.hasMore,
+                  snapshotSequence,
+                },
+              }) as const,
+          }),
+        },
       });
     },
   );
@@ -391,6 +438,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     // recent turns); a snapshot or merged page passes its own page state.
     page: Option.Option<EnvironmentThreadPageState> | "keep",
   ) {
+    if (isThreadRevoked(environmentId, threadId)) return;
+    rememberThreadProject(environmentId, thread);
     const waiting = yield* Ref.get(awaitingCompletion);
     yield* SubscriptionRef.update(state, (current) => ({
       data: Option.some(thread),
@@ -415,6 +464,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const setDeleted = Effect.fn("EnvironmentThreadState.setDeleted")(function* () {
     yield* Ref.set(awaitingCompletion, false);
     yield* Ref.update(historyEpoch, (epoch) => epoch + 1);
+    yield* Ref.set(pendingOlderPage, null);
+    yield* SubscriptionRef.set(lastSequence, 0);
     yield* SubscriptionRef.set(state, {
       data: Option.none(),
       status: "deleted",
@@ -436,10 +487,39 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     );
   });
 
+  const visibilityChanges = yield* Queue.sliding<void>(1);
+  const visibilityResubscriptions = yield* Queue.sliding<void>(1);
+  const stopObservingVisibility = onThreadVisibilityChanged(environmentId, threadId, () => {
+    Queue.offerUnsafe(visibilityChanges, undefined);
+  });
+  if (threadVisibilityRevision(environmentId, threadId) !== visibilityRevision)
+    yield* Queue.offer(visibilityChanges, undefined);
+  yield* Effect.addFinalizer(() => Effect.sync(stopObservingVisibility));
+  yield* Stream.fromQueue(visibilityChanges).pipe(
+    Stream.runForEach(() =>
+      applyLock.withPermits(1)(
+        Effect.gen(function* () {
+          // Read the current decision, since revoke and restore may have coalesced.
+          visibilityRevision = threadVisibilityRevision(environmentId, threadId);
+          yield* setDeleted();
+          if (isThreadRevoked(environmentId, threadId)) return;
+          yield* SubscriptionRef.set(state, {
+            ...EMPTY_ENVIRONMENT_THREAD_STATE,
+            status: "synchronizing" as const,
+          });
+          yield* remember;
+          yield* Queue.offer(visibilityResubscriptions, undefined);
+        }),
+      ),
+    ),
+    Effect.forkScoped,
+  );
+
   // Body of applyItem, running under applyLock.
   const applyItemLocked = Effect.fn("EnvironmentThreadState.applyItemLocked")(function* (
     item: OrchestrationThreadStreamItem,
   ) {
+    if (isThreadRevoked(environmentId, threadId)) return;
     if (item.kind === "synchronized") {
       yield* Ref.set(awaitingCompletion, false);
       yield* SubscriptionRef.update(state, (current) =>
@@ -527,15 +607,44 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 
   const applyItem = Effect.fn("EnvironmentThreadState.applyItem")(function* (
     item: OrchestrationThreadStreamItem,
+    revision: number,
   ) {
-    yield* applyLock.withPermits(1)(applyItemLocked(item).pipe(Effect.andThen(remember)));
+    yield* applyLock.withPermits(1)(
+      Effect.gen(function* () {
+        if (
+          revision !== visibilityRevision ||
+          revision !== threadVisibilityRevision(environmentId, threadId)
+        )
+          return;
+        if (
+          item.kind === "snapshot" &&
+          restoreThreadVisibility(environmentId, item.snapshot.thread, revision)
+        )
+          return;
+        yield* applyItemLocked(item);
+        yield* remember;
+      }),
+    );
   });
 
   const applyItems = Effect.fn("EnvironmentThreadState.applyItems")(function* (
     items: ReadonlyArray<OrchestrationThreadStreamItem>,
+    revision: number,
   ) {
     yield* applyLock.withPermits(1)(
       Effect.gen(function* () {
+        if (
+          revision !== visibilityRevision ||
+          revision !== threadVisibilityRevision(environmentId, threadId)
+        )
+          return;
+        const authorizedSnapshot = items.find((item) => item.kind === "snapshot");
+        if (
+          authorizedSnapshot?.kind === "snapshot" &&
+          restoreThreadVisibility(environmentId, authorizedSnapshot.snapshot.thread, revision)
+        )
+          return;
+        if (isThreadRevoked(environmentId, threadId)) return;
         const current = yield* SubscriptionRef.get(state);
         if (
           Option.isNone(current.data) ||
@@ -589,6 +698,11 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const mergeOlderPage = Effect.fn("EnvironmentThreadState.mergeOlderPage")(function* (
     snapshot: OrchestrationThreadDetailSnapshot,
   ) {
+    if (
+      isThreadRevoked(environmentId, threadId) ||
+      visibilityRevision !== threadVisibilityRevision(environmentId, threadId)
+    )
+      return;
     // The merge is built inside the update callback so it composes with
     // whatever thread value is current at commit time. The applyLock already
     // serializes this against event application; the atomic build is defense
@@ -632,9 +746,12 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (merged !== null && shouldPersistThread(merged)) {
       const snapshotSequence = yield* SubscriptionRef.get(lastSequence);
       yield* Queue.offer(persistence, {
-        snapshotSequence,
-        thread: merged,
-        ...(snapshot.page === undefined ? {} : { page: { ...snapshot.page, snapshotSequence } }),
+        visibilityRevision,
+        snapshot: {
+          snapshotSequence,
+          thread: merged,
+          ...(snapshot.page === undefined ? {} : { page: { ...snapshot.page, snapshotSequence } }),
+        },
       });
     }
     yield* remember;
@@ -656,6 +773,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       return;
     }
     const epochAtStart = yield* Ref.get(historyEpoch);
+    const visibilityAtStart = threadVisibilityRevision(environmentId, threadId);
     yield* SubscriptionRef.update(state, (value) => ({
       ...value,
       page: Option.map(value.page, (existing) => ({ ...existing, loadingOlder: true })),
@@ -682,6 +800,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         // from a projection behind what we render; merging it could
         // resurrect turns a newer snapshot or revert already removed.
         const stale =
+          isThreadRevoked(environmentId, threadId) ||
+          visibilityAtStart !== threadVisibilityRevision(environmentId, threadId) ||
           epochNow !== epochAtStart ||
           Option.match(response, {
             onNone: () => false,
@@ -752,9 +872,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 
   yield* markSynchronizing;
   yield* Effect.forkScoped(
-    subscribeDynamic(
+    subscribeDynamicMapped(
       ORCHESTRATION_WS_METHODS.subscribeThread,
       Effect.fn("EnvironmentThreadState.makeSubscribeInput")(function* (session) {
+        const revision = threadVisibilityRevision(environmentId, threadId);
         const config = yield* session.initialConfig.pipe(
           Effect.orElseSucceed(
             () =>
@@ -762,6 +883,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
                 threadResumeCompletionMarker?: boolean;
                 threadSnapshotPagination?: boolean;
                 reasoningMessages?: boolean;
+                environment?: { capabilities?: { sharedPromptQueue?: boolean } };
               },
           ),
         );
@@ -821,7 +943,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
             supportsReasoningMessages,
           );
           if (Option.isSome(httpSnapshot)) {
-            yield* applyItem({ kind: "snapshot", snapshot: httpSnapshot.value });
+            yield* applyItem({ kind: "snapshot", snapshot: httpSnapshot.value }, revision);
             current = yield* SubscriptionRef.get(state);
           }
         }
@@ -841,21 +963,56 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           ...(canResume ? { afterSequence: sequence } : {}),
           ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
           ...(supportsReasoningMessages ? { reasoningMessages: true as const } : {}),
+          ...(config.environment?.capabilities?.sharedPromptQueue === true
+            ? { sharedPromptQueue: true as const }
+            : {}),
           // The WS fallback snapshot (sent when afterSequence is missing or
           // the gap is too large) should be windowed the same as the HTTP
           // path; without this a resume failure re-downloads the full thread.
           ...(supportsPagination ? { turnLimit: INITIAL_THREAD_USER_TURN_LIMIT } : {}),
         };
       }),
+      (_session, stream) => {
+        const revision = threadVisibilityRevision(environmentId, threadId);
+        return stream.pipe(
+          Stream.map((item) => ({ item, revision })),
+          Stream.tapCause((cause) => {
+            if (
+              revision !== threadVisibilityRevision(environmentId, threadId) ||
+              !isAuthorizationError(Cause.squash(cause))
+            )
+              return Effect.void;
+            revokeThreadVisibility(environmentId, threadId);
+            return Effect.void;
+          }),
+        );
+      },
       {
         onDefect: () => setStreamError("Could not synchronize the thread."),
-        onExpectedFailure: (cause) => setStreamError(formatThreadError(cause)),
+        onExpectedFailure: (cause) => {
+          if (isAuthorizationError(Cause.squash(cause))) {
+            return Effect.void;
+          }
+          return setStreamError(formatThreadError(cause));
+        },
         retryExpectedFailureAfter: "250 millis",
-        resubscribe: foregroundResubscriptions,
+        resubscribe: Stream.merge(
+          foregroundResubscriptions,
+          Stream.fromQueue(visibilityResubscriptions),
+        ),
       },
     ).pipe(
       Stream.runForEachArray((items) =>
-        items.length === 1 ? applyItem(items[0]!) : applyItems(items),
+        items.length === 1
+          ? applyItem(items[0]!.item, items[0]!.revision)
+          : applyItems(
+              items
+                .filter(
+                  (entry) => entry.revision === threadVisibilityRevision(environmentId, threadId),
+                )
+                .map((entry) => entry.item),
+              threadVisibilityRevision(environmentId, threadId),
+            ),
       ),
     ),
   );
@@ -885,21 +1042,24 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         onNone: () => Effect.void,
         onSome: (thread) =>
           shouldPersistThread(thread)
-            ? persist({
-                snapshotSequence,
-                thread,
-                ...Option.match(current.page, {
-                  onNone: () => ({}),
-                  onSome: (page) =>
-                    ({
-                      page: {
-                        beforeCursor: page.beforeCursor,
-                        hasMore: page.hasMore,
-                        snapshotSequence,
-                      },
-                    }) as const,
-                }),
-              })
+            ? persist(
+                {
+                  snapshotSequence,
+                  thread,
+                  ...Option.match(current.page, {
+                    onNone: () => ({}),
+                    onSome: (page) =>
+                      ({
+                        page: {
+                          beforeCursor: page.beforeCursor,
+                          hasMore: page.hasMore,
+                          snapshotSequence,
+                        },
+                      }) as const,
+                  }),
+                },
+                committed.visibilityRevision ?? 0,
+              )
             : Effect.void,
       });
     }),
@@ -947,7 +1107,10 @@ export function createEnvironmentThreadStateAtoms<R, E>(
           get.mount(resumeAtom);
           const resume = get.once(resumeAtom);
           const live = threadStateChanges(environmentId, threadId, resume);
-          return resume.snapshot === undefined
+          return resume.snapshot === undefined ||
+            isThreadRevoked(environmentId, threadId) ||
+            (resume.snapshot.visibilityRevision ?? 0) !==
+              threadVisibilityRevision(environmentId, threadId)
             ? live
             : Stream.concat(Stream.succeed(cachedThreadState(resume.snapshot.state)), live);
         },
@@ -971,6 +1134,7 @@ export * from "./composerPathSearch.ts";
 export * from "./threadCommands.ts";
 export * from "./threadFeedback.ts";
 export * from "./threadDetail.ts";
+export * from "./threadPromptQueue.ts";
 export * from "./threadReducer.ts";
 export * from "./threadShell.ts";
 export * from "./threadState.ts";

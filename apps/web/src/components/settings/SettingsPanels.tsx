@@ -2691,7 +2691,7 @@ export function GeneralSettingsPanel() {
         <SettingsRow
           {...searchableSetting("follow-up-behavior")}
           description={
-            "Queue follow-ups while the agent runs or steer the current run. " +
+            "Personal threads can queue follow-ups or steer the current run. Shared threads always queue until the turn finishes; use Steer now on a queued prompt to interrupt that order. " +
             (settings.sendShortcut === "mod-enter-multiline"
               ? `Press ${modifierLabel} + Enter for single-line prompts or ${modifierLabel} + Shift + Enter for multiline prompts to do the opposite for one message.`
               : `Press ${modifierLabel}${settings.sendShortcut === "mod-enter" ? " + Shift" : ""} + Enter to do the opposite for one message.`)

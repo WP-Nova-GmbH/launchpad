@@ -7,11 +7,12 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
-import type { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import {
   type EnvironmentRpcFailure,
   type EnvironmentRpcSuccess,
-  type EnvironmentRpcUnavailableError,
+  EnvironmentRpcUnavailableError,
+  currentSession,
   request,
 } from "../rpc/client.ts";
 
@@ -50,6 +51,14 @@ export type UnlinkThreadPullRequestInput = CommandInput<"thread.pull-request.unl
 export type SetThreadRuntimeModeInput = CommandInput<"thread.runtime-mode.set">;
 export type SetThreadInteractionModeInput = CommandInput<"thread.interaction-mode.set">;
 export type StartThreadTurnInput = CommandInput<"thread.turn.start">;
+export type EnqueueThreadPromptInput = CommandInput<"thread.prompt.enqueue">;
+export type EditThreadPromptInput = CommandInput<"thread.prompt.edit">;
+export type RemoveThreadPromptInput = CommandInput<"thread.prompt.remove">;
+export type SteerThreadPromptInput = CommandInput<"thread.prompt.steer">;
+export type PauseThreadQueueInput = CommandInput<"thread.queue.pause">;
+export type ResumeThreadQueueInput = CommandInput<"thread.queue.resume">;
+export type ResolveThreadQueueInput = CommandInput<"thread.queue.resolve">;
+export type RetryThreadPreparationInput = CommandInput<"thread.preparation.retry">;
 export type InterruptThreadTurnInput = CommandInput<"thread.turn.interrupt">;
 export type RespondToThreadApprovalInput = CommandInput<"thread.approval.respond">;
 export type RespondToThreadUserInputInput = CommandInput<"thread.user-input.respond">;
@@ -312,6 +321,25 @@ export const startThreadTurn: (input: StartThreadTurnInput) => CommandEffect = E
   "EnvironmentCommands.startThreadTurn",
 )(function* (input) {
   const metadata = yield* timestampedCommandMetadata(input);
+  const session = yield* currentSession();
+  const supervisor = yield* EnvironmentSupervisor;
+  const config = yield* session.initialConfig.pipe(
+    Effect.mapError(
+      () =>
+        new EnvironmentRpcUnavailableError({
+          environmentId: supervisor.target.environmentId,
+          message: "Reconnect before submitting this prompt.",
+        }),
+    ),
+  );
+  if (config.environment.capabilities.sharedPromptQueue === true) {
+    return yield* dispatch({
+      ...input,
+      type: "thread.prompt.enqueue",
+      commandId: metadata.commandId,
+      createdAt: metadata.createdAt,
+    });
+  }
   return yield* dispatch({
     ...input,
     type: "thread.turn.start",
@@ -319,6 +347,61 @@ export const startThreadTurn: (input: StartThreadTurnInput) => CommandEffect = E
     createdAt: metadata.createdAt,
   });
 });
+
+export const enqueueThreadPrompt: (input: EnqueueThreadPromptInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.enqueueThreadPrompt",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.prompt.enqueue", ...metadata });
+});
+
+export const editThreadPrompt: (input: EditThreadPromptInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.editThreadPrompt",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.prompt.edit", ...metadata });
+});
+
+export const removeThreadPrompt: (input: RemoveThreadPromptInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.removeThreadPrompt",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.prompt.remove", ...metadata });
+});
+
+export const steerThreadPrompt: (input: SteerThreadPromptInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.steerThreadPrompt",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.prompt.steer", ...metadata });
+});
+
+export const pauseThreadQueue: (input: PauseThreadQueueInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.pauseThreadQueue",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.queue.pause", ...metadata });
+});
+
+export const resumeThreadQueue: (input: ResumeThreadQueueInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.resumeThreadQueue",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.queue.resume", ...metadata });
+});
+
+export const resolveThreadQueue: (input: ResolveThreadQueueInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.resolveThreadQueue",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.queue.resolve", ...metadata });
+});
+
+export const retryThreadPreparation: (input: RetryThreadPreparationInput) => CommandEffect =
+  Effect.fn("EnvironmentCommands.retryThreadPreparation")(function* (input) {
+    const metadata = yield* timestampedCommandMetadata(input);
+    return yield* dispatch({ ...input, type: "thread.preparation.retry", ...metadata });
+  });
 
 export const interruptThreadTurn: (input: InterruptThreadTurnInput) => CommandEffect = Effect.fn(
   "EnvironmentCommands.interruptThreadTurn",

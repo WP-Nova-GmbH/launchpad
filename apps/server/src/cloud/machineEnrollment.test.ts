@@ -230,6 +230,22 @@ describe("reconcileMachineEnrollment", () => {
     }).pipe(provideEnrollmentHarness(harness));
   });
 
+  it.effect("ignores a seed without relay configuration", () => {
+    const { store } = makeMemorySecretStore();
+    const harness: EnrollmentHarness = {
+      store,
+      requests: [],
+      applyConfigCalls: [],
+      env: { T3CODE_MACHINE_ENROLLMENT_SEED: machineEnv.T3CODE_MACHINE_ENROLLMENT_SEED },
+    };
+    return Effect.gen(function* () {
+      expect(yield* reconcileMachineEnrollment("http://127.0.0.1:4483")).toEqual({
+        outcome: "not-a-machine",
+      });
+      expect(harness.requests).toHaveLength(0);
+    }).pipe(provideEnrollmentHarness(harness));
+  });
+
   it.effect("never re-enrolls once a machine identity is installed", () => {
     const { store } = makeMemorySecretStore([
       [

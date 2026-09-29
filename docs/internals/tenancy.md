@@ -44,6 +44,41 @@ organization cannot end up with nobody able to administer it.
 Removing a member also clears every repository grant they held. Left behind, those rows would
 silently restore access if the person were ever invited back.
 
+### Shared-thread access
+
+Shared threads on organization machines require current access to their project's repository.
+When an environment receives an access removal, it must immediately prevent further reads and
+commands for those threads, including over connections already open. Waiting for a client reconnect
+or token expiry would let a removed member keep participating after the environment learned of
+the removal.
+
+A running environment may continue using its last confirmed permissions while it cannot reach
+the relay. We keep shared machines usable during relay outages, accepting that a person may
+retain access until the environment receives their removal. The relay reports removal as
+**pending** until every affected environment confirms enforcement, including machines reachable
+directly by clients while disconnected from the relay. It must not report removal as complete
+while one of those environments can still honor the old permission.
+
+Revocation does not cancel work the environment already accepted: running turns continue and
+accepted queued prompts remain eligible for delivery under the queue's existing state. That work
+belongs to the organization, and remaining authorized teammates retain control. Once an environment
+applies the removal, it rejects new submissions and edits from that person, including prompts held
+only on a disconnected client when it reconnects. Stopping shared work is separate from removing
+its submitter's access.
+
+These are Launchpad thread-access rules, not filesystem isolation. Organization machines remain
+trusted shared environments under
+[ADR-0017](../adr/0017-shared-machines-remain-trusted-environments.md); agents and accessible host
+files are not separated by repository grants.
+
+The relay publishes signed, revisioned full policy snapshots. Environments fence protected ingress
+and drain open consumers before acknowledging a new revision. The relay persists each environment's
+acknowledgement, including offline targets, so a relay restart cannot turn pending removal into
+completion. Replacing a machine key retains the old generation as a target: the replacement cannot
+acknowledge enforcement for an older instance that may still serve direct clients. A restarted
+environment must fetch a fresh policy before serving shared-thread access;
+its persisted snapshot is sufficient only for work it already accepted.
+
 ## Repositories and canonical keys
 
 A repository is relay-owned and spans machines; a checkout is recognised as belonging to one by its
@@ -64,10 +99,10 @@ Behaviour differs by machine, deliberately:
 - **On a personal machine: derive freely.** A checkout nobody registered is simply not org-governed.
   Settings → Organization shows admins which visible checkouts are not part of the organization and
   offers to register them.
-- **On an executor: refuse.** Still not enforced. Machines exist now (see
-  [machines.md](./machines.md)), so the relay can tell an executor from a personal machine — but the
-  refusal belongs in the executor's project-creation path, which the job runner's project
-  materialization (M5) reshapes; it lands there rather than being built twice.
+- **On an organization machine: refuse new projects.** The checkout must match a registered
+  repository the caller can access. Existing unresolved projects remain visible to organization
+  admins for recovery. A project's repository binding survives remote changes; changing a remote
+  cannot silently move its existing threads to another repository's grant set.
 
 What _is_ enforced today is the other half: dispatching a job against a canonical key that **is**
 registered requires a role on that repository (`requireRepositoryAccessForDispatch` in

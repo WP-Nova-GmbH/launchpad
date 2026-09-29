@@ -173,6 +173,7 @@ import {
 } from "./thread-work-log";
 import { appendPendingThreadMessages, type PendingThreadFeedEntry } from "./pending-thread-feed";
 import type { QueuedThreadMessage } from "../../state/thread-outbox-model";
+import { promptAttributionLabel } from "@t3tools/client-runtime/state/threads";
 import { useMarkdownCodeHighlight } from "./markdownCodeHighlightState";
 import {
   assetEnvironment,
@@ -1554,7 +1555,7 @@ function renderFeedEntry(
         <View className="mb-5 items-end">
           {message.author ? (
             <Text className="mb-1 pr-0.5 font-t3-medium text-xs text-neutral-600 dark:text-neutral-400">
-              {message.author.displayName ?? "Teammate"}
+              {promptAttributionLabel(message)}
             </Text>
           ) : null}
           <View
@@ -1642,7 +1643,11 @@ function renderFeedEntry(
           </View>
           <View className="mt-1 flex-row items-center justify-end gap-1 pr-0.5">
             <Text className="font-t3-medium text-xs tabular-nums text-foreground-secondary">
-              {entry.pendingMessage && !entry.acknowledged ? "Pending" : timestampLabel}
+              {entry.pendingMessage && !entry.acknowledged
+                ? entry.pendingMessage.submissionProtocol === "review-required"
+                  ? "Delivery unknown · Review required"
+                  : "Waiting to submit"
+                : timestampLabel}
             </Text>
             {entry.pendingMessage &&
             !entry.acknowledged &&
@@ -1654,7 +1659,21 @@ function renderFeedEntry(
                 hitSlop={8}
                 className="size-7 items-center justify-center"
                 onPress={() => {
-                  if (entry.pendingMessage) props.onEditPendingMessage(entry.pendingMessage);
+                  const pending = entry.pendingMessage;
+                  if (!pending) return;
+                  if (pending.submissionProtocol === "review-required") {
+                    Alert.alert(
+                      "Review uncertain submission",
+                      "This prompt may already have been accepted. Check the shared queue and conversation before sending it again.",
+                      [
+                        { text: "Cancel", style: "cancel" },
+                        {
+                          text: "Restore draft",
+                          onPress: () => props.onEditPendingMessage(pending),
+                        },
+                      ],
+                    );
+                  } else props.onEditPendingMessage(pending);
                 }}
               >
                 <SymbolView name="pencil" size={14} tintColor={iconSubtleColor} />

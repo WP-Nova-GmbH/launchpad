@@ -1,3 +1,4 @@
+import * as RepositoryPolicies from "../tenancy/RepositoryPolicies.ts";
 import { createClerkClient } from "@clerk/backend";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
@@ -418,6 +419,19 @@ export const organizationApi = HttpApiBuilder.group(
 
     return handlers
       .handle(
+        "getRepositoryAccessRemoval",
+        Effect.fn(function* (args) {
+          const membership = yield* requireMembership();
+          yield* RepositoryPolicies.deliverPending(membership.organization.organizationId).pipe(
+            Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
+          );
+          return yield* RepositoryPolicies.status(
+            membership.organization.organizationId,
+            args.query.revision,
+          ).pipe(Effect.catch(() => relayInternalErrorResponse("persistence_failed")));
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
         "getOrganization",
         Effect.fn("relay.api.organization.get")(function* () {
           const membership = yield* requireMembership();
@@ -484,7 +498,16 @@ export const organizationApi = HttpApiBuilder.group(
             return yield* tenancyNotFound("member_not_found");
           }
           const identities = yield* directory.lookup({ userIds: [updated.userId] });
-          return { ...updated, identity: identities.get(updated.userId) ?? null };
+          yield* RepositoryPolicies.deliverPending(membership.organization.organizationId).pipe(
+            Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
+          );
+          return {
+            ...updated,
+            identity: identities.get(updated.userId) ?? null,
+            accessRemoval: yield* RepositoryPolicies.status(
+              membership.organization.organizationId,
+            ).pipe(Effect.catch(() => relayInternalErrorResponse("persistence_failed"))),
+          };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
@@ -518,7 +541,15 @@ export const organizationApi = HttpApiBuilder.group(
             .pipe(
               Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
             );
-          return { ok: true };
+          yield* RepositoryPolicies.deliverPending(organizationId).pipe(
+            Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
+          );
+          return {
+            ok: true,
+            accessRemoval: yield* RepositoryPolicies.status(organizationId).pipe(
+              Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
+            ),
+          };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
@@ -989,7 +1020,15 @@ export const repositoriesApi = HttpApiBuilder.group(
           yield* atomically(
             repositories.deleteRepository({ repositoryId: args.params.repositoryId }),
           );
-          return { ok: true };
+          yield* RepositoryPolicies.deliverPending(membership.organization.organizationId).pipe(
+            Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
+          );
+          return {
+            ok: true,
+            accessRemoval: yield* RepositoryPolicies.status(
+              membership.organization.organizationId,
+            ).pipe(Effect.catch(() => relayInternalErrorResponse("persistence_failed"))),
+          };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(
@@ -1082,6 +1121,9 @@ export const repositoriesApi = HttpApiBuilder.group(
             role: args.payload.role,
           });
           const identities = yield* directory.lookup({ userIds: [granted.userId] });
+          yield* RepositoryPolicies.deliverPending(repository.organizationId).pipe(
+            Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
+          );
           return { ...granted, identity: identities.get(granted.userId) ?? null };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
@@ -1100,7 +1142,15 @@ export const repositoriesApi = HttpApiBuilder.group(
           if (!revoked) {
             return yield* tenancyNotFound("member_not_found");
           }
-          return { ok: true };
+          yield* RepositoryPolicies.deliverPending(repository.organizationId).pipe(
+            Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
+          );
+          return {
+            ok: true,
+            accessRemoval: yield* RepositoryPolicies.status(repository.organizationId).pipe(
+              Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
+            ),
+          };
         }, mapRelayCommonApiErrors("not_authorized")),
       );
   }),

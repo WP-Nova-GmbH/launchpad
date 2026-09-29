@@ -1,3 +1,5 @@
+import { repositoryAccessServerApi } from "./http/RepositoryAccessApi.ts";
+import * as RepositoryPolicies from "./tenancy/RepositoryPolicies.ts";
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Drizzle from "alchemy/Drizzle/Postgres";
@@ -141,6 +143,7 @@ const relayApiLayer = Layer.mergeAll(
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
+  repositoryAccessServerApi,
   providerAccountsServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
@@ -301,6 +304,7 @@ export const ApiLive = Api.make(
         Layer.provideMerge(MobileRegistrations.layer),
         Layer.provideMerge(AgentActivityPublisher.layer),
         Layer.provideMerge(EnvironmentConnector.layer),
+        Layer.provideMerge(RepositoryPolicies.controlLayer),
         Layer.provideMerge(EnvironmentLinker.layer),
         Layer.provideMerge(MachineEnroller.layer),
         Layer.provideMerge(
@@ -442,6 +446,11 @@ export const ApiLive = Api.make(
     yield* Cloudflare.Workers.cron("*/5 * * * *", () =>
       Effect.all(
         [
+          RepositoryPolicies.deliverPending().pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Policy delivery retry failed", { cause }),
+            ),
+          ),
           DpopProofs.DpopProofReplay.pipe(
             Effect.flatMap((dpopProofs) => dpopProofs.pruneExpired),
             // Keep completed thread rows long enough to show their final state.

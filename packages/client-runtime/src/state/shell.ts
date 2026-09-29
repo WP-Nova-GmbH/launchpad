@@ -23,6 +23,7 @@ import { EnvironmentCacheStore } from "../platform/persistence.ts";
 import { subscribeDynamic } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import { ShellSnapshotLoader } from "./shellSnapshotHttp.ts";
+import { reconcileThreadVisibility } from "./threadVisibility.ts";
 import { applyShellStreamEvent } from "./shellReducer.ts";
 import { type EnvironmentCatalogState, enabledEnvironmentIds } from "./connections.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
@@ -181,6 +182,19 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       }
     }
     if (next.snapshot !== initial.snapshot && Option.isSome(next.snapshot)) {
+      if (receivedSnapshot) {
+        const removed = reconcileThreadVisibility(
+          environmentId,
+          Option.getOrNull(initial.snapshot)?.threads ?? [],
+          next.snapshot.value.threads,
+          next.snapshot.value.projects,
+        );
+        yield* Effect.forEach(
+          removed,
+          (thread) => cache.removeThread(environmentId, thread.id).pipe(Effect.ignore),
+          { discard: true },
+        );
+      }
       yield* Queue.offer(persistence, next.snapshot.value);
     }
   });

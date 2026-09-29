@@ -27,6 +27,7 @@ import { parseAllowedOAuthScope } from "@t3tools/shared/oauthScope";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import { identity } from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Cookies from "effect/unstable/http/Cookies";
@@ -35,6 +36,7 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
+import { RepositoryAccess } from "./RepositoryAccess.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { traceAuthenticatedRelayRequest, traceRelayRequest } from "../cloud/traceRelayRequest.ts";
 import { deriveAuthClientMetadata } from "./utils.ts";
@@ -216,6 +218,21 @@ export const environmentAuthenticatedAuthLayer = Layer.effect(
             failEnvironmentInternal("internal_error", error),
           ),
         );
+        const access = yield* RepositoryAccess;
+        if ((yield* access.status).enabled) {
+          const requestFiber = yield* Effect.withFiber(Effect.succeed);
+          // The HTTP request scope outlives response encoding and body writes.
+          // Revocation interrupts and drains that whole lifetime before ACK.
+          yield* Effect.acquireRelease(
+            access.withFence(
+              access.requireMember(session).pipe(
+                Effect.catch(() => failEnvironmentAuthInvalid("invalid_credential")),
+                Effect.andThen(access.registerConnection(Fiber.interrupt(requestFiber))),
+              ),
+            ),
+            (unregister) => Effect.sync(unregister),
+          );
+        }
         return yield* httpEffect.pipe(
           Effect.provideService(EnvironmentAuthenticatedPrincipal, {
             ...session,

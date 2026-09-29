@@ -87,6 +87,13 @@ export const ServerSelfUpdateCapability = Schema.Literals([
 export type ServerSelfUpdateCapability = typeof ServerSelfUpdateCapability.Type;
 
 export const ExecutionEnvironmentCapabilities = Schema.Struct({
+  /** Environment owns durable shared prompt queues; ordinary sends must enqueue. */
+  sharedPromptQueue: Schema.optionalKey(Schema.Boolean),
+  sharedPreparation: Schema.optionalKey(Schema.Boolean),
+  /** Organization repository grants are enforced on existing connections. */
+  organizationRepositoryAccess: Schema.optionalKey(Schema.Boolean),
+  /** Initial repository policy synchronization has completed. Relay outages do not reset it. */
+  repositoryPolicyReady: Schema.optionalKey(Schema.Boolean),
   repositoryIdentity: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   connectionProbe: Schema.optionalKey(Schema.Boolean),
   /** Missing on older servers, which still accept inline image attachments. */

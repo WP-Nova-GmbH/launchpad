@@ -17,6 +17,7 @@ import type {
   ProviderRespondToRequestInput,
   ProviderRespondToUserInputInput,
   ProviderRuntimeEvent,
+  RuntimeTurnState,
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
@@ -25,6 +26,7 @@ import type {
   ProviderUploadFeedbackResult,
   MessageId,
   ThreadId,
+  TurnId,
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -32,8 +34,12 @@ import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
-import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
+import type { ProviderAdapterCapabilities, ProviderSendTurnCallbacks } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
+
+export type ProviderCompactionResult =
+  | { readonly type: "native" }
+  | { readonly type: "turn"; readonly turnId: TurnId; readonly outcome: RuntimeTurnState };
 
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
@@ -52,13 +58,15 @@ export interface ProviderServiceShape {
    */
   readonly sendTurn: (
     input: ProviderSendTurnInput,
+    callbacks?: ProviderSendTurnCallbacks,
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 
   readonly compactThread: (
     threadId: ThreadId,
     modelSelection?: ProviderSendTurnInput["modelSelection"],
     requestId?: MessageId,
-  ) => Effect.Effect<void, ProviderServiceError>;
+    callbacks?: ProviderSendTurnCallbacks,
+  ) => Effect.Effect<ProviderCompactionResult, ProviderServiceError>;
 
   /**
    * Interrupt a running provider turn.

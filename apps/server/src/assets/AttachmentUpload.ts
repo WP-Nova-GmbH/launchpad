@@ -1,3 +1,7 @@
+import { RepositoryAccess, type RepositoryActor } from "../auth/RepositoryAccess.ts";
+import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
+import { AuthSessionId } from "@t3tools/contracts";
+import { AssetActorClaims, validateAssetActorClaims } from "./AssetAccess.ts";
 import * as NodeCrypto from "node:crypto";
 
 import {
@@ -41,6 +45,7 @@ const PENDING_ATTACHMENT_SWEEP_INTERVAL_MS = 15 * 60_000;
 const lastPendingSweepByDirectory = new Map<string, number>();
 
 const AttachmentUploadClaims = Schema.Struct({
+  access: Schema.optionalKey(AssetActorClaims),
   version: Schema.Literal(1),
   kind: Schema.Literal("attachment-upload"),
   type: Schema.Literals(["image", "file"]).pipe(
@@ -73,7 +78,29 @@ const loadSigningSecret = Effect.gen(function* () {
 
 export const issueAttachmentUploadUrl = Effect.fn("AttachmentUpload.issueUrl")(function* (
   input: AttachmentCreateUploadUrlInput,
+  actor?: RepositoryActor & { readonly sessionId: AuthSessionId },
 ) {
+  const access = yield* RepositoryAccess;
+  let actorClaims: typeof AssetActorClaims.Type | undefined;
+  if ((yield* access.status).enabled) {
+    if (!actor?.user)
+      return yield* new AttachmentUploadSigningKeyError({
+        cause: new Error("An identified session is required."),
+      });
+    yield* access
+      .requireMember(actor)
+      .pipe(Effect.mapError((cause) => new AttachmentUploadSigningKeyError({ cause })));
+    const environment = yield* Effect.serviceOption(ServerEnvironment);
+    if (Option.isNone(environment))
+      return yield* new AttachmentUploadSigningKeyError({
+        cause: new Error("Environment identity unavailable."),
+      });
+    actorClaims = {
+      sessionId: actor.sessionId,
+      userId: actor.user.userId,
+      environmentId: yield* environment.value.getEnvironmentId,
+    };
+  }
   const secret = yield* loadSigningSecret.pipe(
     Effect.mapError((cause) => new AttachmentUploadSigningKeyError({ cause })),
   );
@@ -102,6 +129,7 @@ export const issueAttachmentUploadUrl = Effect.fn("AttachmentUpload.issueUrl")(f
   const encodedPayload = base64UrlEncode(
     encodeAttachmentUploadClaims({
       version: 1,
+      ...(actorClaims ? { access: actorClaims } : {}),
       kind: "attachment-upload",
       type: attachmentType,
       attachmentId,
@@ -141,7 +169,7 @@ export const validateAttachmentUploadToken = Effect.fn("AttachmentUpload.validat
   if (!claims || claims.expiresAt <= (yield* Clock.currentTimeMillis)) {
     return null;
   }
-  return claims;
+  return (yield* validateAssetActorClaims(claims.access)) ? claims : null;
 });
 
 export type StoreAttachmentUploadResult =

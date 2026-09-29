@@ -1,3 +1,4 @@
+import { reconcileSharedPreparations } from "./orchestration/ThreadPreparationReactor.ts";
 import {
   CommandId,
   EventId,
@@ -643,6 +644,15 @@ export const reconcileProviderSessions = Effect.gen(function* () {
         );
       });
 
+    // Shared work is recovered by the durable prompt queue. A synthetic
+    // continuation here could resend an uncertain handoff or bypass Stop.
+    if (thread.promptQueue !== undefined) {
+      yield* settleAsError(
+        "The shared thread stopped during a restart. Review its queue recovery status before continuing.",
+      );
+      continue;
+    }
+
     if (
       Option.isSome(binding) &&
       (continuationMarked || interruptedByRestart) &&
@@ -967,6 +977,7 @@ export const make = (options?: StartupOptions) =>
       );
 
       yield* runStartupPhase("provider-sessions.reconcile", reconcileProviderSessions);
+      yield* runStartupPhase("shared-preparations.reconcile", reconcileSharedPreparations);
       yield* runStartupPhase("worktree-setups.reconcile", reconcileWorktreeSetups);
 
       yield* Effect.logDebug("startup phase: syncing clean projects");

@@ -1593,6 +1593,13 @@ function ConfiguredOrganizationSettings() {
 
   return (
     <SettingsPageContainer>
+      {state.accessRemoval?.status === "pending" ? (
+        <p role="status" className="px-3 text-sm text-muted-foreground sm:px-4">
+          Access removal is pending on {state.accessRemoval.pendingEnvironmentIds.length}{" "}
+          environment(s). Connected environments must acknowledge it before removal is complete.
+          Accepted prompts and ongoing work continue.
+        </p>
+      ) : null}
       {state.error ? (
         <p ref={errorRef} role="alert" className="px-3 text-sm text-destructive sm:px-4">
           {state.error}

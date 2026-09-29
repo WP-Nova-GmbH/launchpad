@@ -1,3 +1,4 @@
+import { ThreadPreparationReactor } from "../ThreadPreparationReactor.ts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -17,6 +18,7 @@ import * as StorageCleanup from "../../storageCleanup.ts";
 import * as OrganizationProjectCatalogRelay from "../../relay/OrganizationProjectCatalogRelay.ts";
 
 export const makeOrchestrationReactor = Effect.gen(function* () {
+  const preparation = yield* ThreadPreparationReactor;
   const providerRuntimeIngestion = yield* ProviderRuntimeIngestionService;
   const providerCommandReactor = yield* ProviderCommandReactor;
   const checkpointReactor = yield* CheckpointReactor;
@@ -30,10 +32,11 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
     yield* OrganizationProjectCatalogRelay.OrganizationProjectCatalogRelay;
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {
+    yield* threadDeletionReactor.start();
+    yield* preparation.start();
     yield* providerRuntimeIngestion.start();
     yield* providerCommandReactor.start();
     yield* checkpointReactor.start();
-    yield* threadDeletionReactor.start();
     yield* threadPullRequestReactor.start();
     yield* threadSettlementReactor.start();
     yield* pullRequestSyncReactor.start();

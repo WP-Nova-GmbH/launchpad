@@ -5,6 +5,7 @@ import {
   CommandId,
   ComposerContextId,
   EventId,
+  EnvironmentId,
   MessageId,
   ProjectId,
   ProviderInstanceId,
@@ -14,6 +15,7 @@ import {
 import type { OrchestrationThread } from "@t3tools/contracts";
 
 import { applyThreadDetailEvent } from "./threadReducer.ts";
+import { scopeThread } from "./models.ts";
 
 const baseEventFields = {
   eventId: EventId.make("event-1"),
@@ -566,7 +568,100 @@ describe("applyThreadDetailEvent", () => {
     });
   });
 
+  it("projects queue deltas and never shows an admitted prompt twice", () => {
+    const entry = {
+      messageId: MessageId.make("queued"),
+      text: "Work",
+      attachments: [],
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      revision: 1,
+      acceptedSequence: 0,
+      createdAt: baseThread.createdAt,
+      state: "pending" as const,
+    };
+    const accepted = applyThreadDetailEvent(baseThread, {
+      ...baseEventFields,
+      sequence: 42,
+      occurredAt: baseThread.updatedAt,
+      aggregateKind: "thread",
+      aggregateId: baseThread.id,
+      type: "thread.prompt-queue-changed",
+      payload: { threadId: baseThread.id, entry, updatedAt: baseThread.updatedAt },
+    });
+    expect(accepted.kind).toBe("updated");
+    if (accepted.kind !== "updated") return;
+    expect(accepted.thread.promptQueue?.entries[0]?.acceptedSequence).toBe(42);
+    expect(accepted.thread.messages).toHaveLength(0);
+    const admitted = applyThreadDetailEvent(accepted.thread, {
+      ...baseEventFields,
+      sequence: 43,
+      occurredAt: baseThread.updatedAt,
+      aggregateKind: "thread",
+      aggregateId: baseThread.id,
+      type: "thread.message-sent",
+      payload: {
+        threadId: baseThread.id,
+        messageId: entry.messageId,
+        role: "user",
+        text: entry.text,
+        turnId: null,
+        streaming: false,
+        createdAt: entry.createdAt,
+        updatedAt: entry.createdAt,
+      },
+    });
+    if (admitted.kind !== "updated") throw new Error("Admission did not update the thread");
+    const displayed = scopeThread(EnvironmentId.make("environment"), admitted.thread);
+    expect(displayed.messages).toHaveLength(0);
+    expect(displayed.promptQueue?.entries).toHaveLength(1);
+    expect(admitted.thread.promptQueue?.entries).toHaveLength(1);
+  });
+
   describe("thread.message-sent", () => {
+    it("retains authenticated authors in live insertion and later message updates", () => {
+      const author = { userId: "alice", displayName: "Alice", imageUrl: null };
+      const event = {
+        ...baseEventFields,
+        sequence: 1,
+        occurredAt: baseThread.updatedAt,
+        aggregateKind: "thread" as const,
+        aggregateId: baseThread.id,
+        type: "thread.message-sent" as const,
+        payload: {
+          threadId: baseThread.id,
+          messageId: MessageId.make("alice-message"),
+          role: "user" as const,
+          text: "First draft",
+          author,
+          editedBy: { userId: "bob", displayName: "Bob", imageUrl: null },
+          steeredBy: { userId: "carol", displayName: "Carol", imageUrl: null },
+          turnId: null,
+          streaming: false,
+          createdAt: baseThread.createdAt,
+          updatedAt: baseThread.updatedAt,
+        },
+      };
+      const inserted = applyThreadDetailEvent(baseThread, event);
+      expect(inserted.kind).toBe("updated");
+      if (inserted.kind !== "updated") return;
+      expect(inserted.thread.messages[0]?.author).toEqual(author);
+      const merged = applyThreadDetailEvent(inserted.thread, {
+        ...event,
+        sequence: 2,
+        payload: { ...event.payload, text: "Final message" },
+      });
+      expect(merged.kind).toBe("updated");
+      if (merged.kind !== "updated") return;
+      expect(merged.thread.messages).toHaveLength(1);
+      expect(merged.thread.messages[0]).toMatchObject({
+        author,
+        editedBy: event.payload.editedBy,
+        steeredBy: event.payload.steeredBy,
+        text: "Final message",
+      });
+    });
+
     it.each([
       ["first", ["first+", "middle", "last"]],
       ["middle", ["first", "middle+", "last"]],

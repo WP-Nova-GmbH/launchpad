@@ -14,6 +14,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   type DpopFailureReason,
   EnvironmentId,
+  EnvironmentAuthorizationError,
   EventId,
   GitCommandError,
   KeybindingRule,
@@ -108,6 +109,7 @@ const encodeTestJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unk
 
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as ThreadPresence from "./orchestration/ThreadPresence.ts";
+import { RepositoryAccess, type RepositoryAccessShape } from "./auth/RepositoryAccess.ts";
 import * as ServerConfig from "./config.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import { HTTP_ROUTER_CONFIG, makeRoutesLayer } from "./server.ts";
@@ -128,10 +130,14 @@ import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngi
 import { OrchestrationThreadSettleBlockedError } from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
+import { ThreadPreparationReactor } from "./orchestration/ThreadPreparationReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { OrchestrationEventStoreLive } from "./persistence/Layers/OrchestrationEventStore.ts";
+import { OrchestrationCommandReceiptRepositoryLive } from "./persistence/Layers/OrchestrationCommandReceipts.ts";
+import { ProjectionThreadRepositoryLive } from "./persistence/Layers/ProjectionThreads.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
+import { OrchestrationCommandReceiptRepository } from "./persistence/Services/OrchestrationCommandReceipts.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
 import * as ModelManifest from "./provider/ModelManifest.ts";
@@ -521,6 +527,7 @@ const buildAppUnderTest = (options?: {
   onPairingChangesSubscribed?: Effect.Effect<void>;
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
   layers?: {
+    repositoryAccess?: Partial<RepositoryAccessShape>;
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     environmentTheme?: Partial<EnvironmentTheme.EnvironmentThemeService["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
@@ -575,6 +582,7 @@ const buildAppUnderTest = (options?: {
 }) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
+    const repositoryAccess = yield* RepositoryAccess;
     const tempBaseDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-router-test-" });
     const baseDir = options?.config?.baseDir ?? tempBaseDir;
     const devUrl = options?.config?.devUrl;
@@ -776,305 +784,320 @@ const buildAppUnderTest = (options?: {
         disableLogger: true,
         routerConfig: HTTP_ROUTER_CONFIG,
       },
-    ).pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(Keybindings.Keybindings)({
-            loadConfigState: Effect.succeed({
-              keybindings: [],
-              issues: [],
-            }),
-            streamChanges: Stream.empty,
-            ...options?.layers?.keybindings,
-          }),
-          Layer.mock(EnvironmentTheme.EnvironmentThemeService)({
-            current: Effect.succeed([]),
-            streamChanges: Stream.empty,
-            ...options?.layers?.environmentTheme,
-          }),
-          Layer.mock(UsageLimitSources.UsageLimitSources)({
-            current: Effect.succeed([]),
-            streamChanges: Stream.make([]),
-            refresh: Effect.void,
-            ...options?.layers?.usageLimitSources,
-          }),
+    )
+      .pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            OrchestrationCommandReceiptRepositoryLive,
+            OrchestrationEventStoreLive,
+            ProjectionThreadRepositoryLive,
+          ).pipe(Layer.provide(SqlitePersistenceMemory)),
         ),
-      ),
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(ModelManifest.ModelManifest)({
-            forceRefresh: Effect.succeed(ModelManifest.BUNDLED_MODEL_MANIFEST),
-            ...options?.layers?.modelManifest,
-          }),
-          Layer.mock(ProviderRegistry.ProviderRegistry)({
-            getProviders: Effect.succeed([]),
-            refresh: () => Effect.succeed([]),
-            refreshInstance: () => Effect.succeed([]),
-            getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
-              Effect.succeed(
-                makeManualOnlyProviderMaintenanceCapabilities({ provider, packageName: null }),
-              ),
-            setProviderMaintenanceActionState: () => Effect.succeed([]),
-            streamChanges: Stream.empty,
-            ...options?.layers?.providerRegistry,
-          }),
-          Layer.mock(ProviderService.ProviderService)({
-            uploadFeedback: () => Effect.die("Provider feedback is not stubbed in this test"),
-            ...options?.layers?.providerService,
-          }),
-          Layer.mock(ProviderAuthService)({
-            ...options?.layers?.providerAuth,
-          }),
-          Layer.mock(ProviderInstanceRegistry)({
-            getInstance: () => Effect.undefined,
-            listInstances: Effect.succeed([]),
-            ...options?.layers?.providerInstanceRegistry,
-          }),
-          Layer.mock(AntigravityInstallation)({
-            managedDirectory: "unused-test-antigravity-runtime",
-            ...options?.layers?.antigravityInstallation,
-          }),
-          Layer.mock(ProviderSessionDirectory.ProviderSessionDirectory)({
-            upsert: () => Effect.void,
-            getBinding: () => Effect.succeedNone,
-            listThreadIds: () => Effect.succeed([]),
-            listBindings: () => Effect.succeed([]),
-            ...options?.layers?.providerSessionDirectory,
-          }),
-          Layer.mock(DeviceService.DeviceService)({
-            state: Effect.succeed(EMPTY_DEVICE_STATE),
-            currentReadiness: () => Effect.succeed(null),
-            sessionsForThread: () => Effect.succeed([]),
-          }),
-        ),
-      ),
-      Layer.provide(
-        Layer.mock(ServerSettings.ServerSettingsService)({
-          start: Effect.void,
-          ready: Effect.void,
-          getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
-          updateSettings: () => Effect.succeed(DEFAULT_SERVER_SETTINGS),
-          streamChanges: Stream.empty,
-          ...options?.layers?.serverSettings,
-        }),
-      ),
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(ExternalLauncher.ExternalLauncher)({
-            resolveAvailableEditors: () => Effect.succeed([]),
-            resolveFileManagerRevealKind: () => Effect.undefined,
-            ...options?.layers?.externalLauncher,
-          }),
-          Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({
-            resolveTargets: () => Effect.succeed([]),
-          }),
-        ),
-      ),
-      Layer.provide(
-        Layer.mock(ProcessDiagnostics.ProcessDiagnostics)({
-          read: Effect.succeed({
-            serverPid: process.pid,
-            readAt: TEST_EPOCH,
-            processCount: 0,
-            totalRssBytes: 0,
-            totalCpuPercent: 0,
-            processes: [],
-            error: Option.none(),
-          }),
-          signal: (input) =>
-            Effect.succeed({
-              pid: input.pid,
-              signal: input.signal,
-              signaled: true,
-              message: Option.none(),
-            }),
-        }),
-      ),
-      Layer.provide([
-        HostResources.layer,
-        Layer.mock(ProcessResourceMonitor.ProcessResourceMonitor)({
-          readHistory: (input) =>
-            Effect.succeed({
-              readAt: TEST_EPOCH,
-              windowMs: input.windowMs,
-              bucketMs: input.bucketMs,
-              sampleIntervalMs: 5_000,
-              retainedSampleCount: 0,
-              totalCpuSecondsApprox: 0,
-              buckets: [],
-              topProcesses: [],
-              error: Option.none(),
-            }),
-        }),
-      ]),
-      Layer.provide(
-        Layer.mock(TraceDiagnostics.TraceDiagnostics)({
-          read: () =>
-            Effect.succeed({
-              traceFilePath: "",
-              scannedFilePaths: [],
-              readAt: TEST_EPOCH,
-              recordCount: 0,
-              parseErrorCount: 0,
-              firstSpanAt: Option.none(),
-              lastSpanAt: Option.none(),
-              failureCount: 0,
-              interruptionCount: 0,
-              slowSpanThresholdMs: 1_000,
-              slowSpanCount: 0,
-              logLevelCounts: {},
-              topSpansByCount: [],
-              slowestSpans: [],
-              commonFailures: [],
-              latestFailures: [],
-              latestWarningAndErrorLogs: [],
-              partialFailure: Option.none(),
-              error: Option.none(),
-            }),
-        }),
-      ),
-      Layer.provide(gitManagerLayer),
-      Layer.provide(gitVcsDriverLayer),
-      Layer.provide(gitWorkflowLayer),
-      Layer.provide(reviewLayer),
-      Layer.provide(vcsProvisioningLayer),
-      Layer.provide(
-        Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({
-          ...options?.layers?.sourceControlRepositoryService,
-        }),
-      ),
-      Layer.provideMerge(vcsStatusBroadcasterLayer),
-      Layer.provide(
-        Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
-          runForThread: () => Effect.succeed({ status: "no-script" as const }),
-          ...options?.layers?.projectSetupScriptRunner,
-        }),
-      ),
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(TerminalManager.TerminalManager)({
-            ...options?.layers?.terminalManager,
-          }),
-          WorktreeSetupTracker.layer,
-          ProjectCloneTracker.layer.pipe(
-            Layer.provide(
-              Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({
-                ...options?.layers?.sourceControlRepositoryService,
+      )
+      .pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(Keybindings.Keybindings)({
+              loadConfigState: Effect.succeed({
+                keybindings: [],
+                issues: [],
               }),
+              streamChanges: Stream.empty,
+              ...options?.layers?.keybindings,
+            }),
+            Layer.mock(EnvironmentTheme.EnvironmentThemeService)({
+              current: Effect.succeed([]),
+              streamChanges: Stream.empty,
+              ...options?.layers?.environmentTheme,
+            }),
+            Layer.mock(UsageLimitSources.UsageLimitSources)({
+              current: Effect.succeed([]),
+              streamChanges: Stream.make([]),
+              refresh: Effect.void,
+              ...options?.layers?.usageLimitSources,
+            }),
+          ),
+        ),
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ModelManifest.ModelManifest)({
+              forceRefresh: Effect.succeed(ModelManifest.BUNDLED_MODEL_MANIFEST),
+              ...options?.layers?.modelManifest,
+            }),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({
+              getProviders: Effect.succeed([]),
+              refresh: () => Effect.succeed([]),
+              refreshInstance: () => Effect.succeed([]),
+              getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
+                Effect.succeed(
+                  makeManualOnlyProviderMaintenanceCapabilities({ provider, packageName: null }),
+                ),
+              setProviderMaintenanceActionState: () => Effect.succeed([]),
+              streamChanges: Stream.empty,
+              ...options?.layers?.providerRegistry,
+            }),
+            Layer.mock(ProviderService.ProviderService)({
+              uploadFeedback: () => Effect.die("Provider feedback is not stubbed in this test"),
+              ...options?.layers?.providerService,
+            }),
+            Layer.mock(ProviderAuthService)({
+              ...options?.layers?.providerAuth,
+            }),
+            Layer.mock(ProviderInstanceRegistry)({
+              getInstance: () => Effect.undefined,
+              listInstances: Effect.succeed([]),
+              ...options?.layers?.providerInstanceRegistry,
+            }),
+            Layer.mock(AntigravityInstallation)({
+              managedDirectory: "unused-test-antigravity-runtime",
+              ...options?.layers?.antigravityInstallation,
+            }),
+            Layer.mock(ProviderSessionDirectory.ProviderSessionDirectory)({
+              upsert: () => Effect.void,
+              getBinding: () => Effect.succeedNone,
+              listThreadIds: () => Effect.succeed([]),
+              listBindings: () => Effect.succeed([]),
+              ...options?.layers?.providerSessionDirectory,
+            }),
+            Layer.mock(DeviceService.DeviceService)({
+              state: Effect.succeed(EMPTY_DEVICE_STATE),
+              currentReadiness: () => Effect.succeed(null),
+              sessionsForThread: () => Effect.succeed([]),
+            }),
+          ),
+        ),
+        Layer.provide(
+          Layer.mock(ServerSettings.ServerSettingsService)({
+            start: Effect.void,
+            ready: Effect.void,
+            getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+            updateSettings: () => Effect.succeed(DEFAULT_SERVER_SETTINGS),
+            streamChanges: Stream.empty,
+            ...options?.layers?.serverSettings,
+          }),
+        ),
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ExternalLauncher.ExternalLauncher)({
+              resolveAvailableEditors: () => Effect.succeed([]),
+              resolveFileManagerRevealKind: () => Effect.undefined,
+              ...options?.layers?.externalLauncher,
+            }),
+            Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({
+              resolveTargets: () => Effect.succeed([]),
+            }),
+          ),
+        ),
+        Layer.provide(
+          Layer.mock(ProcessDiagnostics.ProcessDiagnostics)({
+            read: Effect.succeed({
+              serverPid: process.pid,
+              readAt: TEST_EPOCH,
+              processCount: 0,
+              totalRssBytes: 0,
+              totalCpuPercent: 0,
+              processes: [],
+              error: Option.none(),
+            }),
+            signal: (input) =>
+              Effect.succeed({
+                pid: input.pid,
+                signal: input.signal,
+                signaled: true,
+                message: Option.none(),
+              }),
+          }),
+        ),
+        Layer.provide([
+          HostResources.layer,
+          Layer.mock(ProcessResourceMonitor.ProcessResourceMonitor)({
+            readHistory: (input) =>
+              Effect.succeed({
+                readAt: TEST_EPOCH,
+                windowMs: input.windowMs,
+                bucketMs: input.bucketMs,
+                sampleIntervalMs: 5_000,
+                retainedSampleCount: 0,
+                totalCpuSecondsApprox: 0,
+                buckets: [],
+                topProcesses: [],
+                error: Option.none(),
+              }),
+          }),
+        ]),
+        Layer.provide(
+          Layer.mock(TraceDiagnostics.TraceDiagnostics)({
+            read: () =>
+              Effect.succeed({
+                traceFilePath: "",
+                scannedFilePaths: [],
+                readAt: TEST_EPOCH,
+                recordCount: 0,
+                parseErrorCount: 0,
+                firstSpanAt: Option.none(),
+                lastSpanAt: Option.none(),
+                failureCount: 0,
+                interruptionCount: 0,
+                slowSpanThresholdMs: 1_000,
+                slowSpanCount: 0,
+                logLevelCounts: {},
+                topSpansByCount: [],
+                slowestSpans: [],
+                commonFailures: [],
+                latestFailures: [],
+                latestWarningAndErrorLogs: [],
+                partialFailure: Option.none(),
+                error: Option.none(),
+              }),
+          }),
+        ),
+        Layer.provide(gitManagerLayer),
+        Layer.provide(gitVcsDriverLayer),
+        Layer.provide(gitWorkflowLayer),
+        Layer.provide(reviewLayer),
+        Layer.provide(vcsProvisioningLayer),
+        Layer.provide(
+          Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({
+            ...options?.layers?.sourceControlRepositoryService,
+          }),
+        ),
+        Layer.provideMerge(vcsStatusBroadcasterLayer),
+        Layer.provide(
+          Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
+            runForThread: () => Effect.succeed({ status: "no-script" as const }),
+            ...options?.layers?.projectSetupScriptRunner,
+          }),
+        ),
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(TerminalManager.TerminalManager)({
+              ...options?.layers?.terminalManager,
+            }),
+            WorktreeSetupTracker.layer,
+            ProjectCloneTracker.layer.pipe(
+              Layer.provide(
+                Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({
+                  ...options?.layers?.sourceControlRepositoryService,
+                }),
+              ),
             ),
           ),
         ),
-      ),
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(PreviewManager.PreviewManager)({
-            open: () => Effect.die("PreviewManager not stubbed in this test"),
-            navigate: () => Effect.die("PreviewManager not stubbed in this test"),
-            resize: () => Effect.die("PreviewManager not stubbed in this test"),
-            reportStatus: () => Effect.void,
-            refresh: () => Effect.void,
-            close: () => Effect.void,
-            list: () => Effect.succeed({ sessions: [], serverEpoch: "test-server", revision: 0 }),
-            events: Stream.empty,
-            subscribeEvents: Effect.flatMap(PubSub.unbounded<PreviewEvent>(), (pubsub) =>
-              PubSub.subscribe(pubsub),
-            ),
-          }),
-          Layer.mock(PortScanner.PortDiscovery)({
-            scan: () => Effect.succeed([]),
-            subscribe: () => Effect.void,
-            retain: Effect.void,
-            registerTerminalProcesses: () => Effect.void,
-            unregisterTerminal: () => Effect.void,
-          }),
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(PreviewManager.PreviewManager)({
+              open: () => Effect.die("PreviewManager not stubbed in this test"),
+              navigate: () => Effect.die("PreviewManager not stubbed in this test"),
+              resize: () => Effect.die("PreviewManager not stubbed in this test"),
+              reportStatus: () => Effect.void,
+              refresh: () => Effect.void,
+              close: () => Effect.void,
+              list: () => Effect.succeed({ sessions: [], serverEpoch: "test-server", revision: 0 }),
+              events: Stream.empty,
+              subscribeEvents: Effect.flatMap(PubSub.unbounded<PreviewEvent>(), (pubsub) =>
+                PubSub.subscribe(pubsub),
+              ),
+            }),
+            Layer.mock(PortScanner.PortDiscovery)({
+              scan: () => Effect.succeed([]),
+              subscribe: () => Effect.void,
+              retain: Effect.void,
+              registerTerminalProcesses: () => Effect.void,
+              unregisterTerminal: () => Effect.void,
+            }),
+          ),
         ),
-      ),
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
-            readEvents: () => Stream.empty,
-            readThreadEvents: () => Stream.empty,
-            getThreadReplayStats: () =>
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
+              readEvents: () => Stream.empty,
+              readThreadEvents: () => Stream.empty,
+              getThreadReplayStats: () =>
+                Effect.succeed({
+                  eventCount: 0,
+                  payloadBytes: 0,
+                  hasCreateEvent: false,
+                }),
+              dispatch: () => Effect.succeed({ sequence: 0 }),
+              streamDomainEvents: Stream.empty,
+              latestSequence: Effect.succeed(0),
+              ...options?.layers?.orchestrationEngine,
+            }),
+            Layer.mock(ThreadDeletionReactor)({
+              start: () => Effect.void,
+              drainThrough: () => Effect.void,
+              ...options?.layers?.threadDeletionReactor,
+            }),
+            Layer.mock(ThreadPreparationReactor)({
+              start: () => Effect.void,
+              drain: Effect.void,
+              drainAttemptThrough: () => Effect.void,
+            }),
+            Layer.mock(PullRequestSyncReactor.PullRequestSyncReactor)({
+              start: () => Effect.void,
+              drain: Effect.void,
+              requestSync: () => Effect.void,
+            }),
+          ),
+        ),
+        Layer.provide(
+          Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+            getUserInputActivity: () => Effect.die("unused"),
+            getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
+            getSnapshot: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
+            getShellSnapshot: () =>
               Effect.succeed({
-                eventCount: 0,
-                payloadBytes: 0,
-                hasCreateEvent: false,
+                snapshotSequence: 0,
+                projects: [],
+                threads: [],
+                updatedAt: "1970-01-01T00:00:00.000Z",
               }),
-            dispatch: () => Effect.succeed({ sequence: 0 }),
-            streamDomainEvents: Stream.empty,
-            latestSequence: Effect.succeed(0),
-            ...options?.layers?.orchestrationEngine,
-          }),
-          Layer.mock(ThreadDeletionReactor)({
-            start: () => Effect.void,
-            drainThrough: () => Effect.void,
-            ...options?.layers?.threadDeletionReactor,
-          }),
-          Layer.mock(PullRequestSyncReactor.PullRequestSyncReactor)({
-            start: () => Effect.void,
-            drain: Effect.void,
-            requestSync: () => Effect.void,
+            getArchivedShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 0,
+                projects: [],
+                threads: [],
+                updatedAt: "1970-01-01T00:00:00.000Z",
+              }),
+            searchThreads: () => Effect.succeed({ matches: [] }),
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
+            getProjectShellById: () => Effect.succeedNone,
+            getThreadShellById: () => Effect.succeedNone,
+            getThreadDetailById: () => Effect.succeedNone,
+            getThreadDetailSnapshot: () => Effect.succeedNone,
+            getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
+            getEventReplayStats: ({ fromSequenceExclusive, toSequenceInclusive }) =>
+              Effect.succeed({
+                eventCount: Math.max(0, toSequenceInclusive - fromSequenceExclusive),
+                payloadBytes: 0,
+              }),
+            getActiveProjectByWorkspaceRoot: () => Effect.succeedNone,
+            getFirstActiveThreadIdByProjectId: () => Effect.succeedNone,
+            getImportedAgentSessionSources: () => Effect.succeed([]),
+            getThreadCheckpointContext: () => Effect.succeedNone,
+            ...options?.layers?.projectionSnapshotQuery,
           }),
         ),
-      ),
-      Layer.provide(
-        Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
-          getUserInputActivity: () => Effect.die("unused"),
-          getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
-          getSnapshot: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
-          getShellSnapshot: () =>
-            Effect.succeed({
-              snapshotSequence: 0,
-              projects: [],
-              threads: [],
-              updatedAt: "1970-01-01T00:00:00.000Z",
-            }),
-          getArchivedShellSnapshot: () =>
-            Effect.succeed({
-              snapshotSequence: 0,
-              projects: [],
-              threads: [],
-              updatedAt: "1970-01-01T00:00:00.000Z",
-            }),
-          searchThreads: () => Effect.succeed({ matches: [] }),
-          getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
-          getProjectShellById: () => Effect.succeedNone,
-          getThreadShellById: () => Effect.succeedNone,
-          getThreadDetailById: () => Effect.succeedNone,
-          getThreadDetailSnapshot: () => Effect.succeedNone,
-          getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
-          getEventReplayStats: ({ fromSequenceExclusive, toSequenceInclusive }) =>
-            Effect.succeed({
-              eventCount: Math.max(0, toSequenceInclusive - fromSequenceExclusive),
-              payloadBytes: 0,
-            }),
-          getActiveProjectByWorkspaceRoot: () => Effect.succeedNone,
-          getFirstActiveThreadIdByProjectId: () => Effect.succeedNone,
-          getImportedAgentSessionSources: () => Effect.succeed([]),
-          getThreadCheckpointContext: () => Effect.succeedNone,
-          ...options?.layers?.projectionSnapshotQuery,
-        }),
-      ),
-      Layer.provide(
-        Layer.mock(CheckpointDiffQuery.CheckpointDiffQuery)({
-          getTurnDiff: () =>
-            Effect.succeed({
-              threadId: defaultThreadId,
-              fromTurnCount: 0,
-              toTurnCount: 0,
-              diff: "",
-            }),
-          getFullThreadDiff: () =>
-            Effect.succeed({
-              threadId: defaultThreadId,
-              fromTurnCount: 0,
-              toTurnCount: 0,
-              diff: "",
-            }),
-          ...options?.layers?.checkpointDiffQuery,
-        }),
-      ),
-    );
+        Layer.provide(
+          Layer.mock(CheckpointDiffQuery.CheckpointDiffQuery)({
+            getTurnDiff: () =>
+              Effect.succeed({
+                threadId: defaultThreadId,
+                fromTurnCount: 0,
+                toTurnCount: 0,
+                diff: "",
+              }),
+            getFullThreadDiff: () =>
+              Effect.succeed({
+                threadId: defaultThreadId,
+                fromTurnCount: 0,
+                toTurnCount: 0,
+                diff: "",
+              }),
+            ...options?.layers?.checkpointDiffQuery,
+          }),
+        ),
+      );
 
     const appLayer = servedRoutesLayer
       .pipe(
@@ -1241,6 +1264,12 @@ const buildAppUnderTest = (options?: {
       )
       .pipe(
         Layer.provideMerge(makeAuthTestLayer()),
+        Layer.provide(
+          Layer.succeed(RepositoryAccess, {
+            ...repositoryAccess,
+            ...options?.layers?.repositoryAccess,
+          }),
+        ),
         Layer.provideMerge(ServerSecretStore.layer),
         Layer.provide(workspaceAndProjectServicesLayer),
         Layer.provideMerge(
@@ -1747,6 +1776,382 @@ const EMPTY_DEVICE_STATE: DeviceServiceState = {
 };
 
 it.layer(NodeServices.layer)("server router seam", (it) => {
+  it.effect("authorizes absent-thread receipts and replay by their persisted project scope", () =>
+    Effect.gen(function* () {
+      const receipts = yield* OrchestrationCommandReceiptRepository;
+      const absentThread = ThreadId.make("never-created-bootstrap");
+      const rejectedId = CommandId.make("rejected-bootstrap-receipt");
+      const hiddenId = CommandId.make("hidden-bootstrap-receipt");
+      const hiddenProject = ProjectId.make("hidden-receipt-project");
+      const createdAt = "2026-09-28T10:00:00.000Z";
+      for (const [commandId, projectId, status] of [
+        [rejectedId, defaultProjectId, "rejected"],
+        [hiddenId, hiddenProject, "accepted"],
+      ] as const)
+        yield* receipts.upsert({
+          commandId,
+          projectId,
+          aggregateKind: "thread",
+          aggregateId: absentThread,
+          acceptedAt: createdAt,
+          resultSequence: 0,
+          status,
+          error: status === "rejected" ? "Invalid setup request" : null,
+        });
+      let dispatches = 0;
+      const deny = () =>
+        new EnvironmentAuthorizationError({
+          message: "Repository unavailable",
+          requiredScope: "orchestration:read",
+        });
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: {
+            status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+            requireThread: () => Effect.fail(deny()),
+            requirePersistedProject: (_actor, id) =>
+              id === defaultProjectId ? Effect.void : Effect.fail(deny()),
+          },
+          orchestrationEngine: {
+            dispatch: () =>
+              Effect.sync(() => {
+                dispatches++;
+                return { sequence: 1 };
+              }),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* withWsRpcClient(wsUrl, (client) =>
+        Effect.gen(function* () {
+          const rejected = yield* client[ORCHESTRATION_WS_METHODS.getCommandReceipt]({
+            commandId: rejectedId,
+            threadId: absentThread,
+            projectId: defaultProjectId,
+          });
+          assert.deepEqual(rejected, {
+            status: "rejected",
+            sequence: 0,
+            detail: "Invalid setup request",
+          });
+          const hidden = yield* client[ORCHESTRATION_WS_METHODS.getCommandReceipt]({
+            commandId: hiddenId,
+            threadId: absentThread,
+            projectId: defaultProjectId,
+          }).pipe(Effect.result);
+          assertTrue(hidden._tag === "Failure");
+          assert.equal(hidden.failure._tag, "EnvironmentAuthorizationError");
+          const replay = yield* client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.create",
+            commandId: hiddenId,
+            threadId: absentThread,
+            projectId: defaultProjectId,
+            title: "Forged receipt replay",
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+          }).pipe(Effect.result);
+          assertTrue(replay._tag === "Failure");
+          assert.equal(replay.failure._tag, "OrchestrationDispatchCommandError");
+          assert.equal(dispatches, 0);
+        }),
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          OrchestrationCommandReceiptRepositoryLive.pipe(
+            Layer.provideMerge(SqlitePersistenceMemory),
+          ),
+          NodeHttpServer.layerTest,
+        ),
+      ),
+    ),
+  );
+
+  it.effect("enforces repository visibility on HTTP and WebSocket thread reads", () =>
+    Effect.gen(function* () {
+      const secretProject = ProjectId.make("secret-project");
+      const secretThread = ThreadId.make("secret-thread");
+      const base = makeDefaultOrchestrationReadModel();
+      const snapshot = {
+        ...base,
+        projects: [...base.projects, { ...base.projects[0]!, id: secretProject }],
+        threads: [
+          ...base.threads,
+          { ...base.threads[0]!, id: secretThread, projectId: secretProject },
+        ],
+      };
+      let bodyReads = 0;
+      let diffReads = 0;
+      const denied = () =>
+        new EnvironmentAuthorizationError({
+          message: "Repository access removed.",
+          requiredScope: "orchestration:read",
+        });
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: {
+            status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+            projectIds: () => Effect.succeed(new Set([defaultProjectId])),
+            requireProject: (_actor, id) =>
+              id === defaultProjectId ? Effect.void : Effect.fail(denied()),
+            requireThread: (_actor, id) =>
+              id === defaultThreadId ? Effect.void : Effect.fail(denied()),
+          },
+          projectionSnapshotQuery: {
+            getCommandReadModel: () => Effect.succeed(snapshot),
+            getShellSnapshot: () =>
+              Effect.succeed({
+                ...snapshot,
+                threads: [
+                  makeDefaultOrchestrationThreadShell(),
+                  makeDefaultOrchestrationThreadShell({
+                    id: secretThread,
+                    projectId: secretProject,
+                  }),
+                ],
+              }),
+            getThreadSubscriptionAnchor: (id) =>
+              Effect.succeedSome({
+                projectId: id === defaultThreadId ? defaultProjectId : secretProject,
+                creationSequence: 1,
+                snapshotSequence: 1,
+              }),
+            getThreadDetailSnapshot: () =>
+              Effect.sync(() => {
+                bodyReads += 1;
+                return Option.some({ snapshotSequence: 0, thread: snapshot.threads[1]! });
+              }),
+          },
+          checkpointDiffQuery: {
+            getFullThreadDiff: () =>
+              Effect.sync(() => {
+                diffReads += 1;
+                return {
+                  threadId: secretThread,
+                  fromTurnCount: 0,
+                  toTurnCount: 0,
+                  diff: "private",
+                };
+              }),
+          },
+        },
+      });
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const response = yield* fetchEffect(yield* getHttpServerUrl("/api/orchestration/snapshot"), {
+        headers: { cookie },
+      });
+      assert.equal(response.status, 200);
+      const filtered = yield* responseJsonEffect<{
+        threads: { id: string }[];
+        projects: { id: string }[];
+      }>(response);
+      assert.deepEqual(
+        filtered.threads.map((thread) => thread.id),
+        [defaultThreadId],
+      );
+      assert.deepEqual(
+        filtered.projects.map((project) => project.id),
+        [defaultProjectId],
+      );
+      const hidden = yield* fetchEffect(
+        yield* getHttpServerUrl(`/api/orchestration/threads/${secretThread}`),
+        { headers: { cookie } },
+      );
+      assert.equal(hidden.status, 404);
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            // Shared reconnects replace cached shell state with the authorized view.
+            const first = Option.getOrThrow(
+              yield* client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 0 }).pipe(
+                Stream.runHead,
+              ),
+            );
+            assertTrue(first.kind === "snapshot");
+            assert.deepEqual(
+              first.snapshot.threads.map((thread) => thread.id),
+              [defaultThreadId],
+            );
+            const diff = yield* client[ORCHESTRATION_WS_METHODS.getFullThreadDiff]({
+              threadId: secretThread,
+              toTurnCount: 0,
+            }).pipe(Effect.flip);
+            assert.equal(diff._tag, "EnvironmentAuthorizationError");
+            const thread = yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: secretThread,
+              sharedPromptQueue: true,
+            }).pipe(Stream.runHead, Effect.flip);
+            assert.equal(thread._tag, "EnvironmentAuthorizationError");
+            const oldClient = yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+            }).pipe(Stream.runHead, Effect.flip);
+            assert.equal(oldClient._tag, "EnvironmentAuthorizationError");
+          }),
+        ),
+      );
+      assert.equal(bodyReads, 0);
+      assert.equal(diffReads, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "shared detail subscriptions never follow a reused thread into another repository",
+    () =>
+      Effect.gen(function* () {
+        const events = yield* PubSub.unbounded<OrchestrationEvent>();
+        const initial = makeDefaultOrchestrationReadModel().threads[0]!;
+        const secretProject = ProjectId.make("replacement-secret");
+        let projectId = defaultProjectId;
+        let allowedProject = defaultProjectId;
+        let head = 1;
+        let creation = 1;
+        yield* buildAppUnderTest({
+          layers: {
+            repositoryAccess: {
+              status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+              requireThread: () => Effect.void,
+              requireProject: (_actor, id) =>
+                id === allowedProject
+                  ? Effect.void
+                  : Effect.fail(
+                      new EnvironmentAuthorizationError({
+                        message: "Denied",
+                        requiredScope: "orchestration:read",
+                      }),
+                    ),
+            },
+            orchestrationEngine: {
+              subscribeDomainEvents: PubSub.subscribe(events).pipe(
+                Effect.map(Stream.fromSubscription),
+              ),
+              streamDomainEvents: Stream.fromPubSub(events),
+              latestSequence: Effect.sync(() => head),
+              getThreadReplayStats: () =>
+                Effect.succeed({ eventCount: 2, payloadBytes: 100, hasCreateEvent: true }),
+              readThreadEvents: () =>
+                Stream.make(makeLiveToolActivityEvent(1), makeLiveToolActivityEvent(4)),
+            },
+            projectionSnapshotQuery: {
+              getThreadSubscriptionAnchor: () =>
+                Effect.sync(() =>
+                  Option.some({ projectId, creationSequence: creation, snapshotSequence: head }),
+                ),
+              getThreadDetailSnapshot: (_id, _window, expectedCreation) =>
+                Effect.sync(() =>
+                  expectedCreation === creation
+                    ? Option.some({ snapshotSequence: head, thread: { ...initial, projectId } })
+                    : Option.none(),
+                ),
+            },
+          },
+        });
+        const wsUrl = yield* getWsServerUrl("/ws");
+        yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            Effect.gen(function* () {
+              const first = yield* Deferred.make<void>();
+              const kinds: string[] = [];
+              const active = yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+                threadId: defaultThreadId,
+                sharedPromptQueue: true,
+              }).pipe(
+                Stream.runForEach((item) =>
+                  Effect.sync(() => {
+                    kinds.push(item.kind);
+                  }).pipe(Effect.andThen(Deferred.succeed(first, undefined))),
+                ),
+                Effect.result,
+                Effect.forkScoped,
+              );
+              yield* Deferred.await(first);
+              projectId = secretProject;
+              creation = 3;
+              head = 4;
+              const deleted: OrchestrationEvent = {
+                ...makeLiveToolActivityEvent(2),
+                type: "thread.deleted",
+                payload: { threadId: defaultThreadId, deletedAt: initial.createdAt },
+              };
+              yield* PubSub.publishAll(events, [deleted, makeLiveToolActivityEvent(4)]);
+              const result = yield* Fiber.join(active);
+              assertTrue(result._tag === "Failure");
+              assert.equal(result.failure._tag, "OrchestrationGetSnapshotError");
+              assert.deepEqual(kinds, ["snapshot"]);
+              // A new B-authorized subscription with an A-era cursor must snapshot B,
+              // never emit the previous lifetime's replay bodies.
+              allowedProject = secretProject;
+              const replacement = yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+                threadId: defaultThreadId,
+                sharedPromptQueue: true,
+                afterSequence: 0,
+              }).pipe(Stream.runHead);
+              assertTrue(Option.isSome(replacement));
+              assertTrue(replacement.value.kind === "snapshot");
+              assert.equal(replacement.value.snapshot.thread.projectId, secretProject);
+            }),
+          ),
+        );
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("shared deletion interrupts detail initialization before snapshot release", () =>
+    Effect.gen(function* () {
+      const events = yield* PubSub.unbounded<OrchestrationEvent>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const thread = makeDefaultOrchestrationReadModel().threads[0]!;
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: { status: Effect.succeed({ enabled: true, ready: true, revision: 1 }) },
+          orchestrationEngine: {
+            subscribeDomainEvents: PubSub.subscribe(events).pipe(
+              Effect.map(Stream.fromSubscription),
+            ),
+            streamDomainEvents: Stream.fromPubSub(events),
+          },
+          projectionSnapshotQuery: {
+            getThreadSubscriptionAnchor: () =>
+              Effect.succeedSome({
+                projectId: defaultProjectId,
+                creationSequence: 1,
+                snapshotSequence: 1,
+              }),
+            getThreadDetailSnapshot: () =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as(Option.some({ snapshotSequence: 1, thread })),
+              ),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const pending = yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+              sharedPromptQueue: true,
+            }).pipe(Stream.runHead, Effect.result, Effect.forkScoped);
+            yield* Deferred.await(entered);
+            yield* PubSub.publish(events, {
+              ...makeLiveToolActivityEvent(2),
+              type: "thread.deleted",
+              payload: { threadId: defaultThreadId, deletedAt: thread.createdAt },
+            });
+            const result = yield* Fiber.join(pending);
+            assertTrue(result._tag === "Failure");
+            assert.equal(result.failure._tag, "OrchestrationGetSnapshotError");
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("parks HTTP ingress until command readiness", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -12088,18 +12493,33 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       caseName: "async setup scripts let the turn start before the script exits",
       async: true,
       cancel: false,
+      exitCode: 0,
     },
     {
       caseName: "sync setup scripts hold the turn until the script exits",
       async: false,
       cancel: false,
+      exitCode: 0,
+    },
+    {
+      caseName: "wait setup failure prevents provider start",
+      async: false,
+      cancel: false,
+      exitCode: 7,
+    },
+    {
+      caseName: "wait setup terminal loss prevents provider start",
+      async: false,
+      cancel: false,
+      exitCode: null,
     },
     {
       caseName: "cancelling worktree setup publishes its outcome and cleans up the thread",
       async: false,
       cancel: true,
+      exitCode: 0,
     },
-  ])("$caseName", ({ async, cancel }) =>
+  ])("$caseName", ({ async, cancel, exitCode }) =>
     Effect.gen(function* () {
       const dispatchedCommands: Array<OrchestrationCommand> = [];
       const scriptExit = yield* Deferred.make<void>();
@@ -12117,7 +12537,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             terminalId: "setup-setup",
             cwd: "/tmp/bootstrap-worktree",
             async,
-            completion: Deferred.await(scriptExit).pipe(Effect.as({ exitCode: 0, durationMs: 1 })),
+            completion: Deferred.await(scriptExit).pipe(Effect.as({ exitCode, durationMs: 1 })),
           }),
       );
 
@@ -12249,6 +12669,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assertTrue(result._tag === "Failure");
         assert.propertyVal(result.failure, "message", "Worktree setup cancelled.");
         assert.propertyVal(result.failure, "bootstrapThreadDisposition", "deleted");
+        assert.isFalse(turnStarted());
+        return;
+      }
+
+      if (exitCode !== 0) {
+        yield* Deferred.succeed(scriptExit, undefined);
+        const result = yield* Fiber.join(dispatchFiber).pipe(Effect.result);
+        assertTrue(result._tag === "Failure");
+        assert.include(result.failure.message, "Setup script failed");
         assert.isFalse(turnStarted());
         return;
       }
@@ -12387,12 +12816,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("drains deletion cleanup through the re-created thread event", () =>
+  it.effect("drains deletion cleanup before accepting a re-created thread", () =>
     Effect.gen(function* () {
       // A draft retry reuses the thread id its failed bootstrap deleted. The
-      // deletion reactor stops sessions and closes terminals by that id, so
-      // both thread.create paths use the created event as a fence, then drain
-      // cleanup before handing the new incarnation to resource-owning work.
+      // Both creation paths must finish captured cleanup before accepting the
+      // replacement. Bootstrap also fences resource-owning work after creation.
       const trace: Array<string> = [];
       const drainRequested = yield* Deferred.make<void>();
       const cleanupDone = yield* Deferred.make<void>();
@@ -12440,13 +12868,14 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               }),
             );
             yield* Deferred.await(drainRequested);
-            assert.deepEqual(trace, ["thread.create", "drain:1"]);
+            const waitingTrace = [...trace];
             yield* Deferred.succeed(cleanupDone, undefined);
             yield* Fiber.join(directCreate);
+            assert.deepEqual(waitingTrace, ["drain:0"]);
           }),
         ),
       );
-      assert.deepEqual(trace, ["thread.create", "drain:1"]);
+      assert.deepEqual(trace, ["drain:0", "thread.create"]);
 
       // Cleanup is already released; the bootstrap path must still drain
       // between creating the thread and starting its turn.
@@ -12489,8 +12918,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepEqual(trace, [
+        "drain:0",
         "thread.create",
-        "drain:1",
+        "drain:2",
         "thread.message.user.append",
         "thread.turn.start",
       ]);
@@ -13016,4 +13446,73 @@ it.live(
       assert.deepEqual(transferBudgetViolations(runs), []);
     }).pipe(Effect.provide(NodeServices.layer)),
   120_000,
+);
+
+it.effect(
+  "rejects an HTTP snapshot from a replacement task after authorizing its predecessor",
+  () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const secret = ProjectId.make("review-private-replacement");
+      const initial = makeDefaultOrchestrationReadModel().threads[0]!;
+      let projectId = defaultProjectId;
+      let creation = 1;
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: {
+            status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+            requireProject: (_actor, id) =>
+              id === defaultProjectId
+                ? Effect.void
+                : Effect.fail(
+                    new EnvironmentAuthorizationError({
+                      message: "Denied",
+                      requiredScope: "orchestration:read",
+                    }),
+                  ),
+            requireThread: () =>
+              Effect.suspend(() =>
+                projectId === defaultProjectId
+                  ? Effect.void
+                  : Effect.fail(
+                      new EnvironmentAuthorizationError({
+                        message: "Denied",
+                        requiredScope: "orchestration:read",
+                      }),
+                    ),
+              ),
+          },
+          projectionSnapshotQuery: {
+            getThreadSubscriptionAnchor: () =>
+              Effect.sync(() =>
+                Option.some({ projectId, creationSequence: creation, snapshotSequence: creation }),
+              ),
+            getThreadDetailSnapshot: (_id, _window, expectedCreation) =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(
+                  Effect.sync(() =>
+                    expectedCreation !== undefined && expectedCreation !== creation
+                      ? Option.none()
+                      : Option.some({
+                          snapshotSequence: creation,
+                          thread: { ...initial, projectId, title: "private replacement body" },
+                        }),
+                  ),
+                ),
+              ),
+          },
+        },
+      });
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const url = yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}`);
+      const request = yield* fetchEffect(url, { headers: { cookie } }).pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      projectId = secret;
+      creation = 3;
+      yield* Deferred.succeed(release, undefined);
+      const response = yield* Fiber.join(request);
+      assert.equal(response.status, 404);
+    }).pipe(Effect.provide(Layer.merge(NodeHttpServer.layerTest, NodeServices.layer))),
 );

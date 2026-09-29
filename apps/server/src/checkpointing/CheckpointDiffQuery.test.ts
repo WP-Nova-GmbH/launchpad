@@ -75,6 +75,7 @@ describe("CheckpointDiffQuery.layer", () => {
         Layer.provideMerge(Layer.succeed(CheckpointStore.CheckpointStore, checkpointStore)),
         Layer.provideMerge(
           Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+            getThreadSubscriptionAnchor: () => Effect.succeedNone,
             getUserInputActivity: () => Effect.die("unused"),
             listActivitiesByKind: () => Effect.die("unused"),
             getCommandReadModel: () =>
@@ -192,6 +193,7 @@ describe("CheckpointDiffQuery.layer", () => {
         Layer.provideMerge(Layer.succeed(CheckpointStore.CheckpointStore, checkpointStore)),
         Layer.provideMerge(
           Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+            getThreadSubscriptionAnchor: () => Effect.succeedNone,
             getUserInputActivity: () => Effect.die("unused"),
             listActivitiesByKind: () => Effect.die("unused"),
             getCommandReadModel: () =>
@@ -284,6 +286,7 @@ describe("CheckpointDiffQuery.layer", () => {
         Layer.provideMerge(Layer.succeed(CheckpointStore.CheckpointStore, checkpointStore)),
         Layer.provideMerge(
           Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+            getThreadSubscriptionAnchor: () => Effect.succeedNone,
             getUserInputActivity: () => Effect.die("unused"),
             listActivitiesByKind: () => Effect.die("unused"),
             getCommandReadModel: () =>
@@ -361,6 +364,7 @@ describe("CheckpointDiffQuery.layer", () => {
         Layer.provideMerge(Layer.succeed(CheckpointStore.CheckpointStore, checkpointStore)),
         Layer.provideMerge(
           Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+            getThreadSubscriptionAnchor: () => Effect.succeedNone,
             getUserInputActivity: () => Effect.die("unused"),
             listActivitiesByKind: () => Effect.die("unused"),
             getCommandReadModel: () =>
@@ -423,6 +427,7 @@ describe("CheckpointDiffQuery.layer", () => {
         Layer.provideMerge(Layer.succeed(CheckpointStore.CheckpointStore, checkpointStore)),
         Layer.provideMerge(
           Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+            getThreadSubscriptionAnchor: () => Effect.succeedNone,
             getUserInputActivity: () => Effect.die("unused"),
             listActivitiesByKind: () => Effect.die("unused"),
             getCommandReadModel: () =>

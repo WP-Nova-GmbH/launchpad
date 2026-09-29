@@ -1,3 +1,4 @@
+import { RepositoryPolicyProof, RepositoryPolicyAcknowledgement } from "./repositoryAccess.ts";
 import * as Context from "effect/Context";
 import type * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -10,6 +11,7 @@ import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 
 import {
   AuthAccessTokenResult,
+  AuthSessionUser,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
   AuthClientSession,
@@ -193,7 +195,10 @@ export class EnvironmentInternalError extends Schema.TaggedError<EnvironmentInte
   }
 }
 
-export const EnvironmentResourceNotFoundReason = Schema.Literals(["thread_not_found"]);
+export const EnvironmentResourceNotFoundReason = Schema.Literals([
+  "thread_not_found",
+  "project_not_found",
+]);
 export type EnvironmentResourceNotFoundReason = typeof EnvironmentResourceNotFoundReason.Type;
 
 export class EnvironmentResourceNotFoundError extends Schema.TaggedError<EnvironmentResourceNotFoundError>()(
@@ -341,6 +346,7 @@ const EnvironmentOrchestrationDispatchErrors = [
 ] as const;
 
 export interface EnvironmentSessionPrincipalShape {
+  readonly user?: AuthSessionUser;
   readonly sessionId: AuthSessionId;
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
@@ -547,6 +553,7 @@ class EnvironmentPullRequestsHttpApi extends HttpApiGroup.make("pullRequests").a
     payload: PullRequestDiffInput,
     success: PullRequestDiffResult,
     error: [
+      EnvironmentResourceNotFoundError,
       PullRequestUnavailableError,
       PullRequestOperationError,
       EnvironmentAuthInvalidError,
@@ -613,6 +620,13 @@ class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")
     HttpApiEndpoint.post("t3MintCredential", "/api/t3-connect/mint-credential", {
       payload: RelayCloudMintCredentialRequest,
       success: RelayEnvironmentMintResponse,
+      error: EnvironmentHttpCloudErrors,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("repositoryPolicy", "/api/t3-connect/repository-policy", {
+      payload: RepositoryPolicyProof,
+      success: RepositoryPolicyAcknowledgement,
       error: EnvironmentHttpCloudErrors,
     }),
   )

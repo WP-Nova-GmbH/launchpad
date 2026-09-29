@@ -16,7 +16,6 @@ import { useCallback, useMemo, useRef } from "react";
 
 import { getFallbackThreadIdAfterDelete, pinOrderKeyBetween } from "../components/Sidebar.logic";
 import { useComposerDraftStore } from "../composerDraftStore";
-import { terminalEnvironment } from "../state/terminal";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentServerConfigsAtom } from "../state/server";
 import { threadEnvironment } from "../state/threads";
@@ -191,7 +190,6 @@ export async function navigateAfterThreadDeletion(navigate: () => Promise<void>)
 }
 
 export function useThreadActions() {
-  const closeTerminal = useAtomCommand(terminalEnvironment.close);
   const archiveThreadMutation = useAtomCommand(threadEnvironment.archive, {
     reportFailure: false,
   });
@@ -228,7 +226,6 @@ export function useThreadActions() {
   const unsnoozeThreadMutation = useAtomCommand(threadEnvironment.unsnooze, {
     reportFailure: false,
   });
-  const stopThreadSession = useAtomCommand(threadEnvironment.stopSession);
   const removeWorktree = useAtomCommand(vcsEnvironment.removeWorktree, {
     reportFailure: false,
   });
@@ -426,23 +423,7 @@ export function useThreadActions() {
         shouldDeleteWorktree = confirmationResult.value;
       }
 
-      if (thread.session && thread.session.status !== "stopped") {
-        await stopThreadSession({
-          environmentId: threadRef.environmentId,
-          input: { threadId: threadRef.threadId },
-        });
-      }
-
-      await closeTerminal({
-        environmentId: threadRef.environmentId,
-        input: { threadId: threadRef.threadId, deleteHistory: true },
-      });
-
       const deletedThreadIds = deletedIds ?? new Set<ThreadId>();
-      const currentRouteThreadRef = getCurrentRouteThreadRef();
-      const shouldNavigateToFallback =
-        currentRouteThreadRef?.threadId === threadRef.threadId &&
-        currentRouteThreadRef.environmentId === threadRef.environmentId;
       const fallbackThreadId = getFallbackThreadIdAfterDelete({
         threads,
         deletedThreadId: threadRef.threadId,
@@ -465,6 +446,12 @@ export function useThreadActions() {
       );
       clearTerminalUiState(threadRef);
 
+      // Required setup shutdown can take time. Only leave the task if it is
+      // still the current route after the server confirms deletion.
+      const currentRouteThreadRef = getCurrentRouteThreadRef();
+      const shouldNavigateToFallback =
+        currentRouteThreadRef?.threadId === threadRef.threadId &&
+        currentRouteThreadRef.environmentId === threadRef.environmentId;
       if (shouldNavigateToFallback) {
         const fallbackThread = fallbackThreadId
           ? readThreadShell(scopeThreadRef(threadRef.environmentId, fallbackThreadId))
@@ -537,7 +524,6 @@ export function useThreadActions() {
       clearComposerDraftForThread,
       clearProjectDraftThreadById,
       clearTerminalUiState,
-      closeTerminal,
       deleteThreadMutation,
       getCurrentRouteThreadRef,
       refreshVcsStatus,
@@ -545,7 +531,6 @@ export function useThreadActions() {
       router,
       resolveThreadTarget,
       sidebarThreadSortOrder,
-      stopThreadSession,
     ],
   );
 

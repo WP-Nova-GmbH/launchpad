@@ -28,8 +28,8 @@ import * as Stream from "effect/Stream";
  * State is memory only. It exists from the first `begin` until the turn starts
  * or the setup fails, plus a short grace window so a client that subscribes
  * late still sees the final state. Nothing here is persisted or event-sourced:
- * the durable record of a setup is the thread's worktree path and the setup
- * script activities, both of which already exist.
+ * shared preparation ownership lives in the durable prompt queue; this tracker
+ * supplies progress and cancellation handles, never delivery eligibility.
  */
 export class WorktreeSetupTracker extends Context.Service<
   WorktreeSetupTracker,
@@ -37,6 +37,8 @@ export class WorktreeSetupTracker extends Context.Service<
     /** Creates a fresh running snapshot for the thread, replacing any prior one. */
     readonly begin: (input: {
       readonly threadId: ThreadId;
+      /** Private owner; never sent to clients. */
+      readonly creationSequence?: number;
       readonly branch: string | null;
       readonly baseRef: string | null;
       readonly stages: ReadonlyArray<WorktreeSetupStageId>;
@@ -82,7 +84,10 @@ export class WorktreeSetupTracker extends Context.Service<
     readonly cancel: (threadId: ThreadId) => Effect.Effect<boolean>;
     readonly get: (threadId: ThreadId) => Effect.Effect<WorktreeSetupSnapshot | null>;
     /** Emits the current snapshot (or null) first, then every change until unsubscribed. */
-    readonly stream: (threadId: ThreadId) => Stream.Stream<WorktreeSetupSnapshot | null>;
+    readonly stream: (
+      threadId: ThreadId,
+      creationSequence?: number,
+    ) => Stream.Stream<WorktreeSetupSnapshot | null>;
   }
 >()("t3/project/WorktreeSetupTracker") {}
 
@@ -101,6 +106,7 @@ const FINISHED_RETENTION = "30 seconds";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 interface TrackedSetup {
+  readonly creationSequence?: number;
   readonly snapshot: WorktreeSetupSnapshot;
   readonly fiber: Fiber.Fiber<unknown, unknown> | null;
 }
@@ -121,6 +127,7 @@ export const make = Effect.gen(function* () {
   const setups = yield* Ref.make(new Map<ThreadId, TrackedSetup>());
   const changes = yield* PubSub.unbounded<{
     readonly threadId: ThreadId;
+    readonly creationSequence?: number;
     readonly snapshot: WorktreeSetupSnapshot | null;
   }>();
   const retentionFibers = new Map<ThreadId, Fiber.Fiber<void, never>>();
@@ -128,8 +135,16 @@ export const make = Effect.gen(function* () {
   // opened during a previous setup still accepts the next one's first snapshot.
   const lastSequenceByThread = new Map<ThreadId, number>();
 
-  const publish = (threadId: ThreadId, snapshot: WorktreeSetupSnapshot | null) =>
-    PubSub.publish(changes, { threadId, snapshot }).pipe(Effect.asVoid);
+  const publish = (
+    threadId: ThreadId,
+    snapshot: WorktreeSetupSnapshot | null,
+    creationSequence?: number,
+  ) =>
+    PubSub.publish(changes, {
+      threadId,
+      snapshot,
+      ...(creationSequence === undefined ? {} : { creationSequence }),
+    }).pipe(Effect.asVoid);
 
   const modify = (
     threadId: ThreadId,
@@ -146,8 +161,16 @@ export const make = Effect.gen(function* () {
       lastSequenceByThread.set(threadId, nextSnapshot.sequence);
       const next = new Map(current);
       next.set(threadId, { ...nextTracked, snapshot: nextSnapshot });
-      return [nextSnapshot, next] as const;
-    }).pipe(Effect.tap((snapshot) => (snapshot ? publish(threadId, snapshot) : Effect.void)));
+      return [
+        { snapshot: nextSnapshot, creationSequence: nextTracked.creationSequence },
+        next,
+      ] as const;
+    }).pipe(
+      Effect.tap((tracked) =>
+        tracked ? publish(threadId, tracked.snapshot, tracked.creationSequence) : Effect.void,
+      ),
+      Effect.map((tracked) => tracked?.snapshot ?? null),
+    );
 
   const clearRetention = (threadId: ThreadId) => {
     const fiber = retentionFibers.get(threadId);
@@ -156,15 +179,13 @@ export const make = Effect.gen(function* () {
   };
 
   const remove = (threadId: ThreadId) =>
-    Ref.update(setups, (current) => {
-      if (!current.has(threadId)) return current;
+    Ref.modify(setups, (current) => {
+      const previous = current.get(threadId);
       const next = new Map(current);
       next.delete(threadId);
-      return next;
+      return [previous, next] as const;
     }).pipe(
-      Effect.andThen(publish(threadId, null)),
-      // A subscriber that outlives retention sees `null` here and accepts any
-      // sequence after it, so the counter can start over for this thread.
+      Effect.flatMap((previous) => publish(threadId, null, previous?.creationSequence)),
       Effect.tap(() => Effect.sync(() => lastSequenceByThread.delete(threadId))),
     );
 
@@ -189,10 +210,16 @@ export const make = Effect.gen(function* () {
       lastSequenceByThread.set(input.threadId, snapshot.sequence);
       yield* Ref.update(setups, (current) => {
         const next = new Map(current);
-        next.set(input.threadId, { snapshot, fiber: input.fiber });
+        next.set(input.threadId, {
+          snapshot,
+          fiber: input.fiber,
+          ...(input.creationSequence === undefined
+            ? {}
+            : { creationSequence: input.creationSequence }),
+        });
         return next;
       });
-      yield* publish(input.threadId, snapshot);
+      yield* publish(input.threadId, snapshot, input.creationSequence);
     });
 
   const update: WorktreeSetupTracker["Service"]["update"] = (threadId, mutate) =>
@@ -260,6 +287,7 @@ export const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const endedAt = yield* nowIso;
       const snapshot = yield* modify(threadId, (tracked) => ({
+        ...tracked,
         fiber: null,
         snapshot: {
           ...tracked.snapshot,
@@ -324,12 +352,16 @@ export const make = Effect.gen(function* () {
    * ever holds the newest snapshot, so a chatty setup script cannot grow the
    * server heap. Snapshots are whole states, so skipping intermediates is safe.
    */
-  const stream: WorktreeSetupTracker["Service"]["stream"] = (threadId) =>
+  const stream: WorktreeSetupTracker["Service"]["stream"] = (threadId, creationSequence) =>
     Stream.callback<WorktreeSetupSnapshot | null>(
       (mailbox) =>
         Effect.gen(function* () {
           const subscription = yield* PubSub.subscribe(changes);
-          const initial = yield* get(threadId);
+          const tracked = (yield* Ref.get(setups)).get(threadId);
+          const initial =
+            creationSequence === undefined || tracked?.creationSequence === creationSequence
+              ? (tracked?.snapshot ?? null)
+              : null;
           // Changes published between subscribing and reading `initial` are
           // already folded into it. Drop them so the client never steps back.
           let lastSequence = initial?.sequence ?? -1;
@@ -338,6 +370,8 @@ export const make = Effect.gen(function* () {
             Stream.runForEach((change) =>
               Effect.sync(() => {
                 if (change.threadId !== threadId) return;
+                if (creationSequence !== undefined && change.creationSequence !== creationSequence)
+                  return;
                 if (change.snapshot !== null && change.snapshot.sequence <= lastSequence) return;
                 lastSequence = change.snapshot?.sequence ?? -1;
                 Queue.offerUnsafe(mailbox, change.snapshot);

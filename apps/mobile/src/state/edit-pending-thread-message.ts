@@ -24,6 +24,11 @@ import {
 
 /** Take delivery ownership before any await; the durable draft then takes ownership of the files. */
 export async function editPendingThreadMessage(message: QueuedThreadMessage): Promise<boolean> {
+  if (message.submissionProtocol === "shared" && message.transportAttempted) {
+    throw new Error(
+      "This submission is waiting for server acceptance. Reconnect to resolve it before editing, so it cannot be sent twice.",
+    );
+  }
   if (
     message.creation ||
     appAtomRegistry.get(dispatchingQueuedMessageIdAtom) === message.messageId ||

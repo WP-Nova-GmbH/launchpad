@@ -33,6 +33,12 @@ import type * as Effect from "effect/Effect";
 
 import type { ProjectionRepositoryError } from "../../persistence/Errors.ts";
 
+export interface ThreadSubscriptionAnchor {
+  readonly projectId: ProjectId;
+  readonly creationSequence: number;
+  readonly snapshotSequence: number;
+}
+
 export interface ProjectionSnapshotCounts {
   readonly projectCount: number;
   readonly threadCount: number;
@@ -65,6 +71,8 @@ export interface ProjectionFullThreadDiffContext {
 }
 
 export interface ProjectionThreadDetailQuery {
+  /** Internal callers opt in when inspecting retained work on archived threads. */
+  readonly includeArchived?: boolean;
   /**
    * Limit activities before SQLite returns and decodes their payloads.
    * Any explicit filter omits pinned-request reads. An empty list also skips
@@ -77,6 +85,11 @@ export interface ProjectionThreadDetailQuery {
  * ProjectionSnapshotQueryShape - Service API for read-model snapshots.
  */
 export interface ProjectionSnapshotQueryShape {
+  /** Capture authorization and lifetime without loading a thread body. */
+  readonly getThreadSubscriptionAnchor: (
+    threadId: ThreadId,
+  ) => Effect.Effect<Option.Option<ThreadSubscriptionAnchor>, ProjectionRepositoryError>;
+
   /** Read the latest request or resolution without loading the thread history. */
   readonly getUserInputActivity: (input: {
     readonly threadId: ThreadId;
@@ -150,6 +163,7 @@ export interface ProjectionSnapshotQueryShape {
    */
   readonly searchThreads: (
     input: OrchestrationSearchThreadsInput,
+    allowedProjectIds?: ReadonlyArray<ProjectId>,
   ) => Effect.Effect<OrchestrationSearchThreadsResult, ProjectionRepositoryError>;
 
   /**
@@ -283,6 +297,7 @@ export interface ProjectionSnapshotQueryShape {
   readonly getThreadDetailSnapshot: (
     threadId: ThreadId,
     window?: OrchestrationThreadDetailWindow,
+    expectedCreationSequence?: number,
   ) => Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>, ProjectionRepositoryError>;
 }
 

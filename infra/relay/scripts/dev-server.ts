@@ -1,3 +1,5 @@
+import { repositoryAccessServerApi } from "../src/http/RepositoryAccessApi.ts";
+import * as RepositoryPolicies from "../src/tenancy/RepositoryPolicies.ts";
 /**
  * Runs the relay locally, on Node, against a plain Postgres.
  *
@@ -300,7 +302,9 @@ const runtimeLayer = Layer.empty
   .pipe(
     Layer.provideMerge(MobileRegistrations.layer),
     Layer.provideMerge(AgentActivityPublisher.layer),
-    Layer.provideMerge(EnvironmentConnector.layer),
+    Layer.provideMerge(
+      EnvironmentConnector.layer.pipe(Layer.provideMerge(RepositoryPolicies.controlLayer)),
+    ),
     Layer.provideMerge(EnvironmentLinker.layer),
     Layer.provideMerge(MachineEnroller.layer),
     // Dev-mode machines are Docker containers on this host, running the
@@ -412,6 +416,7 @@ const relayApiLayer = Layer.mergeAll(
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
+  repositoryAccessServerApi,
   providerAccountsServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
@@ -464,7 +469,19 @@ const main = Effect.gen(function* () {
   // Handler requirements are deferred to the serve step rather than discharged
   // by the group layers, so this is where the runtime has to be supplied.
   return yield* Layer.launch(
-    Layer.merge(HttpRouter.serve(routerLayer), managedEndpointSweepLayer).pipe(
+    Layer.mergeAll(
+      HttpRouter.serve(routerLayer),
+      managedEndpointSweepLayer,
+      Layer.effectDiscard(
+        RepositoryPolicies.deliverPending().pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Policy delivery retry failed", { cause }),
+          ),
+          Effect.repeat(Schedule.spaced("30 seconds")),
+          Effect.forkScoped,
+        ),
+      ),
+    ).pipe(
       Layer.provide(NodeHttpServer.layer(nodeHttp.createServer, { host: "127.0.0.1", port })),
       // Delegated thread ids exceed the router's default path parameter limit.
       Layer.provide(Layer.succeed(HttpRouter.RouterConfig, RELAY_HTTP_ROUTER_CONFIG)),

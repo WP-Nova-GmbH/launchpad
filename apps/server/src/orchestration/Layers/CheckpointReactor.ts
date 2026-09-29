@@ -394,17 +394,17 @@ const make = Effect.gen(function* () {
     function* (event: Extract<ProviderRuntimeEvent, { type: "turn.completed" | "turn.aborted" }>) {
       const turnId = toTurnId(event.turnId);
       if (!turnId) {
-        return;
+        return "skipped" as const;
       }
 
       const thread = yield* resolveThreadDetail(event.threadId);
       if (!thread) {
-        return;
+        return "skipped" as const;
       }
 
       // When a primary turn is active, only that turn may produce completion checkpoints.
       if (thread.session?.activeTurnId && !sameId(thread.session.activeTurnId, turnId)) {
-        return;
+        return "skipped" as const;
       }
 
       // Only skip if a real (non-placeholder) checkpoint already exists for this turn.
@@ -415,7 +415,7 @@ const make = Effect.gen(function* () {
           (checkpoint) => checkpoint.turnId === turnId && checkpoint.status !== "missing",
         )
       ) {
-        return;
+        return "skipped" as const;
       }
 
       const projects = yield* resolveThreadProjects(thread.projectId);
@@ -426,7 +426,7 @@ const make = Effect.gen(function* () {
         preferSessionRuntime: true,
       });
       if (!checkpointCwd) {
-        return;
+        return "skipped" as const;
       }
 
       // If a placeholder checkpoint exists for this turn, reuse its turn count
@@ -455,6 +455,7 @@ const make = Effect.gen(function* () {
         assistantMessageId: existingPlaceholder?.assistantMessageId ?? undefined,
         createdAt: event.createdAt,
       });
+      return "ready" as const;
     },
   );
 
@@ -937,6 +938,34 @@ const make = Effect.gen(function* () {
     event: ProviderRuntimeEvent,
   ) {
     if (event.type === "session.exited") {
+      const thread = yield* resolveThreadDetail(event.threadId);
+      const queue = thread?.promptQueue;
+      if (queue?.awaitingTurnId) {
+        if (queue.pauseReason?.code === "stopped") {
+          yield* orchestrationEngine.dispatch({
+            type: "thread.queue.finalize",
+            commandId: yield* serverCommandId("queue-stopped"),
+            threadId: event.threadId,
+            turnId: queue.awaitingTurnId,
+            outcome: "interrupted",
+            checkpoint: "error",
+            detail: "The stopped provider exited before checkpoint capture completed.",
+            createdAt: event.createdAt,
+          });
+        } else {
+          for (const admission of queue.admissions)
+            yield* orchestrationEngine.dispatch({
+              type: "thread.prompt.unknown",
+              commandId: yield* serverCommandId("queue-exited"),
+              threadId: event.threadId,
+              attemptId: admission.attemptId,
+              detail:
+                event.payload.reason ??
+                "The provider exited without a correlated terminal result. Review delivery before continuing.",
+              createdAt: event.createdAt,
+            });
+        }
+      }
       startedTurns.delete(event.threadId);
       pending.delete(event.threadId);
       return;
@@ -982,7 +1011,7 @@ const make = Effect.gen(function* () {
       ) {
         return;
       }
-      yield* captureCheckpointFromTurnCompletion(event).pipe(
+      const checkpoint = yield* captureCheckpointFromTurnCompletion(event).pipe(
         Effect.catch((error) =>
           Effect.flatMap(nowIso, (createdAt) =>
             appendCaptureFailureActivity({
@@ -990,10 +1019,33 @@ const make = Effect.gen(function* () {
               turnId,
               detail: error.message,
               createdAt,
-            }).pipe(Effect.catch(() => Effect.void)),
+            }).pipe(
+              Effect.catch(() => Effect.void),
+              Effect.as("error" as const),
+            ),
           ),
         ),
       );
+      if (turnId !== null) {
+        const state = event.type === "turn.aborted" ? "interrupted" : event.payload.state;
+        yield* orchestrationEngine.dispatch({
+          type: "thread.queue.finalize",
+          commandId: yield* serverCommandId("queue-finalize"),
+          threadId: event.threadId,
+          turnId,
+          outcome:
+            state === "failed"
+              ? "failed"
+              : state === "interrupted" || state === "cancelled"
+                ? "interrupted"
+                : "completed",
+          checkpoint,
+          ...(event.type === "turn.completed" && event.payload.errorMessage
+            ? { detail: event.payload.errorMessage }
+            : {}),
+          createdAt: event.createdAt,
+        });
+      }
       return;
     }
   });

@@ -1,8 +1,11 @@
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import * as Cause from "effect/Cause";
+import { AsyncResult } from "effect/unstable/reactivity";
 
 import { useThreadActions } from "./useThreadActions";
 import { threadEnvironment } from "../state/threads";
+import { terminalEnvironment } from "../state/terminal";
 import { toastManager } from "../components/ui/toast";
 import { useThreadUndoNotice } from "./showThreadUndoNotice";
 
@@ -15,6 +18,15 @@ const commands = vi.hoisted(() => ({
   unsettle: vi.fn(),
   snooze: vi.fn(),
   unsnooze: vi.fn(),
+  delete: vi.fn(),
+  stop: vi.fn(),
+  closeTerminal: vi.fn(),
+}));
+const cleanup = vi.hoisted(() => ({
+  clearDraftThread: vi.fn(),
+  clearProjectDraftThreadById: vi.fn(),
+  clearTerminalUiState: vi.fn(),
+  releaseUploads: vi.fn(),
 }));
 const router = vi.hoisted(() => ({
   navigate: vi.fn(async () => {}),
@@ -29,11 +41,19 @@ vi.mock("react", async (original) => ({
 vi.mock("@tanstack/react-router", () => ({ useRouter: () => router }));
 vi.mock("./useSettings", () => ({ useClientSettings: () => false }));
 vi.mock("./useHandleNewThread", () => ({ useNewThreadHandler: () => vi.fn() }));
-vi.mock("../composerDraftStore", () => ({ useComposerDraftStore: () => vi.fn() }));
-vi.mock("../terminalUiStateStore", () => ({ useTerminalUiStateStore: () => vi.fn() }));
+vi.mock("../composerDraftStore", () => ({
+  useComposerDraftStore: (select: (store: typeof cleanup) => unknown) => select(cleanup),
+}));
+vi.mock("../terminalUiStateStore", () => ({
+  useTerminalUiStateStore: (select: (store: typeof cleanup) => unknown) => select(cleanup),
+}));
+vi.mock("../lib/composerDraftUploads", () => ({
+  releaseComposerDraftUploads: cleanup.releaseUploads,
+}));
 vi.mock("../uiStateStore", () => ({ useUiStateStore: () => vi.fn() }));
 vi.mock("../lib/archivedThreadsState", () => ({ refreshArchivedThreadsForEnvironment: vi.fn() }));
 const threadShell = vi.hoisted(() => ({
+  id: "thread",
   title: "Thread",
   pinOrderKey: "a0",
   pinnedAt: null as string | null,
@@ -41,6 +61,7 @@ const threadShell = vi.hoisted(() => ({
   projectId: "project",
   environmentId: "undo-env",
   session: null,
+  worktreePath: null,
 }));
 vi.mock("../state/entities", async (original) => ({
   ...(await original<typeof import("../state/entities")>()),
@@ -49,10 +70,18 @@ vi.mock("../state/entities", async (original) => ({
   readEnvironmentSupportsSettlement: () => true,
   readEnvironmentSupportsSnooze: () => true,
   readThreadShell: () => threadShell,
+  readEnvironmentThreadRefs: () => [target],
+  readProject: () => null,
 }));
 vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: (command: unknown) => {
     switch (command) {
+      case threadEnvironment.delete:
+        return commands.delete;
+      case threadEnvironment.stopSession:
+        return commands.stop;
+      case terminalEnvironment.close:
+        return commands.closeTerminal;
       case threadEnvironment.pin:
         return commands.pin;
       case threadEnvironment.unpin:
@@ -91,9 +120,51 @@ beforeEach(() => {
     command.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   }
   router.navigate.mockClear();
+  for (const effect of Object.values(cleanup)) effect.mockClear();
   router.state.matches[0]!.params = {};
   threadShell.pinnedAt = null;
   threadShell.snoozedUntil = null;
+});
+
+describe("deletion recovery", () => {
+  it("keeps the route, drafts and terminal recovery when server shutdown fails", async () => {
+    router.state.matches[0]!.params = { ...target };
+    const rejected = AsyncResult.failure(
+      Cause.die(new Error("Setup exit could not be confirmed. Use Stop to retry.")),
+    );
+    commands.delete.mockResolvedValueOnce(rejected);
+    const actions = useThreadActions();
+    expect(await actions.deleteThread(target)).toBe(rejected);
+    expect(commands.stop).not.toHaveBeenCalled();
+    expect(commands.closeTerminal).not.toHaveBeenCalled();
+    for (const effect of Object.values(cleanup)) expect(effect).not.toHaveBeenCalled();
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(router.state.matches[0]!.params).toEqual(target);
+
+    // Only another explicit Delete may clear the retained task.
+    await actions.deleteThread(target);
+    expect(commands.delete).toHaveBeenCalledTimes(2);
+    expect(cleanup.clearDraftThread).toHaveBeenCalledOnce();
+    expect(cleanup.clearTerminalUiState).toHaveBeenCalledOnce();
+  });
+
+  it("does not navigate away from a newer route while shutdown is pending", async () => {
+    let finishDelete!: (result: ReturnType<typeof AsyncResult.success<void>>) => void;
+    const result = new Promise<ReturnType<typeof AsyncResult.success<void>>>((resolve) => {
+      finishDelete = resolve;
+    });
+    commands.delete.mockReturnValueOnce(result);
+    router.state.matches[0]!.params = { ...target };
+    const pending = useThreadActions().deleteThread(target);
+    router.state.matches[0]!.params = {
+      environmentId: target.environmentId,
+      threadId: "newer-thread",
+    };
+    finishDelete(AsyncResult.success(undefined));
+    await pending;
+    expect(cleanup.clearDraftThread).toHaveBeenCalledOnce();
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
 });
 afterEach(() => {
   vi.runAllTimers();

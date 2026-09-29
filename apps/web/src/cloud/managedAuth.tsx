@@ -13,8 +13,10 @@ import { runtime } from "../lib/runtime";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { useAtomCommand } from "../state/use-atom-command";
 import { resolveRelayClerkTokenOptions } from "./publicConfig";
+import { setSharedPromptSubmissionAccount } from "../sharedPromptSubmissionStore";
 
 export function deactivateManagedRelayAuthentication(): void {
+  setSharedPromptSubmissionAccount(null);
   setManagedRelaySession(appAtomRegistry, null);
 }
 
@@ -22,6 +24,7 @@ export function activateManagedRelayAuthentication(
   accountId: string,
   readClerkToken: () => Promise<string | null>,
 ): void {
+  setSharedPromptSubmissionAccount(accountId);
   setManagedRelaySession(appAtomRegistry, {
     accountId,
     readClerkToken,

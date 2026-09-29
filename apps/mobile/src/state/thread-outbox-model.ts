@@ -42,6 +42,7 @@ const QueuedThreadCreationSchema = Schema.Struct({
   branch: Schema.NullOr(Schema.String),
   worktreePath: Schema.NullOr(Schema.String),
   startFromOrigin: Schema.optional(Schema.Boolean),
+  worktreeBranchName: Schema.optional(Schema.String),
 });
 
 export const QueuedThreadMessageSchema = Schema.Struct({
@@ -50,6 +51,13 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   commandId: CommandId,
+  transportAttempted: Schema.optional(Schema.Boolean),
+  acceptanceUncertain: Schema.optional(Schema.Boolean),
+  acceptedWithEdits: Schema.optional(Schema.Boolean),
+  sharedPreparation: Schema.optional(Schema.Boolean),
+  submissionProtocol: Schema.optional(
+    Schema.Literals(["unattempted", "legacy", "shared", "review-required"]),
+  ),
   text: Schema.String,
   context: Schema.optional(OrchestrationMessageContext),
   attachments: Schema.Array(DraftComposerAttachmentSchema),
@@ -73,6 +81,7 @@ export interface QueuedThreadCreation {
   readonly branch: string | null;
   readonly worktreePath: string | null;
   readonly startFromOrigin?: boolean;
+  readonly worktreeBranchName?: string;
 }
 
 export interface QueuedThreadMessage {
@@ -80,6 +89,12 @@ export interface QueuedThreadMessage {
   readonly threadId: ThreadId;
   readonly messageId: MessageId;
   readonly commandId: CommandId;
+  readonly transportAttempted?: boolean;
+  readonly acceptanceUncertain?: boolean;
+  readonly acceptedWithEdits?: boolean;
+  /** Capability captured before the first send; an upgrade cannot prove an older send was atomic. */
+  readonly sharedPreparation?: boolean;
+  readonly submissionProtocol?: "unattempted" | "legacy" | "shared" | "review-required";
   readonly text: string;
   readonly context?: OrchestrationMessageContext;
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
@@ -94,6 +109,53 @@ export interface ThreadSettingsSnapshot {
   readonly modelSelection: ModelSelectionType;
   readonly runtimeMode: RuntimeModeType;
   readonly interactionMode: ProviderInteractionModeType;
+}
+
+/** An authoritative acceptance supersedes earlier transport uncertainty. */
+export function acceptedQueuedThreadMessage(message: QueuedThreadMessage): QueuedThreadMessage {
+  if (!message.acceptanceUncertain && message.submissionProtocol !== "review-required")
+    return message;
+  return {
+    ...message,
+    acceptanceUncertain: false,
+    ...(message.submissionProtocol === "review-required" ? { submissionProtocol: undefined } : {}),
+  };
+}
+
+/** Unknown bootstrap receipts are replayable only with the original atomic acceptance protocol. */
+export function canRetryUnknownSharedSubmission(
+  message: QueuedThreadMessage,
+  supportsSharedPreparation: boolean,
+): boolean {
+  return (
+    message.submissionProtocol === "shared" &&
+    (!message.creation || (message.sharedPreparation === true && supportsSharedPreparation))
+  );
+}
+
+/** Resolve setup targets once; transport retries must describe the same worktree. */
+export function captureQueuedThreadCreation(
+  message: QueuedThreadMessage,
+  projectCwd: string,
+  makeBranchName: () => string,
+): QueuedThreadMessage {
+  const creation = message.creation;
+  if (
+    !creation ||
+    (creation.projectCwd !== undefined &&
+      (creation.workspaceMode !== "worktree" || creation.worktreeBranchName !== undefined))
+  )
+    return message;
+  return {
+    ...message,
+    creation: {
+      ...creation,
+      projectCwd: creation.projectCwd ?? projectCwd,
+      ...(creation.workspaceMode === "worktree"
+        ? { worktreeBranchName: creation.worktreeBranchName ?? makeBranchName() }
+        : {}),
+    },
+  };
 }
 
 export function resolveQueuedThreadSettings(

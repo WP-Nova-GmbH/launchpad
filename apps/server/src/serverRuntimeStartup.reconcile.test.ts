@@ -731,20 +731,37 @@ for (const scenario of [
   "marked without cursor",
   "marked stopped projection",
   "marked superseded turn",
+  "shared queue",
 ] as const) {
   it.effect(`does not recover an interrupted session with ${scenario}`, () => {
     const turnId = TurnId.make("turn-excluded-recovery");
-    const thread = makeThread(
-      "thread-excluded-recovery",
-      scenario.includes("stopped projection")
-        ? "stopped"
-        : scenario === "finished projection"
-          ? "ready"
-          : scenario === "marked superseded turn"
-            ? "starting"
-            : "running",
-      scenario === "marked superseded turn" ? null : turnId,
-    );
+    const thread = {
+      ...makeThread(
+        "thread-excluded-recovery",
+        scenario.includes("stopped projection")
+          ? "stopped"
+          : scenario === "finished projection"
+            ? "ready"
+            : scenario === "marked superseded turn"
+              ? "starting"
+              : "running",
+        scenario === "marked superseded turn" ? null : turnId,
+      ),
+      ...(scenario === "shared queue"
+        ? {
+            promptQueue: {
+              enabled: false,
+              revision: 1,
+              pauseReason: { code: "stopped", detail: "Stopped" },
+              entries: [],
+              handoff: null,
+              awaitingTurnId: turnId,
+              admissions: [],
+              finalizedTurnId: null,
+            },
+          }
+        : {}),
+    };
     const dispatched: OrchestrationCommand[] = [];
     const upserts: ProviderSessionDirectory.ProviderRuntimeBinding[] = [];
     return runReconciliation({

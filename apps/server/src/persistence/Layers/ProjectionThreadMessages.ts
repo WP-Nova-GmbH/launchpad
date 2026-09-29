@@ -25,6 +25,8 @@ const ProjectionThreadMessageDbRowSchema = ProjectionThreadMessage.mapFields(
     attachments: Schema.NullOr(Schema.fromJsonString(Schema.Array(ChatAttachment))),
     context: Schema.NullOr(Schema.fromJsonString(OrchestrationMessageContext)),
     author: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
+    editedBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
+    steeredBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
   }),
 );
 const ProjectionThreadMessageExistsDbRowSchema = Schema.Struct({ exists: Schema.Number });
@@ -44,6 +46,8 @@ function toProjectionThreadMessage(
     ...(row.attachments !== null ? { attachments: row.attachments } : {}),
     ...(row.context !== null ? { context: row.context } : {}),
     ...(row.author !== null ? { author: row.author } : {}),
+    ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
+    ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
   };
 }
 
@@ -67,6 +71,8 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           attachments_json,
           context_json,
           author_json,
+          edited_by_json,
+          steered_by_json,
           is_streaming,
           created_at,
           updated_at
@@ -101,6 +107,8 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
               WHERE message_id = ${row.messageId}
             )
           ),
+          ${row.editedBy ? JSON.stringify(row.editedBy) : null},
+          ${row.steeredBy ? JSON.stringify(row.steeredBy) : null},
           ${row.isStreaming ? 1 : 0},
           ${row.createdAt},
           ${row.updatedAt}
@@ -120,6 +128,8 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
             projection_thread_messages.context_json
           ),
           author_json = COALESCE(excluded.author_json, projection_thread_messages.author_json),
+          edited_by_json = COALESCE(excluded.edited_by_json, projection_thread_messages.edited_by_json),
+          steered_by_json = COALESCE(excluded.steered_by_json, projection_thread_messages.steered_by_json),
           is_streaming = excluded.is_streaming,
           created_at = excluded.created_at,
           updated_at = excluded.updated_at
@@ -192,6 +202,8 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          edited_by_json AS "editedBy",
+          steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
@@ -232,6 +244,8 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          edited_by_json AS "editedBy",
+          steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"

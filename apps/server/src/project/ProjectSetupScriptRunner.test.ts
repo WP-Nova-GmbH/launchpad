@@ -28,6 +28,7 @@ const makeProject = (scripts: OrchestrationProject["scripts"]): OrchestrationPro
 
 const makeProjectionSnapshotQueryLayer = (project: OrchestrationProject) =>
   Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+    getThreadSubscriptionAnchor: () => Effect.succeedNone,
     getUserInputActivity: () => Effect.die("unused"),
     listActivitiesByKind: () => Effect.die("unused"),
     getCommandReadModel: () => Effect.die("unused"),
@@ -62,6 +63,8 @@ type TerminalOverrides = Pick<TerminalManager.TerminalManager["Service"], "open"
 
 const makeTerminalManagerLayer = (overrides: TerminalOverrides) =>
   Layer.succeed(TerminalManager.TerminalManager, {
+    captureCleanup: () => Effect.die("unused"),
+    deleteHistory: () => Effect.void,
     attachStream: () => Effect.die(new Error("unused")),
     resize: () => Effect.void,
     clear: () => Effect.void,
@@ -316,6 +319,8 @@ describe("ProjectSetupScriptRunner", () => {
         yield* emit(`__T3_SETUP_DONE___${"0".repeat(32)}:0\r\n`);
         yield* emit(`${sentinel}3\r\n`);
 
+        // The observer also releases itself when its caller has not started awaiting yet.
+        expect(listener).toBeNull();
         const completion = yield* result.completion!;
         expect(completion.exitCode).toBe(3);
         expect(seen).toEqual([
@@ -440,6 +445,46 @@ describe("ProjectSetupScriptRunner", () => {
       Effect.provideService(HostProcessEnvironment, { SHELL: shell }),
     );
   });
+
+  it.effect.each([true, false])(
+    "retains the wait policy when launching a script fails (async=%s)",
+    (async) => {
+      const project = makeProject([
+        {
+          id: "setup",
+          name: "Setup",
+          command: "false",
+          icon: "configure",
+          runOnWorktreeCreate: true,
+          async,
+        },
+      ]);
+      return Effect.gen(function* () {
+        const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+        const error = yield* runner
+          .runForThread({
+            threadId: "thread-1",
+            projectId: "project-1",
+            worktreePath: "/repo/worktrees/a",
+          })
+          .pipe(Effect.flip);
+        expect(isProjectSetupScriptOperationError(error) && error.waitForCompletion).toBe(!async);
+      }).pipe(
+        Effect.provide(
+          testLayer(project, {
+            open: () =>
+              Effect.fail(
+                new TerminalManager.TerminalCwdStatError({
+                  cwd: "/repo/worktrees/a",
+                  cause: "missing",
+                }),
+              ),
+            write: () => Effect.die("unexpected write"),
+          }),
+        ),
+      );
+    },
+  );
 
   it.effect("keeps terminal failures as the exact cause of a structured operation error", () => {
     const rootCause = new Error("stat failed");

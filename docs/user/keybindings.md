@@ -9,10 +9,14 @@ In **Settings → General → Send shortcut**, choose whether Enter sends, requi
 `mod+Enter` for multiline prompts, or always requires `mod+Enter`. `Shift+Enter`
 inserts a new line. This applies to the web and desktop composer at desktop widths.
 
-**Follow-up behavior** chooses Queue or Steer while the agent runs. Use
+On personal environments, **Follow-up behavior** chooses Queue or Steer while the agent runs. Use
 `mod+Enter` to do the opposite for one message. When sending requires `mod+Enter`,
 use `mod+Shift+Enter` for the opposite action. In a new thread, `mod+Enter` keeps
 starting the thread in the background.
+
+On organization machines, Send always adds to the shared queue. Use **Steer now** on a queued
+prompt, or the `thread.steerQueuedMessage` shortcut for its oldest pending prompt, to steer the
+running turn. See [shared threads](composer.md#shared-threads-on-organization-machines).
 
 Use `mod+shift+m` to choose a model and `mod+shift+h` to choose a host.
 Use `mod+shift+e` for effort, `mod+shift+a` for access mode, `mod+shift+x` for the

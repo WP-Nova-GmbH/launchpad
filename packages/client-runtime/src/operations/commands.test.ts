@@ -1,5 +1,7 @@
 import {
   CommandId,
+  MessageId,
+  type ServerConfig,
   EnvironmentId,
   ORCHESTRATION_WS_METHODS,
   ProjectId,
@@ -23,6 +25,7 @@ import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   archiveThread,
+  startThreadTurn,
   createProject,
   revertThreadCheckpoint,
   reorderActiveThread,
@@ -48,6 +51,7 @@ const TARGET = new PrimaryConnectionTarget({
 
 const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(function* (
   dispatched: ClientOrchestrationCommand[],
+  sharedPromptQueue = false,
 ) {
   const client = {
     [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command: ClientOrchestrationCommand) =>
@@ -58,7 +62,9 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
   } as unknown as WsRpcProtocolClient;
   const session: RpcSession.RpcSession = {
     client,
-    initialConfig: Effect.never,
+    initialConfig: Effect.succeed({
+      environment: { capabilities: { sharedPromptQueue } },
+    } as ServerConfig),
     subscribeServerConfig: (input) => client.subscribeServerConfig(input),
     ready: Effect.void,
     probe: Effect.void,
@@ -76,6 +82,36 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("environment commands", () => {
+  for (const shared of [false, true]) {
+    it.effect(
+      `uses ${shared ? "shared acceptance" : "legacy turn start"} without changing captured settings`,
+      () =>
+        Effect.gen(function* () {
+          const dispatched: ClientOrchestrationCommand[] = [];
+          const supervisor = yield* makeSupervisor(dispatched, shared);
+          const input = {
+            commandId: CommandId.make("stable-command"),
+            threadId: ThreadId.make("thread"),
+            message: {
+              messageId: MessageId.make("stable-message"),
+              role: "user" as const,
+              text: "Do work",
+              attachments: [],
+            },
+            runtimeMode: "full-access" as const,
+            interactionMode: "plan" as const,
+            createdAt: "2026-09-28T00:00:00Z",
+          };
+          yield* startThreadTurn(input).pipe(
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          );
+          expect(dispatched).toEqual([
+            { ...input, type: shared ? "thread.prompt.enqueue" : "thread.turn.start" },
+          ]);
+        }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+    );
+  }
+
   it.effect("adds generated command metadata", () =>
     Effect.gen(function* () {
       const dispatched: ClientOrchestrationCommand[] = [];

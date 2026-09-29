@@ -2628,6 +2628,61 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
   const activityIds = (snapshot: { thread: { activities: ReadonlyArray<{ id: string }> } }) =>
     snapshot.thread.activities.map((activity) => activity.id).toSorted();
 
+  it.effect("archived detail reads stay available without making archived threads active", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const query = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE projection_threads SET archived_at = '2026-09-28T10:00:00Z' WHERE thread_id = ${threadW}`;
+      assert.isTrue(Option.isNone(yield* query.getThreadShellById(threadW)));
+      assert.isTrue(Option.isNone(yield* query.getThreadDetailById(threadW)));
+      assert.isTrue(Option.isSome(yield* query.getThreadSubscriptionAnchor(threadW)));
+      assert.isTrue(
+        Option.isSome(yield* query.getThreadDetailById(threadW, { includeArchived: true })),
+      );
+      const full = yield* query.getThreadDetailSnapshot(threadW);
+      const page = yield* query.getThreadDetailSnapshot(threadW, { turnLimit: 2 });
+      assert.isTrue(Option.isSome(full));
+      assert.isTrue(Option.isSome(page));
+      if (Option.isSome(full)) assert.equal(full.value.thread.messages.length, 9);
+      yield* sql`UPDATE projection_threads SET deleted_at = '2026-09-28T10:01:00Z' WHERE thread_id = ${threadW}`;
+      assert.isTrue(Option.isNone(yield* query.getThreadDetailSnapshot(threadW)));
+    }),
+  );
+
+  it.effect("anchors subscription reads and rejects snapshots from a replacement lifetime", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const query = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`INSERT INTO orchestration_events
+        (sequence, event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+        VALUES (40, 'original-create', 'thread', ${threadW}, 1, 'thread.created', '2026-09-28T10:00:00Z', 'system', '{}', '{}')`;
+      const first = yield* query.getThreadSubscriptionAnchor(threadW);
+      assert.isTrue(Option.isSome(first));
+      if (Option.isNone(first)) return;
+      assert.equal(first.value.creationSequence, 40);
+      assert.equal(first.value.snapshotSequence, 42);
+      assert.isTrue(Option.isSome(yield* query.getThreadDetailSnapshot(threadW, undefined, 40)));
+      yield* sql`UPDATE projection_threads SET deleted_at = '2026-09-28T10:01:00Z' WHERE thread_id = ${threadW}`;
+      assert.isTrue(Option.isNone(yield* query.getThreadSubscriptionAnchor(threadW)));
+      yield* sql`UPDATE projection_threads SET deleted_at = NULL, project_id = 'replacement-project' WHERE thread_id = ${threadW}`;
+      yield* sql`INSERT INTO orchestration_events
+        (sequence, event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+        VALUES (50, 'replacement-create', 'thread', ${threadW}, 2, 'thread.created', '2026-09-28T10:02:00Z', 'system', '{}', '{}')`;
+      yield* sql`UPDATE projection_state SET last_applied_sequence = 50`;
+      assert.isTrue(Option.isNone(yield* query.getThreadDetailSnapshot(threadW, undefined, 40)));
+      const replacement = yield* query.getThreadSubscriptionAnchor(threadW);
+      assert.isTrue(Option.isSome(replacement));
+      if (Option.isSome(replacement))
+        assert.deepStrictEqual(replacement.value, {
+          projectId: "replacement-project",
+          creationSequence: 50,
+          snapshotSequence: 50,
+        });
+    }),
+  );
+
   it.effect("returns the full thread with no page metadata when no window is requested", () =>
     Effect.gen(function* () {
       yield* seedFanOutThread();

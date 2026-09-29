@@ -1,5 +1,6 @@
 import {
   ApprovalRequestId,
+  ThreadPromptQueue,
   isImportedAgentSessionMessageId,
   UserInputAttachmentAnswerPayload,
   type ChatAttachment,
@@ -7,6 +8,8 @@ import {
   type OrchestrationSessionStatus,
   ThreadId,
 } from "@t3tools/contracts";
+import { applyThreadPromptQueueChange } from "@t3tools/shared/threadPromptQueue";
+import { getPromptQueue } from "../../persistence/ProjectionPromptQueues.ts";
 import { compareDateTimeStrings } from "@t3tools/shared/dateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -64,6 +67,8 @@ import {
   toSafeThreadAttachmentSegment,
 } from "../../attachmentStore.ts";
 
+const encodePromptQueue = Schema.encodeEffect(Schema.fromJsonString(ThreadPromptQueue));
+
 export const ORCHESTRATION_PROJECTOR_NAMES = {
   projects: "projection.projects",
   threads: "projection.threads",
@@ -74,6 +79,7 @@ export const ORCHESTRATION_PROJECTOR_NAMES = {
   threadTurns: "projection.thread-turns",
   checkpoints: "projection.checkpoints",
   pendingApprovals: "projection.pending-approvals",
+  promptQueues: "projection.prompt-queues",
 } as const;
 
 type ProjectorName =
@@ -1192,6 +1198,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               : {}),
             isStreaming: false,
             ...(event.payload.author !== undefined ? { author: event.payload.author } : {}),
+            ...(event.payload.editedBy !== undefined ? { editedBy: event.payload.editedBy } : {}),
+            ...(event.payload.steeredBy !== undefined
+              ? { steeredBy: event.payload.steeredBy }
+              : {}),
             createdAt: previousMessage?.createdAt ?? event.payload.createdAt,
             updatedAt: event.payload.updatedAt,
           });
@@ -1951,7 +1961,48 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       }
     });
 
+    const applyPromptQueueProjection: ProjectorDefinition["apply"] = Effect.fn(
+      "applyPromptQueueProjection",
+    )(function* (event, _attachmentSideEffects) {
+      if (event.type === "thread.prompt-queue-changed") {
+        const previous = yield* getPromptQueue(sql, event.payload.threadId);
+        const queue = applyThreadPromptQueueChange(previous, event.payload, event.sequence);
+        // Edits/removals may orphan uploads; re-check all message and queue references
+        // after the transaction before deleting a file.
+        const removedPaths = new Set<string>();
+        const retainedPaths = new Set(
+          queue.entries.flatMap((entry) =>
+            entry.attachments.flatMap((attachment) => {
+              const path = attachmentRelativePath(attachment);
+              return path === null ? [] : [path];
+            }),
+          ),
+        );
+        for (const prompt of previous?.entries ?? [])
+          for (const attachment of prompt.attachments) {
+            const path = attachmentRelativePath(attachment);
+            if (path !== null && !retainedPaths.has(path)) removedPaths.add(path);
+          }
+        if (removedPaths.size > 0) {
+          const paths =
+            _attachmentSideEffects.prunedThreadRelativePaths.get(event.payload.threadId) ??
+            new Set<string>();
+          for (const path of removedPaths) paths.add(path);
+          _attachmentSideEffects.prunedThreadRelativePaths.set(event.payload.threadId, paths);
+        }
+        const stateJson = yield* encodePromptQueue(queue).pipe(Effect.orDie);
+        yield* sql`INSERT INTO projection_thread_prompt_queues (thread_id,state_json) VALUES (${event.payload.threadId},${stateJson}) ON CONFLICT(thread_id) DO UPDATE SET state_json = excluded.state_json`.pipe(
+          Effect.mapError(toPersistenceSqlError("promptQueue.upsert")),
+        );
+      } else if (event.type === "thread.deleted" || event.type === "thread.created") {
+        yield* sql`DELETE FROM projection_thread_prompt_queues WHERE thread_id = ${event.payload.threadId}`.pipe(
+          Effect.mapError(toPersistenceSqlError("promptQueue.delete")),
+        );
+      }
+    });
+
     const projectors: ReadonlyArray<ProjectorDefinition> = [
+      { name: ORCHESTRATION_PROJECTOR_NAMES.promptQueues, apply: applyPromptQueueProjection },
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.projects,
         apply: applyProjectsProjection,
@@ -2019,6 +2070,13 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             threadId: ThreadId.make(threadId),
           });
           const retainedPaths = collectThreadAttachmentRelativePaths(threadId, messages);
+          const queue = yield* getPromptQueue(sql, ThreadId.make(threadId));
+          for (const prompt of queue?.entries ?? []) {
+            for (const attachment of prompt.attachments) {
+              const relativePath = attachmentRelativePath(attachment);
+              if (relativePath !== null) retainedPaths.add(relativePath);
+            }
+          }
           const activities = yield* projectionThreadActivityRepository.listByThreadId({
             threadId: ThreadId.make(threadId),
           });

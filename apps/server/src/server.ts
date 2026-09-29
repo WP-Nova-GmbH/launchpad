@@ -1,3 +1,4 @@
+import * as ThreadPreparationReactor from "./orchestration/ThreadPreparationReactor.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
 
@@ -53,6 +54,7 @@ import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as ResetCreditCoordinator from "./provider/Layers/resetCreditCoordinator.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
+import * as RepositoryAccess from "./auth/RepositoryAccess.ts";
 import { ProviderAuthServiceLive } from "./provider/Layers/ProviderAuthService.ts";
 import { AntigravityInstallation } from "./provider/AntigravityInstallation.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
@@ -140,6 +142,7 @@ import {
 } from "./cloud/http.ts";
 import { ensureExecutorSourceCurrent } from "./cloud/executorSelfUpdate.ts";
 import { reconcileMachineEnrollment } from "./cloud/machineEnrollment.ts";
+import { synchronizeRepositoryPolicy } from "./cloud/repositoryPolicy.ts";
 import { ensureExecutorProviderToolchain } from "./provider/executorProviderToolchain.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import { serverRelayBrokerTracingLayer } from "./cloud/relayTracing.ts";
@@ -271,6 +274,7 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(StorageCleanup.layer),
+  Layer.provideMerge(ThreadPreparationReactor.layer),
   Layer.provideMerge(ThreadDeletionReactorLive),
   Layer.provideMerge(ThreadSettlementReactor.layer),
   Layer.provideMerge(PullRequestSyncReactor.layer),
@@ -531,6 +535,7 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(ReactorLayerLive, JobRunnerLi
     ),
     Layer.provideMerge(GitLayerLive),
     Layer.provideMerge(VcsLayerLive),
+    Layer.provideMerge(RepositoryAccess.layer),
     Layer.provideMerge(ProviderRuntimeLayerLive),
     Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive, DeviceLayerLive)),
     Layer.provideMerge(PersistenceLayerLive),
@@ -788,6 +793,22 @@ const makeServerLayer = Layer.unwrap(
               Effect.catch((cause) =>
                 Effect.logWarning("Failed to reconcile machine enrollment on startup", { cause }),
               ),
+            );
+            // Keep admission closed until this process has a fresh policy. The
+            // ACK is part of the retry, so a lost response cannot strand removal.
+            yield* synchronizeRepositoryPolicy.pipe(
+              Effect.timeout("30 seconds"),
+              Effect.tapError((cause) =>
+                Effect.logWarning("Repository access sync will retry", { cause }),
+              ),
+              Effect.retry({
+                schedule: Schedule.exponential("1 second").pipe(
+                  Schedule.modifyDelay(({ duration }) =>
+                    Effect.succeed(Duration.min(duration, Duration.seconds(30))),
+                  ),
+                ),
+              }),
+              Effect.forkScoped,
             );
             // Once enrolled, an executor brings its own provider CLIs up; on
             // anything else this returns immediately.

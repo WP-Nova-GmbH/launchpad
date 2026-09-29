@@ -24,8 +24,23 @@ import type {
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
+import type { ProviderAdapterValidationError } from "../Errors.ts";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
+
+export type ProviderAdmissionEvidence = "provider-ack" | "harness-dispatch";
+
+export interface ProviderSendTurnCallbacks {
+  /** Revalidate after preparation, immediately before the native dispatch. A
+   * failure proves this prompt was never handed to the provider. */
+  readonly beforeDispatch?: Effect.Effect<void, ProviderAdapterValidationError>;
+  /** Runs before admitted runtime output is exposed. Harness dispatch does not
+   * prove remote consumption; transport failures still require reconciliation. */
+  readonly onAdmitted: (
+    result: ProviderTurnStartResult,
+    evidence: ProviderAdmissionEvidence,
+  ) => Effect.Effect<void>;
+}
 
 /**
  * How ProviderService runs manual context compaction for an adapter.
@@ -38,6 +53,7 @@ export type ProviderCompaction<TError> =
       readonly start: (
         threadId: ThreadId,
         modelSelection?: ProviderSendTurnInput["modelSelection"],
+        beforeDispatch?: ProviderSendTurnCallbacks["beforeDispatch"],
       ) => Effect.Effect<void, TError>;
     }
   | { readonly type: "slash-command"; readonly command: `/${string}` };
@@ -83,6 +99,7 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly sendTurn: (
     input: ProviderSendTurnInput,
+    callbacks?: ProviderSendTurnCallbacks,
   ) => Effect.Effect<ProviderTurnStartResult, TError>;
 
   /** Omitted when this adapter does not support manual context compaction. */

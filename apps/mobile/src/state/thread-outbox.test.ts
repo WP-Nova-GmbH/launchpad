@@ -77,6 +77,8 @@ vi.mock("expo-file-system", () => {
 
 import {
   decodeQueuedThreadMessage,
+  captureQueuedThreadCreation,
+  canRetryUnknownSharedSubmission,
   encodeQueuedThreadMessage,
   groupQueuedThreadMessages,
   isQueuedThreadCreationSendable,
@@ -1381,6 +1383,45 @@ describe("thread outbox", () => {
     ).toBe("remove");
   });
 
+  it.each([
+    { captured: true, current: true, replay: true },
+    { captured: true, current: false, replay: false },
+    { captured: false, current: true, replay: false },
+    { captured: undefined, current: true, replay: false },
+  ])(
+    "replays an unknown creation only when its captured and current protocol are atomic: $captured / $current",
+    ({ captured, current, replay }) => {
+      const stored: QueuedThreadMessage = {
+        ...queuedMessage({ messageId: "unknown-creation", createdAt: "2026-06-08T10:00:01.000Z" }),
+        transportAttempted: true,
+        submissionProtocol: "shared",
+        ...(captured === undefined ? {} : { sharedPreparation: captured }),
+        creation: {
+          projectId: ProjectId.make("project-1"),
+          workspaceMode: "worktree",
+          branch: "main",
+          worktreePath: null,
+        },
+      };
+      const restored = decodeQueuedThreadMessage(encodeQueuedThreadMessage(stored));
+      expect(canRetryUnknownSharedSubmission(restored, current)).toBe(replay);
+      // An upgrade cannot turn an older or uncaptured send into an atomic bootstrap.
+      expect(restored.commandId).toBe(stored.commandId);
+      expect(restored.sharedPreparation).toBe(captured);
+    },
+  );
+
+  it("keeps ordinary shared prompts replayable without inventing an atomic bootstrap capability", () => {
+    const message = {
+      ...queuedMessage({ messageId: "existing-thread", createdAt: "2026-06-08T10:00:01.000Z" }),
+      submissionProtocol: "shared" as const,
+    };
+    expect(canRetryUnknownSharedSubmission(message, false)).toBe(true);
+    expect(
+      canRetryUnknownSharedSubmission({ ...message, submissionProtocol: "legacy" }, true),
+    ).toBe(false);
+  });
+
   it("round-trips queued creations and gates incomplete ones from sending", () => {
     const base = queuedMessage({
       messageId: "message-1",
@@ -1404,6 +1445,19 @@ describe("thread outbox", () => {
     expect(decodeQueuedThreadMessage(encodeQueuedThreadMessage(creationMessage))).toEqual(
       creationMessage,
     );
+    const makeBranch = vi.fn(() => "t3/saved-branch");
+    const captured = captureQueuedThreadCreation(
+      creationMessage,
+      "/workspace/original",
+      makeBranch,
+    );
+    const restored = decodeQueuedThreadMessage(encodeQueuedThreadMessage(captured));
+    const retried = captureQueuedThreadCreation(restored, "/workspace/moved", makeBranch);
+    expect(retried.creation).toMatchObject({
+      projectCwd: "/workspace/original",
+      worktreeBranchName: "t3/saved-branch",
+    });
+    expect(makeBranch).toHaveBeenCalledTimes(1);
     expect(isQueuedThreadCreationSendable(creationMessage)).toBe(true);
     expect(
       isQueuedThreadCreationSendable({

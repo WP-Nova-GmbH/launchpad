@@ -38,6 +38,7 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
+import { ProviderAdapterValidationError } from "../Errors.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -190,7 +191,10 @@ export interface CodexSessionRuntimeOptions {
 }
 
 export interface CodexSessionRuntimeSendTurnInput {
+  readonly beforeDispatch?: Effect.Effect<void, ProviderAdapterValidationError>;
+  readonly requireIdle?: boolean;
   readonly input?: string;
+  readonly steer?: { readonly expectedTurnId: TurnId; readonly messageId: string };
   readonly attachments?: ReadonlyArray<{
     readonly type: "localImage";
     readonly path: string;
@@ -217,7 +221,9 @@ export interface CodexSessionRuntimeShape {
   readonly sendTurn: (
     input: CodexSessionRuntimeSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, CodexSessionRuntimeError>;
-  readonly compactThread: Effect.Effect<void, CodexSessionRuntimeError>;
+  readonly compactThread: (
+    beforeDispatch?: Effect.Effect<void, ProviderAdapterValidationError>,
+  ) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly interruptTurn: (turnId?: TurnId) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly readThread: Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
   readonly rollbackThread: (
@@ -239,6 +245,7 @@ export interface CodexSessionRuntimeShape {
 }
 
 export type CodexSessionRuntimeError =
+  | ProviderAdapterValidationError
   | CodexErrors.CodexAppServerError
   | CodexSessionRuntimePendingApprovalNotFoundError
   | CodexSessionRuntimePendingUserInputNotFoundError
@@ -1318,6 +1325,7 @@ export const makeCodexSessionRuntime = (
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
     const suppressMemoryConsolidationNotification = makeMemoryConsolidationNotificationFilter();
     const closedRef = yield* Ref.make(false);
+    let interruptEpoch = 0;
     /** The `additionalContext` of the latest `turn/start`, restored after compaction. */
     const lastAdditionalContextRef =
       yield* Ref.make<CodexTurnStartParamsWithCollaborationMode["additionalContext"]>(undefined);
@@ -2543,12 +2551,22 @@ export const makeCodexSessionRuntime = (
     return {
       start,
       getSession: Ref.get(sessionRef),
-      compactThread: Effect.gen(function* () {
-        const providerThreadId = yield* readProviderThreadId;
-        yield* client.request("thread/compact/start", { threadId: providerThreadId });
-      }),
+      compactThread: (beforeDispatch) =>
+        Effect.gen(function* () {
+          const startedAtEpoch = interruptEpoch;
+          const providerThreadId = yield* readProviderThreadId;
+          yield* beforeDispatch ?? Effect.void;
+          if (interruptEpoch !== startedAtEpoch || (yield* Ref.get(closedRef)))
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "compactThread",
+              issue: "Compaction was stopped before dispatch. It remains queued.",
+            });
+          yield* client.request("thread/compact/start", { threadId: providerThreadId });
+        }),
       sendTurn: (input) =>
         Effect.gen(function* () {
+          const startedAtEpoch = interruptEpoch;
           const providerThreadId = yield* readProviderThreadId;
           if (hasConfiguredMcpServer(options.appServerArgs)) {
             yield* client.request("config/mcpServer/reload", undefined).pipe(
@@ -2583,6 +2601,38 @@ export const makeCodexSessionRuntime = (
             ),
           });
           yield* Ref.set(lastAdditionalContextRef, params.additionalContext);
+          yield* input.beforeDispatch ?? Effect.void;
+          if (interruptEpoch !== startedAtEpoch || (yield* Ref.get(closedRef))) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue: "The prompt was stopped before dispatch. It remains queued.",
+            });
+          }
+          const activeTurnId = (yield* Ref.get(sessionRef)).activeTurnId;
+          if (
+            (input.steer && activeTurnId !== input.steer.expectedTurnId) ||
+            (input.requireIdle && activeTurnId !== undefined)
+          ) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue: "The active turn changed during preparation. The prompt remains queued.",
+            });
+          }
+          if (input.steer) {
+            const response = yield* client.request("turn/steer", {
+              threadId: providerThreadId,
+              expectedTurnId: input.steer.expectedTurnId,
+              clientUserMessageId: input.steer.messageId,
+              input: params.input,
+            });
+            return {
+              threadId: options.threadId,
+              turnId: TurnId.make(response.turnId),
+              resumeCursor: { threadId: providerThreadId },
+            } satisfies ProviderTurnStartResult;
+          }
           const rawResponse = yield* client.raw.request("turn/start", params);
           const response = yield* decodeV2TurnStartResponse(rawResponse).pipe(
             Effect.mapError((error) =>
@@ -2613,6 +2663,7 @@ export const makeCodexSessionRuntime = (
         }),
       interruptTurn: (turnId) =>
         Effect.gen(function* () {
+          interruptEpoch += 1;
           const providerThreadId = yield* readProviderThreadId;
           const session = yield* Ref.get(sessionRef);
           // Settle parked approvals FIRST. The transport answers server

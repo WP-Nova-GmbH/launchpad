@@ -9,6 +9,7 @@ import * as EffectAcpErrors from "effect-acp/errors";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
+  type ProviderAdapterValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
 const isAcpProcessExitedError = Schema.is(EffectAcpErrors.AcpProcessExitedError);
@@ -18,8 +19,9 @@ export function mapAcpToAdapterError(
   provider: ProviderDriverKind,
   threadId: ThreadId,
   method: string,
-  error: EffectAcpErrors.AcpError,
+  error: EffectAcpErrors.AcpError | ProviderAdapterValidationError,
 ): ProviderAdapterError {
+  if (error._tag === "ProviderAdapterValidationError") return error;
   if (isAcpProcessExitedError(error)) {
     return new ProviderAdapterProcessError({
       provider,

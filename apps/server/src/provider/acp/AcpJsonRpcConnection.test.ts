@@ -19,6 +19,7 @@ import { describe, expect } from "vite-plus/test";
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
 import * as EffectAcpErrors from "effect-acp/errors";
+import { ProviderAdapterValidationError } from "../Errors.ts";
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");
@@ -32,6 +33,159 @@ const mockRuntimeOptions = {
 } satisfies AcpSessionRuntime.AcpSessionRuntimeOptions;
 
 describe("AcpSessionRuntime", () => {
+  it.effect.each(["decoded", "raw"] as const)(
+    "keeps native prompt/cancel order while %s protocol logging waits",
+    (stage) =>
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "acp-order-"))),
+          (directory) =>
+            Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+        );
+        const requestLogPath = NodePath.join(directory, "requests.jsonl");
+        const logging = yield* Deferred.make<void>();
+        const releaseLogging = yield* Deferred.make<void>();
+        const admitted = yield* Deferred.make<void>();
+        const cancelReceived = yield* Deferred.make<void>();
+        yield* Effect.addFinalizer(() => Deferred.succeed(releaseLogging, undefined));
+        const runtime = yield* AcpSessionRuntime.make({
+          ...mockRuntimeOptions,
+          spawn: {
+            ...mockRuntimeOptions.spawn,
+            env: {
+              T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+              T3_ACP_COMPLETE_FIRST_PROMPT_ON_CANCEL: "1",
+            },
+          },
+          cancelBehavior: "wait-for-prompt",
+          protocolLogging: {
+            logOutgoing: true,
+            logger: (event) => {
+              if (event.direction !== "outgoing" || event.stage !== stage) return Effect.void;
+              const payload: unknown =
+                typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+              if (
+                typeof payload !== "object" ||
+                payload === null ||
+                (!("tag" in payload && payload.tag === "session/prompt") &&
+                  !("method" in payload && payload.method === "session/prompt"))
+              )
+                return Effect.void;
+              return Deferred.succeed(logging, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseLogging)),
+              );
+            },
+          },
+        });
+        yield* runtime.getEvents().pipe(
+          Stream.runForEach((event) => {
+            if (event._tag === "EventStreamBarrier")
+              return Deferred.succeed(event.acknowledge, undefined);
+            if (event._tag === "ThoughtDelta" && event.text === "native-cancel-received")
+              return Deferred.succeed(cancelReceived, undefined);
+            return Effect.void;
+          }),
+          Effect.forkChild,
+        );
+        yield* runtime.start();
+        const sending = yield* runtime
+          .prompt(
+            { prompt: [{ type: "text", text: "already dispatched" }] },
+            { onDispatched: Deferred.succeed(admitted, undefined) },
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(logging);
+        yield* Deferred.await(admitted);
+        yield* runtime.request("_test/environment", {});
+        const beforeCancel = NodeFS.readFileSync(requestLogPath, "utf8");
+        const cancellation = yield* runtime.cancel.pipe(Effect.forkChild);
+        yield* Deferred.await(cancelReceived);
+        const received = NodeFS.readFileSync(requestLogPath, "utf8");
+        yield* Deferred.succeed(releaseLogging, undefined);
+        yield* runtime.request("_test/finish-cancel", {});
+        yield* Fiber.join(sending);
+        yield* Fiber.join(cancellation);
+        expect(beforeCancel).toContain('"method":"session/prompt"');
+        expect(received.indexOf('"method":"session/prompt"')).toBeLessThan(
+          received.indexOf('"method":"session/cancel"'),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("revalidates after prompt logging before admitting or writing a stopped prompt", () =>
+    Effect.gen(function* () {
+      const logging = yield* Deferred.make<void>();
+      const releaseLogging = yield* Deferred.make<void>();
+      const cancelStarted = yield* Deferred.make<void>();
+      yield* Effect.addFinalizer(() => Deferred.succeed(releaseLogging, undefined));
+      const methods: string[] = [];
+      let stopped = false;
+      let admitted = false;
+      const rejection = new ProviderAdapterValidationError({
+        provider: "antigravity",
+        operation: "sendTurn",
+        issue: "Stopped while native request logging was pending.",
+      });
+      const runtime = yield* AcpSessionRuntime.make({
+        ...mockRuntimeOptions,
+        cancelBehavior: "wait-for-prompt",
+        requestLogger: (event) =>
+          event.method === "session/prompt" && event.status === "started"
+            ? Deferred.succeed(logging, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseLogging)),
+              )
+            : Effect.void,
+        protocolLogging: {
+          logOutgoing: true,
+          logger: (event) =>
+            Effect.sync(() => {
+              if (
+                event.direction === "outgoing" &&
+                event.stage === "decoded" &&
+                typeof event.payload === "object" &&
+                event.payload !== null &&
+                "tag" in event.payload &&
+                typeof event.payload.tag === "string"
+              )
+                methods.push(event.payload.tag);
+            }),
+        },
+      });
+      yield* runtime.start();
+      const sending = yield* runtime
+        .prompt(
+          { prompt: [{ type: "text", text: "must remain queued" }] },
+          {
+            beforeDispatch: Effect.suspend(() => (stopped ? Effect.fail(rejection) : Effect.void)),
+            onDispatched: Effect.sync(() => {
+              admitted = true;
+            }),
+          },
+        )
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(logging);
+      stopped = true;
+      const cancellation = yield* Deferred.succeed(cancelStarted, undefined).pipe(
+        Effect.andThen(runtime.cancel),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(cancelStarted);
+      const admittedBeforeLoggingFinished = admitted;
+      yield* Deferred.succeed(releaseLogging, undefined);
+      const result = yield* Fiber.join(sending);
+      yield* Fiber.join(cancellation);
+      // A real request/response drains the native transport before checking
+      // that the rejected prompt never crossed it.
+      yield* runtime.request("_test/environment", {});
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") expect(result.failure).toBe(rejection);
+      expect(admittedBeforeLoggingFinished).toBe(false);
+      expect(admitted).toBe(false);
+      expect(methods).toContain("session/cancel");
+      expect(methods).not.toContain("session/prompt");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   for (const setupMethod of ["session/new", "session/resume"] as const) {
     it.effect(`buffers root metadata while ${setupMethod} startup is still pending`, () =>
       Effect.gen(function* () {

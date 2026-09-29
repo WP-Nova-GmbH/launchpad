@@ -1,4 +1,6 @@
 import { useAuth } from "@clerk/react";
+import { RepositoryAccessRemovalStatus } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import type {
   RelayGithubConnectionResponse,
@@ -30,6 +32,8 @@ import { useCallback, useEffect, useState } from "react";
 import { runtime } from "../lib/runtime";
 import { decodedRelayClientError } from "./linkEnvironment";
 import { resolveRelayClerkTokenOptions } from "./publicConfig";
+
+const isAccessRemovalStatus = Schema.is(RepositoryAccessRemovalStatus);
 
 type TenancyClient = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
 
@@ -77,6 +81,7 @@ export interface OrganizationAdminState {
   readonly loading: boolean;
   readonly error: string | null;
   readonly busy: boolean;
+  readonly accessRemoval: RepositoryAccessRemovalStatus | null;
   readonly issuedInvitations: ReadonlyArray<IssuedInvitation>;
   readonly issuedMachineEnrollments: ReadonlyArray<IssuedMachineEnrollment>;
   readonly refresh: () => Promise<void>;
@@ -161,6 +166,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
   const [snapshot, setSnapshot] = useState<OrganizationAdminSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [accessRemoval, setAccessRemoval] = useState<RepositoryAccessRemovalStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [issuedInvitations, setIssuedInvitations] = useState<ReadonlyArray<IssuedInvitation>>([]);
   const [issuedMachineEnrollments, setIssuedMachineEnrollments] = useState<
@@ -192,6 +198,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
   const load = useCallback(async () => {
     if (!isSignedIn) {
       setSnapshot(null);
+      setAccessRemoval(null);
       return;
     }
     setLoading(true);
@@ -200,6 +207,15 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       const membership = await call("Could not read your organization", (client, clerkToken) =>
         client.getOrganization({ clerkToken }),
       );
+      if (membership.role === "admin") {
+        const removal = await call("Could not read access removal status", (client, clerkToken) =>
+          client.getAccessRemoval({ clerkToken }),
+        ).catch(() => null);
+        if (removal)
+          setAccessRemoval((current) =>
+            current && current.revision > removal.revision ? current : removal,
+          );
+      }
       const [members, repositories] = await Promise.all([
         call("Could not list organization members", (client, clerkToken) =>
           client.listMembers({ clerkToken }),
@@ -277,12 +293,43 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    if (!isSignedIn || accessRemoval?.status !== "pending") return;
+    let disposed = false;
+    const timer = setInterval(() => {
+      void call("Could not check access removal", (client, clerkToken) =>
+        client.getAccessRemoval({ clerkToken, revision: accessRemoval.revision }),
+      )
+        .then((status) => {
+          if (!disposed)
+            setAccessRemoval((current) =>
+              current && current.revision > status.revision ? current : status,
+            );
+        })
+        .catch(() => {
+          /* A connection failure never means the removal completed. */
+        });
+    }, 5_000);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [accessRemoval?.revision, accessRemoval?.status, call, isSignedIn]);
+
   const mutate = useCallback(
     async (description: string, run: () => Promise<unknown>): Promise<boolean> => {
       setBusy(true);
       setError(null);
       try {
-        await run();
+        const result = await run();
+        if (
+          typeof result === "object" &&
+          result !== null &&
+          "accessRemoval" in result &&
+          isAccessRemovalStatus(result.accessRemoval)
+        ) {
+          setAccessRemoval(result.accessRemoval);
+        }
         await load();
         return true;
       } catch (cause) {
@@ -301,6 +348,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     loading,
     error,
     busy,
+    accessRemoval,
     issuedInvitations,
     issuedMachineEnrollments,
     refresh: load,

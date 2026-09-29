@@ -1,3 +1,9 @@
+import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
+import { AuthSessionRepository, type AuthSessionRecord } from "../persistence/AuthSessions.ts";
+import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
+import { AuthSessionId, EnvironmentId, EnvironmentAuthorizationError } from "@t3tools/contracts";
+import * as Option from "effect/Option";
+import * as DateTime from "effect/DateTime";
 // @effect-diagnostics nodeBuiltinImport:off - tests inject swaps at the native open boundary.
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeHttpPlatform from "@effect/platform-node/NodeHttpPlatform";
@@ -35,6 +41,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   return { ...actual, open: vi.fn(actual.open), realpath: vi.fn(actual.realpath) };
 });
 
+const encodeAssetAccessError = Schema.encodeEffect(Schema.fromJsonString(AssetAccessError));
+
 const configLayer = ServerConfig.ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-asset-access-test-",
 });
@@ -51,6 +59,69 @@ const testLayer = Layer.mergeAll(
 ).pipe(Layer.provideMerge(NodeServices.layer));
 
 describe("AssetAccess", () => {
+  it.effect("binds protected media to the live session and grant and rejects legacy URLs", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "protected-media-" });
+      const path = `${root}/report.html`;
+      yield* fs.writeFileString(path, "report");
+      const resource = { _tag: "media-file" as const, threadId: ThreadId.make("thread-1"), path };
+      const legacy = yield* issueAssetUrl({ resource });
+      const decode = (url: string) => {
+        const suffix = url.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+        const separator = suffix.indexOf("/");
+        return [suffix.slice(0, separator), suffix.slice(separator + 1)] as const;
+      };
+      const base = yield* RepositoryAccess;
+      let allowed = true,
+        revoked = false;
+      const sessionId = AuthSessionId.make("session-1"),
+        user = { userId: "person", displayName: null, imageUrl: null };
+      yield* Effect.gen(function* () {
+        expect(yield* resolveAsset(...decode(legacy.relativeUrl))).toBeNull();
+        const bound = yield* issueAssetUrl({ resource, actor: { sessionId, user } });
+        expect(yield* resolveAsset(...decode(bound.relativeUrl))).not.toBeNull();
+        allowed = false;
+        expect(yield* resolveAsset(...decode(bound.relativeUrl))).toBeNull();
+        allowed = true;
+        revoked = true;
+        expect(yield* resolveAsset(...decode(bound.relativeUrl))).toBeNull();
+      }).pipe(
+        Effect.provideService(RepositoryAccess, {
+          ...base,
+          status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+          requireThread: () =>
+            allowed
+              ? Effect.void
+              : Effect.fail(
+                  new EnvironmentAuthorizationError({
+                    message: "removed",
+                    requiredScope: "orchestration:read",
+                  }),
+                ),
+        }),
+        Effect.provide(
+          Layer.merge(
+            Layer.mock(ServerEnvironment)({
+              getEnvironmentId: Effect.succeed(EnvironmentId.make("env-1")),
+            }),
+            Layer.mock(AuthSessionRepository)({
+              getById: () =>
+                Effect.sync(() =>
+                  Option.some({
+                    sessionId,
+                    user,
+                    expiresAt: DateTime.makeUnsafe(9999999999999),
+                    revokedAt: revoked ? DateTime.makeUnsafe(0) : null,
+                  } as AuthSessionRecord),
+                ),
+            }),
+          ),
+        ),
+      );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("loads private media immediately after login and reuses the found credential", () => {
     let lookups = 0;
     const authorizations: Array<string | undefined> = [];
@@ -1163,7 +1234,8 @@ describe("AssetAccess", () => {
       ]) {
         const error = yield* issue(url).pipe(Effect.flip);
         expect(error._tag).toBe("AssetGitHubMediaUrlValidationError");
-        const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(AssetAccessError))(error);
+        if (error._tag !== "AssetGitHubMediaUrlValidationError") return yield* Effect.die(error);
+        const encoded = yield* encodeAssetAccessError(error);
         expect(encoded).not.toContain(url);
       }
     }).pipe(Effect.provide(testLayer)),

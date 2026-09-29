@@ -406,6 +406,13 @@ import {
 } from "./chat/ContextWindowMeter.logic";
 import { deriveLatestContextWindowSnapshot, formatContextWindowTokens } from "../lib/contextWindow";
 import { ThreadPresencePill } from "./chat/ThreadPresencePill";
+import { SharedPromptQueue } from "./chat/SharedPromptQueue";
+import { SharedPromptSubmissions } from "./chat/SharedPromptSubmissions";
+import {
+  hasSharedPromptSubmission,
+  relocateSharedPromptSubmissions,
+  useSharedPromptSubmissions,
+} from "../sharedPromptSubmissionStore";
 import {
   DRAFT_HERO_TRANSITION_ANIMATION_ID,
   DRAFT_HERO_TRANSITION_EASING,
@@ -1514,6 +1521,8 @@ export default function ChatView(props: ChatViewProps) {
     reportFailure: false,
   });
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const pauseSharedQueue = useAtomCommand(threadEnvironment.pauseQueue, { reportFailure: false });
+  const steerSharedPrompt = useAtomCommand(threadEnvironment.steerPrompt, { reportFailure: false });
   const createAttachmentAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
     reportFailure: false,
     refresh: true,
@@ -2591,6 +2600,11 @@ export default function ChatView(props: ChatViewProps) {
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const supportsSharedPromptQueue =
+    serverConfig?.environment.capabilities.sharedPromptQueue === true;
+  const supportsSharedPreparation =
+    serverConfig?.environment.capabilities.sharedPreparation === true;
+  const sharedPreparation = activeThread?.promptQueue?.preparation;
   const selectedProviderByThreadId = composerActiveProvider ?? null;
   const threadProvider =
     activeThread?.modelSelection.instanceId ??
@@ -3477,6 +3491,7 @@ export default function ChatView(props: ChatViewProps) {
       }
     };
   }, [attachmentPreviewHandoffByMessageId, clearAttachmentPreviewHandoff, displayServerMessages]);
+  const sharedTransportSubmissions = useSharedPromptSubmissions((state) => state.entries);
   const timelineMessages = useMemo(() => {
     const messages = displayServerMessages;
     const serverMessagesWithPreviewHandoff =
@@ -3506,7 +3521,20 @@ export default function ChatView(props: ChatViewProps) {
             });
           });
 
-    const localMessages = optimisticUserMessages;
+    const acceptedQueueIds = new Set(
+      activeThread?.promptQueue?.entries.map((entry) => entry.messageId),
+    );
+    for (const submission of sharedTransportSubmissions) {
+      if (
+        submission.environmentId === activeThread?.environmentId &&
+        submission.command.type === "thread.turn.start" &&
+        submission.command.threadId === activeThread.id
+      )
+        acceptedQueueIds.add(submission.command.message.messageId);
+    }
+    const localMessages = optimisticUserMessages.filter(
+      (message) => !acceptedQueueIds.has(message.id),
+    );
     if (localMessages.length === 0) {
       return serverMessagesWithPreviewHandoff;
     }
@@ -3520,6 +3548,10 @@ export default function ChatView(props: ChatViewProps) {
     attachmentPreviewHandoffByMessageId,
     displayServerMessages,
     optimisticUserMessages,
+    activeThread?.promptQueue,
+    activeThread?.environmentId,
+    activeThread?.id,
+    sharedTransportSubmissions,
     projectHandoffMessagePreviews,
   ]);
   const timelineProjectionRef = useRef<{
@@ -3562,6 +3594,8 @@ export default function ChatView(props: ChatViewProps) {
   // held only while a snapshot can still change.
   const routeThreadPreparesWorktree =
     (isPreparingWorktree && activeThread?.id === routeThreadRef.threadId) ||
+    sharedPreparation?.state === "pending" ||
+    sharedPreparation?.state === "running" ||
     heldWorktreeSetup?.phase === "running";
   const worktreeSetupQuery = useEnvironmentQuery(
     routeThreadPreparesWorktree
@@ -3577,7 +3611,7 @@ export default function ChatView(props: ChatViewProps) {
   }, [latestWorktreeSetup]);
   useEffect(() => {
     setHeldWorktreeSetup(null);
-  }, [routeThreadKey]);
+  }, [routeThreadKey, sharedPreparation?.attemptId]);
   const liveWorktreeSetup =
     heldWorktreeSetup?.threadId === routeThreadRef.threadId ? heldWorktreeSetup : null;
   const worktreeSetup = resolveVisibleWorktreeSetup({
@@ -3587,13 +3621,15 @@ export default function ChatView(props: ChatViewProps) {
     // Counts the optimistic send too, so the row retires the moment the
     // follow-up is on screen rather than when the server echoes it back.
     followUpSent: timelineMessages.filter((message) => message.role === "user").length > 1,
+    ...(sharedPreparation ? { preparation: sharedPreparation } : {}),
   });
   // Sends wait for the agent handoff, not for the setup script: an async
   // script keeps the snapshot running while the agent already works, and a
   // follow-up must not be held behind a slow install. Before the first
   // snapshot arrives the starting session stands in for it.
-  const worktreeSetupBlocksSend =
-    worktreeSetup !== null
+  const worktreeSetupBlocksSend = supportsSharedPreparation
+    ? false
+    : worktreeSetup !== null
       ? worktreeSetup.phase === "running" && !worktreeSetupAgentStarted(worktreeSetup)
       : isServerThread &&
         activeThreadShell?.session?.status === "starting" &&
@@ -3978,6 +4014,15 @@ export default function ChatView(props: ChatViewProps) {
   );
   const onInterrupt = useCallback(async () => {
     const { activeThread, phase, setThreadError } = interruptContextRef.current;
+    if (activeThread && supportsSharedPromptQueue) {
+      const result = await pauseSharedQueue({
+        environmentId: activeThread.environmentId,
+        input: { threadId: activeThread.id },
+      });
+      if (result._tag === "Failure")
+        setThreadError(activeThread.id, "Could not pause the shared queue.");
+      return;
+    }
     const input = buildRunningThreadTurnInterruptInput(activeThread, phase);
     if (!input || !activeThread) return;
     restoreQueuedMessagesRef.current(
@@ -3996,9 +4041,13 @@ export default function ChatView(props: ChatViewProps) {
         error instanceof Error ? error.message : "Failed to interrupt the current turn.",
       );
     }
-  }, [interruptThreadTurn]);
+  }, [interruptThreadTurn, pauseSharedQueue, supportsSharedPromptQueue]);
   const canInterruptRunningThread =
-    buildRunningThreadTurnInterruptInput(activeThread, phase) !== null;
+    buildRunningThreadTurnInterruptInput(activeThread, phase) !== null ||
+    (supportsSharedPromptQueue &&
+      ((activeThread?.promptQueue?.entries.length ?? 0) > 0 ||
+        sharedPreparation?.state === "pending" ||
+        sharedPreparation?.state === "running"));
 
   const focusComposer = useCallback(() => {
     composerRef.current?.focusAtEnd();
@@ -5800,10 +5849,10 @@ export default function ChatView(props: ChatViewProps) {
 
   useEffect(() => {
     if (!activeThread?.id) return;
-    if (activeThread.messages.length === 0) {
-      return;
-    }
-    const serverIds = new Set(activeThread.messages.map((message) => message.id));
+    const serverIds = new Set([
+      ...activeThread.messages.map((message) => message.id),
+      ...(activeThread.promptQueue?.entries.map((entry) => entry.messageId) ?? []),
+    ]);
     const removedMessages = optimisticUserMessages.filter((message) => serverIds.has(message.id));
     if (removedMessages.length === 0) {
       return;
@@ -5824,7 +5873,13 @@ export default function ChatView(props: ChatViewProps) {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [activeThread?.id, activeThread?.messages, handoffAttachmentPreviews, optimisticUserMessages]);
+  }, [
+    activeThread?.id,
+    activeThread?.messages,
+    activeThread?.promptQueue,
+    handoffAttachmentPreviews,
+    optimisticUserMessages,
+  ]);
 
   useEffect(() => {
     setOptimisticUserMessages((existing) => {
@@ -6921,6 +6976,24 @@ export default function ChatView(props: ChatViewProps) {
       }
 
       if (command === "thread.steerQueuedMessage") {
+        if (supportsSharedPromptQueue) {
+          const entry = activeThread?.promptQueue?.entries.find((item) => item.state === "pending");
+          const turnId = activeThread?.session?.activeTurnId;
+          if (!entry || !turnId || !activeThreadRef) return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (!event.repeat)
+            void steerSharedPrompt({
+              environmentId: activeThreadRef.environmentId,
+              input: {
+                threadId: activeThreadRef.threadId,
+                messageId: entry.messageId,
+                expectedRevision: entry.revision,
+                expectedTurnId: turnId,
+              },
+            });
+          return;
+        }
         const message = activeThreadKey
           ? useQueuedMessageStore.getState().queuesByThreadKey[activeThreadKey]?.[0]
           : undefined;
@@ -6960,6 +7033,10 @@ export default function ChatView(props: ChatViewProps) {
     activeThreadPinned,
     activeThreadSettled,
     canInterruptRunningThread,
+    activeThread?.promptQueue,
+    activeThread?.session?.activeTurnId,
+    supportsSharedPromptQueue,
+    steerSharedPrompt,
     activeThreadKey,
     terminalUiState.terminalOpen,
     terminalUiState.activeTerminalId,
@@ -7234,6 +7311,7 @@ export default function ChatView(props: ChatViewProps) {
           );
         }
       } else {
+        if (supportsSharedPromptQueue) resetLocalDispatch();
         clearUsageLimitsFor(routeThreadKey);
       }
     } finally {
@@ -7676,6 +7754,7 @@ export default function ChatView(props: ChatViewProps) {
     if (
       !queuedMessage &&
       !directAnnotation &&
+      !supportsSharedPromptQueue &&
       phase === "running" &&
       activeThreadKey &&
       (settings.followUpBehavior === "queue") !== (submissionIntent === "alternate")
@@ -7984,6 +8063,7 @@ export default function ChatView(props: ChatViewProps) {
       let releasedComposer = false;
       let canRestoreDraft = () => false;
       let startedCount = 0;
+      let retainedFailure = false;
       try {
         const attachments = await turnAttachmentsPromise;
         const fileBlockReason = readLiveAttachmentCapabilities().fileBlockReason;
@@ -8025,6 +8105,8 @@ export default function ChatView(props: ChatViewProps) {
             const uncertainThreadId = uncertainMultipleSubmissionsRef.current.get(retryKey);
             const targetThreadId = uncertainThreadId ?? newThreadId();
             let requestMayHaveStarted = false;
+            let submissionWasRetained = false;
+            const targetMessageId = newMessageId();
             try {
               if (uncertainThreadId) {
                 throw new Error(
@@ -8035,12 +8117,12 @@ export default function ChatView(props: ChatViewProps) {
                 appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment
                   .capabilities.inlineMessageContext === true;
               requestMayHaveStarted = true;
-              const result = await startThreadTurn({
+              const startPromise = startThreadTurn({
                 environmentId,
                 input: {
                   threadId: targetThreadId,
                   message: {
-                    messageId: newMessageId(),
+                    messageId: targetMessageId,
                     role: "user",
                     text:
                       context && !supportsInlineMessageContext
@@ -8079,6 +8161,12 @@ export default function ChatView(props: ChatViewProps) {
                   createdAt: messageCreatedAt,
                 },
               });
+              submissionWasRetained = hasSharedPromptSubmission(
+                environmentId,
+                targetThreadId,
+                targetMessageId,
+              );
+              const result = await startPromise;
               if (result._tag === "Failure") {
                 const error = squashAtomCommandFailure(result);
                 if (wasBootstrapThreadDeleted(error) || wasBootstrapThreadNotCreated(error)) {
@@ -8091,7 +8179,8 @@ export default function ChatView(props: ChatViewProps) {
               if (requestMayHaveStarted && !uncertainMultipleSubmissionsRef.current.has(retryKey)) {
                 uncertainMultipleSubmissionsRef.current.set(retryKey, targetThreadId);
               }
-              failedSelections.push(target.selection);
+              if (submissionWasRetained) retainedFailure = true;
+              else failedSelections.push(target.selection);
               const retainedThreadId = uncertainMultipleSubmissionsRef.current.get(retryKey);
               const failureToastId = toastManager.add(
                 stackedThreadToast({
@@ -8157,7 +8246,7 @@ export default function ChatView(props: ChatViewProps) {
             }),
           );
         }
-        if (failedSelections.length === 0 && turnUsesAttachmentUploads) {
+        if (failedSelections.length === 0 && !retainedFailure && turnUsesAttachmentUploads) {
           releaseDraftAttachments(composerAttachmentsSnapshot);
         }
       } catch (error) {
@@ -8358,7 +8447,7 @@ export default function ChatView(props: ChatViewProps) {
       }
     }
 
-    if (failure === null && isServerThread) {
+    if (failure === null && isServerThread && !supportsSharedPromptQueue) {
       const settingsResult = await persistThreadSettingsForNextTurn({
         threadId: threadIdForSend,
         createdAt: messageCreatedAt,
@@ -8388,6 +8477,7 @@ export default function ChatView(props: ChatViewProps) {
 
     let turnStartSucceeded = false;
     let backgroundDraftOpened = false;
+    let submissionWasRetained = false;
     if (failure === null && turnAttachmentsResult._tag === "Success") {
       const bootstrap =
         isLocalDraftThread || baseBranchForWorktree
@@ -8470,8 +8560,15 @@ export default function ChatView(props: ChatViewProps) {
           createdAt: messageCreatedAt,
         },
       });
+      // startTurn journals synchronously. Another tab can acknowledge and remove
+      // that entry while this call is waiting, without returning ownership here.
+      submissionWasRetained = hasSharedPromptSubmission(
+        environmentId,
+        threadIdForSend,
+        messageIdForSend,
+      );
       if (backgroundThreadRef) {
-        markPromotedDraftThreadByRef(backgroundThreadRef);
+        if (!supportsSharedPreparation) markPromotedDraftThreadByRef(backgroundThreadRef);
         try {
           backgroundDraftOpened = Boolean(
             await handleNewThread(
@@ -8499,6 +8596,9 @@ export default function ChatView(props: ChatViewProps) {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
+        if (supportsSharedPreparation && isLocalDraftThread)
+          markPromotedDraftThreadByRef(scopeThreadRef(environmentId, threadIdForSend));
+        if (supportsSharedPromptQueue) resetLocalDispatch();
         // The turn is under way and will spend quota, so that thread's limits
         // snapshot is stale. Uploads may have outlasted a navigation, so only
         // the sending thread's panel clears.
@@ -8536,17 +8636,31 @@ export default function ChatView(props: ChatViewProps) {
     }
 
     if (failure !== null) {
+      let recoveryThreadId = threadIdForSend;
+      if (
+        !supportsSharedPreparation &&
+        wasBootstrapThreadDeleted(squashAtomCommandFailure(failure))
+      ) {
+        const replacement = newThreadId();
+        try {
+          relocateSharedPromptSubmissions(environmentId, threadIdForSend, replacement);
+          recoveryThreadId = replacement;
+        } catch {
+          // Keep the reachable original route if the recovery journal cannot be persisted.
+        }
+      }
       if (resolvedSubmissionIntent === "background" && draftId && draftThread) {
-        restoreFailedBackgroundDraftThread(
-          draftId,
-          draftThread,
-          wasBootstrapThreadDeleted(squashAtomCommandFailure(failure))
-            ? newThreadId()
-            : threadIdForSend,
-        );
+        restoreFailedBackgroundDraftThread(draftId, draftThread, recoveryThreadId);
         clearBackgroundDraftSubmissionByRef(scopeThreadRef(environmentId, threadIdForSend));
       }
-      if (queuedMessage) {
+      if (
+        submissionWasRetained ||
+        hasSharedPromptSubmission(environmentId, threadIdForSend, messageIdForSend)
+      ) {
+        setOptimisticUserMessages((existing) =>
+          existing.filter((message) => message.id !== messageIdForSend),
+        );
+      } else if (queuedMessage) {
         setOptimisticUserMessages((existing) => {
           const removed = existing.filter((message) => message.id === messageIdForSend);
           for (const message of removed) {
@@ -8608,7 +8722,7 @@ export default function ChatView(props: ChatViewProps) {
           resolvedSubmissionIntent !== "background" &&
           isLocalDraftThread &&
           draftId &&
-          wasBootstrapThreadDeleted(error)
+          recoveryThreadId !== threadIdForSend
         ) {
           const failedDraftSession = getDraftSession(draftId);
           if (failedDraftSession?.threadId === threadIdForSend) {
@@ -8617,7 +8731,7 @@ export default function ChatView(props: ChatViewProps) {
               scopeProjectRef(failedDraftSession.environmentId, failedDraftSession.projectId),
               draftId,
               {
-                threadId: newThreadId(),
+                threadId: recoveryThreadId,
                 createdAt: new Date().toISOString(),
               },
             );
@@ -8681,6 +8795,7 @@ export default function ChatView(props: ChatViewProps) {
     needsLoadBalancing ||
     activeProviderStatus === null;
   useEffect(() => {
+    if (supportsSharedPromptQueue) return;
     if (!nextQueuedMessage || isSendBusy || queueBlockedByPendingRequest || queueSendGate) return;
     if (sendInFlightRef.current) return;
     if (!isQueuedMessageDue({ message: nextQueuedMessage, phase, latestToolActivityId })) return;
@@ -8692,6 +8807,7 @@ export default function ChatView(props: ChatViewProps) {
     phase,
     queueBlockedByPendingRequest,
     queueSendGate,
+    supportsSharedPromptQueue,
   ]);
 
   // The row handlers are read from refs at call-time so their identity stays
@@ -8988,8 +9104,8 @@ export default function ChatView(props: ChatViewProps) {
       text: string;
       context?: ReturnType<typeof buildMessageContext>;
       interactionMode: "default" | "plan";
-      // Whether the message actually went out. A `false` return tells the caller to put the
-      // composer back, because it cleared it before awaiting this.
+      // A false return leaves ownership with the composer. A retained shared
+      // submission owns its payload even when its acceptance is still unknown.
     }): Promise<boolean> => {
       if (
         !activeThread ||
@@ -9062,6 +9178,7 @@ export default function ChatView(props: ChatViewProps) {
       let failure: AtomCommandResult<unknown, unknown> | null =
         settingsResult._tag === "Failure" ? settingsResult : null;
 
+      let submissionWasRetained = false;
       if (failure === null) {
         // Keep the mode toggle and plan-follow-up banner in sync immediately
         // while the same-thread implementation turn is starting.
@@ -9070,7 +9187,7 @@ export default function ChatView(props: ChatViewProps) {
           nextInteractionMode,
         );
 
-        const startResult = await startThreadTurn({
+        const startPromise = startThreadTurn({
           environmentId,
           input: {
             threadId: threadIdForSend,
@@ -9103,10 +9220,17 @@ export default function ChatView(props: ChatViewProps) {
             createdAt: messageCreatedAt,
           },
         });
+        submissionWasRetained = hasSharedPromptSubmission(
+          environmentId,
+          threadIdForSend,
+          messageIdForSend,
+        );
+        const startResult = await startPromise;
         failure = startResult._tag === "Failure" ? startResult : null;
       }
 
       if (failure === null) {
+        if (supportsSharedPromptQueue) resetLocalDispatch();
         clearUsageLimitsFor(routeThreadKey);
         acknowledgeActiveThreadWoke();
         sendInFlightRef.current = false;
@@ -9125,7 +9249,7 @@ export default function ChatView(props: ChatViewProps) {
       }
       sendInFlightRef.current = false;
       resetLocalDispatch();
-      return false;
+      return submissionWasRetained;
     },
     [
       activeThread,
@@ -9143,6 +9267,7 @@ export default function ChatView(props: ChatViewProps) {
       setComposerDraftInteractionMode,
       setThreadError,
       startThreadTurn,
+      supportsSharedPromptQueue,
       environmentId,
       composerRef,
       clearUsageLimitsFor,
@@ -9217,13 +9342,15 @@ export default function ChatView(props: ChatViewProps) {
     let failure: AtomCommandResult<unknown, unknown> | null =
       createResult._tag === "Failure" ? createResult : null;
 
+    let submissionWasRetained = false;
     if (failure === null) {
-      const startResult = await startThreadTurn({
+      const messageId = newMessageId();
+      const startPromise = startThreadTurn({
         environmentId,
         input: {
           threadId: nextThreadId,
           message: {
-            messageId: newMessageId(),
+            messageId,
             role: "user",
             text: outgoingImplementationPrompt,
             attachments: [],
@@ -9239,6 +9366,8 @@ export default function ChatView(props: ChatViewProps) {
           createdAt,
         },
       });
+      submissionWasRetained = hasSharedPromptSubmission(environmentId, nextThreadId, messageId);
+      const startResult = await startPromise;
       failure = startResult._tag === "Failure" ? startResult : null;
     }
 
@@ -9263,13 +9392,17 @@ export default function ChatView(props: ChatViewProps) {
     }
 
     if (failure !== null) {
-      const cleanupResult = await deleteThread({
-        environmentId,
-        input: {
-          threadId: nextThreadId,
-        },
-      });
-      if (cleanupResult._tag === "Failure" && !isAtomCommandInterrupted(cleanupResult)) {
+      // A journaled prompt may already belong to the team. Failed navigation
+      // or a lost acknowledgement must not delete its accepted work.
+      const cleanupResult = submissionWasRetained
+        ? null
+        : await deleteThread({
+            environmentId,
+            input: {
+              threadId: nextThreadId,
+            },
+          });
+      if (cleanupResult?._tag === "Failure" && !isAtomCommandInterrupted(cleanupResult)) {
         console.warn(
           "Failed to clean up implementation thread after start failure.",
           squashAtomCommandFailure(cleanupResult),
@@ -9444,7 +9577,12 @@ export default function ChatView(props: ChatViewProps) {
   // setup (the bootstrap created it), so this keys off the route, not
   // `isLocalDraftThread`.
   const onWorktreeSetupWorkLocally = useCallback(() => {
-    if (!worktreeSetup || worktreeSetup.phase !== "running" || !draftId) {
+    if (
+      supportsSharedPreparation ||
+      !worktreeSetup ||
+      worktreeSetup.phase !== "running" ||
+      !draftId
+    ) {
       return;
     }
     const target = {
@@ -9456,7 +9594,13 @@ export default function ChatView(props: ChatViewProps) {
       if (result._tag !== "Success" || !result.value.cancelled) return;
       setWorkLocallyResendDraftId(draftId);
     })();
-  }, [cancelWorktreeSetup, draftId, routeThreadRef.environmentId, worktreeSetup]);
+  }, [
+    cancelWorktreeSetup,
+    draftId,
+    routeThreadRef.environmentId,
+    supportsSharedPreparation,
+    worktreeSetup,
+  ]);
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
   // Resend once the cancelled dispatch has settled and the composer is free.
@@ -9465,6 +9609,7 @@ export default function ChatView(props: ChatViewProps) {
   // feedback upload in between. What remains inside `onSend` are the checks
   // that need the user to change something, and those should not auto retry.
   const workLocallyResendReady =
+    !supportsSharedPreparation &&
     workLocallyResendDraftId !== null &&
     workLocallyResendDraftId === draftId &&
     isLocalDraftThread &&
@@ -9945,7 +10090,7 @@ export default function ChatView(props: ChatViewProps) {
                 activeTurnStartedAt={paintOnlyDisplayedTimeline ? null : activeWorkStartedAt}
                 worktreeSetup={paintOnlyDisplayedTimeline ? null : worktreeSetup}
                 onCancelWorktreeSetup={onCancelWorktreeSetup}
-                {...(draftId ? { onWorktreeSetupWorkLocally } : {})}
+                {...(draftId && !supportsSharedPreparation ? { onWorktreeSetupWorkLocally } : {})}
                 {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
                 listRef={legendListRef}
                 timelineEntries={displayedTimeline.entries}
@@ -10078,6 +10223,29 @@ export default function ChatView(props: ChatViewProps) {
                   ) : null}
                   {routeKind === "server" ? (
                     <ThreadPresencePill threadRef={activeThreadRef} />
+                  ) : null}
+                  {activeThreadRef ? (
+                    <SharedPromptSubmissions
+                      threadRef={activeThreadRef}
+                      {...(activeProject ? { projectId: activeProject.id } : {})}
+                      unavailable={activeEnvironmentUnavailable}
+                    />
+                  ) : null}
+                  {supportsSharedPromptQueue && activeThreadRef && activeThread?.promptQueue ? (
+                    <SharedPromptQueue
+                      key={activeThreadKey}
+                      threadRef={activeThreadRef}
+                      queue={activeThread.promptQueue}
+                      supportsPreparation={supportsSharedPreparation}
+                      canWorkLocally={
+                        activeThread.latestTurn === null &&
+                        activeThread.messages.every((message) => message.role !== "user")
+                      }
+                      activeTurnId={
+                        phase === "running" ? (activeThread.session?.activeTurnId ?? null) : null
+                      }
+                      unavailable={activeEnvironmentUnavailable || threadDetailLoading}
+                    />
                   ) : null}
                   <div
                     className="relative"

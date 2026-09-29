@@ -21,6 +21,7 @@ import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import type { ProviderAdapterValidationError } from "../Errors.ts";
 
 import { appendAcpStderrTail, sanitizeAcpStderrExcerpt } from "./AcpStderr.ts";
 import {
@@ -230,6 +231,8 @@ export class AcpSessionRuntime extends Context.Service<
     readonly getEvents: () => Stream.Stream<AcpSessionRuntimeEvent, never>;
     /** Waits for queued events to be processed, or for the runtime scope to close. */
     readonly drainEvents: Effect.Effect<void>;
+    /** True only while the registered prompt RPC is still running. */
+    readonly hasActivePrompt: Effect.Effect<boolean>;
     /** Latest mode state observed from session setup and `session/update` notifications. */
     readonly getModeState: Effect.Effect<AcpSessionModeState | undefined>;
     /** Latest configuration options observed from session setup and configuration writes. */
@@ -242,8 +245,16 @@ export class AcpSessionRuntime extends Context.Service<
      */
     readonly prompt: (
       payload: Omit<EffectAcpSchema.PromptRequest, "sessionId">,
-      options?: { readonly dispatched?: Deferred.Deferred<void> },
-    ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
+      options?: {
+        readonly beforeDispatch?: Effect.Effect<void, ProviderAdapterValidationError>;
+        readonly dispatched?: Deferred.Deferred<void>;
+        /** Persist the local harness handoff before exposing prompt notifications. */
+        readonly onDispatched?: Effect.Effect<void>;
+      },
+    ) => Effect.Effect<
+      EffectAcpSchema.PromptResponse,
+      EffectAcpErrors.AcpError | ProviderAdapterValidationError
+    >;
     /**
      * Sends a real ACP `session/cancel` notification for the active session.
      * @see https://agentclientprotocol.com/protocol/schema#session/cancel
@@ -426,38 +437,40 @@ export const make = (
     const logRequest = (event: AcpSessionRequestLogEvent) =>
       options.requestLogger ? options.requestLogger(event) : Effect.void;
 
+    const completeLoggedRequest = <A>(
+      method: string,
+      payload: unknown,
+      effect: Effect.Effect<A, EffectAcpErrors.AcpError>,
+    ): Effect.Effect<A, EffectAcpErrors.AcpError> =>
+      (options.onStderr ? Effect.raceFirst(effect, Deferred.await(stderrFailure)) : effect).pipe(
+        Effect.catch((error) =>
+          enrichProcessExitWithStderr(error).pipe(Effect.flatMap(Effect.fail)),
+        ),
+        Effect.tap((result) =>
+          logRequest({
+            method,
+            payload,
+            status: "succeeded",
+            result,
+          }),
+        ),
+        Effect.onError((cause) =>
+          logRequest({
+            method,
+            payload,
+            status: "failed",
+            cause,
+          }),
+        ),
+      );
+
     const runLoggedRequest = <A>(
       method: string,
       payload: unknown,
       effect: Effect.Effect<A, EffectAcpErrors.AcpError>,
     ): Effect.Effect<A, EffectAcpErrors.AcpError> =>
       logRequest({ method, payload, status: "started" }).pipe(
-        Effect.flatMap(() =>
-          (options.onStderr
-            ? Effect.raceFirst(effect, Deferred.await(stderrFailure))
-            : effect
-          ).pipe(
-            Effect.catch((error) =>
-              enrichProcessExitWithStderr(error).pipe(Effect.flatMap(Effect.fail)),
-            ),
-            Effect.tap((result) =>
-              logRequest({
-                method,
-                payload,
-                status: "succeeded",
-                result,
-              }),
-            ),
-            Effect.onError((cause) =>
-              logRequest({
-                method,
-                payload,
-                status: "failed",
-                cause,
-              }),
-            ),
-          ),
-        ),
+        Effect.andThen(completeLoggedRequest(method, payload, effect)),
       );
 
     const spawnCommand = yield* resolveSpawnCommand(options.spawn.command, options.spawn.args, {
@@ -1024,6 +1037,11 @@ export const make = (
       start: () => start,
       getEvents: () => Stream.fromQueue(eventQueue),
       drainEvents,
+      hasActivePrompt: Effect.gen(function* () {
+        const active = yield* Ref.get(activePromptRef);
+        if (Option.isNone(active)) return false;
+        return active.value.fiber.pollUnsafe() === undefined;
+      }),
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
       prompt: (payload, promptOptions?) =>
@@ -1039,13 +1057,20 @@ export const make = (
                   ...payload,
                 } satisfies EffectAcpSchema.PromptRequest;
                 const completed = yield* Deferred.make<void>();
-                const fiber = yield* runLoggedRequest(
+                yield* logRequest({
+                  method: "session/prompt",
+                  payload: requestPayload,
+                  status: "started",
+                });
+                yield* promptOptions?.beforeDispatch ?? Effect.void;
+                const fiber = yield* completeLoggedRequest(
                   "session/prompt",
                   requestPayload,
                   acp.agent.prompt(requestPayload),
-                ).pipe(Effect.forkIn(runtimeScope));
+                ).pipe(Effect.forkIn(runtimeScope, { startImmediately: true }));
                 const active = { fiber, completed } satisfies AcpActivePrompt;
                 yield* Ref.set(activePromptRef, Option.some(active));
+                yield* promptOptions?.onDispatched ?? Effect.void;
                 if (promptOptions?.dispatched) {
                   yield* Deferred.succeed(promptOptions.dispatched, undefined);
                 }

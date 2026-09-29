@@ -140,12 +140,6 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       return;
     }
     yield* ensureActive;
-    yield* logProtocol({
-      direction: "outgoing",
-      stage: "decoded",
-      payload: message,
-    });
-
     const method = message._tag === "Request" ? message.tag : undefined;
     const encodedRequestId =
       message._tag === "Request"
@@ -160,15 +154,22 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     });
 
     if (encoded) {
+      // Diagnostics must not let a later cancellation overtake this request.
+      yield* Queue.offer(outgoing, encoded).pipe(Effect.asVoid);
+    }
+    yield* logProtocol({
+      direction: "outgoing",
+      stage: "decoded",
+      payload: message,
+    });
+    if (encoded) {
       yield* logProtocol({
         direction: "outgoing",
         stage: "raw",
         payload: typeof encoded === "string" ? encoded : new TextDecoder().decode(encoded),
       });
-
-      yield* ensureActive;
-      yield* Queue.offer(outgoing, encoded).pipe(Effect.asVoid);
     }
+    yield* ensureActive;
   });
 
   const resolveExtPending = (
@@ -566,11 +567,6 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     payload: unknown,
   ) {
     yield* ensureActive;
-    yield* logProtocol({
-      direction: "outgoing",
-      stage: "decoded",
-      payload: { _tag: "Notification", tag: method, payload },
-    });
     const exit = encodeJsonRpcNotification({ jsonrpc: "2.0", method, params: payload });
     if (Exit.isFailure(exit)) {
       return yield* AcpError.AcpProtocolParseError.fromEncodingError(
@@ -580,9 +576,14 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       );
     }
     const encoded = `${exit.value}\n`;
+    yield* Queue.offer(outgoing, encoded);
+    yield* logProtocol({
+      direction: "outgoing",
+      stage: "decoded",
+      payload: { _tag: "Notification", tag: method, payload },
+    });
     yield* logProtocol({ direction: "outgoing", stage: "raw", payload: encoded });
     yield* ensureActive;
-    yield* Queue.offer(outgoing, encoded);
   });
 
   const sendRequest = Effect.fn("sendRequest")(function* (method: string, payload: unknown) {

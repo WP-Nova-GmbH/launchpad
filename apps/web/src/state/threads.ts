@@ -12,16 +12,105 @@ import {
 } from "@t3tools/client-runtime/state/threads";
 import type { EnvironmentId, OrchestrationThreadShell, ThreadId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
+import * as Cause from "effect/Cause";
+import { serverEnvironment } from "./server";
+import {
+  retainSharedPromptSubmission,
+  forgetSharedPromptSubmission,
+  rejectSharedPromptSubmission,
+} from "../sharedPromptSubmissionStore";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import {
+  wasBootstrapThreadDeleted,
+  wasBootstrapThreadNotCreated,
+} from "@t3tools/client-runtime/errors";
 
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { environmentSnapshotAtom } from "./shell";
 
-export const threadEnvironment = createThreadEnvironmentAtoms(
+const baseThreadEnvironment = createThreadEnvironmentAtoms(
   connectionAtomRuntime,
   environmentSnapshotAtom,
 );
+// The journal owns a shared prompt until the server acknowledges durable acceptance.
+// Retry uses the captured command and message IDs, including after a renderer restart.
+export const threadEnvironment: typeof baseThreadEnvironment = {
+  ...baseThreadEnvironment,
+  startTurn: {
+    ...baseThreadEnvironment.startTurn,
+    run: (async (registry, value) => {
+      if (
+        registry.get(serverEnvironment.configValueAtom(value.environmentId))?.environment
+          .capabilities.sharedPromptQueue !== true
+      ) {
+        return baseThreadEnvironment.startTurn.run(registry, value);
+      }
+      try {
+        const supportsPreparation =
+          registry.get(serverEnvironment.configValueAtom(value.environmentId))?.environment
+            .capabilities.sharedPreparation === true;
+        const pending = retainSharedPromptSubmission(
+          value.environmentId,
+          value.input,
+          supportsPreparation,
+        );
+        if (pending.command.type !== "thread.turn.start") throw new Error("Invalid saved prompt.");
+        const result = await baseThreadEnvironment.enqueuePrompt.run(registry, {
+          ...value,
+          input: pending.command,
+        });
+        if (result._tag === "Success") {
+          try {
+            forgetSharedPromptSubmission(pending.command.commandId);
+          } catch {
+            /* The receipt reconciles a failed cleanup. */
+          }
+        } else {
+          const receipt = await baseThreadEnvironment.getCommandReceipt.run(registry, {
+            environmentId: value.environmentId,
+            input: {
+              threadId: pending.command.threadId,
+              commandId: pending.command.commandId,
+              ...(pending.command.bootstrap?.createThread
+                ? { projectId: pending.command.bootstrap.createThread.projectId }
+                : {}),
+            },
+          });
+          if (
+            receipt._tag === "Success" &&
+            receipt.value.status === "accepted" &&
+            receipt.value.sequence !== undefined
+          ) {
+            try {
+              forgetSharedPromptSubmission(pending.command.commandId);
+            } catch {
+              /* Reconcile on reconnect. */
+            }
+            return AsyncResult.success({ sequence: receipt.value.sequence });
+          }
+          const error = squashAtomCommandFailure(result);
+          if (receipt._tag === "Success" && receipt.value.status === "rejected")
+            rejectSharedPromptSubmission(
+              pending.command.commandId,
+              receipt.value.detail ?? "The server rejected this prompt.",
+            );
+          else if (wasBootstrapThreadDeleted(error) || wasBootstrapThreadNotCreated(error))
+            rejectSharedPromptSubmission(
+              pending.command.commandId,
+              error instanceof Error
+                ? error.message
+                : "The server rejected this prompt before acceptance.",
+            );
+        }
+        return result;
+      } catch (error) {
+        return AsyncResult.failure(Cause.die(error));
+      }
+    }) satisfies typeof baseThreadEnvironment.startTurn.run,
+  },
+};
 const environmentThreads = createEnvironmentThreadStateAtoms(connectionAtomRuntime);
 export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(
   environmentThreads.stateAtom,

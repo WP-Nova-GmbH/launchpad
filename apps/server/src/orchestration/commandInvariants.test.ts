@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { it as effectIt } from "@effect/vitest";
 import {
   MessageId,
   CommandId,
@@ -8,8 +9,10 @@ import {
   type OrchestrationCommand,
   type OrchestrationReadModel,
   ProviderInstanceId,
+  type ThreadPreparation,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
 
 import { listThreadsByProjectId, requireThread, requireThreadAbsent } from "./commandInvariants.ts";
 
@@ -195,33 +198,72 @@ describe("commandInvariants", () => {
     ).rejects.toThrow("already exists");
   });
 
-  it("lets a draft retry re-create a thread id after its first attempt was deleted", async () => {
-    const threadId = ThreadId.make("thread-1");
-    const firstAttempt = readModel.threads.find((thread) => thread.id === threadId)!;
-    const afterRollback: OrchestrationReadModel = {
-      ...readModel,
-      threads: readModel.threads.map((thread) =>
-        thread.id === threadId ? { ...thread, deletedAt: now, updatedAt: now } : thread,
-      ),
-    };
-    const retry: OrchestrationCommand = {
-      type: "thread.create",
-      commandId: CommandId.make("cmd-retry"),
-      threadId,
-      projectId: firstAttempt.projectId,
-      title: firstAttempt.title,
-      modelSelection: firstAttempt.modelSelection,
-      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-      runtimeMode: "approval-required",
-      branch: null,
-      worktreePath: null,
-      createdAt: now,
-    };
+  effectIt.effect("lets a draft retry reuse a deleted id only after setup has settled", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-1");
+      const firstAttempt = readModel.threads.find((thread) => thread.id === threadId)!;
+      const afterRollback: OrchestrationReadModel = {
+        ...readModel,
+        threads: readModel.threads.map((thread) =>
+          thread.id === threadId ? { ...thread, deletedAt: now, updatedAt: now } : thread,
+        ),
+      };
+      const retry: OrchestrationCommand = {
+        type: "thread.create",
+        commandId: CommandId.make("cmd-retry"),
+        threadId,
+        projectId: firstAttempt.projectId,
+        title: firstAttempt.title,
+        modelSelection: firstAttempt.modelSelection,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: now,
+      };
 
-    await expect(
-      Effect.runPromise(
-        requireThreadAbsent({ readModel: afterRollback, command: retry, threadId }),
-      ),
-    ).resolves.toBeUndefined();
-  });
+      yield* requireThreadAbsent({ readModel: afterRollback, command: retry, threadId });
+
+      const preparation: ThreadPreparation = {
+        originalCommandId: CommandId.make("old-setup"),
+        attemptId: CommandId.make("old-setup"),
+        revision: 1,
+        state: "failed",
+        settled: false,
+        recipe: null,
+      };
+      const withUnconfirmedSetup = {
+        ...afterRollback,
+        threads: afterRollback.threads.map((thread) =>
+          thread.id === threadId
+            ? { ...thread, promptQueue: { ...emptyThreadPromptQueue(), preparation } }
+            : thread,
+        ),
+      };
+      const blocked = yield* requireThreadAbsent({
+        readModel: withUnconfirmedSetup,
+        command: retry,
+        threadId,
+      }).pipe(Effect.flip);
+      expect(blocked.message).toContain("unconfirmed setup process");
+      yield* requireThreadAbsent({
+        readModel: {
+          ...withUnconfirmedSetup,
+          threads: withUnconfirmedSetup.threads.map((thread) =>
+            thread.id === threadId
+              ? {
+                  ...thread,
+                  promptQueue: {
+                    ...emptyThreadPromptQueue(),
+                    preparation: { ...preparation, settled: true },
+                  },
+                }
+              : thread,
+          ),
+        },
+        command: retry,
+        threadId,
+      });
+    }),
+  );
 });
