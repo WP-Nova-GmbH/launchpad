@@ -722,6 +722,62 @@ it.effect("refreshes the current branch after an external checkout", () =>
   ).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect.each([
+  { elapsedSeconds: 10, expectedBehind: 1, expectedWarnings: 0 },
+  { elapsedSeconds: 16, expectedBehind: 0, expectedWarnings: 1 },
+])(
+  "handles a background fetch pending for $elapsedSeconds seconds",
+  ({ elapsedSeconds, expectedBehind, expectedWarnings }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const remote = yield* makeTmpDir("git-slow-fetch-remote-");
+        yield* initRepoWithCommit(remote);
+        const cwd = yield* makeTmpDir("git-slow-fetch-local-");
+        yield* git(cwd, ["clone", remote, "."]);
+        yield* git(remote, ["commit", "--allow-empty", "-m", "Remote update"]);
+
+        const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fetchStarted = yield* Deferred.make<void>();
+        const releaseFetch = yield* Deferred.make<void>();
+        const delayedFetchSpawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            if (
+              ChildProcess.isStandardCommand(command) &&
+              command.args.includes("fetch") &&
+              command.args.includes("--quiet")
+            ) {
+              yield* Deferred.succeed(fetchStarted, undefined);
+              yield* Deferred.await(releaseFetch);
+            }
+            return yield* delegate.spawn(command);
+          }),
+        );
+        const driver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, delayedFetchSpawner),
+          Effect.provide(ServerConfigLayer),
+        );
+        const warnings: string[] = [];
+        const logger = Logger.make<unknown, void>(({ message }) => {
+          warnings.push(String(message));
+        });
+        const reading = yield* driver
+          .statusDetailsRemote(cwd)
+          .pipe(
+            Effect.provideService(Logger.CurrentLoggers, new Set([logger])),
+            Effect.forkChild({ startImmediately: true }),
+          );
+        yield* Deferred.await(fetchStarted);
+        yield* TestClock.adjust(`${elapsedSeconds} seconds`);
+        yield* Deferred.succeed(releaseFetch, undefined);
+        const status = yield* Fiber.join(reading);
+
+        assert.equal(status.behindCount, expectedBehind);
+        assert.lengthOf(warnings, expectedWarnings);
+        if (expectedWarnings > 0) assert.include(warnings[0], "Background Git fetch failed");
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect("backs off and logs failed fetch attempts across linked worktrees", () =>
   Effect.scoped(
     Effect.gen(function* () {

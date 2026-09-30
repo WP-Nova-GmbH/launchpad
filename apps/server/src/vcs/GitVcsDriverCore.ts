@@ -63,7 +63,7 @@ const REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES = 1024 * 1024;
 // otherwise leak into the patch and leave every parsed file unnamed.
 export const PATCH_RENDER_PREFIX_ARGS = ["--src-prefix=a/", "--dst-prefix=b/"] as const;
 const STATUS_UPSTREAM_REFRESH_INTERVAL = Duration.seconds(15);
-const STATUS_UPSTREAM_REFRESH_TIMEOUT = Duration.seconds(5);
+const STATUS_UPSTREAM_REFRESH_TIMEOUT = Duration.seconds(15);
 
 const STATUS_UPSTREAM_REFRESH_FAILURE_BASE_COOLDOWN = Duration.seconds(30);
 const STATUS_UPSTREAM_REFRESH_FAILURE_MAX_COOLDOWN = Duration.minutes(15);
