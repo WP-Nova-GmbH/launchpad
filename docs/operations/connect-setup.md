@@ -137,3 +137,32 @@ sign-up. An enabled empty allowlist blocks all new sign-ups.
 
 Sign-up restrictions do not revoke an existing account's access. Ban the account in Clerk when
 its active sessions and future sign-ins must be disabled.
+
+## Organization issue trackers
+
+Linear setup requires an OAuth application for this Launchpad deployment. Configure
+`LINEAR_CLIENT_ID` and `LINEAR_CLIENT_SECRET` on the relay and register this exact redirect URI
+with Linear, using the relay's public issuer origin:
+
+```text
+https://relay.example.com/v1/organization/issue-trackers/linear/callback
+```
+
+The callback belongs to the relay, including when an admin starts setup from a local desktop app;
+do not register a client localhost callback. Launchpad requests Linear's `read` scope with
+`actor=app`, so the shared connection belongs to the Launchpad app rather than the authorizing
+person. After authorization, the admin returns to Launchpad and the connection refreshes. If the
+relay has no Linear application configured, the settings page explains that setup is unavailable.
+See [Linear's app authorization documentation](https://linear.app/developers/oauth-actor-authorization)
+for the application model.
+
+Jira does not need a deployment-wide OAuth application for this release. The organization admin
+supplies a Jira Cloud site, an Atlassian service account API key, and a known issue to verify site
+access. Its Atlassian admin must first
+[enable MCP API key authentication](https://developer.atlassian.com/cloud/rovo-mcp/guides/configuring-authentication-via-api-token/).
+The relay binds the connection to the validated site and performs issue reads there.
+
+Both connections keep credentials on the relay. Only enrolled organization-managed executors can
+request issue reads; this release does not authorize personal environments or support issue writes,
+search, or webhook-triggered jobs. Setup is available in web and desktop settings; supported executor
+chats can be used from any client, including mobile. External OpenCode servers are not supported.

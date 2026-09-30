@@ -44,6 +44,9 @@ import { organizationProjectsApi, projectCatalogServerApi } from "./http/Project
 import { executorReleaseServerApi } from "./http/ExecutorReleaseApi.ts";
 import { organizationSkillsServerApi } from "./http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
+import { issueTrackersApi, issueTrackersServerApi } from "./http/IssueTrackersApi.ts";
+import { issueTrackerCallbackRoute } from "./http/IssueTrackerCallbackRoute.ts";
+import * as IssueTrackerConnectionStore from "./issueTrackers/ConnectionStore.ts";
 import { sourceControlServerApi } from "./http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
 import { ManagedEndpointZone, RelayApiZone, RelayDeploymentConfig } from "./zone.ts";
@@ -145,6 +148,8 @@ const relayApiLayer = Layer.mergeAll(
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
+  issueTrackersApi,
+  issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
 );
@@ -212,6 +217,8 @@ export const ApiLive = Api.make(
 
     // Optional: a deployment without a GitHub App simply hides the surface.
     const githubAppId = yield* Config.String("GITHUB_APP_ID").pipe(Config.option);
+    const linearClientId = yield* Config.String("LINEAR_CLIENT_ID").pipe(Config.option);
+    const linearClientSecret = yield* Config.Redacted("LINEAR_CLIENT_SECRET").pipe(Config.option);
     const githubAppSlug = yield* Config.String("GITHUB_APP_SLUG").pipe(Config.option);
     const githubAppPrivateKey = yield* Config.Redacted("GITHUB_APP_PRIVATE_KEY").pipe(
       Config.option,
@@ -274,6 +281,10 @@ export const ApiLive = Api.make(
         clerkJwtAudience,
         cloudMintPrivateKey: yield* cloudMintPrivateKey,
         cloudMintPublicKey: yield* cloudMintPublicKey,
+        linear:
+          Option.isSome(linearClientId) && Option.isSome(linearClientSecret)
+            ? { clientId: linearClientId.value, clientSecret: linearClientSecret.value }
+            : undefined,
         github:
           Option.isSome(githubAppId) &&
           Option.isSome(githubAppSlug) &&
@@ -365,6 +376,7 @@ export const ApiLive = Api.make(
             GithubApp.layer,
             GithubInstallations.layer,
             ProviderAccounts.layer,
+            IssueTrackerConnectionStore.layer,
             OrganizationSkills.layer,
             Machines.layer,
             OrganizationProjectCatalog.layer,
@@ -499,6 +511,7 @@ export const ApiLive = Api.make(
         HttpApiScalar.layer(RelayApi, { path: "/docs" }),
         relayDocsRedirectRoute,
         githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
+        issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
       ).pipe(Layer.provide([Etag.layerWeak, httpPlatformNotSupportedLayer, relayCors])),
       relayNotFoundRoute,
     ).pipe(

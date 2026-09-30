@@ -82,6 +82,8 @@ export function relayProtectedErrorMessage(error: RelayProtectedError): string {
       return `Relay refused the organization change because it conflicts with existing state (${error.reason}).`;
     case "RelayTenancyInvalidError":
       return `Relay refused the organization record as invalid (${error.reason}).`;
+    case "RelayIssueTrackerError":
+      return error.message;
     case "RelayInternalError":
       return `Relay encountered an internal error (${error.reason}).`;
   }

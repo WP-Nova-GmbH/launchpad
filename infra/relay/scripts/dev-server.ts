@@ -66,6 +66,9 @@ import { organizationProjectsApi, projectCatalogServerApi } from "../src/http/Pr
 import { executorReleaseServerApi } from "../src/http/ExecutorReleaseApi.ts";
 import { organizationSkillsServerApi } from "../src/http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "../src/http/ProviderAccountsApi.ts";
+import { issueTrackersApi, issueTrackersServerApi } from "../src/http/IssueTrackersApi.ts";
+import { issueTrackerCallbackRoute } from "../src/http/IssueTrackerCallbackRoute.ts";
+import * as IssueTrackerConnectionStore from "../src/issueTrackers/ConnectionStore.ts";
 import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
@@ -233,6 +236,13 @@ const relayConfigurationLayer = Layer.succeed(
     clerkJwtAudience: process.env.CLERK_JWT_AUDIENCE?.trim() || "t3-code-relay",
     cloudMintPrivateKey: Redacted.make(cloudMintKeyPair.privateKey),
     cloudMintPublicKey: cloudMintKeyPair.publicKey,
+    linear:
+      process.env.LINEAR_CLIENT_ID?.trim() && process.env.LINEAR_CLIENT_SECRET?.trim()
+        ? {
+            clientId: process.env.LINEAR_CLIENT_ID.trim(),
+            clientSecret: Redacted.make(process.env.LINEAR_CLIENT_SECRET.trim()),
+          }
+        : undefined,
     github:
       process.env.GITHUB_APP_ID && process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_PRIVATE_KEY
         ? {
@@ -372,6 +382,7 @@ const runtimeLayer = Layer.empty
         GithubApp.layer,
         GithubInstallations.layer,
         ProviderAccounts.layer,
+        IssueTrackerConnectionStore.layer,
         OrganizationSkills.layer,
         Machines.layer,
         OrganizationProjectCatalog.layer,
@@ -418,6 +429,8 @@ const relayApiLayer = Layer.mergeAll(
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
+  issueTrackersApi,
+  issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
 );
@@ -435,6 +448,7 @@ const routerLayer = Layer.merge(
     HttpApiScalar.layer(RelayApi, { path: "/docs" }),
     relayDocsRedirectRoute,
     githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
+    issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
   ).pipe(Layer.provide([Etag.layerWeak, relayCors])),
   relayNotFoundRoute,
 );

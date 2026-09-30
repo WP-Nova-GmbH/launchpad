@@ -9,6 +9,7 @@ import type {
   RelayOrgRole,
   RelayRepositoryRole,
   RelayManagedEndpointOrigin,
+  RelayIssueTrackerService,
 } from "@t3tools/contracts/relay";
 import {
   boolean,
@@ -121,6 +122,31 @@ export const relayOrganizationProviderAccounts = pgTable(
     updatedAt: varchar("updated_at", { length: 64 }).notNull(),
   },
   (table) => [primaryKey({ columns: [table.organizationId, table.provider] })],
+);
+
+/** Credentials stay at the relay; executors receive only bounded issue results. */
+export const relayIssueTrackerConnections = pgTable(
+  "relay_issue_tracker_connections",
+  {
+    organizationId: varchar("organization_id", { length: 64 })
+      .notNull()
+      .references(() => relayOrganizations.organizationId, { onDelete: "cascade" }),
+    service: varchar("service", { length: 16 }).notNull().$type<RelayIssueTrackerService>(),
+    version: varchar("version", { length: 64 }).notNull(),
+    status: varchar("status", { length: 32 })
+      .notNull()
+      .$type<"connecting" | "connected" | "reconnect_required">(),
+    accountLabel: text("account_label"),
+    payloadSealed: text("payload_sealed"),
+    pendingStateHash: text("pending_state_hash"),
+    pendingExpiresAt: varchar("pending_expires_at", { length: 64 }),
+    updatedByUserId: varchar("updated_by_user_id", { length: 191 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.organizationId, table.service] }),
+    uniqueIndex("idx_relay_issue_tracker_pending_state").on(table.pendingStateHash),
+  ],
 );
 
 /**

@@ -1,0 +1,70 @@
+import * as Schema from "effect/Schema";
+
+import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+
+export const RELAY_LINEAR_CALLBACK_PATH = "/v1/organization/issue-trackers/linear/callback";
+
+export const RelayIssueTrackerService = Schema.Literals(["linear", "jira"]);
+export type RelayIssueTrackerService = typeof RelayIssueTrackerService.Type;
+
+export const RelayIssueTrackerConnection = Schema.Struct({
+  service: RelayIssueTrackerService,
+  status: Schema.Literals(["connecting", "connected", "reconnect_required"]),
+  accountLabel: Schema.NullOr(Schema.String),
+  updatedAt: Schema.String,
+});
+export type RelayIssueTrackerConnection = typeof RelayIssueTrackerConnection.Type;
+
+export const RelayIssueTrackerConnections = Schema.Struct({
+  connections: Schema.Array(RelayIssueTrackerConnection),
+  linearAvailable: Schema.Boolean,
+});
+export type RelayIssueTrackerConnections = typeof RelayIssueTrackerConnections.Type;
+
+export const RelayConnectJiraRequest = Schema.Struct({
+  siteUrl: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+  apiKey: TrimmedNonEmptyString.check(Schema.isMaxLength(8192)),
+  issue: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+});
+export type RelayConnectJiraRequest = typeof RelayConnectJiraRequest.Type;
+
+export const RelayStartLinearResponse = Schema.Struct({ authorizationUrl: Schema.String });
+export type RelayStartLinearResponse = typeof RelayStartLinearResponse.Type;
+
+export const RelayIssueDetails = Schema.Struct({
+  identifier: Schema.String,
+  title: Schema.String,
+  description: Schema.String,
+  url: Schema.String,
+  status: Schema.NullOr(Schema.String),
+  assignee: Schema.NullOr(Schema.String),
+});
+export type RelayIssueDetails = typeof RelayIssueDetails.Type;
+
+export const RelayReadIssueRequest = Schema.Struct({
+  issue: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+});
+export const RelayReadIssueResponse = Schema.Struct({
+  ...RelayIssueDetails.fields,
+  service: RelayIssueTrackerService,
+  accountLabel: Schema.String,
+});
+export type RelayReadIssueResponse = typeof RelayReadIssueResponse.Type;
+
+export class RelayIssueTrackerError extends Schema.TaggedError<RelayIssueTrackerError>()(
+  "RelayIssueTrackerError",
+  {
+    code: Schema.Literals([
+      "auth_required",
+      "forbidden",
+      "not_found",
+      "invalid_input",
+      "unavailable",
+      "conflict",
+      "not_configured",
+    ]),
+    message: Schema.String,
+    traceId: Schema.optional(Schema.String),
+  },
+  { httpApiStatus: 400 },
+) {}

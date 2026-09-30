@@ -59,6 +59,8 @@ import * as Stream from "effect/Stream";
 import { appendUserInputAttachmentPaths } from "../userInputAttachments.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
+import { readManagedExecutorRelayConfig } from "../../cloud/machineEnrollment.ts";
 import * as DeviceService from "../../device/DeviceService.ts";
 import { ensureAgentDeviceShim } from "../../device/AgentDeviceShim.ts";
 import type * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
@@ -487,6 +489,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const serverSecrets = yield* Effect.serviceOption(ServerSecretStore.ServerSecretStore);
   const projectionQuery = yield* Effect.serviceOption(
     ProjectionSnapshotQuery.ProjectionSnapshotQuery,
   );
@@ -918,6 +921,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     const access = yield* agentAccessSettings(threadId);
     if (access.browser) capabilities.add("preview");
     if (access.device) capabilities.add("device");
+    if (
+      Option.isSome(serverSecrets) &&
+      (yield* readManagedExecutorRelayConfig(serverSecrets.value)) !== null
+    ) {
+      capabilities.add("issue-trackers");
+    }
     return capabilities;
   });
 

@@ -132,6 +132,10 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "list relay organization skills",
   "save relay organization skill",
   "delete relay organization skill",
+  "list relay issue tracker connections",
+  "start relay Linear authorization",
+  "connect relay Jira",
+  "disconnect relay issue tracker",
 ]);
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
@@ -184,6 +188,10 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay organization skill listing",
   "Relay organization skill save",
   "Relay organization skill removal",
+  "Relay issue tracker connection listing",
+  "Relay Linear authorization",
+  "Relay Jira connection",
+  "Relay issue tracker disconnection",
 ]);
 export type ManagedRelayRequestActivity = typeof ManagedRelayRequestActivity.Type;
 

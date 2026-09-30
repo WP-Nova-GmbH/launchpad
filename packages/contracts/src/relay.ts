@@ -4,6 +4,17 @@ import {
   RepositoryAccessRemovalStatus,
 } from "./repositoryAccess.ts";
 import { AuthSessionUser } from "./auth.ts";
+import {
+  RelayIssueTrackerService,
+  RelayIssueTrackerConnection,
+  RelayIssueTrackerConnections,
+  RelayConnectJiraRequest,
+  RelayStartLinearResponse,
+  RelayReadIssueRequest,
+  RelayReadIssueResponse,
+  RelayIssueTrackerError,
+} from "./issueTrackers.ts";
+export * from "./issueTrackers.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -836,6 +847,7 @@ export class RelayInternalError extends Schema.TaggedError<RelayInternalError>()
 }
 
 export const RelayProtectedError = Schema.Union([
+  RelayIssueTrackerError,
   RelayAuthInvalidError,
   RelayEnvironmentLinkProofExpiredError,
   RelayEnvironmentLinkProofInvalidError,
@@ -2796,6 +2808,48 @@ const RelayRepositoryAccessServerGroup = HttpApiGroup.make("repositoryAccessServ
   )
   .middleware(RelayEnvironmentAuth);
 
+export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
+  .add(
+    HttpApiEndpoint.get("listConnections", "/v1/organization/issue-trackers", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayIssueTrackerConnections,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.post("startLinear", "/v1/organization/issue-trackers/linear/authorize", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayStartLinearResponse,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.put("connectJira", "/v1/organization/issue-trackers/jira", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayConnectJiraRequest,
+      success: RelayIssueTrackerConnection,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.delete("disconnect", "/v1/organization/issue-trackers/:service", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ service: RelayIssueTrackerService }),
+      success: RelayOkResponse,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+  )
+  .middleware(RelayClientAuth);
+
+export const RelayIssueTrackersServerGroup = HttpApiGroup.make("issueTrackersServer")
+  .add(
+    HttpApiEndpoint.post(
+      "readIssue",
+      "/v1/environments/:environmentId/issue-trackers/:service/read",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId, service: RelayIssueTrackerService }),
+        payload: RelayReadIssueRequest,
+        success: RelayReadIssueResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+  )
+  .middleware(RelayEnvironmentAuth);
+
 export const RelayApi = HttpApi.make("RelayApi")
   .add(
     RelayHealthGroup,
@@ -2817,6 +2871,8 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayOrganizationSkillsServerGroup,
     RelayExecutorReleaseServerGroup,
     RelayRepositoryAccessServerGroup,
+    RelayIssueTrackersGroup,
+    RelayIssueTrackersServerGroup,
   )
   .annotate(OpenApi.Title, "Launchpad Relay API")
   .annotate(OpenApi.Version, "1.0.0")

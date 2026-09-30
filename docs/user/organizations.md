@@ -49,6 +49,25 @@ From then on, executors clone, push, and open pull requests with the organizatio
 Work they do is authored by the App, and reaches exactly the repositories you installed it on.
 **Disconnect** forgets the installation; uninstalling the App on GitHub revokes access outright.
 
+## Issue trackers
+
+An admin can connect one Linear workspace and one Jira Cloud site under **Settings → Organization →
+Issue trackers** in the web or desktop app. Everyone in the organization then uses that shared
+connection to read issues in chats on organization-managed executors, including chats opened from
+mobile. Personal machines and external OpenCode servers do not support these connections yet.
+
+For Linear, authorize the Launchpad app and return to Launchpad. For Jira, enter the site address,
+a service account API key, and an issue key or URL that account can read. Your Atlassian admin must
+[enable API key access for its MCP server](https://developer.atlassian.com/cloud/rovo-mcp/guides/configuring-authentication-via-api-token/).
+Launchpad checks the issue before saving the connection.
+
+In a supported chat, ask the agent to read a specific issue, such as “Read Linear issue LP-214” or
+“Read Jira issue TEAM-42,” or supply its URL. These connections provide read-only issue context;
+search, issue updates, and automatic jobs are not supported yet.
+
+If a connection needs sign-in again, an admin can reconnect it. Disconnect stops new reads for the
+whole organization; issue content already retrieved remains in chat history.
+
 ## Provider accounts
 
 Your executors need to be signed in to Codex, Claude, Cursor, or OpenCode to do anything, and

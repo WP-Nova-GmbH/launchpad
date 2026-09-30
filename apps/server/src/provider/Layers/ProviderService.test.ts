@@ -78,6 +78,13 @@ import {
   SqlitePersistenceMemory,
 } from "../../persistence/Layers/Sqlite.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
+import {
+  CLOUD_MACHINE_IDENTITY,
+  RELAY_URL_SECRET,
+  RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
+  encodeCloudMachineIdentityJson,
+} from "../../cloud/config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
@@ -5240,7 +5247,10 @@ describe("agent browser access", () => {
     access: boolean | { readonly browser: boolean; readonly device: boolean },
     threadId: ThreadId,
     projectOverride?: boolean | { readonly browser?: boolean; readonly device?: boolean },
-    options?: { readonly withoutOrchestration?: boolean },
+    options?: {
+      readonly withoutOrchestration?: boolean;
+      readonly executorRole?: "agent_executor" | "review_host" | "personal";
+    },
   ) =>
     Effect.gen(function* () {
       const enableAgentBrowserAccess = typeof access === "boolean" ? access : access.browser;
@@ -5305,6 +5315,31 @@ describe("agent browser access", () => {
         getThreadDetailSnapshot: () => Effect.die("unused"),
         searchThreads: () => Effect.die("unused"),
       });
+      const executorSecrets = new Map<string, string>([
+        [RELAY_URL_SECRET, "https://relay.example.test"],
+        [RELAY_ENVIRONMENT_CREDENTIAL_SECRET, "executor-secret"],
+      ]);
+      if (options?.executorRole && options.executorRole !== "personal") {
+        executorSecrets.set(
+          CLOUD_MACHINE_IDENTITY,
+          yield* encodeCloudMachineIdentityJson({
+            machineId: "machine-1",
+            organizationId: "org-1",
+            role: options.executorRole,
+          }),
+        );
+      }
+      const executorSecretsLayer =
+        options?.executorRole === undefined
+          ? Layer.empty
+          : Layer.mock(ServerSecretStore.ServerSecretStore)({
+              get: (name) =>
+                Effect.succeed(
+                  Option.fromNullishOr(executorSecrets.get(name)).pipe(
+                    Option.map((value) => new TextEncoder().encode(value)),
+                  ),
+                ),
+            });
       const providerLayer = makeProviderServiceLive({
         issueMcpCredential: (request) =>
           Effect.sync(() => {
@@ -5315,6 +5350,7 @@ describe("agent browser access", () => {
             return undefined;
           }),
       }).pipe(
+        Layer.provide(executorSecretsLayer),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(options?.withoutOrchestration ? Layer.empty : projectionLayer),
@@ -5361,6 +5397,22 @@ describe("agent browser access", () => {
 
       return issued;
     });
+
+  it.effect("grants issue tracker access only to enrolled organization executors", () =>
+    Effect.gen(function* () {
+      for (const role of ["agent_executor", "review_host", "personal"] as const) {
+        const threadId = asThreadId(`thread-issue-trackers-${role}`);
+        const issued = yield* startSessionWith(false, threadId, undefined, { executorRole: role });
+        assert.deepEqual(issued, [
+          {
+            threadId,
+            capabilities:
+              role === "agent_executor" ? ["issue-trackers", "pull-requests"] : ["pull-requests"],
+          },
+        ]);
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 
   // The capability on the credential is the observable that matters: a session
   // always gets a credential (the pull request toolkit is never withheld), and

@@ -1604,6 +1604,38 @@ describe("relay request tracing", () => {
       }),
   );
 
+  it.effect(
+    "keeps Linear callback credentials out of HTTP traces while the handler receives them",
+    () =>
+      Effect.gen(function* () {
+        const spans: Array<Tracer.NativeSpan> = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            return span;
+          },
+        });
+        const callbackPath = "/v1/organization/issue-trackers/linear/callback";
+        const request = HttpServerRequest.fromWeb(
+          new Request(`https://relay.test${callbackPath}?code=private-code&state=private-state`),
+        );
+        const endpoint = Effect.gen(function* () {
+          const original = yield* HttpServerRequest.HttpServerRequest;
+          const query = new URL(original.url, "https://relay.test").searchParams;
+          expect(query.get("code")).toBe("private-code");
+          expect(query.get("state")).toBe("private-state");
+          return HttpServerResponse.empty({ status: 200 });
+        });
+        yield* traceRelayHttpRequestWith(endpoint, Layer.succeed(Tracer.Tracer, tracer)).pipe(
+          Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+        );
+        expect(spans[0]?.attributes.get("url.path")).toBe(callbackPath);
+        expect(spans[0]?.attributes.get("url.query")).toBeUndefined();
+        expect(spans[0]?.attributes.get("url.full")).not.toContain("private-");
+      }),
+  );
+
   it.effect("fails hung requests with a 504 before the client's 10s abort", () =>
     Effect.gen(function* () {
       const spans: Array<Tracer.NativeSpan> = [];

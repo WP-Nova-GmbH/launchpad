@@ -11,6 +11,11 @@ import type { RepositoryAccessRemovalStatus } from "@t3tools/contracts";
 import {
   RelayApi,
   type RelayConnectMachineResponse,
+  type RelayConnectJiraRequest,
+  type RelayIssueTrackerConnection,
+  type RelayIssueTrackerConnections,
+  type RelayIssueTrackerService,
+  type RelayStartLinearResponse,
   type RelayCreateInvitationRequest,
   type RelayCreateInvitationResponse,
   type RelayGithubInstallResponse,
@@ -195,6 +200,20 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly provider: RelayProviderAccountProvider;
     }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
+    readonly listIssueTrackerConnections: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<RelayIssueTrackerConnections, ManagedRelayClientError>;
+    readonly startLinearAuthorization: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<RelayStartLinearResponse, ManagedRelayClientError>;
+    readonly connectJira: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayConnectJiraRequest;
+    }) => Effect.Effect<RelayIssueTrackerConnection, ManagedRelayClientError>;
+    readonly disconnectIssueTracker: (input: {
+      readonly clerkToken: string;
+      readonly service: RelayIssueTrackerService;
+    }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
     readonly listSkills: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayOrganizationSkill>, ManagedRelayClientError>;
@@ -254,6 +273,14 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     listProviderAccounts: unavailable("clientRuntime.managedRelayTenancy.listProviderAccounts"),
     saveProviderAccount: unavailable("clientRuntime.managedRelayTenancy.saveProviderAccount"),
     deleteProviderAccount: unavailable("clientRuntime.managedRelayTenancy.deleteProviderAccount"),
+    listIssueTrackerConnections: unavailable(
+      "clientRuntime.managedRelayTenancy.listIssueTrackerConnections",
+    ),
+    startLinearAuthorization: unavailable(
+      "clientRuntime.managedRelayTenancy.startLinearAuthorization",
+    ),
+    connectJira: unavailable("clientRuntime.managedRelayTenancy.connectJira"),
+    disconnectIssueTracker: unavailable("clientRuntime.managedRelayTenancy.disconnectIssueTracker"),
     listSkills: unavailable("clientRuntime.managedRelayTenancy.listSkills"),
     saveSkill: unavailable("clientRuntime.managedRelayTenancy.saveSkill"),
     deleteSkill: unavailable("clientRuntime.managedRelayTenancy.deleteSkill"),
@@ -745,6 +772,64 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.deleteProviderAccount"),
+      withRelayClientTracing,
+    ),
+    listIssueTrackerConnections: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.issueTrackers
+          .listConnections({
+            headers: bearerHeaders(input.clerkToken),
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("list relay issue tracker connections")),
+            timeoutRelayRequest("Relay issue tracker connection listing"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.listIssueTrackerConnections"),
+      withRelayClientTracing,
+    ),
+    startLinearAuthorization: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.issueTrackers
+          .startLinear({
+            headers: bearerHeaders(input.clerkToken),
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("start relay Linear authorization")),
+            timeoutRelayRequest("Relay Linear authorization"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.startLinearAuthorization"),
+      withRelayClientTracing,
+    ),
+    connectJira: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.issueTrackers
+          .connectJira({
+            headers: bearerHeaders(input.clerkToken),
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("connect relay Jira")),
+            timeoutRelayRequest("Relay Jira connection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.connectJira"),
+      withRelayClientTracing,
+    ),
+    disconnectIssueTracker: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.issueTrackers
+          .disconnect({
+            headers: bearerHeaders(input.clerkToken),
+            params: { service: input.service },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("disconnect relay issue tracker")),
+            timeoutRelayRequest("Relay issue tracker disconnection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.disconnectIssueTracker"),
       withRelayClientTracing,
     ),
     listSkills: Effect.fnUntraced(
