@@ -4,15 +4,19 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import type { ScopedThreadRef, ThreadPromptQueue, TurnId } from "@t3tools/contracts";
 import {
-  promptAttributionLabel,
   queuedPromptEditConflict,
   type QueuedPromptEdit,
 } from "@t3tools/client-runtime/state/threads";
-import { useState } from "react";
+import { useAtomValue } from "@effect/atom-react";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { Clock3Icon, PauseIcon, PlayIcon } from "lucide-react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { SharedPromptQueueRow } from "./SharedPromptQueueRow";
 
 export function SharedPromptQueue({
   threadRef,
@@ -38,9 +42,16 @@ export function SharedPromptQueue({
   const retryPreparation = useAtomCommand(threadEnvironment.retryPreparation, {
     reportFailure: false,
   });
+  const account = useAtomValue(managedRelaySessionAtom);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  const sectionRef = useRef<HTMLElement>(null);
   const [edit, setEdit] = useState<QueuedPromptEdit | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const editingMessageId = edit?.messageId;
+  useLayoutEffect(() => {
+    if (editingMessageId) editorRef.current?.focus();
+  }, [editingMessageId]);
   const current = queue.entries.find((entry) => entry.messageId === edit?.messageId);
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
   const disabled = busy || unavailable;
@@ -74,11 +85,20 @@ export function SharedPromptQueue({
     return null;
   return (
     <section
+      ref={sectionRef}
+      tabIndex={-1}
       aria-label="Shared prompt queue"
-      className="mb-2 max-h-80 overflow-y-auto rounded-xl border border-border bg-card p-3"
+      data-shared-prompt-queue="true"
+      className="@container/shared-queue mb-2 max-h-[min(20rem,40dvh,var(--shared-queue-available-height,20rem))] scroll-pt-10 overflow-y-auto overscroll-contain bg-background px-3 pb-1 outline-none"
     >
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-sm font-medium">Shared queue · {queue.entries.length}</span>
+      <div className="sticky top-0 z-10 flex min-h-9 items-center justify-between gap-2 bg-background">
+        <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Clock3Icon aria-hidden="true" className="size-3.5" />
+          {queue.pauseReason ? "Queue paused" : "Queued"}
+          <span className="rounded bg-muted px-1 text-3xs tabular-nums">
+            {queue.entries.length}
+          </span>
+        </span>
         {setupRunning || (preparing && preparation.settled === false) ? (
           <Button
             size="xs"
@@ -89,29 +109,47 @@ export function SharedPromptQueue({
             Stop setup
           </Button>
         ) : queue.pauseReason === null && !preparing ? (
-          <Button
-            size="xs"
-            variant="ghost"
-            disabled={disabled}
-            onClick={() => void run(() => pauseQueue(request(input)))}
-          >
-            Pause queue
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  size="icon-xs"
+                  variant="ghost-muted"
+                  aria-label="Pause queue"
+                  disabled={disabled}
+                  onClick={() => void run(() => pauseQueue(request(input)))}
+                />
+              }
+            >
+              <PauseIcon />
+            </TooltipTrigger>
+            <TooltipPopup>Pause queue</TooltipPopup>
+          </Tooltip>
         ) : queue.pauseReason?.code !== "delivery-unknown" && !preparing ? (
-          <Button
-            size="xs"
-            variant="secondary"
-            disabled={disabled || queue.handoff !== null}
-            onClick={() =>
-              void run(() => resumeQueue(request({ ...input, expectedRevision: queue.revision })))
-            }
-          >
-            Resume queue
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  size="icon-xs"
+                  variant="ghost-muted"
+                  aria-label="Resume queue"
+                  disabled={disabled || queue.handoff !== null}
+                  onClick={() =>
+                    void run(() =>
+                      resumeQueue(request({ ...input, expectedRevision: queue.revision })),
+                    )
+                  }
+                />
+              }
+            >
+              <PlayIcon />
+            </TooltipTrigger>
+            <TooltipPopup>Resume queue</TooltipPopup>
+          </Tooltip>
         ) : null}
       </div>
       {preparing ? (
-        <div className="mt-2 space-y-2">
+        <div className="mt-2 space-y-2 wrap-anywhere">
           <p role="status" className="text-xs text-muted-foreground">
             {setupRunning
               ? "Preparing workspace. Accepted prompts will wait for setup."
@@ -121,7 +159,7 @@ export function SharedPromptQueue({
             <p className="text-xs">Reconnect to a compatible server to recover setup.</p>
           ) : null}
           {preparation.state === "failed" ? (
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {preparation.recipe !== null ? (
                 <Button
                   size="xs"
@@ -181,16 +219,12 @@ export function SharedPromptQueue({
         </div>
       ) : null}
       {queue.pauseReason ? (
-        <p role="status" className="mt-1 text-xs text-muted-foreground">
+        <p role="status" className="mt-1 wrap-anywhere text-xs text-muted-foreground">
           Paused: {queue.pauseReason.detail}
-        </p>
-      ) : !preparing ? (
-        <p className="mt-1 text-xs text-muted-foreground">
-          Waiting for the current turn to finish. Steer explicitly to change ongoing work.
         </p>
       ) : null}
       {queue.pauseReason?.code === "delivery-unknown" ? (
-        <div className="mt-2 flex gap-2">
+        <div className="mt-2 flex flex-wrap gap-2">
           <Button
             size="xs"
             variant="secondary"
@@ -231,85 +265,66 @@ export function SharedPromptQueue({
           </Button>
         </div>
       ) : null}
-      <ol className="mt-2 space-y-2">
+      <ol>
         {queue.entries.map((entry, index) => (
-          <li key={entry.messageId} className="rounded-lg border border-border p-2">
-            <p className="whitespace-pre-wrap break-words text-sm">
-              {index + 1}. {entry.text || "Attachments"}
-            </p>
-            {entry.attachments.length > 0 ? (
-              <p className="mt-1 text-xs text-muted-foreground">
-                Files: {entry.attachments.map((attachment) => attachment.name).join(", ")}
-              </p>
-            ) : null}
-            <p className="mt-1 text-xs text-muted-foreground">{promptAttributionLabel(entry)}</p>
-            {entry.state !== "pending" ? (
-              <p role="status" className="mt-1 text-xs">
-                {entry.state === "unknown" ? "Delivery outcome unknown" : "Sending to agent…"}
-              </p>
-            ) : (
-              <div className="mt-1 flex gap-1">
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  disabled={disabled}
-                  onClick={() => {
-                    setEdit({
+          <SharedPromptQueueRow
+            key={entry.messageId}
+            entry={entry}
+            index={index}
+            isNext={
+              index === 0 &&
+              entry.state === "pending" &&
+              queue.enabled &&
+              queue.pauseReason === null &&
+              !preparing &&
+              queue.handoff === null
+            }
+            disabled={disabled}
+            canSteer={activeTurnId !== null && !preparing}
+            viewerId={account?.accountId}
+            editorRef={editorRef}
+            onEdit={() => {
+              if (edit?.messageId === entry.messageId) {
+                return;
+              }
+              setEdit({ messageId: entry.messageId, revision: entry.revision, text: entry.text });
+              setError(null);
+            }}
+            onSteer={() => {
+              if (activeTurnId)
+                void run(
+                  () =>
+                    steerPrompt(
+                      request({
+                        ...input,
+                        messageId: entry.messageId,
+                        expectedRevision: entry.revision,
+                        expectedTurnId: activeTurnId,
+                      }),
+                    ),
+                  () => sectionRef.current?.focus({ preventScroll: true }),
+                );
+            }}
+            onRemove={() =>
+              void run(
+                () =>
+                  removePrompt(
+                    request({
+                      ...input,
                       messageId: entry.messageId,
-                      revision: entry.revision,
-                      text: entry.text,
-                    });
-                    setError(null);
-                  }}
-                >
-                  Edit
-                </Button>
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  disabled={disabled || activeTurnId === null || preparing}
-                  onClick={() => {
-                    if (activeTurnId)
-                      void run(() =>
-                        steerPrompt(
-                          request({
-                            ...input,
-                            messageId: entry.messageId,
-                            expectedRevision: entry.revision,
-                            expectedTurnId: activeTurnId,
-                          }),
-                        ),
-                      );
-                  }}
-                >
-                  Steer now
-                </Button>
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  disabled={disabled}
-                  onClick={() =>
-                    void run(() =>
-                      removePrompt(
-                        request({
-                          ...input,
-                          messageId: entry.messageId,
-                          expectedRevision: entry.revision,
-                        }),
-                      ),
-                    )
-                  }
-                >
-                  Remove
-                </Button>
-              </div>
-            )}
-          </li>
+                      expectedRevision: entry.revision,
+                    }),
+                  ),
+                () => sectionRef.current?.focus({ preventScroll: true }),
+              )
+            }
+          />
         ))}
       </ol>
       {edit ? (
         <div className="mt-3 space-y-2">
           <Textarea
+            ref={editorRef}
             aria-label="Edit queued prompt"
             value={edit.text}
             onChange={(event) => setEdit({ ...edit, text: event.target.value })}
@@ -321,7 +336,9 @@ export function SharedPromptQueue({
           ) : null}
           {current && current.revision !== edit.revision ? (
             <div className="space-y-2">
-              <p className="whitespace-pre-wrap text-xs">Current prompt: {current.text}</p>
+              <p className="whitespace-pre-wrap wrap-anywhere text-xs">
+                Current prompt: {current.text}
+              </p>
               <Button
                 size="xs"
                 variant="secondary"
@@ -332,7 +349,7 @@ export function SharedPromptQueue({
               </Button>
             </div>
           ) : null}
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button
               size="xs"
               disabled={disabled || conflict !== null}
@@ -352,13 +369,24 @@ export function SharedPromptQueue({
                         },
                       }),
                     ),
-                  () => setEdit(null),
+                  () => {
+                    setEdit(null);
+                    sectionRef.current?.focus({ preventScroll: true });
+                  },
                 );
               }}
             >
               Save edit
             </Button>
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => setEdit(null)}>
+            <Button
+              size="xs"
+              variant="ghost"
+              disabled={busy}
+              onClick={() => {
+                setEdit(null);
+                sectionRef.current?.focus({ preventScroll: true });
+              }}
+            >
               Cancel edit
             </Button>
           </div>

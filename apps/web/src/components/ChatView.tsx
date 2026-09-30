@@ -6023,7 +6023,21 @@ export default function ChatView(props: ChatViewProps) {
     if (!composerOverlayElement) return;
 
     const updateHeight = () => {
-      publishComposerOverlayHeight(composerOverlayElement.getBoundingClientRect().height);
+      const overlayHeight = composerOverlayElement.getBoundingClientRect().height;
+      const queue = composerOverlayElement.querySelector<HTMLElement>("[data-shared-prompt-queue]");
+      const viewport = composerOverlayElement.parentElement;
+      if (queue && viewport) {
+        // Docked transitions pin the overlay to its destination height. Only the
+        // full-viewport hero needs a content measurement instead of that stable height.
+        const stack = isDraftHeroState
+          ? composerOverlayElement.querySelector<HTMLElement>("[data-chat-composer-stack]")
+          : null;
+        const contentHeight = stack?.getBoundingClientRect().height ?? overlayHeight;
+        const otherHeight = contentHeight - queue.getBoundingClientRect().height;
+        const availableHeight = Math.max(0, viewport.clientHeight - otherHeight - 16);
+        queue.style.setProperty("--shared-queue-available-height", `${availableHeight}px`);
+      }
+      publishComposerOverlayHeight(overlayHeight);
     };
 
     updateHeight();
@@ -6031,10 +6045,13 @@ export default function ChatView(props: ChatViewProps) {
 
     const resizeObserver = new ResizeObserver(updateHeight);
     resizeObserver.observe(composerOverlayElement);
+    if (composerOverlayElement.parentElement) {
+      resizeObserver.observe(composerOverlayElement.parentElement);
+    }
     return () => {
       resizeObserver.disconnect();
     };
-  }, [composerOverlayElement, publishComposerOverlayHeight]);
+  }, [composerOverlayElement, isDraftHeroState, publishComposerOverlayHeight]);
   // The pill mounts and unmounts in the same commits that expand or rest the
   // composer, and a fast fling lands there while the previous resting tween
   // still pins the overlay at its old height. Measuring the overlay here would
