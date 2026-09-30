@@ -1,7 +1,10 @@
+import { GitHubCliUnavailableError } from "../sourceControl/GitHubCli.ts";
+import * as Logger from "effect/Logger";
 import {
   CheckpointRef,
   EventId,
   GitManagerError,
+  SourceControlProviderError,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -530,6 +533,65 @@ describe("ThreadPullRequestReactor", () => {
               "feature",
             ]);
           }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
+  );
+
+  it.effect(
+    "keeps missing-tool backfills retryable and preserves links without repeated warnings",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let installed = false;
+          const warnings: string[] = [];
+          const fixture = yield* makeHarness({
+            threads: [thread("backfill", { settledOverride: "settled", settledAt: NOW })],
+            branchPullRequest: ({ cwd }) =>
+              installed
+                ? Effect.succeed(branchPullRequest(42, "merged"))
+                : Effect.fail(
+                    new SourceControlProviderError({
+                      provider: "github",
+                      operation: "listChangeRequests",
+                      cwd,
+                      detail: "missing",
+                      cause: new GitHubCliUnavailableError({
+                        command: "gh",
+                        cwd,
+                        cause: new Error("missing"),
+                      }),
+                    }),
+                  ),
+          });
+          yield* Effect.gen(function* () {
+            const reactor = yield* fixture.start();
+            for (let index = 0; index < ThreadPullRequestReactor.BACKFILL_ATTEMPTS + 1; index++) {
+              yield* TestClock.adjust("1 minute");
+              yield* Queue.take(fixture.reads);
+              yield* reactor.drain;
+            }
+            expect(yield* Ref.get(fixture.commands)).toHaveLength(0);
+            expect(warnings).toHaveLength(0);
+            installed = true;
+            yield* TestClock.adjust("1 minute");
+            yield* Queue.take(fixture.reads);
+            yield* reactor.drain;
+            expect((yield* Ref.get(fixture.commands))[0]?.threadId).toBe("backfill");
+          }).pipe(
+            Effect.provide(
+              Layer.merge(
+                fixture.layer,
+                Logger.layer(
+                  [
+                    Logger.make(({ message }) => {
+                      warnings.push(String(message));
+                    }),
+                  ],
+                  { mergeWithExisting: false },
+                ),
+              ),
+            ),
+          );
         }),
       ),
   );

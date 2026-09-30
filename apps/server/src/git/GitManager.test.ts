@@ -1093,7 +1093,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       yield* runGit(repoDir, ["push", "-u", "origin", "feature/rate-limited"]);
       const { manager, ghCalls } = yield* makeManager({
         ghScenario: {
-          failWith: new GitHubCli.GitHubCliUnavailableError({
+          failWith: new GitHubCli.GitHubCliRateLimitError({
             command: "gh",
             cwd: repoDir,
             cause: new Error("rate limited"),
@@ -1563,7 +1563,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     }),
   );
 
-  it.effect("branch PR lookup propagates provider failures", () =>
+  it.effect("branch PR lookup propagates missing-tool failures without caching them", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* initRepo(repoDir);
@@ -1574,15 +1574,14 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       yield* runGit(repoDir, ["push", "-u", "origin", "feature/lookup-failure"]);
       yield* runGit(repoDir, ["checkout", "main"]);
 
-      const { manager, ghCalls } = yield* makeManager({
-        ghScenario: {
-          failWith: new GitHubCli.GitHubCliUnavailableError({
-            command: "gh",
-            cwd: repoDir,
-            cause: new Error("gh is not available on PATH"),
-          }),
-        },
-      });
+      const scenario: FakeGhScenario = {
+        failWith: new GitHubCli.GitHubCliUnavailableError({
+          command: "gh",
+          cwd: repoDir,
+          cause: new Error("gh is not available on PATH"),
+        }),
+      };
+      const { manager, ghCalls } = yield* makeManager({ ghScenario: scenario });
 
       const error = yield* manager
         .branchPullRequest({ cwd: repoDir, branch: "feature/lookup-failure" })
@@ -1593,7 +1592,12 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         .branchPullRequest({ cwd: repoDir, branch: "feature/lookup-failure" }, { refresh: true })
         .pipe(Effect.flip);
       expect(refreshError._tag).toBe("SourceControlProviderError");
-      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(1);
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(2);
+      delete scenario.failWith;
+      expect(
+        yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/lookup-failure" }),
+      ).toBeNull();
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(3);
     }),
   );
 

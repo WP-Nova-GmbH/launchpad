@@ -1,3 +1,4 @@
+import * as GitHubCliAvailability from "./GitHubCliAvailability.ts";
 import { assert, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -33,7 +34,7 @@ function makeProvider(github: Partial<GitHubCli.GitHubCli["Service"]>) {
 it.effect("uses the enterprise quota for a current-repository default branch read", () =>
   Effect.gen(function* () {
     const provider = yield* GitHubSourceControlProvider.make.pipe(
-      Effect.provide(GitHubCli.layer),
+      Effect.provide(GitHubCli.layer.pipe(Layer.provide(GitHubCliAvailability.layer))),
       Effect.provideService(VcsProcess.VcsProcess, {
         run: (input) =>
           Effect.sync(() => {

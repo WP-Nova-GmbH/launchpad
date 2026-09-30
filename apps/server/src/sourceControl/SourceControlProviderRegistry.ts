@@ -14,6 +14,7 @@ import { detectSourceControlProviderFromRemoteUrl } from "@t3tools/shared/source
 
 import * as AzureDevOpsSourceControlProvider from "./AzureDevOpsSourceControlProvider.ts";
 import * as BitbucketSourceControlProvider from "./BitbucketSourceControlProvider.ts";
+import { GitHubCliAvailability } from "./GitHubCliAvailability.ts";
 import * as GitHubSourceControlProvider from "./GitHubSourceControlProvider.ts";
 import * as GitLabSourceControlProvider from "./GitLabSourceControlProvider.ts";
 import * as ForgejoSourceControlProvider from "./ForgejoSourceControlProvider.ts";
@@ -319,6 +320,8 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
 );
 
 export const make = Effect.gen(function* () {
+  const availability = yield* GitHubCliAvailability;
+  const process = yield* VcsProcess.VcsProcess;
   const github = yield* GitHubSourceControlProvider.make;
   const gitlab = yield* GitLabSourceControlProvider.make;
   const forgejo = yield* ForgejoSourceControlProvider.make;
@@ -330,7 +333,22 @@ export const make = Effect.gen(function* () {
     {
       kind: "github",
       provider: github,
-      discovery: GitHubSourceControlProvider.discovery,
+      discovery: {
+        ...GitHubSourceControlProvider.discovery,
+        type: "managed-cli",
+        refineUnknownRemote: () => Effect.succeed(null),
+        probe: (cwd) =>
+          probeSourceControlProvider({
+            cwd,
+            spec: GitHubSourceControlProvider.discovery,
+            process: {
+              run: (input) =>
+                input.args[0] === "--version"
+                  ? availability.run(process, input, true)
+                  : process.run(input),
+            },
+          }),
+      },
     },
     {
       kind: "gitlab",

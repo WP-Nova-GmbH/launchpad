@@ -40,6 +40,10 @@ import {
   hasProjectSettingsOverrides,
   resolveProjectSettings,
 } from "@t3tools/shared/projectSettings";
+import {
+  isGitHubCliMissing,
+  isGitHubCliMissingCause,
+} from "../sourceControl/GitHubCliAvailability.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
   detectSourceControlProviderFromGitRemoteUrl,
@@ -1136,6 +1140,9 @@ export const make = Effect.gen(function* () {
             ? PR_LOOKUP_CACHE_TTL
             : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL;
         }
+        // Missing-tool retries are owned by the environment-wide availability check.
+        // Retaining this failure here would delay recovery after an explicit rescan.
+        if (isGitHubCliMissingCause(exit.cause)) return Duration.zero;
         return nextPrLookupFailureTtl(key);
       },
     },
@@ -1243,7 +1250,10 @@ export const make = Effect.gen(function* () {
       ),
       Effect.map(({ pr }) => pr),
       Effect.catch((error) =>
-        Effect.logWarning("PR lookup failed; keeping last known PR state.").pipe(
+        (isGitHubCliMissing(error)
+          ? Effect.void
+          : Effect.logWarning("PR lookup failed; keeping last known PR state.")
+        ).pipe(
           Effect.annotateLogs({
             operation: "lookupStatusPr",
             branch: details.branch,

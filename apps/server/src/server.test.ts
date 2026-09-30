@@ -1,3 +1,4 @@
+import * as GitHubCliAvailability from "./sourceControl/GitHubCliAvailability.ts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -1283,6 +1284,7 @@ const buildAppUnderTest = (options?: {
         // the organization credential service on a managed executor.
         Layer.provideMerge(OrganizationSourceControlCredentials.layerNone),
         Layer.provide(layerConfig),
+        Layer.provide(GitHubCliAvailability.layer),
       );
 
     yield* Layer.build(appLayer);

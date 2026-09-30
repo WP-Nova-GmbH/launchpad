@@ -6,7 +6,6 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as PlatformError from "effect/PlatformError";
 import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -17,6 +16,7 @@ import {
   type VcsError,
 } from "@t3tools/contracts";
 
+import { GitHubCliAvailability, isMissingExecutable } from "./GitHubCliAvailability.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as GitHubGraphQlBudget from "./githubGraphQlBudget.ts";
 import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
@@ -223,13 +223,7 @@ export function fromVcsError(
   },
   error: VcsError,
 ): GitHubCliError {
-  if (
-    error._tag === "VcsProcessSpawnError" &&
-    error.cause instanceof PlatformError.PlatformError &&
-    error.cause.reason._tag === "NotFound" &&
-    error.cause.reason.module === "ChildProcess" &&
-    error.cause.reason.method === "spawn"
-  ) {
+  if (isMissingExecutable(error)) {
     return new GitHubCliUnavailableError({ ...context, cause: error });
   }
 
@@ -397,6 +391,7 @@ function deriveRepositoryCloneUrlsFromCreateOutput(
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const process = yield* VcsProcess.VcsProcess;
+  const availability = yield* GitHubCliAvailability;
   const budget = yield* GitHubGraphQlBudget.GitHubGraphQlBudget;
   const limits = yield* SourceControlRateLimit.SourceControlRateLimit;
 
@@ -423,8 +418,8 @@ export const make = Effect.gen(function* () {
               GITHUB_ENTERPRISE_TOKEN: token,
               GH_DEBUG: "",
             };
-      return yield* process
-        .run({
+      return yield* availability
+        .run(process, {
           operation: "GitHubCli.execute",
           command: "gh",
           args: input.args,

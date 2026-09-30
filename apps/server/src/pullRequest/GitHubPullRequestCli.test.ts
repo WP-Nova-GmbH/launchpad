@@ -1,3 +1,4 @@
+import * as GitHubCliAvailability from "../sourceControl/GitHubCliAvailability.ts";
 import { afterEach, assert, expect, it, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
@@ -234,10 +235,17 @@ it.effect(
       let activeToken = "broad-credential";
       const commands: VcsProcess.VcsProcessInput[] = [];
       const github = yield* GitHubCli.make.pipe(
-        Effect.provide(Layer.merge(GitHubGraphQlBudget.layer, SourceControlRateLimit.layer)),
+        Effect.provide(
+          Layer.mergeAll(
+            GitHubCliAvailability.layer,
+            GitHubGraphQlBudget.layer,
+            SourceControlRateLimit.layer,
+          ),
+        ),
         Effect.provideService(VcsProcess.VcsProcess, {
           run: (input) =>
             Effect.sync(() => {
+              if (input.args[0] === "--version") return output("gh version test");
               commands.push(input);
               if (input.args[0] === "auth") return output(activeToken);
               if (input.args[0] === "api") return output('{"id":123,"login":"same-account"}');

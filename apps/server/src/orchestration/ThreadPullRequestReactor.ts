@@ -20,6 +20,10 @@ import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import {
+  isGitHubCliMissingCause,
+  logGitHubBackgroundWarning,
+} from "../sourceControl/GitHubCliAvailability.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
@@ -80,12 +84,17 @@ export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   // Settled threads get one link discovery at startup. Failed lookups retry on
   // the periodic pass a few times, then stop until the thread changes or the
-  // server restarts, so a missing or logged-out CLI cannot loop forever.
+  // server restarts. Missing GitHub CLI checks have their own shared cooldown
+  // and must not exhaust this budget before installation can recover them.
   const pendingBackfill = new Map<ThreadId, number>();
   const finishBackfill = (threads: ReadonlyArray<{ readonly id: ThreadId }>) => {
     for (const thread of threads) pendingBackfill.delete(thread.id);
   };
-  const failBackfill = (threads: ReadonlyArray<{ readonly id: ThreadId }>) => {
+  const failBackfill = (
+    threads: ReadonlyArray<{ readonly id: ThreadId }>,
+    cause?: Cause.Cause<unknown>,
+  ) => {
+    if (cause !== undefined && isGitHubCliMissingCause(cause)) return;
     for (const thread of threads) {
       const remaining = pendingBackfill.get(thread.id);
       if (remaining === undefined) continue;
@@ -210,11 +219,11 @@ export const make = Effect.gen(function* () {
               Effect.catchCauseIf(
                 (cause) => !Cause.hasInterruptsOnly(cause),
                 (cause) =>
-                  Effect.logWarning("thread pull request discovery failed", {
+                  logGitHubBackgroundWarning(cause, "thread pull request discovery failed", {
                     threadId: thread.id,
                     cause: Cause.pretty(cause),
                   }).pipe(
-                    Effect.tap(() => Effect.sync(() => failBackfill([thread]))),
+                    Effect.tap(() => Effect.sync(() => failBackfill([thread], cause))),
                     Effect.as(null),
                   ),
               ),
@@ -276,10 +285,10 @@ export const make = Effect.gen(function* () {
                 Effect.catchCauseIf(
                   (cause) => !Cause.hasInterruptsOnly(cause),
                   (cause) =>
-                    Effect.logWarning("thread pull request update failed", {
+                    logGitHubBackgroundWarning(cause, "thread pull request update failed", {
                       threadId: thread.id,
                       cause: Cause.pretty(cause),
-                    }).pipe(Effect.tap(() => Effect.sync(() => failBackfill([thread])))),
+                    }).pipe(Effect.tap(() => Effect.sync(() => failBackfill([thread], cause)))),
                 ),
               ),
             { discard: true },
@@ -288,10 +297,10 @@ export const make = Effect.gen(function* () {
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
             (cause) =>
-              Effect.logWarning("thread branch pull request lookup failed", {
+              logGitHubBackgroundWarning(cause, "thread branch pull request lookup failed", {
                 threadIds: group.map((thread) => thread.id),
                 cause: Cause.pretty(cause),
-              }).pipe(Effect.tap(() => Effect.sync(() => failBackfill(group)))),
+              }).pipe(Effect.tap(() => Effect.sync(() => failBackfill(group, cause)))),
           ),
         ),
       { concurrency: 8, discard: true },
@@ -303,7 +312,7 @@ export const make = Effect.gen(function* () {
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
         (cause) =>
-          Effect.logWarning("thread pull request refresh failed", {
+          logGitHubBackgroundWarning(cause, "thread pull request refresh failed", {
             cause: Cause.pretty(cause),
           }),
       ),

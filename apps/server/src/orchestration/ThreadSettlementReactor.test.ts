@@ -5,6 +5,7 @@ import {
   ProviderInstanceId,
   ProviderDriverKind,
   PullRequestOperationError,
+  PullRequestUnavailableError,
   ThreadId,
   type OrchestrationCommand,
   type OrchestrationEvent,
@@ -1073,47 +1074,51 @@ describe("ThreadSettlementReactor", () => {
     ),
   );
 
-  it.effect("keeps an unknown pull request active and continues with other candidates", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse(NOW));
-        const fixture = yield* makeHarness({
-          snapshot: makeSnapshot(
-            [
-              makeThread("lookup-failed", {
-                latestUserMessageAt: "2026-08-27T00:00:00.000Z",
-                linkedPullRequest: {
-                  projectId: LINKED_PROJECT_ID,
-                  repository: "owner/repository",
-                  number: 9,
-                  url: "https://example.test/owner/repository/pull/9",
-                },
-              }),
-              makeThread("inactive-without-pr"),
-            ],
-            [makeProject(), makeProject(LINKED_PROJECT_ID, "/workspace/linked")],
-          ),
-          pullRequestSummary: () =>
-            Effect.fail(
-              new PullRequestOperationError({
-                operation: "summary",
-                detail: "host unavailable",
-              }),
+  it.effect.each(["network", "missing-tool"] as const)(
+    "keeps an unknown pull request active and continues with other candidates: %s",
+    (failure) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot(
+              [
+                makeThread("lookup-failed", {
+                  latestUserMessageAt: "2026-08-27T00:00:00.000Z",
+                  linkedPullRequest: {
+                    projectId: LINKED_PROJECT_ID,
+                    repository: "owner/repository",
+                    number: 9,
+                    url: "https://example.test/owner/repository/pull/9",
+                  },
+                }),
+                makeThread("inactive-without-pr"),
+              ],
+              [makeProject(), makeProject(LINKED_PROJECT_ID, "/workspace/linked")],
             ),
-        });
+            pullRequestSummary: () =>
+              Effect.fail(
+                failure === "missing-tool"
+                  ? new PullRequestUnavailableError({ provider: "github", reason: "cli-missing" })
+                  : new PullRequestOperationError({
+                      operation: "summary",
+                      detail: "host unavailable",
+                    }),
+              ),
+          });
 
-        yield* Effect.gen(function* () {
-          const reactor = yield* ThreadSettlementReactor.ThreadSettlementReactor;
-          yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
+          yield* Effect.gen(function* () {
+            const reactor = yield* ThreadSettlementReactor.ThreadSettlementReactor;
+            yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
 
-          assert.deepStrictEqual(
-            (yield* Ref.get(fixture.commands)).map((command) => command.threadId),
-            [ThreadId.make("inactive-without-pr")],
-          );
-          assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
-        }).pipe(Effect.provide(fixture.layer));
-      }),
-    ),
+            assert.deepStrictEqual(
+              (yield* Ref.get(fixture.commands)).map((command) => command.threadId),
+              [ThreadId.make("inactive-without-pr")],
+            );
+            assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
   );
 
   it.effect("settles inactive linked and branch threads without reading an unavailable host", () =>

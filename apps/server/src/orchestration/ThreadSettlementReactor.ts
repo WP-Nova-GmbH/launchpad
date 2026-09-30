@@ -17,6 +17,7 @@ import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import { logGitHubBackgroundWarning } from "../sourceControl/GitHubCliAvailability.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -140,7 +141,7 @@ export const make = Effect.gen(function* () {
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
             (cause) =>
-              Effect.logWarning("automatic thread settlement skipped", {
+              logGitHubBackgroundWarning(cause, "automatic thread settlement skipped", {
                 threadId: thread.id,
                 cause: Cause.pretty(cause),
               }).pipe(Effect.as(null)),
@@ -308,7 +309,7 @@ export const make = Effect.gen(function* () {
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
             (cause) =>
-              Effect.logWarning("automatic thread settlement skipped", {
+              logGitHubBackgroundWarning(cause, "automatic thread settlement skipped", {
                 threadIds: group.map((thread) => thread.id),
                 cause: Cause.pretty(cause),
               }),
@@ -326,7 +327,7 @@ export const make = Effect.gen(function* () {
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
         (cause) =>
-          Effect.logWarning("automatic thread settlement sweep failed", {
+          logGitHubBackgroundWarning(cause, "automatic thread settlement sweep failed", {
             cause: Cause.pretty(cause),
           }),
       ),

@@ -185,6 +185,7 @@ import * as SourceControlRepositoryService from "./sourceControl/SourceControlRe
 import * as AzureDevOpsCli from "./sourceControl/AzureDevOpsCli.ts";
 import * as BitbucketApi from "./sourceControl/BitbucketApi.ts";
 import * as GitHubCli from "./sourceControl/GitHubCli.ts";
+import * as GitHubCliAvailability from "./sourceControl/GitHubCliAvailability.ts";
 import * as GitLabCli from "./sourceControl/GitLabCli.ts";
 import * as ForgejoCli from "./sourceControl/ForgejoCli.ts";
 import * as SourceControlProviderRegistry from "./sourceControl/SourceControlProviderRegistry.ts";
@@ -4743,6 +4744,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         ),
     });
     const pullRequests = yield* PullRequestService.PullRequestService;
+    const githubAvailability = yield* GitHubCliAvailability.GitHubCliAvailability;
     const sql = yield* SqlClient.SqlClient;
     return HttpRouter.add(
       "GET",
@@ -4842,6 +4844,9 @@ export const websocketRpcRouteLayer = Layer.unwrap(
                     ),
                   ),
                 ),
+              ),
+              Layer.provide(
+                Layer.succeed(GitHubCliAvailability.GitHubCliAvailability, githubAvailability),
               ),
             ),
           ),

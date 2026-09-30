@@ -26,6 +26,7 @@ import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
+import { logGitHubBackgroundWarning } from "../sourceControl/GitHubCliAvailability.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as OrchestrationEngine from "./Services/OrchestrationEngine.ts";
@@ -150,7 +151,9 @@ export const make = Effect.gen(function* () {
   const logSkipped =
     (message: string, fields: Record<string, unknown>) =>
     <E>(cause: Cause.Cause<E>): Effect.Effect<void, E> =>
-      Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.logWarning(message, fields);
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.failCause(cause)
+        : logGitHubBackgroundWarning(cause, message, fields);
 
   const sweep = Effect.fn("PullRequestSyncReactor.sweep")(function* (requestedKey?: string) {
     const snapshot = yield* snapshots.getShellSnapshot();
@@ -261,8 +264,8 @@ export const make = Effect.gen(function* () {
             })),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
-              () =>
-                Effect.logWarning("pull request stack lookup failed", {
+              (cause) =>
+                logGitHubBackgroundWarning(cause, "pull request stack lookup failed", {
                   key,
                 }).pipe(Effect.as(null)),
             ),

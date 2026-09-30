@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema";
 import * as GitHubPullRequestCli from "../src/pullRequest/GitHubPullRequestCli.ts";
 import * as GitHubPullRequestProvider from "../src/pullRequest/GitHubPullRequestProvider.ts";
 import * as GitHubCli from "../src/sourceControl/GitHubCli.ts";
+import * as GitHubCliAvailability from "../src/sourceControl/GitHubCliAvailability.ts";
 import * as OrganizationSourceControlCredentials from "../src/relay/OrganizationSourceControlCredentials.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 
@@ -54,6 +55,7 @@ const measuredProcess = Layer.effect(
 
 const services = GitHubPullRequestCli.layer.pipe(
   Layer.provide(GitHubCli.layer),
+  Layer.provide(GitHubCliAvailability.layer),
   Layer.provideMerge(measuredProcess),
 );
 

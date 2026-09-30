@@ -3,6 +3,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   PullRequestOperationError,
+  PullRequestUnavailableError,
   ThreadId,
   type OrchestrationCommand,
   type OrchestrationEvent,
@@ -161,7 +162,7 @@ interface HarnessOptions {
   readonly snapshot: OrchestrationShellSnapshot;
   readonly summary?: (
     input: PullRequestRef,
-  ) => Effect.Effect<PullRequestSummary, PullRequestOperationError>;
+  ) => Effect.Effect<PullRequestSummary, PullRequestOperationError | PullRequestUnavailableError>;
   readonly stack?: (
     input: PullRequestRef,
   ) => Effect.Effect<PullRequestStack | null, PullRequestOperationError>;
@@ -845,32 +846,42 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 
-  it.effect("keeps existing snapshots and continues when the host fails", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse(NOW));
-        const fixture = yield* makeHarness({
-          snapshot: makeSnapshot([
-            makeThread("failing", { pullRequests: [makeLink(7, { state: "open" })] }),
-            makeThread("fine", { pullRequests: [makeLink(8)] }),
-          ]),
-          summary: (input) =>
-            input.number === 7
-              ? Effect.fail(
-                  new PullRequestOperationError({ operation: "summary", detail: "host down" }),
-                )
-              : Effect.succeed(makeSummary(input)),
-        });
+  it.effect.each(["network", "missing-tool"] as const)(
+    "keeps existing snapshots and continues when the host fails: %s",
+    (failure) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot([
+              makeThread("failing", { pullRequests: [makeLink(7, { state: "open" })] }),
+              makeThread("fine", { pullRequests: [makeLink(8)] }),
+            ]),
+            summary: (input) =>
+              input.number === 7
+                ? Effect.fail(
+                    failure === "missing-tool"
+                      ? new PullRequestUnavailableError({
+                          provider: "github",
+                          reason: "cli-missing",
+                        })
+                      : new PullRequestOperationError({
+                          operation: "summary",
+                          detail: "host down",
+                        }),
+                  )
+                : Effect.succeed(makeSummary(input)),
+          });
 
-        yield* Effect.gen(function* () {
-          yield* startAndSweep(fixture);
+          yield* Effect.gen(function* () {
+            yield* startAndSweep(fixture);
 
-          assert.deepStrictEqual(
-            (yield* Ref.get(fixture.syncCommands)).map((command) => command.number),
-            [8],
-          );
-        }).pipe(Effect.provide(fixture.layer));
-      }),
-    ),
+            assert.deepStrictEqual(
+              (yield* Ref.get(fixture.syncCommands)).map((command) => command.number),
+              [8],
+            );
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
   );
 });

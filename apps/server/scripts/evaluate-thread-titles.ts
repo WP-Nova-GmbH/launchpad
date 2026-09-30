@@ -24,6 +24,7 @@ import {
 import * as ThreadTitleLinks from "../src/textGeneration/ThreadTitleLinks.ts";
 import * as SourceControlProviderRegistry from "../src/sourceControl/SourceControlProviderRegistry.ts";
 import * as GitHubCli from "../src/sourceControl/GitHubCli.ts";
+import * as GitHubCliAvailability from "../src/sourceControl/GitHubCliAvailability.ts";
 import * as GitLabCli from "../src/sourceControl/GitLabCli.ts";
 import * as ForgejoCli from "../src/sourceControl/ForgejoCli.ts";
 import * as AzureDevOpsCli from "../src/sourceControl/AzureDevOpsCli.ts";
@@ -165,6 +166,7 @@ await Effect.runPromise(
           Layer.provide(FetchHttpClient.layer),
         ),
       ).pipe(
+        Layer.provide(GitHubCliAvailability.layer),
         Layer.provide(OrganizationSourceControlCredentials.layerNone),
         Layer.provideMerge(
           ServerConfig.layerTest(process.cwd(), { prefix: "t3-title-evaluation-state-" }),

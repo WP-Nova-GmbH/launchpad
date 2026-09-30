@@ -1,3 +1,4 @@
+import * as GitHubCliAvailability from "./GitHubCliAvailability.ts";
 import { assert, it, afterEach, describe, expect, vi } from "@effect/vitest";
 import * as Cache from "effect/Cache";
 import * as TestClock from "effect/testing/TestClock";
@@ -34,10 +35,15 @@ const quotaOutput = (remaining = 5000, resetAt = "2099-01-01T00:00:00Z") =>
 const mockRun = vi.fn<VcsProcess.VcsProcess["Service"]["run"]>();
 
 const layer = GitHubCli.layer.pipe(
+  Layer.provide(GitHubCliAvailability.layer),
   Layer.provide(
     Layer.mock(VcsProcess.VcsProcess)({
       run: (input) =>
-        input.args[1] === "rate_limit" ? Effect.succeed(quotaOutput()) : mockRun(input),
+        input.args[0] === "--version"
+          ? Effect.succeed(processOutput("gh version test"))
+          : input.args[1] === "rate_limit"
+            ? Effect.succeed(quotaOutput())
+            : mockRun(input),
     }),
   ),
 );
@@ -55,9 +61,11 @@ it.effect("shares quota checks, preserves the reserve, and resumes after reset",
       DateTime.makeUnsafe((yield* Clock.currentTimeMillis) + 60_000),
     );
     const gh = yield* GitHubCli.make.pipe(
+      Effect.provide(GitHubCliAvailability.layer),
       Effect.provideService(VcsProcess.VcsProcess, {
         run: (input) =>
           Effect.sync(() => {
+            if (input.args[0] === "--version") return processOutput("gh version test");
             if (input.args[1] === "rate_limit") {
               probes++;
               assert.strictEqual(input.args[3], "enterprise.test");
@@ -113,9 +121,11 @@ describe("GitHubCli.layer", () => {
     Effect.gen(function* () {
       let reads = 0;
       const gh = yield* GitHubCli.make.pipe(
+        Effect.provide(GitHubCliAvailability.layer),
         Effect.provideService(VcsProcess.VcsProcess, {
           run: (input) =>
             Effect.sync(() => {
+              if (input.args[0] === "--version") return processOutput("gh version test");
               if (input.args[1] === "rate_limit")
                 return quotaOutput(input.env?.GH_TOKEN === "empty" ? 0 : 5000);
               reads++;

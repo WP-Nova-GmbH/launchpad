@@ -1,3 +1,4 @@
+import * as GitHubCliAvailability from "./GitHubCliAvailability.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
@@ -30,6 +31,7 @@ const sourceControlProviderRegistryTestLayer = (input: {
   readonly process: Partial<VcsProcess.VcsProcess["Service"]>;
 }) =>
   SourceControlProviderRegistry.layer.pipe(
+    Layer.provide(GitHubCliAvailability.layer),
     Layer.provide(
       Layer.mergeAll(
         ServerConfig.layerTest(process.cwd(), {

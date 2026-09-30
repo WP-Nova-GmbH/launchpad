@@ -1,8 +1,12 @@
+import { providerAuth } from "./SourceControlProviderDiscovery.ts";
+import * as GitHubCliAvailability from "./GitHubCliAvailability.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as PlatformError from "effect/PlatformError";
+import { VcsProcessSpawnError } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { VcsRepositoryDetectionError } from "@t3tools/contracts";
@@ -40,6 +44,7 @@ function makeRegistry(input: {
     readonly url: string;
   }>;
   readonly process?: Partial<VcsProcess.VcsProcess["Service"]>;
+  readonly availability?: GitHubCliAvailability.GitHubCliAvailability["Service"];
   readonly github?: Partial<GitHubCli.GitHubCli["Service"]>;
   readonly gitlab?: Partial<GitLabCli.GitLabCli["Service"]>;
   readonly resolve?: VcsDriverRegistry.VcsDriverRegistry["Service"]["resolve"];
@@ -89,11 +94,16 @@ function makeRegistry(input: {
   return SourceControlProviderRegistry.make.pipe(
     Effect.provide(
       Layer.mergeAll(
+        input.availability === undefined
+          ? GitHubCliAvailability.layer
+          : Layer.succeed(GitHubCliAvailability.GitHubCliAvailability, input.availability),
         NodeServices.layer,
         registryLayer,
         processLayer,
         Layer.mock(AzureDevOpsCli.AzureDevOpsCli)({}),
-        Layer.mock(BitbucketApi.BitbucketApi)({}),
+        Layer.mock(BitbucketApi.BitbucketApi)({
+          probeAuth: Effect.succeed(providerAuth({ status: "unknown" })),
+        }),
         Layer.mock(GitHubCli.GitHubCli)(input.github ?? {}),
         Layer.mock(GitLabCli.GitLabCli)(input.gitlab ?? {}),
         Layer.mock(ForgejoCli.ForgejoCli)({ listLogins: () => Effect.succeed([]) }),
@@ -344,4 +354,43 @@ it.effect(
         );
       }
     }).pipe(Effect.scoped),
+);
+
+it.effect("settings discovery recovers the availability shared by background commands", () =>
+  Effect.gen(function* () {
+    const availability = yield* GitHubCliAvailability.make;
+    let installed = false;
+    const process: VcsProcess.VcsProcess["Service"] = {
+      run: () =>
+        Effect.suspend(() =>
+          installed
+            ? Effect.succeed(processOutput("gh version test"))
+            : Effect.fail(
+                new VcsProcessSpawnError({
+                  operation: "test",
+                  command: "gh",
+                  cwd: "/repo",
+                  cause: PlatformError.systemError({
+                    _tag: "NotFound",
+                    module: "ChildProcess",
+                    method: "spawn",
+                  }),
+                }),
+              ),
+        ),
+    };
+    const registry = yield* makeRegistry({ remotes: [], availability, process });
+    assert.equal(
+      (yield* registry.discover).find((item) => item.kind === "github")?.status,
+      "missing",
+    );
+    installed = true;
+    const command = { command: "gh", args: ["pr", "list"], cwd: "/repo", operation: "test" };
+    yield* availability.run(process, command).pipe(Effect.flip);
+    assert.equal(
+      (yield* registry.discover).find((item) => item.kind === "github")?.status,
+      "available",
+    );
+    assert.equal((yield* availability.run(process, command)).stdout, "gh version test");
+  }),
 );
