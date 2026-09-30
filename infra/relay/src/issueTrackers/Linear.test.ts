@@ -19,6 +19,7 @@ import {
 } from "./Linear.ts";
 
 const tokenInput = { clientId: "client", clientSecret: "client-secret" };
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const encodeFailure = Schema.encodeSync(Schema.fromJsonString(IssueTrackerFailure));
 const issueInput = {
   accessToken: "access-secret",
@@ -28,6 +29,7 @@ const issueInput = {
 };
 const workspace = { id: "workspace-id", name: "Launchpad", urlKey: "launchpad" };
 const issue = {
+  id: "issue-id",
   identifier: "LP-42",
   title: "Connect issue trackers",
   description: "Read issues from chat.",
@@ -201,9 +203,11 @@ describe("Linear issue reading", () => {
         expect(
           yield* readLinearIssue({ ...issueInput, issue: reference }).pipe(http.provide),
         ).toEqual({
+          issueId: "issue-id",
           identifier: "LP-42",
           title: issue.title,
           description: issue.description,
+          originalDescription: issue.description,
           url: issue.url,
           status: "In Progress",
           assignee: "Alice",
@@ -384,3 +388,16 @@ describe("Linear issue reading", () => {
     }),
   );
 });
+
+it.effect("bounds escaped issue text without losing the source link", () =>
+  Effect.gen(function* () {
+    const http = mockHttp([graphqlResponse({ ...issue, description: "\u0000".repeat(20_000) })]);
+    const { originalDescription, ...result } = yield* readLinearIssue(issueInput).pipe(
+      http.provide,
+    );
+    expect(originalDescription).toBe("\u0000".repeat(20_000));
+    expect(result.url).toBe(issue.url);
+    expect(result.description).toContain("Description truncated");
+    expect(new TextEncoder().encode(encodeJson(result)).length).toBeLessThanOrEqual(48 * 1024);
+  }),
+);

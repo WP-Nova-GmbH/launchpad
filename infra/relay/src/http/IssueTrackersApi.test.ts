@@ -252,3 +252,36 @@ describe("issue tracker authorization", () => {
     }),
   );
 });
+
+it.effect.each(["readComments", "readImages", "viewImage"] as const)(
+  "enforces managed executor identity before %s follow-ups",
+  (operation) =>
+    Effect.gen(function* () {
+      for (const found of [
+        null,
+        { ...machine, role: "review_host" as const },
+        { ...machine, environmentPublicKey: "other" },
+        machine,
+      ]) {
+        const harness = setup({ machine: found });
+        const client = yield* harness.client;
+        const input = {
+          params: { environmentId: EnvironmentId.make("env-a") },
+          payload: { reference: "sealed-reference" },
+        };
+        const failures = {
+          readComments: client.issueTrackersServer.readComments(input).pipe(Effect.flip),
+          readImages: client.issueTrackersServer.readImages(input).pipe(Effect.flip),
+          viewImage: client.issueTrackersServer.viewImage(input).pipe(Effect.flip),
+        };
+        const error = yield* failures[operation];
+        if (found === machine) {
+          expect(error).toMatchObject({ _tag: "RelayIssueTrackerError", code: "conflict" });
+          expect(harness.seen).toEqual(["get:org-a"]);
+        } else {
+          expect(error._tag).toBe("RelayAuthInvalidError");
+          expect(harness.seen).toEqual([]);
+        }
+      }
+    }),
+);

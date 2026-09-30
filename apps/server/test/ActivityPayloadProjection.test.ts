@@ -9,10 +9,16 @@ import {
   type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import { resolveWorkEntryToolPresentation } from "../../../packages/client-runtime/src/work-log/presentation.ts";
 
-import { buildThreadFeed, type ThreadFeedActivity } from "../../mobile/src/lib/threadActivity.ts";
+import {
+  buildThreadFeed,
+  workEntryRowLabel,
+  type ThreadFeedActivity,
+} from "../../mobile/src/lib/threadActivity.ts";
 import { deriveLatestContextWindowSnapshot } from "../../web/src/lib/contextWindow.ts";
 import { deriveWorkLogEntries } from "../../web/src/session-logic.ts";
+import { workEntryDisplayLabel } from "../../web/src/components/chat/MessagesTimeline.logic.ts";
 import {
   projectActivityEvent,
   projectActivityPayload,
@@ -608,4 +614,143 @@ describe("context-window snapshot dedup", () => {
     });
     expect(projected.thread.activities).toEqual([projectActivityPayload(fixtures[4]!)]);
   });
+});
+
+describe("issue tracker identity through projection and client conversion", () => {
+  it.each([
+    ["read_linear_issue", "Linear", ""],
+    ["read_linear_comments", "Linear", " discussion"],
+    ["read_linear_images", "Linear", " image references"],
+    ["view_linear_image", "Linear", " image"],
+    ["read_jira_issue", "Jira", ""],
+  ] as const)(
+    "retains the label and source link for %s in both clients",
+    (tool, service, suffix) => {
+      const identity = {
+        service: service.toLowerCase(),
+        identifier: "LP-214",
+        accountLabel: "Team · Launchpad",
+        url:
+          service === "Linear"
+            ? "https://linear.app/team/issue/LP-214"
+            : "https://team.atlassian.net/browse/LP-214",
+      };
+      const metadata = { ...identity, description: "Long issue context".repeat(1_000) };
+      const result = {
+        structuredContent: metadata,
+        content: [
+          { type: "text", text: JSON.stringify(metadata) },
+          { type: "image", data: "image-bytes-must-not-survive" },
+        ],
+      };
+      const envelopes = [
+        {
+          provider: "Codex",
+          itemType: "mcp_tool_call",
+          title: `t3-code · ${tool}`,
+          data: { item: { server: "t3-code", tool, status: "completed", result } },
+        },
+        {
+          provider: "Claude",
+          itemType: "mcp_tool_call",
+          title: "MCP tool call",
+          data: {
+            toolName: `mcp__t3_code__${tool}`,
+            result: { type: "tool_result", content: result.content },
+          },
+        },
+        ...[false, true].map((mcp) => ({
+          provider: mcp ? "OpenCode MCP" : "OpenCode",
+          itemType: mcp
+            ? "mcp_tool_call"
+            : tool.includes("image")
+              ? "image_view"
+              : "dynamic_tool_call",
+          title: "Read issue context",
+          data: {
+            tool: `${mcp ? "mcp__t3-code__" : "t3-code_"}${tool}`,
+            state: {
+              status: "completed",
+              title: "Read issue context",
+              output: JSON.stringify(metadata),
+            },
+            ...(mcp ? { result: JSON.stringify(metadata) } : {}),
+          },
+        })),
+        {
+          provider: "ACP raw output",
+          itemType: "dynamic_tool_call",
+          title: tool,
+          data: { rawOutput: result },
+        },
+        {
+          provider: "ACP content",
+          itemType: "dynamic_tool_call",
+          title: `mcp__t3-code__${tool}`,
+          data: { content: [{ type: "content", content: result.content[0] }] },
+        },
+      ];
+      for (const { provider, ...payload } of envelopes) {
+        const projected = projectActivityPayload({
+          ...makeActivity(provider, payload.itemType, {}),
+          payload: { ...payload, status: "completed" },
+        });
+        expect(JSON.stringify(projected)).not.toContain("image-bytes-must-not-survive");
+        expect(JSON.stringify(projected).length).toBeLessThan(1_500);
+        for (const received of [projected, projectActivityPayload(projected)]) {
+          const [webEntry] = deriveWorkLogEntries([received]);
+          const [mobileGroup] = buildThreadFeed(makeThread([received]));
+          expect(mobileGroup?.type, provider).toBe("activity-group");
+          if (mobileGroup?.type !== "activity-group") continue;
+          const mobileEntry = mobileGroup.activities[0]?.workEntry;
+          expect(webEntry, provider).toBeDefined();
+          expect(mobileEntry, provider).toBeDefined();
+          const label = `Read ${service} issue LP-214${suffix} · Team · Launchpad`;
+          expect(workEntryDisplayLabel(webEntry!, undefined), provider).toBe(label);
+          expect(workEntryRowLabel(mobileEntry!), provider).toBe(label);
+          for (const entry of [webEntry!, mobileEntry!]) {
+            expect(resolveWorkEntryToolPresentation(entry)?.issueUrl, provider).toBe(identity.url);
+          }
+        }
+      }
+    },
+  );
+
+  it.each(["failed", "declined", "stopped", "inProgress"])(
+    "does not present a successful shared read or source link while %s",
+    (status) => {
+      const projected = projectActivityPayload({
+        ...makeActivity("incomplete-read", "mcp_tool_call", {}),
+        payload: {
+          itemType: "mcp_tool_call",
+          status,
+          title: "t3-code · read_linear_issue",
+          data: {
+            item: {
+              server: "t3-code",
+              tool: "read_linear_issue",
+              result: {
+                structuredContent: {
+                  service: "linear",
+                  identifier: "LP-214",
+                  accountLabel: "Team · Launchpad",
+                  url: "https://linear.app/team/issue/LP-214",
+                },
+              },
+            },
+          },
+        },
+      });
+      const [webEntry] = deriveWorkLogEntries([projected]);
+      const [mobileGroup] = buildThreadFeed(makeThread([projected]));
+      expect(mobileGroup?.type).toBe("activity-group");
+      if (mobileGroup?.type !== "activity-group") return;
+      for (const entry of [webEntry!, mobileGroup.activities[0]!.workEntry]) {
+        const presentation = resolveWorkEntryToolPresentation(entry);
+        expect(presentation?.displayName).not.toContain("LP-214");
+        expect(presentation?.displayName).not.toContain("Team · Launchpad");
+        expect(presentation?.issueUrl).toBeUndefined();
+      }
+    },
+  );
 });

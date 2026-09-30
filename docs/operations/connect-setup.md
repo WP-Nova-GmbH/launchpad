@@ -156,6 +156,12 @@ relay has no Linear application configured, the settings page explains that setu
 See [Linear's app authorization documentation](https://linear.app/developers/oauth-actor-authorization)
 for the application model.
 
+For a local pilot, put the application credentials in the worktree's gitignored
+`infra/relay/.env`, set `DEV_RELAY_ISSUER` to its reachable relay origin, and use a separate
+`DEV_RELAY_DATABASE_URL`. Register the callback against that issuer before authorizing from
+Launchpad. The application is registered once per deployment; organization admins authorize
+through Launchpad and do not need their own developer applications.
+
 Jira does not need a deployment-wide OAuth application for this release. The organization admin
 supplies a Jira Cloud site, an Atlassian service account API key, and a known issue to verify site
 access. Its Atlassian admin must first

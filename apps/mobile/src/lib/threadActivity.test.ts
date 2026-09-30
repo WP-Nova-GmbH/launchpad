@@ -3748,3 +3748,29 @@ it("keeps attachment-only question answers expandable outside mobile work groups
   expect(running[1]).toBe(group);
   expect(running[2]?.type).toBe("work-toggle");
 });
+
+it.each(["read_linear_issue", "read_linear_comments", "view_linear_image"])(
+  "uses shared Linear identity in native activity: %s",
+  (tool) => {
+    const entry: WorkLogEntry = {
+      id: "linear-read",
+      createdAt: "2026-09-30T12:00:00Z",
+      turnId: null,
+      label: tool,
+      tone: "tool",
+      toolLifecycleStatus: "completed",
+      toolData: {
+        result: {
+          structuredContent: {
+            service: "linear",
+            identifier: "LP-1",
+            accountLabel: "Team · Launchpad",
+            url: "https://linear.app/team/issue/LP-1",
+          },
+        },
+      },
+    };
+    expect(workEntryRowLabel(entry)).toContain("LP-1");
+    expect(workEntryRowLabel(entry)).toContain("Team · Launchpad");
+  },
+);

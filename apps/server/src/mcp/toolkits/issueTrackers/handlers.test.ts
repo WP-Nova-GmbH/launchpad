@@ -1,3 +1,5 @@
+import { McpSchema, McpServer } from "effect/unstable/ai";
+import { IssueTrackersToolkitRegistrationLive } from "../../McpHttpServer.ts";
 import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { RelayReadIssueRequest, type RelayReadIssueResponse } from "@t3tools/contracts/relay";
@@ -102,7 +104,7 @@ const makeHarness = Effect.fnUntraced(function* (
       Effect.map((entries) => entries.at(-1)?.result),
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation(capabilities)),
     );
-  return { call, requests, readSecrets };
+  return { call, requests, readSecrets, dependencies };
 });
 
 describe("issue tracker MCP handlers", () => {
@@ -203,3 +205,127 @@ describe("issue tracker MCP handlers", () => {
     }),
   );
 });
+
+it.effect(
+  "delivers Linear image bytes as MCP image content without copying them into metadata",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const imageResult = {
+          service: "linear",
+          accountLabel: "Team app",
+          identifier: "LP-1",
+          url: "https://linear.app/team/issue/LP-1",
+          workspaceId: "workspace",
+          issueId: "issue",
+          image: { mimeType: "image/png", data: "iVBORw==" },
+        };
+        const harness = yield* makeHarness({ respond: () => Response.json(imageResult) });
+        const output = yield* callRegisteredTool(harness, "view_linear_image");
+        expect(output.isError).toBe(false);
+        expect(output.content).toContainEqual({
+          type: "image",
+          mimeType: "image/png",
+          data: new Uint8Array([137, 80, 78, 71]),
+        });
+        expect(output.structuredContent).toMatchObject({
+          accountLabel: "Team app",
+          identifier: "LP-1",
+        });
+        expect(encodeJson(output.structuredContent)).not.toContain(imageResult.image.data);
+        expect(encodeJson(output.content.filter((block) => block.type === "text"))).not.toContain(
+          imageResult.image.data,
+        );
+        expect(harness.requests[0]?.url).toContain("/issue-trackers/linear/image");
+      }),
+    ),
+);
+
+function callRegisteredTool(harness: Effect.Success<ReturnType<typeof makeHarness>>, name: string) {
+  const layer = IssueTrackersToolkitRegistrationLive.pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provide(harness.dependencies),
+  );
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    return yield* server.callTool({
+      name,
+      arguments: { reference: "source-reference" },
+    });
+  }).pipe(
+    Effect.provide(layer),
+    Effect.provideService(
+      McpInvocationContext.McpInvocationContext,
+      invocation(["issue-trackers"]),
+    ),
+    Effect.provideService(
+      McpSchema.McpServerClient,
+      McpSchema.McpServerClient.of({
+        clientId: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1" },
+        protocolVersion: "2025-06-18",
+        initializePayload: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1" },
+        },
+        getClient: Effect.die("unused"),
+      }),
+    ),
+  );
+}
+
+it.effect.each([
+  { code: "image_too_large", text: "5 MiB" },
+  { code: "unsupported_image", text: "not a supported image" },
+  { code: "forbidden", text: "permission" },
+  { code: "auth_required", text: "administrator" },
+  { code: "conflict", text: "Read the issue again" },
+  { code: "not_found", text: "no longer accessible" },
+  { code: "unavailable", text: "Try again later" },
+])("reports a safe, actionable image failure for $code through MCP", ({ code, text }) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        respond: () =>
+          Response.json(
+            { _tag: "RelayIssueTrackerError", code, message: `Unsafe upstream ${credential}` },
+            { status: 400 },
+          ),
+      });
+      const output = yield* callRegisteredTool(harness, "view_linear_image");
+      expect(output.isError).toBe(true);
+      expect(output.structuredContent).toMatchObject({
+        error: { code, message: expect.stringContaining(text) },
+      });
+      expect(output.content).toContainEqual({ type: "text", text: expect.stringContaining(text) });
+      expect(encodeJson(output)).not.toContain(credential);
+      expect(encodeJson(output)).not.toContain("Unsafe upstream");
+    }),
+  ),
+);
+
+it.effect("routes image-reference pagination through the managed relay", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        respond: () =>
+          Response.json({
+            service: "linear",
+            accountLabel: "Team app",
+            identifier: "LP-1",
+            url: "https://linear.app/team/issue/LP-1",
+            workspaceId: "workspace",
+            issueId: "issue",
+            images: [],
+            imagesTruncated: false,
+            imagesContinuation: null,
+          }),
+      });
+      const output = yield* callRegisteredTool(harness, "read_linear_images");
+      expect(output.isError).not.toBe(true);
+      expect(harness.requests[0]?.url).toContain("/issue-trackers/linear/images");
+    }),
+  ),
+);

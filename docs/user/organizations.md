@@ -65,6 +65,13 @@ In a supported chat, ask the agent to read a specific issue, such as “Read Lin
 “Read Jira issue TEAM-42,” or supply its URL. These connections provide read-only issue context;
 search, issue updates, and automatic jobs are not supported yet.
 
+For Linear, the agent can also read comments and replies, request older discussion, and view
+images uploaded to the issue or its comments. Ask it to inspect an image when visual context
+matters. Long comments may be shortened; their source links open the full text in Linear.
+The agent can request more images when an issue contains many. PNG, JPEG, WebP and GIF images
+up to 5 MiB are supported. Larger images, other documents and externally hosted images remain
+links; an unavailable image does not discard the issue context already read.
+
 If a connection needs sign-in again, an admin can reconnect it. Disconnect stops new reads for the
 whole organization; issue content already retrieved remains in chat history.
 

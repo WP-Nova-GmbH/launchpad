@@ -1,3 +1,4 @@
+import { issueTrackerActivityIdentity } from "@t3tools/shared/issueTrackerActivity";
 import { projectQuestionToolInput } from "@t3tools/shared/toolActivity";
 import type {
   OrchestrationEvent,
@@ -333,6 +334,9 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
   if ("toolName" in data) {
     projectedData.toolName = data.toolName;
   }
+  if (typeof data.tool === "string") {
+    projectedData.tool = data.tool;
+  }
   if ("input" in data) {
     projectedData.input = data.input;
   }
@@ -441,18 +445,27 @@ export function projectActivityPayload(
     ...statusPayload,
   };
   const questionInput = projectQuestionToolInput(data, payload.title);
+  const identity = issueTrackerActivityIdentity({
+    label: activity.summary,
+    ...(typeof payload.title === "string" ? { toolTitle: payload.title } : {}),
+    ...(typeof statusPayload.status === "string"
+      ? { toolLifecycleStatus: statusPayload.status }
+      : {}),
+    toolData: data,
+  });
+  const issueMetadata = identity ? { issueTrackerIdentity: identity } : {};
 
   if (payload.itemType === "mcp_tool_call") {
     return {
       ...activity,
       payload: {
         ...projectedPayload,
-        data: { ...projectMcpToolCallData(data), ...questionInput },
+        data: { ...projectMcpToolCallData(data), ...questionInput, ...issueMetadata },
       },
     };
   }
 
-  const projectedData: Record<string, unknown> = { ...questionInput };
+  const projectedData: Record<string, unknown> = { ...questionInput, ...issueMetadata };
   const item = projectCommandData(data);
   if (item) {
     projectedData.item = item;
@@ -481,6 +494,9 @@ export function projectActivityPayload(
   }
   if ("toolName" in data) {
     projectedData.toolName = data.toolName;
+  }
+  if (typeof data.tool === "string") {
+    projectedData.tool = data.tool;
   }
 
   const rawOutput =

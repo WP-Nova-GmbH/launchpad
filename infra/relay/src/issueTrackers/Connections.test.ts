@@ -22,6 +22,9 @@ import {
   disconnect,
   listConnections,
   readIssue,
+  readComments,
+  readImages,
+  viewImage,
   saveJira,
   startLinear,
 } from "./Connections.ts";
@@ -68,14 +71,15 @@ const linearRow = (expiresAt = Number.MAX_SAFE_INTEGER): ConnectionRecord => ({
   updatedByUserId: "admin",
   updatedAt: "2026-01-01T00:00:00.000Z",
 });
-const issueResponse = () =>
+const issueResponse = (description = "Example") =>
   Response.json({
     data: {
       organization: { id: "workspace", name: "Launchpad", urlKey: "launchpad" },
       issue: {
+        id: "issue-id",
         identifier: "LP-42",
         title: "Read this issue",
-        description: "Example",
+        description,
         url: "https://linear.app/launchpad/issue/LP-42/example",
         state: null,
         assignee: null,
@@ -369,7 +373,7 @@ describe("issue tracker connection lifecycle", () => {
         test.requests
           .filter((request) => request.url.endsWith("/graphql"))
           .map((request) => request.headers.authorization),
-      ).toEqual(["Bearer new-access-secret", "Bearer new-access-secret"]);
+      ).toEqual(Array(4).fill("Bearer new-access-secret"));
       expect((yield* test.store.get(key))?.payloadSealed).toContain("new-refresh-secret");
     }),
   );
@@ -548,3 +552,260 @@ describe("issue tracker connection lifecycle", () => {
       }),
   );
 });
+
+const commentsRequested = (request: HttpClientRequest.HttpClientRequest) =>
+  request.body._tag === "Uint8Array" &&
+  new TextDecoder().decode(request.body.body).includes("LaunchpadComments");
+const commentsResponse = (
+  body = Array.from(
+    { length: 6 },
+    (_, i) => `![screenshot](https://uploads.linear.app/screenshot-${i}.png)`,
+  ).join("\n"),
+) =>
+  Response.json({
+    data: {
+      organization: { id: "workspace" },
+      issue: { id: "issue-id" },
+      comments: {
+        edges: [
+          {
+            cursor: "cursor",
+            node: {
+              id: "comment",
+              issueId: "issue-id",
+              parentId: null,
+              body,
+              user: { name: "Alice" },
+              createdAt: "2026-09-30T12:00:00Z",
+              editedAt: null,
+              url: "https://linear.app/launchpad/issue/LP-42#comment-comment",
+            },
+          },
+        ],
+        pageInfo: { hasNextPage: true },
+      },
+    },
+  });
+
+describe("Linear context lifecycle", () => {
+  it.effect.each([429, 500])("preserves issue details when discussion returns HTTP %s", (status) =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        rows: [linearRow()],
+        respond: (request) =>
+          Effect.succeed(
+            commentsRequested(request) ? new Response(null, { status }) : issueResponse(),
+          ),
+      });
+      const result = yield* readIssue(issueInput).pipe(test.provide);
+      expect(result.title).toBe("Read this issue");
+      expect(result.linear?.discussion.status).toBe("unavailable");
+      expect((yield* test.store.get(key))?.status).toBe("connected");
+    }),
+  );
+
+  it.effect("returns the issue before the operation deadline when discussion stalls", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const test = yield* fixture({
+        rows: [linearRow()],
+        respond: (request) =>
+          commentsRequested(request)
+            ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed(issueResponse()),
+      });
+      const reading = yield* readIssue(issueInput).pipe(test.provide, Effect.forkChild);
+      yield* Deferred.await(started);
+      yield* TestClock.adjust("2 seconds");
+      const result = yield* Fiber.join(reading);
+      expect(result.identifier).toBe("LP-42");
+      expect(result.linear?.discussion).toMatchObject({
+        status: "unavailable",
+        reason: expect.stringContaining("timed out"),
+      });
+    }),
+  );
+
+  it.effect("does not disguise authentication loss during comments as partial success", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        rows: [linearRow()],
+        respond: (request) =>
+          Effect.succeed(
+            commentsRequested(request) ? new Response(null, { status: 401 }) : issueResponse(),
+          ),
+      });
+      expect(yield* readIssue(issueInput).pipe(test.provide, Effect.flip)).toMatchObject({
+        code: "auth_required",
+      });
+      expect((yield* test.store.get(key))?.status).toBe("reconnect_required");
+    }),
+  );
+
+  it.effect.each(["workspace", "disconnect", "generation", "organization"] as const)(
+    "rejects old comment and image references after %s changes",
+    (change) =>
+      Effect.gen(function* () {
+        const test = yield* fixture({
+          rows: [linearRow(), { ...linearRow(), organizationId: "other-org" }],
+          respond: (request) =>
+            Effect.succeed(commentsRequested(request) ? commentsResponse() : issueResponse()),
+        });
+        const result = yield* readIssue(issueInput).pipe(test.provide);
+        const discussion = result.linear!.discussion;
+        if (discussion.status !== "available") throw new Error("Expected discussion");
+        if (change === "disconnect") yield* disconnect(key).pipe(test.provide);
+        else if (change !== "organization")
+          yield* Ref.update(test.records, (rows) => {
+            const current = rows.get(recordKey(key))!;
+            const payload = JSON.parse(current.payloadSealed!.slice(7));
+            const next = new Map(rows);
+            next.set(recordKey(key), {
+              ...current,
+              version: "replacement",
+              payloadSealed: `sealed:${JSON.stringify({ ...payload, ...(change === "workspace" ? { workspaceId: "other-workspace" } : { generation: "replacement" }) })}`,
+            });
+            return next;
+          });
+        const before = test.requests.length;
+        const organizationId = change === "organization" ? "other-org" : "org";
+        expect(
+          yield* readComments({ organizationId, reference: discussion.continuation! }).pipe(
+            test.provide,
+            Effect.flip,
+          ),
+        ).toMatchObject({ code: "conflict" });
+        expect(
+          yield* viewImage({
+            organizationId,
+            reference: discussion.comments[0]!.images[0]!.reference,
+          }).pipe(test.provide, Effect.flip),
+        ).toMatchObject({ code: "conflict" });
+        expect(
+          yield* readImages({
+            organizationId,
+            reference: discussion.comments[0]!.imagesContinuation!,
+          }).pipe(test.provide, Effect.flip),
+        ).toMatchObject({ code: "conflict" });
+        expect(test.requests).toHaveLength(before);
+      }),
+  );
+
+  it.effect("keeps continuation valid through token refresh and starting OAuth", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        rows: [linearRow(60_001)],
+        respond: (request) =>
+          Effect.succeed(
+            request.url.endsWith("/oauth/token")
+              ? tokenResponse()
+              : commentsRequested(request)
+                ? commentsResponse()
+                : issueResponse(),
+          ),
+      });
+      const result = yield* readIssue(issueInput).pipe(test.provide);
+      yield* startLinear({ organizationId: "org", userId: "admin" }).pipe(test.provide);
+      yield* TestClock.adjust(2);
+      const next = yield* readComments({
+        organizationId: "org",
+        reference: result.linear!.source,
+      }).pipe(test.provide);
+      expect(next.identifier).toBe("LP-42");
+      expect(next.discussion.status).toBe("available");
+    }),
+  );
+});
+
+it.effect.each(["description", "comment"])(
+  "retrieves all images beyond clipped %s text through real follow-up operations",
+  (location) =>
+    Effect.gen(function* () {
+      const urls = Array.from({ length: 12 }, (_, i) => `https://uploads.linear.app/${i}.png`);
+      const markdown =
+        "x".repeat(21_000) + "\n\n" + urls.map((url) => `![proof](${url})`).join("\n");
+      let removed = false;
+      const test = yield* fixture({
+        rows: [linearRow()],
+        respond: (request) => {
+          if (request.url.startsWith("https://uploads.linear.app/"))
+            return Effect.succeed(
+              new Response(new Uint8Array([137, 80, 78, 71]), {
+                headers: { "content-type": "image/png" },
+              }),
+            );
+          const body = removed ? "Image removed" : markdown;
+          const query =
+            request.body._tag === "Uint8Array" ? new TextDecoder().decode(request.body.body) : "";
+          if (query.includes("LaunchpadCommentImage"))
+            return Effect.succeed(
+              Response.json({
+                data: {
+                  organization: { id: "workspace" },
+                  comment: {
+                    id: "comment",
+                    issueId: "issue-id",
+                    parentId: null,
+                    body,
+                    user: { name: "Alice" },
+                    createdAt: "2026-09-30T12:00:00Z",
+                    editedAt: null,
+                    url: "https://linear.app/launchpad/issue/LP-42#comment-comment",
+                  },
+                },
+              }),
+            );
+          return Effect.succeed(
+            commentsRequested(request)
+              ? commentsResponse(location === "comment" ? body : "No images")
+              : issueResponse(location === "description" ? body : "No images"),
+          );
+        },
+      });
+      const result = yield* readIssue(issueInput).pipe(test.provide);
+      expect(result).not.toHaveProperty("originalDescription");
+      expect(encodeJson(result)).not.toContain("x".repeat(21_000));
+      const context = result.linear!;
+      if (context.discussion.status !== "available") throw new Error("Expected discussion");
+      const initial = location === "description" ? context : context.discussion.comments[0]!;
+      const found = [...initial.images];
+      let continuation = initial.imagesContinuation;
+      for (let page = 0; page < 2; page++) {
+        expect(continuation).not.toBeNull();
+        const next = yield* readImages({ organizationId: "org", reference: continuation! }).pipe(
+          test.provide,
+        );
+        found.push(...next.images);
+        continuation = next.imagesContinuation;
+      }
+      expect(continuation).toBeNull();
+      expect(found.map((entry) => entry.url)).toEqual(urls);
+      const lastImage = found.at(-1)!;
+      const image = yield* viewImage({
+        organizationId: "org",
+        reference: lastImage.reference,
+      }).pipe(test.provide);
+      expect(image.image).toEqual({ mimeType: "image/png", data: "iVBORw==" });
+      expect(test.requests.at(-1)?.url).toBe(lastImage.url);
+      const imageFetches = test.requests.filter((request) =>
+        request.url.startsWith("https://uploads.linear.app/"),
+      ).length;
+      removed = true;
+      expect(
+        yield* viewImage({ organizationId: "org", reference: lastImage.reference }).pipe(
+          test.provide,
+          Effect.flip,
+        ),
+      ).toMatchObject({ code: "not_found" });
+      expect(
+        test.requests.filter((request) => request.url.startsWith("https://uploads.linear.app/")),
+      ).toHaveLength(imageFetches);
+      yield* disconnect(key).pipe(test.provide);
+      expect(
+        yield* readImages({ organizationId: "org", reference: initial.imagesContinuation! }).pipe(
+          test.provide,
+          Effect.flip,
+        ),
+      ).toMatchObject({ code: "conflict" });
+    }),
+);

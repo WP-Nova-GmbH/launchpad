@@ -44,8 +44,80 @@ export type RelayIssueDetails = typeof RelayIssueDetails.Type;
 export const RelayReadIssueRequest = Schema.Struct({
   issue: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
 });
+const LinearReference = TrimmedNonEmptyString.check(Schema.isMaxLength(16_384));
+export const RelayLinearImageReference = Schema.Struct({
+  reference: LinearReference,
+  url: Schema.String,
+});
+export const RelayLinearComment = Schema.Struct({
+  id: Schema.String,
+  parentId: Schema.NullOr(Schema.String),
+  body: Schema.String,
+  author: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  editedAt: Schema.NullOr(Schema.String),
+  url: Schema.String,
+  bodyTruncated: Schema.Boolean,
+  images: Schema.Array(RelayLinearImageReference),
+  imagesTruncated: Schema.Boolean,
+  imagesContinuation: Schema.NullOr(LinearReference),
+});
+export const RelayLinearDiscussion = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("available"),
+    comments: Schema.Array(RelayLinearComment),
+    continuation: Schema.NullOr(LinearReference),
+    hasMore: Schema.Boolean,
+    contentTruncated: Schema.Boolean,
+  }),
+  Schema.Struct({ status: Schema.Literal("unavailable"), reason: Schema.String }),
+]);
+export type RelayLinearDiscussion = typeof RelayLinearDiscussion.Type;
+export const RelayLinearContext = Schema.Struct({
+  source: LinearReference,
+  workspaceId: Schema.String,
+  issueId: Schema.String,
+  discussion: RelayLinearDiscussion,
+  images: Schema.Array(RelayLinearImageReference),
+  imagesTruncated: Schema.Boolean,
+  imagesContinuation: Schema.NullOr(LinearReference),
+});
+export const RelayLinearReferenceRequest = Schema.Struct({ reference: LinearReference });
+export type RelayLinearReferenceRequest = typeof RelayLinearReferenceRequest.Type;
+export const RelayLinearCommentsResponse = Schema.Struct({
+  service: Schema.Literal("linear"),
+  accountLabel: Schema.String,
+  identifier: Schema.String,
+  url: Schema.String,
+  ...RelayLinearContext.fields,
+});
+export const RelayLinearImagesResponse = Schema.Struct({
+  service: Schema.Literal("linear"),
+  accountLabel: Schema.String,
+  identifier: Schema.String,
+  url: Schema.String,
+  workspaceId: Schema.String,
+  issueId: Schema.String,
+  images: Schema.Array(RelayLinearImageReference),
+  imagesTruncated: Schema.Boolean,
+  imagesContinuation: Schema.NullOr(LinearReference),
+});
+export const RelayLinearImageResponse = Schema.Struct({
+  service: Schema.Literal("linear"),
+  accountLabel: Schema.String,
+  identifier: Schema.String,
+  url: Schema.String,
+  workspaceId: Schema.String,
+  issueId: Schema.String,
+  image: Schema.Struct({
+    mimeType: Schema.Literals(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+    data: Schema.String,
+  }),
+});
+
 export const RelayReadIssueResponse = Schema.Struct({
   ...RelayIssueDetails.fields,
+  linear: Schema.optionalKey(RelayLinearContext),
   service: RelayIssueTrackerService,
   accountLabel: Schema.String,
 });
@@ -60,6 +132,8 @@ export class RelayIssueTrackerError extends Schema.TaggedError<RelayIssueTracker
       "not_found",
       "invalid_input",
       "unavailable",
+      "image_too_large",
+      "unsupported_image",
       "conflict",
       "not_configured",
     ]),

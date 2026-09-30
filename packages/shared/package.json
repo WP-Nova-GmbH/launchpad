@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./issueTrackerActivity": {
+      "types": "./src/issueTrackerActivity.ts",
+      "import": "./src/issueTrackerActivity.ts"
+    },
     "./threadPromptQueue": {
       "types": "./src/threadPromptQueue.ts",
       "import": "./src/threadPromptQueue.ts"

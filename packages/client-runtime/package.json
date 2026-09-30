@@ -43,6 +43,10 @@
       "types": "./src/environment/index.ts",
       "default": "./src/environment/index.ts"
     },
+    "./markdown-image-urls": {
+      "types": "./src/markdownImageUrls.ts",
+      "default": "./src/markdownImageUrls.ts"
+    },
     "./markdown-images": {
       "types": "./src/markdownImages.ts",
       "default": "./src/markdownImages.ts"
@@ -254,6 +258,10 @@
     "./work-log/user-input": {
       "types": "./src/work-log/userInput.ts",
       "default": "./src/work-log/userInput.ts"
+    },
+    "./work-log/issue-tracker-activity": {
+      "types": "./src/work-log/issueTrackerActivity.ts",
+      "default": "./src/work-log/issueTrackerActivity.ts"
     },
     "./work-log/presentation": {
       "types": "./src/work-log/presentation.ts",

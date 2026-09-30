@@ -4765,6 +4765,7 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
       ? undefined
       : (workEntry.toolIcon ?? workEntry.toolSource?.icon);
   const previewText = displayLabel ?? workEntryDisplayLabel(workEntry, workspaceRoot);
+  const issueUrl = resolveWorkEntryToolPresentation(workEntry)?.issueUrl;
   const answerPreview = workEntry.questionAnswer
     ? getQuestionAnswerPreview(workEntry.questionAnswer)
     : null;
@@ -4893,6 +4894,19 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
           !showDestructiveRowStyle &&
           !toolIconAcceptsTint(entryIconName, entryToolIcon) ? (
             <XIcon aria-hidden className={cn("size-3 shrink-0", failedToolIconClassName)} />
+          ) : null}
+          {issueUrl ? (
+            <a
+              href={issueUrl}
+              target="_blank"
+              rel="noreferrer"
+              aria-label="Open source issue"
+              className="shrink-0 text-xs text-muted-foreground underline hover:text-foreground"
+              onClick={stopRowToggle}
+              onKeyDown={stopRowToggle}
+            >
+              Issue
+            </a>
           ) : null}
           <TimelineRowTimestamp createdAt={workEntry.createdAt} timestampFormat={timestampFormat} />
           <span

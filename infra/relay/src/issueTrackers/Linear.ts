@@ -16,7 +16,8 @@ const Identifier = Schema.String.check(
   Schema.isPattern(/^[A-Za-z][A-Za-z0-9_]*-[1-9]\d*$/),
 );
 const Label = Schema.NonEmptyString.check(Schema.isMaxLength(1024));
-const Workspace = Schema.Struct({ id: Label, name: Label, urlKey: Label });
+const StableId = Schema.NonEmptyString.check(Schema.isMaxLength(128));
+const Workspace = Schema.Struct({ id: StableId, name: Label, urlKey: Label });
 const Tokens = Schema.Struct({
   access_token: Schema.NonEmptyString,
   refresh_token: Schema.NonEmptyString,
@@ -37,6 +38,7 @@ const GraphqlErrors = Schema.Struct({
   ),
 });
 
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeOAuthError = Schema.decodeUnknownEffect(
   Schema.Struct({ error: Schema.optionalKey(Schema.String) }),
@@ -56,6 +58,7 @@ const decodeIssue = Schema.decodeUnknownEffect(
       organization: Workspace,
       issue: Schema.NullOr(
         Schema.Struct({
+          id: StableId,
           identifier: Identifier,
           title: Schema.NonEmptyString.check(Schema.isMaxLength(4096)),
           description: Schema.NullOr(Schema.String),
@@ -73,6 +76,8 @@ const unavailable = () =>
     code: "unavailable",
     message: "Linear could not complete the request.",
   });
+const isTrackerFailure = Schema.is(IssueTrackerFailure);
+const safeFailure = (error: unknown) => (isTrackerFailure(error) ? error : unavailable());
 const authRequired = () =>
   new IssueTrackerFailure({ code: "auth_required", message: "Reconnect the Linear workspace." });
 const forbidden = () =>
@@ -99,13 +104,18 @@ const readBody = Effect.fn("relay.linear.read_body")(function* (
       (body, chunk) => {
         const bytes = body.bytes + chunk.byteLength;
         return bytes > MAX_RESPONSE_BYTES
-          ? Effect.fail(unavailable())
+          ? Effect.fail(
+              new IssueTrackerFailure({
+                code: "unavailable",
+                message: "Linear response exceeded the 256 KiB size limit.",
+              }),
+            )
           : Effect.succeed({ bytes, text: body.text + decoder.decode(chunk, { stream: true }) });
       },
     ),
-    Effect.mapError(unavailable),
+    Effect.mapError(safeFailure),
   );
-  return yield* decodeJson(body.text + decoder.decode()).pipe(Effect.mapError(unavailable));
+  return yield* decodeJson(body.text + decoder.decode()).pipe(Effect.mapError(safeFailure));
 });
 
 const execute = Effect.fn("relay.linear.execute")(function* (
@@ -114,7 +124,7 @@ const execute = Effect.fn("relay.linear.execute")(function* (
   const client = yield* HttpClient.HttpClient;
   return yield* client
     .execute(request)
-    .pipe(Effect.timeout(REQUEST_TIMEOUT), Effect.mapError(unavailable));
+    .pipe(Effect.timeout(REQUEST_TIMEOUT), Effect.mapError(safeFailure));
 });
 
 const readResponse = Effect.fn("relay.linear.read_response")(function* (
@@ -128,10 +138,10 @@ const readResponse = Effect.fn("relay.linear.read_response")(function* (
   if (response.status === 400) {
     const body = yield* readBody(response).pipe(
       Effect.timeout(REQUEST_TIMEOUT),
-      Effect.mapError(unavailable),
+      Effect.mapError(safeFailure),
     );
     if (graphqlErrors) return body;
-    const error = yield* decodeOAuthError(body).pipe(Effect.mapError(unavailable));
+    const error = yield* decodeOAuthError(body).pipe(Effect.mapError(safeFailure));
     if (error.error === "invalid_grant" || error.error === "invalid_token")
       return yield* authRequired();
     return yield* unavailable();
@@ -139,23 +149,23 @@ const readResponse = Effect.fn("relay.linear.read_response")(function* (
   if (response.status < 200 || response.status >= 300) return yield* unavailable();
   return yield* readBody(response).pipe(
     Effect.timeout(REQUEST_TIMEOUT),
-    Effect.mapError(unavailable),
+    Effect.mapError(safeFailure),
   );
 });
 
-const graphql = Effect.fn("relay.linear.graphql")(function* <A>(
+export const graphql = Effect.fn("relay.linear.graphql")(function* <A>(
   accessToken: string,
   query: string,
-  variables: Readonly<Record<string, string>>,
+  variables: Readonly<Record<string, string | number | null>>,
   decode: (body: unknown) => Effect.Effect<{ readonly data: A }, Schema.SchemaError>,
 ) {
   const request = yield* HttpClientRequest.post(`${API_URL}/graphql`).pipe(
     HttpClientRequest.bearerToken(accessToken),
     HttpClientRequest.bodyJson({ query, variables }),
-    Effect.mapError(unavailable),
+    Effect.mapError(safeFailure),
   );
   const body = yield* readResponse(request, true);
-  const envelope = yield* decodeGraphqlErrors(body).pipe(Effect.mapError(unavailable));
+  const envelope = yield* decodeGraphqlErrors(body).pipe(Effect.mapError(safeFailure));
   if (envelope.errors?.length) {
     const codes = new Set(
       envelope.errors.flatMap((error) => [error.extensions?.code, error.extensions?.type]),
@@ -173,7 +183,7 @@ const graphql = Effect.fn("relay.linear.graphql")(function* <A>(
   }
   return yield* decode(body).pipe(
     Effect.map((envelope) => envelope.data),
-    Effect.mapError(unavailable),
+    Effect.mapError(safeFailure),
   );
 });
 
@@ -205,7 +215,7 @@ const requestTokens = Effect.fn("relay.linear.request_tokens")(function* (
   const body = yield* readResponse(
     HttpClientRequest.post(`${API_URL}/oauth/token`).pipe(HttpClientRequest.bodyUrlParams(fields)),
   );
-  const tokens = yield* decodeTokens(body).pipe(Effect.mapError(unavailable));
+  const tokens = yield* decodeTokens(body).pipe(Effect.mapError(safeFailure));
   return {
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
@@ -290,11 +300,12 @@ export const readLinearIssue = Effect.fn("relay.linear.read_issue")(function* (i
   readonly workspaceId: string;
   readonly workspaceSlug: string;
   readonly issue: string;
+  readonly issueId?: string;
 }) {
-  const identifier = yield* issueIdentifier(input.issue, input.workspaceSlug);
+  const identifier = input.issueId ?? (yield* issueIdentifier(input.issue, input.workspaceSlug));
   const data = yield* graphql(
     input.accessToken,
-    "query LaunchpadIssue($id: String!) { organization { id name urlKey } issue(id: $id) { identifier title description url state { name } assignee { name } } }",
+    "query LaunchpadIssue($id: String!) { organization { id name urlKey } issue(id: $id) { id identifier title description url state { name } assignee { name } } }",
     { id: identifier },
     decodeIssue,
   );
@@ -308,10 +319,14 @@ export const readLinearIssue = Effect.fn("relay.linear.read_issue")(function* (i
   const returnedIdentifier = yield* issueIdentifier(issue.url, input.workspaceSlug).pipe(
     Effect.mapError(unavailable),
   );
-  if (issue.identifier.toUpperCase() !== identifier || returnedIdentifier !== identifier)
+  if (
+    input.issueId
+      ? issue.id !== input.issueId || returnedIdentifier !== issue.identifier.toUpperCase()
+      : issue.identifier.toUpperCase() !== identifier || returnedIdentifier !== identifier
+  )
     return yield* unavailable();
   const description = issue.description ?? "";
-  return yield* decodeIssueDetails({
+  const details = yield* decodeIssueDetails({
     identifier: issue.identifier,
     title: issue.title,
     description:
@@ -321,7 +336,20 @@ export const readLinearIssue = Effect.fn("relay.linear.read_issue")(function* (i
     url: issue.url,
     status: issue.state?.name ?? null,
     assignee: issue.assignee?.name ?? null,
-  }).pipe(Effect.mapError(unavailable));
+  }).pipe(Effect.mapError(safeFailure));
+  const result = { ...details, issueId: issue.id };
+  const notice = "\n\n[Description truncated by Launchpad. Open the issue for the full text.]";
+  let shortened = result.description;
+  while (new TextEncoder().encode(encodeJson(result)).byteLength > 48 * 1024) {
+    if (shortened.length === 0)
+      return yield* new IssueTrackerFailure({
+        code: "unavailable",
+        message: "Linear issue metadata exceeded the response size limit.",
+      });
+    shortened = shortened.slice(0, Math.floor(shortened.length / 2));
+    result.description = shortened + notice;
+  }
+  return { ...result, originalDescription: description };
 });
 
 export const revokeLinearToken = Effect.fn("relay.linear.revoke_token")(function* (input: {

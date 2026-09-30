@@ -12,6 +12,10 @@ import {
   RelayStartLinearResponse,
   RelayReadIssueRequest,
   RelayReadIssueResponse,
+  RelayLinearReferenceRequest,
+  RelayLinearCommentsResponse,
+  RelayLinearImageResponse,
+  RelayLinearImagesResponse,
   RelayIssueTrackerError,
 } from "./issueTrackers.ts";
 export * from "./issueTrackers.ts";
@@ -2837,6 +2841,36 @@ export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
 
 export const RelayIssueTrackersServerGroup = HttpApiGroup.make("issueTrackersServer")
   .add(
+    HttpApiEndpoint.post(
+      "readComments",
+      "/v1/environments/:environmentId/issue-trackers/linear/comments",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayLinearReferenceRequest,
+        success: RelayLinearCommentsResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "readImages",
+      "/v1/environments/:environmentId/issue-trackers/linear/images",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayLinearReferenceRequest,
+        success: RelayLinearImagesResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "viewImage",
+      "/v1/environments/:environmentId/issue-trackers/linear/image",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayLinearReferenceRequest,
+        success: RelayLinearImageResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
     HttpApiEndpoint.post(
       "readIssue",
       "/v1/environments/:environmentId/issue-trackers/:service/read",

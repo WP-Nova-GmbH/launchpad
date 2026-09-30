@@ -90,22 +90,74 @@ export const issueTrackersServerApi = HttpApiBuilder.group(
   RelayApi,
   "issueTrackersServer",
   (handlers) =>
-    handlers.handle(
-      "readIssue",
-      Effect.fn("issueTrackers.api.read")(
-        function* ({ params, payload }) {
-          const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
-          return yield* Connections.readIssue({
-            organizationId: machine.organizationId,
-            service: params.service,
-            issue: payload.issue,
-          });
-        },
-        mapErrorTags({
-          IssueTrackerConnectionPersistenceError: persistenceFailure,
-          RelayIssueTrackerError: trackerFailure,
-        }),
-        mapRelayCommonApiErrors("not_authorized"),
+    handlers
+      .handle(
+        "readComments",
+        Effect.fn("issueTrackers.api.comments")(
+          function* ({ params, payload }) {
+            const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
+            return yield* Connections.readComments({
+              ...payload,
+              organizationId: machine.organizationId,
+            });
+          },
+          mapErrorTags({
+            IssueTrackerConnectionPersistenceError: persistenceFailure,
+            RelayIssueTrackerError: trackerFailure,
+          }),
+          mapRelayCommonApiErrors("not_authorized"),
+        ),
+      )
+      .handle(
+        "readImages",
+        Effect.fn("issueTrackers.api.images")(
+          function* ({ params, payload }) {
+            const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
+            return yield* Connections.readImages({
+              ...payload,
+              organizationId: machine.organizationId,
+            });
+          },
+          mapErrorTags({
+            IssueTrackerConnectionPersistenceError: persistenceFailure,
+            RelayIssueTrackerError: trackerFailure,
+          }),
+          mapRelayCommonApiErrors("not_authorized"),
+        ),
+      )
+      .handle(
+        "viewImage",
+        Effect.fn("issueTrackers.api.image")(
+          function* ({ params, payload }) {
+            const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
+            return yield* Connections.viewImage({
+              ...payload,
+              organizationId: machine.organizationId,
+            });
+          },
+          mapErrorTags({
+            IssueTrackerConnectionPersistenceError: persistenceFailure,
+            RelayIssueTrackerError: trackerFailure,
+          }),
+          mapRelayCommonApiErrors("not_authorized"),
+        ),
+      )
+      .handle(
+        "readIssue",
+        Effect.fn("issueTrackers.api.read")(
+          function* ({ params, payload }) {
+            const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
+            return yield* Connections.readIssue({
+              organizationId: machine.organizationId,
+              service: params.service,
+              issue: payload.issue,
+            });
+          },
+          mapErrorTags({
+            IssueTrackerConnectionPersistenceError: persistenceFailure,
+            RelayIssueTrackerError: trackerFailure,
+          }),
+          mapRelayCommonApiErrors("not_authorized"),
+        ),
       ),
-    ),
 );

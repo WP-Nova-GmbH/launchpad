@@ -3,6 +3,8 @@ import {
   RelayIssueTrackerError,
   type RelayConnectJiraRequest,
   type RelayIssueTrackerService,
+  type RelayIssueDetails,
+  type RelayLinearDiscussion,
 } from "@t3tools/contracts/relay";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -20,6 +22,22 @@ import {
   type ConnectionKey,
   type ConnectionRecord,
 } from "./ConnectionStore.ts";
+import {
+  linearDiscussion,
+  linearImageReferences,
+  openLinearReference,
+  sealLinearReference,
+  validateLinearSource,
+  type LinearReference,
+  type LinearSource,
+} from "./LinearContext.ts";
+import {
+  fetchLinearImage,
+  ISSUE_RESPONSE_BYTES,
+  linearImageUrls,
+  readLinearCommentBody,
+  utf8Bytes,
+} from "./LinearDiscussion.ts";
 import { connectJira, readJiraIssue } from "./Jira.ts";
 import {
   exchangeLinearCode,
@@ -45,11 +63,13 @@ const Credentials = Schema.Union([
     expiresAt: Schema.Number,
     workspaceId: Schema.String,
     workspaceSlug: Schema.String,
+    generation: Schema.optionalKey(Schema.String),
   }),
 ]);
 type Credentials = typeof Credentials.Type;
 const decodeCredentials = Schema.decodeUnknownEffect(Schema.fromJsonString(Credentials));
 const encodeCredentials = Schema.encodeEffect(Schema.fromJsonString(Credentials));
+const isTrackerFailure = Schema.is(RelayIssueTrackerError);
 const failure = (code: RelayIssueTrackerError["code"], message: string) =>
   new RelayIssueTrackerError({ code, message });
 const conflict = () =>
@@ -194,6 +214,9 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
           expiresAt: (yield* milliseconds) + tokens.expiresIn * 1000,
           workspaceId: identity.workspaceId,
           workspaceSlug: identity.workspaceSlug,
+          generation: yield* (yield* Crypto.Crypto).randomUUIDv4.pipe(
+            Effect.mapError(() => failure("unavailable", "Could not save Linear connection.")),
+          ),
         });
         if (
           !(yield* store.complete({ ...row, payloadSealed, accountLabel: identity.accountLabel }))
@@ -306,19 +329,95 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
     );
   let authRecord = initial;
   return yield* Effect.gen(function* () {
+    const startedAt = yield* milliseconds;
     const active =
       input.service === "linear"
         ? yield* linearCredentials(input)
         : { row: initial, credentials: yield* open(initial) };
     authRecord = active.row;
-    const result =
+    const providerResult =
       active.credentials.service === "linear"
-        ? yield* readLinearIssue({ ...active.credentials, issue: input.issue })
+        ? yield* readLinearIssue({ ...active.credentials, issue: input.issue }).pipe(
+            Effect.timeoutOrElse({
+              duration: Math.max(1, startedAt + 7500 - (yield* milliseconds)),
+              orElse: () =>
+                Effect.fail(failure("unavailable", "Linear took too long to read the issue.")),
+            }),
+          )
         : yield* readJiraIssue({ ...active.credentials, issue: input.issue });
+    // The original body is only for discovering and validating image references.
+    const { originalDescription, ...result } =
+      "originalDescription" in providerResult
+        ? providerResult
+        : { ...providerResult, originalDescription: undefined };
+    let linear;
+    if (
+      active.credentials.service === "linear" &&
+      "issueId" in result &&
+      typeof result.issueId === "string"
+    ) {
+      const source: LinearSource = {
+        organizationId: input.organizationId,
+        generation: active.credentials.generation ?? active.credentials.workspaceId,
+        workspaceId: active.credentials.workspaceId,
+        issueId: result.issueId,
+      };
+      const reference = yield* sealLinearReference({ ...source, kind: "issue" });
+      const images = yield* linearImageReferences(
+        source,
+        typeof originalDescription === "string" ? originalDescription : result.description,
+      );
+      const remaining = startedAt + 7500 - (yield* milliseconds);
+      const discussion: RelayLinearDiscussion =
+        remaining <= 0
+          ? {
+              status: "unavailable",
+              reason: "No time remained to read discussion. Use the source reference to retry.",
+            }
+          : yield* linearDiscussion({
+              source,
+              accessToken: active.credentials.accessToken,
+              byteBudget:
+                ISSUE_RESPONSE_BYTES -
+                utf8Bytes({
+                  ...result,
+                  ...images,
+                  source: reference,
+                  accountLabel: active.row.accountLabel,
+                }) -
+                4096,
+            }).pipe(
+              Effect.timeoutOrElse({
+                duration: Math.min(2000, remaining),
+                orElse: () =>
+                  Effect.fail(
+                    failure(
+                      "unavailable",
+                      "Discussion timed out. Use the source reference to retry.",
+                    ),
+                  ),
+              }),
+              Effect.catch((error) =>
+                error.code === "auth_required" ||
+                error.code === "forbidden" ||
+                error.code === "not_found"
+                  ? Effect.fail(error)
+                  : Effect.succeed({ status: "unavailable" as const, reason: error.message }),
+              ),
+            );
+      linear = {
+        source: reference,
+        workspaceId: source.workspaceId,
+        issueId: source.issueId,
+        discussion,
+        ...images,
+      };
+    }
     const current = yield* store.get(input);
     if (!current || current.version !== active.row.version) return yield* conflict();
     return {
       ...result,
+      ...(linear ? { linear } : {}),
       service: input.service,
       accountLabel: active.row.accountLabel ?? input.service,
     };
@@ -329,5 +428,172 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
         ? store.requireReconnect(authRecord)
         : Effect.void,
     ),
+  );
+});
+
+type LinearCredentials = Extract<Credentials, { service: "linear" }>;
+const withLinearReference = Effect.fn("issueTrackers.withLinearReference")(function* <A, E, R>(
+  input: { readonly organizationId: string; readonly reference: string },
+  use: (context: {
+    readonly reference: LinearReference;
+    readonly source: LinearSource;
+    readonly credentials: LinearCredentials;
+    readonly issue: RelayIssueDetails & {
+      readonly issueId: string;
+      readonly originalDescription: string;
+    };
+    readonly accountLabel: string;
+  }) => Effect.Effect<A, E, R>,
+) {
+  const store = yield* ConnectionStore;
+  const key = { organizationId: input.organizationId, service: "linear" as const };
+  const initial = yield* store.get(key);
+  if (!initial) return yield* conflict();
+  let authRecord = initial;
+  return yield* Effect.gen(function* () {
+    const reference = yield* openLinearReference(input.reference);
+    const active = yield* linearCredentials(key);
+    authRecord = active.row;
+    const source = {
+      organizationId: input.organizationId,
+      generation: active.credentials.generation ?? active.credentials.workspaceId,
+      workspaceId: active.credentials.workspaceId,
+      issueId: reference.issueId,
+    };
+    yield* validateLinearSource(reference, source);
+    const issue = yield* readLinearIssue({
+      ...active.credentials,
+      issue: reference.issueId,
+      issueId: reference.issueId,
+    });
+    const result = yield* use({
+      reference,
+      source,
+      credentials: active.credentials,
+      issue,
+      accountLabel: active.row.accountLabel ?? "Linear",
+    });
+    const current = yield* store.get(key);
+    if (!current || current.version !== active.row.version) return yield* conflict();
+    return result;
+  }).pipe(
+    boundedOperation,
+    Effect.tapError((error) =>
+      isTrackerFailure(error) && error.code === "auth_required"
+        ? store.requireReconnect(authRecord)
+        : Effect.void,
+    ),
+  );
+});
+
+export const readComments = Effect.fn("issueTrackers.readComments")(function* (input: {
+  readonly organizationId: string;
+  readonly reference: string;
+}) {
+  return yield* withLinearReference(
+    input,
+    ({ reference, source, credentials, issue, accountLabel }) =>
+      Effect.gen(function* () {
+        if (reference.kind !== "issue" && reference.kind !== "comments")
+          return yield* failure(
+            "invalid_input",
+            "Use an issue source or discussion continuation reference.",
+          );
+        const discussion = yield* linearDiscussion({
+          source,
+          accessToken: credentials.accessToken,
+          ...(reference.after ? { after: reference.after } : {}),
+        });
+        return {
+          service: "linear" as const,
+          accountLabel,
+          identifier: issue.identifier,
+          url: issue.url,
+          source: yield* sealLinearReference({ ...source, kind: "issue" }),
+          workspaceId: source.workspaceId,
+          issueId: source.issueId,
+          discussion,
+          images: [],
+          imagesTruncated: false,
+          imagesContinuation: null,
+        };
+      }),
+  );
+});
+
+export const readImages = Effect.fn("issueTrackers.readImages")(function* (input: {
+  readonly organizationId: string;
+  readonly reference: string;
+}) {
+  return yield* withLinearReference(
+    input,
+    ({ reference, source, credentials, issue, accountLabel }) =>
+      Effect.gen(function* () {
+        if (reference.kind !== "images" || !reference.afterImage)
+          return yield* failure("invalid_input", "Use an imagesContinuation from a Linear read.");
+        const markdown = reference.commentId
+          ? yield* readLinearCommentBody({
+              ...credentials,
+              issueId: source.issueId,
+              commentId: reference.commentId,
+            })
+          : issue.originalDescription;
+        return {
+          service: "linear" as const,
+          accountLabel,
+          identifier: issue.identifier,
+          url: issue.url,
+          workspaceId: source.workspaceId,
+          issueId: source.issueId,
+          ...(yield* linearImageReferences(
+            source,
+            markdown,
+            reference.commentId,
+            reference.afterImage,
+          )),
+        };
+      }),
+  );
+});
+
+export const viewImage = Effect.fn("issueTrackers.viewImage")(function* (input: {
+  readonly organizationId: string;
+  readonly reference: string;
+}) {
+  return yield* withLinearReference(
+    input,
+    ({ reference, source, credentials, issue, accountLabel }) =>
+      Effect.gen(function* () {
+        if (reference.kind !== "image" || !reference.imageUrl)
+          return yield* failure(
+            "invalid_input",
+            "Use an image reference returned by a Linear read.",
+          );
+        const markdown = reference.commentId
+          ? yield* readLinearCommentBody({
+              ...credentials,
+              issueId: source.issueId,
+              commentId: reference.commentId,
+            })
+          : issue.originalDescription;
+        if (!linearImageUrls(markdown).includes(reference.imageUrl))
+          return yield* failure(
+            "not_found",
+            "This image is no longer embedded in the issue or comment. Read the issue again.",
+          );
+        const image = yield* fetchLinearImage({
+          accessToken: credentials.accessToken,
+          url: reference.imageUrl,
+        });
+        return {
+          service: "linear" as const,
+          accountLabel,
+          identifier: issue.identifier,
+          url: issue.url,
+          workspaceId: source.workspaceId,
+          issueId: source.issueId,
+          image,
+        };
+      }),
   );
 });

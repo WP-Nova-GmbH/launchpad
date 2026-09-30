@@ -1,3 +1,4 @@
+import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { QuestionAnswerHistory } from "./QuestionAnswerHistory";
 import {
   getQuestionAnswerPreview,
@@ -849,6 +850,20 @@ const ThreadWorkLogRow = memo(function ThreadWorkLogRow(
           )}
 
           <View className="shrink-0 flex-row items-center gap-px">
+            {toolPresentation?.issueUrl ? (
+              <Pressable
+                accessibilityRole="link"
+                accessibilityLabel="Open source issue"
+                hitSlop={8}
+                onPress={(event) => {
+                  event.stopPropagation();
+                  void tryOpenExternalUrl(toolPresentation.issueUrl!, "markdown-link");
+                }}
+                className="px-2 py-1"
+              >
+                <Text className="text-xs text-foreground-muted underline">Issue</Text>
+              </Pressable>
+            ) : null}
             {props.copied ? (
               <Text className="pr-1 font-t3-medium text-3xs text-adaptive-emerald-600-400">
                 Copied
