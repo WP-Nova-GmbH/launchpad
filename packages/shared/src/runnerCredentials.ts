@@ -29,7 +29,7 @@ export const RUNNER_CREDENTIAL_ENV_PREFIX = "T3CODE_RUNNER_";
  * Runner-held credential → the variable the corresponding CLI actually reads.
  * Only what M0 needs: `gh`, for push and pull-request creation.
  */
-export const RUNNER_SOURCE_CONTROL_TOKEN_ENV_VARS: ReadonlyArray<{
+const RUNNER_SOURCE_CONTROL_TOKEN_ENV_VARS: ReadonlyArray<{
   readonly runnerVariable: string;
   readonly toolVariable: string;
 }> = [{ runnerVariable: `${RUNNER_CREDENTIAL_ENV_PREFIX}GH_TOKEN`, toolVariable: "GH_TOKEN" }];

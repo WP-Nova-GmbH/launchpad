@@ -30,7 +30,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { readManagedExecutorRelayConfig } from "./machineEnrollment.ts";
 
-export const EXECUTOR_SELF_UPDATE_ENV = "T3CODE_EXECUTOR_SELF_UPDATE";
+const EXECUTOR_SELF_UPDATE_ENV = "T3CODE_EXECUTOR_SELF_UPDATE";
 /** The file that marks the root of a Launchpad source checkout. */
 const SOURCE_ROOT_MARKER = "pnpm-workspace.yaml";
 /** How git learns the organization's installation token (ADR-0015), as the clone path does. */

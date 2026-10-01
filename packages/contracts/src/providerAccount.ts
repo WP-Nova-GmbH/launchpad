@@ -17,8 +17,8 @@ export const ProviderAccountProvider = Schema.Literals([
 export type ProviderAccountProvider = typeof ProviderAccountProvider.Type;
 
 export const PROVIDER_ACCOUNT_LABEL_MAX_LENGTH = 200;
-export const PROVIDER_ACCOUNT_FILE_MAX_LENGTH = 64 * 1024;
-export const PROVIDER_ACCOUNT_MAX_FILES = 8;
+const PROVIDER_ACCOUNT_FILE_MAX_LENGTH = 64 * 1024;
+const PROVIDER_ACCOUNT_MAX_FILES = 8;
 
 /** Relative to the provider's home on the executor; never a directory escape. */
 export const ProviderAccountFilePath = TrimmedNonEmptyString.check(

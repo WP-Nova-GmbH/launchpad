@@ -138,7 +138,7 @@ export function describeCodexAuthStore(content: string): string {
   return email ?? "ChatGPT account";
 }
 
-export const CLAUDE_CREDENTIALS_FILE = ".credentials.json";
+const CLAUDE_CREDENTIALS_FILE = ".credentials.json";
 const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 
 /** `.credentials.json`: the subscription tier is the most a person can recognise it by. */

@@ -13,7 +13,7 @@ import { Atom } from "effect/unstable/reactivity";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { useAtomCommand } from "./use-atom-command";
 
-export const threadPresence = createThreadPresenceAtoms(connectionAtomRuntime);
+const threadPresence = createThreadPresenceAtoms(connectionAtomRuntime);
 
 const EMPTY_PEOPLE_ATOM = Atom.make<ReadonlyArray<ThreadPresencePerson>>([]).pipe(
   Atom.withLabel("web-thread-presence:empty"),

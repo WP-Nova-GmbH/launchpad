@@ -68,7 +68,7 @@ function relayEnvironmentClient(token: string) {
   return HttpClient.mapRequest(HttpClientRequest.setHeader("authorization", `Bearer ${token}`));
 }
 
-export const make = Effect.gen(function* () {
+const make = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
   const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;

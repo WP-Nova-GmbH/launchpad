@@ -72,7 +72,7 @@ export class ThreadPresenceService extends Context.Service<
   }
 >()("t3/orchestration/ThreadPresence/ThreadPresenceService") {}
 
-export function toParticipant(entry: PresenceEntry, nowMillis: number): ThreadPresenceParticipant {
+function toParticipant(entry: PresenceEntry, nowMillis: number): ThreadPresenceParticipant {
   return {
     connectionId: entry.connectionId,
     threadId: entry.threadId,
@@ -83,7 +83,7 @@ export function toParticipant(entry: PresenceEntry, nowMillis: number): ThreadPr
   };
 }
 
-export const make = Effect.fn("orchestration.thread_presence.make")(function* () {
+const make = Effect.fn("orchestration.thread_presence.make")(function* () {
   const entriesRef = yield* Ref.make(new Map<string, PresenceEntry>());
   const changes = yield* PubSub.sliding<ThreadPresenceSnapshot>(1);
   const publishMutex = yield* Semaphore.make(1);

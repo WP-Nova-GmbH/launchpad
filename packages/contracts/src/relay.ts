@@ -1249,9 +1249,9 @@ export type RelayOrgRole = typeof RelayOrgRole.Type;
 export const RelayRepositoryRole = Schema.Literals(["maintainer", "developer"]);
 export type RelayRepositoryRole = typeof RelayRepositoryRole.Type;
 
-export const RELAY_ORGANIZATION_NAME_MAX_LENGTH = 128;
-export const RELAY_CANONICAL_KEY_MAX_LENGTH = 512;
-export const RELAY_EMAIL_MAX_LENGTH = 320;
+const RELAY_ORGANIZATION_NAME_MAX_LENGTH = 128;
+const RELAY_CANONICAL_KEY_MAX_LENGTH = 512;
+const RELAY_EMAIL_MAX_LENGTH = 320;
 
 export const RelayOrganizationName = TrimmedNonEmptyString.check(
   Schema.isMaxLength(RELAY_ORGANIZATION_NAME_MAX_LENGTH),
@@ -1465,7 +1465,7 @@ export const RelayProviderAccountPayload = ProviderAccountPayload;
 export type RelayProviderAccountPayload = typeof RelayProviderAccountPayload.Type;
 export const RelayProviderAccountKind = ProviderAccountKind;
 export type RelayProviderAccountKind = typeof RelayProviderAccountKind.Type;
-export const RELAY_PROVIDER_ACCOUNT_LABEL_MAX_LENGTH = PROVIDER_ACCOUNT_LABEL_MAX_LENGTH;
+const RELAY_PROVIDER_ACCOUNT_LABEL_MAX_LENGTH = PROVIDER_ACCOUNT_LABEL_MAX_LENGTH;
 
 /** An organization's account for one provider, without its secret. */
 export const RelayProviderAccount = Schema.Struct({
@@ -1750,7 +1750,7 @@ export const RelayMachineStatus = Schema.Literals([
 ]);
 export type RelayMachineStatus = typeof RelayMachineStatus.Type;
 
-export const RELAY_MACHINE_LABEL_MAX_LENGTH = 128;
+const RELAY_MACHINE_LABEL_MAX_LENGTH = 128;
 
 export const RelayMachineLabel = TrimmedNonEmptyString.check(
   Schema.isMaxLength(RELAY_MACHINE_LABEL_MAX_LENGTH),
@@ -2189,7 +2189,7 @@ const RelayGetJobEndpoint = HttpApiEndpoint.get("getJob", "/v1/jobs/:jobId", {
  * Its own group rather than an addition to `dpopClient`, because auth is
  * declared per group and jobs need their own scope.
  */
-export const RelayJobsGroup = HttpApiGroup.make("jobs")
+const RelayJobsGroup = HttpApiGroup.make("jobs")
   .add(RelayCreateJobEndpoint, RelayGetJobEndpoint)
   .annotate(OpenApi.Description, "Dispatching jobs to executors and reading their coarse state.")
   .middleware(RelayDpopClientAuth);
@@ -2215,7 +2215,7 @@ const RelayRepositoryParams = Schema.Struct({
  * Organizations, membership, and invitations. Everything here is relay-owned:
  * Clerk says who the caller is and this group decides what that means.
  */
-export const RelayOrganizationGroup = HttpApiGroup.make("organization")
+const RelayOrganizationGroup = HttpApiGroup.make("organization")
   .add(
     HttpApiEndpoint.get("getRepositoryAccessRemoval", "/v1/organization/access-removal", {
       headers: RelayBearerRequestHeaders,
@@ -2443,7 +2443,7 @@ export const RelayOrganizationGroup = HttpApiGroup.make("organization")
   .annotate(OpenApi.Description, "Relay-owned organizations, membership, and invitations.")
   .middleware(RelayClientAuth);
 
-export const RelayRepositoriesGroup = HttpApiGroup.make("repositories")
+const RelayRepositoriesGroup = HttpApiGroup.make("repositories")
   .add(
     HttpApiEndpoint.get("listRepositories", "/v1/repositories", {
       headers: RelayBearerRequestHeaders,
@@ -2535,7 +2535,7 @@ export const RelayRepositoriesGroup = HttpApiGroup.make("repositories")
  * on its environment; this redacted relay projection keeps it discoverable
  * while that environment is offline.
  */
-export const RelayOrganizationProjectsGroup = HttpApiGroup.make("organizationProjects")
+const RelayOrganizationProjectsGroup = HttpApiGroup.make("organizationProjects")
   .add(
     HttpApiEndpoint.get("listOrganizationProjects", "/v1/organization/projects", {
       headers: RelayBearerRequestHeaders,
@@ -2555,7 +2555,7 @@ const RelayMachineParams = Schema.Struct({
  * surface — provisioning buys compute and deprovisioning destroys it, so both
  * require the organization role that owns quota and billing.
  */
-export const RelayMachinesGroup = HttpApiGroup.make("machines")
+const RelayMachinesGroup = HttpApiGroup.make("machines")
   .add(
     HttpApiEndpoint.get("listMachines", "/v1/machines", {
       headers: RelayBearerRequestHeaders,
@@ -2620,7 +2620,7 @@ const RelayMachineEnrollErrors = [
  * relay runs on Cloudflare Workers this endpoint cannot be network-restricted;
  * the single-use, expiring seed plus the machine-signed proof is the control.
  */
-export const RelayMachineEnrollmentGroup = HttpApiGroup.make("machineEnrollment")
+const RelayMachineEnrollmentGroup = HttpApiGroup.make("machineEnrollment")
   .add(
     HttpApiEndpoint.post("enrollMachine", "/v1/machines/enroll", {
       payload: RelayMachineEnrollRequest,
@@ -2679,7 +2679,7 @@ const RelayServerGroup = HttpApiGroup.make("server")
   .annotate(OpenApi.Description, "Environment-authenticated activity publication.")
   .middleware(RelayEnvironmentAuth);
 
-export const RelayProjectCatalogServerGroup = HttpApiGroup.make("projectCatalogServer")
+const RelayProjectCatalogServerGroup = HttpApiGroup.make("projectCatalogServer")
   .add(
     HttpApiEndpoint.post(
       "publishProjectCatalog",
@@ -2695,7 +2695,7 @@ export const RelayProjectCatalogServerGroup = HttpApiGroup.make("projectCatalogS
   .annotate(OpenApi.Description, "Environment-authenticated project catalog publication.")
   .middleware(RelayEnvironmentAuth);
 
-export const RelaySourceControlServerGroup = HttpApiGroup.make("sourceControlServer")
+const RelaySourceControlServerGroup = HttpApiGroup.make("sourceControlServer")
   .add(
     HttpApiEndpoint.post(
       "mintGithubInstallationToken",
@@ -2718,7 +2718,7 @@ export const RelaySourceControlServerGroup = HttpApiGroup.make("sourceControlSer
   )
   .middleware(RelayEnvironmentAuth);
 
-export const RelayProviderAccountsServerGroup = HttpApiGroup.make("providerAccountsServer")
+const RelayProviderAccountsServerGroup = HttpApiGroup.make("providerAccountsServer")
   .add(
     HttpApiEndpoint.get(
       "fetchProviderAccounts",
@@ -2741,7 +2741,7 @@ export const RelayProviderAccountsServerGroup = HttpApiGroup.make("providerAccou
   )
   .middleware(RelayEnvironmentAuth);
 
-export const RelayOrganizationSkillsServerGroup = HttpApiGroup.make("organizationSkillsServer")
+const RelayOrganizationSkillsServerGroup = HttpApiGroup.make("organizationSkillsServer")
   .add(
     HttpApiEndpoint.get("fetchOrganizationSkills", "/v1/environments/:environmentId/skills", {
       params: Schema.Struct({ environmentId: EnvironmentId }),
@@ -2760,7 +2760,7 @@ export const RelayOrganizationSkillsServerGroup = HttpApiGroup.make("organizatio
   )
   .middleware(RelayEnvironmentAuth);
 
-export const RelayExecutorReleaseServerGroup = HttpApiGroup.make("executorReleaseServer")
+const RelayExecutorReleaseServerGroup = HttpApiGroup.make("executorReleaseServer")
   .add(
     HttpApiEndpoint.get("getExecutorRelease", "/v1/environments/:environmentId/executor-release", {
       params: Schema.Struct({ environmentId: EnvironmentId }),

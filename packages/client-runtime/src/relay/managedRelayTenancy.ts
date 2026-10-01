@@ -260,7 +260,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
   });
 }
 
-export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
+const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
   options: ManagedRelayTenancyClientOptions,
 ) {
   const relayUrl = normalizeSecureRelayUrl(options.relayUrl);
