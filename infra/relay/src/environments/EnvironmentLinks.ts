@@ -139,7 +139,7 @@ export class EnvironmentLinks extends Context.Service<
       readonly environmentId: string;
     }) => Effect.Effect<boolean, EnvironmentLinkRevokePersistenceError>;
   }
->()("t3code-relay/environments/EnvironmentLinks") {}
+>()("launchpad-relay/environments/EnvironmentLinks") {}
 
 function agentAwarenessDeliveryUserKeyCondition(input: {
   readonly environmentId: string;

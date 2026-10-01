@@ -138,7 +138,7 @@ export class Organizations extends Context.Service<
       readonly organizationId: string;
     }) => Effect.Effect<void, OrganizationPersistenceError>;
   }
->()("t3code-relay/tenancy/Organizations") {}
+>()("launchpad-relay/tenancy/Organizations") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

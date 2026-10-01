@@ -72,7 +72,7 @@ export class RelayConfiguration extends Context.Service<
     readonly executorSource?: ExecutorSourceRelease | undefined;
     readonly managedEndpointCleanupMode?: ManagedEndpointCleanupMode;
   }
->()("t3code-relay/Config/RelayConfiguration") {}
+>()("launchpad-relay/Config/RelayConfiguration") {}
 
 export interface ExecutorSourceRelease {
   readonly gitUrl: string;

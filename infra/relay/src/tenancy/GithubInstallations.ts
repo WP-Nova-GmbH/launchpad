@@ -69,7 +69,7 @@ export class GithubInstallations extends Context.Service<
       readonly organizationId: string;
     }) => Effect.Effect<boolean, GithubInstallationPersistenceError>;
   }
->()("t3code-relay/tenancy/GithubInstallations") {}
+>()("launchpad-relay/tenancy/GithubInstallations") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

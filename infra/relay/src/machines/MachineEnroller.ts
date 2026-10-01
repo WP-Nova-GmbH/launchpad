@@ -69,7 +69,7 @@ export class MachineEnroller extends Context.Service<
       readonly proof: string;
     }) => Effect.Effect<MachineEnrollResult, MachineEnrollError>;
   }
->()("t3code-relay/machines/MachineEnroller") {}
+>()("launchpad-relay/machines/MachineEnroller") {}
 
 const decodeProof = Schema.decodeUnknownEffect(RelayMachineEnrollProofPayload);
 

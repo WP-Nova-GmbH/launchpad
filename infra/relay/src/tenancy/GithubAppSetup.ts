@@ -195,7 +195,7 @@ export class GithubAppSetup extends Context.Service<
       state: string,
     ) => Effect.Effect<GithubSetupClaims, GithubAppSetupStateInvalid>;
   }
->()("t3code-relay/tenancy/GithubAppSetup") {}
+>()("launchpad-relay/tenancy/GithubAppSetup") {}
 
 function parseReturnUrl(value: string): URL | null {
   try {

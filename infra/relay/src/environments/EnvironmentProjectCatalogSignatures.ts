@@ -60,7 +60,7 @@ export class EnvironmentProjectCatalogSignatures extends Context.Service<
       readonly request: RelayProjectCatalogPublishRequest;
     }) => Effect.Effect<void, ProjectCatalogPublishSignatureError>;
   }
->()("t3code-relay/environments/EnvironmentProjectCatalogSignatures") {}
+>()("launchpad-relay/environments/EnvironmentProjectCatalogSignatures") {}
 
 const decodeProof = Schema.decodeUnknownEffect(RelayProjectCatalogPublishProofPayload);
 

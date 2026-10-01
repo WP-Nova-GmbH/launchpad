@@ -185,19 +185,37 @@ export const deliverPending = Effect.fn("relay.repository_policy.deliver_pending
   );
 });
 
+export class RepositoryPolicySyncError extends Schema.TaggedError<RepositoryPolicySyncError>()(
+  "RepositoryPolicySyncError",
+  {
+    detail: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 export interface RepositoryPolicyControlShape {
   readonly synchronize: (input: {
     organizationId: string;
     environmentId: string;
     publicKey: string;
     url: string;
-  }) => Effect.Effect<void, Error>;
+  }) => Effect.Effect<void, RepositoryPolicySyncError>;
 }
 export class RepositoryPolicyControl extends Context.Reference<RepositoryPolicyControlShape>(
   "relay/RepositoryPolicyControl",
   {
     defaultValue: () => ({
-      synchronize: () => Effect.fail(new Error("Repository policy control is unavailable.")),
+      synchronize: () =>
+        Effect.fail(
+          new RepositoryPolicySyncError({
+            detail: "Repository policy control is unavailable.",
+            cause: null,
+          }),
+        ),
     }),
   },
 ) {}
@@ -225,13 +243,18 @@ export const controlLayer = Layer.effect(
             );
           const accepted = yield* acknowledge({ ...input, ack });
           if (!accepted)
-            return yield* Effect.fail(
-              new Error("Policy acknowledgement did not match this environment."),
-            );
+            return yield* new RepositoryPolicySyncError({
+              detail: "Policy acknowledgement did not match this environment.",
+              cause: null,
+            });
         }).pipe(
           Effect.provide(context),
           Effect.mapError(
-            (cause) => new Error("Could not synchronize repository access.", { cause }),
+            (cause) =>
+              new RepositoryPolicySyncError({
+                detail: "Could not synchronize repository access.",
+                cause,
+              }),
           ),
         ),
     });

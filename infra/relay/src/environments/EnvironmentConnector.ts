@@ -205,7 +205,7 @@ export class EnvironmentConnector extends Context.Service<
       readonly instruction: string;
     }) => Effect.Effect<EnvironmentDispatchJobResult, EnvironmentConnectorError>;
   }
->()("t3code-relay/environments/EnvironmentConnector") {}
+>()("launchpad-relay/environments/EnvironmentConnector") {}
 
 const decodeMintResponseProof = Schema.decodeUnknownEffect(
   RelayEnvironmentMintResponseProofPayload,

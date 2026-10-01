@@ -1,4 +1,7 @@
-import { RepositoryPolicyControl } from "../tenancy/RepositoryPolicies.ts";
+import {
+  RepositoryPolicyControl,
+  RepositoryPolicySyncError,
+} from "../tenancy/RepositoryPolicies.ts";
 import * as NodeCrypto from "node:crypto";
 import * as NodeCryptoLayer from "@effect/platform-node/NodeCrypto";
 
@@ -205,7 +208,7 @@ function connectorTestLayer(
     request: HttpClientRequest.HttpClientRequest,
   ) => Effect.Effect<HttpClientResponse.HttpClientResponse>,
   options?: {
-    readonly policySync?: () => Effect.Effect<void, Error>;
+    readonly policySync?: () => Effect.Effect<void, RepositoryPolicySyncError>;
     readonly links?: EnvironmentLinks.EnvironmentLinks["Service"];
     readonly allocations?: ManagedEndpointAllocations.ManagedEndpointAllocations["Service"];
     readonly machine?: Machines.MachineRecord | null;
@@ -1456,7 +1459,12 @@ describe("EnvironmentConnector.resolveAccess", () => {
           machine: enrolledMachine,
           membershipOrganizationId: "organization-1",
           policySync: () =>
-            Effect.fail(new Error("Old server does not support repository policy.")),
+            Effect.fail(
+              new RepositoryPolicySyncError({
+                detail: "Old server does not support repository policy.",
+                cause: null,
+              }),
+            ),
         }),
       ),
     ),

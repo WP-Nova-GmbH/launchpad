@@ -184,7 +184,7 @@ export class ManagedEndpointAllocations extends Context.Service<
       input: RemoveClaimedManagedEndpointAllocationInput,
     ) => Effect.Effect<boolean, ManagedEndpointAllocationPersistenceError>;
   }
->()("t3code-relay/environments/ManagedEndpointAllocations") {}
+>()("launchpad-relay/environments/ManagedEndpointAllocations") {}
 
 const allocationSelection = {
   userId: relayManagedEndpointAllocations.userId,

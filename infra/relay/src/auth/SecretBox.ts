@@ -28,7 +28,7 @@ export class RelaySecretBox extends Context.Service<
     readonly seal: (plaintext: string) => Effect.Effect<string, SecretBoxError>;
     readonly open: (sealed: string) => Effect.Effect<string, SecretBoxError>;
   }
->()("t3code-relay/auth/SecretBox/RelaySecretBox") {}
+>()("launchpad-relay/auth/SecretBox/RelaySecretBox") {}
 
 const VERSION = "v1";
 const NONCE_BYTES = 12;

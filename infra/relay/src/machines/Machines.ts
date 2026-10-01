@@ -200,7 +200,7 @@ export class Machines extends Context.Service<
       readonly machineId: string;
     }) => Effect.Effect<void, MachinePersistenceError>;
   }
->()("t3code-relay/machines/Machines") {}
+>()("launchpad-relay/machines/Machines") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

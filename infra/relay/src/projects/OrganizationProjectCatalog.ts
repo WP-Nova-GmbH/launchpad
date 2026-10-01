@@ -56,7 +56,7 @@ export class OrganizationProjectCatalog extends Context.Service<
       OrganizationProjectCatalogPersistenceError
     >;
   }
->()("t3code-relay/projects/OrganizationProjectCatalog") {}
+>()("launchpad-relay/projects/OrganizationProjectCatalog") {}
 
 const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

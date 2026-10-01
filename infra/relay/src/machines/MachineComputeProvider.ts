@@ -71,7 +71,7 @@ export class MachineComputeProvider extends Context.Service<
       readonly computeRef: string;
     }) => Effect.Effect<void, MachineComputeError>;
   }
->()("t3code-relay/machines/MachineComputeProvider") {}
+>()("launchpad-relay/machines/MachineComputeProvider") {}
 
 /**
  * A deployment without a compute driver refuses to provision rather than

@@ -100,7 +100,7 @@ export class GithubApp extends Context.Service<
       readonly privateKey: string;
     }) => Effect.Effect<GithubAppDescription, GithubRequestFailed>;
   }
->()("t3code-relay/tenancy/GithubApp") {}
+>()("launchpad-relay/tenancy/GithubApp") {}
 
 export interface GithubAppDescription {
   readonly appId: string;
