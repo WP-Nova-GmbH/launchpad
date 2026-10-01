@@ -267,6 +267,39 @@ describe("reconcileMachineEnrollment", () => {
       const result = yield* reconcileMachineEnrollment("http://127.0.0.1:4483");
       expect(result.outcome).toBe("already-enrolled");
       expect(harness.requests).toHaveLength(0);
+      expect(harness.applyConfigCalls).toEqual([]);
+    }).pipe(provideEnrollmentHarness(harness));
+  });
+
+  it.effect("starts the stored connector when an enrolled machine boots", () => {
+    const endpointRuntime = {
+      providerKind: "cloudflare_tunnel",
+      connectorToken: "connector-token",
+      tunnelId: "tunnel-1",
+      tunnelName: "machine-1",
+    } as const;
+    const { store } = makeMemorySecretStore([
+      [
+        CLOUD_MACHINE_IDENTITY,
+        JSON.stringify({
+          machineId: "machine-1",
+          organizationId: "organization-1",
+          role: "agent_executor",
+        }),
+      ],
+      [CLOUD_ENDPOINT_RUNTIME_CONFIG, JSON.stringify(endpointRuntime)],
+    ]);
+    const harness: EnrollmentHarness = {
+      store,
+      requests: [],
+      applyConfigCalls: [],
+      env: machineEnv,
+    };
+    return Effect.gen(function* () {
+      const result = yield* reconcileMachineEnrollment("http://127.0.0.1:4483");
+      expect(result.outcome).toBe("already-enrolled");
+      expect(harness.requests).toHaveLength(0);
+      expect(harness.applyConfigCalls).toEqual([endpointRuntime]);
     }).pipe(provideEnrollmentHarness(harness));
   });
 
