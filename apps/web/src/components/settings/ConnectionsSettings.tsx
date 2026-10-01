@@ -1618,7 +1618,7 @@ function SavedBackendListRow({
             />
           }
         />
-        <TooltipPopup side="top" className="max-w-80 whitespace-pre-wrap leading-tight">
+        <TooltipPopup side="top" className="max-w-80 whitespace-pre-wrap">
           {organizationMachine
             ? "This machine belongs to your organization and stays connected on every member's devices. Admins remove it under Settings → Organization."
             : unsupported

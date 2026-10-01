@@ -1554,7 +1554,7 @@ function renderFeedEntry(
       return (
         <View className="mb-5 items-end">
           {message.author ? (
-            <Text className="mb-1 pr-0.5 font-t3-medium text-xs text-neutral-600 dark:text-neutral-400">
+            <Text className="mb-1 pr-0.5 font-t3-medium text-xs text-foreground-secondary">
               {promptAttributionLabel(message)}
             </Text>
           ) : null}

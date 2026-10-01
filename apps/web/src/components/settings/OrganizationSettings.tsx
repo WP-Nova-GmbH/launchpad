@@ -104,11 +104,7 @@ function SectionNote({ children }: { children: ReactNode }) {
 }
 
 function RoleBadge({ children }: { children: string }) {
-  return (
-    <Badge variant="secondary" className="font-normal">
-      {children}
-    </Badge>
-  );
+  return <Badge variant="secondary">{children}</Badge>;
 }
 
 function OrganizationSection({ state }: { state: OrganizationAdminState }) {
@@ -404,8 +400,8 @@ function RepositoryRow({
       <div className="space-y-2 pb-2">
         <div className="flex flex-wrap items-center gap-1.5">
           {entry.repository.canonicalKeys.map((canonicalKey) => (
-            <Badge key={canonicalKey} variant="outline" className="gap-1 font-mono text-[11px]">
-              {canonicalKey}
+            <Badge key={canonicalKey} variant="outline">
+              <span className="font-mono">{canonicalKey}</span>
               {canConfigure && entry.repository.canonicalKeys.length > 1 ? (
                 <button
                   type="button"
@@ -1127,7 +1123,7 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
             <div key={repository.fullName} className="flex items-center justify-between gap-3 py-1">
               <span className="min-w-0 truncate font-mono text-xs">{repository.fullName}</span>
               {repository.registered ? (
-                <Badge variant="secondary" className="shrink-0 font-normal">
+                <Badge variant="secondary" className="shrink-0">
                   Registered
                 </Badge>
               ) : isAdmin ? (
@@ -1326,7 +1322,7 @@ function MachineRow({
       }
       control={
         <div className="flex items-center gap-2">
-          <span className="flex items-center gap-1.5 text-[13px] text-muted-foreground">
+          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <ConnectionStatusDot
               dotClassName={status.dotClassName}
               pingClassName={status.pingClassName}

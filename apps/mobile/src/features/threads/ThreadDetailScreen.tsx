@@ -1073,7 +1073,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
 
               {presenceLabel !== null ? (
                 <View className="items-center pb-1">
-                  <Text className="font-t3-medium text-xs text-neutral-600 dark:text-neutral-400">
+                  <Text className="font-t3-medium text-xs text-foreground-secondary">
                     {presenceLabel}
                   </Text>
                 </View>

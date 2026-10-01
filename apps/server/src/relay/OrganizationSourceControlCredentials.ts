@@ -82,12 +82,10 @@ export const make = Effect.gen(function* () {
 
   const unavailable = (retryAfter: Duration.Duration) =>
     DateTime.now.pipe(
-      Effect.map(
-        (now): CredentialState => ({
-          _tag: "unavailable",
-          retryAtMillis: now.epochMilliseconds + Duration.toMillis(retryAfter),
-        }),
-      ),
+      Effect.map((now): CredentialState => ({
+        _tag: "unavailable",
+        retryAtMillis: now.epochMilliseconds + Duration.toMillis(retryAfter),
+      })),
     );
 
   const mint = Effect.fn("OrganizationSourceControlCredentials.mint")(

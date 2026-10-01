@@ -137,19 +137,21 @@ export function ProviderAccountAuthActions({
               account session stays on that device and is not copied to other environments.
             </DialogDescription>
           </DialogHeader>
-          <DialogPanel className="space-y-3">
-            <p className="text-sm text-muted-foreground">
-              {authState.status === "running"
-                ? "Waiting for you to finish in the provider's sign-in page."
-                : authState.status === "succeeded"
-                  ? "The provider confirmed the account session."
-                  : authState.status === "failed"
-                    ? authState.message
-                    : "Start the account login to receive a sign-in link."}
-            </p>
-            <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed text-foreground">
-              {output || "Provider login output will appear here."}
-            </pre>
+          <DialogPanel>
+            <div className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                {authState.status === "running"
+                  ? "Waiting for you to finish in the provider's sign-in page."
+                  : authState.status === "succeeded"
+                    ? "The provider confirmed the account session."
+                    : authState.status === "failed"
+                      ? authState.message
+                      : "Start the account login to receive a sign-in link."}
+              </p>
+              <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed text-foreground">
+                {output || "Provider login output will appear here."}
+              </pre>
+            </div>
           </DialogPanel>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setIsLoginDialogOpen(false)}>

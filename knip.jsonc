@@ -13,9 +13,14 @@
       "vitest": { "entry": [".github/**/*.test.cjs"] },
     },
     "scripts": {
-      // Knip loads its preprocessor through a CLI option; native verification and
-      // worktree setup (from t3.json) run directly.
-      "entry": ["knip-schemas.ts", "mobile-native-client.ts", "setup-worktree.ts"],
+      // Knip loads its preprocessor through a CLI option; native verification,
+      // worktree setup (from t3.json), and brand icon generation run directly.
+      "entry": [
+        "knip-schemas.ts",
+        "mobile-native-client.ts",
+        "setup-worktree.ts",
+        "generate-brand-icons.ts",
+      ],
     },
     "apps/server": {
       // Vite+ pack entries and the launcher used by installed background services.
@@ -80,7 +85,8 @@
       "entry": ["src/*NativeComponent.ts!"],
     },
     "infra/relay": {
-      "entry": ["alchemy.run.ts!", "src/persistence/schema.ts!"],
+      // GitHub App setup runs by hand from the repository root.
+      "entry": ["alchemy.run.ts!", "src/persistence/schema.ts!", "scripts/create-github-app.ts"],
     },
     "packages/*": {
       // These workspace packages are private to this monorepo.

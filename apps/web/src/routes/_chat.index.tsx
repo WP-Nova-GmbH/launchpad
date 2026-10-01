@@ -217,7 +217,7 @@ function OrganizationNoProjectsHero({
                         </div>
                         <span
                           className={cn(
-                            "shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                            "shrink-0 rounded-full border px-2 py-0.5 text-3xs font-medium",
                             isOnline
                               ? "border-success/25 bg-success/8 text-success"
                               : "border-border/60 bg-muted/35 text-muted-foreground",
@@ -255,7 +255,7 @@ function OrganizationNoProjectsHero({
                           {repository.canonicalKeys.join(" · ")}
                         </div>
                       </div>
-                      <span className="shrink-0 text-[10px] font-medium text-muted-foreground uppercase">
+                      <span className="shrink-0 text-3xs font-medium text-muted-foreground uppercase">
                         {role ?? organizationCatalog.data?.membership.role ?? "member"}
                       </span>
                     </div>

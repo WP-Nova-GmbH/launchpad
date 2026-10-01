@@ -76,7 +76,6 @@ export function useThreadPresenceReporter(ref: ScopedThreadRef | null, prompt: s
       void report({ environmentId: ref.environmentId, input: { threadId: null, typing: false } });
     };
     // The prompt is captured for the reset only; edits are handled below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ref, send, report, clearIdleTimer]);
 
   useEffect(() => {
