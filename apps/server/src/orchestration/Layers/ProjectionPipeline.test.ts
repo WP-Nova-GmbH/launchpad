@@ -4645,6 +4645,8 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
         threadId,
       });
       assert.isTrue(Option.isNone(yield* snapshotQuery.getThreadShellById(threadId)));
+      // Stand in for the deletion reactor confirming task cleanup, which reopens the id.
+      yield* sql`DELETE FROM thread_cleanup_fences WHERE thread_id = ${threadId}`;
 
       // Retry from the same draft reuses the thread id.
       yield* createThread("cmd-retry-create-2", "Second attempt");
