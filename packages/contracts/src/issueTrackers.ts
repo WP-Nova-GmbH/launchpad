@@ -7,11 +7,31 @@ export const RELAY_LINEAR_CALLBACK_PATH = "/v1/organization/issue-trackers/linea
 export const RelayIssueTrackerService = Schema.Literals(["linear", "jira"]);
 export type RelayIssueTrackerService = typeof RelayIssueTrackerService.Type;
 
+export const RelayLinearAuthorization = Schema.Struct({
+  id: Schema.String,
+  phase: Schema.Literals(["pending", "exchanging"]),
+  expiresAt: Schema.String,
+});
+export const RelayLinearReplacement = Schema.Struct({
+  id: Schema.String,
+  currentWorkspaceId: Schema.String,
+  workspaceId: Schema.String,
+  currentAccountLabel: Schema.String,
+  accountLabel: Schema.String,
+  expiresAt: Schema.String,
+});
+export const RelayLinearReplacementRequest = Schema.Struct({
+  proposalId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+});
+export type RelayLinearReplacementRequest = typeof RelayLinearReplacementRequest.Type;
+
 export const RelayIssueTrackerConnection = Schema.Struct({
   service: RelayIssueTrackerService,
   status: Schema.Literals(["connecting", "connected", "reconnect_required"]),
   accountLabel: Schema.NullOr(Schema.String),
   updatedAt: Schema.String,
+  authorization: Schema.optionalKey(RelayLinearAuthorization),
+  replacement: Schema.optionalKey(RelayLinearReplacement),
 });
 export type RelayIssueTrackerConnection = typeof RelayIssueTrackerConnection.Type;
 
@@ -28,7 +48,11 @@ export const RelayConnectJiraRequest = Schema.Struct({
 });
 export type RelayConnectJiraRequest = typeof RelayConnectJiraRequest.Type;
 
-export const RelayStartLinearResponse = Schema.Struct({ authorizationUrl: Schema.String });
+export const RelayStartLinearResponse = Schema.Struct({
+  authorizationUrl: Schema.String,
+  authorizationId: Schema.String,
+  connection: RelayIssueTrackerConnection,
+});
 export type RelayStartLinearResponse = typeof RelayStartLinearResponse.Type;
 
 export const RelayIssueDetails = Schema.Struct({

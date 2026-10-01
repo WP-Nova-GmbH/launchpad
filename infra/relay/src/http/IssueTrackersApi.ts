@@ -51,6 +51,44 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       ),
     )
     .handle(
+      "confirmLinearReplacement",
+      Effect.fn("issueTrackers.api.confirmLinearReplacement")(
+        function* ({ payload }) {
+          const { userId } = yield* RelayClientPrincipal;
+          const membership = yield* requireAdmin({ userId });
+          return yield* Connections.confirmLinearReplacement({
+            organizationId: membership.organization.organizationId,
+            userId,
+            proposalId: payload.proposalId,
+          });
+        },
+        mapErrorTags({
+          IssueTrackerConnectionPersistenceError: persistenceFailure,
+          RelayIssueTrackerError: trackerFailure,
+        }),
+        mapRelayCommonApiErrors("not_authorized"),
+      ),
+    )
+    .handle(
+      "cancelLinearReplacement",
+      Effect.fn("issueTrackers.api.cancelLinearReplacement")(
+        function* ({ payload }) {
+          const { userId } = yield* RelayClientPrincipal;
+          const membership = yield* requireAdmin({ userId });
+          return yield* Connections.cancelLinearReplacement({
+            organizationId: membership.organization.organizationId,
+            userId,
+            proposalId: payload.proposalId,
+          });
+        },
+        mapErrorTags({
+          IssueTrackerConnectionPersistenceError: persistenceFailure,
+          RelayIssueTrackerError: trackerFailure,
+        }),
+        mapRelayCommonApiErrors("not_authorized"),
+      ),
+    )
+    .handle(
       "connectJira",
       Effect.fn("issueTrackers.api.connectJira")(
         function* ({ payload }) {

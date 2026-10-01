@@ -101,7 +101,13 @@ const open = Effect.fn("issueTrackers.open")(function* (row: ConnectionRecord) {
   return yield* box.open(row.payloadSealed).pipe(
     Effect.flatMap(decodeCredentials),
     Effect.mapError(() =>
-      failure("auth_required", "Reconnect this service in Organization settings."),
+      failure(
+        "auth_required",
+        // Unreadable credentials hide the workspace identity needed to compare a new grant.
+        row.service === "linear"
+          ? "The saved Linear connection could not be read. Disconnect Linear in Organization settings, then connect it again."
+          : "Reconnect this service in Organization settings.",
+      ),
     ),
   );
 });
@@ -132,7 +138,20 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (organi
   const store = yield* ConnectionStore;
   const config = yield* RelayConfiguration;
   const now = yield* milliseconds;
-  const rows = yield* store.list(organizationId);
+  let rows = yield* store.list(organizationId);
+  let expired = false;
+  for (const row of rows) {
+    if (row.service !== "linear") continue;
+    if (row.authorizationId && row.pendingExpiresAt && Date.parse(row.pendingExpiresAt) <= now) {
+      yield* store.cancelAuthorization({ ...row, authorizationId: row.authorizationId });
+      expired = true;
+    }
+    if (row.replacement && Date.parse(row.replacement.expiresAt) <= now) {
+      yield* store.cancelReplacement({ ...row, proposalId: row.replacement.id });
+      expired = true;
+    }
+  }
+  if (expired) rows = yield* store.list(organizationId);
   return {
     linearAvailable: Boolean(config.linear),
     connections: rows.map((row) => ({
@@ -158,80 +177,214 @@ export const startLinear = Effect.fn("issueTrackers.startLinear")(function* (inp
   );
   const now = yield* milliseconds;
   const store = yield* ConnectionStore;
-  yield* store.begin({
+  const pending = yield* store.begin({
     ...input,
     service: "linear",
     stateHash: yield* hashState(state),
     expiresAt: DateTime.formatIso(DateTime.makeUnsafe(now + 15 * 60_000)),
   });
-  return { authorizationUrl: linearAuthorizationUrl({ ...config, state }) };
+  return {
+    authorizationUrl: linearAuthorizationUrl({ ...config, state }),
+    authorizationId: pending.authorizationId!,
+    connection: metadata(pending),
+  };
+});
+
+const requireLinearAdmin = Effect.fn("issueTrackers.requireLinearAdmin")(function* (input: {
+  readonly organizationId: string;
+  readonly userId: string;
+}) {
+  const organizations = yield* Organizations;
+  const membership = yield* organizations.getMembershipForUser({ userId: input.userId });
+  if (
+    !membership ||
+    membership.role !== "admin" ||
+    membership.organization.organizationId !== input.organizationId
+  )
+    return yield* failure("forbidden", "An organization administrator must connect Linear.");
 });
 
 export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function* (input: {
   readonly state: string;
   readonly code: string | null;
 }) {
+  const deadline = (yield* milliseconds) + 8000;
   const store = yield* ConnectionStore;
-  const pending = yield* store.findPending(yield* hashState(input.state));
-  const now = yield* milliseconds;
-  if (!pending || !pending.pendingExpiresAt || Date.parse(pending.pendingExpiresAt) <= now)
-    return yield* conflict();
-  if (!input.code) {
-    yield* store.cancel(pending);
-    return yield* failure(
-      "invalid_input",
-      "Linear authorization was cancelled. Return to Organization settings to try again.",
-    );
-  }
-  // Authorization can outlive the admin's membership; recheck before accepting the grant.
-  const organizations = yield* Organizations;
-  const membership = yield* organizations.getMembershipForUser({ userId: pending.updatedByUserId });
-  if (
-    !membership ||
-    membership.role !== "admin" ||
-    membership.organization.organizationId !== pending.organizationId
-  ) {
-    yield* store.cancel(pending);
-    return yield* failure("forbidden", "An organization administrator must connect Linear.");
-  }
-  const code = input.code;
-  return yield* store
-    .withLock(pending, (row) =>
+  const stateHash = yield* hashState(input.state);
+  const pending = yield* store.findPending(stateHash);
+  if (!pending?.authorizationId) return yield* conflict();
+  const authorizationId = pending.authorizationId;
+  const attempt = { ...pending, authorizationId };
+  const admin = { organizationId: pending.organizationId, userId: pending.updatedByUserId };
+  // A losing duplicate callback must not cancel the callback that already claimed this code.
+  const discardUnclaimed = store.withLock(pending, (row) =>
+    row?.authorizationId === authorizationId && row.pendingStateHash === stateHash
+      ? store.cancelAuthorization(attempt)
+      : Effect.void,
+  );
+  const claimed = yield* Effect.gen(function* () {
+    if (!input.code)
+      return yield* failure(
+        "invalid_input",
+        "Linear authorization was cancelled. Return to Organization settings to try again.",
+      );
+    yield* requireLinearAdmin(admin);
+    return yield* store.withLock(pending, (row) =>
       Effect.gen(function* () {
         if (
           !row ||
-          row.version !== pending.version ||
-          row.pendingStateHash !== pending.pendingStateHash
+          row.authorizationId !== authorizationId ||
+          row.pendingStateHash !== stateHash ||
+          !row.pendingExpiresAt ||
+          Date.parse(row.pendingExpiresAt) <= (yield* milliseconds)
         )
           return yield* conflict();
-        const config = yield* linearConfig;
-        const tokens = yield* exchangeLinearCode({ ...config, code });
-        const identity = yield* getLinearIdentity({ accessToken: tokens.accessToken });
-        const payloadSealed = yield* seal({
-          service: "linear",
-          accessToken: tokens.accessToken,
-          refreshToken: tokens.refreshToken,
-          expiresAt: (yield* milliseconds) + tokens.expiresIn * 1000,
-          workspaceId: identity.workspaceId,
-          workspaceSlug: identity.workspaceSlug,
-          generation: yield* (yield* Crypto.Crypto).randomUUIDv4.pipe(
-            Effect.mapError(() => failure("unavailable", "Could not save Linear connection.")),
-          ),
-        });
-        if (
-          !(yield* store.complete({ ...row, payloadSealed, accountLabel: identity.accountLabel }))
-        )
+        if (!(yield* store.claimAuthorization({ ...row, authorizationId, stateHash })))
           return yield* conflict();
-        return identity.accountLabel;
+        return row;
       }),
-    )
-    .pipe(
-      boundedOperation,
-      Effect.onExit((exit) =>
-        Exit.isFailure(exit) ? store.cancel(pending).pipe(Effect.ignore) : Effect.void,
-      ),
     );
+  }).pipe(
+    boundedOperation,
+    Effect.onExit((exit) =>
+      Exit.isFailure(exit) ? discardUnclaimed.pipe(Effect.ignore) : Effect.void,
+    ),
+  );
+  const code = input.code!;
+  return yield* Effect.gen(function* () {
+    const previous = claimed.payloadSealed ? yield* open(claimed) : null;
+    if (previous && previous.service !== "linear") return yield* conflict();
+    const config = yield* linearConfig;
+    // Provider calls run outside the connection lock so the selected workspace keeps serving reads.
+    const tokens = yield* exchangeLinearCode({ ...config, code });
+    const expiresAt = (yield* milliseconds) + tokens.expiresIn * 1000;
+    const identity = yield* getLinearIdentity({ accessToken: tokens.accessToken });
+    const sameWorkspace = previous?.workspaceId === identity.workspaceId;
+    const crypto = yield* Crypto.Crypto;
+    const newId = crypto.randomUUIDv4.pipe(
+      Effect.mapError(() => failure("unavailable", "Could not save the Linear connection.")),
+    );
+    const generation =
+      sameWorkspace && previous ? (previous.generation ?? previous.workspaceId) : yield* newId;
+    const payloadSealed = yield* seal({
+      service: "linear",
+      ...tokens,
+      expiresAt,
+      workspaceId: identity.workspaceId,
+      workspaceSlug: identity.workspaceSlug,
+      generation,
+    });
+    const proposalId = previous && !sameWorkspace ? yield* newId : null;
+    yield* requireLinearAdmin(admin);
+    return yield* store.withLock(claimed, (row) =>
+      Effect.gen(function* () {
+        const now = yield* milliseconds;
+        if (
+          !row ||
+          row.version !== claimed.version ||
+          row.authorizationId !== authorizationId ||
+          row.pendingStateHash !== null ||
+          !row.pendingExpiresAt ||
+          Date.parse(row.pendingExpiresAt) <= now
+        )
+          return yield* conflict();
+        if (proposalId && previous) {
+          const replacement = {
+            id: proposalId,
+            payloadSealed,
+            workspaceId: identity.workspaceId,
+            currentWorkspaceId: previous.workspaceId,
+            accountLabel: identity.accountLabel,
+            currentAccountLabel: row.accountLabel ?? "Current Linear workspace",
+            expectedVersion: row.version,
+            createdByUserId: admin.userId,
+            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(now + 15 * 60_000)),
+          };
+          if (!(yield* store.proposeReplacement({ ...row, authorizationId, replacement })))
+            return yield* conflict();
+          return { status: "awaiting_confirmation" as const, accountLabel: identity.accountLabel };
+        }
+        if (
+          !(yield* store.complete({
+            ...row,
+            payloadSealed,
+            accountLabel: identity.accountLabel,
+            userId: admin.userId,
+          }))
+        )
+          return yield* conflict();
+        return { status: "connected" as const, accountLabel: identity.accountLabel };
+      }),
+    );
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: Math.max(1, deadline - (yield* milliseconds)),
+      orElse: () =>
+        Effect.fail(
+          failure("unavailable", "The issue tracker took too long to respond. Try again."),
+        ),
+    }),
+    Effect.onExit((exit) =>
+      Exit.isFailure(exit) ? store.cancelAuthorization(attempt).pipe(Effect.ignore) : Effect.void,
+    ),
+  );
 });
+
+export const confirmLinearReplacement = Effect.fn("issueTrackers.confirmLinearReplacement")(
+  function* (input: {
+    readonly organizationId: string;
+    readonly userId: string;
+    readonly proposalId: string;
+  }) {
+    yield* requireLinearAdmin(input);
+    const store = yield* ConnectionStore;
+    const key = { organizationId: input.organizationId, service: "linear" as const };
+    yield* store.withLock(key, (row) =>
+      Effect.gen(function* () {
+        const proposal = row?.replacement;
+        if (
+          !row ||
+          !proposal ||
+          proposal.id !== input.proposalId ||
+          proposal.expectedVersion !== row.version
+        )
+          return yield* conflict();
+        if (Date.parse(proposal.expiresAt) <= (yield* milliseconds))
+          return yield* failure("conflict", "This workspace change expired. Connect Linear again.");
+        if (
+          !(yield* store.complete({
+            ...row,
+            payloadSealed: proposal.payloadSealed,
+            accountLabel: proposal.accountLabel,
+            userId: input.userId,
+          }))
+        )
+          return yield* conflict();
+      }),
+    );
+    return yield* listConnections(input.organizationId);
+  },
+);
+
+export const cancelLinearReplacement = Effect.fn("issueTrackers.cancelLinearReplacement")(
+  function* (input: {
+    readonly organizationId: string;
+    readonly userId: string;
+    readonly proposalId: string;
+  }) {
+    yield* requireLinearAdmin(input);
+    const store = yield* ConnectionStore;
+    const key = { organizationId: input.organizationId, service: "linear" as const };
+    yield* store.withLock(key, (row) =>
+      Effect.gen(function* () {
+        if (!row?.replacement) return;
+        if (row.replacement.id !== input.proposalId) return yield* conflict();
+        yield* store.cancelReplacement({ ...row, proposalId: input.proposalId });
+      }),
+    );
+    return yield* listConnections(input.organizationId);
+  },
+);
 
 export const saveJira = Effect.fn("issueTrackers.saveJira")(function* (
   input: RelayConnectJiraRequest & { readonly organizationId: string; readonly userId: string },

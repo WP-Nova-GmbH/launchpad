@@ -2,7 +2,7 @@ import type {
   RelayIssueTrackerConnection,
   RelayIssueTrackerService,
 } from "@t3tools/contracts/relay";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -43,11 +43,32 @@ export class ConnectionStore extends Context.Service<
         readonly expiresAt?: string;
       },
     ) => Effect.Effect<ConnectionRecord, ConnectionPersistenceError>;
+    readonly claimAuthorization: (
+      input: ConnectionKey & {
+        readonly version: string;
+        readonly authorizationId: string;
+        readonly stateHash: string;
+      },
+    ) => Effect.Effect<boolean, ConnectionPersistenceError>;
+    readonly cancelAuthorization: (
+      input: ConnectionKey & { readonly authorizationId: string },
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly proposeReplacement: (
+      input: ConnectionKey & {
+        readonly version: string;
+        readonly authorizationId: string;
+        readonly replacement: NonNullable<ConnectionRecord["replacement"]>;
+      },
+    ) => Effect.Effect<boolean, ConnectionPersistenceError>;
+    readonly cancelReplacement: (
+      input: ConnectionKey & { readonly version: string; readonly proposalId: string },
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly complete: (
       input: ConnectionKey & {
         readonly version: string;
         readonly payloadSealed: string;
         readonly accountLabel: string;
+        readonly userId?: string;
       },
     ) => Effect.Effect<boolean, ConnectionPersistenceError>;
     readonly refresh: (
@@ -72,6 +93,27 @@ export const metadata = (row: ConnectionRecord): RelayIssueTrackerConnection => 
   status: row.status,
   accountLabel: row.accountLabel,
   updatedAt: row.updatedAt,
+  ...(row.service === "linear" && row.authorizationId && row.pendingExpiresAt
+    ? {
+        authorization: {
+          id: row.authorizationId,
+          phase: row.pendingStateHash ? ("pending" as const) : ("exchanging" as const),
+          expiresAt: row.pendingExpiresAt,
+        },
+      }
+    : {}),
+  ...(row.service === "linear" && row.replacement
+    ? {
+        replacement: {
+          id: row.replacement.id,
+          workspaceId: row.replacement.workspaceId,
+          currentWorkspaceId: row.replacement.currentWorkspaceId,
+          accountLabel: row.replacement.accountLabel,
+          currentAccountLabel: row.replacement.currentAccountLabel,
+          expiresAt: row.replacement.expiresAt,
+        },
+      }
+    : {}),
 });
 
 export const make = Effect.gen(function* () {
@@ -114,8 +156,11 @@ export const make = Effect.gen(function* () {
     begin: Effect.fn("issueTrackers.begin")(function* (input) {
       const version = yield* uuid;
       const updatedAt = yield* now;
+      // Pending OAuth must not invalidate reads using the active connection.
       const pending = {
-        version,
+        ...(input.service === "linear"
+          ? { authorizationId: yield* uuid, replacement: null }
+          : { version }),
         pendingStateHash: input.stateHash ?? null,
         pendingExpiresAt: input.expiresAt ?? null,
         updatedByUserId: input.userId,
@@ -127,6 +172,7 @@ export const make = Effect.gen(function* () {
           organizationId: input.organizationId,
           service: input.service,
           status: "connecting",
+          version,
           ...pending,
         })
         .onConflictDoUpdate({
@@ -137,6 +183,68 @@ export const make = Effect.gen(function* () {
         .pipe(Effect.mapError(fail));
       return rows[0]!;
     }),
+    claimAuthorization: (input) =>
+      db
+        .update(connections)
+        .set({ pendingStateHash: null })
+        .where(
+          and(
+            current(input),
+            eq(connections.authorizationId, input.authorizationId),
+            eq(connections.pendingStateHash, input.stateHash),
+          ),
+        )
+        .returning({ version: connections.version })
+        .pipe(
+          Effect.map((rows) => rows.length === 1),
+          Effect.mapError(fail),
+        ),
+    cancelAuthorization: (input) =>
+      db.$client
+        .withTransaction(
+          Effect.gen(function* () {
+            const row = yield* get(input);
+            if (!row || row.authorizationId !== input.authorizationId) return;
+            const match = and(where(input), eq(connections.authorizationId, input.authorizationId));
+            if (row.payloadSealed === null) {
+              yield* db.delete(connections).where(match).pipe(Effect.mapError(fail));
+            } else {
+              yield* db
+                .update(connections)
+                .set({ authorizationId: null, pendingStateHash: null, pendingExpiresAt: null })
+                .where(match)
+                .pipe(Effect.mapError(fail));
+            }
+          }),
+        )
+        .pipe(Effect.mapError(fail)),
+    proposeReplacement: (input) =>
+      db
+        .update(connections)
+        .set({
+          replacement: input.replacement,
+          authorizationId: null,
+          pendingStateHash: null,
+          pendingExpiresAt: null,
+        })
+        .where(
+          and(
+            current(input),
+            eq(connections.authorizationId, input.authorizationId),
+            isNull(connections.pendingStateHash),
+          ),
+        )
+        .returning({ version: connections.version })
+        .pipe(
+          Effect.map((rows) => rows.length === 1),
+          Effect.mapError(fail),
+        ),
+    cancelReplacement: (input) =>
+      db
+        .update(connections)
+        .set({ replacement: null })
+        .where(and(current(input), sql`${connections.replacement}->>'id' = ${input.proposalId}`))
+        .pipe(Effect.asVoid, Effect.mapError(fail)),
     complete: Effect.fn("issueTrackers.complete")(function* (input) {
       const rows = yield* db
         .update(connections)
@@ -145,6 +253,9 @@ export const make = Effect.gen(function* () {
           status: "connected",
           payloadSealed: input.payloadSealed,
           accountLabel: input.accountLabel,
+          ...(input.userId ? { updatedByUserId: input.userId } : {}),
+          authorizationId: null,
+          replacement: null,
           pendingStateHash: null,
           pendingExpiresAt: null,
           updatedAt: yield* now,

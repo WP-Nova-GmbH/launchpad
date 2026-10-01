@@ -6,7 +6,7 @@ import type {
   RelayStartLinearResponse,
 } from "@t3tools/contracts/relay";
 import { ArrowUpRightIcon, CheckIcon, CircleDotIcon, RefreshCwIcon } from "lucide-react";
-import { useEffect, useId, useState } from "react";
+import { useId, useState } from "react";
 
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -28,6 +28,10 @@ export interface IssueTrackersSectionProps {
   readonly organizationName: string;
   readonly snapshot: RelayIssueTrackerConnections | null;
   readonly loading: boolean;
+  readonly mutating: boolean;
+  readonly unverified: boolean;
+  readonly confirmLinearReplacement: (proposalId: string) => Promise<void>;
+  readonly cancelLinearReplacement: (proposalId: string) => Promise<void>;
   readonly error: string | null;
   readonly refresh: () => Promise<void>;
   readonly startLinear: () => Promise<RelayStartLinearResponse>;
@@ -64,6 +68,10 @@ export function IssueTrackersSection({
   organizationName,
   snapshot,
   loading,
+  mutating,
+  unverified,
+  confirmLinearReplacement,
+  cancelLinearReplacement,
   error,
   refresh,
   startLinear,
@@ -75,33 +83,38 @@ export function IssueTrackersSection({
   const [busy, setBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
   const [authorizationUrl, setAuthorizationUrl] = useState<string | null>(null);
+  const [authorizationId, setAuthorizationId] = useState<string | null>(null);
+  const [review, setReview] = useState<RelayIssueTrackerConnection["replacement"]>(undefined);
   const [siteUrl, setSiteUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [issue, setIssue] = useState("");
   const fieldId = useId();
-  const linearConnected = snapshot?.connections.some(
-    (entry) => entry.service === "linear" && entry.status === "connected",
-  );
+  const linear = snapshot?.connections.find((entry) => entry.service === "linear");
+  const disabled = busy || mutating || unverified;
+  const reviewIsCurrent = review !== undefined && review.id === linear?.replacement?.id;
 
-  useEffect(() => {
-    if (dialog === "linear" && authorizationUrl && linearConnected) {
-      setDialog(null);
-      setAuthorizationUrl(null);
-    }
-  }, [authorizationUrl, dialog, linearConnected]);
+  // Connected describes the active workspace, even throughout a new OAuth flow.
+  // Close only when our exact authorization attempt disappears or is superseded.
+  const connectDialogOpen =
+    isAdmin &&
+    dialog !== null &&
+    (dialog !== "linear" || !authorizationId || linear?.authorization?.id === authorizationId);
 
   const closeDialog = () => {
     if (busy) return;
     setDialog(null);
     setDisconnectService(null);
+    setReview(undefined);
     setApiKey("");
     setAuthorizationUrl(null);
+    setAuthorizationId(null);
     setDialogError(null);
   };
 
   const showConnect = (service: RelayIssueTrackerService) => {
     setDialogError(null);
     setAuthorizationUrl(null);
+    setAuthorizationId(null);
     setDialog(service);
   };
 
@@ -126,7 +139,7 @@ export function IssueTrackersSection({
           size="icon-sm"
           variant="ghost"
           aria-label="Refresh issue trackers"
-          disabled={loading || busy}
+          disabled={loading || busy || mutating}
           onClick={() => void refresh()}
         >
           <RefreshCwIcon className="size-3.5" />
@@ -140,6 +153,12 @@ export function IssueTrackersSection({
           OpenCode servers are not supported yet.
         </p>
       </div>
+      {unverified ? (
+        <p role="alert" className="px-3 py-3 text-sm text-destructive sm:px-4">
+          Could not verify the current connection. Refresh to check. Connection details below are
+          last known.
+        </p>
+      ) : null}
       {error ? (
         <p role="alert" className="px-3 py-3 text-sm text-destructive sm:px-4">
           {error}
@@ -187,7 +206,7 @@ export function IssueTrackersSection({
                       <Button
                         size="sm"
                         variant="ghost"
-                        disabled={busy}
+                        disabled={disabled}
                         onClick={() => {
                           setDialogError(null);
                           setDisconnectService(service);
@@ -196,14 +215,31 @@ export function IssueTrackersSection({
                         Disconnect
                       </Button>
                     ) : null}
-                    {connection?.status !== "connected" ? (
+                    {service === "linear" && connection?.replacement ? (
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={busy || !available}
+                        disabled={disabled}
+                        onClick={() => {
+                          setDialogError(null);
+                          setReview(connection.replacement);
+                        }}
+                      >
+                        Review change
+                      </Button>
+                    ) : null}
+                    {connection?.status !== "connected" || service === "linear" ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={disabled || !available}
                         onClick={() => showConnect(service)}
                       >
-                        {connection ? "Reconnect" : "Connect"}
+                        {connection?.status === "connected"
+                          ? "Change workspace"
+                          : connection
+                            ? "Reconnect"
+                            : "Connect"}
                       </Button>
                     ) : null}
                   </div>
@@ -218,7 +254,7 @@ export function IssueTrackersSection({
         })
       )}
       <Dialog
-        open={isAdmin && dialog !== null}
+        open={connectDialogOpen}
         onOpenChange={(open) => {
           if (!open) closeDialog();
         }}
@@ -228,11 +264,12 @@ export function IssueTrackersSection({
             className="flex min-h-0 flex-col"
             onSubmit={(event) => {
               event.preventDefault();
-              if (busy) return;
+              if (disabled) return;
               void run(async () => {
                 if (dialog === "linear") {
                   const result = await startLinear();
                   setAuthorizationUrl(result.authorizationUrl);
+                  setAuthorizationId(result.authorizationId);
                   window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
                 } else if (dialog === "jira") {
                   await connectJira({
@@ -247,7 +284,11 @@ export function IssueTrackersSection({
             }}
           >
             <DialogHeader>
-              <DialogTitle>Connect {dialog === "jira" ? "Jira" : "Linear"}</DialogTitle>
+              <DialogTitle>
+                {dialog === "linear" && linear?.accountLabel
+                  ? "Change Linear workspace"
+                  : `Connect ${dialog === "jira" ? "Jira" : "Linear"}`}
+              </DialogTitle>
               <DialogDescription>
                 Share read-only issue access with {organizationName}.
               </DialogDescription>
@@ -267,7 +308,7 @@ export function IssueTrackersSection({
                       placeholder="https://your-team.atlassian.net"
                       value={siteUrl}
                       onChange={(event) => setSiteUrl(event.currentTarget.value)}
-                      disabled={busy}
+                      disabled={disabled}
                     />
                   </div>
                   <div className="space-y-1.5">
@@ -282,7 +323,7 @@ export function IssueTrackersSection({
                       required
                       value={apiKey}
                       onChange={(event) => setApiKey(event.currentTarget.value)}
-                      disabled={busy}
+                      disabled={disabled}
                       aria-describedby={`${fieldId}-key-note`}
                     />
                     <p
@@ -311,7 +352,7 @@ export function IssueTrackersSection({
                       placeholder="PROJ-123"
                       value={issue}
                       onChange={(event) => setIssue(event.currentTarget.value)}
-                      disabled={busy}
+                      disabled={disabled}
                       aria-describedby={`${fieldId}-issue-note`}
                     />
                     <p
@@ -330,8 +371,16 @@ export function IssueTrackersSection({
                   </p>
                   <div className="flex items-start gap-2 text-sm">
                     <CheckIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                    <p>Read issues by ID or link. No issue edits, comments, or automatic jobs.</p>
+                    <p>
+                      Read issues, comments, and images. No changes to Linear or automatic jobs.
+                    </p>
                   </div>
+                  {linear?.accountLabel ? (
+                    <p className="text-sm text-muted-foreground">
+                      {linear.accountLabel} remains selected until you confirm a different
+                      workspace.
+                    </p>
+                  ) : null}
                   {authorizationUrl ? (
                     <p role="status" className="text-sm leading-relaxed text-muted-foreground">
                       Finish in Linear, then return here. If the browser did not open,{" "}
@@ -355,14 +404,19 @@ export function IssueTrackersSection({
               ) : null}
             </DialogPanel>
             <DialogFooter>
-              <Button type="button" variant="ghost" disabled={busy} onClick={closeDialog}>
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={busy || mutating}
+                onClick={closeDialog}
+              >
                 {authorizationUrl ? "Close" : "Cancel"}
               </Button>
               {authorizationUrl ? (
                 <Button
                   type="button"
                   variant="outline"
-                  disabled={loading || busy}
+                  disabled={loading || busy || mutating}
                   onClick={() => void refresh()}
                 >
                   Check connection
@@ -371,7 +425,7 @@ export function IssueTrackersSection({
                 <Button
                   type="submit"
                   disabled={
-                    busy ||
+                    disabled ||
                     (dialog === "jira" && (!siteUrl.trim() || !apiKey.trim() || !issue.trim()))
                   }
                 >
@@ -387,6 +441,73 @@ export function IssueTrackersSection({
               )}
             </DialogFooter>
           </form>
+        </DialogPopup>
+      </Dialog>
+      <Dialog
+        open={isAdmin && review !== undefined}
+        onOpenChange={(open) => {
+          if (!open) closeDialog();
+        }}
+      >
+        <DialogPopup showCloseButton={!busy}>
+          <DialogHeader>
+            <DialogTitle>Replace Linear workspace?</DialogTitle>
+            <DialogDescription>
+              Change the shared workspace for {organizationName}. Future issue reads will use the
+              new workspace. Existing chat history will remain available.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogPanel>
+            <dl className="space-y-3 text-sm">
+              <div>
+                <dt className="text-muted-foreground">Current workspace</dt>
+                <dd className="font-medium">{review?.currentAccountLabel}</dd>
+              </div>
+              <div>
+                <dt className="text-muted-foreground">New workspace</dt>
+                <dd className="font-medium">{review?.accountLabel}</dd>
+              </div>
+            </dl>
+            {!reviewIsCurrent ? (
+              <p role="status" className="text-sm text-muted-foreground">
+                This change is no longer available. Close this dialog to see the current connection.
+              </p>
+            ) : null}
+            {dialogError || unverified ? (
+              <p role="alert" className="text-sm text-destructive">
+                {unverified
+                  ? "Could not verify the current connection. Close this dialog and refresh to check."
+                  : dialogError}
+              </p>
+            ) : null}
+          </DialogPanel>
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              disabled={disabled || !reviewIsCurrent}
+              onClick={() => {
+                if (!review || disabled || !reviewIsCurrent) return;
+                void run(async () => {
+                  await cancelLinearReplacement(review.id);
+                  setReview(undefined);
+                });
+              }}
+            >
+              Cancel change
+            </Button>
+            <Button
+              disabled={disabled || !reviewIsCurrent}
+              onClick={() => {
+                if (!review || disabled || !reviewIsCurrent) return;
+                void run(async () => {
+                  await confirmLinearReplacement(review.id);
+                  setReview(undefined);
+                });
+              }}
+            >
+              {busy ? "Updating…" : "Replace"}
+            </Button>
+          </DialogFooter>
         </DialogPopup>
       </Dialog>
       <Dialog
@@ -413,14 +534,14 @@ export function IssueTrackersSection({
             </DialogPanel>
           ) : null}
           <DialogFooter>
-            <Button variant="ghost" disabled={busy} onClick={closeDialog}>
+            <Button variant="ghost" disabled={busy || mutating} onClick={closeDialog}>
               Cancel
             </Button>
             <Button
               variant="destructive"
-              disabled={busy}
+              disabled={disabled}
               onClick={() => {
-                if (!disconnectService) return;
+                if (!disconnectService || disabled) return;
                 const service = disconnectService;
                 void run(async () => {
                   await disconnect(service);

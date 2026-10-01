@@ -206,6 +206,14 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly startLinearAuthorization: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<RelayStartLinearResponse, ManagedRelayClientError>;
+    readonly confirmLinearReplacement: (input: {
+      readonly clerkToken: string;
+      readonly proposalId: string;
+    }) => Effect.Effect<RelayIssueTrackerConnections, ManagedRelayClientError>;
+    readonly cancelLinearReplacement: (input: {
+      readonly clerkToken: string;
+      readonly proposalId: string;
+    }) => Effect.Effect<RelayIssueTrackerConnections, ManagedRelayClientError>;
     readonly connectJira: (input: {
       readonly clerkToken: string;
       readonly payload: RelayConnectJiraRequest;
@@ -278,6 +286,12 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     ),
     startLinearAuthorization: unavailable(
       "clientRuntime.managedRelayTenancy.startLinearAuthorization",
+    ),
+    confirmLinearReplacement: unavailable(
+      "clientRuntime.managedRelayTenancy.confirmLinearReplacement",
+    ),
+    cancelLinearReplacement: unavailable(
+      "clientRuntime.managedRelayTenancy.cancelLinearReplacement",
     ),
     connectJira: unavailable("clientRuntime.managedRelayTenancy.connectJira"),
     disconnectIssueTracker: unavailable("clientRuntime.managedRelayTenancy.disconnectIssueTracker"),
@@ -800,6 +814,36 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.startLinearAuthorization"),
+      withRelayClientTracing,
+    ),
+    confirmLinearReplacement: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.issueTrackers
+          .confirmLinearReplacement({
+            headers: bearerHeaders(input.clerkToken),
+            payload: { proposalId: input.proposalId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("update relay Linear workspace")),
+            timeoutRelayRequest("Relay Linear workspace change"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.confirmLinearReplacement"),
+      withRelayClientTracing,
+    ),
+    cancelLinearReplacement: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.issueTrackers
+          .cancelLinearReplacement({
+            headers: bearerHeaders(input.clerkToken),
+            payload: { proposalId: input.proposalId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("update relay Linear workspace")),
+            timeoutRelayRequest("Relay Linear workspace change"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelLinearReplacement"),
       withRelayClientTracing,
     ),
     connectJira: Effect.fnUntraced(

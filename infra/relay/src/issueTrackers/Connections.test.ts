@@ -1,22 +1,14 @@
-import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as Layer from "effect/Layer";
-import * as Redacted from "effect/Redacted";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
-import * as Semaphore from "effect/Semaphore";
 import * as TestClock from "effect/testing/TestClock";
-import * as HttpClient from "effect/unstable/http/HttpClient";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
-import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
-import { RelaySecretBox } from "../auth/SecretBox.ts";
-import { RelayConfiguration } from "../Config.ts";
-import { Organizations, type OrganizationMembershipRecord } from "../tenancy/Organizations.ts";
-import { ConnectionStore, type ConnectionKey, type ConnectionRecord } from "./ConnectionStore.ts";
+import { RelaySecretBox, SecretBoxError } from "../auth/SecretBox.ts";
+
 import {
   completeLinear,
   disconnect,
@@ -29,202 +21,24 @@ import {
   startLinear,
 } from "./Connections.ts";
 
-const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+import {
+  encodeJson,
+  recordKey,
+  fixture,
+  key,
+  issueInput,
+  membership,
+  linearRow,
+  issueResponse,
+  identityResponse,
+  tokenResponse,
+} from "./Connections.test-fixture.ts";
+
 const decodeRpc = Schema.decodeUnknownSync(
   Schema.fromJsonString(
-    Schema.Struct({
-      method: Schema.String,
-      id: Schema.optionalKey(Schema.Number),
-    }),
+    Schema.Struct({ method: Schema.String, id: Schema.optionalKey(Schema.Number) }),
   ),
 );
-const key = { organizationId: "org", service: "linear" } as const;
-const issueInput = { ...key, issue: "LP-42" };
-const membership: OrganizationMembershipRecord = {
-  userId: "admin",
-  role: "admin",
-  joinedAt: "2026-01-01T00:00:00.000Z",
-  organization: { organizationId: "org", name: "Launchpad", createdAt: "2026-01-01T00:00:00.000Z" },
-};
-const configuration = {
-  relayIssuer: "https://relay.test",
-  apns: null,
-  clerkSecretKey: Redacted.make("clerk-secret"),
-  clerkPublishableKey: "unused",
-  clerkJwtAudience: "unused",
-  apnsDeliveryJobSigningSecret: Redacted.make("unused"),
-  cloudMintPrivateKey: Redacted.make("unused"),
-  cloudMintPublicKey: "unused",
-  managedEndpointBaseDomain: undefined,
-  managedEndpointNamespace: undefined,
-  linear: { clientId: "client", clientSecret: Redacted.make("linear-client-secret") },
-} satisfies RelayConfiguration["Service"];
-
-const linearRow = (expiresAt = Number.MAX_SAFE_INTEGER): ConnectionRecord => ({
-  ...key,
-  version: "initial",
-  status: "connected",
-  accountLabel: "Launchpad app",
-  payloadSealed: `sealed:${encodeJson({ service: "linear", accessToken: "old-access-secret", refreshToken: "old-refresh-secret", expiresAt, workspaceId: "workspace", workspaceSlug: "launchpad" })}`,
-  pendingStateHash: null,
-  pendingExpiresAt: null,
-  updatedByUserId: "admin",
-  updatedAt: "2026-01-01T00:00:00.000Z",
-});
-const issueResponse = (description = "Example") =>
-  Response.json({
-    data: {
-      organization: { id: "workspace", name: "Launchpad", urlKey: "launchpad" },
-      issue: {
-        id: "issue-id",
-        identifier: "LP-42",
-        title: "Read this issue",
-        description,
-        url: "https://linear.app/launchpad/issue/LP-42/example",
-        state: null,
-        assignee: null,
-      },
-    },
-  });
-const identityResponse = () =>
-  Response.json({
-    data: {
-      organization: { id: "workspace", name: "Launchpad", urlKey: "launchpad" },
-      viewer: { name: "Launchpad app" },
-    },
-  });
-const tokenResponse = () =>
-  Response.json({
-    access_token: "new-access-secret",
-    refresh_token: "new-refresh-secret",
-    expires_in: 86400,
-  });
-const recordKey = (record: ConnectionKey) => `${record.organizationId}:${record.service}`;
-
-const fixture = Effect.fnUntraced(function* (
-  options: {
-    readonly rows?: ReadonlyArray<ConnectionRecord>;
-    readonly membership?: Effect.Effect<OrganizationMembershipRecord | null>;
-    readonly respond?: (request: HttpClientRequest.HttpClientRequest) => Effect.Effect<Response>;
-  } = {},
-) {
-  const records = yield* Ref.make(
-    new Map((options.rows ?? []).map((row) => [recordKey(row), row])),
-  );
-  const semaphore = yield* Semaphore.make(1);
-  const secondLockRequested = yield* Deferred.make<void>();
-  let lockRequests = 0;
-  let version = 0;
-  const get = (input: ConnectionKey) =>
-    Ref.get(records).pipe(Effect.map((rows) => rows.get(recordKey(input)) ?? null));
-  const update = (
-    input: ConnectionKey & { readonly version: string },
-    change: (row: ConnectionRecord) => ConnectionRecord | null,
-  ) =>
-    Ref.modify(records, (rows) => {
-      const existing = rows.get(recordKey(input));
-      if (!existing || existing.version !== input.version) return [false, rows] as const;
-      const next = new Map(rows);
-      const changed = change(existing);
-      if (changed) next.set(recordKey(input), changed);
-      else next.delete(recordKey(input));
-      return [true, next] as const;
-    });
-  const store = ConnectionStore.of({
-    get,
-    list: (organizationId) =>
-      Ref.get(records).pipe(
-        Effect.map((rows) =>
-          [...rows.values()].filter((row) => row.organizationId === organizationId),
-        ),
-      ),
-    findPending: (stateHash) =>
-      Ref.get(records).pipe(
-        Effect.map(
-          (rows) => [...rows.values()].find((row) => row.pendingStateHash === stateHash) ?? null,
-        ),
-      ),
-    begin: (input) =>
-      Ref.modify(records, (rows) => {
-        const existing = rows.get(recordKey(input));
-        const row: ConnectionRecord = {
-          ...input,
-          version: `version-${++version}`,
-          status: existing?.status ?? "connecting",
-          accountLabel: existing?.accountLabel ?? null,
-          payloadSealed: existing?.payloadSealed ?? null,
-          pendingStateHash: input.stateHash ?? null,
-          pendingExpiresAt: input.expiresAt ?? null,
-          updatedByUserId: input.userId,
-          updatedAt: "2026-01-01T00:00:00.000Z",
-        };
-        return [row, new Map(rows).set(recordKey(input), row)] as const;
-      }),
-    complete: (input) =>
-      update(input, (row) => ({
-        ...row,
-        version: `version-${++version}`,
-        payloadSealed: input.payloadSealed,
-        accountLabel: input.accountLabel,
-        status: "connected",
-        pendingStateHash: null,
-        pendingExpiresAt: null,
-      })),
-    refresh: (input) => update(input, (row) => ({ ...row, payloadSealed: input.payloadSealed })),
-    requireReconnect: (input) =>
-      update(input, (row) =>
-        row.payloadSealed === input.payloadSealed ? { ...row, status: "reconnect_required" } : row,
-      ).pipe(Effect.asVoid),
-    remove: (input) =>
-      Ref.update(records, (rows) => {
-        const next = new Map(rows);
-        next.delete(recordKey(input));
-        return next;
-      }),
-    cancel: (input) =>
-      update(input, (row) =>
-        row.payloadSealed ? { ...row, pendingStateHash: null, pendingExpiresAt: null } : null,
-      ).pipe(Effect.asVoid),
-    withLock: (input, use) =>
-      Effect.gen(function* () {
-        lockRequests += 1;
-        if (lockRequests >= 2) yield* Deferred.succeed(secondLockRequested, undefined);
-        return yield* semaphore.withPermits(1)(get(input).pipe(Effect.flatMap(use)));
-      }),
-  });
-  const requests: HttpClientRequest.HttpClientRequest[] = [];
-  const http = HttpClient.make((request) => {
-    requests.push(request);
-    return (options.respond?.(request) ?? Effect.die("Unexpected issue-tracker request")).pipe(
-      Effect.map((response) => HttpClientResponse.fromWeb(request, response)),
-    );
-  });
-  const organizations = Organizations.of({
-    ensureForUser: () => Effect.die("unexpected ensure"),
-    getMembershipForUser: () => options.membership ?? Effect.succeed(membership),
-    listMembers: () => Effect.die("unexpected list"),
-    countAdmins: () => Effect.die("unexpected count"),
-    countMembers: () => Effect.die("unexpected count"),
-    updateMemberRole: () => Effect.die("unexpected update"),
-    removeMember: () => Effect.die("unexpected remove"),
-    addMember: () => Effect.die("unexpected add"),
-    rename: () => Effect.die("unexpected rename"),
-    deleteOrganization: () => Effect.die("unexpected delete"),
-  });
-  const layer = Layer.mergeAll(
-    Layer.succeed(ConnectionStore, store),
-    Layer.succeed(RelayConfiguration, configuration),
-    Layer.succeed(Organizations, organizations),
-    Layer.succeed(HttpClient.HttpClient, http),
-    NodeCrypto.layer,
-    Layer.succeed(RelaySecretBox, {
-      seal: (text) => Effect.succeed(`sealed:${text}`),
-      open: (text) => Effect.succeed(text.slice("sealed:".length)),
-    }),
-  );
-  return { store, records, requests, secondLockRequested, provide: Effect.provide(layer) };
-});
-
 function jiraResponse(request: HttpClientRequest.HttpClientRequest) {
   if (request.url.endsWith("/_edge/tenant_info")) return Response.json({ cloudId: "cloud" });
   if (request.body._tag !== "Uint8Array") throw new Error("Expected Jira request body");
@@ -331,9 +145,9 @@ describe("issue tracker connection lifecycle", () => {
         userId: "admin",
       }).pipe(test.provide);
       const state = new URL(authorizationUrl).searchParams.get("state")!;
-      expect(yield* completeLinear({ state, code: "authorization-code" }).pipe(test.provide)).toBe(
-        "Launchpad · Launchpad app",
-      );
+      expect(
+        yield* completeLinear({ state, code: "authorization-code" }).pipe(test.provide),
+      ).toEqual({ status: "connected", accountLabel: "Launchpad · Launchpad app" });
       expect(
         yield* completeLinear({ state, code: "authorization-code" }).pipe(
           test.provide,
@@ -480,6 +294,75 @@ describe("issue tracker connection lifecycle", () => {
       expect(yield* Fiber.join(oldRead)).toMatchObject({ code: "auth_required" });
       expect((yield* test.store.get(key))?.status).toBe("connected");
     }),
+  );
+
+  it.effect.each(["decryption", "decoding"] as const)(
+    "recovers from credential %s failure through explicit disconnect and connect",
+    (failureMode) =>
+      Effect.gen(function* () {
+        const brokenPayload = "sealed:unreadable-old-credentials";
+        const test = yield* fixture({
+          rows: [{ ...linearRow(), payloadSealed: brokenPayload }],
+          respond: (request) =>
+            Effect.succeed(
+              request.url.endsWith("/oauth/token")
+                ? tokenResponse()
+                : request.body._tag === "Uint8Array" &&
+                    new TextDecoder().decode(request.body.body).includes("LaunchpadIdentity")
+                  ? identityResponse()
+                  : commentsRequested(request)
+                    ? commentsResponse()
+                    : issueResponse(),
+            ),
+        });
+        const box = yield* RelaySecretBox.pipe(test.provide);
+        yield* Effect.gen(function* () {
+          const readFailure = yield* readIssue(issueInput).pipe(Effect.flip);
+          expect(readFailure).toMatchObject({ code: "auth_required" });
+          expect(readFailure.message).toContain(
+            "Disconnect Linear in Organization settings, then connect it again.",
+          );
+          const pending = yield* startLinear({ organizationId: "org", userId: "admin" });
+          const callbackFailure = yield* completeLinear({
+            state: new URL(pending.authorizationUrl).searchParams.get("state")!,
+            code: "new-authorization-code",
+          }).pipe(Effect.flip);
+          expect(callbackFailure).toMatchObject({
+            code: "auth_required",
+            message: readFailure.message,
+          });
+          expect(test.requests).toHaveLength(0);
+          expect(yield* test.store.get(key)).toMatchObject({
+            payloadSealed: brokenPayload,
+            version: "initial",
+            authorizationId: null,
+            replacement: null,
+          });
+
+          // Follow the recovery instruction using the actual connection operations.
+          yield* disconnect(key);
+          const fresh = yield* startLinear({ organizationId: "org", userId: "admin" });
+          expect(
+            yield* completeLinear({
+              state: new URL(fresh.authorizationUrl).searchParams.get("state")!,
+              code: "fresh-authorization-code",
+            }),
+          ).toMatchObject({ status: "connected" });
+          expect((yield* readIssue(issueInput)).identifier).toBe("LP-42");
+          expect((yield* test.store.get(key))?.status).toBe("connected");
+        }).pipe(
+          Effect.provideService(RelaySecretBox, {
+            ...box,
+            open: (payload) =>
+              failureMode === "decryption" && payload === brokenPayload
+                ? Effect.fail(
+                    new SecretBoxError({ operation: "open", cause: "Encryption key changed" }),
+                  )
+                : box.open(payload),
+          }),
+          test.provide,
+        );
+      }),
   );
 
   it.effect("marks reconnect when the newly refreshed credentials themselves fail", () =>

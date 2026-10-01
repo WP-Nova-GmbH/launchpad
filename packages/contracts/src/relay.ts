@@ -10,6 +10,7 @@ import {
   RelayIssueTrackerConnections,
   RelayConnectJiraRequest,
   RelayStartLinearResponse,
+  RelayLinearReplacementRequest,
   RelayReadIssueRequest,
   RelayReadIssueResponse,
   RelayLinearReferenceRequest,
@@ -2824,6 +2825,26 @@ export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
       success: RelayStartLinearResponse,
       error: [...RelayTenancyErrors, RelayIssueTrackerError],
     }),
+    HttpApiEndpoint.post(
+      "confirmLinearReplacement",
+      "/v1/organization/issue-trackers/linear/replacement/confirm",
+      {
+        headers: RelayBearerRequestHeaders,
+        payload: RelayLinearReplacementRequest,
+        success: RelayIssueTrackerConnections,
+        error: [...RelayTenancyErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "cancelLinearReplacement",
+      "/v1/organization/issue-trackers/linear/replacement/cancel",
+      {
+        headers: RelayBearerRequestHeaders,
+        payload: RelayLinearReplacementRequest,
+        success: RelayIssueTrackerConnections,
+        error: [...RelayTenancyErrors, RelayIssueTrackerError],
+      },
+    ),
     HttpApiEndpoint.put("connectJira", "/v1/organization/issue-trackers/jira", {
       headers: RelayBearerRequestHeaders,
       payload: RelayConnectJiraRequest,

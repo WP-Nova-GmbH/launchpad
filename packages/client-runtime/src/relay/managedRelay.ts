@@ -134,6 +134,7 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "delete relay organization skill",
   "list relay issue tracker connections",
   "start relay Linear authorization",
+  "update relay Linear workspace",
   "connect relay Jira",
   "disconnect relay issue tracker",
 ]);
@@ -190,6 +191,7 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay organization skill removal",
   "Relay issue tracker connection listing",
   "Relay Linear authorization",
+  "Relay Linear workspace change",
   "Relay Jira connection",
   "Relay issue tracker disconnection",
 ]);

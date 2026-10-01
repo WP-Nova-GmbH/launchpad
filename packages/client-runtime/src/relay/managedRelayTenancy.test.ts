@@ -31,9 +31,13 @@ describe("organization issue tracker client", () => {
       });
       if (request.method === "PUT") return Response.json(connection);
       if (request.method === "DELETE") return Response.json({ ok: true });
+      if (request.url.includes("/replacement/"))
+        return Response.json({ connections: [connection], linearAvailable: true });
       if (request.method === "POST")
         return Response.json({
           authorizationUrl: "https://linear.app/oauth/authorize?state=test-state",
+          authorizationId: "attempt",
+          connection: { ...connection, service: "linear", status: "connecting" },
         });
       return Response.json({ connections: [connection], linearAvailable: true });
     }) satisfies typeof globalThis.fetch;
@@ -50,6 +54,8 @@ describe("organization issue tracker client", () => {
       };
       expect(yield* client.connectJira({ clerkToken: "admin-token", payload })).toEqual(connection);
       yield* client.disconnectIssueTracker({ clerkToken: "admin-token", service: "jira" });
+      yield* client.confirmLinearReplacement({ clerkToken: "admin-token", proposalId: "proposal" });
+      yield* client.cancelLinearReplacement({ clerkToken: "admin-token", proposalId: "proposal" });
       expect(requests).toEqual([
         {
           url: "https://relay.example.test/v1/organization/issue-trackers",
@@ -75,6 +81,12 @@ describe("organization issue tracker client", () => {
           bearer: "Bearer admin-token",
           body: null,
         },
+        ...["confirm", "cancel"].map((action) => ({
+          url: `https://relay.example.test/v1/organization/issue-trackers/linear/replacement/${action}`,
+          method: "POST",
+          bearer: "Bearer admin-token",
+          body: { proposalId: "proposal" },
+        })),
       ]);
     }).pipe(Effect.provide(testLayer(fetchFn)));
   });

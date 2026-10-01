@@ -21,6 +21,10 @@ export function useIssueTrackers() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestVersion = useRef(0);
+  const mutationPending = useRef(false);
+  const uncertain = useRef(false);
+  const [mutating, setMutating] = useState(false);
+  const [unverified, setUnverified] = useState(false);
 
   const call = useCallback(
     async <A>(
@@ -42,7 +46,7 @@ export function useIssueTrackers() {
     [getToken],
   );
 
-  const refresh = useCallback(async () => {
+  const load = useCallback(async () => {
     const version = ++requestVersion.current;
     setLoading(true);
     setError(null);
@@ -50,7 +54,11 @@ export function useIssueTrackers() {
       const result = await call("Could not load issue trackers", (client, clerkToken) =>
         client.listIssueTrackerConnections({ clerkToken }),
       );
-      if (version === requestVersion.current) setSnapshot(result);
+      if (version === requestVersion.current) {
+        setSnapshot(result);
+        uncertain.current = false;
+        setUnverified(false);
+      }
     } catch (cause) {
       if (version === requestVersion.current) {
         setError(cause instanceof Error ? cause.message : "Could not load issue trackers.");
@@ -59,6 +67,11 @@ export function useIssueTrackers() {
       if (version === requestVersion.current) setLoading(false);
     }
   }, [call]);
+
+  const refresh = useCallback(async () => {
+    // Focus events during an OAuth launch or a mutation must not race its result.
+    if (!mutationPending.current) await load();
+  }, [load]);
 
   useEffect(() => {
     void refresh();
@@ -70,49 +83,120 @@ export function useIssueTrackers() {
     };
   }, [refresh]);
 
-  const startLinear = async () => {
-    const result = await call("Could not start connecting Linear", (client, clerkToken) =>
-      client.startLinearAuthorization({ clerkToken }),
-    );
-    await refresh();
-    return result;
-  };
-
-  const connectJira = async (payload: RelayConnectJiraRequest) => {
-    const connection = await call("Could not connect Jira", (client, clerkToken) =>
-      client.connectJira({ clerkToken, payload }),
-    );
-    // A list started before the mutation must not restore old connection state.
-    requestVersion.current += 1;
+  const mutate = async <A>(action: () => Promise<A>, apply: (result: A) => void) => {
+    if (mutationPending.current || uncertain.current) {
+      throw new Error("Refresh to verify the current connection before changing it.");
+    }
+    mutationPending.current = true;
+    setMutating(true);
+    ++requestVersion.current;
     setLoading(false);
     setError(null);
-    setSnapshot(
-      (current) =>
-        current && {
-          ...current,
-          connections: [
-            ...current.connections.filter((entry) => entry.service !== "jira"),
-            connection,
-          ],
-        },
+    try {
+      const result = await action();
+      ++requestVersion.current;
+      apply(result);
+      return result;
+    } catch (cause) {
+      // The server may have committed even when its response was lost. Reconcile
+      // before allowing another action; never replay the mutation automatically.
+      ++requestVersion.current;
+      uncertain.current = true;
+      setUnverified(true);
+      await load();
+      throw cause;
+    } finally {
+      mutationPending.current = false;
+      setMutating(false);
+    }
+  };
+
+  const startLinear = () =>
+    mutate(
+      () =>
+        call("Could not start connecting Linear", (client, clerkToken) =>
+          client.startLinearAuthorization({ clerkToken }),
+        ),
+      (result) =>
+        setSnapshot(
+          (current) =>
+            current && {
+              ...current,
+              connections: [
+                ...current.connections.filter((entry) => entry.service !== "linear"),
+                result.connection,
+              ],
+            },
+        ),
+    );
+
+  const connectJira = async (payload: RelayConnectJiraRequest) => {
+    await mutate(
+      () =>
+        call("Could not connect Jira", (client, clerkToken) =>
+          client.connectJira({ clerkToken, payload }),
+        ),
+      (connection) =>
+        setSnapshot(
+          (current) =>
+            current && {
+              ...current,
+              connections: [
+                ...current.connections.filter((entry) => entry.service !== "jira"),
+                connection,
+              ],
+            },
+        ),
     );
   };
 
   const disconnect = async (service: RelayIssueTrackerService) => {
-    await call("Could not disconnect the issue tracker", (client, clerkToken) =>
-      client.disconnectIssueTracker({ clerkToken, service }),
-    );
-    requestVersion.current += 1;
-    setLoading(false);
-    setError(null);
-    setSnapshot(
-      (current) =>
-        current && {
-          ...current,
-          connections: current.connections.filter((entry) => entry.service !== service),
-        },
+    await mutate(
+      () =>
+        call("Could not disconnect the issue tracker", (client, clerkToken) =>
+          client.disconnectIssueTracker({ clerkToken, service }),
+        ),
+      () =>
+        setSnapshot(
+          (current) =>
+            current && {
+              ...current,
+              connections: current.connections.filter((entry) => entry.service !== service),
+            },
+        ),
     );
   };
 
-  return { snapshot, loading, error, refresh, startLinear, connectJira, disconnect };
+  const confirmLinearReplacement = async (proposalId: string) => {
+    await mutate(
+      () =>
+        call("Could not replace the Linear workspace", (client, clerkToken) =>
+          client.confirmLinearReplacement({ clerkToken, proposalId }),
+        ),
+      setSnapshot,
+    );
+  };
+  const cancelLinearReplacement = async (proposalId: string) => {
+    await mutate(
+      () =>
+        call("Could not cancel the workspace change", (client, clerkToken) =>
+          client.cancelLinearReplacement({ clerkToken, proposalId }),
+        ),
+      setSnapshot,
+    );
+  };
+
+  return {
+    snapshot,
+    loading,
+    error,
+    mutating,
+    unverified,
+    refresh,
+    startLinear,
+    connectJira,
+    disconnect,
+    confirmLinearReplacement,
+    cancelLinearReplacement,
+  };
 }

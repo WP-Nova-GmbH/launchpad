@@ -41,8 +41,18 @@ export const issueTrackerCallbackRoute = HttpRouter.add(
         400,
       );
     return yield* completeLinear({ state, code: params.get("code") }).pipe(
-      Effect.map((account) =>
-        page("Linear connected", `Organization chats can now read issues from ${account}.`, 200),
+      Effect.map((result) =>
+        result.status === "awaiting_confirmation"
+          ? page(
+              "Confirm workspace change",
+              `Review the change to ${result.accountLabel} in Launchpad. Your current workspace remains selected until you choose Replace.`,
+              200,
+            )
+          : page(
+              "Linear connected",
+              `Organization chats can now read issues from ${result.accountLabel}.`,
+              200,
+            ),
       ),
       Effect.catchTag("RelayIssueTrackerError", (error) =>
         Effect.succeed(page("Linear was not connected", error.message, 400)),

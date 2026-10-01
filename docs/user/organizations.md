@@ -61,6 +61,11 @@ a service account API key, and an issue key or URL that account can read. Your A
 [enable API key access for its MCP server](https://developer.atlassian.com/cloud/rovo-mcp/guides/configuring-authentication-via-api-token/).
 Launchpad checks the issue before saving the connection.
 
+To change Linear workspaces, choose **Change workspace** and authorize the new workspace.
+Your current workspace stays selected until an admin reviews the change and chooses **Replace**.
+Closing the review leaves it available to other organization admins; **Cancel change** discards it.
+Pending changes expire after 15 minutes. Authorizing the same workspace renews access immediately.
+
 In a supported chat, ask the agent to read a specific issue, such as “Read Linear issue LP-214” or
 “Read Jira issue TEAM-42,” or supply its URL. These connections provide read-only issue context;
 search, issue updates, and automatic jobs are not supported yet.
@@ -72,8 +77,9 @@ The agent can request more images when an issue contains many. PNG, JPEG, WebP a
 up to 5 MiB are supported. Larger images, other documents and externally hosted images remain
 links; an unavailable image does not discard the issue context already read.
 
-If a connection needs sign-in again, an admin can reconnect it. Disconnect stops new reads for the
-whole organization; issue content already retrieved remains in chat history.
+If a connection needs sign-in again, an admin can reconnect it. If Launchpad says the saved Linear
+connection could not be read, disconnect Linear and connect it again. Disconnect stops new reads
+for the whole organization; issue content already retrieved remains in chat history.
 
 ## Provider accounts
 

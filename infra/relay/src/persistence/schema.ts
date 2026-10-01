@@ -124,6 +124,18 @@ export const relayOrganizationProviderAccounts = pgTable(
   (table) => [primaryKey({ columns: [table.organizationId, table.provider] })],
 );
 
+export interface LinearReplacementRecord {
+  readonly id: string;
+  readonly payloadSealed: string;
+  readonly workspaceId: string;
+  readonly currentWorkspaceId: string;
+  readonly accountLabel: string;
+  readonly currentAccountLabel: string;
+  readonly expectedVersion: string;
+  readonly createdByUserId: string;
+  readonly expiresAt: string;
+}
+
 /** Credentials stay at the relay; executors receive only bounded issue results. */
 export const relayIssueTrackerConnections = pgTable(
   "relay_issue_tracker_connections",
@@ -138,6 +150,8 @@ export const relayIssueTrackerConnections = pgTable(
       .$type<"connecting" | "connected" | "reconnect_required">(),
     accountLabel: text("account_label"),
     payloadSealed: text("payload_sealed"),
+    authorizationId: varchar("authorization_id", { length: 64 }),
+    replacement: jsonb("replacement").$type<LinearReplacementRecord>(),
     pendingStateHash: text("pending_state_hash"),
     pendingExpiresAt: varchar("pending_expires_at", { length: 64 }),
     updatedByUserId: varchar("updated_by_user_id", { length: 191 }).notNull(),

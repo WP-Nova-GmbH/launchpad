@@ -29,6 +29,8 @@ const record: ConnectionRecord = {
   status: "connected",
   accountLabel: "team.atlassian.net",
   payloadSealed: "secret-ciphertext",
+  authorizationId: null,
+  replacement: null,
   pendingStateHash: null,
   pendingExpiresAt: null,
   updatedByUserId: "admin",
@@ -86,6 +88,10 @@ function setup(
       list: (organizationId) => {
         seen.push(`list:${organizationId}`);
         return Effect.succeed(organizationId === "org-a" ? [record] : []);
+      },
+      withLock: (key, use) => {
+        seen.push(`lock:${key.organizationId}:${key.service}`);
+        return use(null);
       },
       get: ({ organizationId }) => {
         seen.push(`get:${organizationId}`);
@@ -186,6 +192,12 @@ describe("issue tracker authorization", () => {
         disconnectLinear: client.issueTrackers
           .disconnect({ headers, params: { service: "linear" } })
           .pipe(Effect.flip),
+        confirm: client.issueTrackers
+          .confirmLinearReplacement({ headers, payload: { proposalId: "proposal" } })
+          .pipe(Effect.flip),
+        cancel: client.issueTrackers
+          .cancelLinearReplacement({ headers, payload: { proposalId: "proposal" } })
+          .pipe(Effect.flip),
         disconnectJira: client.issueTrackers
           .disconnect({ headers, params: { service: "jira" } })
           .pipe(Effect.flip),
@@ -204,6 +216,25 @@ describe("issue tracker authorization", () => {
         yield* client.issueTrackers.disconnect({ headers, params: { service: "jira" } }),
       ).toEqual({ ok: true });
       expect(harness.seen).toEqual(["remove:org-b:jira"]);
+    }),
+  );
+
+  it.effect("replacement endpoints derive the organization from current membership", () =>
+    Effect.gen(function* () {
+      const harness = setup({ role: "admin", organizationId: "org-b" });
+      const client = yield* harness.client;
+      expect(
+        yield* client.issueTrackers
+          .confirmLinearReplacement({ headers, payload: { proposalId: "org-a-proposal" } })
+          .pipe(Effect.flip),
+      ).toMatchObject({ code: "conflict" });
+      expect(
+        (yield* client.issueTrackers.cancelLinearReplacement({
+          headers,
+          payload: { proposalId: "org-a-proposal" },
+        })).connections,
+      ).toEqual([]);
+      expect(harness.seen).toEqual(["lock:org-b:linear", "lock:org-b:linear", "list:org-b"]);
     }),
   );
 
