@@ -1121,7 +1121,7 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
         <DialogTrigger
           render={
             <Button size="xs" variant="default">
-              <PlusIcon className="size-3" />
+              <PlusIcon />
               Create link
             </Button>
           }
@@ -1640,7 +1640,7 @@ function SavedBackendListRow({
             />
           }
         >
-          <EllipsisIcon className="size-3.5" />
+          <EllipsisIcon />
         </MenuTrigger>
         <MenuPopup align="end">
           <EnvironmentIconMenu
@@ -2692,7 +2692,7 @@ export function ConnectionsSettings() {
         disabled={isAddingSavedBackend}
         onClick={() => void handleAddSavedBackend()}
       >
-        <PlusIcon className="size-3.5" />
+        <PlusIcon />
         {isAddingSavedBackend ? "Adding…" : "Add environment"}
       </Button>
     </div>
@@ -2813,7 +2813,7 @@ export function ConnectionsSettings() {
           disabled={isAddingSavedBackend}
           onClick={() => void handleAddSavedBackend()}
         >
-          <PlusIcon className="size-3.5" />
+          <PlusIcon />
           {isAddingSavedBackend ? "Adding…" : "Add environment"}
         </Button>
       </div>
@@ -3308,7 +3308,7 @@ export function ConnectionsSettings() {
                       />
                     }
                   >
-                    <EllipsisIcon className="size-3.5" />
+                    <EllipsisIcon />
                   </MenuTrigger>
                   <MenuPopup align="end">
                     <EnvironmentIconMenu
@@ -3713,7 +3713,7 @@ export function ConnectionsSettings() {
                     <DialogTrigger
                       render={
                         <Button size="xs" variant="ghost-muted" aria-label="Add environment">
-                          <PlusIcon className="size-3" />
+                          <PlusIcon />
                           <span>Add environment</span>
                         </Button>
                       }

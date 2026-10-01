@@ -39,7 +39,7 @@ export function PullRequestsUnavailableState({
               disabled={refreshing}
               aria-busy={refreshing}
             >
-              <RefreshIcon size="sm" refreshing={refreshing} />
+              <RefreshIcon refreshing={refreshing} />
               Retry
             </Button>
           ) : null}
@@ -49,7 +49,7 @@ export function PullRequestsUnavailableState({
               variant="outline"
               render={<a href={gitHubUrl} target="_blank" rel="noopener noreferrer" />}
             >
-              <ExternalLinkIcon aria-hidden className="size-3.5" />
+              <ExternalLinkIcon aria-hidden />
               Open on GitHub
             </Button>
           ) : null}

@@ -138,7 +138,7 @@ export function DeviceToolsPanel(props: {
           {foregroundApp ? (
             <div className="flex gap-1.5">
               <Button
-                size="xs"
+                size="compact"
                 variant="outline"
                 disabled={disabled}
                 onClick={() => void act({ type: "terminateApp", appId: foregroundApp.id })}
@@ -146,7 +146,7 @@ export function DeviceToolsPanel(props: {
                 Terminate
               </Button>
               <Button
-                size="xs"
+                size="compact"
                 variant="outline"
                 disabled={disabled}
                 onClick={() => void act({ type: "launchApp", appId: foregroundApp.id })}
@@ -386,7 +386,7 @@ function ChoiceSelect<V extends string>(props: {
         if (value !== null && value !== props.value) void props.onChange(value as V);
       }}
     >
-      <SelectTrigger size="xs" className="w-40" aria-label={props.ariaLabel}>
+      <SelectTrigger size="compact" className="w-40" aria-label={props.ariaLabel}>
         <SelectValue>
           {current ? (
             current.label
@@ -420,7 +420,7 @@ function SubmitRow(props: {
   };
   return (
     <form
-      className="flex gap-1.5"
+      className="flex items-center gap-1.5"
       onSubmit={(event) => {
         event.preventDefault();
         submit();
@@ -437,7 +437,7 @@ function SubmitRow(props: {
       />
       <Button
         type="submit"
-        size="xs"
+        size="compact"
         variant="outline"
         disabled={props.disabled || value.trim().length === 0}
       >
@@ -497,7 +497,7 @@ function LocationSection(props: {
             void props.onSet(preset.latitude, preset.longitude);
           }}
         >
-          <SelectTrigger size="xs" className="w-32" aria-label="Location preset">
+          <SelectTrigger size="compact" className="w-32" aria-label="Location preset">
             <SelectValue>
               <span className="text-muted-foreground">Preset…</span>
             </SelectValue>
@@ -511,7 +511,7 @@ function LocationSection(props: {
           </SelectPopup>
         </Select>
         <Button
-          size="xs"
+          size="compact"
           variant="outline"
           disabled={props.disabled || !valid}
           onClick={() => void props.onSet(parsed.latitude, parsed.longitude)}
@@ -520,7 +520,7 @@ function LocationSection(props: {
         </Button>
         {props.canClear ? (
           <Button
-            size="xs"
+            size="compact"
             variant="ghost"
             disabled={props.disabled}
             onClick={() => {
@@ -575,7 +575,7 @@ function PermissionsSection(props: {
           }}
         />
         <Button
-          size="xs"
+          size="compact"
           variant="outline"
           disabled={props.disabled || !resolvedAppId}
           onClick={() => decide("grant")}
@@ -583,7 +583,7 @@ function PermissionsSection(props: {
           Grant
         </Button>
         <Button
-          size="xs"
+          size="compact"
           variant="outline"
           disabled={props.disabled || !resolvedAppId}
           onClick={() => decide("revoke")}
@@ -592,7 +592,7 @@ function PermissionsSection(props: {
         </Button>
         {props.canReset ? (
           <Button
-            size="xs"
+            size="compact"
             variant="ghost"
             disabled={props.disabled || !resolvedAppId}
             onClick={() => decide("reset")}

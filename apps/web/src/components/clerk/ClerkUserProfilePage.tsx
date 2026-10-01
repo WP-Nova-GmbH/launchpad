@@ -56,7 +56,7 @@ export function ClerkUserProfileRefreshButton({
       disabled={disabled || isPending}
       onClick={onClick}
     >
-      <RefreshIcon aria-hidden="true" size="sm" refreshing={isPending} />
+      <RefreshIcon aria-hidden="true" refreshing={isPending} />
       Refresh
     </Button>
   );

@@ -299,7 +299,7 @@ export function UsagePage() {
           size="icon-sm"
           variant="ghost"
         >
-          <RefreshIcon size="sm" refreshing={isRefreshing} />
+          <RefreshIcon refreshing={isRefreshing} />
         </Button>
       </div>
       <div className="col-span-2 ms-auto flex min-w-0 items-center justify-end gap-1 xl:hidden">
@@ -358,7 +358,7 @@ export function UsagePage() {
           size="icon-sm"
           variant="ghost"
         >
-          <RefreshIcon size="sm" refreshing={isRefreshing} />
+          <RefreshIcon refreshing={isRefreshing} />
         </Button>
       </div>
     </div>

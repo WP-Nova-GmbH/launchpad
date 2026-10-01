@@ -490,7 +490,7 @@ function EmptySourceControlDiscovery({
         </EmptyHeader>
         <EmptyContent>
           <Button size="sm" variant="outline" onClick={onScan} disabled={isPending}>
-            <RefreshIcon size="sm" refreshing={isPending} />
+            <RefreshIcon refreshing={isPending} />
             Scan
           </Button>
         </EmptyContent>

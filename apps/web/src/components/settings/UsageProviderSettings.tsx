@@ -40,7 +40,7 @@ export function UsageProviderSettings({
         headerAction={
           !readOnly ? (
             <Button size="xs" variant="outline" onClick={() => setAdding(true)}>
-              <PlusIcon className="size-3" aria-hidden />
+              <PlusIcon aria-hidden />
               Add hub
             </Button>
           ) : null
@@ -97,7 +97,7 @@ function RemoveUsageProviderButton({
   const [open, setOpen] = useState(false);
   return (
     <>
-      <Button size="xs" variant="ghost" onClick={() => setOpen(true)}>
+      <Button size="sm" variant="ghost" onClick={() => setOpen(true)}>
         Remove
       </Button>
       <AlertDialog open={open} onOpenChange={setOpen}>

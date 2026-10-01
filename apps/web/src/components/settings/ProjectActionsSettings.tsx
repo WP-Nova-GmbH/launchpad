@@ -146,7 +146,7 @@ export function ProjectActionsSettings() {
                   render={
                     <Button
                       id="import-scripts"
-                      size="xs"
+                      size="sm"
                       variant="ghost"
                       disabled={saving}
                       type="button"
@@ -154,7 +154,7 @@ export function ProjectActionsSettings() {
                   }
                 >
                   Import scripts
-                  <ChevronDownIcon className="size-3.5" />
+                  <ChevronDownIcon />
                 </MenuTrigger>
                 <MenuPopup align="end">
                   <MenuGroup>
@@ -182,12 +182,12 @@ export function ProjectActionsSettings() {
               </Menu>
             ) : null}
             <Button
-              size="xs"
+              size="sm"
               variant="outline"
               disabled={saving || targets.length === 0}
               onClick={() => setRequest({ scriptId: null, initial: EMPTY_PROJECT_SCRIPT_INPUT })}
             >
-              <PlusIcon className="size-3.5" />
+              <PlusIcon />
               Add action
             </Button>
           </div>

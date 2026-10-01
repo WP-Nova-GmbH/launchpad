@@ -62,13 +62,19 @@ export function EnvironmentRow({
         className,
       )}
     >
-      <EnvironmentMachineIcon aria-hidden kind={kind} className="size-4 text-muted-foreground" />
-      <div className="min-w-0">
-        <p className="truncate text-sm font-medium text-foreground">{label}</p>
+      <span className="col-start-1 row-start-1 inline-flex size-5 items-center justify-center">
+        <EnvironmentMachineIcon aria-hidden kind={kind} className="size-4 text-muted-foreground" />
+      </span>
+      <p className="col-start-2 row-start-1 min-w-0 truncate text-sm font-medium text-foreground">
+        {label}
+      </p>
+      <div className="col-start-2 row-start-2 min-w-0">
         <div className="truncate text-xs text-muted-foreground">{subtitle}</div>
         {below}
       </div>
-      <div className="flex shrink-0 items-center gap-1">{children}</div>
+      <div className="col-start-3 row-start-1 flex min-h-7 shrink-0 items-center gap-1 sm:min-h-6">
+        {children}
+      </div>
     </div>
   );
 }

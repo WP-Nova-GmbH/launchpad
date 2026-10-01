@@ -112,13 +112,13 @@ export function ProviderAccountAuthActions({
   return (
     <>
       {isAccountAuthenticated ? (
-        <Button size="compact" variant="ghost-muted" onClick={() => setIsLogoutDialogOpen(true)}>
+        <Button size="xs" variant="ghost-muted" onClick={() => setIsLogoutDialogOpen(true)}>
           <LogOutIcon />
           Sign out
         </Button>
       ) : (
         <Button
-          size="compact"
+          size="xs"
           variant="outline"
           disabled={!liveProvider?.installed || authState.status === "running"}
           onClick={startLogin}

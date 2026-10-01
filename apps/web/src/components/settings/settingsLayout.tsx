@@ -173,6 +173,7 @@ export function SettingsSection({
   hideTitle = false,
   icon,
   headerAction,
+  wrapHeader = false,
   variant = "grouped",
   children,
   className,
@@ -182,6 +183,7 @@ export function SettingsSection({
   hideTitle?: boolean;
   icon?: ReactNode;
   headerAction?: ReactNode;
+  wrapHeader?: boolean;
   variant?: "grouped" | "plain";
   children: ReactNode;
 }) {
@@ -199,12 +201,17 @@ export function SettingsSection({
       ) : (
         <div
           data-settings-scroll-target
-          className="flex min-h-7 items-start justify-between gap-4 px-3 sm:px-4"
+          className={cn(
+            "flex min-h-7 items-start justify-between gap-x-4 gap-y-2 px-3 sm:px-4",
+            wrapHeader && "flex-wrap",
+          )}
         >
           <div className="min-w-0">
             <h2 className="flex min-h-7 items-center gap-2 text-sm font-normal text-foreground/70">
               {icon}
-              {title}
+              <span className={cn("min-w-0", wrapHeader && "[overflow-wrap:anywhere]")}>
+                {title}
+              </span>
             </h2>
           </div>
           <div className="flex min-h-7 min-w-7 items-center justify-end">{headerAction}</div>
@@ -475,11 +482,13 @@ export function SettingResetButton({
   label,
   tooltip = "Reset to default",
   disabled = false,
+  size = "icon-micro",
   onClick,
 }: {
   label: string;
   tooltip?: string;
   disabled?: boolean;
+  size?: "icon-micro" | "icon-xs";
   onClick: () => void;
 }) {
   return (
@@ -487,7 +496,7 @@ export function SettingResetButton({
       <TooltipTrigger
         render={
           <Button
-            size="icon-micro"
+            size={size}
             variant="ghost-muted"
             aria-label={`Reset ${label} to default`}
             disabled={disabled}
@@ -496,7 +505,7 @@ export function SettingResetButton({
               onClick();
             }}
           >
-            <Undo2Icon className="size-3" />
+            <Undo2Icon className={size === "icon-micro" ? "size-3" : undefined} />
           </Button>
         }
       />

@@ -384,7 +384,7 @@ export function SnapShotSettings() {
                 {settings.snapShotEnabled &&
                 !snapShotSetupComplete(state, settings.snapShotIncludeAccessibility) ? (
                   <Button
-                    size="xs"
+                    size="sm"
                     variant="outline"
                     disabled={setupBusy}
                     onClick={() => void openSetup()}
@@ -436,7 +436,7 @@ export function SnapShotSettings() {
                 control={
                   managedShortcut ? (
                     <Button
-                      size="xs"
+                      size="sm"
                       variant="outline"
                       disabled={setupBusy}
                       onClick={() => void openSetup("shortcut")}
@@ -449,14 +449,14 @@ export function SnapShotSettings() {
                       {shortcutChanged ? (
                         <>
                           <Button
-                            size="xs"
+                            size="sm"
                             disabled={!canSaveShortcut || setupBusy}
                             onClick={() => void saveShortcut()}
                           >
                             {setupBusy ? "Saving…" : "Save"}
                           </Button>
                           <Button
-                            size="xs"
+                            size="sm"
                             variant="ghost"
                             disabled={setupBusy}
                             onClick={() => {
@@ -473,7 +473,7 @@ export function SnapShotSettings() {
                         state.shortcutCanRetry !== false &&
                         !isModifierPairShortcut(savedShortcut) ? (
                         <Button
-                          size="xs"
+                          size="sm"
                           variant="ghost"
                           disabled={setupBusy || state.shortcutPending}
                           onClick={() => void setup("retry-shortcut")}
