@@ -139,3 +139,42 @@ it("shows compatibility in the version popover even when the installed version i
     targetVersion: null,
   });
 });
+
+describe("manual provider update guidance", () => {
+  const message =
+    "This installation is managed by ChatGPT. Launchpad cannot update it. Check for updates in ChatGPT on this environment's machine.";
+  const advisory = {
+    status: "behind_latest" as const,
+    currentVersion: "1.0.0",
+    latestVersion: "2.0.0",
+    updateCommand: null,
+    canUpdate: false,
+    checkedAt: provider.checkedAt,
+    message,
+  };
+
+  it.each(["graceful", "unsupported", "broken"] as const)(
+    "preserves app ownership alongside a %s compatibility warning",
+    (status) => {
+      const view = getProviderVersionAdvisoryPresentation(advisory, {
+        status,
+        latestVersionStatus: "supported",
+        message: "Use 2.0.0 for full support.",
+        recommendedVersion: "2.0.0",
+        recommendedRange: null,
+      });
+      expect(view?.detail).toBe(`Use 2.0.0 for full support. ${message}`);
+      expect(view?.updateCommand).toBeNull();
+    },
+  );
+
+  it("keeps manual guidance when an older server advertises an unavailable action", () => {
+    const view = getProviderVersionAdvisoryPresentation({
+      ...advisory,
+      message: "Install the update now or review provider settings.",
+    });
+    expect(view?.detail).toBe(
+      "Launchpad cannot update this installation. Update it using its original installation method on this environment's machine.",
+    );
+  });
+});

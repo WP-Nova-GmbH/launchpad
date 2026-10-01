@@ -1,6 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import type { StaticScreenProps } from "@react-navigation/native";
 import type { EnvironmentId, ServerProvider } from "@t3tools/contracts";
+import { getManualProviderUpdateMessage } from "@t3tools/client-runtime/provider-update";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useEffect, useRef, useState } from "react";
@@ -312,10 +313,12 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                               {provider.unavailableReason ?? provider.message}
                             </Text>
                           ) : null}
-                          {provider.versionAdvisory?.status === "behind_latest" &&
+                          {provider.versionAdvisory &&
+                          (provider.versionAdvisory.status === "behind_latest" ||
+                            provider.compatibilityAdvisory?.message) &&
                           !provider.versionAdvisory.canUpdate ? (
                             <Text className="text-sm text-foreground-muted">
-                              Update this provider on the environment's machine.
+                              {getManualProviderUpdateMessage(provider.versionAdvisory)}
                             </Text>
                           ) : null}
                         </View>
