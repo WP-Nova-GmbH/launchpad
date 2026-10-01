@@ -3,6 +3,7 @@ import type {
   ServerProviderVersionAdvisory,
   ServerProviderCompatibilityAdvisory,
 } from "@t3tools/contracts";
+import { getManualProviderUpdateMessage } from "@t3tools/client-runtime/provider-update";
 
 /**
  * Visual treatment for each server-reported provider status. Centralized so
@@ -134,11 +135,14 @@ export function getProviderVersionAdvisoryPresentation(
   ) {
     const targetVersion = compatibility.recommendedVersion;
     const recommendation = getProviderVersionLabel(targetVersion) ?? compatibility.recommendedRange;
+    const compatibilityDetail =
+      compatibility.message ??
+      (recommendation ? `Use ${recommendation} for full support.` : "Update for full support.");
     return {
       title: COMPATIBILITY_TITLES[compatibility.status],
-      detail:
-        compatibility.message ??
-        (recommendation ? `Use ${recommendation} for full support.` : "Update for full support."),
+      detail: [compatibilityDetail, getManualProviderUpdateMessage(advisory)]
+        .filter(Boolean)
+        .join(" "),
       updateCommand:
         targetVersion || latestIsIncompatible ? null : (advisory?.updateCommand ?? null),
       emphasis: compatibility.status === "graceful" ? "normal" : "strong",
@@ -161,6 +165,7 @@ export function getProviderVersionAdvisoryPresentation(
   return {
     title: label,
     detail:
+      getManualProviderUpdateMessage(advisory) ??
       advisory.message ??
       (versionLabel
         ? `${label}: install ${versionLabel}.`

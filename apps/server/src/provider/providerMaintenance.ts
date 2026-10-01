@@ -58,6 +58,8 @@ export interface ProviderMaintenanceCapabilities {
   readonly provider: ProviderDriverKind;
   readonly packageName: string | null;
   readonly update: ProviderMaintenanceCommandAction | null;
+  /** The enclosing application owns updates to its bundled executable. */
+  readonly managedByApp?: string;
   /**
    * Latest version reported by the installer that owns the executable.
    * `undefined` means the installer has no channel of its own and the npm
@@ -589,12 +591,20 @@ export const resolveProviderMaintenanceCapabilitiesEffect = Effect.fn(
   if (!realCommandPath) {
     return yield* resolver.resolve(null);
   }
+  const platform = yield* HostProcessPlatform;
+  // The outermost app owns its bundled executables, including symlinked CLIs
+  // whose provider would normally offer a native self-updater.
+  const managedByApp =
+    platform === "darwin" ? /\/([^/]+)\.app\/Contents\//i.exec(realCommandPath)?.[1] : undefined;
+  if (managedByApp) {
+    return { ...(yield* resolver.resolve(null)), update: null, managedByApp };
+  }
   return yield* resolver.resolve({
     binaryPath,
     resolvedCommandPath,
     realCommandPath,
     env,
-    platform: yield* HostProcessPlatform,
+    platform,
   });
 });
 
@@ -647,6 +657,9 @@ export function createProviderVersionAdvisory(input: {
     currentVersion: input.currentVersion,
     latestVersion,
   });
+  const manualUpdateMessage = capabilities.managedByApp
+    ? `This installation is managed by ${capabilities.managedByApp}. Launchpad cannot update it. Check for updates in ${capabilities.managedByApp} on this environment's machine.`
+    : "Launchpad cannot update this installation. Update it using its original installation method on this environment's machine.";
 
   return {
     status: advisory.status,
@@ -656,7 +669,11 @@ export function createProviderVersionAdvisory(input: {
     canUpdate: capabilities.update !== null,
     canInstallVersion: makeTargetedProviderUpdateAction(capabilities, "0.0.0") !== null,
     checkedAt: input.checkedAt ?? null,
-    message: advisory.message,
+    message:
+      (advisory.status === "behind_latest" || capabilities.managedByApp) &&
+      capabilities.update === null
+        ? manualUpdateMessage
+        : advisory.message,
   };
 }
 

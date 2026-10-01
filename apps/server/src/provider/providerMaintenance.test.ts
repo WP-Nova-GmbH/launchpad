@@ -9,6 +9,7 @@ import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { HttpClient } from "effect/unstable/http";
@@ -214,7 +215,7 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
     });
   });
 
-  it("keeps the manual update hint when the install is behind but unowned", () => {
+  it("explains when the install is behind but has no supported updater", () => {
     expect(
       createProviderVersionAdvisory({
         driver: driver("packageTool"),
@@ -227,9 +228,90 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       latestVersion: "2.1.117",
       updateCommand: null,
       canUpdate: false,
-      message: "Install the update now or review provider settings.",
+      message:
+        "Launchpad cannot update this installation. Update it using its original installation method on this environment's machine.",
     });
   });
+
+  for (const { installPath, appName } of [
+    {
+      installPath:
+        "Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+      appName: "ChatGPT",
+    },
+    {
+      installPath: "Applications/Another App.app/Contents/MacOS/codex",
+      appName: "Another App",
+    },
+  ]) {
+    it.effect.skipIf(windowsHost || !symlinksSupported)(
+      `explains that ${appName} owns its bundled provider update`,
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-app-maintenance-" });
+          const realCommandPath = NodePath.join(tempDir, installPath);
+          writeExecutable(realCommandPath);
+          const binaryPath = NodePath.join(tempDir, "codex");
+          NodeFS.symlinkSync(realCommandPath, binaryPath);
+          const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
+            packageToolUpdate,
+            {
+              binaryPath,
+              env: { PATH: "" },
+            },
+          );
+          expect(
+            createProviderVersionAdvisory({
+              driver: driver("packageTool"),
+              currentVersion: "0.158.0-alpha.2.1",
+              latestVersion: "0.158.0",
+              maintenanceCapabilities: capabilities,
+            }),
+          ).toMatchObject({
+            status: "behind_latest",
+            canUpdate: false,
+            updateCommand: null,
+            message: `This installation is managed by ${appName}. Launchpad cannot update it. Check for updates in ${appName} on this environment's machine.`,
+          });
+          expect(
+            createProviderVersionAdvisory({
+              driver: driver("packageTool"),
+              currentVersion: "0.158.0",
+              latestVersion: "0.158.0",
+              maintenanceCapabilities: capabilities,
+            }).message,
+          ).toContain(`managed by ${appName}`);
+        }).pipe(
+          Effect.provideService(HostProcessPlatform, "darwin"),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+          Effect.scoped,
+        ),
+    );
+  }
+
+  it.effect.skipIf(windowsHost)(
+    "does not infer app ownership from an ordinary directory ending in .app",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-not-app-maintenance-" });
+        const binaryPath = NodePath.join(tempDir, "project.app", "bin", "codex");
+        writeExecutable(binaryPath);
+        const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
+          packageToolUpdate,
+          {
+            binaryPath,
+            env: { PATH: "" },
+          },
+        );
+        expect(capabilities).toEqual(manualPackageTool);
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "darwin"),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+        Effect.scoped,
+      ),
+  );
 
   it.effect("stays manual-only when the binary cannot be located", () =>
     resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {

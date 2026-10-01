@@ -40,6 +40,34 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
 const windowsHost = HostProcessPlatform.defaultValue() === "win32";
 
 it.layer(testLayer)("CursorDriver", (it) => {
+  it.effect.skipIf(windowsHost)("defers updates of an app-bundled agent to its owning app", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cursor-app-" });
+      const binaryPath = NodePath.join(tempDir, "Cursor.app", "Contents", "MacOS", "agent");
+      yield* fs.makeDirectory(NodePath.dirname(binaryPath), { recursive: true });
+      yield* fs.writeFileString(binaryPath, "#!/bin/sh\n");
+      yield* fs.chmod(binaryPath, 0o755);
+      const instance = yield* CursorDriver.create({
+        instanceId: ProviderInstanceId.make("cursor-app"),
+        displayName: "Cursor app fixture",
+        enabled: false,
+        environment: [],
+        config: { ...CursorDriver.defaultConfig(), binaryPath },
+      });
+      const capabilities = yield* instance.snapshot.resolveMaintenance();
+      expect(capabilities.update?.command ?? null).toBeNull();
+      expect(capabilities.managedByApp).toBe("Cursor");
+    }).pipe(
+      Effect.provideService(HostProcessPlatform, "darwin"),
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.die("App ownership resolution must not spawn")),
+      ),
+      Effect.scoped,
+    ),
+  );
+
   it.effect.skipIf(windowsHost)(
     "quotes a configured executable path in the copyable update command",
     () =>

@@ -42,6 +42,32 @@ const noSpawner = ChildProcessSpawner.make(() =>
 const windowsHost = HostProcessPlatform.defaultValue() === "win32";
 
 it.layer(testLayer)("GrokDriver", (it) => {
+  it.effect.skipIf(windowsHost)("defers updates of an app-bundled agent to its owning app", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-grok-app-" });
+      const binaryPath = path.join(tempDir, "Agent Desktop.app", "Contents", "MacOS", "grok");
+      yield* fs.makeDirectory(path.dirname(binaryPath), { recursive: true });
+      yield* fs.writeFileString(binaryPath, "#!/bin/sh\n");
+      yield* fs.chmod(binaryPath, 0o755);
+      const instance = yield* GrokDriver.create({
+        instanceId: ProviderInstanceId.make("grok-app"),
+        displayName: "Grok app fixture",
+        enabled: false,
+        environment: [],
+        config: { ...GrokDriver.defaultConfig(), binaryPath },
+      });
+      const capabilities = yield* instance.snapshot.resolveMaintenance();
+      expect(capabilities.update?.command ?? null).toBeNull();
+      expect(capabilities.managedByApp).toBe("Agent Desktop");
+    }).pipe(
+      Effect.provideService(HostProcessPlatform, "darwin"),
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawner),
+      Effect.scoped,
+    ),
+  );
+
   it.effect.skipIf(windowsHost)("updates through the configured executable's own updater", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
