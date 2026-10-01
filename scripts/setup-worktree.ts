@@ -1,6 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - runs before `vp i`, so only Node built-ins exist.
 /**
- * Worktree setup, run by the t3.json "Setup Worktree" action as
+ * Worktree setup, run by the launchpad.json "Setup Worktree" action as
  * `node scripts/setup-worktree.ts`. Plain Node keeps one command working in
  * every shell T3 Code spawns (zsh, bash, fish, PowerShell): it installs
  * dependencies, links the main checkout's gitignored env files into this
@@ -14,7 +14,9 @@ const ENV_FILES = [".env", NodePath.join("infra", "relay", ".env")];
 
 const projectRoot = process.env.T3CODE_PROJECT_ROOT;
 if (!projectRoot) {
-  throw new Error("T3CODE_PROJECT_ROOT is not set. Run this through the t3.json setup action.");
+  throw new Error(
+    "T3CODE_PROJECT_ROOT is not set. Run this through the launchpad.json setup action.",
+  );
 }
 const worktree = NodePath.dirname(import.meta.dirname);
 

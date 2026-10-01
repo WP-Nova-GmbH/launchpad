@@ -21,7 +21,7 @@ import type { ProjectOverrideEntry, ScopedSettingsTarget } from "./scopedSetting
 import { isProjectScopedSettingKey } from "./scopedSettings";
 
 interface InheritanceLayer {
-  readonly key: "project" | "environment" | "t3.json" | "built-in";
+  readonly key: "project" | "environment" | "launchpad.json" | "t3.json" | "built-in";
   readonly label: string;
   readonly value: string;
   readonly effective: boolean;
@@ -82,7 +82,7 @@ function formatValue(key: keyof ServerSettings, value: unknown): string {
 /**
  * The layers a setting resolves through for one target, top-down: the
  * project override when the target is a project, the environment's value,
- * the checkout's t3.json for file-backed keys, and the built-in default. The
+ * the checkout's launchpad.json for file-backed keys, and the built-in default. The
  * first layer that is set wins. Same order as `resolveProjectSettings`.
  */
 export function settingInheritanceLayers(
@@ -112,12 +112,14 @@ export function settingInheritanceLayers(
     set: environmentSet,
   });
   if (fileBacked && target.projectId !== null) {
+    const fileName =
+      target.projectFileName ?? (source === "t3.json" ? "t3.json" : "launchpad.json");
     layers.push({
-      key: "t3.json",
-      label: "t3.json",
-      value: source === "t3.json" ? formatValue(key, target.settings[key]) : "Inherits",
-      effective: source === "t3.json",
-      set: source === "t3.json",
+      key: fileName,
+      label: fileName,
+      value: source === fileName ? formatValue(key, target.settings[key]) : "Inherits",
+      effective: source === fileName,
+      set: source === fileName,
     });
   }
   // For a file-backed key the built-in is what the resolver produced with

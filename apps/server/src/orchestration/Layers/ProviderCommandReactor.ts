@@ -553,7 +553,7 @@ const make = Effect.gen(function* () {
     // A directory deleted without `git worktree remove` leaves an admin entry
     // that makes `git worktree add` refuse the path; prune clears it.
     // Best effort like the rest of this recovery: a settings read failure
-    // falls back to the checkout's t3.json.
+    // falls back to the checkout's launchpad.json.
     const submodules = yield* projectSettingsForThread(thread.id).pipe(
       Effect.map((settings) => settings.worktreeSubmodules),
       Effect.orElseSucceed(() => null),

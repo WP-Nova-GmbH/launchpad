@@ -8,7 +8,7 @@ import {
   type ProjectScopedServerSettingKey,
   type ProjectSettingsOverrides,
   ServerSettings,
-  type T3ProjectFile,
+  type ResolvedProjectFile,
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
 import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
@@ -79,6 +79,7 @@ export interface ScopedSettingsTarget {
   /** The environment's label; a project is the same project on every environment. */
   readonly label: string;
   readonly projectId: ProjectId | null;
+  readonly projectFileName?: ResolvedProjectFile["fileName"] | undefined;
   readonly settings: ServerSettings;
   readonly sources: Readonly<Record<ProjectScopedServerSettingKey, ProjectSettingSource>>;
 }
@@ -87,9 +88,9 @@ export interface ScopedSettingsTarget {
 export function resolveScopedSettingsTargets(
   scope: ResolvedSettingsScope,
   connectedEnvironments: readonly ScopedSettingsEnvironment[],
-  // Each member's decoded t3.json, keyed by physical project key, once read.
+  // Each member's decoded launchpad.json, keyed by physical project key, once read.
   // A member absent here has no file tier yet; null is a missing or invalid file.
-  projectFiles?: ReadonlyMap<string, T3ProjectFile | null>,
+  projectFiles?: ReadonlyMap<string, ResolvedProjectFile | null>,
 ): readonly ScopedSettingsTarget[] {
   const byId = new Map(
     connectedEnvironments.map((environment) => [environment.environmentId, environment]),
@@ -108,6 +109,7 @@ export function resolveScopedSettingsTargets(
           environmentId: member.environmentId,
           label: environment.label,
           projectId: member.id,
+          projectFileName: projectFile?.fileName,
           settings: resolved.settings,
           sources: resolved.sources,
         },
@@ -156,9 +158,11 @@ export function scopedSettingsSource(
     ? "mixed"
     : sources.has("project")
       ? "project"
-      : sources.has("t3.json")
-        ? "t3.json"
-        : "environment";
+      : sources.has("launchpad.json")
+        ? "launchpad.json"
+        : sources.has("t3.json")
+          ? "t3.json"
+          : "environment";
 }
 
 interface ScopedServerWrite {

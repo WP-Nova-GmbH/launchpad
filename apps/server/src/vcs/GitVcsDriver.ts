@@ -131,7 +131,7 @@ export interface CreateWorktreeProgress {
   readonly onSubmodulesStarted?: () => Effect.Effect<void, never>;
   /** Fires when `.gitmodules` exists but the resolved submodule mode is `"none"`. */
   readonly onSubmodulesDisabled?: (input: {
-    source: "settings" | "t3.json";
+    source: "settings" | "launchpad.json" | "t3.json";
   }) => Effect.Effect<void, never>;
   readonly onSubmoduleLine?: (line: string) => Effect.Effect<void, never>;
   readonly onSubmodulesFinished?: (input: {
@@ -145,7 +145,7 @@ export interface CreateWorktreeOptions {
   /**
    * The project-over-environment `worktreeSubmodules` setting. Null (or
    * omitted, for callers without settings access) defers to the checkout's
-   * own t3.json.
+   * own launchpad.json.
    */
   readonly submodules?: WorktreeSubmodules | null;
 }

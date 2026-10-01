@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import type { RuntimeMode } from "@t3tools/contracts";
+import type { ResolvedProjectFile, RuntimeMode } from "@t3tools/contracts";
 
 const testState = vi.hoisted(() => {
   let completeProjectFileRead: (value: null) => void = () => undefined;
@@ -105,7 +105,7 @@ vi.mock("@t3tools/shared/projectSettings", () => ({
     settings: Record<string, unknown>,
     _projectId: unknown,
     _project: unknown,
-    projectFile?: { defaultThreadEnvMode?: "local" | "worktree" } | null,
+    projectFile?: ResolvedProjectFile | null,
   ) => ({
     settings:
       projectFile === undefined
@@ -113,7 +113,7 @@ vi.mock("@t3tools/shared/projectSettings", () => ({
         : {
             ...settings,
             defaultThreadEnvMode:
-              settings.defaultThreadEnvMode ?? projectFile?.defaultThreadEnvMode ?? "local",
+              settings.defaultThreadEnvMode ?? projectFile?.config?.defaultThreadEnvMode ?? "local",
           },
     sources: { defaultModelSelection: "environment", defaultThreadEnvMode: "environment" },
     overrides: {},

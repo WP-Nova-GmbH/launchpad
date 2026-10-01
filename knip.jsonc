@@ -14,7 +14,7 @@
     },
     "scripts": {
       // Knip loads its preprocessor through a CLI option; native verification,
-      // worktree setup (from t3.json), and brand icon generation run directly.
+      // worktree setup (from launchpad.json), and brand icon generation run directly.
       "entry": [
         "knip-schemas.ts",
         "mobile-native-client.ts",

@@ -225,6 +225,16 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceFileSystemLive", (i
       }),
     );
 
+    it.effect("does not classify an unavailable workspace as a missing config file", () =>
+      Effect.gen(function* () {
+        const fs = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const path = yield* Path.Path;
+        const cwd = path.join(yield* makeTempDir, "missing-workspace");
+        const error = yield* fs.readFile({ cwd, relativePath: "launchpad.json" }).pipe(Effect.flip);
+        expect(error).toMatchObject({ notFound: false });
+      }),
+    );
+
     it.effect("preserves the real cause and path for I/O failures", () =>
       Effect.gen(function* () {
         const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -246,6 +256,7 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceFileSystemLive", (i
         });
         expect(error.cause).toBeInstanceOf(Error);
         expect((error.cause as NodeJS.ErrnoException).code).toBe("ENOENT");
+        expect(error).toMatchObject({ notFound: true });
       }),
     );
   });

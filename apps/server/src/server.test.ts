@@ -7965,6 +7965,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             list: client[WS_METHODS.projectsListEntries]({ cwd: invalidWorkspace }).pipe(
               Effect.result,
             ),
+            readMissing: client[WS_METHODS.projectsReadFile]({
+              cwd: workspaceDir,
+              relativePath: "launchpad.json",
+            }).pipe(Effect.result),
             read: client[WS_METHODS.projectsReadFile]({
               cwd: workspaceDir,
               relativePath: "linked-outside.txt",
@@ -8013,6 +8017,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       if (results.read._tag !== "Failure" || results.read.failure._tag !== "ProjectReadFileError") {
         assert.fail("Expected a ProjectReadFileError");
+      }
+      assert.equal(results.readMissing._tag, "Failure");
+      if (
+        results.readMissing._tag === "Failure" &&
+        results.readMissing.failure._tag === "ProjectReadFileError"
+      ) {
+        assert.equal(results.readMissing.failure.notFound, true);
+      } else {
+        assert.fail("Expected a missing-file ProjectReadFileError");
       }
       const readError = results.read.failure;
       assert.equal(

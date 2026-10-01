@@ -1190,7 +1190,7 @@ const makeWsRpcLayer = (
         });
 
       // Project setting > environment setting; null when neither is set so
-      // the driver reads the freshly created checkout's own t3.json (the
+      // the driver reads the freshly created checkout's own launchpad.json (the
       // branch being checked out may declare something the project root does
       // not). Settings that fail to load fall through the same way.
       const resolveBootstrapWorktreeSubmodules = Effect.fnUntraced(function* (input: {
@@ -3690,6 +3690,7 @@ const makeWsRpcLayer = (
                 (cause) =>
                   new ProjectReadFileError({
                     ...input,
+                    notFound: cause._tag === "WorkspaceFileSystemOperationError" && cause.notFound,
                     ...projectFileFailureContext(cause),
                     cause,
                   }),

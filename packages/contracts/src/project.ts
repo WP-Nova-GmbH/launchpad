@@ -237,6 +237,7 @@ type ProjectFileFailureContext = {
   readonly cwd: string;
   readonly relativePath: string;
   readonly failure: ProjectFileFailure;
+  readonly notFound?: boolean;
   readonly resolvedPath?: string;
   readonly resolvedWorkspaceRoot?: string;
   readonly operation?: ProjectFileOperation;
@@ -247,6 +248,7 @@ type ProjectFileFailureContext = {
 export class ProjectReadFileError extends Schema.TaggedError<ProjectReadFileError>()(
   "ProjectReadFileError",
   {
+    notFound: Schema.optional(Schema.Boolean),
     cwd: Schema.optional(TrimmedNonEmptyString),
     relativePath: Schema.optional(TrimmedNonEmptyString),
     failure: Schema.optional(ProjectFileFailure),

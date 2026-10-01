@@ -28,6 +28,8 @@ import * as Schema from "effect/Schema";
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
 
+const isMissingFileCause = Schema.is(Schema.Struct({ code: Schema.Literal("ENOENT") }));
+
 const PROJECT_READ_FILE_MAX_BYTES = 1024 * 1024;
 
 export class WorkspaceFileSystemOperationError extends Schema.TaggedError<WorkspaceFileSystemOperationError>()(
@@ -50,6 +52,10 @@ export class WorkspaceFileSystemOperationError extends Schema.TaggedError<Worksp
     cause: Schema.Defect(),
   },
 ) {
+  get notFound(): boolean {
+    return this.operation !== "realpath-workspace-root" && isMissingFileCause(this.cause);
+  }
+
   override get message(): string {
     return `Workspace file operation '${this.operation}' failed at '${this.operationPath}' for resolved path '${this.resolvedPath}' (requested as '${this.relativePath}' in '${this.workspaceRoot}').`;
   }
