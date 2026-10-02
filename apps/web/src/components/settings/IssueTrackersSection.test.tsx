@@ -143,7 +143,6 @@ afterEach(async () => {
 
 describe("Linear workspace settings interactions", () => {
   it("keeps the renewal dialog open while A is connected, then exposes the returned proposal", async () => {
-    await click("Change workspace");
     mocks.runPromise.mockResolvedValueOnce({
       authorizationUrl: "https://linear.app/oauth/authorize",
       authorizationId: "attempt",
@@ -152,9 +151,13 @@ describe("Linear workspace settings interactions", () => {
         authorization: { id: "attempt", phase: "pending", expiresAt: "2026-10-01T12:00:00Z" },
       },
     });
-    await act(async () => {
-      renderer.root.findByType("form").props.onSubmit({ preventDefault() {} });
-    });
+    await click("Change workspace");
+    expect(window.open).toHaveBeenCalledWith(
+      "https://linear.app/oauth/authorize",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    expect(button("Continue to Linear")).toBeUndefined();
     expect(renderer.root.findAllByProps({ role: "dialog" })).toHaveLength(1);
     expect(textOf(renderer.root)).toContain("Finish in Linear, then return here");
     mocks.runPromise.mockResolvedValueOnce(pending);
@@ -236,6 +239,8 @@ it("connects Jira through OAuth and refreshes the pending dialog after returning
   });
   await click("Connect");
   expect(renderer.root.findAllByType("input")).toHaveLength(0);
+  expect(textOf(renderer.root)).toContain("Waiting for Atlassian");
+  expect(button("Continue to Atlassian")).toBeUndefined();
   expect(window.open).toHaveBeenCalledWith(
     "https://mcp.atlassian.com/v1/authorize?state=test",
     "_blank",
@@ -252,6 +257,39 @@ it("connects Jira through OAuth and refreshes the pending dialog after returning
   await act(async () => window.dispatchEvent(new Event("focus")));
   expect(renderer.root.findAllByProps({ role: "dialog" })).toHaveLength(0);
   expect(textOf(renderer.root)).toContain("Team Jira");
+});
+
+it("shows opening progress immediately and retries failed sign-in without a confirmation step", async () => {
+  let rejectStart!: (error: Error) => void;
+  mocks.runPromise.mockImplementationOnce(
+    () =>
+      new Promise((_, reject) => {
+        rejectStart = reject;
+      }),
+  );
+  await click("Connect");
+  expect(textOf(renderer.root)).toContain("Opening Atlassian…");
+  expect(button("Continue to Atlassian")).toBeUndefined();
+  expect(button("Try again")).toBeUndefined();
+  mocks.runPromise.mockResolvedValueOnce(snapshot);
+  await act(async () => rejectStart(new Error("Atlassian is unavailable")));
+  expect(textOf(renderer.root)).toContain("Could not open Atlassian");
+  expect(textOf(renderer.root.findByProps({ role: "alert" }))).toBe("Atlassian is unavailable");
+  mocks.runPromise.mockResolvedValueOnce({
+    authorizationUrl: "https://auth.atlassian.com/authorize",
+    authorizationId: "retry-attempt",
+    connection: {
+      service: "jira",
+      status: "connecting",
+      accountLabel: null,
+      updatedAt: "2026-10-02",
+      authorization: { id: "retry-attempt", phase: "pending", expiresAt: "2026-10-02T12:00:00Z" },
+    },
+  });
+  await click("Try again");
+  expect(textOf(renderer.root)).toContain("Waiting for Atlassian");
+  expect(window.open).toHaveBeenCalledTimes(1);
+  expect(renderer.root.findAllByProps({ role: "alert" })).toHaveLength(0);
 });
 
 const jiraSelection = {

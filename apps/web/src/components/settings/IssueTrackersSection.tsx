@@ -6,7 +6,7 @@ import type {
   RelayIssueTrackerService,
   RelayStartLinearResponse,
 } from "@t3tools/contracts/relay";
-import { ArrowUpRightIcon, CheckIcon, CircleDotIcon, RefreshCwIcon } from "lucide-react";
+import { CircleDotIcon, RefreshCwIcon } from "lucide-react";
 import { useId, useState } from "react";
 
 import { Badge } from "../ui/badge";
@@ -94,6 +94,7 @@ export function IssueTrackersSection({
   const [review, setReview] = useState<RelayIssueTrackerConnection["replacement"]>(undefined);
   const [siteChoice, setSiteChoice] = useState<RelaySelectJiraSiteRequest | null>(null);
   const fieldId = useId();
+  const providerName = dialog === "jira" ? "Atlassian" : "Linear";
   const authorizing = snapshot?.connections.find((entry) => entry.service === dialog);
   const choosingJiraSite =
     dialog === "jira" &&
@@ -136,7 +137,7 @@ export function IssueTrackersSection({
     setAuthorizationUrl(null);
     setAuthorizationId(null);
     setDialog(service);
-    if (service === "jira") void run(beginJira);
+    void run(() => beginAuthorization(service));
   };
 
   const run = async (action: () => Promise<void>) => {
@@ -151,8 +152,8 @@ export function IssueTrackersSection({
     }
   };
 
-  const beginJira = async () => {
-    const result = await startJira();
+  const beginAuthorization = async (service: RelayIssueTrackerService) => {
+    const result = await (service === "jira" ? startJira() : startLinear());
     setAuthorizationUrl(result.authorizationUrl);
     setAuthorizationId(result.authorizationId);
     window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
@@ -204,28 +205,33 @@ export function IssueTrackersSection({
           return (
             <SettingsRow
               key={service}
-              title={name}
+              title={
+                <span className="inline-flex flex-wrap items-center gap-2">
+                  {name}
+                  {connection ? (
+                    <Badge
+                      variant={
+                        connection.status === "connected"
+                          ? "success"
+                          : connection.status === "reconnect_required"
+                            ? "warning"
+                            : "secondary"
+                      }
+                    >
+                      {connection.status === "connected"
+                        ? "Connected"
+                        : connection.status === "reconnect_required"
+                          ? "Sign-in required"
+                          : "Setup incomplete"}
+                    </Badge>
+                  ) : null}
+                </span>
+              }
               description={connectionDescription(service, connection)}
               status={
-                connection ? (
-                  <Badge
-                    variant={
-                      connection.status === "connected"
-                        ? "success"
-                        : connection.status === "reconnect_required"
-                          ? "warning"
-                          : "secondary"
-                    }
-                  >
-                    {connection.status === "connected"
-                      ? "Connected"
-                      : connection.status === "reconnect_required"
-                        ? "Sign-in required"
-                        : "Setup incomplete"}
-                  </Badge>
-                ) : !available ? (
-                  "Linear is not configured on this Launchpad. Ask its operator to enable it."
-                ) : null
+                !connection && !available
+                  ? "Linear is not configured on this Launchpad. Ask its operator to enable it."
+                  : null
               }
               control={
                 isAdmin ? (
@@ -317,122 +323,88 @@ export function IssueTrackersSection({
             className="flex min-h-0 flex-col"
             onSubmit={(event) => {
               event.preventDefault();
-              if (disabled) return;
-              void run(async () => {
-                if (dialog === "linear") {
-                  const result = await startLinear();
-                  setAuthorizationUrl(result.authorizationUrl);
-                  setAuthorizationId(result.authorizationId);
-                  window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
-                } else if (dialog === "jira") {
-                  if (choosingJiraSite) {
-                    if (!selectedCloudId || !authorizing.authorization) return;
-                    await selectJiraSite({
-                      authorizationId: authorizing.authorization.id,
-                      cloudId: selectedCloudId,
-                    });
-                  } else await beginJira();
-                }
-              });
+              if (disabled || !choosingJiraSite || !selectedCloudId || !authorizing.authorization)
+                return;
+              const authorizationId = authorizing.authorization.id;
+              void run(() => selectJiraSite({ authorizationId, cloudId: selectedCloudId }));
             }}
           >
             <DialogHeader>
               <DialogTitle>
                 {choosingJiraSite
                   ? "Choose Jira site"
-                  : dialog === "linear" && linear?.accountLabel
-                    ? "Change Linear workspace"
-                    : `Connect ${dialog === "jira" ? "Jira" : "Linear"}`}
+                  : authorizationUrl
+                    ? `Waiting for ${providerName}`
+                    : dialogError
+                      ? `Could not open ${providerName}`
+                      : `Connecting to ${providerName}`}
               </DialogTitle>
               <DialogDescription>
                 Share read-only issue access with {organizationName}.
               </DialogDescription>
             </DialogHeader>
             <DialogPanel>
-              {dialog === "jira" ? (
-                <>
-                  {choosingJiraSite ? (
-                    <RadioGroup
-                      aria-label="Jira site"
-                      value={selectedCloudId}
-                      disabled={disabled}
-                      onValueChange={(value) => {
-                        if (typeof value === "string" && authorizing.authorization)
-                          setSiteChoice({
-                            authorizationId: authorizing.authorization.id,
-                            cloudId: value,
-                          });
-                      }}
+              {choosingJiraSite ? (
+                <RadioGroup
+                  aria-label="Jira site"
+                  value={selectedCloudId}
+                  disabled={disabled}
+                  onValueChange={(value) => {
+                    if (typeof value === "string" && authorizing.authorization)
+                      setSiteChoice({
+                        authorizationId: authorizing.authorization.id,
+                        cloudId: value,
+                      });
+                  }}
+                >
+                  {authorizing.jiraSites?.map((site, index) => (
+                    <label
+                      key={site.cloudId}
+                      htmlFor={`${fieldId}-site-${index}`}
+                      className="flex cursor-pointer items-center gap-3 rounded-md border p-3"
                     >
-                      {authorizing.jiraSites?.map((site, index) => (
-                        <label
-                          key={site.cloudId}
-                          htmlFor={`${fieldId}-site-${index}`}
-                          className="flex cursor-pointer items-center gap-3 rounded-md border p-3"
-                        >
-                          <RadioGroupItem id={`${fieldId}-site-${index}`} value={site.cloudId} />
-                          <span className="min-w-0">
-                            <span className="block break-words text-sm font-medium">
-                              {site.accountLabel}
-                            </span>
-                            <span className="block break-all text-xs text-muted-foreground">
-                              {new URL(site.siteUrl).hostname}
-                            </span>
-                          </span>
-                        </label>
-                      ))}
-                    </RadioGroup>
-                  ) : (
+                      <RadioGroupItem id={`${fieldId}-site-${index}`} value={site.cloudId} />
+                      <span className="min-w-0">
+                        <span className="block break-words text-sm font-medium">
+                          {site.accountLabel}
+                        </span>
+                        <span className="block break-all text-xs text-muted-foreground">
+                          {new URL(site.siteUrl).hostname}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+                </RadioGroup>
+              ) : (
+                <>
+                  <p role="status" className="text-sm leading-relaxed text-muted-foreground">
+                    {authorizationUrl
+                      ? `Finish in ${providerName}, then return here.`
+                      : busy
+                        ? `Opening ${providerName}…`
+                        : "Try again to open the sign-in page."}
+                  </p>
+                  {authorizationUrl ? (
                     <p className="text-sm leading-relaxed text-muted-foreground">
-                      Sign in to Atlassian to authorize Jira. Your organization shares the read
-                      access granted by your account.
-                    </p>
-                  )}
-                  {authorizationUrl && !choosingJiraSite ? (
-                    <p role="status" className="text-sm leading-relaxed text-muted-foreground">
-                      Finish in Atlassian, then return here. If the browser did not open,{" "}
+                      If the browser did not open,{" "}
                       <a
                         href={authorizationUrl}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="underline underline-offset-2"
                       >
-                        open Atlassian
+                        open {providerName}
                       </a>
                       .
                     </p>
                   ) : null}
-                </>
-              ) : (
-                <>
                   <p className="text-sm leading-relaxed text-muted-foreground">
-                    Authorize the Launchpad app in Linear. Your organization shares the workspace
-                    access you grant.
+                    Your organization shares the read access granted by your account.
                   </p>
-                  <div className="flex items-start gap-2 text-sm">
-                    <CheckIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                    <p>
-                      Read issues, comments, and images. No changes to Linear or automatic jobs.
-                    </p>
-                  </div>
-                  {linear?.accountLabel ? (
+                  {dialog === "linear" && linear?.accountLabel ? (
                     <p className="text-sm text-muted-foreground">
                       {linear.accountLabel} remains selected until you confirm a different
                       workspace.
-                    </p>
-                  ) : null}
-                  {authorizationUrl ? (
-                    <p role="status" className="text-sm leading-relaxed text-muted-foreground">
-                      Finish in Linear, then return here. If the browser did not open,{" "}
-                      <a
-                        href={authorizationUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="underline underline-offset-2"
-                      >
-                        open Linear
-                      </a>
-                      .
                     </p>
                   ) : null}
                 </>
@@ -450,7 +422,7 @@ export function IssueTrackersSection({
                 disabled={busy || mutating}
                 onClick={closeDialog}
               >
-                {authorizationUrl || choosingJiraSite ? "Close" : "Cancel"}
+                Close
               </Button>
               {choosingJiraSite ? (
                 <>
@@ -480,18 +452,17 @@ export function IssueTrackersSection({
                 >
                   Check connection
                 </Button>
-              ) : (
-                <Button type="submit" disabled={disabled}>
-                  {busy
-                    ? dialog === "jira"
-                      ? "Opening Atlassian…"
-                      : "Opening Linear…"
-                    : dialog === "jira"
-                      ? "Continue to Atlassian"
-                      : "Continue to Linear"}
-                  {!busy ? <ArrowUpRightIcon className="size-3.5" /> : null}
+              ) : dialogError ? (
+                <Button
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => {
+                    if (dialog) void run(() => beginAuthorization(dialog));
+                  }}
+                >
+                  Try again
                 </Button>
-              )}
+              ) : null}
             </DialogFooter>
           </form>
         </DialogPopup>
