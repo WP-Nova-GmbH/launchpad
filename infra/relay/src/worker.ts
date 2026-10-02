@@ -217,8 +217,6 @@ export const ApiLive = Api.make(
 
     // Optional: a deployment without a GitHub App simply hides the surface.
     const githubAppId = yield* Config.String("GITHUB_APP_ID").pipe(Config.option);
-    const linearClientId = yield* Config.String("LINEAR_CLIENT_ID").pipe(Config.option);
-    const linearClientSecret = yield* Config.Redacted("LINEAR_CLIENT_SECRET").pipe(Config.option);
     const githubAppSlug = yield* Config.String("GITHUB_APP_SLUG").pipe(Config.option);
     const githubAppPrivateKey = yield* Config.Redacted("GITHUB_APP_PRIVATE_KEY").pipe(
       Config.option,
@@ -281,10 +279,6 @@ export const ApiLive = Api.make(
         clerkJwtAudience,
         cloudMintPrivateKey: yield* cloudMintPrivateKey,
         cloudMintPublicKey: yield* cloudMintPublicKey,
-        linear:
-          Option.isSome(linearClientId) && Option.isSome(linearClientSecret)
-            ? { clientId: linearClientId.value, clientSecret: linearClientSecret.value }
-            : undefined,
         github:
           Option.isSome(githubAppId) &&
           Option.isSome(githubAppSlug) &&

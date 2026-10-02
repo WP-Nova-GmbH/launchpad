@@ -1,10 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
-import * as HttpClient from "effect/unstable/http/HttpClient";
-import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
-import { RelaySecretBox } from "../auth/SecretBox.ts";
+import { fixture, toolName } from "./Connections.test-fixture.ts";
 import {
   linearDiscussion,
   linearImageReferences,
@@ -49,20 +46,30 @@ const page = (nodes: ReturnType<typeof comment>[], more = false) =>
   });
 function harness(responses: Response[]) {
   const requests: HttpClientRequest.HttpClientRequest[] = [];
-  const layer = Layer.mergeAll(
-    Layer.succeed(
-      HttpClient.HttpClient,
-      HttpClient.make((request) => {
-        requests.push(request);
-        return Effect.succeed(HttpClientResponse.fromWeb(request, responses.shift()!));
-      }),
-    ),
-    Layer.succeed(RelaySecretBox, {
-      seal: (value) => Effect.succeed(value),
-      open: (value) => Effect.succeed(value),
-    }),
-  );
-  return { requests, provide: Effect.provide(layer) };
+  const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        respond: (request) => {
+          requests.push(request);
+          if (toolName(request) === "get_workspace" || toolName(request) === "get_issue")
+            return Effect.succeed(
+              Response.json({
+                data: {
+                  organization: { id: source.workspaceId, urlKey: "org" },
+                  issue: {
+                    id: source.issueId,
+                    identifier: "LP-1",
+                    url: "https://linear.app/org/issue/LP-1",
+                  },
+                },
+              }),
+            );
+          return Effect.succeed(responses.shift()!);
+        },
+      });
+      return yield* effect.pipe(test.provide);
+    });
+  return { requests, provide };
 }
 
 describe("Linear discussion and images", () => {
@@ -85,7 +92,7 @@ describe("Linear discussion and images", () => {
       });
       expect(first.hasMore).toBe(true);
       const next = yield* openLinearReference(first.continuation!).pipe(test.provide);
-      expect(next).toMatchObject({ ...source, kind: "comments", after: "cursor-parent" });
+      expect(next).toMatchObject({ ...source, kind: "comments", after: '{"page":"next-page"}' });
       const last = yield* linearDiscussion({
         source,
         accessToken: input.accessToken,
@@ -114,7 +121,7 @@ describe("Linear discussion and images", () => {
       expect(result.comments.map((entry) => entry.id)).toEqual(["first"]);
       expect(result.contentTruncated).toBe(true);
       expect((yield* openLinearReference(result.continuation!).pipe(test.provide)).after).toBe(
-        "cursor-first",
+        '{"after":"first"}',
       );
       expect(utf8Bytes(result)).toBeLessThan(13000);
     }),

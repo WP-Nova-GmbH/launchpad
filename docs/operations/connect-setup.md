@@ -140,33 +140,22 @@ its active sessions and future sign-ins must be disabled.
 
 ## Organization issue trackers
 
-Linear setup requires an OAuth application for this Launchpad deployment. Configure
-`LINEAR_CLIENT_ID` and `LINEAR_CLIENT_SECRET` on the relay and register this exact redirect URI
-with Linear, using the relay's public issuer origin:
+Linear uses its official read-only MCP endpoint with OAuth dynamic client registration. No
+`LINEAR_CLIENT_ID` or `LINEAR_CLIENT_SECRET` is needed. An organization administrator connects
+Linear in Organization settings; shared access uses that person's Linear permissions.
 
-```text
-https://relay.example.com/v1/organization/issue-trackers/linear/callback
-```
+The callback belongs to the relay, including when setup starts from a desktop or remote client:
+`<relay issuer>/v1/organization/issue-trackers/linear/callback`. For a local pilot, set
+`DEV_RELAY_ISSUER` to the reachable relay origin and use an isolated `DEV_RELAY_DATABASE_URL`.
+The relay registers its callback dynamically and requests only `read` access.
 
-The callback belongs to the relay, including when an admin starts setup from a local desktop app;
-do not register a client localhost callback. Launchpad requests Linear's `read` scope with
-`actor=app`, so the shared connection belongs to the Launchpad app rather than the authorizing
-person. After authorization, the admin returns to Launchpad and the connection refreshes. If the
-relay has no Linear application configured, the settings page explains that setup is unavailable.
-See [Linear's app authorization documentation](https://linear.app/developers/oauth-actor-authorization)
-for the application model.
+Existing connections from the previous static OAuth application must reconnect after upgrading.
+Changing workspace requires explicit confirmation in Launchpad; the current connection stays
+available during authorization. See [Linear's MCP documentation](https://linear.app/docs/mcp).
 
-For a local pilot, put the application credentials in the worktree's gitignored
-`infra/relay/.env`, set `DEV_RELAY_ISSUER` to its reachable relay origin, and use a separate
-`DEV_RELAY_DATABASE_URL`. Register the callback against that issuer before authorizing from
-Launchpad. The application is registered once per deployment; organization admins authorize
-through Launchpad and do not need their own developer applications.
-
-Jira does not need a deployment-wide OAuth application for this release. The organization admin
-supplies a Jira Cloud site, an Atlassian service account API key, and a known issue to verify site
-access. Its Atlassian admin must first
-[enable MCP API key authentication](https://developer.atlassian.com/cloud/rovo-mcp/guides/configuring-authentication-via-api-token/).
-The relay binds the connection to the validated site and performs issue reads there.
+Jira also uses dynamic OAuth registration. An organization administrator authorizes Atlassian
+in Organization settings and chooses a site when their account has access to several sites.
+Shared reads use the permissions granted by that account.
 
 Both connections keep credentials on the relay. Only enrolled organization-managed executors can
 request issue reads; this release does not authorize personal environments or support issue writes,

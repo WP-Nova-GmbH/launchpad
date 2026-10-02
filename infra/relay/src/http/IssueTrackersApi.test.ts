@@ -163,7 +163,7 @@ describe("issue tracker authorization", () => {
       const client = yield* own.client;
       const result = yield* client.issueTrackers.listConnections({ headers });
       expect(result).toEqual({
-        linearAvailable: false,
+        linearAvailable: true,
         connections: [
           {
             service: "jira",

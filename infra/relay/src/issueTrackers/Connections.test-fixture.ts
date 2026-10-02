@@ -34,15 +34,111 @@ const configuration = {
   cloudMintPublicKey: "unused",
   managedEndpointBaseDomain: undefined,
   managedEndpointNamespace: undefined,
-  linear: { clientId: "client", clientSecret: Redacted.make("linear-client-secret") },
 } satisfies RelayConfiguration["Service"];
+
+export const linearOAuth = {
+  server: {
+    issuer: "https://mcp.linear.app",
+    authorization_endpoint: "https://mcp.linear.app/authorize",
+    token_endpoint: "https://mcp.linear.app/token",
+    registration_endpoint: "https://mcp.linear.app/register",
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    authorization_response_iss_parameter_supported: true as const,
+  },
+  client: { client_id: "dynamic-client", token_endpoint_auth_method: "none" as const },
+};
+const decodeRpc = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      id: Schema.optionalKey(Schema.Number),
+      method: Schema.String,
+      params: Schema.optionalKey(Schema.Struct({ name: Schema.optionalKey(Schema.String) })),
+    }),
+  ),
+);
+export const toolName = (request: HttpClientRequest.HttpClientRequest) =>
+  request.body._tag === "Uint8Array" && request.url.endsWith("/mcp/readonly")
+    ? decodeRpc(new TextDecoder().decode(request.body.body)).params?.name
+    : undefined;
+const decodeFixtureRecord = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown));
+const decodeFixtureComments = Schema.decodeUnknownSync(
+  Schema.Struct({
+    edges: Schema.Array(Schema.Struct({ node: Schema.Record(Schema.String, Schema.Unknown) })),
+    pageInfo: Schema.Struct({ hasNextPage: Schema.Boolean }),
+  }),
+);
+/** Wrap fixture provider data in actual MCP protocol responses; lifecycle tests can focus on races. */
+const linearResponse = (request: HttpClientRequest.HttpClientRequest, response: Response) =>
+  Effect.promise(async () => {
+    if (!request.url.endsWith("/mcp/readonly") || response.status !== 200) return response;
+    const rpc = decodeRpc(
+      new TextDecoder().decode(
+        request.body._tag === "Uint8Array" ? request.body.body : new Uint8Array(),
+      ),
+    );
+    const name = rpc.params?.name;
+    if (name === "extract_images") {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 8192)
+        binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+      return Response.json({
+        jsonrpc: "2.0",
+        id: rpc.id,
+        result: {
+          content: [
+            {
+              type: "image",
+              mimeType: response.headers.get("content-type")?.split(";")[0] ?? "image/png",
+              data: btoa(binary),
+            },
+          ],
+        },
+      });
+    }
+
+    const body = decodeFixtureRecord(await response.json());
+    const data = decodeFixtureRecord(body.data ?? body);
+    let value: unknown = data;
+    if (name === "get_workspace") {
+      const organization = decodeFixtureRecord(data.organization ?? {});
+      value = { ...organization, url: `https://linear.app/${organization.urlKey ?? "launchpad"}` };
+    }
+    if (name === "get_user")
+      value = { id: "account", name: "Launchpad app", ...decodeFixtureRecord(data.viewer ?? {}) };
+    if (name === "get_issue" && data.issue) {
+      const issue = decodeFixtureRecord(data.issue);
+      value = {
+        ...issue,
+        uuid: issue.id,
+        id: issue.identifier,
+        status: issue.state ? decodeFixtureRecord(issue.state).name : null,
+        assignee: issue.assignee ? decodeFixtureRecord(issue.assignee).name : null,
+      };
+    }
+    if (name === "list_comments" && data.comments) {
+      const comments = decodeFixtureComments(data.comments);
+      value = {
+        comments: comments.edges.map(({ node }) => ({ ...node, author: node.user })),
+        hasNextPage: comments.pageInfo.hasNextPage,
+        endCursor: comments.pageInfo.hasNextPage ? "next-page" : null,
+      };
+    }
+    return Response.json({
+      jsonrpc: "2.0",
+      id: rpc.id,
+      result: { content: [{ type: "text", text: encodeJson(value) }] },
+    });
+  });
 
 export const linearRow = (expiresAt = Number.MAX_SAFE_INTEGER): ConnectionRecord => ({
   ...key,
   version: "initial",
   status: "connected",
   accountLabel: "Launchpad app",
-  payloadSealed: `sealed:${encodeJson({ service: "linear", accessToken: "old-access-secret", refreshToken: "old-refresh-secret", expiresAt, workspaceId: "workspace", workspaceSlug: "launchpad" })}`,
+  payloadSealed: `sealed:${encodeJson({ service: "linear", oauth: linearOAuth, accountId: "account", accessToken: "old-access-secret", refreshToken: "old-refresh-secret", expiresAt, workspaceId: "workspace", workspaceSlug: "launchpad" })}`,
   authorizationId: null,
   replacement: null,
   jiraSelection: null,
@@ -85,11 +181,15 @@ export const issueResponse = (description = "Example") =>
       },
     },
   });
-export const identityResponse = (workspaceId = "workspace", name = "Launchpad") =>
+export const identityResponse = (
+  workspaceId = "workspace",
+  name = "Launchpad",
+  accountId = "account",
+) =>
   Response.json({
     data: {
       organization: { id: workspaceId, name, urlKey: "launchpad" },
-      viewer: { name: "Launchpad app" },
+      viewer: { id: accountId, name: "Launchpad app" },
     },
   });
 export const tokenResponse = () =>
@@ -97,11 +197,14 @@ export const tokenResponse = () =>
     access_token: "new-access-secret",
     refresh_token: "new-refresh-secret",
     expires_in: 86400,
+    token_type: "Bearer",
+    scope: "read",
   });
 export const recordKey = (record: ConnectionKey) => `${record.organizationId}:${record.service}`;
 
 export const fixture = Effect.fnUntraced(function* (
   options: {
+    readonly rawHttp?: boolean;
     readonly store?: ConnectionStore["Service"];
     readonly rows?: ReadonlyArray<ConnectionRecord>;
     readonly membership?: Effect.Effect<OrganizationMembershipRecord | null>;
@@ -267,8 +370,50 @@ export const fixture = Effect.fnUntraced(function* (
     });
   const requests: HttpClientRequest.HttpClientRequest[] = [];
   const http = HttpClient.make((request) => {
+    if (!options.rawHttp && request.url.startsWith("https://mcp.linear.app")) {
+      if (request.method === "GET" && request.url === "https://mcp.linear.app/mcp/readonly")
+        return Effect.succeed(
+          HttpClientResponse.fromWeb(request, new Response(null, { status: 405 })),
+        );
+      let response: Response | undefined;
+      if (request.url.includes("oauth-protected-resource"))
+        response = Response.json({
+          resource: "https://mcp.linear.app/mcp/readonly",
+          authorization_servers: ["https://mcp.linear.app"],
+          scopes_supported: ["read"],
+        });
+      else if (request.url.endsWith("oauth-authorization-server"))
+        response = Response.json(linearOAuth.server);
+      else if (request.url.endsWith("/register"))
+        response = Response.json(
+          {
+            ...linearOAuth.client,
+            redirect_uris: ["https://relay.test/v1/organization/issue-trackers/linear/callback"],
+          },
+          { status: 201 },
+        );
+      else if (request.url.endsWith("/mcp/readonly") && request.body._tag === "Uint8Array") {
+        const rpc = decodeRpc(new TextDecoder().decode(request.body.body));
+        if (rpc.method === "initialize")
+          response = Response.json({
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: { tools: {} },
+              serverInfo: { name: "Linear", version: "1" },
+            },
+          });
+        if (rpc.method === "notifications/initialized")
+          response = new Response(null, { status: 202 });
+      }
+      if (response) return Effect.succeed(HttpClientResponse.fromWeb(request, response));
+    }
     requests.push(request);
     return (options.respond?.(request) ?? Effect.die("Unexpected issue-tracker request")).pipe(
+      Effect.flatMap((response) =>
+        options.rawHttp ? Effect.succeed(response) : linearResponse(request, response),
+      ),
       Effect.map((response) => HttpClientResponse.fromWeb(request, response)),
     );
   });

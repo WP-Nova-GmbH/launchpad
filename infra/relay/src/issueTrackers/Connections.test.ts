@@ -32,6 +32,7 @@ import {
   issueResponse,
   identityResponse,
   tokenResponse,
+  toolName,
 } from "./Connections.test-fixture.ts";
 
 const decodeRpc = Schema.decodeUnknownSync(
@@ -61,10 +62,15 @@ describe("issue tracker connection lifecycle", () => {
       Effect.gen(function* () {
         const started = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
+        let membershipCalls = 0;
         const test = yield* fixture({
-          membership: Deferred.succeed(started, undefined).pipe(
-            Effect.andThen(Deferred.await(release)),
-            Effect.as(membership),
+          membership: Effect.suspend(() =>
+            ++membershipCalls === 2
+              ? Deferred.succeed(started, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as(membership),
+                )
+              : Effect.succeed(membership),
           ),
         });
         const { authorizationUrl } = yield* startLinear({
@@ -72,11 +78,11 @@ describe("issue tracker connection lifecycle", () => {
           userId: "admin",
         }).pipe(test.provide);
         const state = new URL(authorizationUrl).searchParams.get("state")!;
-        const callback = yield* completeLinear({ state, code: "authorization-code" }).pipe(
-          test.provide,
-          Effect.flip,
-          Effect.forkChild,
-        );
+        const callback = yield* completeLinear({
+          state,
+          iss: "https://mcp.linear.app",
+          code: "authorization-code",
+        }).pipe(test.provide, Effect.flip, Effect.forkChild);
         yield* Deferred.await(started);
         if (action === "disconnect") yield* disconnect(key).pipe(test.provide);
         else
@@ -98,9 +104,7 @@ describe("issue tracker connection lifecycle", () => {
     Effect.gen(function* () {
       const test = yield* fixture({
         respond: (request) =>
-          Effect.succeed(
-            request.url.endsWith("/oauth/token") ? tokenResponse() : identityResponse(),
-          ),
+          Effect.succeed(request.url.endsWith("/token") ? tokenResponse() : identityResponse()),
       });
       const { authorizationUrl } = yield* startLinear({
         organizationId: "org",
@@ -108,16 +112,46 @@ describe("issue tracker connection lifecycle", () => {
       }).pipe(test.provide);
       const state = new URL(authorizationUrl).searchParams.get("state")!;
       expect(
-        yield* completeLinear({ state, code: "authorization-code" }).pipe(test.provide),
+        yield* completeLinear({
+          state,
+          iss: "https://mcp.linear.app",
+          code: "authorization-code",
+        }).pipe(test.provide),
       ).toEqual({ status: "connected", accountLabel: "Launchpad · Launchpad app" });
       expect(
-        yield* completeLinear({ state, code: "authorization-code" }).pipe(
-          test.provide,
-          Effect.flip,
-        ),
+        yield* completeLinear({
+          state,
+          iss: "https://mcp.linear.app",
+          code: "authorization-code",
+        }).pipe(test.provide, Effect.flip),
       ).toMatchObject({ code: "conflict" });
-      expect(test.requests).toHaveLength(2);
+      expect(test.requests).toHaveLength(3);
       expect((yield* test.store.get(key))?.pendingStateHash).toBeNull();
+    }),
+  );
+
+  it.effect("isolates pending PKCE verifiers and invalidates a superseded authorization", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture();
+      const first = yield* startLinear({ organizationId: "org", userId: "admin" }).pipe(
+        test.provide,
+      );
+      const original = (yield* test.store.get(key))!;
+      const second = yield* startLinear({ organizationId: "org", userId: "admin" }).pipe(
+        test.provide,
+      );
+      const current = (yield* test.store.get(key))!;
+      expect(current.pendingOAuthSealed).not.toBe(original.pendingOAuthSealed);
+      expect(current.pendingOAuthSealed).toContain('"codeVerifier"');
+      expect(encodeJson(second)).not.toContain('"codeVerifier"');
+      expect(
+        yield* completeLinear({
+          state: new URL(first.authorizationUrl).searchParams.get("state")!,
+          code: "stale",
+          iss: "https://mcp.linear.app",
+        }).pipe(test.provide, Effect.flip),
+      ).toMatchObject({ code: "conflict" });
+      expect((yield* test.store.get(key))?.authorizationId).toBe(second.authorizationId);
     }),
   );
 
@@ -128,7 +162,7 @@ describe("issue tracker connection lifecycle", () => {
       const test = yield* fixture({
         rows: [linearRow(0)],
         respond: (request) =>
-          request.url.endsWith("/oauth/token")
+          request.url.endsWith("/token")
             ? Deferred.succeed(refreshStarted, undefined).pipe(
                 Effect.andThen(Deferred.await(release)),
                 Effect.as(tokenResponse()),
@@ -142,14 +176,12 @@ describe("issue tracker connection lifecycle", () => {
       yield* Deferred.await(test.secondLockRequested);
       yield* Deferred.succeed(release, undefined);
       expect(yield* Fiber.join(reads)).toHaveLength(2);
-      expect(test.requests.filter((request) => request.url.endsWith("/oauth/token"))).toHaveLength(
-        1,
-      );
+      expect(test.requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(1);
       expect(
         test.requests
-          .filter((request) => request.url.endsWith("/graphql"))
+          .filter((request) => ["get_issue", "list_comments"].includes(toolName(request) ?? ""))
           .map((request) => request.headers.authorization),
-      ).toEqual(Array(4).fill("Bearer new-access-secret"));
+      ).toEqual(Array(6).fill("Bearer new-access-secret"));
       expect((yield* test.store.get(key))?.payloadSealed).toContain("new-refresh-secret");
     }),
   );
@@ -235,7 +267,7 @@ describe("issue tracker connection lifecycle", () => {
       const test = yield* fixture({
         rows: [linearRow(60_001)],
         respond: (request) => {
-          if (request.url.endsWith("/oauth/token")) return Effect.succeed(tokenResponse());
+          if (request.url.endsWith("/token")) return Effect.succeed(tokenResponse());
           if (request.headers.authorization === "Bearer old-access-secret")
             return Deferred.succeed(oldReadStarted, undefined).pipe(
               Effect.andThen(Deferred.await(releaseOldRead)),
@@ -267,10 +299,10 @@ describe("issue tracker connection lifecycle", () => {
           rows: [{ ...linearRow(), payloadSealed: brokenPayload }],
           respond: (request) =>
             Effect.succeed(
-              request.url.endsWith("/oauth/token")
+              request.url.endsWith("/token")
                 ? tokenResponse()
                 : request.body._tag === "Uint8Array" &&
-                    new TextDecoder().decode(request.body.body).includes("LaunchpadIdentity")
+                    new TextDecoder().decode(request.body.body).includes("get_workspace")
                   ? identityResponse()
                   : commentsRequested(request)
                     ? commentsResponse()
@@ -287,6 +319,7 @@ describe("issue tracker connection lifecycle", () => {
           const pending = yield* startLinear({ organizationId: "org", userId: "admin" });
           const callbackFailure = yield* completeLinear({
             state: new URL(pending.authorizationUrl).searchParams.get("state")!,
+            iss: "https://mcp.linear.app",
             code: "new-authorization-code",
           }).pipe(Effect.flip);
           expect(callbackFailure).toMatchObject({
@@ -307,6 +340,7 @@ describe("issue tracker connection lifecycle", () => {
           expect(
             yield* completeLinear({
               state: new URL(fresh.authorizationUrl).searchParams.get("state")!,
+              iss: "https://mcp.linear.app",
               code: "fresh-authorization-code",
             }),
           ).toMatchObject({ status: "connected" });
@@ -333,9 +367,7 @@ describe("issue tracker connection lifecycle", () => {
         rows: [linearRow(0)],
         respond: (request) =>
           Effect.succeed(
-            request.url.endsWith("/oauth/token")
-              ? tokenResponse()
-              : new Response(null, { status: 401 }),
+            request.url.endsWith("/token") ? tokenResponse() : new Response(null, { status: 401 }),
           ),
       });
       expect(yield* readIssue(issueInput).pipe(test.provide, Effect.flip)).toMatchObject({
@@ -357,11 +389,11 @@ describe("issue tracker connection lifecycle", () => {
           userId: "admin",
         }).pipe(test.provide);
         const state = new URL(authorizationUrl).searchParams.get("state")!;
-        const callback = yield* completeLinear({ state, code: "authorization-code" }).pipe(
-          test.provide,
-          Effect.flip,
-          Effect.forkChild,
-        );
+        const callback = yield* completeLinear({
+          state,
+          iss: "https://mcp.linear.app",
+          code: "authorization-code",
+        }).pipe(test.provide, Effect.flip, Effect.forkChild);
         yield* Deferred.await(started);
         if (mode === "interrupt") yield* Fiber.interrupt(callback);
         else {
@@ -375,7 +407,7 @@ describe("issue tracker connection lifecycle", () => {
 
 const commentsRequested = (request: HttpClientRequest.HttpClientRequest) =>
   request.body._tag === "Uint8Array" &&
-  new TextDecoder().decode(request.body.body).includes("LaunchpadComments");
+  new TextDecoder().decode(request.body.body).includes("list_comments");
 const commentsResponse = (
   body = Array.from(
     { length: 6 },
@@ -517,7 +549,7 @@ describe("Linear context lifecycle", () => {
         rows: [linearRow(60_001)],
         respond: (request) =>
           Effect.succeed(
-            request.url.endsWith("/oauth/token")
+            request.url.endsWith("/token")
               ? tokenResponse()
               : commentsRequested(request)
                 ? commentsResponse()
@@ -548,7 +580,7 @@ it.effect.each(["description", "comment"])(
       const test = yield* fixture({
         rows: [linearRow()],
         respond: (request) => {
-          if (request.url.startsWith("https://uploads.linear.app/"))
+          if (toolName(request) === "extract_images")
             return Effect.succeed(
               new Response(new Uint8Array([137, 80, 78, 71]), {
                 headers: { "content-type": "image/png" },
@@ -606,9 +638,9 @@ it.effect.each(["description", "comment"])(
         reference: lastImage.reference,
       }).pipe(test.provide);
       expect(image.image).toEqual({ mimeType: "image/png", data: "iVBORw==" });
-      expect(test.requests.at(-1)?.url).toBe(lastImage.url);
-      const imageFetches = test.requests.filter((request) =>
-        request.url.startsWith("https://uploads.linear.app/"),
+      expect(toolName(test.requests.at(-1)!)).toBe("extract_images");
+      const imageFetches = test.requests.filter(
+        (request) => toolName(request) === "extract_images",
       ).length;
       removed = true;
       expect(
@@ -618,7 +650,7 @@ it.effect.each(["description", "comment"])(
         ),
       ).toMatchObject({ code: "not_found" });
       expect(
-        test.requests.filter((request) => request.url.startsWith("https://uploads.linear.app/")),
+        test.requests.filter((request) => toolName(request) === "extract_images"),
       ).toHaveLength(imageFetches);
       yield* disconnect(key).pipe(test.provide);
       expect(

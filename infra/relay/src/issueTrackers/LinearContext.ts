@@ -23,6 +23,7 @@ const Reference = Schema.Struct({
   imageUrl: Schema.optionalKey(Schema.String),
   afterImage: Schema.optionalKey(Schema.String),
   commentId: Schema.optionalKey(Schema.String),
+  commentCursor: Schema.optionalKey(Schema.String),
 });
 export type LinearReference = typeof Reference.Type;
 export type LinearSource = Pick<
@@ -81,6 +82,7 @@ export const linearImageReferences = Effect.fn("linearContext.image_references")
   markdown: string,
   commentId?: string,
   afterImage?: string,
+  commentCursor?: string,
 ) {
   const urls = linearImageUrls(markdown);
   const previous = afterImage === undefined ? -1 : urls.indexOf(afterImage);
@@ -96,6 +98,7 @@ export const linearImageReferences = Effect.fn("linearContext.image_references")
       kind: "image",
       imageUrl: url,
       ...(commentId ? { commentId } : {}),
+      ...(commentCursor ? { commentCursor } : {}),
     }).pipe(Effect.map((reference) => ({ url, reference }))),
   );
   const imagesTruncated = previous + 1 + images.length < urls.length;
@@ -105,6 +108,7 @@ export const linearImageReferences = Effect.fn("linearContext.image_references")
         kind: "images",
         afterImage: page[page.length - 1]!,
         ...(commentId ? { commentId } : {}),
+        ...(commentCursor ? { commentCursor } : {}),
       })
     : null;
   return { images, imagesTruncated, imagesContinuation };
@@ -135,7 +139,7 @@ export const linearDiscussion = Effect.fn("linearContext.discussion")(function* 
       createdAt: node.createdAt,
       editedAt: node.editedAt,
       url: node.url,
-      ...(yield* linearImageReferences(input.source, node.body, node.id)),
+      ...(yield* linearImageReferences(input.source, node.body, node.id, undefined, cursor)),
     };
     // Reserve room for the sealed continuation and status fields.
     if (utf8Bytes([...comments, comment]) + 8192 > budget) {

@@ -9,7 +9,6 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
 import { RelaySecretBox } from "../auth/SecretBox.ts";
@@ -40,13 +39,15 @@ import {
 import { readJiraIssue } from "./Jira.ts";
 import { JiraOAuthCredentials, jiraCredentials } from "./JiraAuthorization.ts";
 import { fitJiraIssueResponse } from "./JiraDiscussion.ts";
+import { getLinearIdentity, readLinearIssue } from "./Linear.ts";
 import {
+  beginLinearOAuth,
   exchangeLinearCode,
-  getLinearIdentity,
-  linearAuthorizationUrl,
-  readLinearIssue,
   refreshLinearTokens,
-} from "./Linear.ts";
+  LinearOAuthSession,
+  LinearPendingOAuth,
+  linearOAuthErrorCode,
+} from "./LinearOAuth.ts";
 
 export const LINEAR_CALLBACK_PATH = RELAY_LINEAR_CALLBACK_PATH;
 
@@ -54,6 +55,8 @@ const Credentials = Schema.Union([
   JiraOAuthCredentials,
   Schema.Struct({
     service: Schema.Literal("linear"),
+    oauth: LinearOAuthSession,
+    accountId: Schema.NonEmptyString,
     accessToken: Schema.String,
     refreshToken: Schema.String,
     expiresAt: Schema.Number,
@@ -108,16 +111,8 @@ const open = Effect.fn("issueTrackers.open")(function* (row: ConnectionRecord) {
   );
 });
 
-const linearConfig = Effect.gen(function* () {
-  const config = yield* RelayConfiguration;
-  if (!config.linear)
-    return yield* failure("not_configured", "Linear OAuth is not configured on this relay.");
-  return {
-    clientId: config.linear.clientId,
-    clientSecret: Redacted.value(config.linear.clientSecret),
-    redirectUri: new URL(LINEAR_CALLBACK_PATH, config.relayIssuer).toString(),
-  };
-});
+const encodeAuthorization = Schema.encodeEffect(Schema.fromJsonString(LinearPendingOAuth));
+const decodeAuthorization = Schema.decodeUnknownEffect(Schema.fromJsonString(LinearPendingOAuth));
 
 const hashState = (state: string) =>
   Effect.promise(async () => {
@@ -135,7 +130,6 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (
   includeJiraSites = false,
 ) {
   const store = yield* ConnectionStore;
-  const config = yield* RelayConfiguration;
   const now = yield* milliseconds;
   let rows = yield* store.list(organizationId);
   let expired = false;
@@ -155,7 +149,7 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (
   }
   if (expired) rows = yield* store.list(organizationId);
   return {
-    linearAvailable: Boolean(config.linear),
+    linearAvailable: true,
     connections: rows.map((row) => ({
       ...metadata(row, includeJiraSites),
       status:
@@ -172,21 +166,32 @@ export const startLinear = Effect.fn("issueTrackers.startLinear")(function* (inp
   readonly organizationId: string;
   readonly userId: string;
 }) {
-  const config = yield* linearConfig;
+  yield* requireLinearAdmin(input);
+  const config = yield* RelayConfiguration;
   const crypto = yield* Crypto.Crypto;
   const state = yield* crypto.randomUUIDv4.pipe(
     Effect.mapError(() => failure("unavailable", "Could not begin authorization.")),
+  );
+  const started = yield* beginLinearOAuth({
+    state,
+    redirectUri: new URL(LINEAR_CALLBACK_PATH, config.relayIssuer).toString(),
+  });
+  const box = yield* RelaySecretBox;
+  const pendingOAuthSealed = yield* encodeAuthorization(started.pending).pipe(
+    Effect.flatMap(box.seal),
+    Effect.mapError(() => failure("unavailable", "Could not save Linear authorization.")),
   );
   const now = yield* milliseconds;
   const store = yield* ConnectionStore;
   const pending = yield* store.begin({
     ...input,
     service: "linear",
+    pendingOAuthSealed,
     stateHash: yield* hashState(state),
     expiresAt: DateTime.formatIso(DateTime.makeUnsafe(now + 15 * 60_000)),
   });
   return {
-    authorizationUrl: linearAuthorizationUrl({ ...config, state }),
+    authorizationUrl: started.authorizationUrl,
     authorizationId: pending.authorizationId!,
     connection: metadata(pending),
   };
@@ -209,12 +214,20 @@ const requireLinearAdmin = Effect.fn("issueTrackers.requireLinearAdmin")(functio
 export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function* (input: {
   readonly state: string;
   readonly code: string | null;
+  readonly iss?: string;
+  readonly error?: string;
 }) {
+  if (!input.state || input.state.length > 256) return yield* conflict();
+  yield* Effect.logDebug("Linear OAuth callback received", {
+    hasCode: Boolean(input.code),
+    hasIssuer: input.iss !== undefined,
+    oauthError: input.error === undefined ? undefined : linearOAuthErrorCode(input.error),
+  });
   const deadline = (yield* milliseconds) + 8000;
   const store = yield* ConnectionStore;
   const stateHash = yield* hashState(input.state);
   const pending = yield* store.findPending(stateHash);
-  if (!pending?.authorizationId) return yield* conflict();
+  if (pending?.service !== "linear" || !pending.authorizationId) return yield* conflict();
   const authorizationId = pending.authorizationId;
   const attempt = { ...pending, authorizationId };
   const admin = { organizationId: pending.organizationId, userId: pending.updatedByUserId };
@@ -225,7 +238,7 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
       : Effect.void,
   );
   const claimed = yield* Effect.gen(function* () {
-    if (!input.code)
+    if (input.error !== undefined || !input.code || input.code.length > 16_384)
       return yield* failure(
         "invalid_input",
         "Linear authorization was cancelled. Return to Organization settings to try again.",
@@ -256,9 +269,18 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
   return yield* Effect.gen(function* () {
     const previous = claimed.payloadSealed ? yield* open(claimed) : null;
     if (previous && previous.service !== "linear") return yield* conflict();
-    const config = yield* linearConfig;
+    if (!claimed.pendingOAuthSealed) return yield* conflict();
+    const box = yield* RelaySecretBox;
+    const authorization = yield* box.open(claimed.pendingOAuthSealed).pipe(
+      Effect.flatMap(decodeAuthorization),
+      Effect.mapError(() => failure("auth_required", "Start connecting Linear again.")),
+    );
     // Provider calls run outside the connection lock so the selected workspace keeps serving reads.
-    const tokens = yield* exchangeLinearCode({ ...config, code });
+    const tokens = yield* exchangeLinearCode({
+      ...authorization,
+      code,
+      ...(input.iss !== undefined ? { iss: input.iss } : {}),
+    });
     const expiresAt = (yield* milliseconds) + tokens.expiresIn * 1000;
     const identity = yield* getLinearIdentity({ accessToken: tokens.accessToken });
     const sameWorkspace = previous?.workspaceId === identity.workspaceId;
@@ -267,9 +289,13 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
       Effect.mapError(() => failure("unavailable", "Could not save the Linear connection.")),
     );
     const generation =
-      sameWorkspace && previous ? (previous.generation ?? previous.workspaceId) : yield* newId;
+      sameWorkspace && previous?.accountId === identity.accountId
+        ? (previous.generation ?? previous.workspaceId)
+        : yield* newId;
     const payloadSealed = yield* seal({
       service: "linear",
+      oauth: { server: authorization.server, client: authorization.client },
+      accountId: identity.accountId,
       ...tokens,
       expiresAt,
       workspaceId: identity.workspaceId,
@@ -410,9 +436,8 @@ const linearCredentials = Effect.fn("issueTrackers.linearCredentials")(function*
       let activeRow = row;
       if (credentials.service !== "linear") return yield* conflict();
       if (credentials.expiresAt <= (yield* milliseconds) + 60_000) {
-        const config = yield* linearConfig;
         const tokens = yield* refreshLinearTokens({
-          ...config,
+          oauth: credentials.oauth,
           refreshToken: credentials.refreshToken,
         });
         credentials = {
@@ -655,6 +680,7 @@ export const readImages = Effect.fn("issueTrackers.readImages")(function* (input
               ...credentials,
               issueId: source.issueId,
               commentId: reference.commentId,
+              ...(reference.commentCursor ? { commentCursor: reference.commentCursor } : {}),
             })
           : issue.originalDescription;
         return {
@@ -669,6 +695,7 @@ export const readImages = Effect.fn("issueTrackers.readImages")(function* (input
             markdown,
             reference.commentId,
             reference.afterImage,
+            reference.commentCursor,
           )),
         };
       }),
@@ -693,6 +720,7 @@ export const viewImage = Effect.fn("issueTrackers.viewImage")(function* (input: 
               ...credentials,
               issueId: source.issueId,
               commentId: reference.commentId,
+              ...(reference.commentCursor ? { commentCursor: reference.commentCursor } : {}),
             })
           : issue.originalDescription;
         if (!linearImageUrls(markdown).includes(reference.imageUrl))

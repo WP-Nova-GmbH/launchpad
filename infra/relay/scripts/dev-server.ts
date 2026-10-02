@@ -236,13 +236,6 @@ const relayConfigurationLayer = Layer.succeed(
     clerkJwtAudience: process.env.CLERK_JWT_AUDIENCE?.trim() || "t3-code-relay",
     cloudMintPrivateKey: Redacted.make(cloudMintKeyPair.privateKey),
     cloudMintPublicKey: cloudMintKeyPair.publicKey,
-    linear:
-      process.env.LINEAR_CLIENT_ID?.trim() && process.env.LINEAR_CLIENT_SECRET?.trim()
-        ? {
-            clientId: process.env.LINEAR_CLIENT_ID.trim(),
-            clientSecret: Redacted.make(process.env.LINEAR_CLIENT_SECRET.trim()),
-          }
-        : undefined,
     github:
       process.env.GITHUB_APP_ID && process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_PRIVATE_KEY
         ? {

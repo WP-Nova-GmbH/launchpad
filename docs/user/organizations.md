@@ -56,7 +56,8 @@ Issue trackers** in the web or desktop app. Everyone in the organization then us
 connection to read issues in chats on organization-managed executors, including chats opened from
 mobile. Personal machines and external OpenCode servers do not support these connections yet.
 
-For Linear, authorize the Launchpad app and return to Launchpad. For Jira, choose **Connect**
+For Linear, sign in and authorize read access, then return to Launchpad. Your organization shares
+the Linear access granted by that account. For Jira, choose **Connect**
 and sign in to Atlassian to authorize access. Launchpad connects automatically when one Jira
 site is available. If there are several, return to Launchpad and choose which site to share.
 You can resume an unfinished choice from **Choose site**, or discard it with **Cancel setup**.

@@ -43,7 +43,12 @@ const linearCallbackRoute = HttpRouter.add(
         "Start connecting Linear from Organization settings.",
         400,
       );
-    return yield* completeLinear({ state, code: params.get("code") }).pipe(
+    return yield* completeLinear({
+      state,
+      code: params.get("code"),
+      ...(params.has("iss") ? { iss: params.get("iss")! } : {}),
+      ...(params.has("error") ? { error: params.get("error")! } : {}),
+    }).pipe(
       Effect.map((result) =>
         result.status === "awaiting_confirmation"
           ? page(

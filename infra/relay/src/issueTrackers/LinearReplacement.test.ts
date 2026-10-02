@@ -37,6 +37,7 @@ import {
   linearRow,
   membership,
   tokenResponse,
+  toolName,
 } from "./Connections.test-fixture.ts";
 
 // Opt in with an isolated, migrated database. No default URL or live relay config.
@@ -59,11 +60,20 @@ const bodyHas = (request: HttpClientRequest.HttpClientRequest, text: string) =>
   request.body._tag === "Uint8Array" && new TextDecoder().decode(request.body.body).includes(text);
 const respond = (request: HttpClientRequest.HttpClientRequest) =>
   Effect.succeed(
-    request.url.endsWith("/oauth/token")
-      ? tokenResponse()
-      : bodyHas(request, "LaunchpadIdentity")
+    request.url.endsWith("/token")
+      ? bodyHas(request, "refresh_token")
+        ? Response.json({
+            access_token: "refreshed-access-secret",
+            refresh_token: "rotated-refresh",
+            expires_in: 86400,
+            token_type: "Bearer",
+            scope: "read",
+          })
+        : tokenResponse()
+      : bodyHas(request, "get_workspace") &&
+          request.headers.authorization === "Bearer new-access-secret"
         ? identityResponse("workspace-b", "Company B")
-        : bodyHas(request, "LaunchpadComments")
+        : bodyHas(request, "list_comments")
           ? Response.json({
               data: {
                 organization: { id: "workspace" },
@@ -75,7 +85,11 @@ const respond = (request: HttpClientRequest.HttpClientRequest) =>
   );
 const authorize = Effect.gen(function* () {
   const started = yield* startLinear({ organizationId: "org", userId: "admin" });
-  return { state: new URL(started.authorizationUrl).searchParams.get("state")!, code: "code" };
+  return {
+    state: new URL(started.authorizationUrl).searchParams.get("state")!,
+    iss: "https://mcp.linear.app",
+    code: "code",
+  };
 });
 const propose = authorize.pipe(Effect.flatMap(completeLinear));
 const actor = { organizationId: "org", userId: "another-admin" };
@@ -196,7 +210,7 @@ for (const postgres of [false, true]) {
           Effect.gen(function* () {
             const test = yield* setup({
               respond: (request) =>
-                bodyHas(request, "LaunchpadIdentity")
+                bodyHas(request, "get_workspace")
                   ? Effect.succeed(identityResponse("workspace", "Renamed company"))
                   : respond(request),
             });
@@ -214,6 +228,37 @@ for (const postgres of [false, true]) {
         ),
       );
 
+      it.effect(
+        "invalidates source references when another account authorizes the same workspace",
+        () =>
+          run(
+            Effect.gen(function* () {
+              const test = yield* setup({
+                respond: (request) =>
+                  toolName(request) === "get_workspace" || toolName(request) === "get_user"
+                    ? Effect.succeed(
+                        identityResponse(
+                          "workspace",
+                          "Launchpad",
+                          request.headers.authorization === "Bearer new-access-secret"
+                            ? "other-account"
+                            : "account",
+                        ),
+                      )
+                    : respond(request),
+              });
+              const read = yield* readIssue(issueInput).pipe(test.provide);
+              expect(yield* propose.pipe(test.provide)).toMatchObject({ status: "connected" });
+              expect(
+                yield* readComments({ organizationId: "org", reference: read.linear!.source }).pipe(
+                  test.provide,
+                  Effect.flip,
+                ),
+              ).toMatchObject({ code: "conflict" });
+            }),
+          ),
+      );
+
       it.effect("serves reads while OAuth HTTP is paused and exchanges a code only once", () =>
         run(
           Effect.gen(function* () {
@@ -221,7 +266,7 @@ for (const postgres of [false, true]) {
             const release = yield* Deferred.make<void>();
             const test = yield* setup({
               respond: (request) =>
-                request.url.endsWith("/oauth/token")
+                request.url.endsWith("/token")
                   ? Deferred.succeed(started, undefined).pipe(
                       Effect.andThen(Deferred.await(release)),
                       Effect.as(tokenResponse()),
@@ -238,9 +283,9 @@ for (const postgres of [false, true]) {
             expect((yield* readIssue(issueInput).pipe(test.provide)).accountLabel).toBe(
               "Launchpad app",
             );
-            expect(
-              test.requests.filter((request) => request.url.endsWith("/oauth/token")),
-            ).toHaveLength(1);
+            expect(test.requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(
+              1,
+            );
             yield* Deferred.succeed(release, undefined);
             expect(yield* Fiber.join(callback)).toMatchObject({ status: "awaiting_confirmation" });
           }),
@@ -258,7 +303,7 @@ for (const postgres of [false, true]) {
               const test = yield* setup({
                 membership: Ref.get(member),
                 respond: (request) =>
-                  request.url.endsWith("/oauth/token")
+                  request.url.endsWith("/token")
                     ? Deferred.succeed(started, undefined).pipe(
                         Effect.andThen(Deferred.await(release)),
                         Effect.as(tokenResponse()),
@@ -307,7 +352,7 @@ for (const postgres of [false, true]) {
                 const description = "![Screenshot](https://uploads.linear.app/test.png)";
                 const test = yield* setup({
                   respond: (request) => {
-                    if (bodyHas(request, "LaunchpadIssue"))
+                    if (bodyHas(request, "get_issue"))
                       return (
                         holdRead
                           ? Deferred.succeed(started, undefined).pipe(
@@ -315,7 +360,7 @@ for (const postgres of [false, true]) {
                             )
                           : Effect.void
                       ).pipe(Effect.as(issueResponse(description)));
-                    if (request.url === "https://uploads.linear.app/test.png")
+                    if (toolName(request) === "extract_images")
                       return Effect.succeed(
                         new Response(new Uint8Array([137, 80, 78, 71]), {
                           headers: { "content-type": "image/png" },
@@ -431,12 +476,13 @@ for (const postgres of [false, true]) {
             let members = 0;
             const test = yield* setup({
               membership: Effect.gen(function* () {
-                if (++members === 2) yield* Deferred.succeed(arrived, undefined);
+                if (++members === 1) return membership;
+                if (members === 3) yield* Deferred.succeed(arrived, undefined);
                 yield* Deferred.await(allowMembership);
                 return membership;
               }),
               respond: (request) =>
-                request.url.endsWith("/oauth/token")
+                request.url.endsWith("/token")
                   ? Deferred.succeed(httpStarted, undefined).pipe(
                       Effect.andThen(Deferred.await(allowHttp)),
                       Effect.as(tokenResponse()),
@@ -458,9 +504,9 @@ for (const postgres of [false, true]) {
             const results = yield* Fiber.join(callbacks);
             expect(results.filter((result) => result._tag === "Success")).toHaveLength(1);
             expect((yield* test.store.get(key))?.replacement).not.toBeNull();
-            expect(
-              test.requests.filter((request) => request.url.endsWith("/oauth/token")),
-            ).toHaveLength(1);
+            expect(test.requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(
+              1,
+            );
           }),
         ),
       );
