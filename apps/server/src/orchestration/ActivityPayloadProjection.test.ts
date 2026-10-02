@@ -353,17 +353,17 @@ describe("issue tracker activity delivered to clients", () => {
     "read_linear_images",
     "view_linear_image",
     "read_jira_issue",
+    "read_jira_comments",
   ])(
     "keeps compact identity and links for %s across provider envelopes and repeat projection",
     (tool) => {
       const identity = {
-        service: tool === "read_jira_issue" ? "jira" : "linear",
+        service: tool.startsWith("read_jira_") ? "jira" : "linear",
         identifier: "LP-1",
         accountLabel: "Team app",
-        url:
-          tool === "read_jira_issue"
-            ? "https://team.atlassian.net/browse/LP-1"
-            : "https://linear.app/team/issue/LP-1",
+        url: tool.startsWith("read_jira_")
+          ? "https://team.atlassian.net/browse/LP-1"
+          : "https://linear.app/team/issue/LP-1",
       };
       const metadata = {
         ...identity,

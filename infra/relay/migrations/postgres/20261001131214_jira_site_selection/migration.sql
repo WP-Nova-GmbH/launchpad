@@ -1,0 +1,1 @@
+ALTER TABLE "relay_issue_tracker_connections" ADD COLUMN "jira_selection" jsonb;

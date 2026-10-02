@@ -1,5 +1,5 @@
 import * as UserDirectory from "../tenancy/UserDirectory.ts";
-import { RELAY_LINEAR_CALLBACK_PATH } from "@t3tools/contracts/relay";
+import { RELAY_LINEAR_CALLBACK_PATH, RELAY_JIRA_CALLBACK_PATH } from "@t3tools/contracts/relay";
 import { createClerkClient, verifyToken } from "@clerk/backend";
 import { sql as drizzleSql } from "drizzle-orm";
 import * as Crypto from "effect/Crypto";
@@ -203,7 +203,9 @@ export const RELAY_REQUEST_DEADLINE_MS = 9_000;
 /** OAuth codes and state authenticate the callback; keep them out of traces and deadline logs. */
 const traceUrl = (url: string) => {
   const parsed = new URL(url, "https://relay.invalid");
-  return parsed.pathname === RELAY_LINEAR_CALLBACK_PATH ? parsed.pathname : url;
+  return [RELAY_LINEAR_CALLBACK_PATH, RELAY_JIRA_CALLBACK_PATH].includes(parsed.pathname)
+    ? parsed.pathname
+    : url;
 };
 
 const relayRequestDeadline = <E, R>(

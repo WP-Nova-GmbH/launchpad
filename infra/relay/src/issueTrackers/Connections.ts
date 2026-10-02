@@ -1,7 +1,6 @@
 import {
   RELAY_LINEAR_CALLBACK_PATH,
   RelayIssueTrackerError,
-  type RelayConnectJiraRequest,
   type RelayIssueTrackerService,
   type RelayIssueDetails,
   type RelayLinearDiscussion,
@@ -38,7 +37,9 @@ import {
   readLinearCommentBody,
   utf8Bytes,
 } from "./LinearDiscussion.ts";
-import { connectJira, readJiraIssue } from "./Jira.ts";
+import { readJiraIssue } from "./Jira.ts";
+import { JiraOAuthCredentials, jiraCredentials } from "./JiraAuthorization.ts";
+import { fitJiraIssueResponse } from "./JiraDiscussion.ts";
 import {
   exchangeLinearCode,
   getLinearIdentity,
@@ -50,12 +51,7 @@ import {
 export const LINEAR_CALLBACK_PATH = RELAY_LINEAR_CALLBACK_PATH;
 
 const Credentials = Schema.Union([
-  Schema.Struct({
-    service: Schema.Literal("jira"),
-    apiKey: Schema.String,
-    siteUrl: Schema.String,
-    cloudId: Schema.String,
-  }),
+  JiraOAuthCredentials,
   Schema.Struct({
     service: Schema.Literal("linear"),
     accessToken: Schema.String,
@@ -134,16 +130,22 @@ const hashState = (state: string) =>
     );
   });
 
-export const listConnections = Effect.fn("issueTrackers.list")(function* (organizationId: string) {
+export const listConnections = Effect.fn("issueTrackers.list")(function* (
+  organizationId: string,
+  includeJiraSites = false,
+) {
   const store = yield* ConnectionStore;
   const config = yield* RelayConfiguration;
   const now = yield* milliseconds;
   let rows = yield* store.list(organizationId);
   let expired = false;
   for (const row of rows) {
-    if (row.service !== "linear") continue;
     if (row.authorizationId && row.pendingExpiresAt && Date.parse(row.pendingExpiresAt) <= now) {
-      yield* store.cancelAuthorization({ ...row, authorizationId: row.authorizationId });
+      yield* store.cancelAuthorization({
+        ...row,
+        authorizationId: row.authorizationId,
+        expiresAt: row.pendingExpiresAt,
+      });
       expired = true;
     }
     if (row.replacement && Date.parse(row.replacement.expiresAt) <= now) {
@@ -155,7 +157,7 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (organi
   return {
     linearAvailable: Boolean(config.linear),
     connections: rows.map((row) => ({
-      ...metadata(row),
+      ...metadata(row, includeJiraSites),
       status:
         row.status === "connecting" &&
         row.pendingExpiresAt &&
@@ -362,7 +364,7 @@ export const confirmLinearReplacement = Effect.fn("issueTrackers.confirmLinearRe
           return yield* conflict();
       }),
     );
-    return yield* listConnections(input.organizationId);
+    return yield* listConnections(input.organizationId, true);
   },
 );
 
@@ -382,44 +384,9 @@ export const cancelLinearReplacement = Effect.fn("issueTrackers.cancelLinearRepl
         yield* store.cancelReplacement({ ...row, proposalId: input.proposalId });
       }),
     );
-    return yield* listConnections(input.organizationId);
+    return yield* listConnections(input.organizationId, true);
   },
 );
-
-export const saveJira = Effect.fn("issueTrackers.saveJira")(function* (
-  input: RelayConnectJiraRequest & { readonly organizationId: string; readonly userId: string },
-) {
-  const store = yield* ConnectionStore;
-  const pending = yield* store.begin({
-    organizationId: input.organizationId,
-    service: "jira",
-    userId: input.userId,
-    expiresAt: DateTime.formatIso(DateTime.makeUnsafe((yield* milliseconds) + 60_000)),
-  });
-  return yield* Effect.gen(function* () {
-    const identity = yield* connectJira(input);
-    const payloadSealed = yield* seal({
-      service: "jira",
-      apiKey: input.apiKey,
-      cloudId: identity.cloudId,
-      siteUrl: identity.siteUrl,
-    });
-    if (
-      !(yield* store.complete({ ...pending, payloadSealed, accountLabel: identity.accountLabel }))
-    )
-      return yield* conflict();
-    return {
-      ...metadata(pending),
-      status: "connected" as const,
-      accountLabel: identity.accountLabel,
-    };
-  }).pipe(
-    boundedOperation,
-    Effect.onExit((exit) =>
-      Exit.isFailure(exit) ? store.cancel(pending).pipe(Effect.ignore) : Effect.void,
-    ),
-  );
-});
 
 export const disconnect = Effect.fn("issueTrackers.disconnect")(function* (key: ConnectionKey) {
   const store = yield* ConnectionStore;
@@ -484,9 +451,7 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
   return yield* Effect.gen(function* () {
     const startedAt = yield* milliseconds;
     const active =
-      input.service === "linear"
-        ? yield* linearCredentials(input)
-        : { row: initial, credentials: yield* open(initial) };
+      input.service === "linear" ? yield* linearCredentials(input) : yield* jiraCredentials(input);
     authRecord = active.row;
     const providerResult =
       active.credentials.service === "linear"
@@ -568,12 +533,13 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
     }
     const current = yield* store.get(input);
     if (!current || current.version !== active.row.version) return yield* conflict();
-    return {
+    const response = {
       ...result,
       ...(linear ? { linear } : {}),
       service: input.service,
       accountLabel: active.row.accountLabel ?? input.service,
     };
+    return input.service === "jira" ? yield* fitJiraIssueResponse(response) : response;
   }).pipe(
     boundedOperation,
     Effect.tapError((error) =>

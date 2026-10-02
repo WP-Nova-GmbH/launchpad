@@ -9,8 +9,9 @@ import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import type * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
 import { IssueTrackerFailure } from "./IssueTrackerModels.ts";
+import { JIRA_DESCRIPTION_TRUNCATION_NOTICE } from "./JiraDiscussion.ts";
+import { JIRA_MCP_RESOURCE } from "./JiraOAuth.ts";
 
-const MCP_URL = "https://mcp.atlassian.com/v2/mcp";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_DESCRIPTION_LENGTH = 20_000;
@@ -19,7 +20,6 @@ const IssueKey = Schema.String.check(
   Schema.isMaxLength(256),
 );
 const CloudId = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200));
-const Tenant = Schema.Struct({ cloudId: CloudId });
 const RpcResponse = Schema.Struct({
   jsonrpc: Schema.Literal("2.0"),
   id: Schema.Number,
@@ -55,7 +55,30 @@ const JiraIssue = Schema.Struct({
 
 const decodeIssueKey = Schema.decodeEffect(IssueKey);
 const decodeCloudId = Schema.decodeEffect(CloudId);
-const decodeTenant = Schema.decodeUnknownEffect(Tenant);
+const OAuthSites = Schema.Array(
+  Schema.Struct({
+    id: CloudId,
+    url: Schema.String,
+    name: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(1024))),
+    scopes: Schema.Array(Schema.String),
+  }),
+);
+// Rovo v2 returns data.resources with cloudId and no per-site scope list.
+// The OAuth token's Jira read scope is checked during exchange; preserve filtering
+// for older accessible-resource responses that do include per-site scopes.
+const RovoResources = Schema.Struct({
+  resources: Schema.Array(
+    Schema.Struct({
+      cloudId: CloudId,
+      url: Schema.String,
+      name: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(1024))),
+      scopes: Schema.optionalKey(Schema.Array(Schema.String)),
+    }),
+  ),
+});
+const decodeOAuthSites = Schema.decodeUnknownEffect(
+  Schema.Union([OAuthSites, Schema.Struct({ data: Schema.Union([OAuthSites, RovoResources]) })]),
+);
 const decodeRpcResponse = Schema.decodeUnknownEffect(RpcResponse);
 const isRpcResponse = Schema.is(RpcResponse);
 const decodeInitialized = Schema.decodeUnknownEffect(Initialized);
@@ -112,11 +135,14 @@ const issueKey = Effect.fnUntraced(function* (input: string, siteUrl: string) {
   );
 });
 
-const validateKey = Effect.fnUntraced(function* (apiKey: string) {
-  if (!apiKey.trim() || /[\r\n]/.test(apiKey)) {
-    return yield* invalidInput("Enter an Atlassian service-account API key.");
+const validateAccessToken = Effect.fnUntraced(function* (accessToken: string) {
+  if (!accessToken.trim() || /[\r\n]/.test(accessToken)) {
+    return yield* new IssueTrackerFailure({
+      code: "auth_required",
+      message: "The Jira authorization is invalid. Reconnect Jira in Organization settings.",
+    });
   }
-  return apiKey.trim();
+  return accessToken.trim();
 });
 
 const checkStatus = Effect.fnUntraced(function* (response: HttpClientResponse.HttpClientResponse) {
@@ -124,20 +150,20 @@ const checkStatus = Effect.fnUntraced(function* (response: HttpClientResponse.Ht
   if (response.status === 401) {
     return yield* new IssueTrackerFailure({
       code: "auth_required",
-      message: "The Jira service-account API key is invalid or expired. Reconnect Jira.",
+      message: "Atlassian rejected Jira access. Reconnect Jira in Organization settings.",
     });
   }
   if (response.status === 403) {
     return yield* new IssueTrackerFailure({
       code: "forbidden",
       message:
-        "Jira denied access. Check the service account's permissions and your Atlassian MCP settings.",
+        "Jira denied access. Check the connected account's permissions and your Atlassian MCP settings.",
     });
   }
   if (response.status === 404) {
     return yield* new IssueTrackerFailure({
       code: "not_found",
-      message: "The Jira site or issue was not found, or is not visible to the service account.",
+      message: "The Jira site or issue was not found, or is not visible to the connected account.",
     });
   }
   return yield* unavailable();
@@ -183,30 +209,58 @@ const readRpcResponse = Effect.fnUntraced(function* (
   } else {
     payload = yield* readJson(response);
   }
-  const reply = yield* decodeRpcResponse(payload).pipe(Effect.mapError(unavailable));
-  if (reply.id !== id || reply.error || reply.result === undefined) return yield* unavailable();
+  const reply = yield* decodeRpcResponse(payload).pipe(
+    Effect.tapError(() => Effect.logWarning("Jira MCP RPC decoding failed")),
+    Effect.mapError(unavailable),
+  );
+  if (reply.id !== id || reply.error || reply.result === undefined) {
+    yield* Effect.logWarning("Jira MCP invalid RPC response", {
+      idMatches: reply.id === id,
+      rpcErrorCode: reply.error?.code,
+      hasResult: reply.result !== undefined,
+    });
+    return yield* unavailable();
+  }
   return reply.result;
 });
 
-const callJiraIssue = Effect.fnUntraced(function* (apiKey: string, cloudId: string, key: string) {
+const callJiraTool = Effect.fnUntraced(function* (
+  accessToken: string,
+  name: string,
+  args: Readonly<Record<string, unknown>>,
+) {
   const http = yield* HttpClient.HttpClient;
   let sessionId: string | undefined;
   let protocolVersion: string = PROTOCOL_VERSIONS[0];
   const headers = () => ({
-    Authorization: `Bearer ${apiKey}`,
+    Authorization: `Bearer ${accessToken}`,
     Accept: "application/json, text/event-stream",
     "MCP-Protocol-Version": protocolVersion,
     ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
   });
-  const post = (body: unknown) =>
+  const post = (body: { readonly method: string; readonly [key: string]: unknown }) =>
     http
       .execute(
-        HttpClientRequest.post(MCP_URL).pipe(
+        HttpClientRequest.post(JIRA_MCP_RESOURCE).pipe(
           HttpClientRequest.setHeaders(headers()),
           HttpClientRequest.bodyJsonUnsafe(body),
         ),
       )
-      .pipe(Effect.mapError(unavailable), Effect.flatMap(checkStatus));
+      .pipe(
+        Effect.mapError(unavailable),
+        Effect.flatMap((response) =>
+          checkStatus(response).pipe(
+            Effect.tapError((error) =>
+              Effect.logWarning("Jira MCP request rejected", {
+                stage: body.method,
+                tool: name,
+                httpStatus: response.status,
+                code: error.code,
+              }),
+            ),
+          ),
+        ),
+      );
   const initializedResponse = yield* post({
     jsonrpc: "2.0",
     id: 1,
@@ -232,13 +286,8 @@ const callJiraIssue = Effect.fnUntraced(function* (apiKey: string, cloudId: stri
       id: 2,
       method: "tools/call",
       params: {
-        name: "getJiraIssue",
-        arguments: {
-          cloudId,
-          issueIdOrKey: key,
-          fields: ["summary", "description", "status", "assignee"],
-          responseContentFormat: "markdown",
-        },
+        name,
+        arguments: args,
       },
     });
     const toolResult = yield* readRpcResponse(response, 2).pipe(
@@ -246,27 +295,35 @@ const callJiraIssue = Effect.fnUntraced(function* (apiKey: string, cloudId: stri
       Effect.mapError(unavailable),
     );
     if (toolResult.isError) {
+      yield* Effect.logWarning("Jira MCP tool returned an error", { tool: name });
       // Upstream text can contain request details, so only classify it; never surface it.
       const text =
         toolResult.content
           ?.flatMap((part) => (part.type === "text" ? [part.text ?? ""] : []))
           .join("\n") ?? "";
+      if (/insufficient.scope|scope does not match/i.test(text)) {
+        return yield* new IssueTrackerFailure({
+          code: "forbidden",
+          message:
+            "Atlassian did not grant the required Jira permissions. Reconnect Jira and allow read access.",
+        });
+      }
       if (/\b401\b|unauthori[sz]ed|invalid.*token|expired.*token/i.test(text)) {
         return yield* new IssueTrackerFailure({
           code: "auth_required",
-          message: "The Jira service-account API key is invalid or expired. Reconnect Jira.",
+          message: "Atlassian rejected Jira access. Reconnect Jira in Organization settings.",
         });
       }
       if (/\b403\b|forbidden|permission/i.test(text)) {
         return yield* new IssueTrackerFailure({
           code: "forbidden",
-          message: "The service account does not have permission to read this Jira issue.",
+          message: "The connected account does not have permission to read this Jira issue.",
         });
       }
       if (/\b404\b|not found|does not exist/i.test(text)) {
         return yield* new IssueTrackerFailure({
           code: "not_found",
-          message: "The Jira issue was not found, or is not visible to the service account.",
+          message: "The Jira issue was not found, or is not visible to the connected account.",
         });
       }
       return yield* unavailable();
@@ -279,14 +336,16 @@ const callJiraIssue = Effect.fnUntraced(function* (apiKey: string, cloudId: stri
           .map((part) => part.text ?? "")
           .join("\n") ?? "",
       ).pipe(Effect.mapError(unavailable)));
-    return yield* decodeJiraIssue(payload).pipe(Effect.mapError(unavailable));
+    return payload;
   });
   return yield* result.pipe(
     Effect.ensuring(
       sessionId
         ? http
             .execute(
-              HttpClientRequest.delete(MCP_URL).pipe(HttpClientRequest.setHeaders(headers())),
+              HttpClientRequest.delete(JIRA_MCP_RESOURCE).pipe(
+                HttpClientRequest.setHeaders(headers()),
+              ),
             )
             .pipe(Effect.timeout("2 seconds"), Effect.ignore)
         : Effect.void,
@@ -297,16 +356,22 @@ const callJiraIssue = Effect.fnUntraced(function* (apiKey: string, cloudId: stri
 const readIssue = Effect.fnUntraced(function* (input: {
   readonly siteUrl: string;
   readonly cloudId: string;
-  readonly apiKey: string;
+  readonly accessToken: string;
   readonly issue: string;
 }) {
   const siteUrl = yield* normalizeSite(input.siteUrl);
   const key = yield* issueKey(input.issue, siteUrl);
-  const apiKey = yield* validateKey(input.apiKey);
+  const accessToken = yield* validateAccessToken(input.accessToken);
   const cloudId = yield* decodeCloudId(input.cloudId).pipe(
     Effect.mapError(() => invalidInput("Reconnect Jira to verify the connected site.")),
   );
-  const result = yield* callJiraIssue(apiKey, cloudId, key);
+  const payload = yield* callJiraTool(accessToken, "getJiraIssue", {
+    cloudId,
+    issueIdOrKey: key,
+    fields: ["summary", "description", "status", "assignee"],
+    responseContentFormat: "markdown",
+  });
+  const result = yield* decodeJiraIssue(payload).pipe(Effect.mapError(unavailable));
   if (result.key !== key) return yield* unavailable();
   const description = result.fields.description ?? "";
   return {
@@ -314,7 +379,7 @@ const readIssue = Effect.fnUntraced(function* (input: {
     title: result.fields.summary,
     description:
       description.length > MAX_DESCRIPTION_LENGTH
-        ? `${description.slice(0, MAX_DESCRIPTION_LENGTH)}\n\n[Description truncated by Launchpad. Open the issue for the full text.]`
+        ? `${description.slice(0, MAX_DESCRIPTION_LENGTH).replace(/[\uD800-\uDBFF]$/u, "")}${JIRA_DESCRIPTION_TRUNCATION_NOTICE}`
         : description,
     url: `${siteUrl}/browse/${result.key}`,
     status: result.fields.status?.name ?? null,
@@ -331,30 +396,43 @@ const bounded = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 export const readJiraIssue = Effect.fn("relay.jira.readIssue")(function* (input: {
   readonly siteUrl: string;
   readonly cloudId: string;
-  readonly apiKey: string;
+  readonly accessToken: string;
   readonly issue: string;
 }) {
   return yield* readIssue(input);
 }, bounded);
 
-export const connectJira = Effect.fn("relay.jira.connect")(function* (input: {
-  readonly siteUrl: string;
-  readonly apiKey: string;
-  readonly issue: string;
-}) {
-  const siteUrl = yield* normalizeSite(input.siteUrl);
-  const key = yield* issueKey(input.issue, siteUrl);
-  const apiKey = yield* validateKey(input.apiKey);
-  const http = yield* HttpClient.HttpClient;
-  // Atlassian documents this public site-to-cloudId lookup. No service-account secret goes to the site.
-  // https://developer.atlassian.com/platform/teamwork-graph/understanding-aris/
-  const response = yield* http
-    .get(`${siteUrl}/_edge/tenant_info`)
-    .pipe(Effect.mapError(unavailable), Effect.flatMap(checkStatus));
-  const tenant = yield* readJson(response).pipe(
-    Effect.flatMap(decodeTenant),
-    Effect.mapError(unavailable),
-  );
-  yield* readIssue({ siteUrl, cloudId: tenant.cloudId, apiKey, issue: key });
-  return { siteUrl, cloudId: tenant.cloudId, accountLabel: new URL(siteUrl).hostname };
-}, bounded);
+/** Only return Jira Cloud sites that the OAuth grant authorizes for issue reads. */
+export const getJiraOAuthSites = Effect.fn("relay.jira.oauthSites")(
+  function* (accessToken: string) {
+    const payload = yield* callJiraTool(accessToken, "getAccessibleAtlassianResources", {});
+    const decoded = yield* decodeOAuthSites(payload).pipe(Effect.mapError(unavailable));
+    const data = "data" in decoded ? decoded.data : decoded;
+    const resources = "resources" in data ? data.resources : data;
+    const sites = new Map<string, { cloudId: string; siteUrl: string; accountLabel: string }>();
+    for (const resource of resources) {
+      if (resource.scopes && !resource.scopes.includes("read:jira:agent-interface")) continue;
+      const cloudId = "cloudId" in resource ? resource.cloudId : resource.id;
+      const siteUrl = yield* normalizeSite(resource.url).pipe(Effect.mapError(unavailable));
+      const previous = sites.get(cloudId);
+      if (previous && previous.siteUrl !== siteUrl) return yield* unavailable();
+      sites.set(cloudId, {
+        cloudId,
+        siteUrl,
+        accountLabel: resource.name?.trim() || new URL(siteUrl).hostname,
+      });
+    }
+    return [...sites.values()].sort(
+      (a, b) => a.accountLabel.localeCompare(b.accountLabel) || a.siteUrl.localeCompare(b.siteUrl),
+    );
+  },
+  bounded,
+  Effect.mapError((error) =>
+    error.code === "unavailable"
+      ? new IssueTrackerFailure({
+          code: "unavailable",
+          message: "Could not verify your Jira sites after signing in. Try connecting Jira again.",
+        })
+      : error,
+  ),
+);

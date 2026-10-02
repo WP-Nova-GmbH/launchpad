@@ -34,7 +34,7 @@ function toolService(name: unknown): RelayIssueTrackerService | undefined {
     "view_linear_image",
   ].includes(tool)
     ? "linear"
-    : tool === "read_jira_issue"
+    : ["read_jira_issue", "read_jira_comments"].includes(tool)
       ? "jira"
       : undefined;
 }

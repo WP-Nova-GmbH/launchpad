@@ -29,7 +29,6 @@ describe("organization issue tracker client", () => {
         bearer: request.headers.get("authorization"),
         body: request.body ? await request.json() : null,
       });
-      if (request.method === "PUT") return Response.json(connection);
       if (request.method === "DELETE") return Response.json({ ok: true });
       if (request.url.includes("/replacement/"))
         return Response.json({ connections: [connection], linearAvailable: true });
@@ -47,12 +46,6 @@ describe("organization issue tracker client", () => {
       const result = yield* client.listIssueTrackerConnections({ clerkToken: "member-token" });
       expect(result.connections).toEqual([connection]);
       yield* client.startLinearAuthorization({ clerkToken: "admin-token" });
-      const payload = {
-        siteUrl: "https://team.atlassian.net",
-        apiKey: "fixture-key",
-        issue: "TEAM-1",
-      };
-      expect(yield* client.connectJira({ clerkToken: "admin-token", payload })).toEqual(connection);
       yield* client.disconnectIssueTracker({ clerkToken: "admin-token", service: "jira" });
       yield* client.confirmLinearReplacement({ clerkToken: "admin-token", proposalId: "proposal" });
       yield* client.cancelLinearReplacement({ clerkToken: "admin-token", proposalId: "proposal" });
@@ -71,12 +64,6 @@ describe("organization issue tracker client", () => {
         },
         {
           url: "https://relay.example.test/v1/organization/issue-trackers/jira",
-          method: "PUT",
-          bearer: "Bearer admin-token",
-          body: payload,
-        },
-        {
-          url: "https://relay.example.test/v1/organization/issue-trackers/jira",
           method: "DELETE",
           bearer: "Bearer admin-token",
           body: null,
@@ -91,38 +78,103 @@ describe("organization issue tracker client", () => {
     }).pipe(Effect.provide(testLayer(fetchFn)));
   });
 
-  it.effect("keeps an actionable issue access failure instead of an opaque transport error", () => {
-    const message = "The service account cannot read this issue. Check its Jira access.";
-    const fetchFn = (() =>
-      Promise.resolve(
-        Response.json(
-          {
-            _tag: "RelayIssueTrackerError",
-            code: "forbidden",
-            message,
-            traceId: "trace-jira-access",
-          },
-          { status: 400 },
-        ),
-      )) satisfies typeof globalThis.fetch;
+  it.effect(
+    "keeps an actionable authorization failure instead of an opaque transport error",
+    () => {
+      const message = "Atlassian denied authorization. Check your Jira access.";
+      const fetchFn = (() =>
+        Promise.resolve(
+          Response.json(
+            {
+              _tag: "RelayIssueTrackerError",
+              code: "forbidden",
+              message,
+              traceId: "trace-jira-access",
+            },
+            { status: 400 },
+          ),
+        )) satisfies typeof globalThis.fetch;
 
+      return Effect.gen(function* () {
+        const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+        const error = yield* client
+          .startJiraAuthorization({
+            clerkToken: "admin-token",
+          })
+          .pipe(Effect.flip);
+        expect(error._tag).toBe("ManagedRelayRequestFailedError");
+        if (error._tag !== "ManagedRelayRequestFailedError" || !error.relayError)
+          throw new Error("Expected a typed relay failure");
+        expect(relayProtectedErrorMessage(error.relayError)).toBe(message);
+        expect(error.traceId).toBe("trace-jira-access");
+      }).pipe(Effect.provide(testLayer(fetchFn)));
+    },
+  );
+});
+
+it.effect("starts Jira OAuth with only the administrator's relay session", () => {
+  const requests: Request[] = [];
+  const fetchFn = (async (input, init) => {
+    const request = new Request(input, init);
+    requests.push(request);
+    return Response.json({
+      authorizationUrl: "https://mcp.atlassian.com/v1/authorize?state=test",
+      authorizationId: "attempt",
+      connection: {
+        service: "jira",
+        status: "connecting",
+        accountLabel: null,
+        updatedAt: "2026-10-01",
+      },
+    });
+  }) satisfies typeof globalThis.fetch;
+  return Effect.gen(function* () {
+    const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+    const result = yield* client.startJiraAuthorization({
+      clerkToken: "admin-token",
+    });
+    expect(result.authorizationUrl).toContain("mcp.atlassian.com");
+    const request = requests[0]!;
+    expect(request.url).toBe(
+      "https://relay.example.test/v1/organization/issue-trackers/jira/authorize",
+    );
+    expect(request.method).toBe("POST");
+    expect(request.headers.get("authorization")).toBe("Bearer admin-token");
+    expect(yield* Effect.promise(() => request.text())).toBe("");
+  }).pipe(Effect.provide(testLayer(fetchFn)));
+});
+
+it.effect.each(["select", "cancel"] as const)(
+  "sends the %s action with the exact Jira authorization attempt",
+  (action) => {
+    const requests: Request[] = [];
+    const fetchFn = (async (input, init) => {
+      requests.push(new Request(input, init));
+      return Response.json({ linearAvailable: true, connections: [] });
+    }) satisfies typeof globalThis.fetch;
     return Effect.gen(function* () {
       const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
-      const error = yield* client
-        .connectJira({
+      if (action === "select")
+        yield* client.selectJiraSite({
           clerkToken: "admin-token",
-          payload: {
-            siteUrl: "https://team.atlassian.net",
-            apiKey: "fixture-key",
-            issue: "TEAM-1",
-          },
-        })
-        .pipe(Effect.flip);
-      expect(error._tag).toBe("ManagedRelayRequestFailedError");
-      if (error._tag !== "ManagedRelayRequestFailedError" || !error.relayError)
-        throw new Error("Expected a typed relay failure");
-      expect(relayProtectedErrorMessage(error.relayError)).toBe(message);
-      expect(error.traceId).toBe("trace-jira-access");
+          payload: { authorizationId: "attempt", cloudId: "cloud" },
+        });
+      else
+        yield* client.cancelJiraSelection({
+          clerkToken: "admin-token",
+          authorizationId: "attempt",
+        });
+      const request = requests[0]!;
+      expect(request.url).toBe(
+        `https://relay.example.test/v1/organization/issue-trackers/jira/${action === "select" ? "select-site" : "cancel-selection"}`,
+      );
+      expect(request.method).toBe("POST");
+      expect(request.headers.get("authorization")).toBe("Bearer admin-token");
+      expect(yield* Effect.promise(() => request.json())).toEqual(
+        action === "select"
+          ? { authorizationId: "attempt", cloudId: "cloud" }
+          : { authorizationId: "attempt" },
+      );
     }).pipe(Effect.provide(testLayer(fetchFn)));
-  });
-});
+  },
+);

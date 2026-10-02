@@ -1,5 +1,6 @@
 import type {
-  RelayConnectJiraRequest,
+  RelaySelectJiraSiteRequest,
+  RelayStartJiraResponse,
   RelayIssueTrackerConnection,
   RelayIssueTrackerConnections,
   RelayIssueTrackerService,
@@ -19,7 +20,7 @@ import {
   DialogPopup,
   DialogTitle,
 } from "../ui/dialog";
-import { Input } from "../ui/input";
+import { RadioGroup, RadioGroupItem } from "../ui/radio-group";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 
@@ -35,21 +36,25 @@ export interface IssueTrackersSectionProps {
   readonly error: string | null;
   readonly refresh: () => Promise<void>;
   readonly startLinear: () => Promise<RelayStartLinearResponse>;
-  readonly connectJira: (input: RelayConnectJiraRequest) => Promise<void>;
+  readonly startJira: () => Promise<RelayStartJiraResponse>;
+  readonly selectJiraSite: (input: RelaySelectJiraSiteRequest) => Promise<void>;
+  readonly cancelJiraSelection: (authorizationId: string) => Promise<void>;
   readonly disconnect: (service: RelayIssueTrackerService) => Promise<void>;
 }
 
 const SERVICE_NAMES = { linear: "Linear", jira: "Jira" } as const;
 const SERVICES = ["linear", "jira"] as const;
-const JIRA_SETUP_URL =
-  "https://developer.atlassian.com/cloud/rovo-mcp/guides/configuring-authentication-via-api-token/";
 
 function connectionDescription(
   service: RelayIssueTrackerService,
   connection?: RelayIssueTrackerConnection,
 ) {
+  if (connection?.authorization?.phase === "selecting_site")
+    return connection.accountLabel
+      ? `${connection.accountLabel} · Choose a site to finish the new connection.`
+      : "Choose a Jira site to finish connecting.";
   if (connection?.status === "connecting")
-    return "Finish connecting in your browser, then refresh.";
+    return "Not connected yet. Finish setup in your browser, then refresh.";
   if (connection?.status === "reconnect_required") {
     return connection.accountLabel
       ? `${connection.accountLabel} · Sign in again to read issues.`
@@ -75,7 +80,9 @@ export function IssueTrackersSection({
   error,
   refresh,
   startLinear,
-  connectJira,
+  startJira,
+  selectJiraSite,
+  cancelJiraSelection,
   disconnect,
 }: IssueTrackersSectionProps) {
   const [dialog, setDialog] = useState<RelayIssueTrackerService | null>(null);
@@ -85,11 +92,21 @@ export function IssueTrackersSection({
   const [authorizationUrl, setAuthorizationUrl] = useState<string | null>(null);
   const [authorizationId, setAuthorizationId] = useState<string | null>(null);
   const [review, setReview] = useState<RelayIssueTrackerConnection["replacement"]>(undefined);
-  const [siteUrl, setSiteUrl] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [issue, setIssue] = useState("");
+  const [siteChoice, setSiteChoice] = useState<RelaySelectJiraSiteRequest | null>(null);
   const fieldId = useId();
+  const authorizing = snapshot?.connections.find((entry) => entry.service === dialog);
+  const choosingJiraSite =
+    dialog === "jira" &&
+    authorizing?.authorization?.phase === "selecting_site" &&
+    authorizing.jiraSites !== undefined;
+  const selectedCloudId =
+    siteChoice?.authorizationId === authorizing?.authorization?.id
+      ? (siteChoice?.cloudId ?? "")
+      : "";
   const linear = snapshot?.connections.find((entry) => entry.service === "linear");
+  const cancellingSetup =
+    snapshot?.connections.find((entry) => entry.service === disconnectService)?.status ===
+    "connecting";
   const disabled = busy || mutating || unverified;
   const reviewIsCurrent = review !== undefined && review.id === linear?.replacement?.id;
 
@@ -98,14 +115,17 @@ export function IssueTrackersSection({
   const connectDialogOpen =
     isAdmin &&
     dialog !== null &&
-    (dialog !== "linear" || !authorizationId || linear?.authorization?.id === authorizationId);
+    (!authorizationId || authorizing?.authorization?.id === authorizationId);
+  const dialogOpen =
+    connectDialogOpen || (isAdmin && (review !== undefined || disconnectService !== null));
+  // A refresh can close the dialog before a failed mutation reports its error.
+  const sectionError = error ?? (dialogOpen ? null : dialogError);
 
   const closeDialog = () => {
     if (busy) return;
     setDialog(null);
     setDisconnectService(null);
     setReview(undefined);
-    setApiKey("");
     setAuthorizationUrl(null);
     setAuthorizationId(null);
     setDialogError(null);
@@ -116,6 +136,7 @@ export function IssueTrackersSection({
     setAuthorizationUrl(null);
     setAuthorizationId(null);
     setDialog(service);
+    if (service === "jira") void run(beginJira);
   };
 
   const run = async (action: () => Promise<void>) => {
@@ -128,6 +149,13 @@ export function IssueTrackersSection({
     } finally {
       setBusy(false);
     }
+  };
+
+  const beginJira = async () => {
+    const result = await startJira();
+    setAuthorizationUrl(result.authorizationUrl);
+    setAuthorizationId(result.authorizationId);
+    window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
   };
 
   return (
@@ -159,9 +187,9 @@ export function IssueTrackersSection({
           last known.
         </p>
       ) : null}
-      {error ? (
+      {sectionError ? (
         <p role="alert" className="px-3 py-3 text-sm text-destructive sm:px-4">
-          {error}
+          {sectionError}
         </p>
       ) : null}
       {!snapshot ? (
@@ -193,7 +221,7 @@ export function IssueTrackersSection({
                       ? "Connected"
                       : connection.status === "reconnect_required"
                         ? "Sign-in required"
-                        : "Connecting"}
+                        : "Setup incomplete"}
                   </Badge>
                 ) : !available ? (
                   "Linear is not configured on this Launchpad. Ask its operator to enable it."
@@ -212,7 +240,23 @@ export function IssueTrackersSection({
                           setDisconnectService(service);
                         }}
                       >
-                        Disconnect
+                        {connection.status === "connecting" ? "Cancel setup" : "Disconnect"}
+                      </Button>
+                    ) : null}
+                    {service === "jira" && connection?.jiraSites && connection.authorization ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={disabled}
+                        onClick={() => {
+                          setDialogError(null);
+                          setAuthorizationUrl(null);
+                          setAuthorizationId(connection.authorization!.id);
+                          setSiteChoice(null);
+                          setDialog("jira");
+                        }}
+                      >
+                        Choose site
                       </Button>
                     ) : null}
                     {service === "linear" && connection?.replacement ? (
@@ -228,7 +272,8 @@ export function IssueTrackersSection({
                         Review change
                       </Button>
                     ) : null}
-                    {connection?.status !== "connected" || service === "linear" ? (
+                    {(connection?.status !== "connected" || service === "linear") &&
+                    !connection?.jiraSites ? (
                       <Button
                         size="sm"
                         variant="outline"
@@ -237,15 +282,23 @@ export function IssueTrackersSection({
                       >
                         {connection?.status === "connected"
                           ? "Change workspace"
-                          : connection
-                            ? "Reconnect"
-                            : "Connect"}
+                          : connection?.status === "connecting"
+                            ? "Try again"
+                            : connection
+                              ? "Reconnect"
+                              : "Connect"}
                       </Button>
                     ) : null}
                   </div>
                 ) : !connection || connection.status !== "connected" ? (
                   <span className="text-xs text-muted-foreground">
-                    Ask an admin to {connection ? "reconnect" : "connect"}.
+                    Ask an admin to{" "}
+                    {connection?.status === "connecting"
+                      ? "finish setup"
+                      : connection
+                        ? "reconnect"
+                        : "connect"}
+                    .
                   </span>
                 ) : null
               }
@@ -272,22 +325,24 @@ export function IssueTrackersSection({
                   setAuthorizationId(result.authorizationId);
                   window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
                 } else if (dialog === "jira") {
-                  await connectJira({
-                    siteUrl: siteUrl.trim(),
-                    apiKey: apiKey.trim(),
-                    issue: issue.trim(),
-                  });
-                  setApiKey("");
-                  setDialog(null);
+                  if (choosingJiraSite) {
+                    if (!selectedCloudId || !authorizing.authorization) return;
+                    await selectJiraSite({
+                      authorizationId: authorizing.authorization.id,
+                      cloudId: selectedCloudId,
+                    });
+                  } else await beginJira();
                 }
               });
             }}
           >
             <DialogHeader>
               <DialogTitle>
-                {dialog === "linear" && linear?.accountLabel
-                  ? "Change Linear workspace"
-                  : `Connect ${dialog === "jira" ? "Jira" : "Linear"}`}
+                {choosingJiraSite
+                  ? "Choose Jira site"
+                  : dialog === "linear" && linear?.accountLabel
+                    ? "Change Linear workspace"
+                    : `Connect ${dialog === "jira" ? "Jira" : "Linear"}`}
               </DialogTitle>
               <DialogDescription>
                 Share read-only issue access with {organizationName}.
@@ -296,72 +351,57 @@ export function IssueTrackersSection({
             <DialogPanel>
               {dialog === "jira" ? (
                 <>
-                  <div className="space-y-1.5">
-                    <label htmlFor={`${fieldId}-site`} className="text-sm font-medium">
-                      Jira site
-                    </label>
-                    <Input
-                      nativeInput
-                      id={`${fieldId}-site`}
-                      type="url"
-                      required
-                      placeholder="https://your-team.atlassian.net"
-                      value={siteUrl}
-                      onChange={(event) => setSiteUrl(event.currentTarget.value)}
+                  {choosingJiraSite ? (
+                    <RadioGroup
+                      aria-label="Jira site"
+                      value={selectedCloudId}
                       disabled={disabled}
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label htmlFor={`${fieldId}-key`} className="text-sm font-medium">
-                      Service account API key
-                    </label>
-                    <Input
-                      nativeInput
-                      id={`${fieldId}-key`}
-                      type="password"
-                      autoComplete="off"
-                      required
-                      value={apiKey}
-                      onChange={(event) => setApiKey(event.currentTarget.value)}
-                      disabled={disabled}
-                      aria-describedby={`${fieldId}-key-note`}
-                    />
-                    <p
-                      id={`${fieldId}-key-note`}
-                      className="text-xs leading-relaxed text-muted-foreground"
+                      onValueChange={(value) => {
+                        if (typeof value === "string" && authorizing.authorization)
+                          setSiteChoice({
+                            authorizationId: authorizing.authorization.id,
+                            cloudId: value,
+                          });
+                      }}
                     >
-                      An Atlassian admin must enable API key access for the MCP server.{" "}
+                      {authorizing.jiraSites?.map((site, index) => (
+                        <label
+                          key={site.cloudId}
+                          htmlFor={`${fieldId}-site-${index}`}
+                          className="flex cursor-pointer items-center gap-3 rounded-md border p-3"
+                        >
+                          <RadioGroupItem id={`${fieldId}-site-${index}`} value={site.cloudId} />
+                          <span className="min-w-0">
+                            <span className="block break-words text-sm font-medium">
+                              {site.accountLabel}
+                            </span>
+                            <span className="block break-all text-xs text-muted-foreground">
+                              {new URL(site.siteUrl).hostname}
+                            </span>
+                          </span>
+                        </label>
+                      ))}
+                    </RadioGroup>
+                  ) : (
+                    <p className="text-sm leading-relaxed text-muted-foreground">
+                      Sign in to Atlassian to authorize Jira. Your organization shares the read
+                      access granted by your account.
+                    </p>
+                  )}
+                  {authorizationUrl && !choosingJiraSite ? (
+                    <p role="status" className="text-sm leading-relaxed text-muted-foreground">
+                      Finish in Atlassian, then return here. If the browser did not open,{" "}
                       <a
-                        href={JIRA_SETUP_URL}
+                        href={authorizationUrl}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="underline underline-offset-2"
                       >
-                        Setup instructions
+                        open Atlassian
                       </a>
+                      .
                     </p>
-                  </div>
-                  <div className="space-y-1.5">
-                    <label htmlFor={`${fieldId}-issue`} className="text-sm font-medium">
-                      Issue to verify access
-                    </label>
-                    <Input
-                      nativeInput
-                      id={`${fieldId}-issue`}
-                      required
-                      placeholder="PROJ-123"
-                      value={issue}
-                      onChange={(event) => setIssue(event.currentTarget.value)}
-                      disabled={disabled}
-                      aria-describedby={`${fieldId}-issue-note`}
-                    />
-                    <p
-                      id={`${fieldId}-issue-note`}
-                      className="text-xs leading-relaxed text-muted-foreground"
-                    >
-                      An issue key or URL from this site. Launchpad reads it once to check access.
-                    </p>
-                  </div>
+                  ) : null}
                 </>
               ) : (
                 <>
@@ -410,9 +450,28 @@ export function IssueTrackersSection({
                 disabled={busy || mutating}
                 onClick={closeDialog}
               >
-                {authorizationUrl ? "Close" : "Cancel"}
+                {authorizationUrl || choosingJiraSite ? "Close" : "Cancel"}
               </Button>
-              {authorizationUrl ? (
+              {choosingJiraSite ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    disabled={disabled}
+                    onClick={() =>
+                      void run(async () => {
+                        if (authorizing.authorization)
+                          await cancelJiraSelection(authorizing.authorization.id);
+                      })
+                    }
+                  >
+                    Cancel setup
+                  </Button>
+                  <Button type="submit" disabled={disabled || !selectedCloudId}>
+                    {busy ? "Connecting…" : "Connect"}
+                  </Button>
+                </>
+              ) : authorizationUrl ? (
                 <Button
                   type="button"
                   variant="outline"
@@ -422,21 +481,15 @@ export function IssueTrackersSection({
                   Check connection
                 </Button>
               ) : (
-                <Button
-                  type="submit"
-                  disabled={
-                    disabled ||
-                    (dialog === "jira" && (!siteUrl.trim() || !apiKey.trim() || !issue.trim()))
-                  }
-                >
+                <Button type="submit" disabled={disabled}>
                   {busy
                     ? dialog === "jira"
-                      ? "Checking access…"
+                      ? "Opening Atlassian…"
                       : "Opening Linear…"
                     : dialog === "jira"
-                      ? "Connect Jira"
+                      ? "Continue to Atlassian"
                       : "Continue to Linear"}
-                  {dialog === "linear" && !busy ? <ArrowUpRightIcon className="size-3.5" /> : null}
+                  {!busy ? <ArrowUpRightIcon className="size-3.5" /> : null}
                 </Button>
               )}
             </DialogFooter>
@@ -519,11 +572,14 @@ export function IssueTrackersSection({
         <DialogPopup showCloseButton={!busy}>
           <DialogHeader>
             <DialogTitle>
-              Disconnect {disconnectService ? SERVICE_NAMES[disconnectService] : "issue tracker"}?
+              {cancellingSetup ? "Cancel" : "Disconnect"}{" "}
+              {disconnectService ? SERVICE_NAMES[disconnectService] : "issue tracker"}
+              {cancellingSetup ? " setup" : ""}?
             </DialogTitle>
             <DialogDescription>
-              New issue reads will stop for everyone in {organizationName}. Content already
-              retrieved stays in chat history.
+              {cancellingSetup
+                ? "This setup is unfinished. Cancel it and start again when you’re ready."
+                : `New issue reads will stop for everyone in ${organizationName}. Content already retrieved stays in chat history.`}
             </DialogDescription>
           </DialogHeader>
           {dialogError ? (
@@ -549,7 +605,13 @@ export function IssueTrackersSection({
                 });
               }}
             >
-              {busy ? "Disconnecting…" : "Disconnect"}
+              {busy
+                ? cancellingSetup
+                  ? "Cancelling…"
+                  : "Disconnecting…"
+                : cancellingSetup
+                  ? "Cancel setup"
+                  : "Disconnect"}
             </Button>
           </DialogFooter>
         </DialogPopup>

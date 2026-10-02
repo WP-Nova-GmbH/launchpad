@@ -34,7 +34,7 @@ export function issueTrackerActivityPresentation(
     ? " image"
     : toolName.includes("read_linear_images")
       ? " image references"
-      : toolName.includes("read_linear_comments")
+      : toolName.includes("read_linear_comments") || toolName.includes("read_jira_comments")
         ? " discussion"
         : "";
   let url: string | undefined;

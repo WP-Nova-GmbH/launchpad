@@ -3774,3 +3774,23 @@ it.each(["read_linear_issue", "read_linear_comments", "view_linear_image"])(
     expect(workEntryRowLabel(entry)).toContain("Team · Launchpad");
   },
 );
+
+it("uses Jira discussion identity from compact metadata in native activity", () => {
+  const entry: WorkLogEntry = {
+    id: "jira-comments",
+    createdAt: "2026-10-01T10:00:00Z",
+    turnId: null,
+    label: "read_jira_comments",
+    tone: "tool",
+    toolLifecycleStatus: "completed",
+    toolData: {
+      issueTrackerIdentity: {
+        service: "jira",
+        identifier: "ENG-42",
+        accountLabel: "team.atlassian.net",
+        url: "https://team.atlassian.net/browse/ENG-42",
+      },
+    },
+  };
+  expect(workEntryRowLabel(entry)).toBe("Read Jira issue ENG-42 discussion · team.atlassian.net");
+});

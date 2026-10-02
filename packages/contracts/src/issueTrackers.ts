@@ -3,13 +3,14 @@ import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 export const RELAY_LINEAR_CALLBACK_PATH = "/v1/organization/issue-trackers/linear/callback";
+export const RELAY_JIRA_CALLBACK_PATH = "/v1/organization/issue-trackers/jira/callback";
 
 export const RelayIssueTrackerService = Schema.Literals(["linear", "jira"]);
 export type RelayIssueTrackerService = typeof RelayIssueTrackerService.Type;
 
-export const RelayLinearAuthorization = Schema.Struct({
+export const RelayIssueTrackerAuthorization = Schema.Struct({
   id: Schema.String,
-  phase: Schema.Literals(["pending", "exchanging"]),
+  phase: Schema.Literals(["pending", "exchanging", "selecting_site"]),
   expiresAt: Schema.String,
 });
 export const RelayLinearReplacement = Schema.Struct({
@@ -25,12 +26,28 @@ export const RelayLinearReplacementRequest = Schema.Struct({
 });
 export type RelayLinearReplacementRequest = typeof RelayLinearReplacementRequest.Type;
 
+export const RelayJiraSite = Schema.Struct({
+  cloudId: TrimmedNonEmptyString.check(Schema.isMaxLength(200)),
+  siteUrl: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+  accountLabel: TrimmedNonEmptyString.check(Schema.isMaxLength(1024)),
+});
+export type RelayJiraSite = typeof RelayJiraSite.Type;
+export const RelayJiraAuthorizationRequest = Schema.Struct({
+  authorizationId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+});
+export const RelaySelectJiraSiteRequest = Schema.Struct({
+  ...RelayJiraAuthorizationRequest.fields,
+  cloudId: RelayJiraSite.fields.cloudId,
+});
+export type RelaySelectJiraSiteRequest = typeof RelaySelectJiraSiteRequest.Type;
+
 export const RelayIssueTrackerConnection = Schema.Struct({
   service: RelayIssueTrackerService,
   status: Schema.Literals(["connecting", "connected", "reconnect_required"]),
   accountLabel: Schema.NullOr(Schema.String),
   updatedAt: Schema.String,
-  authorization: Schema.optionalKey(RelayLinearAuthorization),
+  authorization: Schema.optionalKey(RelayIssueTrackerAuthorization),
+  jiraSites: Schema.optionalKey(Schema.Array(RelayJiraSite)),
   replacement: Schema.optionalKey(RelayLinearReplacement),
 });
 export type RelayIssueTrackerConnection = typeof RelayIssueTrackerConnection.Type;
@@ -41,19 +58,15 @@ export const RelayIssueTrackerConnections = Schema.Struct({
 });
 export type RelayIssueTrackerConnections = typeof RelayIssueTrackerConnections.Type;
 
-export const RelayConnectJiraRequest = Schema.Struct({
-  siteUrl: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
-  apiKey: TrimmedNonEmptyString.check(Schema.isMaxLength(8192)),
-  issue: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
-});
-export type RelayConnectJiraRequest = typeof RelayConnectJiraRequest.Type;
-
 export const RelayStartLinearResponse = Schema.Struct({
   authorizationUrl: Schema.String,
   authorizationId: Schema.String,
   connection: RelayIssueTrackerConnection,
 });
 export type RelayStartLinearResponse = typeof RelayStartLinearResponse.Type;
+
+export const RelayStartJiraResponse = RelayStartLinearResponse;
+export type RelayStartJiraResponse = typeof RelayStartJiraResponse.Type;
 
 export const RelayIssueDetails = Schema.Struct({
   identifier: Schema.String,
@@ -139,9 +152,48 @@ export const RelayLinearImageResponse = Schema.Struct({
   }),
 });
 
+const JiraReference = TrimmedNonEmptyString.check(Schema.isMaxLength(16_384));
+export const RelayJiraComment = Schema.Struct({
+  id: Schema.String,
+  body: Schema.String,
+  author: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  editedAt: Schema.NullOr(Schema.String),
+  url: Schema.String,
+  bodyTruncated: Schema.Boolean,
+});
+export type RelayJiraComment = typeof RelayJiraComment.Type;
+export const RelayJiraDiscussion = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("available"),
+    comments: Schema.Array(RelayJiraComment),
+    continuation: Schema.NullOr(JiraReference),
+    hasMore: Schema.Boolean,
+    contentTruncated: Schema.Boolean,
+  }),
+  Schema.Struct({ status: Schema.Literal("unavailable"), reason: Schema.String }),
+]);
+export type RelayJiraDiscussion = typeof RelayJiraDiscussion.Type;
+export const RelayJiraContext = Schema.Struct({
+  source: JiraReference,
+  cloudId: Schema.String,
+  issueId: Schema.String,
+  discussion: RelayJiraDiscussion,
+});
+export const RelayJiraReferenceRequest = Schema.Struct({ reference: JiraReference });
+export type RelayJiraReferenceRequest = typeof RelayJiraReferenceRequest.Type;
+export const RelayJiraCommentsResponse = Schema.Struct({
+  service: Schema.Literal("jira"),
+  accountLabel: Schema.String,
+  identifier: Schema.String,
+  url: Schema.String,
+  ...RelayJiraContext.fields,
+});
+
 export const RelayReadIssueResponse = Schema.Struct({
   ...RelayIssueDetails.fields,
   linear: Schema.optionalKey(RelayLinearContext),
+  jira: Schema.optionalKey(RelayJiraContext),
   service: RelayIssueTrackerService,
   accountLabel: Schema.String,
 });

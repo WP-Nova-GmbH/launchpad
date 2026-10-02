@@ -17,7 +17,6 @@ import {
   readComments,
   readImages,
   viewImage,
-  saveJira,
   startLinear,
 } from "./Connections.ts";
 
@@ -29,6 +28,7 @@ import {
   issueInput,
   membership,
   linearRow,
+  jiraRow,
   issueResponse,
   identityResponse,
   tokenResponse,
@@ -40,7 +40,6 @@ const decodeRpc = Schema.decodeUnknownSync(
   ),
 );
 function jiraResponse(request: HttpClientRequest.HttpClientRequest) {
-  if (request.url.endsWith("/_edge/tenant_info")) return Response.json({ cloudId: "cloud" });
   if (request.body._tag !== "Uint8Array") throw new Error("Expected Jira request body");
   const rpc = decodeRpc(new TextDecoder().decode(request.body.body));
   if (rpc.method === "initialize")
@@ -56,43 +55,6 @@ function jiraResponse(request: HttpClientRequest.HttpClientRequest) {
 }
 
 describe("issue tracker connection lifecycle", () => {
-  it.effect.each(["disconnect", "replacement"] as const)(
-    "stale Jira validation cannot undo %s",
-    (action) =>
-      Effect.gen(function* () {
-        const started = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const test = yield* fixture({
-          respond: (request) =>
-            request.url.endsWith("/_edge/tenant_info")
-              ? Deferred.succeed(started, undefined).pipe(
-                  Effect.andThen(Deferred.await(release)),
-                  Effect.as(jiraResponse(request)),
-                )
-              : Effect.succeed(jiraResponse(request)),
-        });
-        const jiraKey = { organizationId: "org", service: "jira" } as const;
-        const saving = yield* saveJira({
-          organizationId: "org",
-          userId: "admin",
-          siteUrl: "https://launchpad.atlassian.net",
-          apiKey: "jira-secret",
-          issue: "LP-42",
-        }).pipe(test.provide, Effect.flip, Effect.forkChild);
-        yield* Deferred.await(started);
-        if (action === "disconnect") yield* disconnect(jiraKey).pipe(test.provide);
-        else yield* test.store.begin({ ...jiraKey, userId: "other-admin" });
-        yield* Deferred.succeed(release, undefined);
-        expect(yield* Fiber.join(saving)).toMatchObject({ code: "conflict" });
-        const row = yield* test.store.get(jiraKey);
-        if (action === "disconnect") expect(row).toBeNull();
-        else {
-          expect(row?.updatedByUserId).toBe("other-admin");
-          expect(row?.payloadSealed).toBeNull();
-        }
-      }),
-  );
-
   it.effect.each(["disconnect", "replacement"] as const)(
     "stale Linear callback cannot undo %s",
     (action) =>
@@ -383,31 +345,6 @@ describe("issue tracker connection lifecycle", () => {
     }),
   );
   it.effect.each(["interrupt", "deadline"] as const)(
-    "cleans up pending Jira validation after %s",
-    (mode) =>
-      Effect.gen(function* () {
-        const started = yield* Deferred.make<void>();
-        const test = yield* fixture({
-          respond: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
-        });
-        const saving = yield* saveJira({
-          organizationId: "org",
-          userId: "admin",
-          siteUrl: "https://launchpad.atlassian.net",
-          apiKey: "jira-secret",
-          issue: "LP-42",
-        }).pipe(test.provide, Effect.flip, Effect.forkChild);
-        yield* Deferred.await(started);
-        if (mode === "interrupt") yield* Fiber.interrupt(saving);
-        else {
-          yield* TestClock.adjust("8 seconds");
-          expect(yield* Fiber.join(saving)).toMatchObject({ code: "unavailable" });
-        }
-        expect(yield* test.store.get({ organizationId: "org", service: "jira" })).toBeNull();
-      }),
-  );
-
-  it.effect.each(["interrupt", "deadline"] as const)(
     "cleans up pending Linear callback after %s",
     (mode) =>
       Effect.gen(function* () {
@@ -691,4 +628,60 @@ it.effect.each(["description", "comment"])(
         ),
       ).toMatchObject({ code: "conflict" });
     }),
+);
+
+it.effect("fits the full Jira read response when issue fields exceed the serialized budget", () =>
+  Effect.gen(function* () {
+    const title = "\u0001".repeat(4096);
+    const description = "\u0001".repeat(20_000);
+    const test = yield* fixture({
+      rows: [jiraRow()],
+      respond: (request) => {
+        const rpc =
+          request.body._tag === "Uint8Array"
+            ? decodeRpc(new TextDecoder().decode(request.body.body))
+            : undefined;
+        return Effect.succeed(
+          rpc?.method === "tools/call"
+            ? Response.json({
+                jsonrpc: "2.0",
+                id: rpc.id,
+                result: {
+                  structuredContent: {
+                    key: "LP-42",
+                    fields: {
+                      summary: title,
+                      description,
+                      status: { name: "Open" },
+                      assignee: null,
+                    },
+                  },
+                },
+              })
+            : jiraResponse(request),
+        );
+      },
+    });
+    const result = yield* readIssue({
+      organizationId: "org",
+      service: "jira",
+      issue: "LP-42",
+    }).pipe(test.provide);
+    expect(new TextEncoder().encode(encodeJson(result)).byteLength).toBeLessThanOrEqual(128 * 1024);
+    expect(result).toMatchObject({
+      service: "jira",
+      identifier: "LP-42",
+      title,
+      status: "Open",
+      assignee: null,
+      accountLabel: "launchpad.atlassian.net",
+      url: "https://launchpad.atlassian.net/browse/LP-42",
+    });
+    expect(result.description.length).toBeLessThan(description.length);
+    expect(
+      result.description.endsWith(
+        "\n\n[Description truncated by Launchpad. Open the issue for the full text.]",
+      ),
+    ).toBe(true);
+  }),
 );

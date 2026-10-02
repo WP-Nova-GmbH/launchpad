@@ -45,10 +45,30 @@ export const linearRow = (expiresAt = Number.MAX_SAFE_INTEGER): ConnectionRecord
   payloadSealed: `sealed:${encodeJson({ service: "linear", accessToken: "old-access-secret", refreshToken: "old-refresh-secret", expiresAt, workspaceId: "workspace", workspaceSlug: "launchpad" })}`,
   authorizationId: null,
   replacement: null,
+  jiraSelection: null,
+  pendingOAuthSealed: null,
   pendingStateHash: null,
   pendingExpiresAt: null,
   updatedByUserId: "admin",
   updatedAt: "2026-01-01T00:00:00.000Z",
+});
+export const jiraOAuth = {
+  server: {
+    issuer: "https://auth.atlassian.com/jira-issuer",
+    authorization_endpoint: "https://auth.atlassian.com/authorize",
+    token_endpoint: "https://auth.atlassian.com/oauth/token",
+    registration_endpoint: "https://auth.atlassian.com/jira-issuer/dcr/register",
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+  },
+  client: { client_id: "jira-client", token_endpoint_auth_method: "none" as const },
+};
+export const jiraRow = (expiresAt = Number.MAX_SAFE_INTEGER): ConnectionRecord => ({
+  ...linearRow(expiresAt),
+  service: "jira",
+  accountLabel: "launchpad.atlassian.net",
+  payloadSealed: `sealed:${encodeJson({ service: "jira", authType: "oauth", oauth: jiraOAuth, accessToken: "oauth-access", refreshToken: "oauth-refresh", expiresAt, siteUrl: "https://launchpad.atlassian.net", cloudId: "cloud" })}`,
 });
 export const issueResponse = (description = "Example") =>
   Response.json({
@@ -133,15 +153,16 @@ export const fixture = Effect.fnUntraced(function* (
           const existing = rows.get(recordKey(input));
           const row: ConnectionRecord = {
             ...input,
-            version:
-              input.service === "linear" && existing ? existing.version : `version-${++version}`,
-            authorizationId: input.service === "linear" ? `auth-${++version}` : null,
+            version: existing?.version ?? `version-${++version}`,
+            authorizationId: `auth-${++version}`,
             replacement: null,
+            jiraSelection: null,
             status: existing?.status ?? "connecting",
             accountLabel: existing?.accountLabel ?? null,
             payloadSealed: existing?.payloadSealed ?? null,
-            pendingStateHash: input.stateHash ?? null,
-            pendingExpiresAt: input.expiresAt ?? null,
+            pendingOAuthSealed: input.pendingOAuthSealed ?? null,
+            pendingStateHash: input.stateHash,
+            pendingExpiresAt: input.expiresAt,
             updatedByUserId: input.userId,
             updatedAt: "2026-01-01T00:00:00.000Z",
           };
@@ -167,13 +188,28 @@ export const fixture = Effect.fnUntraced(function* (
                       ? {
                           ...current,
                           authorizationId: null,
+                          jiraSelection: null,
+                          pendingOAuthSealed: null,
                           pendingStateHash: null,
                           pendingExpiresAt: null,
                         }
                       : null,
-                  (current) => current.authorizationId === input.authorizationId,
+                  (current) =>
+                    current.authorizationId === input.authorizationId &&
+                    (input.expiresAt === undefined || current.pendingExpiresAt === input.expiresAt),
                 ).pipe(Effect.asVoid),
           ),
+        ),
+      awaitJiraSelection: (input) =>
+        update(
+          input,
+          (row) => ({
+            ...row,
+            jiraSelection: input.selection,
+            pendingOAuthSealed: null,
+            pendingExpiresAt: input.expiresAt,
+          }),
+          (row) => row.authorizationId === input.authorizationId && row.pendingStateHash === null,
         ),
       proposeReplacement: (input) =>
         update(
@@ -182,6 +218,7 @@ export const fixture = Effect.fnUntraced(function* (
             ...row,
             replacement: input.replacement,
             authorizationId: null,
+            pendingOAuthSealed: null,
             pendingStateHash: null,
             pendingExpiresAt: null,
           }),
@@ -200,8 +237,11 @@ export const fixture = Effect.fnUntraced(function* (
           payloadSealed: input.payloadSealed,
           accountLabel: input.accountLabel,
           status: "connected",
+          ...(input.userId ? { updatedByUserId: input.userId } : {}),
           authorizationId: null,
           replacement: null,
+          jiraSelection: null,
+          pendingOAuthSealed: null,
           pendingStateHash: null,
           pendingExpiresAt: null,
         })),
@@ -218,10 +258,6 @@ export const fixture = Effect.fnUntraced(function* (
           next.delete(recordKey(input));
           return next;
         }),
-      cancel: (input) =>
-        update(input, (row) =>
-          row.payloadSealed ? { ...row, pendingStateHash: null, pendingExpiresAt: null } : null,
-        ).pipe(Effect.asVoid),
       withLock: (input, use) =>
         Effect.gen(function* () {
           lockRequests += 1;

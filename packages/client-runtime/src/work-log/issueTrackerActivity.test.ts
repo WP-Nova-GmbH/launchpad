@@ -62,3 +62,39 @@ it("renders identity from the compact activity metadata sent by the server", () 
   expect(value?.displayName).toContain(result.accountLabel);
   expect(value?.issueUrl).toBe(result.url);
 });
+
+it.each(["read_jira_comments", "mcp__t3-code__read_jira_comments", "t3-code.read_jira_comments"])(
+  "shows Jira discussion identity from compact activity for %s",
+  (tool) => {
+    const identity = {
+      service: "jira",
+      identifier: "ENG-42",
+      accountLabel: "team.atlassian.net",
+      url: "https://team.atlassian.net/browse/ENG-42",
+    };
+    const value = resolveWorkEntryToolPresentation({
+      label: tool,
+      toolLifecycleStatus: "completed",
+      toolData: { issueTrackerIdentity: identity },
+    });
+    expect(value?.displayName).toBe("Read Jira issue ENG-42 discussion · team.atlassian.net");
+    expect(value?.issueUrl).toBe(identity.url);
+  },
+);
+
+it("does not show a stale Jira discussion link after a failed read", () => {
+  const value = resolveWorkEntryToolPresentation({
+    label: "read_jira_comments",
+    toolLifecycleStatus: "failed",
+    toolData: {
+      result: {
+        service: "jira",
+        identifier: "ENG-42",
+        accountLabel: "team.atlassian.net",
+        url: "https://team.atlassian.net/browse/ENG-42",
+      },
+    },
+  });
+  expect(value?.displayName).toBe("Failed to read a Jira issue discussion");
+  expect(value?.issueUrl).toBeUndefined();
+});

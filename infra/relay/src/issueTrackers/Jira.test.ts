@@ -7,12 +7,12 @@ import * as HttpClient from "effect/unstable/http/HttpClient";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
-import { connectJira, readJiraIssue } from "./Jira.ts";
+import { getJiraOAuthSites, readJiraIssue } from "./Jira.ts";
 
-const apiKey = "service-account-secret";
+const accessToken = "oauth-access-secret";
 const siteUrl = "https://acme.atlassian.net";
 const cloudId = "a436116f-02ce-4520-8fbb-7301462a1674";
-const input = { siteUrl, cloudId, apiKey, issue: "ENG-123" };
+const input = { siteUrl, cloudId, accessToken, issue: "ENG-123" };
 const issue = {
   key: "ENG-123",
   fields: {
@@ -47,9 +47,8 @@ function harness(respond: (request: RecordedRequest) => Response = () => toolRep
           : undefined;
       const recorded = { request, rpc };
       requests.push(recorded);
-      const response = request.url.endsWith("/_edge/tenant_info")
-        ? Response.json({ cloudId })
-        : request.method === "DELETE"
+      const response =
+        request.method === "DELETE"
           ? new Response(null, { status: 204 })
           : rpc?.method === "initialize"
             ? new Response(
@@ -72,16 +71,87 @@ function harness(respond: (request: RecordedRequest) => Response = () => toolRep
 }
 
 describe("Jira", () => {
-  it.effect("verifies the site's cloud ID and a readable issue before connecting", () =>
+  it.effect("reads Rovo v2 resource envelopes with cloudId and no per-site scopes", () =>
+    Effect.gen(function* () {
+      const payload = { data: { resources: [{ cloudId, url: siteUrl }] } };
+      const { provide } = harness(
+        () =>
+          new Response(
+            `event: message\ndata: ${encodeJson({ jsonrpc: "2.0", id: 2, result: { content: [{ type: "text", text: encodeJson(payload) }] } })}\n\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+      );
+      expect(yield* getJiraOAuthSites(accessToken).pipe(provide)).toEqual([
+        { cloudId, siteUrl, accountLabel: "acme.atlassian.net" },
+      ]);
+    }),
+  );
+
+  it.effect("accepts site lists in text and structured data envelopes", () =>
+    Effect.gen(function* () {
+      const resources = [
+        { id: cloudId, url: siteUrl, name: "Acme", scopes: ["read:jira:agent-interface"] },
+        {
+          id: "confluence-only",
+          url: "https://other.atlassian.net",
+          scopes: ["read:confluence:agent-interface"],
+        },
+      ];
+      for (const result of [
+        { content: [{ type: "text", text: encodeJson({ data: resources }) }] },
+        { structuredContent: { data: resources } },
+        { structuredContent: resources },
+      ]) {
+        const { provide } = harness(
+          () =>
+            new Response(
+              `event: message\ndata: ${encodeJson({ jsonrpc: "2.0", id: 2, result })}\n\n`,
+              { headers: { "content-type": "text/event-stream" } },
+            ),
+        );
+        expect(yield* getJiraOAuthSites(accessToken).pipe(provide)).toEqual([
+          { cloudId, siteUrl, accountLabel: "Acme" },
+        ]);
+      }
+    }),
+  );
+
+  it.effect("validates resources inside site-list envelopes", () =>
+    Effect.gen(function* () {
+      for (const data of [
+        null,
+        {},
+        { resources: [{ cloudId: "", url: siteUrl }] },
+        { resources: [{ cloudId, url: "https://attacker.example" }] },
+        {
+          resources: [
+            { cloudId, url: siteUrl },
+            { cloudId, url: "https://other.atlassian.net" },
+          ],
+        },
+        [{ id: cloudId, url: siteUrl }],
+        [{ id: cloudId, url: "https://attacker.example", scopes: ["read:jira:agent-interface"] }],
+      ]) {
+        const { provide } = harness(() => toolReply({ data }));
+        expect((yield* getJiraOAuthSites(accessToken).pipe(provide, Effect.flip)).code).toBe(
+          "unavailable",
+        );
+      }
+    }),
+  );
+
+  it.effect("reads issues using the OAuth access token and negotiated MCP session", () =>
     Effect.gen(function* () {
       const { requests, provide } = harness();
-      expect(yield* connectJira({ ...input, siteUrl: `${siteUrl}/` }).pipe(provide)).toEqual({
-        siteUrl,
-        cloudId,
-        accountLabel: "acme.atlassian.net",
+      expect(
+        yield* readJiraIssue({ ...input, siteUrl: `${siteUrl}/` }).pipe(provide),
+      ).toMatchObject({
+        identifier: "ENG-123",
+        url: `${siteUrl}/browse/ENG-123`,
       });
-      expect(requests[0]?.request.url).toBe(`${siteUrl}/_edge/tenant_info`);
-      expect(requests[0]?.request.headers.authorization).toBeUndefined();
+      expect(
+        requests.every(({ request }) => request.url === "https://mcp.atlassian.com/v2/mcp"),
+      ).toBe(true);
       const call = requests.find(({ rpc }) => rpc?.method === "tools/call");
       expect(call?.rpc?.params).toEqual({
         name: "getJiraIssue",
@@ -93,7 +163,7 @@ describe("Jira", () => {
         },
       });
       expect(call?.request.url).toBe("https://mcp.atlassian.com/v2/mcp");
-      expect(call?.request.headers.authorization).toBe(`Bearer ${apiKey}`);
+      expect(call?.request.headers.authorization).toBe(`Bearer ${accessToken}`);
       expect(call?.request.headers["mcp-session-id"]).toBe("session-1");
       expect(call?.request.headers["mcp-protocol-version"]).toBe("2025-06-18");
       expect(requests.at(-1)?.request.method).toBe("DELETE");
@@ -159,47 +229,43 @@ describe("Jira", () => {
     }),
   );
 
-  it.effect("rejects non-Cloud origins, credentials, ports, and paths before lookup", () =>
-    Effect.gen(function* () {
-      const { requests, provide } = harness();
-      for (const value of [
-        "http://acme.atlassian.net",
-        "https://localhost",
-        "https://acme.atlassian.net.evil.test",
-        "https://atlassian.net",
-        "https://acme.atlassian.net:8443",
-        "https://user:pass@acme.atlassian.net",
-        `${siteUrl}/path`,
-        `${siteUrl}?foo=bar`,
-      ]) {
-        const error = yield* connectJira({ ...input, siteUrl: value }).pipe(provide, Effect.flip);
-        expect(error.code).toBe("invalid_input");
-      }
-      expect(requests).toHaveLength(0);
-    }),
+  it.effect(
+    "rejects non-Cloud origins, credentials, ports, and paths before sending credentials",
+    () =>
+      Effect.gen(function* () {
+        const { requests, provide } = harness();
+        for (const value of [
+          "http://acme.atlassian.net",
+          "https://localhost",
+          "https://acme.atlassian.net.evil.test",
+          "https://atlassian.net",
+          "https://acme.atlassian.net:8443",
+          "https://user:pass@acme.atlassian.net",
+          `${siteUrl}/path`,
+          `${siteUrl}?foo=bar`,
+        ]) {
+          const error = yield* readJiraIssue({ ...input, siteUrl: value }).pipe(
+            provide,
+            Effect.flip,
+          );
+          expect(error.code).toBe("invalid_input");
+        }
+        expect(requests).toHaveLength(0);
+      }),
   );
 
-  it.effect("refuses an empty or header-injected API key and missing cloud ID", () =>
+  it.effect("refuses an empty or header-injected access token and missing cloud ID", () =>
     Effect.gen(function* () {
       const { requests, provide } = harness();
       for (const value of ["", " ", "key\r\nInjected: yes"]) {
         expect(
-          (yield* connectJira({ ...input, apiKey: value }).pipe(provide, Effect.flip)).code,
-        ).toBe("invalid_input");
+          (yield* readJiraIssue({ ...input, accessToken: value }).pipe(provide, Effect.flip)).code,
+        ).toBe("auth_required");
       }
       expect(
         (yield* readJiraIssue({ ...input, cloudId: "" }).pipe(provide, Effect.flip)).code,
       ).toBe("invalid_input");
       expect(requests).toHaveLength(0);
-    }),
-  );
-
-  it.effect("fails connection validation when the known issue cannot be read", () =>
-    Effect.gen(function* () {
-      const { provide } = harness(() => new Response(`Forbidden ${apiKey}`, { status: 403 }));
-      const error = yield* connectJira(input).pipe(provide, Effect.flip);
-      expect(error.code).toBe("forbidden");
-      expect(encodeJson(error)).not.toContain(apiKey);
     }),
   );
 
@@ -213,11 +279,11 @@ describe("Jira", () => {
         [500, "unavailable"],
       ] as const) {
         const { requests, provide } = harness(
-          () => new Response(`upstream includes ${apiKey}`, { status }),
+          () => new Response(`upstream includes ${accessToken}`, { status }),
         );
         const error = yield* readJiraIssue(input).pipe(provide, Effect.flip);
         expect(error.code).toBe(code);
-        expect(encodeJson(error)).not.toContain(apiKey);
+        expect(encodeJson(error)).not.toContain(accessToken);
         expect(requests.at(-1)?.request.method).toBe("DELETE");
       }
     }),
@@ -227,16 +293,17 @@ describe("Jira", () => {
     Effect.gen(function* () {
       for (const [text, code] of [
         ["HTTP 401 Unauthorized", "auth_required"],
+        ["HTTP 401 Unauthorized; scope does not match", "forbidden"],
         ["HTTP 403 Forbidden", "forbidden"],
         ["HTTP 404 Not found", "not_found"],
         ["Upstream failure", "unavailable"],
       ] as const) {
         const { provide } = harness(() =>
-          reply({ isError: true, content: [{ type: "text", text: `${text}; ${apiKey}` }] }),
+          reply({ isError: true, content: [{ type: "text", text: `${text}; ${accessToken}` }] }),
         );
         const error = yield* readJiraIssue(input).pipe(provide, Effect.flip);
         expect(error.code).toBe(code);
-        expect(encodeJson(error)).not.toContain(apiKey);
+        expect(encodeJson(error)).not.toContain(accessToken);
       }
     }),
   );
@@ -272,13 +339,13 @@ describe("Jira", () => {
       for (const response of [
         toolReply({ key: "ENG-123", fields: { summary: "Title", description: { type: "doc" } } }),
         reply({ structuredContent: issue }, 999),
-        Response.json({ jsonrpc: "2.0", id: 2, error: { code: -32603, message: apiKey } }),
+        Response.json({ jsonrpc: "2.0", id: 2, error: { code: -32603, message: accessToken } }),
         new Response("not JSON", { headers: { "content-type": "application/json" } }),
       ]) {
         const { provide } = harness(() => response);
         const error = yield* readJiraIssue(input).pipe(provide, Effect.flip);
         expect(error.code).toBe("unavailable");
-        expect(encodeJson(error)).not.toContain(apiKey);
+        expect(encodeJson(error)).not.toContain(accessToken);
       }
     }),
   );
@@ -297,6 +364,20 @@ describe("Jira", () => {
             : `${"x".repeat(20_000)}\n\n[Description truncated by Launchpad. Open the issue for the full text.]`,
         );
       }
+    }),
+  );
+
+  it.effect("does not split a Unicode character at the description length limit", () =>
+    Effect.gen(function* () {
+      const description = "x".repeat(19_999) + "🙂";
+      const { provide } = harness(() =>
+        toolReply({ ...issue, fields: { ...issue.fields, description } }),
+      );
+      const result = yield* readJiraIssue(input).pipe(provide);
+      expect(result.description).toBe(
+        "x".repeat(19_999) +
+          "\n\n[Description truncated by Launchpad. Open the issue for the full text.]",
+      );
     }),
   );
 

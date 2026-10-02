@@ -157,3 +157,28 @@ describe("issue tracker activity identity", () => {
     }
   });
 });
+
+it("keeps Jira discussion identity through the web work-log path", () => {
+  const [entry] = deriveWorkLogEntries([
+    activity({
+      itemType: "mcp_tool_call",
+      title: "read_jira_comments",
+      status: "completed",
+      data: {
+        issueTrackerIdentity: {
+          service: "jira",
+          identifier: "ENG-42",
+          accountLabel: "team.atlassian.net",
+          url: "https://team.atlassian.net/browse/ENG-42",
+        },
+      },
+    }),
+  ]);
+  expect(entry).toBeDefined();
+  expect(workEntryDisplayLabel(entry!, undefined)).toBe(
+    "Read Jira issue ENG-42 discussion · team.atlassian.net",
+  );
+  expect(liveWorkEntryLabel(entry!, undefined, false)).toBe(
+    "Read Jira issue ENG-42 discussion · team.atlassian.net",
+  );
+});

@@ -56,10 +56,13 @@ Issue trackers** in the web or desktop app. Everyone in the organization then us
 connection to read issues in chats on organization-managed executors, including chats opened from
 mobile. Personal machines and external OpenCode servers do not support these connections yet.
 
-For Linear, authorize the Launchpad app and return to Launchpad. For Jira, enter the site address,
-a service account API key, and an issue key or URL that account can read. Your Atlassian admin must
-[enable API key access for its MCP server](https://developer.atlassian.com/cloud/rovo-mcp/guides/configuring-authentication-via-api-token/).
-Launchpad checks the issue before saving the connection.
+For Linear, authorize the Launchpad app and return to Launchpad. For Jira, choose **Connect**
+and sign in to Atlassian to authorize access. Launchpad connects automatically when one Jira
+site is available. If there are several, return to Launchpad and choose which site to share.
+You can resume an unfinished choice from **Choose site**, or discard it with **Cancel setup**.
+Launchpad refreshes access automatically. Your organization shares the
+read access granted by the connected Atlassian account. If your Atlassian organization restricts
+MCP clients, its admin may need to allow the Launchpad relay's callback domain.
 
 To change Linear workspaces, choose **Change workspace** and authorize the new workspace.
 Your current workspace stays selected until an admin reviews the change and chooses **Replace**.

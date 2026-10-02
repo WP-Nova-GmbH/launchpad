@@ -11,11 +11,11 @@ import type { RepositoryAccessRemovalStatus } from "@t3tools/contracts";
 import {
   RelayApi,
   type RelayConnectMachineResponse,
-  type RelayConnectJiraRequest,
-  type RelayIssueTrackerConnection,
   type RelayIssueTrackerConnections,
   type RelayIssueTrackerService,
   type RelayStartLinearResponse,
+  type RelaySelectJiraSiteRequest,
+  type RelayStartJiraResponse,
   type RelayCreateInvitationRequest,
   type RelayCreateInvitationResponse,
   type RelayGithubInstallResponse,
@@ -214,10 +214,17 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly proposalId: string;
     }) => Effect.Effect<RelayIssueTrackerConnections, ManagedRelayClientError>;
-    readonly connectJira: (input: {
+    readonly startJiraAuthorization: (input: {
       readonly clerkToken: string;
-      readonly payload: RelayConnectJiraRequest;
-    }) => Effect.Effect<RelayIssueTrackerConnection, ManagedRelayClientError>;
+    }) => Effect.Effect<RelayStartJiraResponse, ManagedRelayClientError>;
+    readonly selectJiraSite: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelaySelectJiraSiteRequest;
+    }) => Effect.Effect<RelayIssueTrackerConnections, ManagedRelayClientError>;
+    readonly cancelJiraSelection: (input: {
+      readonly clerkToken: string;
+      readonly authorizationId: string;
+    }) => Effect.Effect<RelayIssueTrackerConnections, ManagedRelayClientError>;
     readonly disconnectIssueTracker: (input: {
       readonly clerkToken: string;
       readonly service: RelayIssueTrackerService;
@@ -293,7 +300,9 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     cancelLinearReplacement: unavailable(
       "clientRuntime.managedRelayTenancy.cancelLinearReplacement",
     ),
-    connectJira: unavailable("clientRuntime.managedRelayTenancy.connectJira"),
+    startJiraAuthorization: unavailable("clientRuntime.managedRelayTenancy.startJiraAuthorization"),
+    selectJiraSite: unavailable("clientRuntime.managedRelayTenancy.selectJiraSite"),
+    cancelJiraSelection: unavailable("clientRuntime.managedRelayTenancy.cancelJiraSelection"),
     disconnectIssueTracker: unavailable("clientRuntime.managedRelayTenancy.disconnectIssueTracker"),
     listSkills: unavailable("clientRuntime.managedRelayTenancy.listSkills"),
     saveSkill: unavailable("clientRuntime.managedRelayTenancy.saveSkill"),
@@ -846,19 +855,46 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       Effect.withSpan("clientRuntime.managedRelayTenancy.cancelLinearReplacement"),
       withRelayClientTracing,
     ),
-    connectJira: Effect.fnUntraced(
+    startJiraAuthorization: Effect.fnUntraced(
       function* (input) {
         return yield* client.issueTrackers
-          .connectJira({
+          .startJira({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.mapError(relayRequestError("start relay Jira authorization")),
+            timeoutRelayRequest("Relay Jira authorization"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.startJiraAuthorization"),
+      withRelayClientTracing,
+    ),
+    selectJiraSite: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.issueTrackers
+          .selectJiraSite({
             headers: bearerHeaders(input.clerkToken),
             payload: input.payload,
           })
           .pipe(
-            Effect.mapError(relayRequestError("connect relay Jira")),
-            timeoutRelayRequest("Relay Jira connection"),
+            Effect.mapError(relayRequestError("select relay Jira site")),
+            timeoutRelayRequest("Relay Jira site selection"),
           );
       },
-      Effect.withSpan("clientRuntime.managedRelayTenancy.connectJira"),
+      Effect.withSpan("clientRuntime.managedRelayTenancy.selectJiraSite"),
+      withRelayClientTracing,
+    ),
+    cancelJiraSelection: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.issueTrackers
+          .cancelJiraSelection({
+            headers: bearerHeaders(input.clerkToken),
+            payload: { authorizationId: input.authorizationId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel relay Jira site selection")),
+            timeoutRelayRequest("Relay Jira site selection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelJiraSelection"),
       withRelayClientTracing,
     ),
     disconnectIssueTracker: Effect.fnUntraced(

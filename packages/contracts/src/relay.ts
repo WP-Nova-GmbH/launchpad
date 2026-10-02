@@ -6,10 +6,11 @@ import {
 import { AuthSessionUser } from "./auth.ts";
 import {
   RelayIssueTrackerService,
-  RelayIssueTrackerConnection,
   RelayIssueTrackerConnections,
-  RelayConnectJiraRequest,
   RelayStartLinearResponse,
+  RelayJiraAuthorizationRequest,
+  RelaySelectJiraSiteRequest,
+  RelayStartJiraResponse,
   RelayLinearReplacementRequest,
   RelayReadIssueRequest,
   RelayReadIssueResponse,
@@ -2845,12 +2846,27 @@ export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
         error: [...RelayTenancyErrors, RelayIssueTrackerError],
       },
     ),
-    HttpApiEndpoint.put("connectJira", "/v1/organization/issue-trackers/jira", {
+    HttpApiEndpoint.post("startJira", "/v1/organization/issue-trackers/jira/authorize", {
       headers: RelayBearerRequestHeaders,
-      payload: RelayConnectJiraRequest,
-      success: RelayIssueTrackerConnection,
+      success: RelayStartJiraResponse,
       error: [...RelayTenancyErrors, RelayIssueTrackerError],
     }),
+    HttpApiEndpoint.post("selectJiraSite", "/v1/organization/issue-trackers/jira/select-site", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelaySelectJiraSiteRequest,
+      success: RelayIssueTrackerConnections,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.post(
+      "cancelJiraSelection",
+      "/v1/organization/issue-trackers/jira/cancel-selection",
+      {
+        headers: RelayBearerRequestHeaders,
+        payload: RelayJiraAuthorizationRequest,
+        success: RelayIssueTrackerConnections,
+        error: [...RelayTenancyErrors, RelayIssueTrackerError],
+      },
+    ),
     HttpApiEndpoint.delete("disconnect", "/v1/organization/issue-trackers/:service", {
       headers: RelayBearerRequestHeaders,
       params: Schema.Struct({ service: RelayIssueTrackerService }),

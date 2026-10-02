@@ -8,6 +8,11 @@ import * as Effect from "effect/Effect";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import * as Connections from "../issueTrackers/Connections.ts";
+import {
+  startJira,
+  selectJiraSite,
+  cancelJiraSelection,
+} from "../issueTrackers/JiraAuthorization.ts";
 import type { ConnectionPersistenceError } from "../issueTrackers/ConnectionStore.ts";
 import { mapErrorTags, mapRelayCommonApiErrors } from "./Api.ts";
 import { requireEnrolledExecutor } from "./enrolledExecutor.ts";
@@ -26,7 +31,10 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
         function* () {
           const { userId } = yield* RelayClientPrincipal;
           const membership = yield* resolveMembership({ userId });
-          return yield* Connections.listConnections(membership.organization.organizationId);
+          return yield* Connections.listConnections(
+            membership.organization.organizationId,
+            membership.role === "admin",
+          );
         },
         mapErrorTags({ IssueTrackerConnectionPersistenceError: persistenceFailure }),
         mapRelayCommonApiErrors("not_authorized"),
@@ -89,16 +97,49 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       ),
     )
     .handle(
-      "connectJira",
-      Effect.fn("issueTrackers.api.connectJira")(
-        function* ({ payload }) {
+      "startJira",
+      Effect.fn("issueTrackers.api.startJira")(
+        function* () {
           const { userId } = yield* RelayClientPrincipal;
           const membership = yield* requireAdmin({ userId });
-          return yield* Connections.saveJira({
-            ...payload,
+          return yield* startJira({
             organizationId: membership.organization.organizationId,
             userId,
           });
+        },
+        mapErrorTags({
+          IssueTrackerConnectionPersistenceError: persistenceFailure,
+          RelayIssueTrackerError: trackerFailure,
+        }),
+        mapRelayCommonApiErrors("not_authorized"),
+      ),
+    )
+    .handle(
+      "selectJiraSite",
+      Effect.fn("issueTrackers.api.selectJiraSite")(
+        function* ({ payload }) {
+          const { userId } = yield* RelayClientPrincipal;
+          const membership = yield* requireAdmin({ userId });
+          const organizationId = membership.organization.organizationId;
+          yield* selectJiraSite({ ...payload, organizationId, userId });
+          return yield* Connections.listConnections(organizationId, true);
+        },
+        mapErrorTags({
+          IssueTrackerConnectionPersistenceError: persistenceFailure,
+          RelayIssueTrackerError: trackerFailure,
+        }),
+        mapRelayCommonApiErrors("not_authorized"),
+      ),
+    )
+    .handle(
+      "cancelJiraSelection",
+      Effect.fn("issueTrackers.api.cancelJiraSelection")(
+        function* ({ payload }) {
+          const { userId } = yield* RelayClientPrincipal;
+          const membership = yield* requireAdmin({ userId });
+          const organizationId = membership.organization.organizationId;
+          yield* cancelJiraSelection({ ...payload, organizationId, userId });
+          return yield* Connections.listConnections(organizationId, true);
         },
         mapErrorTags({
           IssueTrackerConnectionPersistenceError: persistenceFailure,

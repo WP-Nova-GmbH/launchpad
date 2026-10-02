@@ -39,8 +39,9 @@ export class ConnectionStore extends Context.Service<
     readonly begin: (
       input: ConnectionKey & {
         readonly userId: string;
-        readonly stateHash?: string;
-        readonly expiresAt?: string;
+        readonly stateHash: string;
+        readonly pendingOAuthSealed?: string;
+        readonly expiresAt: string;
       },
     ) => Effect.Effect<ConnectionRecord, ConnectionPersistenceError>;
     readonly claimAuthorization: (
@@ -51,8 +52,16 @@ export class ConnectionStore extends Context.Service<
       },
     ) => Effect.Effect<boolean, ConnectionPersistenceError>;
     readonly cancelAuthorization: (
-      input: ConnectionKey & { readonly authorizationId: string },
+      input: ConnectionKey & { readonly authorizationId: string; readonly expiresAt?: string },
     ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly awaitJiraSelection: (
+      input: ConnectionKey & {
+        readonly version: string;
+        readonly authorizationId: string;
+        readonly expiresAt: string;
+        readonly selection: NonNullable<ConnectionRecord["jiraSelection"]>;
+      },
+    ) => Effect.Effect<boolean, ConnectionPersistenceError>;
     readonly proposeReplacement: (
       input: ConnectionKey & {
         readonly version: string;
@@ -78,9 +87,6 @@ export class ConnectionStore extends Context.Service<
       input: ConnectionKey & { readonly version: string; readonly payloadSealed: string | null },
     ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly remove: (key: ConnectionKey) => Effect.Effect<void, ConnectionPersistenceError>;
-    readonly cancel: (
-      input: ConnectionKey & { readonly version: string },
-    ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly withLock: <A, E, R>(
       key: ConnectionKey,
       use: (record: ConnectionRecord | null) => Effect.Effect<A, E, R>,
@@ -88,19 +94,29 @@ export class ConnectionStore extends Context.Service<
   }
 >()("launchpad-relay/issueTrackers/ConnectionStore") {}
 
-export const metadata = (row: ConnectionRecord): RelayIssueTrackerConnection => ({
+export const metadata = (
+  row: ConnectionRecord,
+  includeJiraSites = false,
+): RelayIssueTrackerConnection => ({
   service: row.service,
   status: row.status,
   accountLabel: row.accountLabel,
   updatedAt: row.updatedAt,
-  ...(row.service === "linear" && row.authorizationId && row.pendingExpiresAt
+  ...(row.authorizationId && row.pendingExpiresAt
     ? {
         authorization: {
           id: row.authorizationId,
-          phase: row.pendingStateHash ? ("pending" as const) : ("exchanging" as const),
+          phase: row.jiraSelection
+            ? ("selecting_site" as const)
+            : row.pendingStateHash
+              ? ("pending" as const)
+              : ("exchanging" as const),
           expiresAt: row.pendingExpiresAt,
         },
       }
+    : {}),
+  ...(includeJiraSites && row.service === "jira" && row.jiraSelection
+    ? { jiraSites: row.jiraSelection.sites }
     : {}),
   ...(row.service === "linear" && row.replacement
     ? {
@@ -158,11 +174,12 @@ export const make = Effect.gen(function* () {
       const updatedAt = yield* now;
       // Pending OAuth must not invalidate reads using the active connection.
       const pending = {
-        ...(input.service === "linear"
-          ? { authorizationId: yield* uuid, replacement: null }
-          : { version }),
-        pendingStateHash: input.stateHash ?? null,
-        pendingExpiresAt: input.expiresAt ?? null,
+        authorizationId: yield* uuid,
+        replacement: null,
+        jiraSelection: null,
+        pendingOAuthSealed: input.pendingOAuthSealed ?? null,
+        pendingStateHash: input.stateHash,
+        pendingExpiresAt: input.expiresAt,
         updatedByUserId: input.userId,
         updatedAt,
       };
@@ -205,25 +222,56 @@ export const make = Effect.gen(function* () {
           Effect.gen(function* () {
             const row = yield* get(input);
             if (!row || row.authorizationId !== input.authorizationId) return;
-            const match = and(where(input), eq(connections.authorizationId, input.authorizationId));
+            const match = and(
+              where(input),
+              eq(connections.authorizationId, input.authorizationId),
+              input.expiresAt ? eq(connections.pendingExpiresAt, input.expiresAt) : undefined,
+            );
             if (row.payloadSealed === null) {
               yield* db.delete(connections).where(match).pipe(Effect.mapError(fail));
             } else {
               yield* db
                 .update(connections)
-                .set({ authorizationId: null, pendingStateHash: null, pendingExpiresAt: null })
+                .set({
+                  authorizationId: null,
+                  pendingOAuthSealed: null,
+                  pendingStateHash: null,
+                  pendingExpiresAt: null,
+                  jiraSelection: null,
+                })
                 .where(match)
                 .pipe(Effect.mapError(fail));
             }
           }),
         )
         .pipe(Effect.mapError(fail)),
+    awaitJiraSelection: (input) =>
+      db
+        .update(connections)
+        .set({
+          jiraSelection: input.selection,
+          pendingExpiresAt: input.expiresAt,
+          pendingOAuthSealed: null,
+        })
+        .where(
+          and(
+            current(input),
+            eq(connections.authorizationId, input.authorizationId),
+            isNull(connections.pendingStateHash),
+          ),
+        )
+        .returning({ version: connections.version })
+        .pipe(
+          Effect.map((rows) => rows.length === 1),
+          Effect.mapError(fail),
+        ),
     proposeReplacement: (input) =>
       db
         .update(connections)
         .set({
           replacement: input.replacement,
           authorizationId: null,
+          pendingOAuthSealed: null,
           pendingStateHash: null,
           pendingExpiresAt: null,
         })
@@ -256,6 +304,8 @@ export const make = Effect.gen(function* () {
           ...(input.userId ? { updatedByUserId: input.userId } : {}),
           authorizationId: null,
           replacement: null,
+          jiraSelection: null,
+          pendingOAuthSealed: null,
           pendingStateHash: null,
           pendingExpiresAt: null,
           updatedAt: yield* now,
@@ -289,24 +339,6 @@ export const make = Effect.gen(function* () {
         .pipe(Effect.asVoid, Effect.mapError(fail)),
     remove: (key) =>
       db.delete(connections).where(where(key)).pipe(Effect.asVoid, Effect.mapError(fail)),
-    cancel: (input) =>
-      db.$client
-        .withTransaction(
-          Effect.gen(function* () {
-            const row = yield* get(input);
-            if (!row || row.version !== input.version) return;
-            if (row.payloadSealed === null) {
-              yield* db.delete(connections).where(current(input)).pipe(Effect.mapError(fail));
-            } else {
-              yield* db
-                .update(connections)
-                .set({ pendingStateHash: null, pendingExpiresAt: null })
-                .where(current(input))
-                .pipe(Effect.mapError(fail));
-            }
-          }),
-        )
-        .pipe(Effect.mapError(fail)),
     withLock: (key, use) =>
       db.$client
         .withTransaction(

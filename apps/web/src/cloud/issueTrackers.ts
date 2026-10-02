@@ -1,7 +1,7 @@
 import { useAuth } from "@clerk/react";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import type {
-  RelayConnectJiraRequest,
+  RelaySelectJiraSiteRequest,
   RelayIssueTrackerConnections,
   RelayIssueTrackerService,
 } from "@t3tools/contracts/relay";
@@ -130,23 +130,41 @@ export function useIssueTrackers() {
         ),
     );
 
-  const connectJira = async (payload: RelayConnectJiraRequest) => {
-    await mutate(
+  const startJira = () =>
+    mutate(
       () =>
-        call("Could not connect Jira", (client, clerkToken) =>
-          client.connectJira({ clerkToken, payload }),
+        call("Could not start connecting Jira", (client, clerkToken) =>
+          client.startJiraAuthorization({ clerkToken }),
         ),
-      (connection) =>
+      (result) =>
         setSnapshot(
           (current) =>
             current && {
               ...current,
               connections: [
                 ...current.connections.filter((entry) => entry.service !== "jira"),
-                connection,
+                result.connection,
               ],
             },
         ),
+    );
+
+  const selectJiraSite = async (payload: RelaySelectJiraSiteRequest) => {
+    await mutate(
+      () =>
+        call("Could not connect the Jira site", (client, clerkToken) =>
+          client.selectJiraSite({ clerkToken, payload }),
+        ),
+      setSnapshot,
+    );
+  };
+  const cancelJiraSelection = async (authorizationId: string) => {
+    await mutate(
+      () =>
+        call("Could not cancel Jira setup", (client, clerkToken) =>
+          client.cancelJiraSelection({ clerkToken, authorizationId }),
+        ),
+      setSnapshot,
     );
   };
 
@@ -194,7 +212,9 @@ export function useIssueTrackers() {
     unverified,
     refresh,
     startLinear,
-    connectJira,
+    startJira,
+    selectJiraSite,
+    cancelJiraSelection,
     disconnect,
     confirmLinearReplacement,
     cancelLinearReplacement,

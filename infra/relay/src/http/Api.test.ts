@@ -1604,9 +1604,9 @@ describe("relay request tracing", () => {
       }),
   );
 
-  it.effect(
-    "keeps Linear callback credentials out of HTTP traces while the handler receives them",
-    () =>
+  it.effect.each(["linear", "jira"])(
+    "keeps %s callback credentials out of HTTP traces while the handler receives them",
+    (service) =>
       Effect.gen(function* () {
         const spans: Array<Tracer.NativeSpan> = [];
         const tracer = Tracer.make({
@@ -1616,7 +1616,7 @@ describe("relay request tracing", () => {
             return span;
           },
         });
-        const callbackPath = "/v1/organization/issue-trackers/linear/callback";
+        const callbackPath = `/v1/organization/issue-trackers/${service}/callback`;
         const request = HttpServerRequest.fromWeb(
           new Request(`https://relay.test${callbackPath}?code=private-code&state=private-state`),
         );

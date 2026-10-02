@@ -10,6 +10,7 @@ import type {
   RelayRepositoryRole,
   RelayManagedEndpointOrigin,
   RelayIssueTrackerService,
+  RelayJiraSite,
 } from "@t3tools/contracts/relay";
 import {
   boolean,
@@ -136,6 +137,11 @@ export interface LinearReplacementRecord {
   readonly expiresAt: string;
 }
 
+export interface JiraSelectionRecord {
+  readonly payloadSealed: string;
+  readonly sites: ReadonlyArray<RelayJiraSite>;
+}
+
 /** Credentials stay at the relay; executors receive only bounded issue results. */
 export const relayIssueTrackerConnections = pgTable(
   "relay_issue_tracker_connections",
@@ -152,6 +158,8 @@ export const relayIssueTrackerConnections = pgTable(
     payloadSealed: text("payload_sealed"),
     authorizationId: varchar("authorization_id", { length: 64 }),
     replacement: jsonb("replacement").$type<LinearReplacementRecord>(),
+    jiraSelection: jsonb("jira_selection").$type<JiraSelectionRecord>(),
+    pendingOAuthSealed: text("pending_oauth_sealed"),
     pendingStateHash: text("pending_state_hash"),
     pendingExpiresAt: varchar("pending_expires_at", { length: 64 }),
     updatedByUserId: varchar("updated_by_user_id", { length: 191 }).notNull(),

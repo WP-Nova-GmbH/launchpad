@@ -11,6 +11,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
+import * as Schema from "effect/Schema";
 import { HttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
 import { HttpApi, HttpApiTest } from "effect/unstable/httpapi";
 
@@ -21,6 +22,7 @@ import { Machines, type MachineRecord } from "../machines/Machines.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "./IssueTrackersApi.ts";
 
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const timestamp = "2026-09-30T09:00:00.000Z";
 const record: ConnectionRecord = {
   organizationId: "org-a",
@@ -31,6 +33,8 @@ const record: ConnectionRecord = {
   payloadSealed: "secret-ciphertext",
   authorizationId: null,
   replacement: null,
+  jiraSelection: null,
+  pendingOAuthSealed: null,
   pendingStateHash: null,
   pendingExpiresAt: null,
   updatedByUserId: "admin",
@@ -73,6 +77,7 @@ function setup(
     role?: "member" | "admin";
     machine?: MachineRecord | null;
     organizationId?: string;
+    connection?: ConnectionRecord;
   } = {},
 ) {
   const seen: string[] = [];
@@ -87,7 +92,7 @@ function setup(
     Layer.mock(ConnectionStore, {
       list: (organizationId) => {
         seen.push(`list:${organizationId}`);
-        return Effect.succeed(organizationId === "org-a" ? [record] : []);
+        return Effect.succeed(organizationId === "org-a" ? [input.connection ?? record] : []);
       },
       withLock: (key, use) => {
         seen.push(`lock:${key.organizationId}:${key.service}`);
@@ -183,11 +188,12 @@ describe("issue tracker authorization", () => {
       const client = yield* harness.client;
       const errors = yield* Effect.all({
         linear: client.issueTrackers.startLinear({ headers }).pipe(Effect.flip),
-        jira: client.issueTrackers
-          .connectJira({
-            headers,
-            payload: { siteUrl: "https://team.atlassian.net", apiKey: "secret", issue: "LP-1" },
-          })
+        jiraOAuth: client.issueTrackers.startJira({ headers }).pipe(Effect.flip),
+        selectJira: client.issueTrackers
+          .selectJiraSite({ headers, payload: { authorizationId: "attempt", cloudId: "cloud" } })
+          .pipe(Effect.flip),
+        cancelJira: client.issueTrackers
+          .cancelJiraSelection({ headers, payload: { authorizationId: "attempt" } })
           .pipe(Effect.flip),
         disconnectLinear: client.issueTrackers
           .disconnect({ headers, params: { service: "linear" } })
@@ -315,4 +321,50 @@ it.effect.each(["readComments", "readImages", "viewImage"] as const)(
         }
       }
     }),
+);
+
+it.effect.each(["admin", "member"] as const)(
+  "exposes pending Jira sites only to admins: %s",
+  (role) =>
+    Effect.gen(function* () {
+      const connection: ConnectionRecord = {
+        ...record,
+        authorizationId: "attempt",
+        pendingExpiresAt: "2099-01-01T00:00:00Z",
+        jiraSelection: {
+          payloadSealed: "private-pending-grant",
+          sites: [
+            { cloudId: "cloud", siteUrl: "https://team.atlassian.net", accountLabel: "Team" },
+          ],
+        },
+      };
+      const client = yield* setup({ role, connection }).client;
+      const result = yield* client.issueTrackers.listConnections({ headers });
+      expect(result.connections[0]?.authorization?.phase).toBe("selecting_site");
+      expect(result.connections[0]?.jiraSites).toEqual(
+        role === "admin" ? connection.jiraSelection!.sites : undefined,
+      );
+      expect(yield* encodeJson(result)).not.toContain("private-pending-grant");
+    }),
+);
+
+it.effect("does not let another organization's admin finish or cancel a Jira choice", () =>
+  Effect.gen(function* () {
+    const harness = setup({ role: "admin", organizationId: "org-b" });
+    const client = yield* harness.client;
+    expect(
+      yield* client.issueTrackers
+        .selectJiraSite({
+          headers,
+          payload: { authorizationId: "org-a-attempt", cloudId: "cloud" },
+        })
+        .pipe(Effect.flip),
+    ).toMatchObject({ code: "conflict" });
+    expect(
+      yield* client.issueTrackers
+        .cancelJiraSelection({ headers, payload: { authorizationId: "org-a-attempt" } })
+        .pipe(Effect.flip),
+    ).toMatchObject({ code: "conflict" });
+    expect(harness.seen).toEqual(["get:org-b", "lock:org-b:jira"]);
+  }),
 );

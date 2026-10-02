@@ -1,4 +1,7 @@
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { RELAY_JIRA_CALLBACK_PATH } from "@t3tools/contracts/relay";
+import { completeJira } from "../issueTrackers/JiraAuthorization.ts";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
@@ -27,7 +30,7 @@ const page = (title: string, detail: string, status: number) =>
     },
   );
 
-export const issueTrackerCallbackRoute = HttpRouter.add(
+const linearCallbackRoute = HttpRouter.add(
   "GET",
   LINEAR_CALLBACK_PATH,
   Effect.gen(function* () {
@@ -69,3 +72,53 @@ export const issueTrackerCallbackRoute = HttpRouter.add(
     );
   }),
 );
+
+const jiraCallbackRoute = HttpRouter.add(
+  "GET",
+  RELAY_JIRA_CALLBACK_PATH,
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const params = new URL(request.url, "https://relay.invalid").searchParams;
+    const state = params.get("state");
+    if (!state || state.length > 16_384)
+      return page(
+        "Connection link is invalid",
+        "Start connecting Jira from Organization settings.",
+        400,
+      );
+    return yield* completeJira({
+      state,
+      code: params.get("code"),
+      ...(params.has("iss") ? { iss: params.get("iss")! } : {}),
+      ...(params.has("error") ? { error: params.get("error")! } : {}),
+    }).pipe(
+      Effect.map((result) =>
+        result.status === "awaiting_site_selection"
+          ? page(
+              "Choose your Jira site",
+              "Return to Organization settings in Launchpad to choose which Jira site to share with your organization.",
+              200,
+            )
+          : page(
+              "Jira connected",
+              `Organization chats can now read issues from ${result.accountLabel}.`,
+              200,
+            ),
+      ),
+      Effect.catchTag("RelayIssueTrackerError", (error) =>
+        Effect.succeed(page("Jira was not connected", error.message, 400)),
+      ),
+      Effect.catchCause(() =>
+        Effect.succeed(
+          page(
+            "Jira was not connected",
+            "Could not finish connecting. Try again from Organization settings.",
+            500,
+          ),
+        ),
+      ),
+    );
+  }),
+);
+
+export const issueTrackerCallbackRoute = Layer.merge(linearCallbackRoute, jiraCallbackRoute);
