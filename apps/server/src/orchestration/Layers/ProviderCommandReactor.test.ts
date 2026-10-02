@@ -1,4 +1,9 @@
 import * as WorkspaceLease from "../../workspace/workspaceLease.ts";
+import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
+import {
+  setMcpProviderSession,
+  clearAllMcpProviderSessions,
+} from "../../mcp/McpProviderSession.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -193,6 +198,7 @@ describe("ProviderCommandReactor", () => {
     readonly afterTurnStartDispatch?: () => Effect.Effect<void>;
     readonly compactThreadEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly sendTurnEffect?: ProviderServiceShape["sendTurn"];
+    readonly personalGrants?: ReadonlyMap<string, Uint8Array>;
     readonly interruptTurnEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly stopSessionEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly startSessionEffect?: (
@@ -476,6 +482,11 @@ describe("ProviderCommandReactor", () => {
       }),
     ).pipe(Layer.provide(orchestrationLayer));
     const layer = ProviderCommandReactorLive.pipe(
+      Layer.provide(
+        Layer.mock(ServerSecretStore, {
+          get: (name) => Effect.succeed(Option.fromNullishOr(input?.personalGrants?.get(name))),
+        }),
+      ),
       Layer.provide(Layer.mock(ThreadDeletionReactor, { drainThrough: () => Effect.void })),
       Layer.provideMerge(reactorOrchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
@@ -3789,6 +3800,280 @@ describe("ProviderCommandReactor", () => {
     expect(harness.startSession.mock.calls.length).toBe(1);
     expect(harness.stopSession.mock.calls.length).toBe(0);
   });
+
+  effectIt.effect.each([
+    "same",
+    "other-owner",
+    "changed-connection",
+    "completed",
+    "adapter-rejected",
+  ] as const)("local personal steering preserves the active process: %s", (scenario) =>
+    Effect.gen(function* () {
+      const sent = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<void>();
+      const threadId = ThreadId.make("thread-1");
+      const grants = new Map(
+        ["old", "incoming"].map((id) => [
+          `issue-tracker-turn-${Buffer.from(id).toString("base64url")}`,
+          new TextEncoder().encode(
+            JSON.stringify({
+              authorization: "fixture",
+              relayUrl: "https://relay.test",
+              claims: {
+                commandId: id,
+                threadId,
+                environmentId: "test",
+                commandDigest: "a".repeat(64),
+                ownerUserId: id === "incoming" && scenario === "other-owner" ? "bob" : "alice",
+                expiresAt: 4102444800000,
+                connections: {
+                  jira: "v1",
+                  linear: id === "incoming" && scenario === "changed-connection" ? "v2" : "v1",
+                },
+              },
+            }),
+          ),
+        ]),
+      );
+      let sends = 0;
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          personalGrants: grants,
+          sendTurnEffect: (input) =>
+            Effect.gen(function* () {
+              if (sends === 1 && scenario === "adapter-rejected")
+                return yield* new ProviderAdapterRequestError({
+                  provider: "codex",
+                  method: "turn/steer",
+                  detail: "Steer rejected",
+                });
+              yield* Deferred.succeed(++sends === 1 ? sent : completed, undefined);
+              return { threadId: input.threadId, turnId: TurnId.make("running") };
+            }),
+        }),
+      );
+      const dispatch = (id: string, grant?: string) =>
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(id),
+          threadId,
+          issueTrackerAuthorizationId: grant,
+          message: { messageId: asMessageId(id), role: "user", text: id, attachments: [] },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+      try {
+        yield* dispatch("initial");
+        yield* Deferred.await(sent);
+        yield* Effect.promise(() => harness.drain());
+        harness.runtimeSessions[0] = {
+          ...harness.runtimeSessions[0]!,
+          status: "running",
+          activeTurnId: TurnId.make("running"),
+        };
+        setMcpProviderSession({
+          threadId,
+          environmentId: EnvironmentId.make("test"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerSessionId: "old-session",
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer fixture",
+          capabilities: new Set(["issue-trackers"]),
+          issueTrackerAuthorizationId: "old",
+          issueTrackerTurnId: "running",
+          issueTrackerTurnComplete: scenario === "completed",
+        });
+        const initial = Option.getOrThrow(
+          yield* harness.snapshotQuery.getThreadShellById(threadId),
+        );
+        const runningSession = {
+          ...initial.session!,
+          status: "running" as const,
+          activeTurnId: TurnId.make("running"),
+        };
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("running-session"),
+          threadId,
+          session: runningSession,
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+        const events = yield* harness.engine.subscribeDomainEvents;
+        yield* events.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "thread.activity-appended" &&
+              event.payload.activity.kind === "provider.turn.start.failed",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.andThen(Deferred.succeed(completed, undefined)),
+          Effect.forkChild,
+        );
+        yield* dispatch("steer", "incoming");
+        yield* Deferred.await(completed);
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.startSession).toHaveBeenCalledTimes(1);
+        expect(harness.stopSession).not.toHaveBeenCalled();
+        expect(harness.sendTurn).toHaveBeenCalledTimes(
+          scenario === "same" || scenario === "adapter-rejected" ? 2 : 1,
+        );
+        const after = Option.getOrThrow(yield* harness.snapshotQuery.getThreadShellById(threadId));
+        expect(after.session).toEqual(runningSession);
+        if (scenario !== "same") {
+          const detail = Option.getOrThrow(
+            yield* harness.snapshotQuery.getThreadDetailById(threadId),
+          );
+          expect(
+            detail.activities.some((activity) => activity.kind === "provider.turn.start.failed"),
+          ).toBe(true);
+        }
+        if (scenario === "same")
+          expect(harness.sendTurn.mock.calls[1]?.[0]).toMatchObject({
+            delivery: { mode: "steer", expectedTurnId: "running" },
+          });
+      } finally {
+        clearAllMcpProviderSessions();
+      }
+    }),
+  );
+
+  effectIt.effect(
+    "still reports a failed new turn when the adapter became busy before failing",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            startSessionEffect: (session) =>
+              Effect.succeed({
+                ...session,
+                status: "running",
+                activeTurnId: TurnId.make("failed-new-turn"),
+              }),
+            sendTurnEffect: () =>
+              Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: "codex",
+                  method: "turn/start",
+                  detail: "New turn failed",
+                }),
+              ),
+          }),
+        );
+        const failed = yield* Deferred.make<void>();
+        const events = yield* harness.engine.subscribeDomainEvents;
+        yield* events.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "thread.activity-appended" &&
+              event.payload.activity.kind === "provider.turn.start.failed",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.andThen(Deferred.succeed(failed, undefined)),
+          Effect.forkChild,
+        );
+        const threadId = ThreadId.make("thread-1");
+        yield* harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("failed-new-turn"),
+          threadId,
+          message: {
+            messageId: asMessageId("failed-new-turn"),
+            role: "user",
+            text: "start",
+            attachments: [],
+          },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+        yield* Deferred.await(failed);
+        yield* Effect.promise(() => harness.drain());
+        const thread = Option.getOrThrow(yield* harness.snapshotQuery.getThreadShellById(threadId));
+        expect(thread.session).toMatchObject({
+          status: "error",
+          activeTurnId: null,
+          lastError: expect.stringContaining("New turn failed"),
+        });
+      }),
+  );
+
+  effectIt.effect.each([false, true])(
+    "rotates personal credentials only on an idle provider session (running: %s)",
+    (running) =>
+      Effect.gen(function* () {
+        const sent = yield* Deferred.make<void>();
+        const completed = yield* Deferred.make<void>();
+        let sends = 0;
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            sendTurnEffect: (input) =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(++sends === 1 ? sent : completed, undefined);
+                return { threadId: input.threadId, turnId: TurnId.make(`turn-${sends}`) };
+              }),
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const turn = (id: string) =>
+          harness.engine.dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make(id),
+            threadId,
+            message: { messageId: asMessageId(id), role: "user", text: id, attachments: [] },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          });
+        try {
+          yield* turn("initial-personal-test");
+          yield* Deferred.await(sent);
+          yield* Effect.promise(() => harness.drain());
+          setMcpProviderSession({
+            threadId,
+            environmentId: EnvironmentId.make("test"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            providerSessionId: "old-session",
+            endpoint: "http://localhost/mcp",
+            authorizationHeader: "Bearer old",
+            capabilities: new Set(["issue-trackers"]),
+            issueTrackerAuthorizationId: "old-user",
+          });
+          if (running)
+            harness.runtimeSessions[0] = {
+              ...harness.runtimeSessions[0]!,
+              status: "running",
+              activeTurnId: TurnId.make("running"),
+            };
+          const events = yield* harness.engine.subscribeDomainEvents;
+          yield* events.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "thread.activity-appended" &&
+                event.payload.activity.kind === "provider.turn.start.failed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.andThen(Deferred.succeed(completed, undefined)),
+            Effect.forkChild,
+          );
+          yield* turn("following-personal-test");
+          yield* Deferred.await(completed);
+          yield* Effect.promise(() => harness.drain());
+          expect(harness.startSession).toHaveBeenCalledTimes(running ? 1 : 2);
+          expect(harness.sendTurn).toHaveBeenCalledTimes(running ? 1 : 2);
+          expect(harness.stopSession).not.toHaveBeenCalled();
+          if (!running)
+            expect(harness.startSession.mock.calls[1]?.[1]).toMatchObject({
+              resumeCursor: { opaque: "resume-1" },
+            });
+        } finally {
+          clearAllMcpProviderSessions();
+        }
+      }),
+  );
 
   it("restarts an existing Codex thread on a compatible requested instance", async () => {
     const harness = await createHarness();

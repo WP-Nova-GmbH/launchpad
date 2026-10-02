@@ -1,6 +1,9 @@
 import type { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 
 export interface McpProviderSessionConfig {
+  readonly issueTrackerAuthorizationId?: string;
+  readonly issueTrackerTurnId?: string;
+  readonly issueTrackerTurnComplete?: boolean;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly providerSessionId: string;
@@ -42,6 +45,44 @@ export function setMcpProviderSession(config: McpProviderSessionConfig): void {
 
 export function readMcpProviderSession(threadId: ThreadId): McpProviderSessionConfig | undefined {
   return sessionsByThread.get(threadId);
+}
+
+/** Only admission of the submitted prompt can activate this process's personal grant. */
+export function bindIssueTrackerTurn(
+  threadId: ThreadId,
+  providerSessionId: string,
+  turnId: string,
+): void {
+  const current = sessionsByThread.get(threadId);
+  if (
+    current?.issueTrackerAuthorizationId &&
+    current.providerSessionId === providerSessionId &&
+    !current.issueTrackerTurnComplete &&
+    !current.issueTrackerTurnId
+  ) {
+    sessionsByThread.set(threadId, { ...current, issueTrackerTurnId: turnId });
+  }
+}
+
+export function revokeIssueTrackerTurn(threadId: ThreadId, providerSessionId: string): void {
+  const current = sessionsByThread.get(threadId);
+  if (current?.providerSessionId === providerSessionId && current.issueTrackerAuthorizationId)
+    sessionsByThread.set(threadId, { ...current, issueTrackerTurnComplete: true });
+}
+
+export function completeIssueTrackerTurn(
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceId,
+  turnId: string,
+): void {
+  const current = sessionsByThread.get(threadId);
+  if (
+    current?.issueTrackerAuthorizationId &&
+    current.providerInstanceId === providerInstanceId &&
+    current.issueTrackerTurnId === turnId
+  ) {
+    sessionsByThread.set(threadId, { ...current, issueTrackerTurnComplete: true });
+  }
 }
 
 export function clearMcpProviderSession(threadId: ThreadId): void {

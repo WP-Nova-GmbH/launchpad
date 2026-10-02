@@ -70,7 +70,7 @@ const authRequired = () =>
   new IssueTrackerFailure({
     code: "auth_required",
     message:
-      "Jira authorization has expired or was revoked. Reconnect Jira in Organization settings.",
+      "Jira authorization has expired or was revoked. Reconnect Jira in Account connections.",
   });
 const isOAuthEndpoint = Schema.is(JiraOAuthEndpoint);
 const sdkRequest = makeOAuthRequest({

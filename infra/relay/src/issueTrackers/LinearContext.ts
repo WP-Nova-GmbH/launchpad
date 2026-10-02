@@ -15,7 +15,7 @@ import {
 
 const Reference = Schema.Struct({
   kind: Schema.Literals(["issue", "comments", "image", "images"]),
-  organizationId: Schema.String,
+  ownerUserId: Schema.String,
   generation: Schema.String,
   workspaceId: Schema.String,
   issueId: Schema.String,
@@ -28,7 +28,7 @@ const Reference = Schema.Struct({
 export type LinearReference = typeof Reference.Type;
 export type LinearSource = Pick<
   LinearReference,
-  "organizationId" | "generation" | "workspaceId" | "issueId"
+  "ownerUserId" | "generation" | "workspaceId" | "issueId"
 >;
 const decode = Schema.decodeUnknownEffect(Schema.fromJsonString(Reference));
 const encode = Schema.encodeEffect(Schema.fromJsonString(Reference));
@@ -63,7 +63,7 @@ export function validateLinearSource(
   reference: LinearSource,
   active: Omit<LinearSource, "issueId">,
 ) {
-  return reference.organizationId === active.organizationId &&
+  return reference.ownerUserId === active.ownerUserId &&
     reference.generation === active.generation &&
     reference.workspaceId === active.workspaceId
     ? Effect.void

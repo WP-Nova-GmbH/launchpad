@@ -166,7 +166,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
             ),
           );
           const normalizedCommand = stampCommandAuthor(
-            yield* normalizeDispatchCommand(args.payload).pipe(
+            yield* normalizeDispatchCommand(args.payload, actor.user?.userId).pipe(
               Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
             ),
             actor,

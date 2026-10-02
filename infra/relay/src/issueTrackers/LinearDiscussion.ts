@@ -188,8 +188,10 @@ export const fetchLinearImage = Effect.fn("relay.linear.fetch_image")(function* 
   const url = linearUploadUrl(input.url);
   if (!url)
     return yield* failure("invalid_input", "Only Linear-hosted image uploads are supported.");
+  // Linear's extractor does not recognize angle-bracket Markdown destinations.
+  const destination = url.replace(/[()]/g, (character) => (character === "(" ? "%28" : "%29"));
   const results = yield* callLinearTools(input.accessToken, [
-    { name: "extract_images", arguments: { markdown: `![image](<${url}>)` } },
+    { name: "extract_images", arguments: { markdown: `![image](${destination})` } },
   ]);
   const images = results[0]!.content.filter((entry) => entry.type === "image");
   if (images.length !== 1)

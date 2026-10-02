@@ -11,11 +11,11 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { RelayDb } from "../db.ts";
-import { relayIssueTrackerConnections as connections } from "../persistence/schema.ts";
+import { relayUserIssueTrackerConnections as connections } from "../persistence/schema.ts";
 
 export type ConnectionRecord = typeof connections.$inferSelect;
 export type ConnectionKey = {
-  readonly organizationId: string;
+  readonly ownerUserId: string;
   readonly service: RelayIssueTrackerService;
 };
 
@@ -28,7 +28,7 @@ export class ConnectionStore extends Context.Service<
   ConnectionStore,
   {
     readonly list: (
-      organizationId: string,
+      ownerUserId: string,
     ) => Effect.Effect<ReadonlyArray<ConnectionRecord>, ConnectionPersistenceError>;
     readonly get: (
       key: ConnectionKey,
@@ -136,7 +136,7 @@ export const make = Effect.gen(function* () {
   const db = yield* RelayDb;
   const crypto = yield* Crypto.Crypto;
   const where = (key: ConnectionKey) =>
-    and(eq(connections.organizationId, key.organizationId), eq(connections.service, key.service));
+    and(eq(connections.ownerUserId, key.ownerUserId), eq(connections.service, key.service));
   const current = (key: ConnectionKey & { readonly version: string }) =>
     and(where(key), eq(connections.version, key.version));
   const fail = (cause: unknown) => new ConnectionPersistenceError({ cause });
@@ -153,11 +153,11 @@ export const make = Effect.gen(function* () {
       );
 
   return ConnectionStore.of({
-    list: (organizationId) =>
+    list: (ownerUserId) =>
       db
         .select()
         .from(connections)
-        .where(eq(connections.organizationId, organizationId))
+        .where(eq(connections.ownerUserId, ownerUserId))
         .pipe(Effect.mapError(fail)),
     get,
     findPending: (stateHash) =>
@@ -186,14 +186,14 @@ export const make = Effect.gen(function* () {
       const rows = yield* db
         .insert(connections)
         .values({
-          organizationId: input.organizationId,
+          ownerUserId: input.ownerUserId,
           service: input.service,
           status: "connecting",
           version,
           ...pending,
         })
         .onConflictDoUpdate({
-          target: [connections.organizationId, connections.service],
+          target: [connections.ownerUserId, connections.service],
           set: pending,
         })
         .returning()

@@ -13,7 +13,6 @@ import * as Schema from "effect/Schema";
 
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { RelayConfiguration } from "../Config.ts";
-import { Organizations } from "../tenancy/Organizations.ts";
 import {
   ConnectionStore,
   metadata,
@@ -72,7 +71,7 @@ const isTrackerFailure = Schema.is(RelayIssueTrackerError);
 const failure = (code: RelayIssueTrackerError["code"], message: string) =>
   new RelayIssueTrackerError({ code, message });
 const conflict = () =>
-  failure("conflict", "This connection changed. Start again from Organization settings.");
+  failure("conflict", "This connection changed. Start again from Account connections.");
 const milliseconds = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
 // Leave time for cleanup and a typed response before the relay's 9-second deadline.
 const boundedOperation = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -95,7 +94,7 @@ const seal = Effect.fn("issueTrackers.seal")(function* (credentials: Credentials
 });
 const open = Effect.fn("issueTrackers.open")(function* (row: ConnectionRecord) {
   if (!row.payloadSealed)
-    return yield* failure("not_configured", "Connect this service in Organization settings first.");
+    return yield* failure("not_configured", "Connect this service in Account connections first.");
   const box = yield* RelaySecretBox;
   return yield* box.open(row.payloadSealed).pipe(
     Effect.flatMap(decodeCredentials),
@@ -104,8 +103,8 @@ const open = Effect.fn("issueTrackers.open")(function* (row: ConnectionRecord) {
         "auth_required",
         // Unreadable credentials hide the workspace identity needed to compare a new grant.
         row.service === "linear"
-          ? "The saved Linear connection could not be read. Disconnect Linear in Organization settings, then connect it again."
-          : "Reconnect this service in Organization settings.",
+          ? "The saved Linear connection could not be read. Disconnect Linear in Account connections, then connect it again."
+          : "Reconnect this service in Account connections.",
       ),
     ),
   );
@@ -125,13 +124,10 @@ const hashState = (state: string) =>
     );
   });
 
-export const listConnections = Effect.fn("issueTrackers.list")(function* (
-  organizationId: string,
-  includeJiraSites = false,
-) {
+export const listConnections = Effect.fn("issueTrackers.list")(function* (ownerUserId: string) {
   const store = yield* ConnectionStore;
   const now = yield* milliseconds;
-  let rows = yield* store.list(organizationId);
+  let rows = yield* store.list(ownerUserId);
   let expired = false;
   for (const row of rows) {
     if (row.authorizationId && row.pendingExpiresAt && Date.parse(row.pendingExpiresAt) <= now) {
@@ -147,11 +143,11 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (
       expired = true;
     }
   }
-  if (expired) rows = yield* store.list(organizationId);
+  if (expired) rows = yield* store.list(ownerUserId);
   return {
     linearAvailable: true,
     connections: rows.map((row) => ({
-      ...metadata(row, includeJiraSites),
+      ...metadata(row, true),
       status:
         row.status === "connecting" &&
         row.pendingExpiresAt &&
@@ -163,10 +159,10 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (
 });
 
 export const startLinear = Effect.fn("issueTrackers.startLinear")(function* (input: {
-  readonly organizationId: string;
+  readonly ownerUserId: string;
   readonly userId: string;
 }) {
-  yield* requireLinearAdmin(input);
+  yield* requireConnectionOwner(input);
   const config = yield* RelayConfiguration;
   const crypto = yield* Crypto.Crypto;
   const state = yield* crypto.randomUUIDv4.pipe(
@@ -197,18 +193,12 @@ export const startLinear = Effect.fn("issueTrackers.startLinear")(function* (inp
   };
 });
 
-const requireLinearAdmin = Effect.fn("issueTrackers.requireLinearAdmin")(function* (input: {
-  readonly organizationId: string;
+const requireConnectionOwner = Effect.fn("issueTrackers.requireConnectionOwner")(function* (input: {
+  readonly ownerUserId: string;
   readonly userId: string;
 }) {
-  const organizations = yield* Organizations;
-  const membership = yield* organizations.getMembershipForUser({ userId: input.userId });
-  if (
-    !membership ||
-    membership.role !== "admin" ||
-    membership.organization.organizationId !== input.organizationId
-  )
-    return yield* failure("forbidden", "An organization administrator must connect Linear.");
+  if (input.ownerUserId !== input.userId)
+    return yield* failure("forbidden", "Only the owner can change this connection.");
 });
 
 export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function* (input: {
@@ -230,7 +220,7 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
   if (pending?.service !== "linear" || !pending.authorizationId) return yield* conflict();
   const authorizationId = pending.authorizationId;
   const attempt = { ...pending, authorizationId };
-  const admin = { organizationId: pending.organizationId, userId: pending.updatedByUserId };
+  const owner = { ownerUserId: pending.ownerUserId, userId: pending.updatedByUserId };
   // A losing duplicate callback must not cancel the callback that already claimed this code.
   const discardUnclaimed = store.withLock(pending, (row) =>
     row?.authorizationId === authorizationId && row.pendingStateHash === stateHash
@@ -241,9 +231,9 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
     if (input.error !== undefined || !input.code || input.code.length > 16_384)
       return yield* failure(
         "invalid_input",
-        "Linear authorization was cancelled. Return to Organization settings to try again.",
+        "Linear authorization was cancelled. Return to Account connections to try again.",
       );
-    yield* requireLinearAdmin(admin);
+    yield* requireConnectionOwner(owner);
     return yield* store.withLock(pending, (row) =>
       Effect.gen(function* () {
         if (
@@ -303,7 +293,7 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
       generation,
     });
     const proposalId = previous && !sameWorkspace ? yield* newId : null;
-    yield* requireLinearAdmin(admin);
+    yield* requireConnectionOwner(owner);
     return yield* store.withLock(claimed, (row) =>
       Effect.gen(function* () {
         const now = yield* milliseconds;
@@ -325,7 +315,7 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
             accountLabel: identity.accountLabel,
             currentAccountLabel: row.accountLabel ?? "Current Linear workspace",
             expectedVersion: row.version,
-            createdByUserId: admin.userId,
+            createdByUserId: owner.userId,
             expiresAt: DateTime.formatIso(DateTime.makeUnsafe(now + 15 * 60_000)),
           };
           if (!(yield* store.proposeReplacement({ ...row, authorizationId, replacement })))
@@ -337,7 +327,7 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
             ...row,
             payloadSealed,
             accountLabel: identity.accountLabel,
-            userId: admin.userId,
+            userId: owner.userId,
           }))
         )
           return yield* conflict();
@@ -360,13 +350,13 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
 
 export const confirmLinearReplacement = Effect.fn("issueTrackers.confirmLinearReplacement")(
   function* (input: {
-    readonly organizationId: string;
+    readonly ownerUserId: string;
     readonly userId: string;
     readonly proposalId: string;
   }) {
-    yield* requireLinearAdmin(input);
+    yield* requireConnectionOwner(input);
     const store = yield* ConnectionStore;
-    const key = { organizationId: input.organizationId, service: "linear" as const };
+    const key = { ownerUserId: input.ownerUserId, service: "linear" as const };
     yield* store.withLock(key, (row) =>
       Effect.gen(function* () {
         const proposal = row?.replacement;
@@ -390,19 +380,19 @@ export const confirmLinearReplacement = Effect.fn("issueTrackers.confirmLinearRe
           return yield* conflict();
       }),
     );
-    return yield* listConnections(input.organizationId, true);
+    return yield* listConnections(input.ownerUserId);
   },
 );
 
 export const cancelLinearReplacement = Effect.fn("issueTrackers.cancelLinearReplacement")(
   function* (input: {
-    readonly organizationId: string;
+    readonly ownerUserId: string;
     readonly userId: string;
     readonly proposalId: string;
   }) {
-    yield* requireLinearAdmin(input);
+    yield* requireConnectionOwner(input);
     const store = yield* ConnectionStore;
-    const key = { organizationId: input.organizationId, service: "linear" as const };
+    const key = { ownerUserId: input.ownerUserId, service: "linear" as const };
     yield* store.withLock(key, (row) =>
       Effect.gen(function* () {
         if (!row?.replacement) return;
@@ -410,7 +400,7 @@ export const cancelLinearReplacement = Effect.fn("issueTrackers.cancelLinearRepl
         yield* store.cancelReplacement({ ...row, proposalId: input.proposalId });
       }),
     );
-    return yield* listConnections(input.organizationId, true);
+    return yield* listConnections(input.ownerUserId);
   },
 );
 
@@ -430,7 +420,7 @@ const linearCredentials = Effect.fn("issueTrackers.linearCredentials")(function*
       if (!row || row.status !== "connected")
         return yield* failure(
           "auth_required",
-          "Connect or reconnect Linear in Organization settings.",
+          "Connect or reconnect Linear in Account connections.",
         );
       let credentials = yield* open(row);
       let activeRow = row;
@@ -456,28 +446,25 @@ const linearCredentials = Effect.fn("issueTrackers.linearCredentials")(function*
 });
 
 export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: {
-  readonly organizationId: string;
+  readonly connectionVersion?: string;
+  readonly ownerUserId: string;
   readonly service: RelayIssueTrackerService;
   readonly issue: string;
 }) {
   const store = yield* ConnectionStore;
   const initial = yield* store.get(input);
   if (!initial)
-    return yield* failure(
-      "not_configured",
-      "Ask an administrator to connect this service in Organization settings.",
-    );
+    return yield* failure("not_configured", "Connect this service in Account connections.");
   if (initial.status !== "connected")
-    return yield* failure(
-      "auth_required",
-      "Ask an administrator to reconnect this service in Organization settings.",
-    );
+    return yield* failure("auth_required", "Reconnect this service in Account connections.");
   let authRecord = initial;
   return yield* Effect.gen(function* () {
     const startedAt = yield* milliseconds;
     const active =
       input.service === "linear" ? yield* linearCredentials(input) : yield* jiraCredentials(input);
     authRecord = active.row;
+    if (input.connectionVersion !== undefined && active.row.version !== input.connectionVersion)
+      return yield* conflict();
     const providerResult =
       active.credentials.service === "linear"
         ? yield* readLinearIssue({ ...active.credentials, issue: input.issue }).pipe(
@@ -500,7 +487,7 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
       typeof result.issueId === "string"
     ) {
       const source: LinearSource = {
-        organizationId: input.organizationId,
+        ownerUserId: input.ownerUserId,
         generation: active.credentials.generation ?? active.credentials.workspaceId,
         workspaceId: active.credentials.workspaceId,
         issueId: result.issueId,
@@ -577,7 +564,11 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
 
 type LinearCredentials = Extract<Credentials, { service: "linear" }>;
 const withLinearReference = Effect.fn("issueTrackers.withLinearReference")(function* <A, E, R>(
-  input: { readonly organizationId: string; readonly reference: string },
+  input: {
+    readonly ownerUserId: string;
+    readonly reference: string;
+    readonly connectionVersion?: string;
+  },
   use: (context: {
     readonly reference: LinearReference;
     readonly source: LinearSource;
@@ -590,7 +581,7 @@ const withLinearReference = Effect.fn("issueTrackers.withLinearReference")(funct
   }) => Effect.Effect<A, E, R>,
 ) {
   const store = yield* ConnectionStore;
-  const key = { organizationId: input.organizationId, service: "linear" as const };
+  const key = { ownerUserId: input.ownerUserId, service: "linear" as const };
   const initial = yield* store.get(key);
   if (!initial) return yield* conflict();
   let authRecord = initial;
@@ -598,8 +589,10 @@ const withLinearReference = Effect.fn("issueTrackers.withLinearReference")(funct
     const reference = yield* openLinearReference(input.reference);
     const active = yield* linearCredentials(key);
     authRecord = active.row;
+    if (input.connectionVersion !== undefined && active.row.version !== input.connectionVersion)
+      return yield* conflict();
     const source = {
-      organizationId: input.organizationId,
+      ownerUserId: input.ownerUserId,
       generation: active.credentials.generation ?? active.credentials.workspaceId,
       workspaceId: active.credentials.workspaceId,
       issueId: reference.issueId,
@@ -631,7 +624,8 @@ const withLinearReference = Effect.fn("issueTrackers.withLinearReference")(funct
 });
 
 export const readComments = Effect.fn("issueTrackers.readComments")(function* (input: {
-  readonly organizationId: string;
+  readonly connectionVersion?: string;
+  readonly ownerUserId: string;
   readonly reference: string;
 }) {
   return yield* withLinearReference(
@@ -666,7 +660,8 @@ export const readComments = Effect.fn("issueTrackers.readComments")(function* (i
 });
 
 export const readImages = Effect.fn("issueTrackers.readImages")(function* (input: {
-  readonly organizationId: string;
+  readonly connectionVersion?: string;
+  readonly ownerUserId: string;
   readonly reference: string;
 }) {
   return yield* withLinearReference(
@@ -703,7 +698,8 @@ export const readImages = Effect.fn("issueTrackers.readImages")(function* (input
 });
 
 export const viewImage = Effect.fn("issueTrackers.viewImage")(function* (input: {
-  readonly organizationId: string;
+  readonly connectionVersion?: string;
+  readonly ownerUserId: string;
   readonly reference: string;
 }) {
   return yield* withLinearReference(

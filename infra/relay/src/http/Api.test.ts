@@ -1616,7 +1616,7 @@ describe("relay request tracing", () => {
             return span;
           },
         });
-        const callbackPath = `/v1/organization/issue-trackers/${service}/callback`;
+        const callbackPath = `/v1/user/issue-trackers/${service}/callback`;
         const request = HttpServerRequest.fromWeb(
           new Request(`https://relay.test${callbackPath}?code=private-code&state=private-state`),
         );

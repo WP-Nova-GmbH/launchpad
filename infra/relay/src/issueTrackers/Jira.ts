@@ -139,7 +139,7 @@ const validateAccessToken = Effect.fnUntraced(function* (accessToken: string) {
   if (!accessToken.trim() || /[\r\n]/.test(accessToken)) {
     return yield* new IssueTrackerFailure({
       code: "auth_required",
-      message: "The Jira authorization is invalid. Reconnect Jira in Organization settings.",
+      message: "The Jira authorization is invalid. Reconnect Jira in Account connections.",
     });
   }
   return accessToken.trim();
@@ -150,7 +150,7 @@ const checkStatus = Effect.fnUntraced(function* (response: HttpClientResponse.Ht
   if (response.status === 401) {
     return yield* new IssueTrackerFailure({
       code: "auth_required",
-      message: "Atlassian rejected Jira access. Reconnect Jira in Organization settings.",
+      message: "Atlassian rejected Jira access. Reconnect Jira in Account connections.",
     });
   }
   if (response.status === 403) {
@@ -311,7 +311,7 @@ const callJiraTool = Effect.fnUntraced(function* (
       if (/\b401\b|unauthori[sz]ed|invalid.*token|expired.*token/i.test(text)) {
         return yield* new IssueTrackerFailure({
           code: "auth_required",
-          message: "Atlassian rejected Jira access. Reconnect Jira in Organization settings.",
+          message: "Atlassian rejected Jira access. Reconnect Jira in Account connections.",
         });
       }
       if (/\b403\b|forbidden|permission/i.test(text)) {

@@ -51,25 +51,25 @@ describe("organization issue tracker client", () => {
       yield* client.cancelLinearReplacement({ clerkToken: "admin-token", proposalId: "proposal" });
       expect(requests).toEqual([
         {
-          url: "https://relay.example.test/v1/organization/issue-trackers",
+          url: "https://relay.example.test/v1/user/issue-trackers",
           method: "GET",
           bearer: "Bearer member-token",
           body: null,
         },
         {
-          url: "https://relay.example.test/v1/organization/issue-trackers/linear/authorize",
+          url: "https://relay.example.test/v1/user/issue-trackers/linear/authorize",
           method: "POST",
           bearer: "Bearer admin-token",
           body: null,
         },
         {
-          url: "https://relay.example.test/v1/organization/issue-trackers/jira",
+          url: "https://relay.example.test/v1/user/issue-trackers/jira",
           method: "DELETE",
           bearer: "Bearer admin-token",
           body: null,
         },
         ...["confirm", "cancel"].map((action) => ({
-          url: `https://relay.example.test/v1/organization/issue-trackers/linear/replacement/${action}`,
+          url: `https://relay.example.test/v1/user/issue-trackers/linear/replacement/${action}`,
           method: "POST",
           bearer: "Bearer admin-token",
           body: { proposalId: "proposal" },
@@ -135,9 +135,7 @@ it.effect("starts Jira OAuth with only the administrator's relay session", () =>
     });
     expect(result.authorizationUrl).toContain("mcp.atlassian.com");
     const request = requests[0]!;
-    expect(request.url).toBe(
-      "https://relay.example.test/v1/organization/issue-trackers/jira/authorize",
-    );
+    expect(request.url).toBe("https://relay.example.test/v1/user/issue-trackers/jira/authorize");
     expect(request.method).toBe("POST");
     expect(request.headers.get("authorization")).toBe("Bearer admin-token");
     expect(yield* Effect.promise(() => request.text())).toBe("");
@@ -166,7 +164,7 @@ it.effect.each(["select", "cancel"] as const)(
         });
       const request = requests[0]!;
       expect(request.url).toBe(
-        `https://relay.example.test/v1/organization/issue-trackers/jira/${action === "select" ? "select-site" : "cancel-selection"}`,
+        `https://relay.example.test/v1/user/issue-trackers/jira/${action === "select" ? "select-site" : "cancel-selection"}`,
       );
       expect(request.method).toBe("POST");
       expect(request.headers.get("authorization")).toBe("Bearer admin-token");

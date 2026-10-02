@@ -14,6 +14,8 @@ import type { ReviewCommentContext } from "./reviewCommentContext";
  */
 export interface QueuedComposerMessage {
   id: string;
+  /** A queued prompt must never acquire a different account's personal connections. */
+  ownerAccountId: string | null;
   prompt: string;
   images: ComposerImageAttachment[];
   files: ComposerFileAttachment[];

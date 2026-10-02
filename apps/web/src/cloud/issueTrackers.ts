@@ -14,9 +14,16 @@ import { resolveRelayClerkTokenOptions } from "./publicConfig";
 
 type TenancyClient = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
 
-/** Organization settings own this hook so leaving the organization discards its metadata. */
+/** Mount under a user-ID key so switching accounts discards metadata and pending dialogs. */
 export function useIssueTrackers() {
   const { getToken } = useAuth();
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [snapshot, setSnapshot] = useState<RelayIssueTrackerConnections | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -35,7 +42,7 @@ export function useIssueTrackers() {
       ) => Effect.Effect<A, ManagedRelay.ManagedRelayClientError>,
     ): Promise<A> => {
       const clerkToken = await getToken(resolveRelayClerkTokenOptions());
-      if (!clerkToken) throw new Error("Sign in to Launchpad Connect first.");
+      if (!mounted.current || !clerkToken) throw new Error("Sign in to Launchpad Connect first.");
       return runtime.runPromise(
         ManagedRelayTenancy.ManagedRelayTenancyClient.pipe(
           Effect.flatMap((client) => run(client, clerkToken)),
@@ -94,10 +101,12 @@ export function useIssueTrackers() {
     setError(null);
     try {
       const result = await action();
+      if (!mounted.current) throw new Error("The account changed. Open Connections again.");
       ++requestVersion.current;
       apply(result);
       return result;
     } catch (cause) {
+      if (!mounted.current) throw cause;
       // The server may have committed even when its response was lost. Reconcile
       // before allowing another action; never replay the mutation automatically.
       ++requestVersion.current;

@@ -24,7 +24,7 @@ const client = { client_id: "dynamic-client", token_endpoint_auth_method: "none"
 const pending = {
   server: { ...metadata, authorization_response_iss_parameter_supported: true as const },
   client,
-  redirectUri: "https://relay.test/v1/organization/issue-trackers/linear/callback",
+  redirectUri: "https://relay.test/v1/user/issue-trackers/linear/callback",
   codeVerifier: "private-verifier",
 };
 const tokens = {

@@ -222,6 +222,9 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
           entry: {
             ...entry,
             ...command.message,
+            // Editing replaces authorization, including an edit by a signed-out
+            // participant. Never retain the previous revision's grant.
+            issueTrackerAuthorizationId: command.message.issueTrackerAuthorizationId,
             revision: entry.revision + 1,
             ...(command.author ? { editedBy: command.author } : {}),
           },

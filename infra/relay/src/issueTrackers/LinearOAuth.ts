@@ -70,7 +70,7 @@ const authRequired = () =>
   new IssueTrackerFailure({
     code: "auth_required",
     message:
-      "Linear authorization has expired or was revoked. Reconnect Linear in Organization settings.",
+      "Linear authorization has expired or was revoked. Reconnect Linear in Account connections.",
   });
 const isOAuthEndpoint = Schema.is(LinearOAuthEndpoint);
 const sdkRequest = makeOAuthRequest({

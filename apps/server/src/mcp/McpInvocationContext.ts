@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 export type McpCapability = "preview" | "device" | "pull-requests" | "issue-trackers";
 
 export interface McpInvocationScope {
+  readonly issueTrackerAuthorizationId?: string;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly providerSessionId: string;

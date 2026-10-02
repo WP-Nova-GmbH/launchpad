@@ -26,7 +26,6 @@ import {
   fixture,
   key,
   issueInput,
-  membership,
   linearRow,
   jiraRow,
   issueResponse,
@@ -56,26 +55,40 @@ function jiraResponse(request: HttpClientRequest.HttpClientRequest) {
 }
 
 describe("issue tracker connection lifecycle", () => {
+  it.effect.each(["linear", "jira"] as const)(
+    "rejects a replaced %s connection before reading with its credentials",
+    (service) =>
+      Effect.gen(function* () {
+        const test = yield* fixture({ rows: [linearRow(), jiraRow()] });
+        expect(
+          yield* readIssue({
+            ...issueInput,
+            service,
+            connectionVersion: "previous-connection",
+          }).pipe(test.provide, Effect.flip),
+        ).toMatchObject({ code: "conflict" });
+        expect(test.requests).toHaveLength(0);
+      }),
+  );
+
   it.effect.each(["disconnect", "replacement"] as const)(
     "stale Linear callback cannot undo %s",
     (action) =>
       Effect.gen(function* () {
         const started = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
-        let membershipCalls = 0;
         const test = yield* fixture({
-          membership: Effect.suspend(() =>
-            ++membershipCalls === 2
+          respond: (request) =>
+            request.url.endsWith("/token")
               ? Deferred.succeed(started, undefined).pipe(
                   Effect.andThen(Deferred.await(release)),
-                  Effect.as(membership),
+                  Effect.as(tokenResponse()),
                 )
-              : Effect.succeed(membership),
-          ),
+              : Effect.succeed(identityResponse()),
         });
         const { authorizationUrl } = yield* startLinear({
-          organizationId: "org",
-          userId: "admin",
+          ownerUserId: "org",
+          userId: "org",
         }).pipe(test.provide);
         const state = new URL(authorizationUrl).searchParams.get("state")!;
         const callback = yield* completeLinear({
@@ -85,15 +98,14 @@ describe("issue tracker connection lifecycle", () => {
         }).pipe(test.provide, Effect.flip, Effect.forkChild);
         yield* Deferred.await(started);
         if (action === "disconnect") yield* disconnect(key).pipe(test.provide);
-        else
-          yield* startLinear({ organizationId: "org", userId: "other-admin" }).pipe(test.provide);
+        else yield* startLinear({ ownerUserId: "org", userId: "org" }).pipe(test.provide);
         yield* Deferred.succeed(release, undefined);
         expect(yield* Fiber.join(callback)).toMatchObject({ code: "conflict" });
-        expect(test.requests).toHaveLength(0);
+        expect(test.requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(1);
         const row = yield* test.store.get(key);
         if (action === "disconnect") expect(row).toBeNull();
         else {
-          expect(row?.updatedByUserId).toBe("other-admin");
+          expect(row?.updatedByUserId).toBe("org");
           expect(row?.payloadSealed).toBeNull();
           expect(row?.pendingStateHash).not.toBeNull();
         }
@@ -107,8 +119,8 @@ describe("issue tracker connection lifecycle", () => {
           Effect.succeed(request.url.endsWith("/token") ? tokenResponse() : identityResponse()),
       });
       const { authorizationUrl } = yield* startLinear({
-        organizationId: "org",
-        userId: "admin",
+        ownerUserId: "org",
+        userId: "org",
       }).pipe(test.provide);
       const state = new URL(authorizationUrl).searchParams.get("state")!;
       expect(
@@ -133,13 +145,9 @@ describe("issue tracker connection lifecycle", () => {
   it.effect("isolates pending PKCE verifiers and invalidates a superseded authorization", () =>
     Effect.gen(function* () {
       const test = yield* fixture();
-      const first = yield* startLinear({ organizationId: "org", userId: "admin" }).pipe(
-        test.provide,
-      );
+      const first = yield* startLinear({ ownerUserId: "org", userId: "org" }).pipe(test.provide);
       const original = (yield* test.store.get(key))!;
-      const second = yield* startLinear({ organizationId: "org", userId: "admin" }).pipe(
-        test.provide,
-      );
+      const second = yield* startLinear({ ownerUserId: "org", userId: "org" }).pipe(test.provide);
       const current = (yield* test.store.get(key))!;
       expect(current.pendingOAuthSealed).not.toBe(original.pendingOAuthSealed);
       expect(current.pendingOAuthSealed).toContain('"codeVerifier"');
@@ -314,9 +322,9 @@ describe("issue tracker connection lifecycle", () => {
           const readFailure = yield* readIssue(issueInput).pipe(Effect.flip);
           expect(readFailure).toMatchObject({ code: "auth_required" });
           expect(readFailure.message).toContain(
-            "Disconnect Linear in Organization settings, then connect it again.",
+            "Disconnect Linear in Account connections, then connect it again.",
           );
-          const pending = yield* startLinear({ organizationId: "org", userId: "admin" });
+          const pending = yield* startLinear({ ownerUserId: "org", userId: "org" });
           const callbackFailure = yield* completeLinear({
             state: new URL(pending.authorizationUrl).searchParams.get("state")!,
             iss: "https://mcp.linear.app",
@@ -336,7 +344,7 @@ describe("issue tracker connection lifecycle", () => {
 
           // Follow the recovery instruction using the actual connection operations.
           yield* disconnect(key);
-          const fresh = yield* startLinear({ organizationId: "org", userId: "admin" });
+          const fresh = yield* startLinear({ ownerUserId: "org", userId: "org" });
           expect(
             yield* completeLinear({
               state: new URL(fresh.authorizationUrl).searchParams.get("state")!,
@@ -385,8 +393,8 @@ describe("issue tracker connection lifecycle", () => {
           respond: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
         });
         const { authorizationUrl } = yield* startLinear({
-          organizationId: "org",
-          userId: "admin",
+          ownerUserId: "org",
+          userId: "org",
         }).pipe(test.provide);
         const state = new URL(authorizationUrl).searchParams.get("state")!;
         const callback = yield* completeLinear({
@@ -494,12 +502,12 @@ describe("Linear context lifecycle", () => {
     }),
   );
 
-  it.effect.each(["workspace", "disconnect", "generation", "organization"] as const)(
+  it.effect.each(["workspace", "disconnect", "generation", "owner", "grant"] as const)(
     "rejects old comment and image references after %s changes",
     (change) =>
       Effect.gen(function* () {
         const test = yield* fixture({
-          rows: [linearRow(), { ...linearRow(), organizationId: "other-org" }],
+          rows: [linearRow(), { ...linearRow(), ownerUserId: "other-org" }],
           respond: (request) =>
             Effect.succeed(commentsRequested(request) ? commentsResponse() : issueResponse()),
         });
@@ -507,7 +515,7 @@ describe("Linear context lifecycle", () => {
         const discussion = result.linear!.discussion;
         if (discussion.status !== "available") throw new Error("Expected discussion");
         if (change === "disconnect") yield* disconnect(key).pipe(test.provide);
-        else if (change !== "organization")
+        else if (change !== "owner" && change !== "grant")
           yield* Ref.update(test.records, (rows) => {
             const current = rows.get(recordKey(key))!;
             const payload = JSON.parse(current.payloadSealed!.slice(7));
@@ -520,22 +528,26 @@ describe("Linear context lifecycle", () => {
             return next;
           });
         const before = test.requests.length;
-        const organizationId = change === "organization" ? "other-org" : "org";
+        const ownerUserId = change === "owner" ? "other-org" : "org";
+        const access = {
+          ownerUserId,
+          ...(change === "grant" ? { connectionVersion: "previous-connection" } : {}),
+        };
         expect(
-          yield* readComments({ organizationId, reference: discussion.continuation! }).pipe(
+          yield* readComments({ ...access, reference: discussion.continuation! }).pipe(
             test.provide,
             Effect.flip,
           ),
         ).toMatchObject({ code: "conflict" });
         expect(
           yield* viewImage({
-            organizationId,
+            ...access,
             reference: discussion.comments[0]!.images[0]!.reference,
           }).pipe(test.provide, Effect.flip),
         ).toMatchObject({ code: "conflict" });
         expect(
           yield* readImages({
-            organizationId,
+            ...access,
             reference: discussion.comments[0]!.imagesContinuation!,
           }).pipe(test.provide, Effect.flip),
         ).toMatchObject({ code: "conflict" });
@@ -557,10 +569,10 @@ describe("Linear context lifecycle", () => {
           ),
       });
       const result = yield* readIssue(issueInput).pipe(test.provide);
-      yield* startLinear({ organizationId: "org", userId: "admin" }).pipe(test.provide);
+      yield* startLinear({ ownerUserId: "org", userId: "org" }).pipe(test.provide);
       yield* TestClock.adjust(2);
       const next = yield* readComments({
-        organizationId: "org",
+        ownerUserId: "org",
         reference: result.linear!.source,
       }).pipe(test.provide);
       expect(next.identifier).toBe("LP-42");
@@ -624,7 +636,7 @@ it.effect.each(["description", "comment"])(
       let continuation = initial.imagesContinuation;
       for (let page = 0; page < 2; page++) {
         expect(continuation).not.toBeNull();
-        const next = yield* readImages({ organizationId: "org", reference: continuation! }).pipe(
+        const next = yield* readImages({ ownerUserId: "org", reference: continuation! }).pipe(
           test.provide,
         );
         found.push(...next.images);
@@ -634,7 +646,7 @@ it.effect.each(["description", "comment"])(
       expect(found.map((entry) => entry.url)).toEqual(urls);
       const lastImage = found.at(-1)!;
       const image = yield* viewImage({
-        organizationId: "org",
+        ownerUserId: "org",
         reference: lastImage.reference,
       }).pipe(test.provide);
       expect(image.image).toEqual({ mimeType: "image/png", data: "iVBORw==" });
@@ -644,7 +656,7 @@ it.effect.each(["description", "comment"])(
       ).length;
       removed = true;
       expect(
-        yield* viewImage({ organizationId: "org", reference: lastImage.reference }).pipe(
+        yield* viewImage({ ownerUserId: "org", reference: lastImage.reference }).pipe(
           test.provide,
           Effect.flip,
         ),
@@ -654,7 +666,7 @@ it.effect.each(["description", "comment"])(
       ).toHaveLength(imageFetches);
       yield* disconnect(key).pipe(test.provide);
       expect(
-        yield* readImages({ organizationId: "org", reference: initial.imagesContinuation! }).pipe(
+        yield* readImages({ ownerUserId: "org", reference: initial.imagesContinuation! }).pipe(
           test.provide,
           Effect.flip,
         ),
@@ -695,7 +707,7 @@ it.effect("fits the full Jira read response when issue fields exceed the seriali
       },
     });
     const result = yield* readIssue({
-      organizationId: "org",
+      ownerUserId: "org",
       service: "jira",
       issue: "LP-42",
     }).pipe(test.provide);

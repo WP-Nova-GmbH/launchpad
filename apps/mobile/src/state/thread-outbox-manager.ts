@@ -179,6 +179,11 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       if (staleOrMissing()) {
         return false;
       }
+      // Editor autosaves and upload bookkeeping are not a new submission.
+      const owner = currentMessages().find(
+        (candidate) => candidate.messageId === message.messageId,
+      )?.ownerAccountId;
+      if (owner !== undefined) message = { ...message, ownerAccountId: owner };
       // Receipt ownership survives an editor that captured its payload before
       // the acknowledgement. Saving that draft cannot make it sendable again.
       if (

@@ -914,6 +914,7 @@ export const ThreadPromptPauseReason = Schema.Struct({
 export type ThreadPromptPauseReason = typeof ThreadPromptPauseReason.Type;
 
 export const ThreadPromptQueueEntry = Schema.Struct({
+  issueTrackerAuthorizationId: Schema.optional(Schema.String),
   messageId: MessageId,
   text: Schema.String,
   attachments: Schema.Array(ChatAttachment),
@@ -1490,6 +1491,7 @@ const ThreadInteractionModeSetCommand = Schema.Struct({
 
 const PromptCommandFields = { commandId: CommandId, threadId: ThreadId, createdAt: IsoDateTime };
 const PromptMessage = Schema.Struct({
+  issueTrackerAuthorizationId: Schema.optional(Schema.String),
   text: Schema.String,
   attachments: Schema.Array(ChatAttachment),
   context: Schema.optional(OrchestrationMessageContext),
@@ -1515,6 +1517,7 @@ const ThreadPromptEnqueueCommand = Schema.Struct({
   author: Schema.optional(AuthSessionUser),
 });
 const ClientThreadPromptEnqueueCommand = Schema.Struct({
+  issueTrackerAuthorization: Schema.optional(Schema.String),
   type: Schema.Literal("thread.prompt.enqueue"),
   ...PromptEnqueueFields,
   message: Schema.Struct({ messageId: MessageId, ...ClientPromptMessage.fields }),
@@ -1528,6 +1531,7 @@ const ThreadPromptEditCommand = Schema.Struct({
   author: Schema.optional(AuthSessionUser),
 });
 const ClientThreadPromptEditCommand = Schema.Struct({
+  issueTrackerAuthorization: Schema.optional(Schema.String),
   type: Schema.Literal("thread.prompt.edit"),
   ...PromptCommandFields,
   messageId: MessageId,
@@ -1618,6 +1622,7 @@ const ThreadQueueFinalizeCommand = Schema.Struct({
 });
 
 export const ThreadTurnStartCommand = Schema.Struct({
+  issueTrackerAuthorizationId: Schema.optional(Schema.String),
   type: Schema.Literal("thread.turn.start"),
   commandId: CommandId,
   threadId: ThreadId,
@@ -1644,6 +1649,7 @@ export const ThreadTurnStartCommand = Schema.Struct({
 });
 
 const ClientThreadTurnStartCommand = Schema.Struct({
+  issueTrackerAuthorization: Schema.optional(Schema.String),
   type: Schema.Literal("thread.turn.start"),
   commandId: CommandId,
   threadId: ThreadId,
@@ -2261,6 +2267,7 @@ export const ThreadMessageSentPayload = Schema.Struct({
 });
 
 export const ThreadTurnStartRequestedPayload = Schema.Struct({
+  issueTrackerAuthorizationId: Schema.optional(Schema.String),
   threadId: ThreadId,
   messageId: MessageId,
   modelSelection: Schema.optional(ModelSelection),

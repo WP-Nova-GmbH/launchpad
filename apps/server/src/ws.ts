@@ -2067,7 +2067,7 @@ const makeWsRpcLayer = (
               if (Option.isSome(replay)) return replay.value;
               yield* ProjectCloneTracker.rejectCommandsDuringClone(projectCloneTracker, command);
               const normalizedCommand = stampCommandAuthor(
-                yield* normalizeDispatchCommand(command),
+                yield* normalizeDispatchCommand(command, currentSession.user?.userId),
               );
               // Archive removes the thread from the client, so this transport
               // closes its session and terminals after the command lands.

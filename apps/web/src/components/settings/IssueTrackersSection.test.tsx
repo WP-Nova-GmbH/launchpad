@@ -117,14 +117,8 @@ const click = async (label: string) => {
     button(label).props.onClick();
   });
 };
-function Settings({ isAdmin = true }: { isAdmin?: boolean }) {
-  return (
-    <IssueTrackersSection
-      isAdmin={isAdmin}
-      organizationName="Our organization"
-      {...useIssueTrackers()}
-    />
-  );
+function Settings() {
+  return <IssueTrackersSection {...useIssueTrackers()} />;
 }
 
 beforeEach(async () => {
@@ -168,7 +162,7 @@ describe("Linear workspace settings interactions", () => {
     await click("Review change");
     expect(textOf(renderer.root)).toContain("Company B");
     expect(textOf(renderer.root)).toContain("Company A");
-    expect(textOf(renderer.root)).toContain("Our organization");
+    expect(textOf(renderer.root)).toContain("your connected workspace");
     await click("Dismiss dialog");
     expect(button("Review change")).toBeDefined();
   });
@@ -217,10 +211,10 @@ describe("Linear workspace settings interactions", () => {
     expect(button("Change workspace").props.disabled).toBe(false);
   });
 
-  it("does not offer mutation controls to organization members", async () => {
-    await act(async () => renderer.update(<Settings isAdmin={false} />));
-    expect(button("Change workspace")).toBeUndefined();
-    expect(button("Disconnect")).toBeUndefined();
+  it("offers personal connection controls without organization membership", async () => {
+    await act(async () => renderer.update(<Settings />));
+    expect(button("Change workspace")).toBeDefined();
+    expect(button("Disconnect")).toBeDefined();
   });
 });
 
@@ -433,12 +427,4 @@ it("disables selection after a lost response until metadata is verified", async 
   expect(button("Cancel setup").props.disabled).toBe(true);
   await refreshWith(jiraPending);
   expect(button("Connect").props.disabled).toBe(false);
-});
-
-it("removes picker controls when admin access is lost", async () => {
-  await refreshWith(jiraPending);
-  await click("Choose site");
-  await act(async () => renderer.update(<Settings isAdmin={false} />));
-  expect(renderer.root.findAllByProps({ role: "dialog" })).toHaveLength(0);
-  expect(button("Choose site")).toBeUndefined();
 });

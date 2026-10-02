@@ -75,8 +75,6 @@ import {
   useRelativeTimeTick,
 } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
-import { IssueTrackersSection } from "./IssueTrackersSection";
-import { useIssueTrackers } from "../../cloud/issueTrackers";
 
 const ORG_ROLE_LABELS: Readonly<Record<RelayOrgRole, string>> = {
   admin: "Admin",
@@ -1573,19 +1571,6 @@ function OrganizationSignInButton() {
   return <Button onClick={openAuthPrompt}>Sign in</Button>;
 }
 
-function OrganizationIssueTrackers({ state }: { state: OrganizationAdminState }) {
-  const trackers = useIssueTrackers();
-  const membership = state.snapshot?.membership;
-  if (!membership) return null;
-  return (
-    <IssueTrackersSection
-      {...trackers}
-      isAdmin={membership.role === "admin"}
-      organizationName={membership.organization.name}
-    />
-  );
-}
-
 /**
  * Split from `OrganizationSettings` because the state hook reads Clerk, and
  * `ClerkProvider` is only mounted when Launchpad Connect is configured. Calling the
@@ -1636,12 +1621,6 @@ function ConfiguredOrganizationSettings() {
           <OrganizationSection state={state} />
           <MembersSection state={state} />
           <GithubSection state={state} />
-          {state.snapshot ? (
-            <OrganizationIssueTrackers
-              key={state.snapshot.membership.organization.organizationId}
-              state={state}
-            />
-          ) : null}
           <ProviderAccountsSection state={state} />
           <SkillsSection state={state} />
           <RepositoriesSection state={state} />

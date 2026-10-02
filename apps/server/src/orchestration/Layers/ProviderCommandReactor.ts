@@ -1,3 +1,8 @@
+import {
+  CurrentIssueTrackerAuthorization,
+  readTurnAuthorization,
+} from "../../mcp/IssueTrackerTurnAuthorization.ts";
+import { readMcpProviderSession } from "../../mcp/McpProviderSession.ts";
 import { withWorkspaceLease } from "../../workspace/workspaceLease.ts";
 import {
   type ChatAttachment,
@@ -624,6 +629,7 @@ const make = Effect.gen(function* () {
     options?: {
       readonly modelSelection?: ModelSelection;
       readonly pendingTurnStart?: boolean;
+      readonly personalTurn?: boolean;
     },
   ) {
     yield* deletion.drainThrough(yield* orchestrationEngine.latestSequence, threadId);
@@ -640,6 +646,24 @@ const make = Effect.gen(function* () {
         .pipe(Effect.map((sessions) => sessions.find((session) => session.threadId === threadId)));
 
     const activeSession = yield* resolveActiveSession(threadId);
+    const rotatePersonalSession =
+      options?.personalTurn === true &&
+      Boolean(
+        (yield* CurrentIssueTrackerAuthorization) ||
+        readMcpProviderSession(threadId)?.issueTrackerAuthorizationId,
+      );
+    if (
+      rotatePersonalSession &&
+      activeSession &&
+      (activeSession.status === "running" || activeSession.activeTurnId)
+    ) {
+      return yield* new ProviderAdapterRequestError({
+        provider: providerErrorLabel(activeSession.provider),
+        method: "thread.turn.start",
+        detail:
+          "Personal connection access cannot change during an active turn. Leave this prompt queued for its own turn.",
+      });
+    }
     const activeThreadSession =
       thread.session !== null && thread.session.status !== "stopped" && activeSession
         ? thread.session
@@ -831,6 +855,7 @@ const make = Effect.gen(function* () {
 
       if (
         !runtimeModeChanged &&
+        !rotatePersonalSession &&
         !cwdChanged &&
         !instanceChanged &&
         !shouldRestartForModelChange &&
@@ -883,6 +908,9 @@ const make = Effect.gen(function* () {
   });
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
+    readonly issueTrackerAuthorizationId?: string | undefined;
+    readonly requirePersonalAuthorization?: boolean;
+    readonly allowPersonalSteer?: boolean;
     readonly threadId: ThreadId;
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
@@ -896,10 +924,68 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
+    const grant = yield* readTurnAuthorization(input.issueTrackerAuthorizationId, input.threadId);
+    if (!grant && input.requirePersonalAuthorization) {
+      return yield* new ProviderAdapterRequestError({
+        provider: providerErrorLabel(thread.session?.providerName ?? undefined),
+        method: "thread.turn.start",
+        detail:
+          "Personal connection authorization expired. Edit and save the queued prompt to authorize it again.",
+      });
+    }
+    const current = readMcpProviderSession(input.threadId);
+    if (input.allowPersonalSteer && (grant || current?.issueTrackerAuthorizationId)) {
+      const runtime = (yield* providerService.listSessions()).find(
+        (session) => session.threadId === input.threadId,
+      );
+      if (runtime?.status === "running" || runtime?.activeTurnId) {
+        const previous = yield* readTurnAuthorization(
+          current?.issueTrackerAuthorizationId,
+          input.threadId,
+        );
+        if (
+          !grant ||
+          !previous ||
+          !runtime.activeTurnId ||
+          current?.issueTrackerTurnComplete ||
+          current?.issueTrackerTurnId !== runtime.activeTurnId ||
+          current?.providerInstanceId !== runtime.providerInstanceId ||
+          previous.claims.ownerUserId !== grant.claims.ownerUserId ||
+          previous.claims.connections.jira !== grant.claims.connections.jira ||
+          previous.claims.connections.linear !== grant.claims.connections.linear ||
+          runtime.runtimeMode !== thread.runtimeMode
+        ) {
+          return yield* new ProviderAdapterRequestError({
+            provider: providerErrorLabel(runtime.provider),
+            method: "thread.turn.start",
+            detail:
+              "This prompt cannot use the running turn's personal connections. Send it after the turn finishes.",
+          });
+        }
+        return {
+          threadId: input.threadId,
+          input: toNonEmptyProviderInput(input.messageText),
+          attachments: input.attachments ?? [],
+          ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
+          ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
+          delivery: {
+            attemptId: grant.claims.commandId,
+            mode: "steer" as const,
+            expectedTurnId: runtime.activeTurnId,
+          },
+        };
+      }
+    }
     yield* ensureSessionForThread(input.threadId, input.createdAt, {
       ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
       pendingTurnStart: true,
-    });
+      personalTurn: true,
+    }).pipe(
+      Effect.provideService(
+        CurrentIssueTrackerAuthorization,
+        grant ? input.issueTrackerAuthorizationId : undefined,
+      ),
+    );
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
@@ -1305,11 +1391,17 @@ const make = Effect.gen(function* () {
         return Effect.void;
       }
       const detail = formatFailureDetail(cause);
-      return setThreadSessionErrorOnTurnStartFailure({
-        threadId: event.payload.threadId,
-        detail,
-        createdAt: event.payload.createdAt,
-      }).pipe(
+      // Preserve the turn this follow-up targeted, even if it finished while
+      // the steer was being rejected. A failed new turn still needs an error state.
+      return (
+        thread.session?.status === "running" || thread.session?.activeTurnId != null
+          ? Effect.void
+          : setThreadSessionErrorOnTurnStartFailure({
+              threadId: event.payload.threadId,
+              detail,
+              createdAt: event.payload.createdAt,
+            })
+      ).pipe(
         Effect.flatMap(() => appendTurnStartFailure("Provider turn start failed", detail)),
         Effect.asVoid,
       );
@@ -1534,6 +1626,9 @@ const make = Effect.gen(function* () {
       return;
     }
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
+      allowPersonalSteer: true,
+      issueTrackerAuthorizationId: event.payload.issueTrackerAuthorizationId,
+      requirePersonalAuthorization: Boolean(event.payload.issueTrackerAuthorizationId),
       threadId: event.payload.threadId,
       messageText: attributedPrompt(
         projectComposerContextForProvider({
@@ -1750,6 +1845,36 @@ const make = Effect.gen(function* () {
           return;
         }
       }
+      // A steer shares the running process. Only the same owner with the same
+      // connection generations may add instructions to an authorized turn.
+      if (handoff.mode === "steer") {
+        const active = readMcpProviderSession(threadId);
+        if (prompt.issueTrackerAuthorizationId || active?.issueTrackerAuthorizationId) {
+          const previous = yield* readTurnAuthorization(
+            active?.issueTrackerAuthorizationId,
+            threadId,
+          );
+          const incoming = yield* readTurnAuthorization(
+            prompt.issueTrackerAuthorizationId,
+            threadId,
+          );
+          if (
+            !previous ||
+            !incoming ||
+            active?.issueTrackerTurnComplete ||
+            active?.issueTrackerTurnId !== handoff.expectedTurnId ||
+            handoff.steeredBy?.userId !== previous.claims.ownerUserId ||
+            previous.claims.ownerUserId !== incoming.claims.ownerUserId ||
+            previous.claims.connections.jira !== incoming.claims.connections.jira ||
+            previous.claims.connections.linear !== incoming.claims.connections.linear
+          ) {
+            yield* release(
+              "This prompt uses different personal connections. Leave it queued for its own turn.",
+            );
+            return;
+          }
+        }
+      }
       const request =
         handoff.mode === "steer"
           ? {
@@ -1760,6 +1885,8 @@ const make = Effect.gen(function* () {
               interactionMode: prompt.interactionMode,
             }
           : yield* buildSendTurnRequestForThread({
+              issueTrackerAuthorizationId: prompt.issueTrackerAuthorizationId,
+              requirePersonalAuthorization: Boolean(prompt.issueTrackerAuthorizationId),
               threadId,
               messageText: inputText,
               attachments: prompt.attachments,

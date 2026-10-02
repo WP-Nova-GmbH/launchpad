@@ -1,11 +1,17 @@
-import { RelayIssueTrackerError, type RelayIssueTrackerService } from "@t3tools/contracts/relay";
+import {
+  RelayApi,
+  RelayIssueTrackerError,
+  type RelayIssueTrackerService,
+} from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
+import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
+import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
-import { readManagedExecutorRelayConfig } from "../../../cloud/machineEnrollment.ts";
-import { makeExecutorRelayApiClient } from "../../../relay/executorRelayClient.ts";
+import { readTurnAuthorization } from "../../IssueTrackerTurnAuthorization.ts";
+import { readMcpProviderSession } from "../../McpProviderSession.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { IssueTrackersToolkit, LinearImageToolkit } from "./tools.ts";
 
@@ -13,15 +19,14 @@ const isTrackerFailure = Schema.is(RelayIssueTrackerError);
 const unavailableOnThisEnvironment = () =>
   new RelayIssueTrackerError({
     code: "not_configured",
-    message: "Issue tracker tools are available only on organization-managed executors.",
+    message: "Connect your account in Account → Connections, then send a new message.",
   });
 const failureMessages = {
   auth_required:
-    "The organization's issue tracker connection needs to be reconnected by an administrator.",
-  forbidden: "The organization's connected account does not have permission to read this issue.",
-  not_found: "The issue was not found or is not visible to the organization's connected account.",
-  invalid_input:
-    "Use an issue identifier or a URL from the organization's connected issue tracker.",
+    "Your personal issue tracker connection needs to be reconnected in Account → Connections.",
+  forbidden: "Your connected account does not have permission to read this issue.",
+  not_found: "The issue was not found or is not visible to your connected account.",
+  invalid_input: "Use an issue identifier or a URL from your connected issue tracker.",
   unavailable: "The issue tracker could not be reached. Try again later.",
   image_too_large:
     "This image exceeds the 5 MiB limit. Open its source link from the image reference. Continue with the available issue context; retrying will not resize it.",
@@ -29,7 +34,7 @@ const failureMessages = {
     "This upload is not a supported image (PNG, JPEG, WebP or GIF). Open its source link from the image reference and continue with the available issue context.",
   conflict:
     "The issue tracker connection or source content changed. Read the issue again to get fresh references.",
-  not_configured: "An administrator must connect this issue tracker in Organization settings.",
+  not_configured: "Connect this issue tracker in Account → Connections, then send a new message.",
 } satisfies Record<RelayIssueTrackerError["code"], string>;
 
 const make = Effect.gen(function* () {
@@ -39,11 +44,25 @@ const make = Effect.gen(function* () {
     const scope = yield* McpInvocationContext.requireMcpCapability("issue-trackers").pipe(
       Effect.mapError(unavailableOnThisEnvironment),
     );
-    const config = yield* readManagedExecutorRelayConfig(secrets);
-    if (config === null) return yield* unavailableOnThisEnvironment();
-    const client = yield* makeExecutorRelayApiClient(config).pipe(
-      Effect.provideService(HttpClient.HttpClient, http),
-    );
+    const active = readMcpProviderSession(scope.threadId);
+    if (
+      !active ||
+      !active.issueTrackerTurnId ||
+      active.issueTrackerTurnComplete ||
+      active.providerSessionId !== scope.providerSessionId ||
+      active.issueTrackerAuthorizationId !== scope.issueTrackerAuthorizationId
+    )
+      return yield* unavailableOnThisEnvironment();
+    const grant = yield* readTurnAuthorization(
+      scope.issueTrackerAuthorizationId,
+      scope.threadId,
+    ).pipe(Effect.provideService(ServerSecretStore.ServerSecretStore, secrets));
+    if (!grant || grant.claims.environmentId !== scope.environmentId)
+      return yield* unavailableOnThisEnvironment();
+    const client = yield* HttpApiClient.make(RelayApi, {
+      baseUrl: grant.relayUrl,
+      transformClient: HttpClient.mapRequest(HttpClientRequest.bearerToken(grant.authorization)),
+    }).pipe(Effect.provideService(HttpClient.HttpClient, http));
     return { client, environmentId: scope.environmentId };
   });
   const safe = <A, E, R>(effect: Effect.Effect<A, E, R>, image = false) =>

@@ -1,3 +1,4 @@
+import { CurrentIssueTrackerAuthorization } from "../../mcp/IssueTrackerTurnAuthorization.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -495,8 +496,163 @@ function makeProviderServiceLayer(
   };
 }
 
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+
 const sharedDelivery = makeProviderServiceLayer();
 sharedDelivery.layer("ProviderService shared delivery", (it) => {
+  it.effect.each(["early-completion", "rejected"] as const)(
+    "closes personal access when admission races with %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const threadId = asThreadId(`personal-${outcome}`);
+        const turnId = asTurnId(`turn-${outcome}`);
+        yield* sharedDelivery.codex.whenSubscribed;
+        yield* provider.startSession(threadId, {
+          threadId,
+          providerInstanceId: codexInstanceId,
+          runtimeMode: "full-access",
+        });
+        McpProviderSession.setMcpProviderSession({
+          threadId,
+          providerInstanceId: codexInstanceId,
+          providerSessionId: "personal-process",
+          environmentId: EnvironmentId.make("test"),
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer fixture",
+          capabilities: new Set(["issue-trackers"]),
+          issueTrackerAuthorizationId: "personal-grant",
+        });
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+        );
+        sharedDelivery.codex.sendTurn.mockImplementationOnce((_input, callbacks) =>
+          Effect.gen(function* () {
+            assert(callbacks);
+            if (outcome === "rejected")
+              return yield* new ProviderAdapterValidationError({
+                provider: "codex",
+                operation: "sendTurn",
+                issue: "Rejected before dispatch",
+              });
+            const barrierId = asEventId(`barrier-${outcome}`);
+            const barrier = yield* provider.streamEvents.pipe(
+              Stream.filter((event) => event.eventId === barrierId),
+              Stream.runHead,
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* Effect.yieldNow;
+            sharedDelivery.codex.emit({
+              type: "turn.completed",
+              threadId,
+              turnId,
+              provider: CODEX_DRIVER,
+              eventId: asEventId(`completed-${outcome}`),
+              createdAt: "2026-01-01T00:00:00.000Z",
+              payload: { state: "completed" },
+            });
+            sharedDelivery.codex.emit({
+              type: "runtime.warning",
+              threadId,
+              provider: CODEX_DRIVER,
+              eventId: barrierId,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              payload: { message: "completion processed" },
+            });
+            yield* Fiber.join(barrier);
+            yield* callbacks.onAdmitted({ threadId, turnId }, "provider-ack");
+            return { threadId, turnId };
+          }),
+        );
+        const result = yield* provider
+          .sendTurn({ threadId, input: "Read my issue" })
+          .pipe(Effect.result);
+        assert.equal(result._tag, outcome === "rejected" ? "Failure" : "Success");
+        assert.isTrue(
+          McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerTurnComplete,
+        );
+        yield* provider.stopSession({ threadId });
+      }),
+  );
+  it.effect("binds personal access to prompt admission, never to resumed background turns", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("personal-admission");
+      const turnId = asTurnId("personal-prompt");
+      yield* sharedDelivery.codex.whenSubscribed;
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+      });
+      McpProviderSession.setMcpProviderSession({
+        threadId,
+        providerInstanceId: codexInstanceId,
+        providerSessionId: "personal-process",
+        environmentId: EnvironmentId.make("test"),
+        endpoint: "http://localhost/mcp",
+        authorizationHeader: "Bearer fixture",
+        capabilities: new Set(["issue-trackers"]),
+        issueTrackerAuthorizationId: "personal-grant",
+      });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+      );
+      const background = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.started"),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      sharedDelivery.codex.emit({
+        type: "turn.started",
+        threadId,
+        turnId: "resumed-background",
+        provider: CODEX_DRIVER,
+        eventId: asEventId("background"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        payload: {},
+      });
+      yield* Fiber.join(background);
+      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerTurnId);
+      const admitted = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      sharedDelivery.codex.sendTurn.mockImplementationOnce((_input, callbacks) =>
+        Effect.gen(function* () {
+          assert(callbacks);
+          yield* callbacks.onAdmitted({ threadId, turnId }, "harness-dispatch");
+          yield* Deferred.succeed(admitted, undefined);
+          yield* Deferred.await(finish);
+          return { threadId, turnId };
+        }),
+      );
+      const sending = yield* provider
+        .sendTurn({ threadId, input: "Read my issue" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(admitted);
+      assert.equal(McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerTurnId, turnId);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      sharedDelivery.codex.emit({
+        type: "turn.completed",
+        threadId,
+        turnId,
+        provider: CODEX_DRIVER,
+        eventId: asEventId("personal-completed"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        payload: { state: "completed" },
+      });
+      yield* Fiber.join(completed);
+      assert.isTrue(McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerTurnComplete);
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(sending);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
   it.effect("revalidates after common service preparation and releases a rejected admission", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -5398,20 +5554,25 @@ describe("agent browser access", () => {
       return issued;
     });
 
-  it.effect("grants issue tracker access only to enrolled organization executors", () =>
-    Effect.gen(function* () {
-      for (const role of ["agent_executor", "review_host", "personal"] as const) {
-        const threadId = asThreadId(`thread-issue-trackers-${role}`);
-        const issued = yield* startSessionWith(false, threadId, undefined, { executorRole: role });
-        assert.deepEqual(issued, [
-          {
-            threadId,
-            capabilities:
-              role === "agent_executor" ? ["issue-trackers", "pull-requests"] : ["pull-requests"],
-          },
-        ]);
-      }
-    }).pipe(Effect.provide(NodeServices.layer)),
+  it.effect(
+    "grants issue tracker access only for a personal turn, regardless of machine role",
+    () =>
+      Effect.gen(function* () {
+        for (const role of ["agent_executor", "review_host", "personal"] as const) {
+          for (const grant of [undefined, "personal-grant"]) {
+            const threadId = asThreadId(`thread-issue-trackers-${role}-${grant}`);
+            const issued = yield* startSessionWith(false, threadId, undefined, {
+              executorRole: role,
+            }).pipe(Effect.provideService(CurrentIssueTrackerAuthorization, grant));
+            assert.deepEqual(issued, [
+              {
+                threadId,
+                capabilities: grant ? ["issue-trackers", "pull-requests"] : ["pull-requests"],
+              },
+            ]);
+          }
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   // The capability on the credential is the observable that matters: a session

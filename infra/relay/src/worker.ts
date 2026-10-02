@@ -45,6 +45,7 @@ import { executorReleaseServerApi } from "./http/ExecutorReleaseApi.ts";
 import { organizationSkillsServerApi } from "./http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "./http/IssueTrackersApi.ts";
+import { turnAuthLayer } from "./issueTrackers/TurnAuthorization.ts";
 import { issueTrackerCallbackRoute } from "./http/IssueTrackerCallbackRoute.ts";
 import * as IssueTrackerConnectionStore from "./issueTrackers/ConnectionStore.ts";
 import { sourceControlServerApi } from "./http/SourceControlApi.ts";
@@ -407,6 +408,7 @@ export const ApiLive = Api.make(
       Layer.provideMerge(relayClientAuthLayer),
       Layer.provideMerge(relayDpopClientAuthLayer),
       Layer.provideMerge(relayEnvironmentAuthLayer),
+      Layer.provideMerge(turnAuthLayer),
       Layer.provide(runtimeLayer),
     );
 

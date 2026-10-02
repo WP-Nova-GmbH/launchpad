@@ -3,6 +3,7 @@ import {
   RelayClientPrincipal,
   RelayInternalError,
   RelayIssueTrackerError,
+  RelayIssueTrackerTurnPrincipal,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
@@ -15,8 +16,7 @@ import {
 } from "../issueTrackers/JiraAuthorization.ts";
 import type { ConnectionPersistenceError } from "../issueTrackers/ConnectionStore.ts";
 import { mapErrorTags, mapRelayCommonApiErrors } from "./Api.ts";
-import { requireEnrolledExecutor } from "./enrolledExecutor.ts";
-import { requireAdmin, resolveMembership } from "./TenancyApi.ts";
+import { authorizeRead, authorizeTurn } from "../issueTrackers/TurnAuthorization.ts";
 
 const persistenceFailure = (_error: ConnectionPersistenceError, traceId: string) =>
   new RelayInternalError({ code: "internal_error", reason: "internal_error", traceId });
@@ -26,15 +26,22 @@ const trackerFailure = (error: RelayIssueTrackerError, traceId: string) =>
 export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", (handlers) =>
   handlers
     .handle(
+      "authorizeTurn",
+      Effect.fn("issueTrackers.api.authorizeTurn")(
+        function* ({ payload }) {
+          const { userId } = yield* RelayClientPrincipal;
+          return yield* authorizeTurn(userId, payload);
+        },
+        mapErrorTags({ IssueTrackerConnectionPersistenceError: persistenceFailure }),
+        mapRelayCommonApiErrors("not_authorized"),
+      ),
+    )
+    .handle(
       "listConnections",
       Effect.fn("issueTrackers.api.list")(
         function* () {
           const { userId } = yield* RelayClientPrincipal;
-          const membership = yield* resolveMembership({ userId });
-          return yield* Connections.listConnections(
-            membership.organization.organizationId,
-            membership.role === "admin",
-          );
+          return yield* Connections.listConnections(userId);
         },
         mapErrorTags({ IssueTrackerConnectionPersistenceError: persistenceFailure }),
         mapRelayCommonApiErrors("not_authorized"),
@@ -45,9 +52,8 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       Effect.fn("issueTrackers.api.startLinear")(
         function* () {
           const { userId } = yield* RelayClientPrincipal;
-          const membership = yield* requireAdmin({ userId });
           return yield* Connections.startLinear({
-            organizationId: membership.organization.organizationId,
+            ownerUserId: userId,
             userId,
           });
         },
@@ -63,9 +69,8 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       Effect.fn("issueTrackers.api.confirmLinearReplacement")(
         function* ({ payload }) {
           const { userId } = yield* RelayClientPrincipal;
-          const membership = yield* requireAdmin({ userId });
           return yield* Connections.confirmLinearReplacement({
-            organizationId: membership.organization.organizationId,
+            ownerUserId: userId,
             userId,
             proposalId: payload.proposalId,
           });
@@ -82,9 +87,8 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       Effect.fn("issueTrackers.api.cancelLinearReplacement")(
         function* ({ payload }) {
           const { userId } = yield* RelayClientPrincipal;
-          const membership = yield* requireAdmin({ userId });
           return yield* Connections.cancelLinearReplacement({
-            organizationId: membership.organization.organizationId,
+            ownerUserId: userId,
             userId,
             proposalId: payload.proposalId,
           });
@@ -101,9 +105,8 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       Effect.fn("issueTrackers.api.startJira")(
         function* () {
           const { userId } = yield* RelayClientPrincipal;
-          const membership = yield* requireAdmin({ userId });
           return yield* startJira({
-            organizationId: membership.organization.organizationId,
+            ownerUserId: userId,
             userId,
           });
         },
@@ -119,10 +122,8 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       Effect.fn("issueTrackers.api.selectJiraSite")(
         function* ({ payload }) {
           const { userId } = yield* RelayClientPrincipal;
-          const membership = yield* requireAdmin({ userId });
-          const organizationId = membership.organization.organizationId;
-          yield* selectJiraSite({ ...payload, organizationId, userId });
-          return yield* Connections.listConnections(organizationId, true);
+          yield* selectJiraSite({ ...payload, ownerUserId: userId, userId });
+          return yield* Connections.listConnections(userId);
         },
         mapErrorTags({
           IssueTrackerConnectionPersistenceError: persistenceFailure,
@@ -136,10 +137,8 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       Effect.fn("issueTrackers.api.cancelJiraSelection")(
         function* ({ payload }) {
           const { userId } = yield* RelayClientPrincipal;
-          const membership = yield* requireAdmin({ userId });
-          const organizationId = membership.organization.organizationId;
-          yield* cancelJiraSelection({ ...payload, organizationId, userId });
-          return yield* Connections.listConnections(organizationId, true);
+          yield* cancelJiraSelection({ ...payload, ownerUserId: userId, userId });
+          return yield* Connections.listConnections(userId);
         },
         mapErrorTags({
           IssueTrackerConnectionPersistenceError: persistenceFailure,
@@ -153,9 +152,8 @@ export const issueTrackersApi = HttpApiBuilder.group(RelayApi, "issueTrackers", 
       Effect.fn("issueTrackers.api.disconnect")(
         function* ({ params }) {
           const { userId } = yield* RelayClientPrincipal;
-          const membership = yield* requireAdmin({ userId });
           return yield* Connections.disconnect({
-            organizationId: membership.organization.organizationId,
+            ownerUserId: userId,
             service: params.service,
           });
         },
@@ -170,14 +168,15 @@ export const issueTrackersServerApi = HttpApiBuilder.group(
   "issueTrackersServer",
   (handlers) =>
     handlers
+      .handle("verifyTurn", () => RelayIssueTrackerTurnPrincipal)
       .handle(
         "readComments",
         Effect.fn("issueTrackers.api.comments")(
           function* ({ params, payload }) {
-            const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
+            const access = yield* authorizeRead(params.environmentId, "linear");
             return yield* Connections.readComments({
               ...payload,
-              organizationId: machine.organizationId,
+              ...access,
             });
           },
           mapErrorTags({
@@ -191,10 +190,10 @@ export const issueTrackersServerApi = HttpApiBuilder.group(
         "readImages",
         Effect.fn("issueTrackers.api.images")(
           function* ({ params, payload }) {
-            const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
+            const access = yield* authorizeRead(params.environmentId, "linear");
             return yield* Connections.readImages({
               ...payload,
-              organizationId: machine.organizationId,
+              ...access,
             });
           },
           mapErrorTags({
@@ -208,10 +207,10 @@ export const issueTrackersServerApi = HttpApiBuilder.group(
         "viewImage",
         Effect.fn("issueTrackers.api.image")(
           function* ({ params, payload }) {
-            const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
+            const access = yield* authorizeRead(params.environmentId, "linear");
             return yield* Connections.viewImage({
               ...payload,
-              organizationId: machine.organizationId,
+              ...access,
             });
           },
           mapErrorTags({
@@ -225,9 +224,9 @@ export const issueTrackersServerApi = HttpApiBuilder.group(
         "readIssue",
         Effect.fn("issueTrackers.api.read")(
           function* ({ params, payload }) {
-            const machine = yield* requireEnrolledExecutor({ environmentId: params.environmentId });
+            const access = yield* authorizeRead(params.environmentId, params.service);
             return yield* Connections.readIssue({
-              organizationId: machine.organizationId,
+              ...access,
               service: params.service,
               issue: payload.issue,
             });

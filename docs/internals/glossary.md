@@ -258,10 +258,7 @@ done.
 
 ### Integration
 
-An [organization](#organization)-level connection to an external service — Linear, Slack, Teams.
-Credentials live on the [relay](#relay) and never reach a machine where agents run shell
-commands. Integrations are bidirectional: the relay reads issue state and writes back, moving
-columns and posting links.
+A connection to an external service. Jira and Linear connections are owned by a Launchpad user and carry that user's OAuth permissions. Their read access is granted to an individual prompt; organization membership does not share credentials. [Provider accounts](#provider-account) have a separate organization-sharing model.
 
 ### Mirror
 

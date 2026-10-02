@@ -14,17 +14,16 @@ import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
 import {
-  CLOUD_MACHINE_IDENTITY,
-  RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
-  RELAY_URL_SECRET,
-  encodeCloudMachineIdentityJson,
-} from "../../../cloud/config.ts";
+  setMcpProviderSession,
+  bindIssueTrackerTurn,
+  completeIssueTrackerTurn,
+} from "../../McpProviderSession.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { IssueTrackersToolkitHandlersLive } from "./handlers.ts";
 import { IssueTrackersToolkit } from "./tools.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
-const credential = "executor-secret";
+const credential = "personal-turn-secret";
 const decodeRequest = Schema.decodeEffect(Schema.fromJsonString(RelayReadIssueRequest));
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const result: RelayReadIssueResponse = {
@@ -39,6 +38,7 @@ const result: RelayReadIssueResponse = {
 };
 const invocation = (capabilities: ReadonlyArray<McpInvocationContext.McpCapability>) => ({
   environmentId,
+  issueTrackerAuthorizationId: "command-1",
   threadId: ThreadId.make("thread-1"),
   providerSessionId: "session-1",
   providerInstanceId: ProviderInstanceId.make("codex"),
@@ -47,28 +47,43 @@ const invocation = (capabilities: ReadonlyArray<McpInvocationContext.McpCapabili
 });
 const makeHarness = Effect.fnUntraced(function* (
   options: {
-    readonly role?: "agent_executor" | "review_host" | "personal";
+    readonly grant?: boolean;
+    readonly admitted?: boolean;
     readonly respond?: (request: HttpClientRequest.HttpClientRequest) => Response;
   } = {},
 ) {
   const requests: HttpClientRequest.HttpClientRequest[] = [];
   const readSecrets: string[] = [];
-  const values = new Map([
-    [RELAY_URL_SECRET, "https://relay.example.test"],
-    [RELAY_ENVIRONMENT_CREDENTIAL_SECRET, credential],
-    ...(options.role === "personal"
+  const scope = invocation(["issue-trackers"]);
+  setMcpProviderSession({
+    ...scope,
+    endpoint: "http://localhost/mcp",
+    authorizationHeader: "Bearer session-secret",
+  });
+  if (options.admitted !== false)
+    bindIssueTrackerTurn(scope.threadId, scope.providerSessionId, "turn-1");
+  const values = new Map(
+    options.grant === false
       ? []
       : [
           [
-            CLOUD_MACHINE_IDENTITY,
-            yield* encodeCloudMachineIdentityJson({
-              machineId: "machine-1",
-              organizationId: "org-1",
-              role: options.role ?? "agent_executor",
+            `issue-tracker-turn-${Buffer.from("command-1").toString("base64url")}`,
+            encodeJson({
+              authorization: credential,
+              relayUrl: "https://relay.example.test",
+              claims: {
+                ownerUserId: "alice",
+                environmentId,
+                threadId: scope.threadId,
+                commandId: "command-1",
+                commandDigest: "a".repeat(64),
+                expiresAt: 4102444800000,
+                connections: { jira: "v1", linear: "v1" },
+              },
             }),
-          ] as const,
-        ]),
-  ]);
+          ],
+        ],
+  );
   const dependencies = Layer.mergeAll(
     Layer.mock(ServerSecretStore.ServerSecretStore)({
       get: (name) =>
@@ -108,32 +123,54 @@ const makeHarness = Effect.fnUntraced(function* (
 });
 
 describe("issue tracker MCP handlers", () => {
+  it.effect("denies personal reads before the submitted prompt is admitted", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ admitted: false });
+      expect(yield* harness.call().pipe(Effect.flip)).toMatchObject({ code: "not_configured" });
+      expect(harness.requests).toHaveLength(0);
+      expect(harness.readSecrets).toHaveLength(0);
+    }),
+  );
   it.effect("refuses a provider credential without the issue tracker capability", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
       const error = yield* harness.call("read_jira_issue", ["pull-requests"]).pipe(Effect.flip);
       expect(error).toMatchObject({ _tag: "RelayIssueTrackerError", code: "not_configured" });
-      expect(error.message).toContain("organization-managed executors");
+      expect(error.message).toContain("Account → Connections");
       expect(harness.requests).toHaveLength(0);
       expect(harness.readSecrets).toHaveLength(0);
     }),
   );
 
-  it.effect(
-    "rechecks enrollment and rejects personal and review hosts even with a capability",
-    () =>
-      Effect.gen(function* () {
-        for (const role of ["personal", "review_host"] as const) {
-          const harness = yield* makeHarness({ role });
-          const error = yield* harness.call().pipe(Effect.flip);
-          expect(error).toMatchObject({ code: "not_configured" });
-          expect(harness.requests).toHaveLength(0);
-        }
-      }),
+  it.effect("rejects missing personal grants even when the provider has the capability", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ grant: false });
+      expect(yield* harness.call().pipe(Effect.flip)).toMatchObject({ code: "not_configured" });
+      expect(harness.requests).toHaveLength(0);
+    }),
+  );
+
+  it.effect("rejects calls after completion and from a replaced provider session", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const scope = invocation(["issue-trackers"]);
+      bindIssueTrackerTurn(scope.threadId, scope.providerSessionId, "turn-1");
+      completeIssueTrackerTurn(scope.threadId, scope.providerInstanceId, "turn-1");
+      expect(yield* harness.call().pipe(Effect.flip)).toMatchObject({ code: "not_configured" });
+      setMcpProviderSession({
+        ...scope,
+        providerSessionId: "replacement",
+        issueTrackerAuthorizationId: "other-user-grant",
+        endpoint: "http://localhost/mcp",
+        authorizationHeader: "Bearer another",
+      });
+      expect(yield* harness.call().pipe(Effect.flip)).toMatchObject({ code: "not_configured" });
+      expect(harness.requests).toHaveLength(0);
+    }),
   );
 
   it.effect(
-    "reads through the relay for the credential's environment and preserves shared identity",
+    "reads through the relay for the credential's environment and uses the initiating user’s grant",
     () =>
       Effect.gen(function* () {
         const harness = yield* makeHarness();
@@ -151,7 +188,9 @@ describe("issue tracker MCP handlers", () => {
             issue: "ENG-123",
           });
         }
-        expect(harness.readSecrets.every((name) => name.startsWith("cloud-"))).toBe(true);
+        expect(harness.readSecrets.every((name) => name.startsWith("issue-tracker-turn-"))).toBe(
+          true,
+        );
       }),
   );
 
@@ -194,7 +233,7 @@ describe("issue tracker MCP handlers", () => {
       }),
   );
 
-  it.effect("hides HTTP error requests containing the environment credential", () =>
+  it.effect("hides HTTP error requests containing the personal turn grant", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
         respond: () => new Response(`Request failed with ${credential}`, { status: 502 }),
@@ -280,7 +319,7 @@ it.effect.each([
   { code: "image_too_large", text: "5 MiB" },
   { code: "unsupported_image", text: "not a supported image" },
   { code: "forbidden", text: "permission" },
-  { code: "auth_required", text: "administrator" },
+  { code: "auth_required", text: "Account → Connections" },
   { code: "conflict", text: "Read the issue again" },
   { code: "not_found", text: "no longer accessible" },
   { code: "unavailable", text: "Try again later" },

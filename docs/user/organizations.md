@@ -51,39 +51,7 @@ Work they do is authored by the App, and reaches exactly the repositories you in
 
 ## Issue trackers
 
-An admin can connect one Linear workspace and one Jira Cloud site under **Settings → Organization →
-Issue trackers** in the web or desktop app. Everyone in the organization then uses that shared
-connection to read issues in chats on organization-managed executors, including chats opened from
-mobile. Personal machines and external OpenCode servers do not support these connections yet.
-
-For Linear, sign in and authorize read access, then return to Launchpad. Your organization shares
-the Linear access granted by that account. For Jira, choose **Connect**
-and sign in to Atlassian to authorize access. Launchpad connects automatically when one Jira
-site is available. If there are several, return to Launchpad and choose which site to share.
-You can resume an unfinished choice from **Choose site**, or discard it with **Cancel setup**.
-Launchpad refreshes access automatically. Your organization shares the
-read access granted by the connected Atlassian account. If your Atlassian organization restricts
-MCP clients, its admin may need to allow the Launchpad relay's callback domain.
-
-To change Linear workspaces, choose **Change workspace** and authorize the new workspace.
-Your current workspace stays selected until an admin reviews the change and chooses **Replace**.
-Closing the review leaves it available to other organization admins; **Cancel change** discards it.
-Pending changes expire after 15 minutes. Authorizing the same workspace renews access immediately.
-
-In a supported chat, ask the agent to read a specific issue, such as “Read Linear issue LP-214” or
-“Read Jira issue TEAM-42,” or supply its URL. These connections provide read-only issue context;
-search, issue updates, and automatic jobs are not supported yet.
-
-For Linear, the agent can also read comments and replies, request older discussion, and view
-images uploaded to the issue or its comments. Ask it to inspect an image when visual context
-matters. Long comments may be shortened; their source links open the full text in Linear.
-The agent can request more images when an issue contains many. PNG, JPEG, WebP and GIF images
-up to 5 MiB are supported. Larger images, other documents and externally hosted images remain
-links; an unavailable image does not discard the issue context already read.
-
-If a connection needs sign-in again, an admin can reconnect it. If Launchpad says the saved Linear
-connection could not be read, disconnect Linear and connect it again. Disconnect stops new reads
-for the whole organization; issue content already retrieved remains in chat history.
+Jira and Linear connections belong to individual users. See [Personal issue trackers](composer.md#personal-issue-trackers) for setup and access in shared chats.
 
 ## Provider accounts
 

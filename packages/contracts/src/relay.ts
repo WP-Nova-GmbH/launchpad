@@ -2814,21 +2814,55 @@ const RelayRepositoryAccessServerGroup = HttpApiGroup.make("repositoryAccessServ
   )
   .middleware(RelayEnvironmentAuth);
 
+export const RelayIssueTrackerTurnRequest = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadId: TrimmedNonEmptyString,
+  commandId: TrimmedNonEmptyString,
+  commandDigest: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+});
+export const RelayIssueTrackerTurnClaims = Schema.Struct({
+  ...RelayIssueTrackerTurnRequest.fields,
+  ownerUserId: TrimmedNonEmptyString,
+  expiresAt: Schema.Number,
+  connections: Schema.Struct({
+    jira: Schema.optionalKey(Schema.String),
+    linear: Schema.optionalKey(Schema.String),
+  }),
+});
+export type RelayIssueTrackerTurnClaims = typeof RelayIssueTrackerTurnClaims.Type;
+export class RelayIssueTrackerTurnPrincipal extends Context.Service<
+  RelayIssueTrackerTurnPrincipal,
+  RelayIssueTrackerTurnClaims
+>()("RelayIssueTrackerTurnPrincipal") {}
+export class RelayIssueTrackerTurnAuth extends HttpApiMiddleware.Service<
+  RelayIssueTrackerTurnAuth,
+  { provides: RelayIssueTrackerTurnPrincipal }
+>()("RelayIssueTrackerTurnAuth", {
+  error: [RelayAuthInvalidError, RelayInternalError],
+  security: { turnBearer: HttpApiSecurity.http({ scheme: "bearer" }) },
+}) {}
+
 export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
   .add(
-    HttpApiEndpoint.get("listConnections", "/v1/organization/issue-trackers", {
+    HttpApiEndpoint.post("authorizeTurn", "/v1/user/issue-trackers/authorize-turn", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayIssueTrackerTurnRequest,
+      success: Schema.Struct({ authorization: Schema.NullOr(Schema.String) }),
+      error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.get("listConnections", "/v1/user/issue-trackers", {
       headers: RelayBearerRequestHeaders,
       success: RelayIssueTrackerConnections,
       error: [...RelayTenancyErrors, RelayIssueTrackerError],
     }),
-    HttpApiEndpoint.post("startLinear", "/v1/organization/issue-trackers/linear/authorize", {
+    HttpApiEndpoint.post("startLinear", "/v1/user/issue-trackers/linear/authorize", {
       headers: RelayBearerRequestHeaders,
       success: RelayStartLinearResponse,
       error: [...RelayTenancyErrors, RelayIssueTrackerError],
     }),
     HttpApiEndpoint.post(
       "confirmLinearReplacement",
-      "/v1/organization/issue-trackers/linear/replacement/confirm",
+      "/v1/user/issue-trackers/linear/replacement/confirm",
       {
         headers: RelayBearerRequestHeaders,
         payload: RelayLinearReplacementRequest,
@@ -2838,7 +2872,7 @@ export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
     ),
     HttpApiEndpoint.post(
       "cancelLinearReplacement",
-      "/v1/organization/issue-trackers/linear/replacement/cancel",
+      "/v1/user/issue-trackers/linear/replacement/cancel",
       {
         headers: RelayBearerRequestHeaders,
         payload: RelayLinearReplacementRequest,
@@ -2846,28 +2880,24 @@ export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
         error: [...RelayTenancyErrors, RelayIssueTrackerError],
       },
     ),
-    HttpApiEndpoint.post("startJira", "/v1/organization/issue-trackers/jira/authorize", {
+    HttpApiEndpoint.post("startJira", "/v1/user/issue-trackers/jira/authorize", {
       headers: RelayBearerRequestHeaders,
       success: RelayStartJiraResponse,
       error: [...RelayTenancyErrors, RelayIssueTrackerError],
     }),
-    HttpApiEndpoint.post("selectJiraSite", "/v1/organization/issue-trackers/jira/select-site", {
+    HttpApiEndpoint.post("selectJiraSite", "/v1/user/issue-trackers/jira/select-site", {
       headers: RelayBearerRequestHeaders,
       payload: RelaySelectJiraSiteRequest,
       success: RelayIssueTrackerConnections,
       error: [...RelayTenancyErrors, RelayIssueTrackerError],
     }),
-    HttpApiEndpoint.post(
-      "cancelJiraSelection",
-      "/v1/organization/issue-trackers/jira/cancel-selection",
-      {
-        headers: RelayBearerRequestHeaders,
-        payload: RelayJiraAuthorizationRequest,
-        success: RelayIssueTrackerConnections,
-        error: [...RelayTenancyErrors, RelayIssueTrackerError],
-      },
-    ),
-    HttpApiEndpoint.delete("disconnect", "/v1/organization/issue-trackers/:service", {
+    HttpApiEndpoint.post("cancelJiraSelection", "/v1/user/issue-trackers/jira/cancel-selection", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayJiraAuthorizationRequest,
+      success: RelayIssueTrackerConnections,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.delete("disconnect", "/v1/user/issue-trackers/:service", {
       headers: RelayBearerRequestHeaders,
       params: Schema.Struct({ service: RelayIssueTrackerService }),
       success: RelayOkResponse,
@@ -2878,6 +2908,10 @@ export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
 
 export const RelayIssueTrackersServerGroup = HttpApiGroup.make("issueTrackersServer")
   .add(
+    HttpApiEndpoint.get("verifyTurn", "/v1/issue-trackers/turn", {
+      success: RelayIssueTrackerTurnClaims,
+      error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+    }),
     HttpApiEndpoint.post(
       "readComments",
       "/v1/environments/:environmentId/issue-trackers/linear/comments",
@@ -2919,7 +2953,7 @@ export const RelayIssueTrackersServerGroup = HttpApiGroup.make("issueTrackersSer
       },
     ),
   )
-  .middleware(RelayEnvironmentAuth);
+  .middleware(RelayIssueTrackerTurnAuth);
 
 export const RelayApi = HttpApi.make("RelayApi")
   .add(

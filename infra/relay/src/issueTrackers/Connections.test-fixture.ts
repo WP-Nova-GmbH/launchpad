@@ -15,7 +15,7 @@ import { RelayConfiguration } from "../Config.ts";
 import { Organizations, type OrganizationMembershipRecord } from "../tenancy/Organizations.ts";
 import { ConnectionStore, type ConnectionKey, type ConnectionRecord } from "./ConnectionStore.ts";
 export const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
-export const key = { organizationId: "org", service: "linear" } as const;
+export const key = { ownerUserId: "org", service: "linear" } as const;
 export const issueInput = { ...key, issue: "LP-42" };
 export const membership: OrganizationMembershipRecord = {
   userId: "admin",
@@ -145,7 +145,7 @@ export const linearRow = (expiresAt = Number.MAX_SAFE_INTEGER): ConnectionRecord
   pendingOAuthSealed: null,
   pendingStateHash: null,
   pendingExpiresAt: null,
-  updatedByUserId: "admin",
+  updatedByUserId: "org",
   updatedAt: "2026-01-01T00:00:00.000Z",
 });
 export const jiraOAuth = {
@@ -200,7 +200,7 @@ export const tokenResponse = () =>
     token_type: "Bearer",
     scope: "read",
   });
-export const recordKey = (record: ConnectionKey) => `${record.organizationId}:${record.service}`;
+export const recordKey = (record: ConnectionKey) => `${record.ownerUserId}:${record.service}`;
 
 export const fixture = Effect.fnUntraced(function* (
   options: {
@@ -242,7 +242,7 @@ export const fixture = Effect.fnUntraced(function* (
       list: (organizationId) =>
         Ref.get(records).pipe(
           Effect.map((rows) =>
-            [...rows.values()].filter((row) => row.organizationId === organizationId),
+            [...rows.values()].filter((row) => row.ownerUserId === organizationId),
           ),
         ),
       findPending: (stateHash) =>
@@ -388,7 +388,7 @@ export const fixture = Effect.fnUntraced(function* (
         response = Response.json(
           {
             ...linearOAuth.client,
-            redirect_uris: ["https://relay.test/v1/organization/issue-trackers/linear/callback"],
+            redirect_uris: ["https://relay.test/v1/user/issue-trackers/linear/callback"],
           },
           { status: 201 },
         );

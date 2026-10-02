@@ -25,8 +25,6 @@ import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 
 export interface IssueTrackersSectionProps {
-  readonly isAdmin: boolean;
-  readonly organizationName: string;
   readonly snapshot: RelayIssueTrackerConnections | null;
   readonly loading: boolean;
   readonly mutating: boolean;
@@ -61,16 +59,14 @@ function connectionDescription(
       : "Sign in again to read issues.";
   }
   if (connection?.status === "connected")
-    return connection.accountLabel ?? "Shared with your organization.";
+    return connection.accountLabel ?? "Connected to your account.";
   return service === "linear"
-    ? "Read issues from a shared Linear workspace."
-    : "Read issues from a shared Jira Cloud site.";
+    ? "Read issues from your Linear workspace."
+    : "Read issues from your Jira Cloud site.";
 }
 
 /** The actual settings surface, kept separate from authentication for client rendering and previews. */
 export function IssueTrackersSection({
-  isAdmin,
-  organizationName,
   snapshot,
   loading,
   mutating,
@@ -114,11 +110,8 @@ export function IssueTrackersSection({
   // Connected describes the active workspace, even throughout a new OAuth flow.
   // Close only when our exact authorization attempt disappears or is superseded.
   const connectDialogOpen =
-    isAdmin &&
-    dialog !== null &&
-    (!authorizationId || authorizing?.authorization?.id === authorizationId);
-  const dialogOpen =
-    connectDialogOpen || (isAdmin && (review !== undefined || disconnectService !== null));
+    dialog !== null && (!authorizationId || authorizing?.authorization?.id === authorizationId);
+  const dialogOpen = connectDialogOpen || review !== undefined || disconnectService !== null;
   // A refresh can close the dialog before a failed mutation reports its error.
   const sectionError = error ?? (dialogOpen ? null : dialogError);
 
@@ -161,7 +154,7 @@ export function IssueTrackersSection({
 
   return (
     <SettingsSection
-      {...searchableSetting("organization-issue-trackers")}
+      {...searchableSetting("personal-issue-trackers")}
       icon={<CircleDotIcon className="size-4 text-muted-foreground" />}
       headerAction={
         <Button
@@ -176,10 +169,10 @@ export function IssueTrackersSection({
       }
     >
       <div className="space-y-1 px-3 py-3 sm:px-4">
-        <p className="text-sm text-muted-foreground">Shared issue access for {organizationName}.</p>
+        <p className="text-sm text-muted-foreground">Your personal Jira and Linear connections.</p>
         <p className="text-xs leading-relaxed text-muted-foreground">
-          Read-only, in chats on organization-managed executors. Personal machines and external
-          OpenCode servers are not supported yet.
+          Read-only access for messages you send in local and managed chats. Other people use their
+          own connections. Retrieved content remains visible to everyone in the chat.
         </p>
       </div>
       {unverified ? (
@@ -234,79 +227,67 @@ export function IssueTrackersSection({
                   : null
               }
               control={
-                isAdmin ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    {connection ? (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        disabled={disabled}
-                        onClick={() => {
-                          setDialogError(null);
-                          setDisconnectService(service);
-                        }}
-                      >
-                        {connection.status === "connecting" ? "Cancel setup" : "Disconnect"}
-                      </Button>
-                    ) : null}
-                    {service === "jira" && connection?.jiraSites && connection.authorization ? (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={disabled}
-                        onClick={() => {
-                          setDialogError(null);
-                          setAuthorizationUrl(null);
-                          setAuthorizationId(connection.authorization!.id);
-                          setSiteChoice(null);
-                          setDialog("jira");
-                        }}
-                      >
-                        Choose site
-                      </Button>
-                    ) : null}
-                    {service === "linear" && connection?.replacement ? (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={disabled}
-                        onClick={() => {
-                          setDialogError(null);
-                          setReview(connection.replacement);
-                        }}
-                      >
-                        Review change
-                      </Button>
-                    ) : null}
-                    {(connection?.status !== "connected" || service === "linear") &&
-                    !connection?.jiraSites ? (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={disabled || !available}
-                        onClick={() => showConnect(service)}
-                      >
-                        {connection?.status === "connected"
-                          ? "Change workspace"
-                          : connection?.status === "connecting"
-                            ? "Try again"
-                            : connection
-                              ? "Reconnect"
-                              : "Connect"}
-                      </Button>
-                    ) : null}
-                  </div>
-                ) : !connection || connection.status !== "connected" ? (
-                  <span className="text-xs text-muted-foreground">
-                    Ask an admin to{" "}
-                    {connection?.status === "connecting"
-                      ? "finish setup"
-                      : connection
-                        ? "reconnect"
-                        : "connect"}
-                    .
-                  </span>
-                ) : null
+                <div className="flex flex-wrap items-center gap-2">
+                  {connection ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={disabled}
+                      onClick={() => {
+                        setDialogError(null);
+                        setDisconnectService(service);
+                      }}
+                    >
+                      {connection.status === "connecting" ? "Cancel setup" : "Disconnect"}
+                    </Button>
+                  ) : null}
+                  {service === "jira" && connection?.jiraSites && connection.authorization ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={disabled}
+                      onClick={() => {
+                        setDialogError(null);
+                        setAuthorizationUrl(null);
+                        setAuthorizationId(connection.authorization!.id);
+                        setSiteChoice(null);
+                        setDialog("jira");
+                      }}
+                    >
+                      Choose site
+                    </Button>
+                  ) : null}
+                  {service === "linear" && connection?.replacement ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={disabled}
+                      onClick={() => {
+                        setDialogError(null);
+                        setReview(connection.replacement);
+                      }}
+                    >
+                      Review change
+                    </Button>
+                  ) : null}
+                  {(connection?.status !== "connected" || service === "linear") &&
+                  !connection?.jiraSites ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={disabled || !available}
+                      onClick={() => showConnect(service)}
+                    >
+                      {connection?.status === "connected"
+                        ? "Change workspace"
+                        : connection?.status === "connecting"
+                          ? "Try again"
+                          : connection
+                            ? "Reconnect"
+                            : "Connect"}
+                    </Button>
+                  ) : null}
+                </div>
               }
             />
           );
@@ -340,7 +321,7 @@ export function IssueTrackersSection({
                       : `Connecting to ${providerName}`}
               </DialogTitle>
               <DialogDescription>
-                Share read-only issue access with {organizationName}.
+                Connect your account for read-only issue access.
               </DialogDescription>
             </DialogHeader>
             <DialogPanel>
@@ -399,7 +380,7 @@ export function IssueTrackersSection({
                     </p>
                   ) : null}
                   <p className="text-sm leading-relaxed text-muted-foreground">
-                    Your organization shares the read access granted by your account.
+                    Only messages you send can use this connection.
                   </p>
                   {dialog === "linear" && linear?.accountLabel ? (
                     <p className="text-sm text-muted-foreground">
@@ -468,7 +449,7 @@ export function IssueTrackersSection({
         </DialogPopup>
       </Dialog>
       <Dialog
-        open={isAdmin && review !== undefined}
+        open={review !== undefined}
         onOpenChange={(open) => {
           if (!open) closeDialog();
         }}
@@ -477,8 +458,8 @@ export function IssueTrackersSection({
           <DialogHeader>
             <DialogTitle>Replace Linear workspace?</DialogTitle>
             <DialogDescription>
-              Change the shared workspace for {organizationName}. Future issue reads will use the
-              new workspace. Existing chat history will remain available.
+              Change your connected workspace. Future issue reads will use the new workspace.
+              Existing chat history will remain available.
             </DialogDescription>
           </DialogHeader>
           <DialogPanel>
@@ -535,7 +516,7 @@ export function IssueTrackersSection({
         </DialogPopup>
       </Dialog>
       <Dialog
-        open={isAdmin && disconnectService !== null}
+        open={disconnectService !== null}
         onOpenChange={(open) => {
           if (!open) closeDialog();
         }}
@@ -550,7 +531,7 @@ export function IssueTrackersSection({
             <DialogDescription>
               {cancellingSetup
                 ? "This setup is unfinished. Cancel it and start again when you’re ready."
-                : `New issue reads will stop for everyone in ${organizationName}. Content already retrieved stays in chat history.`}
+                : "New issue reads using your connection will stop. Content already retrieved stays in chat history."}
             </DialogDescription>
           </DialogHeader>
           {dialogError ? (

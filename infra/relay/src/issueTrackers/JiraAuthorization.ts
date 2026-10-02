@@ -7,7 +7,6 @@ import * as Schema from "effect/Schema";
 
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { RelayConfiguration } from "../Config.ts";
-import { Organizations } from "../tenancy/Organizations.ts";
 import { ConnectionStore, metadata, type ConnectionKey } from "./ConnectionStore.ts";
 import { getJiraOAuthSites } from "./Jira.ts";
 import {
@@ -44,9 +43,9 @@ const decodeJiraCredentials = Schema.decodeUnknownEffect(
 const failure = (code: RelayIssueTrackerError["code"], message: string) =>
   new RelayIssueTrackerError({ code, message });
 const conflict = () =>
-  failure("conflict", "This Jira connection changed. Start again from Organization settings.");
+  failure("conflict", "This Jira connection changed. Start again from Account connections.");
 const unavailable = () =>
-  failure("unavailable", "Could not finish connecting Jira. Try again from Organization settings.");
+  failure("unavailable", "Could not finish connecting Jira. Try again from Account connections.");
 const now = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
 const base64url = (bytes: Uint8Array) =>
   btoa(String.fromCharCode(...bytes))
@@ -66,26 +65,18 @@ const bounded = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
     Effect.timeoutOrElse({ duration: "8 seconds", orElse: () => Effect.fail(unavailable()) }),
   );
-const requireAdmin = Effect.fn("jiraAuthorization.requireAdmin")(function* (input: {
-  readonly organizationId: string;
-  readonly userId: string;
-}) {
-  const organizations = yield* Organizations;
-  const membership = yield* organizations.getMembershipForUser({ userId: input.userId });
-  if (
-    !membership ||
-    membership.role !== "admin" ||
-    membership.organization.organizationId !== input.organizationId
-  ) {
-    return yield* failure("forbidden", "An organization administrator must connect Jira.");
-  }
-});
+const requireConnectionOwner = Effect.fn("jiraAuthorization.requireConnectionOwner")(
+  function* (input: { readonly ownerUserId: string; readonly userId: string }) {
+    if (input.ownerUserId !== input.userId)
+      return yield* failure("forbidden", "Only the owner can change this connection.");
+  },
+);
 
 export const startJira = Effect.fn("jiraAuthorization.start")(function* (input: {
-  readonly organizationId: string;
+  readonly ownerUserId: string;
   readonly userId: string;
 }) {
-  yield* requireAdmin(input);
+  yield* requireConnectionOwner(input);
   const config = yield* RelayConfiguration;
   const redirectUri = new URL(RELAY_JIRA_CALLBACK_PATH, config.relayIssuer).toString();
   const crypto = yield* Crypto.Crypto;
@@ -137,14 +128,14 @@ export const completeJira = Effect.fn("jiraAuthorization.complete")(
       authorizationId: pending.authorizationId,
     });
     const attempt = { ...pending, authorizationId: pending.authorizationId };
-    const admin = { organizationId: pending.organizationId, userId: pending.updatedByUserId };
+    const owner = { ownerUserId: pending.ownerUserId, userId: pending.updatedByUserId };
     const claimed = yield* Effect.gen(function* () {
       if (input.error !== undefined || !input.code || input.code.length > 16_384)
         return yield* failure(
           "invalid_input",
           "Jira authorization was cancelled. Connect again when ready.",
         );
-      yield* requireAdmin(admin);
+      yield* requireConnectionOwner(owner);
       return yield* store.withLock(pending, (row) =>
         Effect.gen(function* () {
           if (
@@ -216,7 +207,7 @@ export const completeJira = Effect.fn("jiraAuthorization.complete")(
           ? encodeJiraCredentials({ ...grant, siteUrl: site.siteUrl, cloudId: site.cloudId })
           : encodeJiraGrant(grant)
       ).pipe(Effect.flatMap(box.seal), Effect.mapError(unavailable));
-      yield* requireAdmin(admin);
+      yield* requireConnectionOwner(owner);
       return yield* store.withLock(claimed, (row) =>
         Effect.gen(function* () {
           if (
@@ -247,7 +238,7 @@ export const completeJira = Effect.fn("jiraAuthorization.complete")(
               ...row,
               payloadSealed,
               accountLabel: site.accountLabel,
-              userId: admin.userId,
+              userId: owner.userId,
             }))
           )
             return yield* conflict();
@@ -272,14 +263,14 @@ export const completeJira = Effect.fn("jiraAuthorization.complete")(
 );
 
 export const selectJiraSite = Effect.fn("jiraAuthorization.selectSite")(function* (input: {
-  readonly organizationId: string;
+  readonly ownerUserId: string;
   readonly userId: string;
   readonly authorizationId: string;
   readonly cloudId: string;
 }) {
-  yield* requireAdmin(input);
+  yield* requireConnectionOwner(input);
   const store = yield* ConnectionStore;
-  const key = { organizationId: input.organizationId, service: "jira" as const };
+  const key = { ownerUserId: input.ownerUserId, service: "jira" as const };
   const pending = yield* store.get(key);
   if (!pending?.jiraSelection || pending.authorizationId !== input.authorizationId)
     return yield* conflict();
@@ -290,10 +281,10 @@ export const selectJiraSite = Effect.fn("jiraAuthorization.selectSite")(function
   if (!pending.jiraSelection.sites.some((site) => site.cloudId === input.cloudId))
     return yield* failure("invalid_input", "Choose a Jira site from this authorization.");
   const authorizingAdmin = {
-    organizationId: input.organizationId,
+    ownerUserId: input.ownerUserId,
     userId: pending.updatedByUserId,
   };
-  yield* requireAdmin(authorizingAdmin);
+  yield* requireConnectionOwner(authorizingAdmin);
   const box = yield* RelaySecretBox;
   const grant = yield* box
     .open(pending.jiraSelection.payloadSealed)
@@ -311,8 +302,8 @@ export const selectJiraSite = Effect.fn("jiraAuthorization.selectSite")(function
     siteUrl: site.siteUrl,
     cloudId: site.cloudId,
   }).pipe(Effect.flatMap(box.seal), Effect.mapError(unavailable));
-  yield* requireAdmin(input);
-  yield* requireAdmin(authorizingAdmin);
+  yield* requireConnectionOwner(input);
+  yield* requireConnectionOwner(authorizingAdmin);
   yield* store.withLock(key, (row) =>
     Effect.gen(function* () {
       if (
@@ -338,13 +329,13 @@ export const selectJiraSite = Effect.fn("jiraAuthorization.selectSite")(function
 
 export const cancelJiraSelection = Effect.fn("jiraAuthorization.cancelSelection")(
   function* (input: {
-    readonly organizationId: string;
+    readonly ownerUserId: string;
     readonly userId: string;
     readonly authorizationId: string;
   }) {
-    yield* requireAdmin(input);
+    yield* requireConnectionOwner(input);
     const store = yield* ConnectionStore;
-    const key = { organizationId: input.organizationId, service: "jira" as const };
+    const key = { ownerUserId: input.ownerUserId, service: "jira" as const };
     yield* store.withLock(key, (row) =>
       Effect.gen(function* () {
         if (!row?.jiraSelection || row.authorizationId !== input.authorizationId)
@@ -365,11 +356,11 @@ export const jiraCredentials = Effect.fn("jiraAuthorization.credentials")(functi
   return yield* store.withLock(key, (row) =>
     Effect.gen(function* () {
       if (!row || row.status !== "connected" || !row.payloadSealed)
-        return yield* failure("auth_required", "Connect Jira in Organization settings.");
+        return yield* failure("auth_required", "Connect Jira in Account connections.");
       let credentials = yield* box.open(row.payloadSealed).pipe(
         Effect.flatMap(decodeJiraCredentials),
         Effect.mapError(() =>
-          failure("auth_required", "Reconnect Jira with Atlassian OAuth in Organization settings."),
+          failure("auth_required", "Reconnect Jira with Atlassian OAuth in Account connections."),
         ),
       );
       let activeRow = row;

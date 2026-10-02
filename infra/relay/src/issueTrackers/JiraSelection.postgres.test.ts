@@ -9,7 +9,7 @@ import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
 import { RelayDb } from "../db.ts";
-import { relayIssueTrackerConnections, relayOrganizations } from "../persistence/schema.ts";
+import { relayUserIssueTrackerConnections } from "../persistence/schema.ts";
 import { make as makeStore } from "./ConnectionStore.ts";
 import { encodeJson, fixture, jiraRow, jiraOAuth, membership } from "./Connections.test-fixture.ts";
 import { cancelJiraSelection, jiraCredentials, selectJiraSite } from "./JiraAuthorization.ts";
@@ -22,8 +22,8 @@ const databaseLayer = Layer.effect(RelayDb, PgDrizzle.makeWithDefaults()).pipe(
 );
 const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(databaseLayer), Effect.scoped);
-const actor = { organizationId: "jira-site-picker-test", userId: "admin" };
-const key = { organizationId: actor.organizationId, service: "jira" as const };
+const actor = { ownerUserId: "jira-site-picker-test", userId: "jira-site-picker-test" };
+const key = { ownerUserId: actor.ownerUserId, service: "jira" as const };
 const sites = [
   { cloudId: "a", siteUrl: "https://a.atlassian.net", accountLabel: "Site A" },
   { cloudId: "b", siteUrl: "https://b.atlassian.net", accountLabel: "Site B" },
@@ -37,18 +37,9 @@ const setup = Effect.gen(function* () {
   const db = yield* RelayDb;
   const original = { ...jiraRow(), ...key };
   yield* db
-    .insert(relayOrganizations)
-    .values({
-      organizationId: actor.organizationId,
-      name: "Test",
-      createdAt: original.updatedAt,
-      updatedAt: original.updatedAt,
-    })
-    .onConflictDoNothing();
-  yield* db
-    .delete(relayIssueTrackerConnections)
-    .where(eq(relayIssueTrackerConnections.organizationId, actor.organizationId));
-  yield* db.insert(relayIssueTrackerConnections).values(original);
+    .delete(relayUserIssueTrackerConnections)
+    .where(eq(relayUserIssueTrackerConnections.ownerUserId, actor.ownerUserId));
+  yield* db.insert(relayUserIssueTrackerConnections).values(original);
   const store = yield* makeStore;
   const pending = yield* store.begin({
     ...key,
@@ -80,7 +71,7 @@ const setup = Effect.gen(function* () {
     store,
     membership: Effect.succeed({
       ...membership,
-      organization: { ...membership.organization, organizationId: actor.organizationId },
+      organization: { ...membership.organization, organizationId: actor.ownerUserId },
     }),
     respond: (request) => {
       if (request.method === "DELETE") return Effect.succeed(new Response(null, { status: 204 }));

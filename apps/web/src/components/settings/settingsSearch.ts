@@ -823,11 +823,11 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/organization",
   },
   {
-    id: "organization-issue-trackers",
+    id: "personal-issue-trackers",
     title: "Issue trackers",
-    to: "/settings/organization",
+    to: "/settings/connections",
     cloudOnly: true,
-    searchTerms: ["Linear Jira shared organization issues connect disconnect read-only executor"],
+    searchTerms: ["Linear Jira personal account issues connect disconnect read-only OAuth"],
   },
   {
     id: "organization-provider-accounts",

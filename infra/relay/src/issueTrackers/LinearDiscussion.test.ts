@@ -17,7 +17,7 @@ import {
 } from "./LinearDiscussion.ts";
 
 const source = {
-  organizationId: "org",
+  ownerUserId: "org",
   generation: "generation",
   workspaceId: "workspace",
   issueId: "issue",
@@ -158,7 +158,7 @@ describe("Linear discussion and images", () => {
         yield* openLinearReference(result.images[0]!.reference).pipe(test.provide),
       ).toMatchObject({ ...source, kind: "image", commentId: "comment" });
       for (const mismatch of [
-        { organizationId: "other" },
+        { ownerUserId: "other" },
         { workspaceId: "other" },
         { generation: "other" },
       ]) {
@@ -198,6 +198,14 @@ describe("Linear discussion and images", () => {
         }).pipe(test.provide),
       ).toEqual({ mimeType: "image/png", data: "iVBORw==" });
       expect(test.requests[0]?.headers.authorization).toBe("Bearer access-secret");
+      const request = test.requests.find((request) => toolName(request) === "extract_images");
+      if (request?.body._tag !== "Uint8Array") throw new Error("Expected MCP request body");
+      expect(JSON.parse(new TextDecoder().decode(request.body.body))).toMatchObject({
+        params: {
+          name: "extract_images",
+          arguments: { markdown: "![image](https://uploads.linear.app/a.png)" },
+        },
+      });
     }),
   );
 

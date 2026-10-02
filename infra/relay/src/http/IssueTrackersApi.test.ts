@@ -5,8 +5,8 @@ import {
   RelayApi,
   RelayClientAuth,
   RelayClientPrincipal,
-  RelayEnvironmentAuth,
-  RelayEnvironmentPrincipal,
+  RelayIssueTrackerTurnAuth,
+  RelayIssueTrackerTurnPrincipal,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -18,14 +18,12 @@ import { HttpApi, HttpApiTest } from "effect/unstable/httpapi";
 import { RelayConfiguration } from "../Config.ts";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { ConnectionStore, type ConnectionRecord } from "../issueTrackers/ConnectionStore.ts";
-import { Machines, type MachineRecord } from "../machines/Machines.ts";
-import { Organizations } from "../tenancy/Organizations.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "./IssueTrackersApi.ts";
 
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const timestamp = "2026-09-30T09:00:00.000Z";
 const record: ConnectionRecord = {
-  organizationId: "org-a",
+  ownerUserId: "caller",
   service: "jira",
   version: "version",
   status: "connected",
@@ -39,24 +37,6 @@ const record: ConnectionRecord = {
   pendingExpiresAt: null,
   updatedByUserId: "admin",
   updatedAt: timestamp,
-};
-const machine: MachineRecord = {
-  machineId: "machine",
-  organizationId: "org-a",
-  role: "agent_executor",
-  label: "Executor",
-  computeKind: "self_hosted",
-  computeRef: null,
-  seedExpiresAt: timestamp,
-  environmentId: "env-a",
-  environmentPublicKey: "key-a",
-  endpointHttpBaseUrl: null,
-  endpointWsBaseUrl: null,
-  endpointProviderKind: null,
-  createdByUserId: "admin",
-  enrolledAt: timestamp,
-  deprovisionedAt: null,
-  createdAt: timestamp,
 };
 const config = RelayConfiguration.of({
   relayIssuer: "https://relay.test",
@@ -75,7 +55,7 @@ const headers = { authorization: "Bearer test" };
 function setup(
   input: {
     role?: "member" | "admin";
-    machine?: MachineRecord | null;
+    userId?: string;
     organizationId?: string;
     connection?: ConnectionRecord;
   } = {},
@@ -92,49 +72,40 @@ function setup(
     Layer.mock(ConnectionStore, {
       list: (organizationId) => {
         seen.push(`list:${organizationId}`);
-        return Effect.succeed(organizationId === "org-a" ? [input.connection ?? record] : []);
+        return Effect.succeed(organizationId === "caller" ? [input.connection ?? record] : []);
       },
       withLock: (key, use) => {
-        seen.push(`lock:${key.organizationId}:${key.service}`);
+        seen.push(`lock:${key.ownerUserId}:${key.service}`);
         return use(null);
       },
-      get: ({ organizationId }) => {
-        seen.push(`get:${organizationId}`);
+      get: ({ ownerUserId }) => {
+        seen.push(`get:${ownerUserId}`);
         return Effect.succeed(null);
       },
-      remove: ({ organizationId, service }) => {
-        seen.push(`remove:${organizationId}:${service}`);
+      remove: ({ ownerUserId, service }) => {
+        seen.push(`remove:${ownerUserId}:${service}`);
         return Effect.void;
       },
     }),
-    Layer.mock(Organizations, {
-      getMembershipForUser: ({ userId }) =>
-        Effect.succeed({
-          userId,
-          role: input.role ?? "member",
-          joinedAt: timestamp,
-          organization: {
-            organizationId: input.organizationId ?? "org-a",
-            name: "Team",
-            createdAt: timestamp,
-          },
-        }),
-    }),
-    Layer.mock(Machines, {
-      getActiveByEnvironmentId: () =>
-        Effect.succeed(input.machine === undefined ? machine : input.machine),
-    }),
   );
   const auth = Layer.mergeAll(
+    Layer.succeed(RelayIssueTrackerTurnAuth, {
+      turnBearer: (effect) =>
+        Effect.provideService(effect, RelayIssueTrackerTurnPrincipal, {
+          ownerUserId: "caller",
+          environmentId: EnvironmentId.make("env-a"),
+          threadId: "thread",
+          commandId: "command",
+          commandDigest: "a".repeat(64),
+          expiresAt: 4102444800000,
+          connections: { jira: "version", linear: "version" },
+        }),
+    }),
     Layer.succeed(RelayClientAuth, {
       clientBearer: (effect) =>
-        Effect.provideService(effect, RelayClientPrincipal, { userId: "caller", token: "test" }),
-    }),
-    Layer.succeed(RelayEnvironmentAuth, {
-      environmentBearer: (effect) =>
-        Effect.provideService(effect, RelayEnvironmentPrincipal, {
-          environmentId: "env-a",
-          environmentPublicKey: "key-a",
+        Effect.provideService(effect, RelayClientPrincipal, {
+          userId: input.userId ?? "caller",
+          token: "test",
         }),
     }),
   );
@@ -157,214 +128,120 @@ function setup(
 }
 
 describe("issue tracker authorization", () => {
-  it.effect("members see only their organization's metadata and no credentials", () =>
-    Effect.gen(function* () {
-      const own = setup();
-      const client = yield* own.client;
-      const result = yield* client.issueTrackers.listConnections({ headers });
-      expect(result).toEqual({
-        linearAvailable: true,
-        connections: [
-          {
-            service: "jira",
-            status: "connected",
-            accountLabel: "team.atlassian.net",
-            updatedAt: timestamp,
-          },
-        ],
-      });
-      expect(own.seen).toEqual(["list:org-a"]);
-      const other = setup({ organizationId: "org-b" });
-      expect(
-        (yield* (yield* other.client).issueTrackers.listConnections({ headers })).connections,
-      ).toEqual([]);
-      expect(other.seen).toEqual(["list:org-b"]);
-    }),
+  it.effect(
+    "personal connection metadata is scoped to the authenticated user, not organization membership",
+    () =>
+      Effect.gen(function* () {
+        const harness = setup({ role: "member", organizationId: "another-organization" });
+        const result = yield* (yield* harness.client).issueTrackers.listConnections({ headers });
+        expect(result.connections[0]?.accountLabel).toBe("team.atlassian.net");
+        expect(harness.seen).toEqual(["list:caller"]);
+        expect(result.connections[0]).not.toHaveProperty("payloadSealed");
+      }),
   );
 
-  it.effect("members cannot connect or disconnect either service", () =>
+  it.effect("a member disconnects only their own connection", () =>
     Effect.gen(function* () {
-      const harness = setup();
-      const client = yield* harness.client;
-      const errors = yield* Effect.all({
-        linear: client.issueTrackers.startLinear({ headers }).pipe(Effect.flip),
-        jiraOAuth: client.issueTrackers.startJira({ headers }).pipe(Effect.flip),
-        selectJira: client.issueTrackers
-          .selectJiraSite({ headers, payload: { authorizationId: "attempt", cloudId: "cloud" } })
-          .pipe(Effect.flip),
-        cancelJira: client.issueTrackers
-          .cancelJiraSelection({ headers, payload: { authorizationId: "attempt" } })
-          .pipe(Effect.flip),
-        disconnectLinear: client.issueTrackers
-          .disconnect({ headers, params: { service: "linear" } })
-          .pipe(Effect.flip),
-        confirm: client.issueTrackers
-          .confirmLinearReplacement({ headers, payload: { proposalId: "proposal" } })
-          .pipe(Effect.flip),
-        cancel: client.issueTrackers
-          .cancelLinearReplacement({ headers, payload: { proposalId: "proposal" } })
-          .pipe(Effect.flip),
-        disconnectJira: client.issueTrackers
-          .disconnect({ headers, params: { service: "jira" } })
-          .pipe(Effect.flip),
-      });
-      for (const error of Object.values(errors))
-        expect(error._tag).toBe("RelayTenancyForbiddenError");
-      expect(harness.seen).toEqual([]);
-    }),
-  );
-
-  it.effect("admin disconnect is bound to the caller's organization", () =>
-    Effect.gen(function* () {
-      const harness = setup({ role: "admin", organizationId: "org-b" });
-      const client = yield* harness.client;
+      const harness = setup({ role: "member", organizationId: "another-organization" });
       expect(
-        yield* client.issueTrackers.disconnect({ headers, params: { service: "jira" } }),
+        yield* (yield* harness.client).issueTrackers.disconnect({
+          headers,
+          params: { service: "linear" },
+        }),
       ).toEqual({ ok: true });
-      expect(harness.seen).toEqual(["remove:org-b:jira"]);
+      expect(harness.seen).toEqual(["remove:caller:linear"]);
     }),
   );
 
-  it.effect("replacement endpoints derive the organization from current membership", () =>
+  it.effect("does not expose another user's connections", () =>
     Effect.gen(function* () {
-      const harness = setup({ role: "admin", organizationId: "org-b" });
+      const harness = setup({ userId: "other" });
+      expect(
+        (yield* (yield* harness.client).issueTrackers.listConnections({ headers })).connections,
+      ).toEqual([]);
+      expect(harness.seen).toEqual(["list:other"]);
+    }),
+  );
+
+  it.effect("replacement and Jira site decisions look up only the caller's records", () =>
+    Effect.gen(function* () {
+      const harness = setup({ userId: "other" });
       const client = yield* harness.client;
       expect(
         yield* client.issueTrackers
-          .confirmLinearReplacement({ headers, payload: { proposalId: "org-a-proposal" } })
+          .confirmLinearReplacement({ headers, payload: { proposalId: "someone-elses-proposal" } })
           .pipe(Effect.flip),
       ).toMatchObject({ code: "conflict" });
       expect(
-        (yield* client.issueTrackers.cancelLinearReplacement({
-          headers,
-          payload: { proposalId: "org-a-proposal" },
-        })).connections,
-      ).toEqual([]);
-      expect(harness.seen).toEqual(["lock:org-b:linear", "lock:org-b:linear", "list:org-b"]);
+        yield* client.issueTrackers
+          .selectJiraSite({
+            headers,
+            payload: { authorizationId: "someone-elses-attempt", cloudId: "cloud" },
+          })
+          .pipe(Effect.flip),
+      ).toMatchObject({ code: "conflict" });
+      expect(
+        yield* client.issueTrackers
+          .cancelJiraSelection({ headers, payload: { authorizationId: "someone-elses-attempt" } })
+          .pipe(Effect.flip),
+      ).toMatchObject({ code: "conflict" });
+      expect(harness.seen).toEqual(["lock:other:linear", "get:other", "lock:other:jira"]);
     }),
   );
 
-  it.effect("executor reads derive the organization from enrollment", () =>
+  it.effect("reads never fall back to an organization connection", () =>
     Effect.gen(function* () {
       const harness = setup();
-      const client = yield* harness.client;
-      const error = yield* client.issueTrackersServer
+      const result = yield* (yield* harness.client).issueTrackersServer
         .readIssue({
           params: { environmentId: EnvironmentId.make("env-a"), service: "jira" },
-          payload: { issue: "LP-1" },
+          payload: { issue: "WP-1" },
         })
         .pipe(Effect.flip);
-      expect(error).toMatchObject({ _tag: "RelayIssueTrackerError", code: "not_configured" });
-      expect(harness.seen).toEqual(["get:org-a"]);
+      expect(result._tag).toBe("RelayAuthInvalidError");
+      expect(harness.seen).toEqual(["get:caller"]);
     }),
   );
 
-  it.effect("personal machines, review hosts, and mismatched credentials cannot read", () =>
-    Effect.gen(function* () {
-      for (const found of [
-        null,
-        { ...machine, role: "review_host" as const },
-        { ...machine, environmentPublicKey: "other" },
-      ]) {
-        const harness = setup({ machine: found });
-        const client = yield* harness.client;
-        const error = yield* client.issueTrackersServer
-          .readIssue({
-            params: { environmentId: EnvironmentId.make("env-a"), service: "linear" },
-            payload: { issue: "LP-1" },
-          })
-          .pipe(Effect.flip);
-        expect(error._tag).toBe("RelayAuthInvalidError");
-        expect(harness.seen).toEqual([]);
-      }
-      const harness = setup();
-      const error = yield* (yield* harness.client).issueTrackersServer
-        .readIssue({
-          params: { environmentId: EnvironmentId.make("env-b"), service: "jira" },
-          payload: { issue: "LP-1" },
-        })
-        .pipe(Effect.flip);
-      expect(error._tag).toBe("RelayAuthInvalidError");
-      expect(harness.seen).toEqual([]);
-    }),
-  );
-});
-
-it.effect.each(["readComments", "readImages", "viewImage"] as const)(
-  "enforces managed executor identity before %s follow-ups",
-  (operation) =>
-    Effect.gen(function* () {
-      for (const found of [
-        null,
-        { ...machine, role: "review_host" as const },
-        { ...machine, environmentPublicKey: "other" },
-        machine,
-      ]) {
-        const harness = setup({ machine: found });
+  it.effect.each(["readComments", "readImages", "viewImage"] as const)(
+    "rejects a grant for the wrong environment before %s",
+    (operation) =>
+      Effect.gen(function* () {
+        const harness = setup();
         const client = yield* harness.client;
         const input = {
-          params: { environmentId: EnvironmentId.make("env-a") },
-          payload: { reference: "sealed-reference" },
+          params: { environmentId: EnvironmentId.make("another-environment") },
+          payload: { reference: "source" },
         };
-        const failures = {
-          readComments: client.issueTrackersServer.readComments(input).pipe(Effect.flip),
-          readImages: client.issueTrackersServer.readImages(input).pipe(Effect.flip),
-          viewImage: client.issueTrackersServer.viewImage(input).pipe(Effect.flip),
+        const result = yield* operation === "readComments"
+          ? client.issueTrackersServer.readComments(input).pipe(Effect.flip)
+          : operation === "readImages"
+            ? client.issueTrackersServer.readImages(input).pipe(Effect.flip)
+            : client.issueTrackersServer.viewImage(input).pipe(Effect.flip);
+        expect(result._tag).toBe("RelayAuthInvalidError");
+        expect(harness.seen).toEqual([]);
+      }),
+  );
+
+  it.effect.each(["admin", "member"] as const)(
+    "the owner can choose Jira sites regardless of organization role: %s",
+    (role) =>
+      Effect.gen(function* () {
+        const connection: ConnectionRecord = {
+          ...record,
+          authorizationId: "attempt",
+          pendingExpiresAt: "2099-01-01T00:00:00Z",
+          jiraSelection: {
+            payloadSealed: "private-pending-grant",
+            sites: [
+              { cloudId: "cloud", siteUrl: "https://team.atlassian.net", accountLabel: "Team" },
+            ],
+          },
         };
-        const error = yield* failures[operation];
-        if (found === machine) {
-          expect(error).toMatchObject({ _tag: "RelayIssueTrackerError", code: "conflict" });
-          expect(harness.seen).toEqual(["get:org-a"]);
-        } else {
-          expect(error._tag).toBe("RelayAuthInvalidError");
-          expect(harness.seen).toEqual([]);
-        }
-      }
-    }),
-);
-
-it.effect.each(["admin", "member"] as const)(
-  "exposes pending Jira sites only to admins: %s",
-  (role) =>
-    Effect.gen(function* () {
-      const connection: ConnectionRecord = {
-        ...record,
-        authorizationId: "attempt",
-        pendingExpiresAt: "2099-01-01T00:00:00Z",
-        jiraSelection: {
-          payloadSealed: "private-pending-grant",
-          sites: [
-            { cloudId: "cloud", siteUrl: "https://team.atlassian.net", accountLabel: "Team" },
-          ],
-        },
-      };
-      const client = yield* setup({ role, connection }).client;
-      const result = yield* client.issueTrackers.listConnections({ headers });
-      expect(result.connections[0]?.authorization?.phase).toBe("selecting_site");
-      expect(result.connections[0]?.jiraSites).toEqual(
-        role === "admin" ? connection.jiraSelection!.sites : undefined,
-      );
-      expect(yield* encodeJson(result)).not.toContain("private-pending-grant");
-    }),
-);
-
-it.effect("does not let another organization's admin finish or cancel a Jira choice", () =>
-  Effect.gen(function* () {
-    const harness = setup({ role: "admin", organizationId: "org-b" });
-    const client = yield* harness.client;
-    expect(
-      yield* client.issueTrackers
-        .selectJiraSite({
-          headers,
-          payload: { authorizationId: "org-a-attempt", cloudId: "cloud" },
-        })
-        .pipe(Effect.flip),
-    ).toMatchObject({ code: "conflict" });
-    expect(
-      yield* client.issueTrackers
-        .cancelJiraSelection({ headers, payload: { authorizationId: "org-a-attempt" } })
-        .pipe(Effect.flip),
-    ).toMatchObject({ code: "conflict" });
-    expect(harness.seen).toEqual(["get:org-b", "lock:org-b:jira"]);
-  }),
-);
+        const result = yield* (yield* setup({ role, connection })
+          .client).issueTrackers.listConnections({ headers });
+        expect(result.connections[0]?.jiraSites).toEqual(connection.jiraSelection!.sites);
+        expect(yield* encodeJson(result)).not.toContain("private-pending-grant");
+      }),
+  );
+});

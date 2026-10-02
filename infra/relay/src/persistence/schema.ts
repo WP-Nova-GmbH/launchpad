@@ -171,6 +171,33 @@ export const relayIssueTrackerConnections = pgTable(
   ],
 );
 
+/** Personal grants are separate from legacy organization grants; ownership is never inferred. */
+export const relayUserIssueTrackerConnections = pgTable(
+  "relay_user_issue_tracker_connections",
+  {
+    ownerUserId: varchar("owner_user_id", { length: 191 }).notNull(),
+    service: varchar("service", { length: 16 }).notNull().$type<RelayIssueTrackerService>(),
+    version: varchar("version", { length: 64 }).notNull(),
+    status: varchar("status", { length: 32 })
+      .notNull()
+      .$type<"connecting" | "connected" | "reconnect_required">(),
+    accountLabel: text("account_label"),
+    payloadSealed: text("payload_sealed"),
+    authorizationId: varchar("authorization_id", { length: 64 }),
+    replacement: jsonb("replacement").$type<LinearReplacementRecord>(),
+    jiraSelection: jsonb("jira_selection").$type<JiraSelectionRecord>(),
+    pendingOAuthSealed: text("pending_oauth_sealed"),
+    pendingStateHash: text("pending_state_hash"),
+    pendingExpiresAt: varchar("pending_expires_at", { length: 64 }),
+    updatedByUserId: varchar("updated_by_user_id", { length: 191 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.ownerUserId, table.service] }),
+    uniqueIndex("idx_relay_user_issue_tracker_pending_state").on(table.pendingStateHash),
+  ],
+);
+
 /**
  * A skill an organization gives its agents: a directory of text files with a
  * `SKILL.md` at its root, uploaded by an admin and placed by every agent

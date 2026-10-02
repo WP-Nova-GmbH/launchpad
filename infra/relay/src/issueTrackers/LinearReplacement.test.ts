@@ -14,7 +14,7 @@ import * as TestClock from "effect/testing/TestClock";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 
 import { RelayDb } from "../db.ts";
-import { relayIssueTrackerConnections, relayOrganizations } from "../persistence/schema.ts";
+import { relayUserIssueTrackerConnections } from "../persistence/schema.ts";
 import { ConnectionPersistenceError, make as makeStore, metadata } from "./ConnectionStore.ts";
 import {
   cancelLinearReplacement,
@@ -84,7 +84,7 @@ const respond = (request: HttpClientRequest.HttpClientRequest) =>
           : issueResponse(),
   );
 const authorize = Effect.gen(function* () {
-  const started = yield* startLinear({ organizationId: "org", userId: "admin" });
+  const started = yield* startLinear({ ownerUserId: "org", userId: "org" });
   return {
     state: new URL(started.authorizationUrl).searchParams.get("state")!,
     iss: "https://mcp.linear.app",
@@ -92,7 +92,7 @@ const authorize = Effect.gen(function* () {
   };
 });
 const propose = authorize.pipe(Effect.flatMap(completeLinear));
-const actor = { organizationId: "org", userId: "another-admin" };
+const actor = { ownerUserId: "org", userId: "org" };
 
 for (const postgres of [false, true]) {
   describe.skipIf(postgres && !databaseUrl)(
@@ -103,19 +103,10 @@ for (const postgres of [false, true]) {
           if (!postgres) return yield* fixture({ rows: [linearRow()], respond, ...options });
           const db = yield* testDatabase;
           yield* db
-            .insert(relayOrganizations)
-            .values({
-              organizationId: "org",
-              name: "Launchpad",
-              createdAt: "2026-01-01T00:00:00.000Z",
-              updatedAt: "2026-01-01T00:00:00.000Z",
-            })
-            .onConflictDoNothing();
-          yield* db
-            .delete(relayIssueTrackerConnections)
-            .where(eq(relayIssueTrackerConnections.organizationId, "org"));
+            .delete(relayUserIssueTrackerConnections)
+            .where(eq(relayUserIssueTrackerConnections.ownerUserId, "org"));
           const rows = options.rows ?? [linearRow()];
-          if (rows.length) yield* db.insert(relayIssueTrackerConnections).values([...rows]);
+          if (rows.length) yield* db.insert(relayUserIssueTrackerConnections).values([...rows]);
           const store = yield* testStore;
           return yield* fixture({ respond, ...options, store });
         });
@@ -125,7 +116,7 @@ for (const postgres of [false, true]) {
           Effect.scoped,
         );
 
-      it.effect("keeps A active until another admin confirms B, with safe metadata", () =>
+      it.effect("keeps A active until the owner confirms B, with safe metadata", () =>
         run(
           Effect.gen(function* () {
             const test = yield* setup();
@@ -155,7 +146,7 @@ for (const postgres of [false, true]) {
             expect(active.version).not.toBe(original!.version);
             expect(active.payloadSealed).toContain("workspace-b");
             expect(
-              yield* readComments({ organizationId: "org", reference: read.linear!.source }).pipe(
+              yield* readComments({ ownerUserId: "org", reference: read.linear!.source }).pipe(
                 test.provide,
                 Effect.flip,
               ),
@@ -221,7 +212,7 @@ for (const postgres of [false, true]) {
             expect(active.version).not.toBe(original.version);
             expect(active.replacement).toBeNull();
             expect(active.payloadSealed).toContain('"generation":"workspace"');
-            yield* readComments({ organizationId: "org", reference: read.linear!.source }).pipe(
+            yield* readComments({ ownerUserId: "org", reference: read.linear!.source }).pipe(
               test.provide,
             );
           }),
@@ -250,7 +241,7 @@ for (const postgres of [false, true]) {
               const read = yield* readIssue(issueInput).pipe(test.provide);
               expect(yield* propose.pipe(test.provide)).toMatchObject({ status: "connected" });
               expect(
-                yield* readComments({ organizationId: "org", reference: read.linear!.source }).pipe(
+                yield* readComments({ ownerUserId: "org", reference: read.linear!.source }).pipe(
                   test.provide,
                   Effect.flip,
                 ),
@@ -292,7 +283,7 @@ for (const postgres of [false, true]) {
         ),
       );
 
-      it.effect.each(["disconnect", "supersede", "remove-admin", "expire"] as const)(
+      it.effect.each(["disconnect", "supersede", "expire"] as const)(
         "rejects a late callback after %s",
         (action) =>
           run(
@@ -323,11 +314,10 @@ for (const postgres of [false, true]) {
               if (action === "disconnect") yield* disconnect(key).pipe(test.provide);
               if (action === "supersede")
                 nextAttempt = (yield* startLinear({ ...actor }).pipe(test.provide)).authorizationId;
-              if (action === "remove-admin") yield* Ref.set(member, null);
               if (action === "expire") yield* TestClock.adjust("2 seconds");
               yield* Deferred.succeed(release, undefined);
               expect(yield* Fiber.join(callback)).toMatchObject({
-                code: action === "remove-admin" ? "forbidden" : "conflict",
+                code: "conflict",
               });
               const row = yield* test.store.get(key);
               if (action === "disconnect") expect(row).toBeNull();
@@ -380,11 +370,11 @@ for (const postgres of [false, true]) {
                     ? readIssue(issueInput).pipe(Effect.asVoid)
                     : readKind === "comments"
                       ? readComments({
-                          organizationId: "org",
+                          ownerUserId: "org",
                           reference: initial.linear!.source,
                         }).pipe(Effect.asVoid)
                       : viewImage({
-                          organizationId: "org",
+                          ownerUserId: "org",
                           reference: initial.linear!.images[0]!.reference,
                         }).pipe(Effect.asVoid);
                 const read = yield* operation.pipe(test.provide, Effect.result, Effect.forkChild);
@@ -423,20 +413,10 @@ for (const postgres of [false, true]) {
         (access) =>
           run(
             Effect.gen(function* () {
-              const member = yield* Ref.make(membership);
-              const test = yield* setup({ membership: Ref.get(member) });
+              const test = yield* setup();
               yield* propose.pipe(test.provide);
               const row = (yield* test.store.get(key))!;
-              yield* Ref.set<typeof membership>(
-                member,
-                access === "member"
-                  ? { ...membership, role: "member" }
-                  : {
-                      ...membership,
-                      organization: { ...membership.organization, organizationId: "other-org" },
-                    },
-              );
-              const input = { ...actor, proposalId: row.replacement!.id };
+              const input = { ...actor, userId: access, proposalId: row.replacement!.id };
               expect(
                 yield* confirmLinearReplacement(input).pipe(test.provide, Effect.flip),
               ).toMatchObject({ code: "forbidden" });
@@ -469,18 +449,9 @@ for (const postgres of [false, true]) {
       it.effect("a losing duplicate callback cannot cancel the winning claim", () =>
         run(
           Effect.gen(function* () {
-            const arrived = yield* Deferred.make<void>();
-            const allowMembership = yield* Deferred.make<void>();
             const httpStarted = yield* Deferred.make<void>();
             const allowHttp = yield* Deferred.make<void>();
-            let members = 0;
             const test = yield* setup({
-              membership: Effect.gen(function* () {
-                if (++members === 1) return membership;
-                if (members === 3) yield* Deferred.succeed(arrived, undefined);
-                yield* Deferred.await(allowMembership);
-                return membership;
-              }),
               respond: (request) =>
                 request.url.endsWith("/token")
                   ? Deferred.succeed(httpStarted, undefined).pipe(
@@ -497,8 +468,6 @@ for (const postgres of [false, true]) {
               ],
               { concurrency: "unbounded" },
             ).pipe(test.provide, Effect.forkChild);
-            yield* Deferred.await(arrived);
-            yield* Deferred.succeed(allowMembership, undefined);
             yield* Deferred.await(httpStarted);
             yield* Deferred.succeed(allowHttp, undefined);
             const results = yield* Fiber.join(callbacks);

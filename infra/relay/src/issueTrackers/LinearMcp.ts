@@ -28,7 +28,7 @@ const decodeMissingIssue = Schema.decodeUnknownExit(
 );
 type ReadTool = "get_workspace" | "get_user" | "get_issue" | "list_comments" | "extract_images";
 
-/** Each operation owns its MCP session; credentials and sessions never cross organization boundaries. */
+/** Each operation owns its MCP session; credentials and sessions never cross account boundaries. */
 export const callLinearTools = Effect.fn("linearMcp.callTools")(function* (
   accessToken: string,
   calls: ReadonlyArray<{ name: ReadTool; arguments: Record<string, unknown> }>,
@@ -62,7 +62,7 @@ export const callLinearTools = Effect.fn("linearMcp.callTools")(function* (
               if (response.status === 401)
                 return yield* new IssueTrackerFailure({
                   code: "auth_required",
-                  message: "Reconnect Linear in Organization settings.",
+                  message: "Reconnect Linear in Account connections.",
                 });
               if (response.status === 403)
                 return yield* new IssueTrackerFailure({

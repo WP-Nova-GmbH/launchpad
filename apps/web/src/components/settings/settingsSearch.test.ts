@@ -120,15 +120,12 @@ describe("searchSettings", () => {
     },
   );
 
-  it.each(["Linear", "Jira", "issue trackers"])(
-    "finds organization issue trackers for %s",
-    (query) => {
-      expect(searchSettings(query)[0]).toMatchObject({
-        id: "organization-issue-trackers",
-        to: "/settings/organization",
-      });
-    },
-  );
+  it.each(["Linear", "Jira", "issue trackers"])("finds personal issue trackers for %s", (query) => {
+    expect(searchSettings(query)[0]).toMatchObject({
+      id: "personal-issue-trackers",
+      to: "/settings/connections",
+    });
+  });
 
   it("returns no results for an empty query", () => {
     expect(searchSettings("   ", ITEMS)).toEqual([]);

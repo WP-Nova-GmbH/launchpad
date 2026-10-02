@@ -2,8 +2,8 @@ import * as Schema from "effect/Schema";
 
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 
-export const RELAY_LINEAR_CALLBACK_PATH = "/v1/organization/issue-trackers/linear/callback";
-export const RELAY_JIRA_CALLBACK_PATH = "/v1/organization/issue-trackers/jira/callback";
+export const RELAY_LINEAR_CALLBACK_PATH = "/v1/user/issue-trackers/linear/callback";
+export const RELAY_JIRA_CALLBACK_PATH = "/v1/user/issue-trackers/jira/callback";
 
 export const RelayIssueTrackerService = Schema.Literals(["linear", "jira"]);
 export type RelayIssueTrackerService = typeof RelayIssueTrackerService.Type;

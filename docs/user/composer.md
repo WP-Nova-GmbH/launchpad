@@ -268,3 +268,15 @@ automatically. HTML previews cannot access your Launchpad session.
 
 On mobile, select a PDF attachment or link to open it. iOS uses the native viewer;
 Android opens a compatible installed file viewer.
+
+## Personal issue trackers
+
+Connect Jira and Linear from **Account → Connections** or **Settings → Connections → Issue trackers** in the web or desktop app. Sign in to the provider and authorize read access. Each Launchpad user connects their own account; organization membership does not share access. Previous organization connections must be connected again personally.
+
+For Jira, Launchpad selects the only available site automatically. If several sites are available, return to Connections and choose one. For Linear, changing workspaces keeps the old workspace active until you review and accept the replacement. You can cancel either unfinished setup.
+
+Ask the agent to read an issue identifier or URL in a local or managed chat, including a chat opened from mobile while signed into the same Launchpad account. Linear also supports comments, replies, and uploaded images up to 5 MiB. Search, issue updates, automatic jobs, and external OpenCode servers are not supported by these connections.
+
+A prompt uses the personal connections of the person submitting it. Editing a queued prompt replaces that authorization with the editor's access. Steering into a running turn requires the same user's connections; otherwise leave the prompt queued for its own turn. Queued authorization expires after a day: edit and save the prompt to renew it. Closing your browser does not cancel an already authorized turn.
+
+Retrieved issue content is visible to everyone who can read that chat. Disconnecting stops subsequent reads using that connection, but does not remove content already in chat history. Reconnect from Connections if a provider revokes or expires your access.

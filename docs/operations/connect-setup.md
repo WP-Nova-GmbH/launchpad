@@ -138,14 +138,13 @@ sign-up. An enabled empty allowlist blocks all new sign-ups.
 Sign-up restrictions do not revoke an existing account's access. Ban the account in Clerk when
 its active sessions and future sign-ins must be disabled.
 
-## Organization issue trackers
+## Personal issue trackers
 
 Linear uses its official read-only MCP endpoint with OAuth dynamic client registration. No
-`LINEAR_CLIENT_ID` or `LINEAR_CLIENT_SECRET` is needed. An organization administrator connects
-Linear in Organization settings; shared access uses that person's Linear permissions.
+`LINEAR_CLIENT_ID` or `LINEAR_CLIENT_SECRET` is needed. Each user connects Linear in Account → Connections; reads use that user’s Linear permissions.
 
 The callback belongs to the relay, including when setup starts from a desktop or remote client:
-`<relay issuer>/v1/organization/issue-trackers/linear/callback`. For a local pilot, set
+`<relay issuer>/v1/user/issue-trackers/linear/callback`. For a local pilot, set
 `DEV_RELAY_ISSUER` to the reachable relay origin and use an isolated `DEV_RELAY_DATABASE_URL`.
 The relay registers its callback dynamically and requests only `read` access.
 
@@ -153,11 +152,8 @@ Existing connections from the previous static OAuth application must reconnect a
 Changing workspace requires explicit confirmation in Launchpad; the current connection stays
 available during authorization. See [Linear's MCP documentation](https://linear.app/docs/mcp).
 
-Jira also uses dynamic OAuth registration. An organization administrator authorizes Atlassian
-in Organization settings and chooses a site when their account has access to several sites.
-Shared reads use the permissions granted by that account.
+Jira also uses dynamic OAuth registration. Each user authorizes Atlassian
+in Account → Connections and chooses a site when their account has access to several sites.
+Reads use the permissions granted by that user’s account.
 
-Both connections keep credentials on the relay. Only enrolled organization-managed executors can
-request issue reads; this release does not authorize personal environments or support issue writes,
-search, or webhook-triggered jobs. Setup is available in web and desktop settings; supported executor
-chats can be used from any client, including mobile. External OpenCode servers are not supported.
+Both connections keep provider credentials on the relay. The initiating user authorizes each prompt for its environment and thread, so both local and managed environments can request reads. Former organization connections are retained but not used or reassigned; users must connect personally. Setup is available in web and desktop settings; chats can use the same personal connections from mobile. Issue writes, search, webhook-triggered jobs, and external OpenCode servers are not supported.

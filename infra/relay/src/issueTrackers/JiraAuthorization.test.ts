@@ -20,10 +20,10 @@ import {
 import { exchangeJiraCode, refreshJiraTokens, JiraPendingOAuth } from "./JiraOAuth.ts";
 
 const decodePendingOAuth = Schema.decodeUnknownSync(Schema.fromJsonString(JiraPendingOAuth));
-const key = { organizationId: "org", service: "jira" } as const;
+const key = { ownerUserId: "org", service: "jira" } as const;
 const input = {
-  organizationId: "org",
-  userId: "admin",
+  ownerUserId: "org",
+  userId: "org",
 };
 const decodeRpc = Schema.decodeUnknownSync(
   Schema.fromJsonString(
@@ -67,7 +67,7 @@ function response(request: HttpClientRequest.HttpClientRequest, resources: unkno
     return Response.json({
       client_id: "jira-client",
       token_endpoint_auth_method: "none",
-      redirect_uris: ["https://relay.test/v1/organization/issue-trackers/jira/callback"],
+      redirect_uris: ["https://relay.test/v1/user/issue-trackers/jira/callback"],
     });
   if (request.url === tokenEndpoint)
     return Response.json({
@@ -160,7 +160,7 @@ describe("Jira OAuth", () => {
         "read:jira:agent-interface",
       ]);
       expect(url.searchParams.get("redirect_uri")).toBe(
-        "https://relay.test/v1/organization/issue-trackers/jira/callback",
+        "https://relay.test/v1/user/issue-trackers/jira/callback",
       );
       expect(started.connection.authorization?.id).toBe(started.authorizationId);
       const state = stateFrom(started.authorizationUrl);
@@ -298,18 +298,13 @@ describe("Jira OAuth", () => {
     }),
   );
 
-  it.effect("does not authorize a different organization or a non-admin", () =>
+  it.effect("does not authorize someone else's personal connection", () =>
     Effect.gen(function* () {
-      for (const entry of [
-        { ...membership, role: "member" as const },
-        { ...membership, organization: { ...membership.organization, organizationId: "other" } },
-      ]) {
-        const test = yield* fixture({ membership: Effect.succeed(entry) });
-        expect(yield* startJira(input).pipe(test.provide, Effect.flip)).toMatchObject({
-          code: "forbidden",
-        });
-        expect(test.requests).toHaveLength(0);
-      }
+      const test = yield* fixture();
+      expect(
+        yield* startJira({ ...input, userId: "other-user" }).pipe(test.provide, Effect.flip),
+      ).toMatchObject({ code: "forbidden" });
+      expect(test.requests).toHaveLength(0);
     }),
   );
 
@@ -558,16 +553,16 @@ describe("Jira site selection", () => {
     return { ...test, authorizationId: started.authorizationId };
   });
 
-  it.effect("persists the choices, hides them from members, and connects the selected site", () =>
+  it.effect("persists private choices for their owner and connects the selected site", () =>
     Effect.gen(function* () {
       const test = yield* pendingSelection();
-      const admin = yield* listConnections("org", true).pipe(test.provide);
+      const admin = yield* listConnections("org").pipe(test.provide);
       expect(admin.connections[0]?.authorization?.phase).toBe("selecting_site");
       expect(admin.connections[0]?.jiraSites).toHaveLength(2);
       expect(encodeJson(admin)).not.toContain("oauth-access");
       expect(encodeJson(admin)).not.toContain("oauth-refresh");
-      const member = yield* listConnections("org").pipe(test.provide);
-      expect(member.connections[0]?.jiraSites).toBeUndefined();
+      const member = yield* listConnections("other-user").pipe(test.provide);
+      expect(member.connections).toEqual([]);
       expect((yield* test.store.get(key))?.status).toBe("connecting");
       const requestsBefore = test.requests.length;
       yield* selectJiraSite({ ...choose, authorizationId: test.authorizationId }).pipe(
@@ -606,7 +601,7 @@ describe("Jira site selection", () => {
     }),
   );
 
-  it.effect("rejects arbitrary choices and attempts belonging to a different organization", () =>
+  it.effect("rejects arbitrary choices and attempts belonging to a different owner", () =>
     Effect.gen(function* () {
       const test = yield* pendingSelection();
       const previous = yield* test.store.get(key);
@@ -622,7 +617,7 @@ describe("Jira site selection", () => {
         yield* selectJiraSite({
           ...choose,
           authorizationId: test.authorizationId,
-          organizationId: "other-org",
+          ownerUserId: "other-org",
         }).pipe(test.provide, Effect.flip),
       ).toMatchObject({ code: "forbidden" });
       expect(yield* test.store.get(key)).toEqual(previous);
@@ -685,7 +680,7 @@ describe("Jira site selection", () => {
               Effect.flip,
             ),
           ).toMatchObject({ code: "conflict" });
-        } else yield* listConnections("org", true).pipe(test.provide);
+        } else yield* listConnections("org").pipe(test.provide);
         const row = yield* test.store.get(key);
         expect(row?.jiraSelection).toBeNull();
         expect(row?.payloadSealed).toBe(jiraRow().payloadSealed);
@@ -712,11 +707,11 @@ describe("Jira site selection", () => {
         test.provide,
       );
       yield* TestClock.adjust("30 seconds");
-      expect((yield* listConnections("org", true).pipe(test.provide)).connections).toEqual([]);
+      expect((yield* listConnections("org").pipe(test.provide)).connections).toEqual([]);
     }),
   );
 
-  it.effect("rejects selection and cancellation after the caller loses admin access", () =>
+  it.effect("rejects selection and cancellation by another user", () =>
     Effect.gen(function* () {
       const pending = yield* pendingSelection();
       const row = (yield* pending.store.get(key))!;
@@ -725,16 +720,18 @@ describe("Jira site selection", () => {
         membership: Effect.succeed({ ...membership, role: "member" }),
       });
       expect(
-        yield* selectJiraSite({ ...choose, authorizationId: pending.authorizationId }).pipe(
-          test.provide,
-          Effect.flip,
-        ),
+        yield* selectJiraSite({
+          ...choose,
+          userId: "other-user",
+          authorizationId: pending.authorizationId,
+        }).pipe(test.provide, Effect.flip),
       ).toMatchObject({ code: "forbidden" });
       expect(
-        yield* cancelJiraSelection({ ...input, authorizationId: pending.authorizationId }).pipe(
-          test.provide,
-          Effect.flip,
-        ),
+        yield* cancelJiraSelection({
+          ...input,
+          userId: "other-user",
+          authorizationId: pending.authorizationId,
+        }).pipe(test.provide, Effect.flip),
       ).toMatchObject({ code: "forbidden" });
       expect(test.requests).toHaveLength(0);
     }),

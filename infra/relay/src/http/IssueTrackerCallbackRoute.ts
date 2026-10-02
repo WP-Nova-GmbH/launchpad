@@ -17,7 +17,7 @@ const escapeHtml = (value: string) =>
     .replaceAll("'", "&#39;");
 const page = (title: string, detail: string, status: number) =>
   HttpServerResponse.text(
-    `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Launchpad</title><body style="margin:0;background:#111;color:#eee;font:16px system-ui"><main style="max-width:34rem;margin:4rem auto;padding:1.5rem;line-height:1.6"><p>Launchpad</p><h1>${escapeHtml(title)}</h1><p>${escapeHtml(detail)}</p><p>Return to Organization settings in Launchpad. You can close this tab.</p></main></body></html>`,
+    `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Launchpad</title><body style="margin:0;background:#111;color:#eee;font:16px system-ui"><main style="max-width:34rem;margin:4rem auto;padding:1.5rem;line-height:1.6"><p>Launchpad</p><h1>${escapeHtml(title)}</h1><p>${escapeHtml(detail)}</p><p>Return to Account connections in Launchpad. You can close this tab.</p></main></body></html>`,
     {
       status,
       contentType: "text/html; charset=utf-8",
@@ -40,7 +40,7 @@ const linearCallbackRoute = HttpRouter.add(
     if (!state || state.length > 256)
       return page(
         "Connection link is invalid",
-        "Start connecting Linear from Organization settings.",
+        "Start connecting Linear from Account connections.",
         400,
       );
     return yield* completeLinear({
@@ -69,7 +69,7 @@ const linearCallbackRoute = HttpRouter.add(
         Effect.succeed(
           page(
             "Linear was not connected",
-            "Could not finish the connection. Try again from Organization settings.",
+            "Could not finish the connection. Try again from Account connections.",
             500,
           ),
         ),
@@ -88,7 +88,7 @@ const jiraCallbackRoute = HttpRouter.add(
     if (!state || state.length > 16_384)
       return page(
         "Connection link is invalid",
-        "Start connecting Jira from Organization settings.",
+        "Start connecting Jira from Account connections.",
         400,
       );
     return yield* completeJira({
@@ -101,7 +101,7 @@ const jiraCallbackRoute = HttpRouter.add(
         result.status === "awaiting_site_selection"
           ? page(
               "Choose your Jira site",
-              "Return to Organization settings in Launchpad to choose which Jira site to share with your organization.",
+              "Return to Account connections in Launchpad to choose which Jira site to connect.",
               200,
             )
           : page(
@@ -117,7 +117,7 @@ const jiraCallbackRoute = HttpRouter.add(
         Effect.succeed(
           page(
             "Jira was not connected",
-            "Could not finish connecting. Try again from Organization settings.",
+            "Could not finish connecting. Try again from Account connections.",
             500,
           ),
         ),

@@ -59,7 +59,7 @@ export const threadEnvironment: typeof baseThreadEnvironment = {
         if (pending.command.type !== "thread.turn.start") throw new Error("Invalid saved prompt.");
         const result = await baseThreadEnvironment.enqueuePrompt.run(registry, {
           ...value,
-          input: pending.command,
+          input: { ...pending.command, expectedAccountId: value.input.expectedAccountId },
         });
         if (result._tag === "Success") {
           try {
