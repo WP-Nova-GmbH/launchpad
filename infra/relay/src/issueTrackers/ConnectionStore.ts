@@ -2,7 +2,7 @@ import type {
   RelayIssueTrackerConnection,
   RelayIssueTrackerService,
 } from "@t3tools/contracts/relay";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -11,7 +11,10 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { RelayDb } from "../db.ts";
-import { relayUserIssueTrackerConnections as connections } from "../persistence/schema.ts";
+import {
+  relayUserIssueTrackerConnections as connections,
+  relayIssueTrackerWriteOperations as writeOperations,
+} from "../persistence/schema.ts";
 
 export type ConnectionRecord = typeof connections.$inferSelect;
 export type ConnectionKey = {
@@ -77,11 +80,20 @@ export class ConnectionStore extends Context.Service<
         readonly version: string;
         readonly payloadSealed: string;
         readonly accountLabel: string;
+        readonly writesAvailable: boolean;
         readonly userId?: string;
       },
     ) => Effect.Effect<boolean, ConnectionPersistenceError>;
     readonly refresh: (
-      input: ConnectionKey & { readonly version: string; readonly payloadSealed: string },
+      input: ConnectionKey & {
+        readonly version: string;
+        readonly payloadSealed: string;
+        readonly writesEnabled: boolean;
+        readonly writesAvailable: boolean;
+      },
+    ) => Effect.Effect<boolean, ConnectionPersistenceError>;
+    readonly syncWriteCapability: (
+      input: ConnectionKey & { readonly version: string; readonly enabled: boolean },
     ) => Effect.Effect<boolean, ConnectionPersistenceError>;
     readonly requireReconnect: (
       input: ConnectionKey & { readonly version: string; readonly payloadSealed: string | null },
@@ -142,6 +154,22 @@ export const make = Effect.gen(function* () {
   const fail = (cause: unknown) => new ConnectionPersistenceError({ cause });
   const now = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const uuid = crypto.randomUUIDv4.pipe(Effect.mapError(fail));
+  const cancelPendingWrites = (key: ConnectionKey) =>
+    db
+      .update(writeOperations)
+      .set({
+        state: "cancelled",
+        payloadSealed: null,
+        baselineSealed: null,
+      })
+      .where(
+        and(
+          eq(writeOperations.ownerUserId, key.ownerUserId),
+          eq(writeOperations.service, key.service),
+          inArray(writeOperations.state, ["awaiting_approval", "ready"]),
+        ),
+      )
+      .pipe(Effect.asVoid, Effect.mapError(fail));
   const get = (key: ConnectionKey) =>
     db
       .select()
@@ -299,6 +327,8 @@ export const make = Effect.gen(function* () {
         .set({
           version: yield* uuid,
           status: "connected",
+          writesEnabled: input.writesAvailable,
+          writeGeneration: sql`${connections.writeGeneration} + 1`,
           payloadSealed: input.payloadSealed,
           accountLabel: input.accountLabel,
           ...(input.userId ? { updatedByUserId: input.userId } : {}),
@@ -313,32 +343,72 @@ export const make = Effect.gen(function* () {
         .where(current(input))
         .returning({ version: connections.version })
         .pipe(Effect.mapError(fail));
+      if (rows.length === 1) yield* cancelPendingWrites(input);
       return rows.length === 1;
     }),
     refresh: Effect.fn("issueTrackers.refresh")(function* (input) {
       const rows = yield* db
         .update(connections)
-        .set({ payloadSealed: input.payloadSealed })
+        .set({
+          payloadSealed: input.payloadSealed,
+          ...(input.writesAvailable !== input.writesEnabled
+            ? {
+                writesEnabled: input.writesAvailable,
+                writeGeneration: sql`${connections.writeGeneration} + 1`,
+              }
+            : {}),
+        })
         .where(current(input))
         .returning({ version: connections.version })
         .pipe(Effect.mapError(fail));
+      if (rows.length === 1 && input.writesEnabled && !input.writesAvailable)
+        yield* cancelPendingWrites(input);
+      return rows.length === 1;
+    }),
+    syncWriteCapability: Effect.fn("issueTrackers.syncWriteCapability")(function* (input) {
+      const rows = yield* db
+        .update(connections)
+        .set({
+          writesEnabled: input.enabled,
+          writeGeneration: sql`${connections.writeGeneration} + 1`,
+          updatedAt: yield* now,
+        })
+        .where(and(current(input), eq(connections.status, "connected")))
+        .returning({ version: connections.version })
+        .pipe(Effect.mapError(fail));
+      if (rows.length === 1 && !input.enabled) yield* cancelPendingWrites(input);
       return rows.length === 1;
     }),
     requireReconnect: (input) =>
-      db
-        .update(connections)
-        .set({ status: "reconnect_required" })
-        .where(
-          and(
-            current(input),
-            input.payloadSealed === null
-              ? isNull(connections.payloadSealed)
-              : eq(connections.payloadSealed, input.payloadSealed),
-          ),
+      db.$client
+        .withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* db
+              .update(connections)
+              .set({ status: "reconnect_required" })
+              .where(
+                and(
+                  current(input),
+                  input.payloadSealed === null
+                    ? isNull(connections.payloadSealed)
+                    : eq(connections.payloadSealed, input.payloadSealed),
+                ),
+              )
+              .returning({ version: connections.version })
+              .pipe(Effect.mapError(fail));
+            if (rows.length === 1) yield* cancelPendingWrites(input);
+          }),
         )
-        .pipe(Effect.asVoid, Effect.mapError(fail)),
+        .pipe(Effect.mapError(fail)),
     remove: (key) =>
-      db.delete(connections).where(where(key)).pipe(Effect.asVoid, Effect.mapError(fail)),
+      db.$client
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* db.delete(connections).where(where(key)).pipe(Effect.mapError(fail));
+            yield* cancelPendingWrites(key);
+          }),
+        )
+        .pipe(Effect.mapError(fail)),
     withLock: (key, use) =>
       db.$client
         .withTransaction(

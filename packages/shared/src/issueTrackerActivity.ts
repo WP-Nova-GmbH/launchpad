@@ -18,42 +18,79 @@ export interface IssueTrackerActivity {
   readonly toolLifecycleStatus?: string;
 }
 
-function toolService(name: unknown): RelayIssueTrackerService | undefined {
-  if (typeof name !== "string") return undefined;
-  const tool = name
+export const issueTrackerToolTitles = {
+  read_linear_issue: "Read Linear Issue",
+  read_jira_issue: "Read Jira Issue",
+  search_linear_issues: "Search Linear Issues",
+  search_jira_issues: "Search Jira Issues",
+  read_linear_comments: "Read Linear Discussion",
+  read_jira_comments: "Read Jira Discussion",
+  read_linear_images: "Read Linear Image References",
+  view_linear_image: "View Linear Image",
+  add_linear_comment: "Add Linear Comment",
+  add_jira_comment: "Add Jira Comment",
+  edit_linear_issue: "Edit Linear Issue",
+  edit_jira_issue: "Edit Jira Issue",
+} as const;
+
+export type IssueTrackerToolName = keyof typeof issueTrackerToolTitles;
+
+const isLaunchpadServer = (value: string) => /^t3[-_ ]?code$/i.test(value);
+
+function toolName(value: unknown): IssueTrackerToolName | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value
     .trim()
     .replace(/\s+completed?$/i, "")
-    .replace(
-      /^(?:mcp__(?:t3-code|t3_code|t3code)__|(?:t3-code|t3_code|t3code)(?:[.:/_]|\s*·\s*))/i,
-      "",
-    );
+    .replace(/^mcp__t3[-_ ]?code__/i, "")
+    .replace(/^t3[-_ ]?code(?:[.:/_]|\s*[·°]\s*)/i, "");
+  return Object.hasOwn(issueTrackerToolTitles, normalized)
+    ? (normalized as IssueTrackerToolName)
+    : undefined;
+}
+
+/** Resolve only known Launchpad tools; an explicit foreign server wins over a matching name. */
+export function issueTrackerActivityToolName(
+  entry: Pick<IssueTrackerActivity, "label" | "toolTitle" | "toolData">,
+): IssueTrackerToolName | undefined {
+  const data = Predicate.isObject(entry.toolData) ? entry.toolData : undefined;
+  const item = Predicate.isObject(data?.item) ? data.item : data;
+  if (typeof item?.server === "string") {
+    return isLaunchpadServer(item.server)
+      ? (toolName(item.tool) ?? toolName(item.toolName))
+      : undefined;
+  }
+  return (
+    toolName(item?.toolName) ??
+    toolName(item?.tool) ??
+    toolName(entry.toolTitle) ??
+    toolName(entry.label)
+  );
+}
+
+export function issueTrackerToolTitle(name: IssueTrackerToolName): string {
+  return issueTrackerToolTitles[name];
+}
+
+function toolService(name: unknown): RelayIssueTrackerService | undefined {
+  if (typeof name !== "string") return undefined;
   return [
     "read_linear_issue",
     "read_linear_comments",
     "read_linear_images",
     "view_linear_image",
-  ].includes(tool)
+  ].includes(name)
     ? "linear"
-    : ["read_jira_issue", "read_jira_comments"].includes(tool)
+    : ["read_jira_issue", "read_jira_comments"].includes(name)
       ? "jira"
       : undefined;
 }
 
-/** Only Launchpad issue-tracker tools may supply the shared-account label. */
+/** Only Launchpad issue-tracker reads may supply the connected-account label. */
 export function issueTrackerActivityService(
   entry: Pick<IssueTrackerActivity, "label" | "toolTitle" | "toolData">,
 ) {
-  const data = Predicate.isObject(entry.toolData) ? entry.toolData : undefined;
-  const item = Predicate.isObject(data?.item) ? data.item : data;
-  if (typeof item?.server === "string" && typeof item.tool === "string") {
-    return toolService(`${item.server}.${item.tool}`);
-  }
-  return (
-    toolService(item?.toolName) ??
-    toolService(item?.tool) ??
-    toolService(entry.toolTitle) ??
-    toolService(entry.label)
-  );
+  return toolService(issueTrackerActivityToolName(entry));
 }
 
 function decodeResult(value: unknown) {

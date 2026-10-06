@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import { IssueTrackerFailure } from "./IssueTrackerModels.ts";
 import { callLinearTools, linearToolJson } from "./LinearMcp.ts";
 import { linearUploadUrl, normalizeLinearMarkdown } from "./LinearMarkdown.ts";
+import type { LinearResource } from "./LinearOAuth.ts";
 export { linearUploadUrl } from "./LinearMarkdown.ts";
 
 export const COMMENT_PAGE_SIZE = 10;
@@ -74,6 +75,7 @@ export function linearImageUrls(markdown: string): readonly string[] {
 
 export const readLinearComments = Effect.fn("relay.linear.read_comments")(function* (input: {
   readonly accessToken: string;
+  readonly resource?: LinearResource | undefined;
   readonly workspaceId: string;
   readonly issueId: string;
   readonly after?: string;
@@ -85,19 +87,23 @@ export const readLinearComments = Effect.fn("relay.linear.read_comments")(functi
         ),
       )
     : {};
-  const results = yield* callLinearTools(input.accessToken, [
-    { name: "get_workspace", arguments: {} },
-    { name: "get_issue", arguments: { id: input.issueId } },
-    {
-      name: "list_comments",
-      arguments: {
-        issueId: input.issueId,
-        limit: COMMENT_PAGE_SIZE,
-        orderBy: "createdAt",
-        ...(position.page ? { cursor: position.page } : {}),
+  const results = yield* callLinearTools(
+    input.accessToken,
+    [
+      { name: "get_workspace", arguments: {} },
+      { name: "get_issue", arguments: { id: input.issueId } },
+      {
+        name: "list_comments",
+        arguments: {
+          issueId: input.issueId,
+          limit: COMMENT_PAGE_SIZE,
+          orderBy: "createdAt",
+          ...(position.page ? { cursor: position.page } : {}),
+        },
       },
-    },
-  ]);
+    ],
+    input.resource,
+  );
   const workspace = yield* linearToolJson(results[0]!).pipe(
     Effect.flatMap(decodeWorkspace),
     Effect.mapError(unavailable),
@@ -157,6 +163,7 @@ export const readLinearComments = Effect.fn("relay.linear.read_comments")(functi
 
 export const readLinearCommentBody = Effect.fn("relay.linear.read_comment_body")(function* (input: {
   readonly accessToken: string;
+  readonly resource?: LinearResource | undefined;
   readonly workspaceId: string;
   readonly issueId: string;
   readonly commentId: string;
@@ -183,6 +190,7 @@ const Image = Schema.Struct({
 const decodeImage = Schema.decodeUnknownEffect(Image);
 export const fetchLinearImage = Effect.fn("relay.linear.fetch_image")(function* (input: {
   readonly accessToken: string;
+  readonly resource?: LinearResource | undefined;
   readonly url: string;
 }) {
   const url = linearUploadUrl(input.url);
@@ -190,9 +198,11 @@ export const fetchLinearImage = Effect.fn("relay.linear.fetch_image")(function* 
     return yield* failure("invalid_input", "Only Linear-hosted image uploads are supported.");
   // Linear's extractor does not recognize angle-bracket Markdown destinations.
   const destination = url.replace(/[()]/g, (character) => (character === "(" ? "%28" : "%29"));
-  const results = yield* callLinearTools(input.accessToken, [
-    { name: "extract_images", arguments: { markdown: `![image](${destination})` } },
-  ]);
+  const results = yield* callLinearTools(
+    input.accessToken,
+    [{ name: "extract_images", arguments: { markdown: `![image](${destination})` } }],
+    input.resource,
+  );
   const images = results[0]!.content.filter((entry) => entry.type === "image");
   if (images.length !== 1)
     return yield* failure("unavailable", "Linear could not fetch this image.");

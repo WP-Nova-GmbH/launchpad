@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { IssueDetails, IssueTrackerFailure } from "./IssueTrackerModels.ts";
 import { callLinearTools, linearToolJson } from "./LinearMcp.ts";
 import { normalizeLinearMarkdown } from "./LinearMarkdown.ts";
+import type { LinearResource } from "./LinearOAuth.ts";
 
 const MAX_DESCRIPTION_LENGTH = 20_000;
 const Identifier = Schema.String.check(
@@ -57,11 +58,16 @@ const workspaceSlug = (value: string) => {
 };
 export const getLinearIdentity = Effect.fn("relay.linear.get_identity")(function* (input: {
   readonly accessToken: string;
+  readonly resource?: LinearResource | undefined;
 }) {
-  const results = yield* callLinearTools(input.accessToken, [
-    { name: "get_workspace", arguments: {} },
-    { name: "get_user", arguments: { query: "me" } },
-  ]);
+  const results = yield* callLinearTools(
+    input.accessToken,
+    [
+      { name: "get_workspace", arguments: {} },
+      { name: "get_user", arguments: { query: "me" } },
+    ],
+    input.resource,
+  );
   const workspace = yield* linearToolJson(results[0]!).pipe(
     Effect.flatMap(decodeWorkspace),
     Effect.mapError(safeFailure),
@@ -112,12 +118,17 @@ export const readLinearIssue = Effect.fn("relay.linear.read_issue")(function* (i
   readonly workspaceSlug: string;
   readonly issue: string;
   readonly issueId?: string;
+  readonly resource?: LinearResource | undefined;
 }) {
   const identifier = input.issueId ?? (yield* issueIdentifier(input.issue, input.workspaceSlug));
-  const results = yield* callLinearTools(input.accessToken, [
-    { name: "get_workspace", arguments: {} },
-    { name: "get_issue", arguments: { id: identifier } },
-  ]);
+  const results = yield* callLinearTools(
+    input.accessToken,
+    [
+      { name: "get_workspace", arguments: {} },
+      { name: "get_issue", arguments: { id: identifier } },
+    ],
+    input.resource,
+  );
   const workspace = yield* linearToolJson(results[0]!).pipe(
     Effect.flatMap(decodeWorkspace),
     Effect.mapError(safeFailure),
@@ -163,4 +174,89 @@ export const readLinearIssue = Effect.fn("relay.linear.read_issue")(function* (i
     result.description = shortened + notice;
   }
   return { ...result, originalDescription: description };
+});
+
+const SearchPage = Schema.Struct({
+  issues: Schema.Array(
+    Schema.Struct({
+      id: Identifier,
+      uuid: StableId,
+      title: Schema.String.check(Schema.isMaxLength(4096)),
+      url: Schema.String.check(Schema.isMaxLength(4096)),
+      status: Schema.optionalKey(Schema.NullOr(Label)),
+      assignee: Schema.optionalKey(Schema.NullOr(Label)),
+      project: Schema.optionalKey(Schema.NullOr(Label)),
+      team: Schema.optionalKey(Schema.NullOr(Label)),
+    }),
+  ),
+  hasNextPage: Schema.Boolean,
+  cursor: Schema.optionalKey(Schema.NullOr(Schema.String.check(Schema.isMaxLength(4096)))),
+  endCursor: Schema.optionalKey(Schema.NullOr(Schema.String.check(Schema.isMaxLength(4096)))),
+});
+const decodeSearchPage = Schema.decodeUnknownEffect(SearchPage);
+
+export const searchLinearIssues = Effect.fn("relay.linear.search_issues")(function* (input: {
+  readonly accessToken: string;
+  readonly workspaceId: string;
+  readonly workspaceSlug: string;
+  readonly query?: string;
+  readonly team?: string;
+  readonly status?: string;
+  readonly assignee?: string;
+  readonly project?: string;
+  readonly cursor?: string;
+  readonly resource?: LinearResource | undefined;
+}) {
+  const results = yield* callLinearTools(
+    input.accessToken,
+    [
+      { name: "get_workspace", arguments: {} },
+      {
+        name: "list_issues",
+        arguments: {
+          limit: 20,
+          fields: ["id", "uuid", "title", "url", "status", "assignee", "project", "team"],
+          ...(input.query ? { query: input.query } : {}),
+          ...(input.team ? { team: input.team } : {}),
+          ...(input.status ? { state: input.status } : {}),
+          ...(input.assignee ? { assignee: input.assignee } : {}),
+          ...(input.project ? { project: input.project } : {}),
+          ...(input.cursor ? { cursor: input.cursor } : {}),
+        },
+      },
+    ],
+    input.resource,
+  );
+  const workspace = yield* linearToolJson(results[0]!).pipe(
+    Effect.flatMap(decodeWorkspace),
+    Effect.mapError(safeFailure),
+  );
+  if (workspace.id !== input.workspaceId || workspaceSlug(workspace.url) !== input.workspaceSlug)
+    return yield* forbidden();
+  const page = yield* linearToolJson(results[1]!).pipe(
+    Effect.flatMap(decodeSearchPage),
+    Effect.mapError(safeFailure),
+  );
+  const nextCursor = page.cursor ?? page.endCursor ?? null;
+  if (page.issues.length > 20 || (page.hasNextPage && (!nextCursor || nextCursor === input.cursor)))
+    return yield* unavailable();
+  const issues = yield* Effect.forEach(page.issues, (item) =>
+    Effect.gen(function* () {
+      const key = yield* issueIdentifier(item.url, input.workspaceSlug).pipe(
+        Effect.mapError(unavailable),
+      );
+      if (key !== item.id.toUpperCase()) return yield* unavailable();
+      return {
+        id: item.uuid,
+        identifier: item.id,
+        title: item.title.slice(0, 512),
+        url: item.url,
+        status: item.status?.slice(0, 128) ?? null,
+        assignee: item.assignee?.slice(0, 128) ?? null,
+        project: item.project?.slice(0, 128) ?? null,
+        team: item.team?.slice(0, 128) ?? null,
+      };
+    }),
+  );
+  return { issues, cursor: page.hasNextPage ? nextCursor! : null };
 });

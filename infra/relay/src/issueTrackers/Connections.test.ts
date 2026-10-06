@@ -14,6 +14,7 @@ import {
   disconnect,
   listConnections,
   readIssue,
+  searchIssues,
   readComments,
   readImages,
   viewImage,
@@ -28,10 +29,12 @@ import {
   issueInput,
   linearRow,
   jiraRow,
+  jiraOAuth,
   issueResponse,
   identityResponse,
   tokenResponse,
   toolName,
+  linearOAuth,
 } from "./Connections.test-fixture.ts";
 
 const decodeRpc = Schema.decodeUnknownSync(
@@ -55,6 +58,271 @@ function jiraResponse(request: HttpClientRequest.HttpClientRequest) {
 }
 
 describe("issue tracker connection lifecycle", () => {
+  it.effect("uses the verified OAuth write profile without a separate switch", () =>
+    Effect.gen(function* () {
+      const readOnly = yield* fixture({ rows: [linearRow()] });
+      expect((yield* listConnections("org").pipe(readOnly.provide)).connections[0]).toMatchObject({
+        writesAvailable: false,
+      });
+      expect((yield* readOnly.store.get(key))?.writesEnabled).toBe(false);
+
+      const row = {
+        ...linearRow(),
+        authorizationId: "pending-upgrade",
+        pendingStateHash: "pending-state",
+        pendingOAuthSealed: "sealed:pending",
+        pendingExpiresAt: "2027-01-01T00:00:00.000Z",
+        payloadSealed: `sealed:${encodeJson({
+          service: "linear",
+          oauth: { ...linearOAuth, resource: "https://mcp.linear.app/mcp" },
+          accountId: "account",
+          accessToken: "write-access",
+          refreshToken: "write-refresh",
+          expiresAt: Number.MAX_SAFE_INTEGER,
+          workspaceId: "workspace",
+          workspaceSlug: "launchpad",
+          scopes: ["read", "write"],
+        })}`,
+      };
+      const test = yield* fixture({ rows: [row], respond: () => Effect.succeed(issueResponse()) });
+      expect((yield* listConnections("org").pipe(test.provide)).connections[0]).toMatchObject({
+        writesAvailable: true,
+      });
+      const enabled = (yield* test.store.get(key))!;
+      expect(enabled.writesEnabled).toBe(true);
+      expect(enabled.writeGeneration).toBe(row.writeGeneration + 1);
+      expect(enabled.authorizationId).toBe("pending-upgrade");
+      yield* listConnections("org").pipe(test.provide);
+      expect((yield* test.store.get(key))?.writeGeneration).toBe(enabled.writeGeneration);
+      expect(yield* readIssue(issueInput).pipe(test.provide)).toMatchObject({
+        identifier: "LP-42",
+      });
+    }),
+  );
+  it.effect("keeps stored write capability when saved credentials cannot be opened", () =>
+    Effect.gen(function* () {
+      const row = {
+        ...linearRow(),
+        payloadSealed: "sealed:unreadable",
+        writesEnabled: true,
+        writeGeneration: 7,
+      };
+      const test = yield* fixture({ rows: [row] });
+      expect((yield* listConnections("org").pipe(test.provide)).connections[0]).toMatchObject({
+        writesAvailable: false,
+      });
+      expect(yield* test.store.get(key)).toMatchObject({
+        writesEnabled: true,
+        writeGeneration: 7,
+      });
+    }),
+  );
+  it.effect("retains the write profile for a connection requiring sign-in", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        rows: [
+          {
+            ...linearRow(),
+            status: "reconnect_required",
+            payloadSealed: `sealed:${encodeJson({
+              service: "linear",
+              oauth: { ...linearOAuth, resource: "https://mcp.linear.app/mcp" },
+              accountId: "account",
+              accessToken: "expired-write-access",
+              refreshToken: "write-refresh",
+              expiresAt: 0,
+              workspaceId: "workspace",
+              workspaceSlug: "launchpad",
+              scopes: ["read", "write"],
+            })}`,
+          },
+        ],
+      });
+      expect((yield* listConnections("org").pipe(test.provide)).connections[0]).toMatchObject({
+        status: "reconnect_required",
+        writesAvailable: true,
+      });
+    }),
+  );
+  it.effect("searches through the connection owner and rejects an old generation", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        rows: [linearRow()],
+        respond: () => Effect.succeed(issueResponse()),
+      });
+      expect(
+        yield* searchIssues({
+          ownerUserId: "org",
+          connectionVersion: "initial",
+          service: "linear",
+          request: { query: "queue" },
+        }).pipe(test.provide),
+      ).toMatchObject({
+        service: "linear",
+        issues: [{ identifier: "LP-42" }],
+        continuation: null,
+      });
+      expect(
+        yield* searchIssues({
+          ownerUserId: "org",
+          connectionVersion: "old",
+          service: "linear",
+          request: { query: "queue" },
+        }).pipe(test.provide, Effect.flip),
+      ).toMatchObject({ code: "conflict" });
+    }),
+  );
+  it.effect("marks a connection for reconnect when search receives an authorization failure", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        rows: [linearRow()],
+        respond: () => Effect.succeed(new Response(null, { status: 401 })),
+      });
+      expect(
+        yield* searchIssues({
+          ownerUserId: "org",
+          connectionVersion: "initial",
+          service: "linear",
+          request: { query: "queue" },
+        }).pipe(test.provide, Effect.flip),
+      ).toMatchObject({ code: "auth_required" });
+      expect((yield* test.store.get(key))?.status).toBe("reconnect_required");
+    }),
+  );
+  it.effect("a stale failed search cannot invalidate refreshed credentials", () =>
+    Effect.gen(function* () {
+      const oldSearchStarted = yield* Deferred.make<void>();
+      const releaseOldSearch = yield* Deferred.make<void>();
+      const test = yield* fixture({
+        rows: [linearRow(60_001)],
+        respond: (request) => {
+          if (request.url.endsWith("/token")) return Effect.succeed(tokenResponse());
+          if (request.headers.authorization === "Bearer old-access-secret")
+            return Deferred.succeed(oldSearchStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseOldSearch)),
+              Effect.as(new Response(null, { status: 401 })),
+            );
+          return Effect.succeed(issueResponse());
+        },
+      });
+      const input = {
+        ownerUserId: "org",
+        connectionVersion: "initial",
+        service: "linear" as const,
+        request: { query: "queue" },
+      };
+      const oldSearch = yield* searchIssues(input).pipe(
+        test.provide,
+        Effect.flip,
+        Effect.forkChild,
+      );
+      yield* Deferred.await(oldSearchStarted);
+      yield* TestClock.adjust(2);
+      expect((yield* searchIssues(input).pipe(test.provide)).issues[0]?.identifier).toBe("LP-42");
+      yield* Deferred.succeed(releaseOldSearch, undefined);
+      expect(yield* Fiber.join(oldSearch)).toMatchObject({ code: "auth_required" });
+      expect((yield* test.store.get(key))?.status).toBe("connected");
+    }),
+  );
+  it.effect("returns a typed timeout before the relay deadline on slow search", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const test = yield* fixture({
+        rows: [
+          {
+            ...jiraRow(),
+            payloadSealed: `sealed:${encodeJson({
+              service: "jira",
+              authType: "oauth",
+              oauth: jiraOAuth,
+              accessToken: "oauth-access",
+              refreshToken: "oauth-refresh",
+              expiresAt: Number.MAX_SAFE_INTEGER,
+              siteUrl: "https://launchpad.atlassian.net",
+              cloudId: "cloud",
+              scopes: ["read:jira:agent-interface", "search:jira:agent-interface"],
+            })}`,
+          },
+        ],
+        respond: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const searching = yield* searchIssues({
+        ownerUserId: "org",
+        connectionVersion: "initial",
+        service: "jira",
+        request: { query: "queue" },
+      }).pipe(test.provide, Effect.flip, Effect.forkChild);
+      yield* Deferred.await(started);
+      yield* TestClock.adjust("6 seconds");
+      expect(yield* Fiber.join(searching)).toMatchObject({
+        code: "unavailable",
+        message: "The issue tracker took too long to respond. Try again.",
+      });
+      expect((yield* test.store.get({ ownerUserId: "org", service: "jira" }))?.status).toBe(
+        "connected",
+      );
+    }),
+  );
+  it.effect("finishes Jira session cleanup before the relay search deadline", () =>
+    Effect.gen(function* () {
+      const callStarted = yield* Deferred.make<void>();
+      const cleanupStarted = yield* Deferred.make<void>();
+      const test = yield* fixture({
+        rows: [
+          {
+            ...jiraRow(),
+            payloadSealed: `sealed:${encodeJson({
+              service: "jira",
+              authType: "oauth",
+              oauth: jiraOAuth,
+              accessToken: "oauth-access",
+              refreshToken: "oauth-refresh",
+              expiresAt: Number.MAX_SAFE_INTEGER,
+              siteUrl: "https://launchpad.atlassian.net",
+              cloudId: "cloud",
+              scopes: ["read:jira:agent-interface", "search:jira:agent-interface"],
+            })}`,
+          },
+        ],
+        respond: (request) => {
+          if (request.method === "DELETE")
+            return Deferred.succeed(cleanupStarted, undefined).pipe(
+              Effect.andThen(Effect.sleep("1500 millis")),
+              Effect.as(new Response(null, { status: 204 })),
+            );
+          if (request.body._tag !== "Uint8Array") return Effect.die("Expected Jira request body");
+          const rpc = decodeRpc(new TextDecoder().decode(request.body.body));
+          if (rpc.method === "initialize")
+            return Effect.succeed(
+              Response.json(
+                { jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: "2025-11-25" } },
+                { headers: { "Mcp-Session-Id": "jira-session" } },
+              ),
+            );
+          if (rpc.method === "notifications/initialized")
+            return Effect.succeed(new Response(null, { status: 202 }));
+          return Deferred.succeed(callStarted, undefined).pipe(Effect.andThen(Effect.never));
+        },
+      });
+      const searching = yield* searchIssues({
+        ownerUserId: "org",
+        connectionVersion: "initial",
+        service: "jira",
+        request: { query: "queue" },
+      }).pipe(test.provide, Effect.flip, Effect.timeoutOption("9 seconds"), Effect.forkChild);
+      yield* Deferred.await(callStarted);
+      yield* TestClock.adjust("10 seconds");
+      expect(yield* Fiber.join(searching)).toMatchObject({
+        _tag: "Some",
+        value: {
+          code: "unavailable",
+          message: "The issue tracker took too long to respond. Try again.",
+        },
+      });
+      yield* Deferred.await(cleanupStarted);
+      expect(test.requests.some((request) => request.method === "DELETE")).toBe(true);
+    }),
+  );
   it.effect.each(["linear", "jira"] as const)(
     "rejects a replaced %s connection before reading with its credentials",
     (service) =>
@@ -227,6 +495,8 @@ describe("issue tracker connection lifecycle", () => {
             status: "connected",
             accountLabel: "Launchpad app",
             updatedAt: "2026-01-01T00:00:00.000Z",
+            searchEnabled: true,
+            writesAvailable: false,
           },
         ],
       });

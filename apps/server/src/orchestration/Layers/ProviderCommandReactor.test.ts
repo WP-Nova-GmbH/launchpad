@@ -4,6 +4,8 @@ import {
   setMcpProviderSession,
   clearAllMcpProviderSessions,
 } from "../../mcp/McpProviderSession.ts";
+import { registerIssueWrite, releaseIssueWrite } from "../../mcp/IssueTrackerApprovalBroker.ts";
+import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -41,10 +43,13 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 import { deriveServerPaths, ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "@t3tools/contracts";
@@ -199,6 +204,7 @@ describe("ProviderCommandReactor", () => {
     readonly compactThreadEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly sendTurnEffect?: ProviderServiceShape["sendTurn"];
     readonly personalGrants?: ReadonlyMap<string, Uint8Array>;
+    readonly issueWriteDecision?: "accept" | "decline" | null;
     readonly interruptTurnEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly stopSessionEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly startSessionEffect?: (
@@ -520,6 +526,19 @@ describe("ProviderCommandReactor", () => {
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+      Layer.provideMerge(
+        Layer.succeed(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({ decision: input?.issueWriteDecision ?? null }),
+              ),
+            ),
+          ),
+        ),
+      ),
       Layer.provideMerge(NodeServices.layer),
     );
     runtime = ManagedRuntime.make(layer);
@@ -5031,6 +5050,111 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
+  effectIt.effect(
+    "routes a paired local approval through the owner's verified relay decision",
+    () =>
+      Effect.gen(function* () {
+        const grantId = "issue-write-grant";
+        const storedGrant = yield* encodeJson({
+          authorization: "turn-token",
+          relayUrl: "https://relay.test",
+          claims: {
+            ownerUserId: "authenticated-user",
+            environmentId: "test",
+            threadId: "thread-1",
+            commandId: "issue-write-command",
+            commandDigest: "a".repeat(64),
+            expiresAt: 4102444800000,
+            connections: { jira: "version-1" },
+          },
+        });
+        const grants = new Map([
+          [
+            `issue-tracker-turn-${Buffer.from(grantId).toString("base64url")}`,
+            new TextEncoder().encode(storedGrant),
+          ],
+        ]);
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            unreadableHistory: true,
+            personalGrants: grants,
+            issueWriteDecision: "accept",
+          }),
+        );
+        const now = "2026-01-01T00:00:00.000Z";
+        const { requestId, deferred } = (yield* registerIssueWrite(
+          "reactor-edit-1",
+          ThreadId.make("thread-1"),
+          "provider-session-1",
+          "authenticated-user",
+          EnvironmentId.make("test"),
+          grantId,
+        ))!;
+        return yield* Effect.gen(function* () {
+          yield* harness.engine.dispatch({
+            type: "thread.approval.respond",
+            commandId: CommandId.make("cmd-issue-edit-approval"),
+            threadId: ThreadId.make("thread-1"),
+            requestId,
+            decision: "accept",
+            createdAt: now,
+          });
+          yield* Effect.promise(() => harness.drain());
+          expect(yield* Deferred.await(deferred)).toEqual({
+            decision: "accept",
+            actorUserId: "authenticated-user",
+          });
+          expect(harness.respondToRequest).not.toHaveBeenCalled();
+        }).pipe(Effect.ensuring(releaseIssueWrite(requestId, deferred)));
+      }),
+  );
+
+  it("marks a lost issue write approval as stale after a server restart", async () => {
+    const harness = await createHarness();
+    const requestId = asApprovalRequestId("issue-write:missing-operation");
+    const now = "2026-01-01T00:00:00.000Z";
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.make("cmd-missing-issue-write-request"),
+        threadId: ThreadId.make("thread-1"),
+        activity: {
+          id: EventId.make("missing-issue-write-request"),
+          tone: "approval",
+          kind: "approval.requested",
+          summary: "Issue change approval requested",
+          payload: { requestId, requestKind: "mcp-elicitation" },
+          turnId: null,
+          createdAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.approval.respond",
+        commandId: CommandId.make("cmd-missing-issue-write-approval"),
+        threadId: ThreadId.make("thread-1"),
+        requestId,
+        decision: "accept",
+        createdAt: now,
+      }),
+    );
+    await harness.drain();
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.activities).toContainEqual(
+      expect.objectContaining({
+        kind: "provider.approval.respond.failed",
+        payload: expect.objectContaining({
+          requestId: "issue-write:missing-operation",
+          detail: expect.stringContaining("Stale pending approval request"),
+        }),
+      }),
+    );
+  });
+
   it("forwards user input answers without reading unrelated message bodies", async () => {
     const harness = await createHarness({ unreadableHistory: true });
     const now = "2026-01-01T00:00:00.000Z";
@@ -5194,21 +5318,21 @@ describe("ProviderCommandReactor", () => {
     expect(resolvedActivity).toBeUndefined();
   });
 
-  it("surfaces non-resumable provider user-input callbacks as stale failures", async () => {
-    const harness = await createHarness();
-    const now = "2026-01-01T00:00:00.000Z";
-    harness.respondToUserInput.mockImplementation(() =>
-      Effect.fail(
-        new ProviderAdapterRequestError({
-          provider: ProviderDriverKind.make("claudeAgent"),
-          method: "item/tool/respondToUserInput",
-          detail: "Unknown pending Codex user input request: user-input-request-1",
-        }),
-      ),
-    );
+  effectIt.effect("surfaces non-resumable provider user-input callbacks as stale failures", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness());
+      const now = "2026-01-01T00:00:00.000Z";
+      harness.respondToUserInput.mockImplementation(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: ProviderDriverKind.make("claudeAgent"),
+            method: "item/tool/respondToUserInput",
+            detail: "Unknown pending Codex user input request: user-input-request-1",
+          }),
+        ),
+      );
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
+      yield* harness.engine.dispatch({
         type: "thread.session.set",
         commandId: CommandId.make("cmd-session-set-for-user-input-error"),
         threadId: ThreadId.make("thread-1"),
@@ -5222,11 +5346,9 @@ describe("ProviderCommandReactor", () => {
           updatedAt: now,
         },
         createdAt: now,
-      }),
-    );
+      });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
+      yield* harness.engine.dispatch({
         type: "thread.activity.append",
         commandId: CommandId.make("cmd-user-input-requested"),
         threadId: ThreadId.make("thread-1"),
@@ -5255,11 +5377,9 @@ describe("ProviderCommandReactor", () => {
           createdAt: now,
         },
         createdAt: now,
-      }),
-    );
+      });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
+      yield* harness.engine.dispatch({
         type: "thread.user-input.respond",
         commandId: CommandId.make("cmd-user-input-respond-stale"),
         threadId: ThreadId.make("thread-1"),
@@ -5268,40 +5388,33 @@ describe("ProviderCommandReactor", () => {
           sandbox_mode: "workspace-write",
         },
         createdAt: now,
-      }),
-    );
+      });
 
-    await waitFor(async () => {
-      const readModel = await harness.readModel();
+      yield* Effect.promise(() => harness.drain());
+
+      const readModel = yield* Effect.promise(() => harness.readModel());
       const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-      if (!thread) return false;
-      return thread.activities.some(
+      expect(thread).toBeDefined();
+
+      const failureActivity = thread?.activities.find(
         (activity) => activity.kind === "provider.user-input.respond.failed",
       );
-    });
+      expect(failureActivity).toBeDefined();
+      expect(failureActivity?.payload).toMatchObject({
+        requestId: "user-input-request-1",
+        detail: expect.stringContaining("Stale pending user-input request: user-input-request-1"),
+      });
 
-    const readModel = await harness.readModel();
-    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-    expect(thread).toBeDefined();
-
-    const failureActivity = thread?.activities.find(
-      (activity) => activity.kind === "provider.user-input.respond.failed",
-    );
-    expect(failureActivity).toBeDefined();
-    expect(failureActivity?.payload).toMatchObject({
-      requestId: "user-input-request-1",
-      detail: expect.stringContaining("Stale pending user-input request: user-input-request-1"),
-    });
-
-    const resolvedActivity = thread?.activities.find(
-      (activity) =>
-        activity.kind === "user-input.resolved" &&
-        typeof activity.payload === "object" &&
-        activity.payload !== null &&
-        (activity.payload as Record<string, unknown>).requestId === "user-input-request-1",
-    );
-    expect(resolvedActivity).toBeUndefined();
-  });
+      const resolvedActivity = thread?.activities.find(
+        (activity) =>
+          activity.kind === "user-input.resolved" &&
+          typeof activity.payload === "object" &&
+          activity.payload !== null &&
+          (activity.payload as Record<string, unknown>).requestId === "user-input-request-1",
+      );
+      expect(resolvedActivity).toBeUndefined();
+    }),
+  );
 
   effectIt.effect("stops a provider session without reading unrelated message bodies", () =>
     Effect.gen(function* () {

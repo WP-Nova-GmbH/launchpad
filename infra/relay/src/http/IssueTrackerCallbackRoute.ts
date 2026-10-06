@@ -58,7 +58,7 @@ const linearCallbackRoute = HttpRouter.add(
             )
           : page(
               "Linear connected",
-              `Organization chats can now read issues from ${result.accountLabel}.`,
+              `Your personal connection can now read issues from ${result.accountLabel}.`,
               200,
             ),
       ),
@@ -106,7 +106,7 @@ const jiraCallbackRoute = HttpRouter.add(
             )
           : page(
               "Jira connected",
-              `Organization chats can now read issues from ${result.accountLabel}.`,
+              `Your personal connection can now read issues from ${result.accountLabel}.`,
               200,
             ),
       ),

@@ -215,6 +215,10 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         return yield* fail(
           "Prompt conflict: this entry changed or began delivery. Review it before saving.",
         );
+      if (command.expectedRuntimeMode && command.expectedRuntimeMode !== entry.runtimeMode)
+        return yield* fail(
+          "Prompt conflict: this entry's runtime mode changed. Review it before saving.",
+        );
       if (!command.message.text.trim() && command.message.attachments.length === 0)
         return yield* fail("A prompt needs text or an attachment.");
       return [

@@ -138,6 +138,14 @@ export const normalizeDispatchCommand = (
       } satisfies OrchestrationCommand;
     }
 
+    if (canonicalCommand.type === "thread.approval.respond") {
+      const { actorUserId: _untrustedActor, ...trustedCommand } = canonicalCommand;
+      return {
+        ...trustedCommand,
+        ...(authenticatedUserId ? { actorUserId: authenticatedUserId } : {}),
+      } satisfies OrchestrationCommand;
+    }
+
     if (
       canonicalCommand.type === "project.meta.update" &&
       canonicalCommand.workspaceRoot !== undefined

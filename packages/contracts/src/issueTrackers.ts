@@ -46,11 +46,19 @@ export const RelayIssueTrackerConnection = Schema.Struct({
   status: Schema.Literals(["connecting", "connected", "reconnect_required"]),
   accountLabel: Schema.NullOr(Schema.String),
   updatedAt: Schema.String,
+  searchEnabled: Schema.optionalKey(Schema.Boolean),
+  writesAvailable: Schema.optionalKey(Schema.Boolean),
   authorization: Schema.optionalKey(RelayIssueTrackerAuthorization),
   jiraSites: Schema.optionalKey(Schema.Array(RelayJiraSite)),
   replacement: Schema.optionalKey(RelayLinearReplacement),
 });
 export type RelayIssueTrackerConnection = typeof RelayIssueTrackerConnection.Type;
+
+export const RelayIssueTrackerAuthorizationProfile = Schema.Struct({
+  writes: Schema.Boolean,
+});
+export type RelayIssueTrackerAuthorizationProfile =
+  typeof RelayIssueTrackerAuthorizationProfile.Type;
 
 export const RelayIssueTrackerConnections = Schema.Struct({
   connections: Schema.Array(RelayIssueTrackerConnection),
@@ -81,6 +89,92 @@ export type RelayIssueDetails = typeof RelayIssueDetails.Type;
 export const RelayReadIssueRequest = Schema.Struct({
   issue: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
 });
+export const RelayPrepareIssueCommentRequest = Schema.Struct({
+  ...RelayReadIssueRequest.fields,
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(20_000)),
+  retryAfterUnknown: Schema.optionalKey(Schema.Boolean),
+  invocationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  providerSessionId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+});
+export const RelayPrepareIssueEditRequest = Schema.Struct({
+  ...RelayReadIssueRequest.fields,
+  field: Schema.Literals(["title", "description", "status", "assignee"]),
+  value: Schema.NullOr(Schema.String.check(Schema.isMaxLength(20_000))),
+  retryAfterUnknown: Schema.optionalKey(Schema.Boolean),
+  invocationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  providerSessionId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+});
+export const RelayIssueWriteOperationId = TrimmedNonEmptyString.check(Schema.isMaxLength(64));
+export const RelayIssueWriteIdRequest = Schema.Struct({ operationId: RelayIssueWriteOperationId });
+export const RelayIssueWriteOperation = Schema.Struct({
+  operationId: RelayIssueWriteOperationId,
+  state: Schema.Literals([
+    "awaiting_approval",
+    "ready",
+    "executing",
+    "succeeded",
+    "outcome_unknown",
+    "rejected",
+    "cancelled",
+    "superseded",
+  ]),
+  service: RelayIssueTrackerService,
+  action: Schema.Literals(["add_comment", "edit_issue"]),
+  field: Schema.NullOr(Schema.Literals(["title", "description", "status", "assignee"])),
+  identifier: Schema.String,
+  issueUrl: Schema.String,
+  body: Schema.String,
+  executionAccount: Schema.String,
+  resultResourceId: Schema.NullOr(Schema.String),
+  resultUrl: Schema.NullOr(Schema.String),
+  retryWarning: Schema.optionalKey(Schema.Boolean),
+});
+export const RelayExecuteIssueWriteRequest = Schema.Struct({
+  operationId: RelayIssueWriteOperationId,
+  providerSessionId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+});
+export const RelayIssueWriteResult = Schema.Struct({
+  state: Schema.Literals(["succeeded", "outcome_unknown"]),
+  resourceId: Schema.NullOr(Schema.String),
+  url: Schema.NullOr(Schema.String),
+});
+export const RelayIssueWriteDecisionRequest = Schema.Struct({
+  operationId: RelayIssueWriteOperationId,
+  decision: Schema.Literals(["approve", "reject"]),
+});
+export const RelayIssueWriteVerifiedDecision = Schema.Struct({
+  decision: Schema.NullOr(Schema.Literals(["accept", "decline"])),
+});
+export const ISSUE_TRACKER_WRITE_REQUEST_PREFIX = "issue-write:";
+const SearchFilter = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
+export const RelaySearchIssuesRequest = Schema.Struct({
+  query: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(256))),
+  project: Schema.optionalKey(SearchFilter),
+  team: Schema.optionalKey(SearchFilter),
+  status: Schema.optionalKey(SearchFilter),
+  assignee: Schema.optionalKey(SearchFilter),
+  continuation: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(16_384))),
+});
+export type RelaySearchIssuesRequest = typeof RelaySearchIssuesRequest.Type;
+export const RelaySearchIssuesResponse = Schema.Struct({
+  service: RelayIssueTrackerService,
+  accountLabel: Schema.String,
+  issues: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      identifier: Schema.String,
+      title: Schema.String,
+      url: Schema.String,
+      status: Schema.NullOr(Schema.String),
+      assignee: Schema.NullOr(Schema.String),
+      project: Schema.NullOr(Schema.String),
+      team: Schema.NullOr(Schema.String),
+    }),
+  ),
+  continuation: Schema.NullOr(Schema.String),
+  truncated: Schema.Boolean,
+});
+export type RelaySearchIssuesResponse = typeof RelaySearchIssuesResponse.Type;
 const LinearReference = TrimmedNonEmptyString.check(Schema.isMaxLength(16_384));
 export const RelayLinearImageReference = Schema.Struct({
   reference: LinearReference,
@@ -211,10 +305,13 @@ export class RelayIssueTrackerError extends Schema.TaggedError<RelayIssueTracker
       "image_too_large",
       "unsupported_image",
       "conflict",
+      "write_in_progress",
       "not_configured",
+      "rate_limited",
     ]),
     message: Schema.String,
     traceId: Schema.optional(Schema.String),
+    retryAfterSeconds: Schema.optional(Schema.Number),
   },
   { httpApiStatus: 400 },
 ) {}

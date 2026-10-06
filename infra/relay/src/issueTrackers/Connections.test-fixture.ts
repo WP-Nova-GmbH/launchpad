@@ -58,8 +58,10 @@ const decodeRpc = Schema.decodeUnknownSync(
     }),
   ),
 );
+const isLinearResource = (url: string) =>
+  /^https:\/\/mcp\.linear\.app\/mcp(?:\/readonly)?$/.test(url);
 export const toolName = (request: HttpClientRequest.HttpClientRequest) =>
-  request.body._tag === "Uint8Array" && request.url.endsWith("/mcp/readonly")
+  request.body._tag === "Uint8Array" && isLinearResource(request.url)
     ? decodeRpc(new TextDecoder().decode(request.body.body)).params?.name
     : undefined;
 const decodeFixtureRecord = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown));
@@ -72,7 +74,7 @@ const decodeFixtureComments = Schema.decodeUnknownSync(
 /** Wrap fixture provider data in actual MCP protocol responses; lifecycle tests can focus on races. */
 const linearResponse = (request: HttpClientRequest.HttpClientRequest, response: Response) =>
   Effect.promise(async () => {
-    if (!request.url.endsWith("/mcp/readonly") || response.status !== 200) return response;
+    if (!isLinearResource(request.url) || response.status !== 200) return response;
     const rpc = decodeRpc(
       new TextDecoder().decode(
         request.body._tag === "Uint8Array" ? request.body.body : new Uint8Array(),
@@ -118,6 +120,22 @@ const linearResponse = (request: HttpClientRequest.HttpClientRequest, response: 
         assignee: issue.assignee ? decodeFixtureRecord(issue.assignee).name : null,
       };
     }
+    if (name === "list_issues" && data.issue) {
+      const issue = decodeFixtureRecord(data.issue);
+      value = {
+        issues: [
+          {
+            uuid: issue.id,
+            id: issue.identifier,
+            title: issue.title,
+            url: issue.url,
+            status: issue.state ? decodeFixtureRecord(issue.state).name : null,
+            assignee: issue.assignee ? decodeFixtureRecord(issue.assignee).name : null,
+          },
+        ],
+        hasNextPage: false,
+      };
+    }
     if (name === "list_comments" && data.comments) {
       const comments = decodeFixtureComments(data.comments);
       value = {
@@ -137,6 +155,8 @@ export const linearRow = (expiresAt = Number.MAX_SAFE_INTEGER): ConnectionRecord
   ...key,
   version: "initial",
   status: "connected",
+  writesEnabled: false,
+  writeGeneration: 0,
   accountLabel: "Launchpad app",
   payloadSealed: `sealed:${encodeJson({ service: "linear", oauth: linearOAuth, accountId: "account", accessToken: "old-access-secret", refreshToken: "old-refresh-secret", expiresAt, workspaceId: "workspace", workspaceSlug: "launchpad" })}`,
   authorizationId: null,
@@ -261,6 +281,8 @@ export const fixture = Effect.fnUntraced(function* (
             replacement: null,
             jiraSelection: null,
             status: existing?.status ?? "connecting",
+            writesEnabled: existing?.writesEnabled ?? false,
+            writeGeneration: existing?.writeGeneration ?? 0,
             accountLabel: existing?.accountLabel ?? null,
             payloadSealed: existing?.payloadSealed ?? null,
             pendingOAuthSealed: input.pendingOAuthSealed ?? null,
@@ -340,6 +362,8 @@ export const fixture = Effect.fnUntraced(function* (
           payloadSealed: input.payloadSealed,
           accountLabel: input.accountLabel,
           status: "connected",
+          writesEnabled: input.writesAvailable,
+          writeGeneration: row.writeGeneration + 1,
           ...(input.userId ? { updatedByUserId: input.userId } : {}),
           authorizationId: null,
           replacement: null,
@@ -348,7 +372,20 @@ export const fixture = Effect.fnUntraced(function* (
           pendingStateHash: null,
           pendingExpiresAt: null,
         })),
-      refresh: (input) => update(input, (row) => ({ ...row, payloadSealed: input.payloadSealed })),
+      refresh: (input) =>
+        update(input, (row) => ({
+          ...row,
+          payloadSealed: input.payloadSealed,
+          writesEnabled: input.writesAvailable,
+          writeGeneration:
+            row.writeGeneration + (input.writesAvailable !== row.writesEnabled ? 1 : 0),
+        })),
+      syncWriteCapability: (input) =>
+        update(input, (row) => ({
+          ...row,
+          writesEnabled: input.enabled,
+          writeGeneration: row.writeGeneration + 1,
+        })),
       requireReconnect: (input) =>
         update(input, (row) =>
           row.payloadSealed === input.payloadSealed
@@ -371,7 +408,7 @@ export const fixture = Effect.fnUntraced(function* (
   const requests: HttpClientRequest.HttpClientRequest[] = [];
   const http = HttpClient.make((request) => {
     if (!options.rawHttp && request.url.startsWith("https://mcp.linear.app")) {
-      if (request.method === "GET" && request.url === "https://mcp.linear.app/mcp/readonly")
+      if (request.method === "GET" && isLinearResource(request.url))
         return Effect.succeed(
           HttpClientResponse.fromWeb(request, new Response(null, { status: 405 })),
         );
@@ -392,7 +429,7 @@ export const fixture = Effect.fnUntraced(function* (
           },
           { status: 201 },
         );
-      else if (request.url.endsWith("/mcp/readonly") && request.body._tag === "Uint8Array") {
+      else if (isLinearResource(request.url) && request.body._tag === "Uint8Array") {
         const rpc = decodeRpc(new TextDecoder().decode(request.body.body));
         if (rpc.method === "initialize")
           response = Response.json({

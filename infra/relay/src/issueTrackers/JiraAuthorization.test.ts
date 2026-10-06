@@ -75,7 +75,7 @@ function response(request: HttpClientRequest.HttpClientRequest, resources: unkno
       refresh_token: "oauth-refresh",
       expires_in: 3600,
       token_type: "Bearer",
-      scope: "read:jira:agent-interface offline_access",
+      scope: "read:jira:agent-interface search:jira:agent-interface offline_access",
     });
   if (request.url !== "https://mcp.atlassian.com/v2/mcp")
     return new Response(null, { status: 404 });
@@ -110,6 +110,113 @@ const connected = Effect.fnUntraced(function* () {
 });
 
 describe("Jira OAuth", () => {
+  it.effect.each([false, true])(
+    "uses saved requested scopes when writes=%s and the token omits scope",
+    (writes) =>
+      Effect.gen(function* () {
+        const test = yield* fixture({
+          respond: (request) =>
+            Effect.succeed(
+              request.url === tokenEndpoint
+                ? Response.json({
+                    access_token: "oauth-access",
+                    refresh_token: "oauth-refresh",
+                    expires_in: 3600,
+                    token_type: "Bearer",
+                  })
+                : response(request),
+            ),
+        });
+        const started = yield* startJira({ ...input, writes }).pipe(test.provide);
+        yield* completeJira({ state: stateFrom(started.authorizationUrl), code: "code" }).pipe(
+          test.provide,
+        );
+        expect((yield* listConnections("org").pipe(test.provide)).connections[0]).toMatchObject({
+          searchEnabled: true,
+          writesAvailable: writes,
+        });
+        expect((yield* test.store.get(key))?.writesEnabled).toBe(writes);
+      }),
+  );
+
+  it.effect("does not infer new scopes for an older pending authorization", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        respond: () =>
+          Effect.succeed(
+            Response.json({
+              access_token: "oauth-access",
+              refresh_token: "oauth-refresh",
+              expires_in: 3600,
+              token_type: "Bearer",
+            }),
+          ),
+      });
+      const tokens = yield* exchangeJiraCode({
+        ...jiraOAuth,
+        redirectUri: "https://relay.test/callback",
+        code: "code",
+        codeVerifier: "verifier",
+      }).pipe(test.provide);
+      expect(tokens.scopes).toEqual(["read:jira:agent-interface"]);
+    }),
+  );
+
+  it.effect("honors an explicitly reduced scope on a write authorization", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        respond: (request) =>
+          Effect.succeed(
+            request.url === tokenEndpoint
+              ? Response.json({
+                  access_token: "oauth-access",
+                  refresh_token: "oauth-refresh",
+                  expires_in: 3600,
+                  token_type: "Bearer",
+                  scope: "read:jira:agent-interface search:jira:agent-interface",
+                })
+              : response(request),
+          ),
+      });
+      const started = yield* startJira({ ...input, writes: true }).pipe(test.provide);
+      expect(
+        yield* completeJira({ state: stateFrom(started.authorizationUrl), code: "code" }).pipe(
+          test.provide,
+          Effect.flip,
+        ),
+      ).toMatchObject({ code: "forbidden" });
+      expect(yield* test.store.get(key)).toBeNull();
+    }),
+  );
+
+  it.effect("makes granted write access available as soon as OAuth completes", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        respond: (request) =>
+          Effect.succeed(
+            request.url === tokenEndpoint
+              ? Response.json({
+                  access_token: "oauth-access",
+                  refresh_token: "oauth-refresh",
+                  expires_in: 3600,
+                  token_type: "Bearer",
+                  scope:
+                    "read:jira:agent-interface search:jira:agent-interface write:jira:agent-interface offline_access",
+                })
+              : response(request),
+          ),
+      });
+      const started = yield* startJira({ ...input, writes: true }).pipe(test.provide);
+      yield* completeJira({ state: stateFrom(started.authorizationUrl), code: "code" }).pipe(
+        test.provide,
+      );
+      expect((yield* test.store.get(key))?.writesEnabled).toBe(true);
+      expect((yield* listConnections("org").pipe(test.provide)).connections[0]).toMatchObject({
+        writesAvailable: true,
+      });
+    }),
+  );
+
   it.effect("connects sites returned in the Rovo v2 resource envelope", () =>
     Effect.gen(function* () {
       const test = yield* fixture({
@@ -158,6 +265,7 @@ describe("Jira OAuth", () => {
         "offline_access",
         "email",
         "read:jira:agent-interface",
+        "search:jira:agent-interface",
       ]);
       expect(url.searchParams.get("redirect_uri")).toBe(
         "https://relay.test/v1/user/issue-trackers/jira/callback",
@@ -388,7 +496,7 @@ describe("Jira OAuth", () => {
     }),
   );
 
-  it.effect("retains a refresh token when the provider does not rotate it", () =>
+  it.effect("retains a refresh token and scopes when the provider omits both", () =>
     Effect.gen(function* () {
       const test = yield* fixture({
         respond: () =>
@@ -397,8 +505,68 @@ describe("Jira OAuth", () => {
           ),
       });
       expect(
-        yield* refreshJiraTokens({ oauth: jiraOAuth, refreshToken: "old" }).pipe(test.provide),
-      ).toMatchObject({ accessToken: "next", refreshToken: "old" });
+        yield* refreshJiraTokens({
+          oauth: jiraOAuth,
+          refreshToken: "old",
+          scopes: [
+            "read:jira:agent-interface",
+            "search:jira:agent-interface",
+            "write:jira:agent-interface",
+          ],
+        }).pipe(test.provide),
+      ).toMatchObject({
+        accessToken: "next",
+        refreshToken: "old",
+        scopes: [
+          "read:jira:agent-interface",
+          "search:jira:agent-interface",
+          "write:jira:agent-interface",
+        ],
+      });
+    }),
+  );
+
+  it.effect("keeps Jira search and write capability after a refresh without scope", () =>
+    Effect.gen(function* () {
+      const scopes = [
+        "read:jira:agent-interface",
+        "search:jira:agent-interface",
+        "write:jira:agent-interface",
+      ];
+      const test = yield* fixture({
+        rows: [
+          {
+            ...jiraRow(0),
+            writesEnabled: true,
+            payloadSealed: `sealed:${encodeJson({
+              service: "jira",
+              authType: "oauth",
+              oauth: jiraOAuth,
+              accessToken: "old-access",
+              refreshToken: "old-refresh",
+              expiresAt: 0,
+              siteUrl,
+              cloudId: "cloud",
+              scopes,
+            })}`,
+          },
+        ],
+        respond: () =>
+          Effect.succeed(
+            Response.json({
+              access_token: "new-access",
+              refresh_token: "new-refresh",
+              expires_in: 3600,
+              token_type: "Bearer",
+            }),
+          ),
+      });
+      expect((yield* jiraCredentials(key).pipe(test.provide)).credentials.scopes).toEqual(scopes);
+      expect((yield* listConnections("org").pipe(test.provide)).connections[0]).toMatchObject({
+        searchEnabled: true,
+        writesAvailable: true,
+      });
+      expect((yield* test.store.get(key))?.writesEnabled).toBe(true);
     }),
   );
 

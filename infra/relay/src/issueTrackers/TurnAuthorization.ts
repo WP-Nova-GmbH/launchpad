@@ -14,10 +14,11 @@ import * as Schema from "effect/Schema";
 
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { ConnectionStore } from "./ConnectionStore.ts";
+import { syncWriteCapabilities } from "./Connections.ts";
 import { currentTraceId } from "../observability.ts";
 
 const Envelope = Schema.Struct({
-  purpose: Schema.Literal("personal-issue-read-turn-v1"),
+  purpose: Schema.Literals(["personal-issue-read-turn-v1", "personal-issue-turn-v2"]),
   claims: RelayIssueTrackerTurnClaims,
 });
 const encode = Schema.encodeEffect(Schema.fromJsonString(Envelope));
@@ -38,16 +39,29 @@ export const authorizeTurn = Effect.fn("issueTrackers.authorizeTurn")(function* 
   request: typeof RelayIssueTrackerTurnRequest.Type,
 ) {
   const store = yield* ConnectionStore;
-  const rows = yield* store.list(ownerUserId);
+  let rows = yield* store.list(ownerUserId);
+  if (request.runtimeMode && (yield* syncWriteCapabilities(rows)))
+    rows = yield* store.list(ownerUserId);
   const connections: { jira?: string; linear?: string } = {};
+  const writeGenerations: { jira?: number; linear?: number } = {};
   for (const row of rows) {
-    if (row.status === "connected") connections[row.service] = row.version;
+    if (row.status === "connected") {
+      connections[row.service] = row.version;
+      if (request.runtimeMode && row.writesEnabled)
+        writeGenerations[row.service] = row.writeGeneration;
+    }
   }
   if (Object.keys(connections).length === 0) return { authorization: null };
   const box = yield* RelaySecretBox;
   const authorization = yield* encode({
-    purpose: "personal-issue-read-turn-v1",
-    claims: { ...request, ownerUserId, connections, expiresAt: (yield* now) + 24 * 60 * 60_000 },
+    purpose: request.runtimeMode ? "personal-issue-turn-v2" : "personal-issue-read-turn-v1",
+    claims: {
+      ...request,
+      ownerUserId,
+      connections,
+      ...(request.runtimeMode ? { writeGenerations } : {}),
+      expiresAt: (yield* now) + 24 * 60 * 60_000,
+    },
   }).pipe(Effect.flatMap(box.seal), Effect.catch(denied));
   return { authorization };
 });
@@ -73,6 +87,38 @@ export const authorizeRead = Effect.fn("issueTrackers.authorizeRead")(function* 
   if (!row || row.status !== "connected" || claims.connections[service] !== row.version)
     return yield* denied();
   return { ownerUserId: claims.ownerUserId, connectionVersion: row.version };
+});
+
+export const authorizeWrite = Effect.fn("issueTrackers.authorizeWrite")(function* (
+  environmentId: string,
+  service: RelayIssueTrackerService,
+) {
+  const claims = yield* RelayIssueTrackerTurnPrincipal;
+  if (
+    claims.environmentId !== environmentId ||
+    claims.expiresAt <= (yield* now) ||
+    !claims.runtimeMode ||
+    claims.writeGenerations?.[service] === undefined
+  )
+    return yield* denied();
+  const store = yield* ConnectionStore;
+  const row = yield* store.get({ ownerUserId: claims.ownerUserId, service });
+  if (
+    !row ||
+    row.status !== "connected" ||
+    !row.writesEnabled ||
+    row.version !== claims.connections[service] ||
+    row.writeGeneration !== claims.writeGenerations[service]
+  )
+    return yield* denied();
+  return {
+    ownerUserId: claims.ownerUserId,
+    connectionVersion: row.version,
+    writeGeneration: row.writeGeneration,
+    runtimeMode: claims.runtimeMode,
+    commandId: claims.commandId,
+    threadId: claims.threadId,
+  };
 });
 
 export const turnAuthLayer = Layer.effect(

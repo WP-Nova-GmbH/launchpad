@@ -309,7 +309,10 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     respondToApproval: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:respond-to-approval",
-      execute: (input: RespondToThreadApprovalInput) => respondToThreadApproval(input),
+      execute: (input: RespondToThreadApprovalInput, registry) =>
+        respondToThreadApproval(input).pipe(
+          Effect.provideService(IssueTrackerClientRegistry, registry),
+        ),
       scheduler,
       concurrency,
     }),

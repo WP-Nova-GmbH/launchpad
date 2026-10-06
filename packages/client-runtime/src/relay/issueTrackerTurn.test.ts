@@ -14,8 +14,13 @@ import { AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { ManagedRelayClient } from "./managedRelay.ts";
 import { managedRelaySessionAtom } from "./managedRelayState.ts";
-import { authorizeIssueTrackerTurn, IssueTrackerClientRegistry } from "./issueTrackerTurn.ts";
+import {
+  authorizeIssueTrackerTurn,
+  decideIssueTrackerWrite,
+  IssueTrackerClientRegistry,
+} from "./issueTrackerTurn.ts";
 
+const decodeClientCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 const command = Schema.decodeUnknownSync(ClientOrchestrationCommand)({
   runtimeMode: "full-access",
   interactionMode: "default",
@@ -60,6 +65,90 @@ const dependencies = Layer.mergeAll(
 );
 
 describe("personal prompt authorization", () => {
+  it.effect("requests the queued entry's runtime mode when editing its prompt", () =>
+    Effect.gen(function* () {
+      const registry = AtomRegistry.make();
+      registry.set(managedRelaySessionAtom, {
+        accountId: "alice",
+        readClerkToken: () => Effect.succeed("alice-token"),
+      });
+      const requests: Request[] = [];
+      const fetch: typeof globalThis.fetch = async (input, init) => {
+        requests.push(new Request(input, init));
+        return Response.json({ authorization: "edit-grant" });
+      };
+      const edit = yield* decodeClientCommand({
+        type: "thread.prompt.edit",
+        threadId: "thread",
+        commandId: "edit-command",
+        createdAt: "2026-10-02T00:00:00.000Z",
+        messageId: "message",
+        expectedRevision: 1,
+        expectedRuntimeMode: "full-access",
+        message: { text: "Edited prompt", attachments: [] },
+      });
+      const authorized = yield* authorizeIssueTrackerTurn(edit, "alice").pipe(
+        Effect.provideService(IssueTrackerClientRegistry, registry),
+        Effect.provideService(FetchHttpClient.Fetch, fetch),
+        Effect.ensuring(Effect.sync(() => registry.dispose())),
+      );
+      expect(requests).toHaveLength(1);
+      expect(yield* Effect.promise(() => requests[0]!.json())).toMatchObject({
+        runtimeMode: "full-access",
+      });
+      expect(authorized).toMatchObject({ issueTrackerAuthorization: "edit-grant" });
+    }).pipe(Effect.provide(dependencies)),
+  );
+  it.effect("uses the signed-in user's relay session to approve an issue write", () =>
+    Effect.gen(function* () {
+      const registry = AtomRegistry.make();
+      registry.set(managedRelaySessionAtom, {
+        accountId: "alice",
+        readClerkToken: () => Effect.succeed("alice-token"),
+      });
+      const requests: Request[] = [];
+      const fetch: typeof globalThis.fetch = async (input, init) => {
+        const request = new Request(input, init);
+        requests.push(request);
+        return Response.json({
+          operationId: "operation-1",
+          state: "ready",
+          service: "jira",
+          action: "add_comment",
+          field: null,
+          identifier: "LP-42",
+          issueUrl: "https://example.atlassian.net/browse/LP-42",
+          body: "Exact comment",
+          executionAccount: "Alice",
+          resultResourceId: null,
+          resultUrl: null,
+        });
+      };
+      yield* decideIssueTrackerWrite("issue-write:operation-1", "accept").pipe(
+        Effect.provideService(IssueTrackerClientRegistry, registry),
+        Effect.provideService(FetchHttpClient.Fetch, fetch),
+        Effect.ensuring(Effect.sync(() => registry.dispose())),
+      );
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.url).toBe("https://relay.test/v1/user/issue-trackers/writes/decision");
+      expect(requests[0]?.headers.get("authorization")).toBe("Bearer alice-token");
+      expect(yield* Effect.promise(() => requests[0]!.json())).toEqual({
+        operationId: "operation-1",
+        decision: "approve",
+      });
+    }).pipe(Effect.provide(dependencies)),
+  );
+
+  it.effect("requires a personal session for issue write decisions", () =>
+    Effect.gen(function* () {
+      const outcome = yield* decideIssueTrackerWrite("issue-write:operation-1", "accept").pipe(
+        Effect.result,
+      );
+      expect(outcome._tag).toBe("Failure");
+      expect(yield* decideIssueTrackerWrite("provider-request", "accept")).toBeUndefined();
+    }).pipe(Effect.provide(dependencies)),
+  );
+
   it.effect.each([
     { owner: "alice", account: "bob" },
     { owner: "alice", account: null },

@@ -139,6 +139,7 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "cancel relay Jira site selection",
   "update relay Linear workspace",
   "disconnect relay issue tracker",
+  "change issue tracker write permission",
 ]);
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
@@ -197,6 +198,7 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay Jira site selection",
   "Relay Linear workspace change",
   "Relay issue tracker disconnection",
+  "Relay issue tracker write permission",
 ]);
 export type ManagedRelayRequestActivity = typeof ManagedRelayRequestActivity.Type;
 

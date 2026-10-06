@@ -13,8 +13,18 @@ export { oauthErrorCode as jiraOAuthErrorCode } from "./OAuthHttp.ts";
 export const JIRA_MCP_RESOURCE = "https://mcp.atlassian.com/v2/mcp";
 const RESOURCE_METADATA = "https://mcp.atlassian.com/.well-known/oauth-protected-resource/v2/mcp";
 export const JIRA_READ_SCOPE = "read:jira:agent-interface";
-// Keep the identity scopes from Atlassian's consent flow, but only request Jira reads.
-const scope = ["read:me", "read:account", "offline_access", "email", JIRA_READ_SCOPE].join(" ");
+export const JIRA_SEARCH_SCOPE = "search:jira:agent-interface";
+export const JIRA_WRITE_SCOPE = "write:jira:agent-interface";
+const readScopes = [
+  "read:me",
+  "read:account",
+  "offline_access",
+  "email",
+  JIRA_READ_SCOPE,
+  JIRA_SEARCH_SCOPE,
+];
+const requestedScopes = (writes: boolean) =>
+  writes ? [...readScopes, JIRA_WRITE_SCOPE] : readScopes;
 export const JiraOAuthEndpoint = Schema.String.check(
   Schema.makeFilter((value) => {
     const url = URL.parse(value);
@@ -49,6 +59,8 @@ export const JiraPendingOAuth = Schema.Struct({
   ...JiraOAuthSession.fields,
   redirectUri: Schema.NonEmptyString,
   codeVerifier: Schema.NonEmptyString,
+  writes: Schema.optionalKey(Schema.Boolean),
+  requestedScopes: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 const decodeServer = Schema.decodeUnknownSync(Server);
 const decodeClient = Schema.decodeUnknownSync(Client);
@@ -96,21 +108,40 @@ const sdkRequest = makeOAuthRequest({
     }),
 });
 
-const tokenResult = (value: unknown, previousRefreshToken?: string) => {
+const tokenResult = (
+  value: unknown,
+  options: {
+    readonly previousRefreshToken?: string;
+    readonly fallbackScopes?: ReadonlyArray<string> | undefined;
+  } = {},
+) => {
   const tokens = decodeTokens(value);
   if (tokens.token_type.toLowerCase() !== "bearer") throw unavailable();
-  if (tokens.scope !== undefined && !tokens.scope.split(/\s+/).includes(JIRA_READ_SCOPE))
+  const scopes =
+    tokens.scope !== undefined ? tokens.scope.split(/\s+/).filter(Boolean) : options.fallbackScopes;
+  if (scopes !== undefined && !scopes.includes(JIRA_READ_SCOPE))
     throw new IssueTrackerFailure({
       code: "forbidden",
       message: "Authorize Jira read access to connect this site.",
     });
-  const refreshToken = tokens.refresh_token ?? previousRefreshToken;
+  const refreshToken = tokens.refresh_token ?? options.previousRefreshToken;
   if (!refreshToken) throw authRequired();
-  return { accessToken: tokens.access_token, refreshToken, expiresIn: tokens.expires_in };
+  return {
+    accessToken: tokens.access_token,
+    refreshToken,
+    expiresIn: tokens.expires_in,
+    ...(scopes !== undefined ? { scopes: [...scopes] } : {}),
+  };
 };
 
-export const beginJiraOAuth = (input: { readonly redirectUri: string; readonly state: string }) =>
+export const beginJiraOAuth = (input: {
+  readonly redirectUri: string;
+  readonly state: string;
+  readonly writes?: boolean;
+}) =>
   sdkRequest("authorization", async (fetchFn) => {
+    const scopes = requestedScopes(input.writes === true);
+    const scope = scopes.join(" ");
     const discovery = await discoverOAuthServerInfo(JIRA_MCP_RESOURCE, {
       resourceMetadataUrl: new URL(RESOURCE_METADATA),
       fetchFn,
@@ -154,6 +185,8 @@ export const beginJiraOAuth = (input: { readonly redirectUri: string; readonly s
         client,
         redirectUri: input.redirectUri,
         codeVerifier: started.codeVerifier,
+        writes: input.writes === true,
+        requestedScopes: scopes,
       },
     };
   });
@@ -172,12 +205,15 @@ export const exchangeJiraCode = (
         resource: JIRA_MCP_RESOURCE,
         fetchFn,
       }),
+      // Older pending attempts did not save their request; only their read grant is known.
+      { fallbackScopes: input.requestedScopes ?? [JIRA_READ_SCOPE] },
     ),
   );
 // Refresh-only: the SDK's general auth() helper can fall back to interactive authorization.
 export const refreshJiraTokens = (input: {
   readonly oauth: typeof JiraOAuthSession.Type;
   readonly refreshToken: string;
+  readonly scopes?: ReadonlyArray<string>;
 }) =>
   sdkRequest("token refresh", async (fetchFn) =>
     tokenResult(
@@ -188,6 +224,6 @@ export const refreshJiraTokens = (input: {
         resource: JIRA_MCP_RESOURCE,
         fetchFn,
       }),
-      input.refreshToken,
+      { previousRefreshToken: input.refreshToken, fallbackScopes: input.scopes },
     ),
   );

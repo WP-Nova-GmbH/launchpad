@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { IssueTrackerFailure } from "./IssueTrackerModels.ts";
+import type { LinearResource } from "./LinearOAuth.ts";
 import {
   clipComment,
   COMMENT_PAGE_SIZE,
@@ -117,12 +118,14 @@ export const linearImageReferences = Effect.fn("linearContext.image_references")
 export const linearDiscussion = Effect.fn("linearContext.discussion")(function* (input: {
   readonly source: LinearSource;
   readonly accessToken: string;
+  readonly resource?: LinearResource | undefined;
   readonly after?: string;
   readonly byteBudget?: number;
 }) {
   const page = yield* readLinearComments({
     ...input.source,
     accessToken: input.accessToken,
+    resource: input.resource,
     ...(input.after ? { after: input.after } : {}),
   });
   const comments: Extract<RelayLinearDiscussion, { status: "available" }>["comments"][number][] =

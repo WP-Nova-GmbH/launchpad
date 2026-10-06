@@ -52,6 +52,14 @@ const JiraIssue = Schema.Struct({
     ),
   }),
 });
+const JiraIssuePayload = Schema.Union([
+  JiraIssue,
+  Schema.Struct({ issues: Schema.Struct({ nodes: Schema.Array(JiraIssue) }) }),
+]);
+const JiraIssueResponse = Schema.Union([
+  JiraIssuePayload,
+  Schema.Struct({ data: JiraIssuePayload }),
+]);
 
 const decodeIssueKey = Schema.decodeEffect(IssueKey);
 const decodeCloudId = Schema.decodeEffect(CloudId);
@@ -83,7 +91,7 @@ const decodeRpcResponse = Schema.decodeUnknownEffect(RpcResponse);
 const isRpcResponse = Schema.is(RpcResponse);
 const decodeInitialized = Schema.decodeUnknownEffect(Initialized);
 const decodeToolResult = Schema.decodeUnknownEffect(ToolResult);
-const decodeJiraIssue = Schema.decodeUnknownEffect(JiraIssue);
+const decodeJiraIssue = Schema.decodeUnknownEffect(JiraIssueResponse);
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const unavailable = () =>
@@ -147,6 +155,16 @@ const validateAccessToken = Effect.fnUntraced(function* (accessToken: string) {
 
 const checkStatus = Effect.fnUntraced(function* (response: HttpClientResponse.HttpClientResponse) {
   if (response.status >= 200 && response.status < 300) return response;
+  if (response.status === 429) {
+    const retry = Number(response.headers["retry-after"]);
+    return yield* new IssueTrackerFailure({
+      code: "rate_limited",
+      message: "Atlassian is rate limiting Jira requests. Try again later.",
+      ...(Number.isInteger(retry) && retry > 0 && retry <= 3600
+        ? { retryAfterSeconds: retry }
+        : {}),
+    });
+  }
   if (response.status === 401) {
     return yield* new IssueTrackerFailure({
       code: "auth_required",
@@ -224,7 +242,7 @@ const readRpcResponse = Effect.fnUntraced(function* (
   return reply.result;
 });
 
-const callJiraTool = Effect.fnUntraced(function* (
+export const callJiraTool = Effect.fnUntraced(function* (
   accessToken: string,
   name: string,
   args: Readonly<Record<string, unknown>>,
@@ -281,6 +299,10 @@ const callJiraTool = Effect.fnUntraced(function* (
     );
     protocolVersion = initialized.protocolVersion;
     yield* post({ jsonrpc: "2.0", method: "notifications/initialized" });
+    if (name === "__list_tools") {
+      const response = yield* post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+      return yield* readRpcResponse(response, 2);
+    }
     const response = yield* post({
       jsonrpc: "2.0",
       id: 2,
@@ -353,6 +375,52 @@ const callJiraTool = Effect.fnUntraced(function* (
   );
 });
 
+const JiraToolList = Schema.Struct({
+  tools: Schema.Array(Schema.Struct({ name: Schema.String, inputSchema: Schema.Unknown })),
+});
+const decodeJiraToolList = Schema.decodeUnknownEffect(JiraToolList);
+
+/** Read the tools offered to this specific OAuth grant; Atlassian rolls out names per account. */
+export const listJiraTools = Effect.fnUntraced(function* (accessToken: string) {
+  const value = yield* callJiraTool(accessToken, "__list_tools", {});
+  return yield* decodeJiraToolList(value).pipe(Effect.mapError(unavailable));
+});
+
+/** The comment tool is deferred on Rovo v2; inspect this grant before a write depends on it. */
+export const jiraCommentReadRoute = Effect.fnUntraced(function* (accessToken: string) {
+  const offered = (yield* listJiraTools(accessToken)).tools;
+  if (offered.some((tool) => tool.name === "listJiraIssueComments"))
+    return "listJiraIssueComments" as const;
+  if (offered.some((tool) => tool.name === "executeRead")) return "executeRead" as const;
+  if (offered.some((tool) => tool.name === "execute")) return "execute" as const;
+  return yield* new IssueTrackerFailure({
+    code: "forbidden",
+    message: "This Jira connection cannot read issue comments, so a comment cannot be confirmed.",
+  });
+});
+
+export const listJiraIssueComments = Effect.fnUntraced(function* (input: {
+  readonly accessToken: string;
+  readonly cloudId: string;
+  readonly issueIdOrKey: string;
+  readonly route: "listJiraIssueComments" | "executeRead" | "execute";
+  readonly startAt: number;
+  readonly maxResults: number;
+}) {
+  const args = {
+    issueIdOrKey: input.issueIdOrKey,
+    startAt: input.startAt,
+    maxResults: input.maxResults,
+  };
+  return yield* callJiraTool(
+    input.accessToken,
+    input.route,
+    input.route === "listJiraIssueComments"
+      ? { cloudId: input.cloudId, ...args }
+      : { name: "listJiraIssueComments", cloudId: input.cloudId, inputs: args },
+  );
+});
+
 const readIssue = Effect.fnUntraced(function* (input: {
   readonly siteUrl: string;
   readonly cloudId: string;
@@ -371,7 +439,14 @@ const readIssue = Effect.fnUntraced(function* (input: {
     fields: ["summary", "description", "status", "assignee"],
     responseContentFormat: "markdown",
   });
-  const result = yield* decodeJiraIssue(payload).pipe(Effect.mapError(unavailable));
+  const decoded = yield* decodeJiraIssue(payload).pipe(Effect.mapError(unavailable));
+  const issuePayload = "data" in decoded ? decoded.data : decoded;
+  const result =
+    "issues" in issuePayload
+      ? issuePayload.issues.nodes.length === 1
+        ? issuePayload.issues.nodes[0]!
+        : yield* unavailable()
+      : issuePayload;
   if (result.key !== key) return yield* unavailable();
   const description = result.fields.description ?? "";
   return {
@@ -400,6 +475,91 @@ export const readJiraIssue = Effect.fn("relay.jira.readIssue")(function* (input:
   readonly issue: string;
 }) {
   return yield* readIssue(input);
+}, bounded);
+
+const SearchIssue = Schema.Struct({
+  id: Schema.String.check(Schema.isMaxLength(128)),
+  key: IssueKey,
+  fields: Schema.Struct({
+    summary: Schema.String.check(Schema.isMaxLength(4096)),
+    status: Schema.optionalKey(Schema.NullOr(Schema.Struct({ name: Schema.String }))),
+    assignee: Schema.optionalKey(Schema.NullOr(Schema.Struct({ displayName: Schema.String }))),
+    project: Schema.optionalKey(Schema.NullOr(Schema.Struct({ name: Schema.String }))),
+  }),
+});
+const SearchResult = Schema.Struct({
+  issues: Schema.Struct({
+    nodes: Schema.Array(SearchIssue),
+    remainingCount: Schema.optionalKey(Schema.Number),
+    pageInfo: Schema.optionalKey(
+      Schema.Struct({
+        hasNextPage: Schema.Boolean,
+        endCursor: Schema.optionalKey(Schema.NullOr(Schema.String.check(Schema.isMaxLength(4096)))),
+      }),
+    ),
+  }),
+});
+const SearchResponse = Schema.Union([SearchResult, Schema.Struct({ data: SearchResult })]);
+const decodeSearchResult = Schema.decodeUnknownEffect(SearchResponse);
+const jqlString = (value: string) => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+
+export const searchJiraIssues = Effect.fn("relay.jira.searchIssues")(function* (input: {
+  readonly siteUrl: string;
+  readonly cloudId: string;
+  readonly accessToken: string;
+  readonly query?: string;
+  readonly project?: string;
+  readonly status?: string;
+  readonly assignee?: string;
+  readonly cursor?: string;
+}) {
+  const siteUrl = yield* normalizeSite(input.siteUrl);
+  const accessToken = yield* validateAccessToken(input.accessToken);
+  const cloudId = yield* decodeCloudId(input.cloudId).pipe(Effect.mapError(unavailable));
+  const clauses = [
+    ...(input.query ? [`text ~ ${jqlString(input.query)}`] : []),
+    ...(input.project ? [`project = ${jqlString(input.project)}`] : []),
+    ...(input.status ? [`status = ${jqlString(input.status)}`] : []),
+    ...(input.assignee
+      ? [
+          input.assignee.toLowerCase() === "me"
+            ? "assignee = currentUser()"
+            : `assignee = ${jqlString(input.assignee)}`,
+        ]
+      : []),
+  ];
+  if (clauses.length === 0) return yield* invalidInput("Enter search text or a filter.");
+  const payload = yield* callJiraTool(accessToken, "searchJiraIssuesUsingJql", {
+    cloudId,
+    jql: `${clauses.join(" AND ")} ORDER BY updated DESC`,
+    maxResults: 20,
+    fields: ["summary", "status", "assignee", "project"],
+    ...(input.cursor ? { nextPageToken: input.cursor } : {}),
+  });
+  const decoded = yield* decodeSearchResult(payload).pipe(Effect.mapError(unavailable));
+  const result = "data" in decoded ? decoded.data : decoded;
+  const page = result.issues;
+  const nextCursor = page.pageInfo?.hasNextPage ? page.pageInfo.endCursor : null;
+  if (
+    page.nodes.length > 20 ||
+    (page.pageInfo?.hasNextPage && (!nextCursor || nextCursor === input.cursor)) ||
+    ((page.remainingCount ?? 0) > 0 && !nextCursor) ||
+    (page.nodes.length === 20 && page.pageInfo === undefined && !nextCursor)
+  )
+    return yield* unavailable();
+  return {
+    issues: page.nodes.map((issue) => ({
+      id: issue.id,
+      identifier: issue.key,
+      title: issue.fields.summary.slice(0, 512),
+      url: `${siteUrl}/browse/${issue.key}`,
+      status: issue.fields.status?.name.slice(0, 128) ?? null,
+      assignee: issue.fields.assignee?.displayName.slice(0, 128) ?? null,
+      project: issue.fields.project?.name.slice(0, 128) ?? null,
+      team: null,
+    })),
+    cursor: nextCursor ?? null,
+  };
 }, bounded);
 
 /** Only return Jira Cloud sites that the OAuth grant authorizes for issue reads. */

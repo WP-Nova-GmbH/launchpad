@@ -15,6 +15,7 @@ import {
   saveCommandAuthorization,
 } from "./IssueTrackerTurnAuthorization.ts";
 
+const decodeClientCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 const command = Schema.decodeUnknownSync(ClientOrchestrationCommand)({
   runtimeMode: "full-access",
   interactionMode: "default",
@@ -25,8 +26,8 @@ const command = Schema.decodeUnknownSync(ClientOrchestrationCommand)({
   message: { messageId: "message", text: "Read WP-218", attachments: [] },
   issueTrackerAuthorization: "secret-grant",
 });
-const setup = Effect.fnUntraced(function* () {
-  const digest = yield* issueTrackerCommandDigest(command);
+const setup = Effect.fnUntraced(function* (prompt = command) {
+  const digest = yield* issueTrackerCommandDigest(prompt);
   const claims = {
     environmentId: EnvironmentId.make("environment"),
     threadId: "thread",
@@ -76,6 +77,41 @@ const setup = Effect.fnUntraced(function* () {
 });
 
 describe("personal turn authorization storage", () => {
+  it.effect("binds an edit grant to the queued entry's runtime mode", () =>
+    Effect.gen(function* () {
+      const edit = yield* decodeClientCommand({
+        type: "thread.prompt.edit",
+        commandId: "edit-command",
+        threadId: "thread",
+        createdAt: "2026-10-02T00:00:00.000Z",
+        messageId: "message",
+        expectedRevision: 1,
+        expectedRuntimeMode: "full-access",
+        message: { text: "Edited prompt", attachments: [] },
+        issueTrackerAuthorization: "edit-grant",
+      });
+      const test = yield* setup(edit);
+      test.claims.commandId = "edit-command";
+      Object.assign(test.claims, { runtimeMode: "full-access" });
+      expect(yield* saveCommandAuthorization(edit, "alice").pipe(Effect.provide(test.layer))).toBe(
+        "edit-command",
+      );
+      Object.assign(test.claims, { runtimeMode: "approval-required" });
+      const other = yield* decodeClientCommand({
+        ...edit,
+        commandId: "other-edit",
+      });
+      const otherTest = yield* setup(other);
+      otherTest.claims.commandId = "other-edit";
+      Object.assign(otherTest.claims, { runtimeMode: "approval-required" });
+      expect(
+        yield* saveCommandAuthorization(other, "alice").pipe(
+          Effect.provide(otherTest.layer),
+          Effect.flip,
+        ),
+      ).toMatchObject({ _tag: "OrchestrationDispatchCommandError" });
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+  );
   it.effect("keeps the credential in protected storage and can recover it for its thread", () =>
     Effect.gen(function* () {
       const test = yield* setup();
@@ -89,7 +125,7 @@ describe("personal turn authorization storage", () => {
     }).pipe(Effect.provide(NodeCrypto.layer)),
   );
 
-  it.effect.each(["owner", "environment", "thread", "command", "digest"] as const)(
+  it.effect.each(["owner", "environment", "thread", "command", "digest", "mode"] as const)(
     "rejects mismatched %s before persisting credentials",
     (mismatch) =>
       Effect.gen(function* () {
@@ -98,6 +134,7 @@ describe("personal turn authorization storage", () => {
         if (mismatch === "thread") test.claims.threadId = "other";
         if (mismatch === "command") test.claims.commandId = "other";
         if (mismatch === "digest") test.claims.commandDigest = "b".repeat(64);
+        if (mismatch === "mode") Object.assign(test.claims, { runtimeMode: "approval-required" });
         expect(
           yield* saveCommandAuthorization(command, mismatch === "owner" ? "bob" : "alice").pipe(
             Effect.provide(test.layer),

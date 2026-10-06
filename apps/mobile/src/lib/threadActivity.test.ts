@@ -3794,3 +3794,30 @@ it("uses Jira discussion identity from compact metadata in native activity", () 
   };
   expect(workEntryRowLabel(entry)).toBe("Read Jira issue ENG-42 discussion · team.atlassian.net");
 });
+
+it("shows the human name for an OpenCode Jira comment call on mobile", () => {
+  const thread = makeThread({
+    id: ThreadId.make("jira-write-label"),
+    projectId: ProjectId.make("project-1"),
+    title: "Jira write",
+    activities: [
+      makeActivity({
+        id: EventId.make("jira-write"),
+        kind: "tool.completed",
+        summary: "Tool call",
+        tone: "tool",
+        createdAt: "2026-10-06T10:00:00Z",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          status: "completed",
+          data: { tool: "t3-code_add_jira_comment" },
+        },
+      }),
+    ],
+  });
+  const [group] = buildThreadFeed(thread);
+  expect(group?.type).toBe("activity-group");
+  if (group?.type !== "activity-group") return;
+  expect(workEntryRowLabel(group.activities[0]!.workEntry)).toBe("Add Jira Comment");
+});

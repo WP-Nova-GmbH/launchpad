@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { fixture, encodeJson } from "./Connections.test-fixture.ts";
+import { fixture, encodeJson, linearRow } from "./Connections.test-fixture.ts";
+import type { ConnectionRecord } from "./ConnectionStore.ts";
 
 const decode = Schema.decodeUnknownSync(
   Schema.fromJsonString(
@@ -33,10 +34,13 @@ export const issue = {
 export const mcpFixture = Effect.fnUntraced(function* (
   handle: (name: string, args: Record<string, unknown>) => Effect.Effect<unknown> = () =>
     Effect.succeed(undefined),
+  toolNames: ReadonlyArray<string> = [],
+  rows: ReadonlyArray<ConnectionRecord> = [linearRow()],
 ) {
   const calls: { name: string; arguments: Record<string, unknown> }[] = [];
   const test = yield* fixture({
     rawHttp: true,
+    rows,
     respond: (request) =>
       Effect.gen(function* () {
         if (request.method === "GET") return new Response(null, { status: 405 });
@@ -53,6 +57,18 @@ export const mcpFixture = Effect.fnUntraced(function* (
               serverInfo: { name: "Linear", version: "1" },
             },
           });
+        if (rpc.method === "tools/list")
+          return Response.json({
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: {
+              tools: toolNames.map((name) => ({
+                name,
+                description: name,
+                inputSchema: { type: "object" },
+              })),
+            },
+          });
         if (!rpc.params?.name || !rpc.params.arguments)
           return yield* Effect.die("Missing tool parameters");
         calls.push({ name: rpc.params.name, arguments: rpc.params.arguments });
@@ -62,6 +78,7 @@ export const mcpFixture = Effect.fnUntraced(function* (
           get_workspace: workspace,
           get_user: { id: "account", name: "Alice" },
           get_issue: issue,
+          list_issues: { issues: [issue], hasNextPage: false },
           list_comments: { comments: [], hasNextPage: false },
         };
         const value = response ?? defaults[rpc.params.name];

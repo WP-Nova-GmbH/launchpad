@@ -205,6 +205,7 @@ export class ManagedRelayTenancyClient extends Context.Service<
     }) => Effect.Effect<RelayIssueTrackerConnections, ManagedRelayClientError>;
     readonly startLinearAuthorization: (input: {
       readonly clerkToken: string;
+      readonly writes?: boolean;
     }) => Effect.Effect<RelayStartLinearResponse, ManagedRelayClientError>;
     readonly confirmLinearReplacement: (input: {
       readonly clerkToken: string;
@@ -216,6 +217,7 @@ export class ManagedRelayTenancyClient extends Context.Service<
     }) => Effect.Effect<RelayIssueTrackerConnections, ManagedRelayClientError>;
     readonly startJiraAuthorization: (input: {
       readonly clerkToken: string;
+      readonly writes?: boolean;
     }) => Effect.Effect<RelayStartJiraResponse, ManagedRelayClientError>;
     readonly selectJiraSite: (input: {
       readonly clerkToken: string;
@@ -816,6 +818,7 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
         return yield* client.issueTrackers
           .startLinear({
             headers: bearerHeaders(input.clerkToken),
+            payload: { writes: input.writes === true },
           })
           .pipe(
             Effect.mapError(relayRequestError("start relay Linear authorization")),
@@ -858,7 +861,10 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
     startJiraAuthorization: Effect.fnUntraced(
       function* (input) {
         return yield* client.issueTrackers
-          .startJira({ headers: bearerHeaders(input.clerkToken) })
+          .startJira({
+            headers: bearerHeaders(input.clerkToken),
+            payload: { writes: input.writes === true },
+          })
           .pipe(
             Effect.mapError(relayRequestError("start relay Jira authorization")),
             timeoutRelayRequest("Relay Jira authorization"),

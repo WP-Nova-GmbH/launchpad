@@ -33,8 +33,8 @@ export interface IssueTrackersSectionProps {
   readonly cancelLinearReplacement: (proposalId: string) => Promise<void>;
   readonly error: string | null;
   readonly refresh: () => Promise<void>;
-  readonly startLinear: () => Promise<RelayStartLinearResponse>;
-  readonly startJira: () => Promise<RelayStartJiraResponse>;
+  readonly startLinear: (writes?: boolean) => Promise<RelayStartLinearResponse>;
+  readonly startJira: (writes?: boolean) => Promise<RelayStartJiraResponse>;
   readonly selectJiraSite: (input: RelaySelectJiraSiteRequest) => Promise<void>;
   readonly cancelJiraSelection: (authorizationId: string) => Promise<void>;
   readonly disconnect: (service: RelayIssueTrackerService) => Promise<void>;
@@ -58,8 +58,12 @@ function connectionDescription(
       ? `${connection.accountLabel} · Sign in again to read issues.`
       : "Sign in again to read issues.";
   }
-  if (connection?.status === "connected")
-    return connection.accountLabel ?? "Connected to your account.";
+  if (connection?.status === "connected") {
+    const label = connection.accountLabel ?? "Connected to your account.";
+    if (connection.searchEnabled === false && service === "jira")
+      return `${label} · Issue search needs additional authorization.`;
+    return label;
+  }
   return service === "linear"
     ? "Read issues from your Linear workspace."
     : "Read issues from your Jira Cloud site.";
@@ -82,6 +86,8 @@ export function IssueTrackersSection({
   disconnect,
 }: IssueTrackersSectionProps) {
   const [dialog, setDialog] = useState<RelayIssueTrackerService | null>(null);
+  const [managingJira, setManagingJira] = useState(false);
+  const [writeUpgrade, setWriteUpgrade] = useState(false);
   const [disconnectService, setDisconnectService] = useState<RelayIssueTrackerService | null>(null);
   const [busy, setBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
@@ -122,15 +128,27 @@ export function IssueTrackersSection({
     setReview(undefined);
     setAuthorizationUrl(null);
     setAuthorizationId(null);
+    setManagingJira(false);
+    setWriteUpgrade(false);
     setDialogError(null);
   };
 
-  const showConnect = (service: RelayIssueTrackerService) => {
+  const showConnect = (service: RelayIssueTrackerService, writes = false) => {
     setDialogError(null);
     setAuthorizationUrl(null);
     setAuthorizationId(null);
+    setManagingJira(false);
+    setWriteUpgrade(writes);
     setDialog(service);
-    void run(() => beginAuthorization(service));
+    void run(() => beginAuthorization(service, writes));
+  };
+
+  const showManageJira = () => {
+    setDialogError(null);
+    setAuthorizationUrl(null);
+    setAuthorizationId(null);
+    setManagingJira(true);
+    setDialog("jira");
   };
 
   const run = async (action: () => Promise<void>) => {
@@ -145,8 +163,8 @@ export function IssueTrackersSection({
     }
   };
 
-  const beginAuthorization = async (service: RelayIssueTrackerService) => {
-    const result = await (service === "jira" ? startJira() : startLinear());
+  const beginAuthorization = async (service: RelayIssueTrackerService, writes: boolean) => {
+    const result = await (service === "jira" ? startJira(writes) : startLinear(writes));
     setAuthorizationUrl(result.authorizationUrl);
     setAuthorizationId(result.authorizationId);
     window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
@@ -171,8 +189,9 @@ export function IssueTrackersSection({
       <div className="space-y-1 px-3 py-3 sm:px-4">
         <p className="text-sm text-muted-foreground">Your personal Jira and Linear connections.</p>
         <p className="text-xs leading-relaxed text-muted-foreground">
-          Read-only access for messages you send in local and managed chats. Other people use their
-          own connections. Retrieved content remains visible to everyone in the chat.
+          Read issues and search for messages you send in local and managed chats. Other people use
+          their own connections. Retrieved content remains visible to everyone in the chat. Write
+          access depends on the permissions granted to your connection.
         </p>
       </div>
       {unverified ? (
@@ -217,6 +236,12 @@ export function IssueTrackersSection({
                           ? "Sign-in required"
                           : "Setup incomplete"}
                     </Badge>
+                  ) : null}
+                  {connection?.status === "connected" ? (
+                    <Badge variant="secondary">Read</Badge>
+                  ) : null}
+                  {connection?.status === "connected" && connection.writesAvailable ? (
+                    <Badge variant="secondary">Write</Badge>
                   ) : null}
                 </span>
               }
@@ -270,16 +295,31 @@ export function IssueTrackersSection({
                       Review change
                     </Button>
                   ) : null}
-                  {(connection?.status !== "connected" || service === "linear") &&
-                  !connection?.jiraSites ? (
+                  {connection?.status === "connected" && !connection.writesAvailable ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={disabled}
+                      onClick={() => showConnect(service, true)}
+                    >
+                      Authorize writes
+                    </Button>
+                  ) : null}
+                  {!connection?.jiraSites ? (
                     <Button
                       size="sm"
                       variant="outline"
                       disabled={disabled || !available}
-                      onClick={() => showConnect(service)}
+                      onClick={() =>
+                        service === "jira" && connection?.status === "connected"
+                          ? showManageJira()
+                          : showConnect(service, connection?.writesAvailable === true)
+                      }
                     >
                       {connection?.status === "connected"
-                        ? "Change workspace"
+                        ? service === "jira"
+                          ? "Manage"
+                          : "Change workspace"
                         : connection?.status === "connecting"
                           ? "Try again"
                           : connection
@@ -312,20 +352,35 @@ export function IssueTrackersSection({
           >
             <DialogHeader>
               <DialogTitle>
-                {choosingJiraSite
-                  ? "Choose Jira site"
-                  : authorizationUrl
-                    ? `Waiting for ${providerName}`
-                    : dialogError
-                      ? `Could not open ${providerName}`
-                      : `Connecting to ${providerName}`}
+                {managingJira
+                  ? "Manage Jira connection"
+                  : choosingJiraSite
+                    ? "Choose Jira site"
+                    : authorizationUrl
+                      ? `Waiting for ${providerName}`
+                      : dialogError
+                        ? `Could not open ${providerName}`
+                        : writeUpgrade
+                          ? `Authorize ${providerName} writes`
+                          : `Connecting to ${providerName}`}
               </DialogTitle>
               <DialogDescription>
-                Connect your account for read-only issue access.
+                {managingJira
+                  ? "Change your Jira site or access. Your current connection stays active until you finish connecting again."
+                  : writeUpgrade
+                    ? "Authorize issue changes with your own account. Write access becomes available when you finish connecting."
+                    : "Connect your account to read and search issues."}
               </DialogDescription>
             </DialogHeader>
             <DialogPanel>
-              {choosingJiraSite ? (
+              {managingJira ? (
+                <p className="text-sm text-muted-foreground">
+                  {authorizing?.accountLabel ?? "Jira"} is connected.
+                  {authorizing?.searchEnabled === false
+                    ? " Issue search needs additional authorization."
+                    : ""}
+                </p>
+              ) : choosingJiraSite ? (
                 <RadioGroup
                   aria-label="Jira site"
                   value={selectedCloudId}
@@ -405,7 +460,15 @@ export function IssueTrackersSection({
               >
                 Close
               </Button>
-              {choosingJiraSite ? (
+              {managingJira ? (
+                <Button
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => showConnect("jira", authorizing?.writesAvailable === true)}
+                >
+                  {authorizing?.searchEnabled === false ? "Enable search" : "Change site or access"}
+                </Button>
+              ) : choosingJiraSite ? (
                 <>
                   <Button
                     type="button"
@@ -438,7 +501,7 @@ export function IssueTrackersSection({
                   type="button"
                   disabled={disabled}
                   onClick={() => {
-                    if (dialog) void run(() => beginAuthorization(dialog));
+                    if (dialog) void run(() => beginAuthorization(dialog, writeUpgrade));
                   }}
                 >
                   Try again

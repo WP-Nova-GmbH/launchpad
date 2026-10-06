@@ -60,7 +60,7 @@ describe("organization issue tracker client", () => {
           url: "https://relay.example.test/v1/user/issue-trackers/linear/authorize",
           method: "POST",
           bearer: "Bearer admin-token",
-          body: null,
+          body: { writes: false },
         },
         {
           url: "https://relay.example.test/v1/user/issue-trackers/jira",
@@ -138,7 +138,7 @@ it.effect("starts Jira OAuth with only the administrator's relay session", () =>
     expect(request.url).toBe("https://relay.example.test/v1/user/issue-trackers/jira/authorize");
     expect(request.method).toBe("POST");
     expect(request.headers.get("authorization")).toBe("Bearer admin-token");
-    expect(yield* Effect.promise(() => request.text())).toBe("");
+    expect(yield* Effect.promise(() => request.json())).toEqual({ writes: false });
   }).pipe(Effect.provide(testLayer(fetchFn)));
 });
 

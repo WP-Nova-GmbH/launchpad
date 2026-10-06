@@ -94,6 +94,13 @@ export const saveCommandAuthorization = Effect.fn("issueTrackers.saveCommandAuth
       claims.environmentId !== (yield* environment.getEnvironmentId) ||
       claims.threadId !== command.threadId ||
       claims.commandId !== command.commandId ||
+      (claims.runtimeMode !== undefined &&
+        claims.runtimeMode !==
+          ("runtimeMode" in command
+            ? command.runtimeMode
+            : command.type === "thread.prompt.edit"
+              ? command.expectedRuntimeMode
+              : undefined)) ||
       claims.commandDigest !==
         (yield* issueTrackerCommandDigest(command).pipe(
           Effect.provideService(Crypto.Crypto, cryptoOption.value),
@@ -114,6 +121,7 @@ export const saveCommandAuthorization = Effect.fn("issueTrackers.saveCommandAuth
           if (
             previous.claims.ownerUserId !== claims.ownerUserId ||
             previous.claims.commandDigest !== claims.commandDigest ||
+            previous.claims.runtimeMode !== claims.runtimeMode ||
             previous.claims.threadId !== claims.threadId ||
             previous.claims.environmentId !== claims.environmentId
           )

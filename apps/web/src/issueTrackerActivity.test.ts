@@ -86,6 +86,37 @@ const fixtures = [
 ] as const;
 
 describe("issue tracker activity identity", () => {
+  it.each([
+    [
+      "Codex",
+      {
+        itemType: "mcp_tool_call",
+        title: "T3 Code · add_jira_comment",
+        data: { item: { server: "t3-code", tool: "add_jira_comment" } },
+      },
+    ],
+    [
+      "Claude",
+      {
+        itemType: "mcp_tool_call",
+        title: "MCP tool call",
+        data: { toolName: "mcp__t3_code__add_jira_comment" },
+      },
+    ],
+    [
+      "OpenCode",
+      {
+        itemType: "dynamic_tool_call",
+        title: "Tool call",
+        data: { tool: "t3-code_add_jira_comment" },
+      },
+    ],
+  ] as const)("shows a readable Jira write tool for %s", (_provider, payload) => {
+    const [entry] = deriveWorkLogEntries([activity({ ...payload, status: "completed" })]);
+    expect(entry).toBeDefined();
+    expect(workEntryDisplayLabel(entry!, undefined)).toBe("Add Jira Comment");
+  });
+
   it.each(fixtures)(
     "shows the shared account from %s's existing result envelope",
     (_provider, payload) => {

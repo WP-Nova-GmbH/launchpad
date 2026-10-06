@@ -1,3 +1,4 @@
+import type { RuntimeMode } from "@t3tools/contracts";
 import type {
   RelayAgentActivityAggregateState,
   RelayAgentActivityState,
@@ -183,6 +184,8 @@ export const relayUserIssueTrackerConnections = pgTable(
       .$type<"connecting" | "connected" | "reconnect_required">(),
     accountLabel: text("account_label"),
     payloadSealed: text("payload_sealed"),
+    writesEnabled: boolean("writes_enabled").notNull().default(false),
+    writeGeneration: integer("write_generation").notNull().default(0),
     authorizationId: varchar("authorization_id", { length: 64 }),
     replacement: jsonb("replacement").$type<LinearReplacementRecord>(),
     jiraSelection: jsonb("jira_selection").$type<JiraSelectionRecord>(),
@@ -195,6 +198,66 @@ export const relayUserIssueTrackerConnections = pgTable(
   (table) => [
     primaryKey({ columns: [table.ownerUserId, table.service] }),
     uniqueIndex("idx_relay_user_issue_tracker_pending_state").on(table.pendingStateHash),
+  ],
+);
+
+export const relayIssueTrackerWriteOperations = pgTable(
+  "relay_issue_tracker_write_operations",
+  {
+    operationId: varchar("operation_id", { length: 64 }).primaryKey(),
+    ownerUserId: varchar("owner_user_id", { length: 191 }).notNull(),
+    service: varchar("service", { length: 16 }).notNull().$type<RelayIssueTrackerService>(),
+    environmentId: varchar("environment_id", { length: 191 }).notNull(),
+    threadId: varchar("thread_id", { length: 191 }).notNull(),
+    commandId: varchar("command_id", { length: 191 }).notNull(),
+    providerSessionId: varchar("provider_session_id", { length: 191 }).notNull(),
+    invocationId: varchar("invocation_id", { length: 191 }).notNull(),
+    connectionVersion: varchar("connection_version", { length: 64 }).notNull(),
+    writeGeneration: integer("write_generation").notNull(),
+    runtimeMode: varchar("runtime_mode", { length: 32 }).notNull().$type<RuntimeMode>(),
+    action: varchar("action", { length: 32 }).notNull(),
+    target: varchar("target", { length: 512 }).notNull(),
+    payloadDigest: varchar("payload_digest", { length: 64 }).notNull(),
+    payloadSealed: text("payload_sealed"),
+    baselineSealed: text("baseline_sealed"),
+    state: varchar("state", { length: 32 })
+      .notNull()
+      .$type<
+        | "awaiting_approval"
+        | "ready"
+        | "executing"
+        | "succeeded"
+        | "rejected"
+        | "cancelled"
+        | "outcome_unknown"
+        | "superseded"
+      >(),
+    approvedByUserId: varchar("approved_by_user_id", { length: 191 }),
+    approvedAt: varchar("approved_at", { length: 64 }),
+    claimedAt: varchar("claimed_at", { length: 64 }),
+    claimFence: varchar("claim_fence", { length: 64 }),
+    resultResourceId: varchar("result_resource_id", { length: 191 }),
+    resultUrl: text("result_url"),
+    safeError: text("safe_error"),
+    expiresAt: varchar("expires_at", { length: 64 }).notNull(),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_relay_issue_tracker_write_invocation").on(
+      table.environmentId,
+      table.providerSessionId,
+      table.invocationId,
+    ),
+    index("idx_relay_issue_tracker_write_fingerprint").on(
+      table.ownerUserId,
+      table.service,
+      table.threadId,
+      table.action,
+      table.target,
+      table.payloadDigest,
+    ),
+    index("idx_relay_issue_tracker_write_expiry").on(table.expiresAt, table.state),
   ],
 );
 

@@ -1,9 +1,11 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import { getLinearIdentity, readLinearIssue } from "./Linear.ts";
+import { getLinearIdentity, readLinearIssue, searchLinearIssues } from "./Linear.ts";
 import { issue, mcpFixture, workspace } from "./LinearMcp.test-fixture.ts";
 import { encodeJson } from "./Connections.test-fixture.ts";
 import { normalizeLinearMarkdown } from "./LinearMarkdown.ts";
+import { callLinearTools } from "./LinearMcp.ts";
+import { LINEAR_WRITE_MCP_RESOURCE } from "./LinearOAuth.ts";
 const input = {
   accessToken: "private-access",
   workspaceId: "workspace",
@@ -12,6 +14,84 @@ const input = {
 };
 
 describe("Linear MCP readers", () => {
+  it.effect("rejects a writable profile when the required issue tools are absent", () =>
+    Effect.gen(function* () {
+      const test = yield* mcpFixture(
+        () => Effect.succeed(undefined),
+        ["get_workspace", "save_comment"],
+      );
+      expect(
+        yield* callLinearTools(
+          input.accessToken,
+          [{ name: "get_workspace", arguments: {} }],
+          LINEAR_WRITE_MCP_RESOURCE,
+          ["save_comment", "save_issue"],
+        ).pipe(test.provide, Effect.flip),
+      ).toMatchObject({
+        code: "forbidden",
+        message: expect.stringContaining("save_issue"),
+      });
+      expect(test.calls).toHaveLength(0);
+    }),
+  );
+  it.effect("accepts the write tools advertised by Linear", () =>
+    Effect.gen(function* () {
+      const test = yield* mcpFixture(
+        () => Effect.succeed(undefined),
+        ["get_workspace", "save_comment", "save_issue"],
+      );
+      yield* callLinearTools(
+        input.accessToken,
+        [{ name: "get_workspace", arguments: {} }],
+        LINEAR_WRITE_MCP_RESOURCE,
+        ["save_comment", "save_issue"],
+      ).pipe(test.provide);
+      expect(test.calls.map((call) => call.name)).toEqual(["get_workspace"]);
+    }),
+  );
+  it.effect("searches a bounded page in the connected workspace", () =>
+    Effect.gen(function* () {
+      const test = yield* mcpFixture();
+      const result = yield* searchLinearIssues({
+        accessToken: input.accessToken,
+        workspaceId: input.workspaceId,
+        workspaceSlug: input.workspaceSlug,
+        query: "queue",
+        assignee: "me",
+      }).pipe(test.provide);
+      expect(result).toMatchObject({
+        cursor: null,
+        issues: [{ identifier: "LP-42", id: "issue-id", title: issue.title }],
+      });
+      expect(test.calls.find((call) => call.name === "list_issues")?.arguments).toMatchObject({
+        limit: 20,
+        query: "queue",
+        assignee: "me",
+      });
+    }),
+  );
+  it.effect("rejects a search result outside the connected workspace", () =>
+    Effect.gen(function* () {
+      const test = yield* mcpFixture((name) =>
+        Effect.succeed(
+          name === "list_issues"
+            ? {
+                issues: [{ ...issue, url: "https://linear.app/other/issue/LP-42" }],
+                hasNextPage: false,
+              }
+            : undefined,
+        ),
+      );
+      expect(
+        yield* searchLinearIssues({
+          accessToken: input.accessToken,
+          workspaceId: input.workspaceId,
+          workspaceSlug: input.workspaceSlug,
+          query: "queue",
+        }).pipe(test.provide, Effect.flip),
+      ).toMatchObject({ code: "unavailable" });
+    }),
+  );
   it.effect("identifies the immutable workspace and authorizing account", () =>
     Effect.gen(function* () {
       const test = yield* mcpFixture();
@@ -117,7 +197,7 @@ describe("Linear MCP readers", () => {
     { status: 401, code: "auth_required" },
     { status: 403, code: "forbidden" },
     { status: 404, code: "not_found" },
-    { status: 429, code: "unavailable" },
+    { status: 429, code: "rate_limited" },
     { status: 503, code: "unavailable" },
   ])("classifies HTTP $status without leaking content", ({ status, code }) =>
     Effect.gen(function* () {

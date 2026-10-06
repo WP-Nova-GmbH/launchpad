@@ -1,0 +1,2 @@
+ALTER TABLE "relay_user_issue_tracker_connections" ADD COLUMN "writes_enabled" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "relay_user_issue_tracker_connections" ADD COLUMN "write_generation" integer DEFAULT 0 NOT NULL;

@@ -16,6 +16,7 @@ import {
   JiraPendingOAuth,
   exchangeJiraCode,
   refreshJiraTokens,
+  JIRA_WRITE_SCOPE,
 } from "./JiraOAuth.ts";
 
 const JiraOAuthGrant = Schema.Struct({
@@ -25,6 +26,7 @@ const JiraOAuthGrant = Schema.Struct({
   accessToken: Schema.NonEmptyString,
   refreshToken: Schema.NonEmptyString,
   expiresAt: Schema.Number,
+  scopes: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 export const JiraOAuthCredentials = Schema.Struct({
   ...JiraOAuthGrant.fields,
@@ -75,13 +77,18 @@ const requireConnectionOwner = Effect.fn("jiraAuthorization.requireConnectionOwn
 export const startJira = Effect.fn("jiraAuthorization.start")(function* (input: {
   readonly ownerUserId: string;
   readonly userId: string;
+  readonly writes?: boolean;
 }) {
   yield* requireConnectionOwner(input);
   const config = yield* RelayConfiguration;
   const redirectUri = new URL(RELAY_JIRA_CALLBACK_PATH, config.relayIssuer).toString();
   const crypto = yield* Crypto.Crypto;
   const state = base64url(yield* crypto.randomBytes(32).pipe(Effect.mapError(unavailable)));
-  const started = yield* beginJiraOAuth({ redirectUri, state });
+  const started = yield* beginJiraOAuth({
+    redirectUri,
+    state,
+    ...(input.writes ? { writes: true } : {}),
+  });
   const box = yield* RelaySecretBox;
   const pendingOAuthSealed = yield* encodeAuthorization(started.pending).pipe(
     Effect.flatMap(box.seal),
@@ -182,6 +189,11 @@ export const completeJira = Effect.fn("jiraAuthorization.complete")(
         code: input.code!,
         ...(input.iss !== undefined ? { iss: input.iss } : {}),
       });
+      if (auth.writes && !tokens.scopes?.includes(JIRA_WRITE_SCOPE))
+        return yield* failure(
+          "forbidden",
+          "Atlassian did not grant Jira write access. Connect again and allow issue changes.",
+        );
       const expiresAt = (yield* now) + tokens.expiresIn * 1000;
       const sites = yield* getJiraOAuthSites(tokens.accessToken);
       yield* Effect.logDebug("Jira OAuth sites verified", {
@@ -200,6 +212,7 @@ export const completeJira = Effect.fn("jiraAuthorization.complete")(
         accessToken: tokens.accessToken,
         refreshToken: tokens.refreshToken,
         expiresAt,
+        ...(tokens.scopes ? { scopes: tokens.scopes } : {}),
       };
       const site = sites.length === 1 ? sites[0]! : null;
       const payloadSealed = yield* (
@@ -237,6 +250,7 @@ export const completeJira = Effect.fn("jiraAuthorization.complete")(
             !(yield* store.complete({
               ...row,
               payloadSealed,
+              writesAvailable: Boolean(grant.scopes?.includes(JIRA_WRITE_SCOPE)),
               accountLabel: site.accountLabel,
               userId: owner.userId,
             }))
@@ -318,6 +332,7 @@ export const selectJiraSite = Effect.fn("jiraAuthorization.selectSite")(function
         !(yield* store.complete({
           ...row,
           payloadSealed,
+          writesAvailable: Boolean(grant.scopes?.includes(JIRA_WRITE_SCOPE)),
           accountLabel: site.accountLabel,
           userId: input.userId,
         }))
@@ -371,13 +386,20 @@ export const jiraCredentials = Effect.fn("jiraAuthorization.credentials")(functi
           accessToken: tokens.accessToken,
           refreshToken: tokens.refreshToken,
           expiresAt: (yield* now) + tokens.expiresIn * 1000,
+          ...(tokens.scopes ? { scopes: tokens.scopes } : {}),
         };
         const payloadSealed = yield* encodeJiraCredentials(credentials).pipe(
           Effect.flatMap(box.seal),
           Effect.mapError(unavailable),
         );
-        if (!(yield* store.refresh({ ...row, payloadSealed }))) return yield* conflict();
-        activeRow = { ...row, payloadSealed };
+        const writesAvailable = Boolean(credentials.scopes?.includes(JIRA_WRITE_SCOPE));
+        if (!(yield* store.refresh({ ...row, payloadSealed, writesAvailable })))
+          return yield* conflict();
+        activeRow = {
+          ...row,
+          payloadSealed,
+          writesEnabled: writesAvailable,
+        };
       }
       return { row: activeRow, credentials };
     }),

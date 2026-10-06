@@ -7,7 +7,7 @@ import * as HttpClient from "effect/unstable/http/HttpClient";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
-import { getJiraOAuthSites, readJiraIssue } from "./Jira.ts";
+import { getJiraOAuthSites, readJiraIssue, searchJiraIssues } from "./Jira.ts";
 
 const accessToken = "oauth-access-secret";
 const siteUrl = "https://acme.atlassian.net";
@@ -71,6 +71,88 @@ function harness(respond: (request: RecordedRequest) => Response = () => toolRep
 }
 
 describe("Jira", () => {
+  it.effect("searches the selected site with escaped JQL and a bounded result", () =>
+    Effect.gen(function* () {
+      const searchResult = {
+        issues: {
+          nodes: [
+            {
+              id: "10001",
+              key: "ENG-123",
+              fields: {
+                summary: "Fix the queue",
+                status: { name: "In progress" },
+                assignee: { displayName: "Alex" },
+                project: { name: "Engineering" },
+              },
+            },
+          ],
+          pageInfo: { hasNextPage: true, endCursor: "page-2" },
+        },
+      };
+      const { requests, provide } = harness(() => toolReply(searchResult));
+      expect(
+        yield* searchJiraIssues({
+          accessToken,
+          siteUrl,
+          cloudId,
+          query: 'queue" OR project = SECRET',
+          project: "ENG",
+          assignee: "me",
+        }).pipe(provide),
+      ).toMatchObject({
+        issues: [{ identifier: "ENG-123", url: `${siteUrl}/browse/ENG-123` }],
+        cursor: "page-2",
+      });
+      const call = requests.find(({ rpc }) => rpc?.method === "tools/call");
+      expect(call?.rpc?.params).toEqual({
+        name: "searchJiraIssuesUsingJql",
+        arguments: {
+          cloudId,
+          jql: 'text ~ "queue\\" OR project = SECRET" AND project = "ENG" AND assignee = currentUser() ORDER BY updated DESC',
+          maxResults: 20,
+          fields: ["summary", "status", "assignee", "project"],
+        },
+      });
+    }),
+  );
+  it.effect("accepts a complete final page containing exactly twenty issues", () =>
+    Effect.gen(function* () {
+      const issues = Array.from({ length: 20 }, (_, index) => ({
+        id: String(10000 + index),
+        key: `ENG-${index + 1}`,
+        fields: { summary: `Issue ${index + 1}` },
+      }));
+      const { provide } = harness(() =>
+        toolReply({ issues: { nodes: issues, pageInfo: { hasNextPage: false, endCursor: null } } }),
+      );
+      const result = yield* searchJiraIssues({
+        accessToken,
+        siteUrl,
+        cloudId,
+        query: "Issue",
+      }).pipe(provide);
+      expect(result.issues).toHaveLength(20);
+      expect(result.cursor).toBeNull();
+    }),
+  );
+  it.effect("searches issues in Rovo's data envelope", () =>
+    Effect.gen(function* () {
+      const { provide } = harness(() =>
+        toolReply({
+          data: {
+            issues: {
+              nodes: [{ id: "10001", key: "ENG-123", fields: { summary: "Fix the queue" } }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        }),
+      );
+      expect(
+        yield* searchJiraIssues({ accessToken, siteUrl, cloudId, query: "queue" }).pipe(provide),
+      ).toMatchObject({ issues: [{ identifier: "ENG-123" }], cursor: null });
+    }),
+  );
   it.effect("reads Rovo v2 resource envelopes with cloudId and no per-site scopes", () =>
     Effect.gen(function* () {
       const payload = { data: { resources: [{ cloudId, url: siteUrl }] } };
@@ -210,6 +292,30 @@ describe("Jira", () => {
     }),
   );
 
+  it.effect("reads the single issue in Rovo's issue envelope", () =>
+    Effect.gen(function* () {
+      const { provide } = harness(() =>
+        reply({ structuredContent: { issues: { nodes: [issue] }, context: { cloudId } } }),
+      );
+      expect(yield* readJiraIssue(input).pipe(provide)).toMatchObject({
+        identifier: "ENG-123",
+        title: "Fix the queue",
+      });
+    }),
+  );
+
+  it.effect("reads the issue when Rovo wraps its tool result in data", () =>
+    Effect.gen(function* () {
+      const { provide } = harness(() =>
+        reply({ structuredContent: { data: { issues: { nodes: [issue] } } } }),
+      );
+      expect(yield* readJiraIssue(input).pipe(provide)).toMatchObject({
+        identifier: "ENG-123",
+        title: "Fix the queue",
+      });
+    }),
+  );
+
   it.effect("rejects other-site links and unsupported issue input before sending credentials", () =>
     Effect.gen(function* () {
       const { requests, provide } = harness();
@@ -275,7 +381,7 @@ describe("Jira", () => {
         [401, "auth_required"],
         [403, "forbidden"],
         [404, "not_found"],
-        [429, "unavailable"],
+        [429, "rate_limited"],
         [500, "unavailable"],
       ] as const) {
         const { requests, provide } = harness(
@@ -286,6 +392,23 @@ describe("Jira", () => {
         expect(encodeJson(error)).not.toContain(accessToken);
         expect(requests.at(-1)?.request.method).toBe("DELETE");
       }
+    }),
+  );
+
+  it.effect("returns a bounded Retry-After for Jira rate limits", () =>
+    Effect.gen(function* () {
+      const { provide } = harness(
+        () =>
+          new Response("private upstream content", {
+            status: 429,
+            headers: { "retry-after": "90" },
+          }),
+      );
+      const error = yield* searchJiraIssues({ accessToken, siteUrl, cloudId, query: "queue" }).pipe(
+        provide,
+        Effect.flip,
+      );
+      expect(error).toMatchObject({ code: "rate_limited", retryAfterSeconds: 90 });
     }),
   );
 

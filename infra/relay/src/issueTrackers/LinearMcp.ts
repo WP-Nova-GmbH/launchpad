@@ -6,7 +6,7 @@ import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import { IssueTrackerFailure } from "./IssueTrackerModels.ts";
-import { LINEAR_MCP_RESOURCE } from "./LinearOAuth.ts";
+import { LINEAR_MCP_RESOURCE, type LinearResource } from "./LinearOAuth.ts";
 
 const unavailable = () =>
   new IssueTrackerFailure({
@@ -26,12 +26,22 @@ const decodeMissingIssue = Schema.decodeUnknownExit(
     }),
   ),
 );
-type ReadTool = "get_workspace" | "get_user" | "get_issue" | "list_comments" | "extract_images";
+type ReadTool =
+  | "get_workspace"
+  | "get_user"
+  | "list_users"
+  | "get_issue"
+  | "list_issues"
+  | "list_comments"
+  | "extract_images";
+type WriteTool = "save_comment" | "save_issue";
 
 /** Each operation owns its MCP session; credentials and sessions never cross account boundaries. */
 export const callLinearTools = Effect.fn("linearMcp.callTools")(function* (
   accessToken: string,
-  calls: ReadonlyArray<{ name: ReadTool; arguments: Record<string, unknown> }>,
+  calls: ReadonlyArray<{ name: ReadTool | WriteTool; arguments: Record<string, unknown> }>,
+  resource: LinearResource = LINEAR_MCP_RESOURCE,
+  requiredTools: ReadonlyArray<string> = [],
 ) {
   const http = yield* HttpClient.HttpClient;
   const context = yield* Effect.context<never>();
@@ -40,14 +50,11 @@ export const callLinearTools = Effect.fn("linearMcp.callTools")(function* (
   return yield* Effect.tryPromise({
     try: async (signal) => {
       const client = new Client({ name: "Launchpad", version: "1.0.0" });
-      const transport = new StreamableHTTPClientTransport(new URL(LINEAR_MCP_RESOURCE), {
+      const transport = new StreamableHTTPClientTransport(new URL(resource), {
         authProvider: { token: async () => accessToken },
         fetch: async (input, init) => {
           const request = new Request(input, init);
-          if (
-            request.url !== LINEAR_MCP_RESOURCE ||
-            !["GET", "POST", "DELETE"].includes(request.method)
-          )
+          if (request.url !== resource || !["GET", "POST", "DELETE"].includes(request.method))
             throw unavailable();
           let outgoing = HttpClientRequest.make(request.method as "GET" | "POST" | "DELETE")(
             request.url,
@@ -69,6 +76,16 @@ export const callLinearTools = Effect.fn("linearMcp.callTools")(function* (
                   code: "forbidden",
                   message: "The connected Linear account cannot access this content.",
                 });
+              if (response.status === 429) {
+                const retry = Number(response.headers["retry-after"]);
+                return yield* new IssueTrackerFailure({
+                  code: "rate_limited",
+                  message: "Linear is rate limiting requests. Try again later.",
+                  ...(Number.isInteger(retry) && retry > 0 && retry <= 3600
+                    ? { retryAfterSeconds: retry }
+                    : {}),
+                });
+              }
               if (response.status >= 300 && response.status < 400) return yield* unavailable();
               if (response.status === 202 || response.status === 204)
                 return new Response(null, { status: response.status, headers: response.headers });
@@ -112,7 +129,38 @@ export const callLinearTools = Effect.fn("linearMcp.callTools")(function* (
       });
       try {
         await client.connect(transport, { signal });
-        const results = await Promise.all(calls.map((call) => client.callTool(call, { signal })));
+        if (requiredTools.length > 0) {
+          const found = new Set<string>();
+          let cursor: string | undefined;
+          for (let page = 0; page < 5; page++) {
+            const listed = await client.listTools(cursor ? { cursor } : undefined, { signal });
+            for (const tool of listed.tools) found.add(tool.name);
+            if (requiredTools.every((name) => found.has(name))) break;
+            cursor = listed.nextCursor;
+            if (!cursor) break;
+          }
+          const missingTools = requiredTools.filter((name) => !found.has(name));
+          if (missingTools.length > 0) {
+            await run(
+              Effect.logWarning("Linear MCP required tools missing", {
+                resource,
+                missingTools,
+                advertisedToolCount: found.size,
+                advertisedIssueTools: [...found]
+                  .filter((name) => /issue|comment/i.test(name))
+                  .sort(),
+              }),
+            );
+            throw new IssueTrackerFailure({
+              code: "forbidden",
+              message: `Linear did not offer the required write tools: ${missingTools.join(", ")}. Try authorizing writes again.`,
+            });
+          }
+        }
+        // Mutations must never be dispatched concurrently with another call. In particular,
+        // a read mixed into this batch must not race the write it is meant to verify.
+        const results = [];
+        for (const call of calls) results.push(await client.callTool(call, { signal }));
         for (const [index, result] of results.entries()) {
           if (!result.isError) continue;
           const content = result.content[0];

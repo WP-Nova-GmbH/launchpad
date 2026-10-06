@@ -1527,6 +1527,7 @@ const ThreadPromptEditCommand = Schema.Struct({
   ...PromptCommandFields,
   messageId: MessageId,
   expectedRevision: NonNegativeInt,
+  expectedRuntimeMode: Schema.optional(RuntimeMode),
   message: PromptMessage,
   author: Schema.optional(AuthSessionUser),
 });
@@ -1536,6 +1537,7 @@ const ClientThreadPromptEditCommand = Schema.Struct({
   ...PromptCommandFields,
   messageId: MessageId,
   expectedRevision: NonNegativeInt,
+  expectedRuntimeMode: Schema.optional(RuntimeMode),
   message: ClientPromptMessage,
 });
 const ThreadPromptRemoveCommand = Schema.Struct({
@@ -1683,6 +1685,7 @@ const ThreadApprovalRespondCommand = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   decision: ProviderApprovalDecision,
+  actorUserId: Schema.optional(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
 });
 
@@ -2290,6 +2293,7 @@ export const ThreadApprovalResponseRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   decision: ProviderApprovalDecision,
+  actorUserId: Schema.optional(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
 });
 

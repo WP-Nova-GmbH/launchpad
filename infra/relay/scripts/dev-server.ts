@@ -70,6 +70,7 @@ import { issueTrackersApi, issueTrackersServerApi } from "../src/http/IssueTrack
 import { turnAuthLayer } from "../src/issueTrackers/TurnAuthorization.ts";
 import { issueTrackerCallbackRoute } from "../src/http/IssueTrackerCallbackRoute.ts";
 import * as IssueTrackerConnectionStore from "../src/issueTrackers/ConnectionStore.ts";
+import * as IssueTrackerWriteOperationStore from "../src/issueTrackers/WriteOperationStore.ts";
 import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
@@ -377,6 +378,7 @@ const runtimeLayer = Layer.empty
         GithubInstallations.layer,
         ProviderAccounts.layer,
         IssueTrackerConnectionStore.layer,
+        IssueTrackerWriteOperationStore.layer,
         OrganizationSkills.layer,
         Machines.layer,
         OrganizationProjectCatalog.layer,

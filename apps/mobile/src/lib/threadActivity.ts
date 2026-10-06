@@ -15,7 +15,7 @@ import type {
   UserInputQuestion,
 } from "@t3tools/contracts";
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
-import { issueTrackerActivityService } from "@t3tools/shared/issueTrackerActivity";
+import { issueTrackerActivityToolName } from "@t3tools/shared/issueTrackerActivity";
 import {
   commandDetailRepeatsCommand,
   extractCommandOutputText,
@@ -600,17 +600,17 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
     entry.toolSource = toolPresentation.toolSource;
   }
   const issueTrackerData = asRecord(payload?.data);
-  const isIssueTrackerRead =
+  const isIssueTrackerTool =
     itemType !== undefined &&
-    issueTrackerActivityService({
+    issueTrackerActivityToolName({
       label: entry.label,
       ...(title ? { toolTitle: title } : {}),
       toolData: issueTrackerData,
     }) !== undefined;
-  if (itemType === "mcp_tool_call" || isIssueTrackerRead) {
+  if (itemType === "mcp_tool_call" || isIssueTrackerTool) {
     const data = issueTrackerData;
     // Issue identity is stored beside the provider item by the server projection.
-    const toolData = isIssueTrackerRead
+    const toolData = isIssueTrackerTool
       ? data
       : typeof data?.toolName === "string"
         ? (data.item ?? data)

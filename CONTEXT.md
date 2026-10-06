@@ -40,14 +40,18 @@ its original submitter. Both remain attributed after the prompt reaches the agen
 ## Issue trackers
 
 **Integration application**:
-Launchpad's registered identity with an external service, through which organizations can
+Launchpad's registered identity with an external service, through which individual users can
 independently authorize their own connections.
 _Avoid_: Organization connection
 
 **Issue-tracker connection**:
-One Launchpad organization's authorization to access a workspace or site in an external issue
-tracker. Several Launchpad organizations may each authorize a connection to the same workspace.
-_Avoid_: Shared company account
+One Launchpad user's authorization to access a workspace or site in an external issue tracker.
+Several users may connect to the same workspace or site without sharing their authorization.
+_Avoid_: Organization connection, shared company account
+
+**Write approver**:
+The owner of the personal issue-tracker connection used for a proposed change.
+In a shared thread, another participant cannot approve a change through that connection.
 
 **Linear workspace**:
 The space in Linear that contains a company's teams and issues. It is distinct from a Launchpad

@@ -3,6 +3,11 @@ import {
   readTurnAuthorization,
 } from "../../mcp/IssueTrackerTurnAuthorization.ts";
 import { readMcpProviderSession } from "../../mcp/McpProviderSession.ts";
+import {
+  hasPendingIssueWrite,
+  isIssueWriteRequest,
+  resolveIssueWrite,
+} from "../../mcp/IssueTrackerApprovalBroker.ts";
 import { withWorkspaceLease } from "../../workspace/workspaceLease.ts";
 import {
   type ChatAttachment,
@@ -2236,6 +2241,28 @@ const make = Effect.gen(function* () {
   const processApprovalResponseRequested = Effect.fn("processApprovalResponseRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.approval-response-requested" }>,
   ) {
+    if (isIssueWriteRequest(event.payload.requestId)) {
+      const wasPending = hasPendingIssueWrite(event.payload.requestId, event.payload.threadId);
+      const resolved = yield* resolveIssueWrite(
+        event.payload.requestId,
+        event.payload.threadId,
+        event.payload.actorUserId,
+        event.payload.decision,
+      );
+      if (!resolved)
+        yield* appendProviderFailureActivity({
+          threadId: event.payload.threadId,
+          kind: "provider.approval.respond.failed",
+          summary: "Issue write approval failed",
+          detail: wasPending
+            ? "Could not verify the connection owner's decision for this issue change. Try again while the approval request is pending."
+            : stalePendingRequestDetail("approval", event.payload.requestId),
+          turnId: null,
+          createdAt: event.payload.createdAt,
+          requestId: event.payload.requestId,
+        });
+      return;
+    }
     const thread = yield* resolveThreadShell(event.payload.threadId);
     if (!thread) {
       return;

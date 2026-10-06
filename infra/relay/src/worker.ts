@@ -48,6 +48,7 @@ import { issueTrackersApi, issueTrackersServerApi } from "./http/IssueTrackersAp
 import { turnAuthLayer } from "./issueTrackers/TurnAuthorization.ts";
 import { issueTrackerCallbackRoute } from "./http/IssueTrackerCallbackRoute.ts";
 import * as IssueTrackerConnectionStore from "./issueTrackers/ConnectionStore.ts";
+import * as IssueTrackerWriteOperationStore from "./issueTrackers/WriteOperationStore.ts";
 import { sourceControlServerApi } from "./http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
 import { ManagedEndpointZone, RelayApiZone, RelayDeploymentConfig } from "./zone.ts";
@@ -372,6 +373,7 @@ export const ApiLive = Api.make(
             GithubInstallations.layer,
             ProviderAccounts.layer,
             IssueTrackerConnectionStore.layer,
+            IssueTrackerWriteOperationStore.layer,
             OrganizationSkills.layer,
             Machines.layer,
             OrganizationProjectCatalog.layer,

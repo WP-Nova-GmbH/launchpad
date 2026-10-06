@@ -4,6 +4,7 @@ import {
   type RelayIssueTrackerService,
   type RelayIssueDetails,
   type RelayLinearDiscussion,
+  type RelaySearchIssuesRequest,
 } from "@t3tools/contracts/relay";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -35,16 +36,20 @@ import {
   readLinearCommentBody,
   utf8Bytes,
 } from "./LinearDiscussion.ts";
-import { readJiraIssue } from "./Jira.ts";
+import { readJiraIssue, searchJiraIssues } from "./Jira.ts";
 import { JiraOAuthCredentials, jiraCredentials } from "./JiraAuthorization.ts";
+import { JIRA_SEARCH_SCOPE, JIRA_WRITE_SCOPE } from "./JiraOAuth.ts";
 import { fitJiraIssueResponse } from "./JiraDiscussion.ts";
-import { getLinearIdentity, readLinearIssue } from "./Linear.ts";
+import { getLinearIdentity, readLinearIssue, searchLinearIssues } from "./Linear.ts";
+import { callLinearTools } from "./LinearMcp.ts";
+import { searchInput, sealSearchCursor } from "./SearchContext.ts";
 import {
   beginLinearOAuth,
   exchangeLinearCode,
   refreshLinearTokens,
   LinearOAuthSession,
   LinearPendingOAuth,
+  LINEAR_WRITE_MCP_RESOURCE,
   linearOAuthErrorCode,
 } from "./LinearOAuth.ts";
 
@@ -62,6 +67,7 @@ const Credentials = Schema.Union([
     workspaceId: Schema.String,
     workspaceSlug: Schema.String,
     generation: Schema.optionalKey(Schema.String),
+    scopes: Schema.optionalKey(Schema.Array(Schema.String)),
   }),
 ]);
 type Credentials = typeof Credentials.Type;
@@ -74,10 +80,13 @@ const conflict = () =>
   failure("conflict", "This connection changed. Start again from Account connections.");
 const milliseconds = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
 // Leave time for cleanup and a typed response before the relay's 9-second deadline.
-const boundedOperation = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+const boundedOperation = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  duration: "6 seconds" | "8 seconds" = "8 seconds",
+) =>
   effect.pipe(
     Effect.timeoutOrElse({
-      duration: "8 seconds",
+      duration,
       orElse: () =>
         Effect.fail(
           failure("unavailable", "The issue tracker took too long to respond. Try again."),
@@ -110,6 +119,42 @@ const open = Effect.fn("issueTrackers.open")(function* (row: ConnectionRecord) {
   );
 });
 
+const supportsWrites = (credentials: Credentials) =>
+  credentials.service === "jira"
+    ? Boolean(credentials.scopes?.includes(JIRA_WRITE_SCOPE))
+    : credentials.oauth.resource === LINEAR_WRITE_MCP_RESOURCE &&
+      !(credentials.scopes?.length === 1 && credentials.scopes[0] === "read");
+
+// Bring connections saved before automatic write capability into line with their OAuth grant.
+export const syncWriteCapabilities = Effect.fn("issueTrackers.syncWriteCapabilities")(function* (
+  rows: ReadonlyArray<ConnectionRecord>,
+) {
+  const store = yield* ConnectionStore;
+  let changed = false;
+  for (const row of rows) {
+    if (row.status !== "connected") continue;
+    const available = yield* open(row).pipe(
+      Effect.map(supportsWrites),
+      Effect.orElseSucceed(() => null),
+    );
+    if (available === null || row.writesEnabled === available) continue;
+    const updated = yield* store.withLock(row, (current) =>
+      Effect.gen(function* () {
+        if (!current || current.status !== "connected") return false;
+        const currentAvailable = yield* open(current).pipe(
+          Effect.map(supportsWrites),
+          Effect.orElseSucceed(() => null),
+        );
+        if (currentAvailable !== null && current.writesEnabled !== currentAvailable)
+          return yield* store.syncWriteCapability({ ...current, enabled: currentAvailable });
+        return false;
+      }),
+    );
+    changed ||= updated;
+  }
+  return changed;
+});
+
 const encodeAuthorization = Schema.encodeEffect(Schema.fromJsonString(LinearPendingOAuth));
 const decodeAuthorization = Schema.decodeUnknownEffect(Schema.fromJsonString(LinearPendingOAuth));
 
@@ -128,6 +173,7 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (ownerU
   const store = yield* ConnectionStore;
   const now = yield* milliseconds;
   let rows = yield* store.list(ownerUserId);
+  if (yield* syncWriteCapabilities(rows)) rows = yield* store.list(ownerUserId);
   let expired = false;
   for (const row of rows) {
     if (row.authorizationId && row.pendingExpiresAt && Date.parse(row.pendingExpiresAt) <= now) {
@@ -146,21 +192,53 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (ownerU
   if (expired) rows = yield* store.list(ownerUserId);
   return {
     linearAvailable: true,
-    connections: rows.map((row) => ({
-      ...metadata(row, true),
-      status:
-        row.status === "connecting" &&
-        row.pendingExpiresAt &&
-        Date.parse(row.pendingExpiresAt) < now
-          ? ("reconnect_required" as const)
-          : row.status,
-    })),
+    connections: yield* Effect.forEach(rows, (row) =>
+      Effect.gen(function* () {
+        const searchEnabled =
+          row.service === "linear" && row.status === "connected"
+            ? true
+            : row.service === "jira" && row.status === "connected"
+              ? yield* open(row).pipe(
+                  Effect.map(
+                    (credentials) =>
+                      credentials.service === "jira" &&
+                      Boolean(credentials.scopes?.includes(JIRA_SEARCH_SCOPE)),
+                  ),
+                  Effect.catch(() => Effect.succeed(false)),
+                )
+              : false;
+        const writesAvailable =
+          row.status === "connected"
+            ? yield* open(row).pipe(
+                Effect.map(supportsWrites),
+                Effect.catch(() => Effect.succeed(false)),
+              )
+            : row.status === "reconnect_required"
+              ? yield* open(row).pipe(
+                  Effect.map(supportsWrites),
+                  Effect.orElseSucceed(() => row.writesEnabled),
+                )
+              : false;
+        return {
+          ...metadata(row, true),
+          searchEnabled,
+          writesAvailable,
+          status:
+            row.status === "connecting" &&
+            row.pendingExpiresAt &&
+            Date.parse(row.pendingExpiresAt) < now
+              ? ("reconnect_required" as const)
+              : row.status,
+        };
+      }),
+    ),
   };
 });
 
 export const startLinear = Effect.fn("issueTrackers.startLinear")(function* (input: {
   readonly ownerUserId: string;
   readonly userId: string;
+  readonly writes?: boolean;
 }) {
   yield* requireConnectionOwner(input);
   const config = yield* RelayConfiguration;
@@ -171,6 +249,7 @@ export const startLinear = Effect.fn("issueTrackers.startLinear")(function* (inp
   const started = yield* beginLinearOAuth({
     state,
     redirectUri: new URL(LINEAR_CALLBACK_PATH, config.relayIssuer).toString(),
+    ...(input.writes ? { resource: LINEAR_WRITE_MCP_RESOURCE } : {}),
   });
   const box = yield* RelaySecretBox;
   const pendingOAuthSealed = yield* encodeAuthorization(started.pending).pipe(
@@ -272,26 +351,47 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
       ...(input.iss !== undefined ? { iss: input.iss } : {}),
     });
     const expiresAt = (yield* milliseconds) + tokens.expiresIn * 1000;
-    const identity = yield* getLinearIdentity({ accessToken: tokens.accessToken });
+    const identity = yield* getLinearIdentity({
+      accessToken: tokens.accessToken,
+      resource: authorization.resource,
+    });
+    if (authorization.resource === LINEAR_WRITE_MCP_RESOURCE)
+      yield* callLinearTools(
+        tokens.accessToken,
+        [{ name: "get_workspace", arguments: {} }],
+        LINEAR_WRITE_MCP_RESOURCE,
+        ["save_comment", "save_issue"],
+      ).pipe(
+        Effect.tapError((error) =>
+          Effect.logWarning("Linear writable connection verification failed", {
+            code: error.code,
+            grantedScopes: tokens.scopes ?? [],
+          }),
+        ),
+      );
     const sameWorkspace = previous?.workspaceId === identity.workspaceId;
     const crypto = yield* Crypto.Crypto;
     const newId = crypto.randomUUIDv4.pipe(
       Effect.mapError(() => failure("unavailable", "Could not save the Linear connection.")),
     );
-    const generation =
-      sameWorkspace && previous?.accountId === identity.accountId
-        ? (previous.generation ?? previous.workspaceId)
-        : yield* newId;
-    const payloadSealed = yield* seal({
+    const generation = yield* newId;
+    const credentials = {
       service: "linear",
-      oauth: { server: authorization.server, client: authorization.client },
+      oauth: {
+        server: authorization.server,
+        client: authorization.client,
+        ...(authorization.resource ? { resource: authorization.resource } : {}),
+      },
       accountId: identity.accountId,
-      ...tokens,
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      ...(tokens.scopes ? { scopes: tokens.scopes } : {}),
       expiresAt,
       workspaceId: identity.workspaceId,
       workspaceSlug: identity.workspaceSlug,
       generation,
-    });
+    } as const;
+    const payloadSealed = yield* seal(credentials);
     const proposalId = previous && !sameWorkspace ? yield* newId : null;
     yield* requireConnectionOwner(owner);
     return yield* store.withLock(claimed, (row) =>
@@ -326,6 +426,7 @@ export const completeLinear = Effect.fn("issueTrackers.completeLinear")(function
           !(yield* store.complete({
             ...row,
             payloadSealed,
+            writesAvailable: supportsWrites(credentials),
             accountLabel: identity.accountLabel,
             userId: owner.userId,
           }))
@@ -373,6 +474,9 @@ export const confirmLinearReplacement = Effect.fn("issueTrackers.confirmLinearRe
           !(yield* store.complete({
             ...row,
             payloadSealed: proposal.payloadSealed,
+            writesAvailable: supportsWrites(
+              yield* open({ ...row, payloadSealed: proposal.payloadSealed }),
+            ),
             accountLabel: proposal.accountLabel,
             userId: input.userId,
           }))
@@ -411,7 +515,7 @@ export const disconnect = Effect.fn("issueTrackers.disconnect")(function* (key: 
   return { ok: true };
 });
 
-const linearCredentials = Effect.fn("issueTrackers.linearCredentials")(function* (
+export const linearCredentials = Effect.fn("issueTrackers.linearCredentials")(function* (
   key: ConnectionKey,
 ) {
   const store = yield* ConnectionStore;
@@ -435,10 +539,17 @@ const linearCredentials = Effect.fn("issueTrackers.linearCredentials")(function*
           accessToken: tokens.accessToken,
           refreshToken: tokens.refreshToken,
           expiresAt: (yield* milliseconds) + tokens.expiresIn * 1000,
+          ...(tokens.scopes ? { scopes: tokens.scopes } : {}),
         };
         const payloadSealed = yield* seal(credentials);
-        if (!(yield* store.refresh({ ...row, payloadSealed }))) return yield* conflict();
-        activeRow = { ...row, payloadSealed };
+        const writesAvailable = supportsWrites(credentials);
+        if (!(yield* store.refresh({ ...row, payloadSealed, writesAvailable })))
+          return yield* conflict();
+        activeRow = {
+          ...row,
+          payloadSealed,
+          writesEnabled: writesAvailable,
+        };
       }
       return { row: activeRow, credentials };
     }),
@@ -467,7 +578,11 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
       return yield* conflict();
     const providerResult =
       active.credentials.service === "linear"
-        ? yield* readLinearIssue({ ...active.credentials, issue: input.issue }).pipe(
+        ? yield* readLinearIssue({
+            ...active.credentials,
+            resource: active.credentials.oauth.resource,
+            issue: input.issue,
+          }).pipe(
             Effect.timeoutOrElse({
               duration: Math.max(1, startedAt + 7500 - (yield* milliseconds)),
               orElse: () =>
@@ -507,6 +622,7 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
           : yield* linearDiscussion({
               source,
               accessToken: active.credentials.accessToken,
+              resource: active.credentials.oauth.resource,
               byteBudget:
                 ISSUE_RESPONSE_BYTES -
                 utf8Bytes({
@@ -562,6 +678,85 @@ export const readIssue = Effect.fn("issueTrackers.readIssue")(function* (input: 
   );
 });
 
+export const searchIssues = Effect.fn("issueTrackers.searchIssues")(function* (input: {
+  readonly ownerUserId: string;
+  readonly connectionVersion: string;
+  readonly service: RelayIssueTrackerService;
+  readonly request: RelaySearchIssuesRequest;
+}) {
+  const store = yield* ConnectionStore;
+  const initial = yield* store.get(input);
+  let authRecord = initial;
+  return yield* Effect.gen(function* () {
+    const active =
+      input.service === "linear" ? yield* linearCredentials(input) : yield* jiraCredentials(input);
+    authRecord = active.row;
+    if (active.row.version !== input.connectionVersion) return yield* conflict();
+    const { filters, cursor } = yield* searchInput({
+      ownerUserId: input.ownerUserId,
+      service: input.service,
+      connectionVersion: active.row.version,
+      request: input.request,
+    });
+    if (input.service === "jira" && filters.team)
+      return yield* failure(
+        "invalid_input",
+        "Jira search does not support a team filter. Use a project filter.",
+      );
+    if (
+      active.credentials.service === "jira" &&
+      !active.credentials.scopes?.includes(JIRA_SEARCH_SCOPE)
+    )
+      return yield* failure(
+        "forbidden",
+        "Enable Jira search by reconnecting in Account connections and allowing search access.",
+      );
+    const page =
+      active.credentials.service === "linear"
+        ? yield* searchLinearIssues({
+            ...active.credentials,
+            resource: active.credentials.oauth.resource,
+            ...filters,
+            ...(cursor ? { cursor } : {}),
+          })
+        : yield* searchJiraIssues({
+            ...active.credentials,
+            ...filters,
+            ...(cursor ? { cursor } : {}),
+          });
+    const current = yield* store.get(input);
+    if (!current || current.version !== active.row.version) return yield* conflict();
+    const continuation = yield* sealSearchCursor({
+      ownerUserId: input.ownerUserId,
+      service: input.service,
+      connectionVersion: active.row.version,
+      filters,
+      cursor: page.cursor,
+    });
+    const response = {
+      service: input.service,
+      accountLabel: active.row.accountLabel ?? input.service,
+      issues: page.issues,
+      continuation,
+      truncated: page.cursor !== null,
+    };
+    if (utf8Bytes(response) > 64 * 1024)
+      return yield* failure(
+        "unavailable",
+        "This search page exceeded the response size limit. Narrow the search.",
+      );
+    return response;
+  }).pipe(
+    // A Jira MCP session can spend two seconds closing after a search is interrupted.
+    (effect) => boundedOperation(effect, input.service === "jira" ? "6 seconds" : "8 seconds"),
+    Effect.tapError((error) =>
+      authRecord && isTrackerFailure(error) && error.code === "auth_required"
+        ? store.requireReconnect(authRecord)
+        : Effect.void,
+    ),
+  );
+});
+
 type LinearCredentials = Extract<Credentials, { service: "linear" }>;
 const withLinearReference = Effect.fn("issueTrackers.withLinearReference")(function* <A, E, R>(
   input: {
@@ -600,6 +795,7 @@ const withLinearReference = Effect.fn("issueTrackers.withLinearReference")(funct
     yield* validateLinearSource(reference, source);
     const issue = yield* readLinearIssue({
       ...active.credentials,
+      resource: active.credentials.oauth.resource,
       issue: reference.issueId,
       issueId: reference.issueId,
     });
@@ -640,6 +836,7 @@ export const readComments = Effect.fn("issueTrackers.readComments")(function* (i
         const discussion = yield* linearDiscussion({
           source,
           accessToken: credentials.accessToken,
+          resource: credentials.oauth.resource,
           ...(reference.after ? { after: reference.after } : {}),
         });
         return {
@@ -673,6 +870,7 @@ export const readImages = Effect.fn("issueTrackers.readImages")(function* (input
         const markdown = reference.commentId
           ? yield* readLinearCommentBody({
               ...credentials,
+              resource: credentials.oauth.resource,
               issueId: source.issueId,
               commentId: reference.commentId,
               ...(reference.commentCursor ? { commentCursor: reference.commentCursor } : {}),
@@ -714,6 +912,7 @@ export const viewImage = Effect.fn("issueTrackers.viewImage")(function* (input: 
         const markdown = reference.commentId
           ? yield* readLinearCommentBody({
               ...credentials,
+              resource: credentials.oauth.resource,
               issueId: source.issueId,
               commentId: reference.commentId,
               ...(reference.commentCursor ? { commentCursor: reference.commentCursor } : {}),
@@ -726,6 +925,7 @@ export const viewImage = Effect.fn("issueTrackers.viewImage")(function* (input: 
           );
         const image = yield* fetchLinearImage({
           accessToken: credentials.accessToken,
+          resource: credentials.oauth.resource,
           url: reference.imageUrl,
         });
         return {

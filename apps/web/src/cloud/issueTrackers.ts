@@ -120,11 +120,11 @@ export function useIssueTrackers() {
     }
   };
 
-  const startLinear = () =>
+  const startLinear = (writes = false) =>
     mutate(
       () =>
         call("Could not start connecting Linear", (client, clerkToken) =>
-          client.startLinearAuthorization({ clerkToken }),
+          client.startLinearAuthorization({ clerkToken, writes }),
         ),
       (result) =>
         setSnapshot(
@@ -139,11 +139,11 @@ export function useIssueTrackers() {
         ),
     );
 
-  const startJira = () =>
+  const startJira = (writes = false) =>
     mutate(
       () =>
         call("Could not start connecting Jira", (client, clerkToken) =>
-          client.startJiraAuthorization({ clerkToken }),
+          client.startJiraAuthorization({ clerkToken, writes }),
         ),
       (result) =>
         setSnapshot(

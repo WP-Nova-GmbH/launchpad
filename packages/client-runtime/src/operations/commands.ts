@@ -8,7 +8,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
-import { authorizeIssueTrackerTurn } from "../relay/issueTrackerTurn.ts";
+import { authorizeIssueTrackerTurn, decideIssueTrackerWrite } from "../relay/issueTrackerTurn.ts";
 import {
   type EnvironmentRpcFailure,
   type EnvironmentRpcSuccess,
@@ -436,6 +436,7 @@ export const interruptThreadTurn: (input: InterruptThreadTurnInput) => CommandEf
 export const respondToThreadApproval: (input: RespondToThreadApprovalInput) => CommandEffect =
   Effect.fn("EnvironmentCommands.respondToThreadApproval")(function* (input) {
     const metadata = yield* timestampedCommandMetadata(input);
+    yield* decideIssueTrackerWrite(input.requestId, input.decision);
     return yield* dispatch({
       ...input,
       type: "thread.approval.respond",

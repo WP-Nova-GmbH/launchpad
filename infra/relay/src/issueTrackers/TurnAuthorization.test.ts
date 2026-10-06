@@ -5,13 +5,16 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { ConnectionStore, type ConnectionRecord } from "./ConnectionStore.ts";
-import { authorizeRead, authorizeTurn, openTurn } from "./TurnAuthorization.ts";
+import { linearOAuth } from "./Connections.test-fixture.ts";
+import { authorizeRead, authorizeTurn, authorizeWrite, openTurn } from "./TurnAuthorization.ts";
 
 const row: ConnectionRecord = {
   ownerUserId: "alice",
   service: "linear",
   version: "version-a",
   status: "connected",
+  writesEnabled: false,
+  writeGeneration: 0,
   accountLabel: "Alice",
   payloadSealed: "provider-secret",
   authorizationId: null,
@@ -32,6 +35,20 @@ const request = {
 const fixture = () => {
   let active: ConnectionRecord | null = row;
   const sealed = new Map<string, string>();
+  sealed.set(
+    "provider-secret",
+    JSON.stringify({
+      service: "linear",
+      oauth: { ...linearOAuth, resource: "https://mcp.linear.app/mcp" },
+      accountId: "alice",
+      accessToken: "access",
+      refreshToken: "refresh",
+      expiresAt: Number.MAX_SAFE_INTEGER,
+      workspaceId: "workspace",
+      workspaceSlug: "workspace",
+      scopes: ["read", "write"],
+    }),
+  );
   const deps = Layer.mergeAll(
     Layer.mock(ConnectionStore, {
       list: (ownerUserId) => Effect.succeed(active?.ownerUserId === ownerUserId ? [active] : []),
@@ -39,6 +56,17 @@ const fixture = () => {
         Effect.succeed(
           active?.ownerUserId === ownerUserId && active.service === service ? active : null,
         ),
+      withLock: (_key, use) => use(active),
+      syncWriteCapability: (input) =>
+        Effect.sync(() => {
+          if (!active || active.version !== input.version) return false;
+          active = {
+            ...active,
+            writesEnabled: input.enabled,
+            writeGeneration: active.writeGeneration + 1,
+          };
+          return true;
+        }),
     }),
     Layer.mock(RelaySecretBox, {
       seal: (value) =>
@@ -59,6 +87,35 @@ const fixture = () => {
 };
 
 describe("personal issue read authorization", () => {
+  it.effect("binds write authorization to runtime mode and permission generation", () => {
+    const h = fixture();
+    h.set({ ...row, writesEnabled: true, writeGeneration: 7 });
+    return Effect.gen(function* () {
+      const old = yield* authorizeTurn("alice", request);
+      const oldClaims = yield* openTurn(old.authorization!);
+      expect(
+        yield* authorizeWrite(request.environmentId, "linear").pipe(
+          Effect.provideService(RelayIssueTrackerTurnPrincipal, oldClaims),
+          Effect.flip,
+        ),
+      ).toMatchObject({ code: "auth_invalid" });
+
+      const current = yield* authorizeTurn("alice", { ...request, runtimeMode: "full-access" });
+      const claims = yield* openTurn(current.authorization!);
+      expect(
+        yield* authorizeWrite(request.environmentId, "linear").pipe(
+          Effect.provideService(RelayIssueTrackerTurnPrincipal, claims),
+        ),
+      ).toMatchObject({ ownerUserId: "alice", writeGeneration: 7, runtimeMode: "full-access" });
+      h.set({ ...row, writesEnabled: false, writeGeneration: 8 });
+      expect(
+        yield* authorizeWrite(request.environmentId, "linear").pipe(
+          Effect.provideService(RelayIssueTrackerTurnPrincipal, claims),
+          Effect.flip,
+        ),
+      ).toMatchObject({ code: "auth_invalid" });
+    }).pipe(Effect.provide(h.deps));
+  });
   it.effect(
     "allows a user's connection on either local or managed compute, without organization lookup",
     () => {

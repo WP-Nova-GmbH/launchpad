@@ -1,7 +1,9 @@
 import * as Predicate from "effect/Predicate";
 import {
+  issueTrackerActivityToolName,
   issueTrackerActivityIdentity,
   issueTrackerActivityService,
+  issueTrackerToolTitle,
   type IssueTrackerActivity,
 } from "@t3tools/shared/issueTrackerActivity";
 export { issueTrackerActivityService } from "@t3tools/shared/issueTrackerActivity";
@@ -10,8 +12,16 @@ export function issueTrackerActivityPresentation(
   entry: IssueTrackerActivity,
   fallbackStatus?: string,
 ) {
+  const tool = issueTrackerActivityToolName(entry);
+  if (!tool) return undefined;
   const service = issueTrackerActivityService(entry);
-  if (!service) return undefined;
+  if (!service) {
+    return {
+      displayName: issueTrackerToolTitle(tool),
+      icon: "t3-code" as const,
+      action: undefined,
+    };
+  }
   const data = Predicate.isObject(entry.toolData) ? entry.toolData : undefined;
   const item = Predicate.isObject(data?.item) ? data.item : data;
   const status = entry.toolLifecycleStatus ?? fallbackStatus;

@@ -196,7 +196,7 @@ for (const postgres of [false, true]) {
           ),
       );
 
-      it.effect("renews the same immutable workspace immediately and keeps source references", () =>
+      it.effect("renews the same workspace and invalidates old source references", () =>
         run(
           Effect.gen(function* () {
             const test = yield* setup({
@@ -211,10 +211,14 @@ for (const postgres of [false, true]) {
             const active = (yield* test.store.get(key))!;
             expect(active.version).not.toBe(original.version);
             expect(active.replacement).toBeNull();
-            expect(active.payloadSealed).toContain('"generation":"workspace"');
-            yield* readComments({ ownerUserId: "org", reference: read.linear!.source }).pipe(
-              test.provide,
-            );
+            expect(active.payloadSealed).not.toContain('"generation":"workspace"');
+            expect(
+              yield* readComments({ ownerUserId: "org", reference: read.linear!.source }).pipe(
+                test.provide,
+                Effect.flip,
+              ),
+            ).toMatchObject({ code: "conflict" });
+            yield* readIssue(issueInput).pipe(test.provide);
           }),
         ),
       );
@@ -513,7 +517,12 @@ for (const postgres of [false, true]) {
                 yield* restarted
                   .withLock(key, (row) =>
                     restarted
-                      .complete({ ...row!, payloadSealed: "never-commit", accountLabel: "Never" })
+                      .complete({
+                        ...row!,
+                        payloadSealed: "never-commit",
+                        accountLabel: "Never",
+                        writesAvailable: row!.writesEnabled,
+                      })
                       .pipe(Effect.andThen(Effect.fail("rollback"))),
                   )
                   .pipe(Effect.flip);

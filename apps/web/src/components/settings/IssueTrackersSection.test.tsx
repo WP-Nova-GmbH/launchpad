@@ -305,6 +305,39 @@ const refreshWith = async (value: RelayIssueTrackerConnections) => {
   mocks.runPromise.mockResolvedValueOnce(value);
   await act(async () => window.dispatchEvent(new Event("focus")));
 };
+
+it("manages a connected Jira account before starting a new authorization", async () => {
+  const connectedJira = {
+    service: "jira",
+    status: "connected",
+    accountLabel: "Team Jira",
+    updatedAt: "2026-10-01",
+    searchEnabled: true,
+    writesAvailable: false,
+  } as const;
+  await refreshWith({ ...snapshot, connections: [active, connectedJira] });
+  await click("Manage");
+  expect(textOf(renderer.root)).toContain("Manage Jira connection");
+  expect(textOf(renderer.root)).toContain("Team Jira is connected");
+  expect(window.open).not.toHaveBeenCalled();
+
+  mocks.runPromise.mockResolvedValueOnce({
+    authorizationUrl: "https://auth.atlassian.com/authorize",
+    authorizationId: "jira-manage",
+    connection: {
+      ...connectedJira,
+      authorization: { id: "jira-manage", phase: "pending", expiresAt: "2026-10-02T12:00:00Z" },
+    },
+  });
+  await click("Change site or access");
+  expect(window.open).toHaveBeenCalledWith(
+    "https://auth.atlassian.com/authorize",
+    "_blank",
+    "noopener,noreferrer",
+  );
+  expect(textOf(renderer.root)).toContain("Waiting for Atlassian");
+});
+
 const chooseSite = async (cloudId: string) => {
   await act(async () =>
     renderer.root.findByProps({ role: "radiogroup" }).props.onValueChange(cloudId),

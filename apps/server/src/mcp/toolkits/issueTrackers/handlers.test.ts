@@ -1,9 +1,12 @@
 import { McpSchema, McpServer } from "effect/unstable/ai";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { IssueTrackersToolkitRegistrationLive } from "../../McpHttpServer.ts";
 import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { RelayReadIssueRequest, type RelayReadIssueResponse } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -13,6 +16,8 @@ import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest"
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
+import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
+import { resolveIssueWrite } from "../../IssueTrackerApprovalBroker.ts";
 import {
   setMcpProviderSession,
   bindIssueTrackerTurn,
@@ -50,6 +55,10 @@ const makeHarness = Effect.fnUntraced(function* (
     readonly grant?: boolean;
     readonly admitted?: boolean;
     readonly respond?: (request: HttpClientRequest.HttpClientRequest) => Response;
+    readonly onDispatch?: (command: {
+      readonly type: string;
+      readonly activity?: { readonly kind: string; readonly payload: unknown };
+    }) => Effect.Effect<void>;
   } = {},
 ) {
   const requests: HttpClientRequest.HttpClientRequest[] = [];
@@ -85,6 +94,11 @@ const makeHarness = Effect.fnUntraced(function* (
         ],
   );
   const dependencies = Layer.mergeAll(
+    NodeCrypto.layer,
+    Layer.mock(OrchestrationEngineService, {
+      dispatch: (command) =>
+        (options.onDispatch?.(command) ?? Effect.void).pipe(Effect.as({ sequence: 1 })),
+    }),
     Layer.mock(ServerSecretStore.ServerSecretStore)({
       get: (name) =>
         Effect.sync(() => {
@@ -112,8 +126,14 @@ const makeHarness = Effect.fnUntraced(function* (
   const call = (
     name: keyof typeof IssueTrackersToolkit.tools = "read_jira_issue",
     capabilities: ReadonlyArray<McpInvocationContext.McpCapability> = ["issue-trackers"],
+    input: {
+      issue: string;
+      body?: string;
+      field?: "title" | "description" | "status" | "assignee";
+      value?: string | null;
+    } = { issue: "ENG-123" },
   ) =>
-    toolkit.handle(name, { issue: "ENG-123" }).pipe(
+    toolkit.handle(name, input as never).pipe(
       Stream.unwrap,
       Stream.runCollect,
       Effect.map((entries) => entries.at(-1)?.result),
@@ -209,6 +229,222 @@ describe("issue tracker MCP handlers", () => {
     }),
   );
 
+  it.effect("prepares and executes a full-access comment through the original turn bearer", () =>
+    Effect.gen(function* () {
+      const prepared = {
+        operationId: "operation-1",
+        state: "ready",
+        service: "linear",
+        action: "add_comment",
+        field: null,
+        identifier: "WP-218",
+        issueUrl: "https://linear.app/team/issue/WP-218",
+        body: "Review note",
+        executionAccount: "Team · Alice",
+        resultResourceId: null,
+        resultUrl: null,
+      };
+      const harness = yield* makeHarness({
+        respond: (request) =>
+          Response.json(
+            request.url.endsWith("/execute")
+              ? {
+                  state: "succeeded",
+                  resourceId: "comment-1",
+                  url: "https://linear.app/team/issue/WP-218#comment-1",
+                }
+              : prepared,
+          ),
+      });
+      const output = yield* harness.call("add_linear_comment", ["issue-trackers"], {
+        issue: "WP-218",
+        body: "Review note",
+      });
+      expect(output).toMatchObject({ state: "succeeded", resultResourceId: "comment-1" });
+      expect(harness.requests.map((request) => request.url)).toEqual([
+        "https://relay.example.test/v1/environments/environment-1/issue-trackers/linear/comments/prepare",
+        "https://relay.example.test/v1/environments/environment-1/issue-trackers/comments/execute",
+      ]);
+      expect(
+        harness.requests.every(
+          (request) => request.headers.authorization === `Bearer ${credential}`,
+        ),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("routes a single issue field edit through prepare and execute", () =>
+    Effect.gen(function* () {
+      const prepared = {
+        operationId: "edit-1",
+        state: "ready",
+        service: "jira",
+        action: "edit_issue",
+        field: "title",
+        identifier: "WP-218",
+        issueUrl: "https://example.atlassian.net/browse/WP-218",
+        body: 'title: "Old" → "New"',
+        executionAccount: "Example · Alice",
+        resultResourceId: null,
+        resultUrl: null,
+      };
+      const harness = yield* makeHarness({
+        respond: (request) =>
+          Response.json(
+            request.url.endsWith("/execute")
+              ? { state: "succeeded", resourceId: "WP-218", url: prepared.issueUrl }
+              : prepared,
+          ),
+      });
+      const output = yield* harness.call("edit_jira_issue", ["issue-trackers"], {
+        issue: "WP-218",
+        field: "title",
+        value: "New",
+      });
+      expect(output).toMatchObject({ state: "succeeded", field: "title" });
+      expect(harness.requests.map((request) => request.url)).toEqual([
+        "https://relay.example.test/v1/environments/environment-1/issue-trackers/jira/edits/prepare",
+        "https://relay.example.test/v1/environments/environment-1/issue-trackers/edits/execute",
+      ]);
+    }),
+  );
+
+  it.effect("waits for the connection owner's chat response before executing", () =>
+    Effect.gen(function* () {
+      const requested = yield* Deferred.make<string>();
+      const activities: string[] = [];
+      let approvalName: string | undefined;
+      const prepared = {
+        operationId: "operation-supervised",
+        state: "awaiting_approval",
+        service: "linear",
+        action: "add_comment",
+        field: null,
+        identifier: "WP-218",
+        issueUrl: "https://linear.app/team/issue/WP-218",
+        body: "Exact comment",
+        executionAccount: "Team · Alice",
+        resultResourceId: null,
+        resultUrl: null,
+      };
+      const harness = yield* makeHarness({
+        respond: (request) =>
+          Response.json(
+            request.url.endsWith("/prepare")
+              ? prepared
+              : request.url.endsWith("/decision/verify")
+                ? { decision: "accept" }
+                : {
+                    state: "succeeded",
+                    resourceId: "comment-2",
+                    url: `${prepared.issueUrl}#comment-2`,
+                  },
+          ),
+        onDispatch: (command) =>
+          Effect.gen(function* () {
+            if (!command.activity) return;
+            activities.push(command.activity.kind);
+            if (command.activity.kind === "approval.requested") {
+              const payload = command.activity.payload as { requestId: string; appName: string };
+              approvalName = payload.appName;
+              yield* Deferred.succeed(requested, payload.requestId);
+            }
+          }),
+      });
+      const result = yield* Effect.forkChild(
+        harness.call("add_linear_comment", ["issue-trackers"], {
+          issue: "WP-218",
+          body: "Exact comment",
+        }),
+      );
+      const requestId = yield* Deferred.await(requested);
+      expect(harness.requests).toHaveLength(1);
+      expect(yield* resolveIssueWrite(requestId, ThreadId.make("thread-1"), "bob", "accept")).toBe(
+        false,
+      );
+      expect(
+        yield* resolveIssueWrite(requestId, ThreadId.make("thread-1"), undefined, "accept").pipe(
+          Effect.provide(harness.dependencies),
+        ),
+      ).toBe(true);
+      expect(yield* Fiber.join(result)).toMatchObject({
+        state: "succeeded",
+        resultResourceId: "comment-2",
+      });
+      expect(activities).toEqual(["approval.requested", "approval.resolved"]);
+      expect(approvalName).toBe("Add Linear Comment");
+      expect(harness.requests.map((request) => new URL(request.url).pathname)).toEqual([
+        "/v1/environments/environment-1/issue-trackers/linear/comments/prepare",
+        "/v1/environments/environment-1/issue-trackers/writes/decision/verify",
+        "/v1/environments/environment-1/issue-trackers/comments/execute",
+      ]);
+    }),
+  );
+
+  it.effect("does not cancel the first proposal when a duplicate invocation is refused", () =>
+    Effect.gen(function* () {
+      const requested = yield* Deferred.make<string>();
+      const prepared = {
+        operationId: "operation-duplicate",
+        state: "awaiting_approval",
+        service: "linear",
+        action: "add_comment",
+        field: null,
+        identifier: "WP-218",
+        issueUrl: "https://linear.app/team/issue/WP-218",
+        body: "Exact comment",
+        executionAccount: "Team · Alice",
+        resultResourceId: null,
+        resultUrl: null,
+      };
+      const harness = yield* makeHarness({
+        respond: (request) =>
+          Response.json(
+            request.url.endsWith("/prepare")
+              ? prepared
+              : request.url.endsWith("/decision/verify")
+                ? { decision: "accept" }
+                : {
+                    state: "succeeded",
+                    resourceId: "comment-2",
+                    url: `${prepared.issueUrl}#comment-2`,
+                  },
+          ),
+        onDispatch: (command) =>
+          command.activity?.kind === "approval.requested"
+            ? Deferred.succeed(
+                requested,
+                (command.activity.payload as { requestId: string }).requestId,
+              ).pipe(Effect.asVoid)
+            : Effect.void,
+      });
+      const first = yield* Effect.forkChild(
+        harness.call("add_linear_comment", ["issue-trackers"], {
+          issue: "WP-218",
+          body: "Exact comment",
+        }),
+      );
+      const requestId = yield* Deferred.await(requested);
+      const second = yield* harness
+        .call("add_linear_comment", ["issue-trackers"], {
+          issue: "WP-218",
+          body: "Exact comment",
+        })
+        .pipe(Effect.flip);
+      expect(second).toMatchObject({ code: "write_in_progress" });
+      expect(harness.requests).toHaveLength(2);
+      expect(
+        yield* resolveIssueWrite(requestId, ThreadId.make("thread-1"), undefined, "accept").pipe(
+          Effect.provide(harness.dependencies),
+        ),
+      ).toBe(true);
+      expect(yield* Fiber.join(first)).toMatchObject({ state: "succeeded" });
+      expect(harness.requests.map((request) => request.url.endsWith("/cancel"))).not.toContain(
+        true,
+      );
+    }),
+  );
+
   it.effect(
     "preserves actionable relay failure codes without leaking arbitrary upstream text",
     () =>
@@ -233,6 +469,31 @@ describe("issue tracker MCP handlers", () => {
       }),
   );
 
+  it.effect("describes a write permission failure without exposing upstream details", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        respond: () =>
+          Response.json(
+            {
+              _tag: "RelayIssueTrackerError",
+              code: "forbidden",
+              message: `Unsafe upstream details ${credential}`,
+            },
+            { status: 400 },
+          ),
+      });
+      const error = yield* harness
+        .call("add_linear_comment", ["issue-trackers"], {
+          issue: "WP-218",
+          body: "Exact comment",
+        })
+        .pipe(Effect.flip);
+      expect(error).toMatchObject({ code: "forbidden" });
+      expect(error.message).toContain("cannot change issues");
+      expect(encodeJson(error)).not.toContain(credential);
+    }),
+  );
+
   it.effect("hides HTTP error requests containing the personal turn grant", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
@@ -243,7 +504,45 @@ describe("issue tracker MCP handlers", () => {
       expect(encodeJson(error)).not.toContain(credential);
     }),
   );
+
+  it.effect("explains a revoked message grant without exposing the relay response", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        respond: () =>
+          Response.json(
+            {
+              _tag: "RelayAuthInvalidError",
+              code: "auth_invalid",
+              reason: "not_authorized",
+              traceId: "request-1",
+            },
+            { status: 401 },
+          ),
+      });
+      const error = yield* harness.call().pipe(Effect.flip);
+      expect(error).toMatchObject({ code: "auth_required" });
+      expect(error.message).toContain("send a new message");
+      expect(error.message).not.toContain("request-1");
+    }),
+  );
 });
+
+it.effect("advertises human-readable issue tracker tool titles", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness();
+    const layer = IssueTrackersToolkitRegistrationLive.pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(harness.dependencies),
+    );
+    const advertised = yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      return server.tools.map(({ tool }) => [tool.name, tool.annotations?.title] as const);
+    }).pipe(Effect.provide(layer));
+    expect(advertised).toContainEqual(["add_jira_comment", "Add Jira Comment"]);
+    expect(advertised).toContainEqual(["add_linear_comment", "Add Linear Comment"]);
+    expect(advertised).toContainEqual(["edit_jira_issue", "Edit Jira Issue"]);
+  }),
+);
 
 it.effect(
   "delivers Linear image bytes as MCP image content without copying them into metadata",

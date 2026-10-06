@@ -1,4 +1,5 @@
 import type { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { cancelIssueWritesForSession } from "./IssueTrackerApprovalBroker.ts";
 
 export interface McpProviderSessionConfig {
   readonly issueTrackerAuthorizationId?: string;
@@ -65,6 +66,7 @@ export function bindIssueTrackerTurn(
 }
 
 export function revokeIssueTrackerTurn(threadId: ThreadId, providerSessionId: string): void {
+  cancelIssueWritesForSession(threadId, providerSessionId);
   const current = sessionsByThread.get(threadId);
   if (current?.providerSessionId === providerSessionId && current.issueTrackerAuthorizationId)
     sessionsByThread.set(threadId, { ...current, issueTrackerTurnComplete: true });
@@ -76,6 +78,8 @@ export function completeIssueTrackerTurn(
   turnId: string,
 ): void {
   const current = sessionsByThread.get(threadId);
+  if (current?.providerInstanceId === providerInstanceId)
+    cancelIssueWritesForSession(threadId, current.providerSessionId);
   if (
     current?.issueTrackerAuthorizationId &&
     current.providerInstanceId === providerInstanceId &&

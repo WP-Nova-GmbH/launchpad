@@ -7,6 +7,7 @@ import {
   exchangeLinearCode,
   refreshLinearTokens,
   LINEAR_MCP_RESOURCE,
+  LINEAR_WRITE_MCP_RESOURCE,
 } from "./LinearOAuth.ts";
 
 const issuer = "https://mcp.linear.app";
@@ -37,7 +38,7 @@ const tokens = {
 const decodeRegistration = Schema.decodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
-      scope: Schema.String,
+      scope: Schema.optionalKey(Schema.String),
       redirect_uris: Schema.Array(Schema.String),
       token_endpoint_auth_method: Schema.String,
     }),
@@ -45,6 +46,12 @@ const decodeRegistration = Schema.decodeUnknownSync(
 );
 
 function response(url: string) {
+  if (url === `${issuer}/.well-known/oauth-protected-resource/mcp`)
+    return Response.json({
+      resource: LINEAR_WRITE_MCP_RESOURCE,
+      authorization_servers: [issuer],
+      scopes_supported: ["read", "write"],
+    });
   if (url === `${issuer}/.well-known/oauth-protected-resource/mcp/readonly`)
     return Response.json({
       resource: LINEAR_MCP_RESOURCE,
@@ -59,6 +66,27 @@ function response(url: string) {
 }
 
 describe("Linear MCP OAuth", () => {
+  it.effect("uses the writable MCP resource without requesting the read-only scope", () =>
+    Effect.gen(function* () {
+      const test = yield* fixture({
+        rawHttp: true,
+        respond: (request) => Effect.succeed(response(request.url)),
+      });
+      const started = yield* beginLinearOAuth({
+        redirectUri: pending.redirectUri,
+        state: "write-state",
+        resource: LINEAR_WRITE_MCP_RESOURCE,
+      }).pipe(test.provide);
+      const url = new URL(started.authorizationUrl);
+      expect(url.searchParams.get("resource")).toBe(LINEAR_WRITE_MCP_RESOURCE);
+      expect(url.searchParams.get("scope")).toBeNull();
+      expect(started.pending.resource).toBe(LINEAR_WRITE_MCP_RESOURCE);
+      const registration = test.requests.find((request) => request.url === `${issuer}/register`)!;
+      if (registration.body._tag !== "Uint8Array") throw new Error("Missing registration body");
+      const body = decodeRegistration(new TextDecoder().decode(registration.body.body));
+      expect(body.scope).toBeUndefined();
+    }),
+  );
   it.effect("dynamically registers a read-only PKCE client without configured credentials", () =>
     Effect.gen(function* () {
       const test = yield* fixture({
@@ -103,6 +131,7 @@ describe("Linear MCP OAuth", () => {
         accessToken: "private-access",
         refreshToken: "private-refresh",
         expiresIn: 3600,
+        scopes: ["read"],
       });
       const request = test.requests[0]!;
       expect(request.url).toBe(`${issuer}/token`);

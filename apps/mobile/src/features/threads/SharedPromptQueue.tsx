@@ -332,6 +332,7 @@ export function SharedPromptQueue({
                           threadId,
                           messageId: edit.messageId,
                           expectedRevision: edit.revision,
+                          expectedRuntimeMode: current.runtimeMode,
                           message: {
                             text: edit.text,
                             attachments: current.attachments,

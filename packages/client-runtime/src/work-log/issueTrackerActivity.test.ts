@@ -8,6 +8,36 @@ const result = {
   url: "https://linear.app/team/issue/LP-1",
 };
 describe("shared issue activity", () => {
+  it.each([
+    ["add_jira_comment", "Add Jira Comment"],
+    ["add_linear_comment", "Add Linear Comment"],
+    ["edit_jira_issue", "Edit Jira Issue"],
+    ["edit_linear_issue", "Edit Linear Issue"],
+    ["search_jira_issues", "Search Jira Issues"],
+    ["search_linear_issues", "Search Linear Issues"],
+  ])("shows a readable tool name for %s", (tool, expected) => {
+    for (const entry of [
+      { label: `T3 Code · ${tool}`, toolData: { item: { server: "t3-code", tool } } },
+      { label: `T3 Code ° ${tool}` },
+      { label: "MCP tool call", toolData: { toolName: `mcp__t3_code__${tool}` } },
+      { label: `t3-code_${tool}`, toolData: { tool: `t3-code_${tool}` } },
+    ]) {
+      expect(resolveWorkEntryToolPresentation(entry)?.displayName).toBe(expected);
+    }
+  });
+
+  it("leaves a matching tool from another MCP server alone", () => {
+    expect(
+      resolveWorkEntryToolPresentation({
+        label: "MCP tool call",
+        toolData: { item: { server: "another-server", tool: "add_jira_comment" } },
+      }),
+    ).toBeNull();
+    expect(
+      resolveWorkEntryToolPresentation({ label: "mcp__another_server__add_jira_comment" }),
+    ).toBeNull();
+  });
+
   it.each(["read_linear_issue", "read_linear_comments", "read_linear_images", "view_linear_image"])(
     "shows identity and a safe source link for %s",
     (tool) => {
