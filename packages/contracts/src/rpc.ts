@@ -18,6 +18,8 @@ import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
   AuthAccessStreamEvent,
+  AuthCurrentSessionPresentation,
+  AuthSessionStreamError,
   EnvironmentAuthorizationError,
 } from "./auth.ts";
 import {
@@ -456,6 +458,7 @@ export const WS_METHODS = {
   subscribeServerConfig: "subscribeServerConfig",
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
+  subscribeAuthSession: "subscribeAuthSession",
   subscribeBackgroundPolicy: "subscribeBackgroundPolicy",
   subscribeResourceTelemetry: "subscribeResourceTelemetry",
 } as const;
@@ -1432,6 +1435,13 @@ const WsSubscribeServerLifecycleRpc = Rpc.make(WS_METHODS.subscribeServerLifecyc
   stream: true,
 });
 
+const WsSubscribeAuthSessionRpc = Rpc.make(WS_METHODS.subscribeAuthSession, {
+  payload: Schema.Struct({}),
+  success: Schema.NullOr(AuthCurrentSessionPresentation),
+  error: Schema.Union([AuthSessionStreamError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
 const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
@@ -1591,6 +1601,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
+  WsSubscribeAuthSessionRpc,
   WsSubscribeBackgroundPolicyRpc,
   WsOrchestrationReportThreadPresenceRpc,
   WsOrchestrationSubscribeThreadPresenceRpc,

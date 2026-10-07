@@ -10,6 +10,7 @@ import type {
 import {
   type AuthSessionUser,
   EnvironmentHttpCommonError,
+  EnvironmentRequestInvalidError,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
@@ -24,6 +25,8 @@ import {
 
 import { PrimaryEnvironmentHttpClient } from "./httpClient";
 import { runPrimaryHttp } from "../../lib/runtime";
+
+const isEnvironmentRequestInvalidError = Schema.is(EnvironmentRequestInvalidError);
 
 const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "fetch-session-state",
@@ -137,11 +140,17 @@ export interface ServerClientSessionRecord {
 
 type ServerAuthGateState =
   | { status: "authenticated" }
+  | { status: "needs-client-label"; auth: AuthSessionState["auth"]; errorMessage?: string }
   | {
       status: "requires-auth";
       auth: AuthSessionState["auth"];
       errorMessage?: string;
     };
+
+let pendingPairingCredential: string | null = null;
+export function peekPendingPairingCredential() {
+  return pendingPairingCredential;
+}
 
 let bootstrapPromise: Promise<ServerAuthGateState> | null = null;
 let resolvedAuthenticatedGateState: ServerAuthGateState | null = null;
@@ -223,15 +232,27 @@ function readEnvironmentHttpErrorStatus(error: EnvironmentHttpCommonErrorType): 
   }
 }
 
-async function exchangeBootstrapCredential(credential: string): Promise<AuthBrowserSessionResult> {
+async function exchangeBootstrapCredential(
+  credential: string,
+  label?: string,
+): Promise<AuthBrowserSessionResult> {
   return retryTransientBootstrap(async () => {
     try {
       return await runPrimaryHttp(
         PrimaryEnvironmentHttpClient.pipe(
-          Effect.flatMap((client) => client.auth.browserSession({ payload: { credential } })),
+          Effect.flatMap((client) =>
+            client.auth.browserSession({
+              payload: { credential, ...(label !== undefined ? { client: { label } } : {}) },
+            }),
+          ),
         ),
       );
     } catch (error) {
+      if (
+        isEnvironmentRequestInvalidError(error) &&
+        (error.reason === "client_label_required" || error.reason === "invalid_client_label")
+      )
+        throw error;
       if (
         isEnvironmentHttpCommonError(error) &&
         error._tag === "EnvironmentAuthInvalidError" &&
@@ -314,9 +335,13 @@ function isTransientBootstrapError(error: unknown): boolean {
 
 async function bootstrapServerAuth(urlCredential: string | null): Promise<ServerAuthGateState> {
   const currentSession = await fetchSessionState();
-  if (currentSession.authenticated && !urlCredential) {
+  // A valid session opens the app. The connection resolver gates naming per
+  // environment, so this host cannot lock the user out of their other hosts.
+  if (currentSession.authenticated && !urlCredential && !pendingPairingCredential) {
     return { status: "authenticated" };
   }
+  if (pendingPairingCredential && !urlCredential)
+    return { status: "needs-client-label", auth: currentSession.auth };
 
   const bootstrapCredential = urlCredential ?? getDesktopBootstrapCredential();
   if (!bootstrapCredential) {
@@ -331,6 +356,14 @@ async function bootstrapServerAuth(urlCredential: string | null): Promise<Server
     await waitForAuthenticatedSessionAfterBootstrap();
     return { status: "authenticated" };
   } catch (error) {
+    if (
+      isEnvironmentRequestInvalidError(error) &&
+      (error.reason === "client_label_required" || error.reason === "invalid_client_label")
+    ) {
+      pendingPairingCredential = bootstrapCredential;
+      return { status: "needs-client-label", auth: currentSession.auth };
+    }
+    pendingPairingCredential = null;
     return {
       status: "requires-auth",
       auth: currentSession.auth,
@@ -339,8 +372,11 @@ async function bootstrapServerAuth(urlCredential: string | null): Promise<Server
   }
 }
 
-export async function submitServerAuthCredential(credential: string): Promise<void> {
-  const trimmedCredential = credential.trim();
+export async function submitServerAuthCredential(
+  credential: string,
+  label?: string,
+): Promise<void> {
+  const trimmedCredential = (pendingPairingCredential ?? credential).trim();
   if (!trimmedCredential) {
     throw new PrimaryEnvironmentPairingCredentialRequiredError({
       providedLength: credential.length,
@@ -348,9 +384,19 @@ export async function submitServerAuthCredential(credential: string): Promise<vo
   }
 
   resolvedAuthenticatedGateState = null;
-  await exchangeBootstrapCredential(trimmedCredential);
+  try {
+    await exchangeBootstrapCredential(trimmedCredential, label);
+  } catch (error) {
+    if (
+      !isEnvironmentRequestInvalidError(error) ||
+      (error.reason !== "client_label_required" && error.reason !== "invalid_client_label")
+    )
+      pendingPairingCredential = null;
+    throw error;
+  }
   await waitForAuthenticatedSessionAfterBootstrap();
   resolvedAuthenticatedGateState = { status: "authenticated" };
+  pendingPairingCredential = null;
   bootstrapPromise = null;
   stripPairingTokenFromUrl();
 }
@@ -471,6 +517,7 @@ export async function resolveInitialServerAuthGateState(): Promise<ServerAuthGat
 }
 
 export function __resetServerAuthBootstrapForTests() {
+  pendingPairingCredential = null;
   bootstrapPromise = null;
   resolvedAuthenticatedGateState = null;
 }

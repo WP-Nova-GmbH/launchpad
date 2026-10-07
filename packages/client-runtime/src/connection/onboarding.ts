@@ -1,4 +1,11 @@
-import type { DesktopSshEnvironmentTarget, EnvironmentId } from "@t3tools/contracts";
+import {
+  AuthClientLabel,
+  type AuthClientSession,
+  type AuthSessionState,
+  type AuthSessionId,
+  type DesktopSshEnvironmentTarget,
+  type EnvironmentId,
+} from "@t3tools/contracts";
 import { resolveRemotePairingTarget } from "@t3tools/shared/remote";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -31,9 +38,27 @@ import {
 } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentRegistry from "./registry.ts";
+import * as ConnectionResolver from "./resolver.ts";
+import * as ManagedRelay from "../relay/managedRelay.ts";
+import * as RemoteAuthorization from "../authorization/service.ts";
+import { executeAuthenticatedEnvironmentHttpRequest } from "../state/environmentHttpAuth.ts";
+import { environmentEndpointUrl } from "../environment/endpoint.ts";
 import { orchestrationProtocolCompatibilityError } from "./compatibility.ts";
 
+const decodeClientLabel = Schema.decodeEffect(AuthClientLabel);
+const validateClientLabel = (label: string) =>
+  decodeClientLabel(label).pipe(
+    Effect.mapError(
+      () =>
+        new ConnectionBlockedError({
+          reason: "configuration",
+          detail: "Choose a client name between 1 and 80 characters.",
+        }),
+    ),
+  );
+
 export interface PairingConnectionInput {
+  readonly clientLabel?: string;
   readonly pairingUrl?: string;
   readonly host?: string;
   readonly pairingCode?: string;
@@ -53,6 +78,14 @@ export interface BearerConnectionUpdateInput {
 export class ConnectionOnboarding extends Context.Service<
   ConnectionOnboarding,
   {
+    readonly currentSession: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<AuthSessionState, ConnectionAttemptError>;
+    readonly renameClient: (input: {
+      readonly environmentId: EnvironmentId;
+      readonly label: string;
+      readonly sessionId?: AuthSessionId;
+    }) => Effect.Effect<AuthClientSession, ConnectionAttemptError>;
     readonly registerPairing: (
       input: PairingConnectionInput,
     ) => Effect.Effect<
@@ -88,6 +121,7 @@ export const preparePairingRegistration = Effect.fn(
   "clientRuntime.connection.onboarding.preparePairingRegistration",
 )(function* (input: PairingConnectionInput) {
   const target = yield* resolvePairingTarget(input);
+  const clientLabel = yield* validateClientLabel(input.clientLabel ?? "");
   const presentation = yield* ClientCapabilities.ClientPresentation;
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: target.httpBaseUrl,
@@ -98,7 +132,7 @@ export const preparePairingRegistration = Effect.fn(
     httpBaseUrl: target.httpBaseUrl,
     credential: target.credential,
     scopes: presentation.scopes,
-    clientMetadata: presentation.metadata,
+    clientMetadata: { ...presentation.metadata, label: clientLabel },
   }).pipe(Effect.mapError(mapRemoteEnvironmentError));
   const connectionId = `bearer:${descriptor.environmentId}`;
 
@@ -248,12 +282,91 @@ const registerSshConnection = Effect.fn(
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+  const resolver = yield* ConnectionResolver.ConnectionResolver;
+  const signer = yield* Effect.serviceOption(ManagedRelay.ManagedRelayDpopSigner);
+  const remote = yield* Effect.serviceOption(RemoteAuthorization.RemoteEnvironmentAuthorization);
   const presentation = yield* ClientCapabilities.ClientPresentation;
   const httpClient = yield* HttpClient.HttpClient;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
 
+  const sessionRequest = Effect.fn("ConnectionOnboarding.sessionRequest")(function* (
+    environmentId: EnvironmentId,
+    rename?: { readonly label: string; readonly sessionId?: AuthSessionId },
+  ) {
+    const entry = (yield* SubscriptionRef.get(registry.entries)).get(environmentId);
+    if (!entry)
+      return yield* new ConnectionBlockedError({
+        reason: "configuration",
+        detail: "The environment is no longer saved.",
+      });
+    const prepared = yield* resolver.prepareHttp(entry);
+    return yield* executeAuthenticatedEnvironmentHttpRequest({
+      prepared,
+      signer,
+      remoteAuthorization: remote,
+      method: rename ? "POST" : "GET",
+      url: (base) =>
+        environmentEndpointUrl(base, rename ? "/api/auth/clients/rename" : "/api/auth/session"),
+      timeoutMs: 10_000,
+      group: "auth",
+      request: ({ client, headers }) =>
+        Effect.gen(function* () {
+          if (rename)
+            return {
+              kind: "rename" as const,
+              value: yield* client.renameClient({ headers, payload: rename }),
+            };
+          return { kind: "session" as const, value: yield* client.session({ headers }) };
+        }),
+    }).pipe(
+      Effect.mapError(mapRemoteEnvironmentError),
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+    );
+  });
   return ConnectionOnboarding.of({
+    currentSession: (environmentId) =>
+      sessionRequest(environmentId).pipe(
+        Effect.map((result) => {
+          if (result.kind !== "session") throw new Error("Expected session presentation");
+          return result.value;
+        }),
+      ),
+    renameClient: (input) =>
+      Effect.gen(function* () {
+        const label = yield* validateClientLabel(input.label);
+        const result = yield* sessionRequest(input.environmentId, {
+          label,
+          ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        });
+        if (result.kind !== "rename")
+          return yield* new ConnectionBlockedError({
+            reason: "configuration",
+            detail: "Could not rename this client.",
+          });
+        if (
+          result.value.current &&
+          (yield* registry.state(input.environmentId).pipe(
+            Effect.mapError(
+              () =>
+                new ConnectionBlockedError({
+                  reason: "configuration",
+                  detail: "The environment is no longer saved.",
+                }),
+            ),
+          )).lastFailure?.reason === "client-label-required"
+        )
+          yield* registry.retryNow(input.environmentId).pipe(
+            Effect.mapError(
+              () =>
+                new ConnectionBlockedError({
+                  reason: "configuration",
+                  detail: "The environment is no longer saved.",
+                }),
+            ),
+          );
+        return result.value;
+      }),
     registerPairing: (input) =>
       registerPairingConnection(input).pipe(
         Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, registry),

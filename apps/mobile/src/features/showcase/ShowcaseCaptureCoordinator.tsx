@@ -175,7 +175,8 @@ export function ShowcaseCaptureCoordinator(props: { readonly pathname: string })
         pairingUrls.map(async (pairingUrl) => {
           if (cancelled || attemptedPairingRef.current.has(pairingUrl)) return;
           const paired = await retryShowcaseOperation(
-            async () => AsyncResult.isSuccess(await connectPairingUrl(pairingUrl)),
+            async () =>
+              AsyncResult.isSuccess(await connectPairingUrl(pairingUrl, "Showcase device")),
             { isCancelled: () => cancelled },
           );
           if (paired) attemptedPairingRef.current.add(pairingUrl);

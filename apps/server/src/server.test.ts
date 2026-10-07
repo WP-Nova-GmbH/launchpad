@@ -31,6 +31,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
+  ORCHESTRATION_PROTOCOL_VERSION,
   type PreviewEvent,
   ProjectId,
   type ProviderAuthState,
@@ -1249,18 +1250,7 @@ const buildAppUnderTest = (options?: {
           if (!subscribed) return grants;
           return {
             ...grants,
-            streamChanges: Stream.unwrap(
-              Effect.gen(function* () {
-                const changes =
-                  yield* Queue.unbounded<PairingGrantStore.BootstrapCredentialChange>();
-                yield* grants.streamChanges.pipe(
-                  Stream.runForEach((change) => Queue.offer(changes, change)),
-                  Effect.forkScoped({ startImmediately: true }),
-                );
-                yield* subscribed;
-                return Stream.fromQueue(changes);
-              }),
-            ),
+            subscribeChanges: grants.subscribeChanges.pipe(Effect.tap(() => subscribed)),
           };
         }),
       )
@@ -1295,6 +1285,8 @@ const parseSessionCookieFromWsUrl = (
   wsUrl: string,
 ): { readonly cookie: string | null; readonly url: string } => {
   const next = new URL(wsUrl);
+  if (!next.searchParams.has("orchestrationProtocol"))
+    next.searchParams.set("orchestrationProtocol", String(ORCHESTRATION_PROTOCOL_VERSION));
   const cookie = next.hash.startsWith("#cookie=")
     ? decodeURIComponent(next.hash.slice("#cookie=".length))
     : null;
@@ -1393,6 +1385,7 @@ const bootstrapBrowserSession = (
       },
       body: jsonRequestBody({
         credential,
+        client: { label: "Test browser" },
       }),
     });
     const body = yield* responseJsonEffect<{
@@ -1435,7 +1428,7 @@ const exchangeAccessToken = (
         scope:
           options?.scope ??
           "orchestration:read orchestration:operate terminal:operate review:write relay:read access:read access:write relay:write",
-        ...(options?.clientMetadata?.label ? { client_label: options.clientMetadata.label } : {}),
+        client_label: options?.clientMetadata?.label ?? "Test client",
         ...(options?.clientMetadata?.deviceType
           ? { client_device_type: options.clientMetadata.deviceType }
           : {}),
@@ -2697,6 +2690,231 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("renames own clients without admin scopes and protects other sessions", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const adminCookie = yield* getAuthenticatedSessionCookieHeader();
+      const pairingUrl = yield* getHttpServerUrl("/api/auth/pairing-token");
+      const pairingResponse = yield* fetchEffect(pairingUrl, {
+        method: "POST",
+        headers: { cookie: adminCookie, "content-type": "application/json" },
+        body: jsonRequestBody({ scopes: ["orchestration:read"] }),
+      });
+      assert.equal(pairingResponse.status, 200);
+      const pairing = yield* responseJsonEffect<{ credential: string }>(pairingResponse);
+      const cookie = yield* getAuthenticatedSessionCookieHeader(pairing.credential);
+      const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+      const selfResponse = yield* fetchEffect(sessionUrl, { headers: { cookie } });
+      const self = yield* responseJsonEffect<{ currentSession: { sessionId: string } }>(
+        selfResponse,
+      );
+      const adminResponse = yield* fetchEffect(sessionUrl, { headers: { cookie: adminCookie } });
+      const admin = yield* responseJsonEffect<{ currentSession: { sessionId: string } }>(
+        adminResponse,
+      );
+      const renameUrl = yield* getHttpServerUrl("/api/auth/clients/rename");
+      const rename = (caller: string, label: string, sessionId?: string) =>
+        fetchEffect(renameUrl, {
+          method: "POST",
+          headers: { cookie: caller, "content-type": "application/json" },
+          body: jsonRequestBody({ label, ...(sessionId ? { sessionId } : {}) }),
+        });
+      const own = yield* rename(cookie, "  My phone  ");
+      assert.equal(own.status, 200);
+      assert.deepInclude(yield* responseJsonEffect(own), {
+        current: true,
+        sessionId: self.currentSession.sessionId,
+      });
+      assert.equal(
+        (yield* rename(cookie, "Not allowed", admin.currentSession.sessionId)).status,
+        403,
+      );
+      assert.equal((yield* rename(cookie, " ")).status, 400);
+      assert.equal(
+        (yield* rename(adminCookie, "Admin renamed", self.currentSession.sessionId)).status,
+        200,
+      );
+      const state = yield* responseJsonEffect<{ currentSession: { client: { label: string } } }>(
+        yield* fetchEffect(sessionUrl, { headers: { cookie } }),
+      );
+      assert.equal(state.currentSession.client.label, "Admin renamed");
+      const revokeUrl = yield* getHttpServerUrl("/api/auth/clients/revoke");
+      assert.equal(
+        (yield* fetchEffect(revokeUrl, {
+          method: "POST",
+          headers: { cookie: adminCookie, "content-type": "application/json" },
+          body: jsonRequestBody({ sessionId: self.currentSession.sessionId }),
+        })).status,
+        200,
+      );
+      assert.equal(
+        (yield* rename(adminCookie, "No revival", self.currentSession.sessionId)).status,
+        404,
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("streams only an ordinary client's own presentation after self and admin renames", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const adminCookie = yield* getAuthenticatedSessionCookieHeader();
+      const pairingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/auth/pairing-token"),
+        {
+          method: "POST",
+          headers: { cookie: adminCookie, "content-type": "application/json" },
+          body: jsonRequestBody({ scopes: ["orchestration:read"] }),
+        },
+      );
+      assert.equal(pairingResponse.status, 200);
+      const pairing = yield* responseJsonEffect<{ credential: string }>(pairingResponse);
+      const cookie = yield* getAuthenticatedSessionCookieHeader(pairing.credential);
+      const stateUrl = yield* getHttpServerUrl("/api/auth/session");
+      const own = yield* responseJsonEffect<{ currentSession: { sessionId: string } }>(
+        yield* fetchEffect(stateUrl, { headers: { cookie } }),
+      );
+      const admin = yield* responseJsonEffect<{ currentSession: { sessionId: string } }>(
+        yield* fetchEffect(stateUrl, { headers: { cookie: adminCookie } }),
+      );
+      const renameUrl = yield* getHttpServerUrl("/api/auth/clients/rename");
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookie,
+      );
+      const frames: Array<string> = [];
+      yield* withWsRpcClient(
+        wsUrl,
+        (client) =>
+          Effect.gen(function* () {
+            const updates = yield* Queue.unbounded<
+              import("@t3tools/contracts").AuthCurrentSessionPresentation | null
+            >();
+            yield* client.subscribeAuthSession({}).pipe(
+              Stream.runForEach((value) => Queue.offer(updates, value)),
+              Effect.forkChild,
+            );
+            assert.equal((yield* Queue.take(updates))?.sessionId, own.currentSession.sessionId);
+            // Even an ordinary read-scoped session can observe its own label.
+            const selfRename = yield* fetchEffect(renameUrl, {
+              method: "POST",
+              headers: { cookie, "content-type": "application/json" },
+              body: jsonRequestBody({ label: "Self renamed" }),
+            });
+            assert.equal(selfRename.status, 200);
+            assert.equal((yield* Queue.take(updates))?.client.label, "Self renamed");
+            const otherRename = yield* fetchEffect(renameUrl, {
+              method: "POST",
+              headers: { cookie: adminCookie, "content-type": "application/json" },
+              body: jsonRequestBody({ label: "Admin private name" }),
+            });
+            assert.equal(otherRename.status, 200);
+            const adminRename = yield* fetchEffect(renameUrl, {
+              method: "POST",
+              headers: { cookie: adminCookie, "content-type": "application/json" },
+              body: jsonRequestBody({
+                sessionId: own.currentSession.sessionId,
+                label: "Admin renamed this client",
+              }),
+            });
+            assert.equal(adminRename.status, 200);
+            const update = yield* Queue.take(updates);
+            assert.equal(update?.sessionId, own.currentSession.sessionId);
+            assert.equal(update?.client.label, "Admin renamed this client");
+            assert.notInclude(frames.join(""), admin.currentSession.sessionId);
+            assert.notInclude(frames.join(""), "Admin private name");
+            assert.notInclude(frames.join(""), pairing.credential);
+          }),
+        (frame) => frames.push(frame),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("updates live thread presence after an HTTP rename and later activity reports", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: { repositoryAccess: { requireThread: () => Effect.void } },
+      });
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookie,
+      );
+      const renameUrl = yield* getHttpServerUrl("/api/auth/clients/rename");
+      const threadId = ThreadId.make("presence-test-thread");
+      yield* withWsRpcClient(wsUrl, (client) =>
+        Effect.gen(function* () {
+          const ready = yield* Deferred.make<void>();
+          const original = yield* Deferred.make<void>();
+          const renamed = yield* Deferred.make<void>();
+          const nextActivity = yield* Deferred.make<void>();
+          yield* client[ORCHESTRATION_WS_METHODS.subscribeThreadPresence]({}).pipe(
+            Stream.runForEach((snapshot) =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(ready, undefined);
+                const own = snapshot.participants.find(
+                  (entry) => entry.sessionId === snapshot.viewer?.sessionId,
+                );
+                if (!own) return;
+                assert.equal(own.threadId, threadId);
+                if (own.clientLabel === "Test browser" && own.typing)
+                  yield* Deferred.succeed(original, undefined);
+                if (own.clientLabel === "Renamed client" && own.typing)
+                  yield* Deferred.succeed(renamed, undefined);
+                if (own.clientLabel === "Renamed client" && !own.typing)
+                  yield* Deferred.succeed(nextActivity, undefined);
+              }),
+            ),
+            Effect.forkChild,
+          );
+          yield* Deferred.await(ready);
+          yield* client[ORCHESTRATION_WS_METHODS.reportThreadPresence]({ threadId, typing: true });
+          yield* Deferred.await(original);
+          const response = yield* fetchEffect(renameUrl, {
+            method: "POST",
+            headers: { cookie, "content-type": "application/json" },
+            body: jsonRequestBody({ label: "Renamed client" }),
+          });
+          assert.equal(response.status, 200);
+          yield* Deferred.await(renamed);
+          yield* client[ORCHESTRATION_WS_METHODS.reportThreadPresence]({ threadId, typing: false });
+          yield* Deferred.await(nextActivity);
+        }),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "rejects missing and mismatched WebSocket protocols without invalidating the saved session",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest();
+        const cookie = yield* getAuthenticatedSessionCookieHeader();
+        for (const version of [
+          null,
+          "1",
+          "bogus",
+          "02",
+          String(ORCHESTRATION_PROTOCOL_VERSION + 1),
+        ]) {
+          const url = yield* getHttpServerUrl(
+            version === null ? "/ws" : `/ws?orchestrationProtocol=${version}`,
+          );
+          const response = yield* fetchEffect(url, { headers: { cookie } });
+          assert.equal(response.status, 426);
+          assert.deepInclude(yield* responseJsonEffect(response), {
+            code: "unsupported_protocol",
+            orchestrationProtocolVersion: ORCHESTRATION_PROTOCOL_VERSION,
+          });
+        }
+        const response = yield* fetchEffect(yield* getHttpServerUrl("/api/auth/session"), {
+          headers: { cookie },
+        });
+        assert.equal(
+          (yield* responseJsonEffect<{ authenticated: boolean }>(response)).authenticated,
+          true,
+        );
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
   it.effect("bootstraps a browser session and authenticates the session endpoint via cookie", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();
@@ -2843,6 +3061,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         });
         const { ticket } = (yield* ticketResponse.json) as { ticket: string };
         const socketUrl = new URL(yield* getWsServerUrl("/ws", { authenticated: false }));
+        socketUrl.searchParams.set("orchestrationProtocol", String(ORCHESTRATION_PROTOCOL_VERSION));
         socketUrl.searchParams.set("wsTicket", ticket);
         const closed = yield* Deferred.make<void>();
         yield* Effect.acquireRelease(

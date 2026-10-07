@@ -2,6 +2,8 @@ import type { AuthSessionState } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import React, { startTransition, useEffect, useRef, useState, useCallback } from "react";
 
+import { ClientNameField, useClientName, rememberClientLabel } from "./ClientNameField";
+import { peekPendingPairingCredential } from "../../environments/primary/auth";
 import { APP_DISPLAY_NAME } from "../../branding";
 import { connectPairing } from "../../connection/onboarding";
 import {
@@ -29,29 +31,36 @@ export function PairingPendingSurface() {
 
 export function PairingRouteSurface({
   auth,
+  labelOnly = false,
   initialErrorMessage,
   onAuthenticated,
 }: {
   auth: AuthSessionState["auth"];
+  labelOnly?: boolean;
   initialErrorMessage?: string;
   onAuthenticated: () => void;
 }) {
-  const autoPairTokenRef = useRef<string | null>(peekPairingTokenFromUrl());
-  const [credential, setCredential] = useState(() => autoPairTokenRef.current ?? "");
+  const [credential, setCredential] = useState(
+    () => peekPendingPairingCredential() ?? peekPairingTokenFromUrl() ?? "",
+  );
   const [errorMessage, setErrorMessage] = useState(initialErrorMessage ?? "");
+  const [clientName, setClientName] = useClientName();
+  const submittingRef = useRef(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const autoSubmitAttemptedRef = useRef(false);
 
   const submitCredential = useCallback(
     async (nextCredential: string) => {
+      if (submittingRef.current) return;
+      submittingRef.current = true;
       setIsSubmitting(true);
       setErrorMessage("");
 
-      const submitError = await submitServerAuthCredential(nextCredential).then(
+      const submitError = await submitServerAuthCredential(nextCredential, clientName).then(
         () => null,
         (error) => errorMessageFromUnknown(error),
       );
 
+      submittingRef.current = false;
       setIsSubmitting(false);
 
       if (submitError) {
@@ -59,11 +68,12 @@ export function PairingRouteSurface({
         return;
       }
 
+      rememberClientLabel(clientName);
       startTransition(() => {
         onAuthenticated();
       });
     },
-    [onAuthenticated],
+    [onAuthenticated, clientName],
   );
 
   const handleSubmit = useCallback(
@@ -74,43 +84,37 @@ export function PairingRouteSurface({
     [submitCredential, credential],
   );
 
-  useEffect(() => {
-    const token = autoPairTokenRef.current;
-    if (!token || autoSubmitAttemptedRef.current) {
-      return;
-    }
-
-    autoSubmitAttemptedRef.current = true;
-    stripPairingTokenFromUrl();
-    void submitCredential(token);
-  }, [submitCredential]);
-
   return (
     <StandalonePage tone="pairing">
       <StandalonePageHeader
         eyebrow={APP_DISPLAY_NAME}
-        title="Pair with this environment"
-        description={describeAuthGate(auth.bootstrapMethods)}
+        title={labelOnly ? "Name this client" : "Pair with this environment"}
+        description={
+          labelOnly ? "Choose a name for this connection." : describeAuthGate(auth.bootstrapMethods)
+        }
       />
 
       <form className="mt-6 space-y-4" onSubmit={(event) => void handleSubmit(event)}>
-        <div className="space-y-2">
-          <label className="text-sm font-medium" htmlFor="pairing-token">
-            Pairing token
-          </label>
-          <Input
-            id="pairing-token"
-            autoCapitalize="none"
-            autoComplete="off"
-            autoCorrect="off"
-            disabled={isSubmitting}
-            nativeInput
-            onChange={(event) => setCredential(event.currentTarget.value)}
-            placeholder="Paste a one-time token or pairing secret"
-            spellCheck={false}
-            value={credential}
-          />
-        </div>
+        <ClientNameField value={clientName} onChange={setClientName} disabled={isSubmitting} />
+        {!labelOnly ? (
+          <div className="space-y-2">
+            <label className="text-sm font-medium" htmlFor="pairing-token">
+              Pairing token
+            </label>
+            <Input
+              id="pairing-token"
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              disabled={isSubmitting}
+              nativeInput
+              onChange={(event) => setCredential(event.currentTarget.value)}
+              placeholder="Paste a one-time token or pairing secret"
+              spellCheck={false}
+              value={credential}
+            />
+          </div>
+        ) : null}
 
         {errorMessage ? (
           <div className="rounded-lg border border-destructive/30 bg-destructive/6 px-3 py-2 text-sm text-destructive">
@@ -120,7 +124,7 @@ export function PairingRouteSurface({
 
         <div className="flex flex-wrap gap-2">
           <Button disabled={isSubmitting} size="sm" type="submit">
-            {isSubmitting ? "Pairing..." : "Continue"}
+            {isSubmitting ? "Connecting…" : "Connect"}
           </Button>
           <Button
             disabled={isSubmitting}
@@ -144,21 +148,22 @@ export function HostedPairingRouteSurface() {
   const connectPairingEnvironment = useAtomCommand(connectPairing, {
     reportFailure: false,
   });
-  const hostedPairingRequestRef = useRef(readHostedPairingRequest());
+  const [hostedPairingRequest] = useState(readHostedPairingRequest);
   const [status, setStatus] = useState<"pairing" | "paired" | "error">(() =>
-    hostedPairingRequestRef.current ? "pairing" : "error",
+    hostedPairingRequest ? "pairing" : "error",
   );
   const [message, setMessage] = useState(() =>
-    hostedPairingRequestRef.current
-      ? "Connecting to this backend."
+    hostedPairingRequest
+      ? "Choose a client name, then connect to this backend."
       : "This pairing link is missing its backend host or token.",
   );
   const [canRetry, setCanRetry] = useState(false);
-  const submitAttemptedRef = useRef(false);
+  const [clientName, setClientName] = useClientName();
+  const [confirmed, setConfirmed] = useState(false);
   const tokenSubmittedRef = useRef(false);
 
   const submitHostedPairingRequest = useCallback(async () => {
-    const request = hostedPairingRequestRef.current;
+    const request = hostedPairingRequest;
 
     if (!request) {
       setStatus("error");
@@ -167,12 +172,7 @@ export function HostedPairingRouteSurface() {
       return;
     }
 
-    if (tokenSubmittedRef.current) {
-      setStatus("error");
-      setMessage("This one-time pairing token was already submitted. Request a new pairing link.");
-      setCanRetry(false);
-      return;
-    }
+    if (tokenSubmittedRef.current) return;
 
     setStatus("pairing");
     setMessage("Connecting to this backend.");
@@ -182,48 +182,62 @@ export function HostedPairingRouteSurface() {
     const result = await connectPairingEnvironment({
       host: request.host,
       pairingCode: request.token,
+      clientLabel: clientName,
     });
     if (result._tag === "Success") {
+      rememberClientLabel(clientName);
       setStatus("paired");
       setMessage(`${request.label || "The environment"} is saved in this browser.`);
       return;
     }
 
     tokenSubmittedRef.current = false;
+    setConfirmed(false);
     setStatus("error");
     setCanRetry(true);
     setMessage(
       `${errorMessageFromUnknown(squashAtomCommandFailure(result))} If the backend accepted this one-time token, request a new pairing link before retrying.`,
     );
-  }, [connectPairingEnvironment]);
+  }, [connectPairingEnvironment, clientName, hostedPairingRequest]);
 
   useEffect(() => {
-    if (submitAttemptedRef.current) {
-      return;
-    }
-    submitAttemptedRef.current = true;
-
     stripPairingTokenFromUrl();
-    void submitHostedPairingRequest();
-  }, [submitHostedPairingRequest]);
+  }, []);
 
-  const request = hostedPairingRequestRef.current;
+  const request = hostedPairingRequest;
 
   return (
     <StandalonePage tone="pairing">
       <StandalonePageHeader
         eyebrow={APP_DISPLAY_NAME}
         title={
-          status === "paired"
-            ? "Backend paired"
-            : status === "error"
-              ? "Pairing failed"
-              : "Pairing backend"
+          !confirmed && request
+            ? "Pair with this environment"
+            : status === "paired"
+              ? "Backend paired"
+              : status === "error"
+                ? "Pairing failed"
+                : "Pairing backend"
         }
         description={message}
       />
 
-      {request ? (
+      {request && !confirmed ? (
+        <form
+          className="mt-4 space-y-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setConfirmed(true);
+            void submitHostedPairingRequest();
+          }}
+        >
+          <ClientNameField value={clientName} onChange={setClientName} />
+          <Button type="submit" disabled={!clientName.trim()}>
+            Connect
+          </Button>
+        </form>
+      ) : null}
+      {request && confirmed ? (
         <div className="mt-5 rounded-lg border border-border/70 bg-background/55 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
           Host: <span className="font-mono text-foreground/80">{request.host}</span>
         </div>
@@ -237,11 +251,11 @@ export function HostedPairingRouteSurface() {
       ) : null}
 
       <div className="mt-6 flex flex-wrap gap-2">
-        {status === "pairing" ? (
+        {status === "pairing" && confirmed ? (
           <Button disabled size="sm">
             Pairing...
           </Button>
-        ) : canRetry ? (
+        ) : canRetry && confirmed ? (
           <Button size="sm" onClick={() => void submitHostedPairingRequest()}>
             Try again
           </Button>

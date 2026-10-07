@@ -965,6 +965,7 @@ describe("EnvironmentConnector", () => {
         sub: "user_123",
         name: "Alice Example",
         picture: "https://img.example.test/alice.png",
+        email: "alice@example.test",
       });
     }).pipe(
       Effect.provide(

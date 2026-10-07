@@ -1,3 +1,4 @@
+import { ClientNameField, useClientName, rememberClientLabel } from "../auth/ClientNameField";
 import { useAuth } from "@clerk/react";
 import { useAtomValue } from "@effect/atom-react";
 import type {
@@ -489,6 +490,7 @@ function PairingForm({
 }) {
   const connectPairingEnvironment = useAtomCommand(connectPairing, { reportFailure: false });
   const [pairingUrl, setPairingUrl] = useState("");
+  const [clientName, setClientName] = useClientName();
   const [errorMessage, setErrorMessage] = useState("");
   const mountedRef = useRef(true);
 
@@ -500,13 +502,17 @@ function PairingForm({
   }, []);
 
   const submit = async () => {
-    if (isPairing || pairingUrl.trim().length === 0) return;
+    if (isPairing || !clientName.trim() || pairingUrl.trim().length === 0) return;
     setIsPairing(true);
     setErrorMessage("");
-    const result = await connectPairingEnvironment({ pairingUrl: pairingUrl.trim() });
+    const result = await connectPairingEnvironment({
+      pairingUrl: pairingUrl.trim(),
+      clientLabel: clientName,
+    });
     if (!mountedRef.current) return;
     setIsPairing(false);
     if (result._tag === "Success") {
+      rememberClientLabel(clientName);
       onPaired(result.value);
       return;
     }
@@ -524,6 +530,7 @@ function PairingForm({
           void submit();
         }}
       >
+        <ClientNameField value={clientName} onChange={setClientName} disabled={isPairing} />
         <div>
           <label className="block text-sm text-muted-foreground" htmlFor="onboarding-pairing-url">
             Pairing link

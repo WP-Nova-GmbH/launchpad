@@ -10,7 +10,7 @@ import {
 } from "./baseSchemas.ts";
 
 /** Wire version for orchestration snapshots, streams, commands, and RPC payloads. */
-export const ORCHESTRATION_PROTOCOL_VERSION = 1;
+export const ORCHESTRATION_PROTOCOL_VERSION = 2;
 export const ORCHESTRATION_PROTOCOL_QUERY_PARAM = "orchestrationProtocol";
 
 export const ExecutionEnvironmentPlatformOs = Schema.Literals([

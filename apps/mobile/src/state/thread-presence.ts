@@ -30,6 +30,17 @@ export function useThreadPresencePeople(
   return useAtomValue(ref === null ? EMPTY_PEOPLE_ATOM : threadPresence.peopleAtom(ref));
 }
 
+export function useThreadPresenceParticipants(
+  environmentId: EnvironmentId | null,
+  threadId: ThreadId | null,
+) {
+  const ref = useMemo(
+    () => (environmentId !== null && threadId !== null ? { environmentId, threadId } : null),
+    [environmentId, threadId],
+  );
+  return useAtomValue(ref === null ? EMPTY_PEOPLE_ATOM : threadPresence.participantsAtom(ref));
+}
+
 /**
  * Announces which thread this client is looking at and whether it is typing.
  * Mirrors the web reporter: typing starts on the first draft edit, renews

@@ -1,3 +1,4 @@
+import { rememberClientLabel } from "../features/connection/useClientName";
 import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -121,10 +122,10 @@ export function useRemoteConnections() {
   }, []);
 
   const onConnectPress = useCallback(
-    async (pairingUrl?: string) => {
+    async (pairingUrl?: string, clientLabel?: string) => {
       const nextPairingUrl = pairingUrl ?? connectionPairingUrl;
       setPendingConnectionError(null);
-      const result = await controller.connectPairingUrl(nextPairingUrl);
+      const result = await controller.connectPairingUrl(nextPairingUrl, clientLabel);
       if (AsyncResult.isFailure(result)) {
         const error = Cause.squash(result.cause);
         const message =
@@ -140,6 +141,7 @@ export function useRemoteConnections() {
           setPendingConnectionError(message);
         }
       } else {
+        if (clientLabel) await rememberClientLabel(clientLabel);
         appAtomRegistry.set(connectionPairingUrlAtom, "");
       }
       return result;

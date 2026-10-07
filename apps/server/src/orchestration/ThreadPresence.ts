@@ -14,6 +14,8 @@
  */
 import type {
   AuthSessionUser,
+  AuthSessionId,
+  AuthClientMetadata,
   ThreadId,
   ThreadPresenceParticipant,
   ThreadPresenceSnapshot,
@@ -36,6 +38,10 @@ export const TYPING_LEASE_MILLIS = 8_000;
 const TYPING_SWEEP_INTERVAL = "2 seconds";
 
 export interface ThreadPresenceReport {
+  readonly sessionId: AuthSessionId;
+  readonly clientDeviceType: AuthClientMetadata["deviceType"];
+  readonly clientOs: string | null;
+  readonly clientBrowser: string | null;
   readonly connectionId: string;
   readonly user: AuthSessionUser | null;
   readonly clientLabel: string | null;
@@ -44,6 +50,10 @@ export interface ThreadPresenceReport {
 }
 
 interface PresenceEntry {
+  readonly sessionId: AuthSessionId;
+  readonly clientDeviceType: AuthClientMetadata["deviceType"];
+  readonly clientOs: string | null;
+  readonly clientBrowser: string | null;
   readonly connectionId: string;
   readonly user: AuthSessionUser | null;
   readonly clientLabel: string | null;
@@ -58,6 +68,13 @@ export class ThreadPresenceService extends Context.Service<
     /** Replace what one connection is doing. A null thread removes it. */
     readonly report: (input: ThreadPresenceReport) => Effect.Effect<void>;
     /** The connection went away; forget it and tell everyone. */
+    readonly updatePresentation: (
+      connectionId: string,
+      presentation: Pick<
+        ThreadPresenceReport,
+        "sessionId" | "user" | "clientLabel" | "clientDeviceType" | "clientOs" | "clientBrowser"
+      >,
+    ) => Effect.Effect<void>;
     readonly clear: (connectionId: string) => Effect.Effect<void>;
     /** Every participant on every thread, including the caller's own connection. */
     readonly snapshot: Effect.Effect<ThreadPresenceSnapshot>;
@@ -74,6 +91,10 @@ export class ThreadPresenceService extends Context.Service<
 
 function toParticipant(entry: PresenceEntry, nowMillis: number): ThreadPresenceParticipant {
   return {
+    sessionId: entry.sessionId,
+    clientDeviceType: entry.clientDeviceType,
+    clientOs: entry.clientOs,
+    clientBrowser: entry.clientBrowser,
     connectionId: entry.connectionId,
     threadId: entry.threadId,
     user: entry.user,
@@ -121,9 +142,18 @@ const make = Effect.fn("orchestration.thread_presence.make")(function* () {
           const unchanged =
             previous !== undefined &&
             previous.threadId === input.threadId &&
+            previous.clientLabel === input.clientLabel &&
+            previous.clientDeviceType === input.clientDeviceType &&
+            previous.clientOs === input.clientOs &&
+            previous.clientBrowser === input.clientBrowser &&
+            JSON.stringify(previous.user) === JSON.stringify(input.user) &&
             previous.typingUntilMillis > now.epochMilliseconds === input.typing;
           const next = new Map(entries);
           next.set(input.connectionId, {
+            sessionId: input.sessionId,
+            clientDeviceType: input.clientDeviceType,
+            clientOs: input.clientOs,
+            clientBrowser: input.clientBrowser,
             connectionId: input.connectionId,
             user: input.user,
             clientLabel: input.clientLabel,
@@ -136,6 +166,34 @@ const make = Effect.fn("orchestration.thread_presence.make")(function* () {
         if (changed) {
           yield* publishSnapshotUnlocked;
         }
+      }),
+    );
+
+  const updatePresentation: ThreadPresenceService["Service"]["updatePresentation"] = (
+    connectionId,
+    presentation,
+  ) =>
+    publishMutex.withPermits(1)(
+      Effect.gen(function* () {
+        const changed = yield* Ref.modify(entriesRef, (entries) => {
+          const current = entries.get(connectionId);
+          if (
+            !current ||
+            JSON.stringify({
+              sessionId: current.sessionId,
+              user: current.user,
+              clientLabel: current.clientLabel,
+              clientDeviceType: current.clientDeviceType,
+              clientOs: current.clientOs,
+              clientBrowser: current.clientBrowser,
+            }) === JSON.stringify(presentation)
+          )
+            return [false, entries] as const;
+          const next = new Map(entries);
+          next.set(connectionId, { ...current, ...presentation });
+          return [true, next] as const;
+        });
+        if (changed) yield* publishSnapshotUnlocked;
       }),
     );
 
@@ -190,6 +248,7 @@ const make = Effect.fn("orchestration.thread_presence.make")(function* () {
 
   return ThreadPresenceService.of({
     report,
+    updatePresentation,
     clear,
     snapshot,
     subscribe: subscribeBeforeSnapshot(changes, snapshot, publishMutex),

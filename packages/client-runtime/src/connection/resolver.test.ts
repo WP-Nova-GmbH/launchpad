@@ -73,6 +73,7 @@ function collectingTracer(spans: Array<string>): Tracer.Tracer {
 }
 
 const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((options?: {
+  readonly needsClientLabel?: boolean;
   readonly profiles?: ReadonlyArray<ConnectionProfile>;
   readonly profileStore?: ConnectionProfileStore.ConnectionProfileStore["Service"];
   readonly credentials?: ReadonlyArray<readonly [string, ConnectionCredential]>;
@@ -146,8 +147,28 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   });
 
   const dependencies = Layer.mergeAll(
-    remoteHttpClientLayer((() =>
-      Promise.resolve(
+    remoteHttpClientLayer(((url, init) => {
+      // Model the packaged server's wildcard CORS policy for bearer connections.
+      if (init?.credentials === "include" && new Headers(init.headers).has("authorization"))
+        return Promise.reject(new TypeError("Credentialed requests cannot use wildcard CORS"));
+      if (url.toString().endsWith("/api/auth/session"))
+        return Promise.resolve(
+          Response.json({
+            authenticated: true,
+            auth: {
+              policy: "loopback-browser",
+              bootstrapMethods: ["one-time-token"],
+              sessionMethods: ["browser-session-cookie"],
+              sessionCookieName: "t3_session",
+            },
+            currentSession: {
+              sessionId: "saved-session",
+              client: { deviceType: "desktop" },
+              needsClientLabel: options?.needsClientLabel ?? false,
+            },
+          }),
+        );
+      return Promise.resolve(
         Response.json({
           environmentId: ENVIRONMENT_ID,
           label: "Compatible environment",
@@ -160,7 +181,8 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
               : { orchestrationProtocolVersion: options.descriptorProtocolVersion }),
           capabilities: { repositoryIdentity: true },
         }),
-      )) satisfies typeof fetch),
+      );
+    }) satisfies typeof fetch),
     Layer.succeed(
       ConnectionProfileStore.ConnectionProfileStore,
       options?.profileStore ?? profileStore,
@@ -207,6 +229,25 @@ describe("ConnectionResolver", () => {
     }),
   );
 
+  it.effect(
+    "blocks an unnamed restored connection while leaving its HTTP naming path available",
+    () =>
+      Effect.gen(function* () {
+        const layer = yield* makeDependencies({ needsClientLabel: true });
+        const resolver = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(layer));
+        const entry = catalogEntry(
+          new PrimaryConnectionTarget({
+            environmentId: ENVIRONMENT_ID,
+            label: "Saved environment",
+            ...ENDPOINT,
+          }),
+        );
+        expect(yield* resolver.prepare(entry).pipe(Effect.flip)).toMatchObject({
+          reason: "client-label-required",
+        });
+        expect((yield* resolver.prepareHttp(entry)).target).toEqual(entry.target);
+      }),
+  );
   it.effect("prepares a primary environment without remote capabilities", () =>
     Effect.gen(function* () {
       const brokerLayer = yield* makeDependencies();
@@ -223,7 +264,7 @@ describe("ConnectionResolver", () => {
         label: "Primary",
         httpBaseUrl: "http://127.0.0.1:3777",
         socketUrl:
-          "ws://127.0.0.1:3777/ws?clientSurface=web&clientDeviceType=desktop&connectionMethod=direct&orchestrationProtocol=1",
+          "ws://127.0.0.1:3777/ws?clientSurface=web&clientDeviceType=desktop&connectionMethod=direct&orchestrationProtocol=2",
         httpAuthorization: null,
         target,
       });
@@ -261,7 +302,7 @@ describe("ConnectionResolver", () => {
       });
 
       expect(yield* broker.prepare(catalogEntry(target))).toMatchObject({
-        socketUrl: "ws://127.0.0.1:3777/ws?wsTicket=desktop&orchestrationProtocol=1",
+        socketUrl: "ws://127.0.0.1:3777/ws?wsTicket=desktop&orchestrationProtocol=2",
         httpAuthorization: { _tag: "Bearer", token: "desktop-bearer" },
         target,
       });

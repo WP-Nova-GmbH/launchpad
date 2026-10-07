@@ -7,7 +7,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-import { appendClientConnectionParams } from "../authorization/remote.ts";
+import { appendClientConnectionParams, fetchRemoteSessionState } from "../authorization/remote.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import {
@@ -46,6 +46,9 @@ import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
 export class ConnectionResolver extends Context.Service<
   ConnectionResolver,
   {
+    readonly prepareHttp: (
+      entry: ConnectionCatalogEntry,
+    ) => Effect.Effect<PreparedConnection, ConnectionAttemptError>;
     readonly prepare: (
       entry: ConnectionCatalogEntry,
     ) => Effect.Effect<PreparedConnection, ConnectionAttemptError>;
@@ -245,7 +248,7 @@ export const make = Effect.gen(function* () {
   const ssh = yield* makeSshBroker();
   const httpClient = yield* HttpClient.HttpClient;
 
-  const prepare = Effect.fn("clientRuntime.connection.broker.prepare")(function* (
+  const prepareHttp = Effect.fn("clientRuntime.connection.broker.prepareHttp")(function* (
     entry: ConnectionCatalogEntry,
   ) {
     const target: ConnectionTarget = entry.target;
@@ -265,15 +268,22 @@ export const make = Effect.gen(function* () {
           return ssh({ ...entry, target });
       }
     })();
+    return prepared;
+  });
+
+  const prepare = Effect.fn("clientRuntime.connection.broker.prepare")(function* (
+    entry: ConnectionCatalogEntry,
+  ) {
+    const prepared = yield* prepareHttp(entry);
     const descriptor = yield* fetchRemoteEnvironmentDescriptor({
       httpBaseUrl: prepared.httpBaseUrl,
     }).pipe(
       Effect.mapError(mapRemoteEnvironmentError),
       Effect.provideService(HttpClient.HttpClient, httpClient),
     );
-    if (descriptor.environmentId !== target.environmentId) {
+    if (descriptor.environmentId !== entry.target.environmentId) {
       return yield* environmentMismatchError({
-        expected: target.environmentId,
+        expected: entry.target.environmentId,
         actual: descriptor.environmentId,
       });
     }
@@ -281,10 +291,31 @@ export const make = Effect.gen(function* () {
     if (compatibilityError !== null) {
       return yield* compatibilityError;
     }
+    if (prepared.httpAuthorization?._tag !== "Dpop") {
+      const session = yield* fetchRemoteSessionState({
+        httpBaseUrl: prepared.httpBaseUrl,
+        ...(prepared.httpAuthorization?._tag === "Bearer"
+          ? { bearerToken: prepared.httpAuthorization.token }
+          : {}),
+      }).pipe(
+        Effect.mapError(mapRemoteEnvironmentError),
+        Effect.provideService(HttpClient.HttpClient, httpClient),
+      );
+      if (!session.authenticated)
+        return yield* new ConnectionBlockedError({
+          reason: "authentication",
+          detail: "The environment credential is invalid.",
+        });
+      if (session.currentSession?.needsClientLabel)
+        return yield* new ConnectionBlockedError({
+          reason: "client-label-required",
+          detail: `Choose a client name to connect to ${prepared.label}.`,
+        });
+    }
     return { ...prepared, socketUrl: appendOrchestrationProtocol(prepared.socketUrl) };
   });
 
-  return ConnectionResolver.of({ prepare });
+  return ConnectionResolver.of({ prepare, prepareHttp });
 });
 
 export const layer = Layer.effect(ConnectionResolver, make);

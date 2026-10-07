@@ -134,7 +134,9 @@ describe("device listing compatibility", () => {
           lookup: ({ userIds }) => {
             expect(userIds).toEqual(["user-1"]);
             return Effect.succeed(
-              new Map([["user-1", { displayName: "Stefan", imageUrl: null, email: null }]]),
+              new Map([
+                ["user-1", { displayName: "Stefan", imageUrl: null, email: "stefan@example.com" }],
+              ]),
             );
           },
         }),
@@ -200,6 +202,7 @@ describe("device listing compatibility", () => {
         userId: "user-1",
         displayName: "Stefan",
         imageUrl: null,
+        email: "stefan@example.com",
       });
       for (const [version, devices] of [
         ["v1", [iphone]],

@@ -369,6 +369,7 @@ describe("remote environment authorization", () => {
           authorization: "Bearer bearer-token",
         },
       });
+      expect(fetch.calls[1]?.[1].credentials).toBe("omit");
       expectFetchCall(fetch.calls, 3, {
         url: "https://remote.example.com/api/auth/websocket-ticket",
         method: "POST",
@@ -376,6 +377,29 @@ describe("remote environment authorization", () => {
           authorization: "Bearer bearer-token",
         },
       });
+    }),
+  );
+
+  it.effect("loads cookie session state with browser credentials and no bearer header", () =>
+    Effect.gen(function* () {
+      const fetch = recordedFetch(
+        Response.json({
+          authenticated: true,
+          auth: {
+            policy: "loopback-browser",
+            bootstrapMethods: ["one-time-token"],
+            sessionMethods: ["browser-session-cookie", "bearer-access-token"],
+            sessionCookieName: "t3_session",
+          },
+          sessionMethod: "browser-session-cookie",
+        }),
+      );
+      const session = yield* fetchRemoteSessionState({
+        httpBaseUrl: "https://primary.example.com/",
+      }).pipe(provideRemoteHttp(fetch.fetchFn));
+      expect(session.authenticated).toBe(true);
+      expect(fetch.calls[0]?.[1].credentials).toBe("include");
+      expect(fetch.calls[0]?.[1].headers).not.toHaveProperty("authorization");
     }),
   );
 

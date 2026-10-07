@@ -80,6 +80,7 @@ export const ConnectionTransientReason = Schema.Literals([
 export type ConnectionTransientReason = typeof ConnectionTransientReason.Type;
 
 export const ConnectionBlockedReason = Schema.Literals([
+  "client-label-required",
   "authentication",
   "configuration",
   "permission",

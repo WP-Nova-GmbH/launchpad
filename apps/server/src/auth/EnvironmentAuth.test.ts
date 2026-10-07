@@ -71,6 +71,7 @@ const makeBearerRequest = (
   >[0];
 
 const requestMetadata = {
+  label: "Test computer",
   deviceType: "desktop" as const,
   os: "macOS",
   browser: "Chrome",
@@ -556,7 +557,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         expect(
           clientsBeforeRevoke.find((entry) => entry.sessionId === clientSession.sessionId)?.client
             .label,
-        ).toBe("Julius iPhone");
+        ).toBe("Test computer");
         expect(
           clientsBeforeRevoke.find((entry) => entry.sessionId === clientSession.sessionId)?.client
             .deviceType,
@@ -571,5 +572,86 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
           }),
         ),
       ),
+  );
+  it.effect(
+    "requires a receiver label without consuming an ordinary code on either exchange path",
+    () =>
+      Effect.gen(function* () {
+        const auth = yield* EnvironmentAuth.EnvironmentAuth;
+        const sessions = yield* SessionStore.SessionStore;
+        for (const method of ["cookie", "bearer"] as const) {
+          const code = yield* auth.issuePairingCredential({ label: "Inviter's label" });
+          const exchange = (label?: string) =>
+            method === "cookie"
+              ? auth
+                  .createBrowserSession(code.credential, {
+                    deviceType: "desktop",
+                    ...(label !== undefined ? { label } : {}),
+                  })
+                  .pipe(Effect.map((result) => result.sessionToken))
+              : auth
+                  .exchangeBootstrapCredentialForAccessToken(code.credential, undefined, {
+                    deviceType: "mobile",
+                    ...(label !== undefined ? { label } : {}),
+                  })
+                  .pipe(Effect.map((result) => result.access_token));
+          for (const label of [undefined, "   ", "x".repeat(81)]) {
+            const failure = yield* exchange(label).pipe(Effect.flip);
+            expect(failure).toMatchObject({
+              _tag: "ServerAuthClientLabelError",
+              reason: label === undefined ? "client_label_required" : "invalid_client_label",
+            });
+          }
+          const token = yield* exchange("  Receiver's phone  ");
+          const verified = yield* sessions.verify(token);
+          const active = yield* sessions.getActive(verified.sessionId);
+          expect(active).toMatchObject({
+            _tag: "Some",
+            value: { client: { label: "Receiver's phone" } },
+          });
+          expect((yield* exchange("Replay").pipe(Effect.flip))._tag).toBe(
+            "ServerAuthInvalidCredentialError",
+          );
+        }
+      }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("keeps one-time redemption atomic when named clients race", () =>
+    Effect.gen(function* () {
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const code = yield* auth.issuePairingCredential();
+      const attempts = yield* Effect.all(
+        ["Phone", "Tablet"].map((label) =>
+          auth
+            .createBrowserSession(code.credential, { deviceType: "mobile", label })
+            .pipe(Effect.result),
+        ),
+        { concurrency: "unbounded" },
+      );
+      expect(attempts.filter((result) => result._tag === "Success")).toHaveLength(1);
+      expect(attempts.filter((result) => result._tag === "Failure")).toHaveLength(1);
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("reports unnamed restored sessions and self renaming preserves authentication", () =>
+    Effect.gen(function* () {
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "browser-session-cookie",
+        client: { deviceType: "desktop" },
+      });
+      const request = makeCookieRequest(sessions.cookieName, issued.token);
+      expect((yield* auth.getSessionState(request)).currentSession?.needsClientLabel).toBe(true);
+      yield* sessions.rename(issued.sessionId, "My computer");
+      const state = yield* auth.getSessionState(request);
+      expect(state.currentSession).toMatchObject({
+        sessionId: issued.sessionId,
+        needsClientLabel: false,
+        client: { label: "My computer" },
+      });
+      expect((yield* sessions.verify(issued.token)).sessionId).toBe(issued.sessionId);
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 });

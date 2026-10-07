@@ -8,6 +8,9 @@ import { useCallback } from "react";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { fetchSessionState } from "./auth";
+import { authEnvironment } from "../../state/auth";
+import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useEnvironmentQuery } from "../../state/query";
 
 const primarySessionStateAtom = Atom.make(
   Effect.suspend(() =>
@@ -25,6 +28,18 @@ function refreshPrimarySessionState(): void {
 
 export function usePrimarySessionState() {
   const result = useAtomValue(primarySessionStateAtom);
+  const environmentId = usePrimaryEnvironmentId();
+  const live = useEnvironmentQuery(
+    environmentId === null ? null : authEnvironment.currentSession({ environmentId, input: null }),
+  );
+  let data = Option.getOrNull(AsyncResult.value(result));
+  if (data?.authenticated && live.isSuccess) {
+    const { currentSession: _currentSession, ...state } = data;
+    data =
+      live.data === null
+        ? { ...state, authenticated: false }
+        : { ...state, currentSession: live.data };
+  }
   const refresh = useCallback(() => {
     refreshPrimarySessionState();
   }, []);
@@ -34,7 +49,7 @@ export function usePrimarySessionState() {
     error = cause instanceof Error ? cause.message : "Could not read environment session.";
   }
   return {
-    data: Option.getOrNull(AsyncResult.value(result)),
+    data,
     error,
     isPending: result.waiting,
     refresh,

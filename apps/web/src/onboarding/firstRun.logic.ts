@@ -35,6 +35,7 @@ interface FirstRunWorkspaceInput {
 
 interface FirstRunDecisionInput {
   readonly enabled: boolean;
+  readonly primaryNeedsClientLabel?: boolean;
   readonly hydrated: boolean;
   readonly completed: boolean;
   readonly bootstrapped: boolean;
@@ -127,7 +128,7 @@ export function resolveFirstRunDecision(input: FirstRunDecisionInput): {
   readonly decision: FirstRunDecision;
   readonly persistCompletion: boolean;
 } {
-  if (!input.enabled || (input.hydrated && input.completed)) {
+  if (!input.enabled || input.primaryNeedsClientLabel || (input.hydrated && input.completed)) {
     return { decision: "app", persistCompletion: false };
   }
 

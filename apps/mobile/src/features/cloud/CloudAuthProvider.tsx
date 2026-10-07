@@ -1,4 +1,5 @@
-import { ClerkProvider, useAuth } from "@clerk/expo";
+import { clientLabelAccountNameAtom } from "@t3tools/client-runtime/connection";
+import { ClerkProvider, useAuth, useUser } from "@clerk/expo";
 import { tokenCache } from "@clerk/expo/token-cache";
 import { ManagedRelay, setManagedRelaySession } from "@t3tools/client-runtime/relay";
 import {
@@ -51,6 +52,11 @@ export function activateCloudRelayAccount(
 }
 
 function CloudAuthBridge(props: { readonly children: ReactNode }) {
+  const { user } = useUser();
+  useEffect(() => {
+    appAtomRegistry.set(clientLabelAccountNameAtom, user?.fullName ?? user?.firstName ?? null);
+    return () => appAtomRegistry.set(clientLabelAccountNameAtom, null);
+  }, [user?.fullName, user?.firstName]);
   const { getToken, isLoaded, isSignedIn, userId } = useAuth({ treatPendingAsSignedOut: false });
   const removeRelayEnvironments = useAtomCommand(removeCloudEnvironments, {
     reportFailure: false,
