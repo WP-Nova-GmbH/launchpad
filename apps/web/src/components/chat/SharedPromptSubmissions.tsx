@@ -1,6 +1,8 @@
 import type { ScopedThreadRef, CommandId, ProjectId } from "@t3tools/contracts";
 import { useEffect, useMemo, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
 import {
   forgetSharedPromptSubmission,
   rejectSharedPromptSubmission,
@@ -94,6 +96,7 @@ export function SharedPromptSubmissions({
   };
 
   const reconcile = async (entry: SharedPromptSubmission, retry: boolean) => {
+    const expectedAccountId = appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null;
     const input = receiptInput(entry, projectId);
     if (!input || entry.command.type !== "thread.turn.start") return;
     setBusy(entry.command.commandId);
@@ -139,7 +142,10 @@ export function SharedPromptSubmissions({
           return;
         }
       }
-      const result = await start({ environmentId: entry.environmentId, input: entry.command });
+      const result = await start({
+        environmentId: entry.environmentId,
+        input: { ...entry.command, expectedAccountId },
+      });
       if (result._tag === "Failure")
         setError(
           "This submission remains saved. Check its outcome or your access before retrying.",

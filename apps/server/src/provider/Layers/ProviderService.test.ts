@@ -497,9 +497,86 @@ function makeProviderServiceLayer(
 }
 
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import {
+  registerIssueWrite,
+  releaseIssueWrite,
+  hasPendingIssueWrite,
+} from "../../mcp/IssueTrackerApprovalBroker.ts";
 
 const sharedDelivery = makeProviderServiceLayer();
 sharedDelivery.layer("ProviderService shared delivery", (it) => {
+  it.effect.each([
+    { terminal: "turn.completed", matches: false },
+    { terminal: "turn.aborted", matches: false },
+    { terminal: "turn.completed", matches: true },
+    { terminal: "turn.aborted", matches: true },
+  ] as const)(
+    "only the admitted turn's terminal event cancels its write approval: %j",
+    ({ terminal, matches }) =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const threadId = asThreadId(`personal-write-${terminal}-${matches}`);
+        const environmentId = EnvironmentId.make("test");
+        yield* sharedDelivery.codex.whenSubscribed;
+        yield* provider.startSession(threadId, {
+          threadId,
+          providerInstanceId: codexInstanceId,
+          runtimeMode: "full-access",
+        });
+        McpProviderSession.setMcpProviderSession({
+          threadId,
+          environmentId,
+          providerInstanceId: codexInstanceId,
+          providerSessionId: "current-process",
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer fixture",
+          capabilities: new Set(["issue-trackers"]),
+          issueTrackerAuthorizationId: "current-grant",
+        });
+        McpProviderSession.bindIssueTrackerTurn(threadId, "current-process", "current-turn");
+        const pending = yield* registerIssueWrite(
+          `operation-${threadId}`,
+          threadId,
+          "current-process",
+          "alice",
+          environmentId,
+          "current-grant",
+        );
+        assert(pending);
+        yield* Effect.addFinalizer(() =>
+          releaseIssueWrite(pending.requestId, pending.deferred).pipe(
+            Effect.andThen(Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
+          ),
+        );
+        const eventId = asEventId(`terminal-${threadId}`);
+        const published = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === eventId),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        sharedDelivery.codex.emit({
+          eventId,
+          provider: CODEX_DRIVER,
+          threadId,
+          turnId: asTurnId(matches ? "current-turn" : "previous-turn"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          ...(terminal === "turn.completed"
+            ? { type: terminal, payload: { state: "completed" } }
+            : { type: terminal, payload: { reason: "stopped" } }),
+        });
+        assert(Option.isSome(yield* Fiber.join(published)));
+        assert.equal(yield* Deferred.isDone(pending.deferred), matches);
+        assert.equal(hasPendingIssueWrite(pending.requestId, threadId), !matches);
+        const session = McpProviderSession.readMcpProviderSession(threadId);
+        assert.equal(session?.issueTrackerTurnComplete, matches ? true : undefined);
+        assert.equal(session?.issueTrackerAuthorizationId, "current-grant");
+        if (matches)
+          assert.deepEqual(yield* Deferred.await(pending.deferred), {
+            decision: "cancel",
+            actorUserId: null,
+          });
+      }),
+  );
   it.effect.each(["early-completion", "rejected"] as const)(
     "closes personal access when admission races with %s",
     (outcome) =>

@@ -78,13 +78,12 @@ export function completeIssueTrackerTurn(
   turnId: string,
 ): void {
   const current = sessionsByThread.get(threadId);
-  if (current?.providerInstanceId === providerInstanceId)
-    cancelIssueWritesForSession(threadId, current.providerSessionId);
   if (
     current?.issueTrackerAuthorizationId &&
     current.providerInstanceId === providerInstanceId &&
     current.issueTrackerTurnId === turnId
   ) {
+    cancelIssueWritesForSession(threadId, current.providerSessionId);
     sessionsByThread.set(threadId, { ...current, issueTrackerTurnComplete: true });
   }
 }

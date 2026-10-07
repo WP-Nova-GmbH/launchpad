@@ -7265,6 +7265,7 @@ export default function ChatView(props: ChatViewProps) {
   );
 
   const onCompactContext = async () => {
+    const expectedAccountId = appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null;
     if (compactDisabled || !activeThread || !clientSettingsHydrated || sendInFlightRef.current) {
       return;
     }
@@ -7310,6 +7311,7 @@ export default function ChatView(props: ChatViewProps) {
               input: {
                 threadId,
                 message: { messageId, role: "user", text: "/compact", attachments: [] },
+                expectedAccountId,
                 modelSelection: context.selectedModelSelection,
                 runtimeMode,
                 interactionMode: context.interactionMode,
@@ -7702,6 +7704,7 @@ export default function ChatView(props: ChatViewProps) {
       clearComposerDraftContent(composerDraftTarget);
       composerRef.current?.resetCursorState();
       const followUpSent = await onSubmitPlanFollowUp({
+        expectedAccountId,
         text: followUp.text,
         context: buildMessageContext({
           terminalContexts: sendableComposerTerminalContexts,
@@ -9133,10 +9136,12 @@ export default function ChatView(props: ChatViewProps) {
       text,
       context,
       interactionMode: nextInteractionMode,
+      expectedAccountId,
     }: {
       text: string;
       context?: ReturnType<typeof buildMessageContext>;
       interactionMode: "default" | "plan";
+      expectedAccountId: string | null;
       // A false return leaves ownership with the composer. A retained shared
       // submission owns its payload even when its acceptance is still unknown.
     }): Promise<boolean> => {
@@ -9224,6 +9229,7 @@ export default function ChatView(props: ChatViewProps) {
           environmentId,
           input: {
             threadId: threadIdForSend,
+            expectedAccountId,
             message: {
               messageId: messageIdForSend,
               role: "user",
@@ -9309,6 +9315,7 @@ export default function ChatView(props: ChatViewProps) {
   );
 
   const onImplementPlanInNewThread = useCallback(async () => {
+    const expectedAccountId = appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null;
     if (
       !activeThread ||
       !activeProject ||
@@ -9382,6 +9389,7 @@ export default function ChatView(props: ChatViewProps) {
         environmentId,
         input: {
           threadId: nextThreadId,
+          expectedAccountId,
           message: {
             messageId,
             role: "user",
