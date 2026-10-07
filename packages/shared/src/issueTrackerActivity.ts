@@ -18,7 +18,7 @@ export interface IssueTrackerActivity {
   readonly toolLifecycleStatus?: string;
 }
 
-export const issueTrackerToolTitles = {
+const issueTrackerToolTitles = {
   read_linear_issue: "Read Linear Issue",
   read_jira_issue: "Read Jira Issue",
   search_linear_issues: "Search Linear Issues",

@@ -2861,7 +2861,7 @@ export class RelayIssueTrackerTurnAuth extends HttpApiMiddleware.Service<
   security: { turnBearer: HttpApiSecurity.http({ scheme: "bearer" }) },
 }) {}
 
-export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
+const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
   .add(
     HttpApiEndpoint.post("authorizeTurn", "/v1/user/issue-trackers/authorize-turn", {
       headers: RelayBearerRequestHeaders,
@@ -2933,7 +2933,7 @@ export const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
   )
   .middleware(RelayClientAuth);
 
-export const RelayIssueTrackersServerGroup = HttpApiGroup.make("issueTrackersServer")
+const RelayIssueTrackersServerGroup = HttpApiGroup.make("issueTrackersServer")
   .add(
     HttpApiEndpoint.get("verifyTurn", "/v1/issue-trackers/turn", {
       success: RelayIssueTrackerTurnClaims,

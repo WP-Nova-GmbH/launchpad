@@ -6,7 +6,6 @@ import {
   issueTrackerToolTitle,
   type IssueTrackerActivity,
 } from "@t3tools/shared/issueTrackerActivity";
-export { issueTrackerActivityService } from "@t3tools/shared/issueTrackerActivity";
 
 export function issueTrackerActivityPresentation(
   entry: IssueTrackerActivity,

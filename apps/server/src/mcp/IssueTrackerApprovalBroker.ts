@@ -21,7 +21,7 @@ type Pending = {
   readonly deferred: Deferred.Deferred<Decision>;
 };
 const pending = new Map<string, Pending>();
-export const requestIdForIssueWrite = (operationId: string) =>
+const requestIdForIssueWrite = (operationId: string) =>
   ApprovalRequestId.make(`${ISSUE_TRACKER_WRITE_REQUEST_PREFIX}${operationId}`);
 
 export const isIssueWriteRequest = (requestId: string) =>
