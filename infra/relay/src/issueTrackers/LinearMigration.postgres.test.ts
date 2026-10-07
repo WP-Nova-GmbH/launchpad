@@ -62,8 +62,7 @@ describe.skipIf(!url)("Linear dynamic OAuth migration", () => {
         .pipe(Effect.flip);
       expect(result).toBe("rollback-test");
     }).pipe(
-      Effect.provide(PgClient.layer({ url: Redacted.make(url ?? "") })),
-      Effect.provide(NodeFileSystem.layer),
+      Effect.provide([PgClient.layer({ url: Redacted.make(url ?? "") }), NodeFileSystem.layer]),
       Effect.scoped,
     ),
   );

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import { fixture, toolName } from "./Connections.test-fixture.ts";
 import {
@@ -16,6 +17,7 @@ import {
   utf8Bytes,
 } from "./LinearDiscussion.ts";
 
+const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const source = {
   ownerUserId: "org",
   generation: "generation",
@@ -200,7 +202,7 @@ describe("Linear discussion and images", () => {
       expect(test.requests[0]?.headers.authorization).toBe("Bearer access-secret");
       const request = test.requests.find((request) => toolName(request) === "extract_images");
       if (request?.body._tag !== "Uint8Array") throw new Error("Expected MCP request body");
-      expect(JSON.parse(new TextDecoder().decode(request.body.body))).toMatchObject({
+      expect(yield* decodeJson(new TextDecoder().decode(request.body.body))).toMatchObject({
         params: {
           name: "extract_images",
           arguments: { markdown: "![image](https://uploads.linear.app/a.png)" },
