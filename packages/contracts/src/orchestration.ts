@@ -6,7 +6,7 @@ import * as Struct from "effect/Struct";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import { ProviderOptionSelections } from "./model.ts";
 import { RepositoryIdentity, ThreadEnvMode, WorktreeSubmodules } from "./environment.ts";
-import { AuthSessionUser } from "./auth.ts";
+import { AuthSessionUser, AuthClientMetadataDeviceType } from "./auth.ts";
 import {
   ApprovalRequestId,
   CheckpointRef,
@@ -19,6 +19,7 @@ import {
   PositiveInt,
   ProjectId,
   ProviderItemId,
+  AuthSessionId,
   ThreadId,
   TrimmedNonEmptyString,
   TrimmedString,
@@ -599,6 +600,10 @@ export type OrchestrationMessage = typeof OrchestrationMessage.Type;
  * by device label instead.
  */
 export const ThreadPresenceParticipant = Schema.Struct({
+  sessionId: AuthSessionId,
+  clientDeviceType: AuthClientMetadataDeviceType,
+  clientOs: Schema.NullOr(Schema.String),
+  clientBrowser: Schema.NullOr(Schema.String),
   /** Opaque per-WebSocket id; two tabs of one browser are two participants. */
   connectionId: TrimmedNonEmptyString,
   threadId: ThreadId,
@@ -609,8 +614,11 @@ export const ThreadPresenceParticipant = Schema.Struct({
 });
 export type ThreadPresenceParticipant = typeof ThreadPresenceParticipant.Type;
 
-/** Everyone present on any thread of this environment except the receiving session. */
+/** Repository-visible participants, including the viewer for participant details. */
 export const ThreadPresenceSnapshot = Schema.Struct({
+  viewer: Schema.optionalKey(
+    Schema.Struct({ sessionId: AuthSessionId, userId: Schema.NullOr(Schema.String) }),
+  ),
   participants: Schema.Array(ThreadPresenceParticipant),
 });
 export type ThreadPresenceSnapshot = typeof ThreadPresenceSnapshot.Type;

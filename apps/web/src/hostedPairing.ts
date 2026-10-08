@@ -66,8 +66,30 @@ export function readHostedPairingRequest(url: URL = new URL(window.location.href
   } satisfies HostedPairingRequest;
 }
 
-export function hasHostedPairingRequest(url: URL = new URL(window.location.href)): boolean {
-  return readHostedPairingRequest(url) !== null;
+let pendingHostedPairing: {
+  readonly origin: string;
+  readonly request: HostedPairingRequest;
+} | null = null;
+
+/** Token cleanup reloads the route; retain its request in memory for the same destination. */
+export function resolveHostedPairingRequest(url: URL = new URL(window.location.href)) {
+  if (url.pathname !== "/pair") {
+    pendingHostedPairing = null;
+    return null;
+  }
+  const request = readHostedPairingRequest(url);
+  if (request) {
+    pendingHostedPairing = { origin: url.origin, request };
+    return request;
+  }
+  if (
+    pendingHostedPairing?.origin === url.origin &&
+    pendingHostedPairing.request.host === url.searchParams.get("host")?.trim()
+  ) {
+    return pendingHostedPairing.request;
+  }
+  pendingHostedPairing = null;
+  return null;
 }
 
 export function buildHostedPairingUrl(input: {

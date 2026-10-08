@@ -79,6 +79,11 @@ export function createAuthEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
   return {
+    currentSession: createEnvironmentSubscriptionAtomFamily(runtime, {
+      label: "environment-data:auth-current-session",
+      idleTtlMs: 0,
+      subscribe: (_input: null) => subscribe(WS_METHODS.subscribeAuthSession, {}),
+    }),
     accessChanges: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:server:auth-access-changes",
       subscribe: (_input: null) =>

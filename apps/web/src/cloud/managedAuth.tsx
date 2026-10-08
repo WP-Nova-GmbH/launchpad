@@ -1,6 +1,7 @@
+import { clientLabelAccountNameAtom } from "@t3tools/client-runtime/connection";
 import { setDesktopLocalAccount } from "../environments/primary/desktopAuth";
 import { toastManager } from "../components/ui/toast";
-import { useAuth } from "@clerk/react";
+import { useAuth, useUser } from "@clerk/react";
 import { ManagedRelay, setManagedRelaySession } from "@t3tools/client-runtime/relay";
 import {
   reportAtomCommandResult,
@@ -34,6 +35,11 @@ export function activateManagedRelayAuthentication(
 }
 
 export function ManagedRelayAuthProvider({ children }: { readonly children: ReactNode }) {
+  const { user } = useUser();
+  useEffect(() => {
+    appAtomRegistry.set(clientLabelAccountNameAtom, user?.fullName ?? user?.firstName ?? null);
+    return () => appAtomRegistry.set(clientLabelAccountNameAtom, null);
+  }, [user?.fullName, user?.firstName]);
   const { getToken, isLoaded, isSignedIn, userId } = useAuth({
     treatPendingAsSignedOut: false,
   });

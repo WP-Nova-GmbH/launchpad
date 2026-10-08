@@ -87,6 +87,11 @@ export function FirstRunGate({
   const onboardingCompletedAt = useClientSettings((settings) => settings.onboardingCompletedAt);
   const bootstrapped = useAllEnvironmentShellsBootstrapped();
   const { environments, isReady: environmentCatalogReady } = useEnvironments();
+  const primaryNeedsClientLabel = environments.some(
+    (environment) =>
+      environment.entry.target._tag === "PrimaryConnectionTarget" &&
+      environment.connection.needsClientLabel,
+  );
   const projects = useProjects();
   const threads = useThreadShells();
   const serverConfig = useAtomValue(primaryServerConfigAtom);
@@ -97,7 +102,9 @@ export function FirstRunGate({
   // the wizard) resolve synchronously instead of blanking a frame.
   const [gateState, setGateState] = useState<FirstRunGateState>(() => ({
     decision:
-      (!enabled && !hostedStatic) || (hydrated && onboardingCompletedAt !== null)
+      (!enabled && !hostedStatic) ||
+      primaryNeedsClientLabel ||
+      (hydrated && onboardingCompletedAt !== null)
         ? "app"
         : "pending",
     stalled: false,
@@ -135,6 +142,7 @@ export function FirstRunGate({
       })
     : resolveFirstRunDecision({
         enabled,
+        primaryNeedsClientLabel,
         hydrated,
         completed: onboardingCompletedAt !== null,
         bootstrapped,
@@ -174,13 +182,13 @@ export function FirstRunGate({
   // The timer starts after settings hydrate so slow local hydration does not
   // show a false connection failure.
   useEffect(() => {
-    if (!enabled || decision !== "pending" || !hydrated) return;
+    if (!enabled || primaryNeedsClientLabel || decision !== "pending" || !hydrated) return;
     const timer = window.setTimeout(
       () => setGateState((state) => transitionFirstRunGateState(state, { type: "timeout" })),
       FIRST_RUN_DECISION_TIMEOUT_MS,
     );
     return () => window.clearTimeout(timer);
-  }, [decision, enabled, hydrated]);
+  }, [decision, enabled, hydrated, primaryNeedsClientLabel]);
 
   useEffect(() => {
     if (decision === "wizard" && pathname !== "/welcome") {

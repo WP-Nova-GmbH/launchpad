@@ -859,6 +859,7 @@ const make = Effect.gen(function* () {
         ...(input.deviceId ? { deviceId: input.deviceId } : {}),
         ...(identity?.displayName ? { name: identity.displayName } : {}),
         ...(identity?.imageUrl ? { picture: identity.imageUrl } : {}),
+        ...(identity?.email ? { email: identity.email } : {}),
         nonce,
         scope: ["environment:connect"],
       } satisfies RelayCloudMintCredentialProofPayload;

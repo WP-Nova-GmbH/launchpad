@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ThreadId } from "@t3tools/contracts";
+import { AuthSessionId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
@@ -16,6 +16,10 @@ describe("ThreadPresenceService", () => {
     Effect.gen(function* () {
       const presence = yield* ThreadPresence.ThreadPresenceService;
       yield* presence.report({
+        sessionId: AuthSessionId.make("session"),
+        clientDeviceType: "desktop" as const,
+        clientOs: "macOS",
+        clientBrowser: "Chrome",
         connectionId: "c1",
         user: alice,
         clientLabel: null,
@@ -23,6 +27,10 @@ describe("ThreadPresenceService", () => {
         typing: false,
       });
       yield* presence.report({
+        sessionId: AuthSessionId.make("session"),
+        clientDeviceType: "desktop" as const,
+        clientOs: "macOS",
+        clientBrowser: "Chrome",
         connectionId: "c2",
         user: null,
         clientLabel: "Launchpad Desktop",
@@ -37,6 +45,10 @@ describe("ThreadPresenceService", () => {
 
       yield* presence.clear("c1");
       yield* presence.report({
+        sessionId: AuthSessionId.make("session"),
+        clientDeviceType: "desktop" as const,
+        clientOs: "macOS",
+        clientBrowser: "Chrome",
         connectionId: "c2",
         user: null,
         clientLabel: "Launchpad Desktop",
@@ -57,6 +69,10 @@ describe("ThreadPresenceService", () => {
       yield* Effect.yieldNow;
 
       const typing = {
+        sessionId: AuthSessionId.make("session"),
+        clientDeviceType: "desktop" as const,
+        clientOs: "macOS",
+        clientBrowser: "Chrome",
         connectionId: "c1",
         user: alice,
         clientLabel: null,
@@ -80,6 +96,10 @@ describe("ThreadPresenceService", () => {
       const collector = yield* changes.pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
       yield* Effect.yieldNow;
       yield* presence.report({
+        sessionId: AuthSessionId.make("session"),
+        clientDeviceType: "desktop" as const,
+        clientOs: "macOS",
+        clientBrowser: "Chrome",
         connectionId: "c1",
         user: alice,
         clientLabel: null,

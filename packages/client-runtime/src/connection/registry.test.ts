@@ -1,4 +1,5 @@
 import {
+  AuthStandardClientScopes,
   type DesktopSshEnvironmentTarget,
   EnvironmentId,
   ORCHESTRATION_PROTOCOL_VERSION,
@@ -36,6 +37,9 @@ import {
 import * as Connectivity from "./connectivity.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import * as ConnectionDriver from "./driver.ts";
+import * as ConnectionResolver from "./resolver.ts";
+import * as ConnectionOnboarding from "./onboarding.ts";
+import { remoteHttpClientLayer } from "../rpc/http.ts";
 import {
   ConnectionTransientError,
   ConnectionBlockedError,
@@ -144,6 +148,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   initialCredentials: ReadonlyArray<readonly [string, ConnectionCredential]> = [],
   options?: {
     readonly prepareError?: ConnectionBlockedError;
+    readonly beforePrepare?: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<void, ConnectionBlockedError>;
     readonly beforeSessionConnect?: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly beforeRegistrationRegister?: (
       registration: ConnectionRegistration,
@@ -376,6 +383,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         };
         yield* reportProgress({ stage: "preparing" });
         if (options?.prepareError) return yield* options.prepareError;
+        yield* options?.beforePrepare?.(target.environmentId) ?? Effect.void;
         yield* reportProgress({ stage: "opening", prepared });
         yield* options?.beforeSessionConnect?.(target.environmentId) ?? Effect.void;
         const closed = yield* Deferred.make<never, ConnectionTransientError>();
@@ -435,6 +443,8 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     storedDisabled,
     disconnectedSshTargets,
     networkStatus,
+    credentialStore,
+    sshGateway,
   };
 });
 
@@ -455,6 +465,210 @@ function awaitConnectionState(
 }
 
 describe("EnvironmentRegistry", () => {
+  it.effect(
+    "names a blocked primary cookie session while another environment stays connected",
+    () =>
+      Effect.gen(function* () {
+        let needsName = true;
+        const harness = yield* makeHarness([TARGET, SECOND_TARGET], [], [], {
+          beforePrepare: (id) =>
+            needsName && id === TARGET.environmentId
+              ? Effect.fail(
+                  new ConnectionBlockedError({
+                    reason: "client-label-required",
+                    detail: "Choose a name",
+                  }),
+                )
+              : Effect.void,
+        });
+        const http = remoteHttpClientLayer(((_input, init) => {
+          expect(init?.credentials).toBe("include");
+          expect(new Headers(init?.headers).has("authorization")).toBe(false);
+          const { label } = JSON.parse(String(init?.body)) as { label: string };
+          needsName = false;
+          return Promise.resolve(
+            Response.json({
+              sessionId: "same-cookie-session",
+              subject: "one-time-token",
+              scopes: AuthStandardClientScopes,
+              method: "browser-session-cookie",
+              client: { deviceType: "desktop", label },
+              issuedAt: "2026-01-01T00:00:00Z",
+              expiresAt: "2027-01-01T00:00:00Z",
+              connected: false,
+              lastConnectedAt: null,
+              current: true,
+            }),
+          );
+        }) satisfies typeof fetch);
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          const blocked = yield* awaitConnectionState(
+            registry,
+            TARGET.environmentId,
+            (state) => state.phase === "blocked",
+          );
+          expect(blocked.lastFailure?.reason).toBe("client-label-required");
+          yield* awaitConnectionState(
+            registry,
+            SECOND_TARGET.environmentId,
+            (state) => state.phase === "connected",
+          );
+          expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
+          const onboarding = yield* ConnectionOnboarding.make;
+          const renamed = yield* onboarding.renameClient({
+            environmentId: TARGET.environmentId,
+            label: "My browser",
+          });
+          expect(renamed.sessionId).toBe("same-cookie-session");
+          yield* awaitConnectionState(
+            registry,
+            TARGET.environmentId,
+            (state) => state.phase === "connected",
+          );
+          expect(yield* Ref.get(harness.sessions)).toHaveLength(2);
+          expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+          expect((yield* Ref.get(harness.storedTargets)).get(TARGET.environmentId)).toEqual(TARGET);
+          expect((yield* Ref.get(harness.storedCredentials)).size).toBe(0);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              harness.layer,
+              http,
+              Layer.succeed(ConnectionResolver.ConnectionResolver, {
+                prepare: () => Effect.succeed(PREPARED),
+                prepareHttp: () => Effect.succeed(PREPARED),
+              }),
+              Layer.succeed(ClientCapabilities.ClientPresentation, {
+                metadata: { deviceType: "desktop" },
+                scopes: AuthStandardClientScopes,
+              }),
+              Layer.succeed(
+                ConnectionCredentialStore.ConnectionCredentialStore,
+                harness.credentialStore,
+              ),
+              Layer.succeed(ClientCapabilities.SshEnvironmentGateway, harness.sshGateway),
+            ),
+          ),
+          Effect.scoped,
+        );
+      }),
+  );
+  it.effect(
+    "resumes a restored unlabeled bearer session without replacing credentials or disturbing another environment",
+    () =>
+      Effect.gen(function* () {
+        let needsName = true;
+        let label = "";
+        const harness = yield* makeHarness(
+          [BEARER_TARGET, SECOND_TARGET],
+          [BEARER_PROFILE],
+          [[BEARER_TARGET.connectionId, BEARER_CREDENTIAL]],
+          {
+            beforePrepare: (id) =>
+              needsName && id === BEARER_TARGET.environmentId
+                ? Effect.fail(
+                    new ConnectionBlockedError({
+                      reason: "client-label-required",
+                      detail: "Choose a name",
+                    }),
+                  )
+                : Effect.void,
+          },
+        );
+        const http = remoteHttpClientLayer(((_input, init) => {
+          expect(new Headers(init?.headers).get("authorization")).toBe("Bearer bearer-token");
+          label = (JSON.parse(String(init?.body)) as { label: string }).label;
+          needsName = false;
+          return Promise.resolve(
+            Response.json({
+              sessionId: "saved-session",
+              subject: "one-time-token",
+              scopes: AuthStandardClientScopes,
+              method: "bearer-access-token",
+              client: { deviceType: "mobile", label },
+              issuedAt: "2026-01-01T00:00:00Z",
+              expiresAt: "2027-01-01T00:00:00Z",
+              connected: false,
+              lastConnectedAt: null,
+              current: true,
+            }),
+          );
+        }) satisfies typeof fetch);
+        const prepared: PreparedConnection = {
+          ...PREPARED,
+          target: BEARER_TARGET,
+          environmentId: BEARER_TARGET.environmentId,
+          httpBaseUrl: BEARER_PROFILE.httpBaseUrl,
+          httpAuthorization: { _tag: "Bearer", token: BEARER_CREDENTIAL.token },
+        };
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          const blocked = yield* awaitConnectionState(
+            registry,
+            BEARER_TARGET.environmentId,
+            (state) => state.phase === "blocked",
+          );
+          expect(blocked.lastFailure?.reason).toBe("client-label-required");
+          yield* awaitConnectionState(
+            registry,
+            SECOND_TARGET.environmentId,
+            (state) => state.phase === "connected",
+          );
+          expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
+          const onboarding = yield* ConnectionOnboarding.make;
+          yield* onboarding.renameClient({
+            environmentId: BEARER_TARGET.environmentId,
+            label: "  My phone  ",
+          });
+          yield* awaitConnectionState(
+            registry,
+            BEARER_TARGET.environmentId,
+            (state) => state.phase === "connected",
+          );
+          expect(label).toBe("My phone");
+          expect(yield* Ref.get(harness.sessions)).toHaveLength(2);
+          expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+          expect(
+            (yield* Ref.get(harness.storedCredentials)).get(BEARER_TARGET.connectionId),
+          ).toEqual(BEARER_CREDENTIAL);
+          expect((yield* Ref.get(harness.storedProfiles)).get(BEARER_TARGET.connectionId)).toEqual(
+            BEARER_PROFILE,
+          );
+          yield* onboarding.renameClient({
+            environmentId: BEARER_TARGET.environmentId,
+            label: "Renamed phone",
+          });
+          expect(label).toBe("Renamed phone");
+          expect(yield* Ref.get(harness.sessions)).toHaveLength(2);
+          expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              harness.layer,
+              http,
+              Layer.succeed(ConnectionResolver.ConnectionResolver, {
+                prepare: () => Effect.succeed(prepared),
+                prepareHttp: () => Effect.succeed(prepared),
+              }),
+              Layer.succeed(ClientCapabilities.ClientPresentation, {
+                metadata: { deviceType: "mobile" },
+                scopes: AuthStandardClientScopes,
+              }),
+              Layer.succeed(
+                ConnectionCredentialStore.ConnectionCredentialStore,
+                harness.credentialStore,
+              ),
+              Layer.succeed(ClientCapabilities.SshEnvironmentGateway, harness.sshGateway),
+            ),
+          ),
+          Effect.scoped,
+        );
+      }),
+  );
+
   it.effect("replays connected state when arming a desktop commit observer", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness([TARGET]);

@@ -1,3 +1,9 @@
+import { currentSessionChanges } from "./currentSession.ts";
+import type { AuthCurrentSessionPresentation } from "@t3tools/contracts";
+import { ThreadId } from "@t3tools/contracts";
+import * as ThreadPresence from "../orchestration/ThreadPresence.ts";
+import { makeSessionPresenceReporter } from "../orchestration/sessionPresence.ts";
+import * as Ref from "effect/Ref";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
@@ -102,6 +108,7 @@ const failingSessionLookupRepositoryLayer = Layer.succeed(AuthSessions.AuthSessi
   revokeAllExcept: () => Effect.fail(repositoryFailure),
   setLastConnectedAt: () => Effect.void,
   setClientConnection: () => Effect.void,
+  setLabel: () => Effect.fail(repositoryFailure),
 });
 
 const failingSessionLookupCredentialLayer = Layer.effect(
@@ -840,5 +847,432 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       yield* sessions.recordClientConnection(issued.sessionId, {});
       expect((yield* readRow)[0]).toEqual({ surface: "mobile", appVersion: "1.3.0" });
     }).pipe(Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), SqlitePersistenceMemory))),
+  );
+  it.effect("publishes only the current session's live name and clears revoked presentation", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const own = yield* sessions.issue({
+        subject: "one-time-token",
+        client: { deviceType: "desktop", label: "Original" },
+      });
+      const other = yield* sessions.issue({
+        client: { deviceType: "desktop", label: "Other client" },
+      });
+      const updates = yield* Queue.unbounded<AuthCurrentSessionPresentation | null>();
+      yield* currentSessionChanges(own.sessionId).pipe(
+        Stream.runForEach((value) => Queue.offer(updates, value)),
+        Effect.forkScoped,
+      );
+      expect(yield* Queue.take(updates)).toMatchObject({
+        sessionId: own.sessionId,
+        client: { label: "Original" },
+        needsClientLabel: false,
+      });
+      yield* sessions.rename(other.sessionId, "Other renamed");
+      yield* sessions.rename(own.sessionId, "New name");
+      expect(yield* Queue.take(updates)).toMatchObject({
+        sessionId: own.sessionId,
+        client: { label: "New name" },
+      });
+      yield* sessions.revoke(own.sessionId);
+      expect(yield* Queue.take(updates)).toBeNull();
+    }).pipe(Effect.scoped, Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect.each(["rename", "revoke"] as const)(
+    "retains current presentation when %s races its initial snapshot",
+    (change) =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const own = yield* sessions.issue({ client: { deviceType: "desktop", label: "Original" } });
+        const initialRead = yield* Deferred.make<void>();
+        const releaseRead = yield* Deferred.make<void>();
+        const updates = yield* Queue.unbounded<AuthCurrentSessionPresentation | null>();
+        let firstRead = true;
+        const delayed = {
+          ...sessions,
+          getActive: (id: Parameters<typeof sessions.getActive>[0]) =>
+            Effect.gen(function* () {
+              const value = yield* sessions.getActive(id);
+              if (firstRead) {
+                firstRead = false;
+                yield* Deferred.succeed(initialRead, undefined);
+                yield* Deferred.await(releaseRead);
+              }
+              return value;
+            }),
+        };
+        yield* currentSessionChanges(own.sessionId).pipe(
+          Stream.provideService(SessionStore.SessionStore, delayed),
+          Stream.runForEach((value) => Queue.offer(updates, value)),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(initialRead);
+        yield* sessions.rename(own.sessionId, "First rename");
+        yield* sessions.rename(own.sessionId, "Latest name");
+        if (change === "revoke") yield* sessions.revoke(own.sessionId);
+        yield* Deferred.succeed(releaseRead, undefined);
+        expect(yield* Queue.take(updates)).toMatchObject({ client: { label: "Original" } });
+        const current = yield* Queue.take(updates);
+        if (change === "revoke") expect(current).toBeNull();
+        else expect(current).toMatchObject({ client: { label: "Latest name" } });
+      }).pipe(Effect.scoped, Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("renames only presentation without rotating access or reconnecting the client", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "bearer-access-token",
+        scopes: ["orchestration:read"],
+        client: { deviceType: "mobile", label: "Old" },
+        user: {
+          userId: "verified",
+          displayName: "Alice",
+          imageUrl: null,
+          email: "alice@example.com",
+        },
+      });
+      const before = yield* sessions.verify(issued.token);
+      const unregister = yield* sessions.registerConnection(
+        issued.sessionId,
+        Effect.die("Rename must not disconnect the socket"),
+      );
+      yield* sessions.markConnected(issued.sessionId);
+      const renamed = yield* sessions.rename(issued.sessionId, "My phone");
+      const after = yield* sessions.verify(issued.token);
+      expect(after).toEqual({ ...before, client: { ...before.client, label: "My phone" } });
+      expect(renamed.client.label).toBe("My phone");
+      expect(renamed.user?.email).toBe("alice@example.com");
+      expect(renamed.connected).toBe(true);
+      yield* Effect.sync(unregister);
+      yield* sessions.revoke(issued.sessionId);
+      expect((yield* sessions.rename(issued.sessionId, "No revival").pipe(Effect.flip))._tag).toBe(
+        "UnknownSessionTokenError",
+      );
+      expect(Option.isNone(yield* sessions.getActive(issued.sessionId))).toBe(true);
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("session presence requires a successful initial lookup", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const presence = yield* ThreadPresence.ThreadPresenceService;
+      const issued = yield* sessions.issue({ client: { deviceType: "mobile", label: "Phone" } });
+      const failure = new SessionStore.SessionCredentialVerificationError({
+        sessionId: issued.sessionId,
+        cause: repositoryFailure,
+      });
+      const result = yield* makeSessionPresenceReporter("socket", issued.sessionId).pipe(
+        Effect.provideService(SessionStore.SessionStore, {
+          ...sessions,
+          getActive: () => Effect.fail(failure),
+        }),
+        Effect.flip,
+      );
+      expect(result).toBe(failure);
+      expect((yield* presence.snapshot).participants).toEqual([]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), ThreadPresence.layer)),
+    ),
+  );
+
+  it.effect.each(["rename", "revoke"] as const)(
+    "session presence recovers a %s after a failed refresh without renewing typing",
+    (change) =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const presence = yield* ThreadPresence.ThreadPresenceService;
+        const issued = yield* sessions.issue({
+          client: { deviceType: "mobile", label: "Old phone" },
+        });
+        const failNextRead = yield* Ref.make(false);
+        const failedRead = yield* Deferred.make<void>();
+        const reporterStopped = yield* Deferred.make<void>();
+        const report = yield* makeSessionPresenceReporter("socket", issued.sessionId).pipe(
+          Effect.provideService(SessionStore.SessionStore, {
+            ...sessions,
+            subscribeChanges: sessions.subscribeChanges.pipe(
+              Effect.map((changes) =>
+                changes.pipe(Stream.ensuring(Deferred.succeed(reporterStopped, undefined))),
+              ),
+            ),
+            getActive: (id) =>
+              Effect.gen(function* () {
+                if (yield* Ref.getAndSet(failNextRead, false)) {
+                  yield* Deferred.succeed(failedRead, undefined);
+                  return yield* new SessionStore.SessionCredentialVerificationError({
+                    sessionId: id,
+                    cause: repositoryFailure,
+                  });
+                }
+                return yield* sessions.getActive(id);
+              }),
+          }),
+        );
+        yield* report({ threadId: ThreadId.make("thread"), typing: true });
+        const before = yield* presence.snapshot;
+        yield* TestClock.adjust(6_000);
+        yield* Ref.set(failNextRead, true);
+        yield* sessions.rename(issued.sessionId, "Missed rename");
+        yield* Deferred.await(failedRead);
+        expect(yield* presence.snapshot).toEqual(before);
+
+        const { changes } = yield* presence.subscribe;
+        const expired = yield* changes.pipe(
+          Stream.filter((snapshot) => snapshot.participants[0]?.typing === false),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* TestClock.adjust(4_000);
+        yield* Fiber.join(expired);
+        expect((yield* presence.snapshot).participants[0]?.clientLabel).toBe("Old phone");
+
+        const refreshed = yield* changes.pipe(
+          Stream.filter((snapshot) =>
+            change === "rename"
+              ? snapshot.participants[0]?.clientLabel === "New phone"
+              : snapshot.participants.length === 0,
+          ),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        if (change === "rename") yield* sessions.rename(issued.sessionId, "New phone");
+        else yield* sessions.revoke(issued.sessionId);
+        const outcome = yield* Fiber.join(refreshed).pipe(
+          Effect.as("refreshed"),
+          Effect.raceFirst(Deferred.await(reporterStopped).pipe(Effect.as("stopped"))),
+        );
+        expect(outcome).toBe("refreshed");
+        yield* report({ threadId: ThreadId.make("thread"), typing: false });
+        const snapshot = yield* presence.snapshot;
+        if (change === "rename")
+          expect(snapshot.participants[0]).toMatchObject({
+            clientLabel: "New phone",
+            typing: false,
+          });
+        else expect(snapshot.participants).toEqual([]);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), ThreadPresence.layer)),
+      ),
+  );
+
+  it.effect("a queued old report cannot undo a rename after the refreshed name publishes", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const presence = yield* ThreadPresence.ThreadPresenceService;
+      const issued = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "bearer-access-token",
+        client: { deviceType: "mobile", label: "Old phone" },
+      });
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let blockReport = true;
+      const report = yield* makeSessionPresenceReporter("socket", issued.sessionId).pipe(
+        Effect.provideService(ThreadPresence.ThreadPresenceService, {
+          ...presence,
+          report: (input) =>
+            Effect.gen(function* () {
+              if (blockReport) {
+                blockReport = false;
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              yield* presence.report(input);
+            }),
+        }),
+      );
+      const { changes } = yield* presence.subscribe;
+      const renamedSnapshot = yield* changes.pipe(
+        Stream.filter((snapshot) => snapshot.participants[0]?.clientLabel === "New phone"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const first = yield* report({ threadId: ThreadId.make("thread"), typing: true }).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* sessions.rename(issued.sessionId, "New phone");
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(renamedSnapshot);
+      expect((yield* presence.snapshot).participants[0]).toMatchObject({
+        clientLabel: "New phone",
+        typing: true,
+        threadId: "thread",
+      });
+      yield* report({ threadId: ThreadId.make("thread"), typing: false });
+      expect((yield* presence.snapshot).participants[0]).toMatchObject({
+        clientLabel: "New phone",
+        typing: false,
+      });
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), ThreadPresence.layer)),
+    ),
+  );
+
+  it.effect("a report waiting behind a rename refresh reads the newest presentation", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const presence = yield* ThreadPresence.ThreadPresenceService;
+      const issued = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "bearer-access-token",
+        client: { deviceType: "mobile", label: "Old" },
+      });
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const pause = yield* Ref.make(false);
+      const report = yield* makeSessionPresenceReporter("socket", issued.sessionId).pipe(
+        Effect.provideService(SessionStore.SessionStore, {
+          ...sessions,
+          getActive: (id) =>
+            Effect.gen(function* () {
+              if (yield* Ref.getAndSet(pause, false)) {
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              return yield* sessions.getActive(id);
+            }),
+        }),
+      );
+      yield* report({ threadId: ThreadId.make("thread"), typing: true });
+      yield* Ref.set(pause, true);
+      yield* sessions.rename(issued.sessionId, "New");
+      yield* Deferred.await(entered);
+      const queued = yield* report({ threadId: ThreadId.make("thread"), typing: false }).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(queued);
+      expect((yield* presence.snapshot).participants[0]).toMatchObject({
+        clientLabel: "New",
+        typing: false,
+      });
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), ThreadPresence.layer)),
+    ),
+  );
+
+  it.effect("stale upserts refresh from storage and cannot resurrect a revoked participant", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const presence = yield* ThreadPresence.ThreadPresenceService;
+      const issued = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "bearer-access-token",
+        client: { deviceType: "mobile", label: "Old" },
+      });
+      const stale = Option.getOrThrow(yield* sessions.getActive(issued.sessionId));
+      const queue = yield* Queue.unbounded<SessionStore.SessionCredentialChange>();
+      const report = yield* makeSessionPresenceReporter("socket", issued.sessionId).pipe(
+        Effect.provideService(SessionStore.SessionStore, {
+          ...sessions,
+          subscribeChanges: Effect.succeed(Stream.fromQueue(queue)),
+        }),
+      );
+      yield* report({ threadId: ThreadId.make("thread"), typing: true });
+      const { changes } = yield* presence.subscribe;
+      const renamed = yield* changes.pipe(
+        Stream.filter((snapshot) => snapshot.participants[0]?.clientLabel === "New"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* sessions.rename(issued.sessionId, "New");
+      yield* Queue.offer(queue, { type: "clientUpserted", clientSession: stale });
+      yield* Fiber.join(renamed);
+      expect((yield* presence.snapshot).participants[0]?.typing).toBe(true);
+      const removed = yield* changes.pipe(
+        Stream.filter((snapshot) => snapshot.participants.length === 0),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* sessions.revoke(issued.sessionId);
+      yield* Queue.offer(queue, { type: "clientUpserted", clientSession: stale });
+      yield* Fiber.join(removed);
+      yield* report({ threadId: ThreadId.make("thread"), typing: true });
+      expect((yield* presence.snapshot).participants).toEqual([]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), ThreadPresence.layer)),
+    ),
+  );
+  it.effect("persists a renamed client's credential and name across a server restart", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "launchpad-client-rename-" });
+      const firstLayer = yield* makeDiskSessionStoreLayer(baseDir);
+      const issued = yield* Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const issued = yield* sessions.issue({
+          subject: "one-time-token",
+          method: "bearer-access-token",
+          client: { deviceType: "mobile", label: "Old" },
+        });
+        yield* sessions.rename(issued.sessionId, "My phone");
+        return issued;
+      }).pipe(Effect.provide(firstLayer), Effect.scoped);
+      const nextLayer = yield* makeDiskSessionStoreLayer(baseDir);
+      const restored = yield* SessionStore.SessionStore.pipe(
+        Effect.flatMap((sessions) => sessions.verify(issued.token)),
+        Effect.provide(nextLayer),
+        Effect.scoped,
+      );
+      expect(restored).toMatchObject({
+        sessionId: issued.sessionId,
+        client: { label: "My phone" },
+      });
+    }),
+  );
+
+  it.effect("a presentation-only rename keeps the original typing lease", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const presence = yield* ThreadPresence.ThreadPresenceService;
+      const issued = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "bearer-access-token",
+        client: { deviceType: "mobile", label: "Old" },
+      });
+      const report = yield* makeSessionPresenceReporter("socket", issued.sessionId);
+      yield* report({ threadId: ThreadId.make("thread"), typing: true });
+      yield* TestClock.adjust(6_000);
+      const { changes } = yield* presence.subscribe;
+      const renamed = yield* changes.pipe(
+        Stream.filter((snapshot) => snapshot.participants[0]?.clientLabel === "New"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* sessions.rename(issued.sessionId, "New");
+      yield* Fiber.join(renamed);
+      const expired = yield* changes.pipe(
+        Stream.filter((snapshot) => snapshot.participants[0]?.typing === false),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust(4_000);
+      yield* Fiber.join(expired);
+      expect((yield* presence.snapshot).participants[0]).toMatchObject({
+        clientLabel: "New",
+        threadId: "thread",
+        typing: false,
+      });
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), ThreadPresence.layer)),
+    ),
   );
 });

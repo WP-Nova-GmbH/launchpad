@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Effect from "effect/Effect";
+import { FetchHttpClient } from "effect/unstable/http";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
 import {
   executeEnvironmentHttpRequest,
@@ -162,18 +163,22 @@ export const fetchRemoteSessionState = Effect.fn(
   "clientRuntime.authorization.fetchRemoteSessionState",
 )(function* (input: {
   readonly httpBaseUrl: string;
-  readonly bearerToken: string;
+  readonly bearerToken?: string;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiGroupClient(input.httpBaseUrl, "auth");
   return yield* executeEnvironmentHttpRequest(
     environmentEndpointUrl(input.httpBaseUrl, "/api/auth/session"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
-    client.session({
-      headers: {
-        authorization: `Bearer ${input.bearerToken}`,
-      },
-    }),
+    client
+      .session({
+        headers: input.bearerToken ? { authorization: `Bearer ${input.bearerToken}` } : {},
+      })
+      .pipe(
+        Effect.provideService(FetchHttpClient.RequestInit, {
+          credentials: input.bearerToken ? "omit" : "include",
+        }),
+      ),
   );
 });
 

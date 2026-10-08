@@ -52,9 +52,19 @@ t3 pair
 ```
 
 Scan the QR code on your phone or paste the pairing URL into **Add environment**
-in the receiving app. Connection settings are under **Settings → Connections**
+in the receiving app. Confirm a client name, such as “Stefan’s Phone”, then connect.
+The name identifies that device on this environment; pairing does not verify a
+person’s account identity. Connection settings are under **Settings → Connections**
 on web and desktop and **Settings → Environments** on mobile. A loopback address
 such as `127.0.0.1` reaches only the device opening the link.
+
+You can rename your client in connection settings. On the host, someone with
+access-management permissions can rename clients in the authorized-client list.
+A name change applies only to that environment.
+
+Keep clients and hosts updated together. Older app versions cannot connect to an
+updated host. Updating the app keeps its saved pairing; if an older pairing has
+no name, choose one when asked without pairing again.
 
 Pairing authorizes that device for future connections. Use a fresh one-time link
 for each new device; you do not need the original token to reconnect. Links

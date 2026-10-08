@@ -25,6 +25,10 @@ export function useThreadPresencePeople(
   return useAtomValue(ref === null ? EMPTY_PEOPLE_ATOM : threadPresence.peopleAtom(ref));
 }
 
+export function useThreadPresenceParticipants(ref: ScopedThreadRef | null) {
+  return useAtomValue(ref === null ? EMPTY_PEOPLE_ATOM : threadPresence.participantsAtom(ref));
+}
+
 /**
  * Announces which thread this client is looking at and whether it is typing.
  * Typing is derived from prompt edits: it starts on the first edit, renews

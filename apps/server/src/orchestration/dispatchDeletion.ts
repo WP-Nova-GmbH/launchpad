@@ -1,3 +1,4 @@
+import { authSessionAuthor } from "@t3tools/contracts";
 import { CommandId, type OrchestrationCommand } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -111,7 +112,7 @@ export const makeDeletionDispatcher = Effect.gen(function* () {
           commandId: CommandId.make(`delete-stop:${command.commandId}:${thread.id}`),
           threadId: thread.id,
           createdAt: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
-          ...(actor.user ? { author: actor.user } : {}),
+          ...(actor.user ? { author: authSessionAuthor(actor.user) } : {}),
         };
         const receipt = yield* access.withFence(
           authorizeOrchestrationCommand(actor, stop).pipe(
