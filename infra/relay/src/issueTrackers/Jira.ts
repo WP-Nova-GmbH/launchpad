@@ -1,8 +1,7 @@
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import * as Sse from "effect/unstable/encoding/Sse";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
@@ -20,13 +19,6 @@ const IssueKey = Schema.String.check(
   Schema.isMaxLength(256),
 );
 const CloudId = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200));
-const RpcResponse = Schema.Struct({
-  jsonrpc: Schema.Literal("2.0"),
-  id: Schema.Number,
-  result: Schema.optionalKey(Schema.Unknown),
-  error: Schema.optionalKey(Schema.Struct({ code: Schema.Number, message: Schema.String })),
-});
-const Initialized = Schema.Struct({ protocolVersion: Schema.Literals(PROTOCOL_VERSIONS) });
 const ToolResult = Schema.Struct({
   isError: Schema.optionalKey(Schema.Boolean),
   structuredContent: Schema.optionalKey(Schema.Unknown),
@@ -87,10 +79,7 @@ const RovoResources = Schema.Struct({
 const decodeOAuthSites = Schema.decodeUnknownEffect(
   Schema.Union([OAuthSites, Schema.Struct({ data: Schema.Union([OAuthSites, RovoResources]) })]),
 );
-const decodeRpcResponse = Schema.decodeUnknownEffect(RpcResponse);
-const isRpcResponse = Schema.is(RpcResponse);
-const decodeInitialized = Schema.decodeUnknownEffect(Initialized);
-const decodeToolResult = Schema.decodeUnknownEffect(ToolResult);
+const toolResultSchema = Schema.toStandardSchemaV1(ToolResult);
 const decodeJiraIssue = Schema.decodeUnknownEffect(JiraIssueResponse);
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
@@ -187,59 +176,119 @@ const checkStatus = Effect.fnUntraced(function* (response: HttpClientResponse.Ht
   return yield* unavailable();
 });
 
-/** Limit both JSON and SSE responses before buffering; an SSE connection need not close after its reply. */
-const responseText = (response: HttpClientResponse.HttpClientResponse) =>
-  Stream.suspend(() => {
-    let bytes = 0;
-    return response.stream.pipe(
-      Stream.mapEffect((chunk) => {
-        bytes += chunk.byteLength;
-        return bytes > MAX_RESPONSE_BYTES ? Effect.fail(unavailable()) : Effect.succeed(chunk);
-      }),
-      Stream.decodeText,
-    );
-  });
+const isFailure = Schema.is(IssueTrackerFailure);
+const safeFailure = (cause: unknown) => (isFailure(cause) ? cause : unavailable());
 
-const readJson = (response: HttpClientResponse.HttpClientResponse) =>
-  responseText(response).pipe(
-    Stream.runCollect,
-    Effect.flatMap((chunks) => decodeJson(chunks.join(""))),
-    Effect.mapError(unavailable),
-  );
-
-const readRpcResponse = Effect.fnUntraced(function* (
-  response: HttpClientResponse.HttpClientResponse,
-  id: number,
+/** One operation owns its session; the SDK handles framing and RPC correlation. */
+const withJiraClient = Effect.fnUntraced(function* <A>(
+  accessToken: string,
+  request: (client: Client, signal: AbortSignal) => Promise<A>,
 ) {
-  let payload: unknown;
-  if (response.headers["content-type"]?.includes("text/event-stream")) {
-    const reply = yield* responseText(response).pipe(
-      Stream.pipeThroughChannel(
-        Sse.decodeDataSchema(Schema.Unknown, { maxEventSize: MAX_RESPONSE_BYTES }),
-      ),
-      Stream.map((event) => event.data),
-      Stream.filter((data) => isRpcResponse(data) && data.id === id),
-      Stream.runHead,
-      Effect.mapError(unavailable),
-    );
-    if (Option.isNone(reply)) return yield* unavailable();
-    payload = reply.value;
-  } else {
-    payload = yield* readJson(response);
-  }
-  const reply = yield* decodeRpcResponse(payload).pipe(
-    Effect.tapError(() => Effect.logWarning("Jira MCP RPC decoding failed")),
-    Effect.mapError(unavailable),
+  const http = yield* HttpClient.HttpClient;
+  const context = yield* Effect.context<never>();
+  const run = Effect.runPromiseWith(context);
+  const client = new Client(
+    { name: "launchpad", version: "1.0" },
+    { supportedProtocolVersions: [...PROTOCOL_VERSIONS] },
   );
-  if (reply.id !== id || reply.error || reply.result === undefined) {
-    yield* Effect.logWarning("Jira MCP invalid RPC response", {
-      idMatches: reply.id === id,
-      rpcErrorCode: reply.error?.code,
-      hasResult: reply.result !== undefined,
-    });
-    return yield* unavailable();
-  }
-  return reply.result;
+  let operationSignal: AbortSignal | undefined;
+  let cleanupSignal: AbortSignal | undefined;
+  let failure: IssueTrackerFailure | undefined;
+  const transport = new StreamableHTTPClientTransport(new URL(JIRA_MCP_RESOURCE), {
+    authProvider: { token: async () => accessToken },
+    onInsufficientScope: "throw",
+    reconnectionOptions: {
+      maxRetries: 0,
+      initialReconnectionDelay: 1000,
+      maxReconnectionDelay: 1000,
+      reconnectionDelayGrowFactor: 1,
+    },
+    fetch: async (input, init) => {
+      const incoming = new Request(input, init);
+      if (
+        incoming.url !== JIRA_MCP_RESOURCE ||
+        !["GET", "POST", "DELETE"].includes(incoming.method)
+      )
+        throw unavailable();
+      // Replies arrive on POST; decline the SDK's unused background notification stream.
+      if (incoming.method === "GET") return new Response(null, { status: 405 });
+      const signal =
+        incoming.method === "DELETE" && cleanupSignal
+          ? cleanupSignal
+          : AbortSignal.any([incoming.signal, ...(operationSignal ? [operationSignal] : [])]);
+      let outgoing = HttpClientRequest.make(incoming.method as "POST" | "DELETE")(
+        incoming.url,
+      ).pipe(HttpClientRequest.setHeaders(Object.fromEntries(incoming.headers)));
+      if (incoming.method === "POST")
+        outgoing = outgoing.pipe(
+          HttpClientRequest.bodyText(await incoming.text(), "application/json"),
+        );
+      return run(
+        Effect.gen(function* () {
+          const response = yield* http.execute(outgoing);
+          yield* checkStatus(response);
+          const sessionId = response.headers["mcp-session-id"];
+          if (sessionId && (!/^[\x21-\x7e]+$/.test(sessionId) || sessionId.length > 256))
+            return yield* unavailable();
+          if (response.status === 202 || response.status === 204)
+            return new Response(null, { status: response.status, headers: response.headers });
+          let bytes = 0;
+          const body = yield* Stream.toReadableStreamEffect(
+            response.stream.pipe(
+              Stream.mapEffect((chunk) => {
+                bytes += chunk.byteLength;
+                return bytes > MAX_RESPONSE_BYTES
+                  ? Effect.fail(unavailable())
+                  : Effect.succeed(chunk);
+              }),
+              Stream.interruptWhen(
+                Effect.callback<void>((resume) => {
+                  const abort = () => resume(Effect.void);
+                  if (signal.aborted) abort();
+                  else signal.addEventListener("abort", abort, { once: true });
+                  return Effect.sync(() => signal.removeEventListener("abort", abort));
+                }),
+              ),
+            ),
+          );
+          return new Response(body, { status: response.status, headers: response.headers });
+        }).pipe(
+          Effect.provideService(FetchHttpClient.RequestInit, {
+            redirect: "error",
+            credentials: "omit",
+          }),
+        ),
+        { signal },
+      );
+    },
+  });
+  // oxlint-disable-next-line unicorn/prefer-add-event-listener -- MCP Client exposes a callback, not EventTarget.
+  client.onerror = (cause) => {
+    failure = safeFailure(cause);
+    void client.close().catch(() => {});
+  };
+  return yield* Effect.tryPromise({
+    try: async (signal) => {
+      operationSignal = signal;
+      await client.connect(transport, { signal });
+      return request(client, signal);
+    },
+    catch: (cause) => failure ?? safeFailure(cause),
+  }).pipe(
+    Effect.ensuring(
+      Effect.tryPromise({
+        try: (signal) => {
+          cleanupSignal = signal;
+          return transport.terminateSession();
+        },
+        catch: safeFailure,
+      }).pipe(
+        Effect.timeout("2 seconds"),
+        Effect.ignore,
+        Effect.ensuring(Effect.promise(() => client.close())),
+      ),
+    ),
+  );
 });
 
 export const callJiraTool = Effect.fnUntraced(function* (
@@ -247,143 +296,68 @@ export const callJiraTool = Effect.fnUntraced(function* (
   name: string,
   args: Readonly<Record<string, unknown>>,
 ) {
-  const http = yield* HttpClient.HttpClient;
-  let sessionId: string | undefined;
-  let protocolVersion: string = PROTOCOL_VERSIONS[0];
-  const headers = () => ({
-    Authorization: `Bearer ${accessToken}`,
-    Accept: "application/json, text/event-stream",
-    "MCP-Protocol-Version": protocolVersion,
-    ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
-  });
-  const post = (body: { readonly method: string; readonly [key: string]: unknown }) =>
-    http
-      .execute(
-        HttpClientRequest.post(JIRA_MCP_RESOURCE).pipe(
-          HttpClientRequest.setHeaders(headers()),
-          HttpClientRequest.bodyJsonUnsafe(body),
-        ),
-      )
-      .pipe(
-        Effect.mapError(unavailable),
-        Effect.flatMap((response) =>
-          checkStatus(response).pipe(
-            Effect.tapError((error) =>
-              Effect.logWarning("Jira MCP request rejected", {
-                stage: body.method,
-                tool: name,
-                httpStatus: response.status,
-                code: error.code,
-              }),
-            ),
-          ),
-        ),
-      );
-  const initializedResponse = yield* post({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion,
-      capabilities: {},
-      clientInfo: { name: "launchpad", version: "1.0" },
-    },
-  });
-  sessionId = initializedResponse.headers["mcp-session-id"];
-  if (sessionId && (!/^[\x21-\x7e]+$/.test(sessionId) || sessionId.length > 256))
+  // Use the SDK request API so calls retain Jira's payload schema and never replay mutations.
+  const toolResult = yield* withJiraClient(accessToken, (client, signal) =>
+    client.request({ method: "tools/call", params: { name, arguments: args } }, toolResultSchema, {
+      signal,
+    }),
+  );
+  if (toolResult.isError) {
+    yield* Effect.logWarning("Jira MCP tool returned an error", { tool: name });
+    // Upstream text can contain request details, so only classify it; never surface it.
+    const text =
+      toolResult.content
+        ?.flatMap((part) => (part.type === "text" ? [part.text ?? ""] : []))
+        .join("\n") ?? "";
+    if (/insufficient.scope|scope does not match/i.test(text)) {
+      return yield* new IssueTrackerFailure({
+        code: "forbidden",
+        message:
+          "Atlassian did not grant the required Jira permissions. Reconnect Jira and allow read access.",
+      });
+    }
+    if (/\b401\b|unauthori[sz]ed|invalid.*token|expired.*token/i.test(text)) {
+      return yield* new IssueTrackerFailure({
+        code: "auth_required",
+        message: "Atlassian rejected Jira access. Reconnect Jira in Account connections.",
+      });
+    }
+    if (/\b403\b|forbidden|permission/i.test(text)) {
+      return yield* new IssueTrackerFailure({
+        code: "forbidden",
+        message: "The connected account does not have permission to read this Jira issue.",
+      });
+    }
+    if (/\b404\b|not found|does not exist/i.test(text)) {
+      return yield* new IssueTrackerFailure({
+        code: "not_found",
+        message: "The Jira issue was not found, or is not visible to the connected account.",
+      });
+    }
     return yield* unavailable();
-  const result = Effect.gen(function* () {
-    const initialized = yield* readRpcResponse(initializedResponse, 1).pipe(
-      Effect.flatMap(decodeInitialized),
-      Effect.mapError(unavailable),
-    );
-    protocolVersion = initialized.protocolVersion;
-    yield* post({ jsonrpc: "2.0", method: "notifications/initialized" });
-    if (name === "__list_tools") {
-      const response = yield* post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-      return yield* readRpcResponse(response, 2);
-    }
-    const response = yield* post({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: {
-        name,
-        arguments: args,
-      },
-    });
-    const toolResult = yield* readRpcResponse(response, 2).pipe(
-      Effect.flatMap(decodeToolResult),
-      Effect.mapError(unavailable),
-    );
-    if (toolResult.isError) {
-      yield* Effect.logWarning("Jira MCP tool returned an error", { tool: name });
-      // Upstream text can contain request details, so only classify it; never surface it.
-      const text =
-        toolResult.content
-          ?.flatMap((part) => (part.type === "text" ? [part.text ?? ""] : []))
-          .join("\n") ?? "";
-      if (/insufficient.scope|scope does not match/i.test(text)) {
-        return yield* new IssueTrackerFailure({
-          code: "forbidden",
-          message:
-            "Atlassian did not grant the required Jira permissions. Reconnect Jira and allow read access.",
-        });
-      }
-      if (/\b401\b|unauthori[sz]ed|invalid.*token|expired.*token/i.test(text)) {
-        return yield* new IssueTrackerFailure({
-          code: "auth_required",
-          message: "Atlassian rejected Jira access. Reconnect Jira in Account connections.",
-        });
-      }
-      if (/\b403\b|forbidden|permission/i.test(text)) {
-        return yield* new IssueTrackerFailure({
-          code: "forbidden",
-          message: "The connected account does not have permission to read this Jira issue.",
-        });
-      }
-      if (/\b404\b|not found|does not exist/i.test(text)) {
-        return yield* new IssueTrackerFailure({
-          code: "not_found",
-          message: "The Jira issue was not found, or is not visible to the connected account.",
-        });
-      }
-      return yield* unavailable();
-    }
-    const payload =
-      toolResult.structuredContent ??
-      (yield* decodeJson(
-        toolResult.content
-          ?.filter((part) => part.type === "text")
-          .map((part) => part.text ?? "")
-          .join("\n") ?? "",
-      ).pipe(Effect.mapError(unavailable)));
-    return payload;
-  });
-  return yield* result.pipe(
-    Effect.ensuring(
-      sessionId
-        ? http
-            .execute(
-              HttpClientRequest.delete(JIRA_MCP_RESOURCE).pipe(
-                HttpClientRequest.setHeaders(headers()),
-              ),
-            )
-            .pipe(Effect.timeout("2 seconds"), Effect.ignore)
-        : Effect.void,
-    ),
+  }
+  return (
+    toolResult.structuredContent ??
+    (yield* decodeJson(
+      toolResult.content
+        ?.filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("\n") ?? "",
+    ).pipe(Effect.mapError(unavailable)))
   );
 });
 
 const JiraToolList = Schema.Struct({
   tools: Schema.Array(Schema.Struct({ name: Schema.String, inputSchema: Schema.Unknown })),
 });
-const decodeJiraToolList = Schema.decodeUnknownEffect(JiraToolList);
+const toolListSchema = Schema.toStandardSchemaV1(JiraToolList);
 
 /** Read the tools offered to this specific OAuth grant; Atlassian rolls out names per account. */
 export const listJiraTools = Effect.fnUntraced(function* (accessToken: string) {
-  const value = yield* callJiraTool(accessToken, "__list_tools", {});
-  return yield* decodeJiraToolList(value).pipe(Effect.mapError(unavailable));
+  // Preserve the existing single-page discovery instead of the SDK's automatic pagination.
+  return yield* withJiraClient(accessToken, (client, signal) =>
+    client.request({ method: "tools/list" }, toolListSchema, { signal }),
+  );
 });
 
 /** The comment tool is deferred on Rovo v2; inspect this grant before a write depends on it. */

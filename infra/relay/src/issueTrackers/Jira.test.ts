@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
@@ -7,7 +8,7 @@ import * as HttpClient from "effect/unstable/http/HttpClient";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 
-import { getJiraOAuthSites, readJiraIssue, searchJiraIssues } from "./Jira.ts";
+import { getJiraOAuthSites, listJiraTools, readJiraIssue, searchJiraIssues } from "./Jira.ts";
 
 const accessToken = "oauth-access-secret";
 const siteUrl = "https://acme.atlassian.net";
@@ -29,7 +30,7 @@ const RpcRequest = Schema.Struct({
 });
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeRpcRequest = Schema.decodeEffect(Schema.fromJsonString(RpcRequest));
-const reply = (result: unknown, id = 2) => Response.json({ jsonrpc: "2.0", id, result });
+const reply = (result: unknown, id = 1) => Response.json({ jsonrpc: "2.0", id, result });
 const toolReply = (data: unknown = issue) =>
   reply({ content: [{ type: "text", text: encodeJson(data) }] });
 
@@ -37,7 +38,11 @@ type RecordedRequest = {
   request: HttpClientRequest.HttpClientRequest;
   rpc: typeof RpcRequest.Type | undefined;
 };
-function harness(respond: (request: RecordedRequest) => Response = () => toolReply()) {
+function harness(
+  respond: (request: RecordedRequest) => Response = () => toolReply(),
+  cleanup = () => Effect.succeed(new Response(null, { status: 204 })),
+  notifications = () => new Response(null, { status: 405 }),
+) {
   const requests: RecordedRequest[] = [];
   const http = HttpClient.make((request) =>
     Effect.gen(function* () {
@@ -48,22 +53,28 @@ function harness(respond: (request: RecordedRequest) => Response = () => toolRep
       const recorded = { request, rpc };
       requests.push(recorded);
       const response =
-        request.method === "DELETE"
-          ? new Response(null, { status: 204 })
-          : rpc?.method === "initialize"
-            ? new Response(
-                encodeJson({
-                  jsonrpc: "2.0",
-                  id: 1,
-                  result: { protocolVersion: "2025-06-18" },
-                }),
-                {
-                  headers: { "content-type": "application/json", "mcp-session-id": "session-1" },
-                },
-              )
-            : rpc?.method === "notifications/initialized"
-              ? new Response(null, { status: 202 })
-              : respond(recorded);
+        request.method === "GET"
+          ? notifications()
+          : request.method === "DELETE"
+            ? yield* cleanup()
+            : rpc?.method === "initialize"
+              ? new Response(
+                  encodeJson({
+                    jsonrpc: "2.0",
+                    id: rpc?.id,
+                    result: {
+                      protocolVersion: "2025-06-18",
+                      capabilities: { tools: {} },
+                      serverInfo: { name: "Jira", version: "1" },
+                    },
+                  }),
+                  {
+                    headers: { "content-type": "application/json", "mcp-session-id": "session-1" },
+                  },
+                )
+              : rpc?.method === "notifications/initialized"
+                ? new Response(null, { status: 202 })
+                : respond(recorded);
       return HttpClientResponse.fromWeb(request, response);
     }),
   );
@@ -159,7 +170,7 @@ describe("Jira", () => {
       const { provide } = harness(
         () =>
           new Response(
-            `event: message\ndata: ${encodeJson({ jsonrpc: "2.0", id: 2, result: { content: [{ type: "text", text: encodeJson(payload) }] } })}\n\n`,
+            `event: message\ndata: ${encodeJson({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: encodeJson(payload) }] } })}\n\n`,
             { headers: { "content-type": "text/event-stream" } },
           ),
       );
@@ -187,7 +198,7 @@ describe("Jira", () => {
         const { provide } = harness(
           () =>
             new Response(
-              `event: message\ndata: ${encodeJson({ jsonrpc: "2.0", id: 2, result })}\n\n`,
+              `event: message\ndata: ${encodeJson({ jsonrpc: "2.0", id: 1, result })}\n\n`,
               { headers: { "content-type": "text/event-stream" } },
             ),
         );
@@ -249,6 +260,83 @@ describe("Jira", () => {
       expect(call?.request.headers["mcp-session-id"]).toBe("session-1");
       expect(call?.request.headers["mcp-protocol-version"]).toBe("2025-06-18");
       expect(requests.at(-1)?.request.method).toBe("DELETE");
+    }),
+  );
+
+  it.effect("preserves single-page tool discovery", () =>
+    Effect.gen(function* () {
+      const tool = { name: "getJiraIssue", inputSchema: { type: "object" } };
+      const { requests, provide } = harness(({ rpc }) =>
+        reply({ tools: [tool], nextCursor: "another-page" }, rpc?.id),
+      );
+      expect(yield* listJiraTools(accessToken).pipe(provide)).toEqual({ tools: [tool] });
+      expect(requests.filter(({ rpc }) => rpc?.method === "tools/list")).toHaveLength(1);
+    }),
+  );
+
+  it.effect.each(["rejected", "closed"] as const)(
+    "reads issues without opening a %s notification stream",
+    (stream) =>
+      Effect.gen(function* () {
+        const { requests, provide } = harness(undefined, undefined, () =>
+          stream === "rejected"
+            ? new Response(null, { status: 500 })
+            : new Response("", { headers: { "content-type": "text/event-stream" } }),
+        );
+        expect(yield* readJiraIssue(input).pipe(provide)).toMatchObject({
+          identifier: "ENG-123",
+          title: issue.fields.summary,
+        });
+        expect(requests.filter(({ request }) => request.method === "GET")).toEqual([]);
+        expect(requests.filter(({ rpc }) => rpc?.method === "tools/call")).toHaveLength(1);
+      }),
+  );
+
+  it.effect.each(["rejected", "closed"] as const)(
+    "discovers tools without opening a %s notification stream",
+    (stream) =>
+      Effect.gen(function* () {
+        const tool = { name: "getJiraIssue", inputSchema: { type: "object" } };
+        const { requests, provide } = harness(
+          ({ rpc }) => reply({ tools: [tool] }, rpc?.id),
+          undefined,
+          () =>
+            stream === "rejected"
+              ? new Response(null, { status: 500 })
+              : new Response("", { headers: { "content-type": "text/event-stream" } }),
+        );
+        expect(yield* listJiraTools(accessToken).pipe(provide)).toEqual({ tools: [tool] });
+        expect(requests.filter(({ request }) => request.method === "GET")).toEqual([]);
+        expect(requests.filter(({ rpc }) => rpc?.method === "tools/list")).toHaveLength(1);
+      }),
+  );
+
+  it.effect("keeps the original result and error when session deletion fails", () =>
+    Effect.gen(function* () {
+      const cleanup = () => Effect.succeed(new Response(null, { status: 500 }));
+      const success = harness(() => toolReply(), cleanup);
+      expect((yield* readJiraIssue(input).pipe(success.provide)).identifier).toBe("ENG-123");
+      expect(success.requests.at(-1)?.request.method).toBe("DELETE");
+      const failure = harness(() => new Response(null, { status: 403 }), cleanup);
+      expect((yield* readJiraIssue(input).pipe(failure.provide, Effect.flip)).code).toBe(
+        "forbidden",
+      );
+      expect(failure.requests.at(-1)?.request.method).toBe("DELETE");
+    }),
+  );
+
+  it.effect("bounds stalled session cleanup after a completed request", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const { requests, provide } = harness(
+        () => toolReply(),
+        () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+      );
+      const fiber = yield* readJiraIssue(input).pipe(provide, Effect.forkChild);
+      yield* Deferred.await(started);
+      yield* TestClock.adjust("2 seconds");
+      expect((yield* Fiber.join(fiber)).identifier).toBe("ENG-123");
+      expect(requests.at(-1)?.request.headers["mcp-session-id"]).toBe("session-1");
     }),
   );
 
@@ -441,7 +529,7 @@ describe("Jira", () => {
               start(controller) {
                 controller.enqueue(
                   new TextEncoder().encode(
-                    `event: message\ndata: ${encodeJson({ jsonrpc: "2.0", method: "notifications/message", params: {} })}\n\nevent: message\ndata: ${encodeJson({ jsonrpc: "2.0", id: 2, result: { structuredContent: issue } })}\n\n`,
+                    `event: message\ndata: ${encodeJson({ jsonrpc: "2.0", method: "notifications/message", params: {} })}\n\nevent: message\ndata: ${encodeJson({ jsonrpc: "2.0", id: 1, result: { structuredContent: issue } })}\n\n`,
                   ),
                 );
               },
@@ -462,7 +550,7 @@ describe("Jira", () => {
       for (const response of [
         toolReply({ key: "ENG-123", fields: { summary: "Title", description: { type: "doc" } } }),
         reply({ structuredContent: issue }, 999),
-        Response.json({ jsonrpc: "2.0", id: 2, error: { code: -32603, message: accessToken } }),
+        Response.json({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: accessToken } }),
         new Response("not JSON", { headers: { "content-type": "application/json" } }),
       ]) {
         const { provide } = harness(() => response);

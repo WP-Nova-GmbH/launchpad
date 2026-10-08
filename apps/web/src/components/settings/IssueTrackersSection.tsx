@@ -212,7 +212,6 @@ export function IssueTrackersSection({
       ) : (
         SERVICES.map((service) => {
           const connection = snapshot.connections.find((entry) => entry.service === service);
-          const available = service !== "linear" || snapshot.linearAvailable;
           const name = SERVICE_NAMES[service];
           return (
             <SettingsRow
@@ -246,11 +245,6 @@ export function IssueTrackersSection({
                 </span>
               }
               description={connectionDescription(service, connection)}
-              status={
-                !connection && !available
-                  ? "Linear is not configured on this Launchpad. Ask its operator to enable it."
-                  : null
-              }
               control={
                 <div className="flex flex-wrap items-center gap-2">
                   {connection ? (
@@ -309,7 +303,7 @@ export function IssueTrackersSection({
                     <Button
                       size="sm"
                       variant="outline"
-                      disabled={disabled || !available}
+                      disabled={disabled}
                       onClick={() =>
                         service === "jira" && connection?.status === "connected"
                           ? showManageJira()

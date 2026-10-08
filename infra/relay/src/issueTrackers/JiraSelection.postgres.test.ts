@@ -85,7 +85,11 @@ const setup = Effect.gen(function* () {
           id: rpc.id,
           result:
             rpc.method === "initialize"
-              ? { protocolVersion: "2025-11-25" }
+              ? {
+                  protocolVersion: "2025-11-25",
+                  capabilities: { tools: {} },
+                  serverInfo: { name: "Jira", version: "1" },
+                }
               : {
                   structuredContent: sites.map((site) => ({
                     id: site.cloudId,

@@ -31,14 +31,14 @@ describe("organization issue tracker client", () => {
       });
       if (request.method === "DELETE") return Response.json({ ok: true });
       if (request.url.includes("/replacement/"))
-        return Response.json({ connections: [connection], linearAvailable: true });
+        return Response.json({ connections: [connection] });
       if (request.method === "POST")
         return Response.json({
           authorizationUrl: "https://linear.app/oauth/authorize?state=test-state",
           authorizationId: "attempt",
           connection: { ...connection, service: "linear", status: "connecting" },
         });
-      return Response.json({ connections: [connection], linearAvailable: true });
+      return Response.json({ connections: [connection] });
     }) satisfies typeof globalThis.fetch;
 
     return Effect.gen(function* () {
@@ -148,7 +148,7 @@ it.effect.each(["select", "cancel"] as const)(
     const requests: Request[] = [];
     const fetchFn = (async (input, init) => {
       requests.push(new Request(input, init));
-      return Response.json({ linearAvailable: true, connections: [] });
+      return Response.json({ connections: [] });
     }) satisfies typeof globalThis.fetch;
     return Effect.gen(function* () {
       const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;

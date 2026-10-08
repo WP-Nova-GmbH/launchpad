@@ -78,11 +78,9 @@ const unused = WriteOperationStore.of({
   reject: () => Effect.die("unexpected reject"),
   cancel: () => Effect.die("unexpected cancel"),
   claim: () => Effect.die("unexpected claim"),
-  succeed: () => Effect.die("unexpected succeed"),
   outcomeUnknown: () => Effect.die("unexpected outcomeUnknown"),
   reconcileUnknown: () => Effect.die("unexpected reconcileUnknown"),
   reconcileVerifiedUnknown: () => Effect.die("unexpected reconcileVerifiedUnknown"),
-  cancelPending: () => Effect.die("unexpected cancelPending"),
 });
 const operation = {
   operationId: "edit-1",
@@ -254,17 +252,28 @@ describe("issue field edits", () => {
       expect(result.operation.state).toBe("succeeded");
     }),
   );
-  it.effect(
-    "resolves and confirms a Jira status transition using the tools offered by the grant",
-    () =>
+  it.effect.each([
+    { outcome: "confirmed", stream: "rejected" },
+    { outcome: "confirmed", stream: "closed" },
+    { outcome: "lost-response", stream: "unsupported" },
+    { outcome: "interrupted", stream: "unsupported" },
+  ] as const)(
+    "handles a $outcome Jira status transition with a $stream notification stream",
+    ({ outcome, stream }) =>
       Effect.gen(function* () {
         let status = "To Do";
+        let state = "ready";
+        const enteredWrite = yield* Deferred.make<void>();
         const sent: { name: string; arguments: Record<string, unknown> }[] = [];
         const test = yield* fixture({
           rows: [{ ...jiraRow(), writesEnabled: true, writeGeneration: 4 }],
           rawHttp: true,
           respond: (request) =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
+              if (request.method === "GET")
+                return stream === "closed"
+                  ? new Response("", { headers: { "content-type": "text/event-stream" } })
+                  : new Response(null, { status: stream === "rejected" ? 500 : 405 });
               if (request.method === "DELETE") return new Response(null, { status: 204 });
               if (request.body._tag !== "Uint8Array") throw new Error("Missing Jira request body");
               const rpc = decodeRpc(new TextDecoder().decode(request.body.body));
@@ -272,9 +281,19 @@ describe("issue field edits", () => {
                 return new Response(null, { status: 202 });
               if (rpc.params?.name && rpc.params.arguments)
                 sent.push({ name: rpc.params.name, arguments: rpc.params.arguments });
+              if (rpc.params?.name === "transitionJiraIssue" && outcome !== "confirmed") {
+                status = "In Progress";
+                if (outcome === "lost-response") return new Response(null, { status: 503 });
+                yield* Deferred.succeed(enteredWrite, undefined);
+                return yield* Effect.never;
+              }
               const result =
                 rpc.method === "initialize"
-                  ? { protocolVersion: "2025-11-25" }
+                  ? {
+                      protocolVersion: "2025-11-25",
+                      capabilities: { tools: {} },
+                      serverInfo: { name: "Jira", version: "1" },
+                    }
                   : rpc.method === "tools/list"
                     ? {
                         tools: ["getTransitionsForJiraIssue", "transitionJiraIssue"].map(
@@ -322,17 +341,28 @@ describe("issue field edits", () => {
             Effect.succeed({
               ...prepared,
               operationId: "edit-jira",
-              state: "ready",
+              state,
             } as WriteOperationRecord),
           claim: () =>
-            Effect.succeed({
-              ...prepared,
-              operationId: "edit-jira",
-              state: "executing",
-              claimFence: "fence",
-            } as WriteOperationRecord),
-          outcomeUnknown: () => Effect.succeed(true),
-          reconcileUnknown: () => Effect.succeed({ ...operation, state: "succeeded" }),
+            Effect.sync(() => {
+              state = "executing";
+              return {
+                ...prepared,
+                operationId: "edit-jira",
+                state,
+                claimFence: "fence",
+              } as WriteOperationRecord;
+            }),
+          outcomeUnknown: () =>
+            Effect.sync(() => {
+              if (state === "executing") state = "outcome_unknown";
+              return true;
+            }),
+          reconcileUnknown: () =>
+            Effect.sync(() => {
+              state = "succeeded";
+              return { ...operation, state } as WriteOperationRecord;
+            }),
         });
         const jiraClaims = RelayIssueTrackerTurnPrincipal.of({
           ...claims,
@@ -352,7 +382,7 @@ describe("issue field edits", () => {
           Effect.provideService(RelayIssueTrackerTurnPrincipal, jiraClaims),
           Effect.provideService(WriteOperationStore, store),
         );
-        const result = yield* executeEdit({
+        const execute = executeEdit({
           environmentId: "environment-1",
           providerSessionId: "session-1",
           operationId: "edit-jira",
@@ -361,7 +391,19 @@ describe("issue field edits", () => {
           Effect.provideService(RelayIssueTrackerTurnPrincipal, jiraClaims),
           Effect.provideService(WriteOperationStore, store),
         );
-        expect(result.state).toBe("succeeded");
+        if (outcome === "interrupted") {
+          const fiber = yield* execute.pipe(Effect.forkChild);
+          yield* Deferred.await(enteredWrite);
+          yield* Fiber.interrupt(fiber);
+          expect(state).toBe("outcome_unknown");
+        } else {
+          expect((yield* execute).state).toBe(
+            outcome === "confirmed" ? "succeeded" : "outcome_unknown",
+          );
+        }
+        if (outcome !== "confirmed") expect((yield* execute).state).toBe("outcome_unknown");
+        expect(status).toBe("In Progress");
+        expect(test.requests.filter((request) => request.method === "GET")).toEqual([]);
         expect(sent.filter((call) => call.name === "transitionJiraIssue")).toEqual([
           {
             name: "transitionJiraIssue",

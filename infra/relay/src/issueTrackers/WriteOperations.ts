@@ -30,13 +30,8 @@ const CommentPayload = Schema.Struct({
   body: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(20_000)),
   retryOfOperationId: Schema.optionalKey(Schema.String),
 });
-const CommentBaseline = Schema.Struct({
-  commentIds: Schema.Array(Schema.String),
-  complete: Schema.Boolean,
-});
 const encodePayload = Schema.encodeEffect(Schema.fromJsonString(CommentPayload));
 const decodePayload = Schema.decodeUnknownEffect(Schema.fromJsonString(CommentPayload));
-const encodeBaseline = Schema.encodeEffect(Schema.fromJsonString(CommentBaseline));
 const invalid = (message: string) => new RelayIssueTrackerError({ code: "invalid_input", message });
 const unavailable = () =>
   new RelayIssueTrackerError({
@@ -138,17 +133,6 @@ export const prepareComment = Effect.fn("issueTrackers.prepareComment")(function
     body,
     ...(prior && input.retryAfterUnknown ? { retryOfOperationId: prior.operationId } : {}),
   }).pipe(Effect.mapError(unavailable));
-  const baseline = yield* encodeBaseline({
-    commentIds:
-      issue.service === "linear" && issue.linear?.discussion.status === "available"
-        ? issue.linear.discussion.comments.map((comment) => comment.id)
-        : [],
-    complete:
-      issue.service === "linear" &&
-      issue.linear?.discussion.status === "available" &&
-      !issue.linear.discussion.hasMore &&
-      !issue.linear.discussion.contentTruncated,
-  }).pipe(Effect.mapError(unavailable));
   return yield* store.prepare({
     ownerUserId: grant.ownerUserId,
     service: input.service,
@@ -164,7 +148,7 @@ export const prepareComment = Effect.fn("issueTrackers.prepareComment")(function
     target,
     payloadDigest,
     payloadSealed: yield* box.seal(payload).pipe(Effect.mapError(unavailable)),
-    baselineSealed: yield* box.seal(baseline).pipe(Effect.mapError(unavailable)),
+    baselineSealed: null,
     expiresAt: DateTime.formatIso(DateTime.makeUnsafe(claims.expiresAt)),
     ...(prior && input.retryAfterUnknown ? { retryOfOperationId: prior.operationId } : {}),
   });

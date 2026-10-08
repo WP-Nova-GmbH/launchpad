@@ -88,7 +88,7 @@ const active = {
   accountLabel: "Company A",
   updatedAt: "2026-10-01",
 } as const;
-const snapshot: RelayIssueTrackerConnections = { linearAvailable: true, connections: [active] };
+const snapshot: RelayIssueTrackerConnections = { connections: [active] };
 const pending: RelayIssueTrackerConnections = {
   ...snapshot,
   connections: [

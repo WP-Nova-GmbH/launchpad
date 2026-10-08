@@ -55,11 +55,6 @@ const decodePayload = Schema.decodeUnknownSync(
     }),
   ),
 );
-const decodeBaseline = Schema.decodeUnknownSync(
-  Schema.fromJsonString(
-    Schema.Struct({ complete: Schema.Boolean, commentIds: Schema.Array(Schema.String) }),
-  ),
-);
 const decodeWriteRpc = Schema.decodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
@@ -82,11 +77,9 @@ const unusedOperations = WriteOperationStore.of({
   reject: () => Effect.die("unexpected reject"),
   cancel: () => Effect.die("unexpected cancel"),
   claim: () => Effect.die("unexpected claim"),
-  succeed: () => Effect.die("unexpected succeed"),
   outcomeUnknown: () => Effect.die("unexpected outcomeUnknown"),
   reconcileUnknown: () => Effect.die("unexpected reconcileUnknown"),
   reconcileVerifiedUnknown: () => Effect.die("unexpected reconcileVerifiedUnknown"),
-  cancelPending: () => Effect.die("unexpected cancelPending"),
 });
 
 describe("prepare issue comments", () => {
@@ -252,10 +245,7 @@ describe("prepare issue comments", () => {
         issueId: "issue-id",
       });
       expect(stored!.payloadDigest).toMatch(/^[a-f0-9]{64}$/);
-      expect(decodeBaseline(stored!.baselineSealed!.slice("sealed:".length))).toEqual({
-        complete: true,
-        commentIds: [],
-      });
+      expect(stored!.baselineSealed).toBeNull();
       expect(test.requests.length).toBeGreaterThan(0);
     }),
   );
@@ -266,6 +256,7 @@ describe("prepare issue comments", () => {
         rows: [{ ...jiraRow(), writesEnabled: true, writeGeneration: 4 }],
         rawHttp: true,
         respond: (request) => {
+          if (request.method === "GET") return Effect.succeed(new Response(null, { status: 405 }));
           if (request.method === "DELETE")
             return Effect.succeed(new Response(null, { status: 204 }));
           if (request.body._tag !== "Uint8Array") return Effect.die("missing Jira request body");
@@ -278,7 +269,11 @@ describe("prepare issue comments", () => {
               id: rpc.id,
               result:
                 rpc.method === "initialize"
-                  ? { protocolVersion: "2025-11-25" }
+                  ? {
+                      protocolVersion: "2025-11-25",
+                      capabilities: { tools: {} },
+                      serverInfo: { name: "Jira", version: "1" },
+                    }
                   : rpc.method === "tools/list"
                     ? { tools: [{ name: "executeRead", inputSchema: {} }] }
                     : rpc.params?.name === "executeRead"
@@ -321,7 +316,7 @@ describe("prepare issue comments", () => {
         service: "jira",
         target: "https://launchpad.atlassian.net/browse/LP-42",
       });
-      expect(decodeBaseline(stored!.baselineSealed!.slice("sealed:".length)).complete).toBe(false);
+      expect(stored!.baselineSealed).toBeNull();
     }),
   );
 
@@ -353,6 +348,7 @@ describe("prepare issue comments", () => {
         rawHttp: true,
         respond: (request) =>
           Effect.sync(() => {
+            if (request.method === "GET") return new Response(null, { status: 405 });
             if (request.method === "DELETE") return new Response(null, { status: 204 });
             if (request.body._tag !== "Uint8Array") throw new Error("Missing Jira request");
             const rpc = decodeWriteRpc(new TextDecoder().decode(request.body.body));
@@ -360,7 +356,11 @@ describe("prepare issue comments", () => {
               return new Response(null, { status: 202 });
             const result =
               rpc.method === "initialize"
-                ? { protocolVersion: "2025-11-25" }
+                ? {
+                    protocolVersion: "2025-11-25",
+                    capabilities: { tools: {} },
+                    serverInfo: { name: "Jira", version: "1" },
+                  }
                 : rpc.method === "tools/list"
                   ? { tools: [{ name: "getJiraIssue", inputSchema: {} }] }
                   : { structuredContent: { key: "LP-42", fields: { summary: "Example" } } };
@@ -641,8 +641,8 @@ describe("execute issue comments", () => {
 
   it.effect("uses the Jira comment tool and argument names advertised to this grant", () =>
     Effect.gen(function* () {
-      for (const [returnedBody, readRoute, writeResponse] of [
-        ["Jira note\r\n", "executeRead", "structured"],
+      for (const [returnedBody, readRoute, writeResponse, stream] of [
+        ["Jira note\r\n", "executeRead", "structured", "rejected"],
         [
           {
             type: "doc",
@@ -650,8 +650,9 @@ describe("execute issue comments", () => {
           },
           "listJiraIssueComments",
           "structured",
+          "closed",
         ],
-        ["Jira note", "listJiraIssueComments", "text-data-comment-id"],
+        ["Jira note", "listJiraIssueComments", "text-data-comment-id", "unsupported"],
       ] as const) {
         const sent: { name: string; arguments: Record<string, unknown> }[] = [];
         let posted = false;
@@ -660,6 +661,10 @@ describe("execute issue comments", () => {
           rawHttp: true,
           respond: (request) =>
             Effect.sync(() => {
+              if (request.method === "GET")
+                return stream === "closed"
+                  ? new Response("", { headers: { "content-type": "text/event-stream" } })
+                  : new Response(null, { status: stream === "rejected" ? 500 : 405 });
               if (request.method === "DELETE") return new Response(null, { status: 204 });
               if (request.body._tag !== "Uint8Array") throw new Error("Missing Jira request");
               const rpc = decodeWriteRpc(new TextDecoder().decode(request.body.body));
@@ -669,7 +674,11 @@ describe("execute issue comments", () => {
                 sent.push({ name: rpc.params.name, arguments: rpc.params.arguments });
               const result =
                 rpc.method === "initialize"
-                  ? { protocolVersion: "2025-11-25" }
+                  ? {
+                      protocolVersion: "2025-11-25",
+                      capabilities: { tools: {} },
+                      serverInfo: { name: "Jira", version: "1" },
+                    }
                   : rpc.method === "tools/list"
                     ? {
                         tools: [
@@ -763,6 +772,7 @@ describe("execute issue comments", () => {
           Effect.provideService(WriteOperationStore, store),
         );
         expect(result.state).toBe("succeeded");
+        expect(test.requests.filter((request) => request.method === "GET")).toEqual([]);
         expect(sent.filter((call) => call.name === "addCommentToJiraIssue")).toEqual([
           {
             name: "addCommentToJiraIssue",
@@ -788,28 +798,41 @@ describe("execute issue comments", () => {
     }),
   );
 
-  it.effect(
-    "keeps Jira comments uncertain when the returned ID has no matching body on this issue",
-    () =>
+  it.effect.each(["unverified", "lost-response", "interrupted"] as const)(
+    "keeps a %s Jira comment uncertain without replaying it",
+    (outcome) =>
       Effect.gen(function* () {
         for (const comment of [
           { id: "comment-1", body: "Different note", issueKey: "LP-42" },
           { id: "comment-1", body: "Jira note", issueKey: "OTHER-7" },
         ]) {
           let posts = 0;
+          let state = "ready";
+          const enteredWrite = yield* Deferred.make<void>();
           const test = yield* fixture({
             rows: [{ ...jiraRow(), writesEnabled: true, writeGeneration: 4 }],
             rawHttp: true,
             respond: (request) =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
+                if (request.method === "GET") return new Response(null, { status: 405 });
                 if (request.method === "DELETE") return new Response(null, { status: 204 });
                 if (request.body._tag !== "Uint8Array") throw new Error("Missing Jira request");
                 const rpc = decodeWriteRpc(new TextDecoder().decode(request.body.body));
                 if (rpc.method === "notifications/initialized")
                   return new Response(null, { status: 202 });
+                if (rpc.params?.name === "addCommentToJiraIssue" && outcome !== "unverified") {
+                  posts++;
+                  if (outcome === "lost-response") return new Response(null, { status: 503 });
+                  yield* Deferred.succeed(enteredWrite, undefined);
+                  return yield* Effect.never;
+                }
                 const result =
                   rpc.method === "initialize"
-                    ? { protocolVersion: "2025-11-25" }
+                    ? {
+                        protocolVersion: "2025-11-25",
+                        capabilities: { tools: {} },
+                        serverInfo: { name: "Jira", version: "1" },
+                      }
                     : rpc.method === "tools/list"
                       ? {
                           tools: [
@@ -842,16 +865,20 @@ describe("execute issue comments", () => {
           let candidate: { resourceId: string; url: string } | undefined;
           const store = WriteOperationStore.of({
             ...unusedOperations,
-            get: () => Effect.succeed(jiraOperation),
+            get: () => Effect.succeed({ ...jiraOperation, state } as WriteOperationRecord),
             claim: () =>
-              Effect.succeed({ ...jiraOperation, state: "executing", claimFence: "fence" }),
+              Effect.sync(() => {
+                state = "executing";
+                return { ...jiraOperation, state, claimFence: "fence" } as WriteOperationRecord;
+              }),
             outcomeUnknown: (_id, _fence, _error, result) =>
               Effect.sync(() => {
                 if (result) candidate = result;
+                if (state === "executing") state = "outcome_unknown";
                 return true;
               }),
           });
-          const result = yield* executeComment({
+          const execute = executeComment({
             environmentId: "environment-1",
             providerSessionId: "session-1",
             operationId: "operation-1",
@@ -867,8 +894,18 @@ describe("execute issue comments", () => {
             ),
             Effect.provideService(WriteOperationStore, store),
           );
-          expect(result.state).toBe("outcome_unknown");
-          expect(candidate).toMatchObject({ resourceId: "comment-1" });
+          if (outcome === "interrupted") {
+            const fiber = yield* execute.pipe(Effect.forkChild);
+            yield* Deferred.await(enteredWrite);
+            yield* Fiber.interrupt(fiber);
+            expect(state).toBe("outcome_unknown");
+          } else {
+            expect((yield* execute).state).toBe("outcome_unknown");
+          }
+          expect((yield* execute).state).toBe("outcome_unknown");
+          if (outcome === "unverified")
+            expect(candidate).toMatchObject({ resourceId: "comment-1" });
+          else expect(candidate).toBeUndefined();
           expect(posts).toBe(1);
         }
       }),

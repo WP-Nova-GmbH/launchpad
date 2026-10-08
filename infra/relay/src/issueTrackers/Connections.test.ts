@@ -43,10 +43,20 @@ const decodeRpc = Schema.decodeUnknownSync(
   ),
 );
 function jiraResponse(request: HttpClientRequest.HttpClientRequest) {
+  if (request.method === "GET") return new Response(null, { status: 405 });
+  if (request.method === "DELETE") return new Response(null, { status: 204 });
   if (request.body._tag !== "Uint8Array") throw new Error("Expected Jira request body");
   const rpc = decodeRpc(new TextDecoder().decode(request.body.body));
   if (rpc.method === "initialize")
-    return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: "2025-11-25" } });
+    return Response.json({
+      jsonrpc: "2.0",
+      id: rpc.id,
+      result: {
+        protocolVersion: "2025-11-25",
+        capabilities: { tools: {} },
+        serverInfo: { name: "Jira", version: "1" },
+      },
+    });
   if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 });
   return Response.json({
     jsonrpc: "2.0",
@@ -285,6 +295,7 @@ describe("issue tracker connection lifecycle", () => {
           },
         ],
         respond: (request) => {
+          if (request.method === "GET") return Effect.succeed(new Response(null, { status: 405 }));
           if (request.method === "DELETE")
             return Deferred.succeed(cleanupStarted, undefined).pipe(
               Effect.andThen(Effect.sleep("1500 millis")),
@@ -295,7 +306,15 @@ describe("issue tracker connection lifecycle", () => {
           if (rpc.method === "initialize")
             return Effect.succeed(
               Response.json(
-                { jsonrpc: "2.0", id: rpc.id, result: { protocolVersion: "2025-11-25" } },
+                {
+                  jsonrpc: "2.0",
+                  id: rpc.id,
+                  result: {
+                    protocolVersion: "2025-11-25",
+                    capabilities: { tools: {} },
+                    serverInfo: { name: "Jira", version: "1" },
+                  },
+                },
                 { headers: { "Mcp-Session-Id": "jira-session" } },
               ),
             );
@@ -488,7 +507,6 @@ describe("issue tracker connection lifecycle", () => {
       });
       const listed = yield* listConnections("org").pipe(test.provide);
       expect(listed).toEqual({
-        linearAvailable: true,
         connections: [
           {
             service: "linear",

@@ -62,7 +62,6 @@ export type RelayIssueTrackerAuthorizationProfile =
 
 export const RelayIssueTrackerConnections = Schema.Struct({
   connections: Schema.Array(RelayIssueTrackerConnection),
-  linearAvailable: Schema.Boolean,
 });
 export type RelayIssueTrackerConnections = typeof RelayIssueTrackerConnections.Type;
 
@@ -246,48 +245,9 @@ export const RelayLinearImageResponse = Schema.Struct({
   }),
 });
 
-const JiraReference = TrimmedNonEmptyString.check(Schema.isMaxLength(16_384));
-export const RelayJiraComment = Schema.Struct({
-  id: Schema.String,
-  body: Schema.String,
-  author: Schema.NullOr(Schema.String),
-  createdAt: Schema.String,
-  editedAt: Schema.NullOr(Schema.String),
-  url: Schema.String,
-  bodyTruncated: Schema.Boolean,
-});
-export type RelayJiraComment = typeof RelayJiraComment.Type;
-export const RelayJiraDiscussion = Schema.Union([
-  Schema.Struct({
-    status: Schema.Literal("available"),
-    comments: Schema.Array(RelayJiraComment),
-    continuation: Schema.NullOr(JiraReference),
-    hasMore: Schema.Boolean,
-    contentTruncated: Schema.Boolean,
-  }),
-  Schema.Struct({ status: Schema.Literal("unavailable"), reason: Schema.String }),
-]);
-export type RelayJiraDiscussion = typeof RelayJiraDiscussion.Type;
-export const RelayJiraContext = Schema.Struct({
-  source: JiraReference,
-  cloudId: Schema.String,
-  issueId: Schema.String,
-  discussion: RelayJiraDiscussion,
-});
-export const RelayJiraReferenceRequest = Schema.Struct({ reference: JiraReference });
-export type RelayJiraReferenceRequest = typeof RelayJiraReferenceRequest.Type;
-export const RelayJiraCommentsResponse = Schema.Struct({
-  service: Schema.Literal("jira"),
-  accountLabel: Schema.String,
-  identifier: Schema.String,
-  url: Schema.String,
-  ...RelayJiraContext.fields,
-});
-
 export const RelayReadIssueResponse = Schema.Struct({
   ...RelayIssueDetails.fields,
   linear: Schema.optionalKey(RelayLinearContext),
-  jira: Schema.optionalKey(RelayJiraContext),
   service: RelayIssueTrackerService,
   accountLabel: Schema.String,
 });

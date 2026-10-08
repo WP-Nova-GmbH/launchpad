@@ -79,13 +79,18 @@ function response(request: HttpClientRequest.HttpClientRequest, resources: unkno
     });
   if (request.url !== "https://mcp.atlassian.com/v2/mcp")
     return new Response(null, { status: 404 });
+  if (request.method === "GET") return new Response(null, { status: 405 });
   if (request.method === "DELETE") return new Response(null, { status: 204 });
   if (request.body._tag !== "Uint8Array") throw new Error("Expected MCP request");
   const rpc = decodeRpc(new TextDecoder().decode(request.body.body));
   if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 });
   const result =
     rpc.method === "initialize"
-      ? { protocolVersion: "2025-11-25" }
+      ? {
+          protocolVersion: "2025-11-25",
+          capabilities: { tools: {} },
+          serverInfo: { name: "Jira", version: "1" },
+        }
       : rpc.params?.name === "getJiraIssue"
         ? {
             structuredContent: {

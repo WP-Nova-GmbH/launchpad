@@ -1,4 +1,4 @@
-import { RelayIssueTrackerError, type RelayIssueTrackerService } from "@t3tools/contracts/relay";
+import { RelayIssueTrackerError } from "@t3tools/contracts/relay";
 import { and, eq, gt, inArray, lte, ne, or } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -84,11 +84,6 @@ export class WriteOperationStore extends Context.Service<
       operationId: string,
       fence: ConnectionFence & { readonly retryOfOperationId?: string },
     ) => Effect.Effect<WriteOperationRecord, RelayIssueTrackerError>;
-    readonly succeed: (
-      operationId: string,
-      claimFence: string,
-      result: { resourceId: string; url: string },
-    ) => Effect.Effect<boolean, RelayIssueTrackerError>;
     readonly outcomeUnknown: (
       operationId: string,
       claimFence: string,
@@ -106,10 +101,6 @@ export class WriteOperationStore extends Context.Service<
       resourceId: string,
       fence: ConnectionFence & Pick<WriteOperationRecord, "environmentId">,
     ) => Effect.Effect<WriteOperationRecord, RelayIssueTrackerError>;
-    readonly cancelPending: (
-      ownerUserId: string,
-      service: RelayIssueTrackerService,
-    ) => Effect.Effect<void, RelayIssueTrackerError>;
   }
 >()("launchpad-relay/issueTrackers/WriteOperationStore") {}
 
@@ -547,29 +538,6 @@ export const make = Effect.gen(function* () {
           return rows[0]!;
         }),
       ),
-    succeed: (operationId, claimFence, result) =>
-      Effect.gen(function* () {
-        const rows = yield* db
-          .update(operations)
-          .set({
-            state: "succeeded",
-            resultResourceId: result.resourceId,
-            resultUrl: result.url,
-            payloadSealed: null,
-            baselineSealed: null,
-            updatedAt: yield* now,
-          })
-          .where(
-            and(
-              byId(operationId),
-              eq(operations.state, "executing"),
-              eq(operations.claimFence, claimFence),
-            ),
-          )
-          .returning({ id: operations.operationId })
-          .pipe(Effect.mapError(databaseFailure));
-        return rows.length === 1;
-      }),
     outcomeUnknown: (operationId, claimFence, safeError, candidate) =>
       Effect.gen(function* () {
         const rows = yield* db
@@ -654,25 +622,6 @@ export const make = Effect.gen(function* () {
           return rows[0]!;
         }),
       ),
-    cancelPending: (ownerUserId, service) =>
-      Effect.gen(function* () {
-        yield* db
-          .update(operations)
-          .set({
-            state: "cancelled",
-            payloadSealed: null,
-            baselineSealed: null,
-            updatedAt: yield* now,
-          })
-          .where(
-            and(
-              eq(operations.ownerUserId, ownerUserId),
-              eq(operations.service, service),
-              inArray(operations.state, [...pendingStates]),
-            ),
-          )
-          .pipe(Effect.mapError(databaseFailure));
-      }),
   });
 });
 

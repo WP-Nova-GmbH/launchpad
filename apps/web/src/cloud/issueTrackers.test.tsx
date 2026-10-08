@@ -15,7 +15,6 @@ vi.mock("./publicConfig", () => ({ resolveRelayClerkTokenOptions: () => ({}) }))
 import { useIssueTrackers } from "./issueTrackers";
 
 const connected: RelayIssueTrackerConnections = {
-  linearAvailable: true,
   connections: [
     {
       service: "jira",
@@ -111,7 +110,6 @@ describe("organization issue tracker state", () => {
 });
 
 const pending: RelayIssueTrackerConnections = {
-  linearAvailable: true,
   connections: [
     {
       service: "linear",
@@ -130,7 +128,6 @@ const pending: RelayIssueTrackerConnections = {
   ],
 };
 const replaced: RelayIssueTrackerConnections = {
-  linearAvailable: true,
   connections: [
     { service: "linear", status: "connected", accountLabel: "Company B", updatedAt: "2026-10-01" },
   ],

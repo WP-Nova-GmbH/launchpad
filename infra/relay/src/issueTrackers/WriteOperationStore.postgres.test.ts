@@ -41,7 +41,7 @@ const input = {
   target: "WP-218",
   payloadDigest: "a".repeat(64),
   payloadSealed: "sealed:test-comment",
-  baselineSealed: "sealed:test-baseline",
+  baselineSealed: null,
   expiresAt: "2099-01-01T00:00:00.000Z",
 } satisfies Parameters<WriteOperationStore["Service"]["prepare"]>[0];
 
@@ -68,10 +68,16 @@ describe.skipIf(!databaseUrl)("issue tracker write operation fencing (PostgreSQL
             payloadDigest: "q".repeat(64),
           });
           const successClaim = yield* writes.claim(oldSuccess.operation.operationId, input);
-          yield* writes.succeed(oldSuccess.operation.operationId, successClaim.claimFence!, {
-            resourceId: "old-comment",
-            url: "https://linear.app/launchpad/issue/WP-218#old-comment",
-          });
+          yield* writes.outcomeUnknown(
+            oldSuccess.operation.operationId,
+            successClaim.claimFence!,
+            "Awaiting verification.",
+            {
+              resourceId: "old-comment",
+              url: "https://linear.app/launchpad/issue/WP-218#old-comment",
+            },
+          );
+          yield* writes.reconcileUnknown(oldSuccess.operation.operationId, "old-comment", input);
           const unknown = yield* writes.prepare({
             ...input,
             runtimeMode: "full-access",
@@ -181,17 +187,34 @@ describe.skipIf(!databaseUrl)("issue tracker write operation fencing (PostgreSQL
           yield* writes.claim(first.operation.operationId, input).pipe(Effect.flip),
         ).toMatchObject({ code: "conflict" });
         expect(
-          yield* writes.succeed(first.operation.operationId, "wrong-fence", {
+          yield* writes.outcomeUnknown(first.operation.operationId, "wrong-fence", "Uncertain.", {
             resourceId: "comment-1",
             url: "https://linear.app/launchpad/issue/WP-218#comment-1",
           }),
         ).toBe(false);
         expect(
-          yield* writes.succeed(first.operation.operationId, claimed.claimFence!, {
-            resourceId: "comment-1",
-            url: "https://linear.app/launchpad/issue/WP-218#comment-1",
-          }),
+          yield* writes.outcomeUnknown(
+            first.operation.operationId,
+            claimed.claimFence!,
+            "Uncertain.",
+            {
+              resourceId: "comment-1",
+              url: "https://linear.app/launchpad/issue/WP-218#comment-1",
+            },
+          ),
         ).toBe(true);
+        expect((yield* writes.get(first.operation.operationId))?.state).toBe("outcome_unknown");
+        expect(
+          yield* writes
+            .reconcileUnknown(first.operation.operationId, "comment-1", {
+              ...input,
+              writeGeneration: input.writeGeneration + 1,
+            })
+            .pipe(Effect.flip),
+        ).toMatchObject({ code: "conflict" });
+        expect(
+          (yield* writes.reconcileUnknown(first.operation.operationId, "comment-1", input)).state,
+        ).toBe("succeeded");
         expect((yield* writes.get(first.operation.operationId))?.state).toBe("succeeded");
         const newRequest = yield* writes.prepare({
           ...input,

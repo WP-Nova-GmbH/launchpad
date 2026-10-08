@@ -191,7 +191,6 @@ export const listConnections = Effect.fn("issueTrackers.list")(function* (ownerU
   }
   if (expired) rows = yield* store.list(ownerUserId);
   return {
-    linearAvailable: true,
     connections: yield* Effect.forEach(rows, (row) =>
       Effect.gen(function* () {
         const searchEnabled =
