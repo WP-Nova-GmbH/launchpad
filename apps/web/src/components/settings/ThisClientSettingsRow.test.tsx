@@ -130,7 +130,7 @@ vi.mock("../../../../mobile/src/features/connection/ConnectionFormField", () => 
     onChangeText: (value: string) => void;
   }) => <input value={value} onChange={(event) => onChangeText(event.currentTarget.value)} />,
 }));
-vi.mock("../../../../mobile/src/features/connection/useClientName", () => ({
+vi.mock("../../../../mobile/src/lib/useClientName", () => ({
   useClientName: () => ["Suggested name", () => {}],
   rememberClientLabel: backend.remember,
 }));
