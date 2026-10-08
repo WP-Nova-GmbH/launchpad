@@ -31,6 +31,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
+  ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   ORCHESTRATION_PROTOCOL_VERSION,
   type PreviewEvent,
   ProjectId,
@@ -1373,6 +1374,7 @@ const bootstrapBrowserSession = (
   credential = defaultDesktopBootstrapToken,
   options?: {
     readonly headers?: Record<string, string>;
+    readonly clientLabel?: string;
   },
 ) =>
   Effect.gen(function* () {
@@ -1385,7 +1387,7 @@ const bootstrapBrowserSession = (
       },
       body: jsonRequestBody({
         credential,
-        client: { label: "Test browser" },
+        client: { label: options?.clientLabel ?? "Test browser" },
       }),
     });
     const body = yield* responseJsonEffect<{
@@ -3261,6 +3263,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             subject_token: credential.credential,
             subject_token_type: "urn:t3:params:oauth:token-type:environment-bootstrap",
             requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
+            client_label: "DPoP test client",
             scope: "orchestration:read orchestration:operate terminal:operate review:write",
           }).toString(),
         });
@@ -5667,7 +5670,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           "content-type": "application/json",
         },
         body: jsonRequestBody({
-          label: "Julius iPhone",
+          label: "Julius phone invitation",
         }),
       });
       const ownerPairingBody = yield* responseJsonEffect<{
@@ -5676,6 +5679,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }>(ownerPairingResponse);
       assert.equal(ownerPairingResponse.status, 200);
       const pairedSessionBootstrap = yield* bootstrapBrowserSession(ownerPairingBody.credential, {
+        clientLabel: "Julius iPhone",
         headers: {
           "user-agent":
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
@@ -5737,7 +5741,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       };
 
       assert.equal(listBeforeResponse.status, 200);
-      assert.equal(ownerPairingBody.label, "Julius iPhone");
+      assert.equal(ownerPairingBody.label, "Julius phone invitation");
       assert.lengthOf(clientsBefore, 2);
       assert.isDefined(pairedSessionId);
       assert.isDefined(pairedClientBefore);
@@ -13528,7 +13532,13 @@ it.live(
 
                 const baseUrl = yield* getHttpServerUrl();
                 const cookie = yield* getAuthenticatedSessionCookieHeader();
-                const wsUrl = baseUrl.replace(/^http:/, "ws:") + "/ws";
+                const socketUrl = new URL("/ws", baseUrl);
+                socketUrl.protocol = "ws:";
+                socketUrl.searchParams.set(
+                  ORCHESTRATION_PROTOCOL_QUERY_PARAM,
+                  String(ORCHESTRATION_PROTOCOL_VERSION),
+                );
+                const wsUrl = socketUrl.toString();
 
                 return yield* Effect.scoped(
                   Effect.gen(function* () {

@@ -11,7 +11,7 @@ import {
   stripPairingTokenFromUrl,
   submitServerAuthCredential,
 } from "../../environments/primary";
-import { readHostedPairingRequest } from "../../hostedPairing";
+import { resolveHostedPairingRequest } from "../../hostedPairing";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { StandalonePage, StandalonePageHeader } from "../ui/standalone-page";
@@ -148,7 +148,7 @@ export function HostedPairingRouteSurface() {
   const connectPairingEnvironment = useAtomCommand(connectPairing, {
     reportFailure: false,
   });
-  const [hostedPairingRequest] = useState(readHostedPairingRequest);
+  const [hostedPairingRequest] = useState(resolveHostedPairingRequest);
   const [status, setStatus] = useState<"pairing" | "paired" | "error">(() =>
     hostedPairingRequest ? "pairing" : "error",
   );
@@ -222,6 +222,11 @@ export function HostedPairingRouteSurface() {
         description={message}
       />
 
+      {request ? (
+        <div className="mt-5 break-words rounded-lg border border-border/70 bg-background/55 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
+          Host: <span className="font-mono text-foreground/80">{request.host}</span>
+        </div>
+      ) : null}
       {request && !confirmed ? (
         <form
           className="mt-4 space-y-4"
@@ -236,11 +241,6 @@ export function HostedPairingRouteSurface() {
             Connect
           </Button>
         </form>
-      ) : null}
-      {request && confirmed ? (
-        <div className="mt-5 rounded-lg border border-border/70 bg-background/55 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
-          Host: <span className="font-mono text-foreground/80">{request.host}</span>
-        </div>
       ) : null}
 
       {status === "error" ? (
