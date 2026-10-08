@@ -1,4 +1,4 @@
-import { rememberClientLabel } from "../features/connection/useClientName";
+import { rememberClientLabel } from "../lib/useClientName";
 import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";

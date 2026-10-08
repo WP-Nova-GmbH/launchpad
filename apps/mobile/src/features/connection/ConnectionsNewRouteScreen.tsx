@@ -1,4 +1,4 @@
-import { useClientName } from "./useClientName";
+import { useClientName } from "../../lib/useClientName";
 import { ScreenScrollView as ScrollView } from "../../components/ScreenScrollView";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import {

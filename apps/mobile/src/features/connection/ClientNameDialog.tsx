@@ -10,7 +10,7 @@ import { authEnvironment } from "../../state/auth";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { ConnectionFormField } from "./ConnectionFormField";
-import { rememberClientLabel, useClientName } from "./useClientName";
+import { rememberClientLabel, useClientName } from "../../lib/useClientName";
 
 function ClientNameDialog({
   environmentId,

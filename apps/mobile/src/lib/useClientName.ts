@@ -2,7 +2,7 @@ import { useAtomValue } from "@effect/atom-react";
 import { clientLabelAccountNameAtom, suggestClientLabel } from "@t3tools/client-runtime/connection";
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as SecureStore from "expo-secure-store";
-import { authClientMetadata } from "../../lib/authClientMetadata";
+import { authClientMetadata } from "./authClientMetadata";
 
 const KEY = "launchpad.lastClientLabel";
 export async function rememberClientLabel(label: string) {
