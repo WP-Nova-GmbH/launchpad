@@ -955,6 +955,113 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
     }).pipe(Effect.provide(makeSessionStoreLayer())),
   );
 
+  it.effect("session presence requires a successful initial lookup", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const presence = yield* ThreadPresence.ThreadPresenceService;
+      const issued = yield* sessions.issue({ client: { deviceType: "mobile", label: "Phone" } });
+      const failure = new SessionStore.SessionCredentialVerificationError({
+        sessionId: issued.sessionId,
+        cause: repositoryFailure,
+      });
+      const result = yield* makeSessionPresenceReporter("socket", issued.sessionId).pipe(
+        Effect.provideService(SessionStore.SessionStore, {
+          ...sessions,
+          getActive: () => Effect.fail(failure),
+        }),
+        Effect.flip,
+      );
+      expect(result).toBe(failure);
+      expect((yield* presence.snapshot).participants).toEqual([]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), ThreadPresence.layer)),
+    ),
+  );
+
+  it.effect.each(["rename", "revoke"] as const)(
+    "session presence recovers a %s after a failed refresh without renewing typing",
+    (change) =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const presence = yield* ThreadPresence.ThreadPresenceService;
+        const issued = yield* sessions.issue({
+          client: { deviceType: "mobile", label: "Old phone" },
+        });
+        const failNextRead = yield* Ref.make(false);
+        const failedRead = yield* Deferred.make<void>();
+        const reporterStopped = yield* Deferred.make<void>();
+        const report = yield* makeSessionPresenceReporter("socket", issued.sessionId).pipe(
+          Effect.provideService(SessionStore.SessionStore, {
+            ...sessions,
+            subscribeChanges: sessions.subscribeChanges.pipe(
+              Effect.map((changes) =>
+                changes.pipe(Stream.ensuring(Deferred.succeed(reporterStopped, undefined))),
+              ),
+            ),
+            getActive: (id) =>
+              Effect.gen(function* () {
+                if (yield* Ref.getAndSet(failNextRead, false)) {
+                  yield* Deferred.succeed(failedRead, undefined);
+                  return yield* new SessionStore.SessionCredentialVerificationError({
+                    sessionId: id,
+                    cause: repositoryFailure,
+                  });
+                }
+                return yield* sessions.getActive(id);
+              }),
+          }),
+        );
+        yield* report({ threadId: ThreadId.make("thread"), typing: true });
+        const before = yield* presence.snapshot;
+        yield* TestClock.adjust(6_000);
+        yield* Ref.set(failNextRead, true);
+        yield* sessions.rename(issued.sessionId, "Missed rename");
+        yield* Deferred.await(failedRead);
+        expect(yield* presence.snapshot).toEqual(before);
+
+        const { changes } = yield* presence.subscribe;
+        const expired = yield* changes.pipe(
+          Stream.filter((snapshot) => snapshot.participants[0]?.typing === false),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* TestClock.adjust(4_000);
+        yield* Fiber.join(expired);
+        expect((yield* presence.snapshot).participants[0]?.clientLabel).toBe("Old phone");
+
+        const refreshed = yield* changes.pipe(
+          Stream.filter((snapshot) =>
+            change === "rename"
+              ? snapshot.participants[0]?.clientLabel === "New phone"
+              : snapshot.participants.length === 0,
+          ),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        if (change === "rename") yield* sessions.rename(issued.sessionId, "New phone");
+        else yield* sessions.revoke(issued.sessionId);
+        const outcome = yield* Fiber.join(refreshed).pipe(
+          Effect.as("refreshed"),
+          Effect.raceFirst(Deferred.await(reporterStopped).pipe(Effect.as("stopped"))),
+        );
+        expect(outcome).toBe("refreshed");
+        yield* report({ threadId: ThreadId.make("thread"), typing: false });
+        const snapshot = yield* presence.snapshot;
+        if (change === "rename")
+          expect(snapshot.participants[0]).toMatchObject({
+            clientLabel: "New phone",
+            typing: false,
+          });
+        else expect(snapshot.participants).toEqual([]);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(Layer.mergeAll(makeSessionStoreLayer(), ThreadPresence.layer)),
+      ),
+  );
+
   it.effect("a queued old report cannot undo a rename after the refreshed name publishes", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;

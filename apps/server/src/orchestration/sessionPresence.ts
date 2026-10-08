@@ -43,7 +43,17 @@ export const makeSessionPresenceReporter = Effect.fn("makeSessionPresenceReporte
           if (Option.isSome(latest))
             yield* presence.updatePresentation(connectionId, presentation(latest.value));
           else yield* presence.clear(connectionId);
-        }),
+        }).pipe(
+          Effect.catchTag("SessionCredentialVerificationError", () =>
+            Effect.logWarning(
+              "Failed to refresh session presence; keeping the previous presentation.",
+              {
+                connectionId,
+                sessionId,
+              },
+            ),
+          ),
+        ),
       );
     }),
     Effect.orDie,

@@ -2355,6 +2355,8 @@ export function ConnectionsSettings() {
       return;
     }
 
+    if (!clientName.trim()) return;
+
     setIsAddingSavedBackend(true);
     setSavedBackendError(null);
     let remotePairingInput: ReturnType<typeof parseRemotePairingFields>;
@@ -2701,7 +2703,7 @@ export function ConnectionsSettings() {
       <Button
         variant="outline"
         className="w-full"
-        disabled={isAddingSavedBackend}
+        disabled={isAddingSavedBackend || !clientName.trim()}
         onClick={() => void handleAddSavedBackend()}
       >
         <PlusIcon />
