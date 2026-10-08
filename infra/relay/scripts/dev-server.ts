@@ -66,6 +66,11 @@ import { organizationProjectsApi, projectCatalogServerApi } from "../src/http/Pr
 import { executorReleaseServerApi } from "../src/http/ExecutorReleaseApi.ts";
 import { organizationSkillsServerApi } from "../src/http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "../src/http/ProviderAccountsApi.ts";
+import { issueTrackersApi, issueTrackersServerApi } from "../src/http/IssueTrackersApi.ts";
+import { turnAuthLayer } from "../src/issueTrackers/TurnAuthorization.ts";
+import { issueTrackerCallbackRoute } from "../src/http/IssueTrackerCallbackRoute.ts";
+import * as IssueTrackerConnectionStore from "../src/issueTrackers/ConnectionStore.ts";
+import * as IssueTrackerWriteOperationStore from "../src/issueTrackers/WriteOperationStore.ts";
 import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
@@ -372,6 +377,8 @@ const runtimeLayer = Layer.empty
         GithubApp.layer,
         GithubInstallations.layer,
         ProviderAccounts.layer,
+        IssueTrackerConnectionStore.layer,
+        IssueTrackerWriteOperationStore.layer,
         OrganizationSkills.layer,
         Machines.layer,
         OrganizationProjectCatalog.layer,
@@ -418,6 +425,8 @@ const relayApiLayer = Layer.mergeAll(
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
+  issueTrackersApi,
+  issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
 );
@@ -426,6 +435,7 @@ const appLayer = relayApiLayer.pipe(
   Layer.provideMerge(relayClientAuthLayer),
   Layer.provideMerge(relayDpopClientAuthLayer),
   Layer.provideMerge(relayEnvironmentAuthLayer),
+  Layer.provideMerge(turnAuthLayer),
   Layer.provide(runtimeLayer),
 );
 
@@ -435,6 +445,7 @@ const routerLayer = Layer.merge(
     HttpApiScalar.layer(RelayApi, { path: "/docs" }),
     relayDocsRedirectRoute,
     githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
+    issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
   ).pipe(Layer.provide([Etag.layerWeak, relayCors])),
   relayNotFoundRoute,
 );

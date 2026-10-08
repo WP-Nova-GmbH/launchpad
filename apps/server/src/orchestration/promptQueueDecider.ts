@@ -215,6 +215,10 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         return yield* fail(
           "Prompt conflict: this entry changed or began delivery. Review it before saving.",
         );
+      if (command.expectedRuntimeMode && command.expectedRuntimeMode !== entry.runtimeMode)
+        return yield* fail(
+          "Prompt conflict: this entry's runtime mode changed. Review it before saving.",
+        );
       if (!command.message.text.trim() && command.message.attachments.length === 0)
         return yield* fail("A prompt needs text or an attachment.");
       return [
@@ -222,6 +226,9 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
           entry: {
             ...entry,
             ...command.message,
+            // Editing replaces authorization, including an edit by a signed-out
+            // participant. Never retain the previous revision's grant.
+            issueTrackerAuthorizationId: command.message.issueTrackerAuthorizationId,
             revision: entry.revision + 1,
             ...(command.author ? { editedBy: command.author } : {}),
           },

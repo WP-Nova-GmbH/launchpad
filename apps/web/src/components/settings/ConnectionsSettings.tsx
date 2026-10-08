@@ -1,3 +1,4 @@
+import { PersonalIssueTrackers } from "./PersonalIssueTrackers";
 import {
   ChevronsLeftRightEllipsisIcon,
   EllipsisIcon,
@@ -3689,6 +3690,7 @@ export function ConnectionsSettings() {
 
   return (
     <SettingsPageContainer width="wide">
+      <PersonalIssueTrackers />
       {primarySettings}
       <SettingsSection
         {...searchableSetting("remote-environments")}

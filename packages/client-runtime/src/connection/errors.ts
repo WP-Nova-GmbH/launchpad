@@ -62,10 +62,11 @@ function relayProtectedError(error: RelayProtectedError): ConnectionAttemptError
     case "RelayTenancyNotFoundError":
     case "RelayTenancyConflictError":
     case "RelayTenancyInvalidError":
+    case "RelayIssueTrackerError":
       return new ConnectionBlockedError({
         reason: "configuration",
         detail: error.message,
-        traceId: error.traceId,
+        ...(error.traceId ? { traceId: error.traceId } : {}),
       });
     case "RelayEnvironmentEndpointTimedOutError":
       return new ConnectionTransientError({

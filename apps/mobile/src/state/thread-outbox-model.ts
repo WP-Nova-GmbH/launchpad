@@ -51,6 +51,7 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   commandId: CommandId,
+  ownerAccountId: Schema.optional(Schema.NullOr(Schema.String)),
   transportAttempted: Schema.optional(Schema.Boolean),
   acceptanceUncertain: Schema.optional(Schema.Boolean),
   acceptedWithEdits: Schema.optional(Schema.Boolean),
@@ -89,6 +90,8 @@ export interface QueuedThreadMessage {
   readonly threadId: ThreadId;
   readonly messageId: MessageId;
   readonly commandId: CommandId;
+  /** Missing on older entries; these must not acquire a signed-in account's connections. */
+  readonly ownerAccountId?: string | null;
   readonly transportAttempted?: boolean;
   readonly acceptanceUncertain?: boolean;
   readonly acceptedWithEdits?: boolean;
@@ -109,6 +112,13 @@ export interface ThreadSettingsSnapshot {
   readonly modelSelection: ModelSelectionType;
   readonly runtimeMode: RuntimeModeType;
   readonly interactionMode: ProviderInteractionModeType;
+}
+
+export function queuedThreadMessageAccountMatches(
+  message: QueuedThreadMessage,
+  accountId: string | null,
+): boolean {
+  return (message.ownerAccountId ?? null) === accountId;
 }
 
 /** An authoritative acceptance supersedes earlier transport uncertainty. */

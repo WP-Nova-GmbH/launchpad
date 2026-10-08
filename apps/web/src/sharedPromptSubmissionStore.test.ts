@@ -45,6 +45,16 @@ beforeEach(() => {
   useSharedPromptSubmissions.setState({ entries: [] });
 });
 describe("shared prompt transport journal", () => {
+  it("does not move an in-flight prompt into a different account's journal", () => {
+    setSharedPromptSubmissionAccount("bob");
+    expect(() =>
+      retainSharedPromptSubmission(environmentId, { ...input, expectedAccountId: "alice" }),
+    ).toThrow("account changed");
+    expect(saved.size).toBe(0);
+    const own = retainSharedPromptSubmission(environmentId, { ...input, expectedAccountId: "bob" });
+    expect(own.command).not.toHaveProperty("expectedAccountId");
+    expect(useSharedPromptSubmissions.getState().entries).toHaveLength(1);
+  });
   it("retains both submissions when another browser tab writes at the same time", () => {
     const write = localStorage.setItem.bind(localStorage);
     vi.spyOn(localStorage, "setItem").mockImplementationOnce((key, value) => {

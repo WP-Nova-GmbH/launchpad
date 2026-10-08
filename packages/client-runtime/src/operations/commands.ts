@@ -8,6 +8,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { authorizeIssueTrackerTurn, decideIssueTrackerWrite } from "../relay/issueTrackerTurn.ts";
 import {
   type EnvironmentRpcFailure,
   type EnvironmentRpcSuccess,
@@ -50,8 +51,13 @@ export type LinkThreadPullRequestInput = CommandInput<"thread.pull-request.link"
 export type UnlinkThreadPullRequestInput = CommandInput<"thread.pull-request.unlink">;
 export type SetThreadRuntimeModeInput = CommandInput<"thread.runtime-mode.set">;
 export type SetThreadInteractionModeInput = CommandInput<"thread.interaction-mode.set">;
-export type StartThreadTurnInput = CommandInput<"thread.turn.start">;
-export type EnqueueThreadPromptInput = CommandInput<"thread.prompt.enqueue">;
+export type StartThreadTurnInput = CommandInput<"thread.turn.start"> & {
+  /** Client-only owner captured when the prompt was submitted, before uploads or queuing. */
+  readonly expectedAccountId?: string | null | undefined;
+};
+export type EnqueueThreadPromptInput = CommandInput<"thread.prompt.enqueue"> & {
+  readonly expectedAccountId?: string | null | undefined;
+};
 export type EditThreadPromptInput = CommandInput<"thread.prompt.edit">;
 export type RemoveThreadPromptInput = CommandInput<"thread.prompt.remove">;
 export type SteerThreadPromptInput = CommandInput<"thread.prompt.steer">;
@@ -101,6 +107,9 @@ function timestampedCommandMetadata(input: {
 function dispatch(command: ClientOrchestrationCommand) {
   return request(ORCHESTRATION_WS_METHODS.dispatchCommand, command);
 }
+
+const dispatchPrompt = (command: ClientOrchestrationCommand, expectedAccountId?: string | null) =>
+  authorizeIssueTrackerTurn(command, expectedAccountId).pipe(Effect.flatMap(dispatch));
 
 export const createProject: (input: CreateProjectInput) => CommandEffect = Effect.fn(
   "EnvironmentCommands.createProject",
@@ -319,7 +328,7 @@ export const setThreadInteractionMode: (input: SetThreadInteractionModeInput) =>
 
 export const startThreadTurn: (input: StartThreadTurnInput) => CommandEffect = Effect.fn(
   "EnvironmentCommands.startThreadTurn",
-)(function* (input) {
+)(function* ({ expectedAccountId, ...input }) {
   const metadata = yield* timestampedCommandMetadata(input);
   const session = yield* currentSession();
   const supervisor = yield* EnvironmentSupervisor;
@@ -333,33 +342,42 @@ export const startThreadTurn: (input: StartThreadTurnInput) => CommandEffect = E
     ),
   );
   if (config.environment.capabilities.sharedPromptQueue === true) {
-    return yield* dispatch({
+    return yield* dispatchPrompt(
+      {
+        ...input,
+        type: "thread.prompt.enqueue",
+        commandId: metadata.commandId,
+        createdAt: metadata.createdAt,
+      },
+      expectedAccountId,
+    );
+  }
+  return yield* dispatchPrompt(
+    {
       ...input,
-      type: "thread.prompt.enqueue",
+      type: "thread.turn.start",
       commandId: metadata.commandId,
       createdAt: metadata.createdAt,
-    });
-  }
-  return yield* dispatch({
-    ...input,
-    type: "thread.turn.start",
-    commandId: metadata.commandId,
-    createdAt: metadata.createdAt,
-  });
+    },
+    expectedAccountId,
+  );
 });
 
 export const enqueueThreadPrompt: (input: EnqueueThreadPromptInput) => CommandEffect = Effect.fn(
   "EnvironmentCommands.enqueueThreadPrompt",
-)(function* (input) {
+)(function* ({ expectedAccountId, ...input }) {
   const metadata = yield* timestampedCommandMetadata(input);
-  return yield* dispatch({ ...input, type: "thread.prompt.enqueue", ...metadata });
+  return yield* dispatchPrompt(
+    { ...input, type: "thread.prompt.enqueue", ...metadata },
+    expectedAccountId,
+  );
 });
 
 export const editThreadPrompt: (input: EditThreadPromptInput) => CommandEffect = Effect.fn(
   "EnvironmentCommands.editThreadPrompt",
 )(function* (input) {
   const metadata = yield* timestampedCommandMetadata(input);
-  return yield* dispatch({ ...input, type: "thread.prompt.edit", ...metadata });
+  return yield* dispatchPrompt({ ...input, type: "thread.prompt.edit", ...metadata });
 });
 
 export const removeThreadPrompt: (input: RemoveThreadPromptInput) => CommandEffect = Effect.fn(
@@ -418,6 +436,7 @@ export const interruptThreadTurn: (input: InterruptThreadTurnInput) => CommandEf
 export const respondToThreadApproval: (input: RespondToThreadApprovalInput) => CommandEffect =
   Effect.fn("EnvironmentCommands.respondToThreadApproval")(function* (input) {
     const metadata = yield* timestampedCommandMetadata(input);
+    yield* decideIssueTrackerWrite(input.requestId, input.decision);
     return yield* dispatch({
       ...input,
       type: "thread.approval.respond",

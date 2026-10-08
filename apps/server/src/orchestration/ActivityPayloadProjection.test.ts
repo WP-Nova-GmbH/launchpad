@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { OrchestrationThreadActivity } from "@t3tools/contracts";
+import { issueTrackerActivityIdentity } from "@t3tools/shared/issueTrackerActivity";
 import { projectActivityPayload } from "./ActivityPayloadProjection.ts";
 
 function activity(payload: Record<string, unknown>): OrchestrationThreadActivity {
@@ -342,5 +343,96 @@ describe("projectActivityPayload", () => {
     });
     const projected = projectActivityPayload(source);
     expect(projected.payload).toEqual(source.payload);
+  });
+});
+
+describe("issue tracker activity delivered to clients", () => {
+  it.each([
+    "read_linear_issue",
+    "read_linear_comments",
+    "read_linear_images",
+    "view_linear_image",
+    "read_jira_issue",
+    "read_jira_comments",
+  ])(
+    "keeps compact identity and links for %s across provider envelopes and repeat projection",
+    (tool) => {
+      const identity = {
+        service: tool.startsWith("read_jira_") ? "jira" : "linear",
+        identifier: "LP-1",
+        accountLabel: "Team app",
+        url: tool.startsWith("read_jira_")
+          ? "https://team.atlassian.net/browse/LP-1"
+          : "https://linear.app/team/issue/LP-1",
+      };
+      const metadata = {
+        ...identity,
+        description: "private-issue-body".repeat(100),
+        image: { data: "image-bytes-must-not-survive" },
+      };
+      const result = {
+        structuredContent: metadata,
+        content: [
+          { type: "text", text: JSON.stringify(metadata) },
+          { type: "image", data: "image-bytes-must-not-survive" },
+        ],
+      };
+      for (const data of [
+        { item: { server: "t3-code", tool, result, status: "completed" } },
+        { toolName: `mcp__t3-code__${tool}`, result: { content: result.content } },
+        {
+          tool: `mcp__t3-code__${tool}`,
+          state: { status: "completed", output: JSON.stringify(metadata) },
+        },
+        {
+          toolName: `mcp__t3-code__${tool}`,
+          content: [{ type: "content", content: result.content[0] }],
+        },
+      ]) {
+        const original = activity({ itemType: "mcp_tool_call", status: "completed", data });
+        const projected = projectActivityPayload(original);
+        const again = projectActivityPayload(projected);
+        expect(again).toEqual(projected);
+        const payload = projected.payload as { data: unknown };
+        const presentation = issueTrackerActivityIdentity({
+          label: "Tool completed",
+          toolLifecycleStatus: "completed",
+          toolData: payload.data,
+        });
+        expect(presentation?.identifier).toBe("LP-1");
+        expect(presentation?.accountLabel).toBe("Team app");
+        expect(presentation?.url).toBe(identity.url);
+        expect(payload.data).toMatchObject({ issueTrackerIdentity: identity });
+        expect(JSON.stringify(projected)).not.toContain("image-bytes-must-not-survive");
+        expect(JSON.stringify(projected).length).toBeLessThan(1500);
+      }
+    },
+  );
+  it("does not preserve identity for unrelated tools or failed reads", () => {
+    for (const [server, status] of [
+      ["other", "completed"],
+      ["t3-code", "failed"],
+    ]) {
+      const projected = projectActivityPayload(
+        activity({
+          itemType: "mcp_tool_call",
+          status,
+          data: {
+            item: {
+              server,
+              tool: "read_linear_issue",
+              result: {
+                structuredContent: {
+                  service: "linear",
+                  identifier: "LP-1",
+                  accountLabel: "Team app",
+                },
+              },
+            },
+          },
+        }),
+      );
+      expect(projected.payload).not.toHaveProperty("data.issueTrackerIdentity");
+    }
   });
 });

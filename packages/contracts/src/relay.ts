@@ -4,6 +4,34 @@ import {
   RepositoryAccessRemovalStatus,
 } from "./repositoryAccess.ts";
 import { AuthSessionUser } from "./auth.ts";
+import {
+  RelayIssueTrackerService,
+  RelayIssueTrackerAuthorizationProfile,
+  RelayIssueTrackerConnections,
+  RelayStartLinearResponse,
+  RelayJiraAuthorizationRequest,
+  RelaySelectJiraSiteRequest,
+  RelayStartJiraResponse,
+  RelayLinearReplacementRequest,
+  RelayReadIssueRequest,
+  RelayReadIssueResponse,
+  RelayPrepareIssueCommentRequest,
+  RelayPrepareIssueEditRequest,
+  RelayIssueWriteOperation,
+  RelayIssueWriteVerifiedDecision,
+  RelayIssueWriteIdRequest,
+  RelayIssueWriteDecisionRequest,
+  RelayExecuteIssueWriteRequest,
+  RelayIssueWriteResult,
+  RelaySearchIssuesRequest,
+  RelaySearchIssuesResponse,
+  RelayLinearReferenceRequest,
+  RelayLinearCommentsResponse,
+  RelayLinearImageResponse,
+  RelayLinearImagesResponse,
+  RelayIssueTrackerError,
+} from "./issueTrackers.ts";
+export * from "./issueTrackers.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -22,6 +50,7 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
+import { RuntimeMode } from "./orchestration.ts";
 import {
   PROVIDER_ACCOUNT_LABEL_MAX_LENGTH,
   ProviderAccountKind,
@@ -836,6 +865,7 @@ export class RelayInternalError extends Schema.TaggedError<RelayInternalError>()
 }
 
 export const RelayProtectedError = Schema.Union([
+  RelayIssueTrackerError,
   RelayAuthInvalidError,
   RelayEnvironmentLinkProofExpiredError,
   RelayEnvironmentLinkProofInvalidError,
@@ -2796,6 +2826,232 @@ const RelayRepositoryAccessServerGroup = HttpApiGroup.make("repositoryAccessServ
   )
   .middleware(RelayEnvironmentAuth);
 
+export const RelayIssueTrackerTurnRequest = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadId: TrimmedNonEmptyString,
+  commandId: TrimmedNonEmptyString,
+  commandDigest: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  runtimeMode: Schema.optionalKey(RuntimeMode),
+});
+export const RelayIssueTrackerTurnClaims = Schema.Struct({
+  ...RelayIssueTrackerTurnRequest.fields,
+  ownerUserId: TrimmedNonEmptyString,
+  expiresAt: Schema.Number,
+  connections: Schema.Struct({
+    jira: Schema.optionalKey(Schema.String),
+    linear: Schema.optionalKey(Schema.String),
+  }),
+  writeGenerations: Schema.optionalKey(
+    Schema.Struct({
+      jira: Schema.optionalKey(Schema.Number),
+      linear: Schema.optionalKey(Schema.Number),
+    }),
+  ),
+});
+export type RelayIssueTrackerTurnClaims = typeof RelayIssueTrackerTurnClaims.Type;
+export class RelayIssueTrackerTurnPrincipal extends Context.Service<
+  RelayIssueTrackerTurnPrincipal,
+  RelayIssueTrackerTurnClaims
+>()("@t3tools/contracts/relay/RelayIssueTrackerTurnPrincipal") {}
+export class RelayIssueTrackerTurnAuth extends HttpApiMiddleware.Service<
+  RelayIssueTrackerTurnAuth,
+  { provides: RelayIssueTrackerTurnPrincipal }
+>()("RelayIssueTrackerTurnAuth", {
+  error: [RelayAuthInvalidError, RelayInternalError],
+  security: { turnBearer: HttpApiSecurity.http({ scheme: "bearer" }) },
+}) {}
+
+const RelayIssueTrackersGroup = HttpApiGroup.make("issueTrackers")
+  .add(
+    HttpApiEndpoint.post("authorizeTurn", "/v1/user/issue-trackers/authorize-turn", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayIssueTrackerTurnRequest,
+      success: Schema.Struct({ authorization: Schema.NullOr(Schema.String) }),
+      error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.get("listConnections", "/v1/user/issue-trackers", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayIssueTrackerConnections,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.post("startLinear", "/v1/user/issue-trackers/linear/authorize", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayIssueTrackerAuthorizationProfile,
+      success: RelayStartLinearResponse,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.post(
+      "confirmLinearReplacement",
+      "/v1/user/issue-trackers/linear/replacement/confirm",
+      {
+        headers: RelayBearerRequestHeaders,
+        payload: RelayLinearReplacementRequest,
+        success: RelayIssueTrackerConnections,
+        error: [...RelayTenancyErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "cancelLinearReplacement",
+      "/v1/user/issue-trackers/linear/replacement/cancel",
+      {
+        headers: RelayBearerRequestHeaders,
+        payload: RelayLinearReplacementRequest,
+        success: RelayIssueTrackerConnections,
+        error: [...RelayTenancyErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post("startJira", "/v1/user/issue-trackers/jira/authorize", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayIssueTrackerAuthorizationProfile,
+      success: RelayStartJiraResponse,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.post("selectJiraSite", "/v1/user/issue-trackers/jira/select-site", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelaySelectJiraSiteRequest,
+      success: RelayIssueTrackerConnections,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.post("cancelJiraSelection", "/v1/user/issue-trackers/jira/cancel-selection", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayJiraAuthorizationRequest,
+      success: RelayIssueTrackerConnections,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.delete("disconnect", "/v1/user/issue-trackers/:service", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ service: RelayIssueTrackerService }),
+      success: RelayOkResponse,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.post("decideWrite", "/v1/user/issue-trackers/writes/decision", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayIssueWriteDecisionRequest,
+      success: RelayIssueWriteOperation,
+      error: [...RelayTenancyErrors, RelayIssueTrackerError],
+    }),
+  )
+  .middleware(RelayClientAuth);
+
+const RelayIssueTrackersServerGroup = HttpApiGroup.make("issueTrackersServer")
+  .add(
+    HttpApiEndpoint.get("verifyTurn", "/v1/issue-trackers/turn", {
+      success: RelayIssueTrackerTurnClaims,
+      error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+    }),
+    HttpApiEndpoint.post(
+      "verifyWriteDecision",
+      "/v1/environments/:environmentId/issue-trackers/writes/decision/verify",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayExecuteIssueWriteRequest,
+        success: RelayIssueWriteVerifiedDecision,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "readComments",
+      "/v1/environments/:environmentId/issue-trackers/linear/comments",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayLinearReferenceRequest,
+        success: RelayLinearCommentsResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "readImages",
+      "/v1/environments/:environmentId/issue-trackers/linear/images",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayLinearReferenceRequest,
+        success: RelayLinearImagesResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "viewImage",
+      "/v1/environments/:environmentId/issue-trackers/linear/image",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayLinearReferenceRequest,
+        success: RelayLinearImageResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "readIssue",
+      "/v1/environments/:environmentId/issue-trackers/:service/read",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId, service: RelayIssueTrackerService }),
+        payload: RelayReadIssueRequest,
+        success: RelayReadIssueResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "searchIssues",
+      "/v1/environments/:environmentId/issue-trackers/:service/search",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId, service: RelayIssueTrackerService }),
+        payload: RelaySearchIssuesRequest,
+        success: RelaySearchIssuesResponse,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "prepareComment",
+      "/v1/environments/:environmentId/issue-trackers/:service/comments/prepare",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId, service: RelayIssueTrackerService }),
+        payload: RelayPrepareIssueCommentRequest,
+        success: RelayIssueWriteOperation,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "executeComment",
+      "/v1/environments/:environmentId/issue-trackers/comments/execute",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayExecuteIssueWriteRequest,
+        success: RelayIssueWriteResult,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "prepareEdit",
+      "/v1/environments/:environmentId/issue-trackers/:service/edits/prepare",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId, service: RelayIssueTrackerService }),
+        payload: RelayPrepareIssueEditRequest,
+        success: RelayIssueWriteOperation,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "executeEdit",
+      "/v1/environments/:environmentId/issue-trackers/edits/execute",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayExecuteIssueWriteRequest,
+        success: RelayIssueWriteResult,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "cancelTurnWrite",
+      "/v1/environments/:environmentId/issue-trackers/writes/cancel",
+      {
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        payload: RelayIssueWriteIdRequest,
+        success: RelayIssueWriteOperation,
+        error: [...RelayAuthAndInternalErrors, RelayIssueTrackerError],
+      },
+    ),
+  )
+  .middleware(RelayIssueTrackerTurnAuth);
+
 export const RelayApi = HttpApi.make("RelayApi")
   .add(
     RelayHealthGroup,
@@ -2817,6 +3073,8 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayOrganizationSkillsServerGroup,
     RelayExecutorReleaseServerGroup,
     RelayRepositoryAccessServerGroup,
+    RelayIssueTrackersGroup,
+    RelayIssueTrackersServerGroup,
   )
   .annotate(OpenApi.Title, "Launchpad Relay API")
   .annotate(OpenApi.Version, "1.0.0")

@@ -59,6 +59,7 @@ import * as Stream from "effect/Stream";
 import { appendUserInputAttachmentPaths } from "../userInputAttachments.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
+import { CurrentIssueTrackerAuthorization } from "../../mcp/IssueTrackerTurnAuthorization.ts";
 import * as DeviceService from "../../device/DeviceService.ts";
 import { ensureAgentDeviceShim } from "../../device/AgentDeviceShim.ts";
 import type * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
@@ -918,6 +919,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     const access = yield* agentAccessSettings(threadId);
     if (access.browser) capabilities.add("preview");
     if (access.device) capabilities.add("device");
+    if (yield* CurrentIssueTrackerAuthorization) {
+      capabilities.add("issue-trackers");
+    }
     return capabilities;
   });
 
@@ -951,7 +955,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     Effect.gen(function* () {
       const capabilities = yield* agentAccessCapabilities(threadId);
-      const credential = yield* issueMcpCredential({ threadId, providerInstanceId, capabilities });
+      const issueTrackerAuthorizationId = yield* CurrentIssueTrackerAuthorization;
+      const credential = yield* issueMcpCredential({
+        threadId,
+        providerInstanceId,
+        capabilities,
+        ...(issueTrackerAuthorizationId ? { issueTrackerAuthorizationId } : {}),
+      });
       if (credential) {
         const deviceEnvironment = capabilities.has("device")
           ? yield* agentDeviceEnvironment
@@ -976,6 +986,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   >();
   const publishAdmittedRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Effect.succeed(event).pipe(
+      Effect.tap((event) =>
+        Effect.sync(() => {
+          if (
+            (event.type === "turn.completed" || event.type === "turn.aborted") &&
+            event.turnId &&
+            event.providerInstanceId
+          )
+            McpProviderSession.completeIssueTrackerTurn(
+              event.threadId,
+              event.providerInstanceId,
+              event.turnId,
+            );
+        }),
+      ),
       Effect.tap((canonicalEvent) =>
         canonicalEventLogger
           ? canonicalEventLogger.write(canonicalEvent, canonicalEvent.threadId)
@@ -1530,6 +1554,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           }
         }
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
+        if (
+          (yield* CurrentIssueTrackerAuthorization) ||
+          McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerAuthorizationId
+        ) {
+          const current = (yield* adapter.listSessions()).find(
+            (session) => session.threadId === threadId,
+          );
+          if (current && (current.status === "running" || current.activeTurnId)) {
+            return yield* toValidationError(
+              "ProviderService.startSession",
+              "Wait for the active turn before changing personal connection access.",
+            );
+          }
+        }
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
         const session = yield* adapter
@@ -1603,6 +1641,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       schema: ProviderSendTurnInput,
       payload: raw,
     });
+    const personalSession = McpProviderSession.readMcpProviderSession(parsed.threadId);
+    // Local prompts need the same admission boundary as shared-queue prompts.
+    // Runtime turn.started events can belong to resumed background work.
+    const deliveryHooks: ProviderSendTurnCallbacks | undefined =
+      hooks ??
+      (personalSession?.issueTrackerAuthorizationId
+        ? { onAdmitted: () => Effect.void }
+        : undefined);
 
     const attachments = parsed.attachments ?? [];
     if (!parsed.input && attachments.length === 0 && parsed.continuation !== true) {
@@ -1773,13 +1819,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           );
         }
       }
-      if (hooks && pendingDeliveries.has(input.threadId)) {
+      if (deliveryHooks && pendingDeliveries.has(input.threadId)) {
         return yield* toValidationError(
           "ProviderService.sendTurn",
           "Another prompt is still being admitted for this thread.",
         );
       }
       const persistAdmission = Effect.fnUntraced(function* (turn: ProviderTurnStartResult) {
+        if (personalSession)
+          McpProviderSession.bindIssueTrackerTurn(
+            input.threadId,
+            personalSession.providerSessionId,
+            turn.turnId,
+          );
         yield* directory.upsert({
           threadId: input.threadId,
           provider: routed.adapter.provider,
@@ -1814,7 +1866,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 turnId: String(turn.turnId),
                 metadata: turnMetadata,
               });
-            if (!hooks) {
+            if (!deliveryHooks) {
               const turn = yield* routed.adapter.sendTurn(input);
               yield* associate(turn);
               yield* persistAdmission(turn);
@@ -1827,13 +1879,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             pendingDeliveries.set(input.threadId, pending);
             let admitted = false;
             const admissionCallbacks: ProviderSendTurnCallbacks = {
-              ...(hooks.beforeDispatch ? { beforeDispatch: hooks.beforeDispatch } : {}),
+              ...(deliveryHooks.beforeDispatch
+                ? { beforeDispatch: deliveryHooks.beforeDispatch }
+                : {}),
               onAdmitted: (turn, evidence) =>
                 Effect.gen(function* () {
                   if (admitted) return;
                   yield* persistAdmission(turn).pipe(Effect.orDie);
                   yield* associate(turn);
-                  yield* hooks.onAdmitted(turn, evidence);
+                  yield* deliveryHooks.onAdmitted(turn, evidence);
                   // Keep buffering until the entire early sequence is published;
                   // new events cannot overtake turn.started while this yields.
                   while (pending.events.length > 0) {
@@ -1844,7 +1898,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   pendingDeliveries.delete(input.threadId);
                 }),
             };
-            return yield* (hooks.beforeDispatch ?? Effect.void).pipe(
+            return yield* (deliveryHooks.beforeDispatch ?? Effect.void).pipe(
               Effect.andThen(() => routed.adapter.sendTurn(input, admissionCallbacks)),
               Effect.tap(() =>
                 admitted
@@ -1882,6 +1936,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       return turn;
     }).pipe(
+      Effect.onError(() =>
+        Effect.sync(() => {
+          if (personalSession && input.delivery?.mode !== "steer")
+            McpProviderSession.revokeIssueTrackerTurn(
+              input.threadId,
+              personalSession.providerSessionId,
+            );
+        }),
+      ),
       withMetrics({
         counter: providerTurnsTotal,
         timer: providerTurnDuration,

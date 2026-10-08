@@ -1,3 +1,4 @@
+import { RelayLinearImageResponse, RelayIssueTrackerError } from "@t3tools/contracts/relay";
 import * as NodeCrypto from "node:crypto";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -32,6 +33,15 @@ import {
 } from "./toolkits/preview/tools.ts";
 import { PullRequestsToolkitHandlersLive } from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
+import {
+  IssueTrackersToolkit,
+  LinearImageTool,
+  LinearImageToolkit,
+} from "./toolkits/issueTrackers/tools.ts";
+import {
+  IssueTrackersToolkitHandlersLive,
+  LinearImageToolkitHandlersLive,
+} from "./toolkits/issueTrackers/handlers.ts";
 import {
   DeviceScreenshotToolkitHandlersLive,
   DeviceStandardToolkitHandlersLive,
@@ -647,6 +657,86 @@ export const PullRequestsToolkitRegistrationLive = McpServer.toolkit(PullRequest
   Layer.provide(PullRequestsToolkitHandlersLive),
 );
 
+const decodeLinearImage = Schema.decodeUnknownEffect(RelayLinearImageResponse);
+const registerLinearImage = Effect.gen(function* () {
+  const server = yield* McpServer.McpServer;
+  const built = yield* LinearImageToolkit;
+  yield* server.addTool({
+    tool: new McpSchema.Tool({
+      name: LinearImageTool.name,
+      description: Tool.getDescription(LinearImageTool),
+      inputSchema: Tool.getJsonSchema(LinearImageTool),
+      annotations: {
+        title: "View Linear image",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    }),
+    annotations: LinearImageTool.annotations,
+    handle: (payload) =>
+      Effect.withFiber((fiber) => {
+        const invocation = Context.getUnsafe(
+          fiber.context,
+          McpInvocationContext.McpInvocationContext,
+        );
+        return built
+          .handle("view_linear_image", payload as Tool.Parameters<typeof LinearImageTool>)
+          .pipe(
+            Stream.unwrap,
+            Stream.run(Sink.last()),
+            Effect.flatMap(Effect.fromOption),
+            Effect.flatMap(({ encodedResult }) => decodeLinearImage(encodedResult)),
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.matchCauseEffect({
+              onFailure: (cause) => {
+                const error = cause.reasons
+                  .filter(Cause.isFailReason)
+                  .map((reason) => reason.error)
+                  .find(Schema.is(RelayIssueTrackerError));
+                if (!error || Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason))
+                  return imageToolFailure(
+                    LinearImageTool.name,
+                    "view_linear_image",
+                    "Could not view the Linear image. Try again later.",
+                  )(cause);
+                // The handler replaces remote text with a safe message for each failure code.
+                return Effect.succeed(
+                  new McpSchema.CallToolResult({
+                    isError: true,
+                    structuredContent: { error: { code: error.code, message: error.message } },
+                    content: [{ type: "text", text: error.message }],
+                  }),
+                );
+              },
+              onSuccess: ({ image, ...metadata }) => {
+                return Effect.succeed(
+                  new McpSchema.CallToolResult({
+                    isError: false,
+                    structuredContent: metadata,
+                    content: [
+                      { type: "text", text: JSON.stringify(metadata) },
+                      {
+                        type: "image",
+                        mimeType: image.mimeType,
+                        data: new Uint8Array(Buffer.from(image.data, "base64")),
+                      },
+                    ],
+                  }),
+                );
+              },
+            }),
+          );
+      }),
+  });
+});
+
+export const IssueTrackersToolkitRegistrationLive = Layer.mergeAll(
+  McpServer.toolkit(IssueTrackersToolkit).pipe(Layer.provide(IssueTrackersToolkitHandlersLive)),
+  Layer.effectDiscard(registerLinearImage).pipe(Layer.provide(LinearImageToolkitHandlersLive)),
+);
+
 const DeviceStandardToolkitRegistrationLive = McpServer.toolkit(DeviceStandardToolkit).pipe(
   Layer.provide(DeviceStandardToolkitHandlersLive),
 );
@@ -670,5 +760,6 @@ const McpTransportLive = McpServer.layerHttp({
 export const layer = Layer.mergeAll(
   PreviewToolkitRegistrationLive,
   PullRequestsToolkitRegistrationLive,
+  IssueTrackersToolkitRegistrationLive,
   DeviceToolkitRegistrationLive,
 ).pipe(Layer.provideMerge(McpTransportLive));

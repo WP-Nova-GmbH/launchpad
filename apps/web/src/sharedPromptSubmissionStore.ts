@@ -63,8 +63,14 @@ export function retainSharedPromptSubmission(
   input: StartThreadTurnInput,
   sharedPreparation = false,
 ) {
+  const { expectedAccountId, ...commandInput } = input;
+  if (expectedAccountId !== undefined && expectedAccountId !== accountId) {
+    throw new Error(
+      "Your account changed before this prompt was sent. Send it again from the current account.",
+    );
+  }
   const command = {
-    ...input,
+    ...commandInput,
     type: "thread.turn.start" as const,
     commandId: input.commandId ?? CommandId.make(`prompt-${input.message.messageId}`),
     createdAt: input.createdAt ?? new Date().toISOString(),

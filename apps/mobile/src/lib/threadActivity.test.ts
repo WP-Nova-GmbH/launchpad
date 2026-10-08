@@ -3748,3 +3748,76 @@ it("keeps attachment-only question answers expandable outside mobile work groups
   expect(running[1]).toBe(group);
   expect(running[2]?.type).toBe("work-toggle");
 });
+
+it.each(["read_linear_issue", "read_linear_comments", "view_linear_image"])(
+  "uses shared Linear identity in native activity: %s",
+  (tool) => {
+    const entry: WorkLogEntry = {
+      id: "linear-read",
+      createdAt: "2026-09-30T12:00:00Z",
+      turnId: null,
+      label: tool,
+      tone: "tool",
+      toolLifecycleStatus: "completed",
+      toolData: {
+        result: {
+          structuredContent: {
+            service: "linear",
+            identifier: "LP-1",
+            accountLabel: "Team · Launchpad",
+            url: "https://linear.app/team/issue/LP-1",
+          },
+        },
+      },
+    };
+    expect(workEntryRowLabel(entry)).toContain("LP-1");
+    expect(workEntryRowLabel(entry)).toContain("Team · Launchpad");
+  },
+);
+
+it("uses Jira discussion identity from compact metadata in native activity", () => {
+  const entry: WorkLogEntry = {
+    id: "jira-comments",
+    createdAt: "2026-10-01T10:00:00Z",
+    turnId: null,
+    label: "read_jira_comments",
+    tone: "tool",
+    toolLifecycleStatus: "completed",
+    toolData: {
+      issueTrackerIdentity: {
+        service: "jira",
+        identifier: "ENG-42",
+        accountLabel: "team.atlassian.net",
+        url: "https://team.atlassian.net/browse/ENG-42",
+      },
+    },
+  };
+  expect(workEntryRowLabel(entry)).toBe("Read Jira issue ENG-42 discussion · team.atlassian.net");
+});
+
+it("shows the human name for an OpenCode Jira comment call on mobile", () => {
+  const thread = makeThread({
+    id: ThreadId.make("jira-write-label"),
+    projectId: ProjectId.make("project-1"),
+    title: "Jira write",
+    activities: [
+      makeActivity({
+        id: EventId.make("jira-write"),
+        kind: "tool.completed",
+        summary: "Tool call",
+        tone: "tool",
+        createdAt: "2026-10-06T10:00:00Z",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          status: "completed",
+          data: { tool: "t3-code_add_jira_comment" },
+        },
+      }),
+    ],
+  });
+  const [group] = buildThreadFeed(thread);
+  expect(group?.type).toBe("activity-group");
+  if (group?.type !== "activity-group") return;
+  expect(workEntryRowLabel(group.activities[0]!.workEntry)).toBe("Add Jira Comment");
+});

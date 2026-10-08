@@ -1,3 +1,4 @@
+import { issueTrackerActivityToolName } from "./issueTrackerActivity";
 import {
   requestKindFromRequestType,
   type PendingApproval,
@@ -632,9 +633,22 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (toolPresentation.toolSource) {
     entry.toolSource = toolPresentation.toolSource;
   }
-  if (itemType === "mcp_tool_call") {
-    const data = asRecord(payload?.data);
-    const toolData = typeof data?.toolName === "string" ? (data.item ?? data) : data?.item;
+  const issueTrackerData = asRecord(payload?.data);
+  const isIssueTrackerTool =
+    itemType !== undefined &&
+    issueTrackerActivityToolName({
+      label: entry.label,
+      ...(title ? { toolTitle: title } : {}),
+      toolData: issueTrackerData,
+    }) !== undefined;
+  if (itemType === "mcp_tool_call" || isIssueTrackerTool) {
+    const data = issueTrackerData;
+    // Issue identity is stored beside the provider item by the server projection.
+    const toolData = isIssueTrackerTool
+      ? data
+      : typeof data?.toolName === "string"
+        ? (data.item ?? data)
+        : data?.item;
     if (toolData !== undefined) {
       entry.toolData = toolData;
     }

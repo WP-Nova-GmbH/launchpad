@@ -3,6 +3,14 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./issueTrackerTurn": {
+      "types": "./src/issueTrackerTurn.ts",
+      "import": "./src/issueTrackerTurn.ts"
+    },
+    "./issueTrackerActivity": {
+      "types": "./src/issueTrackerActivity.ts",
+      "import": "./src/issueTrackerActivity.ts"
+    },
     "./threadPromptQueue": {
       "types": "./src/threadPromptQueue.ts",
       "import": "./src/threadPromptQueue.ts"

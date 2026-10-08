@@ -98,6 +98,61 @@ const claim = {
 };
 
 it.layer(NodeServices.layer)("shared prompt queue", (it) => {
+  it.effect("rejects an edit authorized for a different queued runtime mode", () =>
+    Effect.gen(function* () {
+      const original = enqueue("personal");
+      const state = yield* apply(yield* readModelWithThread, original);
+      const edit = {
+        type: "thread.prompt.edit" as const,
+        commandId: CommandId.make("mode-mismatch-edit"),
+        threadId,
+        messageId: original.message.messageId,
+        expectedRevision: 1,
+        expectedRuntimeMode: "approval-required" as const,
+        message: { text: "Changed", attachments: [] },
+        createdAt,
+      };
+      expect(yield* apply(state, edit).pipe(Effect.flip)).toMatchObject({
+        detail: "Prompt conflict: this entry's runtime mode changed. Review it before saving.",
+      });
+    }),
+  );
+  it.effect(
+    "an edit replaces authorization and an unsigned edit clears the previous owner's grant",
+    () =>
+      Effect.gen(function* () {
+        const original = enqueue("personal");
+        let state = yield* apply(yield* readModelWithThread, {
+          ...original,
+          message: { ...original.message, issueTrackerAuthorizationId: "alice-grant" },
+        });
+        state = yield* apply(state, {
+          type: "thread.prompt.edit",
+          commandId: CommandId.make("bob-edit"),
+          threadId,
+          messageId: original.message.messageId,
+          expectedRevision: 1,
+          message: {
+            text: "Bob's revision",
+            attachments: [],
+            issueTrackerAuthorizationId: "bob-grant",
+          },
+          author: editor,
+          createdAt,
+        });
+        expect(queue(state).entries[0]?.issueTrackerAuthorizationId).toBe("bob-grant");
+        state = yield* apply(state, {
+          type: "thread.prompt.edit",
+          commandId: CommandId.make("unsigned-edit"),
+          threadId,
+          messageId: original.message.messageId,
+          expectedRevision: 2,
+          message: { text: "No personal access", attachments: [] },
+          createdAt,
+        });
+        expect(queue(state).entries[0]?.issueTrackerAuthorizationId).toBeUndefined();
+      }),
+  );
   it.effect(
     "orders accepted prompts by sequence and stages handoff without transcript bubbles",
     () =>

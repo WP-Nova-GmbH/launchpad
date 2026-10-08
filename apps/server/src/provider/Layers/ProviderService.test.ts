@@ -1,3 +1,4 @@
+import { CurrentIssueTrackerAuthorization } from "../../mcp/IssueTrackerTurnAuthorization.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -78,6 +79,13 @@ import {
   SqlitePersistenceMemory,
 } from "../../persistence/Layers/Sqlite.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
+import {
+  CLOUD_MACHINE_IDENTITY,
+  RELAY_URL_SECRET,
+  RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
+  encodeCloudMachineIdentityJson,
+} from "../../cloud/config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
@@ -488,8 +496,240 @@ function makeProviderServiceLayer(
   };
 }
 
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import {
+  registerIssueWrite,
+  releaseIssueWrite,
+  hasPendingIssueWrite,
+} from "../../mcp/IssueTrackerApprovalBroker.ts";
+
 const sharedDelivery = makeProviderServiceLayer();
 sharedDelivery.layer("ProviderService shared delivery", (it) => {
+  it.effect.each([
+    { terminal: "turn.completed", matches: false },
+    { terminal: "turn.aborted", matches: false },
+    { terminal: "turn.completed", matches: true },
+    { terminal: "turn.aborted", matches: true },
+  ] as const)(
+    "only the admitted turn's terminal event cancels its write approval: %j",
+    ({ terminal, matches }) =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const threadId = asThreadId(`personal-write-${terminal}-${matches}`);
+        const environmentId = EnvironmentId.make("test");
+        yield* sharedDelivery.codex.whenSubscribed;
+        yield* provider.startSession(threadId, {
+          threadId,
+          providerInstanceId: codexInstanceId,
+          runtimeMode: "full-access",
+        });
+        McpProviderSession.setMcpProviderSession({
+          threadId,
+          environmentId,
+          providerInstanceId: codexInstanceId,
+          providerSessionId: "current-process",
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer fixture",
+          capabilities: new Set(["issue-trackers"]),
+          issueTrackerAuthorizationId: "current-grant",
+        });
+        McpProviderSession.bindIssueTrackerTurn(threadId, "current-process", "current-turn");
+        const pending = yield* registerIssueWrite(
+          `operation-${threadId}`,
+          threadId,
+          "current-process",
+          "alice",
+          environmentId,
+          "current-grant",
+        );
+        assert(pending);
+        yield* Effect.addFinalizer(() =>
+          releaseIssueWrite(pending.requestId, pending.deferred).pipe(
+            Effect.andThen(Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
+          ),
+        );
+        const eventId = asEventId(`terminal-${threadId}`);
+        const published = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === eventId),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        sharedDelivery.codex.emit({
+          eventId,
+          provider: CODEX_DRIVER,
+          threadId,
+          turnId: asTurnId(matches ? "current-turn" : "previous-turn"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          ...(terminal === "turn.completed"
+            ? { type: terminal, payload: { state: "completed" } }
+            : { type: terminal, payload: { reason: "stopped" } }),
+        });
+        assert(Option.isSome(yield* Fiber.join(published)));
+        assert.equal(yield* Deferred.isDone(pending.deferred), matches);
+        assert.equal(hasPendingIssueWrite(pending.requestId, threadId), !matches);
+        const session = McpProviderSession.readMcpProviderSession(threadId);
+        assert.equal(session?.issueTrackerTurnComplete, matches ? true : undefined);
+        assert.equal(session?.issueTrackerAuthorizationId, "current-grant");
+        if (matches)
+          assert.deepEqual(yield* Deferred.await(pending.deferred), {
+            decision: "cancel",
+            actorUserId: null,
+          });
+      }),
+  );
+  it.effect.each(["early-completion", "rejected"] as const)(
+    "closes personal access when admission races with %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const threadId = asThreadId(`personal-${outcome}`);
+        const turnId = asTurnId(`turn-${outcome}`);
+        yield* sharedDelivery.codex.whenSubscribed;
+        yield* provider.startSession(threadId, {
+          threadId,
+          providerInstanceId: codexInstanceId,
+          runtimeMode: "full-access",
+        });
+        McpProviderSession.setMcpProviderSession({
+          threadId,
+          providerInstanceId: codexInstanceId,
+          providerSessionId: "personal-process",
+          environmentId: EnvironmentId.make("test"),
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer fixture",
+          capabilities: new Set(["issue-trackers"]),
+          issueTrackerAuthorizationId: "personal-grant",
+        });
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+        );
+        sharedDelivery.codex.sendTurn.mockImplementationOnce((_input, callbacks) =>
+          Effect.gen(function* () {
+            assert(callbacks);
+            if (outcome === "rejected")
+              return yield* new ProviderAdapterValidationError({
+                provider: "codex",
+                operation: "sendTurn",
+                issue: "Rejected before dispatch",
+              });
+            const barrierId = asEventId(`barrier-${outcome}`);
+            const barrier = yield* provider.streamEvents.pipe(
+              Stream.filter((event) => event.eventId === barrierId),
+              Stream.runHead,
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* Effect.yieldNow;
+            sharedDelivery.codex.emit({
+              type: "turn.completed",
+              threadId,
+              turnId,
+              provider: CODEX_DRIVER,
+              eventId: asEventId(`completed-${outcome}`),
+              createdAt: "2026-01-01T00:00:00.000Z",
+              payload: { state: "completed" },
+            });
+            sharedDelivery.codex.emit({
+              type: "runtime.warning",
+              threadId,
+              provider: CODEX_DRIVER,
+              eventId: barrierId,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              payload: { message: "completion processed" },
+            });
+            yield* Fiber.join(barrier);
+            yield* callbacks.onAdmitted({ threadId, turnId }, "provider-ack");
+            return { threadId, turnId };
+          }),
+        );
+        const result = yield* provider
+          .sendTurn({ threadId, input: "Read my issue" })
+          .pipe(Effect.result);
+        assert.equal(result._tag, outcome === "rejected" ? "Failure" : "Success");
+        assert.isTrue(
+          McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerTurnComplete,
+        );
+        yield* provider.stopSession({ threadId });
+      }),
+  );
+  it.effect("binds personal access to prompt admission, never to resumed background turns", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("personal-admission");
+      const turnId = asTurnId("personal-prompt");
+      yield* sharedDelivery.codex.whenSubscribed;
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+      });
+      McpProviderSession.setMcpProviderSession({
+        threadId,
+        providerInstanceId: codexInstanceId,
+        providerSessionId: "personal-process",
+        environmentId: EnvironmentId.make("test"),
+        endpoint: "http://localhost/mcp",
+        authorizationHeader: "Bearer fixture",
+        capabilities: new Set(["issue-trackers"]),
+        issueTrackerAuthorizationId: "personal-grant",
+      });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+      );
+      const background = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.started"),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      sharedDelivery.codex.emit({
+        type: "turn.started",
+        threadId,
+        turnId: "resumed-background",
+        provider: CODEX_DRIVER,
+        eventId: asEventId("background"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        payload: {},
+      });
+      yield* Fiber.join(background);
+      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerTurnId);
+      const admitted = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      sharedDelivery.codex.sendTurn.mockImplementationOnce((_input, callbacks) =>
+        Effect.gen(function* () {
+          assert(callbacks);
+          yield* callbacks.onAdmitted({ threadId, turnId }, "harness-dispatch");
+          yield* Deferred.succeed(admitted, undefined);
+          yield* Deferred.await(finish);
+          return { threadId, turnId };
+        }),
+      );
+      const sending = yield* provider
+        .sendTurn({ threadId, input: "Read my issue" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(admitted);
+      assert.equal(McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerTurnId, turnId);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      sharedDelivery.codex.emit({
+        type: "turn.completed",
+        threadId,
+        turnId,
+        provider: CODEX_DRIVER,
+        eventId: asEventId("personal-completed"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        payload: { state: "completed" },
+      });
+      yield* Fiber.join(completed);
+      assert.isTrue(McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerTurnComplete);
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(sending);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
   it.effect("revalidates after common service preparation and releases a rejected admission", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -5240,7 +5480,10 @@ describe("agent browser access", () => {
     access: boolean | { readonly browser: boolean; readonly device: boolean },
     threadId: ThreadId,
     projectOverride?: boolean | { readonly browser?: boolean; readonly device?: boolean },
-    options?: { readonly withoutOrchestration?: boolean },
+    options?: {
+      readonly withoutOrchestration?: boolean;
+      readonly executorRole?: "agent_executor" | "review_host" | "personal";
+    },
   ) =>
     Effect.gen(function* () {
       const enableAgentBrowserAccess = typeof access === "boolean" ? access : access.browser;
@@ -5305,6 +5548,31 @@ describe("agent browser access", () => {
         getThreadDetailSnapshot: () => Effect.die("unused"),
         searchThreads: () => Effect.die("unused"),
       });
+      const executorSecrets = new Map<string, string>([
+        [RELAY_URL_SECRET, "https://relay.example.test"],
+        [RELAY_ENVIRONMENT_CREDENTIAL_SECRET, "executor-secret"],
+      ]);
+      if (options?.executorRole && options.executorRole !== "personal") {
+        executorSecrets.set(
+          CLOUD_MACHINE_IDENTITY,
+          yield* encodeCloudMachineIdentityJson({
+            machineId: "machine-1",
+            organizationId: "org-1",
+            role: options.executorRole,
+          }),
+        );
+      }
+      const executorSecretsLayer =
+        options?.executorRole === undefined
+          ? Layer.empty
+          : Layer.mock(ServerSecretStore.ServerSecretStore)({
+              get: (name) =>
+                Effect.succeed(
+                  Option.fromNullishOr(executorSecrets.get(name)).pipe(
+                    Option.map((value) => new TextEncoder().encode(value)),
+                  ),
+                ),
+            });
       const providerLayer = makeProviderServiceLive({
         issueMcpCredential: (request) =>
           Effect.sync(() => {
@@ -5315,6 +5583,7 @@ describe("agent browser access", () => {
             return undefined;
           }),
       }).pipe(
+        Layer.provide(executorSecretsLayer),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(options?.withoutOrchestration ? Layer.empty : projectionLayer),
@@ -5361,6 +5630,27 @@ describe("agent browser access", () => {
 
       return issued;
     });
+
+  it.effect(
+    "grants issue tracker access only for a personal turn, regardless of machine role",
+    () =>
+      Effect.gen(function* () {
+        for (const role of ["agent_executor", "review_host", "personal"] as const) {
+          for (const grant of [undefined, "personal-grant"]) {
+            const threadId = asThreadId(`thread-issue-trackers-${role}-${grant}`);
+            const issued = yield* startSessionWith(false, threadId, undefined, {
+              executorRole: role,
+            }).pipe(Effect.provideService(CurrentIssueTrackerAuthorization, grant));
+            assert.deepEqual(issued, [
+              {
+                threadId,
+                capabilities: grant ? ["issue-trackers", "pull-requests"] : ["pull-requests"],
+              },
+            ]);
+          }
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
 
   // The capability on the credential is the observable that matters: a session
   // always gets a credential (the pull request toolkit is never withheld), and

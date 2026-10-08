@@ -13,6 +13,7 @@ import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpProviderSession from "./McpProviderSession.ts";
 
 export interface McpCredentialRequest {
+  readonly issueTrackerAuthorizationId?: string;
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
   readonly capabilities: ReadonlySet<McpInvocationContext.McpCapability>;
@@ -121,6 +122,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       const rawToken = yield* crypto.randomBytes(32).pipe(Effect.map(tokenFromBytes), Effect.orDie);
       const tokenHash = yield* hashToken(rawToken);
       const scope: McpInvocationContext.McpInvocationScope = {
+        ...(request.issueTrackerAuthorizationId
+          ? { issueTrackerAuthorizationId: request.issueTrackerAuthorizationId }
+          : {}),
         environmentId,
         threadId: ThreadId.make(request.threadId),
         providerSessionId,
@@ -138,6 +142,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       });
       return {
         config: {
+          ...(request.issueTrackerAuthorizationId
+            ? { issueTrackerAuthorizationId: request.issueTrackerAuthorizationId }
+            : {}),
           environmentId,
           threadId: scope.threadId,
           providerSessionId,

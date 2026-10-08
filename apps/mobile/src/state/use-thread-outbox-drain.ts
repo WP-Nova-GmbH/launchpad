@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import type {
   EnvironmentProject,
   EnvironmentThreadShell,
@@ -46,6 +47,7 @@ import {
 import { removeThreadOutboxMessage } from "./thread-outbox-removal";
 import {
   acceptedQueuedThreadMessage,
+  queuedThreadMessageAccountMatches,
   canRetryUnknownSharedSubmission,
   isQueuedThreadCreationSendable,
   captureQueuedThreadCreation,
@@ -941,6 +943,7 @@ export function useThreadOutboxDrain(): void {
         environmentId: queuedMessage.environmentId,
         input: {
           commandId: queuedMessage.commandId,
+          expectedAccountId: queuedMessage.ownerAccountId ?? null,
           threadId: queuedMessage.threadId,
           message: {
             messageId: queuedMessage.messageId,
@@ -1104,32 +1107,35 @@ export function useThreadOutboxDrain(): void {
       const submit = persistedMessage.submissionProtocol === "shared" ? enqueuePrompt : startTurn;
       const deliveryResult = await submit({
         environmentId: queuedMessage.environmentId,
-        input: buildProjectThreadStartTurnInput({
-          projectId: creation.projectId,
-          projectCwd: persistedMessage.creation?.projectCwd ?? projectCwd,
-          threadId: queuedMessage.threadId,
-          commandId: queuedMessage.commandId,
-          messageId: queuedMessage.messageId,
-          createdAt: queuedMessage.createdAt,
-          ...serializeComposerMessageForServer(
-            queuedMessage.text.trim(),
-            uploadedComposerContext(
-              queuedMessage.context,
-              queuedMessage.attachments,
-              prepared.attachments,
+        input: {
+          expectedAccountId: queuedMessage.ownerAccountId ?? null,
+          ...buildProjectThreadStartTurnInput({
+            projectId: creation.projectId,
+            projectCwd: persistedMessage.creation?.projectCwd ?? projectCwd,
+            threadId: queuedMessage.threadId,
+            commandId: queuedMessage.commandId,
+            messageId: queuedMessage.messageId,
+            createdAt: queuedMessage.createdAt,
+            ...serializeComposerMessageForServer(
+              queuedMessage.text.trim(),
+              uploadedComposerContext(
+                queuedMessage.context,
+                queuedMessage.attachments,
+                prepared.attachments,
+              ),
+              currentConfig.environment.capabilities.inlineMessageContext === true,
             ),
-            currentConfig.environment.capabilities.inlineMessageContext === true,
-          ),
-          uploadedAttachments: prepared.attachments,
-          modelSelection: sendSettings.modelSelection,
-          runtimeMode: sendSettings.runtimeMode,
-          interactionMode: sendSettings.interactionMode,
-          workspaceMode: creation.workspaceMode,
-          branch: creation.branch,
-          worktreePath: creation.worktreePath,
-          startFromOrigin: creation.startFromOrigin ?? false,
-          worktreeBranchName: persistedMessage.creation?.worktreeBranchName ?? "",
-        }),
+            uploadedAttachments: prepared.attachments,
+            modelSelection: sendSettings.modelSelection,
+            runtimeMode: sendSettings.runtimeMode,
+            interactionMode: sendSettings.interactionMode,
+            workspaceMode: creation.workspaceMode,
+            branch: creation.branch,
+            worktreePath: creation.worktreePath,
+            startFromOrigin: creation.startFromOrigin ?? false,
+            worktreeBranchName: persistedMessage.creation?.worktreeBranchName ?? "",
+          }),
+        },
       });
       const { reportFailure } = makeDeliveryHelpers(queuedMessage);
       const failure = reportFailure(deliveryResult, "start-turn");
@@ -1434,6 +1440,18 @@ export function useThreadOutboxDrain(): void {
         }
         if (protocol === "review-required") return false;
         if (protocol === "shared" && !sharedQueue) return false;
+        if (
+          deliveryAction === "send" &&
+          !queuedThreadMessageAccountMatches(
+            nextQueuedMessage,
+            appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null,
+          )
+        ) {
+          setPendingConnectionError(
+            "This queued message belongs to another or an unknown account. Switch back, or open it and send it again from your current account.",
+          );
+          return false;
+        }
         if (protocol === "unattempted") {
           await updateThreadOutboxMessage(
             {

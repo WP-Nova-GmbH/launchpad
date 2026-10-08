@@ -15,6 +15,7 @@
   "dependencies": {
     "@clerk/backend": "catalog:",
     "@effect/sql-pg": "catalog:",
+    "@modelcontextprotocol/client": "2.2.0",
     "@noble/curves": "catalog:",
     "@noble/hashes": "catalog:",
     "@t3tools/client-runtime": "workspace:*",

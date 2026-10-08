@@ -1654,6 +1654,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         ...(userMessageEvent ? { causationEventId: userMessageEvent.eventId } : {}),
         type: "thread.turn-start-requested",
         payload: {
+          issueTrackerAuthorizationId: command.issueTrackerAuthorizationId,
           threadId: command.threadId,
           messageId: command.message.messageId,
           ...(command.modelSelection !== undefined
@@ -1803,6 +1804,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           threadId: command.threadId,
           requestId: command.requestId,
           decision: command.decision,
+          ...(command.actorUserId ? { actorUserId: command.actorUserId } : {}),
           createdAt: command.createdAt,
         },
       };
