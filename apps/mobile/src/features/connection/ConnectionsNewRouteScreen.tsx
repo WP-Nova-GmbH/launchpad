@@ -23,7 +23,6 @@ import { useRemoteConnections } from "../../state/use-remote-environment-registr
 type ConnectionsNewRouteParams = {
   readonly mode?: string;
   readonly pairingUrl?: string;
-  readonly autoConnect?: string;
 };
 
 export function ConnectionsNewRouteScreen({
@@ -152,32 +151,26 @@ export function ConnectionsNewRouteScreen({
     [onChangeConnectionPairingUrl, scannerLocked],
   );
 
-  const connectAndClose = useCallback(
-    async (pairingUrl: string, replaceWithHome: boolean) => {
-      if (submittingRef.current || !clientName.trim()) return;
-      submittingRef.current = true;
-      setIsSubmitting(true);
-      onChangeConnectionPairingUrl(pairingUrl);
-      try {
-        const result = await onConnectPress(pairingUrl, clientName);
-        if (AsyncResult.isSuccess(result)) {
-          if (replaceWithHome || !navigation.canGoBack()) {
-            navigation.dispatch(StackActions.replace("Home"));
-          } else {
-            navigation.goBack();
-          }
-        }
-      } finally {
-        submittingRef.current = false;
-        setIsSubmitting(false);
-      }
-    },
-    [navigation, onChangeConnectionPairingUrl, onConnectPress, clientName],
-  );
-
   const handleSubmit = useCallback(async () => {
-    await connectAndClose(buildPairingUrl(hostInput, codeInput), false);
-  }, [codeInput, connectAndClose, hostInput]);
+    if (submittingRef.current || !clientName.trim()) return;
+    const pairingUrl = buildPairingUrl(hostInput, codeInput);
+    submittingRef.current = true;
+    setIsSubmitting(true);
+    onChangeConnectionPairingUrl(pairingUrl);
+    try {
+      const result = await onConnectPress(pairingUrl, clientName);
+      if (AsyncResult.isSuccess(result)) {
+        if (!navigation.canGoBack()) {
+          navigation.dispatch(StackActions.replace("Home"));
+        } else {
+          navigation.goBack();
+        }
+      }
+    } finally {
+      submittingRef.current = false;
+      setIsSubmitting(false);
+    }
+  }, [clientName, codeInput, hostInput, navigation, onChangeConnectionPairingUrl, onConnectPress]);
 
   return (
     <SettingsScreen

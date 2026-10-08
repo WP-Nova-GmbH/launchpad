@@ -99,10 +99,6 @@ export function threadPresenceInitials(person: ThreadPresencePerson): string {
   ).toUpperCase();
 }
 
-function nameOf(person: ThreadPresencePerson): string {
-  return threadPresenceName(person);
-}
-
 function joinNames(names: ReadonlyArray<string>): string {
   if (names.length <= 1) return names[0] ?? "";
   if (names.length === 2) return `${names[0]} and ${names[1]}`;
@@ -114,10 +110,10 @@ export function threadPresenceLabel(people: ReadonlyArray<ThreadPresencePerson>)
   if (people.length === 0) return null;
   const typing = people.filter((person) => person.typing);
   if (typing.length > 0) {
-    const names = typing.map(nameOf);
+    const names = typing.map(threadPresenceName);
     return typing.length === 1 ? `${names[0]} is typing…` : `${joinNames(names)} are typing…`;
   }
-  const names = people.map(nameOf);
+  const names = people.map(threadPresenceName);
   return people.length === 1 ? `${names[0]} is here` : `${joinNames(names)} are here`;
 }
 

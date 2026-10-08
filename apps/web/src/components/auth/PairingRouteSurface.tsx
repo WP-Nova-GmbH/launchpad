@@ -157,7 +157,6 @@ export function HostedPairingRouteSurface() {
       ? "Choose a client name, then connect to this backend."
       : "This pairing link is missing its backend host or token.",
   );
-  const [canRetry, setCanRetry] = useState(false);
   const [clientName, setClientName] = useClientName();
   const [confirmed, setConfirmed] = useState(false);
   const tokenSubmittedRef = useRef(false);
@@ -168,7 +167,6 @@ export function HostedPairingRouteSurface() {
     if (!request) {
       setStatus("error");
       setMessage("This pairing link is missing its backend host or token.");
-      setCanRetry(false);
       return;
     }
 
@@ -176,7 +174,6 @@ export function HostedPairingRouteSurface() {
 
     setStatus("pairing");
     setMessage("Connecting to this backend.");
-    setCanRetry(false);
     tokenSubmittedRef.current = true;
 
     const result = await connectPairingEnvironment({
@@ -194,7 +191,6 @@ export function HostedPairingRouteSurface() {
     tokenSubmittedRef.current = false;
     setConfirmed(false);
     setStatus("error");
-    setCanRetry(true);
     setMessage(
       `${errorMessageFromUnknown(squashAtomCommandFailure(result))} If the backend accepted this one-time token, request a new pairing link before retrying.`,
     );
@@ -254,10 +250,6 @@ export function HostedPairingRouteSurface() {
         {status === "pairing" && confirmed ? (
           <Button disabled size="sm">
             Pairing...
-          </Button>
-        ) : canRetry && confirmed ? (
-          <Button size="sm" onClick={() => void submitHostedPairingRequest()}>
-            Try again
           </Button>
         ) : null}
         {status === "paired" ? (

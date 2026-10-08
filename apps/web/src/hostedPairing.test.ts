@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   buildHostedChannelSelectionUrl,
   buildHostedPairingUrl,
-  hasHostedPairingRequest,
   isHostedStaticApp,
   readHostedPairingRequest,
   resolveHostedPairingRequest,
@@ -62,7 +61,6 @@ describe("hostedPairing", () => {
       token: "ABCD1234",
       label: "",
     });
-    expect(hasHostedPairingRequest(url)).toBe(true);
   });
 
   it("prefers hash tokens so generated hosted links do not put credentials in search params", () => {
@@ -101,11 +99,11 @@ describe("hostedPairing", () => {
 
   it("ignores incomplete hosted pairing requests", () => {
     expect(
-      hasHostedPairingRequest(new URL("https://app.t3.codes/pair?host=backend.example.com")),
-    ).toBe(false);
-    expect(hasHostedPairingRequest(new URL("https://app.t3.codes/pair?token=ABCD1234"))).toBe(
-      false,
-    );
+      readHostedPairingRequest(new URL("https://app.t3.codes/pair?host=backend.example.com")),
+    ).toBeNull();
+    expect(
+      readHostedPairingRequest(new URL("https://app.t3.codes/pair?token=ABCD1234")),
+    ).toBeNull();
   });
 
   it("detects the hosted static app only when no backend URL is configured", () => {

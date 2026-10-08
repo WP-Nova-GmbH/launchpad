@@ -92,10 +92,6 @@ export function resolveHostedPairingRequest(url: URL = new URL(window.location.h
   return null;
 }
 
-export function hasHostedPairingRequest(url: URL = new URL(window.location.href)): boolean {
-  return readHostedPairingRequest(url) !== null;
-}
-
 export function buildHostedPairingUrl(input: {
   readonly host: string;
   readonly token: string;
