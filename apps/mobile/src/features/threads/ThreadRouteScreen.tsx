@@ -1027,7 +1027,7 @@ function ThreadRouteContent(
                   turnStartedAt: selectedThreadDetail?.latestTurn?.startedAt ?? null,
                   working: composer.activeWorkStartedAt !== null,
                   turnStarted: selectedThreadDetail?.latestTurn?.startedAt != null,
-                  onCancel: handleCancelWorktreeSetup,
+                  onCancel: selectedThreadDetail?.workflowJob ? null : handleCancelWorktreeSetup,
                   onWorkLocally:
                     !selectedThreadDetail?.promptQueue?.preparation &&
                     selectedThreadCreation?.outcome == null &&

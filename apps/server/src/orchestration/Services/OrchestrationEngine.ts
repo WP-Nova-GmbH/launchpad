@@ -40,12 +40,15 @@ export interface DeletionPreconditions {
   readonly threads: ReadonlyArray<{
     readonly threadId: ThreadId;
     readonly preparationAttemptId: CommandId | null;
+    readonly worktreePath?: string | null;
+    readonly cleanupAttemptIds?: ReadonlyArray<string>;
   }>;
 }
 
 export interface OrchestrationDispatchOptions {
   readonly origin?: OrchestrationClientOrigin;
   readonly deletionPreconditions?: DeletionPreconditions;
+  readonly requireSetupCleanup?: true;
   /** Serialize a preflight rejection with duplicate commands and their receipts. */
   readonly rejection?: { readonly detail: string; readonly projectId: ProjectId };
 }

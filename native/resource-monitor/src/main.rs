@@ -1,3 +1,5 @@
+mod owned_process;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufWriter, Write};
@@ -786,6 +788,13 @@ fn write_history(
 }
 
 fn main() -> io::Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--setup-owner-v4") {
+        return owned_process::launch(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("--setup-process") {
+        return owned_process::run(&args[1..]);
+    }
     let mut writer = BufWriter::new(io::stdout().lock());
     write_event(
         &mut writer,

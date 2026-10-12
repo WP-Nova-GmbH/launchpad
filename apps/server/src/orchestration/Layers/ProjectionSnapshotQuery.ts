@@ -3633,8 +3633,18 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThread>();
       }
 
+      const workflowRows = threadId.startsWith("workflow:")
+        ? yield* sql<{
+            jobId: string;
+            repositoryId: string;
+            status: string;
+          }>`SELECT job_id AS "jobId", json_extract(record_json, '$.workflow.repositoryId') AS "repositoryId", status FROM repository_workflow_jobs WHERE thread_id = ${threadId} AND status NOT IN ('done', 'cancelled', 'failed')`.pipe(
+            Effect.orDie,
+          )
+        : [];
       const promptQueue = yield* getPromptQueue(sql, threadId);
       const thread = {
+        workflowJob: workflowRows[0] ?? null,
         ...(promptQueue ? { promptQueue } : {}),
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,

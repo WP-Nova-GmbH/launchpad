@@ -1,3 +1,4 @@
+import { SetupProcessJournal } from "../../terminal/SetupProcessJournal.ts";
 import type {
   OrchestrationClientOrigin,
   OrchestrationEvent,
@@ -94,6 +95,7 @@ function commandProjectScope(command: OrchestrationCommand, readModel: Orchestra
 
 const makeOrchestrationEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const setupJournal = yield* SetupProcessJournal;
   const eventStore = yield* OrchestrationEventStore;
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
@@ -210,7 +212,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             new OrchestrationCommandInvariantError({
               commandType: envelope.command.type,
               detail:
-                "The task or its setup changed during deletion. Review it and choose Delete again.",
+                "The task or its setup changed during cleanup. Review it and retry the action.",
             });
           if (
             yield* eventStore.hasEventAfter({
@@ -227,6 +229,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               !thread ||
               thread.deletedAt !== null ||
               thread.projectId !== deletion.projectId ||
+              (captured.worktreePath !== undefined &&
+                thread.worktreePath !== captured.worktreePath) ||
               (thread.promptQueue?.preparation?.attemptId ?? null) !==
                 captured.preparationAttemptId ||
               (yield* eventStore.hasEventAfter({
@@ -237,6 +241,22 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               }))
             )
               return yield* changed();
+            if (envelope.options?.requireSetupCleanup) {
+              const owners = yield* setupJournal
+                .owners(captured.threadId)
+                .pipe(Effect.mapError(() => changed()));
+              const attempts = new Set([
+                ...(captured.cleanupAttemptIds ?? []),
+                ...owners.map((owner) => owner.attemptId),
+              ]);
+              for (const attemptId of attempts)
+                if (
+                  !(yield* setupJournal
+                    .confirmed({ threadId: captured.threadId, attemptId })
+                    .pipe(Effect.mapError(() => changed())))
+                )
+                  return yield* changed();
+            }
           }
           if (
             envelope.command.type === "project.delete" &&
@@ -341,6 +361,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,
+          ...(envelope.command.type === "thread.archive" &&
+          deletion &&
+          envelope.options?.requireSetupCleanup
+            ? { allowFailedPreparationArchive: true }
+            : {}),
           ...(Option.isSome(userInputActivity)
             ? { userInputActivity: userInputActivity.value }
             : {}),

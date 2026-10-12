@@ -860,7 +860,9 @@ export const ThreadPreparation = Schema.Struct({
   originalCommandId: CommandId,
   attemptId: CommandId,
   revision: NonNegativeInt,
+  /** Ready allows delivery while an asynchronous setup command is still running. */
   state: Schema.Literals(["pending", "running", "ready", "failed"]),
+  /** Command completion/stop acknowledgement; an idle setup shell can still need closing. */
   settled: Schema.Boolean,
   recipe: Schema.NullOr(
     Schema.Struct({
@@ -973,6 +975,7 @@ export const ThreadPromptQueueSummary = Schema.Struct({
   pauseReason: Schema.NullOr(ThreadPromptPauseReason),
 });
 export const ThreadPromptQueueChangedPayload = Schema.Struct({
+  stopCommandId: Schema.optional(CommandId),
   preparation: Schema.optional(ThreadPreparation),
   threadId: ThreadId,
   entry: Schema.optional(ThreadPromptQueueEntry),
@@ -986,7 +989,13 @@ export const ThreadPromptQueueChangedPayload = Schema.Struct({
 });
 export type ThreadPromptQueueChangedPayload = typeof ThreadPromptQueueChangedPayload.Type;
 
+export const ThreadWorkflowJob = Schema.Struct({
+  jobId: Schema.String,
+  repositoryId: Schema.String,
+  status: Schema.String,
+});
 export const OrchestrationThread = Schema.Struct({
+  workflowJob: Schema.optional(Schema.NullOr(ThreadWorkflowJob)),
   promptQueue: Schema.optional(ThreadPromptQueue),
   id: ThreadId,
   projectId: ProjectId,
@@ -1079,6 +1088,7 @@ export const OrchestrationProjectShell = Schema.Struct({
 export type OrchestrationProjectShell = typeof OrchestrationProjectShell.Type;
 
 export const OrchestrationThreadShell = Schema.Struct({
+  workflowJob: Schema.optional(Schema.NullOr(ThreadWorkflowJob)),
   promptQueueSummary: Schema.optional(ThreadPromptQueueSummary),
   id: ThreadId,
   projectId: ProjectId,

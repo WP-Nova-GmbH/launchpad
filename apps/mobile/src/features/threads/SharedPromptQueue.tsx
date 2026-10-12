@@ -43,6 +43,7 @@ export function SharedPromptQueue({
   queue,
   activeTurnId,
   unavailable,
+  workflowControlled = false,
   supportsPreparation = false,
   hasStartedTurn = false,
 }: {
@@ -51,6 +52,7 @@ export function SharedPromptQueue({
   queue: ThreadPromptQueue;
   activeTurnId: TurnId | null;
   unavailable: boolean;
+  workflowControlled?: boolean;
   supportsPreparation?: boolean;
   hasStartedTurn?: boolean;
 }) {
@@ -68,9 +70,13 @@ export function SharedPromptQueue({
   const [error, setError] = useState<string | null>(null);
   const current = queue.entries.find((entry) => entry.messageId === edit?.messageId);
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
-  const disabled = unavailable || busy;
+  const disabled = unavailable || busy || workflowControlled;
   const preparation = queue.preparation;
   const blockedByPreparation = preparation !== undefined && preparation.state !== "ready";
+  const setupActive =
+    preparation?.state === "pending" ||
+    preparation?.state === "running" ||
+    preparation?.settled === false;
   const request = <T,>(input: T) => ({ environmentId, input });
   const run = async (
     action: () => Promise<AtomCommandResult<unknown, unknown>>,
@@ -97,7 +103,8 @@ export function SharedPromptQueue({
     queue.entries.length === 0 &&
     queue.pauseReason === null &&
     edit === null &&
-    !blockedByPreparation
+    !blockedByPreparation &&
+    !setupActive
   )
     return null;
   return (
@@ -110,10 +117,10 @@ export function SharedPromptQueue({
         <Text className="font-t3-medium text-sm text-foreground">
           Shared queue · {queue.entries.length}
         </Text>
-        {queue.pauseReason === null || (blockedByPreparation && preparation.settled === false) ? (
+        {queue.pauseReason === null || setupActive ? (
           <QueueButton
-            label={blockedByPreparation ? "Stop setup" : "Pause queue"}
-            disabled={disabled}
+            label={setupActive ? "Stop setup" : "Pause queue"}
+            disabled={disabled || (setupActive && !supportsPreparation)}
             onPress={() => void run(() => pauseQueue(request({ threadId })))}
           />
         ) : queue.pauseReason.code !== "delivery-unknown" ? (
@@ -126,6 +133,16 @@ export function SharedPromptQueue({
           />
         ) : null}
       </View>
+      {workflowControlled ? (
+        <Text className="mb-2 text-xs text-foreground-muted">
+          Use this job’s review or Cancel controls in Settings → Workflow jobs.
+        </Text>
+      ) : null}
+      {setupActive && !blockedByPreparation ? (
+        <Text accessibilityLiveRegion="polite" className="mb-2 text-xs text-foreground-muted">
+          Setup is running in the background.
+        </Text>
+      ) : null}
       {blockedByPreparation ? (
         <View className="mb-2 gap-2">
           <Text accessibilityLiveRegion="polite" className="text-sm text-foreground">

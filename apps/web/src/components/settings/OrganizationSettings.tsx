@@ -27,6 +27,7 @@ import type {
 } from "@t3tools/contracts/relay";
 
 import { GitHubIcon } from "../Icons";
+import { RepositoryWorkflows } from "./RepositoryWorkflows";
 import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useProjects } from "../../state/entities";
@@ -547,6 +548,7 @@ function RepositoryRow({
             </Button>
           </div>
         ) : null}
+        <RepositoryWorkflows repository={entry.repository} canConfigure={canConfigure} />
       </div>
     </SettingsRow>
   );

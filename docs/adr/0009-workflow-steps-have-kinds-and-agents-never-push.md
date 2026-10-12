@@ -34,11 +34,11 @@ legitimate workflow asks an agent for one, so the supervisor needs no judgement 
 
 ## Why `gate` is a kind and not a flag
 
-A repository may override any part of its workflow ([ADR-0007](./0007-the-org-layer-is-defaults-not-enforcement.md)),
-including removing gates. When a gate is a step, removing it is a visible structural deviation —
-_"this repository dropped your review gate"_ — rather than a boolean flipped somewhere inside a
-nested config object. Since visibility is the only control we have, gates must be shaped so that
-their absence is obvious.
+A repository owns its workflow definition ([ADR-0007](./0007-the-org-layer-is-defaults-not-enforcement.md)),
+including its gates. When a gate is a step, removing it is a visible structural change —
+_"this workflow has no human review"_ — rather than a boolean flipped somewhere inside a nested
+config object. Since visibility is the only control we have, gates must be shaped so that their
+absence is obvious.
 
 ## Consequences
 

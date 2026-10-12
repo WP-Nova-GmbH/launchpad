@@ -1,4 +1,5 @@
 import * as Deferred from "effect/Deferred";
+import { WorkflowRunStore } from "./jobs/WorkflowRunStore.ts";
 import { RepositoryAccess, stampCommandAuthor as stampActor } from "./auth/RepositoryAccess.ts";
 import {
   authorizeOrchestrationCommand,
@@ -78,6 +79,7 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  AuthOrchestrationOperateScope,
   ThreadId,
   TerminalProcessExitError,
   type TerminalAttachStreamEvent,
@@ -528,22 +530,71 @@ const makeWsRpcLayer = (
       // Authorship comes from the authenticated session, never from the wire:
       // a client cannot claim to be someone else.
       const access = yield* RepositoryAccess;
+      const workflowJobs = yield* WorkflowRunStore;
+      const workflowMutationMethods = new Set<string>([
+        WS_METHODS.vcsPull,
+        WS_METHODS.gitRunStackedAction,
+        WS_METHODS.gitPreparePullRequestThread,
+        WS_METHODS.vcsCreateWorktree,
+        WS_METHODS.vcsRemoveWorktree,
+        WS_METHODS.vcsCreateRef,
+        WS_METHODS.vcsSwitchRef,
+        WS_METHODS.projectsWriteFile,
+        WS_METHODS.terminalOpen,
+        WS_METHODS.terminalWrite,
+        WS_METHODS.terminalAttach,
+        WS_METHODS.terminalRestart,
+        WS_METHODS.terminalClose,
+        WS_METHODS.vcsInit,
+        WS_METHODS.worktreeSetupCancel,
+        WS_METHODS.projectsRemove,
+      ]);
       const stampCommandAuthor = (command: OrchestrationCommand) =>
         stampActor(command, currentSession);
       const repositoryInputSchema = Schema.Struct({
         threadId: Schema.optional(Schema.NullOr(Schema.String)),
         projectId: Schema.optional(Schema.NullOr(Schema.String)),
+        cwd: Schema.optional(Schema.String),
+        worktreePath: Schema.optional(Schema.NullOr(Schema.String)),
+        path: Schema.optional(Schema.NullOr(Schema.String)),
         reference: Schema.optional(
           Schema.Union([Schema.String, Schema.Struct({ projectId: Schema.String })]),
         ),
       });
-      const authorizeRepositoryInput = (input: unknown) =>
+      const authorizeRepositoryInput = (input: unknown, method?: string) =>
         Effect.gen(function* () {
-          if (!(yield* access.status).enabled) return;
-          yield* access.requireMember(currentSession);
           const resource = yield* Schema.decodeUnknownEffect(repositoryInputSchema)(input).pipe(
             Effect.orDie,
           );
+          if (
+            method !== undefined &&
+            workflowMutationMethods.has(method) &&
+            (method !== WS_METHODS.terminalAttach || resource.cwd !== undefined)
+          ) {
+            if (resource.cwd) yield* workflowJobs.requireWorkspace(resource.cwd);
+            if (resource.worktreePath) yield* workflowJobs.requireWorkspace(resource.worktreePath);
+            if (resource.path) {
+              const path = yield* Path.Path;
+              yield* workflowJobs.requireWorkspace(
+                path.resolve(resource.cwd ?? ".", resource.path),
+              );
+            }
+            const runs = yield* workflowJobs.owners();
+            if (
+              runs.some(
+                (run) =>
+                  run.threadId === resource.threadId ||
+                  (method === WS_METHODS.projectsRemove && run.projectId === resource.projectId),
+              )
+            ) {
+              return yield* new EnvironmentAuthorizationError({
+                message: "This resource belongs to an active workflow job. Use the job controls.",
+                requiredScope: AuthOrchestrationOperateScope,
+              });
+            }
+          }
+          if (!(yield* access.status).enabled) return;
+          yield* access.requireMember(currentSession);
           if (resource.threadId)
             yield* access.requireThread(currentSession, ThreadId.make(resource.threadId));
           if (resource.projectId)
@@ -808,7 +859,7 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcEffect(
           method,
-          authorizeRepositoryInput(input ?? {}).pipe(
+          authorizeRepositoryInput(input ?? {}, method).pipe(
             Effect.andThen(authorizeEffect(requiredScopeForRpcMethod(method), effect)),
           ),
           traceAttributes,
@@ -822,7 +873,7 @@ const makeWsRpcLayer = (
         instrumentRpcStream(
           method,
           Stream.unwrap(
-            authorizeRepositoryInput(input ?? {}).pipe(
+            authorizeRepositoryInput(input ?? {}, method).pipe(
               Effect.as(authorizeStream(requiredScopeForRpcMethod(method), stream)),
             ),
           ),
@@ -840,7 +891,7 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcStreamEffect(
           method,
-          authorizeRepositoryInput(input ?? {}).pipe(
+          authorizeRepositoryInput(input ?? {}, method).pipe(
             Effect.andThen(authorizeEffect(requiredScopeForRpcMethod(method), effect)),
           ),
           traceAttributes,
@@ -2097,7 +2148,8 @@ const makeWsRpcLayer = (
                 : false;
               const result = yield* (
                 normalizedCommand.type === "thread.delete" ||
-                normalizedCommand.type === "project.delete"
+                normalizedCommand.type === "project.delete" ||
+                normalizedCommand.type === "thread.archive"
                   ? startup
                       .enqueueCommand(
                         dispatchDeletion(
@@ -2173,8 +2225,8 @@ const makeWsRpcLayer = (
                   );
                 }
 
-                // Archive removes the thread from view, so its user-opened
-                // terminal panes close with it.
+                // Setup handles were finalized by the lifecycle preflight.
+                // Close the remaining user-opened terminal panes with the thread.
                 yield* terminalManager.close({ threadId: archiveCommand.threadId }).pipe(
                   Effect.catch((error) =>
                     Effect.logWarning("failed to close thread terminals after archive", {
@@ -3923,7 +3975,8 @@ const makeWsRpcLayer = (
               });
               if (Option.isSome(thread) && thread.value.promptQueue?.preparation) {
                 const preparation = thread.value.promptQueue.preparation;
-                if (preparation.state === "ready") return { cancelled: false };
+                if (preparation.state === "ready" && preparation.settled)
+                  return { cancelled: false };
                 yield* dispatchFromClient({
                   type: "thread.queue.pause",
                   threadId: input.threadId,
@@ -4042,7 +4095,16 @@ const makeWsRpcLayer = (
         [WS_METHODS.vcsRemoveWorktree]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsRemoveWorktree,
-            gitWorkflow.removeWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            Effect.gen(function* () {
+              const path = yield* Path.Path;
+              // Git accepts worktree-name shorthand. Pass the same full path
+              // that was checked by authorization so it cannot select another target.
+              yield* gitWorkflow.removeWorktree({
+                ...input,
+                path: path.resolve(input.cwd, input.path),
+              });
+              yield* refreshGitStatus(input.cwd);
+            }),
             { "rpc.aggregate": "vcs" },
             input,
           ),

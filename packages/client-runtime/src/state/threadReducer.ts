@@ -1,3 +1,5 @@
+import { ThreadWorkflowJob } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { pipe } from "effect/Function";
 import * as Arr from "effect/Array";
 import * as O from "effect/Order";
@@ -45,6 +47,8 @@ function withPullRequests(
     },
   };
 }
+
+const isWorkflowProgress = Schema.is(ThreadWorkflowJob);
 
 const proposedPlanOrder = O.combine<OrchestrationThread["proposedPlans"][number]>(
   O.mapInput(O.String, (p) => p.createdAt),
@@ -700,6 +704,14 @@ export function applyThreadDetailEvent(
     // ── Activities ──────────────────────────────────────────────────
     case "thread.activity-appended": {
       const activity = event.payload.activity;
+      const workflowOwnership =
+        activity.kind === "workflow.progress" && isWorkflowProgress(activity.payload)
+          ? {
+              workflowJob: ["done", "cancelled", "failed"].includes(activity.payload.status)
+                ? null
+                : activity.payload,
+            }
+          : {};
       // A resolvable context-window update supersedes earlier resolvable ones
       // for the same turn: consumers only read the latest value (walking the
       // array backwards), and providers stream these updates continuously, so
@@ -729,6 +741,7 @@ export function applyThreadDetailEvent(
           kind: "updated",
           thread: {
             ...thread,
+            ...workflowOwnership,
             activities,
             updatedAt: event.occurredAt,
           },
@@ -752,7 +765,7 @@ export function applyThreadDetailEvent(
 
       return {
         kind: "updated",
-        thread: { ...thread, activities, updatedAt: event.occurredAt },
+        thread: { ...thread, ...workflowOwnership, activities, updatedAt: event.occurredAt },
       };
     }
 

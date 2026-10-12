@@ -1804,3 +1804,39 @@ describe("applyThreadDetailEvent", () => {
     });
   });
 });
+
+it("updates workflow ownership live and releases the composer after approval", () => {
+  let current = baseThread;
+  for (const [sequence, status] of [
+    [1, "preparing"],
+    [2, "awaiting_review"],
+    [3, "done"],
+  ] as const) {
+    const result = applyThreadDetailEvent(current, {
+      ...baseEventFields,
+      sequence,
+      aggregateKind: "thread",
+      aggregateId: current.id,
+      occurredAt: current.updatedAt,
+      type: "thread.activity-appended",
+      payload: {
+        threadId: current.id,
+        activity: {
+          id: EventId.make(`workflow-${sequence}`),
+          tone: "info",
+          kind: "workflow.progress",
+          summary: status,
+          payload: { jobId: "job-1", repositoryId: "repo-1", status },
+          turnId: null,
+          createdAt: current.updatedAt,
+        },
+      },
+    });
+    expect(result.kind).toBe("updated");
+    if (result.kind !== "updated") throw new Error("Missing workflow update");
+    current = result.thread;
+    expect(current.workflowJob).toEqual(
+      status === "done" ? null : { jobId: "job-1", repositoryId: "repo-1", status },
+    );
+  }
+});

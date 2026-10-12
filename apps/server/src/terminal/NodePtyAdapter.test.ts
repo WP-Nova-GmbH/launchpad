@@ -5,17 +5,33 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import { vi } from "vite-plus/test";
 
 import * as NodePtyAdapter from "./NodePtyAdapter.ts";
 import * as PtyAdapter from "./PtyAdapter.ts";
+
+const decodeLaunchRequest = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      protocol: Schema.Literal(1),
+      token: Schema.String,
+      candidates: Schema.Array(
+        Schema.Struct({
+          shell: Schema.String,
+          args: Schema.optional(Schema.Array(Schema.String)),
+        }),
+      ),
+    }),
+  ),
+);
 
 const spawn = vi.fn(() => ({
   pid: 42,
   write: vi.fn(),
   resize: vi.fn(),
   kill: vi.fn(),
-  onData: vi.fn(() => ({ dispose: vi.fn() })),
+  onData: vi.fn((_listener: (data: string) => void) => ({ dispose: vi.fn() })),
   onExit: vi.fn(() => ({ dispose: vi.fn() })),
 }));
 
@@ -152,4 +168,45 @@ it.effect("reports native module load failures as structured startup defects", (
       ),
     ),
   ),
+);
+
+it.effect("filters fragmented shell-exit frames while retaining the ownership anchor", () =>
+  Effect.gen(function* () {
+    const adapter = yield* PtyAdapter.PtyAdapter;
+    const process = yield* adapter.spawn({
+      shell: "/missing",
+      ownerExecutable: "/helper",
+      ownerShellCandidates: [{ shell: "/missing" }, { shell: "/bin/sh", args: ["-i"] }],
+      cwd: ".",
+      cols: 80,
+      rows: 24,
+      env: {},
+    });
+    const call = spawn.mock.calls.at(-1)! as unknown as [string, string[]];
+    const payload = yield* decodeLaunchRequest(call[1][2]!);
+    assert.deepEqual(payload.candidates, [
+      { shell: "/missing" },
+      { shell: "/bin/sh", args: ["-i"] },
+    ]);
+    const native = spawn.mock.results.at(-1)!.value;
+    const feed = native.onData.mock.calls[0]![0];
+    const output: string[] = [];
+    const exits: PtyAdapter.PtyExitEvent[] = [];
+    const ptyExits: PtyAdapter.PtyExitEvent[] = [];
+    process.onData((data) => output.push(data));
+    process.onShellExit!((event) => exits.push(event));
+    process.onExit((event) => ptyExits.push(event));
+    const frame = `\x1b]T3_SETUP_EXIT;${payload.token};7\x07`;
+    feed("hello" + frame.slice(0, 9));
+    feed(frame.slice(9, -2));
+    assert.deepEqual(exits, []);
+    feed(frame.slice(-2) + "world");
+    assert.equal(output.join(""), "helloworld");
+    assert.deepEqual(exits, [{ exitCode: 7, signal: null }]);
+    assert.deepEqual(ptyExits, []);
+    assert.deepEqual(native.kill.mock.calls, []);
+    const late: PtyAdapter.PtyExitEvent[] = [];
+    process.onShellExit!((event) => late.push(event));
+    assert.deepEqual(late, exits);
+  }).pipe(Effect.provide(makeTestLayer("darwin"))),
 );

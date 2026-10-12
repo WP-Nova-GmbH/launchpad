@@ -105,7 +105,7 @@ workflows, and quotas.
 ### Repository role
 
 A member's standing on one [repository](#repository): `maintainer` or `developer`. Maintainers
-configure the repository and override its workflow; developers work in it. Having no repository
+configure the repository and its workflows; developers work in it. Having no repository
 role means having no access to that repository.
 
 Both roles, organization membership, and invitations live in the [relay](#relay)'s own database.
@@ -220,10 +220,9 @@ subprocesses authenticate with. Not a [provider credential](#provider-credential
 
 ### Workflow
 
-An ordered set of [steps](#step) describing how work gets implemented and reviewed. Layered:
-a base workflow ships with the product, an [organization](#organization) adapts it into one or
-more named workflows, and a [repository](#repository) selects one and may override any part of
-it ([ADR-0007][adr7]).
+A named, ordered set of [steps](#step) describing how work gets carried out and reviewed,
+owned by a [repository](#repository). Copying a workflow creates an independent definition;
+later changes to its source do not propagate to the copy ([ADR-0007][adr7]).
 
 ### Step
 
@@ -258,7 +257,11 @@ done.
 
 ### Integration
 
-A connection to an external service. Jira and Linear connections are owned by a Launchpad user and carry that user's OAuth permissions. Their read access is granted to an individual prompt; organization membership does not share credentials. [Provider accounts](#provider-account) have a separate organization-sharing model.
+A connection to an external service. Personal Jira and Linear connections carry one user's OAuth
+permissions and grant read access to individual prompts. An **automation connection** authorizes
+an external workspace or site as a workflow event source, reusable by repositories explicitly
+allowed by its owner. Organization membership alone grants neither kind of access.
+[Provider accounts](#provider-account) have a separate organization-sharing model.
 
 ### Mirror
 

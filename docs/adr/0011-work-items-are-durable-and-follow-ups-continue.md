@@ -19,6 +19,17 @@ Three shapes, and they are not variations of one thing:
 | an issue enters a watched state | external state change | an [integration](../internals/glossary.md#integration), inbound webhooks, **and write-back** |
 | a follow-up on completed work   | continuation          | knowing what was already implemented                                                         |
 
+Each repository workflow selects its own Linear team or Jira project, optional issue labels,
+and triggering event or status transition. This makes routing explicit when several repositories
+use the same automation connection; sharing a connection does not make every event start work
+in every repository. Matching is independent for each enabled workflow: an event matching several
+workflows creates a job for each, without workflow priorities or a first-match rule.
+
+Each distinct matching event creates a new job, even if another job for the same issue and
+workflow is queued, running, or waiting for review. Repeated delivery of the same event creates
+no additional job. An event-triggered job does not update, restart, or continue an existing job;
+continuation is an explicit follow-up.
+
 The third is why work items must be durable: "an issue that was implemented" is only meaningful
 if something outlived the job that implemented it.
 
@@ -55,8 +66,12 @@ Forking a work item's thread, or resetting it to start clean, are wanted and def
   [ADR-0012](./0012-executors-mirror-their-event-log-to-the-relay.md) the history survives, so the
   failure mode is degraded — a follow-up starts a new job with a cold thread — rather than lost
   work. Reclamation should still warn about what it is unpinning.
-- **Integrations are bidirectional and org-credentialed.** Reading issue state and writing back
-  both use organization credentials held on the relay, never on a machine running agents — the
-  same placement as chat tokens.
+- **Automation connections are reusable, with explicit repository authorization.** Connect an
+  external workspace or site once for automation, then allow selected repositories to use it.
+  This avoids repeated setup for repositories sharing an issue tracker without silently sharing
+  personal connections through organization membership. Provider authorization can still depend
+  on the connecting person's permissions; repository authorization does not remove that dependency.
+  Credentials remain on the relay. Personal prompt access and owner-only write approval keep their
+  existing authorization model.
 - Work items give the "box you drop a task definition into" a home, and give the app a unit to
   show progress against that survives more than one run.

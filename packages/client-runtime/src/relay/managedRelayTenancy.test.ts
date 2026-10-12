@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import { RelayRepositoryId } from "@t3tools/contracts/relay";
 
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import * as ManagedRelayTenancy from "./managedRelayTenancy.ts";
@@ -11,6 +12,64 @@ function testLayer(fetchFn: typeof globalThis.fetch) {
     Layer.provide(remoteHttpClientLayer(fetchFn)),
   );
 }
+
+it.effect(
+  "preserves the observed workflow revision when sending preparation and cancellation retries",
+  () => {
+    const bodies: unknown[] = [];
+    const fetchFn = (async (input, init) => {
+      const request = new Request(input, init);
+      bodies.push(await request.json());
+      expect(request.headers.get("authorization")).toBe("Bearer maintainer-token");
+      return Response.json({
+        jobId: "job-1",
+        repositoryId: "repo-1",
+        workflowId: "workflow-1",
+        environmentId: "env-1",
+        instruction: "Fix issue",
+        status: "paused",
+        detail: "Setup failed",
+        workflow: null,
+        progress: {
+          revision: 5,
+          status: "paused",
+          threadId: "workflow:job-1:agent",
+          detail: "Setup failed",
+          checkpoint: null,
+          retryablePreparation: true,
+        },
+        createdAt: "2026-10-08T12:00:00Z",
+        updatedAt: "2026-10-08T12:00:00Z",
+      });
+    }) satisfies typeof globalThis.fetch;
+    return Effect.gen(function* () {
+      const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+      yield* client.respondToWorkflowJob({
+        clerkToken: "maintainer-token",
+        repositoryId: RelayRepositoryId.make("repo-1"),
+        jobId: "job-1",
+        payload: { operation: "retry_cancellation", expectedRevision: 8 },
+      });
+      yield* client.respondToWorkflowJob({
+        clerkToken: "maintainer-token",
+        repositoryId: RelayRepositoryId.make("repo-1"),
+        jobId: "job-1",
+        payload: { operation: "retry_preparation", expectedRevision: 5 },
+      });
+      yield* client.respondToWorkflowJob({
+        clerkToken: "maintainer-token",
+        repositoryId: RelayRepositoryId.make("repo-1"),
+        jobId: "job-1",
+        payload: { operation: "cancel" },
+      });
+      expect(bodies).toEqual([
+        { operation: "retry_cancellation", expectedRevision: 8 },
+        { operation: "retry_preparation", expectedRevision: 5 },
+        { operation: "cancel" },
+      ]);
+    }).pipe(Effect.provide(testLayer(fetchFn)));
+  },
+);
 
 describe("organization issue tracker client", () => {
   it.effect("uses the current organization's bearer for listing and changing connections", () => {

@@ -843,6 +843,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     id: "organization-repositories",
     title: "Repositories and access",
     to: "/settings/organization",
+    searchTerms: ["workflow workflows job jobs human review automation agent manual run cancel"],
   },
   {
     id: "organization-machines",

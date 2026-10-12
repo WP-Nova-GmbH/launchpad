@@ -387,7 +387,11 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
     case "thread.queue.pause":
       return [
         change({
-          ...(preparation && (preparation.state === "pending" || preparation.state === "running")
+          stopCommandId: command.commandId,
+          ...(preparation &&
+          (preparation.state === "pending" ||
+            preparation.state === "running" ||
+            (preparation.state === "ready" && !preparation.settled))
             ? {
                 preparation: {
                   ...preparation,

@@ -7426,6 +7426,16 @@ export default function ChatView(props: ChatViewProps) {
     queuedMessage?: QueuedComposerMessage,
   ) => {
     e?.preventDefault();
+    if (
+      activeThread?.workflowJob &&
+      (!activePendingProgress || directAnnotation || queuedMessage)
+    ) {
+      setThreadError(
+        activeThread.id,
+        "Use the workflow job's review, retry or Cancel controls in Organization settings.",
+      );
+      return;
+    }
     const expectedAccountId = appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null;
     if (queuedMessage && queuedMessage.ownerAccountId !== expectedAccountId) {
       if (activeThreadKey)
@@ -10130,7 +10140,7 @@ export default function ChatView(props: ChatViewProps) {
                 isCompacting={!paintOnlyDisplayedTimeline && isCompacting}
                 activeTurnStartedAt={paintOnlyDisplayedTimeline ? null : activeWorkStartedAt}
                 worktreeSetup={paintOnlyDisplayedTimeline ? null : worktreeSetup}
-                onCancelWorktreeSetup={onCancelWorktreeSetup}
+                {...(activeThread.workflowJob ? {} : { onCancelWorktreeSetup })}
                 {...(draftId && !supportsSharedPreparation ? { onWorktreeSetupWorkLocally } : {})}
                 {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
                 listRef={legendListRef}
@@ -10277,6 +10287,7 @@ export default function ChatView(props: ChatViewProps) {
                       key={activeThreadKey}
                       threadRef={activeThreadRef}
                       queue={activeThread.promptQueue}
+                      workflowControlled={activeThread.workflowJob != null}
                       supportsPreparation={supportsSharedPreparation}
                       canWorkLocally={
                         activeThread.latestTurn === null &&
@@ -10330,15 +10341,17 @@ export default function ChatView(props: ChatViewProps) {
                             isSendBusy={isSendBusy}
                             isRevertingCheckpoint={isRevertingCheckpoint}
                             sendDisabledReason={
-                              isRevertingCheckpoint
-                                ? "Rewinding conversation"
-                                : feedbackUploading
-                                  ? "Sending feedback"
-                                  : threadDetailLoading
-                                    ? "Messages loading"
-                                    : worktreeSetupBlocksSend
-                                      ? "Preparing worktree"
-                                      : projectCloneSendBlockReason
+                              activeThread?.workflowJob && !activePendingProgress
+                                ? "This thread belongs to a workflow. Use its job controls in Organization settings."
+                                : isRevertingCheckpoint
+                                  ? "Rewinding conversation"
+                                  : feedbackUploading
+                                    ? "Sending feedback"
+                                    : threadDetailLoading
+                                      ? "Messages loading"
+                                      : worktreeSetupBlocksSend
+                                        ? "Preparing worktree"
+                                        : projectCloneSendBlockReason
                             }
                             isPreparingWorktree={isPreparingWorktree}
                             bannerItems={composerBannerItems}

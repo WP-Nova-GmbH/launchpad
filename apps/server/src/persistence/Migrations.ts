@@ -72,6 +72,11 @@ import Migration0056 from "./Migrations/056_ProjectionThreadMessageAuthor.ts";
 import Migration0057 from "./Migrations/057_SharedPromptQueue.ts";
 import Migration0058 from "./Migrations/058_CommandReceiptProjectScope.ts";
 import Migration0059 from "./Migrations/059_ThreadCleanupFences.ts";
+import Migration0060 from "./Migrations/060_RepositoryWorkflowJobs.ts";
+import Migration0061 from "./Migrations/061_WorkflowCancellationFences.ts";
+import Migration0063 from "./Migrations/063_SetupCleanupEvidence.ts";
+import Migration0064 from "./Migrations/064_SetupLifecycleCleanup.ts";
+import Migration0062 from "./Migrations/062_SetupProcessOwnership.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -143,6 +148,11 @@ const migrationEntries = [
   [57, "SharedPromptQueue", Migration0057],
   [58, "CommandReceiptProjectScope", Migration0058],
   [59, "ThreadCleanupFences", Migration0059],
+  [60, "RepositoryWorkflowJobs", Migration0060],
+  [61, "WorkflowCancellationFences", Migration0061],
+  [62, "SetupProcessOwnership", Migration0062],
+  [63, "SetupCleanupEvidence", Migration0063],
+  [64, "SetupLifecycleCleanup", Migration0064],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -235,6 +245,46 @@ const verifyMigrationHistory = Effect.gen(function* () {
   );
   const mismatches: Array<string> = [];
   for (const { migration_id, name } of recorded) {
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_WorkflowReaderV5" &&
+      [57, 58, 59, 60, 61, 62, 63, 64].every((id) =>
+        recorded.some((entry) => entry.migration_id === id && entry.name === namesById.get(id)),
+      )
+    )
+      continue;
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_WorkflowReaderV4" &&
+      [57, 58, 59, 60, 61, 62, 63].every((id) =>
+        recorded.some((entry) => entry.migration_id === id && entry.name === namesById.get(id)),
+      )
+    )
+      continue;
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_WorkflowReaderV3" &&
+      [57, 58, 59, 60, 61, 62].every((id) =>
+        recorded.some((entry) => entry.migration_id === id && entry.name === namesById.get(id)),
+      )
+    )
+      continue;
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_WorkflowReaderV2" &&
+      [57, 58, 59, 60, 61].every((id) =>
+        recorded.some((entry) => entry.migration_id === id && entry.name === namesById.get(id)),
+      )
+    )
+      continue;
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_WorkflowReaderV1" &&
+      [57, 58, 59, 60].every((id) =>
+        recorded.some((entry) => entry.migration_id === id && entry.name === namesById.get(id)),
+      )
+    )
+      continue;
     if (
       migration_id === 1 &&
       name === "OrchestrationEvents_ThreadCleanupReaderV1" &&

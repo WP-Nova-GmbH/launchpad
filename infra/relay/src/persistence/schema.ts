@@ -1,5 +1,10 @@
 import type { RuntimeMode } from "@t3tools/contracts";
 import type {
+  RepositoryWorkflow,
+  RepositoryWorkflowJob,
+  RespondToWorkflowJob,
+} from "@t3tools/contracts/workflows";
+import type {
   RelayAgentActivityAggregateState,
   RelayAgentActivityState,
   RelayAgentAwarenessPreferences,
@@ -605,6 +610,42 @@ export const relayJobs = pgTable(
   (table) => [
     index("idx_relay_jobs_owner").on(table.ownerUserId, table.createdAt),
     index("idx_relay_jobs_environment").on(table.environmentId, table.createdAt),
+  ],
+);
+
+export const relayRepositoryWorkflows = pgTable(
+  "relay_repository_workflows",
+  {
+    workflowId: varchar("workflow_id", { length: 64 }).primaryKey(),
+    repositoryId: varchar("repository_id", { length: 64 }).notNull(),
+    revision: integer("revision").notNull(),
+    record: jsonb("record").notNull().$type<RepositoryWorkflow>(),
+  },
+  (table) => [index("idx_repository_workflows_repository").on(table.repositoryId)],
+);
+
+export const relayWorkflowJobs = pgTable(
+  "relay_workflow_jobs",
+  {
+    jobId: varchar("job_id", { length: 64 }).primaryKey(),
+    repositoryId: varchar("repository_id", { length: 64 }).notNull(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    submitterUserId: varchar("submitter_user_id", { length: 191 }).notNull(),
+    repositoryCanonicalKey: text("repository_canonical_key"),
+    status: varchar("status", { length: 32 }).notNull().$type<RepositoryWorkflowJob["status"]>(),
+    record: jsonb("record").notNull().$type<RepositoryWorkflowJob>(),
+    pendingControl: jsonb("pending_control").$type<{
+      userId: string;
+      response: typeof RespondToWorkflowJob.Type;
+    }>(),
+    revision: integer("revision").notNull(),
+    leaseUntil: varchar("lease_until", { length: 64 }),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    checkedAt: varchar("checked_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    index("idx_workflow_jobs_repository").on(table.repositoryId, table.createdAt),
+    index("idx_workflow_jobs_status").on(table.status, table.checkedAt),
   ],
 );
 

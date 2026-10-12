@@ -5458,6 +5458,73 @@ describe("ProviderCommandReactor", () => {
     }),
   );
 
+  effectIt.effect("correlates a failed stop and executes one fresh stop after receipt replay", () =>
+    Effect.gen(function* () {
+      let failStop = true;
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          stopSessionEffect: () =>
+            failStop
+              ? Effect.fail(
+                  new ProviderAdapterRequestError({
+                    provider: "codex",
+                    method: "session.stop",
+                    detail: "Stop failed",
+                  }),
+                )
+              : Effect.void,
+        }),
+      );
+      const now = "2026-10-08T12:00:00.000Z";
+      const threadId = ThreadId.make("thread-1");
+      yield* harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("session-before-failed-stop"),
+        threadId,
+        createdAt: now,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      });
+      const stop = {
+        type: "thread.session.stop" as const,
+        commandId: CommandId.make("failed-stop-attempt"),
+        threadId,
+        createdAt: now,
+      };
+      yield* harness.engine.dispatch(stop);
+      yield* Effect.promise(() => harness.drain());
+      const failed = (yield* Effect.promise(() => harness.readModel())).threads.find(
+        (thread) => thread.id === threadId,
+      )!;
+      expect(
+        failed.activities.find((activity) => activity.kind === "provider.session.stop.failed"),
+      ).toMatchObject({ payload: { stopCommandId: stop.commandId } });
+      expect(failed.session?.status).toBe("ready");
+      yield* harness.engine.dispatch(stop);
+      yield* Effect.promise(() => harness.drain());
+      expect(harness.stopSession).toHaveBeenCalledTimes(1);
+      failStop = false;
+      yield* harness.engine.dispatch({
+        ...stop,
+        commandId: CommandId.make("retried-stop-attempt"),
+      });
+      yield* Effect.promise(() => harness.drain());
+      expect(harness.stopSession).toHaveBeenCalledTimes(2);
+      expect(
+        (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (thread) => thread.id === threadId,
+        )?.session?.status,
+      ).toBe("stopped");
+    }),
+  );
+
   effectIt.effect("stops a ready provider session after automatic settlement", () =>
     Effect.gen(function* () {
       const sessionStopped = yield* Deferred.make<void>();

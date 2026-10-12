@@ -1,4 +1,16 @@
 import {
+  RepositoryWorkflow,
+  RepositoryWorkflowJob,
+  RepositoryWorkflowJobSummary,
+  SaveRepositoryWorkflow,
+  RunRepositoryWorkflow,
+  RespondToWorkflowJob,
+  WorkflowControl,
+  WorkflowControlResult,
+  WorkflowConflictError,
+  WorkflowInvalidError,
+} from "./workflows.ts";
+import {
   RepositoryPolicyProof,
   RepositoryPolicyAcknowledgement,
   RepositoryAccessRemovalStatus,
@@ -1936,6 +1948,7 @@ export const RelayCloudDispatchJobProofPayload = Schema.Struct({
   repositoryCanonicalKey: TrimmedNonEmptyString,
   baseBranch: TrimmedNonEmptyString,
   instruction: TrimmedNonEmptyString,
+  workflowControl: Schema.optional(WorkflowControl),
 });
 export type RelayCloudDispatchJobProofPayload = typeof RelayCloudDispatchJobProofPayload.Type;
 
@@ -1949,6 +1962,8 @@ export const RelayEnvironmentDispatchJobResponseProofPayload = Schema.Struct({
   environmentId: EnvironmentId,
   jobId: RelayJobId,
   accepted: Schema.Boolean,
+  workflowResult: Schema.optional(WorkflowControlResult),
+  requestId: Schema.optional(TrimmedNonEmptyString),
 });
 export type RelayEnvironmentDispatchJobResponseProofPayload =
   typeof RelayEnvironmentDispatchJobResponseProofPayload.Type;
@@ -1960,6 +1975,7 @@ export type RelayEnvironmentDispatchJobResponseProofPayload =
 export const RelayEnvironmentDispatchJobResponse = Schema.Struct({
   accepted: Schema.Boolean,
   proof: TrimmedNonEmptyString,
+  workflowResult: Schema.optional(WorkflowControlResult),
 });
 export type RelayEnvironmentDispatchJobResponse = typeof RelayEnvironmentDispatchJobResponse.Type;
 
@@ -2240,6 +2256,55 @@ const RelayOrganizationMemberParams = Schema.Struct({
 const RelayRepositoryParams = Schema.Struct({
   repositoryId: RelayRepositoryId,
 });
+
+const WorkflowErrors = [
+  ...RelayTenancyErrors,
+  WorkflowConflictError,
+  WorkflowInvalidError,
+] as const;
+const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
+  .add(
+    HttpApiEndpoint.get("list", "/v1/repositories/:repositoryId/workflows", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: Schema.Struct({ workflows: Schema.Array(RepositoryWorkflow) }),
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.post("save", "/v1/repositories/:repositoryId/workflows", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: SaveRepositoryWorkflow,
+      success: RepositoryWorkflow,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get("listJobs", "/v1/repositories/:repositoryId/workflow-jobs", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: Schema.Struct({ jobs: Schema.Array(RepositoryWorkflowJobSummary) }),
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.post("run", "/v1/repositories/:repositoryId/workflow-jobs", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: RunRepositoryWorkflow,
+      success: RepositoryWorkflowJob,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get("getJob", "/v1/repositories/:repositoryId/workflow-jobs/:jobId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+      success: RepositoryWorkflowJob,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.post("respond", "/v1/repositories/:repositoryId/workflow-jobs/:jobId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+      payload: RespondToWorkflowJob,
+      success: RepositoryWorkflowJob,
+      error: WorkflowErrors,
+    }),
+  )
+  .middleware(RelayClientAuth);
 
 /**
  * Organizations, membership, and invitations. Everything here is relay-owned:
@@ -3066,6 +3131,7 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayTokenGroup,
     RelayDpopClientGroup,
     RelayJobsGroup,
+    RelayWorkflowsGroup,
     RelayServerGroup,
     RelayProjectCatalogServerGroup,
     RelaySourceControlServerGroup,

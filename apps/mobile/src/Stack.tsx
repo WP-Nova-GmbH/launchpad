@@ -86,6 +86,7 @@ import {
   SettingsOpenSourceLicensesRouteScreen,
 } from "./features/settings/SettingsOpenSourceLicensesRouteScreen";
 import { SettingsProjectGroupingRouteScreen } from "./features/settings/SettingsProjectGroupingRouteScreen";
+import { WorkflowJobsScreen } from "./features/settings/WorkflowJobsScreen";
 import { SettingsProjectOverviewRouteScreen } from "./features/settings/SettingsProjectOverviewRouteScreen";
 import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
@@ -268,6 +269,11 @@ const SettingsContentStack = createNativeStackNavigator({
       options: {
         title: "Organization",
       },
+    }),
+    SettingsWorkflowJobs: createNativeStackScreen({
+      screen: WorkflowJobsScreen,
+      linking: "workflow-jobs",
+      options: { title: "Workflow jobs" },
     }),
     SettingsProjectOverview: createNativeStackScreen({
       screen: SettingsProjectOverviewRouteScreen,

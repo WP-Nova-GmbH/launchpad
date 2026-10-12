@@ -1,3 +1,4 @@
+import { WorkflowControlResult } from "@t3tools/contracts/workflows";
 import * as RepositoryPolicies from "../tenancy/RepositoryPolicies.ts";
 import {
   EnvironmentHttpBadRequestError,
@@ -170,6 +171,7 @@ const ENVIRONMENT_HEALTH_CLOCK_SKEW_MILLIS = 60 * 1_000;
 
 export interface EnvironmentDispatchJobResult {
   readonly accepted: boolean;
+  readonly workflowResult?: import("@t3tools/contracts/workflows").WorkflowControlResult;
 }
 
 export class EnvironmentConnector extends Context.Service<
@@ -203,6 +205,7 @@ export class EnvironmentConnector extends Context.Service<
       readonly repositoryCanonicalKey: string;
       readonly baseBranch: string;
       readonly instruction: string;
+      readonly workflowControl?: import("@t3tools/contracts/workflows").WorkflowControl;
     }) => Effect.Effect<EnvironmentDispatchJobResult, EnvironmentConnectorError>;
   }
 >()("launchpad-relay/environments/EnvironmentConnector") {}
@@ -355,10 +358,13 @@ function verifyEnvironmentResponse(input: {
   );
 }
 
+const equalWorkflowResult = Schema.toEquivalence(Schema.UndefinedOr(WorkflowControlResult));
+
 function verifyEnvironmentDispatchJobResponse(input: {
   readonly response: RelayEnvironmentDispatchJobResponse;
   readonly environmentId: string;
   readonly jobId: RelayJobId;
+  readonly requestId?: string;
   readonly environmentPublicKeys: ReadonlyArray<string>;
   readonly relayIssuer: string;
   readonly nowEpochSeconds: number;
@@ -376,12 +382,14 @@ function verifyEnvironmentDispatchJobResponse(input: {
       (proof) =>
         proof !== null &&
         proof.environmentId === input.environmentId &&
-        // The job id is what binds this answer to this dispatch; the payload
-        // carries no nonce because a job is dispatched once.
+        // Legacy acceptance binds to the job; workflow controls additionally
+        // bind each signed response to its request nonce.
         proof.jobId === input.jobId &&
         // Only the signed verdict counts, so an unsigned body cannot turn a
         // refusal into an acceptance.
-        proof.accepted === input.response.accepted,
+        proof.accepted === input.response.accepted &&
+        (input.requestId === undefined || proof.requestId === input.requestId) &&
+        equalWorkflowResult(proof.workflowResult, input.response.workflowResult),
     ),
   );
 }
@@ -932,11 +940,41 @@ const make = Effect.gen(function* () {
         "relay.operation": "dispatch-job",
         "relay.job_id": input.jobId,
       });
-      const { access: link, allocation } = yield* resolveAccessAndAllocation({
-        userId: input.userId,
-        environmentId: input.environmentId,
-        operation: "dispatch-job",
-      });
+      const { access: link, allocation } = yield* input.workflowControl === undefined
+        ? resolveAccessAndAllocation({
+            userId: input.userId,
+            environmentId: input.environmentId,
+            operation: "dispatch-job",
+          })
+        : Effect.gen(function* () {
+            const machine = yield* machines.getActiveByEnvironmentId({
+              environmentId: input.environmentId,
+            });
+            const identity = machine === null ? null : Machines.enrolledMachineIdentity(machine);
+            if (
+              machine === null ||
+              identity === null ||
+              machine.organizationId !== input.workflowControl!.organizationId
+            ) {
+              return yield* new EnvironmentConnectNotAuthorized({
+                environmentId: input.environmentId,
+                operation: "dispatch-job",
+                reason: "environment_link_not_found",
+              });
+            }
+            const access = {
+              environmentId: EnvironmentId.make(identity.environmentId),
+              environmentPublicKey: identity.environmentPublicKey,
+              endpoint: identity.endpoint,
+              allocationOwnerKey: Machines.machineEndpointOwnerKey(machine.organizationId),
+              source: "machine",
+            } satisfies EnvironmentAccess;
+            const allocation = yield* allocations.get({
+              userId: access.allocationOwnerKey,
+              environmentId: input.environmentId,
+            });
+            return { access, allocation };
+          });
       const endpoint = yield* resolveManagedEndpoint({
         operation: "dispatch-job",
         link,
@@ -965,6 +1003,7 @@ const make = Effect.gen(function* () {
         repositoryCanonicalKey: input.repositoryCanonicalKey,
         baseBranch: input.baseBranch,
         instruction: input.instruction,
+        ...(input.workflowControl === undefined ? {} : { workflowControl: input.workflowControl }),
       } satisfies RelayCloudDispatchJobProofPayload;
       const proof = yield* signRelayJwt({
         privateKey: Redacted.value(settings.cloudMintPrivateKey),
@@ -983,7 +1022,11 @@ const make = Effect.gen(function* () {
       const environmentClient = yield* makeEnvironmentClient(endpoint.httpBaseUrl);
       // Returns when the environment has *accepted* the job, never when the job
       // is done: a run takes minutes and this request has seconds.
-      const decoded = yield* environmentClient.connect.t3DispatchJob({ payload: { proof } }).pipe(
+      const decoded = yield* (
+        input.workflowControl === undefined
+          ? environmentClient.connect.t3DispatchJob({ payload: { proof } })
+          : environmentClient.connect.t3WorkflowJob({ payload: { proof } })
+      ).pipe(
         withoutRedirects,
         Effect.mapError(
           (cause) =>
@@ -1013,6 +1056,7 @@ const make = Effect.gen(function* () {
         environmentId: input.environmentId,
         jobId: input.jobId,
         environmentPublicKeys: [link.environmentPublicKey],
+        ...(input.workflowControl === undefined ? {} : { requestId: payload.jti }),
         relayIssuer,
         nowEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),
       });
@@ -1022,7 +1066,10 @@ const make = Effect.gen(function* () {
           operation: "dispatch-job",
         });
       }
-      return { accepted: decoded.accepted };
+      return {
+        accepted: decoded.accepted,
+        ...(decoded.workflowResult === undefined ? {} : { workflowResult: decoded.workflowResult }),
+      };
     }),
   });
 });

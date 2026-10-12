@@ -73,6 +73,9 @@ import * as IssueTrackerConnectionStore from "../src/issueTrackers/ConnectionSto
 import * as IssueTrackerWriteOperationStore from "../src/issueTrackers/WriteOperationStore.ts";
 import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
+import * as Workflows from "../src/jobs/Workflows.ts";
+import { workflowsApi } from "../src/http/WorkflowsApi.ts";
+import { deliverPendingWorkflowJobs } from "../src/jobs/WorkflowDispatcher.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
 import * as AgentActivityRows from "../src/agentActivity/AgentActivityRows.ts";
 import * as ApnsClient from "../src/agentActivity/ApnsClient.ts";
@@ -370,6 +373,7 @@ const runtimeLayer = Layer.empty
       Layer.mergeAll(
         AgentActivityRows.layer,
         Jobs.layer,
+        Workflows.layer,
         Organizations.layer,
         Invitations.layer,
         Repositories.layer,
@@ -420,6 +424,7 @@ const relayApiLayer = Layer.mergeAll(
   tokenApi,
   dpopClientApi,
   jobsApi,
+  workflowsApi,
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
@@ -483,6 +488,13 @@ const main = Effect.gen(function* () {
     Layer.mergeAll(
       HttpRouter.serve(routerLayer),
       managedEndpointSweepLayer,
+      Layer.effectDiscard(
+        deliverPendingWorkflowJobs().pipe(
+          Effect.ignoreCause({ log: true }),
+          Effect.repeat(Schedule.spaced("10 seconds")),
+          Effect.forkScoped,
+        ),
+      ),
       Layer.effectDiscard(
         RepositoryPolicies.deliverPending().pipe(
           Effect.catchCause((cause) =>

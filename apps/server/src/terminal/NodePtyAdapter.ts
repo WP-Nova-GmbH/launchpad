@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as NodeModule from "node:module";
 
 import * as Context from "effect/Context";
@@ -82,13 +83,68 @@ const ensureNodePtySpawnHelperExecutable = Effect.fn(function* () {
   yield* fs.chmod(helperPath, 0o755).pipe(Effect.orElseSucceed(() => undefined));
 });
 
+const encodeSetupLaunch = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      protocol: Schema.Literal(1),
+      token: Schema.String,
+      candidates: Schema.Array(
+        Schema.Struct({ shell: Schema.String, args: Schema.optional(Schema.Array(Schema.String)) }),
+      ),
+    }),
+  ),
+);
+
 class NodePtyProcess implements PtyAdapter.PtyProcess {
   private readonly process: import("node-pty").IPty;
   private readonly platform: NodeJS.Platform;
+  private readonly outputListeners = new Set<(data: string) => void>();
+  private readonly shellExitListeners = new Set<(event: PtyAdapter.PtyExitEvent) => void>();
+  private shellExit: PtyAdapter.PtyExitEvent | undefined;
+  private pendingFrame = "";
 
-  constructor(process: import("node-pty").IPty, platform: NodeJS.Platform) {
+  constructor(process: import("node-pty").IPty, platform: NodeJS.Platform, token?: string) {
     this.process = process;
     this.platform = platform;
+    if (token) {
+      const prefix = `\x1b]T3_SETUP_EXIT;${token};`;
+      process.onData((data) => {
+        this.pendingFrame += data;
+        while (this.pendingFrame.length > 0) {
+          const index = this.pendingFrame.indexOf(prefix);
+          if (index < 0) {
+            let keep = Math.min(prefix.length - 1, this.pendingFrame.length);
+            while (keep > 0 && !prefix.startsWith(this.pendingFrame.slice(-keep))) keep--;
+            const output = this.pendingFrame.slice(0, this.pendingFrame.length - keep);
+            this.pendingFrame = keep ? this.pendingFrame.slice(-keep) : "";
+            for (const listener of this.outputListeners) if (output) listener(output);
+            break;
+          }
+          const output = this.pendingFrame.slice(0, index);
+          for (const listener of this.outputListeners) if (output) listener(output);
+          this.pendingFrame = this.pendingFrame.slice(index);
+          const end = this.pendingFrame.indexOf("\x07", prefix.length);
+          if (end < 0 && this.pendingFrame.length <= prefix.length + 16) break;
+          const code = end < 0 ? "" : this.pendingFrame.slice(prefix.length, end);
+          if (/^-?\d{1,10}$/.test(code)) {
+            this.shellExit = { exitCode: Number(code), signal: null };
+            for (const listener of this.shellExitListeners) listener(this.shellExit);
+            this.pendingFrame = this.pendingFrame.slice(end + 1);
+          } else {
+            for (const listener of this.outputListeners) listener(this.pendingFrame[0]!);
+            this.pendingFrame = this.pendingFrame.slice(1);
+          }
+        }
+      });
+      process.onExit(() => {
+        for (const listener of this.outputListeners)
+          if (this.pendingFrame) listener(this.pendingFrame);
+        this.pendingFrame = "";
+      });
+    } else
+      process.onData((data) => {
+        for (const listener of this.outputListeners) listener(data);
+      });
   }
 
   get pid(): number {
@@ -109,9 +165,17 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
   }
 
   onData(callback: (data: string) => void): () => void {
-    const disposable = this.process.onData(callback);
+    this.outputListeners.add(callback);
     return () => {
-      disposable.dispose();
+      this.outputListeners.delete(callback);
+    };
+  }
+
+  onShellExit(callback: (event: PtyAdapter.PtyExitEvent) => void): () => void {
+    this.shellExitListeners.add(callback);
+    if (this.shellExit) callback(this.shellExit);
+    return () => {
+      this.shellExitListeners.delete(callback);
     };
   }
 
@@ -165,15 +229,32 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
         platform === "win32" && input.env["TERM"] === undefined
           ? { ...input.env, TERM: "xterm-256color" }
           : input.env;
+      const token = input.ownerExecutable ? NodeCrypto.randomUUID().replaceAll("-", "") : undefined;
       const ptyProcess = yield* Effect.try({
         try: () =>
-          nodePty.spawn(input.shell, input.args ?? [], {
-            cwd: input.cwd,
-            cols: input.cols,
-            rows: input.rows,
-            env,
-            name: "xterm-256color",
-          }),
+          nodePty.spawn(
+            input.ownerExecutable ?? input.shell,
+            input.ownerExecutable
+              ? [
+                  "--setup-owner-v4",
+                  "--launch-v1",
+                  encodeSetupLaunch({
+                    protocol: 1,
+                    token: token!,
+                    candidates: input.ownerShellCandidates ?? [
+                      { shell: input.shell, args: input.args ?? [] },
+                    ],
+                  }),
+                ]
+              : (input.args ?? []),
+            {
+              cwd: input.cwd,
+              cols: input.cols,
+              rows: input.rows,
+              env,
+              name: "xterm-256color",
+            },
+          ),
         catch: (cause) =>
           new PtyAdapter.PtySpawnError({
             adapter: "node-pty",
@@ -181,7 +262,7 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
             cause,
           }),
       });
-      return new NodePtyProcess(ptyProcess, platform);
+      return new NodePtyProcess(ptyProcess, platform, token);
     }),
   });
 });

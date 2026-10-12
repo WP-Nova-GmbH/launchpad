@@ -1,4 +1,16 @@
+import { OrchestrationCommandInvariantError } from "./orchestration/Errors.ts";
+import {
+  SetupProcessJournal,
+  SetupProcessError,
+  type SetupProcessJournalShape,
+} from "./terminal/SetupProcessJournal.ts";
 import * as GitHubCliAvailability from "./sourceControl/GitHubCliAvailability.ts";
+import {
+  WorkflowRunStore,
+  layer as WorkflowRunStoreLayer,
+  type WorkflowRun,
+  type WorkflowRunStoreShape,
+} from "./jobs/WorkflowRunStore.ts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -6,6 +18,7 @@ import * as NodeCrypto from "node:crypto";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
+  ClientOrchestrationCommand,
   type DeviceServiceState,
   AuthAccessTokenType,
   AuthStandardClientScopes,
@@ -322,6 +335,10 @@ const makeLiveToolActivityEvent = (
     payload: { threadId: defaultThreadId, activity },
   };
 };
+const encodeClientCommandJson = Schema.encodeEffect(
+  Schema.fromJsonString(ClientOrchestrationCommand),
+);
+
 const testEnvironmentDescriptor = {
   environmentId: EnvironmentId.make("environment-test"),
   label: "Test environment",
@@ -529,6 +546,7 @@ const buildAppUnderTest = (options?: {
   onPairingChangesSubscribed?: Effect.Effect<void>;
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
   layers?: {
+    workflowRunStore?: Partial<WorkflowRunStoreShape>;
     repositoryAccess?: Partial<RepositoryAccessShape>;
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     environmentTheme?: Partial<EnvironmentTheme.EnvironmentThemeService["Service"]>;
@@ -556,6 +574,7 @@ const buildAppUnderTest = (options?: {
     providerSessionDirectory?: Partial<
       ProviderSessionDirectory.ProviderSessionDirectory["Service"]
     >;
+    setupProcessJournal?: Partial<SetupProcessJournalShape>;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
     threadDeletionReactor?: Partial<ThreadDeletionReactor["Service"]>;
@@ -585,6 +604,7 @@ const buildAppUnderTest = (options?: {
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const repositoryAccess = yield* RepositoryAccess;
+    const workflowRunStore = yield* WorkflowRunStore;
     const tempBaseDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-router-test-" });
     const baseDir = options?.config?.baseDir ?? tempBaseDir;
     const devUrl = options?.config?.devUrl;
@@ -1030,6 +1050,10 @@ const buildAppUnderTest = (options?: {
               drainThrough: () => Effect.void,
               ...options?.layers?.threadDeletionReactor,
             }),
+            Layer.succeed(SetupProcessJournal, {
+              ...SetupProcessJournal.defaultValue(),
+              ...options?.layers?.setupProcessJournal,
+            }),
             Layer.mock(ThreadPreparationReactor)({
               start: () => Effect.void,
               drain: Effect.void,
@@ -1265,6 +1289,12 @@ const buildAppUnderTest = (options?: {
         }),
       )
       .pipe(
+        Layer.provide(
+          Layer.succeed(WorkflowRunStore, {
+            ...workflowRunStore,
+            ...options?.layers?.workflowRunStore,
+          }),
+        ),
         Layer.provideMerge(makeAuthTestLayer()),
         Layer.provide(
           Layer.succeed(RepositoryAccess, {
@@ -13250,6 +13280,261 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("routes workflow-compatible terminal null and omitted paths through RPC", () =>
+    Effect.gen(function* () {
+      const received: unknown[] = [];
+      const snapshot = {
+        threadId: "thread-1",
+        terminalId: "default",
+        cwd: "/tmp/project",
+        worktreePath: null,
+        status: "running" as const,
+        pid: 1234,
+        history: "",
+        exitCode: null,
+        exitSignal: null,
+        label: "Primary",
+        updatedAt: DateTime.formatIso(TEST_EPOCH),
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          terminalManager: {
+            open: (input) =>
+              Effect.sync(() => {
+                received.push(input);
+                return snapshot;
+              }),
+            restart: (input) =>
+              Effect.sync(() => {
+                received.push(input);
+                return snapshot;
+              }),
+            attachStream: (input, publish) =>
+              Effect.gen(function* () {
+                received.push(input);
+                yield* publish({ type: "snapshot", snapshot });
+                return () => Effect.void;
+              }),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      for (const worktreePath of [undefined, null, "/tmp/unowned-worktree"]) {
+        const input = {
+          threadId: "thread-1",
+          terminalId: "default",
+          cwd: "/tmp/project",
+          ...(worktreePath === undefined ? {} : { worktreePath }),
+        };
+        yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            Effect.gen(function* () {
+              assert.equal((yield* client[WS_METHODS.terminalOpen](input)).terminalId, "default");
+              assert.equal(
+                (yield* client[WS_METHODS.terminalRestart]({ ...input, cols: 120, rows: 40 }))
+                  .terminalId,
+                "default",
+              );
+              const events = yield* client[WS_METHODS.terminalAttach](input).pipe(
+                Stream.take(1),
+                Stream.runCollect,
+              );
+              assert.equal(events[0]?.type, "snapshot");
+            }),
+          ),
+        );
+      }
+      assert.equal(received.length, 9);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "workflow RPC ownership protects the worktree removal target and permits terminal cleanup",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const base = yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-ownership-" });
+        const cwd = path.join(base, "repo");
+        const owned = path.join(base, "job");
+        const alias = path.join(base, "alias");
+        yield* fs.makeDirectory(cwd);
+        yield* fs.makeDirectory(owned);
+        yield* fs.symlink(owned, alias);
+        const now = DateTime.formatIso(TEST_EPOCH);
+        const run: WorkflowRun = {
+          jobId: "ownership-job",
+          userId: "user",
+          repositoryCanonicalKey: "github.com/acme/repo",
+          instruction: "Fix issue",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "test" },
+          baseBranch: "main",
+          baseSha: "sha",
+          createdAt: now,
+          promptDispatched: true,
+          executionReserved: false,
+          worktreePath: owned,
+          preparedHead: "sha",
+          approvedBy: null,
+          progress: {
+            revision: 1,
+            status: "awaiting_review",
+            threadId: ThreadId.make("workflow:ownership-job:agent"),
+            detail: null,
+            checkpoint: null,
+          },
+          workflow: {
+            workflowId: "workflow",
+            organizationId: "org",
+            repositoryId: "repo",
+            revision: 1,
+            archived: false,
+            createdAt: now,
+            updatedAt: now,
+            definition: {
+              name: "Implement",
+              environmentId: EnvironmentId.make("env"),
+              projectId: ProjectId.make("project"),
+              steps: [
+                {
+                  id: "agent",
+                  kind: "agent",
+                  title: "Agent",
+                  instruction: "Implement",
+                  modelSelection: null,
+                },
+                { id: "review", kind: "review", title: "Review", role: "maintainer" },
+              ],
+            },
+          },
+        };
+        const store = yield* WorkflowRunStore;
+        yield* store.save(run);
+        const removed: string[] = [];
+        yield* buildAppUnderTest({
+          layers: {
+            gitVcsDriver: {
+              removeWorktree: (input) =>
+                Effect.sync(() => {
+                  removed.push(input.path);
+                }),
+            },
+            vcsStatusBroadcaster: {
+              refreshStatus: () =>
+                Effect.succeed({
+                  isRepo: true,
+                  hasPrimaryRemote: true,
+                  isDefaultRef: true,
+                  refName: "main",
+                  hasWorkingTreeChanges: false,
+                  workingTree: { files: [], insertions: 0, deletions: 0 },
+                  hasUpstream: true,
+                  aheadCount: 0,
+                  behindCount: 0,
+                  pr: null,
+                }),
+            },
+            terminalManager: {
+              attachStream: (_input, publish) =>
+                Effect.gen(function* () {
+                  yield* publish({
+                    type: "snapshot",
+                    snapshot: {
+                      threadId: run.progress.threadId,
+                      terminalId: "default",
+                      cwd: owned,
+                      worktreePath: owned,
+                      status: "exited",
+                      pid: null,
+                      history: "saved output",
+                      exitCode: 0,
+                      exitSignal: null,
+                      label: "Primary",
+                      updatedAt: now,
+                    },
+                  });
+                  return () => Effect.void;
+                }),
+            },
+          },
+        });
+        const wsUrl = yield* getWsServerUrl("/ws");
+        for (const target of [owned, "../job", alias, path.join(owned, "..", "job")]) {
+          const denied = yield* Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[WS_METHODS.vcsRemoveWorktree]({ cwd, path: target, force: true }).pipe(
+                Effect.result,
+              ),
+            ),
+          );
+          assert.equal(denied._tag, "Failure");
+          if (denied._tag === "Failure")
+            assert.equal(denied.failure._tag, "EnvironmentAuthorizationError");
+        }
+        assert.deepEqual(removed, []);
+        for (const method of [WS_METHODS.terminalOpen, WS_METHODS.terminalRestart]) {
+          const denied = yield* Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[method]({
+                threadId: "another-thread",
+                terminalId: "default",
+                cwd,
+                worktreePath: alias,
+                cols: 120,
+                rows: 40,
+              }).pipe(Effect.result),
+            ),
+          );
+          assert.equal(denied._tag, "Failure");
+          if (denied._tag === "Failure")
+            assert.equal(denied.failure._tag, "EnvironmentAuthorizationError");
+        }
+        const writableAttach = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.terminalAttach]({
+              threadId: run.progress.threadId,
+              terminalId: "default",
+              cwd: owned,
+            }).pipe(Stream.take(1), Stream.runCollect, Effect.result),
+          ),
+        );
+        assert.equal(writableAttach._tag, "Failure");
+        if (writableAttach._tag === "Failure")
+          assert.equal(writableAttach.failure._tag, "EnvironmentAuthorizationError");
+        const events = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.terminalAttach]({
+              threadId: run.progress.threadId,
+              terminalId: "default",
+            }).pipe(Stream.take(1), Stream.runCollect),
+          ),
+        );
+        assert.equal(events[0]?.type, "snapshot");
+        const unowned = path.join(base, "unowned");
+        yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.vcsRemoveWorktree]({ cwd, path: unowned }),
+          ),
+        );
+        for (const status of ["done", "cancelled"] as const) {
+          yield* store.save({ ...run, progress: { ...run.progress, status } });
+          yield* Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[WS_METHODS.vcsRemoveWorktree]({ cwd, path: "../job", force: true }),
+            ),
+          );
+        }
+        assert.deepEqual(removed, [unowned, owned, owned]);
+      }).pipe(
+        Effect.provide(
+          WorkflowRunStoreLayer.pipe(
+            Layer.provide(SqlitePersistenceMemory),
+            Layer.provideMerge(NodeHttpServer.layerTest),
+          ),
+        ),
+      ),
+  );
+
   it.effect("routes websocket rpc terminal.write errors", () =>
     Effect.gen(function* () {
       const terminalError = new TerminalNotRunningError({
@@ -13641,3 +13926,96 @@ it.effect(
       assert.equal(response.status, 404);
     }).pipe(Effect.provide(Layer.merge(NodeHttpServer.layerTest, NodeServices.layer))),
 );
+
+for (const transport of ["http", "websocket"] as const) {
+  for (const failure of [false, true]) {
+    it.effect(`Archive setup cleanup precedes hiding over ${transport}; failure=${failure}`, () =>
+      Effect.gen(function* () {
+        const effects: string[] = [];
+        const owner = {
+          threadId: defaultThreadId,
+          attemptId: "ready-setup",
+          terminalId: "setup-ready",
+          createdAt: "now",
+          pid: 123,
+          identity: "birth",
+          completed: true,
+          exited: false,
+          legacy: false,
+          ownershipVersion: 4 as const,
+        };
+        yield* buildAppUnderTest({
+          layers: {
+            setupProcessJournal: {
+              owners: () => Effect.succeed([owner]),
+              confirmed: () => Effect.succeed(!failure),
+              cleanup: () =>
+                Effect.suspend(() => {
+                  effects.push("cleanup");
+                  return failure
+                    ? Effect.fail(new SetupProcessError({ message: "Setup stop denied" }))
+                    : Effect.succeed({ ...owner, source: "native" as const });
+                }),
+            },
+            terminalManager: {
+              closeOwned: () =>
+                Effect.sync(() => {
+                  effects.push("finalize");
+                  return true;
+                }),
+              close: () => Effect.void,
+            },
+            orchestrationEngine: {
+              dispatch: (command, options) =>
+                Effect.suspend(() => {
+                  if (options?.rejection)
+                    return Effect.fail(
+                      new OrchestrationCommandInvariantError({
+                        commandType: command.type,
+                        detail: options.rejection.detail,
+                      }),
+                    );
+                  effects.push(command.type);
+                  return Effect.succeed({ sequence: effects.length });
+                }),
+            },
+          },
+        });
+        const command = {
+          type: "thread.archive" as const,
+          threadId: defaultThreadId,
+          commandId: CommandId.make(`archive-proof-${transport}-${failure}`),
+        };
+        if (transport === "http") {
+          const response = yield* fetchEffect(
+            yield* getHttpServerUrl("/api/orchestration/dispatch"),
+            {
+              method: "POST",
+              headers: {
+                cookie: yield* getAuthenticatedSessionCookieHeader(),
+                "content-type": "application/json",
+              },
+              body: yield* encodeClientCommandJson(command),
+            },
+          );
+          assert.equal(response.status, failure ? 500 : 200);
+        } else {
+          const result = yield* Effect.scoped(
+            withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+              client[ORCHESTRATION_WS_METHODS.dispatchCommand](command),
+            ).pipe(Effect.result),
+          );
+          assert.equal(result._tag, failure ? "Failure" : "Success");
+        }
+        if (failure) assert.deepEqual(effects, ["thread.queue.pause", "cleanup"]);
+        else
+          assert.deepEqual(effects, [
+            "thread.queue.pause",
+            "cleanup",
+            "finalize",
+            "thread.archive",
+          ]);
+      }).pipe(Effect.provide(Layer.merge(NodeHttpServer.layerTest, NodeServices.layer))),
+    );
+  }
+}

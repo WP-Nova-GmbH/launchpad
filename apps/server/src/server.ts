@@ -1,4 +1,8 @@
 import * as ThreadPreparationReactor from "./orchestration/ThreadPreparationReactor.ts";
+import * as RepositoryWorkflowRunner from "./jobs/RepositoryWorkflowRunner.ts";
+import * as WorkflowRunStore from "./jobs/WorkflowRunStore.ts";
+import * as SetupProcessJournal from "./terminal/SetupProcessJournal.ts";
+import * as SetupProcessAdapter from "./terminal/SetupProcessAdapter.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
 
@@ -518,8 +522,13 @@ const AntigravityInstallationRefreshLive = Layer.effectDiscard(
 // dispatch-job endpoint resolves it once and forks runs against it, so it is
 // merged in here where the orchestration engine, projections, git, and text
 // generation it needs are all in scope.
-const RuntimeCoreDependenciesLive = Layer.mergeAll(ReactorLayerLive, JobRunnerLive)
+const RuntimeCoreDependenciesLive = Layer.mergeAll(
+  ReactorLayerLive,
+  JobRunnerLive,
+  RepositoryWorkflowRunner.layer,
+)
   .pipe(
+    Layer.provideMerge(WorkflowRunStore.layer),
     Layer.provideMerge(AntigravityInstallationRefreshLive),
     Layer.provideMerge(ProviderAuthServiceLive),
     // Core Services
@@ -539,6 +548,16 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(ReactorLayerLive, JobRunnerLi
     Layer.provideMerge(RepositoryAccess.layer),
     Layer.provideMerge(ProviderRuntimeLayerLive),
     Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive, DeviceLayerLive)),
+    Layer.provideMerge(
+      SetupProcessJournal.layer.pipe(
+        Layer.provide(
+          SetupProcessAdapter.layer.pipe(
+            Layer.provide(ResourceMonitorBinary.layer),
+            Layer.provide(ProcessRunner.layer),
+          ),
+        ),
+      ),
+    ),
     Layer.provideMerge(PersistenceLayerLive),
     // Both read a user-owned file out of the state directory and stream changes
     // to clients; neither depends on the other.

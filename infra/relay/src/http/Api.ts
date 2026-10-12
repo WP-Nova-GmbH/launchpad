@@ -75,6 +75,8 @@ import * as EnvironmentLinks from "../environments/EnvironmentLinks.ts";
 import * as GithubInstallations from "../tenancy/GithubInstallations.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
 import * as Jobs from "../jobs/Jobs.ts";
+import * as Workflows from "../jobs/Workflows.ts";
+import * as WorkflowProjectCatalog from "../projects/OrganizationProjectCatalog.ts";
 import * as LiveActivities from "../agentActivity/LiveActivities.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
 import * as Repositories from "../tenancy/Repositories.ts";
@@ -1596,6 +1598,8 @@ const RelayCommonPersistenceError = Schema.Union([
   EnvironmentCredentials.EnvironmentCredentialAuthenticatePersistenceError,
   EnvironmentCredentials.EnvironmentCredentialRevokePersistenceError,
   Jobs.JobPersistenceError,
+  Workflows.WorkflowPersistenceError,
+  WorkflowProjectCatalog.OrganizationProjectCatalogPersistenceError,
   DpopProofs.DpopProofReplayPersistenceError,
   LiveActivities.LiveActivityTargetListPersistenceError,
   AgentActivityRows.AgentActivityRowUpsertPersistenceError,

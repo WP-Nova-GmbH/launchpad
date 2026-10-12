@@ -61,6 +61,9 @@ import * as RelayTokens from "./auth/RelayTokens.ts";
 import * as EnvironmentCredentials from "./environments/EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "./environments/EnvironmentLinks.ts";
 import * as Jobs from "./jobs/Jobs.ts";
+import * as Workflows from "./jobs/Workflows.ts";
+import { workflowsApi } from "./http/WorkflowsApi.ts";
+import { deliverPendingWorkflowJobs } from "./jobs/WorkflowDispatcher.ts";
 import * as ManagedEndpointAllocations from "./environments/ManagedEndpointAllocations.ts";
 import * as LiveActivities from "./agentActivity/LiveActivities.ts";
 import * as RelayDb from "./db.ts";
@@ -145,6 +148,7 @@ const relayApiLayer = Layer.mergeAll(
   tokenApi,
   dpopClientApi,
   jobsApi,
+  workflowsApi,
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
@@ -365,6 +369,7 @@ export const ApiLive = Api.make(
           Layer.mergeAll(
             AgentActivityRows.layer,
             Jobs.layer,
+            Workflows.layer,
             Organizations.layer,
             Invitations.layer,
             Repositories.layer,
@@ -453,6 +458,12 @@ export const ApiLive = Api.make(
         ),
     );
 
+    yield* Cloudflare.Workers.cron("* * * * *", () =>
+      deliverPendingWorkflowJobs().pipe(
+        Effect.ignoreCause({ log: true }),
+        Effect.provide(runtimeLayer),
+      ),
+    );
     yield* Cloudflare.Workers.cron("*/5 * * * *", () =>
       Effect.all(
         [

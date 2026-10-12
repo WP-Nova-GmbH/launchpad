@@ -1,4 +1,5 @@
 import * as Layer from "effect/Layer";
+import { ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Socket from "effect/unstable/socket/Socket";
 
@@ -20,6 +21,7 @@ function configuredRelayUrl(): string {
 const httpClientLayer = remoteHttpClientLayer(fetch);
 
 type RuntimeLayerSource =
+  | ReturnType<typeof ManagedRelayTenancy.layer>
   | ReturnType<typeof managedRelayClientLayer>
   | typeof Socket.layerWebSocketConstructorGlobal
   | typeof cryptoLayer
@@ -31,6 +33,7 @@ const runtimeLayer = Layer.merge(
   managedRelayClientLayer(configuredRelayUrl()),
   Socket.layerWebSocketConstructorGlobal,
 ).pipe(
+  Layer.provideMerge(ManagedRelayTenancy.layer({ relayUrl: configuredRelayUrl() })),
   Layer.provideMerge(cryptoLayer),
   Layer.provideMerge(httpClientLayer),
   Layer.provideMerge(tracingLayer.pipe(Layer.provide(httpClientLayer))),

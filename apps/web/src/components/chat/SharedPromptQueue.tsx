@@ -23,6 +23,7 @@ export function SharedPromptQueue({
   queue,
   activeTurnId,
   unavailable = false,
+  workflowControlled = false,
   supportsPreparation = false,
   canWorkLocally = false,
 }: {
@@ -30,6 +31,7 @@ export function SharedPromptQueue({
   queue: ThreadPromptQueue;
   activeTurnId: TurnId | null;
   unavailable?: boolean;
+  workflowControlled?: boolean;
   supportsPreparation?: boolean;
   canWorkLocally?: boolean;
 }) {
@@ -54,10 +56,11 @@ export function SharedPromptQueue({
   }, [editingMessageId]);
   const current = queue.entries.find((entry) => entry.messageId === edit?.messageId);
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
-  const disabled = busy || unavailable;
+  const disabled = busy || unavailable || workflowControlled;
   const preparation = queue.preparation;
   const preparing = preparation !== undefined && preparation.state !== "ready";
   const setupRunning = preparation?.state === "pending" || preparation?.state === "running";
+  const setupActive = setupRunning || preparation?.settled === false;
   const run = async (
     action: () => Promise<AtomCommandResult<unknown, unknown>>,
     onSuccess?: () => void,
@@ -81,7 +84,13 @@ export function SharedPromptQueue({
   };
   const input = { threadId: threadRef.threadId };
   const request = <T,>(value: T) => ({ environmentId: threadRef.environmentId, input: value });
-  if (queue.entries.length === 0 && queue.pauseReason === null && edit === null && !preparing)
+  if (
+    queue.entries.length === 0 &&
+    queue.pauseReason === null &&
+    edit === null &&
+    !preparing &&
+    !setupActive
+  )
     return null;
   return (
     <section
@@ -99,7 +108,7 @@ export function SharedPromptQueue({
             {queue.entries.length}
           </span>
         </span>
-        {setupRunning || (preparing && preparation.settled === false) ? (
+        {setupActive ? (
           <Button
             size="xs"
             variant="secondary"
@@ -148,6 +157,16 @@ export function SharedPromptQueue({
           </Tooltip>
         ) : null}
       </div>
+      {workflowControlled ? (
+        <p role="status" className="mt-1 text-xs text-muted-foreground">
+          Use this workflow job’s review or Cancel controls in Organization settings.
+        </p>
+      ) : null}
+      {setupActive && !preparing ? (
+        <p role="status" className="mt-1 text-xs text-muted-foreground">
+          Setup is running in the background.
+        </p>
+      ) : null}
       {preparing ? (
         <div className="mt-2 space-y-2 wrap-anywhere">
           <p role="status" className="text-xs text-muted-foreground">

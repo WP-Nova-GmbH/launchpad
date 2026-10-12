@@ -321,6 +321,7 @@ const make = Effect.gen(function* () {
     readonly turnId: TurnId | null;
     readonly createdAt: string;
     readonly requestId?: string;
+    readonly stopCommandId?: string | undefined;
   }) =>
     Effect.all({
       commandId: serverCommandId("provider-failure-activity"),
@@ -339,6 +340,7 @@ const make = Effect.gen(function* () {
             payload: {
               detail: input.detail,
               ...(input.requestId ? { requestId: input.requestId } : {}),
+              ...(input.stopCommandId ? { stopCommandId: input.stopCommandId } : {}),
             },
             turnId: input.turnId,
             createdAt: input.createdAt,
@@ -2391,6 +2393,7 @@ const make = Effect.gen(function* () {
                 kind: "provider.session.stop.failed",
                 summary: "Provider session stop failed",
                 detail,
+                stopCommandId: event.commandId ?? undefined,
                 turnId: null,
                 createdAt: now,
               }),

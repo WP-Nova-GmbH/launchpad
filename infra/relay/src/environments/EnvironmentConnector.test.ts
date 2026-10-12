@@ -1,3 +1,4 @@
+import { ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   RepositoryPolicyControl,
   RepositoryPolicySyncError,
@@ -1353,6 +1354,92 @@ describe("EnvironmentConnector.resolveAccess", () => {
     deprovisionedAt: null,
     createdAt: "2026-08-19T00:00:00.000Z",
   };
+
+  it.effect(
+    "uses the workflow endpoint and rejects a replayed nonce or unsigned progress change",
+    () =>
+      Effect.gen(function* () {
+        for (const variant of ["valid", "wrong_nonce", "changed_body"] as const) {
+          const seenUrls: string[] = [];
+          const execute = (request: HttpClientRequest.HttpClientRequest) =>
+            Effect.sync(() => {
+              seenUrls.push(request.url);
+              const envelope = decodeDispatchJobRequestBody(requestBodyText(request));
+              const requestProof = decodeRequestProof<RelayCloudDispatchJobProofPayload>(
+                envelope.proof,
+              );
+              const progress = {
+                protocol: 3 as const,
+                outcome: "accepted" as const,
+                detail: null,
+                progress: {
+                  revision: 4,
+                  status: "awaiting_review" as const,
+                  threadId: ThreadId.make("workflow-thread"),
+                  detail: null,
+                  checkpoint: null,
+                  approvalPending: true,
+                  retryableApproval: false,
+                },
+              };
+              return HttpClientResponse.fromWeb(
+                request,
+                Response.json(
+                  signDispatchJobResponse(
+                    envelope,
+                    {
+                      accepted: false,
+                      workflowResult: progress,
+                      requestId: variant === "wrong_nonce" ? "old-request" : requestProof.jti,
+                    },
+                    {
+                      workflowResult:
+                        variant === "changed_body" ? { ...progress, outcome: "busy" } : progress,
+                    },
+                  ),
+                ),
+              );
+            });
+          const call = EnvironmentConnector.EnvironmentConnector.pipe(
+            Effect.flatMap((connector) =>
+              connector.dispatchJob({
+                userId: "removed-submitter",
+                environmentId: "env-connector-test",
+                jobId: RelayJobId.make("workflow-job"),
+                repositoryCanonicalKey: "github.com/acme/app",
+                baseBranch: "HEAD",
+                instruction: "Inspect",
+                workflowControl: {
+                  operation: "status",
+                  organizationId: "organization-1",
+                  repositoryId: "repo-1",
+                  projectId: ProjectId.make("project-1"),
+                },
+              }),
+            ),
+            Effect.provide(
+              connectorTestLayer(execute, {
+                machine: {
+                  ...enrolledMachine,
+                  endpointHttpBaseUrl: "https://env.example.test/",
+                  endpointWsBaseUrl: "wss://env.example.test/ws",
+                },
+                links: noLinks(),
+                allocations: makeAllocations(),
+              }),
+            ),
+          );
+          if (variant === "valid")
+            expect((yield* call).workflowResult).toMatchObject({
+              protocol: 3,
+              outcome: "accepted",
+              progress: { approvalPending: true, retryableApproval: false },
+            });
+          else expect((yield* Effect.flip(call))._tag).toBe("EnvironmentMintResponseInvalid");
+          expect(seenUrls).toEqual(["https://env.example.test/api/t3-connect/workflow-job"]);
+        }
+      }),
+  );
 
   it.effect("resolves an enrolled machine for a member of its organization", () =>
     Effect.gen(function* () {

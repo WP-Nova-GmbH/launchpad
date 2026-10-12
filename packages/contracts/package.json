@@ -7,6 +7,10 @@
   ],
   "type": "module",
   "exports": {
+    "./workflows": {
+      "types": "./src/workflows.ts",
+      "import": "./src/workflows.ts"
+    },
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"

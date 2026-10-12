@@ -650,6 +650,11 @@ class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")
       success: RelayEnvironmentDispatchJobResponse,
       error: EnvironmentHttpCloudErrors,
     }),
+    HttpApiEndpoint.post("t3WorkflowJob", "/api/t3-connect/workflow-job", {
+      payload: RelayCloudDispatchJobRequest,
+      success: RelayEnvironmentDispatchJobResponse,
+      error: EnvironmentHttpCloudErrors,
+    }),
   ) {}
 
 export class EnvironmentHttpApi extends HttpApi.make("environment")

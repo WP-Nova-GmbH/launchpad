@@ -1,3 +1,4 @@
+import { TerminalManager } from "../src/terminal/Manager.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
@@ -70,6 +71,7 @@ const makePersistedRuntimeLayer = (dbPath: string) => {
 };
 
 const startupDependencies = Layer.mergeAll(
+  Layer.mock(TerminalManager, { closeOwned: () => Effect.succeed(false) }),
   Layer.mock(Keybindings.Keybindings)({
     start: Effect.void,
   }),

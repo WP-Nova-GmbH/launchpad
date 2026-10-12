@@ -127,6 +127,36 @@ checkout — a repository the organization has not registered is simply not gove
 What the organization does govern is work it runs for you: starting a job against a repository that
 _is_ registered requires a role on that repository.
 
+## Repository workflows
+
+Maintainers and admins can create workflows under **Settings → Organization → Repositories →
+Workflows and jobs**. Choose an enrolled organization machine and a project for that repository,
+then configure the agent's instructions and the human Review step. The highlighted human zone
+shows where work waits for a maintainer.
+
+Anyone with repository access can run a workflow with a description of the task and inspect the
+shared job. Jobs wait while the selected machine is offline or busy. Each accepted job prepares its
+own worktree, runs the project's setup, and saves a result for review. Inspect the result and diff
+before approving. A background setup preview can remain running during Review. Approval stops
+setup and verifies that the saved result has not changed before finishing. If cleanup or finishing
+approval fails, use **Retry approval**. Confirmed cleanup is reused; setup does not run again.
+Changes stay local after approval.
+
+Maintainers can cancel jobs or explicitly retry failed preparation. Cancellation stays pending
+until the machine confirms that work stopped; prepared files and history are retained. Review
+protects the saved result from ordinary chat and git changes until approval or cancellation.
+If stopping fails or is interrupted by a restart, use **Retry cancellation** to finish stopping
+the job. Uncertain prompt delivery pauses the job; cancel it before starting again. Cancellation
+also dismisses that uncertain delivery. If setup ownership has been lost, the job keeps its workspace.
+When the recovery message asks for a host restart, restart the executor machine and retry cleanup;
+restarting Launchpad alone is insufficient. Automatic host-restart recovery is unavailable on Windows.
+
+Automatic cleanup covers ordinary setup programs and background previews. Projects must arrange
+cleanup for Docker containers, system services, and other independently managed services.
+
+On mobile, open **Settings → Workflow jobs** to inspect, approve, or cancel a job. Workflow creation
+and manual Run are available on web and desktop.
+
 ## Machines
 
 Machines are computers the organization buys through Launchpad Connect. An **agent executor** runs work
