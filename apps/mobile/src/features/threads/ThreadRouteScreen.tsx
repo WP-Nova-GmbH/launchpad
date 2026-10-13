@@ -1,3 +1,4 @@
+import { WorkflowResultReturn, type WorkflowResultOrigin } from "../settings/WorkflowResultReturn";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { enqueueThreadOutboxMessage } from "../../state/thread-outbox";
 import {
@@ -216,6 +217,7 @@ function OpeningThreadLoadingScreen() {
 }
 
 type ThreadRouteScreenRouteProps = StaticScreenProps<{
+  readonly workflowOrigin?: WorkflowResultOrigin;
   readonly environmentId: string;
   readonly threadId: string;
 }>;
@@ -251,7 +253,7 @@ function ThreadUnavailableScreen(props: {
   );
 }
 
-export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
   const { state: workspaceState } = useWorkspaceState();
   const { connectionState } = useRemoteConnectionStatus();
   const { selectedThread } = useThreadSelection();
@@ -1101,5 +1103,14 @@ function ThreadRouteContent(
 
       {renderThreadRouteBody()}
     </>
+  );
+}
+
+export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+  return (
+    <View className="flex-1">
+      <WorkflowResultReturn origin={props.route.params.workflowOrigin} />
+      <ThreadRouteScreenContent {...props} />
+    </View>
   );
 }

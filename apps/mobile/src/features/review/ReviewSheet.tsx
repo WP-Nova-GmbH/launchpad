@@ -1,3 +1,4 @@
+import { WorkflowResultReturn, type WorkflowResultOrigin } from "../settings/WorkflowResultReturn";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { nativeHeaderScrollEdgeEffects } from "../../native/StackHeader";
@@ -442,11 +443,12 @@ function ReviewFileNavigator({
 }
 
 type ReviewSheetProps = StaticScreenProps<{
+  readonly workflowOrigin?: WorkflowResultOrigin;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
 }>;
 
-export function ReviewSheet(props: ReviewSheetProps) {
+function ReviewSheetContent(props: ReviewSheetProps) {
   const { nativeReviewDiffStyle } = useAppearanceCodeSurface();
   useAdaptiveWorkspacePaneRole("inspector");
   const { panes, showAuxiliaryPane } = useAdaptiveWorkspaceLayout();
@@ -916,5 +918,14 @@ export function ReviewSheet(props: ReviewSheetProps) {
         </View>
       </MaterialScreenContent>
     </>
+  );
+}
+
+export function ReviewSheet(props: ReviewSheetProps) {
+  return (
+    <View className="flex-1">
+      <WorkflowResultReturn origin={props.route.params.workflowOrigin} />
+      <ReviewSheetContent {...props} />
+    </View>
   );
 }

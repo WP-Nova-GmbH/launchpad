@@ -322,6 +322,10 @@
     "./device/duo-control": {
       "types": "./src/device/duoControl.ts",
       "default": "./src/device/duoControl.ts"
+    },
+    "./relay/workflow-session": {
+      "types": "./src/relay/workflowSession.ts",
+      "default": "./src/relay/workflowSession.ts"
     }
   },
   "scripts": {

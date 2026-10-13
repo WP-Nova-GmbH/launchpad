@@ -1,5 +1,7 @@
 "use client";
 
+import { hasCloudPublicConfig } from "../cloud/publicConfig";
+
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 
@@ -2265,6 +2267,18 @@ function OpenCommandPaletteDialog(props: {
       },
     });
   }
+
+  if (hasCloudPublicConfig())
+    actionItems.push({
+      kind: "action",
+      value: "action:workflows",
+      title: "Open workflows",
+      searchTerms: ["workflow", "automation", "jobs", "human review"],
+      icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        await navigate({ to: "/workflows" });
+      },
+    });
 
   actionItems.push({
     kind: "action",

@@ -7,6 +7,7 @@ import ChatView from "./ChatView";
 import { resolveDraftPromotionNavigationTarget, threadHasStarted } from "./ChatView.logic";
 import { waitForDraftHeroTransition } from "./chat/draftHeroTransition";
 import { SidebarInset } from "./ui/sidebar";
+import { WorkflowResultReturn } from "./workflows/WorkflowNavigation";
 import {
   finalizePromotedDraftThreadByRef,
   markPromotedDraftThreadByRef,
@@ -208,7 +209,8 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
 
   return (
     <SidebarInset className="h-svh min-h-0 overflow-hidden overscroll-y-none md:h-dvh">
-      {view}
+      <WorkflowResultReturn />
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{view}</div>
     </SidebarInset>
   );
 }

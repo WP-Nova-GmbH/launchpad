@@ -1,5 +1,6 @@
 import { ClerkProvider, useAuth } from "@clerk/expo";
 import { tokenCache } from "@clerk/expo/token-cache";
+import { setWorkflowSessionAccount } from "@t3tools/client-runtime/relay/workflow-session";
 import { ManagedRelay, setManagedRelaySession } from "@t3tools/client-runtime/relay";
 import {
   reportAtomCommandResult,
@@ -36,6 +37,7 @@ function resetManagedRelayTokenCache() {
 
 export function deactivateCloudRelayAccount(): void {
   setAgentAwarenessRelayTokenProvider(null);
+  setWorkflowSessionAccount(appAtomRegistry, null);
   setManagedRelaySession(appAtomRegistry, null);
 }
 
@@ -44,6 +46,7 @@ export function activateCloudRelayAccount(
   tokenProvider: () => Promise<string | null>,
 ): void {
   setAgentAwarenessRelayTokenProvider(tokenProvider, accountId);
+  setWorkflowSessionAccount(appAtomRegistry, accountId);
   setManagedRelaySession(appAtomRegistry, {
     accountId,
     readClerkToken: tokenProvider,
@@ -187,6 +190,7 @@ function CloudAuthBridge(props: { readonly children: ReactNode }) {
       // detach the provider without ending lock-screen activities or wiping the
       // persisted registration (a remount reuses both).
       releaseAgentAwarenessRelayTokenProvider();
+      setWorkflowSessionAccount(appAtomRegistry, null);
       setManagedRelaySession(appAtomRegistry, null);
     },
     [],

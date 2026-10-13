@@ -1,6 +1,7 @@
 import { setDesktopLocalAccount } from "../environments/primary/desktopAuth";
 import { toastManager } from "../components/ui/toast";
 import { useAuth } from "@clerk/react";
+import { setWorkflowSessionAccount } from "@t3tools/client-runtime/relay/workflow-session";
 import { ManagedRelay, setManagedRelaySession } from "@t3tools/client-runtime/relay";
 import {
   reportAtomCommandResult,
@@ -19,6 +20,7 @@ import { setSharedPromptSubmissionAccount } from "../sharedPromptSubmissionStore
 
 export function deactivateManagedRelayAuthentication(): void {
   setSharedPromptSubmissionAccount(null);
+  setWorkflowSessionAccount(appAtomRegistry, null);
   setManagedRelaySession(appAtomRegistry, null);
 }
 
@@ -27,6 +29,7 @@ export function activateManagedRelayAuthentication(
   readClerkToken: () => Promise<string | null>,
 ): void {
   setSharedPromptSubmissionAccount(accountId);
+  setWorkflowSessionAccount(appAtomRegistry, accountId);
   setManagedRelaySession(appAtomRegistry, {
     accountId,
     readClerkToken,

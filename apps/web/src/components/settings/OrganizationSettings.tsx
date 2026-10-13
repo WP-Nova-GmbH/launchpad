@@ -27,7 +27,7 @@ import type {
 } from "@t3tools/contracts/relay";
 
 import { GitHubIcon } from "../Icons";
-import { RepositoryWorkflows } from "./RepositoryWorkflows";
+import { Link } from "@tanstack/react-router";
 import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useProjects } from "../../state/entities";
@@ -548,7 +548,20 @@ function RepositoryRow({
             </Button>
           </div>
         ) : null}
-        <RepositoryWorkflows repository={entry.repository} canConfigure={canConfigure} />
+        <div className="border-t pt-3">
+          <Button
+            variant="outline"
+            render={
+              <Link
+                to="/workflows/$repositoryId"
+                params={{ repositoryId: entry.repository.repositoryId }}
+                search={{ tab: "workflows" }}
+              />
+            }
+          >
+            Manage workflows
+          </Button>
+        </div>
       </div>
     </SettingsRow>
   );

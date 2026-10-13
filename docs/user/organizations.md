@@ -129,8 +129,8 @@ _is_ registered requires a role on that repository.
 
 ## Repository workflows
 
-Maintainers and admins can create workflows under **Settings → Organization → Repositories →
-Workflows and jobs**. Choose an enrolled organization machine and a project for that repository,
+Maintainers and admins can create workflows from **Workflows** in the sidebar or command palette.
+Choose a repository; **Settings → Organization → Repositories → Manage workflows** opens the same view. Choose an enrolled organization machine and a project for that repository,
 then add and order Agent, Review, and Input steps. Human zones show where work waits for a
 response. Each checkpoint can require a repository maintainer or allow anyone with repository
 access; Review defaults to maintainers and Input defaults to all repository members. Agent steps
@@ -143,7 +143,14 @@ Anyone with repository access can run a workflow with a description of the task 
 shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own
 worktree and one shared agent conversation. Inspect the saved result and diff before approving a
 Review. Answer an Input checkpoint to supply context for later steps. Responses are retained as
-history, and drafts remain available while waiting for the machine to acknowledge them.
+history, and drafts remain available while waiting for the machine to acknowledge them. Edits and
+responses survive navigation to results and back within the current app session. Reloading or
+restarting the app does not restore unsaved drafts.
+
+**Runs** shows up to the latest 100 jobs, with waiting checkpoints first within those recent runs.
+Older waiting jobs may be outside this view; an existing direct job link still opens them. If starting
+a run loses its reply, check recent runs before explicitly starting another; it may create an
+additional job.
 
 Request changes sends feedback to the Review's chosen earlier Agent step in the same worktree.
 Earlier inputs and results remain valid; later steps run again and need fresh human responses.
