@@ -1,10 +1,16 @@
 import {
   ModelSelection,
+  ProviderDriverKind,
   type OrchestrationCommand,
   EnvironmentAuthorizationError,
   AuthOrchestrationOperateScope,
 } from "@t3tools/contracts";
-import { RepositoryWorkflow, WorkflowJobProgress } from "@t3tools/contracts/workflows";
+import {
+  RepositoryWorkflow,
+  WorkflowJobProgress,
+  WorkflowReviewCheckpoint,
+  WorkflowResponseSummary,
+} from "@t3tools/contracts/workflows";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -19,7 +25,32 @@ const SetupCleanup = Schema.Struct({
   state: Schema.Literals(["pending", "done", "failed"]),
   detail: Schema.NullOr(Schema.String),
 });
+export const WorkflowSequence = Schema.Struct({
+  cursor: Schema.Int,
+  generation: Schema.Int,
+  started: Schema.Boolean,
+  stepStartedAt: Schema.String,
+  completed: Schema.Array(
+    Schema.Struct({
+      stepId: Schema.String,
+      generation: Schema.Int,
+      checkpoint: Schema.NullOr(WorkflowReviewCheckpoint),
+      head: Schema.NullOr(Schema.String),
+    }),
+  ),
+  responses: Schema.Array(WorkflowResponseSummary),
+  feedback: Schema.NullOr(Schema.String),
+});
+export type WorkflowSequence = typeof WorkflowSequence.Type;
 export const WorkflowRun = Schema.Struct({
+  sequence: Schema.optional(WorkflowSequence),
+  /** Pinned before acceptance so an instance ID cannot hide a changed resume identity. */
+  providerContinuation: Schema.optional(
+    Schema.Struct({
+      driver: ProviderDriverKind,
+      continuationKey: Schema.String,
+    }),
+  ),
   jobId: Schema.String,
   userId: Schema.String,
   repositoryCanonicalKey: Schema.String,
@@ -39,7 +70,7 @@ export const WorkflowRun = Schema.Struct({
   approvalAttempt: Schema.optional(
     Schema.NullOr(
       Schema.Struct({
-        approvedBy: Schema.String,
+        approvedBy: Schema.NullOr(Schema.String),
         checkpointId: Schema.String,
         preparedHead: Schema.String,
         acceptedRevision: Schema.Int,
@@ -113,10 +144,15 @@ export const make = Effect.gen(function* () {
       Effect.orDie,
       Effect.map((rows) => (rows[0] ? decodeCancellation(rows[0].record_json) : null)),
     );
-  const active = () =>
-    sql<{
-      record_json: string;
-    }>`SELECT record_json FROM repository_workflow_jobs WHERE status NOT IN ('done', 'cancelled', 'failed')`.pipe(
+  const active = (status?: "waiting_capacity") =>
+    (status
+      ? sql<{
+          record_json: string;
+        }>`SELECT record_json FROM repository_workflow_jobs WHERE status = ${status} ORDER BY job_id`
+      : sql<{
+          record_json: string;
+        }>`SELECT record_json FROM repository_workflow_jobs WHERE status NOT IN ('done', 'cancelled', 'failed')`
+    ).pipe(
       Effect.orDie,
       Effect.map((rows) => rows.map((row) => decode(row.record_json))),
     );

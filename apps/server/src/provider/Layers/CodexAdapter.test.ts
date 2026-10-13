@@ -24,6 +24,7 @@ import { it, vi } from "@effect/vitest";
 
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -37,7 +38,7 @@ import * as CodexErrors from "effect-codex-app-server/errors";
 
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import { ProviderAdapterValidationError } from "../Errors.ts";
+import { ProviderAdapterValidationError, type ProviderAdapterProcessError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
@@ -162,7 +163,8 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     return Stream.fromQueue(this.eventQueue);
   }
 
-  close = Effect.promise(() => this.closeImpl());
+  closeEffect: Effect.Effect<void, ProviderAdapterProcessError> | undefined;
+  close = Effect.suspend(() => this.closeEffect ?? Effect.promise(() => this.closeImpl()));
 
   emit(event: ProviderEvent) {
     return Queue.offer(this.eventQueue, event).pipe(Effect.asVoid);
@@ -222,6 +224,7 @@ function makeScopedRuntimeFactory(options?: { readonly failConstruction?: boolea
 
 const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
   upsert: () => Effect.void,
+  confirmShutdown: () => Effect.succeed(false),
   recordImportedTranscript: () => Effect.die("unused"),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
@@ -1797,7 +1800,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
     }),
   );
 
-  it.effect("maps session/closed lifecycle events to canonical session.exited runtime events", () =>
+  it.effect("maps unexpected native session exit to canonical runtime events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();
       const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
@@ -1808,7 +1811,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         provider: ProviderDriverKind.make("codex"),
         threadId: asThreadId("thread-1"),
         createdAt: "2026-01-01T00:00:00.000Z",
-        method: "session/closed",
+        method: "session/exited",
         message: "Session stopped",
       };
 
@@ -3117,6 +3120,171 @@ usageLimitLayer("CodexAdapterLive usage limits", (it) => {
       if (first._tag !== "Some" || first.value.type !== "runtime.error") return;
       NodeAssert.equal(first.value.payload.message, "Codex is temporarily unavailable.");
       NodeAssert.equal(first.value.payload.class, "provider_error");
+    }),
+  );
+});
+
+const shutdownFailureFactory = makeScopedRuntimeFactory();
+const shutdownFailureLayer = it.layer(
+  Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      return yield* makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: shutdownFailureFactory.factory,
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+);
+shutdownFailureLayer("Codex verified shutdown", (it) => {
+  it.effect("retains failed startup cleanup for an explicit retry", () =>
+    Effect.gen(function* () {
+      let failedRuntime: FakeCodexRuntime | undefined;
+      shutdownFailureFactory.factory.mockImplementationOnce((options) => {
+        const runtime = new FakeCodexRuntime(options);
+        failedRuntime = runtime;
+        runtime.startImpl.mockRejectedValueOnce(new Error("startup failed"));
+        runtime.closeImpl.mockRejectedValueOnce(new Error("cleanup failed"));
+        return Effect.succeed(runtime);
+      });
+      const adapter = yield* CodexAdapter;
+      const id = asThreadId("failed-start-cleanup");
+      const failure = yield* adapter
+        .startSession({ threadId: id, runtimeMode: "approval-required" })
+        .pipe(Effect.exit);
+      NodeAssert.equal(Exit.isFailure(failure), true);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(id), false);
+      NodeAssert.equal(yield* adapter.hasSession(id), false);
+      yield* adapter.stopSession(id);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(id), true);
+      NodeAssert.equal(failedRuntime!.closeImpl.mock.calls.length, 2);
+    }),
+  );
+  it.effect("waits for owned scope disposal and shares concurrent stop confirmation", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      let runtime: FakeCodexRuntime | undefined;
+      shutdownFailureFactory.factory.mockImplementationOnce((options) =>
+        Effect.gen(function* () {
+          yield* Effect.addFinalizer(() =>
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(released))),
+          );
+          runtime = new FakeCodexRuntime(options);
+          return runtime;
+        }),
+      );
+      const adapter = yield* CodexAdapter;
+      const id = asThreadId("scope-close-confirmation");
+      yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+      const first = yield* adapter.stopSession(id).pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      const second = yield* adapter.stopSession(id).pipe(Effect.forkScoped);
+      const proof = yield* adapter.isSessionStopConfirmed!(id);
+      yield* Deferred.succeed(released, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+      NodeAssert.equal(proof, false);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(id), true);
+      NodeAssert.equal(runtime!.closeImpl.mock.calls.length, 1);
+    }),
+  );
+  it.effect("does not publish graceful exit until native cleanup settles", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const id = asThreadId("held-native-close");
+      yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+      const runtime = shutdownFailureFactory.lastRuntime!;
+      const held = yield* Deferred.make<void>();
+      const boundary = yield* Deferred.make<void>();
+      const exited = yield* Deferred.make<void>();
+      let exits = 0;
+      yield* adapter.streamEvents.pipe(
+        Stream.runForEach((event) =>
+          Effect.gen(function* () {
+            if (event.threadId !== id) return;
+            if (event.type === "session.exited") {
+              exits++;
+              yield* Deferred.succeed(exited, undefined);
+            }
+            if (event.type === "session.state.changed" && event.payload.state === "ready")
+              yield* Deferred.succeed(boundary, undefined);
+          }),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      runtime.closeEffect = Effect.gen(function* () {
+        yield* runtime.emit({
+          id: asEventId("early-close"),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId: id,
+          createdAt: "2026-10-12T12:00:00.000Z",
+          method: "session/closed",
+          message: "Session stopped",
+        });
+        yield* runtime.emit({
+          id: asEventId("close-boundary"),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId: id,
+          createdAt: "2026-10-12T12:00:00.000Z",
+          method: "session/ready",
+        });
+        yield* Deferred.await(held);
+      });
+      const stopping = yield* adapter.stopSession(id).pipe(Effect.forkScoped);
+      yield* Deferred.await(boundary);
+      const before = { exits, confirmed: yield* adapter.isSessionStopConfirmed!(id) };
+      yield* Deferred.succeed(held, undefined);
+      yield* Fiber.join(stopping);
+      yield* Deferred.await(exited);
+      NodeAssert.deepEqual(before, { exits: 0, confirmed: false });
+      NodeAssert.equal(exits, 1);
+    }),
+  );
+});
+
+shutdownFailureLayer("Codex runtime episode receipts", (it) => {
+  it.effect("an old stop receipt cannot authorize stopping the replacement", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("codex-episode-replacement");
+      const input = { threadId, runtimeMode: "approval-required" as const };
+      yield* adapter.startSession(input);
+      const oldEpisode = yield* adapter.getSessionRuntimeEpisode!(threadId);
+      yield* adapter.stopSession(threadId, oldEpisode);
+      const entered = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      let nextEpisode: string | undefined;
+      const starting = yield* adapter
+        .startSession(input, {
+          beforeStart: (episode) => {
+            nextEpisode = episode;
+            return Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(released)),
+            );
+          },
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      NodeAssert.notEqual(oldEpisode, nextEpisode);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(threadId, nextEpisode), false);
+      NodeAssert.equal(
+        (yield* adapter.stopSession(threadId, nextEpisode).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* Deferred.succeed(released, undefined);
+      yield* Fiber.join(starting);
+      yield* adapter.stopSession(threadId, oldEpisode);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(threadId, nextEpisode), false);
+      yield* adapter.stopSession(threadId, nextEpisode);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(threadId, nextEpisode), true);
     }),
   );
 });

@@ -904,6 +904,7 @@ export const ThreadPreparationSummary = Schema.Struct({
 });
 
 export const ThreadPromptPauseReason = Schema.Struct({
+  messageId: Schema.optional(MessageId),
   code: Schema.Literals([
     "stopped",
     "failed",

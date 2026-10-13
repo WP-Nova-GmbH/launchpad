@@ -111,6 +111,10 @@
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"
     },
+    "./relay/workflow-responses": {
+      "types": "./src/relay/workflowResponses.ts",
+      "default": "./src/relay/workflowResponses.ts"
+    },
     "./state/auth": {
       "types": "./src/state/auth.ts",
       "default": "./src/state/auth.ts"

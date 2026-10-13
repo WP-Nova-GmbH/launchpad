@@ -16,7 +16,8 @@ import {
 } from "../environments/EnvironmentConnector.ts";
 import { Machines, type MachineRecord } from "../machines/Machines.ts";
 import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
-import { Repositories } from "../tenancy/Repositories.ts";
+import { Organizations } from "../tenancy/Organizations.ts";
+import { Repositories, RepositoryPersistenceError } from "../tenancy/Repositories.ts";
 import { Workflows, type WorkflowJobRecord } from "./Workflows.ts";
 import { refreshWorkflowJob, validateWorkflowTarget } from "./WorkflowDispatcher.ts";
 
@@ -90,7 +91,7 @@ const initial: WorkflowJobRecord = {
   },
 };
 const accepted: WorkflowControlResult = {
-  protocol: 4,
+  protocol: 5,
   outcome: "accepted",
   detail: null,
   progress: {
@@ -102,7 +103,7 @@ const accepted: WorkflowControlResult = {
   },
 };
 const missing: WorkflowControlResult = {
-  protocol: 4,
+  protocol: 5,
   outcome: "missing",
   detail: null,
   progress: null,
@@ -124,10 +125,21 @@ const harness = Effect.gen(function* () {
     | "protocol3"
     | "cancel_during_approve"
   >("online");
+  const permissionOutage = yield* Ref.make(false);
+  const role = yield* Ref.make<"maintainer" | "developer" | null>("maintainer");
   const reply = yield* Ref.make<WorkflowControlResult | null>(null);
   const offers = yield* Ref.make<ReadonlyArray<RepositoryWorkflow>>([]);
   const controls = yield* Ref.make<ReadonlyArray<WorkflowControl>>([]);
   const layer = Layer.mergeAll(
+    Layer.mock(Organizations)({
+      getMembershipForUser: ({ userId }) =>
+        Effect.succeed({
+          organization: { organizationId: "org-1", name: "Org", createdAt: NOW },
+          userId,
+          role: "member" as const,
+          joinedAt: NOW,
+        }),
+    }),
     Layer.mock(Workflows)({
       get: () => Ref.get(definition),
       getJob: () => Ref.get(row),
@@ -166,6 +178,19 @@ const harness = Effect.gen(function* () {
     }),
     Layer.mock(Machines)({ getActiveByEnvironmentId: () => Ref.get(target) }),
     Layer.mock(Repositories)({
+      getAccess: () =>
+        Ref.get(permissionOutage).pipe(
+          Effect.flatMap((offline) =>
+            offline
+              ? Effect.fail(
+                  new RepositoryPersistenceError({
+                    operation: "load-access",
+                    cause: "Permission store unavailable",
+                  }),
+                )
+              : Ref.get(role),
+          ),
+        ),
       getById: () =>
         Effect.succeed({
           repositoryId: "repo-1",
@@ -305,6 +330,8 @@ const harness = Effect.gen(function* () {
     mode,
     offers,
     controls,
+    role,
+    permissionOutage,
     refresh: refreshWorkflowJob("job-1").pipe(Effect.provide(layer)),
     validate: validateWorkflowTarget("org-1", "repo-1", workflow.definition).pipe(
       Effect.provide(layer),
@@ -465,7 +492,7 @@ it.effect("pins protocol 4 with the offer and rejects downgrade completion or ap
   Effect.gen(function* () {
     const h = yield* harness;
     yield* h.refresh;
-    assert.strictEqual((yield* Ref.get(h.row)).record.requiredProtocol, 4);
+    assert.strictEqual((yield* Ref.get(h.row)).record.requiredProtocol, 5);
     const progress = { ...accepted.progress!, status: "done" as const, revision: 20 };
     yield* Ref.set(h.reply, { ...accepted, progress });
     yield* Ref.set(h.mode, "protocol2");
@@ -603,4 +630,62 @@ it.effect(
       assert.deepStrictEqual(after.record.workflow, before.record.workflow);
       assert.include(held!.detail!, "Update this environment");
     }),
+);
+
+it.effect("rechecks saved checkpoint roles before delivering after reconnect", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* h.refresh;
+    const checkpoint = {
+      kind: "input" as const,
+      checkpointId: "input-1",
+      stepId: "brief",
+      generation: 0,
+      question: "What next?",
+      role: "member" as const,
+    };
+    const saveResponse = (role: "member" | "maintainer") =>
+      Ref.update(h.row, (row) => ({
+        ...row,
+        pendingControl: {
+          userId: "responder",
+          response: {
+            operation: "input" as const,
+            checkpointId: "input-1",
+            expectedRevision: 3,
+            text: "Answer",
+          },
+        },
+        record: {
+          ...row.record,
+          status: "awaiting_input" as const,
+          progress: {
+            ...accepted.progress!,
+            revision: 3,
+            status: "awaiting_input" as const,
+            checkpoint: { ...checkpoint, role },
+          },
+        },
+      }));
+    yield* saveResponse("maintainer");
+    yield* Ref.set(h.permissionOutage, true);
+    yield* h.refresh;
+    assert.isNotNull((yield* Ref.get(h.row)).pendingControl);
+    yield* Ref.set(h.permissionOutage, false);
+    yield* Ref.set(h.role, "developer");
+    yield* saveResponse("maintainer");
+    const blocked = yield* h.refresh;
+    assert.include(blocked!.detail!, "no longer has permission");
+    assert.isNull((yield* Ref.get(h.row)).pendingControl);
+    assert.lengthOf(
+      (yield* Ref.get(h.controls)).filter((control) => control.operation === "input"),
+      0,
+    );
+    yield* saveResponse("member");
+    yield* h.refresh;
+    assert.lengthOf(
+      (yield* Ref.get(h.controls)).filter((control) => control.operation === "input"),
+      1,
+    );
+  }),
 );

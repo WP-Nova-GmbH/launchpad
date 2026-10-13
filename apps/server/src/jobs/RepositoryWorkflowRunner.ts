@@ -33,11 +33,18 @@ import { SetupProcessJournal } from "../terminal/SetupProcessJournal.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
+import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import { TextGeneration } from "../textGeneration/TextGeneration.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { forkParked } from "../serverActivation.ts";
+import {
+  activeWorkflowStep,
+  advanceWorkflow,
+  workflowProgress,
+  workflowPromptId,
+} from "./workflowSequence.ts";
 import { workflowTask } from "./workflowTask.ts";
 import { attachApprovalSupervisor, type SupervisorVerdict } from "./supervisor.ts";
 import { WorkflowRunStore, WorkflowRun } from "./WorkflowRunStore.ts";
@@ -69,7 +76,7 @@ export class RepositoryWorkflowRunner extends Context.Reference<RepositoryWorkfl
     defaultValue: () => ({
       handle: () =>
         Effect.succeed({
-          protocol: 4,
+          protocol: 5,
           outcome: "unavailable",
           detail: "Workflow execution is unavailable on this environment.",
           progress: null,
@@ -83,6 +90,7 @@ export function reconcileWorkflowRun(
   run: WorkflowRun,
   thread: OrchestrationThread | null,
   cleanupConfirmed = false,
+  providerShutdownConfirmed = false,
 ): WorkflowRun {
   if (isTerminalWorkflowJob(run.progress.status) || thread === null) return run;
   const preparation = thread.promptQueue?.preparation;
@@ -107,9 +115,9 @@ export function reconcileWorkflowRun(
     },
   });
   if (run.progress.status === "cancelling") {
-    // 'stopped' is emitted only after the provider stop returns. Preparation
-    // also has to acknowledge that its script/process has actually exited.
+    // Runtime exit projection can precede owned cleanup; only durable proof releases capacity.
     if (
+      providerShutdownConfirmed &&
       (thread.session === null || thread.session.status === "stopped") &&
       (!preparation ||
         (preparation.settled &&
@@ -122,20 +130,43 @@ export function reconcileWorkflowRun(
       return withProgress("cancelled", "Cancelled; prepared files and history have been retained.");
     return run;
   }
-  if (run.progress.status === "awaiting_review") return { ...run, worktreePath };
+  if (
+    ["awaiting_review", "awaiting_input", "waiting_capacity", "finishing"].includes(
+      run.progress.status,
+    )
+  )
+    return { ...run, worktreePath };
   const admission = thread.promptQueue?.admissions.find(
-    (entry) => entry.messageId === `workflow:${run.jobId}:prompt`,
+    (entry) => entry.messageId === workflowPromptId(run),
   );
   const unknown = thread.promptQueue?.pauseReason?.code === "delivery-unknown";
   if (
     !admission &&
     unknown &&
-    (thread.promptQueue?.handoff?.messageId === `workflow:${run.jobId}:prompt` ||
+    (thread.promptQueue?.handoff?.messageId === workflowPromptId(run) ||
       thread.promptQueue.entries.some(
-        (entry) => entry.messageId === `workflow:${run.jobId}:prompt` && entry.state === "unknown",
+        (entry) => entry.messageId === workflowPromptId(run) && entry.state === "unknown",
       ))
   ) {
     const detail = "Prompt delivery could not be confirmed. Cancel this job before starting again.";
+    return run.progress.status === "paused" &&
+      run.progress.detail === detail &&
+      !run.progress.retryablePreparation
+      ? { ...run, worktreePath }
+      : {
+          ...withProgress("paused", detail),
+          progress: {
+            ...run.progress,
+            revision: run.progress.revision + 1,
+            status: "paused",
+            detail,
+            retryablePreparation: false,
+          },
+        };
+  }
+  const rejection = thread.promptQueue?.pauseReason;
+  if (!admission && rejection?.code === "failed" && rejection.messageId === workflowPromptId(run)) {
+    const detail = `${rejection.detail} Cancel this job before starting again.`;
     return run.progress.status === "paused" &&
       run.progress.detail === detail &&
       !run.progress.retryablePreparation
@@ -239,6 +270,7 @@ export const make = Effect.gen(function* () {
   const identities = yield* RepositoryIdentityResolver;
   const access = yield* RepositoryAccess;
   const registry = yield* ProviderRegistry;
+  const providersService = yield* ProviderService;
   const textGeneration = yield* TextGeneration;
   const crypto = yield* Crypto.Crypto;
   const lock = yield* Semaphore.make(1);
@@ -259,7 +291,7 @@ export const make = Effect.gen(function* () {
         previous &&
         (previous.progress.status !== run.progress.status ||
           (!previous.promptDispatched && run.promptDispatched)) &&
-        run.promptDispatched &&
+        (run.sequence?.started || run.promptDispatched) &&
         Option.isSome(yield* query.getThreadDetailById(run.progress.threadId).pipe(Effect.orDie))
       ) {
         const createdAt = yield* timestamp;
@@ -290,7 +322,12 @@ export const make = Effect.gen(function* () {
     run: WorkflowRun | null,
     outcome: WorkflowControlResult["outcome"] = run ? "accepted" : "missing",
     detail: string | null = null,
-  ): WorkflowControlResult => ({ protocol: 4, outcome, detail, progress: run?.progress ?? null });
+  ): WorkflowControlResult => ({
+    protocol: 5,
+    outcome,
+    detail,
+    progress: run ? workflowProgress(run) : null,
+  });
   const readThread = (run: WorkflowRun) =>
     query
       .getThreadDetailById(run.progress.threadId)
@@ -352,51 +389,124 @@ export const make = Effect.gen(function* () {
       .pipe(Effect.orDie);
     if (Option.isNone(project))
       return yield* new WorkflowRunnerError({ message: "The selected project no longer exists." });
+    const existing = yield* readThread(run);
+    const promptId = workflowPromptId(run);
+    const alreadyQueued =
+      existing?.promptQueue?.entries.some((entry) => entry.messageId === promptId) ||
+      existing?.promptQueue?.admissions.some((entry) => entry.messageId === promptId);
+    if (!alreadyQueued) {
+      let detail: string | null = null;
+      const selection = run.modelSelection;
+      const info = yield* providersService
+        .getInstanceInfo(selection.instanceId)
+        .pipe(Effect.option);
+      const snapshots = yield* registry.getProviders;
+      const selected = snapshots.find((entry) => entry.instanceId === selection.instanceId);
+      const current = existing?.modelSelection;
+      if (!run.providerContinuation)
+        detail = "This job's original provider compatibility is unavailable.";
+      else if (
+        Option.isNone(info) ||
+        !info.value.enabled ||
+        !selected?.enabled ||
+        !selected.installed ||
+        selected.availability === "unavailable"
+      )
+        detail = "The selected Agent provider is unavailable.";
+      else if (
+        info.value.driverKind !== run.providerContinuation.driver ||
+        info.value.continuationIdentity.continuationKey !== run.providerContinuation.continuationKey
+      )
+        detail = "The Agent provider's continuation identity changed.";
+      else if (
+        existing?.session &&
+        current &&
+        (current.instanceId !== selection.instanceId || current.model !== selection.model) &&
+        (selected.requiresNewThreadForModelChange ||
+          snapshots.find((entry) => entry.instanceId === current.instanceId)
+            ?.requiresNewThreadForModelChange)
+      )
+        detail = "The Agent provider cannot change models within this conversation.";
+      if (detail)
+        return yield* store.save({
+          ...run,
+          progress: {
+            ...run.progress,
+            revision: run.progress.revision + 1,
+            status: "paused",
+            retryablePreparation: false,
+            detail: `${detail} Cancel this job before starting again.`,
+          },
+        });
+    }
     yield* supervise(run);
     const task = workflowTask(run);
-    yield* engine
+    const acknowledgement = yield* engine
       .dispatch({
         type: "thread.prompt.enqueue",
-        commandId: CommandId.make(`workflow:${run.jobId}:start`),
+        commandId: CommandId.make(workflowPromptId(run).replace(/:prompt$/, ":start")),
         threadId: run.progress.threadId,
         message: {
-          messageId: MessageId.make(`workflow:${run.jobId}:prompt`),
+          messageId: MessageId.make(workflowPromptId(run)),
           text: `${task.stepInstruction}\n\nJob context:\n${task.jobContext}\n\n${task.reviewConstraint}`,
           attachments: [],
         },
         runtimeMode: "approval-required",
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         modelSelection: run.modelSelection,
-        createdAt: run.createdAt,
+        createdAt: run.sequence?.stepStartedAt ?? run.createdAt,
         author: { userId: run.userId, displayName: null, imageUrl: null },
-        bootstrap: {
-          createThread: {
-            projectId: project.value.id,
-            title: `${run.workflow.definition.name}: ${run.workflow.definition.steps[0].title}`,
-            modelSelection: run.modelSelection,
-            runtimeMode: "approval-required",
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            branch: null,
-            worktreePath: null,
-            createdAt: run.createdAt,
-          },
-          prepareWorktree: {
-            projectCwd: project.value.workspaceRoot,
-            baseBranch: run.baseSha,
-            branch: jobBranchName(run.jobId),
-            startFromOrigin: false,
-            requireWorktree: true,
-          },
-          runSetupScript: true,
-        },
+        ...(!run.sequence?.started
+          ? {
+              bootstrap: {
+                createThread: {
+                  projectId: project.value.id,
+                  title: run.workflow.definition.name,
+                  modelSelection: run.modelSelection,
+                  runtimeMode: "approval-required",
+                  interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+                  branch: null,
+                  worktreePath: null,
+                  createdAt: run.createdAt,
+                },
+                prepareWorktree: {
+                  projectCwd: project.value.workspaceRoot,
+                  baseBranch: run.baseSha,
+                  branch: jobBranchName(run.jobId),
+                  startFromOrigin: false,
+                  requireWorktree: true,
+                },
+                runSetupScript: true,
+              },
+            }
+          : {}),
       })
-      .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
-    return yield* store.save({ ...run, promptDispatched: true });
+      .pipe(Effect.result);
+    if (acknowledgement._tag === "Failure") {
+      const error = acknowledgement.failure;
+      if (!isOrchestrationCommandRejection(error) && !isPreviouslyRejected(error))
+        return yield* new WorkflowRunnerError({ message: error.message });
+      return yield* store.save({
+        ...run,
+        progress: {
+          ...run.progress,
+          revision: run.progress.revision + 1,
+          status: "paused",
+          retryablePreparation: false,
+          detail: `${error.message} Cancel this job before starting again.`,
+        },
+      });
+    }
+    return yield* store.save({
+      ...run,
+      promptDispatched: true,
+      ...(run.sequence ? { sequence: { ...run.sequence, started: true } } : {}),
+    });
   });
   const verifyResult = Effect.fn("RepositoryWorkflowRunner.verifyResult")(function* (
     run: WorkflowRun,
   ) {
-    if (!run.worktreePath || !run.progress.checkpoint)
+    if (!run.worktreePath || !run.progress.checkpoint || run.progress.checkpoint.kind === "input")
       return "The saved result is unavailable. Cancel the job and run it again.";
     if (
       (yield* git.resolveCommit({ cwd: run.worktreePath, revision: "HEAD" })).commitSha !==
@@ -460,7 +570,7 @@ export const make = Effect.gen(function* () {
                   !current ||
                   saved?.commandId !== attempt.commandId ||
                   (kind === "approvalAttempt"
-                    ? current.progress.status !== "awaiting_review"
+                    ? !["awaiting_review", "finishing"].includes(current.progress.status)
                     : current.progress.status !== "cancelling")
                 )
                   return;
@@ -486,6 +596,7 @@ export const make = Effect.gen(function* () {
                   },
                 });
                 yield* reconcile(next);
+                yield* pumpWaiting();
               }),
             ),
           ),
@@ -569,7 +680,11 @@ export const make = Effect.gen(function* () {
   const reconcileApproval = Effect.fn("RepositoryWorkflowRunner.reconcileApproval")(
     function* (run: WorkflowRun) {
       const attempt = run.approvalAttempt;
-      if (run.progress.status !== "awaiting_review" || !attempt || run.progress.retryableApproval)
+      if (
+        !["awaiting_review", "finishing"].includes(run.progress.status) ||
+        !attempt ||
+        run.progress.retryableApproval
+      )
         return run;
       if (attempt.setupCleanup?.state === "failed") return run;
       if (
@@ -605,10 +720,10 @@ export const make = Effect.gen(function* () {
         progress: {
           ...run.progress,
           revision: run.progress.revision + 1,
-          status: detail ? "awaiting_review" : "done",
+          status: detail ? run.progress.status : "done",
           approvalPending: false,
-          retryableApproval: false,
-          detail: detail ?? "Approved by a repository maintainer.",
+          retryableApproval: !!detail && run.progress.status === "finishing",
+          detail: detail ?? "Workflow completed; setup cleanup and final result verified.",
         },
       });
     },
@@ -619,7 +734,7 @@ export const make = Effect.gen(function* () {
             const current = yield* store.get(run.jobId);
             if (
               !current ||
-              current.progress.status !== "awaiting_review" ||
+              !["awaiting_review", "finishing"].includes(current.progress.status) ||
               current.approvalAttempt?.commandId !== run.approvalAttempt?.commandId
             )
               return current ?? run;
@@ -672,7 +787,12 @@ export const make = Effect.gen(function* () {
             .pipe(Effect.orDie)
         : Option.none();
       const preparation = thread.promptQueue?.preparation;
+      const providerProof = yield* providersService.isWorkflowSessionStopConfirmed({
+        jobId: run.jobId,
+        threadId: run.progress.threadId,
+      });
       const stopped =
+        providerProof &&
         (thread.session === null || thread.session.status === "stopped") &&
         (!preparation ||
           (preparation.settled && !["pending", "running"].includes(preparation.state)));
@@ -709,7 +829,12 @@ export const make = Effect.gen(function* () {
           ? [{ kind: activity.kind, detail: failure.value.detail }]
           : [];
       });
-      const providerStopped = thread.session === null || thread.session.status === "stopped";
+      const providerStopped =
+        (thread.session === null || thread.session.status === "stopped") &&
+        (yield* providersService.isWorkflowSessionStopConfirmed({
+          jobId: run.jobId,
+          threadId: run.progress.threadId,
+        }));
       const currentPreparation = thread.promptQueue?.preparation;
       if (currentPreparation?.script && !run.cancellationAttempt?.setupCleanup)
         run = yield* store.save({
@@ -871,7 +996,11 @@ export const make = Effect.gen(function* () {
     if (
       run.progress.status === "cancelling" &&
       thread === null &&
-      !run.cancellationAttempt?.setupCleanup
+      !run.cancellationAttempt?.setupCleanup &&
+      (yield* providersService.isWorkflowSessionStopConfirmed({
+        jobId: run.jobId,
+        threadId: run.progress.threadId,
+      }))
     )
       return yield* store.save({
         ...run,
@@ -887,7 +1016,7 @@ export const make = Effect.gen(function* () {
           retryableCancellation: false,
         },
       });
-    if (run.progress.status === "awaiting_review" && run.approvalAttempt)
+    if (["awaiting_review", "finishing"].includes(run.progress.status) && run.approvalAttempt)
       run = yield* reconcileApproval(run);
     const cleanupConfirmed =
       run.cancellationAttempt?.setupCleanup?.state === "done"
@@ -896,7 +1025,13 @@ export const make = Effect.gen(function* () {
             attemptId: run.cancellationAttempt.setupCleanup.attemptId,
           })
         : false;
-    let next = reconcileWorkflowRun(run, thread, cleanupConfirmed);
+    const providerShutdownConfirmed =
+      run.progress.status === "cancelling" &&
+      (yield* providersService.isWorkflowSessionStopConfirmed({
+        jobId: run.jobId,
+        threadId: run.progress.threadId,
+      }));
+    let next = reconcileWorkflowRun(run, thread, cleanupConfirmed, providerShutdownConfirmed);
     if (
       run.progress.status !== "awaiting_review" &&
       next.progress.status === "awaiting_review" &&
@@ -916,7 +1051,96 @@ export const make = Effect.gen(function* () {
               },
             };
     }
+    if (
+      next.sequence &&
+      run.progress.status !== "awaiting_review" &&
+      next.progress.status === "awaiting_review" &&
+      next.progress.checkpoint?.kind !== "input"
+    ) {
+      const step = activeWorkflowStep(next);
+      if (step?.kind === "agent")
+        next = advanceWorkflow({
+          ...next,
+          sequence: {
+            ...next.sequence,
+            cursor: next.sequence.cursor + 1,
+            feedback: null,
+            stepStartedAt: yield* timestamp,
+            completed: [
+              ...next.sequence.completed,
+              {
+                stepId: step.id,
+                generation: next.sequence.generation,
+                checkpoint: next.progress.checkpoint,
+                head: next.preparedHead,
+              },
+            ],
+          },
+        });
+    }
+    if (
+      next.sequence?.cursor !== run.sequence?.cursor ||
+      next.sequence?.generation !== run.sequence?.generation
+    ) {
+      const previousScope = supervised.get(run.jobId);
+      if (previousScope) {
+        supervised.delete(run.jobId);
+        yield* Scope.close(previousScope, Exit.void);
+      }
+    }
     if (!equivalentRuns(next, run)) yield* store.save(next);
+    if (next.progress.status === "waiting_capacity" && !(yield* store.isExecuting(next.jobId))) {
+      const step = activeWorkflowStep(next);
+      if (step?.kind === "agent")
+        next = yield* store.save({
+          ...next,
+          modelSelection: step.modelSelection ?? next.modelSelection,
+          executionReserved: true,
+          progress: {
+            ...next.progress,
+            revision: next.progress.revision + 1,
+            status: "preparing",
+            detail: null,
+          },
+        });
+    }
+    if (
+      (next.progress.status === "finishing" ||
+        (next.sequence &&
+          next.sequence.cursor === next.workflow.definition.steps.length &&
+          next.progress.status === "awaiting_review")) &&
+      !next.approvalAttempt &&
+      !next.progress.retryableApproval &&
+      !next.progress.detail
+    ) {
+      const preparation = thread?.promptQueue?.preparation;
+      next = yield* store.save({
+        ...next,
+        approvalAttempt: {
+          approvedBy:
+            (next.workflow.definition.steps.at(-1)?.kind === "review"
+              ? next.sequence?.responses.findLast((response) => response.operation === "approve")
+                  ?.userId
+              : null) ?? null,
+          checkpointId: next.progress.checkpoint!.checkpointId,
+          preparedHead: next.preparedHead!,
+          acceptedRevision: next.progress.revision,
+          commandId: `workflow:${next.jobId}:finish:${next.sequence!.generation}`,
+          createdAt: yield* timestamp,
+          ...(preparation?.script
+            ? {
+                setupCleanup: {
+                  attemptId: preparation.attemptId,
+                  state: "pending" as const,
+                  detail: null,
+                },
+              }
+            : {}),
+        },
+        progress: { ...next.progress, revision: next.progress.revision + 1, approvalPending: true },
+      });
+      next = yield* reconcileApproval(next);
+    }
     if (!["preparing", "running"].includes(next.progress.status)) {
       const scope = supervised.get(next.jobId);
       if (scope) {
@@ -928,6 +1152,13 @@ export const make = Effect.gen(function* () {
       return (yield* dispatchPrompt(next)) ?? next;
     if (thread && ["preparing", "running"].includes(next.progress.status)) yield* supervise(next);
     return next;
+  });
+  const pumpWaiting = Effect.fn("RepositoryWorkflowRunner.pumpWaiting")(function* () {
+    if (yield* store.isExecuting()) return;
+    for (const waiting of yield* store.active("waiting_capacity")) {
+      const resumed = yield* reconcile(waiting);
+      if (resumed.executionReserved) break;
+    }
   });
   const handle = Effect.fn("RepositoryWorkflowRunner.handle")(
     function* (request: WorkflowRequest) {
@@ -990,6 +1221,13 @@ export const make = Effect.gen(function* () {
       }
       if (run) run = yield* reconcile(run);
       if (request.control.operation === "status") return result(run);
+      if (run && request.control.operation !== "cancel")
+        yield* access
+          .requireProject(
+            { user: { userId: request.userId, displayName: null, imageUrl: null } },
+            run.workflow.definition.projectId,
+          )
+          .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
       if (request.control.operation === "start") {
         if (run) return result(run);
         const workflow = request.control.workflow;
@@ -1019,24 +1257,80 @@ export const make = Effect.gen(function* () {
             "unavailable",
             "The project's repository changed; select its current checkout.",
           );
-        const modelSelection =
-          workflow.definition.steps[0].modelSelection ?? project.value.defaultModelSelection;
-        const provider = (yield* registry.getProviders).find(
+        const steps = workflow.definition.steps.map((step) =>
+          step.kind === "agent"
+            ? {
+                ...step,
+                runtimeMode: "approval-required" as const,
+                modelSelection: step.modelSelection ?? project.value.defaultModelSelection,
+              }
+            : step,
+        );
+        const agents = steps.filter((step) => step.kind === "agent");
+        const modelSelection = agents[0]?.modelSelection;
+        const providers = yield* registry.getProviders;
+        const firstProvider = providers.find(
           (entry) => entry.instanceId === modelSelection?.instanceId,
         );
-        // These drivers provide the approval boundary needed by unattended jobs.
-        if (
-          !modelSelection ||
-          !provider?.enabled ||
-          !provider.installed ||
-          provider.availability === "unavailable" ||
-          !["codex", "claudeAgent"].includes(provider.driver)
-        )
-          return result(
-            null,
-            "unavailable",
-            "Select an installed, enabled Codex or Claude provider with approval support.",
-          );
+        let providerContinuation: WorkflowRun["providerContinuation"];
+        for (const step of agents) {
+          const selection = step.modelSelection;
+          const selected = providers.find((entry) => entry.instanceId === selection?.instanceId);
+          if (
+            !selection ||
+            !selected?.enabled ||
+            !selected.installed ||
+            selected.availability === "unavailable" ||
+            !["codex", "claudeAgent"].includes(selected.driver)
+          )
+            return result(
+              null,
+              "unavailable",
+              `Select an installed, enabled Codex or Claude provider for ${step.title}.`,
+            );
+          const info = yield* providersService
+            .getInstanceInfo(selection.instanceId)
+            .pipe(Effect.option);
+          if (
+            Option.isNone(info) ||
+            !info.value.enabled ||
+            info.value.driverKind !== selected.driver
+          )
+            return result(
+              null,
+              "unavailable",
+              `Provider compatibility could not be verified for ${step.title}.`,
+            );
+          const identity = {
+            driver: info.value.driverKind,
+            continuationKey: info.value.continuationIdentity.continuationKey,
+          };
+          if (
+            providerContinuation &&
+            (identity.driver !== providerContinuation.driver ||
+              identity.continuationKey !== providerContinuation.continuationKey)
+          )
+            return result(
+              null,
+              "unavailable",
+              `${step.title} must use a compatible ${providerContinuation.driver} provider to continue this job's conversation.`,
+            );
+          if (
+            modelSelection &&
+            (selection.instanceId !== modelSelection.instanceId ||
+              selection.model !== modelSelection.model) &&
+            (firstProvider?.requiresNewThreadForModelChange ||
+              selected.requiresNewThreadForModelChange)
+          )
+            return result(
+              null,
+              "unavailable",
+              `${step.title} cannot change models or provider instances within this job's conversation.`,
+            );
+          providerContinuation ??= identity;
+        }
+        if (!modelSelection || !providerContinuation)
+          return result(null, "unavailable", "Select a provider for an Agent step.");
         const remote = identity.locator.remoteName;
         yield* git.fetchRemote({ cwd: project.value.workspaceRoot, remoteName: remote });
         const baseBranch = yield* git.resolveDefaultBranchName(project.value.workspaceRoot, remote);
@@ -1052,7 +1346,23 @@ export const make = Effect.gen(function* () {
           userId: request.userId,
           repositoryCanonicalKey: request.repositoryCanonicalKey,
           instruction: request.instruction,
-          workflow,
+          workflow: {
+            ...workflow,
+            definition: {
+              ...workflow.definition,
+              steps,
+            },
+          },
+          providerContinuation,
+          sequence: {
+            cursor: 0,
+            generation: 0,
+            started: false,
+            stepStartedAt: yield* timestamp,
+            completed: [],
+            responses: [],
+            feedback: null,
+          },
           modelSelection,
           baseBranch,
           baseSha: base.commitSha,
@@ -1070,6 +1380,7 @@ export const make = Effect.gen(function* () {
             checkpoint: null,
           },
         };
+        run = advanceWorkflow(run);
         if (!(yield* store.tryAccept(run))) {
           if (yield* store.getCancellation(request.jobId))
             return result(null, "cancelled", "Cancelled before acceptance.");
@@ -1080,7 +1391,7 @@ export const make = Effect.gen(function* () {
             existing ? null : "Another workflow is executing on this environment.",
           );
         }
-        run = (yield* dispatchPrompt(run)) ?? run;
+        run = yield* reconcile(run);
         return result(run);
       }
       if (!run) return result(null);
@@ -1150,6 +1461,147 @@ export const make = Effect.gen(function* () {
         });
         return result(yield* reconcile(run));
       }
+      if (
+        !run.sequence &&
+        request.control.operation === "request_changes" &&
+        run.progress.status === "awaiting_review" &&
+        !run.approvalAttempt &&
+        run.progress.checkpoint?.kind !== "input" &&
+        run.progress.checkpoint
+      ) {
+        run = {
+          ...run,
+          sequence: {
+            cursor: 1,
+            generation: 0,
+            started: true,
+            stepStartedAt: run.createdAt,
+            feedback: null,
+            responses: [],
+            completed: [
+              {
+                stepId: run.workflow.definition.steps[0]!.id,
+                generation: 0,
+                checkpoint: run.progress.checkpoint,
+                head: run.preparedHead,
+              },
+            ],
+          },
+        };
+      }
+      if (
+        run.sequence &&
+        ["approve", "input", "request_changes"].includes(request.control.operation)
+      ) {
+        const control = request.control;
+        if (
+          control.operation !== "approve" &&
+          control.operation !== "input" &&
+          control.operation !== "request_changes"
+        )
+          return result(run, "conflict");
+        const previous = run.sequence.responses.find(
+          (response) => response.checkpointId === control.checkpointId,
+        );
+        if (previous && !run.progress.retryableApproval)
+          return result(
+            run,
+            previous.operation === control.operation &&
+              previous.userId === request.userId &&
+              previous.text === (control.operation === "approve" ? null : control.text)
+              ? "accepted"
+              : "conflict",
+          );
+        // Final completion retries use the existing cleanup attempt; no new response is recorded.
+        if (!(control.operation === "approve" && run.progress.retryableApproval)) {
+          const checkpoint = run.progress.checkpoint;
+          const step = activeWorkflowStep(run);
+          if (
+            !checkpoint ||
+            checkpoint.checkpointId !== control.checkpointId ||
+            run.progress.revision !== control.expectedRevision ||
+            run.approvalAttempt ||
+            (control.operation === "input"
+              ? step?.kind !== "input" || run.progress.status !== "awaiting_input"
+              : step?.kind !== "review" || run.progress.status !== "awaiting_review")
+          )
+            return result(run, "conflict", "This checkpoint changed. Refresh before responding.");
+          if (control.operation === "approve") {
+            const detail = yield* verifyResult(run);
+            if (detail) return result(run, "conflict", detail);
+          }
+          const sequence = run.sequence;
+          const response = {
+            checkpointId: control.checkpointId,
+            stepId: step!.id,
+            generation: sequence.generation,
+            operation: control.operation,
+            userId: request.userId,
+            text: control.operation === "approve" ? null : control.text,
+            createdAt: yield* timestamp,
+          };
+          if (control.operation === "request_changes" && step?.kind === "review") {
+            if (
+              !run.worktreePath ||
+              (yield* git.statusDetailsLocal(run.worktreePath)).branch !==
+                jobBranchName(run.jobId) ||
+              (yield* git.resolveCommit({ cwd: run.worktreePath, revision: "HEAD" })).commitSha !==
+                run.preparedHead
+            )
+              return result(
+                run,
+                "conflict",
+                "The prepared branch changed. Cancel the job before starting again.",
+              );
+            const earlier = run.workflow.definition.steps.slice(0, sequence.cursor);
+            const target = step.reworkStepId
+              ? earlier.findIndex((candidate) => candidate.id === step.reworkStepId)
+              : earlier.findLastIndex((candidate) => candidate.kind === "agent");
+            if (target < 0) return result(run, "conflict", "The rework target is unavailable.");
+            run = advanceWorkflow({
+              ...run,
+              sequence: {
+                ...sequence,
+                cursor: target,
+                generation: sequence.generation + 1,
+                feedback: control.text,
+                stepStartedAt: response.createdAt,
+                responses: [...sequence.responses, response],
+                completed: sequence.completed.filter((entry) =>
+                  earlier.slice(0, target).some((candidate) => candidate.id === entry.stepId),
+                ),
+              },
+            });
+          } else {
+            const oldCheckpoint = run.progress.checkpoint;
+            run = advanceWorkflow({
+              ...run,
+              sequence: {
+                ...sequence,
+                cursor: sequence.cursor + 1,
+                stepStartedAt: response.createdAt,
+                responses: [...sequence.responses, response],
+                completed: [
+                  ...sequence.completed,
+                  {
+                    stepId: step!.id,
+                    generation: sequence.generation,
+                    checkpoint: null,
+                    head: null,
+                  },
+                ],
+              },
+            });
+            if (run.progress.status === "finishing" && control.operation === "approve")
+              run = {
+                ...run,
+                progress: { ...run.progress, status: "awaiting_review", checkpoint: oldCheckpoint },
+              };
+          }
+          yield* store.save(run);
+          return result(yield* reconcile(run));
+        }
+      }
       if (request.control.operation !== "approve")
         return result(run, "conflict", "Unsupported workflow control.");
       const checkpoint = run.progress.checkpoint;
@@ -1160,7 +1612,7 @@ export const make = Effect.gen(function* () {
       )
         return result(run);
       if (
-        run.progress.status !== "awaiting_review" ||
+        !["awaiting_review", "finishing"].includes(run.progress.status) ||
         run.progress.revision !== request.control.expectedRevision ||
         !checkpoint ||
         checkpoint.checkpointId !== request.control.checkpointId ||
@@ -1176,7 +1628,11 @@ export const make = Effect.gen(function* () {
       run = yield* store.save({
         ...run,
         approvalAttempt: {
-          approvedBy: accepted?.approvedBy ?? request.userId,
+          approvedBy: accepted
+            ? accepted.approvedBy
+            : run.progress.status === "finishing"
+              ? null
+              : request.userId,
           checkpointId: checkpoint.checkpointId,
           preparedHead: run.preparedHead,
           acceptedRevision: request.control.expectedRevision,
@@ -1205,7 +1661,10 @@ export const make = Effect.gen(function* () {
       // Cleanup workers wait for exit outside the control mutex.
       return result(yield* reconcileApproval(run));
     },
-    (effect) => Deferred.await(recovered).pipe(Effect.andThen(lock.withPermits(1)(effect))),
+    (effect) =>
+      Deferred.await(recovered).pipe(
+        Effect.andThen(lock.withPermits(1)(effect.pipe(Effect.tap(() => pumpWaiting())))),
+      ),
     Effect.catchCause((cause) =>
       Effect.fail(new WorkflowRunnerError({ message: Cause.pretty(cause) })),
     ),
@@ -1227,7 +1686,10 @@ export const make = Effect.gen(function* () {
                     const run = threadId.startsWith("workflow:")
                       ? yield* store.getByThread(threadId)
                       : null;
-                    if (run) yield* reconcile(run);
+                    if (run) {
+                      yield* reconcile(run);
+                      yield* pumpWaiting();
+                    }
                   }),
                 )
                 .pipe(Effect.ignoreCause({ log: true }));
@@ -1240,6 +1702,7 @@ export const make = Effect.gen(function* () {
       .withPermits(1)(
         Effect.gen(function* () {
           for (const run of yield* store.active()) yield* reconcile(run, true);
+          yield* pumpWaiting();
         }),
       )
       .pipe(

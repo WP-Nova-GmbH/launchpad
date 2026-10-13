@@ -50,12 +50,15 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Predicate from "effect/Predicate";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Stream from "effect/Stream";
 
+import { workflowPromptId } from "../../jobs/workflowSequence.ts";
+import { WorkflowRunStore, type WorkflowRun } from "../../jobs/WorkflowRunStore.ts";
 import { appendUserInputAttachmentPaths } from "../userInputAttachments.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
@@ -74,6 +77,7 @@ import {
   withMetrics,
 } from "../../observability/Metrics.ts";
 import {
+  ProviderAdapterValidationError,
   ProviderAdapterRequestError,
   type ProviderAdapterError,
   type ProviderServiceError,
@@ -95,6 +99,30 @@ import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 const isModelSelection = Schema.is(ModelSelection);
+const ProviderContinuationMetadata = Schema.Struct({
+  continuationKey: Schema.String,
+  workflowJobId: Schema.optional(Schema.String),
+  shutdownConfirmed: Schema.optional(Schema.Boolean),
+  shutdownEvidenceVersion: Schema.optional(Schema.Number),
+  runtimeEpisode: Schema.optional(Schema.String),
+});
+type ProviderContinuationMetadata = typeof ProviderContinuationMetadata.Type;
+const decodeContinuationPayload = Schema.decodeUnknownOption(
+  Schema.Struct({
+    providerContinuation: Schema.optional(ProviderContinuationMetadata),
+  }),
+);
+const readContinuation = (payload: unknown) =>
+  Option.getOrUndefined(decodeContinuationPayload(payload))?.providerContinuation;
+const verifiedShutdown = (metadata: ProviderContinuationMetadata | undefined) =>
+  metadata?.shutdownConfirmed === true && metadata.shutdownEvidenceVersion === 2;
+const ownershipReleased = (run: WorkflowRun) =>
+  ["done", "cancelled", "failed"].includes(run.progress.status) &&
+  !run.executionReserved &&
+  !run.approvalAttempt &&
+  !run.cancellationAttempt &&
+  !run.pendingQueueDismissal &&
+  !run.pendingPreparationRetry;
 const encodePromptJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 interface SnapShotPromptAccessibilityNode {
@@ -393,12 +421,14 @@ function toRuntimePayloadFromSession(
   session: ProviderSession,
   extra?: {
     readonly modelSelection?: unknown;
+    readonly providerContinuation?: ProviderContinuationMetadata;
     readonly continueAfterServerUpdate?: TurnId;
     readonly lastRuntimeEvent?: string;
     readonly lastRuntimeEventAt?: string;
   },
 ): Record<string, unknown> {
   return {
+    ...(extra?.providerContinuation ? { providerContinuation: extra.providerContinuation } : {}),
     cwd: session.cwd ?? null,
     model: session.model ?? null,
     activeTurnId: session.activeTurnId ?? null,
@@ -487,6 +517,277 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+  const workflows = yield* WorkflowRunStore;
+  const ownedSessions = new Map<
+    ThreadId,
+    {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+      readonly continuationKey: string;
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+      shutdownConfirmed: boolean;
+      readonly runtimeEpisode: string | undefined;
+      mcpProviderSessionId: string | undefined;
+    }
+  >();
+  const sessionOwners = new Map<ThreadId, Set<NonNullable<ReturnType<typeof ownedSessions.get>>>>();
+  const workflowPolicy = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    binding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+    expected?: ProviderService.WorkflowProviderContinuation,
+  ) {
+    const metadata = readContinuation(binding?.runtimePayload);
+    if (Predicate.hasProperty(binding?.runtimePayload, "providerContinuation") && !metadata)
+      return yield* toValidationError(
+        "provider.continuation",
+        "The stored provider continuation policy is malformed and cannot prove ownership release.",
+      );
+    let run = yield* workflows.getByThread(threadId);
+    if (!run && metadata?.workflowJobId) {
+      run = yield* workflows.get(metadata.workflowJobId);
+      if (!run || run.progress.threadId !== threadId)
+        return yield* toValidationError(
+          "provider.continuation",
+          "The workflow session owner is unavailable.",
+        );
+      if (ownershipReleased(run)) run = null;
+    }
+    if (
+      expected &&
+      (!run ||
+        run.jobId !== expected.jobId ||
+        !run.executionReserved ||
+        !["preparing", "running"].includes(run.progress.status) ||
+        (expected.messageId !== undefined && workflowPromptId(run) !== expected.messageId))
+    )
+      return yield* toValidationError(
+        "provider.continuation",
+        "The workflow attempt no longer owns this thread.",
+      );
+    if (!run) return undefined;
+    if (!run.providerContinuation)
+      return yield* toValidationError(
+        "provider.continuation",
+        "This job's original provider compatibility is unavailable.",
+      );
+    if (
+      expected &&
+      (expected.driver !== run.providerContinuation.driver ||
+        expected.continuationKey !== run.providerContinuation.continuationKey)
+    )
+      return yield* toValidationError(
+        "provider.continuation",
+        "The workflow's accepted provider identity changed.",
+      );
+    return { jobId: run.jobId, ...run.providerContinuation };
+  });
+  const validateContinuation = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    binding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+    route: ProviderAdapterRegistry.ProviderInstanceRoutingInfo,
+    expected?: ProviderService.WorkflowProviderContinuation,
+  ) {
+    const policy = yield* workflowPolicy(threadId, binding, expected);
+    const metadata = readContinuation(binding?.runtimePayload);
+    if (
+      policy &&
+      (!route.enabled ||
+        route.driverKind !== policy.driver ||
+        route.continuationIdentity.continuationKey !== policy.continuationKey)
+    )
+      return yield* toValidationError(
+        "provider.continuation",
+        "The Agent provider's continuation identity changed or is unavailable. Cancel this job before starting again.",
+      );
+    if (
+      policy &&
+      binding &&
+      (!metadata ||
+        binding.provider !== policy.driver ||
+        metadata.continuationKey !== policy.continuationKey)
+    )
+      return yield* toValidationError(
+        "provider.continuation",
+        "The saved workflow conversation identity cannot be verified. Cancel this job before starting again.",
+      );
+    return policy;
+  });
+  const requireRecoverableOwner = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    binding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+    policy: ProviderService.WorkflowProviderContinuation | undefined,
+    acquiringEpisode?: string,
+  ) {
+    if (!policy || !binding) return;
+    const owners = Array.from(sessionOwners.get(threadId)?.values() ?? []);
+    if (owners.length === 0 && verifiedShutdown(readContinuation(binding.runtimePayload))) return;
+    if (owners.length === 0)
+      return yield* toValidationError(
+        "provider.continuation",
+        "The original workflow runtime ownership was lost. Cancel this job; unconfirmed cleanup remains blocked.",
+      );
+    for (const owner of owners) {
+      if (owner.runtimeEpisode === acquiringEpisode && acquiringEpisode !== undefined) continue;
+      if (owner.shutdownConfirmed) continue;
+      const activeEpisode = yield* (
+        owner.adapter.getSessionRuntimeEpisode?.(threadId) ?? Effect.succeed(undefined)
+      );
+      if (activeEpisode === owner.runtimeEpisode && (yield* owner.adapter.hasSession(threadId)))
+        continue;
+      if (
+        owner.adapter.isSessionStopConfirmed &&
+        (yield* owner.adapter.isSessionStopConfirmed(threadId, owner.runtimeEpisode))
+      )
+        continue;
+      return yield* toValidationError(
+        "provider.continuation",
+        "The previous workflow runtime shutdown is unconfirmed. Cancel this job before starting again.",
+      );
+    }
+  });
+  const rememberSession = (
+    threadId: ThreadId,
+    route: ProviderAdapterRegistry.ProviderInstanceRoutingInfo & {
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+    },
+    runtimeEpisode?: string,
+  ) => {
+    const current = ownedSessions.get(threadId);
+    if (runtimeEpisode === undefined && current?.adapter === route.adapter) return current;
+    const owner = {
+      instanceId: route.instanceId,
+      provider: route.driverKind,
+      continuationKey: route.continuationIdentity.continuationKey,
+      adapter: route.adapter,
+      runtimeEpisode,
+      shutdownConfirmed: false,
+      mcpProviderSessionId: undefined as string | undefined,
+    };
+    ownedSessions.set(threadId, owner);
+    const owners = sessionOwners.get(threadId) ?? new Set();
+    owners.add(owner);
+    sessionOwners.set(threadId, owners);
+    return owner;
+  };
+  const beginWorkflowRuntime = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    binding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+    route: ProviderAdapterRegistry.ProviderInstanceRoutingInfo,
+    policy: ProviderService.WorkflowProviderContinuation | undefined,
+    runtimeMode: ProviderSession["runtimeMode"],
+    runtimeEpisode: string,
+  ) {
+    // Invalidate old proof before this exact native episode can spawn.
+    yield* directory.upsert({
+      threadId,
+      provider: route.driverKind,
+      providerInstanceId: route.instanceId,
+      runtimeMode,
+      ...(binding ? {} : { status: "starting" as const }),
+      runtimePayload: {
+        providerContinuation: {
+          continuationKey: route.continuationIdentity.continuationKey,
+          ...(policy ? { workflowJobId: policy.jobId } : {}),
+          runtimeEpisode,
+          shutdownConfirmed: false,
+        },
+      },
+    });
+  });
+  const beforeRuntimeStart = (
+    threadId: ThreadId,
+    binding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+    route: ProviderAdapterRegistry.ProviderInstanceRoutingInfo & {
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+    },
+    policy: ProviderService.WorkflowProviderContinuation | undefined,
+    runtimeMode: ProviderSession["runtimeMode"],
+    onStarting?: (owner: NonNullable<ReturnType<typeof ownedSessions.get>>) => void,
+    expected?: ProviderService.WorkflowProviderContinuation,
+  ) => {
+    // Original attempt constraints belong to its first episode, not later internal restarts.
+    let initialEpisode: string | undefined;
+    return (runtimeEpisode: string) =>
+      Effect.suspend(() => {
+        initialEpisode ??= runtimeEpisode;
+        const initialAcquisition = initialEpisode === runtimeEpisode;
+        const owner = rememberSession(threadId, route, runtimeEpisode);
+        onStarting?.(owner);
+        return Effect.gen(function* () {
+          const currentRoute = yield* registry.resolveInstance(route.instanceId);
+          if (currentRoute.adapter !== route.adapter)
+            return yield* toValidationError(
+              "provider.continuation",
+              "The provider instance changed before session startup.",
+            );
+          const currentBinding =
+            Option.getOrUndefined(yield* directory.getBinding(threadId)) ?? binding;
+          const currentPolicy = yield* validateContinuation(
+            threadId,
+            currentBinding,
+            currentRoute,
+            initialAcquisition ? expected : undefined,
+          );
+          if (currentPolicy?.jobId !== policy?.jobId) {
+            const released =
+              !initialAcquisition && !currentPolicy && policy
+                ? yield* workflows.get(policy.jobId)
+                : null;
+            if (
+              !released ||
+              released.progress.threadId !== threadId ||
+              !ownershipReleased(released)
+            )
+              return yield* toValidationError(
+                "provider.continuation",
+                "Workflow ownership changed before session startup.",
+              );
+          }
+          if (currentPolicy) {
+            const run = yield* workflows.get(currentPolicy.jobId);
+            if (!run || run.progress.status === "cancelling" || ownershipReleased(run))
+              return yield* toValidationError(
+                "provider.continuation",
+                "The workflow no longer admits native acquisition.",
+              );
+          }
+          yield* requireRecoverableOwner(
+            threadId,
+            currentBinding,
+            currentPolicy ?? policy,
+            runtimeEpisode,
+          );
+          yield* beginWorkflowRuntime(
+            threadId,
+            currentBinding,
+            currentRoute,
+            currentPolicy,
+            runtimeMode,
+            runtimeEpisode,
+          );
+          const credential = yield* prepareMcpSession(threadId, route.instanceId);
+          owner.mcpProviderSessionId = credential?.config.providerSessionId;
+          if (currentPolicy) {
+            const run = yield* workflows.get(currentPolicy.jobId);
+            if (!run || run.progress.status === "cancelling" || ownershipReleased(run))
+              return yield* toValidationError(
+                "provider.continuation",
+                "The workflow stopped admitting native work during acquisition.",
+              );
+          }
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterValidationError({
+                provider: route.driverKind,
+                operation: "startSession",
+                issue: cause.message,
+              }),
+          ),
+          Effect.onError(() => clearMcpSession(threadId, owner.mcpProviderSessionId)),
+        );
+      });
+  };
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const projectionQuery = yield* Effect.serviceOption(
     ProjectionSnapshotQuery.ProjectionSnapshotQuery,
@@ -975,10 +1276,33 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       }
       return credential;
     });
-  const clearMcpSession = (threadId: ThreadId) =>
-    McpSessionRegistry.revokeActiveMcpThread(threadId).pipe(
-      Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
-    );
+  const clearMcpSession = (threadId: ThreadId, providerSessionId?: string) =>
+    providerSessionId === undefined
+      ? Effect.void
+      : McpSessionRegistry.revokeActiveMcpProviderSession(providerSessionId).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              McpProviderSession.revokeIssueTrackerTurn(threadId, providerSessionId);
+              McpProviderSession.clearMcpProviderSession(threadId, providerSessionId);
+            }),
+          ),
+        );
+  const clearCapturedOwners = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    owners: ReadonlyArray<NonNullable<ReturnType<typeof ownedSessions.get>>>,
+  ) {
+    for (const owner of owners) {
+      yield* clearMcpSession(threadId, owner.mcpProviderSessionId);
+      sessionOwners.get(threadId)?.delete(owner);
+      if (ownedSessions.get(threadId) === owner) ownedSessions.delete(threadId);
+      if (owner.runtimeEpisode)
+        yield* (
+          owner.adapter.releaseSessionStopConfirmation?.(threadId, owner.runtimeEpisode) ??
+            Effect.void
+        );
+    }
+    if (sessionOwners.get(threadId)?.size === 0) sessionOwners.delete(threadId);
+  });
 
   const pendingDeliveries = new Map<
     ThreadId,
@@ -1110,25 +1434,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     threadId: ThreadId,
     extra?: {
       readonly modelSelection?: unknown;
+      readonly providerContinuation?: ProviderContinuationMetadata;
       readonly continueAfterServerUpdate?: TurnId;
       readonly lastRuntimeEvent?: string;
       readonly lastRuntimeEventAt?: string;
     },
+    expectedRuntimeEpisode?: string,
   ) =>
     Effect.gen(function* () {
       const providerInstanceId = yield* requireBindingInstanceId(
         "ProviderService.upsertSessionBinding",
         session,
       );
-      yield* directory.upsert({
-        threadId,
-        provider: session.provider,
-        providerInstanceId,
-        runtimeMode: session.runtimeMode,
-        status: toRuntimeStatus(session),
-        ...(session.resumeCursor !== undefined ? { resumeCursor: session.resumeCursor } : {}),
-        runtimePayload: toRuntimePayloadFromSession(session, extra),
-      });
+      yield* directory.upsert(
+        {
+          threadId,
+          provider: session.provider,
+          providerInstanceId,
+          runtimeMode: session.runtimeMode,
+          status: toRuntimeStatus(session),
+          ...(session.resumeCursor !== undefined ? { resumeCursor: session.resumeCursor } : {}),
+          runtimePayload: toRuntimePayloadFromSession(session, extra),
+        },
+        expectedRuntimeEpisode ? { expectedRuntimeEpisode } : undefined,
+      );
     });
 
   const processRuntimeEvent = (
@@ -1291,20 +1620,64 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       "provider.thread_id": input.binding.threadId,
     });
     return yield* Effect.gen(function* () {
-      const adapter = yield* registry.getByInstance(bindingInstanceId);
+      const route = yield* registry.resolveInstance(bindingInstanceId);
+      const policy = yield* validateContinuation(input.binding.threadId, input.binding, route);
+      yield* requireRecoverableOwner(input.binding.threadId, input.binding, policy);
+      const adapter = route.adapter;
       const hasResumeCursor =
         input.binding.resumeCursor !== null && input.binding.resumeCursor !== undefined;
       const hasActiveSession = yield* adapter.hasSession(input.binding.threadId);
       if (hasActiveSession) {
+        const capturedOwner = ownedSessions.get(input.binding.threadId);
+        const episode = yield* (
+          adapter.getSessionRuntimeEpisode?.(input.binding.threadId) ?? Effect.succeed(undefined)
+        );
         const activeSessions = yield* adapter.listSessions();
         const existing = activeSessions.find(
           (session) => session.threadId === input.binding.threadId,
         );
         if (existing) {
+          if (policy && !episode)
+            return yield* toValidationError(
+              input.operation,
+              "The live runtime's native episode is unavailable.",
+            );
+          const currentEpisode = yield* (
+            adapter.getSessionRuntimeEpisode?.(input.binding.threadId) ?? Effect.succeed(undefined)
+          );
+          // Adoption reuses an owner; only native startup can invalidate shutdown proof.
+          const owner = adapter.getSessionRuntimeEpisode
+            ? capturedOwner
+            : rememberSession(input.binding.threadId, route);
+          if (
+            !owner ||
+            owner.adapter !== adapter ||
+            owner.instanceId !== bindingInstanceId ||
+            owner.continuationKey !== route.continuationIdentity.continuationKey ||
+            owner.runtimeEpisode !== episode ||
+            (adapter.getSessionRuntimeEpisode && (!episode || currentEpisode !== episode)) ||
+            owner.shutdownConfirmed ||
+            ownedSessions.get(input.binding.threadId) !== owner
+          )
+            return yield* toValidationError(
+              input.operation,
+              "Runtime ownership changed during session adoption.",
+            );
+          if (!adapter.getSessionRuntimeEpisode)
+            owner.mcpProviderSessionId = McpProviderSession.readMcpProviderSession(
+              input.binding.threadId,
+            )?.providerSessionId;
           yield* upsertSessionBinding(
             { ...existing, providerInstanceId: bindingInstanceId },
             input.binding.threadId,
+            undefined,
+            episode,
           );
+          if (owner.shutdownConfirmed || ownedSessions.get(input.binding.threadId) !== owner)
+            return yield* toValidationError(
+              input.operation,
+              "Runtime ownership changed while session adoption was saved.",
+            );
           yield* analytics.record("provider.session.recovered", {
             provider: existing.provider,
             strategy: "adopt-existing",
@@ -1324,30 +1697,71 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
-      yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
+      let acquisitionOwner: NonNullable<ReturnType<typeof ownedSessions.get>> | undefined;
+      if (
+        !adapter.getSessionRuntimeEpisode &&
+        !["codex", "claudeAgent"].includes(route.driverKind)
+      ) {
+        const credential = yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
+        acquisitionOwner = rememberSession(input.binding.threadId, route);
+        acquisitionOwner.mcpProviderSessionId = credential?.config.providerSessionId;
+      }
       const resumed = yield* adapter
-        .startSession({
-          threadId: input.binding.threadId,
-          provider: input.binding.provider,
-          providerInstanceId: bindingInstanceId,
-          ...(persistedCwd ? { cwd: persistedCwd } : {}),
-          ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
-          ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
-          runtimeMode: input.binding.runtimeMode ?? "full-access",
-        })
-        .pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
+        .startSession(
+          {
+            threadId: input.binding.threadId,
+            provider: input.binding.provider,
+            providerInstanceId: bindingInstanceId,
+            ...(persistedCwd ? { cwd: persistedCwd } : {}),
+            ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
+            ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
+            runtimeMode: input.binding.runtimeMode ?? "full-access",
+          },
+          {
+            requireResume: policy !== undefined,
+            beforeStart: beforeRuntimeStart(
+              input.binding.threadId,
+              input.binding,
+              route,
+              policy,
+              input.binding.runtimeMode ?? "full-access",
+              (owner) => {
+                // Stored callbacks also run on later native restarts; retain this acquisition.
+                if (!acquisitionOwner?.runtimeEpisode) acquisitionOwner = owner;
+              },
+            ),
+          },
+        )
+        .pipe(
+          Effect.onError(() =>
+            clearMcpSession(input.binding.threadId, acquisitionOwner?.mcpProviderSessionId),
+          ),
+        );
       if (resumed.provider !== adapter.provider) {
-        yield* clearMcpSession(input.binding.threadId);
+        yield* clearMcpSession(input.binding.threadId, acquisitionOwner?.mcpProviderSessionId);
         return yield* toValidationError(
           input.operation,
           `Adapter/provider mismatch while recovering thread '${input.binding.threadId}'. Expected '${adapter.provider}', received '${resumed.provider}'.`,
         );
       }
 
+      const owner = acquisitionOwner;
+      if (!owner || owner.shutdownConfirmed || ownedSessions.get(input.binding.threadId) !== owner)
+        return yield* toValidationError(
+          input.operation,
+          "Runtime ownership changed during recovery.",
+        );
       yield* upsertSessionBinding(
         { ...resumed, providerInstanceId: bindingInstanceId },
         input.binding.threadId,
+        undefined,
+        owner.runtimeEpisode,
       );
+      if (owner.shutdownConfirmed || ownedSessions.get(input.binding.threadId) !== owner)
+        return yield* toValidationError(
+          input.operation,
+          "Runtime ownership changed while recovery was saved.",
+        );
       yield* analytics.record("provider.session.recovered", {
         provider: resumed.provider,
         strategy: "resume-thread",
@@ -1378,10 +1792,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     }
     const instanceId = yield* requireBindingInstanceId(input.operation, binding);
-    const adapter = yield* registry.getByInstance(instanceId);
+    const route = yield* registry.resolveInstance(instanceId);
+    const policy = yield* validateContinuation(input.threadId, binding, route);
+    yield* requireRecoverableOwner(input.threadId, binding, policy);
+    const adapter = route.adapter;
 
     const hasRequestedSession = yield* adapter.hasSession(input.threadId);
     if (hasRequestedSession) {
+      yield* (
+        adapter.updateSessionOptions?.(input.threadId, { requireResume: policy !== undefined }) ??
+          Effect.void
+      );
       return {
         adapter,
         instanceId,
@@ -1416,41 +1837,50 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const stopStaleSessionsForThread = Effect.fn("stopStaleSessionsForThread")(function* (input: {
     readonly threadId: ThreadId;
-    readonly currentInstanceId: ProviderInstanceId;
+    readonly currentAdapter: ProviderAdapterShape<ProviderAdapterError>;
+    readonly strict: boolean;
   }) {
-    const currentAdapters = yield* getAdapterEntries;
-    yield* Effect.forEach(
-      currentAdapters,
-      ([instanceId, adapter]) =>
-        instanceId === input.currentInstanceId
-          ? Effect.void
-          : Effect.gen(function* () {
-              const hasSession = yield* adapter.hasSession(input.threadId);
-              if (!hasSession) {
-                return;
-              }
-
-              yield* adapter.stopSession(input.threadId).pipe(
-                Effect.tap(() =>
-                  analytics.record("provider.session.stopped", {
-                    provider: adapter.provider,
-                  }),
-                ),
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("provider.session.stop-stale-failed", {
-                    threadId: input.threadId,
-                    provider: adapter.provider,
-                    cause,
-                  }),
-                ),
-              );
-            }),
-      { discard: true },
-    );
+    const candidates = new Map(yield* getAdapterEntries);
+    const owned = Array.from(sessionOwners.get(input.threadId)?.values() ?? []);
+    const adapters = new Set([...candidates.values(), ...owned.map((owner) => owner.adapter)]);
+    for (const adapter of adapters) {
+      if (adapter === input.currentAdapter) continue;
+      const stop = Effect.gen(function* () {
+        const staleOwners = owned.filter((owner) => owner.adapter === adapter);
+        if (staleOwners.length === 0) {
+          if (yield* adapter.hasSession(input.threadId)) yield* adapter.stopSession(input.threadId);
+          return;
+        }
+        for (const owner of staleOwners) {
+          if (owner.shutdownConfirmed) continue;
+          yield* adapter.stopSession(input.threadId, owner.runtimeEpisode);
+          const nativeConfirmed = yield* (
+            adapter.isSessionStopConfirmed?.(input.threadId, owner.runtimeEpisode) ??
+              Effect.succeed(!input.strict)
+          );
+          if (input.strict && !nativeConfirmed)
+            return yield* toValidationError(
+              "provider.continuation",
+              "The previous provider session shutdown is unconfirmed. Cancel this job before starting again.",
+            );
+          if (nativeConfirmed) owner.shutdownConfirmed = true;
+        }
+      });
+      yield* input.strict
+        ? stop
+        : stop.pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("provider.session.stop-stale-failed", {
+                threadId: input.threadId,
+                cause,
+              }),
+            ),
+          );
+    }
   });
 
   const startSession: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
-    function* (threadId, rawInput) {
+    function* (threadId, rawInput, sessionOptions) {
       const parsed = yield* decodeInputOrValidationError({
         operation: "ProviderService.startSession",
         schema: ProviderSessionStartInput,
@@ -1462,6 +1892,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         parsed,
       );
       let metricProvider = parsed.provider ?? String(resolvedInstanceId);
+      let nativeStartAttempted = false;
       yield* Effect.annotateCurrentSpan({
         "provider.operation": "start-session",
         "provider.instance_id": resolvedInstanceId,
@@ -1469,7 +1900,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.runtime_mode": parsed.runtimeMode,
       });
       return yield* Effect.gen(function* () {
-        const instanceInfo = yield* registry.getInstanceInfo(resolvedInstanceId);
+        const instanceInfo = yield* registry.resolveInstance(resolvedInstanceId);
         const resolvedProvider = instanceInfo.driverKind;
         metricProvider = resolvedProvider;
         if (parsed.provider !== undefined && parsed.provider !== resolvedProvider) {
@@ -1490,36 +1921,54 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           );
         }
         const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
-        if (
+        const policy = yield* validateContinuation(
+          threadId,
+          persistedBinding,
+          instanceInfo,
+          sessionOptions?.workflowContinuation,
+        );
+        yield* requireRecoverableOwner(threadId, persistedBinding, policy);
+        if (policy && !persistedBinding) {
+          const owner = yield* workflows.get(policy.jobId);
+          if (owner?.sequence?.completed.some((step) => step.checkpoint !== null))
+            return yield* toValidationError(
+              "provider.continuation",
+              "The original workflow conversation binding is missing. Cancel this job before starting again.",
+            );
+        }
+        const savedIdentity = readContinuation(persistedBinding?.runtimePayload);
+        let compatibleBinding =
           persistedBinding?.provider === resolvedProvider &&
-          persistedBinding.providerInstanceId !== resolvedInstanceId &&
+          (savedIdentity
+            ? savedIdentity.continuationKey === instanceInfo.continuationIdentity.continuationKey
+            : persistedBinding.providerInstanceId === resolvedInstanceId);
+        if (
+          !compatibleBinding &&
+          persistedBinding?.provider === resolvedProvider &&
+          !savedIdentity &&
+          persistedBinding.providerInstanceId &&
           (input.resumeCursor != null || persistedBinding.resumeCursor != null)
         ) {
-          const previousInstanceId = yield* requireBindingInstanceId(
-            "ProviderService.startSession",
-            persistedBinding,
-          );
-          const previousInfo = yield* registry.getInstanceInfo(previousInstanceId);
-          if (
-            previousInfo.continuationIdentity.continuationKey !==
-            instanceInfo.continuationIdentity.continuationKey
-          ) {
+          const previousInfo = yield* registry.getInstanceInfo(persistedBinding.providerInstanceId);
+          compatibleBinding =
+            previousInfo.continuationIdentity.continuationKey ===
+            instanceInfo.continuationIdentity.continuationKey;
+          if (!compatibleBinding)
             return yield* toValidationError(
               "ProviderService.startSession",
-              `Thread '${threadId}' cannot switch from instance '${previousInstanceId}' to '${resolvedInstanceId}' because their provider resume state is incompatible.`,
+              `Thread '${threadId}' cannot switch instances because their provider resume state is incompatible.`,
             );
-          }
         }
         const effectiveResumeCursor =
-          input.resumeCursor ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
-            ? persistedBinding.resumeCursor
-            : undefined);
+          input.resumeCursor ?? (compatibleBinding ? persistedBinding?.resumeCursor : undefined);
         const effectiveCwd =
           input.cwd ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
-            ? readPersistedCwd(persistedBinding.runtimePayload)
-            : undefined);
+          (compatibleBinding ? readPersistedCwd(persistedBinding?.runtimePayload) : undefined);
+        if (policy && persistedBinding && effectiveResumeCursor == null)
+          return yield* toValidationError(
+            "provider.continuation",
+            "The saved workflow conversation cannot be resumed. Cancel this job before starting again.",
+          );
         yield* Effect.annotateCurrentSpan({
           "provider.kind": resolvedProvider,
           "provider.resume_cursor.source":
@@ -1553,7 +2002,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             return yield* new ProviderWorkspaceMissingError({ threadId, cwd: effectiveCwd });
           }
         }
-        const adapter = yield* registry.getByInstance(resolvedInstanceId);
+        const adapter = instanceInfo.adapter;
         if (
           (yield* CurrentIssueTrackerAuthorization) ||
           McpProviderSession.readMcpProviderSession(threadId)?.issueTrackerAuthorizationId
@@ -1569,23 +2018,59 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           }
         }
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
-        yield* prepareMcpSession(threadId, resolvedInstanceId);
+        let acquisitionOwner: NonNullable<ReturnType<typeof ownedSessions.get>> | undefined;
+        if (
+          !adapter.getSessionRuntimeEpisode &&
+          !["codex", "claudeAgent"].includes(resolvedProvider)
+        ) {
+          const credential = yield* prepareMcpSession(threadId, resolvedInstanceId);
+          acquisitionOwner = rememberSession(threadId, instanceInfo);
+          acquisitionOwner.mcpProviderSessionId = credential?.config.providerSessionId;
+        }
         const session = yield* adapter
-          .startSession({
-            ...input,
-            providerInstanceId: resolvedInstanceId,
-            ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
-            ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
-          })
-          .pipe(Effect.onError(() => clearMcpSession(threadId)));
+          .startSession(
+            {
+              ...input,
+              providerInstanceId: resolvedInstanceId,
+              ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
+              ...(effectiveResumeCursor !== undefined
+                ? { resumeCursor: effectiveResumeCursor }
+                : {}),
+            },
+            {
+              requireResume: policy !== undefined && persistedBinding !== undefined,
+              beforeStart: beforeRuntimeStart(
+                threadId,
+                persistedBinding,
+                instanceInfo,
+                policy,
+                input.runtimeMode,
+                (owner) => {
+                  nativeStartAttempted = true;
+                  // Stored callbacks also run on later native restarts; retain this acquisition.
+                  if (!acquisitionOwner?.runtimeEpisode) acquisitionOwner = owner;
+                },
+                sessionOptions?.workflowContinuation,
+              ),
+            },
+          )
+          .pipe(
+            Effect.onError(() => clearMcpSession(threadId, acquisitionOwner?.mcpProviderSessionId)),
+          );
 
         if (session.provider !== adapter.provider) {
-          yield* clearMcpSession(threadId);
+          yield* clearMcpSession(threadId, acquisitionOwner?.mcpProviderSessionId);
           return yield* toValidationError(
             "ProviderService.startSession",
             `Adapter/provider mismatch: requested '${adapter.provider}', received '${session.provider}'.`,
           );
         }
+        const owner = acquisitionOwner;
+        if (!owner || owner.shutdownConfirmed || ownedSessions.get(threadId) !== owner)
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            "Runtime ownership changed during startup.",
+          );
         const sessionWithInstance = {
           ...session,
           providerInstanceId: resolvedInstanceId,
@@ -1593,11 +2078,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
         yield* stopStaleSessionsForThread({
           threadId,
-          currentInstanceId: resolvedInstanceId,
+          currentAdapter: adapter,
+          strict: policy !== undefined,
         });
-        yield* upsertSessionBinding(sessionWithInstance, threadId, {
-          modelSelection: input.modelSelection,
-        });
+        if (owner.shutdownConfirmed || ownedSessions.get(threadId) !== owner)
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            "Runtime ownership changed during startup.",
+          );
+        yield* upsertSessionBinding(
+          sessionWithInstance,
+          threadId,
+          {
+            modelSelection: input.modelSelection,
+          },
+          owner.runtimeEpisode,
+        );
+        if (owner.shutdownConfirmed || ownedSessions.get(threadId) !== owner)
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            "Runtime ownership changed while startup was saved.",
+          );
         yield* analytics.record("provider.session.started", {
           provider: sessionWithInstance.provider,
           runtimeMode: input.runtimeMode,
@@ -1624,6 +2125,39 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
         return sessionWithInstance;
       }).pipe(
+        Effect.tapError(() =>
+          Effect.gen(function* () {
+            if (nativeStartAttempted || sessionOptions?.workflowContinuation?.firstSession !== true)
+              return;
+            if (Option.isSome(yield* directory.getBinding(threadId))) return;
+            const run = yield* workflows.get(sessionOptions.workflowContinuation.jobId);
+            if (
+              !run?.providerContinuation ||
+              run.progress.threadId !== threadId ||
+              !["preparing", "running", "cancelling"].includes(run.progress.status)
+            )
+              return;
+            // No adapter was invoked, so this is shutdown proof rather than invented native history.
+            yield* directory.upsert(
+              {
+                threadId,
+                provider: run.providerContinuation.driver,
+                providerInstanceId: resolvedInstanceId,
+                status: "stopped",
+                runtimeMode: parsed.runtimeMode,
+                runtimePayload: {
+                  providerContinuation: {
+                    continuationKey: run.providerContinuation.continuationKey,
+                    workflowJobId: run.jobId,
+                    shutdownConfirmed: true,
+                    shutdownEvidenceVersion: 2,
+                  },
+                },
+              },
+              { onConflict: "ignore" },
+            );
+          }),
+        ),
         withMetrics({
           counter: providerSessionsTotal,
           attributes: () =>
@@ -1790,6 +2324,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           allowRecovery: true,
         });
       }
+      const bindingForPolicy = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+      const effectivePolicy = yield* workflowPolicy(input.threadId, bindingForPolicy);
+      const sessionOptions = { requireResume: effectivePolicy !== undefined };
       metricProvider = routed.adapter.provider;
       metricModel = input.modelSelection?.model;
       yield* Effect.annotateCurrentSpan({
@@ -1867,7 +2404,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 metadata: turnMetadata,
               });
             if (!deliveryHooks) {
-              const turn = yield* routed.adapter.sendTurn(input);
+              const turn = yield* routed.adapter.sendTurn(input, {
+                sessionOptions,
+                onAdmitted: () => Effect.void,
+              });
               yield* associate(turn);
               yield* persistAdmission(turn);
               return turn;
@@ -1878,10 +2418,31 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             };
             pendingDeliveries.set(input.threadId, pending);
             let admitted = false;
+            const beforeDispatch = Effect.gen(function* () {
+              const route = yield* registry.resolveInstance(routed.instanceId);
+              if (route.adapter !== routed.adapter)
+                return yield* toValidationError(
+                  "ProviderService.sendTurn",
+                  "The provider instance changed before prompt admission.",
+                );
+              const currentBinding = Option.getOrUndefined(
+                yield* directory.getBinding(input.threadId),
+              );
+              yield* validateContinuation(input.threadId, currentBinding, route);
+              yield* deliveryHooks.beforeDispatch ?? Effect.void;
+            }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapterValidationError({
+                    provider: routed.adapter.provider,
+                    operation: "sendTurn",
+                    issue: cause.message,
+                  }),
+              ),
+            );
             const admissionCallbacks: ProviderSendTurnCallbacks = {
-              ...(deliveryHooks.beforeDispatch
-                ? { beforeDispatch: deliveryHooks.beforeDispatch }
-                : {}),
+              sessionOptions,
+              beforeDispatch,
               onAdmitted: (turn, evidence) =>
                 Effect.gen(function* () {
                   if (admitted) return;
@@ -1898,7 +2459,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   pendingDeliveries.delete(input.threadId);
                 }),
             };
-            return yield* (deliveryHooks.beforeDispatch ?? Effect.void).pipe(
+            return yield* beforeDispatch.pipe(
               Effect.andThen(() => routed.adapter.sendTurn(input, admissionCallbacks)),
               Effect.tap(() =>
                 admitted
@@ -2271,49 +2832,155 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       let metricProvider = "unknown";
       return yield* Effect.gen(function* () {
-        const routed = yield* resolveRoutableSession({
-          threadId: input.threadId,
-          operation: "ProviderService.stopSession",
-          allowRecovery: false,
-        });
-        metricProvider = routed.adapter.provider;
-        yield* Effect.annotateCurrentSpan({
-          "provider.operation": "stop-session",
-          "provider.kind": routed.adapter.provider,
-          "provider.thread_id": input.threadId,
-        });
-        if (routed.isActive) {
-          const session = (yield* routed.adapter.listSessions()).find(
-            (session) => session.threadId === routed.threadId,
+        const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+        const metadata = readContinuation(binding?.runtimePayload);
+        const owned = ownedSessions.get(input.threadId);
+        const activeWorkflow = yield* workflows.getByThread(input.threadId);
+        if (
+          !binding &&
+          !owned &&
+          activeWorkflow &&
+          (yield* isWorkflowSessionStopConfirmed({
+            jobId: activeWorkflow.jobId,
+            threadId: input.threadId,
+          }))
+        )
+          return;
+        if (!binding && !owned)
+          return yield* toValidationError(
+            "ProviderService.stopSession",
+            "No provider runtime ownership is available to confirm stopping.",
           );
-          if (session) {
-            yield* upsertSessionBinding(
-              { ...session, providerInstanceId: routed.instanceId },
-              input.threadId,
-            );
+        const retainedOwner =
+          activeWorkflow ??
+          (metadata?.workflowJobId ? yield* workflows.get(metadata.workflowJobId) : null);
+        const strictOwner =
+          activeWorkflow !== null ||
+          (metadata?.workflowJobId !== undefined &&
+            (!retainedOwner ||
+              retainedOwner.progress.threadId !== input.threadId ||
+              !ownershipReleased(retainedOwner)));
+        if (
+          strictOwner &&
+          binding &&
+          (!retainedOwner?.providerContinuation ||
+            metadata?.workflowJobId !== retainedOwner.jobId ||
+            binding.provider !== retainedOwner.providerContinuation.driver ||
+            metadata.continuationKey !== retainedOwner.providerContinuation.continuationKey)
+        )
+          return yield* toValidationError(
+            "ProviderService.stopSession",
+            "The original workflow runtime identity cannot be verified for cleanup.",
+          );
+        const owners = Array.from(sessionOwners.get(input.threadId)?.values() ?? []);
+        if (owners.length > 0) {
+          for (const owner of owners) {
+            const alreadyConfirmed =
+              owner.shutdownConfirmed ||
+              (owner.adapter.isSessionStopConfirmed
+                ? yield* owner.adapter.isSessionStopConfirmed(input.threadId, owner.runtimeEpisode)
+                : false);
+            if (alreadyConfirmed) {
+              owner.shutdownConfirmed = true;
+              continue;
+            }
+            {
+              const session = (yield* owner.adapter.listSessions()).find(
+                (session) => session.threadId === input.threadId,
+              );
+              if (
+                session &&
+                binding?.providerInstanceId === owner.instanceId &&
+                (!metadata || metadata.continuationKey === owner.continuationKey)
+              )
+                yield* upsertSessionBinding(
+                  { ...session, providerInstanceId: owner.instanceId },
+                  input.threadId,
+                  undefined,
+                  owner.runtimeEpisode,
+                );
+              yield* owner.adapter.stopSession(input.threadId, owner.runtimeEpisode);
+              if (
+                strictOwner &&
+                (!owner.adapter.isSessionStopConfirmed ||
+                  !(yield* owner.adapter.isSessionStopConfirmed(
+                    input.threadId,
+                    owner.runtimeEpisode,
+                  )))
+              )
+                return yield* toValidationError(
+                  "ProviderService.stopSession",
+                  "The original provider shutdown is still unconfirmed. Cleanup remains blocked.",
+                );
+              owner.shutdownConfirmed = true;
+            }
           }
-          yield* routed.adapter.stopSession(routed.threadId);
+        } else if (strictOwner && !verifiedShutdown(metadata)) {
+          return yield* toValidationError(
+            "ProviderService.stopSession",
+            "The original provider runtime ownership was lost after restart. Cleanup remains blocked.",
+          );
         }
-        const pendingCompaction = pendingCompactions.get(input.threadId);
-        if (pendingCompaction !== undefined) {
-          yield* settleCompaction(input.threadId, pendingCompaction, "turn.aborted");
+        const routed = owned ?? {
+          instanceId: yield* requireBindingInstanceId("ProviderService.stopSession", binding!),
+          provider: binding!.provider,
+        };
+        // Non-workflow legacy bindings keep their established stop routing.
+        if (!owned && !strictOwner) {
+          const adapter = yield* registry.getByInstance(routed.instanceId);
+          if (yield* adapter.hasSession(input.threadId)) yield* adapter.stopSession(input.threadId);
         }
-        timedOutNativeCompactions.delete(input.threadId);
-        yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
-        yield* clearMcpSession(input.threadId);
-        yield* directory.upsert({
-          threadId: input.threadId,
-          provider: routed.adapter.provider,
-          providerInstanceId: routed.instanceId,
-          status: "stopped",
-          runtimePayload: {
-            activeTurnId: null,
-            continueAfterServerUpdate: null,
-            continueAfterServerUpdatePrepared: null,
-          },
-        });
+        metricProvider = routed.provider;
+        if (metadata && binding?.providerInstanceId) {
+          if (
+            strictOwner &&
+            owners.length > 0 &&
+            !owners.some(
+              (owner) =>
+                owner.runtimeEpisode === metadata.runtimeEpisode &&
+                owner.provider === binding.provider &&
+                owner.continuationKey === metadata.continuationKey,
+            )
+          )
+            return yield* toValidationError(
+              "ProviderService.stopSession",
+              "The stopped runtime does not own the current shutdown episode.",
+            );
+          const applied = yield* directory.confirmShutdown({
+            threadId: input.threadId,
+            provider: binding.provider,
+            providerInstanceId: binding.providerInstanceId,
+            workflowJobId: metadata.workflowJobId ?? null,
+            continuationKey: metadata.continuationKey,
+            runtimeEpisode: metadata.runtimeEpisode ?? null,
+          });
+          if (!applied)
+            return yield* toValidationError(
+              "ProviderService.stopSession",
+              "Runtime ownership changed before shutdown proof could be saved.",
+            );
+        } else if (binding && !strictOwner) {
+          yield* directory.upsert({
+            threadId: input.threadId,
+            provider: routed.provider,
+            providerInstanceId: routed.instanceId,
+            status: "stopped",
+          });
+        } else if (binding)
+          return yield* toValidationError(
+            "ProviderService.stopSession",
+            "No matched runtime receipt can be persisted.",
+          );
+        if (ownedSessions.get(input.threadId) === owned) {
+          const pendingCompaction = pendingCompactions.get(input.threadId);
+          if (pendingCompaction !== undefined)
+            yield* settleCompaction(input.threadId, pendingCompaction, "turn.aborted");
+          timedOutNativeCompactions.delete(input.threadId);
+          yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
+        }
+        yield* clearCapturedOwners(input.threadId, owners);
         yield* analytics.record("provider.session.stopped", {
-          provider: routed.adapter.provider,
+          provider: routed.provider,
         });
       }).pipe(
         withMetrics({
@@ -2326,6 +2993,57 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     },
   );
+
+  const isWorkflowSessionStopConfirmed: ProviderServiceMethod<"isWorkflowSessionStopConfirmed"> =
+    Effect.fn("isWorkflowSessionStopConfirmed")(function* ({ jobId, threadId }) {
+      const run = yield* workflows.get(jobId);
+      if (!run || run.progress.threadId !== threadId) return false;
+      const owners = Array.from(sessionOwners.get(threadId)?.values() ?? []);
+      for (const owner of owners) {
+        const confirmed = yield* (
+          owner.adapter.isSessionStopConfirmed?.(threadId, owner.runtimeEpisode) ??
+            Effect.succeed(false)
+        );
+        if (!confirmed && !owner.shutdownConfirmed) return false;
+      }
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const metadata = readContinuation(binding?.runtimePayload);
+      if (Array.from(sessionOwners.get(threadId) ?? []).some((owner) => !owners.includes(owner)))
+        return false;
+      if (binding)
+        return (
+          !!run.providerContinuation &&
+          metadata?.workflowJobId === jobId &&
+          binding.provider === run.providerContinuation.driver &&
+          metadata.continuationKey === run.providerContinuation.continuationKey &&
+          verifiedShutdown(metadata)
+        );
+      if (owners.length > 0) return false;
+      if (
+        !run.promptDispatched &&
+        !run.sequence?.completed.some((step) => step.checkpoint !== null)
+      )
+        return true;
+      if (Option.isNone(projectionQuery)) return false;
+      const thread = Option.getOrUndefined(
+        yield* projectionQuery.value.getThreadDetailById(threadId).pipe(Effect.orDie),
+      );
+      const currentBinding = yield* directory.getBinding(threadId);
+      // Check intents after the final await; an empty earlier projection cannot fence a new start.
+      if (Option.isSome(currentBinding) || (sessionOwners.get(threadId)?.size ?? 0) > 0)
+        return false;
+      // Durable startup writes precede spawning; an empty, never-admitted thread can prove no native work.
+      return (
+        !!thread &&
+        thread.session === null &&
+        thread.latestTurn === null &&
+        !thread.messages.some((message) => message.role === "user") &&
+        !thread.promptQueue?.handoff &&
+        !thread.promptQueue?.awaitingTurnId &&
+        (thread.promptQueue?.admissions.length ?? 0) === 0 &&
+        !run.sequence?.completed.some((step) => step.checkpoint !== null)
+      );
+    });
 
   const listSessions: ProviderServiceMethod<"listSessions"> = Effect.fn("listSessions")(
     function* () {
@@ -2528,6 +3246,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   );
 
   const runStopAll = Effect.fn("runStopAll")(function* () {
+    const captured = new Map(
+      Array.from(sessionOwners, ([threadId, owners]) => [threadId, Array.from(owners)] as const),
+    );
     // Continuation is project-scopable, so decide it per session's project;
     // without orchestration the environment value is all there is.
     const stopSettings = yield* serverSettings.getSettings.pipe(
@@ -2567,54 +3288,117 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     const threadIds = yield* directory.listThreadIds();
     const currentAdapters = yield* getAdapterEntries;
     const activeSessions = yield* Effect.forEach(currentAdapters, ([instanceId, adapter]) =>
-      adapter.listSessions().pipe(
-        Effect.map((sessions) =>
-          sessions.map((session) => ({
-            ...session,
-            providerInstanceId: instanceId,
-          })),
-        ),
-      ),
-    ).pipe(Effect.map((sessionsByAdapter) => sessionsByAdapter.flatMap((sessions) => sessions)));
-    yield* Effect.forEach(activeSessions, (session) =>
+      Effect.gen(function* () {
+        const readEpisode = adapter.getSessionRuntimeEpisode;
+        const before = new Map<ThreadId, string | undefined>();
+        if (readEpisode) {
+          for (const [threadId, owners] of captured) {
+            if (owners.some((owner) => owner.adapter === adapter))
+              before.set(threadId, yield* readEpisode(threadId));
+          }
+        }
+        const sessions = yield* adapter.listSessions();
+        const snapshots: Array<{ session: ProviderSession; runtimeEpisode: string | undefined }> =
+          [];
+        for (const session of sessions) {
+          const runtimeEpisode = before.get(session.threadId);
+          if (readEpisode) {
+            const owner = captured
+              .get(session.threadId)
+              ?.find(
+                (owner) => owner.adapter === adapter && owner.runtimeEpisode === runtimeEpisode,
+              );
+            // Never label an earlier session snapshot with a replacement's episode.
+            if (
+              !runtimeEpisode ||
+              !owner ||
+              (yield* readEpisode(session.threadId)) !== runtimeEpisode
+            )
+              continue;
+          }
+          snapshots.push({
+            session: { ...session, providerInstanceId: instanceId },
+            runtimeEpisode,
+          });
+        }
+        return snapshots;
+      }),
+    ).pipe(Effect.map((sessionsByAdapter) => sessionsByAdapter.flat()));
+    yield* Effect.forEach(activeSessions, ({ session, runtimeEpisode }) =>
       Effect.gen(function* () {
         const continueAfterRestart =
           session.status === "running" && session.activeTurnId
             ? yield* continueAfterRestartFor(session.threadId)
             : false;
         const lastRuntimeEventAt = yield* nowIso;
-        yield* upsertSessionBinding(session, session.threadId, {
-          ...(continueAfterRestart && session.activeTurnId
-            ? { continueAfterServerUpdate: session.activeTurnId }
-            : {}),
-          lastRuntimeEvent: "provider.stopAll",
-          lastRuntimeEventAt,
-        });
-      }),
-    ).pipe(Effect.asVoid);
-    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid);
-    yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
-    McpProviderSession.clearAllMcpProviderSessions();
-    const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));
-    yield* Effect.forEach(bindings, (binding) =>
-      Effect.gen(function* () {
-        const providerInstanceId = dieOnMissingBindingInstanceId(
-          "ProviderService.stopAll",
-          binding,
-        );
-        return yield* directory.upsert({
-          threadId: binding.threadId,
-          provider: binding.provider,
-          providerInstanceId,
-          status: "stopped",
-          runtimePayload: {
-            activeTurnId: null,
+        yield* upsertSessionBinding(
+          session,
+          session.threadId,
+          {
+            ...(continueAfterRestart && session.activeTurnId
+              ? { continueAfterServerUpdate: session.activeTurnId }
+              : {}),
             lastRuntimeEvent: "provider.stopAll",
-            lastRuntimeEventAt: yield* nowIso,
+            lastRuntimeEventAt,
           },
-        });
+          runtimeEpisode,
+        );
       }),
     ).pipe(Effect.asVoid);
+    for (const [threadId, owners] of captured) {
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const metadata = readContinuation(binding?.runtimePayload);
+      let confirmed = true;
+      for (const owner of owners) {
+        const result = yield* owner.adapter
+          .stopSession(threadId, owner.runtimeEpisode)
+          .pipe(Effect.result);
+        const proof = yield* (
+          owner.adapter.isSessionStopConfirmed?.(threadId, owner.runtimeEpisode) ??
+            Effect.succeed(!metadata?.workflowJobId && result._tag === "Success")
+        );
+        if (result._tag === "Failure" || !proof) confirmed = false;
+        else owner.shutdownConfirmed = true;
+      }
+      if (!confirmed) continue;
+      if (binding?.providerInstanceId && metadata) {
+        if (
+          !owners.some(
+            (owner) =>
+              owner.runtimeEpisode === metadata.runtimeEpisode &&
+              owner.provider === binding.provider &&
+              owner.continuationKey === metadata.continuationKey,
+          )
+        )
+          continue;
+        const applied = yield* directory.confirmShutdown({
+          threadId,
+          provider: binding.provider,
+          providerInstanceId: binding.providerInstanceId,
+          continuationKey: metadata.continuationKey,
+          workflowJobId: metadata.workflowJobId ?? null,
+          runtimeEpisode: metadata.runtimeEpisode ?? null,
+          preserveRestartIntent: true,
+        });
+        if (!applied) continue;
+      } else if (binding && !metadata?.workflowJobId) {
+        yield* directory.upsert({
+          threadId,
+          provider: binding.provider,
+          providerInstanceId: dieOnMissingBindingInstanceId("ProviderService.stopAll", binding),
+          status: "stopped",
+        });
+      }
+      yield* clearCapturedOwners(threadId, owners);
+    }
+    // Legacy adapters without native episode support retain ordinary best-effort disposal.
+    const capturedAdapters = new Set(
+      Array.from(captured.values()).flatMap((owners) => owners.map((owner) => owner.adapter)),
+    );
+    for (const [, adapter] of currentAdapters) {
+      if (!capturedAdapters.has(adapter) && !adapter.getSessionRuntimeEpisode)
+        yield* adapter.stopAll().pipe(Effect.ignore);
+    }
     yield* analytics.record("provider.sessions.stopped_all", {
       sessionCount: threadIds.length,
     });
@@ -2640,6 +3424,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     respondToUserInput,
     stopSession,
     listSessions,
+    isWorkflowSessionStopConfirmed,
     getCapabilities,
     getInstanceInfo,
     assertConversationRollbackSupported,

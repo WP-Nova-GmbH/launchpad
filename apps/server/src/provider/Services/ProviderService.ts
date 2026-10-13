@@ -12,6 +12,7 @@
  * @module ProviderService
  */
 import type {
+  ProviderDriverKind,
   ProviderInterruptTurnInput,
   ProviderInstanceId,
   ProviderRespondToRequestInput,
@@ -44,6 +45,14 @@ export type ProviderCompactionResult =
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
  */
+export interface WorkflowProviderContinuation {
+  readonly jobId: string;
+  readonly firstSession?: boolean;
+  readonly messageId?: MessageId;
+  readonly driver: ProviderDriverKind;
+  readonly continuationKey: string;
+}
+
 export interface ProviderServiceShape {
   /**
    * Start a provider session.
@@ -51,6 +60,7 @@ export interface ProviderServiceShape {
   readonly startSession: (
     threadId: ThreadId,
     input: ProviderSessionStartInput,
+    options?: { readonly workflowContinuation?: WorkflowProviderContinuation },
   ) => Effect.Effect<ProviderSession, ProviderServiceError>;
 
   /**
@@ -102,6 +112,12 @@ export interface ProviderServiceShape {
    * Aggregates runtime session lists from all registered adapters.
    */
   readonly listSessions: () => Effect.Effect<ReadonlyArray<ProviderSession>>;
+
+  /** Durable cleanup proof for the expected workflow owner, independent of projected status. */
+  readonly isWorkflowSessionStopConfirmed: (input: {
+    readonly jobId: string;
+    readonly threadId: ThreadId;
+  }) => Effect.Effect<boolean, ProviderServiceError>;
 
   /**
    * Read capabilities for the adapter bound to a configured provider instance.

@@ -33,16 +33,22 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
   params: { readonly repositoryId: string; readonly jobId: string },
   payload: typeof RespondToWorkflowJob.Type,
 ) {
-  const membership = yield* authorizeWorkflowRepository(params.repositoryId, true);
+  const membership = yield* authorizeWorkflowRepository(params.repositoryId);
   const store = yield* Workflows;
   const row = yield* store.getJob(params.jobId);
   if (!row || row.repositoryId !== params.repositoryId)
     return yield* tenancyNotFound("repository_not_found");
+  const checkpointResponse =
+    payload.operation === "approve" ||
+    payload.operation === "input" ||
+    payload.operation === "request_changes";
+  if (!checkpointResponse || row.record.progress?.checkpoint?.role !== "member")
+    yield* requireMaintainableRepository({ membership, repositoryId: params.repositoryId });
   if (isTerminalWorkflowJob(row.status)) return row.record;
   if (payload.operation === "cancel" && row.status === "cancelling") return row.record;
   if (
     (row.pendingControl &&
-      !(payload.operation === "cancel" && row.pendingControl.response.operation === "approve")) ||
+      !(payload.operation === "cancel" && row.pendingControl.response.operation !== "cancel")) ||
     (row.status === "cancelling" && payload.operation !== "retry_cancellation")
   )
     return yield* new WorkflowConflictError({
@@ -52,7 +58,7 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     payload.operation === "retry_cancellation" &&
     (row.record.progress?.status !== "cancelling" ||
       !row.record.progress.retryableCancellation ||
-      payload.expectedRevision !== row.record.progress.revision)
+      payload.expectedRevision !== row.record.progress?.revision)
   )
     return yield* new WorkflowConflictError({
       message: "This cancellation changed. Refresh before retrying.",
@@ -61,17 +67,24 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     payload.operation === "retry_preparation" &&
     (row.record.progress?.status !== "paused" ||
       !row.record.progress.retryablePreparation ||
-      payload.expectedRevision !== row.record.progress.revision)
+      payload.expectedRevision !== row.record.progress?.revision)
   )
     return yield* new WorkflowConflictError({
       message: "This preparation changed. Refresh before retrying.",
     });
   if (
-    payload.operation === "approve" &&
-    (row.record.progress?.status !== "awaiting_review" ||
-      (row.record.progress.approvalPending && !row.record.progress.retryableApproval) ||
-      payload.expectedRevision !== row.record.progress.revision ||
-      payload.checkpointId !== row.record.progress.checkpoint?.checkpointId)
+    (payload.operation === "approve" ||
+      payload.operation === "input" ||
+      payload.operation === "request_changes") &&
+    (!(payload.operation === "input"
+      ? row.record.progress?.status === "awaiting_input"
+      : row.record.progress?.status === "awaiting_review" ||
+        (payload.operation === "approve" &&
+          row.record.progress?.status === "finishing" &&
+          row.record.progress.retryableApproval)) ||
+      (row.record.progress?.approvalPending && !row.record.progress?.retryableApproval) ||
+      payload.expectedRevision !== row.record.progress?.revision ||
+      payload.checkpointId !== row.record.progress?.checkpoint?.checkpointId)
   )
     return yield* new WorkflowConflictError({
       message: "This review changed. Refresh before approving.",
@@ -80,6 +93,9 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     row,
     {
       ...row.record,
+      ...(payload.operation === "input" || payload.operation === "request_changes"
+        ? { requiredProtocol: 5 as const }
+        : {}),
       ...(payload.operation === "cancel"
         ? {
             status: "cancelling" as const,

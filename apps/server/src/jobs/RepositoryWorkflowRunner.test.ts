@@ -37,6 +37,8 @@ import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
+import { ProviderService } from "../provider/Services/ProviderService.ts";
+import { ProviderUnsupportedError } from "../provider/Errors.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import { TextGeneration } from "../textGeneration/TextGeneration.ts";
 import type { ApprovalVerdictGenerationInput } from "../textGeneration/TextGeneration.ts";
@@ -160,9 +162,10 @@ function thread(jobId = "job-1"): OrchestrationThread {
     },
   });
 }
-function completed(previous: OrchestrationThread): OrchestrationThread {
+function completed(previous: OrchestrationThread, messageId?: string): OrchestrationThread {
   const jobId = previous.id.split(":")[1]!;
-  const turnId = TurnId.make(`${jobId}-turn`);
+  const count = messageId ? previous.checkpoints.length + 1 : 1;
+  const turnId = TurnId.make(messageId ? `${jobId}-turn-${count}` : `${jobId}-turn`);
   return {
     ...previous,
     branch: `t3-job/${jobId}`,
@@ -176,10 +179,11 @@ function completed(previous: OrchestrationThread): OrchestrationThread {
       assistantMessageId: null,
     },
     checkpoints: [
+      ...(messageId ? previous.checkpoints : []),
       {
         turnId,
-        checkpointTurnCount: 1,
-        checkpointRef: CheckpointRef.make(`refs/t3/${jobId}/turn/1`),
+        checkpointTurnCount: count,
+        checkpointRef: CheckpointRef.make(`refs/t3/${jobId}/turn/${count}`),
         status: "ready",
         files: [],
         assistantMessageId: null,
@@ -195,9 +199,10 @@ function completed(previous: OrchestrationThread): OrchestrationThread {
         target: { branch: `t3-job/${jobId}`, worktreePath: `/jobs/${jobId}` },
       },
       admissions: [
+        ...(messageId ? previous.promptQueue!.admissions : []),
         {
           attemptId: CommandId.make(`admit-${jobId}`),
-          messageId: MessageId.make(`workflow:${jobId}:prompt`),
+          messageId: MessageId.make(messageId ?? `workflow:${jobId}:prompt`),
           turnId,
           evidence: "provider-ack",
         },
@@ -222,11 +227,17 @@ const persistence = Store.layer.pipe(
 );
 const harness = Effect.gen(function* () {
   const currentThread = yield* Ref.make<OrchestrationThread | null>(null);
+  const otherThreads = new Map<string, OrchestrationThread>();
+  const prompts =
+    yield* Queue.unbounded<Extract<OrchestrationCommand, { type: "thread.prompt.enqueue" }>>();
+  const fetches = yield* Ref.make(0);
   const runs = yield* Queue.unbounded<Store.WorkflowRun>();
   const cleanups = yield* Queue.unbounded<string>();
   const cleanupOutcomes = yield* Queue.unbounded<string | null>();
   const confirmedCleanup = yield* Ref.make(false);
+  const providerProof = yield* Ref.make<boolean | null>(null);
   const settlementMode = yield* Ref.make<"normal" | "reject" | "race">("normal");
+  const promptOutage = yield* Ref.make<"none" | "before" | "after" | "reject">("none");
   const finalWriteFailures = yield* Ref.make(0);
   const stored = yield* Store.WorkflowRunStore;
   const commands = yield* Ref.make<ReadonlyArray<OrchestrationCommand>>([]);
@@ -264,7 +275,10 @@ const harness = Effect.gen(function* () {
     slashCommands: [],
     skills: [],
   });
-  const providers = yield* Ref.make<ReadonlyArray<ServerProvider>>([provider]);
+  const projectState = yield* Ref.make(project);
+  const providers = yield* Ref.make<ReadonlyArray<ServerProvider>>([
+    { ...provider, continuation: { groupKey: "codex:test-home" } },
+  ]);
   const repositoryKey = yield* Ref.make("github.com/acme/repo");
   const cleanupReceipt = (input: { threadId: string; attemptId: string }) => ({
     ...input,
@@ -338,6 +352,22 @@ const harness = Effect.gen(function* () {
               });
             return { sequence: 1 };
           }
+          const promptFailure =
+            command.type === "thread.prompt.enqueue" ? yield* Ref.get(promptOutage) : "none";
+          if (promptFailure !== "none") yield* Ref.set(promptOutage, "none");
+          if (promptFailure === "reject") {
+            const rejection = new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: "Injected durable enqueue rejection",
+            });
+            receipts.set(command.commandId, rejection);
+            return yield* rejection;
+          }
+          if (promptFailure === "before")
+            return yield* new OrchestrationProjectorDecodeError({
+              eventType: "thread.prompt-queue-changed",
+              issue: "Prompt acknowledgement unavailable before acceptance",
+            });
           const mode = yield* Ref.get(retryMode);
           const dismiss = yield* Ref.get(dismissalMode);
           if (command.type === "thread.queue.resolve" && dismiss === "before_dismiss")
@@ -427,8 +457,19 @@ const harness = Effect.gen(function* () {
               eventType: "thread.prompt-queue-changed",
               issue: "Lost dismissal acknowledgement after acceptance",
             });
-          if (command.type === "thread.prompt.enqueue")
-            yield* Ref.set(currentThread, thread(command.threadId.split(":")[1]!));
+          if (command.type === "thread.prompt.enqueue") {
+            if (command.bootstrap?.createThread) {
+              const previous = yield* Ref.get(currentThread);
+              if (previous) otherThreads.set(previous.id, previous);
+              yield* Ref.set(currentThread, thread(command.threadId.split(":")[1]!));
+            }
+            yield* Queue.offer(prompts, command);
+          }
+          if (promptFailure === "after")
+            return yield* new OrchestrationProjectorDecodeError({
+              eventType: "thread.prompt-queue-changed",
+              issue: "Prompt acknowledgement lost after acceptance",
+            });
           if (command.type === "thread.preparation.retry" && mode === "after_retry")
             return yield* new OrchestrationProjectorDecodeError({
               eventType: "thread.prompt-queue-changed",
@@ -438,10 +479,50 @@ const harness = Effect.gen(function* () {
         }),
     }),
     Layer.mock(ProjectionSnapshotQuery)({
-      getProjectShellById: () => Effect.succeedSome(project),
-      getThreadDetailById: () => Ref.get(currentThread).pipe(Effect.map(Option.fromNullishOr)),
+      getProjectShellById: () => Ref.get(projectState).pipe(Effect.map(Option.some)),
+      getThreadDetailById: (id) =>
+        Ref.get(currentThread).pipe(
+          Effect.map((current) =>
+            Option.fromNullishOr(current?.id === id ? current : otherThreads.get(id)),
+          ),
+        ),
     }),
     Layer.mock(ProviderRegistry)({ getProviders: Ref.get(providers) }),
+    Layer.mock(ProviderService)({
+      isWorkflowSessionStopConfirmed: () =>
+        Ref.get(providerProof).pipe(
+          Effect.flatMap((proof) =>
+            proof === null
+              ? Ref.get(currentThread).pipe(
+                  Effect.map(
+                    (current) =>
+                      current === null ||
+                      current.session === null ||
+                      current.session.status === "stopped",
+                  ),
+                )
+              : Effect.succeed(proof),
+          ),
+        ),
+      getInstanceInfo: (instanceId) =>
+        Effect.gen(function* () {
+          const selected = (yield* Ref.get(providers)).find(
+            (entry) => entry.instanceId === instanceId,
+          );
+          if (!selected) return yield* new ProviderUnsupportedError({ provider: instanceId });
+          return {
+            instanceId,
+            driverKind: selected.driver,
+            displayName: instanceId,
+            enabled: selected.enabled,
+            continuationIdentity: {
+              driverKind: selected.driver,
+              continuationKey:
+                selected.continuation?.groupKey ?? `${selected.driver}:instance:${instanceId}`,
+            },
+          };
+        }),
+    }),
     Layer.mock(RepositoryIdentityResolver)({
       resolve: () =>
         Ref.get(repositoryKey).pipe(
@@ -457,7 +538,7 @@ const harness = Effect.gen(function* () {
         ),
     }),
     Layer.mock(GitVcsDriver)({
-      fetchRemote: () => Effect.void,
+      fetchRemote: () => Ref.update(fetches, (count) => count + 1),
       resolveDefaultBranchName: () => Effect.succeed("main"),
       resolveRemoteTrackingCommit: () =>
         Effect.succeed({ commitSha: "base-sha", remoteRefName: "origin/main" }),
@@ -494,8 +575,10 @@ const harness = Effect.gen(function* () {
   return {
     cleanups,
     confirmedCleanup,
+    providerProof,
     settlementMode,
     finalWriteFailures,
+    promptOutage,
     cleanupOutcomes,
     awaitRun: (predicate: (run: Store.WorkflowRun) => boolean) =>
       Effect.gen(function* () {
@@ -505,6 +588,10 @@ const harness = Effect.gen(function* () {
         }
       }),
     currentThread,
+    otherThreads,
+    projectState,
+    awaitPrompt: Queue.take(prompts),
+    fetches,
     providers,
     repositoryKey,
     commands,
@@ -530,6 +617,13 @@ const harness = Effect.gen(function* () {
       },
     })),
     newRunner: make.pipe(Effect.provide(mocks)),
+    completeCurrent: Effect.gen(function* () {
+      const start = (yield* Ref.get(commands)).findLast(
+        (command) => command.type === "thread.prompt.enqueue",
+      );
+      if (start?.type !== "thread.prompt.enqueue") return yield* Effect.die("No dispatched prompt");
+      yield* Ref.update(currentThread, (value) => completed(value!, start.message.messageId));
+    }),
     complete: Ref.update(currentThread, (value) => completed(value!)),
     starts: Ref.get(commands).pipe(
       Effect.map((all) => all.filter((command) => command.type === "thread.prompt.enqueue")),
@@ -944,7 +1038,10 @@ it.effect(
         yield* h.emit(event);
         const consultation = yield* Queue.take(h.modelCalls);
         assert.strictEqual(consultation.cwd, "/jobs/job-1");
-        assert.strictEqual(consultation.stepInstruction, workflow.definition.steps[0].instruction);
+        assert.strictEqual(
+          consultation.stepInstruction,
+          workflow.definition.steps.find((step) => step.kind === "agent")!.instruction,
+        );
         assert.strictEqual(consultation.jobContext, request().instruction);
         assert.include(consultation.reviewConstraint!, "human review");
       }),
@@ -1856,4 +1953,767 @@ it.effect(
         assert.isTrue((yield* Ref.get(h.currentThread))!.promptQueue!.preparation!.settled);
       }),
     ),
+);
+
+const multiWorkflow: RepositoryWorkflow = {
+  ...workflow,
+  definition: {
+    ...workflow.definition,
+    steps: [
+      { id: "brief", kind: "input", title: "Brief", question: "What is the goal?", role: "member" },
+      workflow.definition.steps[0]!,
+      workflow.definition.steps[1]!,
+      {
+        id: "details",
+        kind: "input",
+        title: "Details",
+        question: "Any extra requirements?",
+        role: "member",
+      },
+      {
+        id: "verify",
+        kind: "agent",
+        title: "Verify",
+        instruction: "Verify the updated result",
+        modelSelection: null,
+      },
+      {
+        id: "final-review",
+        kind: "review",
+        title: "Final review",
+        role: "maintainer",
+        reworkStepId: "agent",
+      },
+    ],
+  },
+};
+const multiRequest = () => ({
+  ...request(),
+  control: { ...request().control, operation: "start" as const, workflow: multiWorkflow },
+});
+function checkpointResponse(
+  progress: NonNullable<import("@t3tools/contracts/workflows").WorkflowControlResult["progress"]>,
+  operation: "input" | "request_changes",
+  text: string,
+): WorkflowRequest {
+  return {
+    ...request(),
+    control: {
+      ...control("status").control,
+      operation,
+      checkpointId: progress.checkpoint!.checkpointId,
+      expectedRevision: progress.revision,
+      text,
+    },
+  };
+}
+it.effect(
+  "runs multiple human checkpoints, reuses setup, and reworks only the selected suffix",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        let runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        const input = (yield* runner.handle(multiRequest())).progress!;
+        assert.strictEqual(input.status, "awaiting_input");
+        assert.isFalse(input.hasThread);
+        assert.lengthOf(yield* h.starts, 0);
+        const initialAnswer = checkpointResponse(input, "input", "Keep the prefix goal");
+        yield* runner.handle(initialAnswer);
+        assert.strictEqual((yield* h.starts)[0]!.bootstrap!.runSetupScript, true);
+        yield* h.completeCurrent;
+        yield* withBackground(h);
+        const review = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(review.status, "awaiting_review");
+        const detail = (yield* runner.handle(approve(review))).progress!;
+        assert.strictEqual(detail.status, "awaiting_input");
+        assert.lengthOf(yield* h.starts, 1);
+        assert.strictEqual(yield* Queue.size(h.cleanups), 0);
+        assert.isFalse((yield* Ref.get(h.currentThread))!.promptQueue!.preparation!.settled);
+        yield* Scope.close(scope, Exit.void);
+        runner = yield* h.newRunner;
+        const restored = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(restored.checkpoint!.checkpointId, detail.checkpoint!.checkpointId);
+        yield* runner.handle(checkpointResponse(restored, "input", "Suffix requirement"));
+        const second = (yield* h.starts)[1]!;
+        assert.isUndefined(second.bootstrap);
+        assert.include(second.message.text, "Keep the prefix goal");
+        assert.include(second.message.text, "Suffix requirement");
+        assert.strictEqual(second.threadId, review.threadId);
+        yield* h.completeCurrent;
+        const finalReview = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(finalReview.checkpoint!.stepId, "final-review");
+        yield* runner.handle(
+          checkpointResponse(finalReview, "request_changes", "Please revise implementation"),
+        );
+        const rework = (yield* h.starts)[2]!;
+        assert.isUndefined(rework.bootstrap);
+        assert.strictEqual(rework.threadId, second.threadId);
+        assert.include(rework.message.text, "Please revise implementation");
+        assert.include(rework.message.text, "Keep the prefix goal");
+        assert.notInclude(rework.message.text, "Suffix requirement");
+        assert.strictEqual((yield* runner.handle(approve(finalReview))).outcome, "conflict");
+        yield* h.completeCurrent;
+        const freshReview = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(freshReview.generation, 1);
+        assert.notEqual(freshReview.checkpoint!.checkpointId, review.checkpoint!.checkpointId);
+        const freshInput = (yield* runner.handle(approve(freshReview))).progress!;
+        assert.strictEqual(freshInput.status, "awaiting_input");
+        assert.notEqual(freshInput.checkpoint!.checkpointId, detail.checkpoint!.checkpointId);
+        assert.strictEqual(
+          freshInput.responses!.filter((response) => response.operation === "input").length,
+          2,
+        );
+      }),
+    ),
+);
+it.effect("serializes competing Input responses and acknowledges an identical replay once", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const runner = yield* h.newRunner;
+      const input = (yield* runner.handle(multiRequest())).progress!;
+      const first = checkpointResponse(input, "input", "first answer");
+      const second = { ...checkpointResponse(input, "input", "second answer"), userId: "teammate" };
+      const replies = yield* Effect.all([runner.handle(first), runner.handle(second)], {
+        concurrency: "unbounded",
+      });
+      assert.deepStrictEqual(replies.map((reply) => reply.outcome).sort(), [
+        "accepted",
+        "conflict",
+      ]);
+      assert.strictEqual((yield* runner.handle(first)).outcome, "accepted");
+      assert.lengthOf(yield* h.starts, 1);
+      assert.lengthOf((yield* runner.handle(control("status"))).progress!.responses!, 1);
+    }),
+  ),
+);
+it.effect(
+  "keeps an accepted continuation waiting for capacity and cancellation prevents delivery",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        const input = (yield* runner.handle(multiRequest())).progress!;
+        const store = yield* Store.WorkflowRunStore;
+        const run = (yield* store.get("job-1"))!;
+        yield* store.save({
+          ...run,
+          jobId: "other",
+          executionReserved: true,
+          progress: {
+            ...run.progress,
+            threadId: ThreadId.make("workflow:other:agent"),
+            status: "running",
+          },
+        });
+        const waiting = (yield* runner.handle(checkpointResponse(input, "input", "queue this")))
+          .progress!;
+        assert.strictEqual(waiting.status, "waiting_capacity");
+        assert.lengthOf(yield* h.starts, 0);
+        yield* runner.handle(control("cancel"));
+        const other = (yield* store.get("other"))!;
+        yield* store.save({
+          ...other,
+          executionReserved: false,
+          progress: { ...other.progress, status: "done" },
+        });
+        assert.strictEqual((yield* runner.handle(control("status"))).progress!.status, "cancelled");
+        assert.lengthOf(yield* h.starts, 0);
+      }),
+    ),
+);
+it.effect(
+  "completes an Agent-only workflow after final verification without a human approval",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        yield* runner.handle({
+          ...request(),
+          control: {
+            ...request().control,
+            operation: "start",
+            workflow: {
+              ...workflow,
+              definition: { ...workflow.definition, steps: [workflow.definition.steps[0]!] },
+            },
+          },
+        });
+        yield* h.completeCurrent;
+        const done = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(done.status, "done");
+        const progressEvents = (yield* Ref.get(h.commands)).filter(
+          (command) =>
+            command.type === "thread.activity.append" &&
+            command.activity.kind === "workflow.progress",
+        );
+        assert.isTrue(
+          progressEvents.some(
+            (command) =>
+              command.type === "thread.activity.append" &&
+              command.activity.summary === "Workflow done",
+          ),
+        );
+        assert.isNull((yield* (yield* Store.WorkflowRunStore).get("job-1"))!.approvedBy);
+      }),
+    ),
+);
+
+it.effect("wakes accepted continuations when capacity returns without replaying a response", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const runner = yield* h.newRunner;
+      const input = (yield* runner.handle(multiRequest())).progress!;
+      const store = yield* Store.WorkflowRunStore;
+      const run = (yield* store.get("job-1"))!;
+      yield* store.save({
+        ...run,
+        jobId: "other",
+        executionReserved: true,
+        progress: {
+          ...run.progress,
+          threadId: ThreadId.make("workflow:other:agent"),
+          status: "running",
+        },
+      });
+      yield* runner.handle(checkpointResponse(input, "input", "accepted while busy"));
+      const other = (yield* store.get("other"))!;
+      yield* store.save({
+        ...other,
+        executionReserved: false,
+        progress: { ...other.progress, status: "done" },
+      });
+      yield* runner.handle(control("status"));
+      yield* runner.handle(control("status"));
+      assert.lengthOf(yield* h.starts, 1);
+      assert.lengthOf((yield* runner.handle(control("status"))).progress!.responses!, 1);
+    }),
+  ),
+);
+it.effect(
+  "blocks an intermediate changed result while allowing explicit rework on the same branch",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        const input = (yield* runner.handle(multiRequest())).progress!;
+        yield* runner.handle(checkpointResponse(input, "input", "goal"));
+        yield* h.completeCurrent;
+        const review = (yield* runner.handle(control("status"))).progress!;
+        yield* Ref.set(h.difference, "Unexpected edits");
+        assert.strictEqual((yield* runner.handle(approve(review))).outcome, "conflict");
+        assert.lengthOf(yield* h.starts, 1);
+        assert.strictEqual(
+          (yield* runner.handle(
+            checkpointResponse(review, "request_changes", "Include these edits"),
+          )).outcome,
+          "accepted",
+        );
+        assert.lengthOf(yield* h.starts, 2);
+      }),
+    ),
+);
+it.effect(
+  "automatic completion verifies the final result and retries without inventing an approver",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        yield* runner.handle({
+          ...request(),
+          control: {
+            ...request().control,
+            operation: "start",
+            workflow: {
+              ...workflow,
+              definition: { ...workflow.definition, steps: [workflow.definition.steps[0]!] },
+            },
+          },
+        });
+        yield* h.completeCurrent;
+        yield* Ref.set(h.difference, "changed");
+        const blocked = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(blocked.status, "finishing");
+        assert.isTrue(blocked.retryableApproval);
+        yield* Ref.set(h.difference, "");
+        assert.strictEqual((yield* runner.handle(approve(blocked))).progress!.status, "done");
+        assert.isNull((yield* (yield* Store.WorkflowRunStore).get("job-1"))!.approvedBy);
+      }),
+    ),
+);
+
+it.effect(
+  "automatic completion waits for background setup cleanup and releases live thread ownership",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        yield* runner.handle({
+          ...request(),
+          control: {
+            ...request().control,
+            operation: "start",
+            workflow: {
+              ...workflow,
+              definition: { ...workflow.definition, steps: [workflow.definition.steps[0]!] },
+            },
+          },
+        });
+        yield* h.completeCurrent;
+        yield* withBackground(h);
+        const finishing = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(finishing.status, "finishing");
+        assert.isTrue(finishing.approvalPending);
+        yield* Queue.take(h.cleanups);
+        yield* Queue.offer(h.cleanupOutcomes, null);
+        const done = yield* h.awaitRun((run) => run.progress.status === "done");
+        assert.isNull(done.approvedBy);
+        assert.isFalse(done.executionReserved);
+        // The command receipt is appended after the state write; a status read drains the runner's mutex.
+        yield* runner.handle(control("status"));
+        const activities = (yield* Ref.get(h.commands)).filter(
+          (command) => command.type === "thread.activity.append",
+        );
+        assert.isTrue(
+          activities.some(
+            (command) =>
+              command.type === "thread.activity.append" &&
+              command.activity.summary === "Workflow done",
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect.each(["before", "after"] as const)(
+  "recovers a later Agent prompt %s acceptance with its same turn identity and worktree",
+  (outage) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        const runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        const input = (yield* runner.handle(multiRequest())).progress!;
+        yield* runner.handle(checkpointResponse(input, "input", "goal"));
+        yield* h.completeCurrent;
+        const review = (yield* runner.handle(control("status"))).progress!;
+        const details = (yield* runner.handle(approve(review))).progress!;
+        yield* Ref.set(h.promptOutage, outage);
+        assert.strictEqual(
+          (yield* Effect.flip(
+            runner.handle(checkpointResponse(details, "input", "Later instructions")),
+          ))._tag,
+          "WorkflowRunnerError",
+        );
+        const accepted = (yield* (yield* Store.WorkflowRunStore).get("job-1"))!;
+        assert.strictEqual(accepted.sequence!.cursor, 4);
+        assert.isFalse(accepted.promptDispatched);
+        yield* Scope.close(scope, Exit.void);
+        const recovered = yield* h.newRunner;
+        yield* recovered.handle(control("status"));
+        const starts = yield* h.starts;
+        assert.lengthOf(starts, 2);
+        assert.isUndefined(starts[1]!.bootstrap);
+        assert.strictEqual(starts[1]!.threadId, starts[0]!.threadId);
+        assert.include(starts[1]!.message.text, "Later instructions");
+        assert.isTrue((yield* (yield* Store.WorkflowRunStore).get("job-1"))!.promptDispatched);
+      }),
+    ),
+);
+
+it.effect(
+  "reworks a job with a pinned provider identity but no saved sequence without replaying setup",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        yield* runner.handle(request());
+        yield* h.complete;
+        const review = (yield* runner.handle(control("status"))).progress!;
+        const store = yield* Store.WorkflowRunStore;
+        const run = (yield* store.get("job-1"))!;
+        yield* store.save({ ...run, sequence: undefined, promptDispatched: true, workflow });
+        const rework = yield* runner.handle(
+          checkpointResponse(review, "request_changes", "Revise this older result"),
+        );
+        assert.strictEqual(rework.outcome, "accepted");
+        assert.strictEqual(rework.progress!.generation, 1);
+        const starts = yield* h.starts;
+        assert.lengthOf(starts, 2);
+        assert.isUndefined(starts[1]!.bootstrap);
+        assert.strictEqual(starts[1]!.threadId, starts[0]!.threadId);
+      }),
+    ),
+);
+
+it.effect.each(["driver", "account", "model", "instance-model-rule"] as const)(
+  "rejects incompatible workflow providers before acceptance and Git: %s",
+  (kind) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const first = (yield* Ref.get(h.providers))[0]!;
+        const nextId = ProviderInstanceId.make("second-provider");
+        const next = {
+          ...first,
+          instanceId: nextId,
+          driver: ProviderDriverKind.make(kind === "driver" ? "claudeAgent" : "codex"),
+          continuation: {
+            groupKey:
+              kind === "account" || kind === "driver"
+                ? "different-home"
+                : first.continuation!.groupKey,
+          },
+          ...(kind === "instance-model-rule" ? { requiresNewThreadForModelChange: true } : {}),
+        };
+        yield* Ref.set(h.providers, [
+          { ...first, ...(kind === "model" ? { requiresNewThreadForModelChange: true } : {}) },
+          next,
+        ]);
+        const runner = yield* h.newRunner;
+        const reply = yield* runner.handle({
+          ...request(),
+          control: {
+            ...request().control,
+            operation: "start",
+            workflow: {
+              ...workflow,
+              definition: {
+                ...workflow.definition,
+                steps: [
+                  ...workflow.definition.steps,
+                  {
+                    id: "next",
+                    kind: "agent",
+                    title: "Next",
+                    instruction: "Continue",
+                    modelSelection: {
+                      instanceId: kind === "model" ? MODEL.instanceId : nextId,
+                      model: kind === "model" ? "different-model" : MODEL.model,
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        });
+        assert.strictEqual(reply.outcome, "unavailable");
+        assert.include(reply.detail!, "Next");
+        assert.isNull(yield* (yield* Store.WorkflowRunStore).get("job-1"));
+        assert.strictEqual(yield* Ref.get(h.fetches), 0);
+        assert.lengthOf(yield* h.starts, 0);
+      }),
+    ),
+);
+it.effect(
+  "freezes inherited defaults and allows compatible instance/model changes and rework",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const first = (yield* Ref.get(h.providers))[0]!;
+        const secondModel = {
+          instanceId: ProviderInstanceId.make("codex-work"),
+          model: "different-model",
+        };
+        yield* Ref.set(h.providers, [first, { ...first, instanceId: secondModel.instanceId }]);
+        const configured = {
+          ...multiWorkflow,
+          definition: {
+            ...multiWorkflow.definition,
+            steps: multiWorkflow.definition.steps.map((step) =>
+              step.id === "verify" && step.kind === "agent"
+                ? { ...step, modelSelection: secondModel }
+                : step,
+            ),
+          },
+        };
+        const runner = yield* h.newRunner;
+        const input = (yield* runner.handle({
+          ...request(),
+          control: { ...request().control, operation: "start", workflow: configured },
+        })).progress!;
+        yield* Ref.update(h.projectState, (project) => ({
+          ...project,
+          defaultModelSelection: { ...MODEL, model: "edited-default" },
+        }));
+        yield* runner.handle(checkpointResponse(input, "input", "goal"));
+        assert.deepStrictEqual((yield* h.starts)[0]!.modelSelection, MODEL);
+        yield* h.completeCurrent;
+        const review = (yield* runner.handle(control("status"))).progress!;
+        const details = (yield* runner.handle(approve(review))).progress!;
+        yield* runner.handle(checkpointResponse(details, "input", "requirements"));
+        assert.deepStrictEqual((yield* h.starts)[1]!.modelSelection, secondModel);
+        yield* h.completeCurrent;
+        const final = (yield* runner.handle(control("status"))).progress!;
+        yield* runner.handle(checkpointResponse(final, "request_changes", "revise"));
+        assert.deepStrictEqual((yield* h.starts)[2]!.modelSelection, MODEL);
+      }),
+    ),
+);
+it.effect.each(["first-agent", "next-agent", "rework", "restart", "legacy"] as const)(
+  "pins provider resume identity across continuation: %s",
+  (kind) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        let runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        const input = (yield* runner.handle(multiRequest())).progress!;
+        let pending = input;
+        if (kind !== "first-agent") {
+          yield* runner.handle(checkpointResponse(input, "input", "goal"));
+          yield* h.completeCurrent;
+          const review = (yield* runner.handle(control("status"))).progress!;
+          pending = kind === "rework" ? review : (yield* runner.handle(approve(review))).progress!;
+        }
+        const store = yield* Store.WorkflowRunStore;
+        const original = (yield* store.get("job-1"))!;
+        if (kind === "legacy") yield* store.save({ ...original, providerContinuation: undefined });
+        else
+          yield* Ref.update(h.providers, (entries) =>
+            entries.map((provider) => ({
+              ...provider,
+              continuation: { groupKey: "codex:changed-home" },
+            })),
+          );
+        if (kind === "restart") {
+          yield* Scope.close(scope, Exit.void);
+          runner = yield* h.newRunner;
+          pending = (yield* runner.handle(control("status"))).progress!;
+        }
+        const before = (yield* h.starts).length;
+        const paused = (yield* runner.handle(
+          checkpointResponse(pending, kind === "rework" ? "request_changes" : "input", "continue"),
+        )).progress!;
+        assert.strictEqual(paused.status, "paused");
+        assert.isFalse(paused.retryablePreparation);
+        assert.include(paused.detail!, "Cancel this job");
+        assert.lengthOf(yield* h.starts, before);
+        assert.deepStrictEqual(
+          (yield* store.get("job-1"))!.providerContinuation,
+          kind === "legacy" ? undefined : original.providerContinuation,
+        );
+        assert.isNotNull((yield* runner.handle(control("status"))).progress);
+        const cancellation = (yield* runner.handle(control("cancel"))).progress!;
+        if (before > 0) {
+          assert.strictEqual(cancellation.status, "cancelling");
+          yield* Ref.update(h.currentThread, (current) => ({
+            ...current!,
+            session: null,
+            promptQueue: {
+              ...current!.promptQueue!,
+              preparation: {
+                ...current!.promptQueue!.preparation!,
+                state: "failed" as const,
+                settled: true,
+              },
+            },
+          }));
+          assert.strictEqual(
+            (yield* runner.handle(control("status"))).progress!.status,
+            "cancelled",
+          );
+        } else assert.strictEqual(cancellation.status, "cancelled");
+      }),
+    ),
+);
+it.effect(
+  "surfaces a durable enqueue rejection without retrying or releasing its reservation",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        yield* Ref.set(h.promptOutage, "reject");
+        const runner = yield* h.newRunner;
+        const reply = (yield* runner.handle(request())).progress!;
+        assert.strictEqual(reply.status, "paused");
+        assert.include(reply.detail!, "durable enqueue rejection");
+        assert.isFalse(reply.retryablePreparation);
+        yield* runner.handle(control("status"));
+        assert.lengthOf(yield* h.starts, 0);
+        assert.isTrue(yield* (yield* Store.WorkflowRunStore).isExecuting());
+        assert.strictEqual((yield* runner.handle(control("cancel"))).progress!.status, "cancelled");
+      }),
+    ),
+);
+it.effect.each(["success", "failed", "waiter-cancelled"] as const)(
+  "cleanup completion wakes capacity without another status request: %s",
+  (mode) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        const input = (yield* runner.handle(multiRequest())).progress!;
+        yield* runner.handle(request("executing"));
+        assert.strictEqual((yield* h.awaitPrompt).threadId, "workflow:executing:agent");
+        const waiting = (yield* runner.handle(
+          checkpointResponse(input, "input", "continue when free"),
+        )).progress!;
+        assert.strictEqual(waiting.status, "waiting_capacity");
+        yield* Ref.update(h.currentThread, (current) => ({
+          ...completed(current!),
+          promptQueue: {
+            ...completed(current!).promptQueue!,
+            preparation: {
+              ...completed(current!).promptQueue!.preparation!,
+              script: backgroundScript,
+              settled: false,
+            },
+          },
+        }));
+        yield* runner.handle(control("cancel", "executing"));
+        yield* Queue.take(h.cleanups);
+        yield* Ref.update(h.currentThread, (current) => ({
+          ...current!,
+          session: null,
+          promptQueue: {
+            ...current!.promptQueue!,
+            preparation: {
+              ...current!.promptQueue!.preparation!,
+              state: "failed" as const,
+              settled: true,
+            },
+          },
+        }));
+        if (mode === "waiter-cancelled") yield* runner.handle(control("cancel"));
+        yield* Queue.offer(
+          h.cleanupOutcomes,
+          mode === "failed" ? "cleanup ownership uncertain" : null,
+        );
+        if (mode === "success") {
+          assert.strictEqual((yield* h.awaitPrompt).threadId, "workflow:job-1:agent");
+          assert.lengthOf(yield* h.starts, 2);
+          const now = yield* Store.WorkflowRunStore;
+          assert.isNull(yield* now.getByThread("workflow:executing:agent"));
+          // A stale terminal event cannot dispatch an already-admitted successor again.
+          yield* h.emit({
+            sequence: 1,
+            eventId: EventId.make("late-cleanup-event"),
+            aggregateKind: "thread",
+            aggregateId: ThreadId.make("workflow:executing:agent"),
+            occurredAt: NOW,
+            commandId: CommandId.make("late-cleanup-command"),
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            type: "thread.activity-appended",
+            payload: {
+              threadId: ThreadId.make("workflow:executing:agent"),
+              activity: {
+                id: EventId.make("late-cleanup-activity"),
+                kind: "workflow.progress",
+                tone: "info",
+                summary: "Cancelled",
+                payload: {},
+                turnId: null,
+                createdAt: NOW,
+              },
+            },
+          });
+          yield* runner.handle(control("status"));
+          assert.lengthOf(yield* h.starts, 2);
+        } else {
+          yield* h.awaitRun(
+            (run) =>
+              run.jobId === "executing" &&
+              (mode === "failed"
+                ? !!run.progress.retryableCancellation
+                : run.progress.status === "cancelled"),
+          );
+          assert.lengthOf(yield* h.starts, 1);
+          if (mode === "failed")
+            assert.isTrue(yield* (yield* Store.WorkflowRunStore).isExecuting());
+        }
+      }),
+    ),
+);
+
+it.effect(
+  "pauses legacy rework without a historical provider identity and retains its saved files and thread results",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        yield* runner.handle(request());
+        yield* h.complete;
+        const review = (yield* runner.handle(control("status"))).progress!;
+        const store = yield* Store.WorkflowRunStore;
+        const saved = (yield* store.get("job-1"))!;
+        const checkpoints = (yield* Ref.get(h.currentThread))!.checkpoints;
+        yield* store.save({
+          ...saved,
+          sequence: undefined,
+          providerContinuation: undefined,
+          promptDispatched: true,
+          workflow,
+        });
+        const rework = (yield* runner.handle(
+          checkpointResponse(review, "request_changes", "Revise the legacy result"),
+        )).progress!;
+        assert.strictEqual(rework.status, "paused");
+        assert.include(rework.detail!, "original provider compatibility is unavailable");
+        assert.strictEqual((yield* store.get("job-1"))!.preparedHead, saved.preparedHead);
+        assert.deepStrictEqual((yield* Ref.get(h.currentThread))!.checkpoints, checkpoints);
+        assert.lengthOf(yield* h.starts, 1);
+        assert.strictEqual(
+          (yield* runner.handle(control("cancel"))).progress!.status,
+          "cancelling",
+        );
+        yield* Ref.update(h.currentThread, (current) => ({
+          ...current!,
+          session: null,
+          promptQueue: {
+            ...current!.promptQueue!,
+            preparation: {
+              ...current!.promptQueue!.preparation!,
+              state: "failed" as const,
+              settled: true,
+            },
+          },
+        }));
+        assert.strictEqual((yield* runner.handle(control("status"))).progress!.status, "cancelled");
+      }),
+    ),
+);
+
+it.effect("retains capacity when stopped projection lacks provider proof", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* Ref.set(h.providerProof, false);
+    const runner = yield* h.newRunner;
+    yield* runner.handle(request());
+    yield* h.awaitPrompt;
+    yield* Ref.update(h.currentThread, (current) => ({
+      ...current!,
+      session: {
+        threadId: current!.id,
+        status: "stopped" as const,
+        providerName: "codex",
+        runtimeMode: "approval-required" as const,
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: NOW,
+      },
+      promptQueue: { ...current!.promptQueue!, preparation: undefined },
+    }));
+    const pending = (yield* runner.handle(control("cancel"))).progress!;
+    assert.strictEqual(pending.status, "cancelling");
+    assert.strictEqual(
+      (yield* (yield* Store.WorkflowRunStore).get("job-1"))!.executionReserved,
+      true,
+    );
+    yield* Ref.set(h.providerProof, true);
+    assert.strictEqual((yield* runner.handle(control("status"))).progress?.status, "cancelled");
+  }).pipe(Effect.provide(persistence)),
 );

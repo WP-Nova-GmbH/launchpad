@@ -11,7 +11,7 @@ merge**.
 
 | kind     | what it is                                                                                   |
 | -------- | -------------------------------------------------------------------------------------------- |
-| `agent`  | create a thread, send instructions, wait for it to settle                                    |
+| `agent`  | start or continue the job thread, send step instructions, wait for its turn to settle        |
 | `action` | a defined deterministic operation: push, open a pull request, provision a review app, notify |
 | `gate`   | wait for a condition: human sign-off, a check, a review verdict                              |
 
@@ -39,6 +39,22 @@ including its gates. When a gate is a step, removing it is a visible structural 
 _"this workflow has no human review"_ — rather than a boolean flipped somewhere inside a nested
 config object. Since visibility is the only control we have, gates must be shaped so that their
 absence is obvious.
+
+## Thread and workspace lifetime
+
+Ordered repository workflows share one thread and prepared worktree for the job. Each Agent
+step has a distinct, durable turn identity; human checkpoints bind to that step's saved result.
+Rework adds another turn in the same thread and invalidates the selected suffix, keeping prior
+responses as history. The current prompt names the inputs and results that still apply. Sharing
+the thread keeps setup ownership and cancellation on the existing thread lifecycle rather than
+introducing a second set of process owners. Every Agent therefore uses the same provider driver
+and compatible continuation identity; per-step model changes follow that provider's conversation
+rules. The accepted job pins the identity through native prompt admission, and stopped sessions
+resume their saved conversation across compatible instances. Provider reconfiguration must not
+silently start new history. Cancellation remains tied to the original runtime's shutdown proof;
+removing its configuration does not prove that its process stopped. Strict workflow continuation
+ends when the durable job releases ownership, preserving ordinary chat behavior in the retained
+thread. Incompatible changes require cancellation and a new job.
 
 ## Consequences
 

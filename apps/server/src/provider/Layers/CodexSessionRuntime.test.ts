@@ -1,9 +1,17 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeAssert from "node:assert/strict";
+import * as NodeChildProcess from "node:child_process";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { describe } from "vite-plus/test";
+import { describe, vi } from "vite-plus/test";
+vi.mock("node:child_process", { spy: true });
+import * as Ref from "effect/Ref";
+import * as Exit from "effect/Exit";
+import * as PlatformError from "effect/PlatformError";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import { DEFAULT_MODEL, ThreadId } from "@t3tools/contracts";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
@@ -21,6 +29,7 @@ import {
   isRecoverableThreadResumeError,
   makeMemoryConsolidationNotificationFilter,
   openCodexThread,
+  stopCodexProcess,
   readCodexThread,
   rollbackCodexThread,
   toMcpElicitationResponse,
@@ -993,6 +1002,52 @@ describe("openCodexThread", () => {
     }),
   );
 
+  it.effect("never starts a fresh thread when workflow resume is required", () =>
+    Effect.gen(function* () {
+      const failure = yield* openCodexThread({
+        client: {
+          raw: {
+            request: () =>
+              Effect.fail(
+                new CodexErrors.CodexAppServerRequestError({
+                  code: -32603,
+                  errorMessage: "thread not found",
+                }),
+              ),
+          },
+          request: () => Effect.die("Required workflow history must not fall back to thread/start"),
+        },
+        threadId: ThreadId.make("workflow-history"),
+        runtimeMode: "approval-required",
+        cwd: "/tmp/project",
+        requestedModel: undefined,
+        serviceTier: undefined,
+        resumeThreadId: "missing-history",
+        requireResume: true,
+      }).pipe(Effect.result);
+      NodeAssert.equal(failure._tag, "Failure");
+    }),
+  );
+
+  it.effect("rejects a different native conversation on a required resume", () =>
+    Effect.gen(function* () {
+      const result = yield* openCodexThread({
+        client: {
+          raw: { request: () => Effect.succeed(makeThreadOpenResponse("replacement-thread")) },
+          request: () => Effect.die("A required resume cannot start a replacement thread"),
+        },
+        threadId: ThreadId.make("workflow-native-id"),
+        runtimeMode: "approval-required",
+        cwd: "/tmp/project",
+        requestedModel: undefined,
+        serviceTier: undefined,
+        resumeThreadId: "original-thread",
+        requireResume: true,
+      }).pipe(Effect.result);
+      NodeAssert.equal(result._tag, "Failure");
+    }),
+  );
+
   it.effect("falls back to thread/start when resume fails recoverably", () =>
     Effect.gen(function* () {
       const calls: Array<{ method: "thread/start" | "thread/resume"; payload: unknown }> = [];
@@ -1069,3 +1124,70 @@ describe("openCodexThread", () => {
     }),
   );
 });
+
+describe("Codex owned shutdown", () => {
+  it.effect.each(["absent", "present", "denied", "kill-failed", "lost-leader"] as const)(
+    "requires native termination proof: %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const running = yield* Ref.make(mode !== "lost-leader");
+        let kills = 0;
+        const probe = vi.spyOn(process, "kill").mockImplementation(() => {
+          if (mode === "absent") throw Object.assign(new Error("gone"), { code: "ESRCH" });
+          if (mode === "denied") throw Object.assign(new Error("denied"), { code: "EPERM" });
+          return true;
+        });
+        try {
+          const result = yield* stopCodexProcess(ThreadId.make("owned-shutdown"), {
+            pid: ChildProcessSpawner.ProcessId(123456789),
+            isRunning: Ref.get(running),
+            exitCode: Effect.die("POSIX probe does not use a leader-only receipt"),
+            kill: () =>
+              Effect.gen(function* () {
+                kills++;
+                if (mode === "kill-failed")
+                  return yield* new PlatformError.PlatformError(
+                    new PlatformError.BadArgument({
+                      module: "ChildProcess",
+                      method: "kill",
+                      description: "termination failed",
+                    }),
+                  );
+                yield* Ref.set(running, false);
+              }),
+          }).pipe(Effect.exit);
+          NodeAssert.equal(Exit.isSuccess(result), mode === "absent");
+          NodeAssert.equal(kills, mode === "lost-leader" ? 0 : 1);
+        } finally {
+          probe.mockRestore();
+        }
+      }).pipe(Effect.provideService(HostProcessPlatform, "linux")),
+  );
+});
+
+it.effect("does not infer Windows tree cleanup from a failed taskkill fallback", () =>
+  Effect.gen(function* () {
+    const leaderKill = vi.fn(() => Effect.void);
+    const treeKill = vi.mocked(NodeChildProcess.execFile).mockImplementation((...args) => {
+      const callback = args.at(-1);
+      if (typeof callback === "function") callback(new Error("tree termination failed"), "", "");
+      return new NodeChildProcess.ChildProcess();
+    });
+    try {
+      const result = yield* stopCodexProcess(ThreadId.make("owned-windows-tree"), {
+        pid: ChildProcessSpawner.ProcessId(123456789),
+        isRunning: Effect.succeed(true),
+        kill: leaderKill,
+        exitCode: Effect.die("failed tree kill has no exit receipt"),
+      }).pipe(Effect.exit);
+      NodeAssert.equal(Exit.isFailure(result), true);
+      NodeAssert.equal(leaderKill.mock.calls.length, 0);
+      NodeAssert.deepEqual(treeKill.mock.calls[0]?.slice(0, 2), [
+        "taskkill",
+        ["/pid", "123456789", "/t", "/f"],
+      ]);
+    } finally {
+      treeKill.mockRestore();
+    }
+  }).pipe(Effect.provideService(HostProcessPlatform, "win32")),
+);

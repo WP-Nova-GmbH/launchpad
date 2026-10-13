@@ -435,18 +435,24 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           headers: bearerHeaders(input.clerkToken),
           params: { repositoryId: input.repositoryId, jobId: input.jobId },
         };
-        return yield* (
-          input.payload.operation === "approve"
-            ? client.workflows.respond({ ...request, payload: input.payload })
-            : input.payload.operation === "retry_preparation"
-              ? client.workflows.respond({ ...request, payload: input.payload })
-              : input.payload.operation === "retry_cancellation"
-                ? client.workflows.respond({ ...request, payload: input.payload })
-                : client.workflows.respond({
-                    ...request,
-                    payload: { operation: input.payload.operation },
-                  })
-        ).pipe(
+        const payload = input.payload;
+        const response = (() => {
+          switch (payload.operation) {
+            case "approve":
+              return client.workflows.respond({ ...request, payload });
+            case "input":
+              return client.workflows.respond({ ...request, payload });
+            case "request_changes":
+              return client.workflows.respond({ ...request, payload });
+            case "retry_preparation":
+              return client.workflows.respond({ ...request, payload });
+            case "retry_cancellation":
+              return client.workflows.respond({ ...request, payload });
+            case "cancel":
+              return client.workflows.respond({ ...request, payload });
+          }
+        })();
+        return yield* response.pipe(
           Effect.mapError(relayRequestError("respondToWorkflowJob")),
           timeoutRelayRequest("respondToWorkflowJob"),
         );

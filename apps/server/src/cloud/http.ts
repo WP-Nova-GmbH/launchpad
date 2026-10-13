@@ -1805,7 +1805,7 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
       const workflowResult =
         dependencies.workflowRunner === undefined
           ? {
-              protocol: 4 as const,
+              protocol: 5 as const,
               outcome: "unavailable" as const,
               detail: "Workflow execution is unavailable.",
               progress: null,

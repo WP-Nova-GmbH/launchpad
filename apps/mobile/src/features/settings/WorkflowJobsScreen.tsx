@@ -1,9 +1,11 @@
 import { useAuth } from "@clerk/expo";
 import { useNavigation } from "@react-navigation/native";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
+import { clearAcknowledgedWorkflowDraft } from "@t3tools/client-runtime/relay/workflow-responses";
 import type { RelayRepositorySummary, RelayOrganizationMembership } from "@t3tools/contracts/relay";
 import {
   isTerminalWorkflowJob,
+  workflowZones,
   type RepositoryWorkflowJob,
   type RepositoryWorkflowJobSummary,
 } from "@t3tools/contracts/workflows";
@@ -11,7 +13,7 @@ import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 import { useCallback, useEffect, useState } from "react";
-import { AppState, View } from "react-native";
+import { AppState, View, TextInput } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { runtime } from "../../lib/runtime";
 import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "../cloud/publicConfig";
@@ -35,13 +37,14 @@ export function WorkflowJobsScreen() {
 }
 
 function ConfiguredWorkflowJobsScreen() {
-  const { getToken, isSignedIn } = useAuth();
+  const { getToken, isSignedIn, userId } = useAuth();
   const navigation = useNavigation();
   const [repositories, setRepositories] = useState<ReadonlyArray<RelayRepositorySummary>>([]);
   const [membership, setMembership] = useState<RelayOrganizationMembership | null>(null);
   const [selectedRepository, setSelectedRepository] = useState<RelayRepositorySummary | null>(null);
   const [jobs, setJobs] = useState<ReadonlyArray<RepositoryWorkflowJobSummary>>([]);
   const [selectedJob, setSelectedJob] = useState<RepositoryWorkflowJob | null>(null);
+  const [responseDrafts, setResponseDrafts] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const call = useCallback(
@@ -135,39 +138,66 @@ function ConfiguredWorkflowJobsScreen() {
     };
   }, [selectedJobId, selectedJobStatus, selectedRepository, call]);
   const canRespond = membership?.role === "admin" || selectedRepository?.role === "maintainer";
-  const respond = (operation: "approve" | "cancel" | "retry_preparation" | "retry_cancellation") =>
+  const respond = (
+    operation:
+      | "approve"
+      | "input"
+      | "request_changes"
+      | "cancel"
+      | "retry_preparation"
+      | "retry_cancellation",
+  ) =>
     void perform(async () => {
       if (!selectedJob || !selectedRepository) return;
       const checkpoint = selectedJob.progress?.checkpoint;
-      if (operation === "approve" && !checkpoint) return;
+      if (["approve", "input", "request_changes"].includes(operation) && !checkpoint) return;
       const payload =
-        operation === "approve"
-          ? ({
+        operation === "input" || operation === "request_changes"
+          ? {
               operation,
               checkpointId: checkpoint!.checkpointId,
               expectedRevision: selectedJob.progress!.revision,
-            } as const)
-          : operation === "retry_preparation" || operation === "retry_cancellation"
-            ? { operation, expectedRevision: selectedJob.progress!.revision }
-            : { operation };
-      setSelectedJob(
-        await call((client, clerkToken) =>
-          client.respondToWorkflowJob({
-            clerkToken,
-            repositoryId: selectedRepository.repository.repositoryId,
-            jobId: selectedJob.jobId,
-            payload,
-          }),
-        ),
+              text: responseDrafts[checkpoint!.checkpointId] ?? "",
+            }
+          : operation === "approve"
+            ? ({
+                operation,
+                checkpointId: checkpoint!.checkpointId,
+                expectedRevision: selectedJob.progress!.revision,
+              } as const)
+            : operation === "retry_preparation" || operation === "retry_cancellation"
+              ? { operation, expectedRevision: selectedJob.progress!.revision }
+              : { operation };
+      const submitted = {
+        checkpointId: checkpoint?.checkpointId ?? null,
+        operation,
+        userId,
+        text: "text" in payload ? (payload.text ?? null) : null,
+      };
+      const next = await call((client, clerkToken) =>
+        client.respondToWorkflowJob({
+          clerkToken,
+          repositoryId: selectedRepository.repository.repositoryId,
+          jobId: selectedJob.jobId,
+          payload,
+        }),
+      );
+      setSelectedJob(next);
+      setResponseDrafts((previous) =>
+        clearAcknowledgedWorkflowDraft(previous, submitted, next.progress),
       );
     });
   const openResult = (diff: boolean) => {
-    if (!selectedJob?.progress) return;
+    if (!selectedJob?.progress || selectedJob.progress.hasThread === false) return;
     const params = {
       environmentId: selectedJob.environmentId,
       threadId: selectedJob.progress.threadId,
     };
-    if (diff && selectedJob.progress.checkpoint) {
+    if (
+      diff &&
+      selectedJob.progress.checkpoint &&
+      selectedJob.progress.checkpoint.kind !== "input"
+    ) {
       setReviewSelectedSectionId(
         scopedThreadKey(params.environmentId, params.threadId),
         `turn:${selectedJob.progress.checkpoint.checkpointTurnCount}`,
@@ -199,51 +229,133 @@ function ConfiguredWorkflowJobsScreen() {
           </SettingsSection>
           {selectedJob.workflow ? (
             <View className="gap-3">
-              <View className="gap-1 rounded-xl border border-outline bg-grouped-card p-4">
-                <Text className="text-xs text-foreground-muted">AUTOMATIC WORK</Text>
-                <Text className="font-semibold text-foreground">
-                  {selectedJob.workflow.definition.steps[0].title}
-                </Text>
-                <Text className="text-foreground-muted">
-                  {selectedJob.progress?.checkpoint
-                    ? "Result saved"
-                    : "Agent follows the workflow instructions"}
-                </Text>
-              </View>
-              <View className="gap-1 rounded-xl border border-amber-500/40 bg-amber-500/5 p-4">
-                <Text className="text-xs text-foreground-muted">HUMAN INTERVENTION</Text>
-                <Text className="font-semibold text-foreground">
-                  {selectedJob.workflow.definition.steps[1].title}
-                </Text>
-                <Text className="text-foreground-muted">
-                  {selectedJob.status === "done" ? "Approved" : "Repository maintainer review"}
-                </Text>
-              </View>
+              {workflowZones(selectedJob.workflow.definition.steps).map((zone) => (
+                <View
+                  key={zone[0]!.id}
+                  className={
+                    zone[0]!.kind === "agent"
+                      ? "gap-2 rounded-xl border border-outline bg-grouped-card p-4"
+                      : "gap-2 rounded-xl border border-amber-500/40 bg-amber-500/5 p-4"
+                  }
+                >
+                  <Text className="text-xs text-foreground-muted">
+                    {zone[0]!.kind === "agent" ? "AUTOMATIC WORK" : "HUMAN INTERVENTION"}
+                  </Text>
+                  {zone.map((step) => (
+                    <View key={step.id}>
+                      <Text className="font-semibold text-foreground">{step.title}</Text>
+                      <Text className="text-foreground-muted">
+                        {selectedJob.progress?.steps?.find((entry) => entry.stepId === step.id)
+                          ?.status ??
+                          (step.kind === "agent"
+                            ? "Agent work"
+                            : step.role === "member"
+                              ? "Any repository member"
+                              : "Repository maintainer")}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              ))}
             </View>
           ) : null}
+          {(selectedJob.status === "awaiting_input" || selectedJob.status === "awaiting_review") &&
+          (canRespond || selectedJob.progress?.checkpoint?.role === "member") &&
+          selectedJob.progress?.checkpoint &&
+          !selectedJob.progress.approvalPending ? (
+            <SettingsSection
+              title={selectedJob.status === "awaiting_input" ? "Required input" : "Request changes"}
+            >
+              <View className="gap-2 p-4">
+                <Text className="text-foreground">
+                  {selectedJob.progress?.checkpoint?.kind === "input"
+                    ? selectedJob.progress.checkpoint.question
+                    : "Feedback for the agent"}
+                </Text>
+                <TextInput
+                  accessibilityLabel={
+                    selectedJob.status === "awaiting_input"
+                      ? "Checkpoint answer"
+                      : "Rework feedback"
+                  }
+                  multiline
+                  maxLength={8000}
+                  className="min-h-24 rounded-lg border border-outline p-3 text-foreground"
+                  value={responseDrafts[selectedJob.progress!.checkpoint!.checkpointId] ?? ""}
+                  onChangeText={(text) =>
+                    setResponseDrafts((previous) => ({
+                      ...previous,
+                      [selectedJob.progress!.checkpoint!.checkpointId]: text,
+                    }))
+                  }
+                />
+                <Text className="text-xs text-foreground-muted">
+                  Your draft is kept until the environment acknowledges it.
+                </Text>
+              </View>
+              <SettingsActionRow
+                icon="checkmark.circle"
+                label={
+                  selectedJob.status === "awaiting_input" ? "Submit answer" : "Request changes"
+                }
+                disabled={
+                  busy ||
+                  !(responseDrafts[selectedJob.progress!.checkpoint!.checkpointId] ?? "").trim()
+                }
+                onPress={() =>
+                  respond(selectedJob.status === "awaiting_input" ? "input" : "request_changes")
+                }
+              />
+            </SettingsSection>
+          ) : null}
+          {selectedJob.progress?.responses?.length ? (
+            <SettingsSection title="Recent checkpoint history">
+              {selectedJob.progress.responses.map((response) => (
+                <View key={response.checkpointId} className="gap-1 p-4">
+                  <Text className="text-foreground">
+                    {selectedJob.workflow?.definition.steps.find(
+                      (step) => step.id === response.stepId,
+                    )?.title ?? response.stepId}{" "}
+                    · {response.operation.replaceAll("_", " ")} · attempt {response.generation + 1}
+                  </Text>
+                  <Text className="text-xs text-foreground-muted">
+                    {response.userId} · {new Date(response.createdAt).toLocaleString()}
+                  </Text>
+                  {response.text ? <Text className="text-foreground">{response.text}</Text> : null}
+                </View>
+              ))}
+            </SettingsSection>
+          ) : null}
           <SettingsSection title="Job controls">
-            {selectedJob.progress ? (
+            {selectedJob.progress && selectedJob.progress.hasThread !== false ? (
               <SettingsActionRow
                 icon="text.bubble"
                 label="Inspect agent result"
                 onPress={() => openResult(false)}
               />
             ) : null}
-            {selectedJob.progress?.checkpoint ? (
+            {selectedJob.progress?.checkpoint &&
+            selectedJob.progress.checkpoint.kind !== "input" ? (
               <SettingsActionRow
                 icon="doc.text"
                 label="Inspect saved diff"
                 onPress={() => openResult(true)}
               />
             ) : null}
-            {canRespond && selectedJob.status === "awaiting_review" ? (
+            {(canRespond || selectedJob.progress?.checkpoint?.role === "member") &&
+            (selectedJob.status === "awaiting_review" ||
+              (canRespond &&
+                selectedJob.status === "finishing" &&
+                selectedJob.progress?.retryableApproval)) ? (
               <SettingsActionRow
                 icon="checkmark.circle"
                 label={
                   selectedJob.progress?.approvalPending
                     ? "Approval pending"
                     : selectedJob.progress?.retryableApproval
-                      ? "Retry approval"
+                      ? selectedJob.status === "finishing"
+                        ? "Retry completion"
+                        : "Retry approval"
                       : "Approve result"
                 }
                 disabled={busy || selectedJob.progress?.approvalPending}

@@ -364,7 +364,15 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
       return [
         change({
           handoff: null,
-          ...(command.pause ? { control: pause({ code: "failed", detail: command.detail }) } : {}),
+          ...(command.pause
+            ? {
+                control: pause({
+                  code: "failed",
+                  detail: command.detail,
+                  ...(prompt ? { messageId: prompt.messageId } : {}),
+                }),
+              }
+            : {}),
           ...(prompt ? { entry: { ...prompt, state: "pending" } } : {}),
         }),
       ];

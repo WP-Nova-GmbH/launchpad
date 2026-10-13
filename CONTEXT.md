@@ -50,6 +50,9 @@ do not change its copies.
 **Job**:
 A single execution of a repository workflow under the definition used at its start.
 
+**Job completion**:
+A job's successful end, after its configured steps have finished and its setup work has stopped.
+
 **Setup work**:
 A workspace preparation's programs and background previews, retained as part of that preparation
 after the initial setup command finishes. Docker-managed containers and system services have

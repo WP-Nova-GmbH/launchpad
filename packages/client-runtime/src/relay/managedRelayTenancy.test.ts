@@ -62,10 +62,34 @@ it.effect(
         jobId: "job-1",
         payload: { operation: "cancel" },
       });
+      for (const operation of ["input", "request_changes"] as const)
+        yield* client.respondToWorkflowJob({
+          clerkToken: "maintainer-token",
+          repositoryId: RelayRepositoryId.make("repo-1"),
+          jobId: "job-1",
+          payload: {
+            operation,
+            checkpointId: "checkpoint-7",
+            expectedRevision: 7,
+            text: "Preserve this answer",
+          },
+        });
       expect(bodies).toEqual([
         { operation: "retry_cancellation", expectedRevision: 8 },
         { operation: "retry_preparation", expectedRevision: 5 },
         { operation: "cancel" },
+        {
+          operation: "input",
+          checkpointId: "checkpoint-7",
+          expectedRevision: 7,
+          text: "Preserve this answer",
+        },
+        {
+          operation: "request_changes",
+          checkpointId: "checkpoint-7",
+          expectedRevision: 7,
+          text: "Preserve this answer",
+        },
       ]);
     }).pipe(Effect.provide(testLayer(fetchFn)));
   },

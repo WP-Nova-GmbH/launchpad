@@ -322,3 +322,110 @@ it.effect(
       });
     }).pipe(Effect.provide(NodeCrypto.layer)),
 );
+
+for (const checkpointRole of ["member", "maintainer"] as const)
+  it.effect(
+    `Input honors the frozen ${checkpointRole} checkpoint role and current repository access`,
+    () =>
+      Effect.gen(function* () {
+        const now = "2026-10-12T12:00:00Z";
+        const initial: WorkflowJobRecord = {
+          jobId: "job",
+          repositoryId: "repo",
+          organizationId: "org",
+          submitterUserId: "user",
+          repositoryCanonicalKey: "github.com/acme/repo",
+          status: "awaiting_input",
+          revision: 1,
+          leaseUntil: null,
+          pendingControl: null,
+          createdAt: now,
+          checkedAt: now,
+          record: {
+            jobId: "job",
+            repositoryId: "repo",
+            workflowId: "flow",
+            environmentId: EnvironmentId.make("env"),
+            instruction: "Task",
+            status: "awaiting_input",
+            detail: null,
+            workflow: null,
+            createdAt: now,
+            updatedAt: now,
+            progress: {
+              revision: 2,
+              status: "awaiting_input",
+              threadId: ThreadId.make("workflow:job:agent"),
+              detail: null,
+              checkpoint: {
+                kind: "input",
+                checkpointId: "cp",
+                stepId: "input",
+                generation: 0,
+                role: checkpointRole,
+                question: "What next?",
+              },
+            },
+          },
+        };
+        const row = yield* Ref.make(initial);
+        const access = yield* Ref.make<"developer" | "maintainer" | null>("developer");
+        const services = Layer.mergeAll(
+          Layer.mock(Organizations)({
+            getMembershipForUser: () =>
+              Effect.succeed({
+                organization: { organizationId: "org", name: "Org", createdAt: now },
+                userId: "user",
+                role: "member" as const,
+                joinedAt: now,
+              }),
+          }),
+          Layer.mock(Repositories)({
+            getById: () =>
+              Effect.succeed({
+                repositoryId: "repo",
+                organizationId: "org",
+                name: "Repo",
+                canonicalKeys: [],
+                createdAt: now,
+              }),
+            getAccess: () => Ref.get(access),
+          }),
+          Layer.mock(Machines)({}),
+          Layer.mock(OrganizationProjectCatalog)({}),
+          Layer.mock(EnvironmentConnector)({}),
+          Layer.mock(Workflows)({
+            getJob: () => Ref.get(row),
+            claim: () => Effect.succeed(null),
+            updateJob: (previous, record, pendingControl) =>
+              Ref.setAndGet(row, { ...previous, record, pendingControl: pendingControl ?? null }),
+          }),
+        );
+        const respond = (expectedRevision = 2) =>
+          respondToWorkflowJob(
+            { repositoryId: "repo", jobId: "job" },
+            { operation: "input", checkpointId: "cp", expectedRevision, text: "Keep this answer" },
+          ).pipe(
+            Effect.provide(services),
+            Effect.provideService(RelayClientPrincipal, { userId: "user", token: "token" }),
+          );
+        if (checkpointRole === "maintainer") {
+          assert.strictEqual((yield* Effect.flip(respond()))._tag, "RelayTenancyForbiddenError");
+          yield* Ref.set(access, "maintainer");
+        }
+        assert.strictEqual((yield* Effect.flip(respond(1)))._tag, "WorkflowConflictError");
+        yield* respond();
+        assert.deepStrictEqual((yield* Ref.get(row)).pendingControl, {
+          userId: "user",
+          response: {
+            operation: "input",
+            checkpointId: "cp",
+            expectedRevision: 2,
+            text: "Keep this answer",
+          },
+        });
+        assert.strictEqual((yield* Ref.get(row)).record.requiredProtocol, 5);
+        yield* Ref.set(access, null);
+        assert.strictEqual((yield* Effect.flip(respond()))._tag, "RelayTenancyNotFoundError");
+      }).pipe(Effect.provide(NodeCrypto.layer)),
+  );

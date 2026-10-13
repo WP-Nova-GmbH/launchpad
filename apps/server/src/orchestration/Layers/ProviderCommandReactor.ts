@@ -14,7 +14,8 @@ import {
   type AuthSessionUser,
   CommandId,
   EventId,
-  type ModelSelection,
+  MessageId,
+  ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
   type ProjectId,
@@ -44,6 +45,9 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
+import { WorkflowRunStore } from "../../jobs/WorkflowRunStore.ts";
+import { activeWorkflowStep, workflowPromptId } from "../../jobs/workflowSequence.ts";
+import type { WorkflowProviderContinuation } from "../../provider/Services/ProviderService.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
 import {
@@ -84,6 +88,7 @@ const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationErro
 const isProviderValidationError = Schema.is(ProviderValidationError);
 const isProviderWorkspaceMissingError = Schema.is(ProviderWorkspaceMissingError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
+const modelSelectionsEqual = Schema.toEquivalence(ModelSelection);
 
 type ProviderIntentEvent = Extract<
   OrchestrationEvent,
@@ -256,6 +261,7 @@ const make = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerAuthService = yield* ProviderAuthService;
   const providerService = yield* ProviderService;
+  const workflows = yield* WorkflowRunStore;
   const providerRegistry = yield* ProviderRegistry;
   const gitWorkflow = yield* GitWorkflowService;
   const reactorScope = yield* Effect.scope;
@@ -630,6 +636,78 @@ const make = Effect.gen(function* () {
     });
   });
 
+  const workflowAttempt = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    messageId: MessageId,
+    capturedJobId?: string,
+  ) {
+    const run = capturedJobId
+      ? yield* workflows.get(capturedJobId)
+      : yield* workflows.getByThread(threadId);
+    if (!run && !capturedJobId) return undefined;
+    if (
+      !run ||
+      run.progress.threadId !== threadId ||
+      !run.executionReserved ||
+      !["preparing", "running"].includes(run.progress.status) ||
+      activeWorkflowStep(run)?.kind !== "agent" ||
+      workflowPromptId(run) !== messageId ||
+      !run.providerContinuation
+    )
+      return yield* new ProviderAdapterValidationError({
+        provider: "unknown",
+        operation: "sendTurn",
+        issue:
+          "The workflow prompt no longer owns the current Agent step, or its original provider identity is unavailable.",
+      });
+    const info = yield* providerService.getInstanceInfo(run.modelSelection.instanceId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterValidationError({
+            provider: run.providerContinuation!.driver,
+            operation: "sendTurn",
+            issue: cause.message,
+          }),
+      ),
+    );
+    if (
+      !info.enabled ||
+      info.driverKind !== run.providerContinuation.driver ||
+      info.continuationIdentity.continuationKey !== run.providerContinuation.continuationKey
+    )
+      return yield* new ProviderAdapterValidationError({
+        provider: run.providerContinuation.driver,
+        operation: "sendTurn",
+        issue:
+          "The Agent provider's continuation identity changed or is unavailable. Cancel this job before starting again.",
+      });
+    const thread = yield* projectionSnapshotQuery
+      .getThreadDetailById(threadId)
+      .pipe(Effect.map(Option.getOrUndefined), Effect.orDie);
+    const selection = thread?.promptQueue?.entries.find(
+      (prompt) => prompt.messageId === messageId,
+    )?.modelSelection;
+    if (!selection || !modelSelectionsEqual(selection, run.modelSelection))
+      return yield* new ProviderAdapterValidationError({
+        provider: run.providerContinuation.driver,
+        operation: "sendTurn",
+        issue: "The queued prompt no longer matches the workflow's frozen Agent model selection.",
+      });
+    const firstSession =
+      thread?.session === null &&
+      thread.latestTurn === null &&
+      !thread.messages.some((message) => message.role === "user") &&
+      (thread.promptQueue?.admissions.length ?? 0) === 0 &&
+      thread.promptQueue?.pauseReason?.code !== "delivery-unknown" &&
+      !run.sequence?.completed.some((step) => step.checkpoint !== null);
+    return {
+      jobId: run.jobId,
+      ...run.providerContinuation,
+      firstSession,
+      messageId,
+    } satisfies WorkflowProviderContinuation;
+  });
+
   const ensureSessionForThread = Effect.fn("ensureSessionForThread")(function* (
     threadId: ThreadId,
     createdAt: string,
@@ -637,6 +715,7 @@ const make = Effect.gen(function* () {
       readonly modelSelection?: ModelSelection;
       readonly pendingTurnStart?: boolean;
       readonly personalTurn?: boolean;
+      readonly workflowContinuation?: WorkflowProviderContinuation;
     },
   ) {
     yield* deletion.drainThrough(yield* orchestrationEngine.latestSequence, threadId);
@@ -645,6 +724,12 @@ const make = Effect.gen(function* () {
       return yield* Effect.die(new Error(`Thread '${threadId}' was not found in read model.`));
     }
 
+    const ownedWorkflow = yield* workflows.getByThread(threadId);
+    const workflowContinuation =
+      options?.workflowContinuation ??
+      (ownedWorkflow?.providerContinuation
+        ? { jobId: ownedWorkflow.jobId, ...ownedWorkflow.providerContinuation }
+        : undefined);
     const desiredRuntimeMode = thread.runtimeMode;
     const requestedModelSelection = options?.modelSelection;
     const resolveActiveSession = (threadId: ThreadId) =>
@@ -695,20 +780,6 @@ const make = Effect.gen(function* () {
         : thread.modelSelection.instanceId;
     const desiredModelSelection = requestedModelSelection ?? thread.modelSelection;
     const desiredInstanceId = desiredModelSelection.instanceId;
-    const currentInfo = yield* providerService.getInstanceInfo(currentInstanceId).pipe(
-      Effect.mapError(
-        () =>
-          new ProviderAdapterRequestError({
-            provider: providerErrorLabelFromInstanceHint({
-              instanceId: String(currentInstanceId),
-              modelSelectionInstanceId: String(thread.modelSelection.instanceId),
-              sessionProvider: thread.session?.providerName ?? undefined,
-            }),
-            method: "thread.turn.start",
-            detail: `Thread '${threadId}' references unknown provider instance '${currentInstanceId}'. The instance is not configured in this build.`,
-          }),
-      ),
-    );
     const desiredInfo = yield* providerService.getInstanceInfo(desiredInstanceId).pipe(
       Effect.mapError(
         () =>
@@ -721,6 +792,30 @@ const make = Effect.gen(function* () {
           }),
       ),
     );
+    const currentInfo =
+      workflowContinuation && !activeSession
+        ? {
+            ...desiredInfo,
+            driverKind: workflowContinuation.driver,
+            continuationIdentity: {
+              driverKind: workflowContinuation.driver,
+              continuationKey: workflowContinuation.continuationKey,
+            },
+          }
+        : yield* providerService.getInstanceInfo(currentInstanceId).pipe(
+            Effect.mapError(
+              () =>
+                new ProviderAdapterRequestError({
+                  provider: providerErrorLabelFromInstanceHint({
+                    instanceId: String(currentInstanceId),
+                    modelSelectionInstanceId: String(thread.modelSelection.instanceId),
+                    sessionProvider: thread.session?.providerName ?? undefined,
+                  }),
+                  method: "thread.turn.start",
+                  detail: `Thread '${threadId}' references unknown provider instance '${currentInstanceId}'. The instance is not configured in this build.`,
+                }),
+            ),
+          );
     const desiredDriverKind = desiredInfo.driverKind;
     if (!isProviderDriverKind(desiredDriverKind)) {
       return yield* new ProviderAdapterRequestError({
@@ -799,16 +894,20 @@ const make = Effect.gen(function* () {
       readonly provider?: ProviderDriverKind;
     }) =>
       providerService
-        .startSession(threadId, {
+        .startSession(
           threadId,
-          ...(preferredProvider ? { provider: preferredProvider } : {}),
-          providerInstanceId: desiredInstanceId,
-          ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
-          ...(thread.title ? { title: thread.title } : {}),
-          modelSelection: desiredModelSelection,
-          ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
-          runtimeMode: desiredRuntimeMode,
-        })
+          {
+            threadId,
+            ...(preferredProvider ? { provider: preferredProvider } : {}),
+            providerInstanceId: desiredInstanceId,
+            ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+            ...(thread.title ? { title: thread.title } : {}),
+            modelSelection: desiredModelSelection,
+            ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+            runtimeMode: desiredRuntimeMode,
+          },
+          workflowContinuation ? { workflowContinuation } : undefined,
+        )
         .pipe(Effect.tap(() => refreshWorkspaceSnapshot));
 
     const bindSessionToThread = (session: ProviderSession) =>
@@ -915,6 +1014,7 @@ const make = Effect.gen(function* () {
   });
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
+    readonly workflowContinuation?: WorkflowProviderContinuation;
     readonly issueTrackerAuthorizationId?: string | undefined;
     readonly requirePersonalAuthorization?: boolean;
     readonly allowPersonalSteer?: boolean;
@@ -985,6 +1085,7 @@ const make = Effect.gen(function* () {
     }
     yield* ensureSessionForThread(input.threadId, input.createdAt, {
       ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+      ...(input.workflowContinuation ? { workflowContinuation: input.workflowContinuation } : {}),
       pendingTurnStart: true,
       personalTurn: true,
     }).pipe(
@@ -1882,6 +1983,7 @@ const make = Effect.gen(function* () {
           }
         }
       }
+      const continuation = yield* workflowAttempt(threadId, prompt.messageId);
       const request =
         handoff.mode === "steer"
           ? {
@@ -1892,6 +1994,7 @@ const make = Effect.gen(function* () {
               interactionMode: prompt.interactionMode,
             }
           : yield* buildSendTurnRequestForThread({
+              ...(continuation ? { workflowContinuation: continuation } : {}),
               issueTrackerAuthorizationId: prompt.issueTrackerAuthorizationId,
               requirePersonalAuthorization: Boolean(prompt.issueTrackerAuthorizationId),
               threadId,
@@ -1963,6 +2066,7 @@ const make = Effect.gen(function* () {
               "The prompt was stopped or its target changed before dispatch. It remains queued.",
           });
         }
+        yield* workflowAttempt(threadId, prompt.messageId, continuation?.jobId);
       });
       crossedProviderBoundary = true;
       if (isCompact) {
@@ -2370,7 +2474,8 @@ const make = Effect.gen(function* () {
       "The session was stopped during context compaction. Send this message again to continue.",
     ).pipe(
       Effect.andThen(
-        thread.session && thread.session.status !== "stopped"
+        (thread.session && thread.session.status !== "stopped") ||
+          (yield* workflows.getByThread(thread.id))
           ? providerService.stopSession({ threadId: thread.id })
           : Effect.void,
       ),

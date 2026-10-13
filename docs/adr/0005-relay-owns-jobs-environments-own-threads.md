@@ -59,9 +59,13 @@ to launch or a failed exit pauses the queue before delivery. This preserves the 
 to run background work while making a required setup failure visible before dependent work starts.
 
 Workspace preparation retains ownership of its setup work, including background programs that
-outlive the command that started them. A workflow retains control of that work through Review
-and confirms it stopped before approval or cancellation releases the workspace. Current process
-ancestry alone cannot establish that all of the job's setup work has stopped.
+outlive the command that started them. Intermediate Review approvals advance the workflow while
+retaining the job's workspace and setup ownership. They do not stop setup programs or previews:
+later Agent steps and rework can keep using them without rerunning setup. Each Review still checks
+its saved result; unexpected changes block approval. Final job completion confirms setup stopped
+and verifies the final result before releasing the workspace; cancellation also requires confirmed
+cleanup before release. Current process ancestry alone cannot establish that all of the job's setup
+work has stopped.
 Automatic cleanup covers ordinary job-owned background programs. Docker-managed containers
 and system services have separately managed lifecycles; projects using them arrange their
 cleanup. Their automatic cleanup is outside this workflow slice.

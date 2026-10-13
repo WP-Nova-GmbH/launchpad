@@ -64,6 +64,7 @@ import { TerminalManager } from "../../terminal/Manager.ts";
 import { GitVcsDriver } from "../../vcs/GitVcsDriver.ts";
 import { CheckpointStore } from "../../checkpointing/CheckpointStore.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
@@ -3008,6 +3009,7 @@ effectIt.effect(
               deleteCheckpointRefs: () => Effect.void,
             }),
             Layer.mock(ProviderRegistry, {}),
+            Layer.mock(ProviderService, {}),
             Layer.mock(TextGeneration, {}),
             Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver, {
               resolve: () => Effect.succeed(null),

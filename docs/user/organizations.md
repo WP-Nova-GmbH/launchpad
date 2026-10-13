@@ -131,16 +131,27 @@ _is_ registered requires a role on that repository.
 
 Maintainers and admins can create workflows under **Settings → Organization → Repositories →
 Workflows and jobs**. Choose an enrolled organization machine and a project for that repository,
-then configure the agent's instructions and the human Review step. The highlighted human zone
-shows where work waits for a maintainer.
+then add and order Agent, Review, and Input steps. Human zones show where work waits for a
+response. Each checkpoint can require a repository maintainer or allow anyone with repository
+access; Review defaults to maintainers and Input defaults to all repository members. Agent steps
+can choose a Codex or Claude model on that machine or use the project's default. All Agent steps
+in a job must use compatible providers of the same kind so they can share the conversation.
+Model changes are available when that provider supports them. If its configuration becomes
+incompatible during a job, cancel the job and run it again after correcting the workflow.
 
 Anyone with repository access can run a workflow with a description of the task and inspect the
-shared job. Jobs wait while the selected machine is offline or busy. Each accepted job prepares its
-own worktree, runs the project's setup, and saves a result for review. Inspect the result and diff
-before approving. A background setup preview can remain running during Review. Approval stops
-setup and verifies that the saved result has not changed before finishing. If cleanup or finishing
-approval fails, use **Retry approval**. Confirmed cleanup is reused; setup does not run again.
-Changes stay local after approval.
+shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own
+worktree and one shared agent conversation. Inspect the saved result and diff before approving a
+Review. Answer an Input checkpoint to supply context for later steps. Responses are retained as
+history, and drafts remain available while waiting for the machine to acknowledge them.
+
+Request changes sends feedback to the Review's chosen earlier Agent step in the same worktree.
+Earlier inputs and results remain valid; later steps run again and need fresh human responses.
+Rework retains the files already prepared rather than restoring an older copy. Setup and background
+previews remain available through intermediate checkpoints and rework, without running setup again.
+At completion, the job stops setup and checks the final saved result before releasing the worktree.
+If cleanup or completion fails, use **Retry approval** or **Retry completion** when offered. Confirmed
+cleanup is reused. Changes stay local.
 
 Maintainers can cancel jobs or explicitly retry failed preparation. Cancellation stays pending
 until the machine confirms that work stopped; prepared files and history are retained. Review
@@ -154,7 +165,8 @@ restarting Launchpad alone is insufficient. Automatic host-restart recovery is u
 Automatic cleanup covers ordinary setup programs and background previews. Projects must arrange
 cleanup for Docker containers, system services, and other independently managed services.
 
-On mobile, open **Settings → Workflow jobs** to inspect, approve, or cancel a job. Workflow creation
+On mobile, open **Settings → Workflow jobs** to inspect a job, answer checkpoints, approve results,
+request changes, or cancel. Workflow creation
 and manual Run are available on web and desktop.
 
 ## Machines

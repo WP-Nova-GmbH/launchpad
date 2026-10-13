@@ -1810,7 +1810,10 @@ it("updates workflow ownership live and releases the composer after approval", (
   for (const [sequence, status] of [
     [1, "preparing"],
     [2, "awaiting_review"],
-    [3, "done"],
+    [3, "awaiting_input"],
+    [4, "waiting_capacity"],
+    [5, "finishing"],
+    [6, "done"],
   ] as const) {
     const result = applyThreadDetailEvent(current, {
       ...baseEventFields,

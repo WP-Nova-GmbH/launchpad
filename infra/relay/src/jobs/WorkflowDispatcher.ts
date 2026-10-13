@@ -13,6 +13,8 @@ import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { Machines } from "../machines/Machines.ts";
 import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
 import { Repositories } from "../tenancy/Repositories.ts";
+import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
+import { Organizations } from "../tenancy/Organizations.ts";
 import { Workflows } from "./Workflows.ts";
 
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
@@ -64,10 +66,11 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
   const refresh = Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
     let job = row!.record;
-    if ((job.requiredProtocol ?? 2) < 4) {
+    const minimumProtocol = job.workflow === null ? 5 : 4;
+    if ((job.requiredProtocol ?? 2) < minimumProtocol) {
       row = yield* store.updateJob(
         row!,
-        { ...job, requiredProtocol: 4, updatedAt: now },
+        { ...job, requiredProtocol: minimumProtocol, updatedAt: now },
         row!.pendingControl,
         false,
       );
@@ -119,7 +122,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         instruction: job.instruction,
         workflowControl: { ...binding, operation: "status" },
       });
-      if (!probe.workflowResult || probe.workflowResult.protocol !== 4)
+      if (!probe.workflowResult || probe.workflowResult.protocol < 5)
         return yield* new WorkflowInvalidError({
           message: "Update this environment to a version that supports repository workflows.",
         });
@@ -135,7 +138,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         ...job,
         environmentId: workflow.definition.environmentId,
         workflow,
-        requiredProtocol: 4,
+        requiredProtocol: 5,
         status: "dispatching",
         detail: "Offering this workflow to its environment.",
         updatedAt: now,
@@ -160,9 +163,57 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         message: "The offered repository binding is missing.",
       });
     let control: WorkflowControl = { ...binding, operation: "status" };
-    if (row!.pendingControl) control = { ...binding, ...row!.pendingControl.response };
-    else if (job.progress === null) control = { ...binding, operation: "start", workflow };
-    if (control.operation === "approve") {
+    if (row!.pendingControl) {
+      // A saved response is only deliverable while its author still has the checkpoint's role.
+      const pending = row!.pendingControl;
+      const membership = yield* (yield* Organizations).getMembershipForUser({
+        userId: pending.userId,
+      });
+      const response = pending.response;
+      const checkpointResponse =
+        response.operation === "approve" ||
+        response.operation === "input" ||
+        response.operation === "request_changes";
+      const authorized =
+        membership && membership.organization.organizationId === row!.organizationId
+          ? yield* (
+              checkpointResponse && job.progress?.checkpoint?.role === "member"
+                ? requireVisibleRepository({ membership, repositoryId: job.repositoryId }).pipe(
+                    Effect.asVoid,
+                  )
+                : requireMaintainableRepository({
+                    membership,
+                    repositoryId: job.repositoryId,
+                  }).pipe(Effect.asVoid)
+            ).pipe(
+              Effect.as(true),
+              Effect.catchTags({
+                RelayTenancyForbiddenError: () => Effect.succeed(false),
+                RelayTenancyNotFoundError: () => Effect.succeed(false),
+              }),
+            )
+          : false;
+      if (!authorized) {
+        row = yield* store.updateJob(
+          row!,
+          {
+            ...job,
+            detail:
+              "The saved response author no longer has permission. A permitted repository member must respond.",
+            updatedAt: now,
+          },
+          null,
+          false,
+        );
+        return row.record;
+      }
+      control = { ...binding, ...response };
+    } else if (job.progress === null) control = { ...binding, operation: "start", workflow };
+    if (
+      control.operation === "approve" ||
+      control.operation === "input" ||
+      control.operation === "request_changes"
+    ) {
       const capability = yield* connector.dispatchJob({
         userId: row!.pendingControl?.userId ?? row!.submitterUserId,
         environmentId: job.environmentId,
@@ -172,7 +223,10 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         instruction: job.instruction,
         workflowControl: { ...binding, operation: "status" },
       });
-      if (capability.workflowResult?.protocol !== 4)
+      if (
+        !capability.workflowResult ||
+        capability.workflowResult.protocol < (job.requiredProtocol ?? 4)
+      )
         return yield* new WorkflowInvalidError({
           message: "Update this environment before approving a workflow result.",
         });
