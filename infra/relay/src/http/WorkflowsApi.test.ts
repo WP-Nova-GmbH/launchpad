@@ -1,5 +1,6 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { RelayClientPrincipal } from "@t3tools/contracts/relay";
+import type { RespondToWorkflowJob } from "@t3tools/contracts/workflows";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { Workflows, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
@@ -429,3 +430,199 @@ for (const checkpointRole of ["member", "maintainer"] as const)
         assert.strictEqual((yield* Effect.flip(respond()))._tag, "RelayTenancyNotFoundError");
       }).pipe(Effect.provide(NodeCrypto.layer)),
   );
+
+const manualApiHarness = Effect.gen(function* () {
+  const now = "2026-10-13T00:00:00Z";
+  const role = yield* Ref.make<"maintainer" | "developer">("maintainer");
+  const row = yield* Ref.make<WorkflowJobRecord>({
+    jobId: "manual-job",
+    repositoryId: "repo",
+    organizationId: "org",
+    submitterUserId: "author",
+    repositoryCanonicalKey: "github.com/acme/repo",
+    status: "awaiting_input",
+    revision: 0,
+    leaseUntil: null,
+    pendingControl: null,
+    createdAt: now,
+    checkedAt: now,
+    record: {
+      jobId: "manual-job",
+      repositoryId: "repo",
+      workflowId: "flow",
+      environmentId: EnvironmentId.make("env"),
+      requiredProtocol: 6,
+      instruction: "work",
+      workflow: null,
+      status: "awaiting_input",
+      detail: null,
+      createdAt: now,
+      updatedAt: now,
+      progress: {
+        revision: 5,
+        status: "awaiting_input",
+        threadId: ThreadId.make("thread"),
+        detail: null,
+        manualPauseSupported: true,
+        checkpoint: {
+          checkpointId: "input",
+          kind: "input",
+          question: "What?",
+          role: "member",
+          stepId: "input",
+          generation: 0,
+        },
+      },
+    },
+  });
+  const writes = yield* Ref.make(0);
+  const services = Layer.mergeAll(
+    Layer.mock(EnvironmentConnector)({}),
+    Layer.mock(Machines)({}),
+    Layer.mock(OrganizationProjectCatalog)({}),
+    Layer.mock(Organizations)({
+      getMembershipForUser: () =>
+        Effect.succeed({
+          organization: { organizationId: "org", name: "Org", createdAt: now },
+          userId: "maintainer",
+          role: "member" as const,
+          joinedAt: now,
+        }),
+    }),
+    Layer.mock(Repositories)({
+      getById: () =>
+        Effect.succeed({
+          repositoryId: "repo",
+          organizationId: "org",
+          name: "Repo",
+          canonicalKeys: [],
+          createdAt: now,
+        }),
+      getAccess: () => Ref.get(role),
+    }),
+    Layer.mock(Workflows)({
+      getJob: () => Ref.get(row),
+      claim: () => Effect.succeed(null),
+      updateJob: (previous, record, pendingControl) =>
+        Effect.gen(function* () {
+          yield* Ref.update(writes, (n) => n + 1);
+          return yield* Ref.setAndGet(row, {
+            ...previous,
+            record,
+            status: record.status,
+            revision: previous.revision + 1,
+            pendingControl: pendingControl ?? null,
+          });
+        }),
+    }),
+  );
+  return {
+    row,
+    role,
+    writes,
+    respond: (payload: typeof RespondToWorkflowJob.Type) =>
+      respondToWorkflowJob({ repositoryId: "repo", jobId: "manual-job" }, payload).pipe(
+        Effect.provide(services),
+        Effect.provideService(RelayClientPrincipal, { userId: "maintainer", token: "token" }),
+      ),
+  };
+});
+
+it.effect(
+  "manual API requests bind the original revision, retry HTTP idempotently and let Cancel supersede them",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      const pause = { operation: "pause" as const, controlId: "pause", expectedRevision: 5 };
+      const saved = yield* h.respond(pause);
+      assert.deepStrictEqual(saved.pendingManualControl, pause);
+      assert.strictEqual(saved.requiredProtocol, 6);
+      assert.strictEqual(saved.status, "awaiting_input");
+      yield* h.respond(pause);
+      assert.strictEqual(yield* Ref.get(h.writes), 1);
+      assert.strictEqual(
+        (yield* Effect.flip(h.respond({ ...pause, expectedRevision: 6 })))._tag,
+        "WorkflowConflictError",
+      );
+      yield* Ref.set(h.role, "developer");
+      assert.strictEqual((yield* Effect.flip(h.respond(pause)))._tag, "RelayTenancyForbiddenError");
+      yield* Ref.set(h.role, "maintainer");
+      const cancelled = yield* h.respond({ operation: "cancel" });
+      assert.strictEqual(cancelled.status, "cancelling");
+      assert.isNull(cancelled.pendingManualControl);
+      assert.strictEqual((yield* Ref.get(h.row)).pendingControl?.response.operation, "cancel");
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect(
+  "manual API eligibility rejects unsupported and unaccepted jobs and blocks member checkpoints under a hold",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      const pause = { operation: "pause" as const, controlId: "pause", expectedRevision: 5 };
+      const initial = yield* Ref.get(h.row);
+      yield* Ref.update(h.row, (row) => ({ ...row, record: { ...row.record, progress: null } }));
+      assert.strictEqual((yield* Effect.flip(h.respond(pause)))._tag, "WorkflowInvalidError");
+      yield* Ref.set(h.row, {
+        ...initial,
+        record: {
+          ...initial.record,
+          progress: { ...initial.record.progress!, manualPauseSupported: false },
+        },
+      });
+      assert.strictEqual((yield* Effect.flip(h.respond(pause)))._tag, "WorkflowInvalidError");
+      yield* Ref.set(h.row, {
+        ...initial,
+        status: "paused",
+        record: {
+          ...initial.record,
+          status: "paused",
+          progress: {
+            ...initial.record.progress!,
+            status: "paused",
+            underlyingStatus: "awaiting_input",
+            manualPause: { state: "paused" },
+          },
+        },
+      });
+      yield* Ref.set(h.role, "developer");
+      assert.strictEqual(
+        (yield* Effect.flip(
+          h.respond({
+            operation: "input",
+            checkpointId: "input",
+            expectedRevision: 5,
+            text: "answer",
+          }),
+        ))._tag,
+        "WorkflowConflictError",
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(
+          h.respond({ operation: "resume", controlId: "resume", expectedRevision: 5 }),
+        ))._tag,
+        "RelayTenancyForbiddenError",
+      );
+      assert.strictEqual(yield* Ref.get(h.writes), 0);
+      yield* Ref.set(h.role, "maintainer");
+      const resumed = yield* h.respond({
+        operation: "resume",
+        controlId: "resume",
+        expectedRevision: 5,
+      });
+      assert.strictEqual(resumed.pendingManualControl?.operation, "resume");
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("later checkpoint input cannot lower a manual control protocol pin", () =>
+  Effect.gen(function* () {
+    const h = yield* manualApiHarness;
+    const reply = yield* h.respond({
+      operation: "input",
+      checkpointId: "input",
+      expectedRevision: 5,
+      text: "answer",
+    });
+    assert.strictEqual(reply.requiredProtocol, 6);
+  }).pipe(Effect.provide(NodeCrypto.layer)),
+);

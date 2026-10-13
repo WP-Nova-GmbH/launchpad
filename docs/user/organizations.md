@@ -153,6 +153,12 @@ At completion, the job stops setup and checks the final saved result before rele
 If cleanup or completion fails, use **Retry approval** or **Retry completion** when offered. Confirmed
 cleanup is reused. Changes stay local.
 
+Maintainers can pause an accepted job from its job view. The current Agent step, including its
+preparation, finishes before the pause takes effect; later steps wait. Setup and previews stay
+running. Resume before answering checkpoints or retrying preparation. Resume preserves unanswered
+checkpoints and any failure requiring recovery. Requests saved while a machine is offline remain
+pending until it acknowledges them. Queued jobs and jobs on older machines do not offer Pause.
+
 Maintainers can cancel jobs or explicitly retry failed preparation. Cancellation stays pending
 until the machine confirms that work stopped; prepared files and history are retained. Review
 protects the saved result from ordinary chat and git changes until approval or cancellation.
@@ -166,7 +172,7 @@ Automatic cleanup covers ordinary setup programs and background previews. Projec
 cleanup for Docker containers, system services, and other independently managed services.
 
 On mobile, open **Settings → Workflow jobs** to inspect a job, answer checkpoints, approve results,
-request changes, or cancel. Workflow creation
+request changes, pause, resume, or cancel. Workflow creation
 and manual Run are available on web and desktop.
 
 ## Machines

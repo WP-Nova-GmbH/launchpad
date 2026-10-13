@@ -7882,27 +7882,42 @@ it.effect.each([
   }),
 );
 
-it.effect.each(["rework", "review-wait", "released", "cancelling"] as const)(
-  "original workflow startup still validates its attempt after %s",
-  (mode) =>
-    Effect.gen(function* () {
-      const threadId = asThreadId(`initial-start-guard-${mode}`);
-      const run = continuityWorkflow(threadId);
-      const runs = new Map([[run.jobId, run]]);
-      const fixture = makeProviderServiceLayer({ workflowRuns: runs });
-      const scope = yield* Scope.make();
-      const context = yield* Layer.build(fixture.serviceLayer).pipe(Scope.provide(scope));
-      const service = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
-      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory.pipe(
-        Effect.provide(context),
-      );
-      const start = fixture.codex.startSession.getMockImplementation()!;
-      // The service has validated the request; change the job before the adapter enters its hook.
-      fixture.codex.startSession.mockImplementationOnce((input, options) =>
-        Effect.sync(() => {
-          runs.set(
-            run.jobId,
-            mode === "rework"
+it.effect.each([
+  "rework",
+  "review-wait",
+  "released",
+  "cancelling",
+  "manual-paused",
+  "other-prompt",
+  "requested-current",
+] as const)("original workflow startup still validates its attempt after %s", (mode) =>
+  Effect.gen(function* () {
+    const threadId = asThreadId(`initial-start-guard-${mode}`);
+    const run = continuityWorkflow(threadId);
+    const runs = new Map([[run.jobId, run]]);
+    const fixture = makeProviderServiceLayer({ workflowRuns: runs });
+    const scope = yield* Scope.make();
+    const context = yield* Layer.build(fixture.serviceLayer).pipe(Scope.provide(scope));
+    const service = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
+    const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory.pipe(
+      Effect.provide(context),
+    );
+    const start = fixture.codex.startSession.getMockImplementation()!;
+    // The service has validated the request; change the job before the adapter enters its hook.
+    fixture.codex.startSession.mockImplementationOnce((input, options) =>
+      Effect.sync(() => {
+        runs.set(
+          run.jobId,
+          mode === "manual-paused" || mode === "other-prompt" || mode === "requested-current"
+            ? {
+                ...run,
+                manualPause: {
+                  state: mode === "manual-paused" ? "paused" : "requested",
+                  promptId:
+                    mode === "requested-current" ? `workflow:${run.jobId}:prompt` : "other-prompt",
+                },
+              }
+            : mode === "rework"
               ? {
                   ...run,
                   sequence: {
@@ -7928,34 +7943,40 @@ it.effect.each(["rework", "review-wait", "released", "cancelling"] as const)(
                           : "cancelling",
                   },
                 },
-          );
-        }).pipe(Effect.andThen(start(input, options))),
-      );
-      try {
-        const result = yield* service
-          .startSession(
+        );
+      }).pipe(Effect.andThen(start(input, options))),
+    );
+    try {
+      const result = yield* service
+        .startSession(
+          threadId,
+          {
             threadId,
-            {
-              threadId,
-              providerInstanceId: codexInstanceId,
-              runtimeMode: "approval-required",
+            providerInstanceId: codexInstanceId,
+            runtimeMode: "approval-required",
+          },
+          {
+            workflowContinuation: {
+              jobId: run.jobId,
+              ...run.providerContinuation!,
+              firstSession: true,
+              messageId: MessageId.make(`workflow:${run.jobId}:prompt`),
             },
-            {
-              workflowContinuation: {
-                jobId: run.jobId,
-                ...run.providerContinuation!,
-                firstSession: true,
-                messageId: MessageId.make(`workflow:${run.jobId}:prompt`),
-              },
-            },
-          )
-          .pipe(Effect.result);
-        assert.equal(result._tag, "Failure");
-        assert.equal(fixture.codex.startSession.mock.calls.length, 1);
-        assert.isFalse(yield* fixture.codex.adapter.hasSession(threadId));
-        assert.isTrue(Option.isNone(yield* directory.getBinding(threadId)));
-      } finally {
-        yield* Scope.close(scope, Exit.void);
-      }
-    }),
+          },
+        )
+        .pipe(Effect.result);
+      assert.equal(result._tag, mode === "requested-current" ? "Success" : "Failure");
+      assert.equal(fixture.codex.startSession.mock.calls.length, 1);
+      assert.strictEqual(
+        yield* fixture.codex.adapter.hasSession(threadId),
+        mode === "requested-current",
+      );
+      assert.strictEqual(
+        Option.isSome(yield* directory.getBinding(threadId)),
+        mode === "requested-current",
+      );
+    } finally {
+      yield* Scope.close(scope, Exit.void);
+    }
+  }),
 );

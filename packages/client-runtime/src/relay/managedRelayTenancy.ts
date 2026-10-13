@@ -438,6 +438,10 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
         const payload = input.payload;
         const response = (() => {
           switch (payload.operation) {
+            case "pause":
+              return client.workflows.respond({ ...request, payload });
+            case "resume":
+              return client.workflows.respond({ ...request, payload });
             case "approve":
               return client.workflows.respond({ ...request, payload });
             case "input":

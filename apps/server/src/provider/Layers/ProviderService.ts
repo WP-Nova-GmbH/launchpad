@@ -57,7 +57,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Stream from "effect/Stream";
 
-import { workflowPromptId } from "../../jobs/workflowSequence.ts";
+import { workflowPromptId, workflowAllowsPrompt } from "../../jobs/workflowSequence.ts";
 import { WorkflowRunStore, type WorkflowRun } from "../../jobs/WorkflowRunStore.ts";
 import { appendUserInputAttachmentPaths } from "../userInputAttachments.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -558,7 +558,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         run.jobId !== expected.jobId ||
         !run.executionReserved ||
         !["preparing", "running"].includes(run.progress.status) ||
-        (expected.messageId !== undefined && workflowPromptId(run) !== expected.messageId))
+        (expected.messageId !== undefined &&
+          (workflowPromptId(run) !== expected.messageId ||
+            !workflowAllowsPrompt(run, expected.messageId))))
     )
       return yield* toValidationError(
         "provider.continuation",

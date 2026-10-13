@@ -91,7 +91,7 @@ const initial: WorkflowJobRecord = {
   },
 };
 const accepted: WorkflowControlResult = {
-  protocol: 5,
+  protocol: 6,
   outcome: "accepted",
   detail: null,
   progress: {
@@ -100,10 +100,11 @@ const accepted: WorkflowControlResult = {
     threadId: ThreadId.make("workflow:job-1:agent"),
     detail: null,
     checkpoint: null,
+    manualPauseSupported: true,
   },
 };
 const missing: WorkflowControlResult = {
-  protocol: 5,
+  protocol: 6,
   outcome: "missing",
   detail: null,
   progress: null,
@@ -123,6 +124,8 @@ const harness = Effect.gen(function* () {
     | "legacy"
     | "protocol2"
     | "protocol3"
+    | "protocol5"
+    | "pause-waiting"
     | "cancel_during_approve"
   >("online");
   const permissionOutage = yield* Ref.make(false);
@@ -233,12 +236,60 @@ const harness = Effect.gen(function* () {
           if (input.workflowControl)
             yield* Ref.update(controls, (all) => [...all, input.workflowControl!]);
           const current = yield* Ref.get(mode);
+          if (current === "pause-waiting") {
+            const prior = (yield* Ref.get(row)).record.progress!;
+            const pause = input.workflowControl;
+            if (pause?.operation === "pause" && pause.expectedRevision !== prior.revision)
+              return {
+                accepted: true,
+                workflowResult: { ...accepted, outcome: "conflict" as const, progress: prior },
+              };
+            if (pause?.operation === "pause")
+              return {
+                accepted: true,
+                workflowResult: {
+                  ...accepted,
+                  progress: {
+                    ...prior,
+                    revision: prior.revision + 1,
+                    status: "paused" as const,
+                    underlyingStatus: "waiting_capacity" as const,
+                    manualPause: { state: "paused" as const },
+                    lastManualControl: pause,
+                  },
+                },
+              };
+            // As in the real runner, an advancing status probe can reserve the free slot.
+            yield* Ref.update(row, (value) => ({
+              ...value,
+              record: {
+                ...value.record,
+                progress: {
+                  ...prior,
+                  revision: prior.revision + 1,
+                  status: "running" as const,
+                },
+              },
+            }));
+            return {
+              accepted: true,
+              workflowResult: {
+                ...accepted,
+                progress: { ...prior, revision: prior.revision + 1, status: "running" as const },
+              },
+            };
+          }
           if (current === "offline")
             return yield* new EnvironmentMintRequestTimedOut({
               environmentId: "env-1",
               operation: "dispatch-job",
               timeoutMs: 5000,
             });
+          if (current === "protocol5")
+            return {
+              accepted: false,
+              workflowResult: { ...((yield* Ref.get(reply)) ?? missing), protocol: 5 as const },
+            };
           if (current === "protocol3")
             return {
               accepted: false,
@@ -488,11 +539,11 @@ it.effect(
     }),
 );
 
-it.effect("pins protocol 4 with the offer and rejects downgrade completion or approval", () =>
+it.effect("pins protocol 6 with the offer and rejects downgrade completion or approval", () =>
   Effect.gen(function* () {
     const h = yield* harness;
     yield* h.refresh;
-    assert.strictEqual((yield* Ref.get(h.row)).record.requiredProtocol, 5);
+    assert.strictEqual((yield* Ref.get(h.row)).record.requiredProtocol, 6);
     const progress = { ...accepted.progress!, status: "done" as const, revision: 20 };
     yield* Ref.set(h.reply, { ...accepted, progress });
     yield* Ref.set(h.mode, "protocol2");
@@ -687,5 +738,90 @@ it.effect("rechecks saved checkpoint roles before delivering after reconnect", (
       (yield* Ref.get(h.controls)).filter((control) => control.operation === "input"),
       1,
     );
+  }),
+);
+
+it.effect.each([
+  "missing-receipt",
+  "matching-receipt",
+  "conflict",
+  "downgrade",
+  "offline",
+  "revoked",
+] as const)(
+  "manual controls remain durable until matching evidence or definitive rejection: %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const h = yield* harness;
+      yield* h.refresh;
+      const response = {
+        operation: "pause" as const,
+        controlId: "pause-intent",
+        expectedRevision: 1,
+      };
+      yield* Ref.update(h.row, (row) => ({
+        ...row,
+        pendingControl: { userId: "maintainer", response },
+        record: {
+          ...row.record,
+          requiredProtocol: 6 as const,
+          pendingManualControl: response,
+        },
+      }));
+      if (mode === "offline") yield* Ref.set(h.mode, "offline");
+      if (mode === "downgrade") yield* Ref.set(h.mode, "protocol5");
+      if (mode === "revoked") yield* Ref.set(h.role, "developer");
+      yield* Ref.set(h.reply, {
+        ...accepted,
+        outcome: mode === "conflict" ? "conflict" : "accepted",
+        progress: {
+          ...accepted.progress!,
+          revision: 2,
+          manualPause: mode === "conflict" ? null : { state: "requested" },
+          lastManualControl: mode === "matching-receipt" ? response : null,
+        },
+      });
+      yield* h.refresh;
+      const row = yield* Ref.get(h.row);
+      const cleared = mode === "matching-receipt" || mode === "conflict" || mode === "revoked";
+      assert.strictEqual(row.pendingControl === null, cleared);
+      assert.strictEqual(row.record.pendingManualControl == null, cleared);
+      assert.strictEqual(row.record.requiredProtocol, 6);
+      if (mode === "matching-receipt") {
+        assert.strictEqual(row.record.progress?.manualPause?.state, "requested");
+        assert.strictEqual(row.record.status, "running");
+      }
+      if (mode === "revoked")
+        assert.isFalse(
+          (yield* Ref.get(h.controls)).some((control) => control.operation === "pause"),
+        );
+    }),
+);
+
+it.effect("a saved Pause holds an accepted capacity waiter before any advancing status probe", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* h.refresh;
+    const response = { operation: "pause" as const, controlId: "hold-waiter", expectedRevision: 1 };
+    yield* Ref.update(h.row, (row) => ({
+      ...row,
+      status: "waiting_capacity" as const,
+      pendingControl: { userId: "maintainer", response },
+      record: {
+        ...row.record,
+        status: "waiting_capacity" as const,
+        pendingManualControl: response,
+        progress: {
+          ...row.record.progress!,
+          status: "waiting_capacity" as const,
+        },
+      },
+    }));
+    yield* Ref.set(h.mode, "pause-waiting");
+    const result = yield* h.refresh;
+    assert.strictEqual(result?.status, "paused");
+    assert.strictEqual(result?.progress?.underlyingStatus, "waiting_capacity");
+    assert.strictEqual(result?.progress?.revision, 2);
+    assert.isNull((yield* Ref.get(h.row)).pendingControl);
   }),
 );

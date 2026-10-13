@@ -86,3 +86,12 @@ describe("workflow boundaries", () => {
     ).toEqual([["implement"], ["input"], ["verify"], ["review"]]);
   });
 });
+
+it("requires stable identity and a nonnegative revision for manual workflow controls", () => {
+  for (const operation of ["pause", "resume"] as const) {
+    expect(isResponse({ operation, controlId: "intent", expectedRevision: 3 })).toBe(true);
+    expect(isResponse({ operation, expectedRevision: 3 })).toBe(false);
+    expect(isResponse({ operation, controlId: "", expectedRevision: 3 })).toBe(false);
+    expect(isResponse({ operation, controlId: "intent", expectedRevision: -1 })).toBe(false);
+  }
+});

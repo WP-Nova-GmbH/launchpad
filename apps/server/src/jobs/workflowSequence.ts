@@ -12,6 +12,11 @@ export function workflowPromptId(run: WorkflowRun) {
     : `workflow:${run.jobId}:step:${activeWorkflowStep(run)?.id}:${sequence.generation}:prompt`;
 }
 
+/** A requested hold permits only the already-reserved Agent step to finish. */
+export const workflowAllowsPrompt = (run: WorkflowRun, messageId: string) =>
+  !run.manualPause ||
+  (run.manualPause.state === "requested" && run.manualPause.promptId === messageId);
+
 /** Move only after saving the current step's result or human response. */
 export function advanceWorkflow(run: WorkflowRun): WorkflowRun {
   const sequence = run.sequence!;
@@ -70,9 +75,18 @@ export function advanceWorkflow(run: WorkflowRun): WorkflowRun {
 /** Summaries are bounded; full answers remain in the environment's durable record. */
 export function workflowProgress(run: WorkflowRun): WorkflowRun["progress"] {
   const sequence = run.sequence;
-  if (!sequence) return run.progress;
-  return {
+  if (!sequence) return { ...run.progress, manualPauseSupported: false };
+  const pause = run.manualPause;
+  const progress = {
     ...run.progress,
+    manualPauseSupported: Boolean(run.providerContinuation),
+    manualPause: pause ? { state: pause.state } : null,
+    underlyingStatus: run.progress.status,
+    lastManualControl: run.lastManualControl ?? null,
+    ...(pause?.state === "paused" ? { status: "paused" as const } : {}),
+  };
+  return {
+    ...progress,
     hasThread: sequence.started,
     steps: run.workflow.definition.steps.map((step, index) => ({
       stepId: step.id,

@@ -46,7 +46,11 @@ import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { WorkflowRunStore } from "../../jobs/WorkflowRunStore.ts";
-import { activeWorkflowStep, workflowPromptId } from "../../jobs/workflowSequence.ts";
+import {
+  activeWorkflowStep,
+  workflowPromptId,
+  workflowAllowsPrompt,
+} from "../../jobs/workflowSequence.ts";
 import type { WorkflowProviderContinuation } from "../../provider/Services/ProviderService.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
@@ -649,6 +653,7 @@ const make = Effect.gen(function* () {
       !run ||
       run.progress.threadId !== threadId ||
       !run.executionReserved ||
+      !workflowAllowsPrompt(run, messageId) ||
       !["preparing", "running"].includes(run.progress.status) ||
       activeWorkflowStep(run)?.kind !== "agent" ||
       workflowPromptId(run) !== messageId ||

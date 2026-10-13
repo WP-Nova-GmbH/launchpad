@@ -2717,3 +2717,376 @@ it.effect("retains capacity when stopped projection lacks provider proof", () =>
     assert.strictEqual((yield* runner.handle(control("status"))).progress?.status, "cancelled");
   }).pipe(Effect.provide(persistence)),
 );
+
+function manualRequest(
+  progress: NonNullable<import("@t3tools/contracts/workflows").WorkflowControlResult["progress"]>,
+  operation: "pause" | "resume",
+  controlId = `${operation}-${progress.revision}`,
+): WorkflowRequest {
+  return {
+    ...request(),
+    control: {
+      ...control("status").control,
+      operation,
+      controlId,
+      expectedRevision: progress.revision,
+    },
+  };
+}
+
+it.effect("manual Pause preserves Input and Review checkpoints, previews and responses", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const runner = yield* h.newRunner;
+      const input = (yield* runner.handle(multiRequest())).progress!;
+      const paused = (yield* runner.handle(manualRequest(input, "pause"))).progress!;
+      assert.strictEqual(paused.status, "paused");
+      assert.strictEqual(paused.underlyingStatus, "awaiting_input");
+      assert.strictEqual(paused.checkpoint!.checkpointId, input.checkpoint!.checkpointId);
+      assert.isFalse(paused.hasThread);
+      assert.lengthOf(yield* h.starts, 0);
+      assert.strictEqual(
+        (yield* runner.handle(checkpointResponse(paused, "input", "keep draft"))).outcome,
+        "conflict",
+      );
+      const resumed = (yield* runner.handle(manualRequest(paused, "resume"))).progress!;
+      assert.strictEqual(resumed.status, "awaiting_input");
+      yield* runner.handle(checkpointResponse(resumed, "input", "keep answer"));
+      yield* h.completeCurrent;
+      yield* withBackground(h);
+      const review = (yield* runner.handle(control("status"))).progress!;
+      const reviewPaused = (yield* runner.handle(manualRequest(review, "pause"))).progress!;
+      assert.strictEqual((yield* runner.handle(approve(reviewPaused))).outcome, "conflict");
+      assert.strictEqual(yield* Queue.size(h.cleanups), 0);
+      const restored = (yield* runner.handle(manualRequest(reviewPaused, "resume"))).progress!;
+      assert.strictEqual(restored.checkpoint!.checkpointId, review.checkpoint!.checkpointId);
+      assert.deepStrictEqual(restored.responses, review.responses);
+      assert.strictEqual(restored.status, "awaiting_review");
+    }),
+  ),
+);
+
+it.effect(
+  "manual Pause finishes one reserved Agent and blocks its automatic successor across restart",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        let runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        const started = (yield* runner.handle({
+          ...request(),
+          control: {
+            ...request().control,
+            operation: "start",
+            workflow: {
+              ...workflow,
+              definition: {
+                ...workflow.definition,
+                steps: [
+                  workflow.definition.steps[0]!,
+                  {
+                    ...workflow.definition.steps[0]!,
+                    id: "second-agent",
+                  },
+                  workflow.definition.steps[1]!,
+                ],
+              },
+            },
+          },
+        })).progress!;
+        const requested = (yield* runner.handle(manualRequest(started, "pause"))).progress!;
+        assert.strictEqual(requested.manualPause?.state, "requested");
+        assert.notEqual(requested.status, "paused");
+        assert.lengthOf(yield* h.starts, 1);
+        yield* h.completeCurrent;
+        const paused = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(paused.manualPause?.state, "paused");
+        assert.strictEqual(paused.underlyingStatus, "waiting_capacity");
+        assert.lengthOf(yield* h.starts, 1);
+        const store = yield* Store.WorkflowRunStore;
+        assert.isFalse((yield* store.get("job-1"))!.executionReserved);
+        yield* Scope.close(scope, Exit.void);
+        runner = yield* h.newRunner;
+        const recovered = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(recovered.status, "paused");
+        assert.lengthOf(yield* h.starts, 1);
+        yield* runner.handle(manualRequest(recovered, "resume"));
+        const starts = yield* h.starts;
+        assert.lengthOf(starts, 2);
+        assert.isUndefined(starts[1]!.bootstrap);
+        assert.strictEqual(starts[1]!.threadId, starts[0]!.threadId);
+      }),
+    ),
+);
+
+it.effect("manual Pause at the last Agent blocks final completion and setup cleanup", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const runner = yield* h.newRunner;
+      const started = (yield* runner.handle({
+        ...request(),
+        control: {
+          ...request().control,
+          operation: "start",
+          workflow: {
+            ...workflow,
+            definition: { ...workflow.definition, steps: [workflow.definition.steps[0]!] },
+          },
+        },
+      })).progress!;
+      yield* runner.handle(manualRequest(started, "pause"));
+      yield* h.completeCurrent;
+      yield* withBackground(h);
+      const paused = (yield* runner.handle(control("status"))).progress!;
+      assert.strictEqual(paused.status, "paused");
+      assert.strictEqual(paused.underlyingStatus, "finishing");
+      assert.strictEqual(yield* Queue.size(h.cleanups), 0);
+      const store = yield* Store.WorkflowRunStore;
+      assert.isUndefined((yield* store.get("job-1"))!.approvalAttempt);
+      yield* runner.handle(manualRequest(paused, "resume"));
+      yield* Queue.take(h.cleanups);
+      yield* Queue.offer(h.cleanupOutcomes, null);
+      assert.strictEqual(
+        (yield* h.awaitRun((run) => run.progress.status === "done")).progress.status,
+        "done",
+      );
+      assert.lengthOf(yield* h.starts, 1);
+    }),
+  ),
+);
+
+it.effect(
+  "manual control retries are idempotent and an old Pause cannot reapply after Resume",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        const input = (yield* runner.handle(multiRequest())).progress!;
+        const pause = manualRequest(input, "pause", "stable-pause");
+        const paused = (yield* runner.handle(pause)).progress!;
+        const replay = (yield* runner.handle(pause)).progress!;
+        assert.strictEqual(replay.revision, paused.revision);
+        const collision = manualRequest(input, "resume", "stable-pause");
+        assert.strictEqual((yield* runner.handle(collision)).outcome, "conflict");
+        const resume = manualRequest(paused, "resume", "stable-resume");
+        const resumed = (yield* runner.handle(resume)).progress!;
+        assert.strictEqual((yield* runner.handle(resume)).progress?.revision, resumed.revision);
+        assert.strictEqual((yield* runner.handle(pause)).outcome, "conflict");
+        assert.isNull((yield* runner.handle(control("status"))).progress!.manualPause);
+        yield* runner.handle(control("cancel"));
+        assert.strictEqual((yield* runner.handle(resume)).outcome, "conflict");
+        assert.lengthOf(yield* h.starts, 0);
+      }),
+    ),
+);
+
+it.effect("Resume removes only the manual hold and does not retry failed preparation", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const runner = yield* h.newRunner;
+      const started = (yield* runner.handle(request())).progress!;
+      yield* runner.handle(manualRequest(started, "pause"));
+      yield* h.failPreparation;
+      const failed = (yield* runner.handle(control("status"))).progress!;
+      assert.strictEqual(failed.underlyingStatus, "paused");
+      assert.strictEqual(failed.manualPause?.state, "requested");
+      assert.strictEqual((yield* runner.handle(retryRequest(failed.revision))).outcome, "conflict");
+      const resumed = (yield* runner.handle(manualRequest(failed, "resume"))).progress!;
+      assert.strictEqual(resumed.status, "paused");
+      assert.isNull(resumed.manualPause);
+      assert.isTrue(resumed.retryablePreparation);
+      assert.lengthOf(
+        (yield* Ref.get(h.commands)).filter(
+          (command) => command.type === "thread.preparation.retry",
+        ),
+        0,
+      );
+      assert.isTrue((yield* (yield* Store.WorkflowRunStore).get("job-1"))!.executionReserved);
+    }),
+  ),
+);
+
+it.effect("manual Pause survives unknown delivery and Resume never redelivers it", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const runner = yield* h.newRunner;
+      const started = (yield* runner.handle(request())).progress!;
+      yield* runner.handle(manualRequest(started, "pause"));
+      let current = (yield* Ref.get(h.currentThread))!;
+      current = {
+        ...current,
+        promptQueue: {
+          ...current.promptQueue!,
+          preparation: {
+            ...current.promptQueue!.preparation!,
+            state: "ready",
+            settled: true,
+          },
+        },
+      };
+      const apply = Effect.fn(function* (command: Parameters<typeof decidePromptQueueCommand>[1]) {
+        const events = yield* decidePromptQueueCommand(current, command, false);
+        let state: OrchestrationReadModel = { ...createEmptyReadModel(NOW), threads: [current] };
+        for (const event of events)
+          state = yield* projectEvent(state, { ...event, sequence: state.snapshotSequence + 1 });
+        current = state.threads[0]!;
+      });
+      yield* apply({
+        type: "thread.prompt.enqueue",
+        commandId: CommandId.make("pause-enqueue"),
+        threadId: current.id,
+        message: {
+          messageId: MessageId.make("workflow:job-1:prompt"),
+          text: "work",
+          attachments: [],
+        },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        createdAt: NOW,
+      });
+      yield* apply({
+        type: "thread.prompt.claim",
+        commandId: CommandId.make("pause-claim"),
+        threadId: current.id,
+        messageId: MessageId.make("workflow:job-1:prompt"),
+        expectedRevision: current.promptQueue!.entries[0]!.revision,
+        expectedControlRevision: current.promptQueue!.revision,
+        createdAt: NOW,
+      });
+      yield* apply({
+        type: "thread.prompt.unknown",
+        commandId: CommandId.make("pause-unknown"),
+        threadId: current.id,
+        attemptId: CommandId.make("pause-claim"),
+        detail: "Lost delivery acknowledgement",
+        createdAt: NOW,
+      });
+      yield* Ref.set(h.currentThread, current);
+      const uncertain = (yield* runner.handle(control("status"))).progress!;
+      assert.strictEqual(uncertain.underlyingStatus, "paused");
+      assert.isFalse(uncertain.retryablePreparation);
+      yield* runner.handle(manualRequest(uncertain, "resume"));
+      assert.lengthOf(yield* h.starts, 1);
+      assert.isTrue((yield* (yield* Store.WorkflowRunStore).get("job-1"))!.executionReserved);
+    }),
+  ),
+);
+
+it.effect("manual Pause rejects unaccepted and legacy jobs without changing their ownership", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const runner = yield* h.newRunner;
+      assert.strictEqual(
+        (yield* runner.handle({
+          ...request(),
+          control: {
+            ...control("status").control,
+            operation: "pause",
+            controlId: "no-job",
+            expectedRevision: 0,
+          },
+        })).outcome,
+        "conflict",
+      );
+      const started = (yield* runner.handle(request())).progress!;
+      const store = yield* Store.WorkflowRunStore;
+      const run = (yield* store.get("job-1"))!;
+      yield* store.save({ ...run, sequence: undefined });
+      assert.strictEqual(
+        (yield* runner.handle(manualRequest(started, "pause"))).outcome,
+        "unavailable",
+      );
+      assert.isTrue((yield* store.get("job-1"))!.executionReserved);
+      assert.lengthOf(yield* h.starts, 1);
+    }),
+  ),
+);
+
+it.effect.each(["event", "restart", "lost-enqueue-reply"] as const)(
+  "a requested Pause recovers the current step without duplicate delivery: %s",
+  (mode) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        let runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        if (mode === "lost-enqueue-reply") {
+          yield* Ref.set(h.promptOutage, "after");
+          yield* runner.handle(request()).pipe(Effect.flip);
+        } else yield* runner.handle(request());
+        const store = yield* Store.WorkflowRunStore;
+        const saved = (yield* store.get("job-1"))!;
+        yield* runner.handle(manualRequest(saved.progress, "pause"));
+        assert.lengthOf(yield* h.starts, 1);
+        yield* h.completeCurrent;
+        if (mode === "event") {
+          const threadId = ThreadId.make("workflow:job-1:agent");
+          yield* h.emit({
+            sequence: 1,
+            eventId: EventId.make("pause-completion"),
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            occurredAt: NOW,
+            commandId: CommandId.make("pause-completion"),
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            type: "thread.activity-appended",
+            payload: {
+              threadId,
+              activity: {
+                id: EventId.make("pause-completion"),
+                kind: "workflow.progress",
+                tone: "info",
+                summary: "Completed",
+                payload: {},
+                turnId: null,
+                createdAt: NOW,
+              },
+            },
+          });
+          yield* h.awaitRun((run) => run.manualPause?.state === "paused");
+        } else {
+          yield* Scope.close(scope, Exit.void);
+          runner = yield* h.newRunner;
+        }
+        const paused = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(paused.manualPause?.state, "paused");
+        assert.strictEqual(paused.underlyingStatus, "awaiting_review");
+        assert.lengthOf(yield* h.starts, 1);
+      }),
+    ),
+);
+
+it.effect(
+  "a paused capacity waiter stays held while other jobs run and Resume waits for its slot",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        const input = (yield* runner.handle(multiRequest())).progress!;
+        yield* runner.handle(request("other-job"));
+        const waiting = (yield* runner.handle(
+          checkpointResponse(input, "input", "wait for the slot"),
+        )).progress!;
+        assert.strictEqual(waiting.status, "waiting_capacity");
+        const paused = (yield* runner.handle(manualRequest(waiting, "pause"))).progress!;
+        assert.strictEqual(paused.manualPause?.state, "paused");
+        assert.lengthOf(yield* h.starts, 1);
+        const resumed = (yield* runner.handle(manualRequest(paused, "resume"))).progress!;
+        assert.strictEqual(resumed.status, "waiting_capacity");
+        assert.lengthOf(yield* h.starts, 1);
+        const store = yield* Store.WorkflowRunStore;
+        assert.isFalse((yield* store.get("job-1"))!.executionReserved);
+        assert.isTrue((yield* store.get("other-job"))!.executionReserved);
+      }),
+    ),
+);

@@ -6609,36 +6609,58 @@ describe("ProviderCommandReactor", () => {
       }),
   );
 
-  effectIt.effect.each(["done", "cancelled"] as const)(
-    "a captured workflow attempt cannot become an ordinary prompt after %s",
-    (status) =>
-      Effect.gen(function* () {
-        const held = yield* Deferred.make<void>();
-        const entered = yield* Deferred.make<void>();
-        const id = ProviderInstanceId.make("codex");
-        const provider = yield* continuityQueueAdapter(
-          id,
-          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(held))),
+  effectIt.effect.each([
+    "done",
+    "cancelled",
+    "manual-paused",
+    "other-prompt",
+    "requested-current",
+  ] as const)("a captured workflow turn respects lifecycle and manual holds: %s", (status) =>
+    Effect.gen(function* () {
+      const held = yield* Deferred.make<void>();
+      const entered = yield* Deferred.make<void>();
+      const id = ProviderInstanceId.make("codex");
+      const provider = yield* continuityQueueAdapter(
+        id,
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(held))),
+      );
+      const registry = queueRegistry(
+        new Map([[id, { adapter: provider.adapter, key: "codex:shared-queue-home" }]]),
+      );
+      const harness = yield* Effect.promise(() => createHarness({ adapterRegistry: registry }));
+      const run = continuityQueueRun(`captured-${status}`);
+      const save = (value: WorkflowRun) =>
+        Effect.promise(() =>
+          harness.runEffect(WorkflowRunStore.pipe(Effect.flatMap((store) => store.save(value)))),
         );
-        const registry = queueRegistry(
-          new Map([[id, { adapter: provider.adapter, key: "codex:shared-queue-home" }]]),
-        );
-        const harness = yield* Effect.promise(() => createHarness({ adapterRegistry: registry }));
-        const run = continuityQueueRun(`captured-${status}`);
-        const save = (value: WorkflowRun) =>
-          Effect.promise(() =>
-            harness.runEffect(WorkflowRunStore.pipe(Effect.flatMap((store) => store.save(value)))),
-          );
-        yield* save(run);
-        const prompt = `workflow:${run.jobId}:prompt`;
-        const rejected = yield* queueMilestone(harness, prompt, "rejected");
-        yield* enqueueContinuity(harness, prompt, run.modelSelection);
-        yield* Deferred.await(entered);
-        yield* save({ ...run, executionReserved: false, progress: { ...run.progress, status } });
-        yield* Deferred.succeed(held, undefined);
-        yield* Fiber.join(rejected);
-        yield* Effect.promise(harness.drain);
-        expect(provider.nativePrompts).toEqual([]);
-      }),
+      yield* save(run);
+      const prompt = `workflow:${run.jobId}:prompt`;
+      const milestone = yield* queueMilestone(
+        harness,
+        prompt,
+        status === "requested-current" ? "admitted" : "rejected",
+      );
+      yield* enqueueContinuity(harness, prompt, run.modelSelection);
+      yield* Deferred.await(entered);
+      yield* save({
+        ...run,
+        executionReserved: status !== "done" && status !== "cancelled",
+        progress: {
+          ...run.progress,
+          status: status === "done" || status === "cancelled" ? status : run.progress.status,
+        },
+        manualPause:
+          status === "done" || status === "cancelled"
+            ? null
+            : {
+                state: status === "manual-paused" ? "paused" : "requested",
+                promptId: status === "requested-current" ? prompt : "other-prompt",
+              },
+      });
+      yield* Deferred.succeed(held, undefined);
+      yield* Fiber.join(milestone);
+      yield* Effect.promise(harness.drain);
+      expect(provider.nativePrompts).toHaveLength(status === "requested-current" ? 1 : 0);
+    }),
   );
 });

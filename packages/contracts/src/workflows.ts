@@ -106,21 +106,31 @@ export const WorkflowStepProgress = Schema.Struct({
   generation: Revision,
   status: Schema.Literals(["completed", "waiting", "running", "pending"]),
 });
+export const WorkflowManualControl = Schema.Struct({
+  operation: Schema.Literals(["pause", "resume"]),
+  controlId: TrimmedNonEmptyString.check(Schema.isMaxLength(120)),
+  expectedRevision: Revision,
+});
+export type WorkflowManualControl = typeof WorkflowManualControl.Type;
+export const WorkflowManualPause = Schema.Struct({
+  state: Schema.Literals(["requested", "paused"]),
+});
+const WorkflowExecutionStatus = Schema.Literals([
+  "preparing",
+  "running",
+  "awaiting_review",
+  "awaiting_input",
+  "waiting_capacity",
+  "finishing",
+  "paused",
+  "cancelling",
+  "cancelled",
+  "done",
+  "failed",
+]);
 export const WorkflowJobProgress = Schema.Struct({
   revision: Revision,
-  status: Schema.Literals([
-    "preparing",
-    "running",
-    "awaiting_review",
-    "awaiting_input",
-    "waiting_capacity",
-    "finishing",
-    "paused",
-    "cancelling",
-    "cancelled",
-    "done",
-    "failed",
-  ]),
+  status: WorkflowExecutionStatus,
   threadId: ThreadId,
   detail: Schema.NullOr(Schema.String),
   checkpoint: Schema.NullOr(WorkflowCheckpoint),
@@ -133,12 +143,16 @@ export const WorkflowJobProgress = Schema.Struct({
   retryableCancellation: Schema.optional(Schema.Boolean),
   approvalPending: Schema.optional(Schema.Boolean),
   retryableApproval: Schema.optional(Schema.Boolean),
+  manualPauseSupported: Schema.optional(Schema.Boolean),
+  manualPause: Schema.optional(Schema.NullOr(WorkflowManualPause)),
+  underlyingStatus: Schema.optional(WorkflowExecutionStatus),
+  lastManualControl: Schema.optional(Schema.NullOr(WorkflowManualControl)),
 });
 export type WorkflowJobProgress = typeof WorkflowJobProgress.Type;
 
 export const RepositoryWorkflowJob = Schema.Struct({
   /** Pinned with the offer so a downgrade cannot acknowledge newer lifecycle semantics. */
-  requiredProtocol: Schema.optional(Schema.Literals([2, 3, 4, 5])),
+  requiredProtocol: Schema.optional(Schema.Literals([2, 3, 4, 5, 6])),
   jobId: TrimmedNonEmptyString,
   repositoryId: TrimmedNonEmptyString,
   workflowId: TrimmedNonEmptyString,
@@ -163,6 +177,7 @@ export const RepositoryWorkflowJob = Schema.Struct({
   /** Null until a definition is offered. An uncertain offer remains pinned. */
   workflow: Schema.NullOr(RepositoryWorkflow),
   progress: Schema.NullOr(WorkflowJobProgress),
+  pendingManualControl: Schema.optional(Schema.NullOr(WorkflowManualControl)),
   createdAt: Schema.String,
   updatedAt: Schema.String,
 });
@@ -187,6 +202,7 @@ const ControlBinding = {
   projectId: ProjectId,
 };
 export const WorkflowControl = Schema.Union([
+  Schema.Struct({ ...ControlBinding, ...WorkflowManualControl.fields }),
   Schema.Struct({
     ...ControlBinding,
     operation: Schema.Literal("start"),
@@ -224,7 +240,7 @@ export const WorkflowControl = Schema.Union([
 ]);
 export type WorkflowControl = typeof WorkflowControl.Type;
 export const WorkflowControlResult = Schema.Struct({
-  protocol: Schema.Literals([1, 2, 3, 4, 5]),
+  protocol: Schema.Literals([1, 2, 3, 4, 5, 6]),
   outcome: Schema.Literals(["accepted", "cancelled", "missing", "busy", "unavailable", "conflict"]),
   detail: Schema.NullOr(Schema.String),
   progress: Schema.NullOr(WorkflowJobProgress),
@@ -242,6 +258,7 @@ export const RunRepositoryWorkflow = Schema.Struct({
   instruction: Instruction,
 });
 export const RespondToWorkflowJob = Schema.Union([
+  WorkflowManualControl,
   Schema.Struct({ operation: Schema.Literal("cancel") }),
   Schema.Struct({ operation: Schema.Literal("retry_preparation"), expectedRevision: Revision }),
   Schema.Struct({ operation: Schema.Literal("retry_cancellation"), expectedRevision: Revision }),

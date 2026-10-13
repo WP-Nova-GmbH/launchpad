@@ -10,7 +10,12 @@ import { CSS } from "@dnd-kit/utilities";
 import { useAuth } from "@clerk/react";
 import { useNavigate } from "@tanstack/react-router";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
-import { clearAcknowledgedWorkflowDraft } from "@t3tools/client-runtime/relay/workflow-responses";
+import {
+  clearAcknowledgedWorkflowDraft,
+  workflowManualControlState,
+  workflowManualSubmission,
+  type WorkflowManualSubmission,
+} from "@t3tools/client-runtime/relay/workflow-responses";
 import { TurnId } from "@t3tools/contracts";
 import type { RelayRepository, RelayOrganizationProject } from "@t3tools/contracts/relay";
 import {
@@ -458,6 +463,8 @@ export function RepositoryWorkflows({
   const [runWorkflow, setRunWorkflow] = useState<RepositoryWorkflow | null>(null);
   const [instruction, setInstruction] = useState("");
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+  const manualIntent = useRef<WorkflowManualSubmission | null>(null);
+  const manualState = workflowManualControlState(selectedJob);
   const [responseDrafts, setResponseDrafts] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -627,29 +634,40 @@ export function RepositoryWorkflows({
       | "request_changes"
       | "cancel"
       | "retry_preparation"
-      | "retry_cancellation",
+      | "retry_cancellation"
+      | "pause"
+      | "resume",
   ) =>
     void perform(async () => {
       if (!selectedJob) return;
       const checkpoint = selectedJob.progress?.checkpoint;
       if (["approve", "input", "request_changes"].includes(operation) && !checkpoint) return;
+      if (operation === "pause" || operation === "resume")
+        manualIntent.current = workflowManualSubmission(
+          manualIntent.current,
+          selectedJob,
+          operation,
+          randomUUID,
+        );
       const payload =
-        operation === "input" || operation === "request_changes"
-          ? {
-              operation,
-              checkpointId: checkpoint!.checkpointId,
-              expectedRevision: selectedJob.progress!.revision,
-              text: responseDrafts[checkpoint!.checkpointId] ?? "",
-            }
-          : operation === "approve"
-            ? ({
+        operation === "pause" || operation === "resume"
+          ? manualIntent.current!.control
+          : operation === "input" || operation === "request_changes"
+            ? {
                 operation,
                 checkpointId: checkpoint!.checkpointId,
                 expectedRevision: selectedJob.progress!.revision,
-              } as const)
-            : operation === "retry_preparation" || operation === "retry_cancellation"
-              ? { operation, expectedRevision: selectedJob.progress!.revision }
-              : { operation };
+                text: responseDrafts[checkpoint!.checkpointId] ?? "",
+              }
+            : operation === "approve"
+              ? ({
+                  operation,
+                  checkpointId: checkpoint!.checkpointId,
+                  expectedRevision: selectedJob.progress!.revision,
+                } as const)
+              : operation === "retry_preparation" || operation === "retry_cancellation"
+                ? { operation, expectedRevision: selectedJob.progress!.revision }
+                : { operation };
       const submitted = {
         checkpointId: checkpoint?.checkpointId ?? null,
         operation,
@@ -973,6 +991,16 @@ export function RepositoryWorkflows({
               </div>
               <p className="text-sm">{selectedJob.instruction}</p>
               <p className="text-sm font-medium">{selectedJob.status.replaceAll("_", " ")}</p>
+              {manualState.message ? (
+                <p role="status" className="text-sm text-muted-foreground">
+                  {manualState.message}
+                </p>
+              ) : null}
+              {selectedJob.progress?.manualPause?.state === "paused" ? (
+                <p className="text-sm text-muted-foreground">
+                  Next: {manualState.status?.replaceAll("_", " ")}
+                </p>
+              ) : null}
               {selectedJob.detail ? (
                 <p role="status" className="text-sm text-muted-foreground">
                   {selectedJob.detail}
@@ -981,8 +1009,8 @@ export function RepositoryWorkflows({
               {selectedJob.workflow ? (
                 <WorkflowFlow definition={selectedJob.workflow.definition} job={selectedJob} />
               ) : null}
-              {(selectedJob.status === "awaiting_input" ||
-                selectedJob.status === "awaiting_review") &&
+              {(manualState.status === "awaiting_input" ||
+                manualState.status === "awaiting_review") &&
               (canConfigure || selectedJob.progress?.checkpoint?.role === "member") &&
               selectedJob.progress?.checkpoint &&
               !selectedJob.progress.approvalPending ? (
@@ -1010,13 +1038,14 @@ export function RepositoryWorkflows({
                     variant="outline"
                     disabled={
                       busy ||
+                      manualState.checkpointBlocked ||
                       !(responseDrafts[selectedJob.progress!.checkpoint!.checkpointId] ?? "").trim()
                     }
                     onClick={() =>
-                      respond(selectedJob.status === "awaiting_input" ? "input" : "request_changes")
+                      respond(manualState.status === "awaiting_input" ? "input" : "request_changes")
                     }
                   >
-                    {selectedJob.status === "awaiting_input" ? "Submit answer" : "Request changes"}
+                    {manualState.status === "awaiting_input" ? "Submit answer" : "Request changes"}
                   </Button>
                   <p className="text-xs text-muted-foreground">
                     Your draft is kept until the environment acknowledges it.
@@ -1057,13 +1086,15 @@ export function RepositoryWorkflows({
                   </Button>
                 ) : null}
                 {(canConfigure || selectedJob.progress?.checkpoint?.role === "member") &&
-                (selectedJob.status === "awaiting_review" ||
+                (manualState.status === "awaiting_review" ||
                   (canConfigure &&
                     selectedJob.status === "finishing" &&
                     selectedJob.progress?.retryableApproval)) ? (
                   <Button
                     size="sm"
-                    disabled={busy || selectedJob.progress?.approvalPending}
+                    disabled={
+                      busy || manualState.checkpointBlocked || selectedJob.progress?.approvalPending
+                    }
                     onClick={() => respond("approve")}
                   >
                     {selectedJob.progress?.approvalPending
@@ -1076,15 +1107,25 @@ export function RepositoryWorkflows({
                   </Button>
                 ) : null}
                 {canConfigure &&
-                selectedJob.status === "paused" &&
+                manualState.status === "paused" &&
                 selectedJob.progress?.retryablePreparation ? (
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={busy}
+                    disabled={busy || manualState.checkpointBlocked}
                     onClick={() => respond("retry_preparation")}
                   >
                     Retry preparation
+                  </Button>
+                ) : null}
+                {canConfigure && (manualState.canPause || manualState.canResume) ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => respond(manualState.canResume ? "resume" : "pause")}
+                  >
+                    {manualState.canResume ? "Resume workflow" : "Pause workflow"}
                   </Button>
                 ) : null}
                 {canConfigure && !isTerminalWorkflowJob(selectedJob.status) ? (

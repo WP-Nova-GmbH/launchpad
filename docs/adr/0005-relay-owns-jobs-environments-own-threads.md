@@ -66,6 +66,12 @@ its saved result; unexpected changes block approval. Final job completion confir
 and verifies the final result before releasing the workspace; cancellation also requires confirmed
 cleanup before release. Current process ancestry alone cannot establish that all of the job's setup
 work has stopped.
+A manual workflow pause is a separate durable hold on automatic step advancement. The reserved
+Agent step, including preparation, finishes at its finalized checkpoint before acknowledging the
+hold. Keep the underlying human wait or failure state: Resume removes only that hold. Setup and
+previews retain their existing ownership while paused. Accepted holds survive executor restart;
+the compatible-reader barrier prevents older servers from silently ignoring them.
+
 Automatic cleanup covers ordinary job-owned background programs. Docker-managed containers
 and system services have separately managed lifecycles; projects using them arrange their
 cleanup. Their automatic cleanup is outside this workflow slice.

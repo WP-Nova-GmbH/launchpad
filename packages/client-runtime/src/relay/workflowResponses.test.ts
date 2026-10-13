@@ -1,8 +1,10 @@
-import { ThreadId } from "@t3tools/contracts";
-import type { WorkflowJobProgress } from "@t3tools/contracts/workflows";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type { WorkflowJobProgress, RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
 import { describe, expect, it } from "vite-plus/test";
 import {
   clearAcknowledgedWorkflowDraft,
+  workflowManualControlState,
+  workflowManualSubmission,
   type WorkflowDraftSubmission,
 } from "./workflowResponses.ts";
 
@@ -115,6 +117,126 @@ describe("workflow response draft acknowledgement", () => {
         { ...submitted, operation: "approve", text: null },
         acknowledgement(),
       ),
+    ).toBe(drafts);
+  });
+});
+
+const manualJob = (): RepositoryWorkflowJob => ({
+  jobId: "job",
+  repositoryId: "repo",
+  workflowId: "flow",
+  environmentId: EnvironmentId.make("env"),
+  instruction: "work",
+  status: "running",
+  detail: null,
+  workflow: null,
+  progress: { ...acknowledgement(), manualPauseSupported: true },
+  createdAt: "now",
+  updatedAt: "now",
+});
+describe("manual workflow controls", () => {
+  it("distinguishes saved requests, step-boundary waits and acknowledged holds", () => {
+    const job = manualJob();
+    expect(workflowManualControlState(job).canPause).toBe(true);
+    const request = workflowManualSubmission(null, job, "pause", () => "pause-id");
+    const queued = { ...job, pendingManualControl: request.control };
+    expect(workflowManualControlState(queued)).toMatchObject({
+      canPause: false,
+      canResume: false,
+      checkpointBlocked: true,
+    });
+    const requested = {
+      ...job,
+      progress: { ...job.progress!, manualPause: { state: "requested" as const } },
+    };
+    expect(workflowManualControlState(requested)).toMatchObject({
+      canPause: false,
+      canResume: true,
+      checkpointBlocked: true,
+    });
+    const paused = {
+      ...requested,
+      status: "paused" as const,
+      progress: {
+        ...requested.progress,
+        status: "paused" as const,
+        underlyingStatus: "awaiting_input" as const,
+        manualPause: { state: "paused" as const },
+      },
+    };
+    expect(workflowManualControlState(paused)).toMatchObject({
+      canResume: true,
+      status: "awaiting_input",
+    });
+    expect(
+      workflowManualControlState({
+        ...paused,
+        pendingManualControl: { ...request.control, operation: "resume" },
+      }).canResume,
+    ).toBe(false);
+  });
+  it("retries a lost reply with the same identity and requires a new click after acknowledged/stale state", () => {
+    const job = manualJob();
+    let ids = 0;
+    const uuid = () => `control-${++ids}`;
+    const original = workflowManualSubmission(null, job, "pause", uuid);
+    expect(workflowManualSubmission(original, job, "pause", uuid)).toBe(original);
+    const saved = {
+      ...job,
+      pendingManualControl: original.control,
+      progress: { ...job.progress!, revision: 9 },
+    };
+    expect(workflowManualSubmission(original, saved, "pause", uuid)).toBe(original);
+    const acknowledged = {
+      ...job,
+      progress: { ...job.progress!, lastManualControl: original.control },
+    };
+    expect(
+      workflowManualSubmission(original, acknowledged, "pause", uuid).control.controlId,
+    ).not.toBe(original.control.controlId);
+    const refreshed = { ...job, progress: { ...job.progress!, revision: 9 } };
+    expect(
+      workflowManualSubmission(original, refreshed, "pause", uuid).control.expectedRevision,
+    ).toBe(9);
+    expect(workflowManualSubmission(original, job, "resume", uuid).control.operation).toBe(
+      "resume",
+    );
+  });
+  it("hides controls for legacy, queued, finishing and cancelled jobs without erasing failure state or drafts", () => {
+    const job = manualJob();
+    for (const status of ["finishing", "cancelling", "done", "cancelled", "failed"] as const)
+      expect(
+        workflowManualControlState({ ...job, status, progress: { ...job.progress!, status } })
+          .canPause,
+      ).toBe(false);
+    expect(workflowManualControlState({ ...job, progress: null, status: "queued" }).canPause).toBe(
+      false,
+    );
+    expect(
+      workflowManualControlState({
+        ...job,
+        progress: { ...job.progress!, manualPauseSupported: undefined },
+      }).canPause,
+    ).toBe(false);
+    const failed = {
+      ...job,
+      status: "paused" as const,
+      progress: {
+        ...job.progress!,
+        status: "paused" as const,
+        underlyingStatus: "paused" as const,
+        manualPause: { state: "requested" as const },
+        retryablePreparation: true,
+      },
+    };
+    expect(workflowManualControlState(failed)).toMatchObject({
+      canResume: true,
+      checkpointBlocked: true,
+      status: "paused",
+    });
+    const drafts = { "checkpoint-a": "answer-a" };
+    expect(
+      clearAcknowledgedWorkflowDraft(drafts, { ...submitted, operation: "pause" }, failed.progress),
     ).toBe(drafts);
   });
 });

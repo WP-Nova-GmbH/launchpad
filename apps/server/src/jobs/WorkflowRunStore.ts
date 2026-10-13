@@ -10,6 +10,8 @@ import {
   WorkflowJobProgress,
   WorkflowReviewCheckpoint,
   WorkflowResponseSummary,
+  WorkflowManualControl,
+  WorkflowManualPause,
 } from "@t3tools/contracts/workflows";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -43,6 +45,15 @@ export const WorkflowSequence = Schema.Struct({
 });
 export type WorkflowSequence = typeof WorkflowSequence.Type;
 export const WorkflowRun = Schema.Struct({
+  manualPause: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        ...WorkflowManualPause.fields,
+        promptId: Schema.NullOr(Schema.String),
+      }),
+    ),
+  ),
+  lastManualControl: Schema.optional(Schema.NullOr(WorkflowManualControl)),
   sequence: Schema.optional(WorkflowSequence),
   /** Pinned before acceptance so an instance ID cannot hide a changed resume identity. */
   providerContinuation: Schema.optional(

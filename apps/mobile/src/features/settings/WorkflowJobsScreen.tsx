@@ -1,7 +1,12 @@
 import { useAuth } from "@clerk/expo";
 import { useNavigation } from "@react-navigation/native";
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
-import { clearAcknowledgedWorkflowDraft } from "@t3tools/client-runtime/relay/workflow-responses";
+import {
+  clearAcknowledgedWorkflowDraft,
+  workflowManualControlState,
+  workflowManualSubmission,
+  type WorkflowManualSubmission,
+} from "@t3tools/client-runtime/relay/workflow-responses";
 import type { RelayRepositorySummary, RelayOrganizationMembership } from "@t3tools/contracts/relay";
 import {
   isTerminalWorkflowJob,
@@ -12,10 +17,11 @@ import {
 import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState, View, TextInput } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { runtime } from "../../lib/runtime";
+import { uuidv4 } from "../../lib/uuid";
 import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "../cloud/publicConfig";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { SettingsSection } from "./components/SettingsSection";
@@ -44,6 +50,8 @@ function ConfiguredWorkflowJobsScreen() {
   const [selectedRepository, setSelectedRepository] = useState<RelayRepositorySummary | null>(null);
   const [jobs, setJobs] = useState<ReadonlyArray<RepositoryWorkflowJobSummary>>([]);
   const [selectedJob, setSelectedJob] = useState<RepositoryWorkflowJob | null>(null);
+  const manualIntent = useRef<WorkflowManualSubmission | null>(null);
+  const manualState = workflowManualControlState(selectedJob);
   const [responseDrafts, setResponseDrafts] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -145,29 +153,40 @@ function ConfiguredWorkflowJobsScreen() {
       | "request_changes"
       | "cancel"
       | "retry_preparation"
-      | "retry_cancellation",
+      | "retry_cancellation"
+      | "pause"
+      | "resume",
   ) =>
     void perform(async () => {
       if (!selectedJob || !selectedRepository) return;
       const checkpoint = selectedJob.progress?.checkpoint;
       if (["approve", "input", "request_changes"].includes(operation) && !checkpoint) return;
+      if (operation === "pause" || operation === "resume")
+        manualIntent.current = workflowManualSubmission(
+          manualIntent.current,
+          selectedJob,
+          operation,
+          uuidv4,
+        );
       const payload =
-        operation === "input" || operation === "request_changes"
-          ? {
-              operation,
-              checkpointId: checkpoint!.checkpointId,
-              expectedRevision: selectedJob.progress!.revision,
-              text: responseDrafts[checkpoint!.checkpointId] ?? "",
-            }
-          : operation === "approve"
-            ? ({
+        operation === "pause" || operation === "resume"
+          ? manualIntent.current!.control
+          : operation === "input" || operation === "request_changes"
+            ? {
                 operation,
                 checkpointId: checkpoint!.checkpointId,
                 expectedRevision: selectedJob.progress!.revision,
-              } as const)
-            : operation === "retry_preparation" || operation === "retry_cancellation"
-              ? { operation, expectedRevision: selectedJob.progress!.revision }
-              : { operation };
+                text: responseDrafts[checkpoint!.checkpointId] ?? "",
+              }
+            : operation === "approve"
+              ? ({
+                  operation,
+                  checkpointId: checkpoint!.checkpointId,
+                  expectedRevision: selectedJob.progress!.revision,
+                } as const)
+              : operation === "retry_preparation" || operation === "retry_cancellation"
+                ? { operation, expectedRevision: selectedJob.progress!.revision }
+                : { operation };
       const submitted = {
         checkpointId: checkpoint?.checkpointId ?? null,
         operation,
@@ -222,6 +241,14 @@ function ConfiguredWorkflowJobsScreen() {
               <Text className="font-semibold text-foreground">
                 {selectedJob.status.replaceAll("_", " ")}
               </Text>
+              {manualState.message ? (
+                <Text className="text-foreground-muted">{manualState.message}</Text>
+              ) : null}
+              {selectedJob.progress?.manualPause?.state === "paused" ? (
+                <Text className="text-foreground-muted">
+                  Next: {manualState.status?.replaceAll("_", " ")}
+                </Text>
+              ) : null}
               {selectedJob.detail ? (
                 <Text className="text-foreground-muted">{selectedJob.detail}</Text>
               ) : null}
@@ -259,12 +286,12 @@ function ConfiguredWorkflowJobsScreen() {
               ))}
             </View>
           ) : null}
-          {(selectedJob.status === "awaiting_input" || selectedJob.status === "awaiting_review") &&
+          {(manualState.status === "awaiting_input" || manualState.status === "awaiting_review") &&
           (canRespond || selectedJob.progress?.checkpoint?.role === "member") &&
           selectedJob.progress?.checkpoint &&
           !selectedJob.progress.approvalPending ? (
             <SettingsSection
-              title={selectedJob.status === "awaiting_input" ? "Required input" : "Request changes"}
+              title={manualState.status === "awaiting_input" ? "Required input" : "Request changes"}
             >
               <View className="gap-2 p-4">
                 <Text className="text-foreground">
@@ -274,7 +301,7 @@ function ConfiguredWorkflowJobsScreen() {
                 </Text>
                 <TextInput
                   accessibilityLabel={
-                    selectedJob.status === "awaiting_input"
+                    manualState.status === "awaiting_input"
                       ? "Checkpoint answer"
                       : "Rework feedback"
                   }
@@ -296,14 +323,15 @@ function ConfiguredWorkflowJobsScreen() {
               <SettingsActionRow
                 icon="checkmark.circle"
                 label={
-                  selectedJob.status === "awaiting_input" ? "Submit answer" : "Request changes"
+                  manualState.status === "awaiting_input" ? "Submit answer" : "Request changes"
                 }
                 disabled={
                   busy ||
+                  manualState.checkpointBlocked ||
                   !(responseDrafts[selectedJob.progress!.checkpoint!.checkpointId] ?? "").trim()
                 }
                 onPress={() =>
-                  respond(selectedJob.status === "awaiting_input" ? "input" : "request_changes")
+                  respond(manualState.status === "awaiting_input" ? "input" : "request_changes")
                 }
               />
             </SettingsSection>
@@ -343,7 +371,7 @@ function ConfiguredWorkflowJobsScreen() {
               />
             ) : null}
             {(canRespond || selectedJob.progress?.checkpoint?.role === "member") &&
-            (selectedJob.status === "awaiting_review" ||
+            (manualState.status === "awaiting_review" ||
               (canRespond &&
                 selectedJob.status === "finishing" &&
                 selectedJob.progress?.retryableApproval)) ? (
@@ -358,18 +386,28 @@ function ConfiguredWorkflowJobsScreen() {
                         : "Retry approval"
                       : "Approve result"
                 }
-                disabled={busy || selectedJob.progress?.approvalPending}
+                disabled={
+                  busy || manualState.checkpointBlocked || selectedJob.progress?.approvalPending
+                }
                 onPress={() => respond("approve")}
               />
             ) : null}
             {canRespond &&
-            selectedJob.status === "paused" &&
+            manualState.status === "paused" &&
             selectedJob.progress?.retryablePreparation ? (
               <SettingsActionRow
                 icon="arrow.clockwise"
                 label="Retry preparation"
-                disabled={busy}
+                disabled={busy || manualState.checkpointBlocked}
                 onPress={() => respond("retry_preparation")}
+              />
+            ) : null}
+            {canRespond && (manualState.canPause || manualState.canResume) ? (
+              <SettingsActionRow
+                icon={manualState.canResume ? "play" : "pause"}
+                label={manualState.canResume ? "Resume workflow" : "Pause workflow"}
+                disabled={busy}
+                onPress={() => respond(manualState.canResume ? "resume" : "pause")}
               />
             ) : null}
             {canRespond && !isTerminalWorkflowJob(selectedJob.status) ? (

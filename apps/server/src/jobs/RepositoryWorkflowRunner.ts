@@ -44,6 +44,7 @@ import {
   advanceWorkflow,
   workflowProgress,
   workflowPromptId,
+  workflowAllowsPrompt,
 } from "./workflowSequence.ts";
 import { workflowTask } from "./workflowTask.ts";
 import { attachApprovalSupervisor, type SupervisorVerdict } from "./supervisor.ts";
@@ -76,7 +77,7 @@ export class RepositoryWorkflowRunner extends Context.Reference<RepositoryWorkfl
     defaultValue: () => ({
       handle: () =>
         Effect.succeed({
-          protocol: 5,
+          protocol: 6,
           outcome: "unavailable",
           detail: "Workflow execution is unavailable on this environment.",
           progress: null,
@@ -290,7 +291,8 @@ export const make = Effect.gen(function* () {
       if (
         previous &&
         (previous.progress.status !== run.progress.status ||
-          (!previous.promptDispatched && run.promptDispatched)) &&
+          (!previous.promptDispatched && run.promptDispatched) ||
+          previous.manualPause?.state !== run.manualPause?.state) &&
         (run.sequence?.started || run.promptDispatched) &&
         Option.isSome(yield* query.getThreadDetailById(run.progress.threadId).pipe(Effect.orDie))
       ) {
@@ -304,7 +306,12 @@ export const make = Effect.gen(function* () {
             id: EventId.make(`workflow:${run.jobId}:progress:${run.progress.revision}`),
             kind: "workflow.progress",
             tone: "info",
-            summary: `Workflow ${run.progress.status.replaceAll("_", " ")}`,
+            summary:
+              run.manualPause?.state === "requested"
+                ? "Workflow pausing after current step"
+                : run.manualPause?.state === "paused"
+                  ? "Workflow manually paused"
+                  : `Workflow ${run.progress.status.replaceAll("_", " ")}`,
             payload: {
               jobId: run.jobId,
               repositoryId: run.workflow.repositoryId,
@@ -323,7 +330,7 @@ export const make = Effect.gen(function* () {
     outcome: WorkflowControlResult["outcome"] = run ? "accepted" : "missing",
     detail: string | null = null,
   ): WorkflowControlResult => ({
-    protocol: 5,
+    protocol: 6,
     outcome,
     detail,
     progress: run ? workflowProgress(run) : null,
@@ -384,6 +391,7 @@ export const make = Effect.gen(function* () {
   const dispatchPrompt = Effect.fn("RepositoryWorkflowRunner.dispatchPrompt")(function* (
     run: WorkflowRun,
   ) {
+    if (!workflowAllowsPrompt(run, workflowPromptId(run))) return run;
     const project = yield* query
       .getProjectShellById(run.workflow.definition.projectId)
       .pipe(Effect.orDie);
@@ -957,7 +965,8 @@ export const make = Effect.gen(function* () {
     if (
       retry &&
       !isTerminalWorkflowJob(run.progress.status) &&
-      run.progress.status !== "cancelling"
+      run.progress.status !== "cancelling" &&
+      workflowAllowsPrompt(run, workflowPromptId(run))
     ) {
       const acknowledgement = yield* engine
         .dispatch({
@@ -1089,7 +1098,25 @@ export const make = Effect.gen(function* () {
       }
     }
     if (!equivalentRuns(next, run)) yield* store.save(next);
-    if (next.progress.status === "waiting_capacity" && !(yield* store.isExecuting(next.jobId))) {
+    if (
+      next.manualPause?.state === "requested" &&
+      !next.executionReserved &&
+      ["awaiting_review", "awaiting_input", "waiting_capacity", "finishing"].includes(
+        next.progress.status,
+      )
+    ) {
+      next = {
+        ...next,
+        manualPause: { ...next.manualPause, state: "paused" },
+        progress: { ...next.progress, revision: next.progress.revision + 1 },
+      };
+      yield* store.save(next);
+    }
+    if (
+      !next.manualPause &&
+      next.progress.status === "waiting_capacity" &&
+      !(yield* store.isExecuting(next.jobId))
+    ) {
       const step = activeWorkflowStep(next);
       if (step?.kind === "agent")
         next = yield* store.save({
@@ -1109,6 +1136,7 @@ export const make = Effect.gen(function* () {
         (next.sequence &&
           next.sequence.cursor === next.workflow.definition.steps.length &&
           next.progress.status === "awaiting_review")) &&
+      !next.manualPause &&
       !next.approvalAttempt &&
       !next.progress.retryableApproval &&
       !next.progress.detail
@@ -1156,6 +1184,7 @@ export const make = Effect.gen(function* () {
   const pumpWaiting = Effect.fn("RepositoryWorkflowRunner.pumpWaiting")(function* () {
     if (yield* store.isExecuting()) return;
     for (const waiting of yield* store.active("waiting_capacity")) {
+      if (waiting.manualPause) continue;
       const resumed = yield* reconcile(waiting);
       if (resumed.executionReserved) break;
     }
@@ -1198,11 +1227,13 @@ export const make = Effect.gen(function* () {
         if (
           run.progress.status !== "cancelling" ||
           run.pendingPreparationRetry ||
+          run.manualPause ||
           run.approvalAttempt
         )
           run = yield* store.save({
             ...run,
             pendingPreparationRetry: null,
+            manualPause: null,
             approvalAttempt: null,
             cancellationAttempt: run.cancellationAttempt ?? {
               commandId: `workflow:${run.jobId}:cancel`,
@@ -1217,6 +1248,75 @@ export const make = Effect.gen(function* () {
               detail: "Waiting for the environment to stop the agent and setup.",
             },
           });
+        return result(yield* reconcile(run));
+      }
+      if (request.control.operation === "pause" || request.control.operation === "resume") {
+        if (!run) return result(null, "conflict", "Wait for the environment to accept this job.");
+        yield* access
+          .requireProject(
+            { user: { userId: request.userId, displayName: null, imageUrl: null } },
+            run.workflow.definition.projectId,
+          )
+          .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
+        if (isTerminalWorkflowJob(run.progress.status) || run.progress.status === "cancelling")
+          return result(run, "conflict", "This job is cancelling or has finished.");
+        if (!run.sequence || !run.providerContinuation)
+          return result(
+            run,
+            "unavailable",
+            "This legacy job does not support manual Pause/Resume.",
+          );
+        const control = request.control;
+        if (run.lastManualControl?.controlId === control.controlId) {
+          if (
+            run.lastManualControl.operation !== control.operation ||
+            run.lastManualControl.expectedRevision !== control.expectedRevision
+          )
+            return result(
+              run,
+              "conflict",
+              "This control identity was already used for another request.",
+            );
+          return result(yield* reconcile(run));
+        }
+        if (run.progress.revision !== control.expectedRevision)
+          return result(
+            run,
+            "conflict",
+            "This job changed. Refresh before changing its pause state.",
+          );
+        if (
+          control.operation === "pause" &&
+          (run.manualPause ||
+            ![
+              "preparing",
+              "running",
+              "awaiting_review",
+              "awaiting_input",
+              "waiting_capacity",
+            ].includes(run.progress.status))
+        )
+          return result(run, "conflict", "This job cannot be paused in its current state.");
+        if (control.operation === "resume" && !run.manualPause)
+          return result(run, "conflict", "This job has no manual pause to resume.");
+        const active =
+          run.executionReserved && ["preparing", "running"].includes(run.progress.status);
+        run = yield* store.save({
+          ...run,
+          manualPause:
+            control.operation === "resume"
+              ? null
+              : {
+                  state: active ? "requested" : "paused",
+                  promptId: active ? workflowPromptId(run) : null,
+                },
+          lastManualControl: {
+            operation: control.operation,
+            controlId: control.controlId,
+            expectedRevision: control.expectedRevision,
+          },
+          progress: { ...run.progress, revision: run.progress.revision + 1 },
+        });
         return result(yield* reconcile(run));
       }
       if (run) run = yield* reconcile(run);
@@ -1429,6 +1529,8 @@ export const make = Effect.gen(function* () {
         });
         return result(yield* reconcile(run));
       }
+      if (run.manualPause && request.control.operation !== "cancel")
+        return result(run, "conflict", "Resume the manual pause before responding or retrying.");
       if (request.control.operation === "retry_preparation") {
         if (run.progress.revision !== request.control.expectedRevision)
           return result(run, "conflict", "This preparation changed. Refresh before retrying.");

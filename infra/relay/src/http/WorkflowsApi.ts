@@ -2,12 +2,14 @@ import { RelayApi, RelayClientPrincipal } from "@t3tools/contracts/relay";
 import {
   WorkflowConflictError,
   WorkflowInvalidError,
+  WorkflowManualControl,
   isTerminalWorkflowJob,
   type RespondToWorkflowJob,
 } from "@t3tools/contracts/workflows";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { Workflows } from "../jobs/Workflows.ts";
 import { refreshWorkflowJob, validateWorkflowTarget } from "../jobs/WorkflowDispatcher.ts";
@@ -29,6 +31,7 @@ export const authorizeWorkflowRepository = Effect.fn("WorkflowsApi.authorize")(f
   else yield* requireVisibleRepository({ membership, repositoryId });
   return membership;
 });
+const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* (
   params: { readonly repositoryId: string; readonly jobId: string },
   payload: typeof RespondToWorkflowJob.Type,
@@ -44,6 +47,60 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     payload.operation === "request_changes";
   if (!checkpointResponse || row.record.progress?.checkpoint?.role !== "member")
     yield* requireMaintainableRepository({ membership, repositoryId: params.repositoryId });
+  const manual = payload.operation === "pause" || payload.operation === "resume";
+  if (manual) {
+    const pending = row.pendingControl?.response;
+    if (pending?.operation === "pause" || pending?.operation === "resume") {
+      if (pending.controlId === payload.controlId) {
+        if (
+          !sameManualControl(pending, payload) ||
+          row.pendingControl?.userId !== membership.userId
+        )
+          return yield* new WorkflowConflictError({
+            message: "This control identity belongs to another request.",
+          });
+        return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+      }
+    }
+    const receipt = row.record.progress?.lastManualControl;
+    if (receipt?.controlId === payload.controlId && !row.pendingControl) {
+      if (!sameManualControl(receipt, payload))
+        return yield* new WorkflowConflictError({
+          message: "This control identity belongs to another request.",
+        });
+      return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+    }
+    const progress = row.record.progress;
+    if (!progress?.manualPauseSupported)
+      return yield* new WorkflowInvalidError({
+        message: "Pause/Resume requires an accepted ordered job on an updated environment.",
+      });
+    if (progress.revision !== payload.expectedRevision)
+      return yield* new WorkflowConflictError({
+        message: "This job changed. Refresh before changing its pause state.",
+      });
+    if (
+      row.status === "cancelling" ||
+      isTerminalWorkflowJob(row.status) ||
+      (payload.operation === "pause" &&
+        (progress.manualPause ||
+          ![
+            "preparing",
+            "running",
+            "awaiting_review",
+            "awaiting_input",
+            "waiting_capacity",
+          ].includes(progress.underlyingStatus ?? progress.status))) ||
+      (payload.operation === "resume" && !progress.manualPause)
+    )
+      return yield* new WorkflowConflictError({
+        message: "This job cannot change its manual pause in the current state.",
+      });
+  }
+  if (row.record.progress?.manualPause && !manual && payload.operation !== "cancel")
+    return yield* new WorkflowConflictError({
+      message: "Resume the manual pause before responding or retrying.",
+    });
   if (isTerminalWorkflowJob(row.status)) return row.record;
   if (payload.operation === "cancel" && row.status === "cancelling") return row.record;
   if (
@@ -93,8 +150,13 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     row,
     {
       ...row.record,
+      ...(manual
+        ? { requiredProtocol: 6 as const, pendingManualControl: payload }
+        : payload.operation === "cancel"
+          ? { pendingManualControl: null }
+          : {}),
       ...(payload.operation === "input" || payload.operation === "request_changes"
-        ? { requiredProtocol: 5 as const }
+        ? { requiredProtocol: row.record.requiredProtocol === 6 ? (6 as const) : (5 as const) }
         : {}),
       ...(payload.operation === "cancel"
         ? {
@@ -104,7 +166,11 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
               ? { ...row.record.progress, approvalPending: false, retryableApproval: false }
               : null,
           }
-        : { detail: "Response saved; waiting for the environment." }),
+        : {
+            detail: manual
+              ? "Pause/Resume request saved; waiting for the environment."
+              : "Response saved; waiting for the environment.",
+          }),
       updatedAt: DateTime.formatIso(yield* DateTime.now),
     },
     { userId: membership.userId, response: payload },

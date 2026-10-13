@@ -1,6 +1,7 @@
 import { RelayJobId } from "@t3tools/contracts/relay";
 import {
   WorkflowInvalidError,
+  WorkflowManualControl,
   isTerminalWorkflowJob,
   type WorkflowControl,
   type WorkflowDefinition,
@@ -17,6 +18,7 @@ import { requireMaintainableRepository, requireVisibleRepository } from "../http
 import { Organizations } from "../tenancy/Organizations.ts";
 import { Workflows } from "./Workflows.ts";
 
+const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
 
 export const validateWorkflowTarget = Effect.fn("WorkflowDispatcher.validateTarget")(function* (
@@ -66,7 +68,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
   const refresh = Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
     let job = row!.record;
-    const minimumProtocol = job.workflow === null ? 5 : 4;
+    const minimumProtocol = job.workflow === null ? 6 : 4;
     if ((job.requiredProtocol ?? 2) < minimumProtocol) {
       row = yield* store.updateJob(
         row!,
@@ -122,7 +124,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         instruction: job.instruction,
         workflowControl: { ...binding, operation: "status" },
       });
-      if (!probe.workflowResult || probe.workflowResult.protocol < 5)
+      if (!probe.workflowResult || probe.workflowResult.protocol < 6)
         return yield* new WorkflowInvalidError({
           message: "Update this environment to a version that supports repository workflows.",
         });
@@ -138,7 +140,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         ...job,
         environmentId: workflow.definition.environmentId,
         workflow,
-        requiredProtocol: 5,
+        requiredProtocol: 6,
         status: "dispatching",
         detail: "Offering this workflow to its environment.",
         updatedAt: now,
@@ -200,6 +202,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
             ...job,
             detail:
               "The saved response author no longer has permission. A permitted repository member must respond.",
+            pendingManualControl: null,
             updatedAt: now,
           },
           null,
@@ -209,6 +212,24 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       }
       control = { ...binding, ...response };
     } else if (job.progress === null) control = { ...binding, operation: "start", workflow };
+    const manualControl =
+      control.operation === "pause" || control.operation === "resume" ? control : null;
+    const manual = manualControl !== null;
+    // Status reconciles and may start an unreserved step. Use the already-confirmed job
+    // capability so Pause reaches the executor before any advancing probe.
+    if (manual && !job.progress?.manualPauseSupported)
+      return yield* new WorkflowInvalidError({
+        message: "This job has no confirmed manual Pause/Resume capability.",
+      });
+    if (manual && (job.requiredProtocol ?? 2) < 6) {
+      row = yield* store.updateJob(
+        row!,
+        { ...job, requiredProtocol: 6 },
+        row!.pendingControl,
+        false,
+      );
+      job = row.record;
+    }
     if (
       control.operation === "approve" ||
       control.operation === "input" ||
@@ -228,7 +249,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         capability.workflowResult.protocol < (job.requiredProtocol ?? 4)
       )
         return yield* new WorkflowInvalidError({
-          message: "Update this environment before approving a workflow result.",
+          message: "Update this environment before responding to this workflow.",
         });
     }
     const response = yield* connector.dispatchJob({
@@ -253,19 +274,21 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     if (outcome.progress) {
       // Monotonic executor revisions and terminal fences reject stale reports.
       if ((job.progress?.revision ?? -1) > outcome.progress.revision) return job;
+      const receipt = outcome.progress.lastManualControl;
+      const manualAcknowledged =
+        manualControl && receipt && sameManualControl(receipt, manualControl);
+      const keepPending =
+        outcome.outcome === "busy" ||
+        (manual && !manualAcknowledged && outcome.outcome !== "conflict");
       const next: RepositoryWorkflowJob = {
         ...job,
         progress: outcome.progress,
+        pendingManualControl: keepPending ? job.pendingManualControl : null,
         status: outcome.progress.status,
         detail: outcome.detail ?? outcome.progress.detail,
         updatedAt: now,
       };
-      row = yield* store.updateJob(
-        row!,
-        next,
-        outcome.outcome === "busy" ? row!.pendingControl : null,
-        false,
-      );
+      row = yield* store.updateJob(row!, next, keepPending ? row!.pendingControl : null, false);
       return row.record;
     }
     if (outcome.protocol >= 2 && outcome.outcome === "cancelled") {
