@@ -24,7 +24,26 @@ const { navigate, confirmation } = vi.hoisted(() => ({
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => navigate }));
 vi.mock("../../lib/runtime", () => ({ runtime: {} }));
 vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: confirmation }));
-vi.mock("./WorkflowFlow", () => ({ WorkflowFlow: () => null, WorkflowStepEditor: () => null }));
+vi.mock("./WorkflowCanvas", async () => ({
+  ...(await vi.importActual("./WorkflowCanvas")),
+  WorkflowCanvas: (props: Record<string, unknown>) =>
+    createElement("div", { ...props, "data-testid": "canvas-fixture" }),
+}));
+vi.mock("./WorkflowStepEditor", () => ({
+  WorkflowStepEditor: (props: Record<string, unknown>) =>
+    createElement("div", { ...props, "data-testid": "step-fixture" }),
+  useWorkflowEditorModels: () => ({ issues: [] }),
+}));
+vi.mock("../ui/sheet", () => ({
+  Sheet: ({ open, children }: PropsWithChildren<{ open: boolean }>) => (open ? children : null),
+  SheetPopup: ({ children }: PropsWithChildren) => children,
+  SheetTitle: ({ children }: PropsWithChildren) => children,
+}));
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: ({ children }: PropsWithChildren) => children,
+  TooltipTrigger: ({ children }: PropsWithChildren) => children,
+  TooltipPopup: () => null,
+}));
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
@@ -43,7 +62,7 @@ vi.mock("../ui/select", () => {
 });
 
 import { WorkflowBuilder } from "./WorkflowBuilder";
-import { newWorkflowDraft } from "./workflowState";
+import { editWorkflowDraft, selectWorkflowStep, newWorkflowDraft } from "./workflowState";
 
 type Props = Parameters<typeof WorkflowBuilder>[0];
 const scope = {
@@ -105,6 +124,7 @@ async function mount(props: Props = base) {
       <AppAtomRegistryProvider>
         <WorkflowBuilder {...props} />
       </AppAtomRegistryProvider>,
+      { createNodeMock: (element) => (element.type === "form" ? {} : null) },
     );
   });
 }
@@ -142,6 +162,23 @@ async function conflict(id: string) {
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("document", { activeElement: null });
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      constructor(private callback: (entries: Array<{ contentRect: { width: number } }>) => void) {}
+      observe() {
+        this.callback([{ contentRect: { width: 400 } }]);
+      }
+      disconnect() {}
+    },
+  );
+  vi.stubGlobal(
+    "HTMLElement",
+    class {
+      focus() {}
+    },
+  );
   navigate.mockReset();
   confirmation.mockReset().mockResolvedValue(true);
   read.mockReset();
@@ -426,5 +463,225 @@ describe("Reload buffer and view ownership", () => {
         await reply.promise;
       } catch {}
     });
+  });
+});
+
+describe("Canvas editor state", () => {
+  const canvas = () => renderer!.root.findByProps({ "data-testid": "canvas-fixture" });
+  it("starts in overview and retains explicit inspection across navigation", async () => {
+    await mount();
+    const id = newId();
+    expect(editor(id).selectedStepId).toBe("");
+    await act(() => canvas().props.onSelect("review"));
+    await unmount();
+    await mount();
+    expect(editor(id).selectedStepId).toBe("review");
+    await act(() => canvas().props.onOverview());
+    expect(editor(id).selectedStepId).toBe("");
+  });
+  it("allows inspection during Save without unlocking definition edits or losing its receipt", async () => {
+    const reply = deferred<RepositoryWorkflow>();
+    read.mockReturnValue(reply.promise);
+    await mount();
+    const id = newId();
+    const result = saved(id);
+    await submit();
+    const operation = editor(id).operation;
+    await act(() => canvas().props.onSelect("review"));
+    await rename("Blocked edit");
+    await act(() => canvas().props.onInsert({ edge: "end" }, "input"));
+    expect(editor(id).operation).toBe(operation);
+    expect(editor(id).definition).toEqual(result.definition);
+    expect(editor(id).selectedStepId).toBe("review");
+    await act(() => canvas().props.onOverview());
+    expect(editor(id).operation).toBe(operation);
+    await act(async () => {
+      reply.resolve(result);
+      await reply.promise;
+    });
+    expect(editor(id).baseline).toEqual(result);
+    expect(editor(id).selectedStepId).toBe("");
+  });
+  it("inserts using current anchors, selects the new ID, and refuses a removed anchor", async () => {
+    await mount();
+    const id = newId();
+    const initial = editor(id).definition.steps;
+    await act(() => canvas().props.onInsert({ after: initial[0] }, "input"));
+    const inserted = editor(id).definition.steps[1]!;
+    expect(inserted.kind).toBe("input");
+    expect(editor(id).selectedStepId).toBe(inserted.id);
+    expect(editor(id).definition.steps.map((step) => step.id)).toEqual([
+      initial[0]!.id,
+      inserted.id,
+      initial[1]!.id,
+    ]);
+    await act(() =>
+      editWorkflowDraft(scope, id, (draft) => ({
+        ...draft,
+        definition: { ...draft.definition, steps: draft.definition.steps.slice(1) },
+      })),
+    );
+    const before = editor(id).definition;
+    await act(() => canvas().props.onInsert({ after: initial[0] }, "agent"));
+    expect(editor(id).definition).toBe(before);
+  });
+  it("enforces the step limit at mutation time", async () => {
+    await mount();
+    const id = newId();
+    await act(() =>
+      editWorkflowDraft(scope, id, (draft) => ({
+        ...draft,
+        definition: {
+          ...draft.definition,
+          steps: Array.from({ length: 32 }, (_, i) => ({
+            ...draft.definition.steps[0]!,
+            id: `step-${i}`,
+          })),
+        },
+      })),
+    );
+    const before = editor(id).definition;
+    await act(() => canvas().props.onInsert({ edge: "start" }, "input"));
+    expect(editor(id).definition).toBe(before);
+  });
+  it("Save from overview reveals an invalid unmounted step without sending a write", async () => {
+    await mount();
+    const id = newId();
+    await act(() =>
+      editWorkflowDraft(scope, id, (draft) => ({
+        ...draft,
+        definition: {
+          ...draft.definition,
+          steps: [
+            ...draft.definition.steps,
+            { id: "empty-input", kind: "input", title: "Question", question: "", role: "member" },
+          ],
+        },
+      })),
+    );
+    await submit();
+    expect(read).not.toHaveBeenCalled();
+    expect(editor(id).selectedStepId).toBe("empty-input");
+    expect(editor(id).error).toContain("Question");
+    expect(renderer!.root.findByProps({ "data-testid": "step-fixture" }).props.selectedId).toBe(
+      "empty-input",
+    );
+  });
+  it("ignores invalid and cross-account selections", async () => {
+    await mount();
+    const id = newId();
+    const before = editor(id);
+    await act(() => selectWorkflowStep(scope, id, "missing"));
+    expect(editor(id)).toBe(before);
+    await act(() => selectWorkflowStep({ ...scope, accountId: "other" }, id, "review"));
+    expect(editor(id)).toBe(before);
+  });
+  it("dirty-editor Run uses the saved workflow ID and sends no Save", async () => {
+    await mount();
+    const id = newId();
+    const baseline = saved(id);
+    read.mockResolvedValueOnce(baseline);
+    await submit();
+    await unmount();
+    await mount({ ...base, isNew: false, workflow: baseline, workflowId: id });
+    await rename("Unsaved draft name");
+    const count = read.mock.calls.length;
+    await act(() =>
+      renderer!.root
+        .findAllByType("button")
+        .find((node) => node.props.children?.[1] === "Run")!
+        .props.onClick(),
+    );
+    expect(read).toHaveBeenCalledTimes(count);
+    expect(editor(id).definition.name).toBe("Unsaved draft name");
+    expect(navigate).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        to: "/workflows/$repositoryId/$workflowId/run",
+        params: { repositoryId: scope.repositoryId, workflowId: id },
+      }),
+    );
+  });
+});
+
+describe("Reloaded canvas selection", () => {
+  it("returns to overview when the selected step is absent in the reloaded definition", async () => {
+    await mount();
+    const id = newId();
+    const baseline = saved(id);
+    read.mockResolvedValueOnce(baseline);
+    await submit();
+    await unmount();
+    await mount({ ...base, isNew: false, workflow: baseline, workflowId: id });
+    await act(() => selectWorkflowStep(scope, id, "review"));
+    await conflict(id);
+    const next = {
+      ...baseline,
+      revision: 2,
+      definition: { ...baseline.definition, steps: [baseline.definition.steps[0]!] },
+    };
+    read.mockResolvedValueOnce([next]);
+    await click("Reload saved version");
+    expect(editor(id).definition).toEqual(next.definition);
+    expect(editor(id).selectedStepId).toBe("");
+  });
+});
+
+describe("Editor Run archive eligibility", () => {
+  const run = async () =>
+    act(() =>
+      renderer!.root
+        .findAllByType("button")
+        .find((node) => node.props.children?.[1] === "Run")!
+        .props.onClick(),
+    );
+  it("blocks Run when Refresh reports a newer archived version while retaining edits", async () => {
+    await mount();
+    const id = newId();
+    const baseline = saved(id);
+    read.mockResolvedValueOnce(baseline);
+    await submit();
+    await unmount();
+    await mount({ ...base, isNew: false, workflow: baseline, workflowId: id });
+    await rename("Retained changes");
+    await act(() =>
+      renderer!.update(
+        <AppAtomRegistryProvider>
+          <WorkflowBuilder
+            {...base}
+            isNew={false}
+            workflowId={id}
+            workflow={{ ...baseline, revision: 2, archived: true }}
+          />
+        </AppAtomRegistryProvider>,
+      ),
+    );
+    navigate.mockClear();
+    const count = read.mock.calls.length;
+    await run();
+    expect(navigate).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledTimes(count);
+    expect(editor(id).definition.name).toBe("Retained changes");
+  });
+  it("allows Run after a newer Restore receipt despite an older archived list snapshot", async () => {
+    await mount();
+    const id = newId();
+    const restored = saved(id, 3);
+    read.mockResolvedValueOnce(restored);
+    await submit();
+    await unmount();
+    await mount({
+      ...base,
+      isNew: false,
+      workflowId: id,
+      workflow: { ...restored, revision: 2, archived: true },
+    });
+    navigate.mockClear();
+    await run();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        to: "/workflows/$repositoryId/$workflowId/run",
+        params: { repositoryId: scope.repositoryId, workflowId: id },
+      }),
+    );
   });
 });

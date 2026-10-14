@@ -75,6 +75,21 @@ export const editWorkflowDraft = (
         : next;
     return { ...state, editors: { ...state.editors, [key]: edited } };
   });
+
+/** Inspection can change during Save; this never mutates the definition or write receipt. */
+export const selectWorkflowStep = (scope: WorkflowScope, id: string, selectedStepId: string) =>
+  updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
+    const key = workflowSessionKey(scope, id);
+    const draft = state.editors[key];
+    if (
+      !draft ||
+      draft.selectedStepId === selectedStepId ||
+      (selectedStepId && !draft.definition.steps.some((step) => step.id === selectedStepId))
+    )
+      return state;
+    return { ...state, editors: { ...state.editors, [key]: { ...draft, selectedStepId } } };
+  });
+
 export const editWorkflowRun = (
   scope: WorkflowScope,
   id: string,
@@ -99,7 +114,7 @@ export const savedWorkflowDraft = (workflow: RepositoryWorkflow): WorkflowEditor
   workflowId: workflow.workflowId,
   definition: workflow.definition,
   baseline: workflow,
-  selectedStepId: workflow.definition.steps[0]?.id ?? "",
+  selectedStepId: "",
   targetConfirmed: true,
   operation: null,
   error: null,
@@ -114,7 +129,7 @@ export function newWorkflowDraft(
     workflowId: randomUUID(),
     baseline: null,
     targetConfirmed: projects.length === 1,
-    selectedStepId: "agent",
+    selectedStepId: "",
     operation: null,
     error: null,
     definition: {

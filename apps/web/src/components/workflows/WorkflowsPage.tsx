@@ -1,3 +1,4 @@
+import { ArrowLeftIcon } from "lucide-react";
 import { useAuth } from "@clerk/react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useEffect, useState, useCallback, useRef } from "react";
@@ -346,6 +347,73 @@ function WorkflowRepositoryView({
           </div>
         );
       });
+  if (view === "builder")
+    return (
+      <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+        <WorkspacePageHeader electron={isElectron}>
+          <div className="flex min-w-0 flex-1 items-center gap-2 [-webkit-app-region:no-drag]">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Back to workflows"
+              onClick={back}
+            >
+              <ArrowLeftIcon />
+            </Button>
+            <div className="min-w-0 flex-1 max-w-64">
+              <Select
+                value={scope.repositoryId}
+                onValueChange={(id) => {
+                  if (id)
+                    void navigate({
+                      to: "/workflows/$repositoryId",
+                      params: { repositoryId: id },
+                      search: { tab },
+                    });
+                }}
+              >
+                <SelectTrigger aria-label="Workflow repository">
+                  <SelectValue>{entry.repository.name}</SelectValue>
+                </SelectTrigger>
+                <SelectPopup>
+                  {repositories.map((entry) => (
+                    <SelectItem
+                      key={entry.repository.repositoryId}
+                      value={entry.repository.repositoryId}
+                    >
+                      {entry.repository.name}
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+            </div>
+            <Button type="button" variant="ghost" size="sm" onClick={refresh}>
+              Refresh
+            </Button>
+          </div>
+        </WorkspacePageHeader>
+        {error ? (
+          <p role="alert" className="px-4 py-2 text-sm text-destructive">
+            {error} Showing the last available data.
+          </p>
+        ) : null}
+        {!loaded ? (
+          <Spinner />
+        ) : (
+          <WorkflowBuilder
+            scope={scope}
+            workflow={workflow}
+            workflowId={workflowId}
+            isNew={!workflowId}
+            projects={projects}
+            canConfigure={canConfigure}
+            call={call}
+            refresh={refresh}
+          />
+        )}
+      </div>
+    );
   return (
     <div className="flex h-full min-h-0 flex-col">
       <WorkspacePageHeader electron={isElectron}>
@@ -399,17 +467,6 @@ function WorkflowRepositoryView({
           ) : null}
           {!loaded ? (
             <Spinner />
-          ) : view === "builder" ? (
-            <WorkflowBuilder
-              scope={scope}
-              workflow={workflow}
-              workflowId={workflowId}
-              isNew={!workflowId}
-              projects={projects}
-              canConfigure={canConfigure}
-              call={call}
-              refresh={refresh}
-            />
           ) : view === "run" ? (
             workflow ? (
               <WorkflowRun scope={scope} workflow={workflow} projects={projects} call={call} />
