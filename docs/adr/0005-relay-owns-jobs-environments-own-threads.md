@@ -32,6 +32,13 @@ accept external events independently of environment availability. Queued jobs us
 current definition when dispatched. Once execution starts, that definition stays fixed through
 human checkpoints and rework; later workflow edits apply to queued and future jobs.
 
+Withdrawing an automation connection or its repository authorization stops new event admission
+and queued jobs that have not entered a job handoff. A job already being offered may finish
+starting and continue with its frozen instructions; use Cancel run to stop it. A missing reply
+cannot prove whether work started, so withdrawal does not interrupt reconciliation of that same
+handoff. If the environment confirms that it did not start the job, its return to the queue
+requires current source authorization before a later handoff.
+
 ## Why the seam is coarse
 
 `OrchestrationEngine` is deliberately the single ordered writer for thread facts: one fiber

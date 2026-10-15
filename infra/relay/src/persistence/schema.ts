@@ -1,7 +1,9 @@
+import { sql } from "drizzle-orm";
 import type { RuntimeMode } from "@t3tools/contracts";
 import type {
   RepositoryWorkflow,
   RepositoryWorkflowJob,
+  RepositoryWorkflowJobSummary,
   RespondToWorkflowJob,
 } from "@t3tools/contracts/workflows";
 import type {
@@ -634,6 +636,20 @@ export const relayWorkflowJobs = pgTable(
     repositoryCanonicalKey: text("repository_canonical_key"),
     status: varchar("status", { length: 32 }).notNull().$type<RepositoryWorkflowJob["status"]>(),
     record: jsonb("record").notNull().$type<RepositoryWorkflowJob>(),
+    // A stored projection backfills legacy jobs and stays consistent across every writer.
+    // jsonb_object is immutable, as PostgreSQL requires for generated columns.
+    summary: jsonb("summary")
+      .notNull()
+      .$type<RepositoryWorkflowJobSummary>()
+      .generatedAlwaysAs(
+        sql`jsonb_object(
+        ARRAY['jobId','repositoryId','workflowId','environmentId','instruction','status','detail','createdAt','updatedAt'],
+        ARRAY["job_id"::text,"repository_id"::text,"record"->>'workflowId',"record"->>'environmentId',left("record"->>'instruction',500),"status"::text,left("record"->>'detail',500),"created_at"::text,"record"->>'updatedAt']
+      ) || CASE WHEN "status" IN ('awaiting_review','awaiting_input','paused')
+        OR ("status" = 'queued' AND "record"->>'detail' IS NOT NULL)
+        OR ("status" = 'cancelling' AND "record"#>>'{progress,retryableCancellation}' = 'true')
+        THEN '{"needsAttention":true}'::jsonb ELSE '{"needsAttention":false}'::jsonb END`,
+      ),
     pendingControl: jsonb("pending_control").$type<{
       userId: string;
       response: typeof RespondToWorkflowJob.Type;
@@ -646,6 +662,12 @@ export const relayWorkflowJobs = pgTable(
   (table) => [
     index("idx_workflow_jobs_repository").on(table.repositoryId, table.createdAt),
     index("idx_workflow_jobs_status").on(table.status, table.checkedAt),
+    index("idx_workflow_jobs_active_page")
+      .on(table.repositoryId, table.createdAt, table.jobId)
+      .where(sql`"status" NOT IN ('done','cancelled','failed')`),
+    index("idx_workflow_jobs_history_page")
+      .on(table.repositoryId, table.createdAt, table.jobId)
+      .where(sql`"status" IN ('done','cancelled','failed')`),
   ],
 );
 

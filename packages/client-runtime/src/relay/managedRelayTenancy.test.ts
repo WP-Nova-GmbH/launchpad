@@ -259,3 +259,26 @@ it.effect.each(["select", "cancel"] as const)(
     }).pipe(Effect.provide(testLayer(fetchFn)));
   },
 );
+
+it.effect("requests bounded workflow pages without losing the scoped cursor", () => {
+  const seen: URL[] = [];
+  const fetchFn = (async (input, init) => {
+    const request = new Request(input, init);
+    seen.push(new URL(request.url));
+    expect(request.headers.get("authorization")).toBe("Bearer page-token");
+    return Response.json({ jobs: [], nextCursor: null });
+  }) satisfies typeof globalThis.fetch;
+  return Effect.gen(function* () {
+    const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+    expect(
+      yield* client.pageWorkflowJobs({
+        clerkToken: "page-token",
+        repositoryId: RelayRepositoryId.make("repo"),
+        query: { view: "active", limit: 25, cursor: "scope:opaque/cursor" },
+      }),
+    ).toEqual({ jobs: [], nextCursor: null });
+    expect(seen[0]!.pathname).toBe("/v1/repositories/repo/workflow-jobs/page");
+    expect(seen[0]!.searchParams.get("limit")).toBe("25");
+    expect(seen[0]!.searchParams.get("cursor")).toBe("scope:opaque/cursor");
+  }).pipe(Effect.provide(testLayer(fetchFn)));
+});

@@ -20,6 +20,8 @@ import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import type {
   RepositoryWorkflowJob,
   RepositoryWorkflowJobSummary,
+  WorkflowJobPage,
+  WorkflowJobPageQuery,
 } from "@t3tools/contracts/workflows";
 
 const fixture = vi.hoisted(() => ({
@@ -27,6 +29,7 @@ const fixture = vi.hoisted(() => ({
   focused: true,
   getToken: vi.fn().mockResolvedValue("fixture-token"),
   list: vi.fn<(repositoryId: string) => Promise<ReadonlyArray<RepositoryWorkflowJobSummary>>>(),
+  page: vi.fn<(repositoryId: string, query: WorkflowJobPageQuery) => Promise<WorkflowJobPage>>(),
   navigate: vi.fn(),
 }));
 const host = (name: string) => (props: PropsWithChildren<Record<string, unknown>>) =>
@@ -132,9 +135,15 @@ const client = {
   listRepositories: () => Effect.succeed([repository("A"), repository("B")]),
   getOrganization: () => Effect.succeed({ role: "admin" }),
   listOrganizationProjects: () => Effect.succeed([]),
-  listWorkflowJobs: ({ repositoryId }: { repositoryId: string }) =>
+  pageWorkflowJobs: ({
+    repositoryId,
+    query,
+  }: {
+    repositoryId: string;
+    query: WorkflowJobPageQuery;
+  }) =>
     Effect.tryPromise({
-      try: () => fixture.list(repositoryId),
+      try: () => fixture.page(repositoryId, query),
       catch: (cause) =>
         new FixtureReadError({
           message: cause instanceof Error ? cause.message : "Recent list failed",
@@ -199,6 +208,10 @@ beforeEach(() => {
   fixture.accountId = "account";
   fixture.focused = true;
   fixture.list.mockReset().mockResolvedValue([]);
+  fixture.page.mockReset().mockImplementation(async (repositoryId) => ({
+    jobs: await fixture.list(repositoryId),
+    nextCursor: null,
+  }));
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, fixture.accountId);
 });
@@ -231,13 +244,36 @@ effectIt.layer(
         yield* Effect.promise(body);
       }),
     );
+  screenTest(
+    "loads further active pages, refreshes from the start, and switches to history",
+    async () => {
+      fixture.page
+        .mockResolvedValueOnce({ jobs: [summary("Old waiting run")], nextCursor: "next" })
+        .mockResolvedValueOnce({ jobs: [summary("Further active run")], nextCursor: null })
+        .mockResolvedValueOnce({ jobs: [summary("Current active run")], nextCursor: null })
+        .mockResolvedValueOnce({ jobs: [summary("Completed run")], nextCursor: null });
+      await mount({ repositoryId: "A" });
+      await press("Load more runs");
+      expect(fixture.page).toHaveBeenLastCalledWith("A", { view: "active", cursor: "next" });
+      expect(content()).toContain("Old waiting run");
+      expect(content()).toContain("Further active run");
+      await press("Refresh jobs");
+      expect(content()).toContain("Current active run");
+      expect(content()).not.toContain("Old waiting run");
+      expect(content()).not.toContain("Further active run");
+      await press("History");
+      expect(fixture.page).toHaveBeenLastCalledWith("A", { view: "history" });
+      expect(content()).toContain("Completed run");
+      expect(content()).not.toContain("Current active run");
+    },
+  );
   screenTest("loads recent runs after an incoming job route and Back to jobs", async () => {
     fixture.list.mockResolvedValue([summary("Recent A run")]);
     await mount({ repositoryId: "A", jobId: detail.jobId });
     expect(content()).toContain("Older direct job");
     await press("Back to jobs");
     expect(content()).toContain("Recent A run");
-    expect(content()).not.toContain("No recent runs");
+    expect(content()).not.toContain("No runs in this view");
     expect(fixture.list).toHaveBeenCalledWith("A");
   });
   screenTest(
@@ -246,14 +282,14 @@ effectIt.layer(
       const reply = deferred<ReadonlyArray<RepositoryWorkflowJobSummary>>();
       fixture.list.mockReturnValue(reply.promise);
       await mount({ repositoryId: "A" }, false);
-      expect(content()).toContain("Loading recent runs");
-      expect(content()).not.toContain("No recent runs");
+      expect(content()).toContain("Loading runs");
+      expect(content()).not.toContain("No runs in this view");
       await act(async () => {
         reply.resolve([]);
         await reply.promise;
         await deliveries[3];
       });
-      expect(content()).toContain("No recent runs");
+      expect(content()).toContain("No runs in this view");
     },
   );
   screenTest(
@@ -275,7 +311,7 @@ effectIt.layer(
       expect(content()).toContain("Retained feedback");
       await press("Back to jobs");
       expect(content()).toContain("Recent list offline");
-      expect(content()).not.toContain("No recent runs");
+      expect(content()).not.toContain("No runs in this view");
       fixture.list.mockResolvedValue([summary("Recovered recent run")]);
       await press("Refresh jobs");
       expect(content()).toContain("Recovered recent run");

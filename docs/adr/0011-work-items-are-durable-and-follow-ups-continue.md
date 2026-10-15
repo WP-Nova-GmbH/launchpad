@@ -13,11 +13,11 @@ which pins that work item to the [executor](../internals/glossary.md#executor) h
 
 Three shapes, and they are not variations of one thing:
 
-| trigger                         | shape                 | requires                                                                                     |
-| ------------------------------- | --------------------- | -------------------------------------------------------------------------------------------- |
-| a person acts in the app        | imperative            | nothing new                                                                                  |
-| an issue enters a watched state | external state change | an [integration](../internals/glossary.md#integration), inbound webhooks, **and write-back** |
-| a follow-up on completed work   | continuation          | knowing what was already implemented                                                         |
+| trigger                         | shape                 | requires                                                                    |
+| ------------------------------- | --------------------- | --------------------------------------------------------------------------- |
+| a person acts in the app        | imperative            | nothing new                                                                 |
+| an issue enters a watched state | external state change | an [integration](../internals/glossary.md#integration) and inbound webhooks |
+| a follow-up on completed work   | continuation          | knowing what was already implemented                                        |
 
 Each repository workflow selects its own Linear team or Jira project, optional issue labels,
 and triggering event or status transition. This makes routing explicit when several repositories
@@ -29,6 +29,13 @@ Each distinct matching event creates a new job, even if another job for the same
 workflow is queued, running, or waiting for review. Repeated delivery of the same event creates
 no additional job. An event-triggered job does not update, restart, or continue an existing job;
 continuation is an explicit follow-up.
+
+An edited event trigger applies only to events occurring after the edit is saved. Delayed older
+events cannot newly match its changed criteria, while already-created jobs are retained. Edits
+only to the workflow's name or execution steps/settings do not change event eligibility.
+
+Event automation does not require issue write-back. Automatic issue comments and status changes
+remain deferred.
 
 The third is why work items must be durable: "an issue that was implemented" is only meaningful
 if something outlived the job that implemented it.

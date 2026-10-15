@@ -2,6 +2,8 @@ import type {
   RepositoryWorkflow,
   RepositoryWorkflowJob,
   WorkflowDefinition,
+  WorkflowJobPage,
+  RepositoryWorkflowJobSummary,
 } from "@t3tools/contracts/workflows";
 import {
   WorkflowDefinition as WorkflowDefinitionSchema,
@@ -16,7 +18,12 @@ import {
   type WorkflowManualSubmission,
   type WorkflowDraftSubmission,
 } from "./workflowResponses.ts";
-import type { RelayRepositoryId } from "@t3tools/contracts/relay";
+import {
+  RelayAuthInvalidError,
+  RelayTenancyForbiddenError,
+  RelayTenancyNotFoundError,
+  type RelayRepositoryId,
+} from "@t3tools/contracts/relay";
 
 export interface WorkflowScope {
   readonly accountId: string;
@@ -305,22 +312,6 @@ export const workflowStatusLabel = (status: string) =>
     cancelled: "Cancelled",
     failed: "Failed",
   })[status] ?? status.replaceAll("_", " ");
-export const recentWorkflowJobs = <A extends { status: string; createdAt: string }>(
-  jobs: ReadonlyArray<A>,
-) =>
-  [...jobs].sort((left, right) => {
-    const priority = (status: string) =>
-      ["awaiting_review", "awaiting_input"].includes(status)
-        ? 0
-        : ["done", "cancelled", "failed"].includes(status)
-          ? 2
-          : 1;
-    return (
-      priority(left.status) - priority(right.status) ||
-      right.createdAt.localeCompare(left.createdAt)
-    );
-  });
-
 interface JobRequest {
   readonly accountId: string;
   readonly key: string;
@@ -455,3 +446,67 @@ export function invalidateWorkflowJobRead(
     jobs: { ...state.jobs, [key]: { ...previous, epoch: state.sequence + 1, reading: false } },
   });
 }
+
+/** A list request owns exactly one scope/view and cursor. Refresh replaces all loaded pages. */
+export interface WorkflowJobPageRequest {
+  readonly key: string;
+  readonly cursor: string | null;
+}
+export interface WorkflowJobPageRead {
+  readonly key: string;
+  readonly jobs: ReadonlyArray<RepositoryWorkflowJobSummary> | null;
+  readonly nextCursor: string | null;
+  readonly request: WorkflowJobPageRequest | null;
+  readonly error: string | null;
+}
+export const emptyWorkflowJobPageRead: WorkflowJobPageRead = {
+  key: "",
+  jobs: null,
+  nextCursor: null,
+  request: null,
+  error: null,
+};
+export function beginWorkflowJobPage(
+  read: WorkflowJobPageRead,
+  request: WorkflowJobPageRequest,
+): WorkflowJobPageRead {
+  return {
+    ...(read.key === request.key ? read : emptyWorkflowJobPageRead),
+    key: request.key,
+    request,
+    error: null,
+  };
+}
+export function settleWorkflowJobPage(
+  read: WorkflowJobPageRead,
+  request: WorkflowJobPageRequest,
+  result: WorkflowJobPage | string,
+  accessLost = false,
+): WorkflowJobPageRead {
+  if (read.request !== request) return read;
+  if (typeof result === "string")
+    return {
+      ...(accessLost ? { ...emptyWorkflowJobPageRead, key: read.key } : read),
+      request: null,
+      error: result,
+    };
+  const rows = request.cursor === null ? result.jobs : [...(read.jobs ?? []), ...result.jobs];
+  return {
+    ...read,
+    jobs: [...new Map(rows.map((job) => [job.jobId, job])).values()],
+    nextCursor: result.nextCursor,
+    request: null,
+    error: null,
+  };
+}
+
+/** A definite access rejection must not keep repository summaries visible as offline data. */
+export const workflowJobPageAccessLost = Schema.is(
+  Schema.Struct({
+    cause: Schema.Union([
+      RelayAuthInvalidError,
+      RelayTenancyForbiddenError,
+      RelayTenancyNotFoundError,
+    ]),
+  }),
+);

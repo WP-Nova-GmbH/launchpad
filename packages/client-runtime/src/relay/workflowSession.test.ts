@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
-import { RelayRepositoryId } from "@t3tools/contracts/relay";
+import { RelayTenancyForbiddenError, RelayRepositoryId } from "@t3tools/contracts/relay";
 import type { RepositoryWorkflowJob, WorkflowDefinition } from "@t3tools/contracts/workflows";
 import {
   activateWorkflowJobView,
@@ -16,9 +16,12 @@ import {
   updateWorkflowDrafts,
   clearWorkflowScope,
   workflowDraftIssue,
-  recentWorkflowJobs,
   workflowStepState,
   startNewWorkflowDraft,
+  workflowJobPageAccessLost,
+  emptyWorkflowJobPageRead,
+  beginWorkflowJobPage,
+  settleWorkflowJobPage,
 } from "./workflowSession.ts";
 
 const scope = {
@@ -399,17 +402,66 @@ describe("whole workflow validation and presentation", () => {
     };
     expect(workflowStepState(current, "agent")).toBe("pending");
   });
-  it("prioritizes attention within only the supplied recent set", () => {
-    const recent = [
-      { status: "done", createdAt: "3" },
-      { status: "awaiting_input", createdAt: "1" },
-      { status: "running", createdAt: "2" },
-    ];
-    expect(recentWorkflowJobs(recent).map((job) => job.status)).toEqual([
-      "awaiting_input",
-      "running",
-      "done",
-    ]);
-    expect(recent).toHaveLength(3);
+});
+
+describe("workflow page response ownership", () => {
+  const row = (jobId: string) => ({ ...job(), jobId });
+  it("rejects old view/scope responses and refresh replaces every loaded page", () => {
+    const first = { key: "account:org:repo:active", cursor: null };
+    let read = beginWorkflowJobPage(emptyWorkflowJobPageRead, first);
+    read = settleWorkflowJobPage(read, first, { jobs: [row("a")], nextCursor: "next" });
+    const next = { key: first.key, cursor: "next" };
+    read = beginWorkflowJobPage(read, next);
+    read = settleWorkflowJobPage(read, next, { jobs: [row("a"), row("b")], nextCursor: null });
+    expect(read.jobs?.map((j) => j.jobId)).toEqual(["a", "b"]);
+    const refresh = { key: first.key, cursor: null };
+    read = beginWorkflowJobPage(read, refresh);
+    read = settleWorkflowJobPage(read, refresh, { jobs: [row("c")], nextCursor: "new-next" });
+    expect(read.jobs?.map((j) => j.jobId)).toEqual(["c"]);
+    const other = { key: "other-account:org:repo:history", cursor: null };
+    read = beginWorkflowJobPage(read, other);
+    expect(read.jobs).toBeNull();
+    expect(settleWorkflowJobPage(read, next, { jobs: [row("late")], nextCursor: null })).toBe(read);
+    read = settleWorkflowJobPage(read, other, "Offline");
+    expect(read.error).toBe("Offline");
+    expect(read.jobs).toBeNull();
   });
+  it("retains loaded rows and retry cursor after an append fails", () => {
+    const first = { key: "repo:active", cursor: null };
+    let read = settleWorkflowJobPage(beginWorkflowJobPage(emptyWorkflowJobPageRead, first), first, {
+      jobs: [row("a")],
+      nextCursor: "next",
+    });
+    const next = { key: first.key, cursor: "next" };
+    read = settleWorkflowJobPage(beginWorkflowJobPage(read, next), next, "Offline");
+    expect(read.jobs?.map((j) => j.jobId)).toEqual(["a"]);
+    expect(read.nextCursor).toBe("next");
+  });
+});
+
+it("clears list rows and cursors after a definite repository access rejection", () => {
+  const request = { key: "repo:active", cursor: null };
+  let read = settleWorkflowJobPage(
+    beginWorkflowJobPage(emptyWorkflowJobPageRead, request),
+    request,
+    { jobs: [job()], nextCursor: "next" },
+  );
+  const refresh = { key: request.key, cursor: null };
+  const cause = {
+    cause: new RelayTenancyForbiddenError({
+      code: "tenancy_forbidden",
+      reason: "no_repository_access",
+      traceId: "trace",
+    }),
+  };
+  expect(workflowJobPageAccessLost(cause)).toBe(true);
+  expect(workflowJobPageAccessLost(new Error("Offline"))).toBe(false);
+  read = settleWorkflowJobPage(
+    beginWorkflowJobPage(read, refresh),
+    refresh,
+    "Access removed",
+    workflowJobPageAccessLost(cause),
+  );
+  expect(read.jobs).toBeNull();
+  expect(read.nextCursor).toBeNull();
 });

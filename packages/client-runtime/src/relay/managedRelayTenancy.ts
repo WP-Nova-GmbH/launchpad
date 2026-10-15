@@ -55,6 +55,8 @@ import type {
   RepositoryWorkflow,
   RepositoryWorkflowJob,
   RepositoryWorkflowJobSummary,
+  WorkflowJobPage,
+  WorkflowJobPageQuery,
   SaveRepositoryWorkflow,
   RunRepositoryWorkflow,
   RespondToWorkflowJob,
@@ -93,6 +95,11 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly repositoryId: RelayRepositoryId;
     }) => Effect.Effect<ReadonlyArray<RepositoryWorkflowJobSummary>, ManagedRelayClientError>;
+    readonly pageWorkflowJobs: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly query: WorkflowJobPageQuery;
+    }) => Effect.Effect<WorkflowJobPage, ManagedRelayClientError>;
     readonly runWorkflow: (input: {
       readonly clerkToken: string;
       readonly repositoryId: RelayRepositoryId;
@@ -294,6 +301,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     listWorkflows: unavailable("clientRuntime.managedRelayTenancy.listWorkflows"),
     saveWorkflow: unavailable("clientRuntime.managedRelayTenancy.saveWorkflow"),
     listWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.listWorkflowJobs"),
+    pageWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.pageWorkflowJobs"),
     runWorkflow: unavailable("clientRuntime.managedRelayTenancy.runWorkflow"),
     getWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJob"),
     respondToWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.respondToWorkflowJob"),
@@ -401,6 +409,20 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
             Effect.map((response) => response.jobs),
             Effect.mapError(relayRequestError("listWorkflowJobs")),
             timeoutRelayRequest("listWorkflowJobs"),
+          );
+      },
+    ),
+    pageWorkflowJobs: Effect.fn("clientRuntime.managedRelayTenancy.pageWorkflowJobs")(
+      function* (input) {
+        return yield* client.workflows
+          .pageJobs({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId },
+            query: input.query,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("pageWorkflowJobs")),
+            timeoutRelayRequest("pageWorkflowJobs"),
           );
       },
     ),

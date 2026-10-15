@@ -12,7 +12,11 @@ import {
   emptyWorkflowJobRead,
   workflowStepState,
   workflowStatusLabel,
-  recentWorkflowJobs,
+  workflowJobPageAccessLost,
+  emptyWorkflowJobPageRead,
+  beginWorkflowJobPage,
+  settleWorkflowJobPage,
+  type WorkflowJobPageRequest,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry } from "../../state/atom-registry";
@@ -32,12 +36,12 @@ import type {
 import {
   isTerminalWorkflowJob,
   workflowZones,
-  type RepositoryWorkflowJobSummary,
+  type WorkflowJobListView,
 } from "@t3tools/contracts/workflows";
 import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
-import { useCallback, useEffect, useState, useMemo } from "react";
+import { useCallback, useEffect, useState, useMemo, useRef } from "react";
 import { Linking, Alert, AppState, View, TextInput } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { runtime } from "../../lib/runtime";
@@ -86,13 +90,9 @@ function WorkflowJobsContent(props: Props) {
   const [repositories, setRepositories] = useState<ReadonlyArray<RelayRepositorySummary>>([]);
   const [membership, setMembership] = useState<RelayOrganizationMembership | null>(null);
   const [selectedRepository, setSelectedRepository] = useState<RelayRepositorySummary | null>(null);
-  const [recent, setRecent] = useState<{
-    key: string;
-    jobs: ReadonlyArray<RepositoryWorkflowJobSummary> | null;
-    loading: boolean;
-    error: string | null;
-  }>({ key: "", jobs: null, loading: false, error: null });
-  const [listRefresh, setListRefresh] = useState(0);
+  const [recent, setRecent] = useState(emptyWorkflowJobPageRead);
+  const [listView, setListView] = useState<WorkflowJobListView>("active");
+  const listRequest = useRef<WorkflowJobPageRequest | null>(null);
   const [projects, setProjects] = useState<ReadonlyArray<RelayOrganizationProject>>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(
     props.route.params?.jobId ?? null,
@@ -109,7 +109,7 @@ function WorkflowJobsContent(props: Props) {
     [userId, organizationId, repositoryId],
   );
   const jobKey = scope && selectedJobId ? workflowSessionKey(scope, selectedJobId) : "";
-  const listKey = scope ? workflowSessionKey(scope, "recent") : "";
+  const listKey = scope ? workflowSessionKey(scope, `runs:${listView}`) : "";
   const jobs = recent.key === listKey ? recent.jobs : null;
   const read = reads.jobs[jobKey] ?? emptyWorkflowJobRead;
   const selectedJob = read.job;
@@ -191,36 +191,43 @@ function WorkflowJobsContent(props: Props) {
       disposed = true;
     };
   }, [isSignedIn, call, props.route.params?.repositoryId]);
+  const loadJobs = useCallback(
+    async (cursor: string | null = null) => {
+      if (!scope || !focused) return;
+      const request = { key: listKey, cursor };
+      listRequest.current = request;
+      setRecent((previous) => beginWorkflowJobPage(previous, request));
+      try {
+        const page = await call((client, clerkToken) =>
+          client.pageWorkflowJobs({
+            clerkToken,
+            repositoryId: scope.repositoryId,
+            query: { view: listView, ...(cursor ? { cursor } : {}) },
+          }),
+        );
+        if (listRequest.current === request)
+          setRecent((previous) => settleWorkflowJobPage(previous, request, page));
+      } catch (cause) {
+        if (listRequest.current === request)
+          setRecent((previous) =>
+            settleWorkflowJobPage(
+              previous,
+              request,
+              cause instanceof Error ? cause.message : "Could not load runs.",
+              workflowJobPageAccessLost(cause),
+            ),
+          );
+      }
+    },
+    [scope, focused, listKey, listView, call],
+  );
   useEffect(() => {
-    if (!scope || !focused) return;
-    let disposed = false;
-    // oxlint-disable-next-line react/set-state-in-effect -- Mark this external relay read pending before its asynchronous result.
-    setRecent((previous) =>
-      previous.key === listKey
-        ? { ...previous, loading: true, error: null }
-        : { key: listKey, jobs: null, loading: true, error: null },
-    );
-    void call((client, clerkToken) =>
-      client.listWorkflowJobs({ clerkToken, repositoryId: scope.repositoryId }),
-    ).then(
-      (list) => {
-        if (!disposed) setRecent({ key: listKey, jobs: list, loading: false, error: null });
-      },
-      (cause) => {
-        if (!disposed)
-          setRecent((previous) => ({
-            key: listKey,
-            jobs: previous.key === listKey ? previous.jobs : null,
-            loading: false,
-            error: cause instanceof Error ? cause.message : "Could not load recent runs.",
-          }));
-      },
-    );
+    // oxlint-disable-next-line react/set-state-in-effect -- This effect starts the external relay read for the selected repository and view.
+    void loadJobs();
     return () => {
-      disposed = true;
+      listRequest.current = null;
     };
-    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Explicit Refresh starts a new read without changing repository selection.
-  }, [scope, focused, listKey, call, listRefresh]);
+  }, [loadJobs]);
   const refreshJob = useCallback(async () => {
     if (!scope || !selectedJobId) return;
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, selectedJobId);
@@ -624,7 +631,7 @@ function WorkflowJobsContent(props: Props) {
               label="Back to jobs"
               onPress={() => {
                 setSelectedJobId(null);
-                setListRefresh((version) => version + 1);
+                void loadJobs();
               }}
             />
           </SettingsSection>
@@ -695,37 +702,55 @@ function WorkflowJobsContent(props: Props) {
             label="Back to jobs"
             onPress={() => {
               setSelectedJobId(null);
-              setListRefresh((version) => version + 1);
+              void loadJobs();
             }}
           />
         </SettingsSection>
       ) : selectedRepository ? (
-        <SettingsSection title={selectedRepository.repository.name + " · Recent runs"}>
+        <SettingsSection title={selectedRepository.repository.name + " · Runs"}>
+          <View className="flex-row flex-wrap">
+            {(["active", "attention", "history"] as const).map((choice) => (
+              <SettingsActionRow
+                key={choice}
+                icon="line.3.horizontal.decrease"
+                label={
+                  (choice === "active"
+                    ? "Active"
+                    : choice === "attention"
+                      ? "Needs attention"
+                      : "History") + (listView === choice ? " · Selected" : "")
+                }
+                onPress={() => setListView(choice)}
+              />
+            ))}
+          </View>
           <Text className="p-4 text-xs text-foreground-muted">
-            Shows up to the latest 100 runs. Older waiting checkpoints may be outside this view.
+            {listView === "history"
+              ? "Completed runs, newest first."
+              : "Active runs, oldest first."}
           </Text>
           <SettingsActionRow
             icon="arrow.clockwise"
             label="Refresh jobs"
-            disabled={recent.key === listKey && recent.loading}
-            onPress={() => setListRefresh((version) => version + 1)}
+            disabled={recent.key === listKey && !!recent.request}
+            onPress={() => void loadJobs()}
           />
           {recent.key === listKey && recent.error ? (
             <Text accessibilityRole="alert" className="p-4 text-danger-foreground">
               {recent.error}
-              {jobs ? " Showing the last available recent runs." : " Refresh to retry."}
+              {jobs ? " Showing the last available runs." : " Refresh to retry."}
             </Text>
           ) : null}
           {jobs === null ? (
             recent.key !== listKey || !recent.error ? (
-              <Text className="p-4 text-foreground-muted">Loading recent runs…</Text>
+              <Text className="p-4 text-foreground-muted">Loading runs…</Text>
             ) : null
           ) : jobs.length === 0 ? (
             <Text className="p-4 text-foreground-muted">
-              No recent runs. Create and run workflows from Workflows on web or desktop.
+              No runs in this view. Create and run workflows from Workflows on web or desktop.
             </Text>
           ) : (
-            recentWorkflowJobs(jobs).map((job) => (
+            jobs.map((job) => (
               <SettingsRow
                 key={job.jobId}
                 icon="arrow.triangle.branch"
@@ -736,6 +761,14 @@ function WorkflowJobsContent(props: Props) {
               />
             ))
           )}
+          {recent.key === listKey && recent.nextCursor ? (
+            <SettingsActionRow
+              icon="chevron.down"
+              label="Load more runs"
+              disabled={!!recent.request}
+              onPress={() => void loadJobs(recent.nextCursor)}
+            />
+          ) : null}
           <SettingsActionRow
             icon="chevron.left"
             label="Back to repositories"

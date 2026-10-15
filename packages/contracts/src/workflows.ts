@@ -226,8 +226,25 @@ export const RepositoryWorkflowJobSummary = Schema.Struct({
   detail: RepositoryWorkflowJob.fields.detail,
   createdAt: RepositoryWorkflowJob.fields.createdAt,
   updatedAt: RepositoryWorkflowJob.fields.updatedAt,
+  needsAttention: Schema.optional(Schema.Boolean),
 });
 export type RepositoryWorkflowJobSummary = typeof RepositoryWorkflowJobSummary.Type;
+
+export const WorkflowJobListView = Schema.Literals(["active", "attention", "history"]);
+export type WorkflowJobListView = typeof WorkflowJobListView.Type;
+export const WorkflowJobPageQuery = Schema.Struct({
+  view: WorkflowJobListView,
+  cursor: Schema.optionalKey(Schema.NonEmptyString.check(Schema.isMaxLength(2048))),
+  limit: Schema.optionalKey(
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isBetween({ minimum: 1, maximum: 100 })),
+  ),
+});
+export type WorkflowJobPageQuery = typeof WorkflowJobPageQuery.Type;
+export const WorkflowJobPage = Schema.Struct({
+  jobs: Schema.Array(RepositoryWorkflowJobSummary),
+  nextCursor: Schema.NullOr(Schema.String),
+});
+export type WorkflowJobPage = typeof WorkflowJobPage.Type;
 
 const ControlBinding = {
   organizationId: TrimmedNonEmptyString,

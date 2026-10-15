@@ -2,6 +2,8 @@ import {
   RepositoryWorkflow,
   RepositoryWorkflowJob,
   RepositoryWorkflowJobSummary,
+  WorkflowJobPageQuery,
+  WorkflowJobPage,
   SaveRepositoryWorkflow,
   RunRepositoryWorkflow,
   RespondToWorkflowJob,
@@ -2281,6 +2283,13 @@ const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
       headers: RelayBearerRequestHeaders,
       params: RelayRepositoryParams,
       success: Schema.Struct({ jobs: Schema.Array(RepositoryWorkflowJobSummary) }),
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get("pageJobs", "/v1/repositories/:repositoryId/workflow-jobs/page", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      query: WorkflowJobPageQuery,
+      success: WorkflowJobPage,
       error: WorkflowErrors,
     }),
     HttpApiEndpoint.post("run", "/v1/repositories/:repositoryId/workflow-jobs", {

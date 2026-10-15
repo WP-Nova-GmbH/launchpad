@@ -263,6 +263,12 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
         };
       }).pipe(errors),
     )
+    .handle("pageJobs", ({ params, query }) =>
+      Effect.gen(function* () {
+        yield* authorizeWorkflowRepository(params.repositoryId);
+        return yield* (yield* Workflows).pageJobs(params.repositoryId, query);
+      }).pipe(errors),
+    )
     .handle("run", ({ params, payload }) =>
       Effect.gen(function* () {
         const membership = yield* authorizeWorkflowRepository(params.repositoryId);

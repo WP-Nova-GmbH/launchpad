@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { EnvironmentId, ProjectId } from "./baseSchemas.ts";
 import {
   WorkflowDefinition,
+  WorkflowJobPageQuery,
   RespondToWorkflowJob,
   workflowZones,
   type WorkflowStep,
@@ -128,4 +129,18 @@ it("validates publishing order and groups actions into automatic zones", () => {
   expect(isResponse({ operation: "retry_action", actionId: "action", expectedRevision: -1 })).toBe(
     false,
   );
+});
+
+it("validates bounded page sizes and supported list views at the wire boundary", () => {
+  const decode = Schema.decodeUnknownSync(WorkflowJobPageQuery);
+  expect(decode({ view: "active", limit: "100" }).limit).toBe(100);
+  for (const value of [
+    { view: "all" },
+    { view: "active", limit: "101" },
+    { view: "active", limit: "0" },
+    { view: "history", limit: "1.5" },
+    { view: "active", cursor: "x".repeat(2049) },
+  ]) {
+    expect(() => decode(value)).toThrow();
+  }
 });

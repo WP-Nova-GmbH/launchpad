@@ -3,9 +3,12 @@ import {
   RepositoryWorkflowJob,
   isTerminalWorkflowJob,
   WorkflowConflictError,
+  WorkflowInvalidError,
+  type WorkflowJobPageQuery,
+  type WorkflowJobPage,
   type SaveRepositoryWorkflow,
 } from "@t3tools/contracts/workflows";
-import { and, asc, desc, eq, inArray, isNull, lte, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -14,7 +17,16 @@ import * as Schema from "effect/Schema";
 import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
 
-export type WorkflowJobRecord = typeof relayWorkflowJobs.$inferSelect;
+export type WorkflowJobRecord = Omit<typeof relayWorkflowJobs.$inferSelect, "summary">;
+const JobPageCursor = Schema.Struct({
+  version: Schema.Literal(1),
+  repositoryId: Schema.String,
+  view: Schema.Literals(["active", "attention", "history"]),
+  createdAt: Schema.String.check(Schema.isMaxLength(64)),
+  jobId: Schema.String.check(Schema.isMaxLength(64)),
+});
+const decodeCursor = Schema.decodeEffect(Schema.fromJsonString(JobPageCursor));
+const encodeCursor = Schema.encodeSync(Schema.fromJsonString(JobPageCursor));
 export class WorkflowPersistenceError extends Schema.TaggedError<WorkflowPersistenceError>()(
   "WorkflowPersistenceError",
   { cause: Schema.Defect() },
@@ -36,7 +48,7 @@ export const make = Effect.gen(function* () {
   const getJob = (jobId: string) =>
     persist(
       db.select().from(relayWorkflowJobs).where(eq(relayWorkflowJobs.jobId, jobId)).limit(1),
-    ).pipe(Effect.map((rows) => rows[0] ?? null));
+    ).pipe(Effect.map((rows): WorkflowJobRecord | null => rows[0] ?? null));
   return {
     get,
     getJob,
@@ -114,6 +126,70 @@ export const make = Effect.gen(function* () {
           .orderBy(desc(relayWorkflowJobs.createdAt))
           .limit(100),
       ),
+    pageJobs: Effect.fn("Workflows.pageJobs")(function* (
+      repositoryId: string,
+      query: WorkflowJobPageQuery,
+    ): Effect.fn.Return<WorkflowJobPage, WorkflowPersistenceError | WorkflowInvalidError> {
+      const cursor =
+        query.cursor === undefined
+          ? null
+          : yield* decodeCursor(query.cursor).pipe(
+              Effect.mapError(
+                () =>
+                  new WorkflowInvalidError({
+                    message: "Invalid run-list cursor. Refresh the list.",
+                  }),
+              ),
+            );
+      if (cursor && (cursor.repositoryId !== repositoryId || cursor.view !== query.view))
+        return yield* new WorkflowInvalidError({
+          message: "This cursor belongs to a different run list. Refresh the list.",
+        });
+      const jobs = relayWorkflowJobs;
+      const history = query.view === "history";
+      const limit = query.limit ?? 50;
+      const rows = yield* persist(
+        db
+          .select({ summary: jobs.summary })
+          .from(jobs)
+          .where(
+            and(
+              eq(jobs.repositoryId, repositoryId),
+              history
+                ? sql`${jobs.status} IN ('done','cancelled','failed')`
+                : sql`${jobs.status} NOT IN ('done','cancelled','failed')`,
+              query.view === "attention"
+                ? sql`${jobs.summary}->>'needsAttention' = 'true'`
+                : undefined,
+              cursor
+                ? history
+                  ? sql`(${jobs.createdAt}, ${jobs.jobId}) < (${cursor.createdAt}, ${cursor.jobId})`
+                  : sql`(${jobs.createdAt}, ${jobs.jobId}) > (${cursor.createdAt}, ${cursor.jobId})`
+                : undefined,
+            ),
+          )
+          .orderBy(
+            history ? desc(jobs.createdAt) : asc(jobs.createdAt),
+            history ? desc(jobs.jobId) : asc(jobs.jobId),
+          )
+          .limit(limit + 1),
+      );
+      const page = rows.slice(0, limit).map((row) => row.summary);
+      const last = page.at(-1);
+      return {
+        jobs: page,
+        nextCursor:
+          rows.length > limit && last
+            ? encodeCursor({
+                version: 1,
+                repositoryId,
+                view: query.view,
+                createdAt: last.createdAt,
+                jobId: last.jobId,
+              })
+            : null,
+      };
+    }),
     pendingJobs: () =>
       persist(
         db
@@ -155,7 +231,8 @@ export const make = Effect.gen(function* () {
           )
           .returning(),
       );
-      return rows[0] ?? null;
+      const row: WorkflowJobRecord | null = rows[0] ?? null;
+      return row;
     }),
     updateJob: Effect.fn("Workflows.updateJob")(function* (
       previous: WorkflowJobRecord,
@@ -187,7 +264,8 @@ export const make = Effect.gen(function* () {
         return yield* new WorkflowConflictError({
           message: "The job changed. Refresh its current state.",
         });
-      return rows[0]!;
+      const row: WorkflowJobRecord = rows[0]!;
+      return row;
     }),
     release: (jobId: string, leaseUntil: string) =>
       persist(

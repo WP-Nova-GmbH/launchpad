@@ -151,10 +151,11 @@ history, and drafts remain available while waiting for the machine to acknowledg
 responses survive navigation to results and back within the current app session. Reloading or
 restarting the app does not restore unsaved drafts.
 
-**Runs** shows up to the latest 100 jobs, with waiting checkpoints first within those recent runs.
-Older waiting jobs may be outside this view; an existing direct job link still opens them. If starting
-a run loses its reply, check recent runs before explicitly starting another; it may create an
-additional job.
+**Runs** opens with active jobs, oldest first, including jobs from archived workflows. Use
+**Needs attention** to find human checkpoints, pauses and blocked jobs, or **History** for completed
+runs, newest first. Load more runs to reach older history or further active jobs. Refresh starts from
+the first page and picks up status changes. If starting a run loses its reply, check active runs
+before explicitly starting another; it may create an additional job.
 
 Request changes sends feedback to the Review's chosen earlier Agent step in the same worktree.
 Earlier inputs and results remain valid; later steps run again and need fresh human responses.

@@ -50,6 +50,10 @@ do not change its copies.
 **Job**:
 A single execution of a repository workflow under the definition used at its start.
 
+**Job handoff**:
+An offer of a job to its selected execution environment, awaiting confirmation of acceptance.
+An uncertain handoff may still have started work.
+
 **Job completion**:
 A job's successful end, after its configured steps have finished and its setup work has stopped.
 

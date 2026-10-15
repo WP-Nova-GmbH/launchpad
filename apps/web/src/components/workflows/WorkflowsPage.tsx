@@ -7,16 +7,11 @@ import {
   type RelayRepositorySummary,
   type RelayOrganizationProject,
 } from "@t3tools/contracts/relay";
-import type {
-  RepositoryWorkflow,
-  RepositoryWorkflowJobSummary,
-} from "@t3tools/contracts/workflows";
+import type { RepositoryWorkflow } from "@t3tools/contracts/workflows";
 import {
   workflowDraftAtom,
   workflowSessionKey,
   workflowEditorDirty,
-  recentWorkflowJobs,
-  workflowStatusLabel,
   clearWorkflowScope,
   startNewWorkflowDraft,
   type WorkflowScope,
@@ -44,6 +39,7 @@ import { Select, SelectPopup, SelectTrigger, SelectValue, SelectItem } from "../
 import { WorkflowBuilder } from "./WorkflowBuilder";
 import { WorkflowRun } from "./WorkflowRun";
 import { WorkflowJob } from "./WorkflowJob";
+import { WorkflowJobs } from "./WorkflowJobs";
 import {
   useWorkflowClient,
   useWorkflowDrafts,
@@ -230,7 +226,6 @@ function WorkflowRepositoryView({
   const call = useWorkflowClient(scope);
   const drafts = useWorkflowDrafts();
   const [workflows, setWorkflows] = useState<ReadonlyArray<RepositoryWorkflow>>([]);
-  const [jobs, setJobs] = useState<ReadonlyArray<RepositoryWorkflowJobSummary>>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const active = useActiveWorkflowView();
@@ -315,19 +310,11 @@ function WorkflowRepositoryView({
   const refresh = useCallback(async () => {
     const generation = ++loadGeneration.current;
     try {
-      const [definitions, recent] = await Promise.all([
-        call((client, token) =>
-          client.listWorkflows({ clerkToken: token, repositoryId: scope.repositoryId }),
-        ),
-        view === "catalog"
-          ? call((client, token) =>
-              client.listWorkflowJobs({ clerkToken: token, repositoryId: scope.repositoryId }),
-            )
-          : Promise.resolve([]),
-      ]);
+      const definitions = await call((client, token) =>
+        client.listWorkflows({ clerkToken: token, repositoryId: scope.repositoryId }),
+      );
       if (generation !== loadGeneration.current) return;
       setWorkflows(definitions);
-      setJobs(recent);
       setLoaded(true);
       setError(null);
     } catch (cause) {
@@ -335,7 +322,7 @@ function WorkflowRepositoryView({
       setError(workflowError(cause));
       setLoaded(true);
     }
-  }, [call, scope.repositoryId, view]);
+  }, [call, scope.repositoryId]);
   useEffect(() => {
     // oxlint-disable-next-line react/set-state-in-effect -- The relay read settles asynchronously; this effect owns the initial request.
     void refresh();
@@ -632,9 +619,11 @@ function WorkflowRepositoryView({
                 </Select>
               </div>
             </div>
-            <Button variant="ghost" onClick={refresh}>
-              Refresh
-            </Button>
+            {view !== "catalog" || tab !== "runs" ? (
+              <Button variant="ghost" onClick={refresh}>
+                Refresh
+              </Button>
+            ) : null}
           </div>
           {error ? (
             <p role="alert" className="text-sm text-destructive">
@@ -747,50 +736,7 @@ function WorkflowRepositoryView({
                   ) : null}
                 </div>
               ) : (
-                <div>
-                  <h1 className="text-lg font-semibold">Recent runs</h1>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {jobs.length === 100
-                      ? "Showing the latest 100 runs. "
-                      : "Shows up to the latest 100 runs. "}
-                    Older runs, including waiting checkpoints, may be outside this view.
-                  </p>
-                  {!jobs.some((job) =>
-                    ["awaiting_review", "awaiting_input"].includes(job.status),
-                  ) ? (
-                    <p className="mt-4 text-sm text-muted-foreground">
-                      No checkpoints in recent runs.
-                    </p>
-                  ) : (
-                    <h2 className="mt-4 text-sm font-medium">Needs attention in recent runs</h2>
-                  )}
-                  {recentWorkflowJobs(jobs).map((job) => (
-                    <div
-                      key={job.jobId}
-                      className="flex items-center justify-between gap-4 border-b py-4"
-                    >
-                      <div className="min-w-0">
-                        <p className="truncate font-medium">{job.instruction}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {workflows.find((workflow) => workflow.workflowId === job.workflowId)
-                            ?.definition.name ?? "Workflow run"}{" "}
-                          · {workflowStatusLabel(job.status)}
-                        </p>
-                      </div>
-                      <Button
-                        variant="ghost"
-                        onClick={() =>
-                          navigate({
-                            to: "/workflows/$repositoryId/jobs/$jobId",
-                            params: { repositoryId: scope.repositoryId, jobId: job.jobId },
-                          })
-                        }
-                      >
-                        View
-                      </Button>
-                    </div>
-                  ))}
-                </div>
+                <WorkflowJobs scope={scope} workflows={workflows} refreshWorkflows={refresh} />
               )}
             </>
           )}
