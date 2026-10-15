@@ -626,3 +626,86 @@ it.effect("later checkpoint input cannot lower a manual control protocol pin", (
     assert.strictEqual(reply.requiredProtocol, 6);
   }).pipe(Effect.provide(NodeCrypto.layer)),
 );
+
+for (const operation of ["pause", "input"] as const)
+  it.effect(`preserves publishing protocol through ${operation}`, () =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      yield* Ref.update(h.row, (row) => ({
+        ...row,
+        record: { ...row.record, requiredProtocol: 7 as const },
+      }));
+      const payload =
+        operation === "pause"
+          ? { operation, controlId: "hold", expectedRevision: 5 }
+          : { operation, checkpointId: "input", expectedRevision: 5, text: "answer" };
+      assert.equal((yield* h.respond(payload)).requiredProtocol, 7);
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+  );
+it.effect(
+  "binds publishing retries to current action/revision and preserves pending/replayed receipts",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      const action = {
+        actionId: "publish",
+        stepId: "push",
+        generation: 1,
+        operation: "push" as const,
+        state: "uncertain" as const,
+        retryable: true,
+        detail: "Lost reply",
+        commitSha: "sha",
+        pullRequestUrl: null,
+      };
+      yield* Ref.update(h.row, (row) => ({
+        ...row,
+        status: "paused" as const,
+        record: {
+          ...row.record,
+          status: "paused" as const,
+          requiredProtocol: 7 as const,
+          progress: {
+            ...row.record.progress!,
+            status: "paused" as const,
+            stepId: "push",
+            generation: 1,
+            checkpoint: null,
+            actions: [action],
+          },
+        },
+      }));
+      const payload = {
+        operation: "retry_action" as const,
+        actionId: "publish",
+        expectedRevision: 5,
+      };
+      assert.equal((yield* h.respond(payload)).requiredProtocol, 7);
+      assert.equal(yield* Ref.get(h.writes), 1);
+      yield* h.respond(payload);
+      assert.equal(yield* Ref.get(h.writes), 1);
+      yield* Ref.update(h.row, (row) => ({
+        ...row,
+        pendingControl: null,
+        record: {
+          ...row.record,
+          progress: {
+            ...row.record.progress!,
+            revision: 7,
+            actions: [{ ...action, state: "running" as const, retryable: false, retryRevision: 5 }],
+          },
+        },
+      }));
+      yield* h.respond(payload);
+      assert.equal(yield* Ref.get(h.writes), 1);
+      assert.equal(
+        (yield* h.respond({ ...payload, expectedRevision: 4 }).pipe(Effect.flip))._tag,
+        "WorkflowConflictError",
+      );
+      yield* Ref.set(h.role, "developer");
+      assert.equal(
+        (yield* h.respond(payload).pipe(Effect.flip))._tag,
+        "RelayTenancyForbiddenError",
+      );
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+);

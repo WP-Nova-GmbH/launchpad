@@ -2,7 +2,7 @@ import { useEnvironments } from "../../state/environments";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { useProject } from "../../state/entities";
 import styles from "./workflowEditor.module.css";
-import { BotIcon, MessageSquareIcon, UserRoundCheckIcon, XIcon } from "lucide-react";
+import { UploadIcon, BotIcon, MessageSquareIcon, UserRoundCheckIcon, XIcon } from "lucide-react";
 import type { WorkflowStep, WorkflowDefinition } from "@t3tools/contracts/workflows";
 import { workflowModelState } from "../settings/workflowModels";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
@@ -50,7 +50,9 @@ export function WorkflowStepEditor({
         <div>
           <header className={styles["workflow-inspector-header"]}>
             <span className={styles["workflow-node-icon"]} data-kind={step.kind}>
-              {step.kind === "agent" ? (
+              {step.kind === "action" ? (
+                <UploadIcon />
+              ) : step.kind === "agent" ? (
                 <BotIcon />
               ) : step.kind === "input" ? (
                 <MessageSquareIcon />
@@ -75,7 +77,11 @@ export function WorkflowStepEditor({
                   ? "Agent"
                   : step.kind === "input"
                     ? "Human input"
-                    : "Human review"}{" "}
+                    : step.kind === "action"
+                      ? step.action === "push"
+                        ? "Push branch"
+                        : "Open PR"
+                      : "Human review"}{" "}
                 · Step {index + 1}
               </p>
             </div>
@@ -91,7 +97,7 @@ export function WorkflowStepEditor({
             </Button>
           </header>
           <fieldset disabled={disabled} className={styles["workflow-inspector-fields"]}>
-            {step.kind !== "agent" ? (
+            {step.kind === "input" || step.kind === "review" ? (
               <p className={styles["workflow-checkpoint-note"]} data-kind={step.kind}>
                 {step.kind === "input"
                   ? "The workflow waits here until someone answers."
@@ -166,6 +172,12 @@ export function WorkflowStepEditor({
                   </Button>
                 ) : null}
               </div>
+            ) : step.kind === "action" ? (
+              <p className="text-sm text-muted-foreground">
+                {step.action === "push"
+                  ? "Commits the saved result and pushes the job branch. Retries reuse the prepared commit."
+                  : "Opens or reuses this job's pull request."}
+              </p>
             ) : (
               <div className="space-y-1">
                 <p className="text-sm">Who can respond?</p>

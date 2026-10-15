@@ -189,6 +189,34 @@ export function startNewWorkflowDraft(
   return id;
 }
 
+/** Compare the retained draft before installing a replacement approved by the caller. */
+export function replaceNewWorkflowDraft(
+  registry: AtomRegistry.AtomRegistry,
+  scope: WorkflowScope,
+  expected: WorkflowEditorDraft | undefined,
+  draft: WorkflowEditorDraft,
+) {
+  let installed = false;
+  updateWorkflowDrafts(registry, scope.accountId, (state) => {
+    const slot = workflowSessionKey(scope, "new");
+    const previousId = state.newWorkflowIds[slot];
+    const previous = previousId ? state.editors[workflowSessionKey(scope, previousId)] : undefined;
+    if (previous !== expected || previous?.operation || draft.baseline || draft.operation)
+      return state;
+    const editors = { ...state.editors };
+    if (previous && !previous.baseline)
+      delete editors[workflowSessionKey(scope, previous.workflowId)];
+    editors[workflowSessionKey(scope, draft.workflowId)] = draft;
+    installed = true;
+    return {
+      ...state,
+      editors,
+      newWorkflowIds: { ...state.newWorkflowIds, [slot]: draft.workflowId },
+    };
+  });
+  return installed;
+}
+
 export function workflowEditorDirty(draft: WorkflowEditorDraft) {
   return !draft.baseline || !sameWorkflowDefinition(draft.definition, draft.baseline.definition);
 }

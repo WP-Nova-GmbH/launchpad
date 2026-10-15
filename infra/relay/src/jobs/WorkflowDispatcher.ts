@@ -110,6 +110,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         job.repositoryId,
         workflow.definition,
       );
+      const publishing = workflow.definition.steps.filter((step) => step.kind === "action");
+      const protocol = publishing.length ? 7 : 6;
       const binding = {
         organizationId: row!.organizationId,
         repositoryId: job.repositoryId,
@@ -124,7 +126,11 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         instruction: job.instruction,
         workflowControl: { ...binding, operation: "status" },
       });
-      if (!probe.workflowResult || probe.workflowResult.protocol < 6)
+      if (
+        !probe.workflowResult ||
+        probe.workflowResult.protocol < protocol ||
+        publishing.some((step) => !probe.workflowResult?.actions?.includes(step.action))
+      )
         return yield* new WorkflowInvalidError({
           message: "Update this environment to a version that supports repository workflows.",
         });
@@ -140,7 +146,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         ...job,
         environmentId: workflow.definition.environmentId,
         workflow,
-        requiredProtocol: 6,
+        requiredProtocol: protocol,
         status: "dispatching",
         detail: "Offering this workflow to its environment.",
         updatedAt: now,
@@ -233,7 +239,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     if (
       control.operation === "approve" ||
       control.operation === "input" ||
-      control.operation === "request_changes"
+      control.operation === "request_changes" ||
+      control.operation === "retry_action"
     ) {
       const capability = yield* connector.dispatchJob({
         userId: row!.pendingControl?.userId ?? row!.submitterUserId,

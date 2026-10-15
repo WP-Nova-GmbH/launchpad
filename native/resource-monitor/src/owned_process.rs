@@ -17,6 +17,7 @@ struct State {
     full_stop: bool,
     boot: Option<Boot>,
     setup_launch_protocol: u8,
+    command_launch_protocol: u8,
     launch: Option<LaunchResult>,
 }
 
@@ -130,6 +131,7 @@ fn output_launch(
             full_stop,
             boot: boot()?,
             setup_launch_protocol: 1,
+            command_launch_protocol: if cfg!(unix) { 1 } else { 0 },
             launch
         })?
     );
@@ -139,6 +141,35 @@ fn output_launch(
 /// Keep the ownership anchor alive when the shell or PTY parent exits. Deliberately
 /// detached services have their own lifecycle; ordinary descendants remain in this session/job.
 pub fn launch(args: &[String]) -> io::Result<()> {
+    launch_mode(args, false)
+}
+
+pub fn launch_command(args: &[String]) -> io::Result<()> {
+    if !cfg!(unix) {
+        return Err(io::Error::other(
+            "Owned headless commands are unavailable on this platform",
+        ));
+    }
+    launch_mode(args, true)
+}
+
+fn launch_mode(args: &[String], command_mode: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    let mut control = if command_mode {
+        use std::os::fd::FromRawFd;
+        unsafe {
+            if getsid(0) != getpid() && setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // The command receives stdout/stderr, never the owner's result channel.
+            if fcntl(3, 2, 1) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Some(std::fs::File::from_raw_fd(3))
+        }
+    } else {
+        None
+    };
     let request = if args.first().map(String::as_str) == Some("--launch-v1") {
         let payload = args
             .get(1)
@@ -199,7 +230,10 @@ pub fn launch(args: &[String]) -> io::Result<()> {
             {
                 use std::os::unix::process::CommandExt;
                 unsafe {
-                    command.pre_exec(|| {
+                    command.pre_exec(move || {
+                        if command_mode {
+                            close(3);
+                        }
                         if setpgid(0, 0) < 0 {
                             return Err(io::Error::last_os_error());
                         }
@@ -250,7 +284,11 @@ pub fn launch(args: &[String]) -> io::Result<()> {
             .ok()
             .and_then(|status| status.code())
             .unwrap_or(-1);
-        if !request.token.is_empty() {
+        #[cfg(unix)]
+        if let Some(mut channel) = control.take() {
+            report_command_result(&mut channel, code, &mut io::stderr());
+        }
+        if !command_mode && !request.token.is_empty() {
             use std::io::Write;
             // Private, bounded launch frame. Shell exit settles completion, never ownership.
             let _ = write!(
@@ -266,6 +304,30 @@ pub fn launch(args: &[String]) -> io::Result<()> {
     loop {
         std::thread::park();
     }
+}
+
+// Result delivery can disappear with the server; ownership must outlive every pipe.
+#[cfg(unix)]
+fn report_command_result(mut channel: impl io::Write, code: i32, mut diagnostic: impl io::Write) {
+    if writeln!(channel, "{{\"protocol\":1,\"code\":{code}}}")
+        .and_then(|_| channel.flush())
+        .is_err()
+    {
+        let _ = writeln!(
+            diagnostic,
+            "Workflow command result delivery failed; ownership retained."
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn command_result_survives_disconnected_result_and_diagnostic_readers() {
+    let (mut result, result_reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (mut diagnostic, diagnostic_reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(result_reader);
+    drop(diagnostic_reader);
+    report_command_result(&mut result, 37, &mut diagnostic);
 }
 
 #[cfg(unix)]
@@ -379,7 +441,10 @@ fn await_arm(
 
 #[cfg(unix)]
 unsafe extern "C" {
+    fn close(fd: i32) -> i32;
     fn getsid(pid: i32) -> i32;
+    fn setsid() -> i32;
+    fn fcntl(fd: i32, command: i32, value: i32) -> i32;
     fn getpid() -> i32;
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn isatty(fd: i32) -> i32;
@@ -410,7 +475,11 @@ fn is_owner(pid: u32, expected: &str) -> io::Result<bool> {
     );
     Ok(system
         .process(sysinfo::Pid::from_u32(pid))
-        .is_some_and(|p| p.cmd().get(1).is_some_and(|arg| arg == "--setup-owner-v4"))
+        .is_some_and(|p| {
+            p.cmd()
+                .get(1)
+                .is_some_and(|arg| arg == "--setup-owner-v4" || arg == "--command-owner-v1")
+        })
         && identity(pid)?.as_deref() == Some(expected))
 }
 #[cfg(unix)]

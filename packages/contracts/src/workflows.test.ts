@@ -95,3 +95,37 @@ it("requires stable identity and a nonnegative revision for manual workflow cont
     expect(isResponse({ operation, controlId: "intent", expectedRevision: -1 })).toBe(false);
   }
 });
+
+it("validates publishing order and groups actions into automatic zones", () => {
+  const push: WorkflowStep = { id: "push", title: "Push branch", kind: "action", action: "push" };
+  const pr: WorkflowStep = {
+    id: "pr",
+    title: "Open PR",
+    kind: "action",
+    action: "open_pull_request",
+  };
+  for (const steps of [
+    [agent, push, pr],
+    [agent, review, push, input, pr],
+    [agent, push, pr, { ...review, reworkStepId: agent.id }],
+  ])
+    expect(isDefinition(definition(steps))).toBe(true);
+  for (const steps of [
+    [push, agent],
+    [agent, pr],
+    [agent, push, { ...agent, id: "next" }, pr],
+  ])
+    expect(isDefinition(definition(steps))).toBe(false);
+  expect(
+    workflowZones([agent, push, pr, input, review, agent]).map((zone) =>
+      zone.map((step) => step.id),
+    ),
+  ).toEqual([["implement", "push", "pr"], ["input"], ["review"], ["implement"]]);
+  expect(isResponse({ operation: "retry_action", actionId: "action", expectedRevision: 7 })).toBe(
+    true,
+  );
+  expect(isResponse({ operation: "retry_action", actionId: "", expectedRevision: 7 })).toBe(false);
+  expect(isResponse({ operation: "retry_action", actionId: "action", expectedRevision: -1 })).toBe(
+    false,
+  );
+});

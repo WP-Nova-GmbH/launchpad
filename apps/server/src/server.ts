@@ -1,4 +1,5 @@
 import * as ThreadPreparationReactor from "./orchestration/ThreadPreparationReactor.ts";
+import * as WorkflowActions from "./jobs/WorkflowActions.ts";
 import * as RepositoryWorkflowRunner from "./jobs/RepositoryWorkflowRunner.ts";
 import * as WorkflowRunStore from "./jobs/WorkflowRunStore.ts";
 import * as SetupProcessJournal from "./terminal/SetupProcessJournal.ts";
@@ -529,6 +530,16 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(
   RepositoryWorkflowRunner.layer,
 )
   .pipe(
+    Layer.provideMerge(
+      WorkflowActions.layer.pipe(
+        Layer.provide(
+          SetupProcessAdapter.layer.pipe(
+            Layer.provide(ResourceMonitorBinary.layer),
+            Layer.provide(ProcessRunner.layer),
+          ),
+        ),
+      ),
+    ),
     Layer.provideMerge(WorkflowRunStore.layer),
     Layer.provideMerge(AntigravityInstallationRefreshLive),
     Layer.provideMerge(ProviderAuthServiceLive),

@@ -20,6 +20,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { BootEvidence } from "../terminal/SetupProcessAdapter.ts";
 import { classifyApprovalRequest } from "./approvalClassification.ts";
 
 const SetupCleanup = Schema.Struct({
@@ -44,7 +45,47 @@ export const WorkflowSequence = Schema.Struct({
   feedback: Schema.NullOr(Schema.String),
 });
 export type WorkflowSequence = typeof WorkflowSequence.Type;
+export const WorkflowActionRecord = Schema.Struct({
+  actionId: Schema.String,
+  stepId: Schema.String,
+  generation: Schema.Int,
+  operation: Schema.Literals(["push", "open_pull_request"]),
+  state: Schema.Literals(["running", "uncertain", "failed", "completed"]),
+  phase: Schema.Literals(["prepare", "commit", "push", "pull_request", "done"]),
+  parent: Schema.String,
+  tree: Schema.String,
+  checkpointRef: Schema.String,
+  commitMessage: Schema.NullOr(Schema.String),
+  commitSha: Schema.NullOr(Schema.String),
+  oldRemoteSha: Schema.NullOr(Schema.String),
+  prTitle: Schema.NullOr(Schema.String),
+  prBody: Schema.NullOr(Schema.String),
+  pullRequestUrl: Schema.NullOr(Schema.String),
+  detail: Schema.NullOr(Schema.String),
+  retryRevision: Schema.optional(Schema.Int),
+  commands: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      phase: Schema.optional(Schema.Literals(["prepare", "commit", "push", "pull_request"])),
+      pid: Schema.NullOr(Schema.Number),
+      identity: Schema.NullOr(Schema.String),
+      boot: Schema.NullOr(BootEvidence),
+      stopped: Schema.Boolean,
+      code: Schema.NullOr(Schema.Int),
+    }),
+  ),
+});
+export type WorkflowActionRecord = typeof WorkflowActionRecord.Type;
 export const WorkflowRun = Schema.Struct({
+  actions: Schema.optional(Schema.Array(WorkflowActionRecord)),
+  publication: Schema.optional(
+    Schema.Struct({
+      remoteName: Schema.String,
+      remoteUrl: Schema.String,
+      publishedHead: Schema.NullOr(Schema.String),
+      pullRequestUrl: Schema.NullOr(Schema.String),
+    }),
+  ),
   manualPause: Schema.optional(
     Schema.NullOr(
       Schema.Struct({

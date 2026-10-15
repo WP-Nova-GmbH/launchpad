@@ -4,16 +4,15 @@ status: accepted
 
 # Workflow steps have kinds, and agents never perform irreversible operations
 
-A workflow step is one of three kinds — `agent`, `action`, or `gate` — rather than every step
-being "run an agent." Deterministic operations that leave the workspace are `action` steps
+Workflows have Agent steps, closed Action operations, and explicit human Review/Input checkpoints rather than making every step "run an agent." Deterministic operations that leave the workspace are `action` steps
 executed by the job runner, which means **agents never push, never open pull requests, and never
 merge**.
 
-| kind     | what it is                                                                                   |
-| -------- | -------------------------------------------------------------------------------------------- |
-| `agent`  | start or continue the job thread, send step instructions, wait for its turn to settle        |
-| `action` | a defined deterministic operation: push, open a pull request, provision a review app, notify |
-| `gate`   | wait for a condition: human sign-off, a check, a review verdict                              |
+| kind               | what it is                                                                                   |
+| ------------------ | -------------------------------------------------------------------------------------------- |
+| `agent`            | start or continue the job thread, send step instructions, wait for its turn to settle        |
+| `action`           | a defined deterministic operation: push, open a pull request, provision a review app, notify |
+| `review` / `input` | wait for a human response, with a result-bound Review or contextual Input                    |
 
 ## Why not let agents do the tail
 
@@ -32,7 +31,7 @@ problem into a structural one:
 A `git push` originating from an agent is therefore always anomalous and always deniable — no
 legitimate workflow asks an agent for one, so the supervisor needs no judgement about it.
 
-## Why `gate` is a kind and not a flag
+## Why human checkpoints are steps
 
 A repository owns its workflow definition ([ADR-0007](./0007-the-org-layer-is-defaults-not-enforcement.md)),
 including its gates. When a gate is a step, removing it is a visible structural change —
@@ -55,6 +54,14 @@ silently start new history. Cancellation remains tied to the original runtime's 
 removing its configuration does not prove that its process stopped. Strict workflow continuation
 ends when the durable job releases ownership, preserving ordinary chat behavior in the retained
 thread. Incompatible changes require cancellation and a new job.
+
+## Publishing binds to the prepared result
+
+Push commits and publishes the saved result; Open PR cannot implicitly push. The accepted job fixes the repository, remote, base and job branch. A runner-created commit may change HEAD only when its tree still matches the saved checkpoint, so commit hooks cannot upload unreviewed changes. Review and completion verify that authorized HEAD rather than the pre-commit Agent HEAD.
+
+Publishing receipts survive suffix invalidation during rework. The sequence can run again without forgetting a remote effect: retries observe the intended commit/ref, and all generations bind to one PR. A first PR's stable job marker permits recovery after a lost reply; once recorded, its exact identity remains authoritative even if someone edits the body. Missing, ambiguous or incomplete evidence blocks another creation. Closed/merged PRs require attention rather than replacement.
+
+Local command stopping and remote outcome are separate facts. Workflow Git/forge mutations use the native owner boundary with capture before arm, durable command results and full-stop proof. A stopped command may still have published remotely. Lost ownership retains capacity until stopping is proven; a new boot on the same recorded host can prove it, while an app restart or database move cannot. Revisit that proof when VM execution is added. These constraints span native execution, the runner and relay; ordinary chat Git commands keep their existing lifecycle.
 
 ## Consequences
 

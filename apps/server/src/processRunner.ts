@@ -17,7 +17,24 @@ import {
   type CollectedUint8StreamText,
 } from "./stream/collectUint8StreamText.ts";
 
+export interface OwnedCommand {
+  readonly executable: string;
+  readonly capture: (pid: number) => Effect.Effect<void, ProcessOwnershipError>;
+  readonly arm: Effect.Effect<void, ProcessOwnershipError>;
+  readonly completed: (code: number) => Effect.Effect<void, ProcessOwnershipError>;
+  readonly stop: Effect.Effect<void, ProcessOwnershipError>;
+}
+const decodeOwnedCommandResult = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Struct({ protocol: Schema.Literal(1), code: Schema.Int })),
+);
+/** Only VCS calls inside a workflow mutation inherit this factory. */
+export const CurrentWorkflowCommand = Context.Reference<Effect.Effect<
+  OwnedCommand,
+  ProcessOwnershipError
+> | null>("t3/processRunner/CurrentWorkflowCommand", { defaultValue: () => null });
+
 export interface ProcessRunInput {
+  readonly owner?: OwnedCommand;
   readonly command: string;
   readonly args: ReadonlyArray<string>;
   readonly cwd?: string | undefined;
@@ -130,6 +147,9 @@ export class ProcessTimeoutError extends Schema.TaggedError<ProcessTimeoutError>
   }
 }
 
+export const ProcessOwnershipError = ProcessSpawnError;
+export type ProcessOwnershipError = ProcessSpawnError;
+
 export const ProcessRunError = Schema.Union([
   ProcessSpawnError,
   ProcessStdinError,
@@ -146,6 +166,17 @@ export class ProcessRunner extends Context.Service<
   }
 >()("t3/processRunner") {}
 
+const encodeOwnedCommand = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      protocol: Schema.Literal(1),
+      token: Schema.String,
+      candidates: Schema.Array(
+        Schema.Struct({ shell: Schema.String, args: Schema.Array(Schema.String) }),
+      ),
+    }),
+  ),
+);
 const DEFAULT_TIMEOUT = "60 seconds";
 const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
@@ -299,18 +330,34 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
     input.env === undefined ? {} : { env: input.env, extendEnv },
   );
 
+  const owner = input.owner;
   const child = yield* spawner
     .spawn(
-      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-        ...((input.spawnCwd ?? input.cwd) ? { cwd: input.spawnCwd ?? input.cwd } : {}),
-        ...(input.env !== undefined
-          ? {
-              env: input.env,
-              extendEnv,
-            }
-          : {}),
-        shell: spawnCommand.shell,
-      }),
+      ChildProcess.make(
+        owner?.executable ?? spawnCommand.command,
+        owner
+          ? [
+              "--command-owner-v1",
+              "--launch-v1",
+              encodeOwnedCommand({
+                protocol: 1,
+                token: "0".repeat(32),
+                candidates: [{ shell: spawnCommand.command, args: spawnCommand.args }],
+              }),
+            ]
+          : spawnCommand.args,
+        {
+          ...(owner ? { additionalFds: { fd3: { type: "output" as const } } } : {}),
+          ...((input.spawnCwd ?? input.cwd) ? { cwd: input.spawnCwd ?? input.cwd } : {}),
+          ...(input.env !== undefined
+            ? {
+                env: input.env,
+                extendEnv,
+              }
+            : {}),
+          shell: owner ? false : spawnCommand.shell,
+        },
+      ),
     )
     .pipe(
       Effect.mapError(
@@ -347,7 +394,36 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
           ),
         );
 
-  const [stdout, stderr] = yield* Effect.all(
+  const ownershipError = (cause: unknown) =>
+    new ProcessOwnershipError({
+      command: input.command,
+      argumentCount: input.args.length,
+      cwd: input.cwd,
+      spawnCwd: input.spawnCwd,
+      cause,
+    });
+  const stopOwner = owner ? owner.stop.pipe(Effect.mapError(ownershipError)) : Effect.void;
+  const ownedResult = !owner
+    ? Effect.succeed(null)
+    : Effect.gen(function* () {
+        yield* owner.capture(child.pid).pipe(Effect.mapError(ownershipError));
+        yield* owner.arm.pipe(Effect.mapError(ownershipError));
+        const frame = yield* collectText({
+          ...input,
+          streamName: "stdout",
+          stream: child.getOutputFd(3),
+          maxOutputBytes: 4096,
+          outputMode: "error",
+          truncatedMarker: "",
+        });
+        const result = yield* decodeOwnedCommandResult(frame.text).pipe(
+          Effect.mapError(ownershipError),
+        );
+        yield* owner.completed(result.code);
+        yield* stopOwner;
+        return ChildProcessSpawner.ExitCode(result.code);
+      });
+  const [stdout, stderr, , ownedCode] = yield* Effect.all(
     [
       collectText({
         command: input.command,
@@ -374,23 +450,26 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
         truncatedMarker,
       }),
       writeStdin,
+      ownedResult,
     ],
     { concurrency: "unbounded" },
-  );
+  ).pipe(Effect.onExit(() => stopOwner));
 
-  const exitCode = yield* child.exitCode.pipe(
-    Effect.mapError(
-      (cause) =>
-        new ProcessReadError({
-          command: input.command,
-          argumentCount: input.args.length,
-          cwd: input.cwd,
-          spawnCwd: input.spawnCwd,
-          stream: "exitCode",
-          cause,
-        }),
-    ),
-  );
+  const exitCode =
+    ownedCode ??
+    (yield* child.exitCode.pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProcessReadError({
+            command: input.command,
+            argumentCount: input.args.length,
+            cwd: input.cwd,
+            spawnCwd: input.spawnCwd,
+            stream: "exitCode",
+            cause,
+          }),
+      ),
+    ));
 
   return {
     stdout: stdout.text,

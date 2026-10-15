@@ -1,3 +1,10 @@
+import {
+  WorkflowActions,
+  WorkflowActionError,
+  workflowPublishingRemote,
+  changeWorkflowAction,
+  type WorkflowActionIO,
+} from "./WorkflowActions.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
 import {
   CheckpointRef,
@@ -20,6 +27,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -283,6 +291,13 @@ export const make = Effect.gen(function* () {
     }),
   );
   const timestamp = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+  const actions = yield* WorkflowActions;
+  const publishingSupported = yield* actions.available;
+  const actionWorkers = new Map<
+    string,
+    { fiber: Fiber.Fiber<void, never> | null; stopping: boolean }
+  >();
+  const actionCleanupWorkers = new Set<string>();
   const store = {
     ...persistence,
     save: Effect.fn("RepositoryWorkflowRunner.save")(function* (run: WorkflowRun) {
@@ -330,7 +345,12 @@ export const make = Effect.gen(function* () {
     outcome: WorkflowControlResult["outcome"] = run ? "accepted" : "missing",
     detail: string | null = null,
   ): WorkflowControlResult => ({
-    protocol: 6,
+    protocol: publishingSupported ? 7 : 6,
+    actions: publishingSupported
+      ? actions.canOpenPullRequest
+        ? ["push", "open_pull_request"]
+        : ["push"]
+      : [],
     outcome,
     detail,
     progress: run ? workflowProgress(run) : null,
@@ -953,10 +973,174 @@ export const make = Effect.gen(function* () {
       return run;
     },
   );
+  const actionIO = (jobId: string): WorkflowActionIO => ({
+    read: persistence
+      .get(jobId)
+      .pipe(
+        Effect.flatMap((run) =>
+          run
+            ? Effect.succeed(run)
+            : Effect.fail(new WorkflowActionError({ message: "The workflow job is unavailable." })),
+        ),
+      ),
+    update: (change) => {
+      const effect = Effect.gen(function* () {
+        const current = yield* persistence.get(jobId);
+        if (!current)
+          return yield* new WorkflowActionError({ message: "The workflow job is unavailable." });
+        const next = change(current);
+        return yield* store.save({
+          ...next,
+          progress: { ...next.progress, revision: current.progress.revision + 1 },
+        });
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.fail(new WorkflowActionError({ message: Cause.pretty(cause) })),
+        ),
+      );
+      return lock.withPermits(1)(effect);
+    },
+  });
+  const actionSettled = (jobId: string) =>
+    lock.withPermits(1)(
+      Effect.gen(function* () {
+        const latest = yield* persistence.get(jobId);
+        if (latest) yield* reconcile(latest);
+        yield* pumpWaiting();
+      }),
+    );
+  const recoverCancelledAction = Effect.fn("RepositoryWorkflowRunner.recoverCancelledAction")(
+    function* (run: WorkflowRun) {
+      if (actionCleanupWorkers.has(run.jobId) || run.progress.retryableCancellation) return;
+      actionCleanupWorkers.add(run.jobId);
+      const io = actionIO(run.jobId);
+      yield* actions.recover(io).pipe(
+        Effect.flatMap((stopped) =>
+          stopped
+            ? Effect.void
+            : Effect.fail(
+                new WorkflowActionError({
+                  message:
+                    "Publishing process ownership could not be confirmed. The job remains owned until stopping is proven.",
+                }),
+              ),
+        ),
+        Effect.catchCause((cause) =>
+          io
+            .update((current) => ({
+              ...current,
+              executionReserved: true,
+              progress: {
+                ...current.progress,
+                retryableCancellation: true,
+                detail: Cause.pretty(cause),
+              },
+            }))
+            .pipe(Effect.asVoid),
+        ),
+        Effect.onExit(() => Effect.sync(() => actionCleanupWorkers.delete(run.jobId))),
+        Effect.andThen(actionSettled(run.jobId)),
+        Effect.ignoreCause({ log: true }),
+        Effect.forkIn(runnerScope),
+      );
+    },
+  );
+  const startAction = Effect.fn("RepositoryWorkflowRunner.startAction")(function* (
+    run: WorkflowRun,
+  ): Effect.fn.Return<WorkflowRun, Error> {
+    const step = activeWorkflowStep(run);
+    if (step?.kind !== "action" || !run.sequence || actionWorkers.has(run.jobId)) return run;
+    const id = `workflow:${run.jobId}:action:${step.id}:${run.sequence.generation}`;
+    let action = run.actions?.find((entry) => entry.actionId === id);
+    if (!action) {
+      const result = run.sequence.completed.findLast((entry) => entry.checkpoint);
+      if (!result?.checkpoint || !run.worktreePath || !run.preparedHead || !run.publication)
+        return yield* new WorkflowRunnerError({
+          message: "The publishing step has no prepared result.",
+        });
+      const tree = yield* git.execute({
+        operation: "WorkflowAction.tree",
+        cwd: run.worktreePath,
+        args: ["rev-parse", `${result.checkpoint.checkpointRef}^{tree}`],
+      });
+      action = {
+        actionId: id,
+        stepId: step.id,
+        generation: run.sequence.generation,
+        operation: step.action,
+        state: "running",
+        phase: "prepare",
+        parent: run.preparedHead,
+        tree: tree.stdout.trim(),
+        checkpointRef: result.checkpoint.checkpointRef,
+        commitMessage: null,
+        commitSha: null,
+        oldRemoteSha: run.publication.publishedHead,
+        prTitle: null,
+        prBody: null,
+        pullRequestUrl: null,
+        detail: null,
+        commands: [],
+      };
+      run = { ...run, actions: [...(run.actions ?? []), action] };
+    }
+    if (action.state !== "running") return run;
+    run = yield* store.save({
+      ...run,
+      executionReserved: true,
+      progress: {
+        ...run.progress,
+        revision: run.progress.revision + 1,
+        status: "running",
+        detail: null,
+      },
+    });
+    const worker = { fiber: null as Fiber.Fiber<void, never> | null, stopping: false };
+    actionWorkers.set(run.jobId, worker);
+    const io = actionIO(run.jobId);
+    worker.fiber = yield* actions.execute(id, io).pipe(
+      Effect.onExit((exit) =>
+        Effect.gen(function* () {
+          if (Exit.isFailure(exit)) {
+            const failure = Cause.squash(exit.cause);
+            const detail = (
+              failure instanceof Error
+                ? failure.message
+                : "Publishing was interrupted; its outcome needs reconciliation."
+            ).slice(0, 500);
+            yield* io.update((current) => ({
+              ...changeWorkflowAction(current, id, (entry) =>
+                entry.state === "completed" ? entry : { ...entry, state: "uncertain", detail },
+              ),
+              executionReserved:
+                current.actions?.some((entry) =>
+                  entry.commands.some((command) => !command.stopped),
+                ) ?? false,
+              progress:
+                current.progress.status === "cancelling"
+                  ? current.progress
+                  : { ...current.progress, status: "paused", detail },
+            }));
+          }
+        }).pipe(
+          Effect.ensuring(
+            Effect.gen(function* () {
+              actionWorkers.delete(run.jobId);
+              yield* actionSettled(run.jobId).pipe(Effect.ignoreCause({ log: true }));
+            }),
+          ),
+        ),
+      ),
+      Effect.ignoreCause({ log: true }),
+      Effect.forkIn(runnerScope),
+    );
+    return run;
+  });
   const reconcile = Effect.fn("RepositoryWorkflowRunner.reconcile")(function* (
     run: WorkflowRun,
     recovering = false,
-  ) {
+  ): Effect.fn.Return<WorkflowRun, Error> {
+    if (isTerminalWorkflowJob(run.progress.status)) return run;
     let retry = run.pendingPreparationRetry;
     if (retry && (yield* readThread(run))?.promptQueue?.pauseReason?.code === "delivery-unknown") {
       run = yield* store.save({ ...run, pendingPreparationRetry: null });
@@ -998,6 +1182,61 @@ export const make = Effect.gen(function* () {
         // Receipt replay is safe even if setup finished before acknowledgement.
         // Clear only after acceptance, then read fresh preparation/turn evidence.
         run = yield* store.save({ ...run, pendingPreparationRetry: null });
+      }
+    }
+    const activeStep = activeWorkflowStep(run);
+    if (activeStep?.kind === "action" && run.sequence) {
+      const currentAction = run.actions?.findLast(
+        (entry) => entry.stepId === activeStep.id && entry.generation === run.sequence!.generation,
+      );
+      if (run.progress.status === "cancelling") {
+        const worker = actionWorkers.get(run.jobId);
+        if (worker) {
+          if (!worker.stopping && worker.fiber) {
+            worker.stopping = true;
+            yield* Fiber.interrupt(worker.fiber).pipe(Effect.forkIn(runnerScope));
+          }
+          return run;
+        }
+        if (actionCleanupWorkers.has(run.jobId)) return run;
+        if (run.actions?.some((action) => action.commands.some((command) => !command.stopped))) {
+          yield* recoverCancelledAction(run);
+          return run;
+        }
+      } else if (currentAction?.state === "completed") {
+        run = yield* store.save(
+          advanceWorkflow({
+            ...run,
+            sequence: {
+              ...run.sequence,
+              cursor: run.sequence.cursor + 1,
+              completed: [
+                ...run.sequence.completed,
+                {
+                  stepId: activeStep.id,
+                  generation: run.sequence.generation,
+                  checkpoint: null,
+                  head: currentAction.commitSha,
+                },
+              ],
+            },
+          }),
+        );
+      } else {
+        if (run.manualPause?.state === "requested" && !run.executionReserved) {
+          run = yield* store.save({ ...run, manualPause: { ...run.manualPause, state: "paused" } });
+        }
+        if (
+          (!run.manualPause ||
+            (run.manualPause.state === "requested" &&
+              run.executionReserved &&
+              currentAction?.state === "running")) &&
+          !actionWorkers.has(run.jobId) &&
+          (!currentAction || currentAction.state === "running") &&
+          !(yield* store.isExecuting(run.jobId))
+        )
+          return yield* startAction(run);
+        return run;
       }
     }
     if (run.progress.status === "cancelling") run = yield* reconcileCancellation(run, recovering);
@@ -1331,6 +1570,13 @@ export const make = Effect.gen(function* () {
       if (request.control.operation === "start") {
         if (run) return result(run);
         const workflow = request.control.workflow;
+        const publishing = workflow.definition.steps.filter((step) => step.kind === "action");
+        if (publishing.length && !publishingSupported)
+          return result(
+            null,
+            "unavailable",
+            "This environment does not support the selected publishing steps.",
+          );
         if (
           workflow.organizationId !== request.control.organizationId ||
           workflow.repositoryId !== request.control.repositoryId ||
@@ -1356,6 +1602,27 @@ export const make = Effect.gen(function* () {
             null,
             "unavailable",
             "The project's repository changed; select its current checkout.",
+          );
+        if (publishing.length && !workflowPublishingRemote(identity.locator.remoteUrl))
+          return result(
+            null,
+            "unavailable",
+            "Publishing requires a remote URL without embedded credentials. Configure runner-held source-control credentials instead.",
+          );
+        if (
+          publishing.some((step) => step.action === "open_pull_request") &&
+          (!actions.canOpenPullRequest ||
+            !identity ||
+            !(yield* actions.canOpenPullRequest({
+              cwd: project.value.workspaceRoot,
+              remoteName: identity.locator.remoteName,
+              remoteUrl: identity.locator.remoteUrl,
+            })))
+        )
+          return result(
+            null,
+            "unavailable",
+            "This repository does not support workflow PR publishing.",
           );
         const steps = workflow.definition.steps.map((step) =>
           step.kind === "agent"
@@ -1454,6 +1721,17 @@ export const make = Effect.gen(function* () {
             },
           },
           providerContinuation,
+          ...(publishing.length
+            ? {
+                actions: [],
+                publication: {
+                  remoteName: remote,
+                  remoteUrl: identity.locator.remoteUrl,
+                  publishedHead: null,
+                  pullRequestUrl: null,
+                },
+              }
+            : {}),
           sequence: {
             cursor: 0,
             generation: 0,
@@ -1531,6 +1809,38 @@ export const make = Effect.gen(function* () {
       }
       if (run.manualPause && request.control.operation !== "cancel")
         return result(run, "conflict", "Resume the manual pause before responding or retrying.");
+      if (request.control.operation === "retry_action") {
+        const response = request.control;
+        const action = run.actions?.find((entry) => entry.actionId === response.actionId);
+        const step = activeWorkflowStep(run);
+        if (action?.retryRevision === response.expectedRevision) return result(run);
+        if (
+          !action ||
+          step?.kind !== "action" ||
+          action.stepId !== step.id ||
+          action.generation !== run.sequence?.generation ||
+          response.expectedRevision !== run.progress.revision ||
+          !["uncertain", "failed"].includes(action.state)
+        )
+          return result(run, "conflict", "The publishing action changed. Refresh before retrying.");
+        if (yield* store.isExecuting(run.jobId))
+          return result(run, "busy", "Another workflow is executing.");
+        run = yield* store.save({
+          ...changeWorkflowAction(run, action.actionId, (entry) => ({
+            ...entry,
+            state: "running",
+            retryRevision: response.expectedRevision,
+            detail: null,
+          })),
+          progress: {
+            ...run.progress,
+            revision: run.progress.revision + 1,
+            status: "waiting_capacity",
+            detail: null,
+          },
+        });
+        return result(yield* reconcile(run));
+      }
       if (request.control.operation === "retry_preparation") {
         if (run.progress.revision !== request.control.expectedRevision)
           return result(run, "conflict", "This preparation changed. Refresh before retrying.");

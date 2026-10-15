@@ -448,6 +448,8 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
               return client.workflows.respond({ ...request, payload });
             case "request_changes":
               return client.workflows.respond({ ...request, payload });
+            case "retry_action":
+              return client.workflows.respond({ ...request, payload });
             case "retry_preparation":
               return client.workflows.respond({ ...request, payload });
             case "retry_cancellation":

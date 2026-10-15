@@ -120,3 +120,18 @@ it.effect.each(["stale", "launch-failure", "missing-result", "selected"] as cons
       }).pipe(Effect.provide(h.layer));
     }),
 );
+
+it.effect("requires native command-launch capability before exposing publishing", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    const native = yield* Adapter.SetupProcessAdapter.pipe(Effect.provide(h.layer));
+    assert.equal((yield* native.commandLauncher!.pipe(Effect.result))._tag, "Failure");
+    yield* Ref.update(h.output, (output) => ({
+      ...output,
+      stdout:
+        '{"protocol":4,"identity":null,"owned":false,"fullStop":false,"boot":null,"setupLaunchProtocol":1,"commandLaunchProtocol":1}',
+    }));
+    assert.equal(yield* native.commandLauncher!, "/native/helper");
+    assert.isTrue((yield* Ref.get(h.calls)).every((call) => call.args[1] === "host"));
+  }),
+);

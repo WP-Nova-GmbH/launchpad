@@ -1,3 +1,11 @@
+import * as Deferred from "effect/Deferred";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import {
+  WorkflowActions,
+  WorkflowActionError,
+  changeWorkflowAction,
+  type WorkflowActionIO,
+} from "./WorkflowActions.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
 import {
   ApprovalRequestId,
@@ -538,6 +546,14 @@ const harness = Effect.gen(function* () {
         ),
     }),
     Layer.mock(GitVcsDriver)({
+      execute: () =>
+        Effect.succeed({
+          exitCode: ChildProcessSpawner.ExitCode(0),
+          stdout: "prepared-tree",
+          stderr: "",
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        }),
       fetchRemote: () => Ref.update(fetches, (count) => count + 1),
       resolveDefaultBranchName: () => Effect.succeed("main"),
       resolveRemoteTrackingCommit: () =>
@@ -3089,4 +3105,654 @@ it.effect(
         assert.isTrue((yield* store.get("other-job"))!.executionReserved);
       }),
     ),
+);
+
+it.effect("publishing runs outside the control mutex and keeps Pause at the action boundary", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const actionService = WorkflowActions.of({
+        available: Effect.succeed(true),
+        recover: () => Effect.succeed(true),
+        execute: (id, io) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined);
+            yield* Deferred.await(release);
+            yield* Ref.set(h.head, "published-sha");
+            yield* io.update((run) => ({
+              ...changeWorkflowAction(run, id, (action) => ({
+                ...action,
+                state: "completed",
+                phase: "done",
+                commitSha: "published-sha",
+              })),
+              preparedHead: "published-sha",
+            }));
+          }),
+      });
+      const runner = yield* h.newRunner.pipe(Effect.provideService(WorkflowActions, actionService));
+      const original = request();
+      const start: WorkflowRequest = {
+        ...original,
+        control: {
+          ...original.control,
+          operation: "start",
+          workflow: {
+            ...workflow,
+            definition: {
+              ...workflow.definition,
+              steps: [
+                ...workflow.definition.steps,
+                { id: "push", kind: "action", title: "Push branch", action: "push" },
+              ],
+            },
+          },
+        },
+      };
+      assert.equal((yield* runner.handle(start)).protocol, 7);
+      yield* h.complete;
+      const review = (yield* runner.handle(control("status"))).progress!;
+      yield* runner.handle(approve(review));
+      yield* Deferred.await(started);
+      const running = (yield* runner.handle(control("status"))).progress!;
+      const paused = yield* runner.handle({
+        ...control("status"),
+        control: {
+          ...control("status").control,
+          operation: "pause",
+          controlId: "hold-push",
+          expectedRevision: running.revision,
+        },
+      });
+      assert.equal(paused.progress?.manualPause?.state, "requested");
+      yield* Deferred.succeed(release, undefined);
+      yield* h.awaitRun((run) => run.manualPause?.state === "paused");
+      const held = (yield* runner.handle(control("status"))).progress!;
+      assert.equal(held.manualPause?.state, "paused");
+      assert.equal(held.actions?.[0]?.state, "completed");
+      yield* runner.handle({
+        ...control("status"),
+        control: {
+          ...control("status").control,
+          operation: "resume",
+          controlId: "resume-push",
+          expectedRevision: held.revision,
+        },
+      });
+      const done = (yield* runner.handle(control("status"))).progress!;
+      assert.equal(done.status, "done");
+      assert.equal(
+        (yield* (yield* Store.WorkflowRunStore).get("job-1"))?.preparedHead,
+        "published-sha",
+      );
+      assert.equal((yield* h.starts).length, 1);
+    }),
+  ),
+);
+
+it.effect(
+  "Cancel interrupts publishing and keeps controls responsive while native cleanup is uncertain",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const started = yield* Deferred.make<void>();
+        const interrupted = yield* Deferred.make<void>();
+        const recoveries = yield* Queue.unbounded<void>();
+        const outcomes = yield* Queue.unbounded<boolean>();
+        const service = WorkflowActions.of({
+          available: Effect.succeed(true),
+          execute: (id, io) =>
+            Effect.gen(function* () {
+              yield* io.update((run) =>
+                changeWorkflowAction(run, id, (action) => ({
+                  ...action,
+                  commands: [
+                    {
+                      id: "command",
+                      phase: "push",
+                      pid: 42,
+                      identity: "birth",
+                      boot: { host: "host", session: "boot" },
+                      stopped: false,
+                      code: null,
+                    },
+                  ],
+                })),
+              );
+              yield* Deferred.succeed(started, undefined);
+              return yield* Effect.never;
+            }).pipe(Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined))),
+          recover: (io) =>
+            Effect.gen(function* () {
+              yield* Queue.offer(recoveries, undefined);
+              const stopped = yield* Queue.take(outcomes);
+              if (stopped)
+                yield* io.update((run) => ({
+                  ...run,
+                  actions: run.actions?.map((action) => ({
+                    ...action,
+                    commands: action.commands.map((command) => ({ ...command, stopped: true })),
+                  })),
+                }));
+              return stopped;
+            }),
+        });
+        const runner = yield* h.newRunner.pipe(Effect.provideService(WorkflowActions, service));
+        const original = request();
+        yield* runner.handle({
+          ...original,
+          control: {
+            ...original.control,
+            operation: "start",
+            workflow: {
+              ...workflow,
+              definition: {
+                ...workflow.definition,
+                steps: [
+                  ...workflow.definition.steps,
+                  { id: "push", title: "Push branch", kind: "action", action: "push" },
+                ],
+              },
+            },
+          },
+        });
+        yield* h.complete;
+        const review = (yield* runner.handle(control("status"))).progress!;
+        yield* runner.handle(approve(review));
+        yield* Deferred.await(started);
+        assert.equal((yield* runner.handle(control("cancel"))).progress?.status, "cancelling");
+        yield* Deferred.await(interrupted);
+        yield* Queue.take(recoveries);
+        assert.equal((yield* runner.handle(control("status"))).progress?.status, "cancelling");
+        assert.isTrue(yield* (yield* Store.WorkflowRunStore).isExecuting());
+        yield* Queue.offer(outcomes, false);
+        const blocked = yield* h.awaitRun((run) => run.progress.retryableCancellation === true);
+        assert.isTrue(blocked.executionReserved);
+        assert.equal(blocked.actions?.[0]?.commands[0]?.stopped, false);
+        yield* Ref.update(h.currentThread, (thread) => ({
+          ...thread!,
+          session: { ...thread!.session!, status: "stopped" as const },
+        }));
+        yield* Ref.set(h.providerProof, true);
+        const retry = control("status");
+        yield* runner.handle({
+          ...retry,
+          control: {
+            ...retry.control,
+            operation: "retry_cancellation",
+            expectedRevision: blocked.progress.revision,
+          },
+        });
+        yield* Queue.take(recoveries);
+        yield* Queue.offer(outcomes, true);
+        const cancelled = yield* h.awaitRun((run) => run.progress.status === "cancelled");
+        assert.isFalse(cancelled.executionReserved);
+        assert.isTrue(cancelled.actions![0]!.commands[0]!.stopped);
+        assert.equal((yield* h.starts).length, 1);
+      }),
+    ),
+);
+
+/** Persist the state a crash leaves; gracefully stopping a worker would mark it uncertain. */
+const seedPublishingRecovery = Effect.fn(function* (
+  h: Effect.Success<typeof harness>,
+  operation: Store.WorkflowActionRecord["operation"] = "push",
+  successor = false,
+) {
+  const bootstrap = yield* h.newRunner;
+  yield* bootstrap.handle(request());
+  yield* h.complete;
+  yield* bootstrap.handle(control("status"));
+  const store = yield* Store.WorkflowRunStore;
+  const saved = (yield* store.get("job-1"))!;
+  const checkpoint = saved.progress.checkpoint;
+  if (!checkpoint || checkpoint.kind === "input")
+    return yield* Effect.die("Publishing recovery needs the saved Agent checkpoint.");
+  const stepId = operation === "push" ? "push" : "pr";
+  const action: Store.WorkflowActionRecord = {
+    actionId: `workflow:job-1:action:${stepId}:0`,
+    stepId,
+    generation: 0,
+    operation,
+    state: "running",
+    phase: operation === "push" ? "push" : "pull_request",
+    parent: "base-sha",
+    tree: "prepared-tree",
+    checkpointRef: checkpoint.checkpointRef,
+    commitMessage: "Implement",
+    commitSha: operation === "push" ? "published-sha" : null,
+    oldRemoteSha: null,
+    prTitle: operation === "push" ? null : "Implement",
+    prBody: operation === "push" ? null : "Saved body <!-- launchpad-workflow-job:job-1 -->",
+    pullRequestUrl: null,
+    detail: null,
+    commands: [
+      {
+        id: "saved-command",
+        phase: operation === "push" ? "push" : "pull_request",
+        pid: 42,
+        identity: "saved-birth",
+        boot: { host: "host", session: "boot" },
+        stopped: false,
+        code: 0,
+      },
+    ],
+  };
+  const run: Store.WorkflowRun = {
+    ...saved,
+    workflow: {
+      ...saved.workflow,
+      definition: {
+        ...saved.workflow.definition,
+        steps: [
+          ...saved.workflow.definition.steps,
+          { id: "push", kind: "action", title: "Push", action: "push" },
+          ...(operation === "open_pull_request" || successor
+            ? [
+                {
+                  id: "pr",
+                  kind: "action" as const,
+                  title: "Open PR",
+                  action: "open_pull_request" as const,
+                },
+              ]
+            : []),
+        ],
+      },
+    },
+    sequence: {
+      ...saved.sequence!,
+      cursor: operation === "push" ? 2 : 3,
+      completed: [
+        ...saved.sequence!.completed,
+        { stepId: "review", generation: 0, checkpoint: null, head: null },
+        ...(operation === "open_pull_request"
+          ? [{ stepId: "push", generation: 0, checkpoint: null, head: "published-sha" }]
+          : []),
+      ],
+    },
+    preparedHead: "published-sha",
+    publication: {
+      remoteName: "origin",
+      remoteUrl: "https://github.com/acme/repo.git",
+      publishedHead: operation === "open_pull_request" ? "published-sha" : null,
+      pullRequestUrl: null,
+    },
+    manualPause: { state: "requested", promptId: `workflow:job-1:step:${stepId}:0:prompt` },
+    lastManualControl: {
+      operation: "pause",
+      controlId: "saved-pause",
+      expectedRevision: saved.progress.revision,
+    },
+    executionReserved: true,
+    progress: { ...saved.progress, status: "running", checkpoint: null, stepId },
+    actions: [
+      ...(operation === "open_pull_request"
+        ? [
+            {
+              ...action,
+              actionId: "workflow:job-1:action:push:0",
+              stepId: "push",
+              operation: "push" as const,
+              state: "completed" as const,
+              phase: "done" as const,
+              commitSha: "published-sha",
+              commands: [],
+            },
+          ]
+        : []),
+      action,
+    ],
+  };
+  yield* Ref.set(h.head, "published-sha");
+  return yield* store.save(run);
+});
+
+for (const status of ["done", "cancelled", "failed"] as const)
+  for (const completedAction of [false, true])
+    it.effect(
+      `terminal ${status} never restarts publishing with ${completedAction ? "completed" : "absent"} intent`,
+      () =>
+        test(
+          Effect.gen(function* () {
+            const h = yield* harness;
+            const seed = yield* seedPublishingRecovery(h);
+            const store = yield* Store.WorkflowRunStore;
+            const terminal = yield* store.save({
+              ...seed,
+              manualPause: null,
+              executionReserved: false,
+              progress: { ...seed.progress, status },
+              actions: completedAction
+                ? seed.actions!.map((action) => ({
+                    ...action,
+                    state: "completed",
+                    phase: "done",
+                    commands: [],
+                  }))
+                : [],
+            });
+            let executions = 0;
+            let recoveries = 0;
+            const runner = yield* h.newRunner.pipe(
+              Effect.provideService(
+                WorkflowActions,
+                WorkflowActions.of({
+                  available: Effect.succeed(true),
+                  execute: () =>
+                    Effect.sync(() => {
+                      executions++;
+                    }).pipe(Effect.andThen(Effect.never)),
+                  recover: () =>
+                    Effect.sync(() => {
+                      recoveries++;
+                      return true;
+                    }),
+                }),
+              ),
+            );
+            for (let index = 0; index < 2; index++)
+              assert.equal((yield* runner.handle(control("status"))).progress?.status, status);
+            yield* runner.handle(control("cancel"));
+            yield* runner.handle({
+              ...control("status"),
+              control: {
+                ...control("status").control,
+                operation: "retry_action",
+                actionId: "workflow:job-1:action:push:0",
+                expectedRevision: terminal.progress.revision,
+              },
+            });
+            assert.deepEqual(yield* store.get("job-1"), terminal);
+            assert.equal(executions, 0);
+            assert.equal(recoveries, 0);
+            assert.lengthOf(yield* h.starts, 1);
+            assert.isFalse(yield* store.isExecuting());
+          }),
+        ),
+    );
+
+for (const operation of ["push", "open_pull_request"] as const)
+  it.effect(
+    `requested Pause recovers reserved ${operation} once and blocks its next boundary`,
+    () =>
+      test(
+        Effect.gen(function* () {
+          const h = yield* harness;
+          const seed = yield* seedPublishingRecovery(h, operation, operation === "push");
+          const store = yield* Store.WorkflowRunStore;
+          yield* store.save({
+            ...seed,
+            jobId: "other-job",
+            manualPause: null,
+            lastManualControl: undefined,
+            workflow: {
+              ...seed.workflow,
+              definition: { ...seed.workflow.definition, steps: workflow.definition.steps },
+            },
+            worktreePath: null,
+            preparedHead: null,
+            promptDispatched: false,
+            executionReserved: false,
+            publication: undefined,
+            actions: [],
+            sequence: {
+              ...seed.sequence!,
+              cursor: 0,
+              started: false,
+              completed: [],
+              responses: [],
+            },
+            progress: {
+              ...seed.progress,
+              threadId: ThreadId.make("workflow:other-job:agent"),
+              status: "waiting_capacity",
+              stepId: "agent",
+              checkpoint: null,
+            },
+          });
+          const started = yield* Deferred.make<void>();
+          const stopped = yield* Deferred.make<void>();
+          const ids: string[] = [];
+          const recover = (io: WorkflowActionIO) =>
+            Deferred.await(stopped).pipe(
+              Effect.andThen(
+                io.update((run) => ({
+                  ...run,
+                  actions: run.actions?.map((action) => ({
+                    ...action,
+                    commands: action.commands.map((command) => ({ ...command, stopped: true })),
+                  })),
+                })),
+              ),
+              Effect.as(true),
+            );
+          const runner = yield* h.newRunner.pipe(
+            Effect.provideService(
+              WorkflowActions,
+              WorkflowActions.of({
+                available: Effect.succeed(true),
+                recover,
+                execute: (id, io) =>
+                  Effect.gen(function* () {
+                    ids.push(id);
+                    yield* Deferred.succeed(started, undefined);
+                    yield* recover(io);
+                    yield* io.update((run) => ({
+                      ...changeWorkflowAction(run, id, (action) => ({
+                        ...action,
+                        state: "completed",
+                        phase: "done",
+                        commitSha: "published-sha",
+                      })),
+                      publication: {
+                        ...run.publication!,
+                        publishedHead: "published-sha",
+                        pullRequestUrl:
+                          operation === "open_pull_request"
+                            ? "https://github.com/acme/repo/pull/17"
+                            : null,
+                      },
+                    }));
+                  }),
+              }),
+            ),
+          );
+          yield* Deferred.await(started);
+          for (let index = 0; index < 2; index++) {
+            const active = (yield* runner.handle(control("status"))).progress!;
+            assert.equal(active.manualPause?.state, "requested");
+            assert.equal(active.status, "running");
+          }
+          assert.isTrue(yield* store.isExecuting());
+          assert.isFalse((yield* store.get("other-job"))!.executionReserved);
+          assert.deepEqual(ids, [seed.actions!.at(-1)!.actionId]);
+          yield* Deferred.succeed(stopped, undefined);
+          const paused = yield* h.awaitRun((run) => run.manualPause?.state === "paused");
+          assert.isFalse(paused.executionReserved);
+          assert.equal(paused.sequence!.cursor, seed.sequence!.cursor + 1);
+          assert.equal(
+            paused.progress.status,
+            operation === "push" ? "waiting_capacity" : "finishing",
+          );
+          assert.deepEqual(paused.lastManualControl, seed.lastManualControl);
+          assert.deepEqual(
+            paused.actions!.at(-1)!.commands,
+            seed.actions!.at(-1)!.commands.map((command) => ({ ...command, stopped: true })),
+          );
+          assert.equal(paused.actions!.at(-1)!.prBody, seed.actions!.at(-1)!.prBody);
+          assert.lengthOf(
+            (yield* h.starts).filter((command) => command.threadId === seed.progress.threadId),
+            1,
+          );
+          assert.isUndefined(paused.approvalAttempt);
+          assert.equal(yield* Queue.size(h.cleanups), 0);
+          yield* runner.handle(control("status"));
+          assert.lengthOf(ids, 1);
+          yield* h.awaitRun((run) => run.jobId === "other-job" && run.executionReserved);
+          assert.isTrue((yield* store.get("other-job"))!.executionReserved);
+          assert.equal((yield* store.get("job-1"))!.manualPause?.state, "paused");
+        }),
+      ),
+  );
+
+for (const excluded of ["uncertain", "failed", "paused", "unreserved", "missing-intent"] as const)
+  it.effect(`requested-hold recovery does not admit ${excluded} actions`, () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const seed = yield* seedPublishingRecovery(h);
+        const store = yield* Store.WorkflowRunStore;
+        yield* store.save({
+          ...seed,
+          executionReserved: excluded !== "unreserved" && excluded !== "paused",
+          manualPause: { state: excluded === "paused" ? "paused" : "requested", promptId: "saved" },
+          actions:
+            excluded === "missing-intent"
+              ? []
+              : seed.actions!.map((action) => ({
+                  ...action,
+                  state: excluded === "uncertain" || excluded === "failed" ? excluded : "running",
+                })),
+        });
+        let executions = 0;
+        const runner = yield* h.newRunner.pipe(
+          Effect.provideService(
+            WorkflowActions,
+            WorkflowActions.of({
+              available: Effect.succeed(true),
+              recover: () => Effect.succeed(true),
+              execute: () =>
+                Effect.sync(() => {
+                  executions++;
+                }).pipe(Effect.andThen(Effect.never)),
+            }),
+          ),
+        );
+        yield* runner.handle(control("status"));
+        assert.equal(executions, 0);
+        assert.equal((yield* store.get("job-1"))!.sequence!.cursor, seed.sequence!.cursor);
+        assert.lengthOf(yield* h.starts, 1);
+      }),
+    ),
+  );
+
+it.effect("requested-hold recovery keeps ownership when stopping cannot be proven", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      yield* seedPublishingRecovery(h);
+      const recover = () => Effect.succeed(false);
+      const runner = yield* h.newRunner.pipe(
+        Effect.provideService(
+          WorkflowActions,
+          WorkflowActions.of({
+            available: Effect.succeed(true),
+            recover,
+            execute: () =>
+              recover().pipe(
+                Effect.andThen(
+                  Effect.fail(new WorkflowActionError({ message: "Cleanup unconfirmed" })),
+                ),
+              ),
+          }),
+        ),
+      );
+      yield* runner.handle(control("status"));
+      const failed = yield* h.awaitRun((run) => run.actions?.at(-1)?.state === "uncertain");
+      assert.isTrue(failed.executionReserved);
+      assert.equal(failed.manualPause?.state, "requested");
+      assert.include(failed.progress.detail!, "Cleanup unconfirmed");
+      assert.isFalse(failed.actions!.at(-1)!.commands[0]!.stopped);
+    }),
+  ),
+);
+
+it.effect("Resume during reserved-action recovery does not launch a second worker", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      yield* seedPublishingRecovery(h);
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let executions = 0;
+      const runner = yield* h.newRunner.pipe(
+        Effect.provideService(
+          WorkflowActions,
+          WorkflowActions.of({
+            available: Effect.succeed(true),
+            recover: () => Effect.succeed(true),
+            execute: (id, io) =>
+              Effect.gen(function* () {
+                executions++;
+                yield* Deferred.succeed(started, undefined);
+                yield* Deferred.await(release);
+                yield* io.update((run) => ({
+                  ...changeWorkflowAction(run, id, (action) => ({
+                    ...action,
+                    state: "completed",
+                    phase: "done",
+                    commitSha: "published-sha",
+                    commands: action.commands.map((command) => ({ ...command, stopped: true })),
+                  })),
+                }));
+              }),
+          }),
+        ),
+      );
+      yield* Deferred.await(started);
+      const active = (yield* runner.handle(control("status"))).progress!;
+      yield* runner.handle(manualRequest(active, "resume"));
+      yield* runner.handle(control("status"));
+      assert.equal(executions, 1);
+      yield* Deferred.succeed(release, undefined);
+      yield* h.awaitRun((run) => run.progress.status === "done");
+      assert.equal(executions, 1);
+    }),
+  ),
+);
+
+it.effect("Cancel during held recovery retains a late completed action without advancing it", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const seed = yield* seedPublishingRecovery(h, "push", true);
+      const savedReceipt = yield* Deferred.make<void>();
+      const runner = yield* h.newRunner.pipe(
+        Effect.provideService(
+          WorkflowActions,
+          WorkflowActions.of({
+            available: Effect.succeed(true),
+            recover: () => Effect.succeed(true),
+            execute: (id, io) =>
+              Effect.gen(function* () {
+                yield* io.update((run) =>
+                  changeWorkflowAction(run, id, (action) => ({
+                    ...action,
+                    state: "completed",
+                    phase: "done",
+                    commands: action.commands.map((command) => ({ ...command, stopped: true })),
+                  })),
+                );
+                yield* Deferred.succeed(savedReceipt, undefined);
+                return yield* Effect.never;
+              }),
+          }),
+        ),
+      );
+      yield* Deferred.await(savedReceipt);
+      yield* Ref.set(h.providerProof, true);
+      yield* Ref.update(h.currentThread, (thread) => ({ ...thread!, session: null }));
+      yield* runner.handle(control("cancel"));
+      const cancelled = yield* h.awaitRun((run) => run.progress.status === "cancelled");
+      assert.equal(cancelled.actions!.at(-1)!.state, "completed");
+      assert.equal(cancelled.sequence!.cursor, seed.sequence!.cursor);
+      assert.isFalse(cancelled.executionReserved);
+      assert.equal((yield* runner.handle(control("status"))).progress?.status, "cancelled");
+      assert.lengthOf(yield* h.starts, 1);
+    }),
+  ),
 );

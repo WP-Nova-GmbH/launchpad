@@ -155,8 +155,15 @@ export const make = Effect.gen(function* () {
     // exactly as it was.
     const resolvedEnv = yield* resolveRunnerEnv(input.env);
 
+    const beginOwner = yield* ProcessRunner.CurrentWorkflowCommand;
+    const owner = beginOwner
+      ? yield* beginOwner.pipe(
+          Effect.mapError((cause) => new VcsProcessSpawnError({ ...baseError, cause })),
+        )
+      : null;
     const result = yield* processRunner
       .run({
+        ...(owner ? { owner } : {}),
         command: input.command,
         args: input.args,
         cwd: input.cwd,

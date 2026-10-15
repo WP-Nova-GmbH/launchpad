@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import {
   workflowManualControlState,
+  workflowActionState,
   workflowManualSubmission,
 } from "@t3tools/client-runtime/relay/workflow-responses";
 import {
@@ -56,6 +57,8 @@ export function WorkflowJob({
   const read = reads.jobs[key] ?? emptyWorkflowJobRead;
   const selectedJob = read.job;
   const manualState = workflowManualControlState(selectedJob);
+  const actionState = workflowActionState(selectedJob);
+  const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const checkpoint = selectedJob?.progress?.checkpoint;
   const responseDrafts = drafts.responses[key] ?? {};
@@ -135,9 +138,15 @@ export function WorkflowJob({
                 checkpointId: checkpoint!.checkpointId,
                 expectedRevision: selectedJob.progress!.revision,
               }
-            : operation === "retry_preparation" || operation === "retry_cancellation"
-              ? { operation, expectedRevision: selectedJob.progress!.revision }
-              : { operation };
+            : operation === "retry_action"
+              ? {
+                  operation,
+                  actionId: actionState.action!.actionId,
+                  expectedRevision: selectedJob.progress!.revision,
+                }
+              : operation === "retry_preparation" || operation === "retry_cancellation"
+                ? { operation, expectedRevision: selectedJob.progress!.revision }
+                : { operation };
     const submitted = {
       checkpointId: checkpoint?.checkpointId ?? null,
       operation,
@@ -227,7 +236,7 @@ export function WorkflowJob({
       !!text.trim(),
   );
   return (
-    <div className="space-y-6">
+    <div className="min-w-0 space-y-6 wrap-anywhere">
       <header>
         <h1 className="text-xl font-semibold">
           {selectedJob.workflow?.definition.name ?? "Workflow run"}
@@ -245,8 +254,8 @@ export function WorkflowJob({
           {read.error} Showing the last acknowledged state.
         </p>
       ) : null}
-      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
-        <div className="space-y-5">
+      <div className="grid min-w-0 grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
+        <div className="min-w-0 space-y-5">
           <section className="space-y-4 rounded-lg border p-5" aria-label="Current workflow task">
             <div>
               <p className="text-xs text-muted-foreground">
@@ -262,9 +271,7 @@ export function WorkflowJob({
             {manualState.message ? (
               <p className="text-sm text-warning">{manualState.message}</p>
             ) : null}
-            {selectedJob.detail ? (
-              <p className="text-sm text-muted-foreground">{selectedJob.detail}</p>
-            ) : null}
+            {detail ? <p className="text-sm text-muted-foreground">{detail}</p> : null}
             {selectedJob.progress && selectedJob.progress.hasThread !== false ? (
               <div className="flex flex-wrap gap-2">
                 {checkpoint && checkpoint.kind !== "input" ? (
@@ -381,6 +388,20 @@ export function WorkflowJob({
             </details>
           ) : null}
           <div className="flex flex-wrap items-center gap-2">
+            {canConfigure && actionState.canRetry ? (
+              <Button
+                variant="outline"
+                disabled={busy}
+                onClick={() => void respond("retry_action")}
+              >
+                Retry publishing action
+              </Button>
+            ) : null}
+            {selectedJob.progress?.pullRequestUrl ? (
+              <a href={selectedJob.progress.pullRequestUrl} target="_blank" rel="noreferrer">
+                Open pull request
+              </a>
+            ) : null}
             {canConfigure && (manualState.canPause || manualState.canResume) ? (
               <Button
                 variant="outline"

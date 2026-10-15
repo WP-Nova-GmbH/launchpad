@@ -30,7 +30,14 @@ export const WorkflowInputStep = Schema.Struct({
   question: Instruction,
   role: Schema.Literals(["maintainer", "member"]),
 });
+export const WorkflowActionStep = Schema.Struct({
+  id: Label,
+  kind: Schema.Literal("action"),
+  title: Label,
+  action: Schema.Literals(["push", "open_pull_request"]),
+});
 export const WorkflowStep = Schema.Union([
+  WorkflowActionStep,
   WorkflowAgentStep,
   WorkflowReviewStep,
   WorkflowInputStep,
@@ -44,6 +51,18 @@ export function workflowDefinitionError(steps: ReadonlyArray<WorkflowStep>): str
   for (const [index, step] of steps.entries()) {
     if (ids.has(step.id)) return "Each workflow step needs a unique ID.";
     ids.add(step.id);
+    if (step.kind === "action") {
+      const earlier = steps.slice(0, index);
+      const lastAgent = earlier.findLastIndex((entry) => entry.kind === "agent");
+      if (lastAgent < 0) return "Publishing must follow an Agent step.";
+      if (
+        step.action === "open_pull_request" &&
+        !earlier
+          .slice(lastAgent + 1)
+          .some((entry) => entry.kind === "action" && entry.action === "push")
+      )
+        return "Open PR needs a Push branch step after the latest Agent.";
+    }
     if (step.kind !== "review") continue;
     const earlier = steps.slice(0, index).filter((candidate) => candidate.kind === "agent");
     if (!earlier.length) return "Review must follow an Agent step.";
@@ -128,7 +147,21 @@ const WorkflowExecutionStatus = Schema.Literals([
   "done",
   "failed",
 ]);
+export const WorkflowActionProgress = Schema.Struct({
+  retryRevision: Schema.optional(Revision),
+  actionId: TrimmedNonEmptyString,
+  stepId: Label,
+  generation: Revision,
+  operation: Schema.Literals(["push", "open_pull_request"]),
+  state: Schema.Literals(["running", "uncertain", "failed", "completed"]),
+  detail: Schema.NullOr(Schema.String),
+  commitSha: Schema.NullOr(Schema.String),
+  pullRequestUrl: Schema.NullOr(Schema.String),
+  retryable: Schema.Boolean,
+});
 export const WorkflowJobProgress = Schema.Struct({
+  pullRequestUrl: Schema.optional(Schema.NullOr(Schema.String)),
+  actions: Schema.optional(Schema.Array(WorkflowActionProgress)),
   revision: Revision,
   status: WorkflowExecutionStatus,
   threadId: ThreadId,
@@ -152,7 +185,7 @@ export type WorkflowJobProgress = typeof WorkflowJobProgress.Type;
 
 export const RepositoryWorkflowJob = Schema.Struct({
   /** Pinned with the offer so a downgrade cannot acknowledge newer lifecycle semantics. */
-  requiredProtocol: Schema.optional(Schema.Literals([2, 3, 4, 5, 6])),
+  requiredProtocol: Schema.optional(Schema.Literals([2, 3, 4, 5, 6, 7])),
   jobId: TrimmedNonEmptyString,
   repositoryId: TrimmedNonEmptyString,
   workflowId: TrimmedNonEmptyString,
@@ -202,6 +235,12 @@ const ControlBinding = {
   projectId: ProjectId,
 };
 export const WorkflowControl = Schema.Union([
+  Schema.Struct({
+    ...ControlBinding,
+    operation: Schema.Literal("retry_action"),
+    actionId: TrimmedNonEmptyString,
+    expectedRevision: Revision,
+  }),
   Schema.Struct({ ...ControlBinding, ...WorkflowManualControl.fields }),
   Schema.Struct({
     ...ControlBinding,
@@ -240,7 +279,8 @@ export const WorkflowControl = Schema.Union([
 ]);
 export type WorkflowControl = typeof WorkflowControl.Type;
 export const WorkflowControlResult = Schema.Struct({
-  protocol: Schema.Literals([1, 2, 3, 4, 5, 6]),
+  actions: Schema.optional(Schema.Array(Schema.Literals(["push", "open_pull_request"]))),
+  protocol: Schema.Literals([1, 2, 3, 4, 5, 6, 7]),
   outcome: Schema.Literals(["accepted", "cancelled", "missing", "busy", "unavailable", "conflict"]),
   detail: Schema.NullOr(Schema.String),
   progress: Schema.NullOr(WorkflowJobProgress),
@@ -258,6 +298,11 @@ export const RunRepositoryWorkflow = Schema.Struct({
   instruction: Instruction,
 });
 export const RespondToWorkflowJob = Schema.Union([
+  Schema.Struct({
+    operation: Schema.Literal("retry_action"),
+    actionId: TrimmedNonEmptyString,
+    expectedRevision: Revision,
+  }),
   WorkflowManualControl,
   Schema.Struct({ operation: Schema.Literal("cancel") }),
   Schema.Struct({ operation: Schema.Literal("retry_preparation"), expectedRevision: Revision }),
@@ -299,15 +344,19 @@ export function isTerminalWorkflowJob(status: RepositoryWorkflowJob["status"]): 
   return status === "done" || status === "cancelled" || status === "failed";
 }
 
-/** Automatic zones are consecutive Agent steps; each human step forms a boundary. */
+/** Automatic zones are consecutive Agent and action steps; each human step forms a boundary. */
 export function workflowZones(
   steps: ReadonlyArray<WorkflowStep>,
 ): ReadonlyArray<ReadonlyArray<WorkflowStep>> {
   const zones: Array<Array<WorkflowStep>> = [];
   for (const step of steps) {
     const previous = zones.at(-1);
-    if (step.kind === "agent" && previous?.[0]?.kind === "agent") previous.push(step);
+    if (isAutomaticWorkflowStep(step) && previous?.[0] && isAutomaticWorkflowStep(previous[0]))
+      previous.push(step);
     else zones.push([step]);
   }
   return zones;
 }
+
+export const isAutomaticWorkflowStep = (step: WorkflowStep) =>
+  step.kind === "agent" || step.kind === "action";

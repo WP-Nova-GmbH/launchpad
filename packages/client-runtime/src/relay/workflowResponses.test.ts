@@ -3,6 +3,7 @@ import type { WorkflowJobProgress, RepositoryWorkflowJob } from "@t3tools/contra
 import { describe, expect, it } from "vite-plus/test";
 import {
   clearAcknowledgedWorkflowDraft,
+  workflowActionState,
   workflowManualControlState,
   workflowManualSubmission,
   type WorkflowDraftSubmission,
@@ -239,4 +240,49 @@ describe("manual workflow controls", () => {
       clearAcknowledgedWorkflowDraft(drafts, { ...submitted, operation: "pause" }, failed.progress),
     ).toBe(drafts);
   });
+});
+
+it("offers publishing recovery only for the current uncertain action outside a manual hold", () => {
+  const job = manualJob();
+  const action = {
+    actionId: "publish",
+    stepId: "push",
+    generation: 2,
+    operation: "push" as const,
+    state: "uncertain" as const,
+    retryable: true,
+    detail: "Lost reply",
+    commitSha: "sha",
+    pullRequestUrl: null,
+  };
+  const paused = {
+    ...job,
+    status: "paused" as const,
+    progress: {
+      ...job.progress!,
+      status: "paused" as const,
+      stepId: "push",
+      generation: 2,
+      actions: [action],
+    },
+  };
+  expect(workflowActionState(paused).canRetry).toBe(true);
+  expect(
+    workflowActionState({ ...paused, progress: { ...paused.progress, generation: 3 } }).canRetry,
+  ).toBe(false);
+  expect(
+    workflowActionState({
+      ...paused,
+      progress: { ...paused.progress, manualPause: { state: "paused" } },
+    }).canRetry,
+  ).toBe(false);
+  expect(
+    workflowActionState({
+      ...paused,
+      progress: {
+        ...paused.progress,
+        actions: [{ ...action, state: "completed", retryable: false }],
+      },
+    }).canRetry,
+  ).toBe(false);
 });

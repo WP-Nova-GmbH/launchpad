@@ -20,6 +20,7 @@ const State = Schema.Struct({
   fullStop: Schema.Boolean,
   boot: Schema.NullOr(BootEvidence),
   setupLaunchProtocol: Schema.optional(Schema.Literal(1)),
+  commandLaunchProtocol: Schema.optional(Schema.Int),
   launch: Schema.optional(
     Schema.NullOr(
       Schema.Struct({
@@ -34,6 +35,7 @@ export class SetupProcessAdapter extends Context.Service<
   SetupProcessAdapter,
   {
     readonly launcher: Effect.Effect<string, SetupProcessError>;
+    readonly commandLauncher?: Effect.Effect<string, SetupProcessError>;
     readonly host: Effect.Effect<typeof BootEvidence.Type | null, SetupProcessError>;
     readonly inspect: (pid: number) => Effect.Effect<typeof State.Type, SetupProcessError>;
     readonly arm: (pid: number, identity: string) => Effect.Effect<string, SetupProcessError>;
@@ -64,6 +66,17 @@ export const layer = Layer.effect(
     );
     const host = invoke(["host"]).pipe(Effect.map((state) => state.boot));
     return SetupProcessAdapter.of({
+      commandLauncher: Effect.gen(function* () {
+        const state = yield* invoke(["host"]);
+        if (state.commandLaunchProtocol !== 1)
+          return yield* new SetupProcessError({
+            message:
+              "Owned workflow commands require an updated native helper on a supported host.",
+          });
+        return yield* binary.resolve.pipe(
+          Effect.mapError((error) => new SetupProcessError({ message: error.message })),
+        );
+      }),
       // Probe the resolved binary before opening a PTY: stale helpers cannot deliver setup.
       launcher: Effect.gen(function* () {
         const state = yield* invoke(["host"]);

@@ -11,6 +11,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import {
   BotIcon,
+  UploadIcon,
   MessageSquareIcon,
   UserRoundCheckIcon,
   GripVerticalIcon,
@@ -25,6 +26,7 @@ import { useCallback, useLayoutEffect, useRef, useState, type CSSProperties } fr
 import {
   workflowZones,
   type WorkflowDefinition,
+  isAutomaticWorkflowStep,
   type WorkflowStep,
 } from "@t3tools/contracts/workflows";
 import type { workflowModelState } from "../settings/workflowModels";
@@ -63,7 +65,7 @@ export function WorkflowCanvas({
   pending: boolean;
   onSelect: (id: string) => void;
   onReorder: (steps: ReadonlyArray<WorkflowStep>) => boolean;
-  onInsert: (anchor: WorkflowInsertion, kind: WorkflowStep["kind"]) => void;
+  onInsert: (anchor: WorkflowInsertion, kind: WorkflowStep["kind"] | "open_pull_request") => void;
   onOverview: () => void;
   panelOpen: boolean;
   movementVersion?: number;
@@ -173,7 +175,7 @@ export function WorkflowCanvas({
               />
             </div>
             {workflowZones(definition.steps).map((zone) => {
-              const kind = zone[0]!.kind;
+              const kind = isAutomaticWorkflowStep(zone[0]!) ? "agent" : zone[0]!.kind;
               return (
                 <section
                   key={zone[0]!.id}
@@ -193,9 +195,13 @@ export function WorkflowCanvas({
                     const summary =
                       step.kind === "agent"
                         ? `Agent · ${models.triggerLabel(step) ?? models.effectiveSelection(step)?.model ?? "Project default"}`
-                        : step.role === "member"
-                          ? "Repository members"
-                          : "Maintainers";
+                        : step.kind === "action"
+                          ? step.action === "push"
+                            ? "Commit and push branch"
+                            : "Open pull request"
+                          : step.role === "member"
+                            ? "Repository members"
+                            : "Maintainers";
                     return (
                       <div key={step.id} className={styles["workflow-canvas-row"]}>
                         {zoneIndex === 0 ? (
@@ -216,7 +222,7 @@ export function WorkflowCanvas({
                             </strong>
                             <span>
                               {kind === "agent"
-                                ? "Agent continues the work"
+                                ? "Automatic steps continue the work"
                                 : kind === "input"
                                   ? "Waits for an answer"
                                   : "Waits for approval"}
@@ -364,7 +370,9 @@ function CanvasNode({
           }
         >
           <span className={styles["workflow-node-icon"]} data-kind={step.kind}>
-            {step.kind === "agent" ? (
+            {step.kind === "action" ? (
+              <UploadIcon />
+            ) : step.kind === "agent" ? (
               <BotIcon />
             ) : step.kind === "input" ? (
               <MessageSquareIcon />
@@ -404,7 +412,7 @@ function InsertMenu({
   definition: WorkflowDefinition;
   anchor: WorkflowInsertion;
   disabled: boolean;
-  onInsert: (anchor: WorkflowInsertion, kind: WorkflowStep["kind"]) => void;
+  onInsert: (anchor: WorkflowInsertion, kind: WorkflowStep["kind"] | "open_pull_request") => void;
   label: string;
   toolbar?: boolean;
 }) {
@@ -442,7 +450,7 @@ function InsertMenu({
         ) : null}
       </MenuTrigger>
       <MenuPopup finalFocus={() => !inserted.current}>
-        {(["agent", "input", "review"] as const).map((kind) => (
+        {(["agent", "input", "review", "action", "open_pull_request"] as const).map((kind) => (
           <MenuItem
             key={kind}
             onClick={() => {
@@ -453,14 +461,24 @@ function InsertMenu({
               setCaptured(null);
             }}
           >
-            {kind === "agent" ? (
+            {kind === "action" || kind === "open_pull_request" ? (
+              <UploadIcon />
+            ) : kind === "agent" ? (
               <BotIcon />
             ) : kind === "input" ? (
               <MessageSquareIcon />
             ) : (
               <UserRoundCheckIcon />
             )}
-            {kind === "agent" ? "Agent step" : kind === "input" ? "Human input" : "Human review"}
+            {kind === "open_pull_request"
+              ? "Open PR"
+              : kind === "action"
+                ? "Push branch"
+                : kind === "agent"
+                  ? "Agent step"
+                  : kind === "input"
+                    ? "Human input"
+                    : "Human review"}
           </MenuItem>
         ))}
       </MenuPopup>

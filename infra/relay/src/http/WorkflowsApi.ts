@@ -47,6 +47,25 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     payload.operation === "request_changes";
   if (!checkpointResponse || row.record.progress?.checkpoint?.role !== "member")
     yield* requireMaintainableRepository({ membership, repositoryId: params.repositoryId });
+  if (payload.operation === "retry_action") {
+    const pending = row.pendingControl;
+    if (
+      pending?.response.operation === "retry_action" &&
+      pending.response.actionId === payload.actionId &&
+      pending.response.expectedRevision === payload.expectedRevision
+    ) {
+      if (pending.userId !== membership.userId)
+        return yield* new WorkflowConflictError({
+          message: "This retry belongs to another request.",
+        });
+      return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+    }
+    const receipt = row.record.progress?.actions?.find(
+      (action) => action.actionId === payload.actionId,
+    );
+    if (!pending && receipt?.retryRevision === payload.expectedRevision)
+      return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+  }
   const manual = payload.operation === "pause" || payload.operation === "resume";
   if (manual) {
     const pending = row.pendingControl?.response;
@@ -111,6 +130,20 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     return yield* new WorkflowConflictError({
       message: "A response is already waiting for acknowledgement. Refresh the job.",
     });
+  if (payload.operation === "retry_action") {
+    const progress = row.record.progress;
+    const action = progress?.actions?.findLast((entry) => entry.actionId === payload.actionId);
+    if (
+      !progress ||
+      progress.revision !== payload.expectedRevision ||
+      !action?.retryable ||
+      action.stepId !== progress.stepId ||
+      action.generation !== progress.generation
+    )
+      return yield* new WorkflowConflictError({
+        message: "This publishing action changed. Refresh before retrying.",
+      });
+  }
   if (
     payload.operation === "retry_cancellation" &&
     (row.record.progress?.status !== "cancelling" ||
@@ -151,12 +184,22 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     {
       ...row.record,
       ...(manual
-        ? { requiredProtocol: 6 as const, pendingManualControl: payload }
+        ? {
+            requiredProtocol: row.record.requiredProtocol === 7 ? (7 as const) : (6 as const),
+            pendingManualControl: payload,
+          }
         : payload.operation === "cancel"
           ? { pendingManualControl: null }
           : {}),
       ...(payload.operation === "input" || payload.operation === "request_changes"
-        ? { requiredProtocol: row.record.requiredProtocol === 6 ? (6 as const) : (5 as const) }
+        ? {
+            requiredProtocol:
+              row.record.requiredProtocol === 7
+                ? (7 as const)
+                : row.record.requiredProtocol === 6
+                  ? (6 as const)
+                  : (5 as const),
+          }
         : {}),
       ...(payload.operation === "cancel"
         ? {

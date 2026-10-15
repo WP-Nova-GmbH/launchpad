@@ -125,6 +125,7 @@ const harness = Effect.gen(function* () {
     | "protocol2"
     | "protocol3"
     | "protocol5"
+    | "protocol7"
     | "pause-waiting"
     | "cancel_during_approve"
   >("online");
@@ -311,6 +312,32 @@ const harness = Effect.gen(function* () {
               record: { ...value.record, status: "cancelling" as const },
               pendingControl: { userId: "canceller", response: { operation: "cancel" as const } },
             }));
+          }
+          if (current === "protocol7") {
+            if (input.workflowControl?.operation === "start") {
+              yield* Ref.update(offers, (all) => [
+                ...all,
+                input.workflowControl!.operation === "start"
+                  ? input.workflowControl!.workflow
+                  : workflow,
+              ]);
+              return {
+                accepted: true,
+                workflowResult: {
+                  ...accepted,
+                  protocol: 7 as const,
+                  actions: ["push" as const, "open_pull_request" as const],
+                },
+              };
+            }
+            return {
+              accepted: false,
+              workflowResult: {
+                ...((yield* Ref.get(reply)) ?? missing),
+                protocol: 7 as const,
+                actions: ["push" as const, "open_pull_request" as const],
+              },
+            };
           }
           const override = yield* Ref.get(reply);
           if (override) return { accepted: true, workflowResult: override };
@@ -823,5 +850,60 @@ it.effect("a saved Pause holds an accepted capacity waiter before any advancing 
     assert.strictEqual(result?.progress?.underlyingStatus, "waiting_capacity");
     assert.strictEqual(result?.progress?.revision, 2);
     assert.isNull((yield* Ref.get(h.row)).pendingControl);
+  }),
+);
+
+it.effect(
+  "requires publishing capabilities before offering and retains protocol 7 across downgrade",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* harness;
+      yield* Ref.update(h.definition, (value) => ({
+        ...value,
+        definition: {
+          ...value.definition,
+          steps: [
+            ...value.definition.steps,
+            { id: "push", kind: "action" as const, title: "Push branch", action: "push" as const },
+            {
+              id: "pr",
+              kind: "action" as const,
+              title: "Open PR",
+              action: "open_pull_request" as const,
+            },
+          ],
+        },
+      }));
+      const unsupported = yield* h.refresh;
+      assert.equal(unsupported?.status, "queued");
+      assert.equal((yield* Ref.get(h.offers)).length, 0);
+      yield* Ref.set(h.mode, "protocol7");
+      assert.equal((yield* h.refresh)?.status, "running");
+      assert.equal((yield* Ref.get(h.row)).record.requiredProtocol, 7);
+      assert.equal((yield* Ref.get(h.offers)).length, 1);
+      yield* Ref.set(h.reply, {
+        ...accepted,
+        protocol: 6,
+        progress: { ...accepted.progress!, revision: 99, status: "done" },
+      });
+      yield* Ref.set(h.mode, "online");
+      const held = yield* h.refresh;
+      assert.equal(held?.status, "running");
+      assert.equal(held?.requiredProtocol, 7);
+      assert.include(held!.detail!, "Update this environment");
+    }),
+);
+it.effect("archive blocks unoffered jobs while accepted runs retain their frozen definition", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* Ref.update(h.definition, (value) => ({ ...value, archived: true }));
+    assert.equal((yield* h.refresh)?.status, "queued");
+    assert.equal((yield* Ref.get(h.offers)).length, 0);
+    yield* Ref.update(h.definition, (value) => ({ ...value, archived: false }));
+    assert.equal((yield* h.refresh)?.status, "running");
+    yield* Ref.update(h.definition, (value) => ({ ...value, archived: true, revision: 2 }));
+    const active = yield* h.refresh;
+    assert.equal(active?.status, "running");
+    assert.equal(active?.workflow?.revision, 1);
   }),
 );

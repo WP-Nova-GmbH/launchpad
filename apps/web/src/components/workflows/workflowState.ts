@@ -6,6 +6,7 @@ import {
   workflowJobReadAtom,
   updateWorkflowDrafts,
   workflowSessionKey,
+  replaceNewWorkflowDraft,
   sameWorkflowDefinition,
   type WorkflowScope,
   type WorkflowEditorDraft,
@@ -122,6 +123,7 @@ export const savedWorkflowDraft = (workflow: RepositoryWorkflow): WorkflowEditor
 
 export function newWorkflowDraft(
   projects: ReadonlyArray<RelayOrganizationProject>,
+  template: "review" | "publish" = "review",
 ): WorkflowEditorDraft | null {
   const target = projects[0];
   if (!target) return null;
@@ -133,7 +135,7 @@ export function newWorkflowDraft(
     operation: null,
     error: null,
     definition: {
-      name: "New workflow",
+      name: template === "publish" ? "Reviewed implementation" : "New workflow",
       environmentId: target.environmentId,
       projectId: target.projectId,
       steps: [
@@ -145,9 +147,78 @@ export function newWorkflowDraft(
           modelSelection: null,
         },
         { id: "review", kind: "review", title: "Review changes", role: "maintainer" },
+        ...(template === "publish"
+          ? [
+              {
+                id: "push",
+                kind: "action" as const,
+                title: "Push branch",
+                action: "push" as const,
+              },
+              {
+                id: "pr",
+                kind: "action" as const,
+                title: "Open PR",
+                action: "open_pull_request" as const,
+              },
+            ]
+          : []),
       ],
     },
   };
+}
+
+export function copiedWorkflowDraft(
+  source: RepositoryWorkflow,
+  projects: ReadonlyArray<RelayOrganizationProject>,
+  sameRepository: boolean,
+) {
+  const draft = newWorkflowDraft(projects);
+  if (!draft) return null;
+  const target = sameRepository
+    ? projects.find(
+        (project) =>
+          project.environmentId === source.definition.environmentId &&
+          project.projectId === source.definition.projectId,
+      )
+    : undefined;
+  return {
+    ...draft,
+    targetConfirmed: !!target || projects.length === 1,
+    definition: {
+      ...draft.definition,
+      name: `Copy of ${source.definition.name}`.slice(0, 120),
+      ...(target ? { environmentId: target.environmentId, projectId: target.projectId } : {}),
+      steps: structuredClone(source.definition.steps),
+    },
+  };
+}
+
+/** Draft replacement is explicit and cannot displace a pending or uncertain Create. */
+export async function openNewWorkflowDraft(
+  scope: WorkflowScope,
+  create: () => WorkflowEditorDraft | null,
+) {
+  const state = appAtomRegistry.get(workflowDraftAtom);
+  if (state.accountId !== scope.accountId) return null;
+  const id = state.newWorkflowIds[workflowSessionKey(scope, "new")];
+  const previous = id ? state.editors[workflowSessionKey(scope, id)] : undefined;
+  if (previous?.operation)
+    throw new Error(
+      "Finish or reconcile the retained new workflow's save before starting another draft.",
+    );
+  if (
+    previous &&
+    !previous.baseline &&
+    !(await confirmWorkflow("Discard the retained new workflow draft and start this one?"))
+  )
+    return null;
+  const draft = create();
+  if (!draft)
+    throw new Error(
+      "Enroll an organization machine with a checkout in the destination repository first.",
+    );
+  return replaceNewWorkflowDraft(appAtomRegistry, scope, previous, draft) ? draft.workflowId : null;
 }
 
 export function useActiveWorkflowView() {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -28,6 +29,7 @@ function asChildProcessCommand(command: unknown): ChildProcessCommand {
 }
 
 function makeHandle(input: {
+  readonly control?: string;
   readonly stdout?: string | Stream.Stream<Uint8Array>;
   readonly stderr?: string | Stream.Stream<Uint8Array>;
   readonly code?: number;
@@ -51,7 +53,8 @@ function makeHandle(input: {
         : (input.stderr ?? Stream.empty),
     all: Stream.empty,
     getInputFd: () => Sink.drain,
-    getOutputFd: () => Stream.empty,
+    getOutputFd: (fd) =>
+      fd === 3 && input.control ? Stream.encodeText(Stream.make(input.control)) : Stream.empty,
   });
 }
 
@@ -63,6 +66,15 @@ function makeSpawner(
   return ChildProcessSpawner.make((command) => f(asChildProcessCommand(command)));
 }
 
+const decodeLaunchRequest = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      candidates: Schema.Array(
+        Schema.Struct({ shell: Schema.String, args: Schema.Array(Schema.String) }),
+      ),
+    }),
+  ),
+);
 const runWith =
   (spawner: ChildProcessSpawner.ChildProcessSpawner["Service"]) =>
   (input: ProcessRunner.ProcessRunInput) =>
@@ -412,3 +424,79 @@ describe("isWindowsCommandNotFound", () => {
     }),
   );
 });
+
+it.effect("uses private command results and captures ownership before arming", () =>
+  Effect.gen(function* () {
+    const events: string[] = [];
+    const spawner = makeSpawner((command) =>
+      Effect.sync(() => {
+        expect(command.command).toBe("native-owner");
+        expect(command.args[0]).toBe("--command-owner-v1");
+        const request = decodeLaunchRequest(command.args[2]!);
+        expect(request.candidates).toEqual([
+          { shell: "git", args: ["commit", "-m", "exact message"] },
+        ]);
+        return makeHandle({
+          stdout: '{"protocol":1,"code":0}',
+          control: '{"protocol":1,"code":37}\n',
+          exitCode: Effect.never,
+        });
+      }),
+    );
+    const result = yield* runWith(spawner)({
+      command: "git",
+      args: ["commit", "-m", "exact message"],
+      owner: {
+        executable: "native-owner",
+        capture: () =>
+          Effect.sync(() => {
+            events.push("capture");
+          }),
+        arm: Effect.sync(() => {
+          events.push("arm");
+        }),
+        completed: (code) =>
+          Effect.sync(() => {
+            events.push(`result:${code}`);
+          }),
+        stop: Effect.sync(() => {
+          events.push("stop");
+        }),
+      },
+    });
+    expect(result.code).toBe(37);
+    expect(events.slice(0, 4)).toEqual(["capture", "arm", "result:37", "stop"]);
+  }),
+);
+it.effect("never arms after a failed ownership capture and attempts cleanup", () =>
+  Effect.gen(function* () {
+    const events: string[] = [];
+    const spawner = makeSpawner(() =>
+      Effect.succeed(makeHandle({ control: '{"protocol":1,"code":0}\n' })),
+    );
+    const outcome = yield* runWith(spawner)({
+      command: "git",
+      args: ["push"],
+      owner: {
+        executable: "native-owner",
+        capture: () =>
+          Effect.fail(
+            new ProcessRunner.ProcessOwnershipError({
+              command: "git",
+              argumentCount: 1,
+              cause: "Save failed",
+            }),
+          ),
+        arm: Effect.sync(() => {
+          events.push("arm");
+        }),
+        completed: () => Effect.void,
+        stop: Effect.sync(() => {
+          events.push("stop");
+        }),
+      },
+    }).pipe(Effect.result);
+    expect(outcome._tag).toBe("Failure");
+    expect(events).toEqual(["stop"]);
+  }),
+);

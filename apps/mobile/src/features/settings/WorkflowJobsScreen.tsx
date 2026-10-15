@@ -21,6 +21,7 @@ import { useNavigation, useIsFocused, type StaticScreenProps } from "@react-navi
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import {
   workflowManualControlState,
+  workflowActionState,
   workflowManualSubmission,
 } from "@t3tools/client-runtime/relay/workflow-responses";
 import type {
@@ -37,7 +38,7 @@ import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 import { useCallback, useEffect, useState, useMemo } from "react";
-import { Alert, AppState, View, TextInput } from "react-native";
+import { Linking, Alert, AppState, View, TextInput } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { runtime } from "../../lib/runtime";
 import { uuidv4 } from "../../lib/uuid";
@@ -113,6 +114,8 @@ function WorkflowJobsContent(props: Props) {
   const read = reads.jobs[jobKey] ?? emptyWorkflowJobRead;
   const selectedJob = read.job;
   const manualState = workflowManualControlState(selectedJob);
+  const actionState = workflowActionState(selectedJob);
+  const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
   const terminal = !!selectedJob && isTerminalWorkflowJob(selectedJob.status);
   const responseDrafts = drafts.responses[jobKey] ?? {};
   const [feedbackOpen, setFeedbackOpen] = useState(false);
@@ -276,6 +279,7 @@ function WorkflowJobsContent(props: Props) {
       | "input"
       | "request_changes"
       | "cancel"
+      | "retry_action"
       | "retry_preparation"
       | "retry_cancellation"
       | "pause"
@@ -311,9 +315,15 @@ function WorkflowJobsContent(props: Props) {
                   checkpointId: checkpoint!.checkpointId,
                   expectedRevision: selectedJob.progress!.revision,
                 } as const)
-              : operation === "retry_preparation" || operation === "retry_cancellation"
-                ? { operation, expectedRevision: selectedJob.progress!.revision }
-                : { operation };
+              : operation === "retry_action"
+                ? {
+                    operation,
+                    actionId: actionState.action!.actionId,
+                    expectedRevision: selectedJob.progress!.revision,
+                  }
+                : operation === "retry_preparation" || operation === "retry_cancellation"
+                  ? { operation, expectedRevision: selectedJob.progress!.revision }
+                  : { operation };
       const submitted = {
         checkpointId: checkpoint?.checkpointId ?? null,
         operation,
@@ -391,9 +401,7 @@ function WorkflowJobsContent(props: Props) {
                   Next: {manualState.status?.replaceAll("_", " ")}
                 </Text>
               ) : null}
-              {selectedJob.detail ? (
-                <Text className="text-foreground-muted">{selectedJob.detail}</Text>
-              ) : null}
+              {detail ? <Text className="text-foreground-muted">{detail}</Text> : null}
             </View>
           </SettingsSection>
           <SettingsSection title="Current task">
@@ -547,6 +555,22 @@ function WorkflowJobsContent(props: Props) {
             </SettingsSection>
           ) : null}
           <SettingsSection title="Run controls">
+            {canRespond && actionState.canRetry ? (
+              <SettingsActionRow
+                icon="arrow.clockwise"
+                label="Retry publishing action"
+                disabled={busy}
+                onPress={() => respond("retry_action")}
+              />
+            ) : null}
+            {selectedJob.progress?.pullRequestUrl ? (
+              <SettingsRow
+                icon="link"
+                label="Pull request"
+                value={selectedJob.progress.pullRequestUrl}
+                onPress={() => void Linking.openURL(selectedJob.progress!.pullRequestUrl!)}
+              />
+            ) : null}
             {canRespond &&
             manualState.status === "paused" &&
             selectedJob.progress?.retryablePreparation ? (
@@ -610,13 +634,13 @@ function WorkflowJobsContent(props: Props) {
                 <View
                   key={zone[0]!.id}
                   className={
-                    zone[0]!.kind === "agent"
+                    zone[0]!.kind === "agent" || zone[0]!.kind === "action"
                       ? "gap-2 border-l-2 border-outline pl-3"
                       : "gap-2 border-l-2 border-amber-500/40 pl-3"
                   }
                 >
                   <Text className="text-xs text-foreground-muted">
-                    {zone[0]!.kind === "agent"
+                    {zone[0]!.kind === "agent" || zone[0]!.kind === "action"
                       ? "Automatic work"
                       : zone[0]!.kind === "input"
                         ? "Human input"
@@ -628,7 +652,7 @@ function WorkflowJobsContent(props: Props) {
                       className={
                         selectedJob.progress?.stepId === step.id ||
                         selectedJob.progress?.checkpoint?.stepId === step.id
-                          ? step.kind === "agent"
+                          ? step.kind === "agent" || step.kind === "action"
                             ? "gap-1 rounded-lg bg-grouped-card p-2"
                             : "gap-1 rounded-lg bg-amber-500/5 p-2"
                           : "gap-1 p-2"

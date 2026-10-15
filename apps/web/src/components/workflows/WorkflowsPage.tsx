@@ -1,4 +1,4 @@
-import { ArrowLeftIcon } from "lucide-react";
+import { ArrowLeftIcon, CopyIcon, ChevronDownIcon } from "lucide-react";
 import { useAuth } from "@clerk/react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useEffect, useState, useCallback, useRef } from "react";
@@ -30,6 +30,16 @@ import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
+import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
+import {
+  Dialog,
+  DialogPopup,
+  DialogTitle,
+  DialogDescription,
+  DialogHeader,
+  DialogPanel,
+  DialogFooter,
+} from "../ui/dialog";
 import { Select, SelectPopup, SelectTrigger, SelectValue, SelectItem } from "../ui/select";
 import { WorkflowBuilder } from "./WorkflowBuilder";
 import { WorkflowRun } from "./WorkflowRun";
@@ -40,6 +50,9 @@ import {
   workflowError,
   savedWorkflowDraft,
   newWorkflowDraft,
+  copiedWorkflowDraft,
+  openNewWorkflowDraft,
+  useActiveWorkflowView,
   confirmWorkflow,
   saveWorkflowDraft,
 } from "./workflowState";
@@ -159,6 +172,11 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
       scope={scope}
       entry={entry}
       repositories={catalog.data.repositories}
+      allProjects={catalog.data.projects}
+      copyRepositories={catalog.data.repositories.filter(
+        (destination) =>
+          catalog.data!.membership.role === "admin" || destination.role === "maintainer",
+      )}
       projects={catalog.data.projects.filter(
         (project) =>
           project.repositoryCanonicalKey !== null &&
@@ -188,6 +206,8 @@ function WorkflowRepositoryView({
   scope,
   entry,
   repositories,
+  allProjects,
+  copyRepositories,
   projects,
   canConfigure,
   view,
@@ -195,6 +215,8 @@ function WorkflowRepositoryView({
   scope: WorkflowScope;
   entry: RelayRepositorySummary;
   repositories: ReadonlyArray<RelayRepositorySummary>;
+  copyRepositories: ReadonlyArray<RelayRepositorySummary>;
+  allProjects: ReadonlyArray<RelayOrganizationProject>;
   projects: ReadonlyArray<RelayOrganizationProject>;
   canConfigure: boolean;
   view: WorkflowView;
@@ -211,6 +233,84 @@ function WorkflowRepositoryView({
   const [jobs, setJobs] = useState<ReadonlyArray<RepositoryWorkflowJobSummary>>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const active = useActiveWorkflowView();
+  const [copy, setCopy] = useState<RepositoryWorkflow | null>(null);
+  const [copyDestination, setCopyDestination] = useState<string>(scope.repositoryId);
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const copyRequest = useRef<object | null>(null);
+  const closeCopy = () => {
+    copyRequest.current = null;
+    setCopy(null);
+    setCopyBusy(false);
+    setCopyError(null);
+  };
+  const copySaved = async () => {
+    if (!copy || copyBusy) return;
+    const destination = copyRepositories.find(
+      (entry) => entry.repository.repositoryId === copyDestination,
+    );
+    if (!destination) {
+      setCopyError("Choose a repository you can configure.");
+      return;
+    }
+    const request = {};
+    copyRequest.current = request;
+    setCopyBusy(true);
+    setCopyError(null);
+    const owns = () => active.current && copyRequest.current === request;
+    try {
+      const saved = (
+        await call((client, token) =>
+          client.listWorkflows({ clerkToken: token, repositoryId: scope.repositoryId }),
+        )
+      ).find((entry) => entry.workflowId === copy.workflowId);
+      if (!owns()) return;
+      if (!saved) throw new Error("The saved source workflow is no longer available.");
+      const destinationScope = { ...scope, repositoryId: destination.repository.repositoryId };
+      const targets = allProjects.filter(
+        (project) =>
+          project.repositoryCanonicalKey !== null &&
+          destination.repository.canonicalKeys.includes(project.repositoryCanonicalKey),
+      );
+      const id = await openNewWorkflowDraft(destinationScope, () =>
+        owns()
+          ? copiedWorkflowDraft(
+              saved,
+              targets,
+              destinationScope.repositoryId === scope.repositoryId,
+            )
+          : null,
+      );
+      if (!owns() || !id) return;
+      closeCopy();
+      void navigate({
+        to: "/workflows/$repositoryId/new",
+        params: { repositoryId: destinationScope.repositoryId },
+      });
+    } catch (cause) {
+      if (owns()) setCopyError(workflowError(cause));
+    } finally {
+      if (owns()) {
+        copyRequest.current = null;
+        setCopyBusy(false);
+      }
+    }
+  };
+  const useTemplate = async (template: "review" | "publish") => {
+    try {
+      const id = await openNewWorkflowDraft(scope, () =>
+        active.current ? newWorkflowDraft(projects, template) : null,
+      );
+      if (active.current && id)
+        void navigate({
+          to: "/workflows/$repositoryId/new",
+          params: { repositoryId: scope.repositoryId },
+        });
+    } catch (cause) {
+      if (active.current) setError(workflowError(cause));
+    }
+  };
   const loadGeneration = useRef(0);
   const refresh = useCallback(async () => {
     const generation = ++loadGeneration.current;
@@ -257,7 +357,7 @@ function WorkflowRepositoryView({
   const archive = async (workflow: RepositoryWorkflow) => {
     const key = workflowSessionKey(scope, workflow.workflowId);
     const existing = appAtomRegistry.get(workflowDraftAtom).editors[key];
-    if (existing?.operation?.state === "pending") return;
+    if (existing?.operation) return;
     if (
       existing &&
       workflowEditorDirty(existing) &&
@@ -306,7 +406,25 @@ function WorkflowRepositoryView({
                 </p>
               ) : null}
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
+              {copyRepositories.length ? (
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setCopyDestination(
+                      copyRepositories.some(
+                        (entry) => entry.repository.repositoryId === scope.repositoryId,
+                      )
+                        ? scope.repositoryId
+                        : copyRepositories[0]!.repository.repositoryId,
+                    );
+                    setCopyError(null);
+                    setCopy(workflow);
+                  }}
+                >
+                  <CopyIcon /> Copy
+                </Button>
+              ) : null}
               {canConfigure ? (
                 <Button
                   variant="ghost"
@@ -324,7 +442,7 @@ function WorkflowRepositoryView({
                 canConfigure ? (
                   <Button
                     variant="outline"
-                    disabled={local?.operation?.state === "pending"}
+                    disabled={!!local?.operation}
                     onClick={() => void archive(workflow)}
                   >
                     Restore
@@ -415,20 +533,78 @@ function WorkflowRepositoryView({
       </div>
     );
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      {copy ? (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) closeCopy();
+          }}
+        >
+          <DialogPopup>
+            <DialogHeader>
+              <DialogTitle>Copy workflow</DialogTitle>
+              <DialogDescription>
+                Copy the latest saved version into an independent, unsaved draft. Your source edits
+                and run history stay here.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogPanel>
+              <Select
+                value={copyDestination}
+                onValueChange={(id) => {
+                  if (id) setCopyDestination(id);
+                }}
+                disabled={copyBusy}
+              >
+                <SelectTrigger aria-label="Copy destination repository">
+                  <SelectValue>
+                    {copyRepositories.find(
+                      (entry) => entry.repository.repositoryId === copyDestination,
+                    )?.repository.name ?? "Choose a repository"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectPopup>
+                  {copyRepositories.map((entry) => (
+                    <SelectItem
+                      key={entry.repository.repositoryId}
+                      value={entry.repository.repositoryId}
+                    >
+                      {entry.repository.name}
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+              {copyError ? (
+                <p role="alert" className="text-sm text-destructive">
+                  {copyError}
+                </p>
+              ) : null}
+            </DialogPanel>
+            <DialogFooter>
+              <Button variant="ghost" onClick={closeCopy}>
+                Cancel
+              </Button>
+              <Button disabled={copyBusy} onClick={() => void copySaved()}>
+                {copyBusy ? "Reading saved workflow…" : "Copy saved workflow"}
+              </Button>
+            </DialogFooter>
+          </DialogPopup>
+        </Dialog>
+      ) : null}
       <WorkspacePageHeader electron={isElectron}>
         <span className="text-sm font-medium">Workflows</span>
       </WorkspacePageHeader>
       <div className="min-h-0 flex-1 overflow-y-auto">
         <WorkspacePageContainer width="expanded">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
               {view !== "catalog" ? (
                 <Button variant="ghost" onClick={back}>
                   ← Workflows
                 </Button>
               ) : null}
-              <div className="w-64">
+              <div className="w-64 max-w-full">
                 <Select
                   value={scope.repositoryId}
                   onValueChange={(id) => {
@@ -514,30 +690,45 @@ function WorkflowRepositoryView({
                   </Button>
                 </div>
                 {canConfigure && tab === "workflows" ? (
-                  <Button
-                    onClick={() => {
-                      startNewWorkflowDraft(
-                        appAtomRegistry,
-                        scope,
-                        () => newWorkflowDraft(projects),
-                        true,
-                      );
-                      navigate({
-                        to: "/workflows/$repositoryId/new",
-                        params: { repositoryId: scope.repositoryId },
-                      });
-                    }}
-                  >
-                    {drafts.newWorkflowIds[workflowSessionKey(scope, "new")] &&
-                    !drafts.editors[
-                      workflowSessionKey(
-                        scope,
-                        drafts.newWorkflowIds[workflowSessionKey(scope, "new")]!,
-                      )
-                    ]?.baseline
-                      ? "Resume new workflow"
-                      : "Create workflow"}
-                  </Button>
+                  <div className="flex flex-wrap gap-2">
+                    <Menu>
+                      <MenuTrigger render={<Button variant="outline" />}>
+                        Use template <ChevronDownIcon />
+                      </MenuTrigger>
+                      <MenuPopup>
+                        <MenuItem onClick={() => void useTemplate("review")}>
+                          Agent → Review
+                        </MenuItem>
+                        <MenuItem onClick={() => void useTemplate("publish")}>
+                          Reviewed implementation → PR
+                        </MenuItem>
+                      </MenuPopup>
+                    </Menu>
+                    <Button
+                      onClick={() => {
+                        startNewWorkflowDraft(
+                          appAtomRegistry,
+                          scope,
+                          () => newWorkflowDraft(projects),
+                          true,
+                        );
+                        navigate({
+                          to: "/workflows/$repositoryId/new",
+                          params: { repositoryId: scope.repositoryId },
+                        });
+                      }}
+                    >
+                      {drafts.newWorkflowIds[workflowSessionKey(scope, "new")] &&
+                      !drafts.editors[
+                        workflowSessionKey(
+                          scope,
+                          drafts.newWorkflowIds[workflowSessionKey(scope, "new")]!,
+                        )
+                      ]?.baseline
+                        ? "Resume new workflow"
+                        : "Create workflow"}
+                    </Button>
+                  </div>
                 ) : null}
               </div>
               {tab === "workflows" ? (

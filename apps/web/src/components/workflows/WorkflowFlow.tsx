@@ -7,7 +7,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { BotIcon, HandIcon, GripVerticalIcon, CheckIcon } from "lucide-react";
+import { UploadIcon, BotIcon, HandIcon, GripVerticalIcon, CheckIcon } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import {
   isTerminalWorkflowJob,
@@ -66,13 +66,13 @@ export function WorkflowFlow({
             <section
               key={zone[0]!.id}
               className={
-                zone[0]!.kind === "agent"
+                zone[0]!.kind === "agent" || zone[0]!.kind === "action"
                   ? "border-l-2 border-border pl-3"
                   : "border-l-2 border-warning/50 pl-3"
               }
             >
               <p className="mb-1 text-xs text-muted-foreground">
-                {zone[0]!.kind === "agent"
+                {zone[0]!.kind === "agent" || zone[0]!.kind === "action"
                   ? "Automatic work"
                   : zone[0]!.kind === "input"
                     ? "Human input"
@@ -92,7 +92,9 @@ export function WorkflowFlow({
                     <span className="w-5 shrink-0 text-xs text-muted-foreground">
                       {state === "completed" ? <CheckIcon className="size-4" /> : index + 1}
                     </span>
-                    {step.kind === "agent" ? (
+                    {step.kind === "action" ? (
+                      <UploadIcon className="size-4 shrink-0" />
+                    ) : step.kind === "agent" ? (
                       <BotIcon className="size-4 shrink-0" />
                     ) : (
                       <HandIcon className="size-4 shrink-0" />
@@ -108,9 +110,13 @@ export function WorkflowFlow({
                             : state
                           : step.kind === "agent"
                             ? "Agent"
-                            : step.role === "member"
-                              ? "Repository members"
-                              : "Maintainers"}
+                            : step.kind === "action"
+                              ? step.action === "push"
+                                ? "Push branch"
+                                : "Open PR"
+                              : step.role === "member"
+                                ? "Repository members"
+                                : "Maintainers"}
                       </span>
                     </span>
                     {invalidStepId === step.id ? (
@@ -118,7 +124,7 @@ export function WorkflowFlow({
                     ) : null}
                   </>
                 );
-                const appearance = `flex w-full items-center gap-2 rounded-md border px-2 py-2 text-left ${selected ? "border-ring bg-accent" : current ? (step.kind === "agent" ? "border-ring bg-accent" : "border-warning/60 bg-warning-surface") : "border-transparent"}`;
+                const appearance = `flex w-full items-center gap-2 rounded-md border px-2 py-2 text-left ${selected ? "border-ring bg-accent" : current ? (step.kind === "agent" || step.kind === "action" ? "border-ring bg-accent" : "border-warning/60 bg-warning-surface") : "border-transparent"}`;
                 return (
                   <div key={step.id}>
                     <SortableWorkflowStep id={step.id} title={step.title} enabled={!!onReorder}>

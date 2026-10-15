@@ -75,7 +75,7 @@ export function workflowManualControlState(job: RepositoryWorkflowJob | null) {
         : hold?.state === "requested"
           ? status === "paused"
             ? "Pause is waiting for recovery. Resume preserves the existing failure."
-            : "Pausing after the current Agent step, including its preparation."
+            : "Pausing after the current automatic step, including its preparation."
           : null,
   };
 }
@@ -104,5 +104,21 @@ export function workflowManualSubmission(
   return {
     jobId: job.jobId,
     control: { operation, controlId: createId(), expectedRevision: revision },
+  };
+}
+
+export function workflowActionState(job: RepositoryWorkflowJob | null) {
+  const progress = job?.progress;
+  const action = progress?.actions?.findLast(
+    (entry) => entry.stepId === progress.stepId && entry.generation === progress.generation,
+  );
+  return {
+    action,
+    canRetry: Boolean(
+      action?.retryable &&
+      job?.status === "paused" &&
+      !progress?.manualPause &&
+      !job.pendingManualControl,
+    ),
   };
 }

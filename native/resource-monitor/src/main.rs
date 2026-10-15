@@ -789,6 +789,9 @@ fn write_history(
 
 fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--command-owner-v1") {
+        return owned_process::launch_command(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("--setup-owner-v4") {
         return owned_process::launch(&args[1..]);
     }

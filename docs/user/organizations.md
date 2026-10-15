@@ -131,13 +131,17 @@ _is_ registered requires a role on that repository.
 
 Maintainers and admins can create workflows from **Workflows** in the sidebar or command palette.
 Choose a repository; **Settings → Organization → Repositories → Manage workflows** opens the same view. Choose an enrolled organization machine and a project for that repository,
-then add and order Agent, Review, and Input steps. Human zones show where work waits for a
+then add and order Agent, Review, Input, Push branch, and Open PR steps. Human zones show where work waits for a
 response. Each checkpoint can require a repository maintainer or allow anyone with repository
 access; Review defaults to maintainers and Input defaults to all repository members. Agent steps
 can choose a Codex or Claude model on that machine or use the project's default. All Agent steps
 in a job must use compatible providers of the same kind so they can share the conversation.
 Model changes are available when that provider supports them. If its configuration becomes
 incompatible during a job, cancel the job and run it again after correcting the workflow.
+
+Start with **Agent → Review** or **Reviewed implementation → PR** from **Use template**, or build your own sequence. **Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy; choose a destination checkout if more than one is available. A retained new-workflow draft requires explicit discard before replacement, and an uncertain save must be reconciled first.
+
+**Push branch** commits the saved result, including normal commit hooks, and pushes the job's branch. **Open PR** opens a PR against the base selected when the job was accepted; it requires a Push after the latest Agent step. Add Review before publishing when human approval is wanted. Workflows without publishing steps keep changes local. Publishing requires an updated Linux or macOS executor; PR publishing currently supports GitHub. Other forges are rejected before the run starts.
 
 Anyone with repository access can run a workflow with a description of the task and inspect the
 shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own
@@ -158,11 +162,15 @@ Rework retains the files already prepared rather than restoring an older copy. S
 previews remain available through intermediate checkpoints and rework, without running setup again.
 At completion, the job stops setup and checks the final saved result before releasing the worktree.
 If cleanup or completion fails, use **Retry approval** or **Retry completion** when offered. Confirmed
-cleanup is reused. Changes stay local.
+cleanup is reused. Rework keeps using the same published branch and PR. A closed or merged PR needs attention; the job will not open a replacement.
 
-Maintainers can pause an accepted job from its job view. The current Agent step, including its
-preparation, finishes before the pause takes effect; later steps wait. Setup and previews stay
-running. Resume before answering checkpoints or retrying preparation. Resume preserves unanswered
+If publishing loses a reply, use **Retry publishing action** when offered. The job checks the saved commit, remote branch, and PR before attempting more work. An uncertain PR creation may remain paused if its identity cannot be confirmed. Cancellation cannot undo an existing push or PR.
+
+Archive workflows to prevent new runs without deleting their history. Already accepted runs continue with their saved definition; queued jobs wait for restore or cancellation. Restore requires a valid execution target.
+
+Maintainers can pause an accepted job from its job view. The current automatic step, including Agent
+preparation or publishing, finishes before the pause takes effect; later steps wait. Setup and previews stay
+running. Resume before answering checkpoints or retrying work. Resume preserves unanswered
 checkpoints and any failure requiring recovery. Requests saved while a machine is offline remain
 pending until it acknowledges them. Queued jobs and jobs on older machines do not offer Pause.
 
@@ -179,7 +187,7 @@ Automatic cleanup covers ordinary setup programs and background previews. Projec
 cleanup for Docker containers, system services, and other independently managed services.
 
 On mobile, open **Settings → Workflow jobs** to inspect a job, answer checkpoints, approve results,
-request changes, pause, resume, or cancel. Workflow creation
+request changes, open the PR, retry publishing, pause, resume, or cancel. Workflow creation
 and manual Run are available on web and desktop.
 
 ## Machines

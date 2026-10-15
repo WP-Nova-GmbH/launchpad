@@ -24,7 +24,7 @@ export function advanceWorkflow(run: WorkflowRun): WorkflowRun {
   const latestResult = sequence.completed.findLast((entry) => entry.checkpoint !== null);
   const status = !step
     ? "finishing"
-    : step.kind === "agent"
+    : step.kind === "agent" || step.kind === "action"
       ? "waiting_capacity"
       : step.kind === "input"
         ? "awaiting_input"
@@ -56,7 +56,7 @@ export function advanceWorkflow(run: WorkflowRun): WorkflowRun {
     ...run,
     promptDispatched: false,
     executionReserved: false,
-    preparedHead: latestResult?.head ?? run.preparedHead,
+    preparedHead: run.preparedHead ?? latestResult?.head ?? null,
     progress: {
       ...run.progress,
       revision: run.progress.revision + 1,
@@ -100,6 +100,19 @@ export function workflowProgress(run: WorkflowRun): WorkflowRun["progress"] {
             ? ("running" as const)
             : ("waiting" as const)
           : ("pending" as const),
+    })),
+    pullRequestUrl: run.publication?.pullRequestUrl ?? null,
+    actions: (run.actions ?? []).slice(-32).map((action) => ({
+      ...(action.retryRevision !== undefined ? { retryRevision: action.retryRevision } : {}),
+      actionId: action.actionId,
+      stepId: action.stepId,
+      generation: action.generation,
+      operation: action.operation,
+      state: action.state,
+      detail: action.detail?.slice(0, 500) ?? null,
+      commitSha: action.commitSha,
+      pullRequestUrl: action.pullRequestUrl,
+      retryable: ["uncertain", "failed"].includes(action.state),
     })),
     responses: sequence.responses.slice(-100).map((response) => ({
       ...response,

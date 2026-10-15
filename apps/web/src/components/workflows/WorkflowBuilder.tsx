@@ -297,7 +297,7 @@ function WorkflowBuilderEditor({
   };
   const discard = async () => {
     const captured = appAtomRegistry.get(workflowDraftAtom).editors[key];
-    if (!captured || captured.operation?.state === "pending") return;
+    if (!captured || captured.operation) return;
     if (
       workflowEditorDirty(captured) &&
       !(await confirmWorkflow("Discard this workflow's unsaved changes?"))
@@ -329,7 +329,7 @@ function WorkflowBuilderEditor({
   const archive = async () => {
     const captured = appAtomRegistry.get(workflowDraftAtom).editors[key];
     const baseline = captured?.baseline;
-    if (!captured || !baseline || captured.operation?.state === "pending") return;
+    if (!captured || !baseline || captured.operation) return;
     if (
       workflowEditorDirty(captured) &&
       !(await confirmWorkflow(
@@ -352,26 +352,33 @@ function WorkflowBuilderEditor({
     )
       refresh();
   };
-  const insert = (anchor: WorkflowInsertion, kind: WorkflowStep["kind"]) => {
+  const insert = (anchor: WorkflowInsertion, kind: WorkflowStep["kind"] | "open_pull_request") => {
     const stepId = randomUUID();
     const step: WorkflowStep =
-      kind === "agent"
+      kind === "action" || kind === "open_pull_request"
         ? {
             id: stepId,
-            kind,
-            title: "Agent",
-            instruction: "Implement the requested change and verify it.",
-            modelSelection: null,
+            kind: "action",
+            title: kind === "open_pull_request" ? "Open PR" : "Push branch",
+            action: kind === "open_pull_request" ? "open_pull_request" : "push",
           }
-        : kind === "input"
+        : kind === "agent"
           ? {
               id: stepId,
               kind,
-              title: "Human input",
-              question: "What should the agent know before continuing?",
-              role: "member",
+              title: "Agent",
+              instruction: "Implement the requested change and verify it.",
+              modelSelection: null,
             }
-          : { id: stepId, kind, title: "Review changes", role: "maintainer" };
+          : kind === "input"
+            ? {
+                id: stepId,
+                kind,
+                title: "Human input",
+                question: "What should the agent know before continuing?",
+                role: "member",
+              }
+            : { id: stepId, kind, title: "Review changes", role: "maintainer" };
     let inserted = false;
     edit((draft) => {
       const index = workflowInsertionIndex(draft.definition.steps, anchor);
@@ -452,7 +459,10 @@ function WorkflowBuilderWorkspace({
   issue: ReturnType<typeof workflowDraftIssue>;
   edit: (update: (draft: WorkflowEditorDraft) => WorkflowEditorDraft) => void;
   select: (id: string) => void;
-  insert: (anchor: WorkflowInsertion, kind: WorkflowStep["kind"]) => string | null;
+  insert: (
+    anchor: WorkflowInsertion,
+    kind: WorkflowStep["kind"] | "open_pull_request",
+  ) => string | null;
   save: () => Promise<void>;
   reload: () => Promise<void>;
   reconcile: () => Promise<void>;
@@ -687,7 +697,12 @@ function WorkflowBuilderWorkspace({
           Discard changes
         </Button>
         {draft.baseline ? (
-          <Button type="button" variant="ghost" onClick={() => void archive()}>
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={!!draft.operation}
+            onClick={() => void archive()}
+          >
             {draft.baseline.archived ? "Restore workflow" : "Archive workflow"}
           </Button>
         ) : null}

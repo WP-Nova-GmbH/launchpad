@@ -62,7 +62,13 @@ vi.mock("../ui/select", () => {
 });
 
 import { WorkflowBuilder } from "./WorkflowBuilder";
-import { editWorkflowDraft, selectWorkflowStep, newWorkflowDraft } from "./workflowState";
+import {
+  editWorkflowDraft,
+  selectWorkflowStep,
+  newWorkflowDraft,
+  copiedWorkflowDraft,
+  openNewWorkflowDraft,
+} from "./workflowState";
 
 type Props = Parameters<typeof WorkflowBuilder>[0];
 const scope = {
@@ -683,5 +689,76 @@ describe("Editor Run archive eligibility", () => {
         params: { repositoryId: scope.repositoryId, workflowId: id },
       }),
     );
+  });
+});
+
+describe("workflow templates and copies", () => {
+  it("starts the publish template as an independent unsaved definition", () => {
+    const draft = newWorkflowDraft([project], "publish")!;
+    expect(
+      draft.definition.steps.map((step) => (step.kind === "action" ? step.action : step.kind)),
+    ).toEqual(["agent", "review", "push", "open_pull_request"]);
+    expect(draft.baseline).toBeNull();
+    expect(draft.operation).toBeNull();
+    expect(draft.targetConfirmed).toBe(true);
+  });
+  it("copies only saved definition data and binds the destination checkout", () => {
+    const sourceDraft = newWorkflowDraft([project])!;
+    const source: RepositoryWorkflow = {
+      workflowId: "source",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      revision: 9,
+      createdAt: "now",
+      updatedAt: "now",
+      definition: { ...sourceDraft.definition, name: "Saved source" },
+      archived: true,
+    };
+    const destination = {
+      ...project,
+      projectId: ProjectId.make("destination"),
+      environmentId: EnvironmentId.make("other-env"),
+    };
+    const copied = copiedWorkflowDraft(source, [destination], false)!;
+    expect(copied.workflowId).not.toBe(source.workflowId);
+    expect(copied.definition.name).toBe("Copy of Saved source");
+    expect(copied.definition.projectId).toBe(destination.projectId);
+    expect(copied.baseline).toBeNull();
+    expect(copied.operation).toBeNull();
+    expect(copied.definition.steps).toEqual(source.definition.steps);
+    expect(copied.definition.steps).not.toBe(source.definition.steps);
+    expect(copied.definition.steps[0]).not.toBe(source.definition.steps[0]);
+    expect(copiedWorkflowDraft(source, [project, destination], true)?.targetConfirmed).toBe(true);
+    expect(copiedWorkflowDraft(source, [project, destination], false)?.targetConfirmed).toBe(false);
+  });
+  it("requires explicit discard and cannot overwrite a changed or uncertain retained draft", async () => {
+    await mount();
+    const id = newId();
+    confirmation.mockResolvedValueOnce(false);
+    expect(
+      await openNewWorkflowDraft(scope, () => newWorkflowDraft([project], "publish")),
+    ).toBeNull();
+    expect(newId()).toBe(id);
+    const confirm = deferred<boolean>();
+    confirmation.mockReturnValueOnce(confirm.promise);
+    const pending = openNewWorkflowDraft(scope, () => newWorkflowDraft([project], "publish"));
+    await rename("Changed during confirmation");
+    confirm.resolve(true);
+    expect(await pending).toBeNull();
+    expect(newId()).toBe(id);
+    editWorkflowDraft(scope, id, (draft) => ({
+      ...draft,
+      operation: {
+        requestId: "uncertain",
+        state: "uncertain",
+        definition: draft.definition,
+        archived: false,
+        expectedRevision: 0,
+      },
+    }));
+    await expect(openNewWorkflowDraft(scope, () => newWorkflowDraft([project]))).rejects.toThrow(
+      "reconcile",
+    );
+    expect(newId()).toBe(id);
   });
 });

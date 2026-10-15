@@ -81,7 +81,7 @@ vi.mock("./WorkflowStepEditor", () => ({
         value: step.title,
         disabled: props.disabled,
       }),
-      step.kind === "review"
+      step.kind === "review" || step.kind === "action"
         ? null
         : createElement("textarea", {
             "data-focus-key": `${step.id}:${field}`,
