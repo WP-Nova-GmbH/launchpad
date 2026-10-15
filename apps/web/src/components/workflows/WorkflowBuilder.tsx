@@ -1,3 +1,4 @@
+import { RepositorySourcesButton } from "./WorkflowSources";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import styles from "./workflowEditor.module.css";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -652,6 +653,7 @@ function WorkflowBuilderWorkspace({
       </header>
       <fieldset disabled={pending} className={styles["workflow-inspector-fields"]}>
         <div className="space-y-2">
+          <RepositorySourcesButton repositoryId={scope.repositoryId} />
           <p className="text-sm">Execution target</p>
           <Select
             value={

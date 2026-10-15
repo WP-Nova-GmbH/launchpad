@@ -1,4 +1,5 @@
 import { ArrowLeftIcon, CopyIcon, ChevronDownIcon } from "lucide-react";
+import { RepositorySourcesButton } from "./WorkflowSources";
 import { useAuth } from "@clerk/react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useEffect, useState, useCallback, useRef } from "react";
@@ -680,6 +681,7 @@ function WorkflowRepositoryView({
                 </div>
                 {canConfigure && tab === "workflows" ? (
                   <div className="flex flex-wrap gap-2">
+                    <RepositorySourcesButton repositoryId={scope.repositoryId} />
                     <Menu>
                       <MenuTrigger render={<Button variant="outline" />}>
                         Use template <ChevronDownIcon />

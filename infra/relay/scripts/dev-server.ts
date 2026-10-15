@@ -68,6 +68,7 @@ import { organizationSkillsServerApi } from "../src/http/OrganizationSkillsApi.t
 import { providerAccountsServerApi } from "../src/http/ProviderAccountsApi.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "../src/http/IssueTrackersApi.ts";
 import { turnAuthLayer } from "../src/issueTrackers/TurnAuthorization.ts";
+import { workflowSourcesApi, workflowSourceCallbackRoute } from "../src/http/WorkflowSourcesApi.ts";
 import { issueTrackerCallbackRoute } from "../src/http/IssueTrackerCallbackRoute.ts";
 import * as IssueTrackerConnectionStore from "../src/issueTrackers/ConnectionStore.ts";
 import * as IssueTrackerWriteOperationStore from "../src/issueTrackers/WriteOperationStore.ts";
@@ -241,6 +242,14 @@ const relayConfigurationLayer = Layer.succeed(
     clerkJwtAudience: process.env.CLERK_JWT_AUDIENCE?.trim() || "t3-code-relay",
     cloudMintPrivateKey: Redacted.make(cloudMintKeyPair.privateKey),
     cloudMintPublicKey: cloudMintKeyPair.publicKey,
+    linearWorkflow: process.env.LINEAR_WORKFLOW_CLIENT_ID?.trim()
+      ? {
+          clientId: process.env.LINEAR_WORKFLOW_CLIENT_ID.trim(),
+          ...(process.env.LINEAR_WORKFLOW_CLIENT_SECRET?.trim()
+            ? { clientSecret: Redacted.make(process.env.LINEAR_WORKFLOW_CLIENT_SECRET.trim()) }
+            : {}),
+        }
+      : undefined,
     github:
       process.env.GITHUB_APP_ID && process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_PRIVATE_KEY
         ? {
@@ -431,6 +440,7 @@ const relayApiLayer = Layer.mergeAll(
   repositoryAccessServerApi,
   providerAccountsServerApi,
   issueTrackersApi,
+  workflowSourcesApi,
   issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
@@ -451,6 +461,7 @@ const routerLayer = Layer.merge(
     relayDocsRedirectRoute,
     githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
     issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+    workflowSourceCallbackRoute.pipe(Layer.provide(runtimeLayer)),
   ).pipe(Layer.provide([Etag.layerWeak, relayCors])),
   relayNotFoundRoute,
 );

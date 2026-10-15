@@ -46,6 +46,7 @@ import { organizationSkillsServerApi } from "./http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "./http/IssueTrackersApi.ts";
 import { turnAuthLayer } from "./issueTrackers/TurnAuthorization.ts";
+import { workflowSourcesApi, workflowSourceCallbackRoute } from "./http/WorkflowSourcesApi.ts";
 import { issueTrackerCallbackRoute } from "./http/IssueTrackerCallbackRoute.ts";
 import * as IssueTrackerConnectionStore from "./issueTrackers/ConnectionStore.ts";
 import * as IssueTrackerWriteOperationStore from "./issueTrackers/WriteOperationStore.ts";
@@ -155,6 +156,7 @@ const relayApiLayer = Layer.mergeAll(
   repositoryAccessServerApi,
   providerAccountsServerApi,
   issueTrackersApi,
+  workflowSourcesApi,
   issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
@@ -222,6 +224,10 @@ export const ApiLive = Api.make(
     const axiomTracesEndpoint = yield* observability.traces.otelTracesEndpoint;
 
     // Optional: a deployment without a GitHub App simply hides the surface.
+    const linearClientId = yield* Config.String("LINEAR_WORKFLOW_CLIENT_ID").pipe(Config.option);
+    const linearClientSecret = yield* Config.Redacted("LINEAR_WORKFLOW_CLIENT_SECRET").pipe(
+      Config.option,
+    );
     const githubAppId = yield* Config.String("GITHUB_APP_ID").pipe(Config.option);
     const githubAppSlug = yield* Config.String("GITHUB_APP_SLUG").pipe(Config.option);
     const githubAppPrivateKey = yield* Config.Redacted("GITHUB_APP_PRIVATE_KEY").pipe(
@@ -285,6 +291,16 @@ export const ApiLive = Api.make(
         clerkJwtAudience,
         cloudMintPrivateKey: yield* cloudMintPrivateKey,
         cloudMintPublicKey: yield* cloudMintPublicKey,
+        linearWorkflow:
+          Option.isSome(linearClientId) && linearClientId.value.trim()
+            ? {
+                clientId: linearClientId.value.trim(),
+                ...(Option.isSome(linearClientSecret) &&
+                Redacted.value(linearClientSecret.value).trim()
+                  ? { clientSecret: linearClientSecret.value }
+                  : {}),
+              }
+            : undefined,
         github:
           Option.isSome(githubAppId) &&
           Option.isSome(githubAppSlug) &&
@@ -521,6 +537,7 @@ export const ApiLive = Api.make(
         relayDocsRedirectRoute,
         githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
         issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+        workflowSourceCallbackRoute.pipe(Layer.provide(runtimeLayer)),
       ).pipe(Layer.provide([Etag.layerWeak, httpPlatformNotSupportedLayer, relayCors])),
       relayNotFoundRoute,
     ).pipe(

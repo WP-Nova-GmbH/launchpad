@@ -823,6 +823,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/organization",
   },
   {
+    id: "workflow-sources",
+    title: "Workflow sources",
+    to: "/settings/connections",
+    cloudOnly: true,
+    searchTerms: ["Linear workflow source repository consent connect reconnect disconnect"],
+  },
+  {
     id: "personal-issue-trackers",
     title: "Issue trackers",
     to: "/settings/connections",

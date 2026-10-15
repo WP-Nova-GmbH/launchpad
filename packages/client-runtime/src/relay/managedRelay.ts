@@ -85,6 +85,7 @@ export const ManagedRelayDpopSignerError = Schema.Union([
 export type ManagedRelayDpopSignerError = typeof ManagedRelayDpopSignerError.Type;
 
 export const ManagedRelayRequestAction = Schema.Literals([
+  "workflow sources",
   "listWorkflows",
   "saveWorkflow",
   "listWorkflowJobs",
@@ -152,6 +153,7 @@ export const ManagedRelayRequestAction = Schema.Literals([
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
 export const ManagedRelayRequestActivity = Schema.Literals([
+  "workflow sources",
   "listWorkflows",
   "saveWorkflow",
   "listWorkflowJobs",

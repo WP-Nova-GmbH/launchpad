@@ -1,3 +1,4 @@
+import { WorkflowSourceHealth } from "./WorkflowSourceHealth";
 import { useAtomValue } from "@effect/atom-react";
 import {
   workflowDraftAtom,
@@ -707,74 +708,81 @@ function WorkflowJobsContent(props: Props) {
           />
         </SettingsSection>
       ) : selectedRepository ? (
-        <SettingsSection title={selectedRepository.repository.name + " · Runs"}>
-          <View className="flex-row flex-wrap">
-            {(["active", "attention", "history"] as const).map((choice) => (
-              <SettingsActionRow
-                key={choice}
-                icon="line.3.horizontal.decrease"
-                label={
-                  (choice === "active"
-                    ? "Active"
-                    : choice === "attention"
-                      ? "Needs attention"
-                      : "History") + (listView === choice ? " · Selected" : "")
-                }
-                onPress={() => setListView(choice)}
-              />
-            ))}
-          </View>
-          <Text className="p-4 text-xs text-foreground-muted">
-            {listView === "history"
-              ? "Completed runs, newest first."
-              : "Active runs, oldest first."}
-          </Text>
-          <SettingsActionRow
-            icon="arrow.clockwise"
-            label="Refresh jobs"
-            disabled={recent.key === listKey && !!recent.request}
-            onPress={() => void loadJobs()}
+        <>
+          <WorkflowSourceHealth
+            key={(userId ?? "") + ":" + selectedRepository.repository.repositoryId}
+            repositoryId={selectedRepository.repository.repositoryId}
+            focused={focused}
           />
-          {recent.key === listKey && recent.error ? (
-            <Text accessibilityRole="alert" className="p-4 text-danger-foreground">
-              {recent.error}
-              {jobs ? " Showing the last available runs." : " Refresh to retry."}
+          <SettingsSection title={selectedRepository.repository.name + " · Runs"}>
+            <View className="flex-row flex-wrap">
+              {(["active", "attention", "history"] as const).map((choice) => (
+                <SettingsActionRow
+                  key={choice}
+                  icon="line.3.horizontal.decrease"
+                  label={
+                    (choice === "active"
+                      ? "Active"
+                      : choice === "attention"
+                        ? "Needs attention"
+                        : "History") + (listView === choice ? " · Selected" : "")
+                  }
+                  onPress={() => setListView(choice)}
+                />
+              ))}
+            </View>
+            <Text className="p-4 text-xs text-foreground-muted">
+              {listView === "history"
+                ? "Completed runs, newest first."
+                : "Active runs, oldest first."}
             </Text>
-          ) : null}
-          {jobs === null ? (
-            recent.key !== listKey || !recent.error ? (
-              <Text className="p-4 text-foreground-muted">Loading runs…</Text>
-            ) : null
-          ) : jobs.length === 0 ? (
-            <Text className="p-4 text-foreground-muted">
-              No runs in this view. Create and run workflows from Workflows on web or desktop.
-            </Text>
-          ) : (
-            jobs.map((job) => (
-              <SettingsRow
-                key={job.jobId}
-                icon="arrow.triangle.branch"
-                label={job.instruction}
-                value={workflowStatusLabel(job.status)}
-                disabled={busy}
-                onPress={() => setSelectedJobId(job.jobId)}
-              />
-            ))
-          )}
-          {recent.key === listKey && recent.nextCursor ? (
             <SettingsActionRow
-              icon="chevron.down"
-              label="Load more runs"
-              disabled={!!recent.request}
-              onPress={() => void loadJobs(recent.nextCursor)}
+              icon="arrow.clockwise"
+              label="Refresh jobs"
+              disabled={recent.key === listKey && !!recent.request}
+              onPress={() => void loadJobs()}
             />
-          ) : null}
-          <SettingsActionRow
-            icon="chevron.left"
-            label="Back to repositories"
-            onPress={() => setSelectedRepository(null)}
-          />
-        </SettingsSection>
+            {recent.key === listKey && recent.error ? (
+              <Text accessibilityRole="alert" className="p-4 text-danger-foreground">
+                {recent.error}
+                {jobs ? " Showing the last available runs." : " Refresh to retry."}
+              </Text>
+            ) : null}
+            {jobs === null ? (
+              recent.key !== listKey || !recent.error ? (
+                <Text className="p-4 text-foreground-muted">Loading runs…</Text>
+              ) : null
+            ) : jobs.length === 0 ? (
+              <Text className="p-4 text-foreground-muted">
+                No runs in this view. Create and run workflows from Workflows on web or desktop.
+              </Text>
+            ) : (
+              jobs.map((job) => (
+                <SettingsRow
+                  key={job.jobId}
+                  icon="arrow.triangle.branch"
+                  label={job.instruction}
+                  value={workflowStatusLabel(job.status)}
+                  disabled={busy}
+                  onPress={() => setSelectedJobId(job.jobId)}
+                />
+              ))
+            )}
+            {recent.key === listKey && recent.nextCursor ? (
+              <SettingsActionRow
+                icon="chevron.down"
+                label="Load more runs"
+                disabled={!!recent.request}
+                onPress={() => void loadJobs(recent.nextCursor)}
+              />
+            ) : null}
+            <SettingsActionRow
+              icon="chevron.left"
+              label="Back to repositories"
+              onPress={() => setSelectedRepository(null)}
+            />
+          </SettingsSection>
+        </>
       ) : (
         <SettingsSection title="Repositories">
           {repositories.length === 0 ? (

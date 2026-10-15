@@ -46,6 +46,19 @@ import {
   RelayIssueTrackerError,
 } from "./issueTrackers.ts";
 export * from "./issueTrackers.ts";
+export * from "./workflowSources.ts";
+import {
+  WorkflowSourceError,
+  WorkflowSourceOwner,
+  WorkflowRepositorySources,
+  WorkflowSourceHealthList,
+  BeginWorkflowSource,
+  WorkflowSourceAuthorization,
+  DisconnectWorkflowSource,
+  AllowWorkflowSource,
+  WorkflowSourceMetadataQuery,
+  WorkflowSourceMetadataPage,
+} from "./workflowSources.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -2259,6 +2272,90 @@ const RelayRepositoryParams = Schema.Struct({
   repositoryId: RelayRepositoryId,
 });
 
+const RelayWorkflowSourcesGroup = HttpApiGroup.make("workflowSources")
+  .add(
+    HttpApiEndpoint.get("health", "/v1/repositories/:repositoryId/workflow-sources/health", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: WorkflowSourceHealthList,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.get("owner", "/v1/workflow-sources", {
+      headers: RelayBearerRequestHeaders,
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("begin", "/v1/workflow-sources/linear/begin", {
+      headers: RelayBearerRequestHeaders,
+      payload: BeginWorkflowSource,
+      success: WorkflowSourceAuthorization,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("cancel", "/v1/workflow-sources/linear/cancel", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ attemptId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("disconnect", "/v1/workflow-sources/disconnect", {
+      headers: RelayBearerRequestHeaders,
+      payload: DisconnectWorkflowSource,
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("refreshOwner", "/v1/workflow-sources/refresh", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ connectionId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.get("repository", "/v1/repositories/:repositoryId/workflow-sources", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("allow", "/v1/repositories/:repositoryId/workflow-sources/allow", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: AllowWorkflowSource,
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("withdraw", "/v1/repositories/:repositoryId/workflow-sources/withdraw", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("withdrawOwner", "/v1/workflow-sources/withdraw", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post(
+      "refreshRepository",
+      "/v1/repositories/:repositoryId/workflow-sources/refresh",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: RelayRepositoryParams,
+        payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+        success: WorkflowRepositorySources,
+        error: [...RelayTenancyErrors, WorkflowSourceError],
+      },
+    ),
+    HttpApiEndpoint.post("metadata", "/v1/repositories/:repositoryId/workflow-sources/metadata", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: WorkflowSourceMetadataQuery,
+      success: WorkflowSourceMetadataPage,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+  )
+  .middleware(RelayClientAuth);
+
 const WorkflowErrors = [
   ...RelayTenancyErrors,
   WorkflowConflictError,
@@ -3141,6 +3238,7 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayDpopClientGroup,
     RelayJobsGroup,
     RelayWorkflowsGroup,
+    RelayWorkflowSourcesGroup,
     RelayServerGroup,
     RelayProjectCatalogServerGroup,
     RelaySourceControlServerGroup,

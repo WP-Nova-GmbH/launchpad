@@ -157,3 +157,33 @@ in Account → Connections and chooses a site when their account has access to s
 Reads use the permissions granted by that user’s account.
 
 Both connections keep provider credentials on the relay. The initiating user authorizes each prompt for its environment and thread, so both local and managed environments can request reads. Former organization connections are retained but not used or reassigned; users must connect personally. Setup is available in web and desktop settings; chats can use the same personal connections from mobile. Issue writes, search, webhook-triggered jobs, and external OpenCode servers are not supported.
+
+## Native Linear workflow connections
+
+Native workflow authorization is independent of personal MCP issue-tracker connections. Configure
+`LINEAR_WORKFLOW_CLIENT_ID` and, if the application uses one, `LINEAR_WORKFLOW_CLIENT_SECRET` on
+the relay only. Both the Worker and Node development relay use these names. Register the exact
+callback `<relay issuer>/oauth/workflow-sources/linear/callback`; the client never chooses its
+origin. The flow requests only `read`, with a user actor and PKCE S256. A missing client ID leaves
+source connection setup unavailable without preventing relay startup. No application secret belongs
+in public client configuration.
+
+Keep production native OAuth configuration absent until an authorized development application has
+proven workspace identity, repeated consent, rotating refresh recovery, and independent authorization
+for multiple owners, including two Launchpad accounts using the same Linear identity. Fixture tests
+prove implementation behavior, not provider credential independence. If that evidence is unavailable
+or fails, native connection release remains blocked; do not silently share provider credentials.
+
+Event delivery has a separate release gate. This source-management release does not provide the
+production Issue webhook receiver or trigger enable controls; do not activate production subscriptions
+yet. When those ship, verify coverage and revocation behavior, including workspaces authorized before
+webhook settings existed. Such connections remain delivery-unverified until their existing subscription
+or a tested explicit owner reauthorization establishes coverage for the current delivery configuration.
+A successful API read or token exchange does not establish that coverage. Reconfiguration must not
+replay historical events or automatically revoke a workspace app used by other owners.
+
+An `invalid_client` or `unauthorized_client` error during token exchange/refresh is a service
+configuration fault. Repair the application's configured credentials and retry the failed operation;
+existing credentials and repository consent are retained. A confirmed invalid refresh grant instead
+requires the connection owner to reconnect. Rotating application credentials does not require removing
+repository grants. Keep callback query strings and token payloads out of diagnostics.

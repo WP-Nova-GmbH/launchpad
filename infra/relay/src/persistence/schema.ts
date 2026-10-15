@@ -750,3 +750,74 @@ export const relayRepositoryPolicyAcknowledgements = pgTable(
     }),
   ],
 );
+
+/** Native workflow sources deliberately do not share personal MCP credentials. */
+export const relayWorkflowConnections = pgTable(
+  "relay_workflow_connections",
+  {
+    connectionId: text("connection_id").primaryKey(),
+    ownerUserId: text("owner_user_id").notNull(),
+    applicationId: text("application_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    workspaceName: text("workspace_name").notNull(),
+    viewerName: text("viewer_name").notNull(),
+    status: text("status").notNull(),
+    authorizationEpoch: integer("authorization_epoch").notNull().default(1),
+    activatedAt: text("activated_at").notNull(),
+    credentialVersion: integer("credential_version").notNull().default(1),
+    payloadSealed: text("payload_sealed"),
+    health: jsonb("health").notNull(),
+    leaseId: text("lease_id"),
+    leaseUntil: text("lease_until"),
+    refreshStartedAt: text("refresh_started_at"),
+  },
+  (t) => [
+    uniqueIndex("workflow_connection_owner_workspace").on(
+      t.ownerUserId,
+      t.applicationId,
+      t.workspaceId,
+    ),
+  ],
+);
+export const relayWorkflowAuthorizations = pgTable(
+  "relay_workflow_authorizations",
+  {
+    ownerUserId: text("owner_user_id").notNull(),
+    applicationId: text("application_id").notNull(),
+    version: integer("version").notNull().default(0),
+    attemptId: text("attempt_id"),
+    connectionId: text("connection_id"),
+    expectedEpoch: integer("expected_epoch"),
+    stateHash: text("state_hash"),
+    pendingSealed: text("pending_sealed"),
+    expiresAt: text("expires_at"),
+    status: text("status"),
+    error: text("error"),
+  },
+  (t) => [
+    primaryKey({ columns: [t.ownerUserId, t.applicationId] }),
+    uniqueIndex("workflow_authorization_state").on(t.stateHash),
+  ],
+);
+export const relayWorkflowRepositoryGrants = pgTable(
+  "relay_workflow_repository_grants",
+  {
+    grantId: text("grant_id").primaryKey(),
+    connectionId: text("connection_id").notNull(),
+    organizationId: text("organization_id").notNull(),
+    repositoryId: text("repository_id").notNull(),
+    ownerUserId: text("owner_user_id").notNull(),
+    generation: integer("generation").notNull(),
+    revoked: boolean("revoked").notNull().default(false),
+    createdAt: text("created_at").notNull(),
+    revokedAt: text("revoked_at"),
+    revokedReason: text("revoked_reason"),
+  },
+  (t) => [
+    uniqueIndex("workflow_active_repository_source")
+      .on(t.repositoryId, t.connectionId)
+      .where(sql`NOT ${t.revoked}`),
+    uniqueIndex("workflow_grant_generation").on(t.repositoryId, t.connectionId, t.generation),
+    index("workflow_grant_owner_org").on(t.ownerUserId, t.organizationId),
+  ],
+);

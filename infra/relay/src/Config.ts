@@ -56,6 +56,10 @@ export class RelayConfiguration extends Context.Service<
     readonly cloudMintPublicKey: string;
     /** Absent until a deployment configures a GitHub App; the surface hides itself. */
     readonly github?: GithubAppCredentials | undefined;
+    /** Configure only after native owner/credential isolation has been proven. */
+    readonly linearWorkflow?:
+      | { readonly clientId: string; readonly clientSecret?: Redacted.Redacted<string> }
+      | undefined;
     readonly managedEndpointBaseDomain: string | undefined;
     readonly managedEndpointNamespace: string | undefined;
     /**

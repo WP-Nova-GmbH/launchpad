@@ -127,6 +127,25 @@ checkout — a repository the organization has not registered is simply not gove
 What the organization does govern is work it runs for you: starting a job against a repository that
 _is_ registered requires a role on that repository.
 
+## Workflow sources
+
+When Linear workflow connections are available on your relay, open **Settings → Connections →
+Workflow sources** to connect your workspace. This is separate from your personal issue-tracker
+connection in the composer. Only the connection owner can allow new repository use, and only for
+repositories they maintain or administer. Other repository maintainers can inspect granted sources
+and withdraw their repository's use. **Workflow sources** in the repository workflow view opens
+that repository's access management, including when it has no saved workflows.
+
+Reconnect uses the same Linear workspace and preserves existing repository consent. Connect a
+separate source for a different workspace. Withdrawing access requires fresh owner consent before
+it can be used again. Disconnect removes Launchpad's stored authorization; it does not cancel
+Starting or running work. Use the run's Cancel action to stop that work.
+
+This currently provides source connections and repository consent. Automatic Linear triggers are
+not available yet; a connected source still shows unverified event delivery. Mobile shows source
+health; configure sources in the web or desktop app. If the service configuration needs attention,
+retry after the relay operator repairs it rather than reconnecting your account.
+
 ## Repository workflows
 
 Maintainers and admins can create workflows from **Workflows** in the sidebar or command palette.

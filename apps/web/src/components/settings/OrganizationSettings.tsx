@@ -1,3 +1,4 @@
+import { RepositorySourcesButton } from "../workflows/WorkflowSources";
 import {
   BuildingIcon,
   CopyIcon,
@@ -548,7 +549,8 @@ function RepositoryRow({
             </Button>
           </div>
         ) : null}
-        <div className="border-t pt-3">
+        <div className="flex flex-wrap gap-2 border-t pt-3">
+          {canConfigure ? <RepositorySourcesButton repositoryId={repositoryId} /> : null}
           <Button
             variant="outline"
             render={
