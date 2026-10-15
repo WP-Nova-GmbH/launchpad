@@ -64,4 +64,53 @@ describe("workflow source client", () => {
       ),
     ),
   );
+  it.effect("decodes a Begin link independently of a newer owner snapshot", () =>
+    Effect.gen(function* () {
+      const client = yield* Sources.client;
+      const result = yield* client.begin("token", {
+        attemptId: "A",
+        expectedVersion: 0,
+        connectionId: null,
+      });
+      expect(result.authorization).toEqual({
+        applicationId: "app",
+        attemptId: "A",
+        url: "https://linear.app/oauth/authorize?state=A",
+      });
+      expect(result.owner.attempt?.attemptId).toBe("B");
+      expect(result.owner.withdrawableGrants).toEqual([
+        { grantId: "hidden", connectionId: "owned", repositoryName: null },
+      ]);
+    }).pipe(
+      Effect.provide(
+        layer(async () =>
+          Response.json({
+            authorization: {
+              applicationId: "app",
+              attemptId: "A",
+              url: "https://linear.app/oauth/authorize?state=A",
+            },
+            owner: {
+              configured: true,
+              applicationId: "app",
+              version: 2,
+              attempt: {
+                attemptId: "B",
+                connectionId: null,
+                expiresAt: 600000,
+                status: "pending",
+                error: null,
+              },
+              connections: [],
+              repositories: [],
+              grants: [],
+              withdrawableGrants: [
+                { grantId: "hidden", connectionId: "owned", repositoryName: null },
+              ],
+            },
+          }),
+        ),
+      ),
+    ),
+  );
 });

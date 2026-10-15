@@ -65,12 +65,15 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
         setError(null);
         uncertain.current = false;
         setUnverified(false);
+        return result;
       }
+      return null;
     } catch (cause) {
       if (live.current && identity.current === accountId && request === version.current) {
         if (WorkflowSources.accessRejected(cause)) setSnapshot(null);
         setError(cause instanceof Error ? cause.message : "Could not load workflow sources.");
       }
+      return null;
     } finally {
       if (live.current && request === version.current) setLoading(false);
     }
@@ -96,8 +99,17 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
     try {
       const result = await call(operation);
       if (!live.current || identity.current !== accountId) return null;
-      await load();
-      return result;
+      uncertain.current = true;
+      setUnverified(true);
+      const verified = await load();
+      if (!live.current || identity.current !== accountId) return null;
+      if (verified === null) {
+        uncertain.current = true;
+        setUnverified(true);
+        setError((previous) => previous ?? "Refresh to verify this change.");
+        return null;
+      }
+      return { result, snapshot: verified };
     } catch (cause) {
       if (live.current && identity.current === accountId) {
         uncertain.current = true;

@@ -77,6 +77,9 @@ export const WorkflowSourceOwner = Schema.Struct({
     Schema.Struct({ repositoryId: Id, organizationId: Id, name: Schema.String }),
   ),
   grants: Schema.Array(WorkflowSourceGrant),
+  withdrawableGrants: Schema.Array(
+    Schema.Struct({ grantId: Id, connectionId: Id, repositoryName: Schema.NullOr(Schema.String) }),
+  ),
 });
 export type WorkflowSourceOwner = typeof WorkflowSourceOwner.Type;
 export const WorkflowRepositorySources = Schema.Struct({
@@ -94,9 +97,12 @@ export const BeginWorkflowSource = Schema.Struct({
   connectionId: Schema.NullOr(Id),
 });
 export const WorkflowSourceAuthorization = Schema.Struct({
-  authorizationUrl: Schema.NullOr(Schema.String),
+  authorization: Schema.NullOr(
+    Schema.Struct({ applicationId: Id, attemptId: Id, url: Schema.String }),
+  ),
   owner: WorkflowSourceOwner,
 });
+export type WorkflowSourceAuthorization = typeof WorkflowSourceAuthorization.Type;
 export const DisconnectWorkflowSource = Schema.Struct({
   connectionId: Id,
   expectedEpoch: Revision,

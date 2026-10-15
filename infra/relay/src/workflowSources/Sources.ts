@@ -92,13 +92,21 @@ export const begin = Effect.fn("workflowSources.begin")(function* (
       return updated!;
     }),
   );
-  const authorizationUrl =
-    saved.status === "pending" && saved.pending_sealed && Date.parse(saved.expires_at!) > time
-      ? yield* box
-          .open(saved.pending_sealed)
-          .pipe(Effect.flatMap(decodePending), Effect.flatMap(Linear.authorizationUrl))
+  const authorization =
+    saved.status === "pending" &&
+    saved.attempt_id &&
+    saved.pending_sealed &&
+    Date.parse(saved.expires_at!) > (yield* Store.now)
+      ? {
+          applicationId: saved.application_id,
+          attemptId: saved.attempt_id,
+          url: yield* box
+            .open(saved.pending_sealed)
+            .pipe(Effect.flatMap(decodePending), Effect.flatMap(Linear.authorizationUrl)),
+        }
       : null;
-  return { authorizationUrl, owner: yield* owner(user) };
+  // The snapshot may already contain a newer attempt; it never identifies this link.
+  return { authorization, owner: yield* owner(user) };
 });
 export const cancel = Effect.fn("workflowSources.cancel")(function* (user: string, id: string) {
   const sql = (yield* RelayDb).$client;
@@ -219,20 +227,32 @@ const recordFailure = Effect.fn("workflowSources.recordFailure")(function* (
   leaseId: string | null = null,
 ) {
   const sql = (yield* RelayDb).$client;
-  const lost = error.code === "reconnect_required";
+  // A read's expired access token is not proof that a faulted refresh grant was lost.
+  const lost = sql`${error.code === "reconnect_required"} AND (${leaseId}::text IS NOT NULL OR health->>'code'<>'service_configuration')`;
+  const confirmedLoss = error.code === "reconnect_required" && leaseId !== null;
   const retryAt =
     error.retryAt ?? (error.code === "unavailable" ? (yield* Store.now) + 5000 : null);
-  const health = {
-    code: lost
+  const code =
+    error.code === "reconnect_required"
       ? "reconnect_required"
       : error.code === "service_configuration"
         ? "service_configuration"
         : error.code === "rate_limited"
           ? "rate_limited"
-          : "unavailable",
-    retryAt,
-  };
-  yield* sql`UPDATE relay_workflow_connections SET status=CASE WHEN ${lost} THEN 'reconnect_required' ELSE status END,authorization_epoch=authorization_epoch+CASE WHEN ${lost} THEN 1 ELSE 0 END,health=${Store.json(health)}::jsonb,lease_id=CASE WHEN ${leaseId}::text IS NOT NULL THEN NULL ELSE lease_id END,lease_until=CASE WHEN ${leaseId}::text IS NOT NULL THEN NULL ELSE lease_until END,refresh_started_at=CASE WHEN ${leaseId}::text IS NOT NULL AND ${c.refresh_started_at}::text IS NULL AND ${error.code !== "unavailable"} THEN NULL ELSE refresh_started_at END WHERE connection_id=${c.connection_id} AND status='connected' AND authorization_epoch=${c.authorization_epoch} AND credential_version=${c.credential_version} AND (${leaseId}::text IS NULL OR lease_id=${leaseId})`;
+          : "unavailable";
+  yield* sql`UPDATE relay_workflow_connections SET
+    status=CASE WHEN ${lost} THEN 'reconnect_required' ELSE status END,
+    authorization_epoch=authorization_epoch+CASE WHEN ${lost} THEN 1 ELSE 0 END,
+    health=jsonb_build_object(
+    'code',CASE WHEN health->>'code'='service_configuration' AND NOT ${confirmedLoss} THEN 'service_configuration' ELSE ${code}::text END,
+    'retryAt',GREATEST((health->>'retryAt')::double precision,${retryAt}::double precision)
+  ),
+    lease_id=CASE WHEN ${leaseId}::text IS NOT NULL THEN NULL ELSE lease_id END,
+    lease_until=CASE WHEN ${leaseId}::text IS NOT NULL THEN NULL ELSE lease_until END,
+    refresh_started_at=CASE WHEN ${leaseId}::text IS NOT NULL AND ${c.refresh_started_at}::text IS NULL AND ${error.code !== "unavailable"} THEN NULL ELSE refresh_started_at END
+    WHERE connection_id=${c.connection_id} AND status='connected'
+      AND authorization_epoch=${c.authorization_epoch} AND credential_version=${c.credential_version}
+      AND (${leaseId}::text IS NULL OR lease_id=${leaseId})`;
 });
 export const credentials = Effect.fn("workflowSources.credentials")(function* (
   c: Store.Connection,
@@ -259,8 +279,20 @@ export const credentials = Effect.fn("workflowSources.credentials")(function* (
     return { credentials: payload, connection: c };
   const sql = (yield* RelayDb).$client;
   const lease = yield* uuid;
-  const [claimed] =
-    yield* sql<Store.Connection>`UPDATE relay_workflow_connections SET lease_id=${lease},lease_until=${Store.iso(time + 30_000)},refresh_started_at=COALESCE(refresh_started_at,${Store.iso(time)}) WHERE connection_id=${c.connection_id} AND status='connected' AND authorization_epoch=${c.authorization_epoch} AND credential_version=${c.credential_version} AND (lease_id IS NULL OR lease_until<=${Store.iso(time)}) RETURNING *`;
+  // Capture pre-lease recovery state atomically; the caller may hold an older snapshot.
+  const [claimed] = yield* sql<Store.Connection & { prior_refresh_started_at: string | null }>`
+    WITH previous AS (
+      SELECT connection_id,refresh_started_at FROM relay_workflow_connections
+      WHERE connection_id=${c.connection_id} AND status='connected'
+        AND authorization_epoch=${c.authorization_epoch} AND credential_version=${c.credential_version}
+        AND (lease_id IS NULL OR lease_until<=${Store.iso(time)})
+        AND ((health->>'retryAt')::double precision IS NULL OR (health->>'retryAt')::double precision<=${time})
+      FOR UPDATE
+    )
+    UPDATE relay_workflow_connections c SET lease_id=${lease},lease_until=${Store.iso(time + 30_000)},
+      refresh_started_at=COALESCE(previous.refresh_started_at,${Store.iso(time)})
+    FROM previous WHERE c.connection_id=previous.connection_id
+    RETURNING c.*,previous.refresh_started_at AS prior_refresh_started_at`;
   if (!claimed)
     return yield* Store.fail(
       "refresh_in_progress",
@@ -268,7 +300,10 @@ export const credentials = Effect.fn("workflowSources.credentials")(function* (
       time + 1000,
     );
   return yield* Effect.gen(function* () {
-    if (c.refresh_started_at && time - Date.parse(c.refresh_started_at) > 30 * 60_000)
+    if (
+      claimed.prior_refresh_started_at &&
+      time - Date.parse(claimed.prior_refresh_started_at) > 30 * 60_000
+    )
       return yield* Store.fail(
         "reconnect_required",
         "Credential recovery expired. The source owner must reconnect Linear.",
@@ -276,7 +311,10 @@ export const credentials = Effect.fn("workflowSources.credentials")(function* (
     const tokens = yield* Linear.exchange({ refreshToken: payload.refreshToken });
     const sealed = yield* box.seal(Store.json(tokens));
     const [saved] =
-      yield* sql<Store.Connection>`UPDATE relay_workflow_connections SET payload_sealed=${sealed},credential_version=credential_version+1,health=${Store.json(Store.healthy)}::jsonb,lease_id=NULL,lease_until=NULL,refresh_started_at=NULL WHERE connection_id=${c.connection_id} AND status='connected' AND authorization_epoch=${c.authorization_epoch} AND credential_version=${c.credential_version} AND lease_id=${lease} RETURNING *`;
+      yield* sql<Store.Connection>`UPDATE relay_workflow_connections SET payload_sealed=${sealed},credential_version=credential_version+1,health=CASE
+      WHEN (health->>'retryAt')::double precision>${yield* Store.now} THEN
+        jsonb_set(health,'{code}',CASE WHEN health->>'code'='service_configuration' THEN '"unavailable"'::jsonb ELSE health->'code' END)
+      ELSE ${Store.json(Store.healthy)}::jsonb END,lease_id=NULL,lease_until=NULL,refresh_started_at=NULL WHERE connection_id=${c.connection_id} AND status='connected' AND authorization_epoch=${c.authorization_epoch} AND credential_version=${c.credential_version} AND lease_id=${lease} RETURNING *`;
     if (!saved)
       return yield* Store.fail(
         "conflict",
@@ -285,7 +323,13 @@ export const credentials = Effect.fn("workflowSources.credentials")(function* (
     return { credentials: tokens, connection: saved };
   }).pipe(
     Effect.tapError((error) =>
-      isSourceError(error) ? recordFailure(c, error, lease).pipe(Effect.ignore) : Effect.void,
+      isSourceError(error)
+        ? recordFailure(
+            { ...claimed, refresh_started_at: claimed.prior_refresh_started_at },
+            error,
+            lease,
+          ).pipe(Effect.ignore)
+        : Effect.void,
     ),
   );
 });
@@ -318,7 +362,7 @@ export const refresh = Effect.fn("workflowSources.refresh")(function* (c: Store.
       "The Linear workspace changed. Connect it as a new source.",
     );
   const sql = (yield* RelayDb).$client;
-  yield* sql`UPDATE relay_workflow_connections SET workspace_name=${identity.organization.name},viewer_name=${identity.viewer.name},health=${Store.json(Store.healthy)}::jsonb WHERE connection_id=${c.connection_id} AND status='connected' AND authorization_epoch=${c.authorization_epoch} AND health->>'code'<>'service_configuration'`;
+  yield* sql`UPDATE relay_workflow_connections SET workspace_name=${identity.organization.name},viewer_name=${identity.viewer.name},health=${Store.json(Store.healthy)}::jsonb WHERE connection_id=${c.connection_id} AND status='connected' AND authorization_epoch=${c.authorization_epoch} AND health->>'code'<>'service_configuration' AND ((health->>'retryAt')::double precision IS NULL OR (health->>'retryAt')::double precision<=${yield* Store.now})`;
 });
 export const refreshOwner = Effect.fn("workflowSources.refreshOwner")(function* (
   user: string,

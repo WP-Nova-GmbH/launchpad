@@ -10,6 +10,8 @@ import {
   RelayRepositoryId,
   type WorkflowRepositorySources,
   type WorkflowSource,
+  type WorkflowSourceOwner,
+  type BeginWorkflowSource,
 } from "@t3tools/contracts/relay";
 const fixture = vi.hoisted(() => ({
   account: "owner",
@@ -23,6 +25,12 @@ const fixture = vi.hoisted(() => ({
   dropAllow: false,
   allowCount: 0,
   readCount: 0,
+  owner: null as unknown as WorkflowSourceOwner,
+  begins: [] as Array<typeof BeginWorkflowSource.Type>,
+  beginReply: null as
+    | null
+    | ((body: typeof BeginWorkflowSource.Type) => Response | Promise<Response>),
+  dropWithdraw: false,
 }));
 vi.mock("@clerk/react", () => ({
   useAuth: () => ({ userId: fixture.account, isLoaded: true, getToken: fixture.getToken }),
@@ -33,7 +41,11 @@ vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
 vi.mock("./settingsLayout", () => ({
-  SettingsSection: ({ children }: PropsWithChildren) => createElement("section", null, children),
+  SettingsSection: ({
+    children,
+    headerAction,
+  }: PropsWithChildren<{ headerAction?: React.ReactNode }>) =>
+    createElement("section", null, headerAction, children),
 }));
 vi.mock("./settingsSearch", () => ({
   searchableSetting: (id: string) => ({ id, title: "Workflow sources" }),
@@ -110,6 +122,7 @@ vi.mock("../../../../mobile/src/features/settings/components/SettingsActionRow",
 const { WorkflowSourceHealth } = await vi.importActual<{
   WorkflowSourceHealth: ComponentType<{ repositoryId: RelayRepositoryId; focused: boolean }>;
 }>("../../../../mobile/src/features/settings/WorkflowSourceHealth");
+import { WorkflowSourcesSettings } from "./WorkflowSources";
 import { RepositorySources } from "../workflows/WorkflowSources";
 const source: WorkflowSource = {
   connectionId: "connection",
@@ -128,9 +141,11 @@ const words = () => JSON.stringify(renderer.toJSON());
 const button = (text: string) =>
   renderer.root.findAllByType("button").find((b) => b.children.join("") === text)!;
 const drain = async () => {
-  await act(async () => {
-    while (fixture.deliveries.length) await Promise.all(fixture.deliveries.splice(0));
-  });
+  do {
+    await act(async () => {
+      while (fixture.deliveries.length) await Promise.all(fixture.deliveries.splice(0));
+    });
+  } while (fixture.deliveries.length);
 };
 const mount = async () => {
   await act(async () => {
@@ -142,7 +157,21 @@ const mount = async () => {
 };
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  fixture.account = "owner";
   fixture.deliveries = [];
+  fixture.begins = [];
+  fixture.beginReply = null;
+  fixture.dropWithdraw = false;
+  fixture.owner = {
+    configured: true,
+    applicationId: "app",
+    version: 0,
+    attempt: null,
+    connections: [],
+    repositories: [],
+    grants: [],
+    withdrawableGrants: [],
+  };
   fixture.failRead = false;
   fixture.denyRead = false;
   fixture.dropAllow = false;
@@ -184,7 +213,50 @@ beforeEach(() => {
             },
           ],
         });
-      return Response.json(fixture.repo);
+      return Response.json(
+        request.url.endsWith("/v1/workflow-sources") ? fixture.owner : fixture.repo,
+      );
+    }
+    if (request.url.endsWith("/linear/begin")) {
+      const body = (await request.json()) as typeof BeginWorkflowSource.Type;
+      fixture.begins.push(body);
+      fixture.owner = {
+        ...fixture.owner,
+        version: fixture.owner.version + 1,
+        attempt: {
+          attemptId: body.attemptId,
+          connectionId: body.connectionId,
+          expiresAt: 600000,
+          status: "pending",
+          error: null,
+        },
+      };
+      if (fixture.beginReply) return fixture.beginReply(body);
+      return Response.json({
+        authorization: {
+          applicationId: "app",
+          attemptId: body.attemptId,
+          url: "https://linear.app/oauth/authorize?state=" + body.attemptId,
+        },
+        owner: fixture.owner,
+      });
+    }
+    if (request.url.endsWith("/v1/workflow-sources/withdraw")) {
+      const { grantId } = (await request.json()) as { grantId: string };
+      fixture.owner = {
+        ...fixture.owner,
+        withdrawableGrants: fixture.owner.withdrawableGrants.filter((g) => g.grantId !== grantId),
+      };
+      if (fixture.dropWithdraw) throw new Error("withdraw reply lost after commit");
+      return Response.json(fixture.owner);
+    }
+    if (request.url.endsWith("/linear/cancel")) {
+      fixture.owner = {
+        ...fixture.owner,
+        version: fixture.owner.version + 1,
+        attempt: fixture.owner.attempt ? { ...fixture.owner.attempt, status: "cancelled" } : null,
+      };
+      return Response.json(fixture.owner);
     }
     if (request.url.endsWith("/allow")) {
       fixture.allowCount++;
@@ -337,6 +409,237 @@ it.effect("mobile reads safe source health, refreshes stale status and clears re
       await drain();
       expect(words()).not.toContain("Engineering workspace");
       expect(words()).toContain("Repository access removed");
+    });
+  }),
+);
+
+const mountOwner = async () => {
+  await act(async () => {
+    renderer = create(<WorkflowSourcesSettings />);
+  });
+  await drain();
+};
+const refreshOwner = async () => {
+  await act(async () => {
+    renderer.root
+      .findAllByType("button")
+      .find((b) => b.props["aria-label"] === "Refresh workflow sources")!
+      .props.onClick();
+  });
+  await drain();
+};
+const click = async (label: string) => {
+  await act(async () => {
+    button(label).props.onClick();
+  });
+  await drain();
+};
+const pendingB = () => {
+  fixture.owner = {
+    ...fixture.owner,
+    version: fixture.owner.version + 1,
+    attempt: {
+      attemptId: "other-device-B",
+      connectionId: null,
+      expiresAt: 600000,
+      status: "pending",
+      error: null,
+    },
+  };
+};
+const links = () => renderer.root.findAllByType("a");
+
+it.effect("lets owners withdraw a hidden repository's consent and reconciles a lost reply", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [source],
+        withdrawableGrants: [
+          { grantId: "hidden", connectionId: source.connectionId, repositoryName: null },
+          {
+            grantId: "visible",
+            connectionId: source.connectionId,
+            repositoryName: "Visible repository",
+          },
+        ],
+      };
+      await mountOwner();
+      expect(words()).toContain("Repository no longer visible");
+      expect(words()).toContain("You can still withdraw");
+      fixture.dropWithdraw = true;
+      await click("Withdraw access");
+      expect(words()).not.toContain("Repository no longer visible");
+      expect(words()).toContain("Visible repository");
+      expect(fixture.owner.withdrawableGrants.map((g) => g.grantId)).toEqual(["visible"]);
+    });
+  }),
+);
+it.effect("suppresses a superseded link and explicitly resumes the same current attempt", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      await mountOwner();
+      await click("Connect Linear workspace");
+      const oldUrl = links()[0]!.props.href;
+      expect(window.open).toHaveBeenCalledExactlyOnceWith(oldUrl, "_blank", "noopener,noreferrer");
+      pendingB();
+      await refreshOwner();
+      expect(links()).toHaveLength(0);
+      expect(button("Continue authorization")).toBeDefined();
+      expect(window.open).toHaveBeenCalledTimes(1);
+      await click("Continue authorization");
+      expect(fixture.begins[1]?.attemptId).toBe("other-device-B");
+      expect(links()[0]!.props.href).toContain("state=other-device-B");
+      expect(window.open).toHaveBeenCalledTimes(2);
+      await refreshOwner();
+      expect(window.open).toHaveBeenCalledTimes(2);
+      await click("Cancel authorization");
+      expect(links()).toHaveLength(0);
+    });
+  }),
+);
+for (const responseOwner of ["A", "B"] as const) {
+  it.effect(
+    `rejects link A when response owner is ${responseOwner} and verification observes B`,
+    () =>
+      Effect.gen(function* () {
+        yield* serveRequests;
+        yield* Effect.promise(async () => {
+          fixture.beginReply = (body) => {
+            const oldOwner = fixture.owner;
+            pendingB();
+            return Response.json({
+              authorization: {
+                applicationId: "app",
+                attemptId: body.attemptId,
+                url: "https://linear.app/oauth/authorize?state=A",
+              },
+              owner: responseOwner === "A" ? oldOwner : fixture.owner,
+            });
+          };
+          await mountOwner();
+          await click("Connect Linear workspace");
+          expect(links()).toHaveLength(0);
+          expect(window.open).not.toHaveBeenCalled();
+          expect(button("Continue authorization")).toBeDefined();
+        });
+      }),
+  );
+}
+it.effect(
+  "recovers a lost Begin reply without offering the retained old link or starting new consent",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountOwner();
+        await click("Connect Linear workspace");
+        fixture.beginReply = () => {
+          throw new Error("Begin reply lost after commit");
+        };
+        await click("Connect Linear workspace");
+        const committed = fixture.owner.attempt!.attemptId;
+        expect(links()).toHaveLength(0);
+        expect(window.open).toHaveBeenCalledTimes(1);
+        fixture.beginReply = null;
+        await click("Continue authorization");
+        expect(fixture.begins[2]?.attemptId).toBe(committed);
+        expect(links()[0]!.props.href).toContain(committed);
+      });
+    }),
+);
+it.effect(
+  "blocks writes and consent links until a successful Refresh after failed mutation verification",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountOwner();
+        fixture.beginReply = (body) => {
+          fixture.failRead = true;
+          return Response.json({
+            authorization: {
+              applicationId: "app",
+              attemptId: body.attemptId,
+              url: "https://linear.app/oauth/authorize?state=unverified",
+            },
+            owner: fixture.owner,
+          });
+        };
+        await click("Connect Linear workspace");
+        expect(window.open).not.toHaveBeenCalled();
+        expect(links()).toHaveLength(0);
+        expect(button("Connect Linear workspace").props.disabled).toBe(true);
+        // Invoke the handler as well: the shared hook must reject a second write.
+        await click("Connect Linear workspace");
+        expect(fixture.begins).toHaveLength(1);
+        fixture.failRead = false;
+        fixture.beginReply = null;
+        await refreshOwner();
+        expect(button("Continue authorization").props.disabled).toBe(false);
+        await click("Continue authorization");
+        expect(fixture.begins[1]?.attemptId).toBe(fixture.begins[0]?.attemptId);
+        expect(window.open).toHaveBeenCalledTimes(1);
+      });
+    }),
+);
+for (const status of ["exchanging", "connected", "failed", "cancelled"] as const) {
+  it.effect(`removes the local authorization link when the attempt becomes ${status}`, () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountOwner();
+        await click("Connect Linear workspace");
+        fixture.owner = { ...fixture.owner, attempt: { ...fixture.owner.attempt!, status } };
+        await refreshOwner();
+        expect(links()).toHaveLength(0);
+        expect(button("Continue authorization")).toBeUndefined();
+        expect(window.open).toHaveBeenCalledTimes(1);
+      });
+    }),
+  );
+}
+it.effect("drops a delayed Begin result after the authenticated account changes", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      fixture.beginReply = async (body) => {
+        const owner = fixture.owner;
+        enter();
+        await gate;
+        return Response.json({
+          authorization: {
+            applicationId: "app",
+            attemptId: body.attemptId,
+            url: "https://linear.app/oauth/authorize?state=old-account",
+          },
+          owner,
+        });
+      };
+      await mountOwner();
+      await act(async () => {
+        button("Connect Linear workspace").props.onClick();
+        await entered;
+      });
+      fixture.account = "another-account";
+      fixture.owner = { ...fixture.owner, attempt: null, version: 0 };
+      await act(async () => {
+        renderer.update(<WorkflowSourcesSettings />);
+        release();
+      });
+      await drain();
+      expect(window.open).not.toHaveBeenCalled();
+      expect(links()).toHaveLength(0);
+      expect(button("Continue authorization")).toBeUndefined();
     });
   }),
 );

@@ -4,6 +4,7 @@ import {
   RelayRepositoryId,
   type WorkflowSource,
   type WorkflowSourceOwner,
+  type WorkflowSourceAuthorization,
 } from "@t3tools/contracts/relay";
 import { useCallback, useState } from "react";
 import { LinkIcon, RefreshCwIcon } from "lucide-react";
@@ -30,9 +31,20 @@ function OwnerSources({ accountId }: { accountId: string }) {
     [],
   );
   const state = useWorkflowSources<WorkflowSourceOwner>(accountId, read);
-  const [authorizationUrl, setAuthorizationUrl] = useState<string | null>(null);
+  const [authorization, setAuthorization] =
+    useState<WorkflowSourceAuthorization["authorization"]>(null);
   const snapshot = state.snapshot,
     disabled = state.busy || state.loading || state.unverified;
+  const matches = (
+    link: WorkflowSourceAuthorization["authorization"],
+    current: WorkflowSourceOwner,
+  ) =>
+    link !== null &&
+    current.applicationId === link.applicationId &&
+    current.attempt?.attemptId === link.attemptId &&
+    current.attempt.status === "pending";
+  const activeAuthorization =
+    !disabled && snapshot && matches(authorization, snapshot) ? authorization : null;
   const connect = async (connectionId: string | null, resumeId?: string) => {
     if (!snapshot) return;
     const result = await state.mutate((client, token) =>
@@ -42,9 +54,11 @@ function OwnerSources({ accountId }: { accountId: string }) {
         connectionId,
       }),
     );
-    if (result?.authorizationUrl) {
-      setAuthorizationUrl(result.authorizationUrl);
-      window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
+    if (!result) return;
+    const link = result.result.authorization;
+    if (link && matches(link, result.snapshot)) {
+      setAuthorization(link);
+      window.open(link.url, "_blank", "noopener,noreferrer");
     }
   };
   return (
@@ -100,7 +114,7 @@ function OwnerSources({ accountId }: { accountId: string }) {
                   variant="outline"
                   disabled={disabled}
                   onClick={() => {
-                    setAuthorizationUrl(null);
+                    setAuthorization(null);
                     void state.mutate((c, t) => c.cancel(t, snapshot.attempt!.attemptId));
                   }}
                 >
@@ -108,7 +122,7 @@ function OwnerSources({ accountId }: { accountId: string }) {
                 </Button>
               </div>
             ) : null}
-            {snapshot.attempt?.status === "pending" && !authorizationUrl ? (
+            {snapshot.attempt?.status === "pending" && !activeAuthorization ? (
               <Button
                 variant="outline"
                 disabled={disabled}
@@ -126,9 +140,9 @@ function OwnerSources({ accountId }: { accountId: string }) {
                   : "Authorization did not complete. Your existing sources were preserved."}
               </p>
             ) : null}
-            {authorizationUrl && snapshot.attempt?.status === "pending" ? (
+            {activeAuthorization ? (
               <a
-                href={authorizationUrl}
+                href={activeAuthorization.url}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-sm underline"
@@ -220,13 +234,17 @@ function OwnerSourceRow({
           ) : null}
         </div>
       </div>
-      {current
-        .filter((g) => !g.revoked)
+      {snapshot.withdrawableGrants
+        .filter((g) => g.connectionId === source.connectionId)
         .map((g) => (
           <div key={g.grantId} className="flex flex-wrap items-center gap-2 text-sm">
             <span className="min-w-0 flex-1 break-words">
-              {snapshot.repositories.find((r) => r.repositoryId === g.repositoryId)?.name ??
-                "Allowed repository"}
+              {g.repositoryName ?? "Repository no longer visible"}
+              {g.repositoryName === null ? (
+                <span className="block text-xs text-muted-foreground">
+                  You can still withdraw this repository's access.
+                </span>
+              ) : null}
             </span>
             <Button
               size="sm"

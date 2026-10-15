@@ -236,6 +236,16 @@ export const ownerSnapshot = Effect.fn("workflowSources.ownerSnapshot")(function
   }>`SELECT r.repository_id AS "repositoryId",r.organization_id AS "organizationId",r.name FROM relay_repositories r JOIN relay_organizations o ON o.organization_id=r.organization_id JOIN relay_organization_members m ON m.organization_id=r.organization_id AND m.user_id=${owner} LEFT JOIN relay_repository_access a ON a.repository_id=r.repository_id AND a.user_id=${owner} WHERE m.role='admin' OR a.role='maintainer' ORDER BY r.name,r.repository_id`;
   const grants =
     yield* sql<Grant>`SELECT g.* FROM relay_workflow_repository_grants g JOIN relay_repositories r ON r.repository_id=g.repository_id JOIN relay_organization_members m ON m.organization_id=r.organization_id AND m.user_id=${owner} LEFT JOIN relay_repository_access a ON a.repository_id=r.repository_id AND a.user_id=${owner} WHERE g.owner_user_id=${owner} AND (m.role='admin' OR a.user_id IS NOT NULL) ORDER BY g.generation`;
+  const withdrawableGrants = yield* sql<WorkflowSourceOwner["withdrawableGrants"][number]>`
+    SELECT g.grant_id AS "grantId",g.connection_id AS "connectionId",
+      CASE WHEN m.role='admin' OR a.user_id IS NOT NULL THEN r.name ELSE NULL END AS "repositoryName"
+    FROM relay_workflow_repository_grants g
+    JOIN relay_workflow_connections c ON c.connection_id=g.connection_id AND c.owner_user_id=${owner}
+    JOIN relay_repositories r ON r.repository_id=g.repository_id AND r.organization_id=g.organization_id
+    JOIN relay_organizations o ON o.organization_id=g.organization_id
+    JOIN relay_organization_members m ON m.organization_id=g.organization_id AND m.user_id=${owner}
+    LEFT JOIN relay_repository_access a ON a.repository_id=g.repository_id AND a.user_id=${owner}
+    WHERE g.owner_user_id=${owner} AND NOT g.revoked ORDER BY g.grant_id`;
   return {
     configured: app !== null,
     applicationId: app,
@@ -257,6 +267,7 @@ export const ownerSnapshot = Effect.fn("workflowSources.ownerSnapshot")(function
     connections: connections.map(source),
     repositories,
     grants: grants.map(grant),
+    withdrawableGrants,
   } satisfies WorkflowSourceOwner;
 });
 
