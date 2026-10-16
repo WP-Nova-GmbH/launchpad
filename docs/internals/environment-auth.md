@@ -56,6 +56,18 @@ back to the reusable credential. OAuth exchanges create ordinary local bearer
 or DPoP children with normal expiry and revocation. The reusable cookie expires
 after 30 days.
 
+## Workflow execution identity
+
+A workflow's saved origin identifies its original human submitter or automation handoff;
+human checkpoint and control requesters remain separate. Legacy manual proofs recover the
+starter from an accepted run, since their signed subject can be a different reviewer.
+Automation requires protocol 8 and the enrolled organization's exact current repository/project
+binding. It never inherits the Linear connection owner's account or grants general session access.
+Removing a binding blocks new work while durable cancellation and owned cleanup remain possible.
+The workflow reader barrier protects saved origins and message attribution from older executors.
+See [dispatch verification](../../apps/server/src/cloud/http.ts) and
+[repository access](../../apps/server/src/auth/RepositoryAccess.ts).
+
 ## The environment is the filesystem boundary
 
 Organization machines retain this shared filesystem boundary under

@@ -8,6 +8,7 @@ import {
   type WorkflowJobPage,
   type SaveRepositoryWorkflow,
 } from "@t3tools/contracts/workflows";
+import { WorkflowOrigin, sameWorkflowOrigin } from "@t3tools/contracts";
 import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -18,6 +19,8 @@ import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
 
 export type WorkflowJobRecord = Omit<typeof relayWorkflowJobs.$inferSelect, "summary">;
+const decodeOrigin = Schema.decodeUnknownSync(WorkflowOrigin);
+
 const JobPageCursor = Schema.Struct({
   version: Schema.Literal(1),
   repositoryId: Schema.String,
@@ -33,6 +36,24 @@ export class WorkflowPersistenceError extends Schema.TaggedError<WorkflowPersist
 ) {}
 const persist = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.mapError((cause) => new WorkflowPersistenceError({ cause })));
+
+function validateOrigin(row: WorkflowJobRecord, record = row.record) {
+  const origin = decodeOrigin(
+    record.origin ??
+      (row.submitterUserId ? { kind: "manual", userId: row.submitterUserId } : undefined),
+  );
+  if (
+    origin.kind === "manual"
+      ? origin.userId !== row.submitterUserId
+      : row.submitterUserId !== null ||
+        origin.organizationId !== row.organizationId ||
+        origin.repositoryId !== row.repositoryId ||
+        origin.workflowId !== record.workflowId ||
+        (record.requiredProtocol ?? 0) < 8
+  )
+    throw new Error("Invalid workflow origin binding.");
+  return { ...record, origin };
+}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb;
@@ -116,7 +137,11 @@ export const make = Effect.gen(function* () {
       return record;
     }),
     createJob: (row: WorkflowJobRecord) =>
-      persist(db.insert(relayWorkflowJobs).values(row)).pipe(Effect.as(row)),
+      persist(
+        Effect.try(() => validateOrigin(row)).pipe(
+          Effect.flatMap((record) => db.insert(relayWorkflowJobs).values({ ...row, record })),
+        ),
+      ).pipe(Effect.as(row)),
     listJobs: (repositoryId: string) =>
       persist(
         db
@@ -241,6 +266,15 @@ export const make = Effect.gen(function* () {
       releaseLease = true,
     ) {
       if (isTerminalWorkflowJob(previous.record.status)) return previous;
+      record = yield* persist(
+        Effect.try(() => {
+          const saved = validateOrigin(previous);
+          const next = validateOrigin(previous, record);
+          if (!sameWorkflowOrigin(saved.origin, next.origin))
+            throw new Error("Workflow origin is immutable.");
+          return next;
+        }),
+      );
       const rows = yield* persist(
         db
           .update(relayWorkflowJobs)

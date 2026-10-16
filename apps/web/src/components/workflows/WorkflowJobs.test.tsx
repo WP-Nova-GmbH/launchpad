@@ -114,3 +114,22 @@ it("retains loaded runs on a failed refresh and lets the user retry", async () =
   expect(content()).toContain("No active runs");
   expect(content()).not.toContain("Last known run");
 });
+
+it("keeps the frozen automatic workflow name when catalog metadata is unavailable", async () => {
+  fixture.call.mockResolvedValueOnce({
+    jobs: [
+      {
+        ...row("Automatic job"),
+        originSummary: { kind: "automation", workflowName: "Frozen workflow" },
+      },
+    ],
+    nextCursor: null,
+  });
+  await act(async () => {
+    renderer = create(
+      <WorkflowJobs scope={scope} workflows={[]} refreshWorkflows={refreshWorkflows} />,
+    );
+  });
+  expect(content()).toContain("Frozen workflow");
+  expect(content()).toContain("Started by workflow");
+});

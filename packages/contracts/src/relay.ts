@@ -61,6 +61,7 @@ import {
 } from "./workflowSources.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
+import { WorkflowOrigin } from "./workflowOrigin.ts";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiEndpoint from "effect/unstable/httpapi/HttpApiEndpoint";
 import * as HttpApiGroup from "effect/unstable/httpapi/HttpApiGroup";
@@ -1957,6 +1958,8 @@ export type RelayJob = typeof RelayJob.Type;
  * relay issuer, and the response is signed back.
  */
 export const RelayCloudDispatchJobProofPayload = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowOrigin),
+  requestedBy: Schema.optional(TrimmedNonEmptyString),
   ...RelaySignedJwtRegisteredClaims,
   environmentId: EnvironmentId,
   jobId: RelayJobId,

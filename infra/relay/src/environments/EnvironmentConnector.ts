@@ -7,6 +7,7 @@ import {
   EnvironmentHttpInternalServerError,
   EnvironmentHttpUnauthorizedError,
   EnvironmentId,
+  WorkflowOrigin,
 } from "@t3tools/contracts";
 import { makeEnvironmentHttpApiClient } from "@t3tools/client-runtime/rpc";
 import {
@@ -199,7 +200,9 @@ export class EnvironmentConnector extends Context.Service<
       readonly environmentId: string;
     }) => Effect.Effect<RelayEnvironmentStatusResponse, EnvironmentConnectorError>;
     readonly dispatchJob: (input: {
-      readonly userId: string;
+      readonly userId?: string | null;
+      readonly workflowOrigin?: WorkflowOrigin;
+      readonly requestedBy?: string;
       readonly environmentId: string;
       readonly jobId: RelayJobId;
       readonly repositoryCanonicalKey: string;
@@ -935,6 +938,25 @@ const make = Effect.gen(function* () {
       };
     }),
     dispatchJob: Effect.fn("relay.environment_connector.dispatch_job")(function* (input) {
+      const origin = input.workflowOrigin;
+      if (
+        (!input.workflowControl && (origin !== undefined || !input.userId)) ||
+        (origin?.kind === "automation" &&
+          (!input.workflowControl ||
+            origin.organizationId !== input.workflowControl.organizationId ||
+            origin.repositoryId !== input.workflowControl.repositoryId ||
+            (input.workflowControl.operation === "start" &&
+              origin.workflowId !== input.workflowControl.workflow.workflowId))) ||
+        (origin?.kind !== "automation" && !input.userId && origin?.kind !== "manual")
+      )
+        return yield* new EnvironmentMintResponseInvalid({
+          environmentId: input.environmentId,
+          operation: "dispatch-job",
+        });
+      const subject =
+        origin?.kind === "automation"
+          ? `workflow:${input.jobId}`
+          : (input.requestedBy ?? input.userId ?? (origin?.kind === "manual" ? origin.userId : ""));
       yield* Effect.annotateCurrentSpan({
         "relay.environment_id": input.environmentId,
         "relay.operation": "dispatch-job",
@@ -942,7 +964,7 @@ const make = Effect.gen(function* () {
       });
       const { access: link, allocation } = yield* input.workflowControl === undefined
         ? resolveAccessAndAllocation({
-            userId: input.userId,
+            userId: input.userId!,
             environmentId: input.environmentId,
             operation: "dispatch-job",
           })
@@ -985,7 +1007,9 @@ const make = Effect.gen(function* () {
       const payload = {
         iss: relayIssuer,
         aud: `t3-env:${link.environmentId}`,
-        sub: input.userId,
+        sub: subject,
+        ...(origin === undefined ? {} : { workflowOrigin: origin }),
+        ...(input.requestedBy === undefined ? {} : { requestedBy: input.requestedBy }),
         jti: yield* crypto.randomUUIDv4.pipe(
           Effect.mapError(
             (cause) =>

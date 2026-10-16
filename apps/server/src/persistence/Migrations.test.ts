@@ -1,3 +1,6 @@
+import * as Schema from "effect/Schema";
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Migrator from "effect/unstable/sql/Migrator";
@@ -31,7 +34,7 @@ describe("migration history guard", () => {
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(
         yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-        [{ name: "OrchestrationEvents_WorkflowReaderV7" }],
+        [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
       );
       yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 59`;
       assert.instanceOf(yield* Effect.flip(runMigrations()), Migrator.MigrationError);
@@ -95,6 +98,7 @@ describe("migration history guard", () => {
         [64, "SetupLifecycleCleanup"],
         [65, "WorkflowSteps"],
         [66, "WorkflowManualPause"],
+        [67, "WorkflowOrigin"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT project_id FROM orchestration_command_receipts`, [
         { project_id: null },
@@ -215,7 +219,7 @@ it.effect(
       yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json) VALUES ('workflow-delete-test', 'thread', 'another-thread', 1, 'thread.deleted', '2026-10-08T00:00:00Z', 'system', '{}', '{}')`;
       assert.deepStrictEqual(
         yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-        [{ name: "OrchestrationEvents_WorkflowReaderV7" }],
+        [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
       );
       assert.deepStrictEqual(yield* runMigrations(), []);
       yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 60`;
@@ -239,6 +243,7 @@ it.effect("upgrades workflow ownership without changing accepted jobs", () =>
       [64, "SetupLifecycleCleanup"],
       [65, "WorkflowSteps"],
       [66, "WorkflowManualPause"],
+      [67, "WorkflowOrigin"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM repository_workflow_jobs`, [
       {
@@ -251,7 +256,7 @@ it.effect("upgrades workflow ownership without changing accepted jobs", () =>
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-      [{ name: "OrchestrationEvents_WorkflowReaderV7" }],
+      [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
     );
   }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );
@@ -263,7 +268,7 @@ it.effect("protects a cancellation-only database from older workflow readers", (
     yield* sql`UPDATE effect_sql_migrations SET name = 'OrchestrationEvents_WorkflowReaderV1' WHERE migration_id = 1`;
     assert.deepStrictEqual(
       yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-      [{ name: "OrchestrationEvents_WorkflowReaderV7" }],
+      [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
     );
     assert.deepStrictEqual(yield* runMigrations(), []);
     yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 61`;
@@ -278,7 +283,7 @@ it.effect("setup ownership alone activates and preserves the process reader barr
     yield* sql`UPDATE effect_sql_migrations SET name = 'OrchestrationEvents_SharedThreadReaderV2' WHERE migration_id = 1`;
     assert.deepStrictEqual(
       yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-      [{ name: "OrchestrationEvents_WorkflowReaderV7" }],
+      [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
     );
     assert.deepStrictEqual(yield* runMigrations(), []);
     yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 63`;
@@ -304,6 +309,7 @@ it.effect(
         [64, "SetupLifecycleCleanup"],
         [65, "WorkflowSteps"],
         [66, "WorkflowManualPause"],
+        [67, "WorkflowOrigin"],
       ]);
       const rows = yield* sql<{
         state: string;
@@ -333,7 +339,7 @@ it.effect(
       yield* sql`UPDATE effect_sql_migrations SET name = 'OrchestrationEvents_WorkflowReaderV3' WHERE migration_id = 1`;
       assert.deepStrictEqual(
         yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-        [{ name: "OrchestrationEvents_WorkflowReaderV7" }],
+        [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
       );
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );
@@ -351,6 +357,7 @@ it.effect("V4 upgrade preserves cleanup proof and blocks old PID-only fence read
       [64, "SetupLifecycleCleanup"],
       [65, "WorkflowSteps"],
       [66, "WorkflowManualPause"],
+      [67, "WorkflowOrigin"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT record_json FROM setup_processes`, [
       { record_json: record },
@@ -361,7 +368,7 @@ it.effect("V4 upgrade preserves cleanup proof and blocks old PID-only fence read
     yield* sql`UPDATE effect_sql_migrations SET name = 'OrchestrationEvents_WorkflowReaderV4' WHERE migration_id = 1`;
     assert.deepStrictEqual(
       yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-      [{ name: "OrchestrationEvents_WorkflowReaderV7" }],
+      [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
     );
     yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 64`;
     assert.instanceOf(yield* Effect.flip(runMigrations()), Migrator.MigrationError);
@@ -376,7 +383,10 @@ it.effect(
       yield* runMigrations({ toMigrationInclusive: 65 });
       const record = '{"manualPause":{"state":"paused","promptId":null}}';
       yield* sql`INSERT INTO repository_workflow_jobs VALUES ('paused-job', 'thread', 'waiting_capacity', 0, ${record})`;
-      assert.deepStrictEqual(yield* runMigrations(), [[66, "WorkflowManualPause"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [66, "WorkflowManualPause"],
+        [67, "WorkflowOrigin"],
+      ]);
       assert.deepStrictEqual(yield* sql`SELECT record_json FROM repository_workflow_jobs`, [
         { record_json: record },
       ]);
@@ -384,9 +394,40 @@ it.effect(
       yield* sql`UPDATE effect_sql_migrations SET name = 'OrchestrationEvents_WorkflowReaderV6' WHERE migration_id = 1`;
       assert.deepStrictEqual(
         yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-        [{ name: "OrchestrationEvents_WorkflowReaderV7" }],
+        [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
       );
       yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 66`;
+      assert.instanceOf(yield* Effect.flip(runMigrations()), Migrator.MigrationError);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+);
+
+it.effect(
+  "backfills real legacy starters and protects attribution-only history after terminal cleanup",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 66 });
+      const record = { userId: "alice", instruction: "retained", progress: { status: "done" } };
+      yield* sql`INSERT INTO repository_workflow_jobs VALUES ('old', 'old-thread', 'done', 0, ${encodeJson(record)})`;
+      yield* runMigrations();
+      const rows = yield* sql<{
+        record_json: string;
+      }>`SELECT record_json FROM repository_workflow_jobs`;
+      assert.deepStrictEqual(decodeJson(rows[0]!.record_json), {
+        ...record,
+        origin: { kind: "manual", userId: "alice" },
+      });
+      yield* sql`DELETE FROM repository_workflow_jobs`;
+      yield* sql`INSERT INTO projection_thread_messages (message_id,thread_id,turn_id,role,text,is_streaming,created_at,updated_at,workflow_origin_json)
+    VALUES ('auto','thread',NULL,'user','task',0,'now','now','{"kind":"automation","jobId":"job","workflowId":"flow","workflowName":"Frozen"}')`;
+      yield* sql`DELETE FROM projection_thread_messages`;
+      yield* sql`UPDATE effect_sql_migrations SET name = 'OrchestrationEvents_WorkflowReaderV7' WHERE migration_id = 1`;
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
+        [{ name: "OrchestrationEvents_WorkflowReaderV8" }],
+      );
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 67`;
       assert.instanceOf(yield* Effect.flip(runMigrations()), Migrator.MigrationError);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );

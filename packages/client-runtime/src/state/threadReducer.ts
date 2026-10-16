@@ -415,6 +415,9 @@ export function applyThreadDetailEvent(
           : {}),
         ...(event.payload.context !== undefined ? { context: event.payload.context } : {}),
         ...(event.payload.author !== undefined ? { author: event.payload.author } : {}),
+        ...(event.payload.workflowOrigin !== undefined
+          ? { workflowOrigin: event.payload.workflowOrigin }
+          : {}),
         ...(event.payload.editedBy !== undefined ? { editedBy: event.payload.editedBy } : {}),
         ...(event.payload.steeredBy !== undefined ? { steeredBy: event.payload.steeredBy } : {}),
         turnId: event.payload.turnId,
@@ -440,6 +443,9 @@ export function applyThreadDetailEvent(
           ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
           ...(message.context !== undefined ? { context: message.context } : {}),
           ...(message.author !== undefined ? { author: message.author } : {}),
+          ...(message.workflowOrigin !== undefined
+            ? { workflowOrigin: message.workflowOrigin }
+            : {}),
           ...(message.editedBy !== undefined ? { editedBy: message.editedBy } : {}),
           ...(message.steeredBy !== undefined ? { steeredBy: message.steeredBy } : {}),
         };

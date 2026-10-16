@@ -22,6 +22,7 @@ import type {
 } from "@t3tools/contracts/relay";
 import {
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -632,7 +633,7 @@ export const relayWorkflowJobs = pgTable(
     jobId: varchar("job_id", { length: 64 }).primaryKey(),
     repositoryId: varchar("repository_id", { length: 64 }).notNull(),
     organizationId: varchar("organization_id", { length: 64 }).notNull(),
-    submitterUserId: varchar("submitter_user_id", { length: 191 }).notNull(),
+    submitterUserId: varchar("submitter_user_id", { length: 191 }),
     repositoryCanonicalKey: text("repository_canonical_key"),
     status: varchar("status", { length: 32 }).notNull().$type<RepositoryWorkflowJob["status"]>(),
     record: jsonb("record").notNull().$type<RepositoryWorkflowJob>(),
@@ -648,7 +649,12 @@ export const relayWorkflowJobs = pgTable(
       ) || CASE WHEN "status" IN ('awaiting_review','awaiting_input','paused')
         OR ("status" = 'queued' AND "record"->>'detail' IS NOT NULL)
         OR ("status" = 'cancelling' AND "record"#>>'{progress,retryableCancellation}' = 'true')
-        THEN '{"needsAttention":true}'::jsonb ELSE '{"needsAttention":false}'::jsonb END`,
+        THEN '{"needsAttention":true}'::jsonb ELSE '{"needsAttention":false}'::jsonb END
+      || ('{"originSummary":' || (
+        jsonb_object(ARRAY['kind'], ARRAY["record"#>>'{origin,kind}'])
+        || CASE WHEN "record"#>>'{workflow,definition,name}' IS NOT NULL
+          THEN jsonb_object(ARRAY['workflowName'], ARRAY[left("record"#>>'{workflow,definition,name}',120)])
+          ELSE '{}'::jsonb END)::text || '}')::jsonb`,
       ),
     pendingControl: jsonb("pending_control").$type<{
       userId: string;
@@ -660,6 +666,24 @@ export const relayWorkflowJobs = pgTable(
     checkedAt: varchar("checked_at", { length: 64 }).notNull(),
   },
   (table) => [
+    check(
+      "workflow_job_origin",
+      sql`(
+      ("record"#>>'{origin,kind}' = 'manual' AND "submitter_user_id" IS NOT NULL
+        AND "record"#>>'{origin,userId}' = "submitter_user_id")
+      OR ("record"#>>'{origin,kind}' = 'automation' AND "submitter_user_id" IS NULL
+        AND "record"#>>'{origin,organizationId}' = "organization_id"
+        AND "record"#>>'{origin,repositoryId}' = "repository_id"
+        AND "record"#>>'{origin,workflowId}' = "record"->>'workflowId'
+        AND "record"#>>'{origin,source,provider}' = 'linear'
+        AND length(trim("record"#>>'{origin,source,applicationId}')) > 0
+        AND length(trim("record"#>>'{origin,source,workspaceId}')) > 0
+        AND length(trim("record"#>>'{origin,source,connectionId}')) > 0
+        AND length(trim("record"#>>'{origin,source,grantId}')) > 0
+        AND length(trim("record"#>>'{origin,occurrenceId}')) > 0
+        AND "record"->'requiredProtocol' = '8'::jsonb)
+    ) IS TRUE`,
+    ),
     index("idx_workflow_jobs_repository").on(table.repositoryId, table.createdAt),
     index("idx_workflow_jobs_status").on(table.status, table.checkedAt),
     index("idx_workflow_jobs_active_page")

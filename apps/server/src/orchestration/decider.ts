@@ -1647,6 +1647,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
               turnId: null,
               streaming: false,
               ...(command.author !== undefined ? { author: command.author } : {}),
+              ...(command.workflowOrigin !== undefined
+                ? { workflowOrigin: command.workflowOrigin }
+                : {}),
               createdAt: command.createdAt,
               updatedAt: command.createdAt,
             },
@@ -1751,6 +1754,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           messageId: command.message.messageId,
           role: "user",
           ...(command.author ? { author: command.author } : {}),
+          ...(command.workflowOrigin ? { workflowOrigin: command.workflowOrigin } : {}),
           text: command.message.text,
           attachments: command.message.attachments,
           ...(command.message.context !== undefined ? { context: command.message.context } : {}),

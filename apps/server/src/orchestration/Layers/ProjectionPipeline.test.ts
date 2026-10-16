@@ -4353,24 +4353,23 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
   ),
 );
 
-const engineLayer = it.layer(
-  OrchestrationEngineLive.pipe(
-    Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
-    Layer.provide(ThreadBackgroundLiveness.layer),
-    Layer.provide(ThreadPlanProgress.layer),
-    Layer.provideMerge(OrchestrationProjectionPipelineLive),
-    Layer.provide(OrchestrationEventStoreLive),
-    Layer.provide(OrchestrationCommandReceiptRepositoryLive),
-    Layer.provide(RepositoryIdentityResolver.layer),
-    Layer.provideMerge(SqlitePersistenceMemory),
-    Layer.provideMerge(
-      ServerConfig.layerTest(process.cwd(), {
-        prefix: "t3-projection-pipeline-engine-dispatch-",
-      }),
-    ),
-    Layer.provideMerge(NodeServices.layer),
+const engineTestLayer = OrchestrationEngineLive.pipe(
+  Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
+  Layer.provide(ThreadBackgroundLiveness.layer),
+  Layer.provide(ThreadPlanProgress.layer),
+  Layer.provideMerge(OrchestrationProjectionPipelineLive),
+  Layer.provide(OrchestrationEventStoreLive),
+  Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+  Layer.provide(RepositoryIdentityResolver.layer),
+  Layer.provideMerge(SqlitePersistenceMemory),
+  Layer.provideMerge(
+    ServerConfig.layerTest(process.cwd(), {
+      prefix: "t3-projection-pipeline-engine-dispatch-",
+    }),
   ),
+  Layer.provideMerge(NodeServices.layer),
 );
+const engineLayer = it.layer(engineTestLayer);
 
 engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
   it.effect("projects dispatched engine events immediately", () =>
@@ -4809,5 +4808,116 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
         cursorBeforeRetry[0]!.lastAppliedSequence,
       );
     }),
+  );
+});
+
+it.layer(Layer.fresh(engineTestLayer))("workflow attribution projection", (it) => {
+  it.effect(
+    "retains automatic attribution through engine events, SQL snapshots and projection replay",
+    () =>
+      Effect.gen(function* () {
+        const engine = yield* OrchestrationEngineService;
+        const query = yield* ProjectionSnapshotQuery;
+        const pipeline = yield* OrchestrationProjectionPipeline;
+        const sql = yield* SqlClient.SqlClient;
+        const projectId = ProjectId.make("origin-project"),
+          threadId = ThreadId.make("origin-thread"),
+          messageId = MessageId.make("origin-message");
+        const createdAt = "2026-10-15T00:00:00.000Z";
+        const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "test" };
+        const workflowOrigin = {
+          kind: "automation" as const,
+          jobId: "job",
+          workflowId: "flow",
+          workflowName: "Frozen name",
+        };
+        yield* engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("origin-project"),
+          projectId,
+          title: "Project",
+          workspaceRoot: "/tmp/origin",
+          defaultModelSelection: modelSelection,
+          createdAt,
+        });
+        yield* engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("origin-thread"),
+          threadId,
+          projectId,
+          title: "Workflow",
+          modelSelection,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+        });
+        yield* engine.dispatch({
+          type: "thread.prompt.enqueue",
+          commandId: CommandId.make("origin-enqueue"),
+          threadId,
+          message: { messageId, text: "task", attachments: [] },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          workflowOrigin,
+          createdAt,
+        });
+        const attemptId = CommandId.make("origin-claim");
+        yield* engine.dispatch({
+          type: "thread.prompt.claim",
+          commandId: attemptId,
+          threadId,
+          messageId,
+          expectedRevision: 1,
+          expectedControlRevision: 0,
+          createdAt,
+        });
+        yield* engine.dispatch({
+          type: "thread.prompt.admit",
+          commandId: CommandId.make("origin-admit"),
+          threadId,
+          attemptId,
+          turnId: TurnId.make("origin-turn"),
+          evidence: "provider-ack",
+          createdAt,
+        });
+        yield* engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("origin-started"),
+          threadId,
+          session: {
+            threadId,
+            providerName: "codex",
+            status: "running",
+            runtimeMode: "approval-required",
+            activeTurnId: TurnId.make("origin-turn"),
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
+        });
+        const assertOrigin = Effect.gen(function* () {
+          const snapshot = yield* query.getThreadDetailById(threadId);
+          assert.isTrue(Option.isSome(snapshot));
+          if (Option.isSome(snapshot)) {
+            assert.deepStrictEqual(snapshot.value.messages[0]?.workflowOrigin, workflowOrigin);
+            assert.isUndefined(snapshot.value.messages[0]?.author);
+          }
+          const page = yield* query.getThreadDetailSnapshot(threadId, { turnLimit: 1 });
+          assert.isTrue(Option.isSome(page));
+          if (Option.isSome(page))
+            assert.deepStrictEqual(page.value.thread.messages[0]?.workflowOrigin, workflowOrigin);
+          const start = yield* query.getTurnStartMessage({ threadId, messageId });
+          assert.isTrue(Option.isSome(start));
+          if (Option.isSome(start))
+            assert.deepStrictEqual(start.value.message.workflowOrigin, workflowOrigin);
+        });
+        yield* assertOrigin;
+        yield* sql`DELETE FROM projection_thread_messages WHERE thread_id = ${threadId}`;
+        yield* sql`DELETE FROM projection_state WHERE projector = 'projection.thread-messages'`;
+        yield* pipeline.bootstrap;
+        yield* assertOrigin;
+      }),
   );
 });

@@ -4,6 +4,9 @@ import {
   type OrchestrationCommand,
   EnvironmentAuthorizationError,
   AuthOrchestrationOperateScope,
+  WorkflowOrigin,
+  TrimmedNonEmptyString,
+  sameWorkflowOrigin,
 } from "@t3tools/contracts";
 import {
   RepositoryWorkflow,
@@ -22,6 +25,8 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { BootEvidence } from "../terminal/SetupProcessAdapter.ts";
 import { classifyApprovalRequest } from "./approvalClassification.ts";
+
+const decodeOrigin = Schema.decodeUnknownSync(WorkflowOrigin);
 
 const SetupCleanup = Schema.Struct({
   attemptId: Schema.String,
@@ -104,7 +109,8 @@ export const WorkflowRun = Schema.Struct({
     }),
   ),
   jobId: Schema.String,
-  userId: Schema.String,
+  origin: Schema.optional(WorkflowOrigin),
+  userId: Schema.NullOr(TrimmedNonEmptyString),
   repositoryCanonicalKey: Schema.String,
   instruction: Schema.String,
   workflow: RepositoryWorkflow,
@@ -162,7 +168,13 @@ export const WorkflowRun = Schema.Struct({
   ),
 });
 export type WorkflowRun = typeof WorkflowRun.Type;
+export function workflowRunOrigin(run: WorkflowRun): WorkflowOrigin {
+  return decodeOrigin(
+    run.origin ?? (run.userId ? { kind: "manual", userId: run.userId } : undefined),
+  );
+}
 const WorkflowCancellation = Schema.Struct({
+  origin: Schema.optional(WorkflowOrigin),
   jobId: Schema.String,
   organizationId: Schema.String,
   repositoryId: Schema.String,
@@ -173,7 +185,21 @@ const WorkflowCancellation = Schema.Struct({
 export type WorkflowCancellation = typeof WorkflowCancellation.Type;
 const decodeCancellation = Schema.decodeUnknownSync(Schema.fromJsonString(WorkflowCancellation));
 const encodeCancellation = Schema.encodeSync(Schema.fromJsonString(WorkflowCancellation));
-const decode = Schema.decodeUnknownSync(Schema.fromJsonString(WorkflowRun));
+const decodeRun = Schema.decodeUnknownSync(Schema.fromJsonString(WorkflowRun));
+const decode = (json: string): WorkflowRun => {
+  const run = decodeRun(json);
+  const origin = workflowRunOrigin(run);
+  if (
+    origin.kind === "manual"
+      ? run.userId !== origin.userId
+      : run.userId !== null ||
+        origin.organizationId !== run.workflow.organizationId ||
+        origin.repositoryId !== run.workflow.repositoryId ||
+        origin.workflowId !== run.workflow.workflowId
+  )
+    throw new Error("Invalid persisted workflow origin.");
+  return { ...run, origin };
+};
 const encode = Schema.encodeSync(Schema.fromJsonString(WorkflowRun));
 
 export const make = Effect.gen(function* () {
@@ -251,7 +277,7 @@ export const make = Effect.gen(function* () {
     owners,
     tryAccept: (run: WorkflowRun) =>
       sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json)
-        SELECT ${run.jobId}, ${run.progress.threadId}, ${run.progress.status}, ${run.executionReserved ? 1 : 0}, ${encode(run)}
+        SELECT ${run.jobId}, ${run.progress.threadId}, ${run.progress.status}, ${run.executionReserved ? 1 : 0}, ${encode({ ...run, origin: workflowRunOrigin(run) })}
         WHERE NOT EXISTS (SELECT 1 FROM repository_workflow_cancellations WHERE job_id = ${run.jobId})
         ON CONFLICT DO NOTHING RETURNING job_id`.pipe(
         Effect.orDie,
@@ -270,16 +296,23 @@ export const make = Effect.gen(function* () {
         Effect.map((rows) => rows.length > 0),
       ),
     save: (run: WorkflowRun) =>
-      sql`INSERT INTO repository_workflow_jobs ${sql.insert({
-        job_id: run.jobId,
-        thread_id: run.progress.threadId,
-        status: run.progress.status,
-        execution_reserved: run.executionReserved ? 1 : 0,
-        record_json: encode(run),
-      })} ON CONFLICT(job_id) DO UPDATE SET status = excluded.status, execution_reserved = excluded.execution_reserved, record_json = excluded.record_json`.pipe(
-        Effect.orDie,
-        Effect.as(run),
-      ),
+      Effect.gen(function* () {
+        const origin = workflowRunOrigin(run);
+        const previous = yield* get(run.jobId);
+        if (previous && !sameWorkflowOrigin(workflowRunOrigin(previous), origin))
+          return yield* Effect.die("Workflow origin is immutable.");
+        run = decode(encode({ ...run, origin }));
+        return yield* sql`INSERT INTO repository_workflow_jobs ${sql.insert({
+          job_id: run.jobId,
+          thread_id: run.progress.threadId,
+          status: run.progress.status,
+          execution_reserved: run.executionReserved ? 1 : 0,
+          record_json: encode(run),
+        })} ON CONFLICT(job_id) DO UPDATE SET status = excluded.status, execution_reserved = excluded.execution_reserved, record_json = excluded.record_json`.pipe(
+          Effect.orDie,
+          Effect.as(run),
+        );
+      }),
     requireCommand: Effect.fn("WorkflowRunStore.requireCommand")(function* (
       command: OrchestrationCommand,
     ) {

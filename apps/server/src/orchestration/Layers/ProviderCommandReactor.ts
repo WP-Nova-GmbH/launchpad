@@ -1,3 +1,4 @@
+import type { WorkflowAttribution } from "@t3tools/contracts";
 import {
   CurrentIssueTrackerAuthorization,
   readTurnAuthorization,
@@ -120,19 +121,26 @@ function toNonEmptyProviderInput(value: string | undefined): string | undefined 
 function attributedPrompt(
   text: string,
   identities: {
+    workflowOrigin?: WorkflowAttribution | undefined;
     author?: AuthSessionUser | undefined;
     editedBy?: AuthSessionUser | undefined;
     steeredBy?: AuthSessionUser | undefined;
   },
   shared = false,
 ) {
-  if ((!shared && !identities.author) || text.trimStart().startsWith("/")) return text;
+  if (
+    (!shared && !identities.author && !identities.workflowOrigin) ||
+    text.trimStart().startsWith("/")
+  )
+    return text;
   const label = (actor: AuthSessionUser) =>
     `${actor.displayName ?? actor.userId} (${actor.userId})`.replace(/[\r\n[\]]/g, " ");
   const labels = [
-    identities.author
-      ? `Submitted by ${label(identities.author)}`
-      : "Submitted by an unidentified teammate",
+    identities.workflowOrigin
+      ? `Started by workflow ${identities.workflowOrigin.workflowName.replace(/[\r\n[\]]/g, " ")}`
+      : identities.author
+        ? `Submitted by ${label(identities.author)}`
+        : "Submitted by an unidentified teammate",
     identities.editedBy ? `edited by ${label(identities.editedBy)}` : undefined,
     identities.steeredBy ? `steered by ${label(identities.steeredBy)}` : undefined,
   ]

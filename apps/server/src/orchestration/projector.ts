@@ -803,6 +803,9 @@ export function projectEvent(
             turnId: payload.turnId,
             streaming: payload.streaming,
             ...(payload.author !== undefined ? { author: payload.author } : {}),
+            ...(payload.workflowOrigin !== undefined
+              ? { workflowOrigin: payload.workflowOrigin }
+              : {}),
             ...(payload.editedBy !== undefined ? { editedBy: payload.editedBy } : {}),
             ...(payload.steeredBy !== undefined ? { steeredBy: payload.steeredBy } : {}),
             createdAt: payload.createdAt,
@@ -831,6 +834,7 @@ export function projectEvent(
                       : {}),
                     ...(message.context !== undefined ? { context: message.context } : {}),
                     ...(message.author ? { author: message.author } : {}),
+                    ...(message.workflowOrigin ? { workflowOrigin: message.workflowOrigin } : {}),
                     ...(message.editedBy ? { editedBy: message.editedBy } : {}),
                     ...(message.steeredBy ? { steeredBy: message.steeredBy } : {}),
                   }

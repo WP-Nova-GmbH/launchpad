@@ -176,6 +176,9 @@ runs, newest first. Load more runs to reach older history or further active jobs
 the first page and picks up status changes. If starting a run loses its reply, check active runs
 before explicitly starting another; it may create an additional job.
 
+Runs marked **Started by workflow** and their automatic prompts identify the workflow that
+started them. Human checkpoint responses still identify the person who responded.
+
 Request changes sends feedback to the Review's chosen earlier Agent step in the same worktree.
 Earlier inputs and results remain valid; later steps run again and need fresh human responses.
 Rework retains the files already prepared rather than restoring an older copy. Setup and background

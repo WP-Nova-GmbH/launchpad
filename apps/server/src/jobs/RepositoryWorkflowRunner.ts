@@ -7,6 +7,8 @@ import {
 } from "./WorkflowActions.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
 import {
+  WorkflowOrigin,
+  sameWorkflowOrigin,
   CheckpointRef,
   CommandId,
   EventId,
@@ -56,7 +58,7 @@ import {
 } from "./workflowSequence.ts";
 import { workflowTask } from "./workflowTask.ts";
 import { attachApprovalSupervisor, type SupervisorVerdict } from "./supervisor.ts";
-import { WorkflowRunStore, WorkflowRun } from "./WorkflowRunStore.ts";
+import { WorkflowRunStore, WorkflowRun, workflowRunOrigin } from "./WorkflowRunStore.ts";
 import {
   isOrchestrationCommandRejection,
   OrchestrationCommandPreviouslyRejectedError,
@@ -65,7 +67,9 @@ import { jobBranchName } from "./Layers/JobRunner.ts";
 
 export interface WorkflowRequest {
   readonly jobId: string;
-  readonly userId: string;
+  readonly userId?: string;
+  readonly origin?: WorkflowOrigin;
+  readonly requestedBy?: string;
   readonly repositoryCanonicalKey: string;
   readonly instruction: string;
   readonly control: WorkflowControl;
@@ -340,21 +344,6 @@ export const make = Effect.gen(function* () {
       return run;
     }),
   };
-  const result = (
-    run: WorkflowRun | null,
-    outcome: WorkflowControlResult["outcome"] = run ? "accepted" : "missing",
-    detail: string | null = null,
-  ): WorkflowControlResult => ({
-    protocol: publishingSupported ? 7 : 6,
-    actions: publishingSupported
-      ? actions.canOpenPullRequest
-        ? ["push", "open_pull_request"]
-        : ["push"]
-      : [],
-    outcome,
-    detail,
-    progress: run ? workflowProgress(run) : null,
-  });
   const readThread = (run: WorkflowRun) =>
     query
       .getThreadDetailById(run.progress.threadId)
@@ -408,10 +397,66 @@ export const make = Effect.gen(function* () {
     );
     supervised.set(run.jobId, scope);
   });
+  const requireExecution = (run: WorkflowRun) =>
+    workflowRunOrigin(run).kind === "automation"
+      ? access.requireWorkflowProject({
+          organizationId: run.workflow.organizationId,
+          repositoryId: run.workflow.repositoryId,
+          projectId: run.workflow.definition.projectId,
+          repositoryCanonicalKey: run.repositoryCanonicalKey,
+        })
+      : access.requireProject(
+          { user: { userId: run.userId!, displayName: null, imageUrl: null } },
+          run.workflow.definition.projectId,
+        );
+  const blockedExecutionDetail =
+    "Repository access is unavailable. Cancel this run or restore its repository binding.";
+  // Fence new work against policy changes; completion evidence and owned cleanup stay outside.
+  const withExecutionAccess = <E, R>(
+    run: WorkflowRun,
+    work: (run: WorkflowRun) => Effect.Effect<WorkflowRun, E, R>,
+  ) =>
+    access.withFence(
+      workflowRunOrigin(run).kind !== "automation"
+        ? work(run)
+        : requireExecution(run).pipe(
+            Effect.matchEffect({
+              onFailure: () =>
+                run.progress.detail && run.progress.detail !== "Waiting for executor capacity."
+                  ? Effect.succeed(run)
+                  : store.save({
+                      ...run,
+                      progress: {
+                        ...run.progress,
+                        revision: run.progress.revision + 1,
+                        detail: blockedExecutionDetail,
+                      },
+                    }),
+              onSuccess: () =>
+                Effect.gen(function* () {
+                  if (run.progress.detail === blockedExecutionDetail)
+                    run = yield* store.save({
+                      ...run,
+                      progress: {
+                        ...run.progress,
+                        revision: run.progress.revision + 1,
+                        detail: null,
+                      },
+                    });
+                  return yield* work(run);
+                }),
+            }),
+          ),
+    );
   const dispatchPrompt = Effect.fn("RepositoryWorkflowRunner.dispatchPrompt")(function* (
     run: WorkflowRun,
   ) {
     if (!workflowAllowsPrompt(run, workflowPromptId(run))) return run;
+    if (run.progress.status === "waiting_capacity") {
+      const step = activeWorkflowStep(run);
+      if (step?.kind !== "agent") return run;
+      run = { ...run, modelSelection: step.modelSelection ?? run.modelSelection };
+    }
     const project = yield* query
       .getProjectShellById(run.workflow.definition.projectId)
       .pipe(Effect.orDie);
@@ -422,8 +467,8 @@ export const make = Effect.gen(function* () {
     const alreadyQueued =
       existing?.promptQueue?.entries.some((entry) => entry.messageId === promptId) ||
       existing?.promptQueue?.admissions.some((entry) => entry.messageId === promptId);
+    let detail: string | null = null;
     if (!alreadyQueued) {
-      let detail: string | null = null;
       const selection = run.modelSelection;
       const info = yield* providersService
         .getInstanceInfo(selection.instanceId)
@@ -455,81 +500,109 @@ export const make = Effect.gen(function* () {
             ?.requiresNewThreadForModelChange)
       )
         detail = "The Agent provider cannot change models within this conversation.";
-      if (detail)
+    }
+    const task = workflowTask(run);
+    return yield* withExecutionAccess(run, (run) =>
+      Effect.gen(function* () {
+        if (!workflowAllowsPrompt(run, workflowPromptId(run))) return run;
+        if (detail)
+          return yield* store.save({
+            ...run,
+            progress: {
+              ...run.progress,
+              revision: run.progress.revision + 1,
+              status: "paused",
+              retryablePreparation: false,
+              detail: `${detail} Cancel this job before starting again.`,
+            },
+          });
+        if (run.progress.status === "waiting_capacity") {
+          if (run.manualPause || (yield* store.isExecuting(run.jobId))) return run;
+          // Keep the durable reservation and local enqueue in the same policy fence.
+          run = yield* store.save({
+            ...run,
+            executionReserved: true,
+            progress: {
+              ...run.progress,
+              revision: run.progress.revision + 1,
+              status: "preparing",
+              detail: null,
+            },
+          });
+        }
+        yield* supervise(run);
+        const acknowledgement = yield* engine
+          .dispatch({
+            type: "thread.prompt.enqueue",
+            commandId: CommandId.make(workflowPromptId(run).replace(/:prompt$/, ":start")),
+            threadId: run.progress.threadId,
+            message: {
+              messageId: MessageId.make(workflowPromptId(run)),
+              text: `${task.stepInstruction}\n\nJob context:\n${task.jobContext}\n\n${task.reviewConstraint}`,
+              attachments: [],
+            },
+            runtimeMode: "approval-required",
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            modelSelection: run.modelSelection,
+            createdAt: run.sequence?.stepStartedAt ?? run.createdAt,
+            ...(workflowRunOrigin(run).kind === "automation"
+              ? {
+                  workflowOrigin: {
+                    kind: "automation" as const,
+                    jobId: run.jobId,
+                    workflowId: run.workflow.workflowId,
+                    workflowName: run.workflow.definition.name,
+                  },
+                }
+              : { author: { userId: run.userId!, displayName: null, imageUrl: null } }),
+            ...(!run.sequence?.started
+              ? {
+                  bootstrap: {
+                    createThread: {
+                      projectId: project.value.id,
+                      title: run.workflow.definition.name,
+                      modelSelection: run.modelSelection,
+                      runtimeMode: "approval-required",
+                      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+                      branch: null,
+                      worktreePath: null,
+                      createdAt: run.createdAt,
+                    },
+                    prepareWorktree: {
+                      projectCwd: project.value.workspaceRoot,
+                      baseBranch: run.baseSha,
+                      branch: jobBranchName(run.jobId),
+                      startFromOrigin: false,
+                      requireWorktree: true,
+                    },
+                    runSetupScript: true,
+                  },
+                }
+              : {}),
+          })
+          .pipe(Effect.result);
+        if (acknowledgement._tag === "Failure") {
+          const error = acknowledgement.failure;
+          if (!isOrchestrationCommandRejection(error) && !isPreviouslyRejected(error))
+            return yield* new WorkflowRunnerError({ message: error.message });
+          return yield* store.save({
+            ...run,
+            progress: {
+              ...run.progress,
+              revision: run.progress.revision + 1,
+              status: "paused",
+              retryablePreparation: false,
+              detail: `${error.message} Cancel this job before starting again.`,
+            },
+          });
+        }
         return yield* store.save({
           ...run,
-          progress: {
-            ...run.progress,
-            revision: run.progress.revision + 1,
-            status: "paused",
-            retryablePreparation: false,
-            detail: `${detail} Cancel this job before starting again.`,
-          },
+          promptDispatched: true,
+          ...(run.sequence ? { sequence: { ...run.sequence, started: true } } : {}),
         });
-    }
-    yield* supervise(run);
-    const task = workflowTask(run);
-    const acknowledgement = yield* engine
-      .dispatch({
-        type: "thread.prompt.enqueue",
-        commandId: CommandId.make(workflowPromptId(run).replace(/:prompt$/, ":start")),
-        threadId: run.progress.threadId,
-        message: {
-          messageId: MessageId.make(workflowPromptId(run)),
-          text: `${task.stepInstruction}\n\nJob context:\n${task.jobContext}\n\n${task.reviewConstraint}`,
-          attachments: [],
-        },
-        runtimeMode: "approval-required",
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        modelSelection: run.modelSelection,
-        createdAt: run.sequence?.stepStartedAt ?? run.createdAt,
-        author: { userId: run.userId, displayName: null, imageUrl: null },
-        ...(!run.sequence?.started
-          ? {
-              bootstrap: {
-                createThread: {
-                  projectId: project.value.id,
-                  title: run.workflow.definition.name,
-                  modelSelection: run.modelSelection,
-                  runtimeMode: "approval-required",
-                  interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-                  branch: null,
-                  worktreePath: null,
-                  createdAt: run.createdAt,
-                },
-                prepareWorktree: {
-                  projectCwd: project.value.workspaceRoot,
-                  baseBranch: run.baseSha,
-                  branch: jobBranchName(run.jobId),
-                  startFromOrigin: false,
-                  requireWorktree: true,
-                },
-                runSetupScript: true,
-              },
-            }
-          : {}),
-      })
-      .pipe(Effect.result);
-    if (acknowledgement._tag === "Failure") {
-      const error = acknowledgement.failure;
-      if (!isOrchestrationCommandRejection(error) && !isPreviouslyRejected(error))
-        return yield* new WorkflowRunnerError({ message: error.message });
-      return yield* store.save({
-        ...run,
-        progress: {
-          ...run.progress,
-          revision: run.progress.revision + 1,
-          status: "paused",
-          retryablePreparation: false,
-          detail: `${error.message} Cancel this job before starting again.`,
-        },
-      });
-    }
-    return yield* store.save({
-      ...run,
-      promptDispatched: true,
-      ...(run.sequence ? { sequence: { ...run.sequence, started: true } } : {}),
-    });
+      }),
+    );
   });
   const verifyResult = Effect.fn("RepositoryWorkflowRunner.verifyResult")(function* (
     run: WorkflowRun,
@@ -1142,6 +1215,37 @@ export const make = Effect.gen(function* () {
   ): Effect.fn.Return<WorkflowRun, Error> {
     if (isTerminalWorkflowJob(run.progress.status)) return run;
     let retry = run.pendingPreparationRetry;
+    if (retry && workflowRunOrigin(run).kind === "automation") {
+      const receipt = yield* commandReceipts
+        .getByCommandId({ commandId: CommandId.make(retry.commandId) })
+        .pipe(Effect.orDie);
+      if (Option.isSome(receipt)) {
+        if (
+          receipt.value.aggregateKind !== "thread" ||
+          receipt.value.aggregateId !== run.progress.threadId
+        )
+          return yield* new WorkflowRunnerError({
+            message: "The saved preparation retry receipt belongs to another target.",
+          });
+        const preparation = (yield* readThread(run))?.promptQueue?.preparation;
+        run = yield* store.save({
+          ...run,
+          pendingPreparationRetry: null,
+          ...(receipt.value.status === "rejected"
+            ? {
+                progress: {
+                  ...run.progress,
+                  revision: run.progress.revision + 1,
+                  status: "paused",
+                  detail: receipt.value.error,
+                  retryablePreparation: preparation?.state === "failed" && preparation.settled,
+                },
+              }
+            : {}),
+        });
+        retry = null;
+      }
+    }
     if (retry && (yield* readThread(run))?.promptQueue?.pauseReason?.code === "delivery-unknown") {
       run = yield* store.save({ ...run, pendingPreparationRetry: null });
       retry = null;
@@ -1152,37 +1256,42 @@ export const make = Effect.gen(function* () {
       run.progress.status !== "cancelling" &&
       workflowAllowsPrompt(run, workflowPromptId(run))
     ) {
-      const acknowledgement = yield* engine
-        .dispatch({
-          type: "thread.preparation.retry",
-          commandId: CommandId.make(retry.commandId),
-          threadId: run.progress.threadId,
-          expectedRevision: retry.expectedRevision,
-          expectedControlRevision: retry.expectedControlRevision,
-          createdAt: retry.createdAt,
-        })
-        .pipe(Effect.result);
-      if (acknowledgement._tag === "Failure") {
-        const error = acknowledgement.failure;
-        if (!isOrchestrationCommandRejection(error) && !isPreviouslyRejected(error))
-          return yield* error;
-        const preparation = (yield* readThread(run))?.promptQueue?.preparation;
-        run = yield* store.save({
-          ...run,
-          pendingPreparationRetry: null,
-          progress: {
-            ...run.progress,
-            revision: run.progress.revision + 1,
-            status: "paused",
-            detail: error.message,
-            retryablePreparation: preparation?.state === "failed" && preparation.settled,
-          },
-        });
-      } else {
-        // Receipt replay is safe even if setup finished before acknowledgement.
-        // Clear only after acceptance, then read fresh preparation/turn evidence.
-        run = yield* store.save({ ...run, pendingPreparationRetry: null });
-      }
+      run = yield* withExecutionAccess(run, (run) =>
+        Effect.gen(function* () {
+          const acknowledgement = yield* engine
+            .dispatch({
+              type: "thread.preparation.retry",
+              commandId: CommandId.make(retry.commandId),
+              threadId: run.progress.threadId,
+              expectedRevision: retry.expectedRevision,
+              expectedControlRevision: retry.expectedControlRevision,
+              createdAt: retry.createdAt,
+            })
+            .pipe(Effect.result);
+          if (acknowledgement._tag === "Failure") {
+            const error = acknowledgement.failure;
+            if (!isOrchestrationCommandRejection(error) && !isPreviouslyRejected(error))
+              return yield* error;
+            const preparation = (yield* readThread(run))?.promptQueue?.preparation;
+            run = yield* store.save({
+              ...run,
+              pendingPreparationRetry: null,
+              progress: {
+                ...run.progress,
+                revision: run.progress.revision + 1,
+                status: "paused",
+                detail: error.message,
+                retryablePreparation: preparation?.state === "failed" && preparation.settled,
+              },
+            });
+          } else {
+            // Receipt replay is safe even if setup finished before acknowledgement.
+            // Clear only after acceptance, then read fresh preparation/turn evidence.
+            run = yield* store.save({ ...run, pendingPreparationRetry: null });
+          }
+          return run;
+        }),
+      );
     }
     const activeStep = activeWorkflowStep(run);
     if (activeStep?.kind === "action" && run.sequence) {
@@ -1235,8 +1344,8 @@ export const make = Effect.gen(function* () {
           (!currentAction || currentAction.state === "running") &&
           !(yield* store.isExecuting(run.jobId))
         )
-          return yield* startAction(run);
-        return run;
+          return yield* withExecutionAccess(run, startAction);
+        return yield* withExecutionAccess(run, Effect.succeed);
       }
     }
     if (run.progress.status === "cancelling") run = yield* reconcileCancellation(run, recovering);
@@ -1352,25 +1461,6 @@ export const make = Effect.gen(function* () {
       yield* store.save(next);
     }
     if (
-      !next.manualPause &&
-      next.progress.status === "waiting_capacity" &&
-      !(yield* store.isExecuting(next.jobId))
-    ) {
-      const step = activeWorkflowStep(next);
-      if (step?.kind === "agent")
-        next = yield* store.save({
-          ...next,
-          modelSelection: step.modelSelection ?? next.modelSelection,
-          executionReserved: true,
-          progress: {
-            ...next.progress,
-            revision: next.progress.revision + 1,
-            status: "preparing",
-            detail: null,
-          },
-        });
-    }
-    if (
       (next.progress.status === "finishing" ||
         (next.sequence &&
           next.sequence.cursor === next.workflow.definition.steps.length &&
@@ -1378,7 +1468,7 @@ export const make = Effect.gen(function* () {
       !next.manualPause &&
       !next.approvalAttempt &&
       !next.progress.retryableApproval &&
-      !next.progress.detail
+      (!next.progress.detail || next.progress.detail === blockedExecutionDetail)
     ) {
       const preparation = thread?.promptQueue?.preparation;
       next = yield* store.save({
@@ -1415,10 +1505,19 @@ export const make = Effect.gen(function* () {
         yield* Scope.close(scope, Exit.void);
       }
     }
-    if (!next.promptDispatched && next.progress.status === "preparing")
+    if (
+      !next.promptDispatched &&
+      (next.progress.status === "preparing" ||
+        (next.progress.status === "waiting_capacity" &&
+          !next.manualPause &&
+          activeWorkflowStep(next)?.kind === "agent" &&
+          !(yield* store.isExecuting(next.jobId))))
+    )
       return (yield* dispatchPrompt(next)) ?? next;
     if (thread && ["preparing", "running"].includes(next.progress.status)) yield* supervise(next);
-    return next;
+    return isTerminalWorkflowJob(next.progress.status) || next.progress.status === "cancelling"
+      ? next
+      : yield* withExecutionAccess(next, Effect.succeed);
   });
   const pumpWaiting = Effect.fn("RepositoryWorkflowRunner.pumpWaiting")(function* () {
     if (yield* store.isExecuting()) return;
@@ -1430,20 +1529,96 @@ export const make = Effect.gen(function* () {
   });
   const handle = Effect.fn("RepositoryWorkflowRunner.handle")(
     function* (request: WorkflowRequest) {
+      const result = (
+        run: WorkflowRun | null,
+        outcome: WorkflowControlResult["outcome"] = run ? "accepted" : "missing",
+        detail: string | null = null,
+      ): WorkflowControlResult => ({
+        protocol: request.origin ? 8 : publishingSupported ? 7 : 6,
+        actions: publishingSupported
+          ? actions.canOpenPullRequest
+            ? ["push", "open_pull_request"]
+            : ["push"]
+          : [],
+        outcome,
+        detail,
+        progress: run ? workflowProgress(run) : null,
+      });
       let run = yield* store.get(request.jobId);
+      const savedCancellation = yield* store.getCancellation(request.jobId);
+      const requestedBy = request.requestedBy ?? request.userId;
+      let origin =
+        request.origin ??
+        (run && workflowRunOrigin(run).kind === "manual"
+          ? workflowRunOrigin(run)
+          : savedCancellation?.origin?.kind === "manual"
+            ? savedCancellation.origin
+            : request.userId
+              ? { kind: "manual" as const, userId: request.userId }
+              : undefined);
+      if (
+        !origin ||
+        (run && !sameWorkflowOrigin(workflowRunOrigin(run), origin)) ||
+        (run && run.repositoryCanonicalKey !== request.repositoryCanonicalKey) ||
+        (origin.kind === "automation" &&
+          (origin.organizationId !== request.control.organizationId ||
+            origin.repositoryId !== request.control.repositoryId ||
+            (request.control.operation === "start" &&
+              origin.workflowId !== request.control.workflow.workflowId)))
+      )
+        return result(null, "conflict", "The workflow origin or target does not match this job.");
+      if (!["start", "status"].includes(request.control.operation) && !requestedBy)
+        return result(null, "conflict", "A human requester is required for this control.");
+      // Keep legacy requesters separate from the original execution identity.
+      if (
+        requestedBy &&
+        !["start", "status", "cancel", "retry_cancellation"].includes(request.control.operation)
+      )
+        yield* access
+          .requireProject(
+            { user: { userId: requestedBy, displayName: null, imageUrl: null } },
+            request.control.projectId,
+          )
+          .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
+      if (
+        !run &&
+        !savedCancellation &&
+        origin.kind === "automation" &&
+        request.control.operation !== "cancel"
+      )
+        yield* access
+          .requireWorkflowProject({
+            ...request.control,
+            repositoryCanonicalKey: request.repositoryCanonicalKey,
+          })
+          .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
       const cancellation =
         request.control.operation === "cancel" && !run
           ? yield* store.cancelBeforeAcceptance({
               jobId: request.jobId,
+              ...(request.origin ? { origin } : {}),
               ...request.control,
               repositoryCanonicalKey: request.repositoryCanonicalKey,
               createdAt: yield* timestamp,
             })
           : { run, cancellation: yield* store.getCancellation(request.jobId) };
       run = cancellation.run;
+      if (!request.origin) {
+        const savedOrigin = run ? workflowRunOrigin(run) : cancellation.cancellation?.origin;
+        if (savedOrigin?.kind === "manual") origin = savedOrigin;
+      }
+      if (
+        run &&
+        (!sameWorkflowOrigin(workflowRunOrigin(run), origin) ||
+          run.repositoryCanonicalKey !== request.repositoryCanonicalKey)
+      )
+        return result(null, "conflict", "The workflow origin or target does not match this job.");
       if (cancellation.cancellation) {
         const saved = cancellation.cancellation;
-        return saved.organizationId === request.control.organizationId &&
+        return (saved.origin
+          ? sameWorkflowOrigin(saved.origin, origin)
+          : origin.kind === "manual") &&
+          saved.organizationId === request.control.organizationId &&
           saved.repositoryId === request.control.repositoryId &&
           saved.projectId === request.control.projectId &&
           saved.repositoryCanonicalKey === request.repositoryCanonicalKey
@@ -1493,7 +1668,7 @@ export const make = Effect.gen(function* () {
         if (!run) return result(null, "conflict", "Wait for the environment to accept this job.");
         yield* access
           .requireProject(
-            { user: { userId: request.userId, displayName: null, imageUrl: null } },
+            { user: { userId: requestedBy!, displayName: null, imageUrl: null } },
             run.workflow.definition.projectId,
           )
           .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
@@ -1560,10 +1735,15 @@ export const make = Effect.gen(function* () {
       }
       if (run) run = yield* reconcile(run);
       if (request.control.operation === "status") return result(run);
-      if (run && request.control.operation !== "cancel")
+      if (
+        run &&
+        request.control.operation !== "cancel" &&
+        request.control.operation !== "start" &&
+        !(origin.kind === "automation" && request.control.operation === "retry_cancellation")
+      )
         yield* access
           .requireProject(
-            { user: { userId: request.userId, displayName: null, imageUrl: null } },
+            { user: { userId: requestedBy!, displayName: null, imageUrl: null } },
             run.workflow.definition.projectId,
           )
           .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
@@ -1585,12 +1765,17 @@ export const make = Effect.gen(function* () {
           return result(null, "unavailable", "Invalid workflow target binding.");
         if (yield* store.isExecuting())
           return result(null, "busy", "Another workflow is executing on this environment.");
-        yield* access
-          .requireProject(
-            { user: { userId: request.userId, displayName: null, imageUrl: null } },
-            request.control.projectId,
-          )
-          .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
+        yield* (
+          origin.kind === "automation"
+            ? access.requireWorkflowProject({
+                ...request.control,
+                repositoryCanonicalKey: request.repositoryCanonicalKey,
+              })
+            : access.requireProject(
+                { user: { userId: origin.userId, displayName: null, imageUrl: null } },
+                request.control.projectId,
+              )
+        ).pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
         const project = yield* query
           .getProjectShellById(request.control.projectId)
           .pipe(Effect.orDie);
@@ -1710,7 +1895,8 @@ export const make = Effect.gen(function* () {
         });
         run = {
           jobId: request.jobId,
-          userId: request.userId,
+          origin,
+          userId: origin.kind === "manual" ? origin.userId : null,
           repositoryCanonicalKey: request.repositoryCanonicalKey,
           instruction: request.instruction,
           workflow: {
@@ -1759,7 +1945,14 @@ export const make = Effect.gen(function* () {
           },
         };
         run = advanceWorkflow(run);
-        if (!(yield* store.tryAccept(run))) {
+        if (
+          !(yield* access.withFence(
+            Effect.gen(function* () {
+              if (origin.kind === "automation") yield* requireExecution(run!);
+              return yield* store.tryAccept(run!);
+            }),
+          ))
+        ) {
           if (yield* store.getCancellation(request.jobId))
             return result(null, "cancelled", "Cancelled before acceptance.");
           const existing = yield* store.get(request.jobId);
@@ -1919,7 +2112,7 @@ export const make = Effect.gen(function* () {
           return result(
             run,
             previous.operation === control.operation &&
-              previous.userId === request.userId &&
+              previous.userId === requestedBy &&
               previous.text === (control.operation === "approve" ? null : control.text)
               ? "accepted"
               : "conflict",
@@ -1948,7 +2141,7 @@ export const make = Effect.gen(function* () {
             stepId: step!.id,
             generation: sequence.generation,
             operation: control.operation,
-            userId: request.userId,
+            userId: requestedBy!,
             text: control.operation === "approve" ? null : control.text,
             createdAt: yield* timestamp,
           };
@@ -2044,7 +2237,7 @@ export const make = Effect.gen(function* () {
             ? accepted.approvedBy
             : run.progress.status === "finishing"
               ? null
-              : request.userId,
+              : requestedBy!,
           checkpointId: checkpoint.checkpointId,
           preparedHead: run.preparedHead,
           acceptedRevision: request.control.expectedRevision,

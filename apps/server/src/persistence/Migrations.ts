@@ -78,6 +78,7 @@ import Migration0063 from "./Migrations/063_SetupCleanupEvidence.ts";
 import Migration0064 from "./Migrations/064_SetupLifecycleCleanup.ts";
 import Migration0065 from "./Migrations/065_WorkflowSteps.ts";
 import Migration0066 from "./Migrations/066_WorkflowManualPause.ts";
+import Migration0067 from "./Migrations/067_WorkflowOrigin.ts";
 import Migration0062 from "./Migrations/062_SetupProcessOwnership.ts";
 
 /**
@@ -157,6 +158,7 @@ const migrationEntries = [
   [64, "SetupLifecycleCleanup", Migration0064],
   [65, "WorkflowSteps", Migration0065],
   [66, "WorkflowManualPause", Migration0066],
+  [67, "WorkflowOrigin", Migration0067],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -249,6 +251,14 @@ const verifyMigrationHistory = Effect.gen(function* () {
   );
   const mismatches: Array<string> = [];
   for (const { migration_id, name } of recorded) {
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_WorkflowReaderV8" &&
+      [57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67].every((id) =>
+        recorded.some((entry) => entry.migration_id === id && entry.name === namesById.get(id)),
+      )
+    )
+      continue;
     if (
       migration_id === 1 &&
       name === "OrchestrationEvents_WorkflowReaderV7" &&

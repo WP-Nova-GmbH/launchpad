@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { WorkflowAttribution } from "./workflowOrigin.ts";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Struct from "effect/Struct";
@@ -576,6 +577,7 @@ export const OrchestrationMessageRole = Schema.Literals([
 export type OrchestrationMessageRole = typeof OrchestrationMessageRole.Type;
 
 export const OrchestrationMessage = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   id: MessageId,
   role: OrchestrationMessageRole,
   text: Schema.String,
@@ -917,6 +919,7 @@ export const ThreadPromptPauseReason = Schema.Struct({
 export type ThreadPromptPauseReason = typeof ThreadPromptPauseReason.Type;
 
 export const ThreadPromptQueueEntry = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   issueTrackerAuthorizationId: Schema.optional(Schema.String),
   messageId: MessageId,
   text: Schema.String,
@@ -1522,6 +1525,7 @@ const PromptEnqueueFields = {
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
 };
 const ThreadPromptEnqueueCommand = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   type: Schema.Literal("thread.prompt.enqueue"),
   ...PromptEnqueueFields,
   message: Schema.Struct({ messageId: MessageId, ...PromptMessage.fields }),
@@ -1635,6 +1639,7 @@ const ThreadQueueFinalizeCommand = Schema.Struct({
 });
 
 export const ThreadTurnStartCommand = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   issueTrackerAuthorizationId: Schema.optional(Schema.String),
   type: Schema.Literal("thread.turn.start"),
   commandId: CommandId,
@@ -1902,6 +1907,7 @@ const ThreadHistoryImportCommand = Schema.Struct({
  * turn that follows references the same message id.
  */
 const ThreadMessageUserAppendCommand = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   author: Schema.optional(AuthSessionUser),
   type: Schema.Literal("thread.message.user.append"),
   commandId: CommandId,
@@ -2264,6 +2270,7 @@ export const ThreadInteractionModeSetPayload = Schema.Struct({
 });
 
 export const ThreadMessageSentPayload = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   threadId: ThreadId,
   messageId: MessageId,
   role: OrchestrationMessageRole,

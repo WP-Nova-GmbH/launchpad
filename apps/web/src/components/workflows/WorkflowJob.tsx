@@ -242,6 +242,12 @@ export function WorkflowJob({
           {selectedJob.workflow?.definition.name ?? "Workflow run"}
         </h1>
         <p className="mt-2 text-sm">{selectedJob.instruction}</p>
+        {selectedJob.origin?.kind === "automation" ? (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Started by workflow
+            {selectedJob.workflow ? ` · ${selectedJob.workflow.definition.name}` : ""}
+          </p>
+        ) : null}
         <p className="mt-2 text-xs text-muted-foreground" role="status">
           {workflowStatusLabel(selectedJob.status)} ·{" "}
           {target

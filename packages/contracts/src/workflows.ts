@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import { EnvironmentId, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { WorkflowOrigin, WorkflowOriginSummary } from "./workflowOrigin.ts";
 import { ModelSelection } from "./orchestration.ts";
 
 const Label = TrimmedNonEmptyString.check(Schema.isMaxLength(120));
@@ -184,8 +185,10 @@ export const WorkflowJobProgress = Schema.Struct({
 export type WorkflowJobProgress = typeof WorkflowJobProgress.Type;
 
 export const RepositoryWorkflowJob = Schema.Struct({
+  origin: Schema.optional(WorkflowOrigin),
+  originSummary: Schema.optional(WorkflowOriginSummary),
   /** Pinned with the offer so a downgrade cannot acknowledge newer lifecycle semantics. */
-  requiredProtocol: Schema.optional(Schema.Literals([2, 3, 4, 5, 6, 7])),
+  requiredProtocol: Schema.optional(Schema.Literals([2, 3, 4, 5, 6, 7, 8])),
   jobId: TrimmedNonEmptyString,
   repositoryId: TrimmedNonEmptyString,
   workflowId: TrimmedNonEmptyString,
@@ -217,6 +220,7 @@ export const RepositoryWorkflowJob = Schema.Struct({
 export type RepositoryWorkflowJob = typeof RepositoryWorkflowJob.Type;
 /** Lists carry a short context preview; the frozen definition/result is detail-only. */
 export const RepositoryWorkflowJobSummary = Schema.Struct({
+  originSummary: Schema.optional(WorkflowOriginSummary),
   jobId: RepositoryWorkflowJob.fields.jobId,
   repositoryId: RepositoryWorkflowJob.fields.repositoryId,
   workflowId: RepositoryWorkflowJob.fields.workflowId,
@@ -297,7 +301,7 @@ export const WorkflowControl = Schema.Union([
 export type WorkflowControl = typeof WorkflowControl.Type;
 export const WorkflowControlResult = Schema.Struct({
   actions: Schema.optional(Schema.Array(Schema.Literals(["push", "open_pull_request"]))),
-  protocol: Schema.Literals([1, 2, 3, 4, 5, 6, 7]),
+  protocol: Schema.Literals([1, 2, 3, 4, 5, 6, 7, 8]),
   outcome: Schema.Literals(["accepted", "cancelled", "missing", "busy", "unavailable", "conflict"]),
   detail: Schema.NullOr(Schema.String),
   progress: Schema.NullOr(WorkflowJobProgress),

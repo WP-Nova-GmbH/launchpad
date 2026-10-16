@@ -395,6 +395,12 @@ function WorkflowJobsContent(props: Props) {
           <SettingsSection title={selectedJob.workflow?.definition.name ?? "Workflow job"}>
             <View className="gap-2 p-4">
               <Text className="text-foreground">{selectedJob.instruction}</Text>
+              {selectedJob.origin?.kind === "automation" ? (
+                <Text className="text-xs text-foreground-muted">
+                  Started by workflow
+                  {selectedJob.workflow ? ` · ${selectedJob.workflow.definition.name}` : ""}
+                </Text>
+              ) : null}
               <Text className="font-semibold text-foreground">
                 {workflowStatusLabel(selectedJob.status)} ·{" "}
                 {target
@@ -762,7 +768,7 @@ function WorkflowJobsContent(props: Props) {
                   key={job.jobId}
                   icon="arrow.triangle.branch"
                   label={job.instruction}
-                  value={workflowStatusLabel(job.status)}
+                  value={`${job.originSummary?.kind === "automation" ? "Started by workflow · " : ""}${workflowStatusLabel(job.status)}`}
                   disabled={busy}
                   onPress={() => setSelectedJobId(job.jobId)}
                 />

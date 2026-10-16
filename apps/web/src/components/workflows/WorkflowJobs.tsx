@@ -120,10 +120,18 @@ export function WorkflowJobs({
           <div className="min-w-0">
             <p className="truncate font-medium">{job.instruction}</p>
             <p className="text-xs text-muted-foreground">
-              {workflows.find((workflow) => workflow.workflowId === job.workflowId)?.definition
-                .name ?? "Workflow run"}{" "}
+              {job.originSummary?.workflowName ??
+                workflows.find((workflow) => workflow.workflowId === job.workflowId)?.definition
+                  .name ??
+                "Workflow run"}{" "}
               · {workflowStatusLabel(job.status)}
             </p>
+            {job.originSummary?.kind === "automation" ? (
+              <p className="text-xs text-muted-foreground">
+                Started by workflow
+                {job.originSummary.workflowName ? ` · ${job.originSummary.workflowName}` : ""}
+              </p>
+            ) : null}
             {job.detail ? <p className="text-xs text-muted-foreground">{job.detail}</p> : null}
           </div>
           <Button

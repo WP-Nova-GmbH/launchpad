@@ -290,6 +290,7 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
         );
         const now = DateTime.formatIso(yield* DateTime.now);
         const job = {
+          origin: { kind: "manual" as const, userId: membership.userId },
           jobId,
           repositoryId: params.repositoryId,
           workflowId: workflow.workflowId,

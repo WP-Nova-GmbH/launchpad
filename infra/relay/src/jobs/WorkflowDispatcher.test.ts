@@ -907,3 +907,73 @@ it.effect("archive blocks unoffered jobs while accepted runs retain their frozen
     assert.equal(active?.workflow?.revision, 1);
   }),
 );
+
+it.effect("keeps unoffered automation queued and never adopts the current manual workflow", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    const origin = {
+      kind: "automation" as const,
+      organizationId: "org-1",
+      repositoryId: "repo-1",
+      workflowId: "flow-1",
+      source: {
+        provider: "linear" as const,
+        applicationId: "app",
+        workspaceId: "ws",
+        connectionId: "connection",
+        grantId: "grant",
+      },
+      occurrenceId: "event",
+    };
+    yield* Ref.update(h.row, (row) => ({
+      ...row,
+      submitterUserId: null,
+      record: { ...row.record, origin, requiredProtocol: 8 as const },
+    }));
+    const result = yield* h.refresh;
+    assert.equal(result?.status, "queued");
+    assert.isNull(result?.workflow);
+    assert.lengthOf(yield* Ref.get(h.offers), 0);
+    assert.lengthOf(yield* Ref.get(h.controls), 0);
+  }),
+);
+it.effect("a frozen automation offer probes protocol 8 before sending Start", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    const origin = {
+      kind: "automation" as const,
+      organizationId: "org-1",
+      repositoryId: "repo-1",
+      workflowId: "flow-1",
+      source: {
+        provider: "linear" as const,
+        applicationId: "app",
+        workspaceId: "ws",
+        connectionId: "connection",
+        grantId: "grant",
+      },
+      occurrenceId: "event",
+    };
+    yield* Ref.update(h.row, (row) => ({
+      ...row,
+      submitterUserId: null,
+      repositoryCanonicalKey: "github.com/acme/repo",
+      record: {
+        ...row.record,
+        origin,
+        workflow,
+        status: "dispatching" as const,
+        requiredProtocol: 8 as const,
+      },
+    }));
+    const result = yield* h.refresh;
+    assert.equal(result?.status, "queued");
+    assert.equal(result?.requiredProtocol, 8);
+    assert.isNull(result?.workflow);
+    assert.lengthOf(yield* Ref.get(h.offers), 0);
+    assert.deepStrictEqual(
+      (yield* Ref.get(h.controls)).map((control) => control.operation),
+      ["status"],
+    );
+  }),
+);

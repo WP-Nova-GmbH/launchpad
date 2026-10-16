@@ -3,6 +3,7 @@ import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import { workflowRunOrigin } from "./WorkflowRunStore.ts";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
@@ -144,12 +145,19 @@ export const make = Effect.gen(function* () {
       return yield* new WorkflowActionError({
         message: "Publishing stopped before the next command.",
       });
-    yield* access
-      .requireProject(
-        { user: { userId: run.userId, displayName: null, imageUrl: null } },
-        run.workflow.definition.projectId,
-      )
-      .pipe(Effect.mapError(error));
+    yield* (
+      workflowRunOrigin(run).kind === "automation"
+        ? access.requireWorkflowProject({
+            organizationId: run.workflow.organizationId,
+            repositoryId: run.workflow.repositoryId,
+            projectId: run.workflow.definition.projectId,
+            repositoryCanonicalKey: run.repositoryCanonicalKey,
+          })
+        : access.requireProject(
+            { user: { userId: run.userId!, displayName: null, imageUrl: null } },
+            run.workflow.definition.projectId,
+          )
+    ).pipe(Effect.mapError(error));
     if (
       !run.worktreePath ||
       !run.publication ||
@@ -217,14 +225,18 @@ export const make = Effect.gen(function* () {
             identity = state.identity;
             yield* patch((command) => ({ ...command, pid: actualPid, identity, boot: state.boot }));
           }).pipe(Effect.mapError(ownError)),
-        arm: Effect.gen(function* () {
-          yield* requireRun(io);
-          if (pid === null || identity === null)
-            return yield* new WorkflowActionError({
-              message: "Command capture is required before delivery.",
-            });
-          yield* native.arm(pid, identity);
-        }).pipe(Effect.mapError(ownError)),
+        arm: access
+          .withFence(
+            Effect.gen(function* () {
+              yield* requireRun(io);
+              if (pid === null || identity === null)
+                return yield* new WorkflowActionError({
+                  message: "Command capture is required before delivery.",
+                });
+              yield* native.arm(pid, identity);
+            }),
+          )
+          .pipe(Effect.mapError(ownError)),
         completed: (code) =>
           patch((command) => ({ ...command, code })).pipe(Effect.asVoid, Effect.mapError(ownError)),
         stop: Effect.gen(function* () {

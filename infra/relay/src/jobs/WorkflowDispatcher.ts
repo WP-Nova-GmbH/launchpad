@@ -1,3 +1,4 @@
+import { WorkflowOrigin } from "@t3tools/contracts";
 import { RelayJobId } from "@t3tools/contracts/relay";
 import {
   WorkflowInvalidError,
@@ -17,6 +18,8 @@ import { Repositories } from "../tenancy/Repositories.ts";
 import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { Workflows } from "./Workflows.ts";
+
+const decodeOrigin = Schema.decodeUnknownEffect(WorkflowOrigin);
 
 const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
@@ -68,7 +71,16 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
   const refresh = Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
     let job = row!.record;
-    const minimumProtocol = job.workflow === null ? 6 : 4;
+    const origin = yield* decodeOrigin(
+      job.origin ??
+        (row!.submitterUserId ? { kind: "manual", userId: row!.submitterUserId } : undefined),
+    );
+    const dispatchIdentity = () => ({
+      userId: origin.kind === "manual" ? origin.userId : null,
+      workflowOrigin: origin,
+      ...(row!.pendingControl ? { requestedBy: row!.pendingControl.userId } : {}),
+    });
+    const minimumProtocol = origin.kind === "automation" ? 8 : job.workflow === null ? 6 : 4;
     if ((job.requiredProtocol ?? 2) < minimumProtocol) {
       row = yield* store.updateJob(
         row!,
@@ -91,6 +103,17 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         );
         return row.record;
       }
+      if (origin.kind === "automation")
+        return (yield* store.updateJob(
+          row!,
+          {
+            ...job,
+            detail: "Automatic starts await event context and source validation.",
+            updatedAt: now,
+          },
+          row!.pendingControl,
+          false,
+        )).record;
       workflow = yield* store.get(job.workflowId);
       if (workflow === null || workflow.archived) {
         row = yield* store.updateJob(
@@ -118,7 +141,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         projectId: workflow.definition.projectId,
       };
       const probe = yield* connector.dispatchJob({
-        userId: row!.submitterUserId,
+        ...dispatchIdentity(),
         environmentId: workflow.definition.environmentId,
         jobId: RelayJobId.make(jobId),
         repositoryCanonicalKey: canonicalKey,
@@ -243,7 +266,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       control.operation === "retry_action"
     ) {
       const capability = yield* connector.dispatchJob({
-        userId: row!.pendingControl?.userId ?? row!.submitterUserId,
+        ...dispatchIdentity(),
         environmentId: job.environmentId,
         jobId: RelayJobId.make(jobId),
         repositoryCanonicalKey: canonicalKey,
@@ -259,8 +282,51 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           message: "Update this environment before responding to this workflow.",
         });
     }
+    if (origin.kind === "automation" && control.operation === "start") {
+      const capability = yield* connector.dispatchJob({
+        ...dispatchIdentity(),
+        environmentId: job.environmentId,
+        jobId: RelayJobId.make(jobId),
+        repositoryCanonicalKey: canonicalKey,
+        baseBranch: "HEAD",
+        instruction: job.instruction,
+        workflowControl: { ...binding, operation: "status" },
+      });
+      if (!capability.workflowResult || capability.workflowResult.protocol < 8) {
+        // A confirmed missing result relinquishes an unaccepted offer; unknown delivery stays pinned.
+        if (
+          capability.workflowResult?.outcome === "missing" &&
+          capability.workflowResult.progress === null
+        )
+          return (yield* store.updateJob(
+            row!,
+            {
+              ...job,
+              workflow: null,
+              status: "queued",
+              requiredProtocol: 8,
+              detail: "Update this environment before running automatic workflows.",
+              updatedAt: now,
+            },
+            row!.pendingControl,
+            false,
+          )).record;
+        return yield* new WorkflowInvalidError({
+          message: "Update this environment to reconcile this automatic workflow.",
+        });
+      }
+      const supported = capability.workflowResult.actions ?? [];
+      if (
+        workflow.definition.steps.some(
+          (step) => step.kind === "action" && !supported.includes(step.action),
+        )
+      )
+        return yield* new WorkflowInvalidError({
+          message: "This environment does not support the workflow's publishing steps.",
+        });
+    }
     const response = yield* connector.dispatchJob({
-      userId: row!.pendingControl?.userId ?? row!.submitterUserId,
+      ...dispatchIdentity(),
       environmentId: job.environmentId,
       jobId: RelayJobId.make(jobId),
       repositoryCanonicalKey: canonicalKey,

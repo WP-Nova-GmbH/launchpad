@@ -1355,6 +1355,83 @@ describe("EnvironmentConnector.resolveAccess", () => {
     createdAt: "2026-08-19T00:00:00.000Z",
   };
 
+  it.effect("signs automation with a job subject and keeps the human reviewer separate", () => {
+    const origin = {
+      kind: "automation",
+      organizationId: "organization-1",
+      repositoryId: "repo-1",
+      workflowId: "flow",
+      source: {
+        provider: "linear",
+        applicationId: "app",
+        workspaceId: "ws",
+        connectionId: "connection",
+        grantId: "grant",
+      },
+      occurrenceId: "event",
+    } as const;
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const envelope = decodeDispatchJobRequestBody(requestBodyText(request));
+        const proof = decodeRequestProof<RelayCloudDispatchJobProofPayload>(envelope.proof);
+        expect(proof).toMatchObject({
+          sub: "workflow:workflow-job",
+          workflowOrigin: origin,
+          requestedBy: "bob",
+        });
+        expect(request.url).toContain("/workflow-job");
+        const workflowResult = {
+          protocol: 8 as const,
+          outcome: "missing" as const,
+          detail: null,
+          progress: null,
+        };
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(
+            signDispatchJobResponse(
+              envelope,
+              { workflowResult, requestId: proof.jti },
+              { workflowResult },
+            ),
+          ),
+        );
+      });
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const input = {
+        environmentId: "env-connector-test",
+        jobId: RelayJobId.make("workflow-job"),
+        repositoryCanonicalKey: "github.com/acme/app",
+        baseBranch: "HEAD",
+        instruction: "Inspect",
+        workflowOrigin: origin,
+        requestedBy: "bob",
+        workflowControl: {
+          operation: "status" as const,
+          organizationId: "organization-1",
+          repositoryId: "repo-1",
+          projectId: ProjectId.make("project-1"),
+        },
+      };
+      expect((yield* connector.dispatchJob(input)).workflowResult?.protocol).toBe(8);
+      const { workflowControl: _control, ...personal } = input;
+      expect((yield* Effect.exit(connector.dispatchJob(personal)))._tag).toBe("Failure");
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(execute, {
+          machine: {
+            ...enrolledMachine,
+            endpointHttpBaseUrl: "https://env.example.test/",
+            endpointWsBaseUrl: "wss://env.example.test/ws",
+          },
+          links: noLinks(),
+          allocations: makeAllocations(),
+        }),
+      ),
+    );
+  });
+
   it.effect(
     "uses the workflow endpoint and rejects a replayed nonce or unsigned progress change",
     () =>

@@ -1777,6 +1777,25 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
       });
     }
     const proof = proofOption.value;
+    const origin = proof.workflowOrigin;
+    if (
+      (origin === undefined && proof.sub.startsWith("workflow:")) ||
+      (origin !== undefined && !proof.workflowControl) ||
+      (origin?.kind === "automation" &&
+        (principal.kind !== "machine" ||
+          proof.sub !== `workflow:${proof.jobId}` ||
+          origin.organizationId !== proof.workflowControl?.organizationId ||
+          origin.repositoryId !== proof.workflowControl?.repositoryId ||
+          (proof.workflowControl.operation === "start" &&
+            origin.workflowId !== proof.workflowControl.workflow.workflowId))) ||
+      (origin?.kind === "manual" && proof.sub !== (proof.requestedBy ?? origin.userId)) ||
+      (origin?.kind !== "automation" &&
+        proof.requestedBy !== undefined &&
+        proof.requestedBy !== proof.sub)
+    )
+      return yield* new EnvironmentHttpUnauthorizedError({
+        message: "Invalid workflow origin or requester.",
+      });
     if (
       workflowOnly !== (proof.workflowControl !== undefined) ||
       (proof.workflowControl !== undefined &&
@@ -1813,7 +1832,9 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
           : yield* dependencies.workflowRunner
               .handle({
                 jobId: proof.jobId,
-                userId: proof.sub,
+                ...(origin?.kind === "automation" ? {} : { userId: proof.sub }),
+                ...(origin === undefined ? {} : { origin }),
+                ...(proof.requestedBy === undefined ? {} : { requestedBy: proof.requestedBy }),
                 repositoryCanonicalKey: proof.repositoryCanonicalKey,
                 instruction: proof.instruction,
                 control: proof.workflowControl,

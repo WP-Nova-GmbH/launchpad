@@ -79,6 +79,18 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
               yield* store.createJob(waiting);
               for (const statement of migration.split("--> statement-breakpoint"))
                 yield* sql.unsafe(statement);
+              const originMigration = yield* fs.readFileString(
+                new URL(
+                  "../../migrations/postgres/20261015151148_workflow_origin/migration.sql",
+                  import.meta.url,
+                ).pathname,
+              );
+              for (const statement of originMigration.split("--> statement-breakpoint"))
+                yield* sql.unsafe(statement);
+              expect((yield* store.getJob(waiting.jobId))?.record.origin).toEqual({
+                kind: "manual",
+                userId: "author",
+              });
               for (let n = 0; n < 151; n++)
                 yield* store.createJob(job(`done-${String(n).padStart(3, "0")}`, "done"));
               for (let n = 0; n < 122; n++)
