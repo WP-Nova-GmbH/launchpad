@@ -47,7 +47,7 @@ export const WorkflowSource = Schema.Struct({
   authorizationEpoch: Revision,
   status: Schema.Literals(["connected", "reconnect_required", "disconnected"]),
   health: WorkflowSourceHealth,
-  delivery: Schema.Literal("unverified"),
+  delivery: Schema.Literals(["unverified", "verified"]),
 });
 export type WorkflowSource = typeof WorkflowSource.Type;
 export const WorkflowSourceGrant = Schema.Struct({
@@ -134,7 +134,7 @@ export const WorkflowSourceHealthList = Schema.Struct({
       ownerUserId: Id,
       status: WorkflowSource.fields.status,
       health: WorkflowSourceHealth,
-      delivery: Schema.Literal("unverified"),
+      delivery: Schema.Literals(["unverified", "verified"]),
     }),
   ),
 });

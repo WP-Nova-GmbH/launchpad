@@ -1,3 +1,4 @@
+import { workflowEventsRoute } from "../src/http/WorkflowEventsRoute.ts";
 import { repositoryAccessServerApi } from "../src/http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "../src/tenancy/RepositoryPolicies.ts";
 /**
@@ -242,6 +243,14 @@ const relayConfigurationLayer = Layer.succeed(
     clerkJwtAudience: process.env.CLERK_JWT_AUDIENCE?.trim() || "t3-code-relay",
     cloudMintPrivateKey: Redacted.make(cloudMintKeyPair.privateKey),
     cloudMintPublicKey: cloudMintKeyPair.publicKey,
+    linearWorkflowWebhook: RelayConfiguration.workflowWebhookConfiguration(
+      process.env.LINEAR_WORKFLOW_CLIENT_ID,
+      process.env.LINEAR_WORKFLOW_WEBHOOK_SECRET?.trim()
+        ? Redacted.make(process.env.LINEAR_WORKFLOW_WEBHOOK_SECRET)
+        : undefined,
+      process.env.LINEAR_WORKFLOW_WEBHOOK_GENERATION,
+      process.env.LINEAR_WORKFLOW_ADMISSION_ENABLED === "true",
+    ),
     linearWorkflow: process.env.LINEAR_WORKFLOW_CLIENT_ID?.trim()
       ? {
           clientId: process.env.LINEAR_WORKFLOW_CLIENT_ID.trim(),
@@ -462,6 +471,7 @@ const routerLayer = Layer.merge(
     githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
     issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
     workflowSourceCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+    workflowEventsRoute.pipe(Layer.provide(runtimeLayer)),
   ).pipe(Layer.provide([Etag.layerWeak, relayCors])),
   relayNotFoundRoute,
 );

@@ -208,6 +208,12 @@ vp lint <files>
 vp run --filter <package> typecheck
 ```
 
+Relay workflow event integration suites require `WORKFLOW_SOURCES_TEST_DATABASE_URL` for a
+disposable PostgreSQL instance whose role can create/drop test databases. Set
+`WORKFLOW_PAGES_TEST_DATABASE_URL` to that instance for the job-page/origin regressions. CI and
+release test jobs provide an isolated service; the event suites fail clearly when their URL is absent.
+Never point either variable at production state.
+
 Use `vp run lint:mobile` for native mobile changes. CI owns the full suite; see
 [ci.yml](../../.github/workflows/ci.yml) for its current jobs.
 The [manual Windows lane](../../.github/workflows/windows-tests.yml) is available for focused

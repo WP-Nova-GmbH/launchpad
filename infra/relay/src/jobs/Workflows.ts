@@ -15,10 +15,13 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Routing from "../workflowEvents/Routing.ts";
 import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
 
 export type WorkflowJobRecord = Omit<typeof relayWorkflowJobs.$inferSelect, "summary">;
+const isInvalid = Schema.is(WorkflowInvalidError);
+const isConflict = Schema.is(WorkflowConflictError);
 const decodeOrigin = Schema.decodeUnknownSync(WorkflowOrigin);
 
 const JobPageCursor = Schema.Struct({
@@ -61,7 +64,7 @@ export const make = Effect.gen(function* () {
   const get = (workflowId: string) =>
     persist(
       db
-        .select()
+        .select({ record: relayRepositoryWorkflows.record })
         .from(relayRepositoryWorkflows)
         .where(eq(relayRepositoryWorkflows.workflowId, workflowId))
         .limit(1),
@@ -76,7 +79,7 @@ export const make = Effect.gen(function* () {
     list: (repositoryId: string) =>
       persist(
         db
-          .select()
+          .select({ record: relayRepositoryWorkflows.record })
           .from(relayRepositoryWorkflows)
           .where(eq(relayRepositoryWorkflows.repositoryId, repositoryId)),
       ).pipe(Effect.map((rows) => rows.map((row) => row.record))),
@@ -84,6 +87,7 @@ export const make = Effect.gen(function* () {
       organizationId: string,
       repositoryId: string,
       input: typeof SaveRepositoryWorkflow.Type,
+      context?: Routing.SaveContext,
     ) {
       const timestamp = yield* now;
       const previous = yield* get(input.workflowId);
@@ -102,9 +106,28 @@ export const make = Effect.gen(function* () {
         revision: input.expectedRevision + 1,
         definition: input.definition,
         archived: input.archived,
+        automation: Routing.automation(previous?.automation),
         createdAt: previous?.createdAt ?? timestamp,
         updatedAt: timestamp,
       } satisfies RepositoryWorkflow;
+      if (input.automation !== undefined || previous?.automation?.trigger) {
+        return yield* Routing.save(
+          {
+            ...record,
+            automation: Routing.automation(
+              input.automation === undefined ? previous?.automation : input.automation,
+            ),
+          },
+          input,
+          previous,
+          context,
+        ).pipe(
+          Effect.provideService(RelayDb, db),
+          Effect.mapError((cause) =>
+            isInvalid(cause) || isConflict(cause) ? cause : new WorkflowPersistenceError({ cause }),
+          ),
+        );
+      }
       const rows = previous
         ? yield* persist(
             db

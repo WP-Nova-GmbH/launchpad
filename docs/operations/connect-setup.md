@@ -174,13 +174,39 @@ for multiple owners, including two Launchpad accounts using the same Linear iden
 prove implementation behavior, not provider credential independence. If that evidence is unavailable
 or fails, native connection release remains blocked; do not silently share provider credentials.
 
-Event delivery has a separate release gate. This source-management release does not provide the
-production Issue webhook receiver or trigger enable controls; do not activate production subscriptions
-yet. When those ship, verify coverage and revocation behavior, including workspaces authorized before
-webhook settings existed. Such connections remain delivery-unverified until their existing subscription
-or a tested explicit owner reauthorization establishes coverage for the current delivery configuration.
-A successful API read or token exchange does not establish that coverage. Reconfiguration must not
-replay historical events or automatically revoke a workspace app used by other owners.
+Event delivery has a separate release gate. The receiver is `POST
+/webhooks/workflow-sources/linear` on the relay origin. In addition to the native client ID,
+configure `LINEAR_WORKFLOW_WEBHOOK_SECRET` and `LINEAR_WORKFLOW_WEBHOOK_GENERATION` on the
+relay only. Missing or partial configuration returns 503; native source management still works.
+Rotate the generation whenever the signing secret or app subscription coverage changes. Both
+relay entry points use these settings; keep the secret out of client bundles and diagnostics.
+
+Keep `LINEAR_WORKFLOW_ADMISSION_ENABLED` absent or `false` in production. Before activation,
+prove native authorization independence as above, then verify signed Issue create and status-entry
+coverage for selected teams, including private teams and pre-existing authorizations, duplicate
+subscriptions, actual retry timestamp behavior, and the exact app/workspace scope and timestamp
+ordering of OAuth revocation. Do not activate production subscriptions to discover these facts.
+Use an explicitly authorized development application. Fixture success cannot replace this evidence.
+
+The receiver tracks observed create AND true status-entry delivery per team, current authorization
+epoch and webhook generation. An existing connection can gain this evidence from new verified
+post-activation deliveries; an API read or token exchange alone cannot establish it. Unsupported
+teams remain blocked. Reauthorization clears old evidence while preserving source and grant identity;
+repair must not revoke an installation used by other owners. The existing source label describes
+observed teams and does not assert complete workspace coverage or enabled automatic execution.
+
+Unknown occurrences require a signed body `webhookTimestamp` within 60 seconds. Authenticated
+retries of a committed occurrence acknowledge without additional jobs even when stale. Linear
+retry intervals exceed that window: verify that actual retries refresh their signed timestamp before
+activation; otherwise revisit this policy before release. A 400 indicates invalid routing facts,
+401 invalid signature/freshness, 413 a body over 1 MiB, and 500 an uncommitted admission failure.
+Diagnostics must retain only the bounded failure code, never the body or signing/OAuth material.
+
+Events commit all matching queued jobs or none. Successful and unmatched occurrences retain a
+duplicate fence; reconfiguration never rematches them. Trigger authoring and automatic-start context
+are subsequent slices: admitted jobs remain unoffered until that start path ships. Do not present
+this receiver as production automatic execution or enable the admission flag before those slices
+and the provider proof are complete.
 
 An `invalid_client` or `unauthorized_client` error during token exchange/refresh is a service
 configuration fault. Repair the application's configured credentials and retry the failed operation;

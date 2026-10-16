@@ -3,7 +3,7 @@ import * as SecretBox from "../auth/SecretBox.ts";
 import * as Crypto from "effect/Crypto";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { UserDirectory } from "../tenancy/UserDirectory.ts";
-import { RelayDb } from "../db.ts";
+import { RelayDb, RelayTransactions } from "../db.ts";
 import * as PgClient from "@effect/sql-pg/PgClient";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -86,19 +86,33 @@ export const withDatabase = <A, E, R>(program: Effect.Effect<A, E, R>) =>
           for (const statement of `CREATE TABLE relay_organizations(organization_id text PRIMARY KEY,name text NOT NULL,created_at text DEFAULT '2026',updated_at text DEFAULT '2026');
 CREATE TABLE relay_organization_members(organization_id text NOT NULL,user_id text NOT NULL UNIQUE,role text NOT NULL,created_at text DEFAULT '2026',updated_at text DEFAULT '2026',PRIMARY KEY(organization_id,user_id));
 CREATE TABLE relay_repositories(repository_id text PRIMARY KEY,organization_id text NOT NULL,name text NOT NULL,created_at text DEFAULT '2026',updated_at text DEFAULT '2026');
-CREATE TABLE relay_repository_access(repository_id text NOT NULL,user_id text NOT NULL,organization_id text NOT NULL,role text NOT NULL,PRIMARY KEY(repository_id,user_id));
-CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_id text NOT NULL,organization_id text NOT NULL);
-CREATE TABLE relay_machines(environment_id text,organization_id text,environment_public_key text,endpoint_http_base_url text);`.split(
+CREATE TABLE relay_repository_access(repository_id text NOT NULL,user_id text NOT NULL,organization_id text NOT NULL,role text NOT NULL,created_at text DEFAULT '2026',updated_at text DEFAULT '2026',PRIMARY KEY(repository_id,user_id));
+CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_id text NOT NULL,organization_id text NOT NULL,created_at text DEFAULT '2026');`.split(
             ";",
           ))
             if (statement.trim()) yield* sql.unsafe(statement);
           const fs = yield* FileSystem.FileSystem;
           for (const file of [
+            ...["20260819153249_machines", "20260824143719_organization_project_catalog"].map(
+              (name) =>
+                new URL(`../../migrations/postgres/${name}/migration.sql`, import.meta.url)
+                  .pathname,
+            ),
             new URL(
               "../../migrations/postgres/20260928113352_repository_policy/migration.sql",
               import.meta.url,
             ).pathname,
             migrationPath,
+            ...[
+              "20261008114100_repository_workflows",
+              "20261015110011_workflow_job_pages",
+              "20261015151148_workflow_origin",
+              "20261016074602_workflow_events",
+            ].map(
+              (name) =>
+                new URL(`../../migrations/postgres/${name}/migration.sql`, import.meta.url)
+                  .pathname,
+            ),
           ]) {
             const migration = yield* fs.readFileString(file);
             for (const statement of migration.split("--> statement-breakpoint"))
@@ -108,7 +122,7 @@ CREATE TABLE relay_machines(environment_id text,organization_id text,environment
           yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role) VALUES ('org','owner','member'),('org','maintainer','member'),('org','reader','member'),('org','admin','admin'),('other-org','outsider','admin')`;
           yield* sql`INSERT INTO relay_repositories(repository_id,organization_id,name) VALUES ('repo','org','Repository'),('repo-2','org','Second'),('foreign','other-org','Foreign')`;
           yield* sql`INSERT INTO relay_repository_access(repository_id,user_id,organization_id,role) VALUES ('repo','owner','org','maintainer'),('repo','maintainer','org','maintainer'),('repo','reader','org','developer'),('repo-2','owner','org','maintainer')`;
-          return yield* program;
+          return yield* program.pipe(Effect.provide(RelayTransactions.layer));
         }).pipe(Effect.provide(dependencies), Effect.scoped),
       () => admin.unsafe(`DROP DATABASE "${name}"`).pipe(Effect.orDie),
     );

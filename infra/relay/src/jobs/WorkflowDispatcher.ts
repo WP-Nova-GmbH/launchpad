@@ -5,56 +5,22 @@ import {
   WorkflowManualControl,
   isTerminalWorkflowJob,
   type WorkflowControl,
-  type WorkflowDefinition,
   type RepositoryWorkflowJob,
 } from "@t3tools/contracts/workflows";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
-import { Machines } from "../machines/Machines.ts";
-import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
-import { Repositories } from "../tenancy/Repositories.ts";
 import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { Workflows } from "./Workflows.ts";
+import { validateWorkflowTarget } from "./WorkflowTarget.ts";
+export { validateWorkflowTarget } from "./WorkflowTarget.ts";
 
 const decodeOrigin = Schema.decodeUnknownEffect(WorkflowOrigin);
 
 const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
-
-export const validateWorkflowTarget = Effect.fn("WorkflowDispatcher.validateTarget")(function* (
-  organizationId: string,
-  repositoryId: string,
-  definition: WorkflowDefinition,
-) {
-  const machine = yield* (yield* Machines).getActiveByEnvironmentId({
-    environmentId: definition.environmentId,
-  });
-  const repository = yield* (yield* Repositories).getById({ repositoryId });
-  const catalog = yield* (yield* OrganizationProjectCatalog).listForOrganization({
-    organizationId,
-  });
-  const project = catalog.find(
-    (entry) =>
-      entry.environmentId === definition.environmentId && entry.projectId === definition.projectId,
-  );
-  if (
-    !machine ||
-    machine.organizationId !== organizationId ||
-    machine.enrolledAt === null ||
-    !repository ||
-    repository.organizationId !== organizationId ||
-    !project?.repositoryCanonicalKey ||
-    !repository.canonicalKeys.includes(project.repositoryCanonicalKey)
-  ) {
-    return yield* new WorkflowInvalidError({
-      message: "Choose an enrolled organization environment and a checkout of this repository.",
-    });
-  }
-  return project.repositoryCanonicalKey;
-});
 
 export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(function* (
   jobId: string,

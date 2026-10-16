@@ -623,8 +623,36 @@ export const relayRepositoryWorkflows = pgTable(
     repositoryId: varchar("repository_id", { length: 64 }).notNull(),
     revision: integer("revision").notNull(),
     record: jsonb("record").notNull().$type<RepositoryWorkflow>(),
+    automationEnabled: boolean("automation_enabled").notNull().default(false),
+    sourceApplicationId: text("source_application_id"),
+    sourceWorkspaceId: text("source_workspace_id"),
+    triggerTeamId: text("trigger_team_id"),
+    triggerEvent: text("trigger_event"),
+    triggerGrantId: text("trigger_grant_id"),
+    routingGeneration: integer("routing_generation").notNull().default(0),
+    effectiveAfter: text("effective_after"),
+    targetCapability: jsonb("target_capability"),
   },
-  (table) => [index("idx_repository_workflows_repository").on(table.repositoryId)],
+  (table) => [
+    check(
+      "workflow_routing_consistent",
+      sql`automation_enabled = COALESCE((record#>>'{automation,enabled}')::boolean,false)
+    AND (NOT automation_enabled OR COALESCE((record->>'archived' = 'false' AND source_application_id IS NOT NULL
+    AND source_workspace_id IS NOT NULL AND effective_after IS NOT NULL AND target_capability IS NOT NULL
+    AND routing_generation > 0 AND trigger_team_id IS NOT NULL AND trigger_grant_id IS NOT NULL
+    AND trigger_event IN ('issue_created','entered_status') AND trigger_team_id = record#>>'{automation,trigger,teamId}'
+    AND trigger_grant_id = record#>>'{automation,trigger,grantId}' AND trigger_event = record#>>'{automation,trigger,event}'),false))`,
+    ),
+    index("idx_repository_workflows_repository").on(table.repositoryId),
+    index("idx_workflow_event_rules")
+      .on(
+        table.sourceApplicationId,
+        table.sourceWorkspaceId,
+        table.triggerTeamId,
+        table.triggerEvent,
+      )
+      .where(sql`automation_enabled`),
+  ],
 );
 
 export const relayWorkflowJobs = pgTable(
@@ -788,6 +816,8 @@ export const relayWorkflowConnections = pgTable(
     status: text("status").notNull(),
     authorizationEpoch: integer("authorization_epoch").notNull().default(1),
     activatedAt: text("activated_at").notNull(),
+    authorizationStartedAt: text("authorization_started_at"),
+    deliveryEvidence: jsonb("delivery_evidence"),
     credentialVersion: integer("credential_version").notNull().default(1),
     payloadSealed: text("payload_sealed"),
     health: jsonb("health").notNull(),
@@ -810,6 +840,7 @@ export const relayWorkflowAuthorizations = pgTable(
     applicationId: text("application_id").notNull(),
     version: integer("version").notNull().default(0),
     attemptId: text("attempt_id"),
+    startedAt: text("started_at"),
     connectionId: text("connection_id"),
     expectedEpoch: integer("expected_epoch"),
     stateHash: text("state_hash"),
@@ -843,5 +874,49 @@ export const relayWorkflowRepositoryGrants = pgTable(
       .where(sql`NOT ${t.revoked}`),
     uniqueIndex("workflow_grant_generation").on(t.repositoryId, t.connectionId, t.generation),
     index("workflow_grant_owner_org").on(t.ownerUserId, t.organizationId),
+  ],
+);
+
+export const relayWorkflowOccurrences = pgTable(
+  "relay_workflow_occurrences",
+  {
+    occurrenceId: text("occurrence_id").primaryKey(),
+    applicationId: text("application_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    eventKey: text("event_key").notNull(),
+    eventType: text("event_type").notNull(),
+    occurredAt: text("occurred_at").notNull(),
+    receivedAt: text("received_at").notNull(),
+    facts: jsonb("facts").notNull(),
+    jobCount: integer("job_count").notNull().default(0),
+  },
+  (t) => [
+    uniqueIndex("workflow_occurrence_identity").on(t.applicationId, t.workspaceId, t.eventKey),
+    index("workflow_revocation_cutoff").on(
+      t.applicationId,
+      t.workspaceId,
+      t.eventType,
+      t.occurredAt,
+    ),
+  ],
+);
+export const relayWorkflowAdmissions = pgTable(
+  "relay_workflow_admissions",
+  {
+    occurrenceId: text("occurrence_id").notNull(),
+    workflowId: text("workflow_id").notNull(),
+    jobId: text("job_id").notNull(),
+    organizationId: text("organization_id").notNull(),
+    repositoryId: text("repository_id").notNull(),
+    connectionId: text("connection_id").notNull(),
+    grantId: text("grant_id").notNull(),
+    grantGeneration: integer("grant_generation").notNull(),
+    authorizationEpoch: integer("authorization_epoch").notNull(),
+    workflowRevision: integer("workflow_revision").notNull(),
+    routingGeneration: integer("routing_generation").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.occurrenceId, t.workflowId] }),
+    uniqueIndex("workflow_admission_job").on(t.jobId),
   ],
 );

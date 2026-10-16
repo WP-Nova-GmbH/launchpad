@@ -21,6 +21,7 @@ const fixture = vi.hoisted(() => ({
   enqueue: (_effect: Effect.Effect<void>) => {},
   repo: null as unknown as WorkflowRepositorySources,
   failRead: false,
+  delivery: "unverified" as WorkflowSource["delivery"],
   denyRead: false,
   dropAllow: false,
   allowCount: 0,
@@ -173,6 +174,7 @@ beforeEach(() => {
     withdrawableGrants: [],
   };
   fixture.failRead = false;
+  fixture.delivery = "unverified";
   fixture.denyRead = false;
   fixture.dropAllow = false;
   fixture.allowCount = 0;
@@ -209,7 +211,7 @@ beforeEach(() => {
               ownerUserId: "owner",
               status: source.status,
               health: source.health,
-              delivery: "unverified",
+              delivery: fixture.delivery,
             },
           ],
         });
@@ -398,6 +400,11 @@ it.effect("mobile reads safe source health, refreshes stale status and clears re
       expect(words()).toContain("Engineering workspace");
       expect(words()).toContain("Configure workflow sources in the web or desktop app");
       expect(button("Allow repository")).toBeUndefined();
+      expect(words()).toContain("Event delivery is not verified.");
+      fixture.delivery = "verified";
+      await act(async () => button("Refresh workflow sources").props.onClick());
+      await drain();
+      expect(words()).toContain("Event delivery verified for observed teams.");
       fixture.failRead = true;
       await act(async () => button("Refresh workflow sources").props.onClick());
       await drain();

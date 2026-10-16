@@ -11,7 +11,8 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
-import { Workflows } from "../jobs/Workflows.ts";
+import { prepare as prepareAutomationSave } from "../workflowEvents/Preparation.ts";
+import { Workflows, WorkflowPersistenceError } from "../jobs/Workflows.ts";
 import { refreshWorkflowJob, validateWorkflowTarget } from "../jobs/WorkflowDispatcher.ts";
 import {
   resolveMembership,
@@ -31,6 +32,7 @@ export const authorizeWorkflowRepository = Effect.fn("WorkflowsApi.authorize")(f
   else yield* requireVisibleRepository({ membership, repositoryId });
   return membership;
 });
+const isInvalid = Schema.is(WorkflowInvalidError);
 const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* (
   params: { readonly repositoryId: string; readonly jobId: string },
@@ -232,7 +234,20 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
     .handle("save", ({ params, payload }) =>
       Effect.gen(function* () {
         const membership = yield* authorizeWorkflowRepository(params.repositoryId, true);
-        if (!payload.archived)
+        const store = yield* Workflows;
+        const previous = yield* store.get(payload.workflowId);
+        const saveContext = yield* prepareAutomationSave(
+          membership.organization.organizationId,
+          params.repositoryId,
+          membership.userId,
+          payload,
+          previous,
+        ).pipe(
+          Effect.mapError((cause) =>
+            isInvalid(cause) ? cause : new WorkflowPersistenceError({ cause }),
+          ),
+        );
+        if (!payload.archived && payload.automation === undefined && !previous?.automation?.trigger)
           yield* validateWorkflowTarget(
             membership.organization.organizationId,
             params.repositoryId,
@@ -242,6 +257,7 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
           membership.organization.organizationId,
           params.repositoryId,
           payload,
+          saveContext,
         );
       }).pipe(errors),
     )

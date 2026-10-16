@@ -39,6 +39,12 @@ cannot prove whether work started, so withdrawal does not interrupt reconciliati
 handoff. If the environment confirms that it did not start the job, its return to the queue
 requires current source authorization before a later handoff.
 
+A signed provider occurrence and all its matching queued jobs commit in one relay transaction.
+Retain its semantic identity even when it matches no workflow: retries cannot reinterpret old events
+after an edit or a later enable. A trigger Save and admission serialize on the same logical source;
+new criteria apply strictly after the database-clock Save boundary. Queued-job admission is separate
+from execution handoff and cannot depend on environment availability or provider refresh HTTP.
+
 ## Why the seam is coarse
 
 `OrchestrationEngine` is deliberately the single ordered writer for thread facts: one fiber

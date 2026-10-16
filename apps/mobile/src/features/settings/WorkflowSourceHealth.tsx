@@ -76,8 +76,8 @@ export function WorkflowSourceHealth({
       ) : null}
       {data?.sources.map((source) => (
         <Text key={source.connectionId} className="p-4 text-foreground">
-          {source.workspaceName} · {WorkflowSources.sourceHealthLabel(source)}. Event delivery is
-          not verified.
+          {source.workspaceName} · {WorkflowSources.sourceHealthLabel(source)}.{" "}
+          {WorkflowSources.sourceDeliveryLabel(source)}
         </Text>
       ))}
       {data && !data.sources.length ? (

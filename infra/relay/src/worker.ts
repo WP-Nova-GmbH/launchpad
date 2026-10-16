@@ -1,3 +1,4 @@
+import { workflowEventsRoute } from "./http/WorkflowEventsRoute.ts";
 import { repositoryAccessServerApi } from "./http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "./tenancy/RepositoryPolicies.ts";
 import * as Alchemy from "alchemy";
@@ -225,6 +226,15 @@ export const ApiLive = Api.make(
 
     // Optional: a deployment without a GitHub App simply hides the surface.
     const linearClientId = yield* Config.String("LINEAR_WORKFLOW_CLIENT_ID").pipe(Config.option);
+    const linearWebhookSecret = yield* Config.Redacted("LINEAR_WORKFLOW_WEBHOOK_SECRET").pipe(
+      Config.option,
+    );
+    const linearWebhookGeneration = yield* Config.String("LINEAR_WORKFLOW_WEBHOOK_GENERATION").pipe(
+      Config.option,
+    );
+    const linearAdmissionEnabled = yield* Config.Boolean("LINEAR_WORKFLOW_ADMISSION_ENABLED").pipe(
+      Config.withDefault(false),
+    );
     const linearClientSecret = yield* Config.Redacted("LINEAR_WORKFLOW_CLIENT_SECRET").pipe(
       Config.option,
     );
@@ -291,6 +301,12 @@ export const ApiLive = Api.make(
         clerkJwtAudience,
         cloudMintPrivateKey: yield* cloudMintPrivateKey,
         cloudMintPublicKey: yield* cloudMintPublicKey,
+        linearWorkflowWebhook: RelayConfiguration.workflowWebhookConfiguration(
+          Option.getOrUndefined(linearClientId),
+          Option.getOrUndefined(linearWebhookSecret),
+          Option.getOrUndefined(linearWebhookGeneration),
+          linearAdmissionEnabled,
+        ),
         linearWorkflow:
           Option.isSome(linearClientId) && linearClientId.value.trim()
             ? {
@@ -538,6 +554,7 @@ export const ApiLive = Api.make(
         githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
         issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
         workflowSourceCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+        workflowEventsRoute.pipe(Layer.provide(runtimeLayer)),
       ).pipe(Layer.provide([Etag.layerWeak, httpPlatformNotSupportedLayer, relayCors])),
       relayNotFoundRoute,
     ).pipe(

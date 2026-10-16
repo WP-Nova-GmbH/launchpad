@@ -114,3 +114,12 @@ describe("workflow source client", () => {
     ),
   );
 });
+
+it("describes observed delivery without implying active automatic execution", () => {
+  expect(Sources.sourceDeliveryLabel({ delivery: "verified" })).toBe(
+    "Event delivery verified for observed teams.",
+  );
+  expect(Sources.sourceDeliveryLabel({ delivery: "unverified" })).toBe(
+    "Event delivery is not verified.",
+  );
+});

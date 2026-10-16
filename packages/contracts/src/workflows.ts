@@ -80,7 +80,40 @@ export const WorkflowDefinition = Schema.Struct({
 }).check(Schema.makeFilter((definition) => workflowDefinitionError(definition.steps) ?? true));
 export type WorkflowDefinition = typeof WorkflowDefinition.Type;
 
+const TriggerId = TrimmedNonEmptyString.check(Schema.isMaxLength(191));
+const TriggerBase = {
+  provider: Schema.Literal("linear"),
+  connectionId: TriggerId,
+  grantId: TriggerId,
+  teamId: TriggerId,
+  labelIds: Schema.Array(TriggerId).check(Schema.isMaxLength(100)),
+};
+export const WorkflowTrigger = Schema.Union([
+  Schema.Struct({ ...TriggerBase, event: Schema.Literal("issue_created") }),
+  Schema.Struct({ ...TriggerBase, event: Schema.Literal("entered_status"), stateId: TriggerId }),
+]);
+export type WorkflowTrigger = typeof WorkflowTrigger.Type;
+export const WorkflowAutomation = Schema.Struct({
+  enabled: Schema.Boolean,
+  trigger: Schema.NullOr(WorkflowTrigger),
+});
+export type WorkflowAutomation = typeof WorkflowAutomation.Type;
+export const WorkflowEventFacts = Schema.Struct({
+  issueId: TriggerId,
+  teamId: TriggerId,
+  stateId: TriggerId,
+  labelIds: Schema.Array(TriggerId).check(Schema.isMaxLength(100)),
+  identifier: Label,
+  title: Label,
+  url: Schema.String.check(Schema.isMaxLength(2048)),
+  occurredAt: Schema.String,
+  issueUpdatedAt: Schema.String,
+  previousStateId: Schema.optional(Schema.NullOr(TriggerId)),
+});
+export type WorkflowEventFacts = typeof WorkflowEventFacts.Type;
+
 export const RepositoryWorkflow = Schema.Struct({
+  automation: Schema.optional(WorkflowAutomation),
   workflowId: TrimmedNonEmptyString,
   organizationId: TrimmedNonEmptyString,
   repositoryId: TrimmedNonEmptyString,
@@ -185,6 +218,7 @@ export const WorkflowJobProgress = Schema.Struct({
 export type WorkflowJobProgress = typeof WorkflowJobProgress.Type;
 
 export const RepositoryWorkflowJob = Schema.Struct({
+  event: Schema.optional(WorkflowEventFacts),
   origin: Schema.optional(WorkflowOrigin),
   originSummary: Schema.optional(WorkflowOriginSummary),
   /** Pinned with the offer so a downgrade cannot acknowledge newer lifecycle semantics. */
@@ -309,6 +343,7 @@ export const WorkflowControlResult = Schema.Struct({
 export type WorkflowControlResult = typeof WorkflowControlResult.Type;
 
 export const SaveRepositoryWorkflow = Schema.Struct({
+  automation: Schema.optional(Schema.NullOr(WorkflowAutomation)),
   workflowId: TrimmedNonEmptyString,
   expectedRevision: Revision,
   definition: WorkflowDefinition,

@@ -13,6 +13,8 @@ import { RelaySecretBox } from "../auth/SecretBox.ts";
 import * as Store from "./Store.ts";
 import { UserDirectory } from "../tenancy/UserDirectory.ts";
 import * as Linear from "./Linear.ts";
+import * as EventFence from "../workflowEvents/Fence.ts";
+import type { WorkflowTrigger } from "@t3tools/contracts/workflows";
 
 const decodePending = Schema.decodeUnknownEffect(Schema.fromJsonString(Linear.Pending));
 const decodeCredentials = Schema.decodeUnknownEffect(Schema.fromJsonString(Linear.Credentials));
@@ -87,8 +89,9 @@ export const begin = Effect.fn("workflowSources.begin")(function* (
           "service_configuration",
           "This connection belongs to a different Linear application.",
         );
+      const startedAt = yield* EventFence.timestamp;
       const [updated] =
-        yield* sql<Store.Attempt>`UPDATE relay_workflow_authorizations SET version=version+1,attempt_id=${input.attemptId},connection_id=${input.connectionId},expected_epoch=${c?.authorization_epoch ?? null},state_hash=${stateHash},pending_sealed=${sealed},expires_at=${Store.iso(time + 600_000)},status='pending',error=NULL WHERE owner_user_id=${user} AND application_id=${config.clientId} RETURNING *`;
+        yield* sql<Store.Attempt>`UPDATE relay_workflow_authorizations SET started_at=${startedAt},version=version+1,attempt_id=${input.attemptId},connection_id=${input.connectionId},expected_epoch=${c?.authorization_epoch ?? null},state_hash=${stateHash},pending_sealed=${sealed},expires_at=${Store.iso(time + 600_000)},status='pending',error=NULL WHERE owner_user_id=${user} AND application_id=${config.clientId} RETURNING *`;
       return updated!;
     }),
   );
@@ -171,22 +174,35 @@ export const callback = Effect.fn("workflowSources.callback")(function* (
     const identity = yield* Linear.identity(tokens.accessToken);
     const sealed = yield* box.seal(Store.json(tokens));
     const id = yield* uuid;
-    const stamp = Store.iso(yield* Store.now);
     return yield* sql.withTransaction(
       Effect.gen(function* () {
+        yield* EventFence.lock(claimed.application_id, identity.organization.id);
+        const cutoff = yield* EventFence.revocationCutoff(
+          claimed.application_id,
+          identity.organization.id,
+        );
         const current = yield* Store.attempt(claimed.owner_user_id, claimed.application_id, true);
+        if (
+          cutoff &&
+          (!current?.started_at || Date.parse(current.started_at) <= Date.parse(cutoff))
+        )
+          return yield* Store.fail(
+            "conflict",
+            "Linear was revoked during this authorization. Start connecting again.",
+          );
+        const stamp = yield* EventFence.timestamp;
         if (
           current?.attempt_id !== attemptId ||
           current.status !== "exchanging" ||
           Date.parse(current.expires_at!) <= (yield* Store.now)
         )
           return yield* Store.fail("conflict", "Authorization changed. Start connecting again.");
-        const [target] = claimed.connection_id
-          ? yield* sql<Store.Connection>`SELECT * FROM relay_workflow_connections WHERE connection_id=${claimed.connection_id} AND owner_user_id=${claimed.owner_user_id} FOR UPDATE`
+        const [target] = current.connection_id
+          ? yield* sql<Store.Connection>`SELECT * FROM relay_workflow_connections WHERE connection_id=${current.connection_id} AND owner_user_id=${claimed.owner_user_id} FOR UPDATE`
           : yield* sql<Store.Connection>`SELECT * FROM relay_workflow_connections WHERE owner_user_id=${claimed.owner_user_id} AND application_id=${claimed.application_id} AND workspace_id=${identity.organization.id} FOR UPDATE`;
         if (
-          claimed.connection_id &&
-          (!target || target.authorization_epoch !== claimed.expected_epoch)
+          current.connection_id &&
+          (!target || target.authorization_epoch !== current.expected_epoch)
         )
           return yield* Store.fail("conflict", "The source changed during authorization.");
         if (target && target.workspace_id !== identity.organization.id)
@@ -196,9 +212,9 @@ export const callback = Effect.fn("workflowSources.callback")(function* (
           );
         const connectionId = target?.connection_id ?? id;
         if (target)
-          yield* sql`UPDATE relay_workflow_connections SET payload_sealed=${sealed},status='connected',workspace_name=${identity.organization.name},viewer_name=${identity.viewer.name},authorization_epoch=authorization_epoch+1,credential_version=credential_version+1,activated_at=${stamp},health=${Store.json(Store.healthy)}::jsonb,lease_id=NULL,lease_until=NULL,refresh_started_at=NULL WHERE connection_id=${connectionId}`;
+          yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=NULL,authorization_started_at=${current?.started_at ?? null},payload_sealed=${sealed},status='connected',workspace_name=${identity.organization.name},viewer_name=${identity.viewer.name},authorization_epoch=authorization_epoch+1,credential_version=credential_version+1,activated_at=${stamp},health=${Store.json(Store.healthy)}::jsonb,lease_id=NULL,lease_until=NULL,refresh_started_at=NULL WHERE connection_id=${connectionId}`;
         else
-          yield* sql`INSERT INTO relay_workflow_connections (connection_id,owner_user_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health) VALUES (${id},${claimed.owner_user_id},${claimed.application_id},${identity.organization.id},${identity.organization.name},${identity.viewer.name},'connected',${stamp},${sealed},${Store.json(Store.healthy)}::jsonb)`;
+          yield* sql`INSERT INTO relay_workflow_connections (authorization_started_at,connection_id,owner_user_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health) VALUES (${current?.started_at ?? null},${id},${claimed.owner_user_id},${claimed.application_id},${identity.organization.id},${identity.organization.name},${identity.viewer.name},'connected',${stamp},${sealed},${Store.json(Store.healthy)}::jsonb)`;
         yield* sql`UPDATE relay_workflow_authorizations SET status='connected',version=version+1,connection_id=${connectionId},pending_sealed=NULL,error=NULL WHERE owner_user_id=${claimed.owner_user_id} AND application_id=${claimed.application_id}`;
         return connectionId;
       }),
@@ -447,4 +463,82 @@ export const metadata = Effect.fn("workflowSources.metadata")(function* (
         )
       : null,
   } satisfies WorkflowSourceMetadataPage;
+});
+
+const SelectionNode = Schema.Struct({
+  id: Schema.String,
+  archivedAt: Schema.NullOr(Schema.String),
+});
+const decodeSelection = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    data: Schema.Struct({
+      organization: Schema.Struct({ id: Schema.String }),
+      team: Schema.NullOr(SelectionNode),
+      state: Schema.optional(
+        Schema.NullOr(
+          Schema.Struct({ ...SelectionNode.fields, team: Schema.Struct({ id: Schema.String }) }),
+        ),
+      ),
+      labels: Schema.optional(
+        Schema.Struct({
+          nodes: Schema.Array(
+            Schema.Struct({
+              ...SelectionNode.fields,
+              isGroup: Schema.Boolean,
+              team: Schema.NullOr(Schema.Struct({ id: Schema.String })),
+            }),
+          ),
+          pageInfo: Schema.Struct({ hasNextPage: Schema.Boolean }),
+        }),
+      ),
+    }),
+  }),
+);
+/** Validate only the selected IDs; no workspace-wide metadata crawl. */
+export const validateTrigger = Effect.fn("workflowSources.validateTrigger")(function* (
+  connection: Store.Connection,
+  trigger: WorkflowTrigger,
+) {
+  const state = trigger.event === "entered_status";
+  const labels = trigger.labelIds.length > 0;
+  const result = yield* read(connection, (token) =>
+    Linear.graphql(
+      token,
+      `query WorkflowTriggerSelection($team:String!${labels ? ",$labels:[ID!]!" : ""}${state ? ",$state:String!" : ""}) {organization{id} team(id:$team){id archivedAt} ${state ? "state:workflowState(id:$state){id archivedAt team{id}}" : ""} ${labels ? "labels:issueLabels(first:100,filter:{id:{in:$labels}}){nodes{id archivedAt isGroup team{id}} pageInfo{hasNextPage}}" : ""}}`,
+      {
+        team: trigger.teamId,
+        ...(labels ? { labels: trigger.labelIds } : {}),
+        ...(state ? { state: trigger.stateId } : {}),
+      },
+      decodeSelection,
+    ),
+  );
+  if (
+    result.organization.id !== connection.workspace_id ||
+    !result.team ||
+    result.team.id !== trigger.teamId ||
+    result.team.archivedAt ||
+    (state &&
+      (!result.state ||
+        result.state.id !== trigger.stateId ||
+        result.state.team.id !== trigger.teamId ||
+        result.state.archivedAt)) ||
+    (labels &&
+      (!result.labels ||
+        result.labels.pageInfo.hasNextPage ||
+        trigger.labelIds.some(
+          (id) =>
+            !result.labels?.nodes.some(
+              (l) =>
+                l.id === id &&
+                !l.archivedAt &&
+                !l.isGroup &&
+                (!l.team || l.team.id === trigger.teamId),
+            ),
+        )))
+  )
+    return yield* Store.fail(
+      "invalid_input",
+      "The selected Linear team, state or labels are unavailable.",
+    );
 });

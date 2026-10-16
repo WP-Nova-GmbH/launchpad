@@ -87,6 +87,20 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
               );
               for (const statement of originMigration.split("--> statement-breakpoint"))
                 yield* sql.unsafe(statement);
+              const eventsMigration = yield* fs.readFileString(
+                new URL(
+                  "../../migrations/postgres/20261016074602_workflow_events/migration.sql",
+                  import.meta.url,
+                ).pathname,
+              );
+              // This legacy fixture has no native source tables; the source suite runs the full migration.
+              for (const statement of eventsMigration.split("--> statement-breakpoint"))
+                if (
+                  statement.trim() &&
+                  !/ALTER TABLE "relay_workflow_(connections|authorizations)"/.test(statement)
+                )
+                  yield* sql.unsafe(statement);
+
               expect((yield* store.getJob(waiting.jobId))?.record.origin).toEqual({
                 kind: "manual",
                 userId: "author",

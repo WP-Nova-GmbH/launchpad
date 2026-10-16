@@ -107,3 +107,8 @@ export const sourceHealthLabel = (source: { status: string; health: { code: stri
           : source.health.code === "unavailable"
             ? "Linear unavailable"
             : "Connected";
+
+export const sourceDeliveryLabel = (source: { delivery: string }) =>
+  source.delivery === "verified"
+    ? "Event delivery verified for observed teams."
+    : "Event delivery is not verified.";

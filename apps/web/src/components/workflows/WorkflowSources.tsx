@@ -20,7 +20,7 @@ export function SourceIdentity({ source }: { source: WorkflowSource }) {
       <p className="break-words text-xs text-muted-foreground">
         {source.viewerName} · {WorkflowSources.sourceHealthLabel(source)}
       </p>
-      <p className="text-xs text-muted-foreground">Event delivery is not verified.</p>
+      <p className="text-xs text-muted-foreground">{WorkflowSources.sourceDeliveryLabel(source)}</p>
     </div>
   );
 }

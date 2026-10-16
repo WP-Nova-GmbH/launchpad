@@ -1,3 +1,4 @@
+import * as EventFence from "../workflowEvents/Fence.ts";
 import {
   WorkflowSourceError,
   type WorkflowSource,
@@ -26,6 +27,8 @@ export interface Connection {
   status: WorkflowSource["status"];
   authorization_epoch: number;
   activated_at: string;
+  authorization_started_at: string | null;
+  delivery_evidence: unknown;
   credential_version: number;
   payload_sealed: string | null;
   health: WorkflowSourceHealth;
@@ -38,6 +41,7 @@ export interface Attempt {
   application_id: string;
   version: number;
   attempt_id: string | null;
+  started_at: string | null;
   connection_id: string | null;
   expected_epoch: number | null;
   state_hash: string | null;
@@ -55,7 +59,10 @@ export interface Grant {
   generation: number;
   revoked: boolean;
 }
-export const source = (c: Connection): WorkflowSource => ({
+export const source = (
+  c: Connection,
+  config?: Effect.Success<typeof EventFence.configuration>,
+): WorkflowSource => ({
   connectionId: c.connection_id,
   ownerUserId: c.owner_user_id,
   applicationId: c.application_id,
@@ -65,7 +72,14 @@ export const source = (c: Connection): WorkflowSource => ({
   status: c.status,
   authorizationEpoch: c.authorization_epoch,
   health: c.health,
-  delivery: "unverified",
+  delivery:
+    c.status === "connected" &&
+    config?.applicationId === c.application_id &&
+    Object.values(EventFence.evidence(c, config.generation)?.teams ?? {}).some(
+      (t) => t.created && t.entered,
+    )
+      ? "verified"
+      : "unverified",
 });
 export const grant = (g: Grant): WorkflowSourceGrant => ({
   grantId: g.grant_id,
@@ -226,6 +240,7 @@ export const ownerSnapshot = Effect.fn("workflowSources.ownerSnapshot")(function
   app: string | null,
 ) {
   const sql = (yield* RelayDb).$client;
+  const eventConfig = yield* EventFence.configuration;
   const a = app ? yield* attempt(owner, app) : null;
   const connections =
     yield* sql<Connection>`SELECT * FROM relay_workflow_connections WHERE owner_user_id=${owner} ORDER BY workspace_name,connection_id`;
@@ -264,7 +279,7 @@ export const ownerSnapshot = Effect.fn("workflowSources.ownerSnapshot")(function
             error: a.error,
           }
         : null,
-    connections: connections.map(source),
+    connections: connections.map((c) => source(c, eventConfig)),
     repositories,
     grants: grants.map(grant),
     withdrawableGrants,
@@ -277,6 +292,7 @@ export const repositorySnapshot = Effect.fn("workflowSources.repositorySnapshot"
   app: string | null,
 ) {
   const sql = (yield* RelayDb).$client;
+  const eventConfig = yield* EventFence.configuration;
   return yield* sql.withTransaction(
     Effect.gen(function* () {
       const { canManage } = yield* repositoryAuthority(repo, caller, null, true);
@@ -292,7 +308,7 @@ export const repositorySnapshot = Effect.fn("workflowSources.repositorySnapshot"
         canManage,
         sources: grants.flatMap((g) => {
           const c = all.find((c) => c.connection_id === g.connection_id);
-          return c ? [{ source: source(c), grant: grant(g) }] : [];
+          return c ? [{ source: source(c, eventConfig), grant: grant(g) }] : [];
         }),
         eligible: canManage
           ? all
@@ -304,7 +320,7 @@ export const repositorySnapshot = Effect.fn("workflowSources.repositorySnapshot"
                   !grants.some((g) => g.connection_id === c.connection_id),
               )
               .map((c) => ({
-                source: source(c),
+                source: source(c, eventConfig),
                 previousGrantId:
                   previous.find((g) => g.connection_id === c.connection_id)?.grant_id ?? null,
               }))
@@ -319,6 +335,7 @@ export const repositoryHealth = Effect.fn("workflowSources.repositoryHealth")(fu
   user: string,
 ) {
   const sql = (yield* RelayDb).$client;
+  const eventConfig = yield* EventFence.configuration;
   return yield* sql.withTransaction(
     Effect.gen(function* () {
       yield* repositoryAuthority(repo, user, null, false);
@@ -331,7 +348,7 @@ export const repositoryHealth = Effect.fn("workflowSources.repositoryHealth")(fu
           ownerUserId: c.owner_user_id,
           status: c.status,
           health: c.health,
-          delivery: "unverified" as const,
+          delivery: source(c, eventConfig).delivery,
         })),
       };
     }),
