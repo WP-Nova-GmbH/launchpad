@@ -1,3 +1,5 @@
+vi.mock("./WorkflowSources", () => ({ RepositorySourcesButton: () => null }));
+vi.mock("./WorkflowEditorDepartureGuard", () => ({ WorkflowEditorDepartureGuard: () => null }));
 import { act, createElement, useLayoutEffect, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";

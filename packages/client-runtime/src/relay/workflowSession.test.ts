@@ -11,6 +11,9 @@ import {
   invalidateWorkflowJobRead,
   workflowJobReadAtom,
   workflowDraftAtom,
+  sameWorkflowAutomation,
+  workflowEditorDirty,
+  discardWorkflowEditor,
   workflowSessionKey,
   setWorkflowSessionAccount,
   updateWorkflowDrafts,
@@ -464,4 +467,58 @@ it("clears list rows and cursors after a definite repository access rejection", 
   );
   expect(read.jobs).toBeNull();
   expect(read.nextCursor).toBeNull();
+});
+
+const triggerRule = {
+  provider: "linear",
+  connectionId: "connection",
+  grantId: "grant",
+  teamId: "team",
+  event: "issue_created",
+  labelIds: ["a", "b"],
+} as const;
+it("treats automation edits as dirty, compares labels as a set and discards only that editor", () => {
+  expect(sameWorkflowAutomation(undefined, { enabled: false, trigger: null })).toBe(true);
+  const automation = { enabled: true, trigger: triggerRule };
+  expect(
+    sameWorkflowAutomation(automation, {
+      ...automation,
+      trigger: { ...triggerRule, labelIds: ["b", "a", "a"] },
+    }),
+  ).toBe(true);
+  const baseline = {
+    workflowId: "flow",
+    organizationId: scope.organizationId,
+    repositoryId: scope.repositoryId,
+    definition,
+    automation,
+    revision: 1,
+    archived: false,
+    createdAt: "2026",
+    updatedAt: "2026",
+  };
+  const draft = {
+    workflowId: "flow",
+    definition,
+    automation,
+    baseline,
+    selectedStepId: "",
+    targetConfirmed: true,
+    operation: null,
+    error: null,
+  };
+  expect(workflowEditorDirty(draft)).toBe(false);
+  expect(workflowEditorDirty({ ...draft, automation: { ...automation, enabled: false } })).toBe(
+    true,
+  );
+  const registry = setup();
+  startNewWorkflowDraft(registry, scope, () => ({ ...draft, baseline: null }));
+  updateWorkflowDrafts(registry, scope.accountId, (state) => ({
+    ...state,
+    responses: { response: { input: "Keep this" } },
+  }));
+  discardWorkflowEditor(registry, scope, "flow");
+  expect(registry.get(workflowDraftAtom).editors).toEqual({});
+  expect(registry.get(workflowDraftAtom).newWorkflowIds).toEqual({});
+  expect(registry.get(workflowDraftAtom).responses).toEqual({ response: { input: "Keep this" } });
 });

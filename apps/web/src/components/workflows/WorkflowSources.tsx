@@ -168,8 +168,8 @@ export function RepositorySources({
             </div>
           ))}
           <p className="text-sm text-muted-foreground">
-            Connect or reconnect your workspaces in Account connections. Only an owner can allow new
-            repository use.
+            Use Connect Linear in trigger settings, or Account connections, to manage your
+            workspaces. Only an owner can allow new repository use.
           </p>
         </>
       )}

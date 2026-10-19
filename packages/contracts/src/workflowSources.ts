@@ -139,3 +139,26 @@ export const WorkflowSourceHealthList = Schema.Struct({
   ),
 });
 export type WorkflowSourceHealthList = typeof WorkflowSourceHealthList.Type;
+
+export const WorkflowSourceSelectionQuery = Schema.Struct({
+  grantId: Id,
+  teamId: Id,
+  stateId: Schema.optional(Id),
+  labelIds: Schema.Array(Id).check(Schema.isMaxLength(100)),
+});
+export type WorkflowSourceSelectionQuery = typeof WorkflowSourceSelectionQuery.Type;
+const SelectedItem = Schema.Struct({ id: Id, name: Schema.String });
+export const WorkflowSourceSelection = Schema.Struct({
+  authorizationEpoch: Revision,
+  team: Schema.NullOr(SelectedItem),
+  state: Schema.NullOr(SelectedItem),
+  labels: Schema.Array(Schema.Struct({ ...SelectedItem.fields, teamId: Schema.NullOr(Id) })),
+  issues: Schema.Array(
+    Schema.Struct({
+      field: Schema.Literals(["team", "state", "labels"]),
+      message: Schema.String,
+    }),
+  ),
+  deliveryReady: Schema.Boolean,
+});
+export type WorkflowSourceSelection = typeof WorkflowSourceSelection.Type;

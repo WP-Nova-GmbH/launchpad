@@ -10,17 +10,26 @@ import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import type {
   RepositoryWorkflow,
+  SaveRepositoryWorkflow,
   WorkflowJobPage,
   WorkflowJobPageQuery,
 } from "@t3tools/contracts/workflows";
 import type { ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
-import { setWorkflowSessionAccount } from "@t3tools/client-runtime/relay/workflow-session";
+import {
+  setWorkflowSessionAccount,
+  workflowDraftAtom,
+  workflowSessionKey,
+  updateWorkflowDrafts,
+} from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 
 const fixture = vi.hoisted(() => ({
   definitions: vi.fn<() => Promise<ReadonlyArray<RepositoryWorkflow>>>(),
   page: vi.fn<(query: WorkflowJobPageQuery) => Promise<WorkflowJobPage>>(),
   navigate: vi.fn(),
+  tab: "runs",
+  supported: false,
+  save: vi.fn<(payload: typeof SaveRepositoryWorkflow.Type) => Promise<RepositoryWorkflow>>(),
 }));
 vi.mock("@clerk/react", () => ({
   useAuth: () => ({ isLoaded: true, isSignedIn: true, userId: "account" }),
@@ -28,7 +37,7 @@ vi.mock("@clerk/react", () => ({
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
   useParams: () => ({ repositoryId: "repository" }),
-  useSearch: () => ({ tab: "runs" }),
+  useSearch: () => ({ tab: fixture.tab }),
 }));
 vi.mock("../../cloud/publicConfig", () => ({ hasCloudPublicConfig: () => true }));
 vi.mock("../../cloud/managedRelayState", () => ({
@@ -90,7 +99,30 @@ const readError = (cause: unknown) =>
     message: cause instanceof Error ? cause.message : "Fixture read failed.",
   });
 const client = {
+  readWorkflowCatalog: () =>
+    Effect.tryPromise({
+      try: async () => {
+        const workflows = await fixture.definitions();
+        return {
+          workflows,
+          ...(fixture.supported
+            ? {
+                automationSupported: true,
+                automationSummaries: workflows.map((entry) => ({
+                  workflowId: entry.workflowId,
+                  revision: entry.revision,
+                  state: entry.automation?.enabled ? ("on" as const) : ("off" as const),
+                  reason: null,
+                })),
+              }
+            : {}),
+        };
+      },
+      catch: readError,
+    }),
   listWorkflows: () => Effect.tryPromise({ try: () => fixture.definitions(), catch: readError }),
+  saveWorkflow: ({ payload }: Parameters<Client["saveWorkflow"]>[0]) =>
+    Effect.tryPromise({ try: () => fixture.save(payload), catch: readError }),
   pageWorkflowJobs: ({ query }: Parameters<Client["pageWorkflowJobs"]>[0]) =>
     Effect.tryPromise({ try: () => fixture.page(query), catch: readError }),
 } as unknown as Client;
@@ -184,6 +216,9 @@ beforeEach(() => {
   fixture.definitions.mockReset();
   fixture.page.mockReset();
   fixture.navigate.mockReset();
+  fixture.save.mockReset();
+  fixture.tab = "runs";
+  fixture.supported = false;
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, "account");
 });
@@ -244,6 +279,145 @@ it.effect(
         expect(content()).not.toContain("Older history run");
         expect(button("Refresh runs").props.disabled).toBe(false);
         expect(fixture.navigate).not.toHaveBeenCalled();
+      });
+    }),
+);
+
+const serve = Effect.gen(function* () {
+  reads = yield* Queue.unbounded<Effect.Effect<void>>();
+  yield* Effect.forever(
+    Queue.take(reads).pipe(Effect.flatMap((read) => read.pipe(Effect.forkScoped))),
+  ).pipe(Effect.forkScoped);
+});
+async function mountCatalog() {
+  await act(() => {
+    renderer = create(
+      <AppAtomRegistryProvider>
+        <WorkflowsPage />
+      </AppAtomRegistryProvider>,
+    );
+  });
+  await act(async () => {
+    await Promise.all(deliveries);
+  });
+}
+for (const retained of [false, true])
+  it.effect(
+    `opens trigger setup for On without a trigger while preserving saved Off (retained unknown draft: ${retained})`,
+    () =>
+      Effect.gen(function* () {
+        yield* serve;
+        yield* Effect.promise(async () => {
+          fixture.tab = "workflows";
+          fixture.supported = true;
+          fixture.definitions.mockResolvedValue([
+            { ...workflow, automation: { enabled: false, trigger: null } },
+          ]);
+          if (retained) {
+            const scope = { accountId: "account", organizationId: "organization", repositoryId };
+            updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+              ...state,
+              editors: {
+                ...state.editors,
+                [workflowSessionKey(scope, workflow.workflowId)]: {
+                  workflowId: workflow.workflowId,
+                  definition: { ...workflow.definition, name: "Retained name" },
+                  baseline: workflow,
+                  automation: { enabled: false, trigger: null },
+                  selectedStepId: "",
+                  targetConfirmed: true,
+                  operation: null,
+                  error: null,
+                },
+              },
+            }));
+          }
+          await mountCatalog();
+          await press("Turn On");
+          expect(fixture.navigate).toHaveBeenCalledWith(
+            expect.objectContaining({ to: "/workflows/$repositoryId/$workflowId/edit" }),
+          );
+          const draft =
+            appAtomRegistry.get(workflowDraftAtom).editors[
+              workflowSessionKey(
+                { accountId: "account", organizationId: "organization", repositoryId },
+                workflow.workflowId,
+              )
+            ];
+          expect(draft?.triggerSetup).toBe(true);
+          expect(draft?.automation?.enabled).toBe(true);
+          expect(draft?.automationResolved).toBe(true);
+          if (retained) expect(draft?.definition.name).toBe("Retained name");
+          expect(draft?.baseline?.automation?.enabled).toBe(false);
+          expect(fixture.save).not.toHaveBeenCalled();
+        });
+      }),
+  );
+it.effect(
+  "keeps automation unknown against a legacy relay that omits capability even with an On record",
+  () =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.definitions.mockResolvedValue([
+          { ...workflow, automation: { enabled: true, trigger: null } },
+        ]);
+        await mountCatalog();
+        expect(content()).toContain("Automation state unavailable on this relay");
+        expect(content()).not.toContain("Automatic triggering Off");
+        expect(button("Turn Off")).toBeUndefined();
+        expect(button("Run")).toBeDefined();
+      });
+    }),
+);
+it.effect(
+  "turns Off the saved complete rule and reconciles a lost reply without a second write",
+  () =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.supported = true;
+        const trigger = {
+          provider: "linear",
+          connectionId: "connection",
+          grantId: "grant",
+          teamId: "team",
+          event: "issue_created",
+          labelIds: ["label"],
+        } as const;
+        let current: RepositoryWorkflow = { ...workflow, automation: { enabled: true, trigger } };
+        fixture.definitions.mockImplementation(async () => [current]);
+        fixture.save.mockImplementation(async (payload) => {
+          current = {
+            ...current,
+            ...payload,
+            automation: payload.automation ?? current.automation,
+            revision: current.revision + 1,
+          };
+          throw new Error("Reply lost after commit");
+        });
+        await mountCatalog();
+        await press("Turn Off");
+        // Follow-up refresh is queued by the action after its receipt.
+        await act(async () => {
+          await Promise.all(deliveries);
+        });
+        expect(fixture.save).toHaveBeenCalledWith(
+          expect.objectContaining({
+            expectedRevision: 1,
+            definition: workflow.definition,
+            automation: { enabled: false, trigger },
+          }),
+        );
+        expect(content()).toContain("Automatic triggering Off");
+        await press("Retry");
+        await act(async () => {
+          await Promise.all(deliveries);
+        });
+        expect(fixture.save).toHaveBeenCalledTimes(1);
+        expect(button("Turn On")).toBeDefined();
       });
     }),
 );

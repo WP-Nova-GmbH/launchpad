@@ -1,5 +1,6 @@
 import type {
   RepositoryWorkflow,
+  WorkflowAutomation,
   RepositoryWorkflowJob,
   WorkflowDefinition,
   WorkflowJobPage,
@@ -7,6 +8,7 @@ import type {
 } from "@t3tools/contracts/workflows";
 import {
   WorkflowDefinition as WorkflowDefinitionSchema,
+  WorkflowAutomation as WorkflowAutomationSchema,
   WorkflowStep as WorkflowStepSchema,
   workflowDefinitionError,
 } from "@t3tools/contracts/workflows";
@@ -34,6 +36,10 @@ export interface WorkflowScope {
 export interface WorkflowEditorDraft {
   readonly workflowId: string;
   readonly definition: WorkflowDefinition;
+  readonly automation?: WorkflowAutomation;
+  /** False when an older relay omitted the saved rule; a display default is not Save intent. */
+  readonly automationResolved?: boolean;
+  readonly triggerSetup?: boolean;
   readonly baseline: RepositoryWorkflow | null;
   readonly selectedStepId: string;
   readonly targetConfirmed: boolean;
@@ -41,6 +47,9 @@ export interface WorkflowEditorDraft {
     readonly requestId: string;
     readonly state: "pending" | "uncertain";
     readonly definition: WorkflowDefinition;
+    readonly automation?: WorkflowAutomation;
+    /** Absent only on a retained operation captured before wire intent was tracked. */
+    readonly includesAutomation?: boolean;
     readonly archived: boolean;
     readonly expectedRevision: number;
   } | null;
@@ -225,9 +234,51 @@ export function replaceNewWorkflowDraft(
 }
 
 export function workflowEditorDirty(draft: WorkflowEditorDraft) {
-  return !draft.baseline || !sameWorkflowDefinition(draft.definition, draft.baseline.definition);
+  return (
+    !draft.baseline ||
+    !sameWorkflowDefinition(draft.definition, draft.baseline.definition) ||
+    !sameWorkflowAutomation(workflowDraftAutomation(draft), draft.baseline.automation)
+  );
 }
 
+export const normalizeWorkflowAutomation = (
+  value?: WorkflowAutomation | null,
+): WorkflowAutomation => ({
+  enabled: value?.enabled ?? false,
+  trigger: value?.trigger
+    ? { ...value.trigger, labelIds: [...new Set(value.trigger.labelIds)].sort() }
+    : null,
+});
+export const workflowDraftAutomationResolved = (
+  draft: Pick<WorkflowEditorDraft, "automationResolved" | "baseline">,
+) => draft.automationResolved ?? (!draft.baseline || draft.baseline.automation !== undefined);
+
+export const workflowDraftAutomation = (
+  draft: Pick<WorkflowEditorDraft, "automation" | "baseline">,
+) => normalizeWorkflowAutomation(draft.automation ?? draft.baseline?.automation);
+const equivalentAutomation = Schema.toEquivalence(WorkflowAutomationSchema);
+export const sameWorkflowAutomation = (
+  a?: WorkflowAutomation | null,
+  b?: WorkflowAutomation | null,
+) => equivalentAutomation(normalizeWorkflowAutomation(a), normalizeWorkflowAutomation(b));
+
+/** Explicit departure detaches a pending Save without cancelling its captured request. */
+export function discardWorkflowEditor(
+  registry: AtomRegistry.AtomRegistry,
+  scope: WorkflowScope,
+  id: string,
+) {
+  updateWorkflowDrafts(registry, scope.accountId, (state) => {
+    const editors = { ...state.editors };
+    const newWorkflowIds = { ...state.newWorkflowIds };
+    delete editors[workflowSessionKey(scope, id)];
+    const slot = workflowSessionKey(scope, "new");
+    if (newWorkflowIds[slot] === id) delete newWorkflowIds[slot];
+    return { ...state, editors, newWorkflowIds };
+  });
+}
+
+export const workflowCatalogRevisionAtom = Atom.make(0).pipe(Atom.keepAlive);
 export const sameWorkflowDefinition = Schema.toEquivalence(WorkflowDefinitionSchema);
 const decodeWorkflowDefinition = Schema.decodeExit(WorkflowDefinitionSchema);
 const decodeWorkflowStep = Schema.decodeExit(WorkflowStepSchema);

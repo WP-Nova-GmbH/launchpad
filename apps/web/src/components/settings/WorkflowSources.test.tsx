@@ -1,4 +1,7 @@
-import { act, createElement, type PropsWithChildren, type ComponentType } from "react";
+import * as Schema from "effect/Schema";
+import type { WorkflowAutomation } from "@t3tools/contracts/workflows";
+import { WorkflowTriggerInspector } from "../workflows/WorkflowTriggerInspector";
+import { act, useState, createElement, type PropsWithChildren, type ComponentType } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
@@ -13,6 +16,7 @@ import {
   type WorkflowSourceOwner,
   type BeginWorkflowSource,
 } from "@t3tools/contracts/relay";
+const decodeAutomation = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const fixture = vi.hoisted(() => ({
   account: "owner",
   getToken: vi.fn(async () => "fixture-token"),
@@ -21,6 +25,7 @@ const fixture = vi.hoisted(() => ({
   enqueue: (_effect: Effect.Effect<void>) => {},
   repo: null as unknown as WorkflowRepositorySources,
   failRead: false,
+  failSelection: false,
   delivery: "unverified" as WorkflowSource["delivery"],
   denyRead: false,
   dropAllow: false,
@@ -41,6 +46,27 @@ vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: () => Promise.reso
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
+vi.mock("../ui/select", () => {
+  const part = ({ children }: PropsWithChildren) => createElement("div", null, children);
+  return {
+    Select: (props: Record<string, unknown>) =>
+      createElement("div", { ...props, "data-picker": true }),
+    SelectTrigger: part,
+    SelectValue: part,
+    SelectPopup: part,
+    SelectItem: part,
+  };
+});
+vi.mock("../ui/sheet", () => {
+  const part = ({ children }: PropsWithChildren) => children;
+  return {
+    Sheet: ({ open, children }: PropsWithChildren<{ open: boolean }>) => (open ? children : null),
+    SheetPopup: part,
+    SheetHeader: part,
+    SheetTitle: part,
+    SheetDescription: part,
+  };
+});
 vi.mock("./settingsLayout", () => ({
   SettingsSection: ({
     children,
@@ -174,6 +200,7 @@ beforeEach(() => {
     withdrawableGrants: [],
   };
   fixture.failRead = false;
+  fixture.failSelection = false;
   fixture.delivery = "unverified";
   fixture.denyRead = false;
   fixture.dropAllow = false;
@@ -218,6 +245,31 @@ beforeEach(() => {
       return Response.json(
         request.url.endsWith("/v1/workflow-sources") ? fixture.owner : fixture.repo,
       );
+    }
+    if (request.url.endsWith("/metadata"))
+      return Response.json({
+        items: [{ id: "new-team", name: "Another page item" }],
+        nextCursor: null,
+      });
+    if (request.url.endsWith("/selection")) {
+      if (fixture.failSelection) return new Response("Unavailable", { status: 503 });
+      const body = (await request.json()) as {
+        teamId: string;
+        stateId?: string;
+        labelIds: string[];
+      };
+      return Response.json({
+        authorizationEpoch: 1,
+        team: { id: body.teamId, name: "Saved team" },
+        state: body.stateId ? { id: body.stateId, name: "Saved status" } : null,
+        labels: body.labelIds.map((id) => ({
+          id,
+          name: id === "global" ? "Global label" : "Team label",
+          teamId: id === "global" ? null : body.teamId,
+        })),
+        issues: [],
+        deliveryReady: true,
+      });
     }
     if (request.url.endsWith("/linear/begin")) {
       const body = (await request.json()) as typeof BeginWorkflowSource.Type;
@@ -647,6 +699,144 @@ it.effect("drops a delayed Begin result after the authenticated account changes"
       expect(window.open).not.toHaveBeenCalled();
       expect(links()).toHaveLength(0);
       expect(button("Continue authorization")).toBeUndefined();
+    });
+  }),
+);
+
+it.effect(
+  "resolves saved selections beyond the current page and clears only incompatible team criteria",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        fixture.repo = {
+          ...fixture.repo,
+          eligible: [],
+          sources: [
+            {
+              source,
+              grant: {
+                grantId: "grant",
+                connectionId: "connection",
+                organizationId: "org",
+                repositoryId: "repo",
+                ownerUserId: "owner",
+                generation: 1,
+                revoked: false,
+              },
+            },
+          ],
+        };
+        const initial: WorkflowAutomation = {
+          enabled: false,
+          trigger: {
+            provider: "linear",
+            connectionId: "connection",
+            grantId: "grant",
+            teamId: "saved-team",
+            event: "entered_status",
+            stateId: "saved-status",
+            labelIds: ["global", "team-label"],
+          },
+        };
+        function Editor() {
+          const [automation, setAutomation] = useState(initial);
+          return (
+            <>
+              <WorkflowTriggerInspector
+                scope={{
+                  accountId: "owner",
+                  organizationId: "org",
+                  repositoryId: RelayRepositoryId.make("repo"),
+                }}
+                automation={automation}
+                supported
+                disabled={false}
+                onChange={setAutomation}
+                onClose={() => {}}
+              />
+              <output>{JSON.stringify(automation)}</output>
+            </>
+          );
+        }
+        await act(() => {
+          renderer = create(<Editor />);
+        });
+        await drain();
+        expect(words()).toContain("Saved team");
+        expect(words()).toContain("Saved status");
+        expect(words()).toContain("Global label");
+        expect(words()).toContain("Team label");
+        const team = renderer.root
+          .findAllByProps({ "data-picker": true })
+          .find((node) => node.props.value === "saved-team")!;
+        await act(() => team.props.onValueChange("new-team"));
+        await drain();
+        const state = renderer.root.findByType("output").children.join("");
+        expect(decodeAutomation(state)).toMatchObject({
+          trigger: { teamId: "new-team", stateId: "", labelIds: ["global"] },
+        });
+        expect(words()).not.toContain("Team label");
+      });
+    }),
+);
+it.effect("keeps selected IDs and shows an error when selection metadata is unavailable", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.failSelection = true;
+      fixture.repo = {
+        ...fixture.repo,
+        eligible: [],
+        sources: [
+          {
+            source,
+            grant: {
+              grantId: "grant",
+              connectionId: "connection",
+              organizationId: "org",
+              repositoryId: "repo",
+              ownerUserId: "owner",
+              generation: 1,
+              revoked: false,
+            },
+          },
+        ],
+      };
+      const automation: WorkflowAutomation = {
+        enabled: false,
+        trigger: {
+          provider: "linear",
+          connectionId: "connection",
+          grantId: "grant",
+          teamId: "saved-team",
+          event: "entered_status",
+          stateId: "saved-status",
+          labelIds: ["global"],
+        },
+      };
+      const change = vi.fn();
+      await act(() => {
+        renderer = create(
+          <WorkflowTriggerInspector
+            scope={{
+              accountId: "owner",
+              organizationId: "org",
+              repositoryId: RelayRepositoryId.make("repo"),
+            }}
+            automation={automation}
+            supported
+            disabled={false}
+            onChange={change}
+            onClose={() => {}}
+          />,
+        );
+      });
+      await drain();
+      expect(words()).toContain("Saved selections are retained");
+      expect(words()).toContain("saved-team");
+      expect(words()).toContain("saved-status");
+      expect(change).not.toHaveBeenCalled();
     });
   }),
 );

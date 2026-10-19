@@ -8,6 +8,8 @@ import {
   workflowSessionKey,
   replaceNewWorkflowDraft,
   sameWorkflowDefinition,
+  sameWorkflowAutomation,
+  normalizeWorkflowAutomation,
   type WorkflowScope,
   type WorkflowEditorDraft,
   type WorkflowRunDraft,
@@ -71,7 +73,9 @@ export const editWorkflowDraft = (
     if (!draft || draft.operation?.state === "pending") return state;
     const next = update(draft);
     const edited =
-      next.error === draft.error && !sameWorkflowDefinition(next.definition, draft.definition)
+      next.error === draft.error &&
+      (!sameWorkflowDefinition(next.definition, draft.definition) ||
+        !sameWorkflowAutomation(next.automation, draft.automation))
         ? { ...next, error: null }
         : next;
     return { ...state, editors: { ...state.editors, [key]: edited } };
@@ -111,9 +115,14 @@ export const editWorkflowRun = (
           },
         };
   });
-export const savedWorkflowDraft = (workflow: RepositoryWorkflow): WorkflowEditorDraft => ({
+export const savedWorkflowDraft = (
+  workflow: RepositoryWorkflow,
+  automationSupported = false,
+): WorkflowEditorDraft => ({
   workflowId: workflow.workflowId,
   definition: workflow.definition,
+  automation: normalizeWorkflowAutomation(workflow.automation),
+  automationResolved: automationSupported || workflow.automation !== undefined,
   baseline: workflow,
   selectedStepId: "",
   targetConfirmed: true,
@@ -129,6 +138,8 @@ export function newWorkflowDraft(
   if (!target) return null;
   return {
     workflowId: randomUUID(),
+    automation: normalizeWorkflowAutomation(),
+    automationResolved: true,
     baseline: null,
     targetConfirmed: projects.length === 1,
     selectedStepId: "",

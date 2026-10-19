@@ -1,3 +1,7 @@
+import * as Schema from "effect/Schema";
+import { WorkflowAutomation } from "@t3tools/contracts/workflows";
+import { WorkflowEditorDepartureGuard } from "./WorkflowEditorDepartureGuard";
+import { WorkflowTriggerInspector, workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import styles from "./workflowEditor.module.css";
@@ -12,7 +16,10 @@ import {
   updateWorkflowDrafts,
   workflowDraftAtom,
   startNewWorkflowDraft,
-  sameWorkflowDefinition,
+  discardWorkflowEditor,
+  workflowDraftAutomation,
+  workflowDraftAutomationResolved,
+  normalizeWorkflowAutomation,
   type WorkflowScope,
   type WorkflowEditorDraft,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -38,6 +45,14 @@ import {
   workflowError,
 } from "./workflowState";
 
+import {
+  assertWorkflowSaveSupport,
+  matchesWorkflowSave,
+  applyWorkflowSaveReceipt,
+} from "./workflowOperations";
+
+const isWorkflowAutomation = Schema.is(WorkflowAutomation);
+
 type WorkflowBuilderProps = {
   scope: WorkflowScope;
   workflow: RepositoryWorkflow | undefined;
@@ -47,10 +62,21 @@ type WorkflowBuilderProps = {
   canConfigure: boolean;
   call: ReturnType<typeof useWorkflowClient>;
   refresh: () => void;
+  automationSupported?: boolean;
+  automationReason?: string | null | undefined;
 };
 
 export function WorkflowBuilder(props: WorkflowBuilderProps) {
   const state = useWorkflowDrafts();
+  const departureKey = workflowSessionKey(
+    props.scope,
+    props.isNew ? "new" : (props.workflowId ?? props.workflow?.workflowId ?? "missing"),
+  );
+  const departure = useRef<string | null>(null);
+  const isDeparting = useCallback(() => departure.current === departureKey, [departureKey]);
+  const onDepart = useCallback(() => {
+    departure.current = departureKey;
+  }, [departureKey]);
   const id = props.isNew
     ? state.newWorkflowIds[workflowSessionKey(props.scope, "new")]
     : (props.workflowId ?? props.workflow?.workflowId);
@@ -58,6 +84,8 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
     <WorkflowBuilderEditor
       key={workflowSessionKey(props.scope, `${props.isNew ? "new" : "edit"}:${id ?? ""}`)}
       {...props}
+      isDeparting={isDeparting}
+      onDepart={onDepart}
       id={id}
     />
   );
@@ -71,8 +99,16 @@ function WorkflowBuilderEditor({
   canConfigure,
   call,
   refresh,
+  automationSupported = false,
+  automationReason,
+  isDeparting,
+  onDepart,
   id,
-}: WorkflowBuilderProps & { id: string | undefined }) {
+}: WorkflowBuilderProps & {
+  id: string | undefined;
+  isDeparting: () => boolean;
+  onDepart: () => void;
+}) {
   const navigate = useNavigate();
   const active = useActiveWorkflowView();
   const state = useWorkflowDrafts();
@@ -88,18 +124,40 @@ function WorkflowBuilderEditor({
     [],
   );
   useEffect(() => {
-    if (!canConfigure) return;
+    if (!canConfigure || isDeparting()) return;
     if (isNew) {
       startNewWorkflowDraft(appAtomRegistry, scope, () => newWorkflowDraft(projects));
       return;
     }
     if (!id || !workflow) return;
-    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) =>
-      state.editors[key]
-        ? state
-        : { ...state, editors: { ...state.editors, [key]: savedWorkflowDraft(workflow) } },
-    );
-  }, [canConfigure, workflow, isNew, projects, scope, key, id]);
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
+      const current = state.editors[key];
+      if (!current)
+        return {
+          ...state,
+          editors: { ...state.editors, [key]: savedWorkflowDraft(workflow, automationSupported) },
+        };
+      if (
+        automationSupported &&
+        !workflowDraftAutomationResolved(current) &&
+        !current.operation &&
+        current.baseline?.revision === workflow.revision
+      )
+        return {
+          ...state,
+          editors: {
+            ...state.editors,
+            [key]: {
+              ...current,
+              automation: normalizeWorkflowAutomation(workflow.automation),
+              automationResolved: true,
+              baseline: workflow,
+            },
+          },
+        };
+      return state;
+    });
+  }, [canConfigure, workflow, isNew, projects, scope, key, id, isDeparting, automationSupported]);
   useEffect(() => {
     if (!isNew || !id || !draft?.baseline || !active.current) return;
     const current = appAtomRegistry.get(workflowDraftAtom);
@@ -134,20 +192,46 @@ function WorkflowBuilderEditor({
   const edit = (update: (draft: WorkflowEditorDraft) => WorkflowEditorDraft) =>
     editWorkflowDraft(scope, draft.workflowId, update);
   const save = async () => {
-    const problem = workflowDraftIssue(draft.definition);
-    if (problem) {
-      edit((draft) => ({
-        ...draft,
-        selectedStepId: problem.stepId ?? draft.selectedStepId,
-        error: problem.message,
-      }));
-      return;
+    if (pending) return;
+    if (!draft.operation) {
+      const problem = workflowDraftIssue(draft.definition);
+      if (problem) {
+        edit((draft) => ({
+          ...draft,
+          selectedStepId: problem.stepId ?? draft.selectedStepId,
+          error: problem.message,
+        }));
+        return;
+      }
+      if (!draft.targetConfirmed) return;
+      const automation = workflowDraftAutomation(draft);
+      if (
+        automationSupported &&
+        (!isWorkflowAutomation(automation) || (automation.enabled && !automation.trigger))
+      ) {
+        edit((current) => ({
+          ...current,
+          triggerSetup: true,
+          error: "Complete the Linear trigger selections, or remove the trigger before saving.",
+        }));
+        return;
+      }
     }
-    if (!draft.targetConfirmed) return;
-    const saved = await saveWorkflowDraft(scope, draft.workflowId, (payload) =>
-      call((client, token) =>
-        client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
-      ),
+    const saved = await saveWorkflowDraft(
+      scope,
+      draft.workflowId,
+      (payload) =>
+        call((client, token) =>
+          client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
+        ),
+      undefined,
+      {
+        automationSupported,
+        read: () =>
+          call((client, token) =>
+            client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+          ),
+      },
     );
     if (!saved || !active.current) return;
     refresh();
@@ -186,11 +270,13 @@ function WorkflowBuilderEditor({
         appAtomRegistry.get(workflowDraftAtom).editors[key] !== request.draft
       )
         return;
-      const definitions = await call((client, token) =>
-        client.listWorkflows({ clerkToken: token, repositoryId: scope.repositoryId }),
+      const catalog = await call((client, token) =>
+        client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
       );
       if (!ownsRead(request)) return;
-      const saved = definitions.find((entry) => entry.workflowId === request.draft.workflowId);
+      const saved = catalog.workflows.find(
+        (entry) => entry.workflowId === request.draft.workflowId,
+      );
       let applied = false;
       updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
         if (!ownsRead(request) || state.editors[key] !== request.draft) return state;
@@ -201,7 +287,7 @@ function WorkflowBuilderEditor({
             ...state.editors,
             [key]: saved
               ? {
-                  ...savedWorkflowDraft(saved),
+                  ...savedWorkflowDraft(saved, catalog.automationSupported === true),
                   selectedStepId: saved.definition.steps.some(
                     (step) => step.id === request.draft.selectedStepId,
                   )
@@ -244,17 +330,15 @@ function WorkflowBuilderEditor({
       return;
     }
     try {
-      const saved = (
-        await call((client, token) =>
-          client.listWorkflows({ clerkToken: token, repositoryId: scope.repositoryId }),
-        )
-      ).find((entry) => entry.workflowId === request.draft.workflowId);
+      const catalog = await call((client, token) =>
+        client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+      );
       if (!ownsRead(request)) return;
-      const matched =
-        !!saved &&
-        saved.revision === operation.expectedRevision + 1 &&
-        saved.archived === operation.archived &&
-        sameWorkflowDefinition(saved.definition, operation.definition);
+      assertWorkflowSaveSupport(operation, catalog);
+      const saved = catalog.workflows.find(
+        (entry) => entry.workflowId === request.draft.workflowId,
+      );
+      const matched = !!saved && matchesWorkflowSave(saved, operation);
       let applied = false;
       updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
         const current = state.editors[key];
@@ -269,7 +353,7 @@ function WorkflowBuilderEditor({
           editors: {
             ...state.editors,
             [key]: matched
-              ? { ...current, baseline: saved!, operation: null, error: null }
+              ? applyWorkflowSaveReceipt(current, operation, saved!)
               : {
                   ...current,
                   error: saved
@@ -298,34 +382,31 @@ function WorkflowBuilderEditor({
   };
   const discard = async () => {
     const captured = appAtomRegistry.get(workflowDraftAtom).editors[key];
-    if (!captured || captured.operation) return;
+    if (!captured || captured.operation?.state === "pending") return;
+    if (captured.operation) {
+      await navigate({
+        to: "/workflows/$repositoryId",
+        params: { repositoryId: scope.repositoryId },
+        search: { tab: "workflows" },
+      });
+      return;
+    }
     if (
       workflowEditorDirty(captured) &&
       !(await confirmWorkflow("Discard this workflow's unsaved changes?"))
     )
       return;
     if (!active.current || appAtomRegistry.get(workflowDraftAtom).editors[key] !== captured) return;
-    // Leave the new route before removing its slot so its initializer cannot allocate a replacement.
-    if (!captured.baseline)
+    if (!captured.baseline) {
+      onDepart();
+      discardWorkflowEditor(appAtomRegistry, scope, captured.workflowId);
       await navigate({
         to: "/workflows/$repositoryId",
         params: { repositoryId: scope.repositoryId },
         search: { tab: "workflows" },
       });
-    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
-      if (state.editors[key] !== captured) return state;
-      if (captured.baseline)
-        return {
-          ...state,
-          editors: { ...state.editors, [key]: savedWorkflowDraft(captured.baseline) },
-        };
-      const editors = { ...state.editors };
-      const newWorkflowIds = { ...state.newWorkflowIds };
-      delete editors[key];
-      const slot = workflowSessionKey(scope, "new");
-      if (newWorkflowIds[slot] === captured.workflowId) delete newWorkflowIds[slot];
-      return { ...state, editors, newWorkflowIds };
-    });
+    } else
+      edit(() => savedWorkflowDraft(captured.baseline!, workflowDraftAutomationResolved(captured)));
   };
   const archive = async () => {
     const captured = appAtomRegistry.get(workflowDraftAtom).editors[key];
@@ -339,7 +420,7 @@ function WorkflowBuilderEditor({
     )
       return;
     if (!active.current || appAtomRegistry.get(workflowDraftAtom).editors[key] !== captured) return;
-    edit(() => savedWorkflowDraft(baseline));
+    edit(() => savedWorkflowDraft(baseline, workflowDraftAutomationResolved(captured)));
     if (
       await saveWorkflowDraft(
         scope,
@@ -349,6 +430,13 @@ function WorkflowBuilderEditor({
             client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
           ),
         !baseline.archived,
+        {
+          automationSupported,
+          read: () =>
+            call((client, token) =>
+              client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+            ),
+        },
       )
     )
       refresh();
@@ -402,6 +490,9 @@ function WorkflowBuilderEditor({
   };
   return (
     <WorkflowBuilderWorkspace
+      automationSupported={automationSupported}
+      automationReason={automationReason}
+      onDepart={onDepart}
       draft={draft}
       projects={projects}
       pending={pending}
@@ -435,6 +526,9 @@ type WorkflowFieldFocus = {
 
 function WorkflowBuilderWorkspace({
   draft,
+  automationSupported,
+  automationReason,
+  onDepart,
   projects,
   pending,
   archived,
@@ -452,6 +546,9 @@ function WorkflowBuilderWorkspace({
   scope,
 }: {
   draft: WorkflowEditorDraft;
+  automationSupported: boolean;
+  automationReason?: string | null | undefined;
+  onDepart: () => void;
   projects: ReadonlyArray<RelayOrganizationProject>;
   pending: boolean;
   archived: boolean;
@@ -474,6 +571,15 @@ function WorkflowBuilderWorkspace({
   const navigate = useNavigate();
   const models = useWorkflowEditorModels(draft.definition);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const triggerOpen = draft.triggerSetup === true;
+  const setTriggerOpen = (open: boolean) =>
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
+      const key = workflowSessionKey(scope, draft.workflowId),
+        current = state.editors[key];
+      return current
+        ? { ...state, editors: { ...state.editors, [key]: { ...current, triggerSetup: open } } }
+        : state;
+    });
   // Measure before mounting a panel so a retained desktop selection never opens a transient Sheet.
   const [docked, setDocked] = useState<boolean | null>(null);
   const focusRequest = useRef<WorkflowFieldFocus | null>(null);
@@ -488,7 +594,7 @@ function WorkflowBuilderWorkspace({
   const fields = useRef(new Map<string, HTMLElement>());
   const returnFocus = useRef<HTMLElement | null>(null);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
-  const panelOpen = settingsOpen || !!selected;
+  const panelOpen = triggerOpen || settingsOpen || !!selected;
   const target = projects.find(
     (project) =>
       project.environmentId === draft.definition.environmentId &&
@@ -503,7 +609,13 @@ function WorkflowBuilderWorkspace({
     if (node) fields.current.set(field, node);
     else fields.current.delete(field);
   }, []);
-  const panelKey = settingsOpen ? "workflow" : selected ? `step:${selected.id}` : null;
+  const panelKey = triggerOpen
+    ? "trigger"
+    : settingsOpen
+      ? "workflow"
+      : selected
+        ? `step:${selected.id}`
+        : null;
   const setFocusRequest = (request: WorkflowFieldFocus | null) => {
     focusRequest.current = request;
     setFocusVersion(++focusEpoch.current);
@@ -511,7 +623,11 @@ function WorkflowBuilderWorkspace({
   const focusPending = useCallback(() => {
     const request = focusRequest.current;
     if (!mounted.current || !request) return false;
-    const expectedPanel = request.stepId ? `step:${request.stepId}` : "workflow";
+    const expectedPanel = request.stepId
+      ? `step:${request.stepId}`
+      : request.field.startsWith("trigger:")
+        ? "trigger"
+        : "workflow";
     if (request.field !== "name" && panelIdentity.current !== expectedPanel) {
       focusRequest.current = null;
       return false;
@@ -596,6 +712,7 @@ function WorkflowBuilderWorkspace({
   const choose = (id: string) => {
     setFocusRequest(null);
     setSettingsOpen(false);
+    setTriggerOpen(false);
     returnFocus.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     select(id);
@@ -603,18 +720,33 @@ function WorkflowBuilderWorkspace({
   const close = () => {
     setFocusRequest(null);
     setSettingsOpen(false);
+    setTriggerOpen(false);
     select("");
     returnFocus.current?.focus();
   };
   const openSettings = () => {
+    setTriggerOpen(false);
     setFocusRequest(null);
     returnFocus.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     select("");
     setSettingsOpen(true);
   };
+  const openTrigger = () => {
+    setFocusRequest(null);
+    setSettingsOpen(false);
+    select("");
+    returnFocus.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setTriggerOpen(true);
+  };
   const submit = async () => {
     if (pending) return;
+    if (draft.operation?.state === "uncertain") {
+      setFocusRequest(null);
+      await save();
+      return;
+    }
     const problem = workflowDraftIssue(draft.definition);
     if (problem) {
       edit((current) => ({ ...current, error: problem.message }));
@@ -623,7 +755,27 @@ function WorkflowBuilderWorkspace({
       setFocusRequest({ field: problem.field, stepId: problem.stepId });
       return;
     }
-    if (!draft.targetConfirmed || !target) {
+    if (automationSupported && !workflowDraftAutomationResolved(draft)) {
+      edit((current) => ({
+        ...current,
+        error:
+          "Refresh or reload the saved workflow before saving automation. Your edits are retained.",
+      }));
+      return;
+    }
+    const automation = workflowDraftAutomation(draft);
+    if (
+      automationSupported &&
+      (!isWorkflowAutomation(automation) || (automation.enabled && !automation.trigger))
+    ) {
+      openTrigger();
+      edit((current) => ({
+        ...current,
+        error: "Complete the Linear trigger selections, or remove the trigger before saving.",
+      }));
+      return;
+    }
+    if (!draft.targetConfirmed || (!target && !draft.baseline)) {
       select("");
       setSettingsOpen(true);
       edit((current) => ({
@@ -636,7 +788,18 @@ function WorkflowBuilderWorkspace({
     setFocusRequest(null);
     await save();
   };
-  const panel = settingsOpen ? (
+  const panel = triggerOpen ? (
+    <WorkflowTriggerInspector
+      scope={scope}
+      automation={draft.automation ?? draft.baseline?.automation}
+      supported={automationSupported}
+      resolved={workflowDraftAutomationResolved(draft)}
+      registerField={registerField}
+      disabled={pending || archived}
+      onChange={(automation) => edit((current) => ({ ...current, automation }))}
+      onClose={close}
+    />
+  ) : settingsOpen ? (
     <div>
       <header className={styles["workflow-inspector-header"]}>
         <Settings2Icon size={20} />
@@ -763,15 +926,28 @@ function WorkflowBuilderWorkspace({
               {pending
                 ? "Saving…"
                 : draft.operation
-                  ? "Save unconfirmed"
+                  ? "Save needs retry"
                   : workflowEditorDirty(draft)
                     ? "Unsaved changes"
                     : "Saved"}
             </span>{" "}
             · {draft.definition.steps.length} steps{archived ? " · Archived" : ""}
+            {automationSupported && workflowDraftAutomationResolved(draft)
+              ? ` · Automatic triggering ${draft.baseline?.automation?.enabled ? "On" : "Off"} (saved)`
+              : " · Automation state unavailable"}
           </p>
         </div>
+        <WorkflowEditorDepartureGuard scope={scope} id={draft.workflowId} onDiscard={onDepart} />
         <div className={styles["workflow-editor-actions"]}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label="Trigger settings"
+            onClick={openTrigger}
+          >
+            Trigger settings
+          </Button>
           <Tooltip>
             <TooltipTrigger
               render={
@@ -892,6 +1068,10 @@ function WorkflowBuilderWorkspace({
       ) : null}
       <div className={styles["workflow-editor-body"]}>
         <WorkflowCanvas
+          triggerLabel={workflowTriggerLabel(workflowDraftAutomation(draft).trigger)}
+          triggerSelected={triggerOpen}
+          triggerIssue={automationReason}
+          onTrigger={openTrigger}
           definition={draft.definition}
           selectedStepId={draft.selectedStepId}
           invalidStepId={issue?.stepId}
@@ -902,6 +1082,7 @@ function WorkflowBuilderWorkspace({
           movementVersion={movementVersion}
           onInsert={(anchor, kind) => {
             setSettingsOpen(false);
+            setTriggerOpen(false);
             const inserted = insert(anchor, kind);
             if (inserted) setFocusRequest({ field: "title", stepId: inserted });
           }}
@@ -910,7 +1091,13 @@ function WorkflowBuilderWorkspace({
         />
         {docked && panelOpen ? (
           <aside
-            aria-label={settingsOpen ? "Workflow settings" : "Selected step settings"}
+            aria-label={
+              triggerOpen
+                ? "Trigger settings"
+                : settingsOpen
+                  ? "Workflow settings"
+                  : "Selected step settings"
+            }
             data-workflow-step={selected?.id}
             className={styles["workflow-inspector"]}
           >
@@ -942,11 +1129,15 @@ function WorkflowBuilderWorkspace({
                 if (!mounted.current || presentation.current !== false) return false;
                 return returnFocus.current?.isConnected
                   ? returnFocus.current
-                  : (workspace.current?.querySelector('[aria-label="Workflow settings"]') ?? true);
+                  : (workspace.current?.querySelector('[aria-label="Trigger settings"]') ?? true);
               }}
             >
               <SheetTitle className="sr-only">
-                {settingsOpen ? "Workflow settings" : "Selected step settings"}
+                {triggerOpen
+                  ? "Trigger settings"
+                  : settingsOpen
+                    ? "Workflow settings"
+                    : "Selected step settings"}
               </SheetTitle>
               <div className="min-h-0 overflow-y-auto" data-workflow-step={selected?.id}>
                 {panel}

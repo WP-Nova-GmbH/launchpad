@@ -416,3 +416,18 @@ export function workflowZones(
 
 export const isAutomaticWorkflowStep = (step: WorkflowStep) =>
   step.kind === "agent" || step.kind === "action";
+
+/** Derived readiness is separate from the saved rule; absence means an older relay. */
+export const WorkflowAutomationSummary = Schema.Struct({
+  workflowId: Schema.String,
+  revision: Schema.Int,
+  state: Schema.Literals(["off", "on", "needs_attention"]),
+  reason: Schema.NullOr(Schema.String),
+});
+export type WorkflowAutomationSummary = typeof WorkflowAutomationSummary.Type;
+export const WorkflowCatalog = Schema.Struct({
+  workflows: Schema.Array(RepositoryWorkflow),
+  automationSupported: Schema.optional(Schema.Boolean),
+  automationSummaries: Schema.optional(Schema.Array(WorkflowAutomationSummary)),
+});
+export type WorkflowCatalog = typeof WorkflowCatalog.Type;

@@ -1,3 +1,5 @@
+import { useAtomValue } from "@effect/atom-react";
+import { workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import { ArrowLeftIcon, CopyIcon, ChevronDownIcon } from "lucide-react";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { useAuth } from "@clerk/react";
@@ -8,11 +10,14 @@ import {
   type RelayRepositorySummary,
   type RelayOrganizationProject,
 } from "@t3tools/contracts/relay";
-import type { RepositoryWorkflow } from "@t3tools/contracts/workflows";
+import type { RepositoryWorkflow, WorkflowAutomationSummary } from "@t3tools/contracts/workflows";
 import {
   workflowDraftAtom,
+  workflowCatalogRevisionAtom,
+  normalizeWorkflowAutomation,
   workflowSessionKey,
   workflowEditorDirty,
+  workflowDraftAutomationResolved,
   clearWorkflowScope,
   startNewWorkflowDraft,
   type WorkflowScope,
@@ -226,6 +231,9 @@ function WorkflowRepositoryView({
   const jobId = "jobId" in params ? params.jobId : undefined;
   const call = useWorkflowClient(scope);
   const drafts = useWorkflowDrafts();
+  const catalogRevision = useAtomValue(workflowCatalogRevisionAtom);
+  const [automationSupported, setAutomationSupported] = useState(false);
+  const [summaries, setSummaries] = useState<ReadonlyArray<WorkflowAutomationSummary>>([]);
   const [workflows, setWorkflows] = useState<ReadonlyArray<RepositoryWorkflow>>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -311,11 +319,13 @@ function WorkflowRepositoryView({
   const refresh = useCallback(async () => {
     const generation = ++loadGeneration.current;
     try {
-      const definitions = await call((client, token) =>
-        client.listWorkflows({ clerkToken: token, repositoryId: scope.repositoryId }),
+      const result = await call((client, token) =>
+        client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
       );
       if (generation !== loadGeneration.current) return;
-      setWorkflows(definitions);
+      setWorkflows(result.workflows);
+      setAutomationSupported(result.automationSupported === true);
+      setSummaries(result.automationSummaries ?? []);
       setLoaded(true);
       setError(null);
     } catch (cause) {
@@ -327,10 +337,14 @@ function WorkflowRepositoryView({
   useEffect(() => {
     // oxlint-disable-next-line react/set-state-in-effect -- The relay read settles asynchronously; this effect owns the initial request.
     void refresh();
+    const onFocus = () => void refresh();
+    if (typeof window !== "undefined") window.addEventListener("focus", onFocus);
     return () => {
       loadGeneration.current++;
+      if (typeof window !== "undefined") window.removeEventListener("focus", onFocus);
     };
-  }, [refresh]);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Canonical write receipts invalidate the repository catalog, including detached Save completions.
+  }, [refresh, catalogRevision]);
   const back = () =>
     navigate({
       to: "/workflows/$repositoryId",
@@ -345,7 +359,27 @@ function WorkflowRepositoryView({
   const archive = async (workflow: RepositoryWorkflow) => {
     const key = workflowSessionKey(scope, workflow.workflowId);
     const existing = appAtomRegistry.get(workflowDraftAtom).editors[key];
-    if (existing?.operation) return;
+    if (existing?.operation?.state === "pending") return;
+    if (existing?.operation) {
+      await saveWorkflowDraft(
+        scope,
+        workflow.workflowId,
+        (payload) =>
+          call((client, token) =>
+            client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
+          ),
+        undefined,
+        {
+          automationSupported,
+          read: () =>
+            call((client, token) =>
+              client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+            ),
+        },
+      );
+      if (active.current) void refresh();
+      return;
+    }
     if (
       existing &&
       workflowEditorDirty(existing) &&
@@ -357,7 +391,7 @@ function WorkflowRepositoryView({
     if (appAtomRegistry.get(workflowDraftAtom).editors[key] !== existing) return;
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
       ...state,
-      editors: { ...state.editors, [key]: savedWorkflowDraft(workflow) },
+      editors: { ...state.editors, [key]: savedWorkflowDraft(workflow, automationSupported) },
     }));
     if (
       await saveWorkflowDraft(
@@ -368,15 +402,112 @@ function WorkflowRepositoryView({
             client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
           ),
         !workflow.archived,
+        {
+          automationSupported,
+          read: () =>
+            call((client, token) =>
+              client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+            ),
+        },
       )
     )
       refresh();
+  };
+  const setupTrigger = (workflow: RepositoryWorkflow) => {
+    const key = workflowSessionKey(scope, workflow.workflowId);
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
+      const draft = state.editors[key] ?? savedWorkflowDraft(workflow, automationSupported);
+      if (draft.operation)
+        return { ...state, editors: { ...state.editors, [key]: { ...draft, triggerSetup: true } } };
+      return {
+        ...state,
+        editors: {
+          ...state.editors,
+          [key]: {
+            ...draft,
+            triggerSetup: true,
+            ...(!workflowDraftAutomationResolved(draft) &&
+            draft.baseline?.revision === workflow.revision
+              ? { baseline: workflow }
+              : {}),
+            automationResolved: true,
+            automation: {
+              ...normalizeWorkflowAutomation(
+                workflowDraftAutomationResolved(draft) ? draft.automation : workflow.automation,
+              ),
+              enabled: true,
+            },
+          },
+        },
+      };
+    });
+    void navigate({
+      to: "/workflows/$repositoryId/$workflowId/edit",
+      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+    });
+  };
+  const toggleAutomation = async (workflow: RepositoryWorkflow) => {
+    if (!automationSupported || error || workflow.archived) return;
+    const key = workflowSessionKey(scope, workflow.workflowId);
+    const current = appAtomRegistry.get(workflowDraftAtom).editors[key];
+    if (
+      current?.operation?.state === "pending" ||
+      (current?.baseline && current.baseline.revision > workflow.revision)
+    )
+      return;
+    if (!current?.operation && !workflow.automation?.enabled && !workflow.automation?.trigger) {
+      setupTrigger(workflow);
+      return;
+    }
+    if (!current?.operation) {
+      if (current && workflowEditorDirty(current)) {
+        setupTrigger(workflow);
+        return;
+      }
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        editors: {
+          ...state.editors,
+          [key]: {
+            ...savedWorkflowDraft(workflow, automationSupported),
+            automation: {
+              ...normalizeWorkflowAutomation(workflow.automation),
+              enabled: !workflow.automation?.enabled,
+            },
+          },
+        },
+      }));
+    }
+    const result = await saveWorkflowDraft(
+      scope,
+      workflow.workflowId,
+      (payload) =>
+        call((client, token) =>
+          client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
+        ),
+      undefined,
+      {
+        automationSupported,
+        read: () =>
+          call((client, token) =>
+            client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+          ),
+      },
+    );
+    if (!active.current) return;
+    const retained = appAtomRegistry.get(workflowDraftAtom).editors[key];
+    if (!result && !workflow.automation?.enabled && retained?.error && !retained.operation)
+      setupTrigger(workflow);
+    void refresh();
   };
   const rows = (archived: boolean) =>
     workflows
       .filter((workflow) => workflow.archived === archived)
       .map((workflow) => {
         const local = drafts.editors[workflowSessionKey(scope, workflow.workflowId)];
+        const summary = summaries.find(
+          (item) => item.workflowId === workflow.workflowId && item.revision === workflow.revision,
+        );
         return (
           <div
             key={workflow.workflowId}
@@ -388,6 +519,12 @@ function WorkflowRepositoryView({
                 {workflow.definition.steps.length} steps
                 {local && workflowEditorDirty(local) ? " · Unsaved changes" : ""}
               </p>
+              <p className="text-xs text-muted-foreground">
+                {automationSupported
+                  ? `${workflowTriggerLabel(workflow.automation?.trigger)} · Automatic triggering ${summary?.state === "on" ? "On" : summary?.state === "off" ? "Off" : summary?.state === "needs_attention" ? "needs attention" : "state unavailable"}`
+                  : "Automation state unavailable on this relay"}
+              </p>
+              {summary?.reason ? <p className="text-xs text-warning">{summary.reason}</p> : null}
               {local?.error ? (
                 <p role="alert" className="text-sm text-destructive">
                   {local.error}
@@ -395,6 +532,35 @@ function WorkflowRepositoryView({
               ) : null}
             </div>
             <div className="flex flex-wrap gap-2">
+              {canConfigure && automationSupported && !archived ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  aria-label={`Turn automatic triggering ${workflow.automation?.enabled ? "off" : "on"} for ${workflow.definition.name}`}
+                  disabled={
+                    !!error ||
+                    !summary ||
+                    local?.operation?.state === "pending" ||
+                    (!!local?.baseline && local.baseline.revision > workflow.revision)
+                  }
+                  onClick={() => void toggleAutomation(workflow)}
+                >
+                  {local?.operation?.state === "pending"
+                    ? "Saving…"
+                    : local?.operation
+                      ? "Retry"
+                      : workflow.automation?.enabled
+                        ? "Turn Off"
+                        : "Turn On"}
+                </Button>
+              ) : null}
+              {canConfigure &&
+              automationSupported &&
+              (summary?.state === "needs_attention" || local?.error) ? (
+                <Button variant="ghost" size="sm" onClick={() => setupTrigger(workflow)}>
+                  Trigger settings
+                </Button>
+              ) : null}
               {copyRepositories.length ? (
                 <Button
                   variant="ghost"
@@ -430,10 +596,10 @@ function WorkflowRepositoryView({
                 canConfigure ? (
                   <Button
                     variant="outline"
-                    disabled={!!local?.operation}
+                    disabled={local?.operation?.state === "pending"}
                     onClick={() => void archive(workflow)}
                   >
-                    Restore
+                    {local?.operation ? "Retry save" : "Restore"}
                   </Button>
                 ) : null
               ) : (
@@ -509,6 +675,13 @@ function WorkflowRepositoryView({
         ) : (
           <WorkflowBuilder
             scope={scope}
+            automationSupported={automationSupported}
+            automationReason={
+              summaries.find(
+                (item) =>
+                  item.workflowId === workflow?.workflowId && item.revision === workflow?.revision,
+              )?.reason
+            }
             workflow={workflow}
             workflowId={workflowId}
             isNew={!workflowId}

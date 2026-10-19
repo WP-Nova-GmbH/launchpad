@@ -6,6 +6,7 @@ import {
   type DisconnectWorkflowSource,
   type AllowWorkflowSource,
   type WorkflowSourceMetadataQuery,
+  type WorkflowSourceSelectionQuery,
   RelayAuthInvalidError,
   RelayTenancyForbiddenError,
   RelayTenancyNotFoundError,
@@ -79,6 +80,12 @@ export const client = Effect.gen(function* () {
           payload: { grantId },
         }),
       ),
+    selection: (
+      token: string,
+      repositoryId: RelayRepositoryId,
+      payload: WorkflowSourceSelectionQuery,
+    ) =>
+      finish(api.selection({ headers: bearerHeaders(token), params: { repositoryId }, payload })),
     metadata: (
       token: string,
       repositoryId: RelayRepositoryId,

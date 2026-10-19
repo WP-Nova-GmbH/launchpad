@@ -3,6 +3,8 @@ import {
   type BeginWorkflowSource,
   type WorkflowSourceMetadataQuery,
   type WorkflowSourceMetadataPage,
+  type WorkflowSourceSelectionQuery,
+  type WorkflowSourceSelection,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
@@ -467,6 +469,7 @@ export const metadata = Effect.fn("workflowSources.metadata")(function* (
 
 const SelectionNode = Schema.Struct({
   id: Schema.String,
+  name: Schema.optional(Schema.String),
   archivedAt: Schema.NullOr(Schema.String),
 });
 const decodeSelection = Schema.decodeUnknownEffect(
@@ -494,49 +497,99 @@ const decodeSelection = Schema.decodeUnknownEffect(
     }),
   }),
 );
-/** Validate only the selected IDs; no workspace-wide metadata crawl. */
-export const validateTrigger = Effect.fn("workflowSources.validateTrigger")(function* (
+/** The same bounded selection read serves the inspector and enable validation. */
+const readSelection = Effect.fn("workflowSources.readSelection")(function* (
   connection: Store.Connection,
-  trigger: WorkflowTrigger,
+  input: WorkflowSourceSelectionQuery,
 ) {
-  const state = trigger.event === "entered_status";
-  const labels = trigger.labelIds.length > 0;
+  const state = !!input.stateId;
+  const labels = input.labelIds.length > 0;
   const result = yield* read(connection, (token) =>
     Linear.graphql(
       token,
-      `query WorkflowTriggerSelection($team:String!${labels ? ",$labels:[ID!]!" : ""}${state ? ",$state:String!" : ""}) {organization{id} team(id:$team){id archivedAt} ${state ? "state:workflowState(id:$state){id archivedAt team{id}}" : ""} ${labels ? "labels:issueLabels(first:100,filter:{id:{in:$labels}}){nodes{id archivedAt isGroup team{id}} pageInfo{hasNextPage}}" : ""}}`,
+      `query WorkflowTriggerSelection($team:String!${labels ? ",$labels:[ID!]!" : ""}${state ? ",$state:String!" : ""}) {organization{id} team(id:$team){id name archivedAt} ${state ? "state:workflowState(id:$state){id name archivedAt team{id}}" : ""} ${labels ? "labels:issueLabels(first:100,filter:{id:{in:$labels}}){nodes{id name archivedAt isGroup team{id}} pageInfo{hasNextPage}}" : ""}}`,
       {
-        team: trigger.teamId,
-        ...(labels ? { labels: trigger.labelIds } : {}),
-        ...(state ? { state: trigger.stateId } : {}),
+        team: input.teamId,
+        ...(labels ? { labels: input.labelIds } : {}),
+        ...(state ? { state: input.stateId } : {}),
       },
       decodeSelection,
     ),
   );
-  if (
-    result.organization.id !== connection.workspace_id ||
-    !result.team ||
-    result.team.id !== trigger.teamId ||
-    result.team.archivedAt ||
-    (state &&
-      (!result.state ||
-        result.state.id !== trigger.stateId ||
-        result.state.team.id !== trigger.teamId ||
-        result.state.archivedAt)) ||
-    (labels &&
-      (!result.labels ||
-        result.labels.pageInfo.hasNextPage ||
-        trigger.labelIds.some(
-          (id) =>
-            !result.labels?.nodes.some(
-              (l) =>
-                l.id === id &&
-                !l.archivedAt &&
-                !l.isGroup &&
-                (!l.team || l.team.id === trigger.teamId),
-            ),
-        )))
-  )
+  if (result.organization.id !== connection.workspace_id)
+    return yield* Store.fail("workspace_mismatch", "Linear returned a different workspace.");
+  const team = result.team?.id === input.teamId && !result.team.archivedAt ? result.team : null;
+  const selectedState =
+    result.state?.id === input.stateId &&
+    result.state?.team.id === input.teamId &&
+    !result.state.archivedAt
+      ? result.state
+      : null;
+  const selectedLabels = (
+    result.labels?.pageInfo.hasNextPage ? [] : (result.labels?.nodes ?? [])
+  ).filter(
+    (label) =>
+      input.labelIds.includes(label.id) &&
+      !label.archivedAt &&
+      !label.isGroup &&
+      (!label.team || label.team.id === input.teamId),
+  );
+  const issues: WorkflowSourceSelection["issues"][number][] = [];
+  if (!team) issues.push({ field: "team", message: "The selected Linear team is unavailable." });
+  if (state && !selectedState)
+    issues.push({ field: "state", message: "The selected status is unavailable in this team." });
+  if (input.labelIds.some((id) => !selectedLabels.some((label) => label.id === id)))
+    issues.push({ field: "labels", message: "Some selected labels are unavailable in this team." });
+  const config = yield* EventFence.configuration;
+  return {
+    authorizationEpoch: connection.authorization_epoch,
+    team: team ? { id: team.id, name: team.name ?? team.id } : null,
+    state: selectedState
+      ? { id: selectedState.id, name: selectedState.name ?? selectedState.id }
+      : null,
+    labels: selectedLabels.map((label) => ({
+      id: label.id,
+      name: label.name ?? label.id,
+      teamId: label.team?.id ?? null,
+    })),
+    issues,
+    deliveryReady:
+      !!config?.admissionEnabled &&
+      config.applicationId === connection.application_id &&
+      EventFence.covers(connection, config.generation, input.teamId),
+  } satisfies WorkflowSourceSelection;
+});
+export const selection = Effect.fn("workflowSources.selection")(function* (
+  repo: string,
+  user: string,
+  input: WorkflowSourceSelectionQuery,
+) {
+  const sql = (yield* RelayDb).$client;
+  const bound = yield* sql.withTransaction(Store.authority(repo, input.grantId, user));
+  const result = yield* readSelection(bound.connection, input);
+  const current = yield* sql.withTransaction(Store.authority(repo, input.grantId, user));
+  if (current.connection.authorization_epoch !== bound.connection.authorization_epoch)
+    return yield* Store.fail("conflict", "The source changed while loading selections.");
+  const config = yield* EventFence.configuration;
+  return {
+    ...result,
+    deliveryReady:
+      !!config?.admissionEnabled &&
+      config.applicationId === current.connection.application_id &&
+      EventFence.covers(current.connection, config.generation, input.teamId),
+  };
+});
+export const validateTrigger = Effect.fn("workflowSources.validateTrigger")(function* (
+  connection: Store.Connection,
+  trigger: WorkflowTrigger,
+) {
+  const result = yield* readSelection(connection, {
+    grantId: trigger.grantId,
+    teamId: trigger.teamId,
+    labelIds: trigger.labelIds,
+    ...(trigger.event === "entered_status" ? { stateId: trigger.stateId } : {}),
+  });
+  if (result.issues.length)
     return yield* Store.fail(
       "invalid_input",
       "The selected Linear team, state or labels are unavailable.",

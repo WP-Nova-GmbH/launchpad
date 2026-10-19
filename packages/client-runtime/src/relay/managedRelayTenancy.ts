@@ -82,6 +82,13 @@ export class ManagedRelayTenancyClient extends Context.Service<
   ManagedRelayTenancyClient,
   {
     readonly relayUrl: string;
+    readonly readWorkflowCatalog: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<
+      import("@t3tools/contracts/workflows").WorkflowCatalog,
+      ManagedRelayClientError
+    >;
     readonly listWorkflows: (input: {
       readonly clerkToken: string;
       readonly repositoryId: RelayRepositoryId;
@@ -298,6 +305,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
   return ManagedRelayTenancyClient.of({
     relayUrl,
     getOrganization: unavailable("clientRuntime.managedRelayTenancy.getOrganization"),
+    readWorkflowCatalog: unavailable("clientRuntime.managedRelayTenancy.readWorkflowCatalog"),
     listWorkflows: unavailable("clientRuntime.managedRelayTenancy.listWorkflows"),
     saveWorkflow: unavailable("clientRuntime.managedRelayTenancy.saveWorkflow"),
     listWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.listWorkflowJobs"),
@@ -374,6 +382,19 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
 
   return ManagedRelayTenancyClient.of({
     relayUrl,
+    readWorkflowCatalog: Effect.fn("clientRuntime.managedRelayTenancy.readWorkflowCatalog")(
+      function* (input) {
+        return yield* client.workflows
+          .list({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("listWorkflows")),
+            timeoutRelayRequest("listWorkflows"),
+          );
+      },
+    ),
     listWorkflows: Effect.fn("clientRuntime.managedRelayTenancy.listWorkflows")(function* (input) {
       return yield* client.workflows
         .list({

@@ -137,6 +137,17 @@ export const workflowSourcesApi = HttpApiBuilder.group(RelayApi, "workflowSource
           }),
         ),
       )
+      .handle("selection", (args) =>
+        safe(
+          Effect.gen(function* () {
+            return yield* Sources.selection(
+              args.params.repositoryId,
+              (yield* RelayClientPrincipal).userId,
+              args.payload,
+            );
+          }),
+        ),
+      )
       .handle("metadata", (args) =>
         safe(
           Effect.gen(function* () {

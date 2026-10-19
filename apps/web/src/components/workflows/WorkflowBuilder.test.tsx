@@ -1,3 +1,8 @@
+vi.mock("./WorkflowTriggerInspector", async () => ({
+  ...(await vi.importActual("./WorkflowTriggerInspector")),
+  WorkflowTriggerInspector: () => null,
+}));
+vi.mock("./WorkflowEditorDepartureGuard", () => ({ WorkflowEditorDepartureGuard: () => null }));
 import { act, createElement, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -14,6 +19,8 @@ import {
   setWorkflowSessionAccount,
   updateWorkflowDrafts,
   startNewWorkflowDraft,
+  workflowEditorDirty,
+  workflowDraftAutomationResolved,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 
@@ -275,32 +282,29 @@ describe("Create route identity", () => {
     await unmount();
     await mount();
     expect(editor(id).definition.name).toBe("Later edits");
-    read.mockResolvedValueOnce([result]);
+    read.mockResolvedValueOnce({ workflows: [result] });
     await click("Check saved version");
     expect(editor(id).definition.name).toBe("Later edits");
     expect(editor(id).baseline).toEqual(result);
     expect(editor(id).operation).toBeNull();
     expect(Object.keys(appAtomRegistry.get(workflowDraftAtom).editors)).toHaveLength(1);
   });
-  it("ignores old reconciliation after a newer Save acknowledges", async () => {
+  it("reconciles the captured Save before submitting newer edits", async () => {
     read.mockRejectedValueOnce(new Error("Reply lost"));
     await mount();
     const id = newId();
     const old = saved(id);
     await submit();
-    const reconciliation = deferred<RepositoryWorkflow[]>();
-    read.mockReturnValueOnce(reconciliation.promise);
-    await click("Check saved version");
     await rename("Newer save");
-    const next = saved(id);
+    read.mockResolvedValueOnce({ workflows: [old] });
+    await submit();
+    expect(editor(id).baseline).toEqual(old);
+    expect(editor(id).definition.name).toBe("Newer save");
+    expect(editor(id).operation).toBeNull();
+    const next = saved(id, 2);
     read.mockResolvedValueOnce(next);
     await submit();
-    await act(async () => {
-      reconciliation.resolve([old]);
-      await reconciliation.promise;
-    });
     expect(editor(id).baseline).toEqual(next);
-    expect(editor(id).definition.name).toBe("Newer save");
   });
   it("preserves a saved editor when explicitly allocating the next new workflow", async () => {
     await mount();
@@ -331,12 +335,12 @@ describe("Reload buffer and view ownership", () => {
   }
   it("keeps text edited during Reload", async () => {
     const { id, baseline } = await openSaved();
-    const reply = deferred<RepositoryWorkflow[]>();
+    const reply = deferred<{ workflows: RepositoryWorkflow[] }>();
     read.mockReturnValueOnce(reply.promise);
     await click("Reload saved version");
     await rename("Typed after confirmation");
     await act(async () => {
-      reply.resolve([baseline]);
+      reply.resolve({ workflows: [baseline] });
       await reply.promise;
     });
     expect(editor(id).definition.name).toBe("Typed after confirmation");
@@ -353,15 +357,15 @@ describe("Reload buffer and view ownership", () => {
       revision: 2,
       definition: { ...baseline.definition, name: "Updated remotely" },
     };
-    read.mockResolvedValueOnce([next]);
+    read.mockResolvedValueOnce({ workflows: [next] });
     await click("Reload saved version");
     expect(editor(id).baseline).toEqual(next);
     expect(editor(id).definition).toEqual(next.definition);
   });
   it.each(["old-first", "new-first"])("rejects a previous mount's Reload (%s)", async (order) => {
     const { id, baseline, props } = await openSaved();
-    const first = deferred<RepositoryWorkflow[]>();
-    const second = deferred<RepositoryWorkflow[]>();
+    const first = deferred<{ workflows: RepositoryWorkflow[] }>();
+    const second = deferred<{ workflows: RepositoryWorkflow[] }>();
     read.mockReturnValueOnce(first.promise);
     await click("Reload saved version");
     await unmount();
@@ -380,12 +384,12 @@ describe("Reload buffer and view ownership", () => {
     };
     const resolveFirst = () =>
       act(async () => {
-        first.resolve([old]);
+        first.resolve({ workflows: [old] });
         await first.promise;
       });
     const resolveSecond = () =>
       act(async () => {
-        second.resolve([latest]);
+        second.resolve({ workflows: [latest] });
         await second.promise;
       });
     if (order === "old-first") {
@@ -401,12 +405,12 @@ describe("Reload buffer and view ownership", () => {
   });
   it("does not adopt a Reload after leaving without requesting another", async () => {
     const { id, baseline } = await openSaved();
-    const reply = deferred<RepositoryWorkflow[]>();
+    const reply = deferred<{ workflows: RepositoryWorkflow[] }>();
     read.mockReturnValueOnce(reply.promise);
     await click("Reload saved version");
     await unmount();
     await act(async () => {
-      reply.resolve([{ ...baseline, revision: 2 }]);
+      reply.resolve({ workflows: [{ ...baseline, revision: 2 }] });
       await reply.promise;
     });
     expect(editor(id).baseline).toEqual(baseline);
@@ -451,7 +455,7 @@ describe("Reload buffer and view ownership", () => {
     await openSaved();
     const answer = deferred<boolean>();
     confirmation.mockReturnValueOnce(answer.promise);
-    const reply = deferred<RepositoryWorkflow[]>();
+    const reply = deferred<{ workflows: RepositoryWorkflow[] }>();
     read.mockReturnValueOnce(reply.promise);
     const count = read.mock.calls.length;
     await click("Reload saved version");
@@ -625,7 +629,7 @@ describe("Reloaded canvas selection", () => {
       revision: 2,
       definition: { ...baseline.definition, steps: [baseline.definition.steps[0]!] },
     };
-    read.mockResolvedValueOnce([next]);
+    read.mockResolvedValueOnce({ workflows: [next] });
     await click("Reload saved version");
     expect(editor(id).definition).toEqual(next.definition);
     expect(editor(id).selectedStepId).toBe("");
@@ -671,7 +675,7 @@ describe("Editor Run archive eligibility", () => {
   it("allows Run after a newer Restore receipt despite an older archived list snapshot", async () => {
     await mount();
     const id = newId();
-    const restored = saved(id, 3);
+    const restored = saved(id);
     read.mockResolvedValueOnce(restored);
     await submit();
     await unmount();
@@ -679,7 +683,7 @@ describe("Editor Run archive eligibility", () => {
       ...base,
       isNew: false,
       workflowId: id,
-      workflow: { ...restored, revision: 2, archived: true },
+      workflow: { ...restored, revision: 0, archived: true },
     });
     navigate.mockClear();
     await run();
@@ -760,5 +764,253 @@ describe("workflow templates and copies", () => {
       "reconcile",
     );
     expect(newId()).toBe(id);
+  });
+});
+
+const recoveryTrigger = {
+  provider: "linear",
+  connectionId: "connection",
+  grantId: "grant",
+  teamId: "team",
+  event: "entered_status",
+  stateId: "ready",
+  labelIds: [],
+} as const;
+const recoveryAuto = { enabled: true, trigger: recoveryTrigger };
+describe("captured automation recovery in the editor", () => {
+  for (const committed of [true, false])
+    it(`recovers an earlier ${committed ? "committed" : "uncommitted"} Save before validating incomplete edits`, async () => {
+      await mount({ ...base, automationSupported: true });
+      const id = newId();
+      const receipt = { ...saved(id), automation: recoveryAuto };
+      await act(() =>
+        editWorkflowDraft(scope, id, (current) => ({ ...current, automation: recoveryAuto })),
+      );
+      read.mockRejectedValueOnce(new Error("Reply lost"));
+      await submit();
+      const operation = editor(id).operation!;
+      await act(() =>
+        editWorkflowDraft(scope, id, (current) => ({
+          ...current,
+          targetConfirmed: false,
+          definition: {
+            ...current.definition,
+            name: "",
+            projectId: ProjectId.make("later-project"),
+          },
+          automation: {
+            ...recoveryAuto,
+            trigger: { ...recoveryTrigger, teamId: "later-team", stateId: "" },
+          },
+        })),
+      );
+      read.mockResolvedValueOnce({
+        workflows: committed ? [receipt] : [],
+        automationSupported: true,
+      });
+      if (!committed) read.mockResolvedValueOnce(receipt);
+      const before = read.mock.calls.length;
+      await submit();
+      expect(read.mock.calls.length - before).toBe(committed ? 1 : 2);
+      expect(editor(id).baseline).toEqual(receipt);
+      expect(editor(id).operation).toBeNull();
+      expect(editor(id).definition.name).toBe("");
+      expect(editor(id).targetConfirmed).toBe(false);
+      expect(editor(id).automation?.trigger).toMatchObject({ teamId: "later-team", stateId: "" });
+      expect(operation.definition).toEqual(receipt.definition);
+      const after = read.mock.calls.length;
+      await submit();
+      expect(read).toHaveBeenCalledTimes(after);
+    });
+  it("does not confirm an automation Save through Check saved version after a downgrade", async () => {
+    await mount({ ...base, automationSupported: true });
+    const id = newId();
+    const receipt = { ...saved(id), automation: recoveryAuto };
+    await act(() =>
+      editWorkflowDraft(scope, id, (current) => ({ ...current, automation: recoveryAuto })),
+    );
+    read.mockRejectedValueOnce(new Error("Reply lost"));
+    await submit();
+    await unmount();
+    await mount({ ...base, automationSupported: false });
+    read.mockResolvedValueOnce({ workflows: [saved(id)] });
+    await click("Check saved version");
+    expect(editor(id).operation?.state).toBe("uncertain");
+    read.mockResolvedValueOnce({ workflows: [receipt], automationSupported: true });
+    await click("Check saved version");
+    expect(editor(id).operation).toBeNull();
+    expect(editor(id).baseline).toEqual(receipt);
+  });
+  for (const laterEdit of ["none", "definition", "automation"] as const)
+    it(`applies upgraded canonical automation on read-only recovery while ${laterEdit !== "none" ? `preserving newer ${laterEdit} edits` : "keeping the draft clean"}`, async () => {
+      await mount(base);
+      const id = newId();
+      const receipt = { ...saved(id), automation: recoveryAuto };
+      read.mockRejectedValueOnce(new Error("Reply lost"));
+      await submit();
+      if (laterEdit !== "none")
+        await act(() =>
+          editWorkflowDraft(scope, id, (current) => ({
+            ...current,
+            definition:
+              laterEdit === "definition"
+                ? { ...current.definition, name: "Later name" }
+                : current.definition,
+            ...(laterEdit === "automation"
+              ? {
+                  automation: {
+                    ...recoveryAuto,
+                    trigger: { ...recoveryTrigger, teamId: "later-team", stateId: "" },
+                  },
+                }
+              : {}),
+          })),
+        );
+      await unmount();
+      await mount({ ...base, automationSupported: true });
+      read.mockResolvedValueOnce({ workflows: [receipt], automationSupported: true });
+      await click("Check saved version");
+      expect(editor(id).operation).toBeNull();
+      expect(editor(id).baseline).toEqual(receipt);
+      if (laterEdit === "definition") expect(editor(id).definition.name).toBe("Later name");
+      if (laterEdit === "automation")
+        expect(editor(id).automation?.trigger?.teamId).toBe("later-team");
+      else expect(editor(id).automation).toEqual(recoveryAuto);
+      expect(workflowEditorDirty(editor(id))).toBe(laterEdit !== "none");
+    });
+});
+
+describe("automation state after a relay upgrade", () => {
+  for (const retained of [false, true])
+    it(`preserves saved On and unrelated edits for a ${retained ? "pre-fix retained" : "new"} unsupported editor`, async () => {
+      const legacy: RepositoryWorkflow = {
+        workflowId: "legacy-flow",
+        repositoryId: scope.repositoryId,
+        organizationId: scope.organizationId,
+        revision: 1,
+        archived: false,
+        definition: newWorkflowDraft([project])!.definition,
+        createdAt: "now",
+        updatedAt: "now",
+      };
+      await mount({
+        ...base,
+        isNew: false,
+        workflowId: legacy.workflowId,
+        workflow: legacy,
+        automationSupported: false,
+      });
+      await rename("Only rename the workflow");
+      if (retained)
+        await act(() =>
+          updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
+            const current = editor(legacy.workflowId);
+            const { automationResolved: _resolved, ...old } = current;
+            return {
+              ...state,
+              editors: {
+                ...state.editors,
+                [workflowSessionKey(scope, legacy.workflowId)]: {
+                  ...old,
+                  automation: { enabled: false, trigger: null },
+                },
+              },
+            };
+          }),
+        );
+      await unmount();
+      const canonical = { ...legacy, automation: recoveryAuto };
+      await mount({
+        ...base,
+        isNew: false,
+        workflowId: canonical.workflowId,
+        workflow: canonical,
+        automationSupported: true,
+      });
+      expect(editor(legacy.workflowId).definition.name).toBe("Only rename the workflow");
+      expect(editor(legacy.workflowId).automation).toEqual(recoveryAuto);
+      expect(workflowDraftAutomationResolved(editor(legacy.workflowId))).toBe(true);
+      const { saveWorkflowDraft } = await import("./workflowOperations");
+      const write = vi.fn(
+        async (payload: Parameters<Parameters<typeof saveWorkflowDraft>[2]>[0]) => ({
+          ...canonical,
+          definition: payload.definition,
+          automation: payload.automation ?? canonical.automation,
+          revision: 2,
+        }),
+      );
+      await act(async () => {
+        await saveWorkflowDraft(scope, legacy.workflowId, write, undefined, {
+          automationSupported: true,
+          read: async () => ({ workflows: [canonical], automationSupported: true }),
+        });
+      });
+      expect(write).toHaveBeenCalledWith(expect.objectContaining({ automation: recoveryAuto }));
+      expect(editor(legacy.workflowId).operation).toBeNull();
+      expect(workflowEditorDirty(editor(legacy.workflowId))).toBe(false);
+      // An explicit later Off remains a real edit rather than being replaced on refresh.
+      await act(() =>
+        editWorkflowDraft(scope, legacy.workflowId, (current) => ({
+          ...current,
+          automation: { ...recoveryAuto, enabled: false },
+        })),
+      );
+      expect(editor(legacy.workflowId).automation?.enabled).toBe(false);
+    });
+  it("resolves a supported legacy manual workflow as Off without changing its definition", async () => {
+    const legacy: RepositoryWorkflow = {
+      workflowId: "legacy-off",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      revision: 1,
+      archived: false,
+      definition: newWorkflowDraft([project])!.definition,
+      createdAt: "now",
+      updatedAt: "now",
+    };
+    await mount({
+      ...base,
+      isNew: false,
+      workflowId: legacy.workflowId,
+      workflow: legacy,
+      automationSupported: true,
+    });
+    expect(workflowDraftAutomationResolved(editor(legacy.workflowId))).toBe(true);
+    expect(editor(legacy.workflowId).automation).toEqual({ enabled: false, trigger: null });
+    expect(workflowEditorDirty(editor(legacy.workflowId))).toBe(false);
+  });
+  it("keeps unknown drafts and edits when a newer saved revision needs an explicit reload", async () => {
+    const legacy: RepositoryWorkflow = {
+      workflowId: "legacy-stale",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      revision: 1,
+      archived: false,
+      definition: newWorkflowDraft([project])!.definition,
+      createdAt: "now",
+      updatedAt: "now",
+    };
+    await mount({
+      ...base,
+      isNew: false,
+      workflowId: legacy.workflowId,
+      workflow: legacy,
+      automationSupported: false,
+    });
+    await rename("Retain my edit");
+    await unmount();
+    await mount({
+      ...base,
+      isNew: false,
+      workflowId: legacy.workflowId,
+      workflow: { ...legacy, revision: 2, automation: recoveryAuto },
+      automationSupported: true,
+    });
+    expect(workflowDraftAutomationResolved(editor(legacy.workflowId))).toBe(false);
+    await submit();
+    expect(read).not.toHaveBeenCalled();
+    expect(editor(legacy.workflowId).definition.name).toBe("Retain my edit");
+    expect(editor(legacy.workflowId).baseline?.revision).toBe(1);
+    expect(editor(legacy.workflowId).error).toContain("Refresh or reload");
   });
 });

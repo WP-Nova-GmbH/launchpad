@@ -282,3 +282,12 @@ it.effect("requests bounded workflow pages without losing the scoped cursor", ()
     expect(seen[0]!.searchParams.get("cursor")).toBe("scope:opaque/cursor");
   }).pipe(Effect.provide(testLayer(fetchFn)));
 });
+
+it.effect("keeps legacy catalog capability unknown and retains the legacy array helper", () =>
+  Effect.gen(function* () {
+    const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+    const input = { clerkToken: "token", repositoryId: RelayRepositoryId.make("repo") };
+    expect(yield* client.readWorkflowCatalog(input)).toEqual({ workflows: [] });
+    expect(yield* client.listWorkflows(input)).toEqual([]);
+  }).pipe(Effect.provide(testLayer(async () => Response.json({ workflows: [] })))),
+);

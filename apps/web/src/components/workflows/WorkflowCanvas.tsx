@@ -47,6 +47,10 @@ export function workflowInsertionIndex(
 
 export function WorkflowCanvas({
   definition,
+  triggerLabel = "Manual run",
+  triggerSelected = false,
+  triggerIssue,
+  onTrigger,
   selectedStepId,
   invalidStepId,
   models,
@@ -59,6 +63,10 @@ export function WorkflowCanvas({
   movementVersion = 0,
 }: {
   definition: WorkflowDefinition;
+  triggerLabel?: string;
+  triggerSelected?: boolean;
+  triggerIssue?: string | null | undefined;
+  onTrigger?: () => void;
   selectedStepId: string;
   invalidStepId: string | null | undefined;
   models: ReturnType<typeof workflowModelState>;
@@ -138,12 +146,19 @@ export function WorkflowCanvas({
         <div className={styles["workflow-start"]}>
           <div className={styles["workflow-zone-label"]}>
             <strong>Starts when</strong>
-            <span>Someone runs this workflow</span>
+            <span>Manual run{triggerLabel !== "Manual run" ? " or a Linear event" : ""}</span>
           </div>
-          <span className={styles["workflow-start-marker"]}>
+          <button
+            type="button"
+            className={styles["workflow-start-marker"]}
+            aria-label="Configure workflow trigger"
+            aria-pressed={triggerSelected}
+            onClick={onTrigger}
+          >
             <PlayIcon size={14} />
-            Manual run
-          </span>
+            {triggerLabel}
+            {triggerIssue ? <AlertCircleIcon size={14} aria-label={triggerIssue} /> : null}
+          </button>
         </div>
         <DndContext
           sensors={sensors}

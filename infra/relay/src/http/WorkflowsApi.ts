@@ -11,6 +11,8 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+import { summaries as automationSummaries } from "../workflowEvents/Summaries.ts";
+import { targetKey } from "../workflowEvents/Routing.ts";
 import { prepare as prepareAutomationSave } from "../workflowEvents/Preparation.ts";
 import { Workflows, WorkflowPersistenceError } from "../jobs/Workflows.ts";
 import { refreshWorkflowJob, validateWorkflowTarget } from "../jobs/WorkflowDispatcher.ts";
@@ -223,43 +225,62 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
   return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
 });
 const errors = mapRelayCommonApiErrors("not_authorized");
+export const saveRepositoryWorkflow = Effect.fn("WorkflowsApi.save")(function* (
+  repositoryId: string,
+  payload: typeof import("@t3tools/contracts/workflows").SaveRepositoryWorkflow.Type,
+) {
+  const membership = yield* authorizeWorkflowRepository(repositoryId, true);
+  const store = yield* Workflows;
+  const previous = yield* store.get(payload.workflowId);
+  const saveContext = yield* prepareAutomationSave(
+    membership.organization.organizationId,
+    repositoryId,
+    membership.userId,
+    payload,
+    previous,
+  ).pipe(
+    Effect.mapError((cause) =>
+      isInvalid(cause) ? cause : new WorkflowPersistenceError({ cause }),
+    ),
+  );
+  if (
+    !payload.archived &&
+    !payload.automation?.enabled &&
+    (!previous ||
+      previous.repositoryId !== repositoryId ||
+      previous.archived ||
+      targetKey(previous.definition) !== targetKey(payload.definition) ||
+      !previous.automation?.trigger)
+  )
+    yield* validateWorkflowTarget(
+      membership.organization.organizationId,
+      repositoryId,
+      payload.definition,
+    );
+  return yield* (yield* Workflows).save(
+    membership.organization.organizationId,
+    repositoryId,
+    payload,
+    saveContext,
+  );
+});
+
 export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handlers) =>
   handlers
     .handle("list", ({ params }) =>
       Effect.gen(function* () {
         yield* authorizeWorkflowRepository(params.repositoryId);
-        return { workflows: yield* (yield* Workflows).list(params.repositoryId) };
+        return {
+          workflows: yield* (yield* Workflows).list(params.repositoryId),
+          automationSupported: true,
+          automationSummaries: yield* automationSummaries(params.repositoryId).pipe(
+            Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+          ),
+        };
       }).pipe(errors),
     )
     .handle("save", ({ params, payload }) =>
-      Effect.gen(function* () {
-        const membership = yield* authorizeWorkflowRepository(params.repositoryId, true);
-        const store = yield* Workflows;
-        const previous = yield* store.get(payload.workflowId);
-        const saveContext = yield* prepareAutomationSave(
-          membership.organization.organizationId,
-          params.repositoryId,
-          membership.userId,
-          payload,
-          previous,
-        ).pipe(
-          Effect.mapError((cause) =>
-            isInvalid(cause) ? cause : new WorkflowPersistenceError({ cause }),
-          ),
-        );
-        if (!payload.archived && payload.automation === undefined && !previous?.automation?.trigger)
-          yield* validateWorkflowTarget(
-            membership.organization.organizationId,
-            params.repositoryId,
-            payload.definition,
-          );
-        return yield* (yield* Workflows).save(
-          membership.organization.organizationId,
-          params.repositoryId,
-          payload,
-          saveContext,
-        );
-      }).pipe(errors),
+      saveRepositoryWorkflow(params.repositoryId, payload).pipe(errors),
     )
     .handle("listJobs", ({ params }) =>
       Effect.gen(function* () {

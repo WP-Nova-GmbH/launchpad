@@ -141,9 +141,7 @@ separate source for a different workspace. Withdrawing access requires fresh own
 it can be used again. Disconnect removes Launchpad's stored authorization; it does not cancel
 Starting or running work. Use the run's Cancel action to stop that work.
 
-This currently provides source connections and repository consent. Automatic Linear triggers are
-not available yet; a connected source still shows unverified event delivery. Mobile shows source
-health; configure sources in the web or desktop app. If the service configuration needs attention,
+Automatic Linear triggers require relay support and verified event delivery for the selected team. Rollout of automatic execution depends on the relay’s available integration. Mobile shows source health; configure sources and triggers in the web or desktop app. If the service configuration needs attention,
 retry after the relay operator repairs it rather than reconnecting your account.
 
 ## Repository workflows
@@ -158,7 +156,7 @@ in a job must use compatible providers of the same kind so they can share the co
 Model changes are available when that provider supports them. If its configuration becomes
 incompatible during a job, cancel the job and run it again after correcting the workflow.
 
-Start with **Agent → Review** or **Reviewed implementation → PR** from **Use template**, or build your own sequence. **Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy; choose a destination checkout if more than one is available. A retained new-workflow draft requires explicit discard before replacement, and an uncertain save must be reconciled first.
+Start with **Agent → Review** or **Reviewed implementation → PR** from **Use template**, or build your own sequence. **Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy; choose a destination checkout if more than one is available. Copies start with automatic triggering Off and no trigger.
 
 **Push branch** commits the saved result, including normal commit hooks, and pushes the job's branch. **Open PR** opens a PR against the base selected when the job was accepted; it requires a Push after the latest Agent step. Add Review before publishing when human approval is wanted. Workflows without publishing steps keep changes local. Publishing requires an updated Linux or macOS executor; PR publishing currently supports GitHub. Other forges are rejected before the run starts.
 
@@ -166,9 +164,9 @@ Anyone with repository access can run a workflow with a description of the task 
 shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own
 worktree and one shared agent conversation. Inspect the saved result and diff before approving a
 Review. Answer an Input checkpoint to supply context for later steps. Responses are retained as
-history, and drafts remain available while waiting for the machine to acknowledge them. Edits and
-responses survive navigation to results and back within the current app session. Reloading or
-restarting the app does not restore unsaved drafts.
+history, and response drafts remain available while waiting for the machine to acknowledge them. Leaving an editor with unsaved changes asks whether to keep editing or discard and leave. Discard removes local edits; a Save already submitted may still complete. Save errors retain edits; Retry checks the saved version before submitting again. Reloading or restarting the app does not restore unsaved drafts.
+
+When automatic triggering is available on your relay, open **Trigger settings** in the editor. Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected status. Optional labels must all match. You can connect Linear and allow repository use from the editor without leaving your draft. Enabling requires verified event delivery for that exact team and a validated execution target. Save applies the rule and its On/Off setting; changed rules apply only to events after Save. The catalog shows the saved state and any source or target problem. Turning On without a trigger opens setup; turning Off stops new event admissions and preserves existing jobs and manual Run. Archive disables automation, and restore leaves it Off. Automatic execution depends on your relay’s available integration and rollout; configuring a trigger alone does not confirm that a job has started.
 
 **Runs** opens with active jobs, oldest first, including jobs from archived workflows. Use
 **Needs attention** to find human checkpoints, pauses and blocked jobs, or **History** for completed

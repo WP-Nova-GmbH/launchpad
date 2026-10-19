@@ -3,11 +3,13 @@ import * as Schema from "effect/Schema";
 import { EnvironmentId, ProjectId } from "./baseSchemas.ts";
 import {
   WorkflowDefinition,
+  WorkflowCatalog,
   WorkflowJobPageQuery,
   RespondToWorkflowJob,
   workflowZones,
   type WorkflowStep,
 } from "./workflows.ts";
+const decodeCatalog = Schema.decodeUnknownSync(WorkflowCatalog);
 const isDefinition = Schema.is(WorkflowDefinition);
 const isResponse = Schema.is(RespondToWorkflowJob);
 const agent: WorkflowStep = {
@@ -143,4 +145,17 @@ it("validates bounded page sizes and supported list views at the wire boundary",
   ]) {
     expect(() => decode(value)).toThrow();
   }
+});
+
+it("decodes older workflow catalog responses without inventing automation capability", () => {
+  const old = decodeCatalog({ workflows: [] });
+  expect(old.automationSupported).toBeUndefined();
+  expect(old.automationSummaries).toBeUndefined();
+  expect(
+    decodeCatalog({
+      workflows: [],
+      automationSupported: true,
+      automationSummaries: [],
+    }).automationSupported,
+  ).toBe(true);
 });

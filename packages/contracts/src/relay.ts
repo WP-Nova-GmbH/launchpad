@@ -1,5 +1,6 @@
 import {
   RepositoryWorkflow,
+  WorkflowCatalog,
   RepositoryWorkflowJob,
   RepositoryWorkflowJobSummary,
   WorkflowJobPageQuery,
@@ -58,6 +59,8 @@ import {
   AllowWorkflowSource,
   WorkflowSourceMetadataQuery,
   WorkflowSourceMetadataPage,
+  WorkflowSourceSelectionQuery,
+  WorkflowSourceSelection,
 } from "./workflowSources.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
@@ -2349,6 +2352,13 @@ const RelayWorkflowSourcesGroup = HttpApiGroup.make("workflowSources")
         error: [...RelayTenancyErrors, WorkflowSourceError],
       },
     ),
+    HttpApiEndpoint.post("selection", "/v1/repositories/:repositoryId/workflow-sources/selection", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: WorkflowSourceSelectionQuery,
+      success: WorkflowSourceSelection,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
     HttpApiEndpoint.post("metadata", "/v1/repositories/:repositoryId/workflow-sources/metadata", {
       headers: RelayBearerRequestHeaders,
       params: RelayRepositoryParams,
@@ -2369,7 +2379,7 @@ const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
     HttpApiEndpoint.get("list", "/v1/repositories/:repositoryId/workflows", {
       headers: RelayBearerRequestHeaders,
       params: RelayRepositoryParams,
-      success: Schema.Struct({ workflows: Schema.Array(RepositoryWorkflow) }),
+      success: WorkflowCatalog,
       error: WorkflowErrors,
     }),
     HttpApiEndpoint.post("save", "/v1/repositories/:repositoryId/workflows", {
