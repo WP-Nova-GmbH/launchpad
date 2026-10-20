@@ -642,7 +642,11 @@ export const harness = Effect.gen(function* () {
 export const test = <A, E, R>(program: Effect.Effect<A, E, R>) =>
   program.pipe(Effect.provide(persistence), Effect.scoped);
 
-export const workflowAccess = (h: Effect.Success<typeof harness>) =>
+export const workflowAccess = (
+  h: Effect.Success<typeof harness>,
+  organizationId = "org-1",
+  repositoryId = "repo-1",
+) =>
   Effect.gen(function* () {
     const values = new Map<string, Uint8Array>();
     const bytes = (value: string) => new TextEncoder().encode(value);
@@ -651,7 +655,7 @@ export const workflowAccess = (h: Effect.Success<typeof harness>) =>
       bytes(
         yield* encodeCloudMachineIdentityJson({
           machineId: "machine",
-          organizationId: "org-1",
+          organizationId,
           role: "agent_executor",
         }),
       ),
@@ -691,7 +695,7 @@ export const workflowAccess = (h: Effect.Success<typeof harness>) =>
     );
     const access = yield* construct;
     const policy: OrganizationRepositoryPolicy = {
-      organizationId: "org-1",
+      organizationId,
       revision: 1,
       members: [
         { userId: "bob", role: "admin" },
@@ -699,7 +703,7 @@ export const workflowAccess = (h: Effect.Success<typeof harness>) =>
       ],
       repositories: [
         {
-          repositoryId: "repo-1",
+          repositoryId,
           canonicalKeys: [identity.canonicalKey],
           userIds: ["bob", "user-1"],
         },

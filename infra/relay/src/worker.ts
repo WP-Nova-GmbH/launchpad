@@ -1,3 +1,5 @@
+import * as AutomaticOffers from "./workflowEvents/AutomaticOffer.ts";
+import * as WorkflowWake from "./jobs/WorkflowWake.ts";
 import { workflowEventsRoute } from "./http/WorkflowEventsRoute.ts";
 import { repositoryAccessServerApi } from "./http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "./tenancy/RepositoryPolicies.ts";
@@ -342,7 +344,8 @@ export const ApiLive = Api.make(
       }).pipe(Effect.map(makeRelayTraceLayer)),
     );
 
-    const runtimeLayer = Layer.empty
+    const runtimeLayer = WorkflowWake.layer
+      .pipe(Layer.provideMerge(AutomaticOffers.layer))
       .pipe(
         Layer.provideMerge(MobileRegistrations.layer),
         Layer.provideMerge(AgentActivityPublisher.layer),

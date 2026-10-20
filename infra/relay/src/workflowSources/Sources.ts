@@ -351,21 +351,21 @@ export const credentials = Effect.fn("workflowSources.credentials")(function* (
     ),
   );
 });
-const read = Effect.fn("workflowSources.read")(function* <A, R>(
+export const read = Effect.fn("workflowSources.read")(function* <A, R>(
   c: Store.Connection,
-  use: (token: string) => Effect.Effect<A, WorkflowSourceError, R>,
+  use: (token: string, connection: Store.Connection) => Effect.Effect<A, WorkflowSourceError, R>,
 ) {
   let current = yield* credentials(c);
-  const result = yield* use(current.credentials.accessToken).pipe(
+  const result = yield* use(current.credentials.accessToken, current.connection).pipe(
     Effect.catchTag("WorkflowSourceError", (error) => {
       if (error.code !== "reconnect_required") return Effect.fail(error);
       return Effect.gen(function* () {
         current = yield* credentials(current.connection, true);
-        return yield* use(current.credentials.accessToken);
+        return yield* use(current.credentials.accessToken, current.connection);
       });
     }),
     Effect.tapError((error) =>
-      isSourceError(error) && error.code !== "forbidden"
+      isSourceError(error) && error.code !== "forbidden" && error.code !== "invalid_input"
         ? recordFailure(current.connection, error).pipe(Effect.ignore)
         : Effect.void,
     ),

@@ -9,7 +9,7 @@ import {
   type SaveRepositoryWorkflow,
 } from "@t3tools/contracts/workflows";
 import { WorkflowOrigin, sameWorkflowOrigin } from "@t3tools/contracts";
-import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -19,6 +19,11 @@ import * as Routing from "../workflowEvents/Routing.ts";
 import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
 
+export type WorkflowDispatchScope = {
+  occurrenceId?: string;
+  connectionId?: string;
+  environmentId?: string;
+};
 export type WorkflowJobRecord = Omit<typeof relayWorkflowJobs.$inferSelect, "summary">;
 const isInvalid = Schema.is(WorkflowInvalidError);
 const isConflict = Schema.is(WorkflowConflictError);
@@ -238,42 +243,56 @@ export const make = Effect.gen(function* () {
             : null,
       };
     }),
-    pendingJobs: () =>
+    pendingJobs: (scope: WorkflowDispatchScope = {}) =>
       persist(
         db
           .select()
           .from(relayWorkflowJobs)
           .where(
-            inArray(relayWorkflowJobs.status, [
-              "queued",
-              "dispatching",
-              "preparing",
-              "running",
-              "awaiting_review",
-              "awaiting_input",
-              "waiting_capacity",
-              "finishing",
-              "paused",
-              "cancelling",
-            ]),
+            and(
+              scope.occurrenceId
+                ? sql`${relayWorkflowJobs.jobId} IN (SELECT job_id FROM relay_workflow_admissions WHERE occurrence_id=${scope.occurrenceId})`
+                : undefined,
+              scope.connectionId
+                ? sql`${relayWorkflowJobs.jobId} IN (SELECT job_id FROM relay_workflow_admissions WHERE connection_id=${scope.connectionId})`
+                : undefined,
+              scope.environmentId
+                ? sql`(${relayWorkflowJobs.record}->>'environmentId'=${scope.environmentId} OR (${relayWorkflowJobs.record}->'workflow'='null'::jsonb AND ${relayWorkflowJobs.record}->>'workflowId' IN (SELECT workflow_id FROM relay_repository_workflows WHERE record#>>'{definition,environmentId}'=${scope.environmentId})))`
+                : undefined,
+              sql`(${relayWorkflowJobs.pendingControl} IS NOT NULL OR ${relayWorkflowJobs.record}->'workflow'<>'null'::jsonb OR COALESCE((${relayWorkflowJobs.record}#>>'{queueReason,retryAt}')::double precision,0)<=extract(epoch FROM clock_timestamp())*1000)`,
+              inArray(relayWorkflowJobs.status, [
+                "queued",
+                "dispatching",
+                "preparing",
+                "running",
+                "awaiting_review",
+                "awaiting_input",
+                "waiting_capacity",
+                "finishing",
+                "paused",
+                "cancelling",
+              ]),
+            ),
           )
           .orderBy(asc(relayWorkflowJobs.checkedAt), asc(relayWorkflowJobs.createdAt))
           .limit(100),
       ),
     /** A cross-instance lease pins an offered snapshot until acceptance is reconciled. */
     claim: Effect.fn("Workflows.claim")(function* (jobId: string) {
-      const timestamp = yield* now;
-      const leaseUntil = DateTime.formatIso(DateTime.add(yield* DateTime.now, { seconds: 30 }));
+      // Database time also governs lease-fenced writes; relay clocks may differ.
       const rows = yield* persist(
         db
           .update(relayWorkflowJobs)
-          .set({ leaseUntil, checkedAt: timestamp })
+          .set({
+            leaseUntil: sql`to_char((clock_timestamp() + interval '30 seconds') AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`,
+            checkedAt: sql`to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`,
+          })
           .where(
             and(
               eq(relayWorkflowJobs.jobId, jobId),
               or(
                 isNull(relayWorkflowJobs.leaseUntil),
-                lte(relayWorkflowJobs.leaseUntil, timestamp),
+                sql`${relayWorkflowJobs.leaseUntil}::timestamptz <= clock_timestamp()`,
               ),
             ),
           )
@@ -287,6 +306,7 @@ export const make = Effect.gen(function* () {
       record: RepositoryWorkflowJob,
       pendingControl = previous.pendingControl,
       releaseLease = true,
+      expectedLease?: string,
     ) {
       if (isTerminalWorkflowJob(previous.record.status)) return previous;
       record = yield* persist(
@@ -313,6 +333,12 @@ export const make = Effect.gen(function* () {
             and(
               eq(relayWorkflowJobs.jobId, previous.jobId),
               eq(relayWorkflowJobs.revision, previous.revision),
+              ...(expectedLease === undefined
+                ? []
+                : [
+                    eq(relayWorkflowJobs.leaseUntil, expectedLease),
+                    sql`${relayWorkflowJobs.leaseUntil}::timestamptz > clock_timestamp()`,
+                  ]),
             ),
           )
           .returning(),

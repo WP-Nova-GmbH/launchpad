@@ -63,8 +63,8 @@ after the initial setup command finishes. Docker-managed containers and system s
 a separate lifecycle.
 
 **Event trigger**:
-A repository workflow's rule selecting external events and filtering their issue context to
-determine which occurrences start jobs.
+A repository workflow's rule selecting external events using issue details at the time of the
+event. Later issue changes do not change which occurrences created existing jobs.
 
 **Trigger occurrence**:
 A distinct external event that matches a workflow's event trigger. Several occurrences may
@@ -129,6 +129,10 @@ _Avoid_: Team when referring to Linear without qualification
 The details, comment discussion, and embedded images from an external issue used to inform work
 in a Launchpad thread. It is distinct from a Launchpad work item.
 _Avoid_: Imported work item, synced issue
+
+**Issue snapshot**:
+The issue details preserved for a particular job at handoff. Later changes to the external
+issue do not change that job’s instructions.
 
 ## Managed compute
 

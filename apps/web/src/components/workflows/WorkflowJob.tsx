@@ -1,3 +1,4 @@
+import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
@@ -104,7 +105,7 @@ export function WorkflowJob({
     };
   }, [refresh, terminal, read.mutation, scope, jobId]);
   const respond = async (operation: Operation) => {
-    if (!selectedJob || busy) return;
+    if (!selectedJob || busy || (manualState.responsePending && operation !== "cancel")) return;
     if (
       ["approve", "input", "request_changes"].includes(operation) &&
       (!selectedJob.progress?.checkpoint || isTerminalWorkflowJob(selectedJob.status))
@@ -241,7 +242,7 @@ export function WorkflowJob({
         <h1 className="text-xl font-semibold">
           {selectedJob.workflow?.definition.name ?? "Workflow run"}
         </h1>
-        <p className="mt-2 text-sm">{selectedJob.instruction}</p>
+        <WorkflowIssueDetails key={key} job={selectedJob} />
         {selectedJob.origin?.kind === "automation" ? (
           <p className="mt-1 text-xs text-muted-foreground">
             Started by workflow
@@ -298,16 +299,22 @@ export function WorkflowJob({
                   }
                   onClick={() => void respond("approve")}
                 >
-                  {selectedJob.progress?.approvalPending
-                    ? "Approval pending"
-                    : selectedJob.progress?.retryableApproval
-                      ? selectedJob.status === "finishing"
-                        ? "Retry completion"
-                        : "Retry approval"
-                      : "Approve result"}
+                  {manualState.responsePending
+                    ? "Response pending"
+                    : selectedJob.progress?.approvalPending
+                      ? "Approval pending"
+                      : selectedJob.progress?.retryableApproval
+                        ? selectedJob.status === "finishing"
+                          ? "Retry completion"
+                          : "Retry approval"
+                        : "Approve result"}
                 </Button>
                 {waiting && !selectedJob.progress?.approvalPending ? (
-                  <Button variant="outline" onClick={() => setFeedbackOpen(true)}>
+                  <Button
+                    variant="outline"
+                    disabled={busy || manualState.checkpointBlocked}
+                    onClick={() => setFeedbackOpen(true)}
+                  >
                     Request changes
                   </Button>
                 ) : null}
@@ -344,7 +351,11 @@ export function WorkflowJob({
                   type="submit"
                   disabled={busy || manualState.checkpointBlocked || !response.trim()}
                 >
-                  {input ? "Submit answer" : "Send requested changes"}
+                  {manualState.responsePending
+                    ? "Response pending"
+                    : input
+                      ? "Submit answer"
+                      : "Send requested changes"}
                 </Button>
               </form>
             ) : waiting && !allowed ? (
@@ -431,20 +442,21 @@ export function WorkflowJob({
                     disabled={
                       busy ||
                       (selectedJob.status === "cancelling" &&
-                        !selectedJob.progress?.retryableCancellation)
+                        (manualState.responsePending ||
+                          !selectedJob.progress?.retryableCancellation))
                     }
                     onClick={async () => {
                       if (selectedJob.status === "cancelling") void respond("retry_cancellation");
                       else if (
                         await confirmWorkflow(
-                          `Cancel this run: ${selectedJob.instruction.slice(0, 140)}?`,
+                          `Cancel this run: ${selectedJob.issueSnapshot?.identifier ?? selectedJob.event?.identifier ?? selectedJob.instruction.slice(0, 140)}?`,
                         )
                       )
                         void respond("cancel");
                     }}
                   >
                     {selectedJob.status === "cancelling"
-                      ? selectedJob.progress?.retryableCancellation
+                      ? selectedJob.progress?.retryableCancellation && !manualState.responsePending
                         ? "Retry cancellation"
                         : "Cancellation pending"
                       : "Cancel run"}

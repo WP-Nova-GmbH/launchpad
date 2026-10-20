@@ -673,16 +673,17 @@ export const relayWorkflowJobs = pgTable(
       .generatedAlwaysAs(
         sql`jsonb_object(
         ARRAY['jobId','repositoryId','workflowId','environmentId','instruction','status','detail','createdAt','updatedAt'],
-        ARRAY["job_id"::text,"repository_id"::text,"record"->>'workflowId',"record"->>'environmentId',left("record"->>'instruction',500),"status"::text,left("record"->>'detail',500),"created_at"::text,"record"->>'updatedAt']
+        ARRAY["job_id"::text,"repository_id"::text,"record"->>'workflowId',"record"->>'environmentId',left(CASE WHEN "record"->'event' IS NOT NULL THEN COALESCE("record"#>>'{issueSnapshot,identifier}',"record"#>>'{event,identifier}') || ': ' || COALESCE("record"#>>'{issueSnapshot,title}',"record"#>>'{event,title}') ELSE "record"->>'instruction' END,500),"status"::text,left("record"->>'detail',500),"created_at"::text,"record"->>'updatedAt']
       ) || CASE WHEN "status" IN ('awaiting_review','awaiting_input','paused')
-        OR ("status" = 'queued' AND "record"->>'detail' IS NOT NULL)
+        OR ("status" = 'queued' AND CASE WHEN "record" ? 'queueReason' THEN COALESCE("record"#>>'{queueReason,code}' NOT IN ('environment_offline','environment_busy','source_unavailable','source_rate_limited','workflow_changed'),false) ELSE "record"->>'detail' IS NOT NULL END)
         OR ("status" = 'cancelling' AND "record"#>>'{progress,retryableCancellation}' = 'true')
         THEN '{"needsAttention":true}'::jsonb ELSE '{"needsAttention":false}'::jsonb END
       || ('{"originSummary":' || (
         jsonb_object(ARRAY['kind'], ARRAY["record"#>>'{origin,kind}'])
         || CASE WHEN "record"#>>'{workflow,definition,name}' IS NOT NULL
           THEN jsonb_object(ARRAY['workflowName'], ARRAY[left("record"#>>'{workflow,definition,name}',120)])
-          ELSE '{}'::jsonb END)::text || '}')::jsonb`,
+          ELSE '{}'::jsonb END)::text || '}')::jsonb
+      || CASE WHEN "record" ? 'queueReason' THEN ('{"queueReason":' || ("record"->'queueReason')::text || '}')::jsonb ELSE '{}'::jsonb END`,
       ),
     pendingControl: jsonb("pending_control").$type<{
       userId: string;
@@ -694,6 +695,9 @@ export const relayWorkflowJobs = pgTable(
     checkedAt: varchar("checked_at", { length: 64 }).notNull(),
   },
   (table) => [
+    index("idx_workflow_jobs_dispatch_pending")
+      .on(table.checkedAt, table.createdAt)
+      .where(sql`"status" NOT IN ('done','cancelled','failed')`),
     check(
       "workflow_job_origin",
       sql`(
@@ -918,5 +922,6 @@ export const relayWorkflowAdmissions = pgTable(
   (t) => [
     primaryKey({ columns: [t.occurrenceId, t.workflowId] }),
     uniqueIndex("workflow_admission_job").on(t.jobId),
+    index("idx_workflow_admissions_connection").on(t.connectionId),
   ],
 );

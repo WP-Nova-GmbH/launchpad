@@ -135,6 +135,28 @@ const manualJob = (): RepositoryWorkflowJob => ({
   createdAt: "now",
   updatedAt: "now",
 });
+describe("pending workflow responses", () => {
+  it("blocks conflicting controls until a refreshed acknowledgement, including legacy compatibility", () => {
+    const job = manualJob();
+    const pending = { ...job, responsePending: true };
+    expect(workflowManualControlState(pending)).toMatchObject({
+      canPause: false,
+      canResume: false,
+      checkpointBlocked: true,
+      responsePending: true,
+      message: "Response pending; waiting for the environment.",
+    });
+    const held = {
+      ...pending,
+      progress: { ...pending.progress!, manualPause: { state: "paused" as const } },
+    };
+    expect(workflowManualControlState(held).canResume).toBe(false);
+    expect(workflowManualControlState({ ...job, responsePending: false }).canPause).toBe(true);
+    expect(workflowManualControlState(job).canPause).toBe(true);
+    expect(workflowManualControlState({ ...pending, status: "done" }).message).toBeNull();
+  });
+});
+
 describe("manual workflow controls", () => {
   it("distinguishes saved requests, step-boundary waits and acknowledged holds", () => {
     const job = manualJob();

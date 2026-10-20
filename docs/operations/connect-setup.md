@@ -203,8 +203,10 @@ activation; otherwise revisit this policy before release. A 400 indicates invali
 Diagnostics must retain only the bounded failure code, never the body or signing/OAuth material.
 
 Events commit all matching queued jobs or none. Successful and unmatched occurrences retain a
-duplicate fence; reconfiguration never rematches them. Trigger authoring and automatic-start context
-are subsequent slices: admitted jobs remain unoffered until that start path ships. Do not present
+duplicate fence; reconfiguration never rematches them. After admission, automatic starts read issue context through the original connection and grant,
+then persist their authorized offer before delivery. Background wakeups accelerate the existing
+periodic retry worker; a lost wakeup does not lose a job. The production release gates above still
+apply even when fixture-based execution succeeds. Do not present
 this receiver as production automatic execution or enable the admission flag before those slices
 and the provider proof are complete.
 

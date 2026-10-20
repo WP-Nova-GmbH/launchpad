@@ -11,6 +11,7 @@ import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import { WORKFLOW_LINEAR_CALLBACK_PATH } from "@t3tools/contracts/relay";
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import { RelayDb } from "../db.ts";
 import * as Sources from "../workflowSources/Sources.ts";
 import * as Store from "../workflowSources/Store.ts";
@@ -66,10 +67,12 @@ export const workflowSourcesApi = HttpApiBuilder.group(RelayApi, "workflowSource
       .handle("refreshOwner", (args) =>
         safe(
           Effect.gen(function* () {
-            return yield* Sources.refreshOwner(
+            const result = yield* Sources.refreshOwner(
               (yield* RelayClientPrincipal).userId,
               args.payload.connectionId,
             );
+            yield* wakeWorkflows({ connectionId: args.payload.connectionId });
+            return result;
           }),
         ),
       )
@@ -130,6 +133,7 @@ export const workflowSourcesApi = HttpApiBuilder.group(RelayApi, "workflowSource
               Store.authority(args.params.repositoryId, args.payload.grantId, user),
             );
             yield* Sources.refresh(bound.connection);
+            yield* wakeWorkflows({ connectionId: bound.connection.connection_id });
             yield* sql.withTransaction(
               Store.authority(args.params.repositoryId, args.payload.grantId, user),
             );
@@ -177,6 +181,7 @@ export const workflowSourceCallbackRoute = HttpRouter.add(
         onFailure: () => false,
       }),
     );
+    if (outcome) yield* wakeWorkflows();
     return HttpServerResponse.text(
       `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Workflow source · Launchpad</title><body><h1>${outcome ? "Linear connected" : "Linear was not connected"}</h1><p>Return to Workflow sources in Launchpad and refresh the connection status. You can close this tab.</p></body></html>`,
       {

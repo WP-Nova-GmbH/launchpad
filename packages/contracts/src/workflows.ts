@@ -112,6 +112,63 @@ export const WorkflowEventFacts = Schema.Struct({
 });
 export type WorkflowEventFacts = typeof WorkflowEventFacts.Type;
 
+const IssueName = Schema.Struct({
+  id: TriggerId,
+  name: Schema.String.check(Schema.isMaxLength(1024)),
+});
+export const WorkflowIssueSnapshot = Schema.Struct({
+  workspaceId: TriggerId,
+  issueId: TriggerId,
+  identifier: Schema.String.check(Schema.isMaxLength(1024)),
+  url: Schema.String.check(Schema.isMaxLength(2048)),
+  title: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096)),
+  description: Schema.String.check(Schema.isMaxLength(32_000)),
+  team: IssueName,
+  status: IssueName,
+  labels: Schema.Array(IssueName).check(Schema.isMaxLength(100)),
+  issueUpdatedAt: Schema.String,
+  retrievedAt: Schema.String,
+  authorizationEpoch: Revision,
+  credentialVersion: Revision,
+});
+export type WorkflowIssueSnapshot = typeof WorkflowIssueSnapshot.Type;
+export const WorkflowQueueReason = Schema.Struct({
+  code: Schema.Literals([
+    "environment_offline",
+    "environment_busy",
+    "environment_update",
+    "workflow_unavailable",
+    "target_invalid",
+    "workflow_changed",
+    "source_unavailable",
+    "source_rate_limited",
+    "source_reconnect",
+    "source_configuration",
+    "source_withdrawn",
+    "source_owner_ineligible",
+    "issue_unavailable",
+    "issue_context_invalid",
+    "issue_context_too_large",
+  ]),
+  retryAt: Schema.NullOr(Schema.Number),
+});
+export type WorkflowQueueReason = typeof WorkflowQueueReason.Type;
+export function workflowIssueUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.origin === "https://linear.app" &&
+      !url.username &&
+      !url.password &&
+      /^\/[^/]+\/issue\/[^/]+(?:\/[^/]*)?\/?$/.test(url.pathname) &&
+      !url.search &&
+      !url.hash
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export const RepositoryWorkflow = Schema.Struct({
   automation: Schema.optional(WorkflowAutomation),
   workflowId: TrimmedNonEmptyString,
@@ -218,6 +275,13 @@ export const WorkflowJobProgress = Schema.Struct({
 export type WorkflowJobProgress = typeof WorkflowJobProgress.Type;
 
 export const RepositoryWorkflowJob = Schema.Struct({
+  issueSnapshot: Schema.optional(WorkflowIssueSnapshot),
+  queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),
+  /** Marked before sending: absent on legacy offers means delivery may already have happened. */
+  startAttempted: Schema.optional(Schema.Boolean),
+  offerAuthority: Schema.optional(
+    Schema.Struct({ authorizationEpoch: Revision, grantGeneration: Revision }),
+  ),
   event: Schema.optional(WorkflowEventFacts),
   origin: Schema.optional(WorkflowOrigin),
   originSummary: Schema.optional(WorkflowOriginSummary),
@@ -247,6 +311,8 @@ export const RepositoryWorkflowJob = Schema.Struct({
   /** Null until a definition is offered. An uncertain offer remains pinned. */
   workflow: Schema.NullOr(RepositoryWorkflow),
   progress: Schema.NullOr(WorkflowJobProgress),
+  /** Relay response awaiting executor acknowledgement; derived from the durable pending control. */
+  responsePending: Schema.optional(Schema.Boolean),
   pendingManualControl: Schema.optional(Schema.NullOr(WorkflowManualControl)),
   createdAt: Schema.String,
   updatedAt: Schema.String,
@@ -254,6 +320,7 @@ export const RepositoryWorkflowJob = Schema.Struct({
 export type RepositoryWorkflowJob = typeof RepositoryWorkflowJob.Type;
 /** Lists carry a short context preview; the frozen definition/result is detail-only. */
 export const RepositoryWorkflowJobSummary = Schema.Struct({
+  queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),
   originSummary: Schema.optional(WorkflowOriginSummary),
   jobId: RepositoryWorkflowJob.fields.jobId,
   repositoryId: RepositoryWorkflowJob.fields.repositoryId,

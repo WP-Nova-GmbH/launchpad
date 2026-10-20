@@ -967,9 +967,9 @@ it.effect("a frozen automation offer probes protocol 8 before sending Start", ()
       },
     }));
     const result = yield* h.refresh;
-    assert.equal(result?.status, "queued");
+    assert.equal(result?.status, "dispatching");
     assert.equal(result?.requiredProtocol, 8);
-    assert.isNull(result?.workflow);
+    assert.isNotNull(result?.workflow);
     assert.lengthOf(yield* Ref.get(h.offers), 0);
     assert.deepStrictEqual(
       (yield* Ref.get(h.controls)).map((control) => control.operation),

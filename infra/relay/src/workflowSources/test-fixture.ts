@@ -108,6 +108,7 @@ CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_
               "20261015110011_workflow_job_pages",
               "20261015151148_workflow_origin",
               "20261016074602_workflow_events",
+              "20261019163246_workflow_automatic_starts",
             ].map(
               (name) =>
                 new URL(`../../migrations/postgres/${name}/migration.sql`, import.meta.url)

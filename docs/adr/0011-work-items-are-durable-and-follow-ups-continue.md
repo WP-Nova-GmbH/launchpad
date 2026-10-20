@@ -30,6 +30,11 @@ workflow is queued, running, or waiting for review. Repeated delivery of the sam
 no additional job. An event-triggered job does not update, restart, or continue an existing job;
 continuation is an explicit follow-up.
 
+Later changes to an issue’s team, status or labels do not rematch or cancel jobs already created
+from its events. A team move within the same Linear workspace therefore does not block a queued
+job while its original connection can still read the issue. Current source access is still required
+for a new handoff.
+
 An edited event trigger applies only to events occurring after the edit is saved. Delayed older
 events cannot newly match its changed criteria, while already-created jobs are retained. Edits
 only to the workflow's name or execution steps/settings do not change event eligibility.
@@ -48,6 +53,12 @@ posting a pull-request link. The snapshot is what correctness needs: without it,
 mid-job silently changes what a running agent was told, and there is no way to reconstruct the
 actual instruction afterwards. Same replayability requirement as
 [ADR-0004](./0004-thread-portability-is-deferred-not-designed-away.md).
+
+An event’s routing facts and a job’s issue snapshot are distinct: matching uses the facts at the
+event, while the instructions use a read before handoff. The snapshot is frozen when the relay
+persists the offer, before its network delivery. A timeout cannot justify changing those instructions
+or their target: a delayed request could still start the old offer. Source withdrawal blocks a new
+handoff but does not revoke an offer already saved; cancellation is the explicit stop control.
 
 ## Continuation
 

@@ -1,3 +1,4 @@
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
@@ -52,7 +53,10 @@ export const receiveWorkflowEvent = Effect.gen(function* () {
   const value = yield* decodeJson(new TextDecoder().decode(bytes)).pipe(
     Effect.mapError(() => new WebhookError({ status: 400, code: "invalid_json" })),
   );
-  yield* admit(yield* normalize(value, config.applicationId));
+  const event = yield* normalize(value, config.applicationId);
+  const result = yield* admit(event);
+  if (result.jobs && event.kind === "issue")
+    yield* wakeWorkflows({ occurrenceId: `linear:${event.eventKey}` });
   return HttpServerResponse.empty({ status: 200 });
 }).pipe(Effect.catch((e) => Effect.succeed(HttpServerResponse.text(e.code, { status: e.status }))));
 export const workflowEventsRoute = HttpRouter.add("POST", WEBHOOK_PATH, receiveWorkflowEvent);

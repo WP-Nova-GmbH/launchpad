@@ -15,10 +15,11 @@ import {
   updateWorkflowDrafts,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import type {
   RepositoryWorkflowJob,
+  RespondToWorkflowJob,
   RepositoryWorkflowJobSummary,
   WorkflowJobPage,
   WorkflowJobPageQuery,
@@ -31,6 +32,8 @@ const fixture = vi.hoisted(() => ({
   list: vi.fn<(repositoryId: string) => Promise<ReadonlyArray<RepositoryWorkflowJobSummary>>>(),
   page: vi.fn<(repositoryId: string, query: WorkflowJobPageQuery) => Promise<WorkflowJobPage>>(),
   navigate: vi.fn(),
+  job: vi.fn<() => RepositoryWorkflowJob>(),
+  respond: vi.fn<(payload: typeof RespondToWorkflowJob.Type) => RepositoryWorkflowJob>(),
 }));
 const host = (name: string) => (props: PropsWithChildren<Record<string, unknown>>) =>
   createElement(
@@ -60,6 +63,8 @@ vi.mock("../../../../mobile/node_modules/react-native/index.js", () => ({
   View: host("view"),
   Text: host("text"),
   TextInput: host("input"),
+  Pressable: host("button"),
+  Linking: { openURL: vi.fn() },
   Platform: { OS: "ios" },
   Alert: { alert: vi.fn() },
   AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
@@ -149,7 +154,9 @@ const client = {
           message: cause instanceof Error ? cause.message : "Recent list failed",
         }),
     }),
-  getWorkflowJob: () => Effect.succeed(detail),
+  getWorkflowJob: () => Effect.sync(() => fixture.job()),
+  respondToWorkflowJob: ({ payload }: { payload: typeof RespondToWorkflowJob.Type }) =>
+    Effect.sync(() => fixture.respond(payload)),
 };
 type Params = { repositoryId?: string; jobId?: string };
 type Props = { route: { params: Params | undefined } };
@@ -207,6 +214,8 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   fixture.accountId = "account";
   fixture.focused = true;
+  fixture.job.mockReset().mockReturnValue(detail);
+  fixture.respond.mockReset();
   fixture.list.mockReset().mockResolvedValue([]);
   fixture.page.mockReset().mockImplementation(async (repositoryId) => ({
     jobs: await fixture.list(repositoryId),
@@ -244,6 +253,239 @@ effectIt.layer(
         yield* Effect.promise(body);
       }),
     );
+  for (const operation of ["approve", "input", "request_changes"] as const) {
+    screenTest(
+      `keeps native controls blocked after a saved ${operation} until a refreshed acknowledgement`,
+      async () => {
+        const status = operation === "input" ? "awaiting_input" : "awaiting_review";
+        const job: RepositoryWorkflowJob = {
+          ...detail,
+          status,
+          responsePending: false,
+          progress: {
+            revision: 5,
+            status,
+            threadId: ThreadId.make("thread"),
+            detail: null,
+            manualPauseSupported: true,
+            checkpoint:
+              operation === "input"
+                ? {
+                    kind: "input",
+                    checkpointId: "checkpoint",
+                    stepId: "input",
+                    generation: 0,
+                    role: "member",
+                    question: "What should the agent do?",
+                  }
+                : {
+                    kind: "review",
+                    checkpointId: "checkpoint",
+                    turnId: "turn",
+                    checkpointRef: "ref",
+                    checkpointTurnCount: 1,
+                    role: "member",
+                  },
+          },
+        };
+        fixture.job.mockReturnValue(job);
+        fixture.respond.mockImplementation(() => {
+          const pending = { ...job, responsePending: true };
+          fixture.job.mockReturnValue(pending);
+          return pending;
+        });
+        await mount({ repositoryId: "A", jobId: job.jobId });
+        if (operation === "request_changes") await press("Request changes");
+        if (operation !== "approve") {
+          await act(() =>
+            renderer!.root
+              .findAllByType("input")
+              .find(
+                (node) =>
+                  node.props.accessibilityLabel ===
+                  (operation === "input" ? "Checkpoint answer" : "Rework feedback"),
+              )!
+              .props.onChangeText("Keep this response"),
+          );
+        }
+        const before = deliveries.length;
+        await act(async () => {
+          renderer!.root
+            .findAll((node) => String(node.type) === "action")
+            .findLast(
+              (node) =>
+                node.props.label ===
+                (operation === "approve"
+                  ? "Approve result"
+                  : operation === "input"
+                    ? "Submit answer"
+                    : "Request changes"),
+            )!
+            .props.onPress();
+        });
+        await act(async () => {
+          await Promise.all(deliveries.slice(before));
+        });
+        expect(fixture.respond).toHaveBeenCalledTimes(1);
+        expect(fixture.respond.mock.calls[0]![0].operation).toBe(operation);
+        expect(content()).toContain("Response pending; waiting for the environment.");
+        const pendingActions = renderer!.root.findAll(
+          (node) => String(node.type) === "action" && node.props.label === "Response pending",
+        );
+        expect(pendingActions.length).toBeGreaterThan(0);
+        expect(pendingActions.every((node) => node.props.disabled)).toBe(true);
+        expect(
+          renderer!.root.findAll(
+            (node) => String(node.type) === "action" && node.props.label === "Pause workflow",
+          ),
+        ).toHaveLength(0);
+        expect(
+          renderer!.root
+            .findAll((node) => String(node.type) === "action")
+            .find((node) => node.props.label === "Cancel job")!.props.disabled,
+        ).toBe(false);
+        await act(async () => {
+          pendingActions[0]!.props.onPress();
+        });
+        expect(fixture.respond).toHaveBeenCalledTimes(1);
+        fixture.job.mockReturnValue({
+          ...job,
+          status: "running",
+          responsePending: false,
+          progress: { ...job.progress!, revision: 6, status: "running", checkpoint: null },
+        });
+        const readsBeforeFocus = deliveries.length;
+        fixture.focused = false;
+        await act(() =>
+          renderer!.update(
+            <AppAtomRegistryProvider>
+              <WorkflowJobsScreen route={{ params: { repositoryId: "A", jobId: job.jobId } }} />
+            </AppAtomRegistryProvider>,
+          ),
+        );
+        fixture.focused = true;
+        await act(() =>
+          renderer!.update(
+            <AppAtomRegistryProvider>
+              <WorkflowJobsScreen route={{ params: { repositoryId: "A", jobId: job.jobId } }} />
+            </AppAtomRegistryProvider>,
+          ),
+        );
+        await act(async () => {
+          await Promise.all(deliveries.slice(readsBeforeFocus));
+        });
+        expect(content()).not.toContain("Response pending; waiting for the environment.");
+        expect(
+          renderer!.root
+            .findAll((node) => String(node.type) === "action")
+            .find((node) => node.props.label === "Pause workflow")!.props.disabled,
+        ).toBe(false);
+      },
+    );
+  }
+  screenTest(
+    "keeps frozen issue details collapsed and expands them without another relay read",
+    async () => {
+      fixture.job.mockReturnValue({
+        ...detail,
+        origin: {
+          kind: "automation",
+          organizationId: "organization",
+          repositoryId: "A",
+          workflowId: "workflow",
+          source: {
+            provider: "linear",
+            applicationId: "app",
+            workspaceId: "workspace",
+            connectionId: "source",
+            grantId: "grant",
+          },
+          occurrenceId: "event",
+        },
+        issueSnapshot: {
+          workspaceId: "workspace",
+          issueId: "issue",
+          identifier: "ENG-123",
+          title: "Fix navigation",
+          url: "https://linear.app/test/issue/ENG-123",
+          description: "Frozen requirements with ![no downloads](https://images.test/private.png)",
+          team: { id: "team", name: "Engineering" },
+          status: { id: "ready", name: "Ready" },
+          labels: [],
+          issueUpdatedAt: "2026-10-19",
+          retrievedAt: "2026-10-19",
+          authorizationEpoch: 1,
+          credentialVersion: 1,
+        },
+      });
+      await mount({ repositoryId: "A", jobId: detail.jobId });
+      expect(content()).toContain("ENG-123");
+      expect(content()).not.toContain("Frozen requirements");
+      const readsBefore = deliveries.length;
+      const disclosure = () =>
+        renderer!.root
+          .findAll((node) => node.type === "button")
+          .find((node) => node.props.accessibilityState !== undefined)!;
+      await act(() => disclosure().props.onPress());
+      expect(content()).toContain("Frozen requirements");
+      expect(content()).toContain("Ready");
+      expect(deliveries.length).toBe(readsBefore);
+      await act(() => disclosure().props.onPress());
+      expect(content()).not.toContain("Frozen requirements");
+    },
+  );
+  for (const status of ["queued", "done"] as const) {
+    screenTest(`shows truthful ${status} issue context when no snapshot exists`, async () => {
+      fixture.job.mockReturnValue({
+        ...detail,
+        status,
+        instruction: "Stored legacy instructions",
+        origin: {
+          kind: "automation",
+          organizationId: "organization",
+          repositoryId: "A",
+          workflowId: "workflow",
+          source: {
+            provider: "linear",
+            applicationId: "app",
+            workspaceId: "workspace",
+            connectionId: "source",
+            grantId: "grant",
+          },
+          occurrenceId: "event",
+        },
+        event: {
+          issueId: "issue",
+          teamId: "team",
+          stateId: "ready",
+          labelIds: [],
+          identifier: "ENG-123",
+          title: "Fix navigation",
+          url: "https://linear.app/test/issue/ENG-123",
+          occurredAt: "2026-10-19",
+          issueUpdatedAt: "2026-10-19",
+        },
+      });
+      await mount({ repositoryId: "A", jobId: detail.jobId });
+      expect(content()).toContain("ENG-123");
+      if (status === "queued") {
+        expect(content()).toContain("Issue details will be read before this job starts.");
+      } else {
+        expect(content()).not.toContain("will be read");
+        expect(content()).not.toContain("Stored legacy instructions");
+        const before = deliveries.length;
+        await act(() =>
+          renderer!.root
+            .findAll((node) => node.type === "button")
+            .find((node) => node.props.accessibilityState !== undefined)!
+            .props.onPress(),
+        );
+        expect(content()).toContain("No issue snapshot was saved");
+        expect(content()).toContain("Stored legacy instructions");
+        expect(deliveries.length).toBe(before);
+      }
+    });
+  }
   screenTest(
     "loads further active pages, refreshes from the start, and switches to history",
     async () => {

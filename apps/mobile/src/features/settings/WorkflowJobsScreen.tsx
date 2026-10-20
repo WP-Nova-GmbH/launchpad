@@ -1,3 +1,4 @@
+import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import { WorkflowSourceHealth } from "./WorkflowSourceHealth";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -294,7 +295,13 @@ function WorkflowJobsContent(props: Props) {
       | "resume",
   ) =>
     void perform(async () => {
-      if (!selectedJob || !selectedRepository || !scope) return;
+      if (
+        !selectedJob ||
+        !selectedRepository ||
+        !scope ||
+        (manualState.responsePending && operation !== "cancel")
+      )
+        return;
       const checkpoint = selectedJob.progress?.checkpoint;
       if (["approve", "input", "request_changes"].includes(operation) && !checkpoint) return;
       const request = beginWorkflowJobRequest(appAtomRegistry, scope, selectedJob.jobId, uuidv4());
@@ -394,7 +401,7 @@ function WorkflowJobsContent(props: Props) {
         <View className="gap-4">
           <SettingsSection title={selectedJob.workflow?.definition.name ?? "Workflow job"}>
             <View className="gap-2 p-4">
-              <Text className="text-foreground">{selectedJob.instruction}</Text>
+              <WorkflowIssueDetails key={jobKey} job={selectedJob} />
               {selectedJob.origin?.kind === "automation" ? (
                 <Text className="text-xs text-foreground-muted">
                   Started by workflow
@@ -444,13 +451,15 @@ function WorkflowJobsContent(props: Props) {
               <SettingsActionRow
                 icon="checkmark.circle"
                 label={
-                  selectedJob.progress?.approvalPending
-                    ? "Approval pending"
-                    : selectedJob.progress?.retryableApproval
-                      ? selectedJob.status === "finishing"
-                        ? "Retry completion"
-                        : "Retry approval"
-                      : "Approve result"
+                  manualState.responsePending
+                    ? "Response pending"
+                    : selectedJob.progress?.approvalPending
+                      ? "Approval pending"
+                      : selectedJob.progress?.retryableApproval
+                        ? selectedJob.status === "finishing"
+                          ? "Retry completion"
+                          : "Retry approval"
+                        : "Approve result"
                 }
                 disabled={
                   busy || manualState.checkpointBlocked || selectedJob.progress?.approvalPending
@@ -464,6 +473,7 @@ function WorkflowJobsContent(props: Props) {
               <SettingsActionRow
                 icon="pencil"
                 label="Request changes"
+                disabled={busy || manualState.checkpointBlocked}
                 onPress={() => setFeedbackOpen(true)}
               />
             ) : null}
@@ -509,7 +519,11 @@ function WorkflowJobsContent(props: Props) {
               <SettingsActionRow
                 icon="checkmark.circle"
                 label={
-                  manualState.status === "awaiting_input" ? "Submit answer" : "Request changes"
+                  manualState.responsePending
+                    ? "Response pending"
+                    : manualState.status === "awaiting_input"
+                      ? "Submit answer"
+                      : "Request changes"
                 }
                 disabled={
                   busy ||
@@ -608,7 +622,7 @@ function WorkflowJobsContent(props: Props) {
                 icon="xmark.circle.fill"
                 label={
                   selectedJob.status === "cancelling"
-                    ? selectedJob.progress?.retryableCancellation
+                    ? selectedJob.progress?.retryableCancellation && !manualState.responsePending
                       ? "Retry cancellation"
                       : "Cancellation pending"
                     : "Cancel job"
@@ -617,19 +631,25 @@ function WorkflowJobsContent(props: Props) {
                 disabled={
                   busy ||
                   (selectedJob.status === "cancelling" &&
-                    !selectedJob.progress?.retryableCancellation)
+                    (manualState.responsePending || !selectedJob.progress?.retryableCancellation))
                 }
                 onPress={() =>
                   selectedJob.status === "cancelling"
                     ? void respond("retry_cancellation")
-                    : Alert.alert("Cancel run?", selectedJob.instruction, [
-                        { text: "Keep run", style: "cancel" },
-                        {
-                          text: "Cancel run",
-                          style: "destructive",
-                          onPress: () => void respond("cancel"),
-                        },
-                      ])
+                    : Alert.alert(
+                        "Cancel run?",
+                        selectedJob.issueSnapshot?.identifier ??
+                          selectedJob.event?.identifier ??
+                          selectedJob.instruction.slice(0, 140),
+                        [
+                          { text: "Keep run", style: "cancel" },
+                          {
+                            text: "Cancel run",
+                            style: "destructive",
+                            onPress: () => void respond("cancel"),
+                          },
+                        ],
+                      )
                 }
               />
             ) : null}

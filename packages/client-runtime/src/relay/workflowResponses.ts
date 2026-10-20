@@ -1,5 +1,6 @@
 import {
   WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT,
+  isTerminalWorkflowJob,
   type WorkflowControl,
   type WorkflowJobProgress,
   type RepositoryWorkflowJob,
@@ -49,6 +50,7 @@ export function workflowManualControlState(job: RepositoryWorkflowJob | null) {
   const progress = job?.progress;
   const hold = progress?.manualPause;
   const pending = job?.pendingManualControl;
+  const responsePending = job?.responsePending === true && !isTerminalWorkflowJob(job.status);
   const status = progress?.underlyingStatus ?? progress?.status;
   const eligible =
     progress?.manualPauseSupported === true &&
@@ -60,23 +62,27 @@ export function workflowManualControlState(job: RepositoryWorkflowJob | null) {
     canPause:
       eligible &&
       !pending &&
+      !responsePending &&
       !hold &&
       !progress.approvalPending &&
       ["preparing", "running", "awaiting_review", "awaiting_input", "waiting_capacity"].includes(
         status!,
       ),
-    canResume: eligible && !pending && Boolean(hold),
-    checkpointBlocked: Boolean(pending || hold),
+    canResume: eligible && !pending && !responsePending && Boolean(hold),
+    checkpointBlocked: Boolean(pending || hold || responsePending),
+    responsePending,
     status,
     message: pending
       ? `${pending.operation === "pause" ? "Pause" : "Resume"} requested; waiting for the environment.`
-      : hold?.state === "paused"
-        ? "Paused. Setup and previews remain running."
-        : hold?.state === "requested"
-          ? status === "paused"
-            ? "Pause is waiting for recovery. Resume preserves the existing failure."
-            : "Pausing after the current automatic step, including its preparation."
-          : null,
+      : responsePending
+        ? "Response pending; waiting for the environment."
+        : hold?.state === "paused"
+          ? "Paused. Setup and previews remain running."
+          : hold?.state === "requested"
+            ? status === "paused"
+              ? "Pause is waiting for recovery. Resume preserves the existing failure."
+              : "Pausing after the current automatic step, including its preparation."
+            : null,
   };
 }
 
@@ -118,7 +124,8 @@ export function workflowActionState(job: RepositoryWorkflowJob | null) {
       action?.retryable &&
       job?.status === "paused" &&
       !progress?.manualPause &&
-      !job.pendingManualControl,
+      !job.pendingManualControl &&
+      !job.responsePending,
     ),
   };
 }

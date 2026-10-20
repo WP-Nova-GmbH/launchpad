@@ -14,7 +14,8 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { summaries as automationSummaries } from "../workflowEvents/Summaries.ts";
 import { targetKey } from "../workflowEvents/Routing.ts";
 import { prepare as prepareAutomationSave } from "../workflowEvents/Preparation.ts";
-import { Workflows, WorkflowPersistenceError } from "../jobs/Workflows.ts";
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
+import { Workflows, WorkflowPersistenceError, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import { refreshWorkflowJob, validateWorkflowTarget } from "../jobs/WorkflowDispatcher.ts";
 import {
   resolveMembership,
@@ -23,6 +24,26 @@ import {
 } from "./TenancyApi.ts";
 import { tenancyNotFound } from "./tenancyErrors.ts";
 import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
+
+const jobForClient = (row: WorkflowJobRecord) => ({
+  ...row.record,
+  responsePending: row.pendingControl !== null && !isTerminalWorkflowJob(row.record.status),
+});
+
+export const refreshWorkflowJobForClient = Effect.fn("WorkflowsApi.refreshForClient")(function* (
+  jobId: string,
+) {
+  const store = yield* Workflows;
+  let row = yield* store.getJob(jobId);
+  if (!row) return null;
+  if (row.record.origin?.kind === "automation") {
+    yield* wakeWorkflows({ occurrenceId: row.record.origin.occurrenceId });
+  } else {
+    yield* refreshWorkflowJob(jobId);
+    row = yield* store.getJob(jobId);
+  }
+  return row ? jobForClient(row) : null;
+});
 
 export const authorizeWorkflowRepository = Effect.fn("WorkflowsApi.authorize")(function* (
   repositoryId: string,
@@ -62,13 +83,13 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
         return yield* new WorkflowConflictError({
           message: "This retry belongs to another request.",
         });
-      return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+      return (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
     }
     const receipt = row.record.progress?.actions?.find(
       (action) => action.actionId === payload.actionId,
     );
     if (!pending && receipt?.retryRevision === payload.expectedRevision)
-      return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+      return (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
   }
   const manual = payload.operation === "pause" || payload.operation === "resume";
   if (manual) {
@@ -82,7 +103,7 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
           return yield* new WorkflowConflictError({
             message: "This control identity belongs to another request.",
           });
-        return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+        return (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
       }
     }
     const receipt = row.record.progress?.lastManualControl;
@@ -91,7 +112,7 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
         return yield* new WorkflowConflictError({
           message: "This control identity belongs to another request.",
         });
-      return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+      return (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
     }
     const progress = row.record.progress;
     if (!progress?.manualPauseSupported)
@@ -124,8 +145,8 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     return yield* new WorkflowConflictError({
       message: "Resume the manual pause before responding or retrying.",
     });
-  if (isTerminalWorkflowJob(row.status)) return row.record;
-  if (payload.operation === "cancel" && row.status === "cancelling") return row.record;
+  if (isTerminalWorkflowJob(row.status)) return jobForClient(row);
+  if (payload.operation === "cancel" && row.status === "cancelling") return jobForClient(row);
   if (
     (row.pendingControl &&
       !(payload.operation === "cancel" && row.pendingControl.response.operation !== "cancel")) ||
@@ -183,13 +204,14 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     return yield* new WorkflowConflictError({
       message: "This review changed. Refresh before approving.",
     });
+  const requiredProtocol = row.record.requiredProtocol ?? 2;
   yield* store.updateJob(
     row,
     {
       ...row.record,
       ...(manual
         ? {
-            requiredProtocol: row.record.requiredProtocol === 7 ? (7 as const) : (6 as const),
+            requiredProtocol: requiredProtocol >= 6 ? requiredProtocol : 6,
             pendingManualControl: payload,
           }
         : payload.operation === "cancel"
@@ -197,12 +219,7 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
           : {}),
       ...(payload.operation === "input" || payload.operation === "request_changes"
         ? {
-            requiredProtocol:
-              row.record.requiredProtocol === 7
-                ? (7 as const)
-                : row.record.requiredProtocol === 6
-                  ? (6 as const)
-                  : (5 as const),
+            requiredProtocol: requiredProtocol >= 5 ? requiredProtocol : 5,
           }
         : {}),
       ...(payload.operation === "cancel"
@@ -222,7 +239,7 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     },
     { userId: membership.userId, response: payload },
   );
-  return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+  return (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
 });
 const errors = mapRelayCommonApiErrors("not_authorized");
 export const saveRepositoryWorkflow = Effect.fn("WorkflowsApi.save")(function* (
@@ -354,7 +371,7 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
           createdAt: now,
           checkedAt: now,
         });
-        return (yield* refreshWorkflowJob(jobId)) ?? job;
+        return (yield* refreshWorkflowJobForClient(jobId)) ?? job;
       }).pipe(errors),
     )
     .handle("getJob", ({ params }) =>
@@ -363,7 +380,7 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
         const row = yield* (yield* Workflows).getJob(params.jobId);
         if (!row || row.repositoryId !== params.repositoryId)
           return yield* tenancyNotFound("repository_not_found");
-        return (yield* refreshWorkflowJob(params.jobId)) ?? row.record;
+        return (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
       }).pipe(errors),
     )
     .handle("respond", ({ params, payload }) => respondToWorkflowJob(params, payload).pipe(errors)),

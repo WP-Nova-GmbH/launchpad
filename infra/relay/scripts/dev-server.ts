@@ -1,3 +1,5 @@
+import * as AutomaticOffers from "../src/workflowEvents/AutomaticOffer.ts";
+import * as WorkflowWake from "../src/jobs/WorkflowWake.ts";
 import { workflowEventsRoute } from "../src/http/WorkflowEventsRoute.ts";
 import { repositoryAccessServerApi } from "../src/http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "../src/tenancy/RepositoryPolicies.ts";
@@ -324,7 +326,8 @@ const managedEndpointClientsLayer =
         }),
       ).pipe(Layer.provide(FetchHttpClient.layer));
 
-const runtimeLayer = Layer.empty
+const runtimeLayer = WorkflowWake.layer
+  .pipe(Layer.provideMerge(AutomaticOffers.layer))
   .pipe(
     Layer.provideMerge(MobileRegistrations.layer),
     Layer.provideMerge(AgentActivityPublisher.layer),

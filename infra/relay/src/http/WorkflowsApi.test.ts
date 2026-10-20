@@ -12,7 +12,11 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { Repositories } from "../tenancy/Repositories.ts";
-import { authorizeWorkflowRepository, respondToWorkflowJob } from "./WorkflowsApi.ts";
+import {
+  authorizeWorkflowRepository,
+  respondToWorkflowJob,
+  refreshWorkflowJobForClient,
+} from "./WorkflowsApi.ts";
 
 it.effect(
   "allows shared job reads/run while checking the responder's current maintainer role",
@@ -520,6 +524,7 @@ const manualApiHarness = Effect.gen(function* () {
     row,
     role,
     writes,
+    refresh: () => refreshWorkflowJobForClient("manual-job").pipe(Effect.provide(services)),
     respond: (payload: typeof RespondToWorkflowJob.Type) =>
       respondToWorkflowJob({ repositoryId: "repo", jobId: "manual-job" }, payload).pipe(
         Effect.provide(services),
@@ -642,6 +647,192 @@ for (const operation of ["pause", "input"] as const)
       assert.equal((yield* h.respond(payload)).requiredProtocol, 7);
     }).pipe(Effect.provide(NodeCrypto.layer)),
   );
+const automaticOrigin = {
+  kind: "automation",
+  organizationId: "org",
+  repositoryId: "repo",
+  workflowId: "flow",
+  source: {
+    provider: "linear",
+    applicationId: "native-app",
+    workspaceId: "workspace",
+    connectionId: "connection",
+    grantId: "grant",
+  },
+  occurrenceId: "event",
+} as const;
+
+for (const operation of ["pause", "resume", "input", "request_changes"] as const)
+  it.effect(
+    `saves automatic ${operation} with its protocol, actor and pending response intact`,
+    () =>
+      Effect.gen(function* () {
+        const h = yield* manualApiHarness;
+        const origin = automaticOrigin;
+        const status =
+          operation === "resume"
+            ? "paused"
+            : operation === "request_changes"
+              ? "awaiting_review"
+              : "awaiting_input";
+        yield* Ref.update(
+          h.row,
+          (row) =>
+            ({
+              ...row,
+              status,
+              submitterUserId: null,
+              record: {
+                ...row.record,
+                status,
+                origin,
+                requiredProtocol: 8,
+                progress: {
+                  ...row.record.progress!,
+                  status,
+                  ...(operation === "resume"
+                    ? {
+                        manualPause: { state: "paused" as const },
+                        underlyingStatus: "awaiting_input" as const,
+                      }
+                    : {}),
+                  ...(operation === "request_changes"
+                    ? {
+                        checkpoint: {
+                          kind: "review" as const,
+                          role: "member" as const,
+                          checkpointId: "review",
+                          turnId: "turn",
+                          checkpointRef: "ref",
+                          checkpointTurnCount: 1,
+                        },
+                      }
+                    : {}),
+                },
+              },
+            }) satisfies WorkflowJobRecord,
+        );
+        const payload =
+          operation === "pause" || operation === "resume"
+            ? { operation, controlId: "control", expectedRevision: 5 }
+            : {
+                operation,
+                checkpointId: operation === "input" ? "input" : "review",
+                expectedRevision: 5,
+                text: "Keep this response",
+              };
+        const saved = yield* h.respond(payload);
+        assert.strictEqual(saved.requiredProtocol, 8);
+        assert.deepStrictEqual(saved.origin, origin);
+        const row = yield* Ref.get(h.row);
+        assert.isNull(row.submitterUserId);
+        assert.deepStrictEqual(row.pendingControl, { userId: "maintainer", response: payload });
+        assert.strictEqual(yield* Ref.get(h.writes), 1);
+        if (payload.operation === "pause" || payload.operation === "resume") {
+          assert.deepStrictEqual(saved.pendingManualControl, payload);
+          yield* h.respond(payload);
+          assert.strictEqual(yield* Ref.get(h.writes), 1);
+        }
+      }).pipe(Effect.provide(NodeCrypto.layer)),
+  );
+
+for (const operation of ["approve", "input", "request_changes"] as const)
+  it.effect(`exposes a durable pending ${operation} on every read until acknowledgement`, () =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      const status = operation === "input" ? "awaiting_input" : "awaiting_review";
+      const checkpointId = operation === "input" ? "input" : "review";
+      yield* Ref.update(
+        h.row,
+        (row) =>
+          ({
+            ...row,
+            submitterUserId: null,
+            status,
+            record: {
+              ...row.record,
+              origin: automaticOrigin,
+              requiredProtocol: 8,
+              status,
+              progress: {
+                ...row.record.progress!,
+                status,
+                ...(operation === "input"
+                  ? {}
+                  : {
+                      checkpoint: {
+                        kind: "review" as const,
+                        role: "member" as const,
+                        checkpointId,
+                        turnId: "turn",
+                        checkpointRef: "ref",
+                        checkpointTurnCount: 1,
+                      },
+                    }),
+              },
+            },
+          }) satisfies WorkflowJobRecord,
+      );
+      const payload =
+        operation === "approve"
+          ? { operation, checkpointId, expectedRevision: 5 }
+          : { operation, checkpointId, expectedRevision: 5, text: "Keep this response" };
+      const pending = yield* h.respond(payload);
+      assert.isTrue(pending.responsePending);
+      assert.isTrue((yield* h.refresh())!.responsePending);
+      assert.isUndefined((yield* Ref.get(h.row)).record.responsePending);
+      assert.strictEqual((yield* Ref.get(h.row)).pendingControl?.response.operation, operation);
+      yield* Ref.update(
+        h.row,
+        (row) =>
+          ({
+            ...row,
+            pendingControl: null,
+            status: "running",
+            record: {
+              ...row.record,
+              status: "running",
+              progress: {
+                ...row.record.progress!,
+                revision: 6,
+                status: "running",
+                checkpoint: null,
+              },
+            },
+          }) satisfies WorkflowJobRecord,
+      );
+      assert.isFalse((yield* h.refresh())!.responsePending);
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+  );
+
+it.effect(
+  "Cancel supersedes a pending response and terminal reads clear the pending indicator",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      yield* h.respond({
+        operation: "input",
+        checkpointId: "input",
+        expectedRevision: 5,
+        text: "Answer",
+      });
+      const cancelled = yield* h.respond({ operation: "cancel" });
+      assert.strictEqual(cancelled.status, "cancelling");
+      assert.isTrue(cancelled.responsePending);
+      assert.strictEqual((yield* Ref.get(h.row)).pendingControl?.response.operation, "cancel");
+      yield* Ref.update(
+        h.row,
+        (row) =>
+          ({
+            ...row,
+            status: "cancelled",
+            record: { ...row.record, status: "cancelled" },
+          }) satisfies WorkflowJobRecord,
+      );
+      assert.isFalse((yield* h.refresh())!.responsePending);
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
 it.effect(
   "binds publishing retries to current action/revision and preserves pending/replayed receipts",
   () =>

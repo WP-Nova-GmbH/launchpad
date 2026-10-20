@@ -9,7 +9,7 @@ import {
 import { WorkflowSourceError, RelayJobId } from "@t3tools/contracts/relay";
 import { RelayDb } from "../db.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
-import { validateWorkflowTarget } from "../jobs/WorkflowDispatcher.ts";
+import { validateWorkflowTarget } from "../jobs/WorkflowTarget.ts";
 import * as Sources from "../workflowSources/Sources.ts";
 import * as Store from "../workflowSources/Store.ts";
 import * as Fence from "./Fence.ts";

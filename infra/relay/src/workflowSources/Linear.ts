@@ -5,7 +5,7 @@ import * as Redacted from "effect/Redacted";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
-import { WORKFLOW_LINEAR_CALLBACK_PATH } from "@t3tools/contracts/relay";
+import { WorkflowSourceError, WORKFLOW_LINEAR_CALLBACK_PATH } from "@t3tools/contracts/relay";
 import { RelayConfiguration } from "../Config.ts";
 import { fail, now } from "./Store.ts";
 
@@ -39,6 +39,7 @@ const ErrorBody = Schema.Struct({
 });
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeError = Schema.decodeUnknownEffect(ErrorBody);
+const isWorkflowSourceError = Schema.is(WorkflowSourceError);
 const decodeTokens = Schema.decodeUnknownEffect(Tokens);
 const decodeIdentity = Schema.decodeUnknownEffect(Schema.Struct({ data: Identity }));
 export const configuration = Effect.gen(function* () {
@@ -87,7 +88,10 @@ export const authorizationUrl = Effect.fn("workflowSources.linear.authorizationU
   return url.toString();
 });
 export const request = Effect.fn("workflowSources.linear.request")(
-  function* (req: HttpClientRequest.HttpClientRequest, stage: "code" | "refresh" | "read") {
+  function* (
+    req: HttpClientRequest.HttpClientRequest,
+    stage: "code" | "refresh" | "read" | "issue",
+  ) {
     const http = yield* HttpClient.HttpClient;
     const response = yield* http
       .execute(req)
@@ -97,14 +101,23 @@ export const request = Effect.fn("workflowSources.linear.request")(
         () => new Uint8Array(0),
         (prev, chunk) => {
           if (prev.length + chunk.length > 524_288)
-            return Effect.fail(fail("unavailable", "Linear returned too much data."));
+            return Effect.fail(
+              fail(
+                stage === "issue" ? "invalid_input" : "unavailable",
+                "Linear returned too much issue data.",
+              ),
+            );
           const next = new Uint8Array(prev.length + chunk.length);
           next.set(prev);
           next.set(chunk, prev.length);
           return Effect.succeed(next);
         },
       ),
-      Effect.mapError(() => fail("unavailable", "Could not read the Linear response.")),
+      Effect.mapError((error) =>
+        isWorkflowSourceError(error)
+          ? error
+          : fail("unavailable", "Could not read the Linear response."),
+      ),
     );
     const value = yield* decodeJson(new TextDecoder().decode(bytes)).pipe(
       Effect.orElseSucceed(() => null),
@@ -144,10 +157,19 @@ export const request = Effect.fn("workflowSources.linear.request")(
         Math.min(time + 86_400_000, Math.max(time + 1000, ...candidates)),
       );
     }
-    if (stage === "read" && response.status === 401)
+    if ((stage === "read" || stage === "issue") && response.status === 401)
       return yield* fail("reconnect_required", "Linear access needs refreshing.");
     if (response.status === 403)
       return yield* fail("forbidden", "This Linear resource is not accessible.");
+    if (stage === "issue" && error.errors?.length)
+      return yield* fail(
+        error.errors.some((e) =>
+          ["FORBIDDEN", "NOT_FOUND", "ENTITY_NOT_FOUND"].includes(e.extensions?.code ?? ""),
+        )
+          ? "forbidden"
+          : "invalid_input",
+        "The Linear issue could not be read completely.",
+      );
     if (
       response.status < 200 ||
       response.status >= 300 ||
@@ -218,6 +240,7 @@ export const graphql = Effect.fn("workflowSources.linear.graphql")(function* <A>
   query: string,
   variables: Record<string, unknown>,
   decode: (value: unknown) => Effect.Effect<{ readonly data: A }, Schema.SchemaError>,
+  stage: "read" | "issue" = "read",
 ) {
   const req = yield* HttpClientRequest.bodyJson(
     HttpClientRequest.post("https://api.linear.app/graphql").pipe(
@@ -225,9 +248,11 @@ export const graphql = Effect.fn("workflowSources.linear.graphql")(function* <A>
     ),
     { query, variables },
   ).pipe(Effect.mapError(() => fail("invalid_input", "Invalid Linear query.")));
-  const result = yield* request(req, "read");
+  const result = yield* request(req, stage);
   const envelope = yield* decode(result).pipe(
-    Effect.mapError(() => fail("unavailable", "Linear returned incomplete data.")),
+    Effect.mapError(() =>
+      fail(stage === "issue" ? "invalid_input" : "unavailable", "Linear returned incomplete data."),
+    ),
   );
   return envelope.data;
 });

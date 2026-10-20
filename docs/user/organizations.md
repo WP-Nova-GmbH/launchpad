@@ -168,6 +168,15 @@ history, and response drafts remain available while waiting for the machine to a
 
 When automatic triggering is available on your relay, open **Trigger settings** in the editor. Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected status. Optional labels must all match. You can connect Linear and allow repository use from the editor without leaving your draft. Enabling requires verified event delivery for that exact team and a validated execution target. Save applies the rule and its On/Off setting; changed rules apply only to events after Save. The catalog shows the saved state and any source or target problem. Turning On without a trigger opens setup; turning Off stops new event admissions and preserves existing jobs and manual Run. Archive disables automation, and restore leaves it Off. Automatic execution depends on your relay’s available integration and rollout; configuring a trigger alone does not confirm that a job has started.
 
+Before an automatic job is handed to its environment, Launchpad reads the issue’s current title,
+description, status and labels. Comments and images are excluded. The run keeps those details even
+if the issue changes later; open **Issue details** on the run to inspect what it used. Later team,
+status or label changes do not cancel a job already created by an event. Offline or busy environments
+leave jobs queued. If issue context exceeds 32,000 characters including its metadata, shorten the
+description and refresh the run; Launchpad does not start with truncated requirements. Source or
+issue access problems keep the job queued with recovery guidance. Disconnecting a source prevents
+new handoffs; work already marked Starting may continue. Use Cancel run to stop existing work.
+
 **Runs** opens with active jobs, oldest first, including jobs from archived workflows. Use
 **Needs attention** to find human checkpoints, pauses and blocked jobs, or **History** for completed
 runs, newest first. Load more runs to reach older history or further active jobs. Refresh starts from
