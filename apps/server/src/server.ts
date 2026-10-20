@@ -1,3 +1,8 @@
+import * as CheckoutAccess from "./workspace/CheckoutAccess.ts";
+import { readInstalledThreadVm } from "./relay/ThreadVmEnrollment.ts";
+import { threadVmProviderAuthRouteLayer } from "./relay/ThreadVmProviderAuth.ts";
+import { managedTunnelsDisabled } from "./cloud/config.ts";
+import { runThreadVmManagedEndpoint } from "./relay/ThreadVmManagedEndpoint.ts";
 import * as ThreadPreparationReactor from "./orchestration/ThreadPreparationReactor.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
@@ -53,6 +58,7 @@ import { ProviderAdapterRegistryLive } from "./provider/Layers/ProviderAdapterRe
 import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as ResetCreditCoordinator from "./provider/Layers/resetCreditCoordinator.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
+import { OrchestrationEventStoreLive } from "./persistence/Layers/OrchestrationEventStore.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
 import * as RepositoryAccess from "./auth/RepositoryAccess.ts";
 import { ProviderAuthServiceLive } from "./provider/Layers/ProviderAuthService.ts";
@@ -96,6 +102,8 @@ import * as ThreadSettlementReactor from "./orchestration/ThreadSettlementReacto
 import * as StorageCleanup from "./storageCleanup.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "./orchestration/ThreadPullRequestReactor.ts";
+import * as ThreadExecution from "./relay/ThreadExecution.ts";
+import * as ThreadRelayCoordinator from "./relay/ThreadRelayCoordinator.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as OrganizationProjectCatalogRelay from "./relay/OrganizationProjectCatalogRelay.ts";
 import * as OrganizationProviderAccounts from "./relay/OrganizationProviderAccounts.ts";
@@ -269,6 +277,8 @@ const HttpServerLive = Layer.unwrap(
 
 const PlatformServicesLive = NodeServices.layer;
 
+const ThreadExecutionLayerLive = ThreadExecution.layer.pipe(Layer.provide(ServerSecretStore.layer));
+
 const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(OrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
@@ -280,6 +290,14 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ThreadSettlementReactor.layer),
   Layer.provideMerge(PullRequestSyncReactor.layer),
   Layer.provideMerge(ThreadPullRequestReactor.layer),
+  Layer.provideMerge(
+    ThreadRelayCoordinator.layer.pipe(
+      Layer.provide(ProviderSessionRuntime.layer),
+      Layer.provide(ProcessRunner.layer),
+      Layer.provide(ServerSecretStore.layer),
+      Layer.provide(ThreadExecutionLayerLive),
+    ),
+  ),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(
     OrganizationProjectCatalogRelay.layer.pipe(Layer.provide(ServerSecretStore.layer)),
@@ -298,6 +316,8 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
 // NDJSON writers and is provided at the outer runtime layer so both
 // `ProviderService` and the per-instance drivers read the same logger pair.
 const ProviderLayerLive = ProviderServiceLive.pipe(
+  Layer.provide(OrchestrationEventStoreLive),
+  Layer.provide(ThreadExecutionLayerLive),
   Layer.provide(ProviderAdapterRegistryLive),
   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
 );
@@ -427,6 +447,7 @@ const CheckpointingLayerLive = Layer.empty.pipe(
 const PortScannerLayerLive = PortScanner.layer.pipe(Layer.provide(ProcessRunner.layer));
 
 const TerminalLayerLive = TerminalManager.layer.pipe(
+  Layer.provide(ThreadExecutionLayerLive),
   Layer.provide(PtyAdapterLive),
   Layer.provide(PortScannerLayerLive),
   Layer.provide(NativeTelemetryLayerLive),
@@ -640,6 +661,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     assetRouteLayer,
     attachmentUploadRouteLayer,
     deviceHubProxyRouteLayer,
+    threadVmProviderAuthRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
   ),
@@ -857,6 +879,7 @@ const makeServerLayer = Layer.unwrap(
         }
         yield* forkParked(
           Effect.gen(function* () {
+            const tunnelsDisabled = yield* managedTunnelsDisabled;
             if (!cleanupBeforeActivation) {
               yield* Effect.addFinalizer(() => releaseManagedTunnel);
             }
@@ -864,6 +887,10 @@ const makeServerLayer = Layer.unwrap(
             const address = server.address;
             if (typeof address === "string" || !("port" in address)) return;
             const localOrigin = `http://127.0.0.1:${address.port}`;
+            if (yield* readInstalledThreadVm()) {
+              if (!tunnelsDisabled) yield* runThreadVmManagedEndpoint;
+              return;
+            }
             const endpointRuntime = yield* CloudManagedEndpointRuntime.CloudManagedEndpointRuntime;
             const recoveryLock = yield* Semaphore.make(1);
             let lastRecoveryAtMillis = 0;
@@ -939,6 +966,7 @@ const makeServerLayer = Layer.unwrap(
                   ),
                 )
               : null;
+            if (tunnelsDisabled && desiredCliLinkMode !== "publish_only") return;
             // A publish-only link must not expose the host, even if a managed
             // config from an earlier link is still stored.
             const startedConfirmed =
@@ -1090,6 +1118,7 @@ const makeServerLayer = Layer.unwrap(
       Layer.provideMerge(FetchHttpClient.layer),
       // PR reads, Git operations, and WebSocket discovery share one process limiter.
       Layer.provide(VcsProcess.layer),
+      Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(PersistenceLayerLive))),
       // Below VcsProcess on purpose: it is what VcsProcess picks up when this
       // environment is a managed executor.
       Layer.provideMerge(

@@ -10,11 +10,13 @@ this is that VM. On the one machine:
   [`infra/relay/Dockerfile`](../relay/Dockerfile), supervised by the `launchpad-relay` systemd
   unit on `127.0.0.1:8610`.
 - **Caddy** — TLS for the relay domain, reverse-proxying to the relay.
-- **Docker** — org machines provision as sibling containers on this host, booting the executor
-  image built from `infra/executor-image/Dockerfile`.
+
+Thread VMs run on a separate self-hosted E2B Linux host; see
+[the E2B host setup](../../docs/operations/e2b-host-setup.md). The relay container has no
+Docker socket access and does not create Docker or Hetzner executor machines.
 
 Deploys ship the developer's local working tree with `deploy.sh` — rsync to the host, build the
-images there, migrate, restart. No Git remote is involved, so unpublished work deploys exactly as
+relay image there, migrate, restart. No Git remote is involved, so unpublished work deploys exactly as
 it is on disk, and the host never needs a Node toolchain.
 
 ## Provision
@@ -45,7 +47,7 @@ infra/hetzner/deploy.sh
 ```
 
 The host defaults to `root@<relay_public_ip>` from this module's Terraform state; pass
-`user@host` to override. The first build is slow (full dependency install in both images);
+`user@host` to override. The first build is slow (full relay dependency install);
 afterwards the pnpm store is cached by lockfile and deploys are mostly rsync plus a rebuild.
 
 ### Deployment CI
@@ -61,7 +63,7 @@ personal key.
 
 The relay restarts until its secrets exist. Fill `/etc/launchpad-relay/relay.env` on the server
 from [`../relay/.env.example`](../relay/.env.example) — Clerk keys and audience at minimum, plus
-`GITHUB_APP_*` and `HETZNER_API_TOKEN` (same Launchpad project) if those features are in use —
+`GITHUB_APP_*` if the GitHub integration is in use —
 then `systemctl restart launchpad-relay`.
 
 `GITHUB_APP_*` is the relay's GitHub App — the one every organization's **Connect GitHub**
@@ -121,5 +123,5 @@ relay but not for a hosted one.
 ## Current limits
 
 The Node relay entry does not yet replace every Cloudflare binding (that is the rest of M4):
-APNs delivery is dropped rather than queued, and org machines run as Docker containers on this
-host rather than as separate Hetzner servers.
+APNs delivery is dropped rather than queued. E2B thread VM rollout still requires the runtime
+and product verification gates described in the E2B host guide.

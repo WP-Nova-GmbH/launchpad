@@ -1,0 +1,327 @@
+--- a/packages/shared/pkg/storage/storage_fs.go
++++ b/packages/shared/pkg/storage/storage_fs.go
+@@ -137,12 +137,15 @@
+ 		return err
+ 	}
+ 	defer release()
+-	_, err = o.replaceFrom(bytes.NewReader(data))
++	_, err = o.replaceFrom(ctx, bytes.NewReader(data))
+ 
+ 	return err
+ }
+ 
+ func (o *fsObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (*FullFrameTable, [32]byte, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, [32]byte{}, err
++	}
+ 	release, err := AcquireLocalBuildWrite(ctx, o.basePath, o.key)
+ 	if err != nil {
+ 		return nil, [32]byte{}, err
+@@ -178,10 +181,16 @@
+ 		return nil, [32]byte{}, fmt.Errorf("failed to stat file %s: %w", path, err)
+ 	}
+ 	if dstInfo, statErr := os.Stat(o.path); statErr == nil && os.SameFile(srcInfo, dstInfo) {
+-		return nil, [32]byte{}, nil
+-	}
+-
+-	n, err := o.replaceFrom(r)
++		if err := ctx.Err(); err != nil {
++			return nil, [32]byte{}, err
++		}
++		if err := r.Sync(); err != nil {
++			return nil, [32]byte{}, err
++		}
++		return nil, [32]byte{}, syncPublicationDirectories(filepath.Dir(o.path))
++	}
++
++	n, err := o.replaceFrom(ctx, r)
+ 	if err != nil {
+ 		return nil, [32]byte{}, err
+ 	}
+@@ -220,7 +229,7 @@
+ 	// partial read, compress error) doesn't leave Size() reporting the new size
+ 	// against the unchanged data file.
+ 	sidecarPath := SizeSidecar(o.path)
+-	if writeErr := os.WriteFile(sidecarPath, []byte(strconv.FormatInt(fi.Size(), 10)), 0o644); writeErr != nil {
++	if _, writeErr := replaceFile(ctx, sidecarPath, bytes.NewReader([]byte(strconv.FormatInt(fi.Size(), 10)))); writeErr != nil {
+ 		return nil, [32]byte{}, fmt.Errorf("failed to write uncompressed-size sidecar for %s: %w", o.path, writeErr)
+ 	}
+ 
+@@ -317,7 +326,10 @@
+ 	return handle, nil
+ }
+ 
+-func replaceFile(path string, r io.Reader) (int64, error) {
++func replaceFile(ctx context.Context, path string, r io.Reader) (int64, error) {
++	if err := ctx.Err(); err != nil {
++		return 0, err
++	}
+ 	dir := filepath.Dir(path)
+ 	if err := os.MkdirAll(dir, 0o755); err != nil {
+ 		return 0, err
+@@ -344,38 +356,91 @@
+ 			return 0, statErr
+ 		}
+ 		if info.Mode().IsRegular() {
+-			n, err = copySparseFile(tmp, source)
++			n, err = copySparseFile(ctx, tmp, source)
+ 		} else {
+-			n, err = io.Copy(tmp, r)
++			n, err = io.Copy(tmp, publicationReader{ctx: ctx, reader: r})
+ 		}
+ 	} else {
+-		n, err = io.Copy(tmp, r)
++		n, err = io.Copy(tmp, publicationReader{ctx: ctx, reader: r})
+ 	}
+ 	if err != nil {
+ 		tmp.Close()
+ 
+ 		return n, err
+ 	}
++	if err := ctx.Err(); err != nil {
++		tmp.Close()
++		return n, err
++	}
++	if err := tmp.Sync(); err != nil {
++		tmp.Close()
++		return n, err
++	}
+ 	if err := tmp.Close(); err != nil {
+ 		return n, err
+ 	}
++	if err := ctx.Err(); err != nil {
++		return n, err
++	}
+ 
+ 	if err := os.Rename(tmpPath, path); err != nil {
+ 		return n, err
+ 	}
+ 
+-	return n, nil
++	return n, syncPublicationDirectories(dir)
++}
++
++// Success is a recoverable disk reference: flush new directory entries as well
++// as the file, including parents created for a newly published build.
++func syncPublicationDirectories(dir string) error {
++	for {
++		f, err := os.Open(dir)
++		if err != nil {
++			return err
++		}
++		err = errors.Join(f.Sync(), f.Close())
++		if err != nil {
++			return err
++		}
++		parent := filepath.Dir(dir)
++		if parent == dir {
++			return nil
++		}
++		dir = parent
++	}
++}
++
++type publicationReader struct {
++	ctx    context.Context
++	reader io.Reader
++}
++
++func (r publicationReader) Read(p []byte) (int, error) {
++	if err := r.ctx.Err(); err != nil {
++		return 0, err
++	}
++	n, err := r.reader.Read(p)
++	if cancelled := r.ctx.Err(); cancelled != nil {
++		return n, cancelled
++	}
++	return n, err
+ }
+ 
+ // StoreFile publishes verified VM disks containing large free zeroed regions.
+ // A kernel file copy can allocate those holes again and exhaust restore capacity.
+ // Copy every byte, leaving zero chunks sparse and preserving trailing geometry.
+-func copySparseFile(dst, src *os.File) (int64, error) {
++func copySparseFile(ctx context.Context, dst, src *os.File) (int64, error) {
+ 	buffer := make([]byte, 1<<20)
+ 	zero := make([]byte, len(buffer))
+ 	var offset int64
+ 	for {
++		if err := ctx.Err(); err != nil {
++			return offset, err
++		}
+ 		n, err := io.ReadFull(src, buffer)
++		if cancelled := ctx.Err(); cancelled != nil {
++			return offset, cancelled
++		}
+ 		if n > 0 {
+ 			if !bytes.Equal(buffer[:n], zero[:n]) {
+ 				if _, writeErr := dst.WriteAt(buffer[:n], offset); writeErr != nil {
+@@ -393,8 +458,8 @@
+ 	}
+ }
+ 
+-func (o *fsObject) replaceFrom(r io.Reader) (int64, error) {
+-	n, err := replaceFile(o.path, r)
++func (o *fsObject) replaceFrom(ctx context.Context, r io.Reader) (int64, error) {
++	n, err := replaceFile(ctx, o.path, r)
+ 	if err != nil {
+ 		return n, err
+ 	}
+@@ -404,7 +469,10 @@
+ 
+ func (o *fsObject) clearSizeSidecar() error {
+ 	err := os.Remove(SizeSidecar(o.path))
+-	if err == nil || os.IsNotExist(err) {
++	if err == nil {
++		return syncPublicationDirectories(filepath.Dir(o.path))
++	}
++	if os.IsNotExist(err) {
+ 		return nil
+ 	}
+ 
+@@ -420,12 +488,12 @@
+ 	fullPath string
+ }
+ 
+-func (u *fsPartUploader) Complete(_ context.Context) error {
++func (u *fsPartUploader) Complete(ctx context.Context) error {
+ 	if err := os.MkdirAll(filepath.Dir(u.fullPath), 0o755); err != nil {
+ 		return fmt.Errorf("failed to create directory: %w", err)
+ 	}
+ 
+-	_, err := replaceFile(u.fullPath, bytes.NewReader(u.Assemble()))
++	_, err := replaceFile(ctx, u.fullPath, bytes.NewReader(u.Assemble()))
+ 
+ 	return err
+ }
+--- a/packages/shared/pkg/storage/storage_fs_test.go
++++ b/packages/shared/pkg/storage/storage_fs_test.go
+@@ -263,7 +263,7 @@
+ 	fsObj, ok := obj.(*fsObject)
+ 	require.True(t, ok)
+ 
+-	_, err = fsObj.replaceFrom(&errAfterReader{prefix: []byte("xx"), err: errors.New("nope")})
++	_, err = fsObj.replaceFrom(ctx, &errAfterReader{prefix: []byte("xx"), err: errors.New("nope")})
+ 	require.Error(t, err)
+ 
+ 	data, err := GetBlob(ctx, obj)
+--- /dev/null
++++ b/packages/shared/pkg/storage/storage_fs_publication_test.go
+@@ -0,0 +1,117 @@
++package storage
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestFSStoreFileCancelledPreservesExisting(t *testing.T) {
++	t.Parallel()
++	p := newTempProvider(t)
++	object, err := p.OpenSeekable(t.Context(), "published/rootfs.ext4")
++	require.NoError(t, err)
++	require.NoError(t, os.WriteFile(p.getPath("published/rootfs.ext4"), []byte("verified prior disk"), 0600))
++	source := filepath.Join(t.TempDir(), "candidate.ext4")
++	require.NoError(t, os.WriteFile(source, bytes.Repeat([]byte{0x4b}, 2<<20), 0600))
++	ctx, cancel := context.WithCancel(t.Context())
++	cancel()
++	_, _, err = object.StoreFile(ctx, source)
++	require.ErrorIs(t, err, context.Canceled)
++	data, err := os.ReadFile(p.getPath("published/rootfs.ext4"))
++	require.NoError(t, err)
++	require.Equal(t, "verified prior disk", string(data))
++	leftovers, err := filepath.Glob(filepath.Join(p.basePath, "published", ".rootfs.ext4.tmp-*"))
++	require.NoError(t, err)
++	require.Empty(t, leftovers)
++}
++
++func TestFSPutCancelledPreservesExisting(t *testing.T) {
++	t.Parallel()
++	p := newTempProvider(t)
++	object, err := p.OpenBlob(t.Context(), "retained/manifest.json")
++	require.NoError(t, err)
++	require.NoError(t, object.Put(t.Context(), []byte("verified prior manifest")))
++	ctx, cancel := context.WithCancel(t.Context())
++	cancel()
++	require.ErrorIs(t, object.Put(ctx, []byte("cancelled replacement")), context.Canceled)
++	data, err := GetBlob(t.Context(), object)
++	require.NoError(t, err)
++	require.Equal(t, "verified prior manifest", string(data))
++}
++
++func TestFSMultipartCancelledPreservesExisting(t *testing.T) {
++	t.Parallel()
++	target := filepath.Join(t.TempDir(), "rootfs.ext4")
++	require.NoError(t, os.WriteFile(target, []byte("verified prior disk"), 0600))
++	upload := fsPartUploader{fullPath: target}
++	require.NoError(t, upload.Start(t.Context()))
++	require.NoError(t, upload.UploadPart(t.Context(), 0, []byte("cancelled compressed disk")))
++	ctx, cancel := context.WithCancel(t.Context())
++	cancel()
++	require.ErrorIs(t, upload.Complete(ctx), context.Canceled)
++	data, err := os.ReadFile(target)
++	require.NoError(t, err)
++	require.Equal(t, "verified prior disk", string(data))
++}
++
++// Cancellation arriving during a source read must never publish a partial save.
++type cancellingPublicationReader struct {
++	cancel context.CancelFunc
++	reads  int
++}
++
++func (r *cancellingPublicationReader) Read(p []byte) (int, error) {
++	r.reads++
++	if r.reads > 1 {
++		return 0, io.EOF
++	}
++	r.cancel()
++	return copy(p, "cancelled candidate disk"), nil
++}
++func TestFSReplaceCancelledDuringReadPreservesExisting(t *testing.T) {
++	t.Parallel()
++	p := newTempProvider(t)
++	obj, err := p.OpenBlob(t.Context(), "rootfs.ext4")
++	require.NoError(t, err)
++	require.NoError(t, obj.Put(t.Context(), []byte("verified prior disk")))
++	ctx, cancel := context.WithCancel(t.Context())
++	defer cancel()
++	_, err = obj.(*fsObject).replaceFrom(ctx, &cancellingPublicationReader{cancel: cancel})
++	require.ErrorIs(t, err, context.Canceled)
++	data, err := GetBlob(t.Context(), obj)
++	require.NoError(t, err)
++	require.Equal(t, "verified prior disk", string(data))
++	leftovers, err := filepath.Glob(filepath.Join(p.basePath, ".rootfs.ext4.tmp-*"))
++	require.NoError(t, err)
++	require.Empty(t, leftovers)
++}
++
++// Run this case under the Linux proof container's seccomp fsync=EIO profile.
++// The real syscall failure must prevent a newly copied disk replacing recovery.
++func TestFSStoreFileSyncFailurePreservesExisting(t *testing.T) {
++	if os.Getenv("LAUNCHPAD_TEST_FSYNC_FAILURE") != "1" {
++		t.Skip("requires syscall fault injection")
++	}
++	p := newTempProvider(t)
++	target := p.getPath("rootfs.ext4")
++	require.NoError(t, os.WriteFile(target, []byte("verified prior disk"), 0600))
++	object, err := p.OpenSeekable(t.Context(), "rootfs.ext4")
++	require.NoError(t, err)
++	source := filepath.Join(t.TempDir(), "candidate.ext4")
++	require.NoError(t, os.WriteFile(source, []byte("new candidate disk"), 0600))
++	_, _, err = object.StoreFile(t.Context(), source)
++	require.ErrorIs(t, err, syscall.EIO)
++	data, err := os.ReadFile(target)
++	require.NoError(t, err)
++	require.Equal(t, "verified prior disk", string(data))
++	leftovers, err := filepath.Glob(filepath.Join(p.basePath, ".rootfs.ext4.tmp-*"))
++	require.NoError(t, err)
++	require.Empty(t, leftovers)
++}

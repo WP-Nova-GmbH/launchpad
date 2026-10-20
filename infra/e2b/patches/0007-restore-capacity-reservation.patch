@@ -1,0 +1,643 @@
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -639,7 +639,13 @@
+   The caller owns one-use ticket validation and source-identity revocation.
+ - **Prepared restore ordering**: Postgres restore operations serialize admission,
+   capacity reservation and activation-versus-cancellation. Expired worker claims
+-  grant reconciliation rights, never proof that a guest stopped. Source pins and
++  grant reconciliation rights, never proof that a guest stopped. Before boot,
++  restores acquire a non-expiring, operation-bound Redis capacity reservation;
++  ordinary starts count those reservations in the same atomic team-limit check.
++  The reservation survives API restart and is removed only after registration or
++  host-confirmed never-started cleanup. Expired requests use an explicit
++  reconciliation-only RPC flag, so clock skew cannot bypass capacity admission.
++  Source pins and
+   reservations are released only after confirmed cleanup or transfer to the live
+   sandbox's immutable build lineage. Template deletion holds the same env lock
+   as restore admission and rejects pinned sources. The authenticated Launchpad
+diff --git a/packages/api/internal/handlers/launchpad_restore_worker.go b/packages/api/internal/handlers/launchpad_restore_worker.go
+--- a/packages/api/internal/handlers/launchpad_restore_worker.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker.go
+@@ -22,7 +22,7 @@
+ 
+ type restoreRuntime interface {
+ 	RestoreClient(context.Context, uuid.UUID, string) (rpc.SandboxServiceClient, context.Context, error)
+-	ActivatePreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string) error
++	ActivatePreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string, int) error
+ }
+ 
+ func (a *APIStore) restoreRuntime() restoreRuntime {
+@@ -146,6 +146,13 @@
+ 		}
+ 		return nil
+ 	case "activating":
++		team, err := a.authService.GetTeamByID(ctx, op.TeamID)
++		if err != nil {
++			return err
++		}
++		if team == nil || team.Limits == nil {
++			return errors.New("restore team policy is unavailable")
++		}
+ 		if len(op.ActivationRequest) == 0 {
+ 			var input api.LaunchpadRestoreRequest
+ 			if err := json.Unmarshal(op.RequestPayload, &input); err != nil {
+@@ -155,10 +162,6 @@
+ 			if err != nil {
+ 				return err
+ 			}
+-			team, err := a.authService.GetTeamByID(ctx, op.TeamID)
+-			if err != nil {
+-				return err
+-			}
+ 			request, err := orchestrator.BuildRestoreRequest(op, build, team, input, time.Now())
+ 			if err != nil {
+ 				return err
+@@ -178,7 +181,7 @@
+ 			return err
+ 		}
+ 		digest := sha256.Sum256(op.Manifest)
+-		if err := a.restoreRuntime().ActivatePreparedRestore(ctx, op, request, hex.EncodeToString(digest[:])); err != nil {
++		if err := a.restoreRuntime().ActivatePreparedRestore(ctx, op, request, hex.EncodeToString(digest[:]), int(team.Limits.SandboxConcurrency)); err != nil {
+ 			if restoreresult.IsExpired(err, op.PreparedBuildID.String()) {
+ 				return store.Complete(ctx, op.TeamID, op.OperationID, *op.ClaimID, "failed")
+ 			}
+diff --git a/packages/api/internal/handlers/launchpad_restore_worker_test.go b/packages/api/internal/handlers/launchpad_restore_worker_test.go
+--- a/packages/api/internal/handlers/launchpad_restore_worker_test.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker_test.go
+@@ -7,6 +7,7 @@
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	authtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
+ 	"testing"
+ 	"time"
+ 
+@@ -49,7 +50,7 @@
+ 	r.released = true
+ 	return &emptypb.Empty{}, nil
+ }
+-func (r *restoreWorkerRuntime) ActivatePreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string) error {
++func (r *restoreWorkerRuntime) ActivatePreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string, int) error {
+ 	if r.activationError != nil {
+ 		return r.activationError
+ 	}
+@@ -81,7 +82,7 @@
+ 	_, err := store.Create(t.Context(), p, p.ReservedBytes)
+ 	require.NoError(t, err)
+ 	runtime := &restoreWorkerRuntime{lostReply: true}
+-	server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime}
++	server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime, authService: fakeAPIKeyAuthService{team: &authtypes.Team{Limits: &authtypes.TeamLimits{SandboxConcurrency: 3}}}}
+ 	prepared := claimRestoreWork(t, db)
+ 	require.NoError(t, server.processRestoreOperation(t.Context(), prepared))
+ 	_, err = store.Activate(t.Context(), p.TeamID, p.OperationID)
+@@ -123,7 +124,7 @@
+ 	_, err = store.Cancel(t.Context(), p.TeamID, p.OperationID)
+ 	require.NoError(t, err)
+ 	runtime := &restoreWorkerRuntime{}
+-	server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime}
++	server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime, authService: fakeAPIKeyAuthService{team: &authtypes.Team{Limits: &authtypes.TeamLimits{SandboxConcurrency: 3}}}}
+ 	require.NoError(t, server.processRestoreOperation(t.Context(), claimed))
+ 	require.True(t, runtime.cancelled)
+ 	require.Zero(t, runtime.boots)
+@@ -144,7 +145,7 @@
+ 			_, err := store.Create(t.Context(), p, p.ReservedBytes)
+ 			require.NoError(t, err)
+ 			runtime := &restoreWorkerRuntime{}
+-			server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime}
++			server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime, authService: fakeAPIKeyAuthService{team: &authtypes.Team{Limits: &authtypes.TeamLimits{SandboxConcurrency: 3}}}}
+ 			require.NoError(t, server.processRestoreOperation(t.Context(), claimRestoreWork(t, db)))
+ 			_, err = store.Activate(t.Context(), p.TeamID, p.OperationID)
+ 			require.NoError(t, err)
+diff --git a/packages/api/internal/orchestrator/restore.go b/packages/api/internal/orchestrator/restore.go
+--- a/packages/api/internal/orchestrator/restore.go
++++ b/packages/api/internal/orchestrator/restore.go
+@@ -15,6 +15,7 @@
+ 	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++	"github.com/e2b-dev/infra/packages/shared/pkg/restoreresult"
+ )
+ 
+ // RestoreClient deliberately uses the recorded node. Normal placement may
+@@ -58,7 +59,16 @@
+ 	}, nil
+ }
+ 
+-func (o *Orchestrator) ActivatePreparedRestore(ctx context.Context, op queries.SandboxRestoreOperation, request *rpc.SandboxCreateRequest, digest string) error {
++func (o *Orchestrator) ActivatePreparedRestore(ctx context.Context, op queries.SandboxRestoreOperation, request *rpc.SandboxCreateRequest, digest string, concurrency int) error {
++	// An already-expired request is reconciliation-only: the host's durable
++	// receipt either returns the previous result or rejects a never-started VM.
++	// It must reach that receipt even when current capacity is exhausted.
++	reconcileOnly := !request.GetEndTime().AsTime().After(time.Now())
++	if !reconcileOnly {
++		if err := o.sandboxStore.ReserveRestore(ctx, op.TeamID, op.SandboxID, op.OperationID, concurrency); err != nil {
++			return err
++		}
++	}
+ 	request = proto.CloneOf(request)
+ 	config := request.GetSandbox()
+ 	token, err := o.accessTokenGenerator.GenerateEnvdAccessToken(op.SandboxID)
+@@ -75,8 +85,13 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	response, err := client.ActivateRestoreDisk(child, &rpc.RestoreDiskActivateRequest{Create: request, ManifestSha256: digest})
++	response, err := client.ActivateRestoreDisk(child, &rpc.RestoreDiskActivateRequest{Create: request, ManifestSha256: digest, ReconcileOnly: reconcileOnly})
+ 	if err != nil {
++		if restoreresult.IsExpired(err, op.PreparedBuildID.String()) {
++			if releaseErr := o.sandboxStore.ReleaseRestore(ctx, op.TeamID, op.SandboxID, op.OperationID); releaseErr != nil {
++				return releaseErr
++			}
++		}
+ 		return err
+ 	}
+ 	if !response.GetFilesystemBootApplied() {
+@@ -87,7 +102,7 @@
+ 		if existing.ExecutionID != op.ExecutionID.String() {
+ 			return errors.New("restore execution conflicts with registered sandbox")
+ 		}
+-		return nil // Do not overwrite an accepted renewal or lifecycle transition.
++		return o.sandboxStore.ReleaseRestore(ctx, op.TeamID, op.SandboxID, op.OperationID) // Preserve accepted renewals/lifecycle transitions.
+ 	}
+ 	if !errors.Is(err, sandbox.ErrNotFound) {
+ 		return err
+@@ -110,5 +125,8 @@
+ 	}
+ 	// A failed registration keeps the durable activation pending. Never launch an
+ 	// asynchronous kill here: a late kill could destroy a successfully retried VM.
+-	return o.sandboxStore.Add(ctx, sbx, nil)
++	if err := o.sandboxStore.Add(ctx, sbx, nil); err != nil {
++		return err
++	}
++	return o.sandboxStore.ReleaseRestore(ctx, op.TeamID, op.SandboxID, op.OperationID)
+ }
+diff --git a/packages/api/internal/sandbox/reservations/redis/README.md b/packages/api/internal/sandbox/reservations/redis/README.md
+--- a/packages/api/internal/sandbox/reservations/redis/README.md
++++ b/packages/api/internal/sandbox/reservations/redis/README.md
+@@ -11,10 +11,20 @@
+ 
+ ## Flow
+ 
+-`Reserve` runs a Lua script that atomically removes stale pending entries, checks whether the sandbox already exists or has already pending start, enforces the team limit using `SCARD(storage index) + ZCARD(pending zset)`, deletes any stale result key, and adds the sandbox ID to the pending zset.
++`Reserve` runs a Lua script that atomically removes stale pending entries, checks whether the sandbox already exists or has already pending start, enforces the team limit using `SCARD(storage index) + ZCARD(pending zset) + HLEN(restore reservations)`, deletes any stale result key, and adds the sandbox ID to the pending zset.
+ 
+ When creation completes, it removes the sandbox from the pending zset, writes a TTL result key containing either the sandbox or the creation error, and publishes the routing key.
+ 
+ A waiter subscribes to the routing key, probes the result key immediately, then waits for PubSub notifications or the 1 second fallback ticker. PubSub is best-effort; the fallback ticker is required for correctness.
+ 
+ `Release` is called when the sandbox is removed from storage (`Store.Remove`). It removes the sandbox from the pending zset, deletes the result key, and publishes the routing key.
++
++Prepared restores also use an operation-bound hash at
++`sandbox:storage:{teamID}:reservations:restores`. It has no stale TTL: an API
++worker disappearing does not prove its VM stopped. Both admission paths count
++this hash atomically with the running index and ordinary pending starts. A
++restore retry with the same operation retains its reservation; another operation
++cannot release it. The restore worker releases it only after registering the VM
++or receiving a host-confirmed never-started cleanup result. Registration followed
++by a lost release reply can temporarily count twice; recovery retries the same
++release instead of admitting excess work.
+diff --git a/packages/api/internal/sandbox/reservations/redis/reservation.go b/packages/api/internal/sandbox/reservations/redis/reservation.go
+--- a/packages/api/internal/sandbox/reservations/redis/reservation.go
++++ b/packages/api/internal/sandbox/reservations/redis/reservation.go
+@@ -57,7 +57,7 @@
+ 	staleCutoff := float64(time.Now().Add(-staleTTL).Unix())
+ 
+ 	result, err := reserveScript.Run(ctx, s.redisClient,
+-		[]string{storageIndexKey, pendingSetKey, resultKeyStr},
++		[]string{storageIndexKey, pendingSetKey, resultKeyStr, getRestoreReservationsKey(teamIDStr)},
+ 		sandboxID, limit, now, staleCutoff,
+ 	).Int()
+ 	if err != nil {
+diff --git a/packages/api/internal/sandbox/reservations/redis/restore.go b/packages/api/internal/sandbox/reservations/redis/restore.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/sandbox/reservations/redis/restore.go
+@@ -0,0 +1,69 @@
++package redis
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"github.com/e2b-dev/infra/packages/api/internal/sandbox/sandboxtypes"
++	"github.com/google/uuid"
++	"github.com/redis/go-redis/v9"
++	"time"
++)
++
++// Restore admission shares normal creation's capacity count and Redis slot.
++// It has no expiry: a stale API worker cannot establish that a guest stopped.
++// Registered-but-not-yet-released entries may briefly count twice; this errs
++// toward retaining capacity, and the durable restore worker retries release.
++var reserveRestoreScript = redis.NewScript(`
++ local owner=redis.call('HGET',KEYS[3],ARGV[1])
++ if owner then
++  if owner==ARGV[2] then return 0 end
++  return 4
++ end
++ if redis.call('SISMEMBER',KEYS[1],ARGV[1])==1 then return 1 end
++ redis.call('ZREMRANGEBYSCORE',KEYS[2],'-inf',ARGV[4])
++ if redis.call('ZSCORE',KEYS[2],ARGV[1]) then return 4 end
++ local limit=tonumber(ARGV[3])
++ if limit>=0 and redis.call('SCARD',KEYS[1])+redis.call('ZCARD',KEYS[2])+redis.call('HLEN',KEYS[3])>=limit then return 3 end
++ redis.call('HSET',KEYS[3],ARGV[1],ARGV[2])
++ return 0
++`)
++var releaseRestoreScript = redis.NewScript(`
++ local owner=redis.call('HGET',KEYS[1],ARGV[1])
++ if not owner then return 0 end
++ if owner~=ARGV[2] then return 4 end
++ redis.call('HDEL',KEYS[1],ARGV[1])
++ return 0
++`)
++
++func (s *ReservationStorage) ReserveRestore(ctx context.Context, teamID uuid.UUID, sandboxID string, operationID uuid.UUID, limit int) error {
++	if teamID == uuid.Nil || operationID == uuid.Nil || sandboxID == "" {
++		return errors.New("invalid restore reservation identity")
++	}
++	team := teamID.String()
++	result, err := reserveRestoreScript.Run(ctx, s.redisClient, []string{getStorageIndexKey(team), getPendingSetKey(team), getRestoreReservationsKey(team)}, sandboxID, operationID.String(), limit, time.Now().Add(-staleTTL).Unix()).Int()
++	if err != nil {
++		return fmt.Errorf("reserve restore capacity: %w", err)
++	}
++	switch result {
++	case reserveResultReserved, reserveResultAlreadyInStorage:
++		return nil
++	case reserveResultLimitExceeded:
++		return &sandboxtypes.LimitExceededError{TeamID: teamID}
++	default:
++		return errors.New("restore capacity reservation identity conflicts")
++	}
++}
++func (s *ReservationStorage) ReleaseRestore(ctx context.Context, teamID uuid.UUID, sandboxID string, operationID uuid.UUID) error {
++	if teamID == uuid.Nil || operationID == uuid.Nil || sandboxID == "" {
++		return errors.New("invalid restore reservation identity")
++	}
++	result, err := releaseRestoreScript.Run(ctx, s.redisClient, []string{getRestoreReservationsKey(teamID.String())}, sandboxID, operationID.String()).Int()
++	if err != nil {
++		return fmt.Errorf("release restore capacity: %w", err)
++	}
++	if result != 0 {
++		return errors.New("restore capacity reservation identity conflicts")
++	}
++	return nil
++}
+diff --git a/packages/api/internal/sandbox/reservations/redis/restore_test.go b/packages/api/internal/sandbox/reservations/redis/restore_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/sandbox/reservations/redis/restore_test.go
+@@ -0,0 +1,85 @@
++package redis
++
++import (
++	"context"
++	"github.com/e2b-dev/infra/packages/api/internal/sandbox/sandboxtypes"
++	"github.com/google/uuid"
++	goredis "github.com/redis/go-redis/v9"
++	"github.com/stretchr/testify/require"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestRestoreReservationSharesCapacityAndSurvivesOrdinaryExpiry(t *testing.T) {
++	t.Parallel()
++	s, client := setupTestReservationStorage(t)
++	team, op := uuid.New(), uuid.New()
++	require.NoError(t, s.ReserveRestore(t.Context(), team, "restore", op, 1))
++	// An API process restart creates another adapter against the same state.
++	recovered := NewReservationStorage(client, s.notifier)
++	require.NoError(t, recovered.ReserveRestore(t.Context(), team, "restore", op, 0), "admitted work survives a reduced cap")
++	require.NoError(t, client.ZAdd(t.Context(), getPendingSetKey(team.String()), goredis.Z{Score: float64(time.Now().Add(-2 * staleTTL).Unix()), Member: "old-ordinary"}).Err())
++	_, _, err := recovered.Reserve(t.Context(), team, "ordinary", 1)
++	require.ErrorAs(t, err, new(*sandboxtypes.LimitExceededError))
++	require.NoError(t, s.Release(t.Context(), team, "restore"), "ordinary cleanup cannot release a durable restore reservation")
++	require.ErrorAs(t, recovered.ReserveRestore(t.Context(), team, "another", uuid.New(), 1), new(*sandboxtypes.LimitExceededError))
++	require.Equal(t, int64(-1), client.TTL(t.Context(), getRestoreReservationsKey(team.String())).Val().Nanoseconds(), "restore reservation has no expiration")
++	require.Error(t, recovered.ReleaseRestore(t.Context(), team, "restore", uuid.New()))
++	require.Error(t, recovered.ReserveRestore(t.Context(), team, "restore", uuid.New(), 3))
++	require.NoError(t, recovered.ReleaseRestore(t.Context(), team, "restore", op))
++	require.NoError(t, recovered.ReleaseRestore(t.Context(), team, "restore", op))
++	finish, _, err := recovered.Reserve(t.Context(), team, "ordinary", 1)
++	require.NoError(t, err)
++	require.NotNil(t, finish)
++	finish(sandboxtypes.Sandbox{}, context.Canceled)
++}
++
++func TestRestoreReservationRacesOrdinaryAdmissionAtomically(t *testing.T) {
++	t.Parallel()
++	s, client := setupTestReservationStorage(t)
++	team := uuid.New()
++	var admitted atomic.Int32
++	start := make(chan struct{})
++	var wg sync.WaitGroup
++	for i := range 24 {
++		wg.Go(func() {
++			<-start
++			id := uuid.NewString()
++			var err error
++			if i%2 == 0 {
++				err = s.ReserveRestore(t.Context(), team, id, uuid.New(), 3)
++			} else {
++				_, _, err = s.Reserve(t.Context(), team, id, 3)
++			}
++			if err == nil {
++				admitted.Add(1)
++			}
++		})
++	}
++	close(start)
++	wg.Wait()
++	require.Equal(t, int32(3), admitted.Load())
++	total := client.ZCard(t.Context(), getPendingSetKey(team.String())).Val() + client.HLen(t.Context(), getRestoreReservationsKey(team.String())).Val()
++	require.Equal(t, int64(3), total)
++}
++
++func TestRestoreReservationCountsRunningVMsAndPromotesOnce(t *testing.T) {
++	t.Parallel()
++	s, client := setupTestReservationStorage(t)
++	team, op := uuid.New(), uuid.New()
++	index := getStorageIndexKey(team.String())
++	require.NoError(t, client.SAdd(t.Context(), index, "ordinary").Err())
++	require.ErrorAs(t, s.ReserveRestore(t.Context(), team, "restore", op, 1), new(*sandboxtypes.LimitExceededError))
++	require.NoError(t, s.ReserveRestore(t.Context(), team, "restore", op, 2))
++	// Registration happened but its reply was lost. A retry keeps the same slot
++	// until the destination is recognized and the operation explicitly releases.
++	require.NoError(t, client.SAdd(t.Context(), index, "restore").Err())
++	require.NoError(t, s.ReserveRestore(t.Context(), team, "restore", op, 2))
++	require.NoError(t, s.ReleaseRestore(t.Context(), team, "restore", op))
++	require.NoError(t, s.ReserveRestore(t.Context(), team, "restore", op, 2))
++	require.Zero(t, client.HLen(t.Context(), getRestoreReservationsKey(team.String())).Val())
++	_, _, err := s.Reserve(t.Context(), team, "third", 2)
++	require.ErrorAs(t, err, new(*sandboxtypes.LimitExceededError))
++}
+diff --git a/packages/api/internal/sandbox/reservations/redis/scripts.go b/packages/api/internal/sandbox/reservations/redis/scripts.go
+--- a/packages/api/internal/sandbox/reservations/redis/scripts.go
++++ b/packages/api/internal/sandbox/reservations/redis/scripts.go
+@@ -22,6 +22,7 @@
+ 	// KEYS[1] = storage index key (sandbox:storage:{teamID}:index)
+ 	// KEYS[2] = pending zset key (sandbox:storage:{teamID}:reservations:pending)
+ 	// KEYS[3] = result key (sandbox:storage:{teamID}:reservations:sandboxID:result)
++	// KEYS[4] = restore reservation hash (sandboxID -> durable operationID)
+ 	// ARGV[1] = sandboxID
+ 	// ARGV[2] = limit (-1 means no limit)
+ 	// ARGV[3] = current Unix timestamp (seconds, float)
+@@ -42,7 +43,7 @@
+ 		end
+ 
+ 		-- Check if sandbox is already pending (has a score in the zset)
+-		if redis.call('ZSCORE', KEYS[2], ARGV[1]) then
++		if redis.call('ZSCORE', KEYS[2], ARGV[1]) or redis.call('HEXISTS', KEYS[4], ARGV[1]) == 1 then
+ 			return %d
+ 		end
+ 
+@@ -51,7 +52,8 @@
+ 		if limit >= 0 then
+ 			local storageCount = redis.call('SCARD', KEYS[1])
+ 			local pendingCount = redis.call('ZCARD', KEYS[2])
+-			if storageCount + pendingCount >= limit then
++			local restoreCount = redis.call('HLEN', KEYS[4])
++			if storageCount + pendingCount + restoreCount >= limit then
+ 				return %d
+ 			end
+ 		end
+diff --git a/packages/api/internal/sandbox/reservations/redis/utils.go b/packages/api/internal/sandbox/reservations/redis/utils.go
+--- a/packages/api/internal/sandbox/reservations/redis/utils.go
++++ b/packages/api/internal/sandbox/reservations/redis/utils.go
+@@ -40,3 +40,7 @@
+ func getReservationRoutingKey(teamID, sandboxID string) string {
+ 	return redis_utils.CreateKey(getReservationPrefix(teamID), sandboxID, notifySuffix)
+ }
++
++func getRestoreReservationsKey(teamID string) string {
++	return redis_utils.CreateKey(getReservationPrefix(teamID), "restores")
++}
+diff --git a/packages/api/internal/sandbox/sandboxtypes/storage.go b/packages/api/internal/sandbox/sandboxtypes/storage.go
+--- a/packages/api/internal/sandbox/sandboxtypes/storage.go
++++ b/packages/api/internal/sandbox/sandboxtypes/storage.go
+@@ -43,6 +43,10 @@
+ // ReservationStorage tracks per-team sandbox-start reservations to enforce
+ // concurrency limits.
+ type ReservationStorage interface {
++	// Restore reservations outlive worker leases and API processes. Only a
++	// registered destination or a host-confirmed cleanup may release them.
++	ReserveRestore(ctx context.Context, teamID uuid.UUID, sandboxID string, operationID uuid.UUID, limit int) error
++	ReleaseRestore(ctx context.Context, teamID uuid.UUID, sandboxID string, operationID uuid.UUID) error
+ 	Reserve(ctx context.Context, teamID uuid.UUID, sandboxID string, limit int) (finishStart func(Sandbox, error), waitForStart func(ctx context.Context) (Sandbox, error), err error)
+ 	Release(ctx context.Context, teamID uuid.UUID, sandboxID string) error
+ }
+diff --git a/packages/api/internal/sandbox/store.go b/packages/api/internal/sandbox/store.go
+--- a/packages/api/internal/sandbox/store.go
++++ b/packages/api/internal/sandbox/store.go
+@@ -173,3 +173,10 @@
+ 
+ 	return finishStart, waitForStart, nil
+ }
++
++func (s *Store) ReserveRestore(ctx context.Context, teamID uuid.UUID, sandboxID string, operationID uuid.UUID, limit int) error {
++	return s.reservations.ReserveRestore(ctx, teamID, sandboxID, operationID, limit)
++}
++func (s *Store) ReleaseRestore(ctx context.Context, teamID uuid.UUID, sandboxID string, operationID uuid.UUID) error {
++	return s.reservations.ReleaseRestore(ctx, teamID, sandboxID, operationID)
++}
+diff --git a/packages/api/internal/sandbox/store_test.go b/packages/api/internal/sandbox/store_test.go
+--- a/packages/api/internal/sandbox/store_test.go
++++ b/packages/api/internal/sandbox/store_test.go
+@@ -385,3 +385,10 @@
+ 		}
+ 	}
+ }
++
++func (*NoOpReservationStorage) ReserveRestore(context.Context, uuid.UUID, string, uuid.UUID, int) error {
++	return nil
++}
++func (*NoOpReservationStorage) ReleaseRestore(context.Context, uuid.UUID, string, uuid.UUID) error {
++	return nil
++}
+diff --git a/packages/orchestrator/orchestrator.proto b/packages/orchestrator/orchestrator.proto
+--- a/packages/orchestrator/orchestrator.proto
++++ b/packages/orchestrator/orchestrator.proto
+@@ -296,6 +296,8 @@
+ message RestoreDiskActivateRequest {
+   string manifest_sha256 = 1;
+   SandboxCreateRequest create = 2;
++  // Inspection/cleanup only, even if the API and node clocks disagree.
++  bool reconcile_only = 3;
+ }
+ 
+ service SandboxService {
+diff --git a/packages/orchestrator/pkg/server/restore_disk.go b/packages/orchestrator/pkg/server/restore_disk.go
+--- a/packages/orchestrator/pkg/server/restore_disk.go
++++ b/packages/orchestrator/pkg/server/restore_disk.go
+@@ -193,6 +193,9 @@
+ 		return nil, s.restoreActivationFailure(ctx, activation, id, err)
+ 	}
+ 	record := activation.Record()
++	if req.GetReconcileOnly() && record.State == "accepted" {
++		return nil, status.Error(codes.FailedPrecondition, "restore reconciliation cannot start a guest")
++	}
+ 	if record.State == "active" {
+ 		result := &orchestrator.SandboxCreateResponse{}
+ 		if err := protojson.Unmarshal(record.Response, result); err != nil {
+diff --git a/packages/orchestrator/pkg/server/restore_disk_test.go b/packages/orchestrator/pkg/server/restore_disk_test.go
+--- a/packages/orchestrator/pkg/server/restore_disk_test.go
++++ b/packages/orchestrator/pkg/server/restore_disk_test.go
+@@ -6,6 +6,7 @@
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"encoding/json"
++	"fmt"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/restoreresult"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+@@ -75,45 +76,64 @@
+ 
+ func TestRestoreExpiredRequestCleansAndReturnsDurableFailureWithoutGuestFactory(t *testing.T) {
+ 	t.Parallel()
+-	server := &Server{}
+-	server.config.RestorePreparationEnabled = true
+-	server.config.OrchestratorBaseDir = t.TempDir()
+-	var err error
+-	server.persistence, err = storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: t.TempDir()})
+-	require.NoError(t, err)
+-	id := uuid.New()
+-	token := "test-access-token"
+-	req := &orchestrator.RestoreDiskActivateRequest{
+-		ManifestSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+-		Create: &orchestrator.SandboxCreateRequest{
+-			Sandbox:        &orchestrator.SandboxConfig{BuildId: id.String(), TeamId: uuid.NewString(), SandboxId: "destination", ExecutionId: uuid.NewString(), TemplateId: "restore", Snapshot: true, EnvdAccessToken: &token},
+-			FilesystemBoot: new(true), StartTime: timestamppb.New(time.Now().Add(-time.Hour)), EndTime: timestamppb.New(time.Now().Add(-time.Minute)),
+-		},
++	for _, expired := range []bool{false, true} {
++		t.Run(fmt.Sprint(expired), func(t *testing.T) {
++			endAt := time.Now().Add(time.Hour)
++			if expired {
++				endAt = time.Now().Add(-time.Minute)
++			}
++			server := &Server{}
++			server.config.RestorePreparationEnabled = true
++			server.config.OrchestratorBaseDir = t.TempDir()
++			var err error
++			server.persistence, err = storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: t.TempDir()})
++			require.NoError(t, err)
++			id := uuid.New()
++			token := "test-access-token"
++			req := &orchestrator.RestoreDiskActivateRequest{
++				ManifestSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
++				Create: &orchestrator.SandboxCreateRequest{
++					Sandbox:        &orchestrator.SandboxConfig{BuildId: id.String(), TeamId: uuid.NewString(), SandboxId: "destination", ExecutionId: uuid.NewString(), TemplateId: "restore", Snapshot: true, EnvdAccessToken: &token},
++					FilesystemBoot: new(true), StartTime: timestamppb.New(time.Now().Add(-time.Hour)), EndTime: timestamppb.New(endAt),
++				},
++			}
++			raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(req.GetCreate())
++			require.NoError(t, err)
++			digest := sha256.New()
++			digest.Write([]byte(req.GetManifestSha256()))
++			digest.Write(raw)
++			receipt, err := json.Marshal(rootfs.RestoreActivation{Version: 1, RequestSHA256: hex.EncodeToString(digest.Sum(nil)), State: "accepted"})
++			require.NoError(t, err)
++			directory, err := server.restoreDiskDirectory()
++			require.NoError(t, err)
++			require.NoError(t, os.MkdirAll(filepath.Join(directory, id.String()), 0o700))
++			require.NoError(t, os.WriteFile(filepath.Join(directory, id.String()+".activation.json"), receipt, 0o600))
++			// A previous attempt published part of this destination, then failed preflight.
++			blob, err := server.persistence.OpenBlob(t.Context(), storage.Paths{BuildID: id.String()}.Rootfs())
++			require.NoError(t, err)
++			require.NoError(t, blob.Put(t.Context(), []byte("partial publication")))
++			req.ReconcileOnly = true
++			if !expired {
++				_, err := server.ActivateRestoreDisk(t.Context(), req)
++				require.Equal(t, codes.FailedPrecondition, status.Code(err))
++				require.False(t, restoreresult.IsExpired(err, id.String()))
++				exists, err := blob.Exists(t.Context())
++				require.NoError(t, err)
++				require.True(t, exists)
++				return
++			}
++
++			for range 2 {
++				response, err := server.ActivateRestoreDisk(t.Context(), req)
++				require.Nil(t, response)
++				require.True(t, restoreresult.IsExpired(err, id.String()), "unexpected error: %v", err)
++			}
++			exists, err := blob.Exists(t.Context())
++			require.NoError(t, err)
++			require.False(t, exists)
++			_, err = os.Stat(filepath.Join(directory, id.String()))
++			require.ErrorIs(t, err, os.ErrNotExist)
++			require.Error(t, server.requireRestoreActivated(req.GetCreate()), "ordinary create cannot bypass the receipt")
++		})
+ 	}
+-	raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(req.GetCreate())
+-	require.NoError(t, err)
+-	digest := sha256.New()
+-	digest.Write([]byte(req.GetManifestSha256()))
+-	digest.Write(raw)
+-	receipt, err := json.Marshal(rootfs.RestoreActivation{Version: 1, RequestSHA256: hex.EncodeToString(digest.Sum(nil)), State: "accepted"})
+-	require.NoError(t, err)
+-	directory, err := server.restoreDiskDirectory()
+-	require.NoError(t, err)
+-	require.NoError(t, os.MkdirAll(filepath.Join(directory, id.String()), 0o700))
+-	require.NoError(t, os.WriteFile(filepath.Join(directory, id.String()+".activation.json"), receipt, 0o600))
+-	// A previous attempt published part of this destination, then failed preflight.
+-	blob, err := server.persistence.OpenBlob(t.Context(), storage.Paths{BuildID: id.String()}.Rootfs())
+-	require.NoError(t, err)
+-	require.NoError(t, blob.Put(t.Context(), []byte("partial publication")))
+-	for range 2 {
+-		response, err := server.ActivateRestoreDisk(t.Context(), req)
+-		require.Nil(t, response)
+-		require.True(t, restoreresult.IsExpired(err, id.String()), "unexpected error: %v", err)
+-	}
+-	exists, err := blob.Exists(t.Context())
+-	require.NoError(t, err)
+-	require.False(t, exists)
+-	_, err = os.Stat(filepath.Join(directory, id.String()))
+-	require.ErrorIs(t, err, os.ErrNotExist)
+-	require.Error(t, server.requireRestoreActivated(req.GetCreate()), "ordinary create cannot bypass the receipt")
+ }
+diff --git a/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go b/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
+--- a/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
++++ b/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
+@@ -1884,8 +1884,10 @@
+ 	state          protoimpl.MessageState `protogen:"open.v1"`
+ 	ManifestSha256 string                 `protobuf:"bytes,1,opt,name=manifest_sha256,json=manifestSha256,proto3" json:"manifest_sha256,omitempty"`
+ 	Create         *SandboxCreateRequest  `protobuf:"bytes,2,opt,name=create,proto3" json:"create,omitempty"`
+-	unknownFields  protoimpl.UnknownFields
+-	sizeCache      protoimpl.SizeCache
++	// Inspection/cleanup only, even if the API and node clocks disagree.
++	ReconcileOnly bool `protobuf:"varint,3,opt,name=reconcile_only,json=reconcileOnly,proto3" json:"reconcile_only,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
+ }
+ 
+ func (x *RestoreDiskActivateRequest) Reset() {
+@@ -1930,6 +1932,13 @@
+ 		return x.Create
+ 	}
+ 	return nil
++}
++
++func (x *RestoreDiskActivateRequest) GetReconcileOnly() bool {
++	if x != nil {
++		return x.ReconcileOnly
++	}
++	return false
+ }
+ 
+ var File_orchestrator_proto protoreflect.FileDescriptor
+@@ -2125,10 +2134,11 @@
+ 	"\x11prepared_build_id\x18\x01 \x01(\tR\x0fpreparedBuildId\"Z\n" +
+ 	"\x13RestoreDiskResponse\x12\x1a\n" +
+ 	"\bmanifest\x18\x01 \x01(\fR\bmanifest\x12'\n" +
+-	"\x0fmanifest_sha256\x18\x02 \x01(\tR\x0emanifestSha256\"t\n" +
++	"\x0fmanifest_sha256\x18\x02 \x01(\tR\x0emanifestSha256\"\x9b\x01\n" +
+ 	"\x1aRestoreDiskActivateRequest\x12'\n" +
+ 	"\x0fmanifest_sha256\x18\x01 \x01(\tR\x0emanifestSha256\x12-\n" +
+-	"\x06create\x18\x02 \x01(\v2\x15.SandboxCreateRequestR\x06create2\xc6\x05\n" +
++	"\x06create\x18\x02 \x01(\v2\x15.SandboxCreateRequestR\x06create\x12%\n" +
++	"\x0ereconcile_only\x18\x03 \x01(\bR\rreconcileOnly2\xc6\x05\n" +
+ 	"\x0eSandboxService\x12A\n" +
+ 	"\x12ReleaseRestoreDisk\x12\x13.RestoreDiskRequest\x1a\x16.google.protobuf.Empty\x12J\n" +
+ 	"\x13ActivateRestoreDisk\x12\x1b.RestoreDiskActivateRequest\x1a\x16.SandboxCreateResponse\x12F\n" +

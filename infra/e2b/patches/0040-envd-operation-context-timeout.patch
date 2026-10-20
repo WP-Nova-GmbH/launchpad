@@ -1,0 +1,93 @@
+--- a/packages/orchestrator/pkg/sandbox/envd.go
++++ b/packages/orchestrator/pkg/sandbox/envd.go
+@@ -460,7 +460,10 @@
+ 		req.Header.Set("X-Access-Token", *s.Config.Envd.AccessToken)
+ 	}
+ 
+-	resp, err := sandboxHttpClient.Do(req)
++	// These operations already carry their own bounded context (fsfreeze may
++	// need the RAM-scaled sync budget). Keep its deadline instead of imposing
++	// the shared client's shorter health-request timeout.
++	resp, err := (&http.Client{Transport: sandboxHttpClient.Transport}).Do(req)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("%s request: %w", path, err)
+ 	}
+--- a/packages/orchestrator/pkg/sandbox/envd_timeout_test.go
++++ b/packages/orchestrator/pkg/sandbox/envd_timeout_test.go
+@@ -0,0 +1,76 @@
++//go:build linux
++
++package sandbox
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++)
++
++type envdTimeoutTransport func(*http.Request) (*http.Response, error)
++
++func (f envdTimeoutTransport) RoundTrip(r *http.Request) (*http.Response, error) {
++	return f(r)
++}
++
++// Not parallel: temporarily replaces the shared HTTP client, like envd_test.go.
++func TestEnvdPostUsesCallerDeadline(t *testing.T) { //nolint:paralleltest
++	original := sandboxHttpClient
++	t.Cleanup(func() { sandboxHttpClient = original })
++	token := "public-test-token"
++	s := &Sandbox{Metadata: &Metadata{Config: &Config{Envd: EnvdMetadata{AccessToken: &token}}}}
++	s.internalConfig.envdServerURLOverride = "http://envd.test"
++
++	for _, budget := range []time.Duration{81 * time.Second, 3 * time.Second} {
++		t.Run(budget.String(), func(t *testing.T) { //nolint:paralleltest
++			ctx, cancel := context.WithTimeout(t.Context(), budget)
++			defer cancel()
++			wantDeadline, _ := ctx.Deadline()
++			calls := 0
++			sandboxHttpClient = http.Client{Timeout: 10 * time.Second, Transport: envdTimeoutTransport(func(r *http.Request) (*http.Response, error) {
++				calls++
++				deadline, ok := r.Context().Deadline()
++				if !ok || !deadline.Equal(wantDeadline) {
++					t.Errorf("caller deadline %v replaced by %v", wantDeadline, deadline)
++				}
++				if r.Method != http.MethodPost || r.URL.String() != "http://envd.test/fsfreeze" || r.Header.Get("X-Access-Token") != token {
++					t.Errorf("native operation request changed")
++				}
++				return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
++			})}
++			response, err := s.doEnvdPost(ctx, "fsfreeze")
++			if err != nil {
++				t.Fatal(err)
++			}
++			response.Body.Close()
++			if calls != 1 {
++				t.Fatalf("operation made %d requests", calls)
++			}
++		})
++	}
++}
++
++func TestEnvdPostKeepsCallerCancellation(t *testing.T) { //nolint:paralleltest
++	original := sandboxHttpClient
++	t.Cleanup(func() { sandboxHttpClient = original })
++	s := &Sandbox{Metadata: &Metadata{Config: &Config{}}}
++	s.internalConfig.envdServerURLOverride = "http://envd.test"
++	ctx, cancel := context.WithCancel(t.Context())
++	defer cancel()
++	calls := 0
++	sandboxHttpClient = http.Client{Timeout: 10 * time.Second, Transport: envdTimeoutTransport(func(r *http.Request) (*http.Response, error) {
++		calls++
++		cancel()
++		<-r.Context().Done()
++		return nil, r.Context().Err()
++	})}
++	response, err := s.doEnvdPost(ctx, "fsthaw")
++	if response != nil || !errors.Is(err, context.Canceled) || calls != 1 {
++		t.Fatalf("cancelled operation returned response=%v error=%v calls=%d", response, err, calls)
++	}
++}

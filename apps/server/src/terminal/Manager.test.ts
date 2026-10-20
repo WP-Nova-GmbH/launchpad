@@ -1,3 +1,11 @@
+import * as CheckoutAccess from "../workspace/CheckoutAccess.ts";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import {
+  makeThreadExecutionRelay,
+  ThreadExecutionRelayError,
+} from "../relay/ThreadExecutionRelay.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -36,7 +44,6 @@ import { expect } from "vite-plus/test";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
-import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TerminalManager from "./Manager.ts";
@@ -214,6 +221,8 @@ const multiTerminalHistoryLogPath = (
   );
 
 interface CreateManagerOptions {
+  checkoutAccess?: Parameters<typeof TerminalManager.makeWithOptions>[0]["checkoutAccess"];
+  execution?: Parameters<typeof TerminalManager.makeWithOptions>[0]["execution"];
   shellResolver?: () => string;
   env?: NodeJS.ProcessEnv;
   subprocessInspector?: (terminalPid: number) => Effect.Effect<{
@@ -259,6 +268,12 @@ const createManager = (
       const ptyAdapter = options.ptyAdapter ?? new FakePtyAdapter();
 
       const manager = yield* TerminalManager.makeWithOptions({
+        checkoutAccess: options.checkoutAccess ?? { assertAvailable: () => Effect.void },
+        execution: options.execution ?? {
+          begin: () => Effect.succeed("ordinary" as const),
+          assertAccepting: () => Effect.succeed(undefined),
+          withActiveWork: (_work, effect) => effect,
+        },
         logsDir,
         historyLineLimit,
         ptyAdapter,
@@ -405,6 +420,50 @@ it.layer(
   Layer.merge(NodeServices.layer, ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer))),
   { excludeTestServices: true },
 )("TerminalManager", (it) => {
+  it.effect(
+    "blocks ordinary terminal startup, restart, and shell input into another thread's frozen checkout",
+    () =>
+      Effect.gen(function* () {
+        const access = yield* CheckoutAccess.CheckoutAccess;
+        const sql = yield* SqlClient.SqlClient;
+        const { manager, ptyAdapter, baseDir } = yield* createManager(5, {
+          checkoutAccess: access,
+        });
+        yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+        VALUES ('reserved-project', 'Reserved', ${baseDir}, '[]', '2026-10-05T10:00:00.000Z', '2026-10-05T10:00:00.000Z')`;
+        yield* sql`INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at)
+        VALUES ('reserved-thread', 'reserved-project', 'Reserved', '{"instanceId":"codex","model":"gpt-5"}', 'full-access', 'default', '2026-10-05T10:00:00.000Z', '2026-10-05T10:00:00.000Z')`;
+        yield* sql`INSERT INTO thread_execution_fences (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+        VALUES ('reserved-thread', 'https://relay.example', 'source', 'reserved-project', 1, 'move', 'frozen')`;
+        expect((yield* Effect.flip(manager.open(openInput({ cwd: baseDir }))))._tag).toBe(
+          "TerminalExecutionError",
+        );
+        expect(ptyAdapter.spawnInputs).toHaveLength(0);
+        yield* sql`UPDATE thread_execution_fences SET phase = 'active' WHERE thread_id = 'reserved-thread'`;
+        yield* manager.open(openInput({ cwd: baseDir }));
+        yield* sql`UPDATE thread_execution_fences SET phase = 'frozen' WHERE thread_id = 'reserved-thread'`;
+        yield* Effect.flip(
+          manager.write({
+            threadId: "thread-1",
+            terminalId: DEFAULT_TERMINAL_ID,
+            data: "touch changed\n",
+          }),
+        );
+        yield* Effect.flip(manager.restart(restartInput({ cwd: baseDir })));
+        expect(ptyAdapter.spawnInputs).toHaveLength(1);
+        expect(ptyAdapter.processes[0]!.writes).toEqual([]);
+        yield* sql`UPDATE thread_execution_fences SET phase = 'retired' WHERE thread_id = 'reserved-thread'`;
+        yield* manager.write({
+          threadId: "thread-1",
+          terminalId: DEFAULT_TERMINAL_ID,
+          data: "pwd\n",
+        });
+        expect(ptyAdapter.processes[0]!.writes).toEqual(["pwd\n"]);
+      }).pipe(
+        Effect.provide(CheckoutAccess.layer.pipe(Layer.provideMerge(SqlitePersistenceMemory))),
+      ),
+  );
+
   it.effect("spawns lazily and reuses running terminal per thread", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager();
@@ -2896,5 +2955,164 @@ it.layer(
       assert.equal(process.killSignals[0], "SIGTERM");
       expect(process.killSignals).toContain("SIGKILL");
     }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
+
+const portableTerminalFixture = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const fence = makeThreadExecutionFence(sql);
+  const owner = {
+    threadId: "thread-1",
+    projectId: "project",
+    environmentId: "environment",
+    relayUrl: "https://relay.test",
+    generation: 1,
+    operationId: "enroll",
+  };
+  yield* fence.prepare(owner);
+  yield* fence.activate(owner);
+  const authority = {
+    admit: () => Effect.succeed({ completed: false, newlyAdmitted: true }),
+    complete: () => Effect.void,
+  };
+  const execution = makeThreadExecutionRelay(sql, authority);
+  const move = { ...owner, operationId: "move", previousOperationId: "enroll" };
+  return { sql, fence, owner, authority, execution, move };
+});
+
+it.layer(
+  Layer.mergeAll(NodeServices.layer, ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer))),
+  { excludeTestServices: true },
+)("Portable terminals", (it) => {
+  it.effect("portable terminals block input and new shells when a move drains execution", () =>
+    Effect.gen(function* () {
+      const { sql, fence, execution, move } = yield* portableTerminalFixture;
+      const { manager, ptyAdapter } = yield* createManager(5, { execution });
+      yield* manager.open(openInput());
+      const process = ptyAdapter.processes[0]!;
+      yield* manager.write({
+        threadId: "thread-1",
+        terminalId: DEFAULT_TERMINAL_ID,
+        data: "echo before\n",
+      });
+      expect(process.writes).toEqual(["echo before\n"]);
+      yield* fence.beginDrain(move);
+      expect(
+        (yield* Effect.result(
+          manager.write({
+            threadId: "thread-1",
+            terminalId: DEFAULT_TERMINAL_ID,
+            data: "echo after\n",
+          }),
+        ))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* Effect.result(manager.restart({ ...openInput(), cols: 80, rows: 24 })))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* Effect.result(
+          manager.attachStream(
+            { threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID, cols: 90, rows: 30 },
+            () => Effect.void,
+          ),
+        ))._tag,
+      ).toBe("Failure");
+      expect(process.writes).toEqual(["echo before\n"]);
+      expect(ptyAdapter.processes).toHaveLength(1);
+      expect((yield* Effect.result(fence.freeze(move)))._tag).toBe("Failure");
+      // Actual shell exit remains insufficient evidence for its detached children.
+      process.emitExit({ exitCode: 0, signal: null });
+      yield* manager.close({ threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID });
+      expect(yield* sql`SELECT 1 FROM thread_execution_work WHERE completed = 0`).toHaveLength(1);
+      expect((yield* Effect.result(fence.freeze(move)))._tag).toBe("Failure");
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
+  it.effect(
+    "portable terminal admission failure never spawns a process, including attach restart",
+    () =>
+      Effect.gen(function* () {
+        const { sql, fence, authority, move } = yield* portableTerminalFixture;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const execution = makeThreadExecutionRelay(sql, {
+          ...authority,
+          admit: () =>
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(authority.admit()),
+            ),
+        });
+        const { manager, ptyAdapter } = yield* createManager(5, { execution });
+        const pending = yield* manager
+          .attachStream({ ...openInput(), restartIfNotRunning: true }, () => Effect.void)
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* fence.beginDrain(move);
+        yield* Deferred.succeed(release, undefined);
+        expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+        expect(ptyAdapter.processes).toHaveLength(0);
+        expect(yield* fence.freeze(move)).toBe(0);
+      }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
+  it.effect("lost terminal admission responses reuse one reservation before spawning", () =>
+    Effect.gen(function* () {
+      const { sql, authority } = yield* portableTerminalFixture;
+      let attempts = 0;
+      const workIds: string[] = [];
+      const execution = makeThreadExecutionRelay(sql, {
+        ...authority,
+        admit: (work) => {
+          workIds.push(work.workId);
+          return ++attempts === 1
+            ? Effect.fail(
+                new ThreadExecutionRelayError({
+                  threadId: work.threadId,
+                  operation: "admit",
+                  detail: "Lost response",
+                }),
+              )
+            : authority.admit();
+        },
+      });
+      const { manager, ptyAdapter } = yield* createManager(5, { execution });
+      expect((yield* Effect.result(manager.open(openInput())))._tag).toBe("Failure");
+      expect(ptyAdapter.processes).toHaveLength(0);
+      yield* manager.open(openInput());
+      expect(ptyAdapter.processes).toHaveLength(1);
+      expect(workIds).toHaveLength(2);
+      expect(workIds[0]).toBe(workIds[1]);
+      expect(yield* sql`SELECT 1 FROM thread_execution_work`).toHaveLength(1);
+      ptyAdapter.processes[0]!.emitExit({ exitCode: 0, signal: null });
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
+  it.effect("ordinary terminals work without a relay while portable admission fails closed", () =>
+    Effect.gen(function* () {
+      const { sql, authority } = yield* portableTerminalFixture;
+      const execution = makeThreadExecutionRelay(sql, {
+        ...authority,
+        admit: () =>
+          Effect.fail(
+            new ThreadExecutionRelayError({
+              threadId: "thread-1",
+              operation: "admit",
+              detail: "Offline",
+            }),
+          ),
+      });
+      const { manager, ptyAdapter } = yield* createManager(5, { execution });
+      expect((yield* Effect.result(manager.open(openInput())))._tag).toBe("Failure");
+      expect(ptyAdapter.processes).toHaveLength(0);
+      yield* manager.open({ ...openInput(), threadId: "ordinary" });
+      yield* manager.write({
+        threadId: "ordinary",
+        terminalId: DEFAULT_TERMINAL_ID,
+        data: "ordinary\n",
+      });
+      expect(ptyAdapter.processes[0]!.writes).toEqual(["ordinary\n"]);
+      ptyAdapter.processes[0]!.emitExit({ exitCode: 0, signal: null });
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
 });

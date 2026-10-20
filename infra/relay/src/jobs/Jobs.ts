@@ -105,7 +105,7 @@ export class Jobs extends Context.Service<
       readonly detail: string | null;
     }) => Effect.Effect<RelayJobRecord | null, JobPersistenceError>;
   }
->()("t3code-relay/jobs/Jobs") {}
+>()("launchpad-relay/jobs/Jobs") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

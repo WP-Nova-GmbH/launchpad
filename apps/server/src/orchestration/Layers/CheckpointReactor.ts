@@ -407,6 +407,13 @@ const make = Effect.gen(function* () {
         return "skipped" as const;
       }
 
+      // Portable native capture must finish before queue finalization. A duplicate
+      // Git checkpoint does not prove that independently retained native state exists.
+      yield* (
+        providerService.checkpointConversation?.({ threadId: event.threadId, turnId }) ??
+          Effect.void
+      );
+
       // Only skip if a real (non-placeholder) checkpoint already exists for this turn.
       // ProviderRuntimeIngestion may insert placeholder entries with status "missing"
       // before this reactor runs; those must not prevent real git capture.

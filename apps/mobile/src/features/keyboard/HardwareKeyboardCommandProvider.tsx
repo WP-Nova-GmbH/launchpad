@@ -1,3 +1,6 @@
+import { useAtomSet } from "@effect/atom-react";
+import { portableThreadLibrary } from "../../state/threads";
+import { PortableThreadLibraryOverlay } from "../threads/PortableThreadLibrary";
 import { StackActions, useNavigation } from "@react-navigation/native";
 import { resolveThreadReferenceCopyTarget } from "@t3tools/shared/threadReference";
 import {
@@ -47,6 +50,7 @@ export function HardwareKeyboardCommandProvider({
   pathname,
 }: PropsWithChildren<{ readonly pathname: string }>) {
   const navigation = useNavigation();
+  const setVmLibraryOpen = useAtomSet(portableThreadLibrary.openAtom);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const closePalette = useCallback(() => setPaletteOpen(false), []);
   const activeThreadRef = useMemo(() => parseActiveThreadPath(pathname), [pathname]);
@@ -100,6 +104,7 @@ export function HardwareKeyboardCommandProvider({
     const commands = new Set<HardwareKeyboardCommand>(getRegisteredHardwareKeyboardCommands());
     commands.add("newTask");
     commands.add("commandPalette");
+    if (process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED === "1") commands.add("threadVms");
     if (pathname !== "/" && !pathname.startsWith("/threads/")) {
       for (const command of commands) {
         if (command.startsWith("thread.jump.")) commands.delete(command);
@@ -117,6 +122,11 @@ export function HardwareKeyboardCommandProvider({
 
   const onCommand = useCallback(
     (command: HardwareKeyboardCommand) => {
+      if (command === "threadVms" && process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED === "1") {
+        setPaletteOpen(false);
+        setVmLibraryOpen(true);
+        return;
+      }
       if (command === "commandPalette") {
         setPaletteOpen(true);
         return;
@@ -172,7 +182,7 @@ export function HardwareKeyboardCommandProvider({
         navigation.navigate("ThreadReview", thread);
       }
     },
-    [copyTarget, navigation, pathname, showCopyFeedback],
+    [copyTarget, navigation, pathname, showCopyFeedback, setVmLibraryOpen],
   );
 
   const palette = useMemo(
@@ -188,6 +198,7 @@ export function HardwareKeyboardCommandProvider({
       <T3KeyboardCommands enabledCommands={enabledCommands} onCommand={onCommand}>
         {children}
       </T3KeyboardCommands>
+      <PortableThreadLibraryOverlay />
       <GitActionProgressOverlay progress={copyFeedback} onDismiss={dismissCopyFeedback} />
     </CommandPaletteContext>
   );

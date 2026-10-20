@@ -26,7 +26,7 @@ export interface OrchestrationAggregateReplayRange {
 export interface OrchestrationAggregateReplayStats {
   readonly eventCount: number;
   readonly payloadBytes: number;
-  /** A creation in this range does not prove that the aggregate still exists. */
+  /** Creation or history replacement requires a fresh snapshot; neither proves it still exists. */
   readonly hasCreateEvent: boolean;
 }
 

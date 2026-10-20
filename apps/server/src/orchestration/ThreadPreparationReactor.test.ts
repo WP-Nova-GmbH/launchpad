@@ -103,6 +103,12 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
   };
   // The real manager acquires the same workspace lease as preparation. Only the PTY is fake.
   const terminal = yield* TerminalManager.makeWithOptions({
+    checkoutAccess: { assertAvailable: () => Effect.void },
+    execution: {
+      begin: () => Effect.succeed("ordinary" as const),
+      assertAccepting: () => Effect.succeed(undefined),
+      withActiveWork: (_work, effect) => effect,
+    },
     logsDir: path.join(config.baseDir, "preparation-terminal-logs"),
     ptyAdapter: {
       spawn: (input) =>

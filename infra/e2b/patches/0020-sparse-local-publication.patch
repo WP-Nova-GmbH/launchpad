@@ -1,0 +1,123 @@
+--- a/packages/shared/pkg/storage/storage_fs.go
++++ b/packages/shared/pkg/storage/storage_fs.go
+@@ -336,7 +336,21 @@
+ 		return 0, err
+ 	}
+ 
+-	n, err := io.Copy(tmp, r)
++	var n int64
++	if source, ok := r.(*os.File); ok {
++		info, statErr := source.Stat()
++		if statErr != nil {
++			tmp.Close()
++			return 0, statErr
++		}
++		if info.Mode().IsRegular() {
++			n, err = copySparseFile(tmp, source)
++		} else {
++			n, err = io.Copy(tmp, r)
++		}
++	} else {
++		n, err = io.Copy(tmp, r)
++	}
+ 	if err != nil {
+ 		tmp.Close()
+ 
+@@ -351,6 +365,32 @@
+ 	}
+ 
+ 	return n, nil
++}
++
++// StoreFile publishes verified VM disks containing large free zeroed regions.
++// A kernel file copy can allocate those holes again and exhaust restore capacity.
++// Copy every byte, leaving zero chunks sparse and preserving trailing geometry.
++func copySparseFile(dst, src *os.File) (int64, error) {
++	buffer := make([]byte, 1<<20)
++	zero := make([]byte, len(buffer))
++	var offset int64
++	for {
++		n, err := io.ReadFull(src, buffer)
++		if n > 0 {
++			if !bytes.Equal(buffer[:n], zero[:n]) {
++				if _, writeErr := dst.WriteAt(buffer[:n], offset); writeErr != nil {
++					return offset, writeErr
++				}
++			}
++			offset += int64(n)
++		}
++		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++			return offset, dst.Truncate(offset)
++		}
++		if err != nil {
++			return offset, err
++		}
++	}
+ }
+ 
+ func (o *fsObject) replaceFrom(r io.Reader) (int64, error) {
+--- /dev/null
++++ b/packages/shared/pkg/storage/storage_fs_sparse_linux_test.go
+@@ -0,0 +1,62 @@
++//go:build linux
++
++package storage
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"golang.org/x/sys/unix"
++)
++
++func TestFSStoreFilePreservesSparseDisk(t *testing.T) {
++	t.Parallel()
++	for _, mixed := range []bool{false, true} {
++		name := "empty-disk"
++		if mixed {
++			name = "mixed-disk"
++		}
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++			const size = 16<<20 + 4096
++			contents := make([]byte, size)
++			if mixed {
++				copy(contents[(2<<20)-512:], bytes.Repeat([]byte{0x6a}, 4096))
++				copy(contents[14<<20:], []byte("preserved filesystem data"))
++			}
++			source := filepath.Join(t.TempDir(), "disk.ext4")
++			f, err := os.OpenFile(source, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
++			require.NoError(t, err)
++			require.NoError(t, f.Truncate(size))
++			if mixed {
++				_, err = f.WriteAt(contents[(2<<20)-512:(2<<20)-512+4096], (2<<20)-512)
++				require.NoError(t, err)
++				_, err = f.WriteAt(contents[14<<20:(14<<20)+4096], 14<<20)
++				require.NoError(t, err)
++			}
++			require.NoError(t, f.Close())
++			p := newTempProvider(t)
++			object, err := p.OpenSeekable(t.Context(), "published/rootfs.ext4")
++			require.NoError(t, err)
++			// Replacing an existing dense object must also discard its old blocks.
++			require.NoError(t, os.WriteFile(p.getPath("published/rootfs.ext4"), bytes.Repeat([]byte{0xff}, 4<<20), 0o600))
++			_, _, err = object.StoreFile(t.Context(), source)
++			require.NoError(t, err)
++			actual, err := os.ReadFile(p.getPath("published/rootfs.ext4"))
++			require.NoError(t, err)
++			require.True(t, bytes.Equal(contents, actual), "every source byte must survive publication")
++			require.Equal(t, sha256.Sum256(contents), sha256.Sum256(actual))
++			unchanged, err := os.ReadFile(source)
++			require.NoError(t, err)
++			require.True(t, bytes.Equal(contents, unchanged), "publication must not alter the verified source")
++			var info unix.Stat_t
++			require.NoError(t, unix.Stat(p.getPath("published/rootfs.ext4"), &info))
++			require.EqualValues(t, size, info.Size, "trailing holes define the disk geometry")
++			require.Less(t, info.Blocks*512, int64(size/2), "publishing free disk space must not allocate a second whole VM disk")
++		})
++	}
++}

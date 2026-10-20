@@ -1,4 +1,8 @@
 import { setDesktopLocalAccount } from "../environments/primary/desktopAuth";
+import { synchronizeBrowserIdentity } from "../environments/primary/browserIdentity";
+import { usePrimarySessionState } from "../environments/primary/sessionState";
+import { resolvePrimaryEnvironmentHttpUrl } from "../environments/primary/target";
+import { usePrimaryEnvironmentId } from "../state/environments";
 import { toastManager } from "../components/ui/toast";
 import { useAuth } from "@clerk/react";
 import { ManagedRelay, setManagedRelaySession } from "@t3tools/client-runtime/relay";
@@ -44,6 +48,10 @@ export function ManagedRelayAuthProvider({ children }: { readonly children: Reac
   const observedAccountRef = useRef<string | null | undefined>(undefined);
   const accountTransitionRef = useRef<Promise<void> | null>(null);
   const localIdentityWarningRef = useRef<string | null>(null);
+  const browserIdentityTransitionRef = useRef<Promise<void>>(Promise.resolve());
+  const { data: primarySession, refresh: refreshPrimarySession } = usePrimarySessionState();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const reconnectPrimary = useAtomCommand(environmentCatalog.retryNow);
 
   useEffect(() => {
     if (!isLoaded) return;
@@ -67,6 +75,55 @@ export function ManagedRelayAuthProvider({ children }: { readonly children: Reac
       },
     );
   }, [getToken, isLoaded, isSignedIn, userId]);
+
+  useEffect(() => {
+    if (
+      !isLoaded ||
+      window.desktopBridge ||
+      !primaryEnvironmentId ||
+      !primarySession?.authenticated ||
+      primarySession.sessionMethod !== "browser-session-cookie" ||
+      new URL(resolvePrimaryEnvironmentHttpUrl("/")).origin !== window.location.origin
+    )
+      return;
+    let cancelled = false;
+    const id = isSignedIn && userId ? userId : null;
+    browserIdentityTransitionRef.current = browserIdentityTransitionRef.current.then(async () => {
+      if (cancelled) return;
+      try {
+        const changed = await synchronizeBrowserIdentity(
+          id ? { id, readToken: () => getToken(resolveRelayClerkTokenOptions()) } : null,
+          () => !cancelled,
+        );
+        if (changed) {
+          refreshPrimarySession();
+          await reconnectPrimary(primaryEnvironmentId);
+        }
+      } catch {
+        refreshPrimarySession();
+        if (cancelled || localIdentityWarningRef.current === id) return;
+        localIdentityWarningRef.current = id;
+        toastManager.add({
+          type: "warning",
+          title: "Account verification is unavailable",
+          description:
+            "Local message names and thread moves need a verified Launchpad Connect account.",
+        });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    getToken,
+    isLoaded,
+    isSignedIn,
+    userId,
+    primaryEnvironmentId,
+    primarySession,
+    refreshPrimarySession,
+    reconnectPrimary,
+  ]);
 
   useEffect(() => {
     if (!isLoaded) {

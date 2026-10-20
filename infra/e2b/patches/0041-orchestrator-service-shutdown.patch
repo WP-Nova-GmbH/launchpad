@@ -1,0 +1,139 @@
+--- a/packages/orchestrator/pkg/factories/run.go
++++ b/packages/orchestrator/pkg/factories/run.go
+@@ -274,14 +274,6 @@
+ 	close func(ctx context.Context) error
+ }
+ 
+-type serviceDoneError struct {
+-	name string
+-}
+-
+-func (e serviceDoneError) Error() string {
+-	return fmt.Sprintf("service %s finished", e.name)
+-}
+-
+ // Run starts the orchestrator, blocking until shutdown.
+ // Returns true on clean shutdown.
+ func Run(opts Options) bool {
+@@ -446,7 +438,7 @@
+ 	// defer waiting on the group so that this runs even when
+ 	// there's a panic.
+ 	defer func(g *errgroup.Group) {
+-		err := g.Wait()
++		err := waitForServices(cancel, g.Wait)
+ 		if err != nil {
+ 			log.Printf("error while shutting down: %v", err)
+ 			success = false
+@@ -468,7 +460,7 @@
+ 	}
+ 	e2bgrpc.StartChannelzSampler(ctx)
+ 	defer func() {
+-		err := tel.Shutdown(ctx)
++		err := tel.Shutdown(context.WithoutCancel(ctx))
+ 		if err != nil {
+ 			log.Printf("error while shutting down telemetry: %v", err)
+ 			success = false
+@@ -1157,8 +1149,7 @@
+ 	}
+ 
+ 	logger.L().Info(ctx, "Waiting for services to finish")
+-	var sde serviceDoneError
+-	if err := g.Wait(); err != nil && !errors.As(err, &sde) {
++	if err := waitForServices(cancel, g.Wait); err != nil {
+ 		logger.L().Error(ctx, "service group error", zap.Error(err))
+ 		success = false
+ 	}
+--- a/packages/orchestrator/pkg/factories/shutdown.go
++++ b/packages/orchestrator/pkg/factories/shutdown.go
+@@ -0,0 +1,22 @@
++package factories
++
++import (
++	"context"
++	"errors"
++	"fmt"
++)
++
++type serviceDoneError struct{ name string }
++
++func (e serviceDoneError) Error() string { return fmt.Sprintf("service %s finished", e.name) }
++
++func waitForServices(cancel context.CancelFunc, wait func() error) error {
++	// Stop context-bound workers before joining them. Normal shutdown calls
++	// this only after draining sandboxes and closing their dependencies.
++	cancel()
++	var done serviceDoneError
++	if err := wait(); err != nil && !errors.As(err, &done) {
++		return err
++	}
++	return nil
++}
+--- a/packages/orchestrator/pkg/factories/shutdown_test.go
++++ b/packages/orchestrator/pkg/factories/shutdown_test.go
+@@ -0,0 +1,66 @@
++package factories
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestWaitForServicesStopsContextWorker(t *testing.T) {
++	for _, mode := range []string{"normal shutdown", "early return", "panic"} {
++		t.Run(mode, func(t *testing.T) {
++			ctx, cancel := context.WithCancel(t.Context())
++			defer cancel()
++			signalCtx, signal := context.WithCancel(ctx)
++			signal()
++			<-signalCtx.Done()
++			if ctx.Err() != nil {
++				t.Fatal("signal cancelled the parent before drain")
++			}
++			cleanupCtx := context.WithoutCancel(ctx)
++			var workers sync.WaitGroup
++			workers.Go(func() { <-ctx.Done() })
++			stopped := make(chan error, 1)
++			go func() {
++				wait := func() error { workers.Wait(); return serviceDoneError{name: "routing"} }
++				if mode != "normal shutdown" {
++					func() {
++						defer func() { _ = recover() }()
++						defer func() { stopped <- waitForServices(cancel, wait) }()
++						if mode == "panic" {
++							panic("startup failed")
++						}
++					}()
++				} else {
++					stopped <- waitForServices(cancel, wait)
++				}
++			}()
++			select {
++			case err := <-stopped:
++				if err != nil {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("shutdown waited for a context worker before cancelling it")
++			}
++			if cleanupCtx.Err() != nil {
++				t.Fatal("telemetry cleanup lost its live context")
++			}
++		})
++	}
++}
++
++func TestWaitForServicesPreservesFailure(t *testing.T) {
++	ctx, cancel := context.WithCancel(t.Context())
++	defer cancel()
++	want := errors.New("service failed")
++	err := waitForServices(cancel, func() error { return want })
++	if !errors.Is(err, want) {
++		t.Fatalf("failure replaced: %v", err)
++	}
++	if ctx.Err() == nil {
++		t.Fatal("failure path left context workers running")
++	}
++}

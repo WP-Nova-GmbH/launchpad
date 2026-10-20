@@ -125,10 +125,6 @@ export interface OrganizationAdminState {
   /** Installations of the App as GitHub reports them, for picking one that was installed directly. */
   readonly listGithubInstallations: () => Promise<ReadonlyArray<RelayGithubInstallationCandidate> | null>;
   readonly disconnectGithub: () => Promise<boolean>;
-  readonly provisionMachine: (input: {
-    readonly label: string;
-    readonly role: RelayMachineRole;
-  }) => Promise<boolean>;
   readonly connectMachine: (input: {
     readonly label: string;
     readonly role: RelayMachineRole;
@@ -502,12 +498,6 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       mutate("Could not revoke access", () =>
         call("Could not revoke access", (client, clerkToken) =>
           client.revokeAccess({ clerkToken, ...input }),
-        ),
-      ),
-    provisionMachine: (input) =>
-      mutate("Could not provision the machine", () =>
-        call("Could not provision the machine", (client, clerkToken) =>
-          client.provisionMachine({ clerkToken, payload: input }),
         ),
       ),
     connectMachine: (input) =>

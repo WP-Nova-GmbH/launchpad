@@ -37,6 +37,7 @@ import * as CliTokenManager from "../cloud/CliTokenManager.ts";
 import { filterRelayResponse } from "../cloud/relayResponse.ts";
 import {
   CLOUD_LINKED_USER_ID,
+  requireManagedTunnels,
   isAgentActivityPublishingEnabledValue,
   PUBLISH_AGENT_ACTIVITY_SECRET,
   RELAY_URL_SECRET,
@@ -250,6 +251,7 @@ export const acquireRelayClientForLink = Effect.fn("cloud.cli.acquire_relay_clie
     confirmInstall: (version: string) => Effect.Effect<boolean, ConfirmError, ConfirmContext>,
     reportProgress: (event: RelayClientInstallProgressEvent) => Effect.Effect<void>,
   ) {
+    yield* requireManagedTunnels;
     const executable = yield* relayClient.resolve;
     if (executable.status === "available") {
       return Option.some(executable);

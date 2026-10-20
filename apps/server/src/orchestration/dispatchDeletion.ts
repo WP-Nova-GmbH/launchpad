@@ -1,4 +1,9 @@
-import { CommandId, type OrchestrationCommand } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentAuthorizationError,
+  type OrchestrationCommand,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -67,6 +72,29 @@ export const makeDeletionDispatcher = Effect.gen(function* () {
     command: DeleteCommand,
     options?: OrchestrationDispatchOptions,
   ) {
+    const authorizeProjectThreads = Effect.fnUntraced(function* (
+      threads: ReadonlyArray<{ readonly id: ThreadId }>,
+    ) {
+      if (command.type !== "project.delete") return;
+      for (const thread of threads)
+        yield* access
+          .requireCommand(actor, {
+            type: "thread.delete",
+            commandId: command.commandId,
+            threadId: thread.id,
+          })
+          .pipe(
+            Effect.mapError((error) =>
+              error.reason === "portable-thread"
+                ? new EnvironmentAuthorizationError({
+                    ...error,
+                    message:
+                      "Delete this project's managed threads through Launchpad Connect before deleting the project.",
+                  })
+                : error,
+            ),
+          );
+    });
     const captured = yield* access.withFence(
       Effect.gen(function* () {
         const replay = yield* replayAuthorizedOrchestrationCommand(actor, command);
@@ -87,7 +115,12 @@ export const makeDeletionDispatcher = Effect.gen(function* () {
           projectId === undefined ||
           (command.type === "project.delete" && !command.force && threads.length > 0)
         )
-          return { replay: yield* engine.dispatch(command, options) } as const;
+          return {
+            replay: yield* engine.dispatch(command, { ...options, directClientCommand: true }),
+          } as const;
+        // Check every captured thread before pausing any setup. A project command
+        // has no thread ID, so it cannot inherit the ordinary portable-thread guard.
+        yield* authorizeProjectThreads(threads);
         const preconditions: DeletionPreconditions = {
           projectId,
           snapshotSequence: snapshot.snapshotSequence,
@@ -100,7 +133,11 @@ export const makeDeletionDispatcher = Effect.gen(function* () {
       }),
     );
     if ("replay" in captured) return captured.replay;
-    const guarded = { ...options, deletionPreconditions: captured.preconditions };
+    const guarded = {
+      ...options,
+      directClientCommand: true,
+      deletionPreconditions: captured.preconditions,
+    } satisfies OrchestrationDispatchOptions;
     const stopped = yield* Effect.gen(function* () {
       for (const thread of captured.threads) {
         const setup = thread.promptQueue?.preparation;
@@ -133,9 +170,11 @@ export const makeDeletionDispatcher = Effect.gen(function* () {
           });
       }
       return yield* access.withFence(
-        authorizeOrchestrationCommand(actor, command).pipe(
-          Effect.andThen(engine.dispatch(command, guarded)),
-        ),
+        Effect.gen(function* () {
+          yield* authorizeOrchestrationCommand(actor, command);
+          yield* authorizeProjectThreads(captured.threads);
+          return yield* engine.dispatch(command, guarded);
+        }),
       );
     }).pipe(Effect.result);
     if (stopped._tag === "Success") return stopped.success;

@@ -333,6 +333,13 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   switch (command.type) {
     case "thread.preparation.update":
     case "thread.preparation.retry":
+    case "thread.move.claim":
+    case "thread.move.progress":
+    case "thread.move.finish":
+    case "thread.move.enqueue":
+    case "thread.move.edit":
+    case "thread.move.cancel":
+    case "thread.queue.reorder":
     case "thread.prompt.enqueue":
     case "thread.prompt.edit":
     case "thread.prompt.remove":

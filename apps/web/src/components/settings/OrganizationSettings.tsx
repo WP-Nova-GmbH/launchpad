@@ -75,6 +75,7 @@ import {
   useRelativeTimeTick,
 } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
+import { ThreadVmPolicySettings } from "./ThreadVmPolicySettings";
 
 const ORG_ROLE_LABELS: Readonly<Record<RelayOrgRole, string>> = {
   admin: "Admin",
@@ -1286,8 +1287,7 @@ function MachineRow({
   nowMs: number;
   enrollment: IssuedMachineEnrollment | undefined;
 }) {
-  // Destroying a machine destroys thread history on it, so the trash icon
-  // arms a second, labeled click instead of acting immediately.
+  // Disconnecting removes organization access; confirm before revoking it.
   const [confirming, setConfirming] = useState(false);
   const { copyToClipboard } = useCopyToClipboard({ target: "setup command" });
   const isAdmin = state.snapshot?.membership.role === "admin";
@@ -1307,6 +1307,7 @@ function MachineRow({
     selfHosted && awaitingSetup && !enrollment
       ? "the setup command was only shown when the machine was created"
       : null,
+    !selfHosted ? "legacy managed compute needs cleanup on its original host" : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -1326,7 +1327,7 @@ function MachineRow({
       }
       control={
         <div className="flex items-center gap-2">
-          <span className="flex items-center gap-1.5 text-[13px] text-muted-foreground">
+          <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
             <ConnectionStatusDot
               dotClassName={status.dotClassName}
               pingClassName={status.pingClassName}
@@ -1343,7 +1344,7 @@ function MachineRow({
               Copy setup command
             </Button>
           ) : null}
-          {isAdmin && machine.status !== "deprovisioned" ? (
+          {isAdmin && selfHosted && machine.status !== "deprovisioned" ? (
             confirming ? (
               <Button
                 size="sm"
@@ -1355,13 +1356,13 @@ function MachineRow({
                   void state.deprovisionMachine(machine.machineId);
                 }}
               >
-                Destroy machine
+                Disconnect machine
               </Button>
             ) : (
               <Button
                 size="icon-sm"
                 variant="ghost"
-                aria-label={`Destroy ${machine.label}`}
+                aria-label={`Disconnect ${machine.label}`}
                 disabled={state.busy}
                 onClick={() => setConfirming(true)}
               >
@@ -1377,9 +1378,8 @@ function MachineRow({
 
 function MachinesSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
-  // A machine flips to ready on its own within a couple of minutes of being
-  // provisioned. While one is in that window, the list keeps itself fresh —
-  // asking the admin to reload the page would make the product look stuck.
+  // Refresh while an invited computer completes enrollment or its invitation
+  // expires, so the admin sees the change without reloading.
   const nowMs = useRelativeTimeTick(30_000);
   const machines = visibleMachines(snapshot?.machines ?? []);
   const settingUp = hasMachineSettingUp(machines, nowMs);
@@ -1403,10 +1403,9 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
       icon={<ServerIcon className="size-4 text-muted-foreground" />}
     >
       <SectionNote>
-        Machines are computers this organization works through — bought via Launchpad Connect or its
-        own, connected by hand. Agent executors run work, review hosts will run review apps. A ready
-        machine appears to every member beside their own environments. Destroying one also destroys
-        any thread history it holds.
+        Connect computers your organization already runs. A ready machine appears to members beside
+        their own environments. Disconnecting it revokes its Launchpad Connect access and keeps its
+        files.
       </SectionNote>
       {machines.length === 0 ? (
         <Empty className="min-h-48">
@@ -1416,8 +1415,8 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
           <EmptyHeader>
             <EmptyTitle>No machines yet</EmptyTitle>
             <EmptyDescription>
-              Provision one and it joins this organization on its own — nobody signs in on it, and
-              it can never be linked as somebody&apos;s personal environment.
+              Connect an existing computer and run its setup command to make it available to your
+              organization.
             </EmptyDescription>
           </EmptyHeader>
         </Empty>
@@ -1437,13 +1436,6 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
       {isAdmin ? (
         <>
           <MachineCreateRow
-            title="Provision a machine"
-            description="Creates a fresh machine that sets itself up and calls home on its own — usually within a couple of minutes. Review hosts sit idle until review apps ship."
-            actionLabel="Provision"
-            busy={state.busy}
-            onCreate={(input) => state.provisionMachine(input)}
-          />
-          <MachineCreateRow
             title="Connect your own machine"
             description="Registers a computer this organization already runs. Copy the setup command it hands back and run it on that computer within 24 hours — the machine enrolls itself from there."
             actionLabel="Connect"
@@ -1457,8 +1449,7 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
 }
 
 /**
- * One machine-creation row: name, role, and the verb that decides who gets
- * the enrollment seed — a compute driver (Provision) or the admin (Connect).
+ * Register an existing computer and deliver its one-use enrollment seed.
  */
 function MachineCreateRow({
   title,
@@ -1474,7 +1465,6 @@ function MachineCreateRow({
   onCreate: (input: { label: string; role: RelayMachineRole }) => Promise<boolean>;
 }) {
   const [label, setLabel] = useState("");
-  const [role, setRole] = useState<RelayMachineRole>("agent_executor");
   return (
     <SettingsRow
       title={title}
@@ -1489,29 +1479,11 @@ function MachineCreateRow({
             onChange={(event) => setLabel(event.currentTarget.value)}
             className="w-full sm:w-48"
           />
-          <Select
-            value={role}
-            onValueChange={(value) => {
-              if (typeof value === "string") setRole(value as RelayMachineRole);
-            }}
-          >
-            <SelectTrigger className="w-40" aria-label={`${title} — role`}>
-              <SelectValue>{MACHINE_ROLE_LABELS[role]}</SelectValue>
-            </SelectTrigger>
-            <SelectPopup align="end" alignItemWithTrigger={false}>
-              <SelectItem hideIndicator value="agent_executor">
-                Agent executor
-              </SelectItem>
-              <SelectItem hideIndicator value="review_host">
-                Review host
-              </SelectItem>
-            </SelectPopup>
-          </Select>
           <Button
             size="sm"
             disabled={busy || label.trim().length === 0}
             onClick={() => {
-              void onCreate({ label: label.trim(), role }).then((ok) => {
+              void onCreate({ label: label.trim(), role: "agent_executor" }).then((ok) => {
                 if (ok) setLabel("");
               });
             }}
@@ -1617,6 +1589,9 @@ function ConfiguredOrganizationSettings() {
           <ProviderAccountsSection state={state} />
           <SkillsSection state={state} />
           <RepositoriesSection state={state} />
+          {state.snapshot ? (
+            <ThreadVmPolicySettings isAdmin={state.snapshot.membership.role === "admin"} />
+          ) : null}
           <MachinesSection state={state} />
         </>
       )}

@@ -1,3 +1,4 @@
+import { VmWorkloadTracking, vmWorkloadCommand } from "../vmWorkloadCommand.ts";
 import * as NodeModule from "node:module";
 
 import * as Context from "effect/Context";
@@ -130,6 +131,7 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
 
 export const make = Effect.fn("NodePtyAdapter.make")(function* () {
   const loadNodePtyModule = yield* NodePtyModuleLoaderRef;
+  const trackWorkloads = yield* VmWorkloadTracking;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const platform = yield* HostProcessPlatform;
@@ -165,9 +167,12 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
         platform === "win32" && input.env["TERM"] === undefined
           ? { ...input.env, TERM: "xterm-256color" }
           : input.env;
+      const launch = trackWorkloads
+        ? vmWorkloadCommand(input.shell, input.args ?? [], "terminal")
+        : { command: input.shell, args: input.args ?? [] };
       const ptyProcess = yield* Effect.try({
         try: () =>
-          nodePty.spawn(input.shell, input.args ?? [], {
+          nodePty.spawn(launch.command, launch.args, {
             cwd: input.cwd,
             cols: input.cols,
             rows: input.rows,

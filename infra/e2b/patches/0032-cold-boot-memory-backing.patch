@@ -1,0 +1,77 @@
+--- a/packages/api/internal/orchestrator/restore.go
++++ b/packages/api/internal/orchestrator/restore.go
+@@ -15,6 +15,7 @@
+ 	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/e2b-dev/infra/packages/shared/pkg/fcversion"
+ 	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/restoreresult"
+ )
+@@ -37,6 +38,10 @@
+ 	if int64(*input.LeaseSeconds) > team.Limits.MaxLengthHours*3600 {
+ 		return nil, errors.New("restore lease exceeds team policy")
+ 	}
++	version, err := fcversion.New(build.FirecrackerVersion)
++	if err != nil {
++		return nil, err
++	}
+ 	metadata := map[string]string{}
+ 	if input.Metadata != nil {
+ 		for key, value := range *input.Metadata {
+@@ -52,7 +57,9 @@
+ 			SandboxId: op.SandboxID, ExecutionId: op.ExecutionID.String(), TeamId: op.TeamID.String(),
+ 			Snapshot: true, Metadata: metadata, KernelVersion: build.KernelVersion,
+ 			FirecrackerVersion: build.FirecrackerVersion, EnvdVersion: *build.EnvdVersion,
+-			Vcpu: build.Vcpu, RamMb: build.RamMb, TotalDiskSizeMb: *build.TotalDiskSizeMb,
++			// Use the same memory backing as ordinary E2B startup.
++			HugePages: version.HasHugePages(),
++			Vcpu:      build.Vcpu, RamMb: build.RamMb, TotalDiskSizeMb: *build.TotalDiskSizeMb,
+ 			MaxSandboxLength: team.Limits.MaxLengthHours, EventsTtlDays: team.Limits.EventsTTLDays,
+ 			AllowInternetAccess: new(true), Network: &rpc.SandboxNetworkConfig{Ingress: &rpc.SandboxNetworkIngressConfig{}},
+ 		},
+--- a/packages/api/internal/orchestrator/restore_test.go
++++ b/packages/api/internal/orchestrator/restore_test.go
+@@ -18,7 +18,7 @@
+ 	t.Parallel()
+ 	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+ 	op := queries.SandboxRestoreOperation{PreparedBuildID: uuid.New(), TeamID: uuid.New(), ExecutionID: uuid.New(), OperationID: uuid.New(), SandboxID: "destination", SourceTemplateID: "source", Generation: "placement-3"}
+-	build := queries.EnvBuild{KernelVersion: "kernel", FirecrackerVersion: "fc", EnvdVersion: new("envd"), TotalDiskSizeMb: new(int64(64)), RamMb: 1024, Vcpu: 1}
++	build := queries.EnvBuild{KernelVersion: "kernel", FirecrackerVersion: "v1.14-0.2.0", EnvdVersion: new("envd"), TotalDiskSizeMb: new(int64(64)), RamMb: 1024, Vcpu: 1}
+ 	team := &teamtypes.Team{Limits: &teamtypes.TeamLimits{MaxLengthHours: 1}}
+ 	input := api.LaunchpadRestoreRequest{LeaseSeconds: new(600), Metadata: &map[string]string{"launchpad.thread_id": "thread-1", "launchpad.operation_id": "spoofed"}}
+ 	req, err := BuildRestoreRequest(op, build, team, input, now)
+@@ -59,3 +59,33 @@
+ 	require.NoError(t, err)
+ 	require.Equal(t, activationBytes, cleanupBytes, "the host receipt binds the full request, including reconstructed credentials")
+ }
++
++func TestPreparedRestoreUsesSupportedHugePages(t *testing.T) {
++	t.Parallel()
++	for _, tc := range []struct {
++		name      string
++		version   string
++		hugePages bool
++		invalid   bool
++	}{
++		{name: "pinned runtime", version: "v1.14-0.2.0", hugePages: true},
++		{name: "upstream supported", version: "v1.7.0", hugePages: true},
++		{name: "older runtime", version: "v1.6.0"},
++		{name: "unknown runtime", version: "fc", invalid: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			build := queries.EnvBuild{FirecrackerVersion: tc.version, EnvdVersion: new("envd"), TotalDiskSizeMb: new(int64(64)), RamMb: 4096, Vcpu: 2}
++			team := &teamtypes.Team{Limits: &teamtypes.TeamLimits{MaxLengthHours: 1}}
++			request, err := BuildRestoreRequest(queries.SandboxRestoreOperation{}, build, team, api.LaunchpadRestoreRequest{LeaseSeconds: new(600)}, time.Now())
++			if tc.invalid {
++				require.Error(t, err)
++				require.Nil(t, request)
++				return
++			}
++			require.NoError(t, err)
++			require.Equal(t, tc.hugePages, request.GetSandbox().GetHugePages())
++			require.True(t, request.GetFilesystemBoot(), "memory backing must not restore saved processes")
++			require.Equal(t, int64(4096), request.GetSandbox().GetRamMb(), "memory backing must retain the admitted VM size")
++		})
++	}
++}

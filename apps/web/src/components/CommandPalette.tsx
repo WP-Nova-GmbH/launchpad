@@ -1,5 +1,8 @@
 "use client";
 
+import { PortableThreadLibraryOverlay } from "./chat/PortableThreadLibrary";
+import { portableThreadLibrary } from "../state/threads";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 
@@ -72,7 +75,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomSet, useAtomValue } from "@effect/atom-react";
 
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
@@ -499,6 +502,7 @@ function overlayModeForCommand(command: string | null): SearchOverlayMode | null
 }
 
 export function CommandPalette({ children }: { children: ReactNode }) {
+  const setVmLibraryOpen = useAtomSet(portableThreadLibrary.openAtom);
   const navigate = useNavigate();
   const [state, dispatch] = useReducer(reduceCommandPaletteUiState, {
     open: false,
@@ -592,6 +596,14 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         });
         return;
       }
+      if (command === "threadVms.open" && import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED === "1") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.repeat) return;
+        setOpen(false);
+        setVmLibraryOpen(true);
+        return;
+      }
       if (command === "usage.open") {
         event.preventDefault();
         event.stopPropagation();
@@ -616,6 +628,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
     previewOpen,
     resolvedTheme,
     setAppearanceMode,
+    setVmLibraryOpen,
     setOpen,
     terminalOpen,
     theme,
@@ -668,6 +681,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
           clearOpenIntent={clearOpenIntent}
         />
       </CommandDialog>
+      <PortableThreadLibraryOverlay />
     </ComposerHandleContext>
   );
 }
@@ -695,7 +709,8 @@ function CommandPaletteDialog(props: {
       data-palette-mode={props.mode}
       data-testid="command-palette"
       finalFocus={() => {
-        composerHandleRef?.current?.focusAtEnd();
+        if (!document.querySelector("[data-portable-thread-library]"))
+          composerHandleRef?.current?.focusAtEnd();
         return false;
       }}
       onBackdropPointerDown={() => {
@@ -726,6 +741,8 @@ function OpenCommandPaletteDialog(props: {
 }) {
   const navigate = useNavigate();
   const organizationCatalog = useManagedRelayOrganizationCatalog();
+  const vmSession = useAtomValue(managedRelaySessionAtom);
+  const setVmLibraryOpen = useAtomSet(portableThreadLibrary.openAtom);
   const pathname = useLocation({ select: (location) => location.pathname });
   const { clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
   const [query, setQuery] = useState(openIntent?.kind === "search" ? openIntent.query : "");
@@ -1982,6 +1999,18 @@ function OpenCommandPaletteDialog(props: {
   ]);
 
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
+  if (vmSession && import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED === "1")
+    actionItems.push({
+      kind: "action",
+      value: "action:vm-threads",
+      title: "VM threads",
+      searchTerms: ["sandbox", "VM", "saved", "restore", "reset", "create", "private"],
+      icon: <MonitorIcon className={ITEM_ICON_CLASS} />,
+      shortcutCommand: "threadVms.open",
+      run: async () => {
+        setVmLibraryOpen(true);
+      },
+    });
 
   if (projects.length > 0) {
     const activeProjectTitle =

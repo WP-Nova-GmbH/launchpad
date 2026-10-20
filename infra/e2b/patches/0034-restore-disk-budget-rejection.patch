@@ -1,0 +1,137 @@
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -82,6 +82,8 @@
+ 		a.sendAPIStoreError(c, 404, "Restore or source not found")
+ 	case errors.Is(err, restorestore.ErrConflict):
+ 		a.sendAPIStoreError(c, 409, "Restore operation conflicts with its request or state")
++	case errors.Is(err, restorestore.ErrRequestTooLarge):
++		a.sendAPIStoreError(c, http.StatusRequestEntityTooLarge, "Restore disk reservation exceeds host capacity")
+ 	case errors.Is(err, restorestore.ErrCapacity):
+ 		a.sendAPIStoreError(c, 429, "Restore preparation capacity is exhausted")
+ 	case errors.Is(err, restorestore.ErrInvalid):
+--- a/packages/api/internal/handlers/launchpad_restore_test.go
++++ b/packages/api/internal/handlers/launchpad_restore_test.go
+@@ -4,6 +4,7 @@
+ 	"bytes"
+ 	"encoding/json"
+ 	"math"
++	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+ 	"testing"
+@@ -12,6 +13,7 @@
+ 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
+ 	authtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
+ 	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
++	restorestore "github.com/e2b-dev/infra/packages/db/pkg/restores"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/gin-gonic/gin"
+@@ -47,6 +49,24 @@
+ 	input.Metadata = &map[string]string{"arbitrary": "label"}
+ 	_, err = canonicalRestoreRequest(input)
+ 	require.Error(t, err)
++}
++
++func TestLaunchpadRestoreCapacityResponsesDistinguishPermanentSizeFromContention(t *testing.T) {
++	t.Parallel()
++	for _, tc := range []struct {
++		name   string
++		err    error
++		status int
++	}{
++		{"request-too-large", restorestore.ErrRequestTooLarge, http.StatusRequestEntityTooLarge},
++		{"temporarily-occupied", restorestore.ErrCapacity, http.StatusTooManyRequests},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c, response := restoreHTTPContext(t, uuid.New(), nil)
++			(&APIStore{}).restoreError(c, tc.err)
++			require.Equal(t, tc.status, response.Code, response.Body.String())
++		})
++	}
+ }
+ 
+ func TestLaunchpadRestoreAdmissionIdentityIsolationAndCancellation(t *testing.T) {
+--- a/packages/db/pkg/restores/store.go
++++ b/packages/db/pkg/restores/store.go
+@@ -18,9 +18,10 @@
+ )
+ 
+ var (
+-	ErrConflict = errors.New("restore operation conflicts with its existing request or state")
+-	ErrCapacity = errors.New("restore preparation capacity is exhausted")
+-	ErrInvalid  = errors.New("invalid restore request")
++	ErrConflict        = errors.New("restore operation conflicts with its existing request or state")
++	ErrCapacity        = errors.New("restore preparation capacity is exhausted")
++	ErrRequestTooLarge = errors.New("restore disk reservation exceeds host capacity")
++	ErrInvalid         = errors.New("invalid restore request")
+ )
+ 
+ type Store struct{ DB *client.Client }
+@@ -73,6 +74,11 @@
+ 	if !errors.Is(err, pgx.ErrNoRows) {
+ 		return empty, err
+ 	}
++	// This immutable request cannot fit even when all other reservations clear.
++	// Keep it distinct from temporary contention; neither rejection admits work.
++	if p.ReservedBytes > hostCapacity {
++		return empty, ErrRequestTooLarge
++	}
+ 	if err = txDB.LockRestoreCapacity(ctx, "restore-capacity:"+p.ClusterID.String()+":"+p.NodeID); err != nil {
+ 		return empty, err
+ 	}
+@@ -80,7 +86,7 @@
+ 	if err != nil {
+ 		return empty, err
+ 	}
+-	if p.ReservedBytes > hostCapacity || reserved > hostCapacity-p.ReservedBytes {
++	if reserved > hostCapacity-p.ReservedBytes {
+ 		return empty, ErrCapacity
+ 	}
+ 	if _, err = txDB.LockRestoreSourceTemplate(ctx, queries.LockRestoreSourceTemplateParams{TeamID: p.TeamID, TemplateID: p.SourceTemplateID}); err != nil {
+--- a/packages/db/pkg/tests/restores/operations_test.go
++++ b/packages/db/pkg/tests/restores/operations_test.go
+@@ -248,6 +248,43 @@
+ 	require.Equal(t, a.ReservedBytes, reserved)
+ }
+ 
++func TestRestoreAdmissionRejectsSingleOversizedReservationWithoutSideEffects(t *testing.T) {
++	t.Parallel()
++	db := testutils.SetupDatabase(t)
++	store := restorestore.Store{DB: db.SqlcClient}
++	p := newOperation(t, db)
++	_, err := store.Create(t.Context(), p, p.ReservedBytes-1)
++	require.ErrorIs(t, err, restorestore.ErrRequestTooLarge)
++	require.NotErrorIs(t, err, restorestore.ErrCapacity)
++	_, err = db.SqlcClient.GetRestoreOperation(t.Context(), queries.GetRestoreOperationParams{TeamID: p.TeamID, OperationID: p.OperationID})
++	require.ErrorIs(t, err, pgx.ErrNoRows)
++	reserved, err := db.SqlcClient.RestoreReservedBytes(t.Context(), queries.RestoreReservedBytesParams{ClusterID: p.ClusterID, NodeID: p.NodeID})
++	require.NoError(t, err)
++	require.Zero(t, reserved)
++	pinned, err := db.SqlcClient.HasRestoreBuildPins(t.Context(), p.SourceBuildID)
++	require.NoError(t, err)
++	require.False(t, pinned)
++	_, err = store.Create(t.Context(), p, p.ReservedBytes)
++	require.NoError(t, err, "a later operator budget change can admit a new attempt")
++}
++
++func TestRestoreAdmissionReconcilesExistingOperationAfterBudgetShrinks(t *testing.T) {
++	t.Parallel()
++	db := testutils.SetupDatabase(t)
++	store := restorestore.Store{DB: db.SqlcClient}
++	p := newOperation(t, db)
++	first, err := store.Create(t.Context(), p, p.ReservedBytes)
++	require.NoError(t, err)
++	retry, err := store.Create(t.Context(), p, p.ReservedBytes-1)
++	require.NoError(t, err, "a lower current budget must not reject already admitted work")
++	require.Equal(t, first.PreparedBuildID, retry.PreparedBuildID)
++	require.Equal(t, first.SandboxID, retry.SandboxID)
++	require.Equal(t, first.ReservedBytes, retry.ReservedBytes)
++	p.Generation = "changed-generation"
++	_, err = store.Create(t.Context(), p, p.ReservedBytes-1)
++	require.ErrorIs(t, err, restorestore.ErrConflict, "identity conflicts still take precedence over the budget")
++}
++
+ func TestRestoreAdmissionRejectsUnownedOrDeletedSource(t *testing.T) {
+ 	t.Parallel()
+ 	db := testutils.SetupDatabase(t)

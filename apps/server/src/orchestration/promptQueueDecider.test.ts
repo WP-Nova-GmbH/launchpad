@@ -782,3 +782,548 @@ it.layer(NodeServices.layer)("shared preparation decisions", (it) => {
     }),
   );
 });
+
+const enqueueMove = (id = "move") => ({
+  type: "thread.move.enqueue" as const,
+  commandId: CommandId.make(`enqueue:${id}`),
+  threadId,
+  messageId: MessageId.make(id),
+  destination: { kind: "vm" as const },
+  author,
+  createdAt,
+});
+
+it.layer(NodeServices.layer)("moves in the shared queue", (it) => {
+  it.effect("inserts a move next atomically without replacing a claimed prompt", () =>
+    Effect.gen(function* () {
+      let state = yield* apply(yield* readModelWithThread, enqueue("first"));
+      state = yield* apply(state, enqueue("waiting"));
+      state = yield* apply(state, claim);
+      const handoff = queue(state).handoff;
+      state = yield* apply(state, { ...enqueueMove(), position: "next" });
+      expect(queue(state).entries.map((entry) => entry.messageId)).toEqual([
+        "first",
+        "move",
+        "waiting",
+      ]);
+      expect(queue(state).handoff).toEqual(handoff);
+      expect(queue(state).revision).toBe(handoff!.controlRevision);
+      expect(state.threads[0]!.messages).toEqual([]);
+      state = yield* apply(state, {
+        type: "thread.prompt.admit",
+        commandId: CommandId.make("admit-before-move"),
+        threadId,
+        attemptId: claim.commandId,
+        turnId: TurnId.make("turn-before-move"),
+        evidence: "provider-ack",
+        createdAt,
+      });
+      expect(queue(state).entries.map((entry) => entry.messageId)).toEqual(["move", "waiting"]);
+      expect(queue(state).awaitingTurnId).toBe("turn-before-move");
+    }),
+  );
+
+  it.effect("puts a requested next move before pending work while preserving a paused queue", () =>
+    Effect.gen(function* () {
+      let state = yield* apply(yield* readModelWithThread, enqueue("waiting"));
+      state = yield* apply(state, {
+        type: "thread.queue.pause",
+        commandId: CommandId.make("pause-before-move"),
+        threadId,
+        createdAt,
+      });
+      const paused = queue(state).pauseReason;
+      state = yield* apply(state, { ...enqueueMove(), position: "next" });
+      expect(queue(state).entries.map((entry) => entry.messageId)).toEqual(["move", "waiting"]);
+      expect(queue(state).enabled).toBe(false);
+      expect(queue(state).pauseReason).toEqual(paused);
+      expect(queue(state).revision).toBe(1);
+    }),
+  );
+
+  it.effect("keeps prompts on either side of a move without creating a chat message", () =>
+    Effect.gen(function* () {
+      let state = yield* apply(yield* readModelWithThread, enqueue("first"));
+      state = yield* apply(state, enqueueMove());
+      state = yield* apply(state, enqueue("last"));
+      expect(queue(state).entries.map((entry) => [entry.messageId, entry.kind])).toEqual([
+        ["first", "prompt"],
+        ["move", "move"],
+        ["last", "prompt"],
+      ]);
+      expect(state.threads[0]!.messages).toEqual([]);
+      for (const messageId of ["move", "last"]) {
+        expect(
+          (yield* Effect.flip(apply(state, { ...claim, messageId: MessageId.make(messageId) })))
+            ._tag,
+        ).toBe("OrchestrationCommandInvariantError");
+      }
+      state = yield* apply(state, claim);
+      expect(queue(state).handoff?.messageId).toBe("first");
+    }),
+  );
+
+  it.effect("retains a chosen order through edits, new arrivals and cancellation", () =>
+    Effect.gen(function* () {
+      let state = yield* apply(yield* readModelWithThread, enqueue("first"));
+      state = yield* apply(state, enqueueMove());
+      state = yield* apply(state, enqueue("last"));
+      const reorder = {
+        type: "thread.queue.reorder" as const,
+        commandId: CommandId.make("move-next"),
+        threadId,
+        expectedRevision: 0,
+        order: ["move", "first", "last"].map((id) => MessageId.make(id)),
+        createdAt,
+      };
+      state = yield* apply(state, reorder);
+      expect((yield* Effect.flip(apply(state, reorder)))._tag).toBe(
+        "OrchestrationCommandInvariantError",
+      );
+      state = yield* apply(state, {
+        type: "thread.prompt.edit",
+        commandId: CommandId.make("edit"),
+        threadId,
+        messageId: MessageId.make("first"),
+        expectedRevision: 1,
+        message: { text: "changed", attachments: [] },
+        createdAt,
+      });
+      state = yield* apply(state, {
+        type: "thread.move.edit",
+        commandId: CommandId.make("edit-move"),
+        threadId,
+        messageId: MessageId.make("move"),
+        expectedRevision: 1,
+        destination: { kind: "vm" },
+        author: editor,
+        createdAt,
+      });
+      state = yield* apply(state, enqueue("new"));
+      expect(queue(state).entries.map((entry) => entry.messageId)).toEqual([
+        "move",
+        "first",
+        "last",
+        "new",
+      ]);
+      expect(queue(state).entries[0]?.editedBy).toEqual(editor);
+      for (const order of [
+        ["move", "first", "last"],
+        ["move", "first", "last", "last"],
+        ["move", "first", "last", "unknown"],
+      ]) {
+        expect(
+          (yield* Effect.flip(
+            apply(state, {
+              ...reorder,
+              expectedRevision: 1,
+              order: order.map((id) => MessageId.make(id)),
+            }),
+          ))._tag,
+        ).toBe("OrchestrationCommandInvariantError");
+      }
+      expect(
+        (yield* Effect.flip(
+          apply(state, {
+            type: "thread.move.cancel",
+            commandId: CommandId.make("stale-cancel"),
+            threadId,
+            messageId: MessageId.make("move"),
+            expectedRevision: 1,
+            createdAt,
+          }),
+        ))._tag,
+      ).toBe("OrchestrationCommandInvariantError");
+      state = yield* apply(state, {
+        type: "thread.move.cancel",
+        commandId: CommandId.make("cancel"),
+        threadId,
+        messageId: MessageId.make("move"),
+        expectedRevision: 2,
+        createdAt,
+      });
+      expect(queue(state).entries.map((entry) => entry.messageId)).toEqual([
+        "first",
+        "last",
+        "new",
+      ]);
+    }),
+  );
+
+  it.effect("does not steer across a move and preserves the current turn boundary", () =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("active");
+      let state = yield* apply(yield* readModelWithThread, {
+        type: "thread.session.set",
+        commandId: CommandId.make("running"),
+        threadId,
+        createdAt,
+        session: {
+          threadId,
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          status: "running",
+          runtimeMode: "full-access",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      state = yield* apply(state, enqueueMove());
+      expect(queue(state).awaitingTurnId).toBe(turnId);
+      state = yield* apply(state, enqueue("after-move"));
+      const steer = {
+        type: "thread.prompt.steer" as const,
+        commandId: CommandId.make("steer"),
+        threadId,
+        messageId: MessageId.make("after-move"),
+        expectedRevision: 1,
+        expectedTurnId: turnId,
+        createdAt,
+      };
+      expect(yield* Effect.flip(apply(state, steer))).toMatchObject({
+        detail: expect.stringContaining("cannot cross"),
+      });
+      state = yield* apply(state, {
+        type: "thread.queue.reorder",
+        commandId: CommandId.make("prompt-next"),
+        threadId,
+        expectedRevision: 0,
+        order: [MessageId.make("after-move"), MessageId.make("move")],
+        createdAt,
+      });
+      expect(queue(state).awaitingTurnId).toBe(turnId);
+      state = yield* apply(state, steer);
+      expect(queue(state).handoff?.messageId).toBe("after-move");
+    }),
+  );
+
+  it.effect("rejects prompt operations against a move", () =>
+    Effect.gen(function* () {
+      const state = yield* apply(yield* readModelWithThread, enqueueMove());
+      const common = {
+        commandId: CommandId.make("wrong-kind"),
+        threadId,
+        messageId: MessageId.make("move"),
+        expectedRevision: 1,
+        createdAt,
+      };
+      expect(
+        (yield* Effect.flip(apply(state, { ...common, type: "thread.prompt.remove" })))._tag,
+      ).toBe("OrchestrationCommandInvariantError");
+      expect(
+        (yield* Effect.flip(
+          apply(state, {
+            ...common,
+            type: "thread.prompt.edit",
+            message: { text: "oops", attachments: [] },
+          }),
+        ))._tag,
+      ).toBe("OrchestrationCommandInvariantError");
+      expect(queue(state).entries).toHaveLength(1);
+    }),
+  );
+});
+
+it.layer(NodeServices.layer)("move acknowledgements", (it) => {
+  const moveClaim = {
+    type: "thread.move.claim" as const,
+    threadId,
+    commandId: CommandId.make("move-operation"),
+    messageId: MessageId.make("move"),
+    expectedRevision: 1,
+    expectedControlRevision: 0,
+    createdAt,
+  };
+
+  it.effect("keeps a pending move notice editable and cancellable, then clears it on claim", () =>
+    Effect.gen(function* () {
+      let state = yield* apply(yield* readModelWithThread, enqueueMove());
+      const notice = {
+        type: "thread.move.progress" as const,
+        threadId,
+        commandId: CommandId.make("pending-notice"),
+        messageId: MessageId.make("move"),
+        expectedRevision: 1,
+        detail: "Local process shutdown is unverified. Cancel to continue here.",
+        blocked: true,
+        createdAt,
+      };
+      state = yield* apply(state, notice);
+      expect(queue(state).entries[0]).toMatchObject({
+        state: "pending",
+        revision: 2,
+        detail: notice.detail,
+      });
+      expect(queue(state).entries[0]).not.toHaveProperty("operationId");
+      expect(queue(state).handoff).toBeNull();
+      expect((yield* Effect.flip(apply(state, notice)))._tag).toBe(
+        "OrchestrationCommandInvariantError",
+      );
+      const cancelled = yield* apply(state, {
+        type: "thread.move.cancel",
+        threadId,
+        commandId: CommandId.make("cancel-pending-notice"),
+        messageId: MessageId.make("move"),
+        expectedRevision: 2,
+        createdAt,
+      });
+      expect(queue(cancelled).entries).toEqual([]);
+      state = yield* apply(state, {
+        type: "thread.move.edit",
+        threadId,
+        commandId: CommandId.make("edit-pending-notice"),
+        messageId: MessageId.make("move"),
+        expectedRevision: 2,
+        destination: { kind: "vm" },
+        createdAt,
+      });
+      expect(queue(state).entries[0]?.state).toBe("pending");
+      state = yield* apply(state, { ...moveClaim, expectedRevision: 3 });
+      expect(queue(state).entries[0]).toMatchObject({ state: "moving", revision: 4 });
+      expect(queue(state).entries[0]).not.toHaveProperty("detail");
+    }),
+  );
+
+  it.effect("rejects pending notices for a non-head, a claimed move or an operation mismatch", () =>
+    Effect.gen(function* () {
+      const notice = {
+        type: "thread.move.progress" as const,
+        threadId,
+        commandId: CommandId.make("pending-notice"),
+        messageId: MessageId.make("move"),
+        expectedRevision: 1,
+        detail: "Unverified local work",
+        blocked: true,
+        createdAt,
+      };
+      const behindPrompt = yield* apply(
+        yield* apply(yield* readModelWithThread, enqueue("first")),
+        enqueueMove(),
+      );
+      expect((yield* Effect.flip(apply(behindPrompt, notice)))._tag).toBe(
+        "OrchestrationCommandInvariantError",
+      );
+      const pending = yield* apply(yield* readModelWithThread, enqueueMove());
+      expect(
+        (yield* Effect.flip(apply(pending, { ...notice, operationId: moveClaim.commandId })))._tag,
+      ).toBe("OrchestrationCommandInvariantError");
+      const claimed = yield* apply(pending, moveClaim);
+      expect((yield* Effect.flip(apply(claimed, { ...notice, expectedRevision: 2 })))._tag).toBe(
+        "OrchestrationCommandInvariantError",
+      );
+    }),
+  );
+
+  it.effect("claims only the ready head and keeps running moves fixed in the queue", () =>
+    Effect.gen(function* () {
+      let state = yield* apply(yield* readModelWithThread, enqueue("first"));
+      state = yield* apply(state, enqueueMove());
+      expect((yield* Effect.flip(apply(state, moveClaim)))._tag).toBe(
+        "OrchestrationCommandInvariantError",
+      );
+      state = yield* apply(state, {
+        type: "thread.prompt.remove",
+        threadId,
+        commandId: CommandId.make("remove-first"),
+        messageId: MessageId.make("first"),
+        expectedRevision: 1,
+        createdAt,
+      });
+      state = yield* apply(state, moveClaim);
+      expect(queue(state).entries[0]).toMatchObject({
+        state: "moving",
+        operationId: "move-operation",
+        revision: 2,
+      });
+      expect((yield* Effect.flip(apply(state, moveClaim)))._tag).toBe(
+        "OrchestrationCommandInvariantError",
+      );
+      expect(
+        (yield* Effect.flip(
+          apply(state, {
+            type: "thread.queue.reorder",
+            threadId,
+            commandId: CommandId.make("reorder-running"),
+            expectedRevision: 0,
+            order: [MessageId.make("move")],
+            createdAt,
+          }),
+        ))._tag,
+      ).toBe("OrchestrationCommandInvariantError");
+      expect(
+        (yield* Effect.flip(
+          apply(state, {
+            type: "thread.move.edit",
+            threadId,
+            commandId: CommandId.make("edit-running"),
+            messageId: MessageId.make("move"),
+            expectedRevision: 2,
+            destination: { kind: "vm" },
+            createdAt,
+          }),
+        ))._tag,
+      ).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
+  it.effect.each(["cancelled", "completed"] as const)(
+    "retains cancellation until the worker confirms %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        let state = yield* apply(yield* readModelWithThread, enqueueMove());
+        state = yield* apply(state, enqueue("later"));
+        state = yield* apply(state, moveClaim);
+        state = yield* apply(state, {
+          type: "thread.move.cancel",
+          threadId,
+          commandId: CommandId.make("cancel"),
+          messageId: MessageId.make("move"),
+          expectedRevision: 2,
+          createdAt,
+        });
+        expect(queue(state).entries[0]).toMatchObject({ state: "cancelling", revision: 3 });
+        const progress = {
+          type: "thread.move.progress" as const,
+          threadId,
+          commandId: CommandId.make("progress"),
+          messageId: MessageId.make("move"),
+          operationId: moveClaim.commandId,
+          expectedRevision: 2,
+          detail: "Waiting for destination cleanup",
+          blocked: true,
+          createdAt,
+        };
+        expect((yield* Effect.flip(apply(state, progress)))._tag).toBe(
+          "OrchestrationCommandInvariantError",
+        );
+        state = yield* apply(state, { ...progress, expectedRevision: 3 });
+        expect(queue(state).entries[0]).toMatchObject({
+          state: "cancelling",
+          revision: 4,
+          detail: progress.detail,
+        });
+        expect(
+          (yield* Effect.flip(apply(state, { ...claim, messageId: MessageId.make("later") })))._tag,
+        ).toBe("OrchestrationCommandInvariantError");
+        const finish = {
+          type: "thread.move.finish" as const,
+          threadId,
+          commandId: CommandId.make("finish"),
+          messageId: MessageId.make("move"),
+          operationId: moveClaim.commandId,
+          expectedRevision: 4,
+          outcome,
+          createdAt,
+        };
+        expect(
+          (yield* Effect.flip(
+            apply(state, { ...finish, operationId: CommandId.make("old-operation") }),
+          ))._tag,
+        ).toBe("OrchestrationCommandInvariantError");
+        state = yield* apply(state, finish);
+        expect(queue(state).entries.map((entry) => entry.messageId)).toEqual(["later"]);
+        state = yield* apply(state, { ...claim, messageId: MessageId.make("later") });
+        expect(queue(state).handoff?.messageId).toBe("later");
+      }),
+  );
+
+  it.effect("waits for legacy active turns and their checkpoint", () =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("legacy-turn");
+      let state = yield* apply(yield* readModelWithThread, {
+        type: "thread.session.set",
+        threadId,
+        commandId: CommandId.make("legacy-session"),
+        createdAt,
+        session: {
+          threadId,
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          status: "running",
+          runtimeMode: "full-access",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      state = yield* apply(state, enqueueMove());
+      expect((yield* Effect.flip(apply(state, moveClaim)))._tag).toBe(
+        "OrchestrationCommandInvariantError",
+      );
+      state = yield* apply(state, {
+        type: "thread.session.set",
+        threadId,
+        commandId: CommandId.make("idle-session"),
+        createdAt,
+        session: {
+          threadId,
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          status: "ready",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      expect((yield* Effect.flip(apply(state, moveClaim)))._tag).toBe(
+        "OrchestrationCommandInvariantError",
+      );
+      state = yield* apply(state, {
+        type: "thread.queue.finalize",
+        threadId,
+        commandId: CommandId.make("checkpoint"),
+        turnId,
+        outcome: "completed",
+        checkpoint: "ready",
+        createdAt,
+      });
+      state = yield* apply(state, moveClaim);
+      expect(queue(state).entries[0]?.state).toBe("moving");
+    }),
+  );
+});
+
+it.layer(NodeServices.layer)("move recovery ordering", (it) => {
+  it.effect("restores a late uncertain prompt ahead of a move after manual reordering", () =>
+    Effect.gen(function* () {
+      let state = yield* apply(yield* readModelWithThread, enqueue("first"));
+      state = yield* apply(state, enqueueMove());
+      state = yield* apply(state, enqueue("last"));
+      state = yield* apply(state, claim);
+      state = yield* apply(state, {
+        type: "thread.prompt.admit",
+        threadId,
+        commandId: CommandId.make("admit"),
+        attemptId: claim.commandId,
+        turnId: TurnId.make("turn"),
+        evidence: "provider-ack",
+        createdAt,
+      });
+      state = yield* apply(state, {
+        type: "thread.queue.reorder",
+        threadId,
+        commandId: CommandId.make("reorder"),
+        expectedRevision: 0,
+        order: [MessageId.make("last"), MessageId.make("move")],
+        createdAt,
+      });
+      state = yield* apply(state, {
+        type: "thread.prompt.unknown",
+        threadId,
+        commandId: CommandId.make("uncertain"),
+        attemptId: claim.commandId,
+        detail: "Lost provider confirmation",
+        createdAt,
+      });
+      expect(queue(state).entries.map((entry) => entry.messageId)).toEqual([
+        "first",
+        "last",
+        "move",
+      ]);
+      expect(queue(state).entries[0]?.state).toBe("unknown");
+      expect(queue(state).enabled).toBe(false);
+    }),
+  );
+});

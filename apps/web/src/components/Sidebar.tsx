@@ -1,3 +1,4 @@
+import { PortableThreadLibrary } from "./chat/PortableThreadLibrary";
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
@@ -119,7 +120,8 @@ import {
   getThreadKeysToDeselectAfterDelete,
   useThreadSelectionStore,
 } from "../threadSelectionStore";
-import { useThreadActions } from "../hooks/useThreadActions";
+import { requiresThreadDeleteConfirmation, useThreadActions } from "../hooks/useThreadActions";
+import { THREAD_DELETE_WARNING } from "@t3tools/client-runtime/relay/threadVmControls";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
@@ -3949,13 +3951,15 @@ export default function Sidebar() {
         return;
       }
       if (clicked.value !== "delete") return;
-      if (confirmThreadDelete) {
+      if (
+        threadKeys.some((key) => {
+          const ref = parseScopedThreadKey(key);
+          return ref && requiresThreadDeleteConfirmation(ref, confirmThreadDelete);
+        })
+      ) {
         const confirmed = await settlePromise(() =>
           api.dialogs.confirm(
-            [
-              `Delete ${count} thread${count === 1 ? "" : "s"}?`,
-              "This permanently clears conversation history for these threads.",
-            ].join("\n"),
+            [`Delete ${count} thread${count === 1 ? "" : "s"}?`, THREAD_DELETE_WARNING].join("\n"),
             { variant: "destructive" },
           ),
         );
@@ -4234,13 +4238,10 @@ export default function Sidebar() {
             return;
           }
           case "delete": {
-            if (confirmThreadDelete) {
+            if (requiresThreadDeleteConfirmation(threadRef, confirmThreadDelete)) {
               const confirmed = await settlePromise(() =>
                 api.dialogs.confirm(
-                  [
-                    `Delete thread "${thread.title}"?`,
-                    "This permanently clears conversation history for this thread.",
-                  ].join("\n"),
+                  [`Delete thread "${thread.title}"?`, THREAD_DELETE_WARNING].join("\n"),
                   { variant: "destructive" },
                 ),
               );
@@ -4961,6 +4962,7 @@ export default function Sidebar() {
           ) : null}
         </SidebarGroup>
       </SidebarContent>
+      <PortableThreadLibrary />
       <SidebarChromeFooter />
     </>
   );

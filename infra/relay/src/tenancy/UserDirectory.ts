@@ -25,7 +25,7 @@ export class UserDirectory extends Context.Service<
       readonly userIds: ReadonlyArray<string>;
     }) => Effect.Effect<ReadonlyMap<string, RelayUserIdentity>>;
   }
->()("t3code-relay/tenancy/UserDirectory") {}
+>()("launchpad-relay/tenancy/UserDirectory") {}
 
 /** Clerk's user list caps a page; rosters beyond this are fetched in chunks. */
 const LOOKUP_CHUNK_SIZE = 100;

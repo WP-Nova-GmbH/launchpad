@@ -87,7 +87,7 @@ function withDevCause(message: string, cause: unknown): string {
   return detail ? `${message} (${detail})` : message;
 }
 
-function decodedRelayClientError(message: string) {
+export function decodedRelayClientError(message: string) {
   return (cause: ManagedRelay.ManagedRelayClientError) => {
     const relayError =
       cause._tag === "ManagedRelayRequestFailedError" ? cause.relayError : undefined;

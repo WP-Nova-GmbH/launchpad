@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentAuthenticatedAuth, EnvironmentHttpApi } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -11,6 +12,8 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
   FetchHttpClient,
+  HttpClient,
+  HttpClientResponse,
   HttpEffect,
   HttpServerRequest,
   HttpServerResponse,
@@ -52,20 +55,22 @@ const environmentAuthLayer = EnvironmentAuth.layer.pipe(
   Layer.provide(ServerEnvironment.identityLayer),
   Layer.provide(configLayer),
 );
-const routesLayer = HttpApiBuilder.layer(AuthTestApi).pipe(
-  Layer.provide(authHttpApiLayer),
-  Layer.provide(FetchHttpClient.layer),
-  Layer.provide(environmentAuthenticatedAuthLayer),
-  Layer.provideMerge(environmentAuthLayer),
-  Layer.provide(configLayer),
-  Layer.provideMerge(
-    HttpPlatform.layer.pipe(
-      Layer.provideMerge(NodeServices.layer),
-      Layer.provideMerge(Etag.layerWeak),
+const makeRoutesLayer = (clientLayer: Layer.Layer<HttpClient.HttpClient> = FetchHttpClient.layer) =>
+  HttpApiBuilder.layer(AuthTestApi).pipe(
+    Layer.provide(authHttpApiLayer),
+    Layer.provide(clientLayer),
+    Layer.provide(environmentAuthenticatedAuthLayer),
+    Layer.provideMerge(environmentAuthLayer),
+    Layer.provide(configLayer),
+    Layer.provideMerge(
+      HttpPlatform.layer.pipe(
+        Layer.provideMerge(NodeServices.layer),
+        Layer.provideMerge(Etag.layerWeak),
+      ),
     ),
-  ),
-  Layer.provide(NodeServices.layer),
-);
+    Layer.provide(NodeServices.layer),
+  );
+const routesLayer = makeRoutesLayer();
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const postJson = (path: string, body: unknown, headers?: Readonly<Record<string, string>>) =>
@@ -74,6 +79,141 @@ const postJson = (path: string, body: unknown, headers?: Readonly<Record<string,
     headers: { "content-type": "application/json", ...headers },
     body: encodeJson(body),
   });
+
+it.effect("verifies a paired browser profile without exposing or widening its credential", () =>
+  Effect.gen(function* () {
+    const crypto = yield* Crypto.Crypto;
+    const secretStore = ServerSecretStore.ServerSecretStore.of({
+      get: () => Effect.succeedNone,
+      set: () => Effect.void,
+      create: () => Effect.void,
+      getOrCreateRandom: () => Effect.die("Not used"),
+      remove: () => Effect.void,
+    });
+    const requestContext = Context.make(Crypto.Crypto, crypto).pipe(
+      Context.add(ServerSecretStore.ServerSecretStore, secretStore),
+    );
+    const clientLayer = Layer.succeed(
+      HttpClient.HttpClient,
+      HttpClient.make((request) => {
+        expect(request.url).toBe("https://relay.test/v1/client/identity");
+        expect(request.headers.authorization).toBe("Bearer verified-profile-token");
+        return Effect.succeed(
+          HttpClientResponse.fromWeb(
+            request,
+            Response.json({ userId: "alice", displayName: "Alice", imageUrl: null }),
+          ),
+        );
+      }),
+    );
+    const layer = makeRoutesLayer(clientLayer).pipe(
+      Layer.provide(
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({ env: { T3CODE_RELAY_URL: "https://relay.test" } }),
+        ),
+      ),
+    );
+    return yield* Effect.acquireUseRelease(
+      Effect.sync(() => HttpRouter.toWebHandler(layer, { disableLogger: true })),
+      (api) =>
+        Effect.tryPromise(async () => {
+          const dev = await api.handler(
+            postJson("/api/auth/browser-session", { credential: DEV_TOKEN }),
+            requestContext,
+          );
+          const devCookie =
+            dev.headers
+              .getSetCookie()
+              .find((cookie) => cookie.startsWith("t3_dev_session_"))
+              ?.split(";", 1)[0] ?? "";
+          const forbidden = await api.handler(
+            postJson("/api/auth/browser-identity", { identity: null }, { cookie: devCookie }),
+            requestContext,
+          );
+          expect(forbidden.status).toBe(403);
+          expect(await forbidden.json()).toMatchObject({
+            reason: "personal_browser_session_required",
+          });
+          const pairingResponse = await api.handler(
+            postJson(
+              "/api/auth/pairing-token",
+              { scopes: ["orchestration:read"] },
+              { cookie: devCookie },
+            ),
+            requestContext,
+          );
+          const pairing = (await pairingResponse.json()) as { credential: string };
+          const paired = await api.handler(
+            postJson("/api/auth/browser-session", { credential: pairing.credential }),
+            requestContext,
+          );
+          const cookie = paired.headers.getSetCookie()[0]?.split(";", 1)[0] ?? "";
+          const identityResponse = await api.handler(
+            postJson(
+              "/api/auth/browser-identity",
+              {
+                identity: { accountId: "alice", token: "verified-profile-token" },
+              },
+              { cookie },
+            ),
+            requestContext,
+          );
+          expect(identityResponse.status).toBe(200);
+          expect(await identityResponse.json()).toEqual({
+            user: { userId: "alice", displayName: "Alice", imageUrl: null },
+          });
+          const replacementCookie =
+            identityResponse.headers.getSetCookie()[0]?.split(";", 1)[0] ?? "";
+          expect(replacementCookie).not.toBe(cookie);
+          expect(identityResponse.headers.getSetCookie()[0]).toContain("HttpOnly");
+          const readSession = (value: string) =>
+            api.handler(
+              new Request("http://127.0.0.1/api/auth/session", { headers: { cookie: value } }),
+              requestContext,
+            );
+          expect(await (await readSession(cookie)).json()).toMatchObject({ authenticated: false });
+          expect(await (await readSession(replacementCookie)).json()).toMatchObject({
+            authenticated: true,
+            scopes: ["orchestration:read"],
+            user: { userId: "alice" },
+          });
+          const mismatch = await api.handler(
+            postJson(
+              "/api/auth/browser-identity",
+              {
+                identity: { accountId: "bob", token: "verified-profile-token" },
+              },
+              { cookie: replacementCookie },
+            ),
+            requestContext,
+          );
+          expect(mismatch.status).toBe(500);
+          expect(await mismatch.json()).toMatchObject({ reason: "identity_verification_failed" });
+          expect(await (await readSession(replacementCookie)).json()).toMatchObject({
+            authenticated: true,
+            user: { userId: "alice" },
+          });
+          const cleared = await api.handler(
+            postJson(
+              "/api/auth/browser-identity",
+              { identity: null },
+              { cookie: replacementCookie },
+            ),
+            requestContext,
+          );
+          const clearedCookie = cleared.headers.getSetCookie()[0]?.split(";", 1)[0] ?? "";
+          expect(cleared.status).toBe(200);
+          const clearedSession = await (await readSession(clearedCookie)).json();
+          expect(clearedSession).toMatchObject({
+            authenticated: true,
+            scopes: ["orchestration:read"],
+          });
+          expect(clearedSession).not.toHaveProperty("user");
+        }),
+      (api) => Effect.promise(() => api.dispose()),
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect(
   "repository revocation drains an authenticated response body before acknowledgement",

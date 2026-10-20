@@ -413,6 +413,22 @@ export function projectEvent(
         })),
       );
 
+    case "thread.placement-imported":
+      return Effect.succeed({
+        ...nextBase,
+        threads: nextBase.threads.map((thread) =>
+          thread.id === event.payload.threadId
+            ? {
+                ...thread,
+                projectId: event.payload.projectId,
+                branch: event.payload.branch,
+                worktreePath: event.payload.worktreePath,
+                updatedAt: event.payload.updatedAt,
+              }
+            : thread,
+        ),
+      });
+
     case "thread.created":
       return Effect.gen(function* () {
         const payload = yield* decodeForEvent(

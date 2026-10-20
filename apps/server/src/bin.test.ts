@@ -29,6 +29,15 @@ import * as CliError from "effect/unstable/cli/CliError";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
+import {
+  threadVmEnrollmentCommand,
+  threadVmRestoreIdentityCommand,
+  threadVmRestoreCleanupCommand,
+  threadVmRestoreImportCommand,
+  threadVmSetupCommand,
+  threadVmServeCommand,
+  threadVmGitCredentialCommand,
+} from "./cli/threadVm.ts";
 import { cli, makeCli } from "./bin.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import {
@@ -880,4 +889,25 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       assert.equal(optionError.option, "--dev-url");
     }),
   );
+});
+
+it("private VM commands resolve their own server configuration", () => {
+  const commands = [
+    threadVmEnrollmentCommand,
+    threadVmRestoreIdentityCommand,
+    threadVmRestoreCleanupCommand,
+    threadVmRestoreImportCommand,
+    threadVmSetupCommand,
+    threadVmServeCommand,
+    threadVmGitCredentialCommand,
+  ] as const;
+  // The CLI resolves configuration from its selected base directory, rather
+  // than requiring an unrelated caller's running-server configuration.
+  const selfConfigured: Extract<
+    Command.Services<(typeof commands)[number]>,
+    ServerConfig.ServerConfig
+  > extends never
+    ? true
+    : never = true;
+  assert.isTrue(selfConfigured);
 });

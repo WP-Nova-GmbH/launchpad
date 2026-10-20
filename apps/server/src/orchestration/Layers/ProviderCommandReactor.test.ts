@@ -1,3 +1,4 @@
+import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
 import * as WorkspaceLease from "../../workspace/workspaceLease.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
@@ -46,6 +47,7 @@ import { TextGenerationError } from "@t3tools/contracts";
 import {
   ProviderAdapterRequestError,
   ProviderValidationError,
+  ProviderExecutionError,
   ProviderWorkspaceMissingError,
   type ProviderServiceError,
 } from "../../provider/Errors.ts";
@@ -613,6 +615,20 @@ describe("ProviderCommandReactor", () => {
 
     return {
       engine,
+      freezeForMove: (threadId: ThreadId) =>
+        runtime!.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            yield* makeThreadExecutionFence(sql).prepare({
+              threadId,
+              projectId: "project-1",
+              relayUrl: "https://relay.example",
+              environmentId: "destination",
+              generation: 2,
+              operationId: "move",
+            });
+          }),
+        ),
       providerService: service,
       emitRuntime: (event: ProviderRuntimeEvent) => PubSub.publish(runtimeEventPubSub, event),
       snapshotQuery,
@@ -967,6 +983,58 @@ describe("ProviderCommandReactor", () => {
           expect(thread.messages).toHaveLength(0);
           expect(harness.sendTurn).not.toHaveBeenCalled();
           expect(harness.tryHandlePromptCommand).not.toHaveBeenCalled();
+        }),
+      ),
+  );
+
+  effectIt.effect.each([false, true])(
+    "portable execution receipt preserves uncertainty (%s)",
+    (uncertain) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* Effect.promise(() =>
+            createHarness({
+              sendTurnEffect: (input) =>
+                Effect.fail(
+                  new ProviderExecutionError({
+                    threadId: input.threadId,
+                    operation: "send-turn",
+                    uncertain,
+                  }),
+                ),
+            }),
+          );
+          const threadId = ThreadId.make("thread-1");
+          const stream = yield* harness.engine.subscribeDomainEvents;
+          const settled = yield* stream.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "thread.prompt-queue-changed" &&
+                event.payload.entry?.state === (uncertain ? "unknown" : "pending") &&
+                event.commandId?.endsWith(uncertain ? ":unknown" : ":release") === true,
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* harness.engine.dispatch({
+            type: "thread.prompt.enqueue",
+            commandId: CommandId.make("portable-enqueue"),
+            threadId,
+            message: {
+              messageId: MessageId.make("portable-message"),
+              text: "do work",
+              attachments: [],
+            },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          });
+          yield* Fiber.join(settled);
+          const thread = (yield* Effect.promise(() => harness.readModel())).threads[0]!;
+          expect(thread.promptQueue?.entries[0]?.state).toBe(uncertain ? "unknown" : "pending");
+          expect(thread.messages).toHaveLength(0);
+          expect(harness.sendTurn).toHaveBeenCalledTimes(1);
         }),
       ),
   );
@@ -1438,6 +1506,23 @@ describe("ProviderCommandReactor", () => {
         createdAt: now,
       });
       yield* Deferred.await(called);
+      // Runtime readiness can arrive before the in-flight queue handoff is
+      // acknowledged. A null active turn must not make that delivery idle.
+      yield* harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("stop-race-ready-before-admission"),
+        threadId,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      });
       yield* harness.engine.dispatch({
         type: "thread.queue.pause",
         commandId: CommandId.make("stop-race-stop"),
@@ -1445,6 +1530,7 @@ describe("ProviderCommandReactor", () => {
         createdAt: now,
       });
       yield* Effect.promise(() => harness.drain());
+      expect(harness.interruptTurn).toHaveBeenCalledTimes(1);
       yield* Deferred.succeed(admit, undefined);
       yield* Deferred.await(lateInterrupted);
       const thread = (yield* Effect.promise(() => harness.readModel())).threads[0]!;
@@ -1452,6 +1538,75 @@ describe("ProviderCommandReactor", () => {
       expect(thread.promptQueue?.awaitingTurnId).toBe("stop-race-turn");
       expect(thread.messages.map((message) => message.id)).toEqual(["stop-race"]);
     }),
+  );
+
+  effectIt.effect("a frozen transferred queue does not block recovery of another thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness({ deferReactorStart: true }));
+        const createdAt = "2026-01-01T00:00:00.000Z";
+        const held = ThreadId.make("thread-1"),
+          other = ThreadId.make("thread-2");
+        yield* harness.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("other-create"),
+          threadId: other,
+          projectId: ProjectId.make("project-1"),
+          title: "Other",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+        });
+        for (const threadId of [held, other]) {
+          const messageId = MessageId.make(`queued-${threadId}`);
+          yield* harness.engine.dispatch({
+            type: "thread.prompt.enqueue",
+            commandId: CommandId.make(`enqueue-${threadId}`),
+            threadId,
+            message: { messageId, text: "Queued work", attachments: [] },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            createdAt,
+          });
+          yield* harness.engine.dispatch({
+            type: "thread.prompt.claim",
+            commandId: CommandId.make(`claim-${threadId}`),
+            threadId,
+            messageId,
+            expectedRevision: 1,
+            expectedControlRevision: 0,
+            createdAt,
+          });
+        }
+        yield* Effect.promise(() => harness.freezeForMove(held));
+        const stream = yield* harness.engine.subscribeDomainEvents;
+        const recovered = yield* stream.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "thread.prompt-queue-changed" &&
+              event.aggregateId === other &&
+              event.payload.control?.pauseReason?.code === "delivery-unknown",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* Effect.promise(() => harness.startReactor());
+        yield* Fiber.join(recovered);
+        yield* Effect.promise(() => harness.drain());
+        const snapshot = yield* Effect.promise(() => harness.readModel());
+        expect(
+          snapshot.threads.find((thread) => thread.id === held)?.promptQueue?.handoff,
+        ).toBeTruthy();
+        expect(
+          snapshot.threads.find((thread) => thread.id === other)?.promptQueue?.entries[0]?.state,
+        ).toBe("unknown");
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+      }),
+    ),
   );
 
   effectIt.effect("shared startup pauses persisted handoff without resending it", () =>
@@ -4328,6 +4483,68 @@ describe("ProviderCommandReactor", () => {
       },
     });
   });
+
+  effectIt.effect.each(["new", "ready", "stopped"] as const)(
+    "pauses an idle %s thread quietly and keeps subsequent prompts waiting",
+    (sessionStatus) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        const threadId = ThreadId.make("thread-1");
+        const createdAt = "2026-01-01T00:00:00.000Z";
+        if (sessionStatus !== "new") {
+          yield* harness.engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`idle-session-${sessionStatus}`),
+            threadId,
+            session: {
+              threadId,
+              status: sessionStatus,
+              providerName: "codex",
+              runtimeMode: "approval-required",
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: createdAt,
+            },
+            createdAt,
+          });
+        }
+        yield* harness.engine.dispatch({
+          type: "thread.queue.pause",
+          commandId: CommandId.make("idle-queue-pause"),
+          threadId,
+          createdAt,
+        });
+        yield* Effect.promise(harness.drain);
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.enqueue",
+          commandId: CommandId.make("idle-queue-prompt"),
+          threadId,
+          message: {
+            messageId: MessageId.make("waiting-after-idle-pause"),
+            text: "Keep this prompt waiting until the queue resumes.",
+            attachments: [],
+          },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt,
+        });
+        yield* Effect.promise(harness.drain);
+        const thread = (yield* Effect.promise(harness.readModel)).threads[0]!;
+        expect(thread.promptQueue).toMatchObject({
+          enabled: false,
+          pauseReason: { code: "stopped" },
+          entries: [{ messageId: "waiting-after-idle-pause", state: "pending" }],
+          handoff: null,
+          awaitingTurnId: null,
+        });
+        expect(
+          thread.activities.some((activity) => activity.kind === "provider.turn.interrupt.failed"),
+        ).toBe(false);
+        expect(harness.interruptTurn).not.toHaveBeenCalled();
+        expect(harness.startSession).not.toHaveBeenCalled();
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+      }),
+  );
 
   it("reacts to thread.turn.interrupt-requested by calling provider interrupt", async () => {
     const harness = await createHarness();

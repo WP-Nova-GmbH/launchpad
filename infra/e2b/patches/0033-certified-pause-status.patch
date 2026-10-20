@@ -1,0 +1,148 @@
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -710,6 +710,7 @@
+ 
+ // LaunchpadRuntimeCapabilities defines model for LaunchpadRuntimeCapabilities.
+ type LaunchpadRuntimeCapabilities struct {
++	CertifiedPauses              bool `json:"certifiedPauses"`
+ 	BuildCollectionAdmission     bool `json:"buildCollectionAdmission"`
+ 	DiskRestore                  bool `json:"diskRestore"`
+ 	DurableCreationIdentity      bool `json:"durableCreationIdentity"`
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -33,7 +33,7 @@
+ 		a.sendAPIStoreError(c, http.StatusForbidden, "Launchpad restore is not enabled for this team")
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{DurableCreationIdentity: true, PrivatePreviewHeaderBoundary: true, Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
++	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{CertifiedPauses: true, DurableCreationIdentity: true, PrivatePreviewHeaderBoundary: true, Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
+ }
+ 
+ func canonicalRestoreRequest(body api.LaunchpadRestoreRequest) ([]byte, error) {
+--- a/packages/api/internal/handlers/sandbox_get.go
++++ b/packages/api/internal/handlers/sandbox_get.go
+@@ -13,6 +13,7 @@
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+ 	"github.com/e2b-dev/infra/packages/api/internal/utils"
+ 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+@@ -146,6 +147,12 @@
+ 			return
+ 		}
+ 
++		// A transitional upstream state is not a completed managed pause.
++		if state == api.Paused && a.restoreAdmissionEnabled(team.ID) && sbx.Metadata["launchpad.managed"] == "thread-vm-v1" {
++			a.sendAPIStoreError(c, http.StatusConflict, "The filesystem pause is not confirmed; keep the sandbox")
++			return
++		}
++
+ 		// Sandbox exists and belongs to the team - return running sandbox sbx
+ 		sandbox := api.SandboxDetail{
+ 			ClientID:            sbx.ClientID,
+@@ -245,6 +252,13 @@
+ 		networkConfig = lastSnapshot.Snapshot.Config.Network
+ 	}
+ 
++	if a.restoreAdmissionEnabled(team.ID) && lastSnapshot.Snapshot.Metadata["launchpad.managed"] == "thread-vm-v1" {
++		if err := (executions.Store{DB: a.sqlcDB}).ValidatePausedDisk(ctx, team.ID, sandboxId, lastSnapshot.EnvBuild.ID); err != nil {
++			a.sendAPIStoreError(c, http.StatusConflict, "A confirmed paused disk is unavailable; keep the sandbox")
++			return
++		}
++	}
++
+ 	pausedAlias := firstAlias(lastSnapshot.Aliases)
+ 
+ 	sandbox := api.SandboxDetail{
+--- a/packages/db/pkg/executions/paused_disk.go
++++ b/packages/db/pkg/executions/paused_disk.go
+@@ -132,3 +132,38 @@
+ 	}
+ 	return env, tx.Commit(ctx)
+ }
++
++// ValidatePausedDisk is read-only. Routing absence and an older ready snapshot
++// cannot certify a pause whose latest disk build or physical stop failed.
++func (s Store) ValidatePausedDisk(ctx context.Context, team uuid.UUID, sandbox string, build uuid.UUID) error {
++	if team == uuid.Nil || sandbox == "" || build == uuid.Nil {
++		return ErrPausedDisk
++	}
++	_, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	var confirmed bool
++	err = tx.QueryRow(ctx, `SELECT EXISTS (
++        SELECT 1 FROM public.sandbox_execution_fences f
++        JOIN public.snapshots s ON s.team_id=f.team_id AND s.sandbox_id=f.sandbox_id
++        JOIN public.env_build_assignments a ON a.env_id=s.env_id AND a.tag='default'
++        JOIN public.env_builds b ON b.id=a.build_id
++        WHERE f.team_id=$1 AND f.sandbox_id=$2 AND f.state='paused'
++          AND f.current_execution_id IS NOT NULL AND f.paused_build_id=$3 AND b.id=$3
++          AND b.status_group='ready' AND s.config->>'filesystemOnly'='true'
++          AND s.metadata->>'launchpad.managed'='thread-vm-v1'
++          AND a.created_at=(SELECT max(tip.created_at) FROM public.env_build_assignments tip
++            WHERE tip.env_id=s.env_id AND tip.tag='default')
++          AND EXISTS(SELECT 1 FROM public.sandbox_execution_build_roots r
++            WHERE r.team_id=f.team_id AND r.sandbox_id=f.sandbox_id AND r.execution_id=f.current_execution_id)
++    )`, team, sandbox, build).Scan(&confirmed)
++	if err != nil {
++		return err
++	}
++	if !confirmed {
++		return ErrPausedDisk
++	}
++	return nil
++}
+--- a/packages/db/pkg/executions/paused_disk_test.go
++++ b/packages/db/pkg/executions/paused_disk_test.go
+@@ -35,6 +35,7 @@
+ 		return uncertain
+ 	})
+ 	require.ErrorIs(t, err, uncertain)
++	require.ErrorIs(t, store.ValidatePausedDisk(t.Context(), team, sbx, snap.BuildID), executions.ErrPausedDisk)
+ 	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
+ 	require.ErrorIs(t, err, executions.ErrPausedDisk)
+ 	require.NoError(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error {
+@@ -43,6 +44,8 @@
+ 	}))
+ 	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
+ 	require.NoError(t, err)
++	require.NoError(t, store.ValidatePausedDisk(t.Context(), team, sbx, snap.BuildID))
++	require.ErrorIs(t, store.ValidatePausedDisk(t.Context(), uuid.New(), sbx, snap.BuildID), executions.ErrPausedDisk)
+ }
+ 
+ func TestPausedDiskRetainsOneIndependentBuildWithoutBooting(t *testing.T) {
+@@ -79,10 +82,12 @@
+ 	}
+ 	_, err = store.RetainPausedDisk(t.Context(), other, sbx, namespace, alias)
+ 	require.Error(t, err)
++	require.NoError(t, store.ValidatePausedDisk(t.Context(), team, sbx, snap.BuildID))
+ 	// A new explicit resume clears the receipt before any boot RPC.
+ 	resumed := attempt
+ 	resumed.ExecutionID = uuid.New()
+ 	require.NoError(t, store.Register(t.Context(), resumed, snap.BuildID, true))
++	require.ErrorIs(t, store.ValidatePausedDisk(t.Context(), team, sbx, snap.BuildID), executions.ErrPausedDisk)
+ 	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
+ 	require.ErrorIs(t, err, executions.ErrPausedDisk)
+ 	require.ErrorIs(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }), executions.ErrPausedDisk, "late pause response cannot freeze the resumed guest")
+@@ -116,12 +121,16 @@
+ 	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_builds SET status='failed' WHERE id=$1`, snap.BuildID))
+ 	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
+ 	require.ErrorIs(t, err, executions.ErrPausedDisk)
++	require.ErrorIs(t, store.ValidatePausedDisk(t.Context(), team, sbx, snap.BuildID), executions.ErrPausedDisk)
+ 	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_builds SET status='success' WHERE id=$1`, snap.BuildID))
+ 	// A different published tip cannot inherit the prior pause acknowledgement.
+ 	newer := testutils.UpsertTestSnapshot(t, t.Context(), db, snap.TemplateID, sbx, team, base)
+ 	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_build_assignments SET created_at=created_at+interval '1 second' WHERE build_id=$1`, newer.BuildID))
+ 	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
+ 	require.ErrorIs(t, err, executions.ErrPausedDisk)
++	require.ErrorIs(t, store.ValidatePausedDisk(t.Context(), team, sbx, snap.BuildID), executions.ErrPausedDisk)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_builds SET status='failed' WHERE id=$1`, newer.BuildID))
++	require.ErrorIs(t, store.ValidatePausedDisk(t.Context(), team, sbx, snap.BuildID), executions.ErrPausedDisk, "an older ready disk is insufficient after a later failed pause")
+ 	_, err = store.BeginStop(t.Context(), team, sbx)
+ 	require.NoError(t, err)
+ 	require.ErrorIs(t, store.Register(t.Context(), attempt, uuid.New(), true), executions.ErrFenced)

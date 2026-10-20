@@ -2,6 +2,8 @@ import { ThreadId } from "@t3tools/contracts";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Schema from "effect/Schema";
 
+import type { ThreadExecutionFenceError } from "../persistence/ThreadExecutionFence.ts";
+
 import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
 
 export class OrchestrationCommandInvariantError extends Schema.TaggedError<OrchestrationCommandInvariantError>()(
@@ -77,6 +79,7 @@ export class OrchestrationProjectorDecodeError extends Schema.TaggedError<Orches
 }
 
 export type OrchestrationDispatchError =
+  | ThreadExecutionFenceError
   | ProjectionRepositoryError
   | OrchestrationCommandRejection
   | OrchestrationCommandIdConflictError

@@ -5,6 +5,12 @@ import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
+/** Local dev transports can name this relay without changing its durable token issuer. */
+export const RelayTokenResourceAliases = Context.Reference<ReadonlyArray<string>>(
+  "launchpad-relay/Config/RelayTokenResourceAliases",
+  { defaultValue: () => [] },
+);
+
 export const ApnsEnvironment = Schema.Literals(["sandbox", "production"]);
 export type ApnsEnvironment = typeof ApnsEnvironment.Type;
 
@@ -59,12 +65,6 @@ export class RelayConfiguration extends Context.Service<
     readonly managedEndpointBaseDomain: string | undefined;
     readonly managedEndpointNamespace: string | undefined;
     /**
-     * Development-only escape hatch for relay-provisioned Docker machines.
-     * When enabled, the connector may call a machine's loopback-only manual
-     * endpoint. Personal links and non-loopback endpoints remain rejected.
-     */
-    readonly allowLocalMachineEndpoints?: boolean;
-    /**
      * The source enrolled executors keep themselves current with. Absent on a
      * relay that does not want machines updating themselves; executors then
      * stay on whatever they were started with.
@@ -72,7 +72,7 @@ export class RelayConfiguration extends Context.Service<
     readonly executorSource?: ExecutorSourceRelease | undefined;
     readonly managedEndpointCleanupMode?: ManagedEndpointCleanupMode;
   }
->()("t3code-relay/Config/RelayConfiguration") {}
+>()("launchpad-relay/Config/RelayConfiguration") {}
 
 export interface ExecutorSourceRelease {
   readonly gitUrl: string;

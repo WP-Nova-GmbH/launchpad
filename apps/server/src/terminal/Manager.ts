@@ -1,3 +1,4 @@
+import { CheckoutAccess } from "../workspace/CheckoutAccess.ts";
 /**
  * TerminalManager - Terminal session orchestration service interface.
  *
@@ -6,6 +7,9 @@
  *
  * @module TerminalManager
  */
+import * as NodeCrypto from "node:crypto";
+import { ThreadExecution } from "../relay/ThreadExecution.ts";
+import type { ThreadWorkIdentity } from "../relay/ThreadExecutionRelay.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
   DEFAULT_TERMINAL_ID,
@@ -14,6 +18,7 @@ import {
   TerminalCwdNotFoundError,
   TerminalCwdStatError,
   TerminalError,
+  TerminalExecutionError,
   TerminalHistoryError,
   TerminalNotRunningError,
   TerminalProcessExitError,
@@ -274,6 +279,7 @@ export interface TerminalStartInput extends TerminalOpenInput {
 }
 
 interface TerminalSessionState {
+  pendingExecution?: ThreadWorkIdentity;
   /** Required setup must not report closure while its process can still write. */
   waitForProcessExitOnClose?: boolean;
   threadId: string;
@@ -1329,6 +1335,8 @@ function normalizedRuntimeEnv(
 }
 
 interface TerminalManagerOptions {
+  checkoutAccess: Pick<CheckoutAccess["Service"], "assertAvailable">;
+  execution: Pick<ThreadExecution["Service"], "begin" | "assertAccepting" | "withActiveWork">;
   logsDir: string;
   historyLineLimit?: number;
   historyByteLimit?: number;
@@ -1406,6 +1414,8 @@ export const resolveProviderInstanceTerminalEnvironment = Effect.fn(
 export const make = Effect.fn("TerminalManager.make")(function* () {
   const { terminalLogsDir } = yield* ServerConfig.ServerConfig;
   const ptyAdapter = yield* PtyAdapter.PtyAdapter;
+  const execution = yield* ThreadExecution;
+  const checkoutAccess = yield* CheckoutAccess;
   const portDiscovery = yield* PortScanner.PortDiscovery;
   const nativeTelemetry = yield* NativeTelemetryClient.NativeTelemetryClient;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -1421,6 +1431,8 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
     }),
   );
   return yield* makeWithOptions({
+    execution,
+    checkoutAccess,
     logsDir: terminalLogsDir,
     ptyAdapter,
     processTable: nativeTelemetry.processTable.pipe(
@@ -1442,6 +1454,30 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
 
+  const executionError = (input: { threadId: string; terminalId: string }) => () =>
+    new TerminalExecutionError({
+      threadId: input.threadId,
+      terminalId: input.terminalId,
+      detail: "Terminal execution is awaiting permission from the thread’s current environment.",
+    });
+  const processWork = new WeakMap<PtyAdapter.PtyProcess, ThreadWorkIdentity>();
+  const withProcessPermission = <A, E, R>(
+    session: TerminalSessionState,
+    process: PtyAdapter.PtyProcess,
+    effect: Effect.Effect<A, E, R>,
+  ) =>
+    options.execution
+      .withActiveWork(
+        processWork.get(process) ?? {
+          threadId: session.threadId,
+          workId: "untracked",
+          kind: "terminal",
+        },
+        options.checkoutAccess
+          .assertAvailable({ path: session.cwd })
+          .pipe(Effect.mapError(executionError(session)), Effect.andThen(effect), Effect.result),
+      )
+      .pipe(Effect.mapError(executionError(session)), Effect.flatMap(Effect.fromResult));
   const logsDir = options.logsDir;
   const historyLineLimit = options.historyLineLimit ?? DEFAULT_HISTORY_LINE_LIMIT;
   const historyByteLimit = options.historyByteLimit ?? DEFAULT_HISTORY_BYTE_LIMIT;
@@ -2316,6 +2352,20 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     input: TerminalStartInput,
     eventType: "started" | "restarted",
   ) {
+    const work: ThreadWorkIdentity = session.pendingExecution ?? {
+      threadId: session.threadId,
+      workId: NodeCrypto.randomUUID(),
+      kind: "terminal",
+    };
+    session.pendingExecution = work;
+    const permission = yield* options.execution
+      .begin(work)
+      .pipe(Effect.mapError(executionError(session)));
+    if (permission !== "start" && permission !== "ordinary")
+      return yield* executionError(session)();
+    // A shell exit does not prove that detached children stopped. Its durable
+    // reservation stays pending until workload reconciliation can prove those
+    // children stopped; onExit alone cannot release it.
     yield* stopProcess(session);
     yield* Effect.annotateCurrentSpan({
       "terminal.thread_id": session.threadId,
@@ -2353,6 +2403,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             const terminalEnv = createTerminalSpawnEnv(baseEnv, session.runtimeEnv);
             const spawnResult = yield* trySpawn(shellCandidates, terminalEnv, session);
             ptyProcess = spawnResult.process;
+            processWork.set(ptyProcess, work);
+            delete session.pendingExecution;
             trackProcess(ptyProcess, session);
             startedShell = spawnResult.shellLabel;
 
@@ -2664,6 +2716,12 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     input: TerminalOpenInput & { readonly waitForProcessExitOnClose?: boolean },
   ) {
     const terminalId = input.terminalId;
+    yield* options.execution
+      .assertAccepting(input.threadId)
+      .pipe(Effect.mapError(executionError(input)));
+    yield* options.checkoutAccess
+      .assertAvailable({ path: input.cwd })
+      .pipe(Effect.mapError(executionError(input)));
     yield* assertValidCwd(input.cwd);
 
     const sessionKey = toSessionKey(input.threadId, terminalId);
@@ -2778,7 +2836,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     if (liveSession.cols !== targetCols || liveSession.rows !== targetRows) {
-      yield* resizePtyProcess(liveSession, liveSession.process, targetCols, targetRows);
+      yield* withProcessPermission(
+        liveSession,
+        liveSession.process,
+        resizePtyProcess(liveSession, liveSession.process, targetCols, targetRows),
+      );
       liveSession.cols = targetCols;
       liveSession.rows = targetRows;
       liveSession.updatedAt = yield* nowIso;
@@ -2841,7 +2903,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             (session.cols !== targetCols || session.rows !== targetRows)
           ) {
             const process = session.process;
-            yield* resizePtyProcess(session, process, targetCols, targetRows);
+            yield* withProcessPermission(
+              session,
+              process,
+              resizePtyProcess(session, process, targetCols, targetRows),
+            );
             session.cols = targetCols;
             session.rows = targetRows;
             session.updatedAt = yield* nowIso;
@@ -3052,16 +3118,20 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         terminalId,
       });
     }
-    yield* Effect.try({
-      try: () => process.write(input.data),
-      catch: (cause) =>
-        new TerminalWriteError({
-          threadId: input.threadId,
-          terminalId,
-          terminalPid: process.pid,
-          cause,
-        }),
-    });
+    yield* withProcessPermission(
+      session,
+      process,
+      Effect.try({
+        try: () => process.write(input.data),
+        catch: (cause) =>
+          new TerminalWriteError({
+            threadId: input.threadId,
+            terminalId,
+            terminalPid: process.pid,
+            cause,
+          }),
+      }),
+    );
   });
 
   const resizeLocked = Effect.fn("terminal.resize")(function* (input: TerminalResizeInput) {
@@ -3074,7 +3144,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     if (!process || session.value.status !== "running") {
       return;
     }
-    yield* resizePtyProcess(session.value, process, input.cols, input.rows);
+    yield* withProcessPermission(
+      session.value,
+      process,
+      resizePtyProcess(session.value, process, input.cols, input.rows),
+    );
     session.value.cols = input.cols;
     session.value.rows = input.rows;
     session.value.updatedAt = yield* nowIso;
@@ -3110,8 +3184,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
   const restartResolved = (input: TerminalRestartInput) =>
     Effect.gen(function* () {
+      yield* options.execution
+        .assertAccepting(input.threadId)
+        .pipe(Effect.mapError(executionError(input)));
       yield* increment(terminalRestartsTotal, { scope: "thread" });
       const terminalId = input.terminalId;
+      yield* options.checkoutAccess
+        .assertAvailable({ path: input.cwd })
+        .pipe(Effect.mapError(executionError(input)));
       yield* assertValidCwd(input.cwd);
 
       const sessionKey = toSessionKey(input.threadId, terminalId);

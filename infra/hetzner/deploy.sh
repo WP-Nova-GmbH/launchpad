@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploys the local working tree to the self-hosted relay host: rsync the
 # source (respecting .gitignore, so no secrets and no node_modules travel),
-# build the relay and executor images on the host, apply migrations, restart.
+# build the relay image on the host, apply migrations, restart.
 #
 # Usage: infra/hetzner/deploy.sh [user@host]
 # Defaults the host to root@<relay_public_ip> from this module's Terraform state.
@@ -37,8 +37,6 @@ set -euo pipefail
 cd /opt/launchpad
 echo "deploy: building relay image"
 docker build -t launchpad-relay -f infra/relay/Dockerfile .
-echo "deploy: building executor image"
-docker build -t t3code-executor-dev -f infra/executor-image/Dockerfile .
 docker image prune -f >/dev/null
 echo "deploy: applying migrations"
 launchpad-relay-migrate
@@ -51,9 +49,11 @@ unit=/etc/systemd/system/launchpad-relay.service
 install -m 0700 -d /var/lib/launchpad-relay
 if ! grep -q -- '-v /var/lib/launchpad-relay:/var/lib/launchpad-relay' "${unit}"; then
   echo "deploy: mounting the persistent signing key directory into the relay"
-  sed -i 's#^\(\s*\)-v /var/run/docker.sock:/var/run/docker.sock \\$#&\n\1-v /var/lib/launchpad-relay:/var/lib/launchpad-relay \\#' "${unit}"
-  systemctl daemon-reload
+  sed -i '/--env-file \/etc\/launchpad-relay\/relay.env/a\        -v /var/lib/launchpad-relay:/var/lib/launchpad-relay \\' "${unit}"
 fi
+# VM provisioning no longer needs unrestricted access to the host Docker API.
+sed -i '\#-v /var/run/docker.sock:/var/run/docker.sock#d' "${unit}"
+systemctl daemon-reload
 if ! grep -q '^DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH=' /etc/launchpad-relay/provisioned.env; then
   echo "DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH=/var/lib/launchpad-relay/cloud-mint-private.pem" \
     >> /etc/launchpad-relay/provisioned.env

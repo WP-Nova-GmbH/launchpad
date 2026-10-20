@@ -210,7 +210,24 @@ export type ProviderAdapterError =
   | ProviderAdapterRequestError
   | ProviderAdapterProcessError;
 
+export class ProviderExecutionError extends Schema.TaggedError<ProviderExecutionError>()(
+  "ProviderExecutionError",
+  {
+    threadId: Schema.String,
+    operation: Schema.String,
+    uncertain: Schema.Boolean,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message() {
+    return this.uncertain
+      ? "This provider operation may already have started. Reconcile it before retrying."
+      : "Provider execution is waiting for permission from the thread’s current environment.";
+  }
+}
+
 export type ProviderServiceError =
+  | ProviderExecutionError
   | ProviderValidationError
   | ProviderUnsupportedError
   | ProviderWorkspaceMissingError

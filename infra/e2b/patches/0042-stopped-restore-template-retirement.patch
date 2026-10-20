@@ -1,0 +1,366 @@
+--- a/packages/api/internal/handlers/launchpad_execution.go
++++ b/packages/api/internal/handlers/launchpad_execution.go
+@@ -35,8 +35,8 @@
+ 	// registry tombstone already prevents all later managed starts/resumes.
+ 	state, err := a.sqlcDB.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
+ 	if err == nil && state == "stopped" {
+-		if err := store.CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
+-			return 503, "Stopped snapshot cleanup is incomplete"
++		if err := a.cleanupStoppedExecution(ctx, team, sandboxID); err != nil {
++			return 503, "Stopped execution metadata cleanup is incomplete"
+ 		}
+ 		return 0, ""
+ 	}
+@@ -60,7 +60,7 @@
+ 		}
+ 		err = a.deleteSnapshot(ctx, sandboxID, team)
+ 		if err != nil && !errors.Is(err, db.ErrSnapshotNotFound) {
+-			return 503, "Stopped snapshot cleanup is incomplete"
++			return 503, "Stopped execution metadata cleanup is incomplete"
+ 		}
+ 	}
+ 	// Zero attempts are allowed by BeginStop only for an identity captured before
+@@ -69,10 +69,27 @@
+ 	if err != nil || count != 1 {
+ 		return 503, "Physical stop receipt could not be saved"
+ 	}
+-	if err := store.CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
+-		return 503, "Stopped snapshot cleanup is incomplete"
++	if err := a.cleanupStoppedExecution(ctx, team, sandboxID); err != nil {
++		return 503, "Stopped execution metadata cleanup is incomplete"
+ 	}
+ 	return 0, ""
++}
++
++// Replays finish metadata retirement even after the stopped host is unavailable.
++func (a *APIStore) cleanupStoppedExecution(ctx context.Context, team uuid.UUID, sandboxID string) error {
++	store := executions.Store{DB: a.sqlcDB}
++	if err := store.CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
++		return err
++	}
++	aliases, retired, err := store.RetireStoppedRestoreTemplate(ctx, team, sandboxID)
++	if err != nil {
++		return err
++	}
++	if retired && a.templateCache != nil {
++		a.templateCache.InvalidateAllTags(context.WithoutCancel(ctx), sandboxID)
++		a.templateCache.InvalidateAliasesByTemplateID(context.WithoutCancel(ctx), sandboxID, aliases)
++	}
++	return nil
+ }
+ 
+ func confirmExecutionStops(ctx context.Context, attempts []queries.SandboxExecutionAttempt, connect func(context.Context, uuid.UUID, string) (rpc.SandboxServiceClient, context.Context, error)) error {
+--- /dev/null
++++ b/packages/db/pkg/executions/stopped_restore.go
+@@ -0,0 +1,87 @@
++package executions
++
++import (
++	"context"
++	"errors"
++
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
++)
++
++var ErrRestoreTemplateInUse = errors.New("stopped restore template is still in use")
++
++// RetireStoppedRestoreTemplate releases only the private template created by
++// restore activation. Its flattened disk is independent of the retained source;
++// physical collection still follows every surviving build's block ancestry.
++func (s Store) RetireStoppedRestoreTemplate(ctx context.Context, team uuid.UUID, sandboxID string) ([]string, bool, error) {
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return nil, false, err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
++	if err != nil {
++		return nil, false, err
++	}
++	if state != "stopped" {
++		return nil, false, ErrFenced
++	}
++	// The env lock also serializes restore admission and build registration. Use
++	// a fresh statement afterwards to see pins/assignments committed before it.
++	var template string
++	err = tx.QueryRow(ctx, `SELECT id FROM public.envs
++        WHERE id=$2 AND team_id=$1 AND source='snapshot_template' FOR UPDATE`, team, sandboxID).Scan(&template)
++	if errors.Is(err, pgx.ErrNoRows) {
++		return nil, false, nil
++	}
++	if err != nil {
++		return nil, false, err
++	}
++	var build uuid.UUID
++	err = tx.QueryRow(ctx, `SELECT o.prepared_build_id
++        FROM public.sandbox_restore_operations o
++        JOIN public.envs e ON e.id=o.sandbox_id AND e.team_id=o.team_id
++        JOIN public.snapshot_templates st ON st.env_id=e.id AND st.sandbox_id=o.sandbox_id
++          AND st.build_id=o.prepared_build_id AND st.origin_node_id=o.node_id
++        JOIN public.sandbox_execution_build_roots r
++          ON r.team_id=o.team_id AND r.sandbox_id=o.sandbox_id AND r.execution_id=o.execution_id
++          AND r.cluster_id=o.cluster_id AND r.node_id=o.node_id AND r.build_id=o.prepared_build_id
++        WHERE o.team_id=$1 AND o.sandbox_id=$2 AND o.state='active'
++          AND o.prepared_build_id<>o.source_build_id AND o.source_template_id<>o.sandbox_id
++          AND e.cluster_id IS NOT DISTINCT FROM NULLIF(o.cluster_id,'00000000-0000-0000-0000-000000000000'::uuid)
++          AND NOT EXISTS(SELECT 1 FROM public.env_build_assignments a
++            WHERE a.env_id=e.id AND a.build_id<>o.prepared_build_id)`, team, sandboxID).Scan(&build)
++	if errors.Is(err, pgx.ErrNoRows) {
++		return nil, false, nil // an ordinary or repurposed template is not ours to retire
++	}
++	if err != nil {
++		return nil, false, err
++	}
++	pinned, err := db.HasRestoreTemplatePins(ctx, template)
++	if err != nil {
++		return nil, false, err
++	}
++	var used bool
++	if err := tx.QueryRow(ctx, `SELECT EXISTS(
++        SELECT 1 FROM public.sandbox_execution_build_roots r
++        JOIN public.sandbox_execution_fences f USING(team_id,sandbox_id)
++        WHERE r.build_id=$1 AND f.state<>'stopped'
++        UNION ALL SELECT 1 FROM public.snapshots WHERE base_env_id=$2)`, build, template).Scan(&used); err != nil {
++		return nil, false, err
++	}
++	if pinned || used {
++		return nil, false, ErrRestoreTemplateInUse
++	}
++	if _, err := db.SoftDeleteTemplate(ctx, queries.SoftDeleteTemplateParams{TeamID: team, TemplateID: template}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
++		return nil, false, err
++	}
++	aliases, err := db.ReleaseTemplateAliases(ctx, template)
++	if err != nil {
++		return nil, false, err
++	}
++	if err := db.DeleteActiveTemplateBuilds(ctx, template); err != nil {
++		return nil, false, err
++	}
++	return aliases, true, tx.Commit(ctx)
++}
+--- /dev/null
++++ b/packages/db/pkg/executions/stopped_restore_test.go
+@@ -0,0 +1,146 @@
++package executions_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func stoppedRestoreFixture(t *testing.T, db *testutils.Database) (executions.Store, queries.InsertExecutionAttemptParams, uuid.UUID, uuid.UUID) {
++	t.Helper()
++	team := testutils.CreateTestTeam(t, db)
++	source := testutils.CreateTestTemplate(t, db, team)
++	base := testutils.CreateTestBuild(t, t.Context(), db, source, "uploaded")
++	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: "restored-" + uuid.NewString(), ExecutionID: uuid.New(), NodeID: "host"}
++	op, prepared := uuid.New(), uuid.New()
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `INSERT INTO sandbox_restore_operations(team_id,operation_id,request_sha256,request_payload,source_template_id,source_build_id,prepared_build_id,sandbox_id,execution_id,cluster_id,node_id,generation,state,reserved_bytes,manifest)
++      VALUES($1,$2,repeat('a',64),'{}',$3,$4,$5,$6,$7,$8,$9,'3','activating',0,'{}')`, team, op, source, base, prepared, p.SandboxID, p.ExecutionID, p.ClusterID, p.NodeID))
++	require.NoError(t, db.SqlcClient.CreateRestoreBuild(t.Context(), queries.CreateRestoreBuildParams{TeamID: team, OperationID: op}))
++	_, err := db.SqlcClient.CreateSnapshotTemplateEnv(t.Context(), queries.CreateSnapshotTemplateEnvParams{SnapshotID: p.SandboxID, TeamID: team, SandboxID: p.SandboxID, OriginNodeID: &p.NodeID, BuildID: &prepared, Tag: "default"})
++	require.NoError(t, err)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE sandbox_restore_operations SET state='active' WHERE operation_id=$1", op))
++	store := executions.Store{DB: db.SqlcClient}
++	require.NoError(t, store.Register(t.Context(), p, prepared, true))
++	return store, p, op, prepared
++}
++
++func stopRestoredFixture(t *testing.T, db *testutils.Database, store executions.Store, p queries.InsertExecutionAttemptParams) {
++	t.Helper()
++	_, err := store.BeginStop(t.Context(), p.TeamID, p.SandboxID)
++	require.NoError(t, err)
++	n, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: p.TeamID, SandboxID: p.SandboxID})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, n)
++}
++
++func assertRestoreTemplateLive(t *testing.T, db *testutils.Database, sandbox string) {
++	t.Helper()
++	_, tx, err := db.SqlcClient.WithTx(t.Context())
++	require.NoError(t, err)
++	defer tx.Rollback(context.WithoutCancel(t.Context()))
++	var live bool
++	require.NoError(t, tx.QueryRow(t.Context(), "SELECT deleted_at IS NULL FROM envs WHERE id=$1", sandbox).Scan(&live))
++	require.True(t, live)
++}
++
++func TestStoppedRestoreTemplateRejectsUnstoppedFences(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	for _, state := range []string{"active", "paused", "stopping"} {
++		t.Run(state, func(t *testing.T) {
++			store, p, _, _ := stoppedRestoreFixture(t, db)
++			require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE sandbox_execution_fences SET state=$3 WHERE team_id=$1 AND sandbox_id=$2", p.TeamID, p.SandboxID, state))
++			_, retired, err := store.RetireStoppedRestoreTemplate(t.Context(), p.TeamID, p.SandboxID)
++			require.ErrorIs(t, err, executions.ErrFenced)
++			require.False(t, retired)
++			assertRestoreTemplateLive(t, db, p.SandboxID)
++		})
++	}
++}
++
++func TestStoppedRestoreTemplateRequiresExactActivationProvenance(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "INSERT INTO clusters(id,name,endpoint,token) VALUES('00000000-0000-0000-0000-000000000001','other-test-cluster','unused','unused')"))
++	for _, mutation := range []string{
++		"UPDATE envs SET source='template' WHERE id=$1",
++		"UPDATE snapshot_templates SET origin_node_id='other-host' WHERE env_id=$1",
++		"UPDATE snapshot_templates SET sandbox_id='other-sandbox' WHERE env_id=$1",
++		"UPDATE sandbox_restore_operations SET state='failed' WHERE sandbox_id=$1",
++		"UPDATE sandbox_restore_operations SET source_template_id=sandbox_id WHERE sandbox_id=$1",
++		"DELETE FROM sandbox_execution_build_roots WHERE sandbox_id=$1",
++		"UPDATE envs SET cluster_id='00000000-0000-0000-0000-000000000001' WHERE id=$1",
++	} {
++		t.Run(mutation, func(t *testing.T) {
++			store, p, _, _ := stoppedRestoreFixture(t, db)
++			stopRestoredFixture(t, db, store, p)
++			require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), mutation, p.SandboxID))
++			_, retired, err := store.RetireStoppedRestoreTemplate(t.Context(), p.TeamID, p.SandboxID)
++			require.NoError(t, err)
++			require.False(t, retired)
++			assertRestoreTemplateLive(t, db, p.SandboxID)
++		})
++	}
++	store, p, _, _ := stoppedRestoreFixture(t, db)
++	stopRestoredFixture(t, db, store, p)
++	_, retired, err := store.RetireStoppedRestoreTemplate(t.Context(), uuid.New(), p.SandboxID)
++	require.Error(t, err)
++	require.False(t, retired)
++	assertRestoreTemplateLive(t, db, p.SandboxID)
++	newBuild := testutils.CreateTestBuild(t, t.Context(), db, p.SandboxID, "uploaded")
++	testutils.CreateTestBuildAssignment(t, t.Context(), db, p.SandboxID, newBuild, "other")
++	_, retired, err = store.RetireStoppedRestoreTemplate(t.Context(), p.TeamID, p.SandboxID)
++	require.NoError(t, err)
++	require.False(t, retired, "a repurposed template must not be retired")
++	assertRestoreTemplateLive(t, db, p.SandboxID)
++}
++
++func TestStoppedRestoreTemplatePreservesBorrowersAndPendingRestore(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	for _, state := range []string{"active", "paused"} {
++		t.Run(state, func(t *testing.T) {
++			store, p, _, build := stoppedRestoreFixture(t, db)
++			other := p
++			other.SandboxID, other.ExecutionID = "borrower-"+uuid.NewString(), uuid.New()
++			require.NoError(t, store.Register(t.Context(), other, build, true))
++			require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE sandbox_execution_fences SET state=$3 WHERE team_id=$1 AND sandbox_id=$2", p.TeamID, other.SandboxID, state))
++			stopRestoredFixture(t, db, store, p)
++			_, retired, err := store.RetireStoppedRestoreTemplate(t.Context(), p.TeamID, p.SandboxID)
++			require.ErrorIs(t, err, executions.ErrRestoreTemplateInUse)
++			require.False(t, retired)
++			assertRestoreTemplateLive(t, db, p.SandboxID)
++		})
++	}
++	store, p, _, build := stoppedRestoreFixture(t, db)
++	stopRestoredFixture(t, db, store, p)
++	// An independently paused sandbox may still name this destination as its
++	// base even if its execution root came from an older admission path.
++	paused := "paused-child-" + uuid.NewString()
++	testutils.UpsertTestSnapshot(t, t.Context(), db, "paused-tip-"+uuid.NewString(), paused, p.TeamID, p.SandboxID)
++	_, retired, err := store.RetireStoppedRestoreTemplate(t.Context(), p.TeamID, p.SandboxID)
++	require.ErrorIs(t, err, executions.ErrRestoreTemplateInUse)
++	require.False(t, retired)
++	assertRestoreTemplateLive(t, db, p.SandboxID)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "DELETE FROM snapshots WHERE team_id=$1 AND sandbox_id=$2", p.TeamID, paused))
++	op := uuid.New()
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `INSERT INTO sandbox_restore_operations(team_id,operation_id,request_sha256,request_payload,source_template_id,source_build_id,prepared_build_id,sandbox_id,execution_id,cluster_id,node_id,generation,state,reserved_bytes)
++      VALUES($1,$2,repeat('b',64),'{}',$3,$4,$5,$6,$7,$8,$9,'4','preparing',0)`, p.TeamID, op, p.SandboxID, build, uuid.New(), "pending-"+uuid.NewString(), uuid.New(), p.ClusterID, p.NodeID))
++	require.NoError(t, db.SqlcClient.PinRestoreBuild(t.Context(), queries.PinRestoreBuildParams{TeamID: p.TeamID, OperationID: op, BuildID: build}))
++	_, retired, err = store.RetireStoppedRestoreTemplate(t.Context(), p.TeamID, p.SandboxID)
++	require.ErrorIs(t, err, executions.ErrRestoreTemplateInUse)
++	require.False(t, retired)
++	assertRestoreTemplateLive(t, db, p.SandboxID)
++	// A retry after normal pin release may finish; the original source and its
++	// assignment remain independently named and are never part of this cleanup.
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE sandbox_restore_operations SET state='cancelled' WHERE operation_id=$1", op))
++	require.NoError(t, db.SqlcClient.ReleaseRestorePins(t.Context(), queries.ReleaseRestorePinsParams{TeamID: p.TeamID, OperationID: op}))
++	_, retired, err = store.RetireStoppedRestoreTemplate(t.Context(), p.TeamID, p.SandboxID)
++	require.NoError(t, err)
++	require.True(t, retired)
++	_, retired, err = store.RetireStoppedRestoreTemplate(t.Context(), p.TeamID, p.SandboxID)
++	require.NoError(t, err)
++	require.True(t, retired, "completed cleanup must replay successfully")
++}
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_execution_restore_test.go
+@@ -0,0 +1,72 @@
++package handlers
++
++import (
++	"context"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/db/pkg/buildretention"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestExecutionStopRetiresOnlyOwnedRestoredDestinationTemplate(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	source := testutils.CreateTestTemplate(t, db, team)
++	sourceBuild := testutils.CreateTestBuild(t, t.Context(), db, source, "uploaded")
++	store := executions.Store{DB: db.SqlcClient}
++	makeRestore := func(generation string) (queries.InsertExecutionAttemptParams, uuid.UUID) {
++		p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: "restored-" + uuid.NewString(), ExecutionID: uuid.New(), NodeID: "host"}
++		op, prepared := uuid.New(), uuid.New()
++		require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `INSERT INTO sandbox_restore_operations(team_id,operation_id,request_sha256,request_payload,source_template_id,source_build_id,prepared_build_id,sandbox_id,execution_id,cluster_id,node_id,generation,state,reserved_bytes,manifest)
++          VALUES($1,$2,repeat('a',64),'{}',$3,$4,$5,$6,$7,$8,$9,$10,'activating',0,'{}')`, team, op, source, sourceBuild, prepared, p.SandboxID, p.ExecutionID, p.ClusterID, p.NodeID, generation))
++		require.NoError(t, db.SqlcClient.CreateRestoreBuild(t.Context(), queries.CreateRestoreBuildParams{TeamID: team, OperationID: op}))
++		_, err := db.SqlcClient.CreateSnapshotTemplateEnv(t.Context(), queries.CreateSnapshotTemplateEnvParams{SnapshotID: p.SandboxID, TeamID: team, SandboxID: p.SandboxID, OriginNodeID: &p.NodeID, BuildID: &prepared, Tag: "default"})
++		require.NoError(t, err)
++		require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE sandbox_restore_operations SET state='active' WHERE operation_id=$1", op))
++		require.NoError(t, store.Register(t.Context(), p, prepared, true))
++		return p, prepared
++	}
++	stopped, prepared := makeRestore("3")
++	other, _ := makeRestore("4")
++	// A resume changes the current execution. Cleanup must still recognize the
++	// original activation's historical build root after permanent stop.
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE sandbox_execution_fences SET state='paused' WHERE team_id=$1 AND sandbox_id=$2", team, stopped.SandboxID))
++	resumed := stopped
++	resumed.ExecutionID = uuid.New()
++	require.NoError(t, store.Register(t.Context(), resumed, uuid.New(), true))
++	alias := testutils.CreateTestTemplateAlias(t, db, stopped.SandboxID)
++	_, err := store.BeginStop(t.Context(), team, stopped.SandboxID)
++	require.NoError(t, err)
++	n, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: stopped.SandboxID})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, n)
++	server := &APIStore{sqlcDB: db.SqlcClient}
++	for range 2 {
++		ctx, response := restoreHTTPContext(t, team, nil)
++		server.StopLaunchpadExecution(ctx, stopped.SandboxID)
++		require.Equal(t, 200, response.Code)
++	}
++	_, tx, err := db.SqlcClient.WithTx(t.Context())
++	require.NoError(t, err)
++	defer tx.Rollback(context.WithoutCancel(t.Context()))
++	var retired, sourceLive, otherLive bool
++	var aliases int
++	require.NoError(t, tx.QueryRow(t.Context(), "SELECT deleted_at IS NOT NULL FROM envs WHERE id=$1", stopped.SandboxID).Scan(&retired))
++	require.True(t, retired, "a physically stopped restored VM must release its private activation template")
++	require.NoError(t, tx.QueryRow(t.Context(), "SELECT deleted_at IS NULL FROM envs WHERE id=$1", source).Scan(&sourceLive))
++	require.True(t, sourceLive, "the retained source snapshot/template is independent")
++	require.NoError(t, tx.QueryRow(t.Context(), "SELECT deleted_at IS NULL FROM envs WHERE id=$1", other.SandboxID).Scan(&otherLive))
++	require.True(t, otherLive, "another generation's serving VM stays intact")
++	require.NoError(t, tx.QueryRow(t.Context(), "SELECT count(*) FROM env_aliases WHERE alias=$1", alias).Scan(&aliases))
++	require.Zero(t, aliases)
++	require.NoError(t, tx.Rollback(t.Context()))
++	require.NoError(t, buildretention.WithPinnedCatalog(t.Context(), db.SqlcClient, func(c buildretention.Catalog) error {
++		require.NotContains(t, c.Roots, prepared, "only descendant block lineage may retain the retired disk")
++		require.Contains(t, c.Roots, sourceBuild)
++		return nil
++	}))
++}

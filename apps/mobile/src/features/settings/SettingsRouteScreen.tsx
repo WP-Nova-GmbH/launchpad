@@ -87,6 +87,7 @@ function ConfiguredSettingsRouteScreen() {
             target="SettingsEnvironments"
           />
           <SettingsRow icon="bell.badge" label="Notifications" target="SettingsNotifications" />
+          <SettingsRow icon="desktopcomputer" label="Thread VMs" target="SettingsThreadVms" />
         </SettingsSection>
 
         <SettingsIndexSections />

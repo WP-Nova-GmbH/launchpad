@@ -125,23 +125,17 @@ _is_ registered requires a role on that repository.
 
 ## Machines
 
-Machines are computers the organization buys through Launchpad Connect. An **agent executor** runs work
-for the organization; a **review host** is reserved for running review builds of your application
-in a later release. Only admins provision and remove them; every member can see the list.
+Machines are existing computers an admin connects to the organization. Every member can see
+the list. In **Settings → Organization**, choose **Connect existing machine**, then run the
+returned setup command on that computer. The invitation expires after one day; if it expires,
+disconnect the unused entry and create another.
 
-Provisioning takes a name and a role. The machine sets itself up and reports in on its own —
-nobody signs in on it, and it can never be linked as somebody's personal environment. Until it
-does, it shows as **Setting up** and the list refreshes itself; if it never manages to report in
-within a day, it shows as **Enrollment expired** and the only fix is to destroy it and provision a
-fresh one.
+Once enrolled, the machine appears alongside your environments on every signed-in client.
+An admin can disconnect it from Organization settings. Disconnecting removes organization
+access and its managed connection; it keeps the computer's files and running server.
 
-Once a machine is **Ready**, it appears to every member of the organization alongside their own
-environments, so you can open projects and threads on it from any client, exactly as you would on
-a machine of your own. Nobody presses Connect for it: each device you sign in on picks the
-organization's machines up on its own, including a device you sign in on for the first time, and
-drops a machine once an admin destroys it. In **Settings → Connections** such a machine is
-labelled **Organization machine** and has no Disconnect or Remove; it comes and goes with the
-organization, not with your device.
+Managed Docker and Hetzner machine creation has been retired in favor of thread VMs. Existing
+managed compute needs cleanup by its host operator.
 
 Its projects remain listed on Start when the machine is offline. They are labelled **Offline** and
 cannot be opened until that machine reconnects. This retained catalog contains only project and
@@ -184,6 +178,28 @@ themselves within half an hour, with no one logging in. Signing in to a
 provider on a machine directly (**Settings → Providers**, with the machine selected) still works
 and stays on that machine until the organization shares a new account for that provider.
 
-Destroying a machine destroys everything on it, including any projects and thread history it
-holds — which is why the trash can asks for a second, labelled click. The organization has a limit
-on how many machines it can hold at once; ask us to raise it when you hit it.
+The organization has a limit on how many connected machines it can hold at once;
+ask us to raise it when you hit it.
+
+## Thread VM policy
+
+Start a thread with the default Codex provider on your machine, then use **Move thread → Private VM**
+to transfer its workspace and conversation to a dedicated VM. The first version uploads your local checkout rather than
+cloning its remote repository, so this move does not require a GitHub App. The move waits for
+the current turn to finish and keeps queued prompts with the conversation.
+If Launchpad cannot verify that local terminal or setup processes have stopped, the move stays
+queued with an explanation. Cancel the move to continue working locally.
+Fresh VMs need their own Codex sign-in; follow the sign-in step in the thread to let preparation continue.
+After a saved workspace expires, **Reset VM** preserves the conversation and recreates the workspace
+at the Git commit uploaded during the move. Changes made inside the VM are discarded, and queued
+prompts stay paused until you resume them.
+
+If a VM becomes unavailable, open its controls and choose **Recover from backup…**.
+Recovery restores the selected workspace backup and the independently saved conversation;
+workspace changes made after the backup may be lost. Queued prompts remain paused.
+When the conversation or attachments are not completely saved, recovery stays unavailable
+and keeps the existing data.
+
+Admins can configure the organization's VM limits and inactivity policy in
+**Settings → Organization → Thread VMs**. The timezone controls which days count toward
+weekday retention; Saturdays and Sundays are excluded. Other members can view the current policy.

@@ -1,3 +1,5 @@
+import { ThreadMoveControls } from "./ThreadMoveControls";
+import { ThreadVmControls } from "./ThreadVmControls";
 import type { WorktreeSetupCardProps } from "./worktree-setup-card";
 import type { ComposerTextPaste } from "../../native/T3ComposerEditor.types";
 import { type EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
@@ -12,6 +14,7 @@ import type {
 import { threadPresenceLabel } from "@t3tools/client-runtime/state/threadPresence";
 import { AppText as Text } from "../../components/AppText";
 import { useThreadPresencePeople, useThreadPresenceReporter } from "../../state/thread-presence";
+import { PortableThreadCommandStatus } from "./PortableThreadCommandStatus";
 import { SharedPromptQueue } from "./SharedPromptQueue";
 import { useKeyboardChatComposerInset, useKeyboardScrollToEnd } from "@legendapp/list/keyboard";
 import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSkills";
@@ -1078,6 +1081,18 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                   </Text>
                 </View>
               ) : null}
+              <PortableThreadCommandStatus
+                environmentId={props.environmentId}
+                threadId={props.selectedThread.id}
+              />
+              <ThreadVmControls
+                environmentId={props.environmentId}
+                threadId={props.selectedThread.id}
+              />
+              <ThreadMoveControls
+                environmentId={props.environmentId}
+                threadId={props.selectedThread.id}
+              />
               {props.promptQueue ? (
                 <SharedPromptQueue
                   key={`${props.environmentId}:${props.selectedThread.id}`}

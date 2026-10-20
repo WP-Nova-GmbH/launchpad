@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
   EnvironmentId,
+  MessageId,
   ORCHESTRATION_WS_METHODS,
   ProjectId,
   ProviderInstanceId,
@@ -18,6 +19,7 @@ import * as Queue from "effect/Queue";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 
+import { ThreadCommandRouting } from "../operations/commandRouting.ts";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { RpcSession } from "../rpc/session.ts";
@@ -56,7 +58,7 @@ const SNAPSHOT: OrchestrationShellSnapshot = {
   ],
 };
 
-const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
+const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (portable = false) {
   const requests = yield* Queue.unbounded<{
     command: ClientOrchestrationCommand;
     reply: Deferred.Deferred<{ sequence: number }, Error>;
@@ -65,6 +67,9 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
     target: { environmentId: ENVIRONMENT_ID },
     session: yield* SubscriptionRef.make(
       Option.some({
+        initialConfig: Effect.succeed({
+          environment: { capabilities: { sharedPromptQueue: false } },
+        }),
         client: {
           [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command: ClientOrchestrationCommand) =>
             Effect.gen(function* () {
@@ -78,6 +83,20 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
   } as EnvironmentSupervisor["Service"]);
   const runtime = Atom.runtime(
     Layer.mergeAll(
+      Layer.succeed(
+        ThreadCommandRouting,
+        portable
+          ? {
+              remember: () => {},
+              isPortable: () => true,
+              receipt: () => Effect.succeed(null),
+              dispatch: (command) =>
+                Effect.succeed({
+                  relay: { commandId: command.commandId, position: 1, receipt: null },
+                }),
+            }
+          : null,
+      ),
       Layer.succeed(EnvironmentRegistry, {
         run: (_environmentId, effect) =>
           Effect.provideService(effect, EnvironmentSupervisor, supervisor),
@@ -101,6 +120,23 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
 });
 
 describe("remote thread lifecycle commands", () => {
+  it.effect("does not leave a queued relay change looking applied in the sidebar", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness(true);
+        const result = yield* Effect.promise(() =>
+          h.commands.settle.run(h.registry, {
+            environmentId: ENVIRONMENT_ID,
+            input: { threadId: THREAD_ID, commandId: CommandId.make("relay-settle") },
+          }),
+        );
+        expect(result).toMatchObject({ _tag: "Success", value: { relay: { receipt: null } } });
+        expect(h.registry.get(h.visibleAtom)?.threads[0]?.settledOverride).toBeNull();
+        expect(yield* Queue.size(h.requests)).toBe(0);
+      }),
+    ),
+  );
+
   const actions = [
     ["settle", {}, { settledOverride: "settled", pinnedAt: null, snoozedUntil: null }],
     ["unsettle", { reason: "user" }, { settledOverride: "active", settledAt: null }],
@@ -355,3 +391,52 @@ describe("remote thread lifecycle commands", () => {
     );
   }
 });
+
+for (const queued of [false, true])
+  it.effect(
+    `uses ${queued ? "queued acceptance for a paused local move" : "legacy local start without a queue"}`,
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeHarness();
+          if (queued)
+            h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), {
+              ...SNAPSHOT,
+              threads: [
+                {
+                  ...SNAPSHOT.threads[0]!,
+                  promptQueueSummary: {
+                    count: 1,
+                    enabled: false,
+                    pauseReason: { code: "stopped", detail: "Review the waiting move." },
+                  },
+                },
+              ],
+            });
+          const input = {
+            threadId: THREAD_ID,
+            commandId: CommandId.make("followup"),
+            message: {
+              messageId: MessageId.make("followup-message"),
+              role: "user" as const,
+              text: "Keep this after the move",
+              attachments: [],
+            },
+            runtimeMode: "full-access" as const,
+            interactionMode: "default" as const,
+            createdAt: NOW,
+          };
+          const result = h.commands.startTurn.run(h.registry, {
+            environmentId: ENVIRONMENT_ID,
+            input,
+          });
+          const request = yield* Queue.take(h.requests);
+          expect(request.command).toEqual({
+            ...input,
+            type: queued ? "thread.prompt.enqueue" : "thread.turn.start",
+          });
+          yield* Deferred.succeed(request.reply, { sequence: 2 });
+          expect((yield* Effect.promise(() => result))._tag).toBe("Success");
+        }),
+      ),
+  );

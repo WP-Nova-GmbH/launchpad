@@ -5,6 +5,7 @@ import * as NodeCryptoLayer from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  ThreadId,
   EnvironmentAuthorizationError,
   AuthOrchestrationReadScope,
   REPOSITORY_POLICY_ACK_TYPE,
@@ -15,11 +16,42 @@ import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as HttpClient from "effect/unstable/http/HttpClient";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
 import { CLOUD_MINT_PUBLIC_KEY, RELAY_ISSUER_SECRET } from "./config.ts";
-import { applyRepositoryPolicyProof } from "./repositoryPolicy.ts";
+import { applyRepositoryPolicyProof, synchronizeRepositoryPolicy } from "./repositoryPolicy.ts";
+
+it.effect("does not synchronize an organization policy for private thread VM access", () =>
+  Effect.gen(function* () {
+    const base = yield* RepositoryAccess;
+    yield* synchronizeRepositoryPolicy.pipe(
+      Effect.provideService(RepositoryAccess, {
+        ...base,
+        threadId: ThreadId.make("private-thread"),
+        status: Effect.succeed({ enabled: true, ready: false, revision: 2 }),
+        apply: () => Effect.die("Private access must not receive an organization policy"),
+      }),
+      Effect.provideService(ServerSecretStore, {
+        get: () => Effect.die("Private access must not read legacy relay credentials"),
+        set: () => Effect.die("Unexpected credential mutation"),
+        create: () => Effect.die("Unexpected credential mutation"),
+        remove: () => Effect.die("Unexpected credential mutation"),
+        getOrCreateRandom: () => Effect.die("Unexpected credential mutation"),
+      }),
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make(() => Effect.die("Unexpected organization policy request")),
+      ),
+      Effect.provide(
+        Layer.mock(ServerEnvironment)({
+          getEnvironmentId: Effect.succeed(EnvironmentId.make("vm")),
+        }),
+      ),
+    );
+  }).pipe(Effect.provide(NodeCryptoLayer.layer)),
+);
 
 const keys = () =>
   NodeCrypto.generateKeyPairSync("ed25519", {

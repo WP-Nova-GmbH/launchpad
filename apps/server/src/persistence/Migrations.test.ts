@@ -14,7 +14,83 @@ import {
 import MigrationAuthSessionUser from "./Migrations/055_AuthSessionUser.ts";
 import MigrationProjectionThreadMessageAuthor from "./Migrations/056_ProjectionThreadMessageAuthor.ts";
 
+it.effect(
+  "upgrades settled native and chat checkpoints without losing files, receipts or foreign keys",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 68 });
+      yield* sql`INSERT INTO thread_native_checkpoints(thread_id,turn_id,environment_id,generation,source_sequence,
+      native_thread_id,directory,manifest_sha256,archive_sha256,published_artifact_id)
+      VALUES ('thread','turn','environment',1,5,'native','/retained/native',${"a".repeat(64)},${"b".repeat(64)},'native-artifact')`;
+      yield* sql`INSERT INTO thread_attachment_checkpoints(thread_id,generation,turn_id,environment_id,source_sequence,
+      directory,manifest_sha256,published_artifact_id)
+      VALUES ('thread',1,'turn','environment',5,'/retained/chat',${"c".repeat(64)},'chat-artifact')`;
+      assert.deepStrictEqual(yield* runMigrations(), [[69, "FrozenThreadCheckpoints"]]);
+      assert.deepStrictEqual(
+        yield* sql`SELECT turn_id,checkpoint_id,capture_operation_id,directory,published_artifact_id
+      FROM thread_native_checkpoints`,
+        [
+          {
+            turn_id: "turn",
+            checkpoint_id: "turn",
+            capture_operation_id: null,
+            directory: "/retained/native",
+            published_artifact_id: "native-artifact",
+          },
+        ],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT turn_id,checkpoint_id,directory,published_artifact_id FROM thread_attachment_checkpoints`,
+        [
+          {
+            turn_id: "turn",
+            checkpoint_id: "turn",
+            directory: "/retained/chat",
+            published_artifact_id: "chat-artifact",
+          },
+        ],
+      );
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      yield* Effect.flip(sql`INSERT INTO thread_attachment_checkpoints(thread_id,generation,checkpoint_id,turn_id,environment_id,
+      source_sequence,directory,manifest_sha256) VALUES ('thread',1,'missing','turn','environment',6,'/no-native',${"d".repeat(64)})`);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+);
+
 describe("migration history guard", () => {
+  for (const payload of ['{"entry":{"kind":"move"}}', '{"order":["second","first"]}']) {
+    it.effect(`protects queue semantics from older readers: ${payload}`, () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const insert = sql`INSERT INTO orchestration_events
+          (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+          VALUES ('queue-change', 'thread', 'moving-thread', 1, 'thread.prompt-queue-changed', '2026-10-05T00:00:00Z', 'system', ${payload}, '{}')`;
+        yield* sql
+          .withTransaction(insert.pipe(Effect.andThen(Effect.fail("rollback"))))
+          .pipe(Effect.ignore);
+        assert.deepStrictEqual(
+          yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
+          [{ name: "OrchestrationEvents" }],
+        );
+        yield* insert;
+        yield* sql`INSERT INTO thread_execution_fences
+          (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+          VALUES ('moving-thread', 'https://relay.test', 'env', 'project', 1, 'move', 'active')`;
+        yield* sql`INSERT INTO orchestration_events
+          (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+          VALUES ('delete-other', 'thread', 'other-thread', 1, 'thread.deleted', '2026-10-05T00:00:00Z', 'system', '{}', '{}')`;
+        yield* markSharedThreadDatabase;
+        assert.deepStrictEqual(
+          yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
+          [{ name: "OrchestrationEvents_ThreadMoveQueueReaderV1" }],
+        );
+        assert.deepStrictEqual(yield* runMigrations(), []);
+        yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 66`;
+        assert.instanceOf(yield* Effect.flip(runMigrations()), Migrator.MigrationError);
+      }).pipe(Effect.provide(SqlitePersistenceMemory)),
+    );
+  }
+
   it.effect("commits cleanup fences with deletion and refuses readers that cannot honor them", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -88,6 +164,16 @@ describe("migration history guard", () => {
       assert.deepStrictEqual(yield* runMigrations(), [
         [58, "CommandReceiptProjectScope"],
         [59, "ThreadCleanupFences"],
+        [60, "ThreadExecutionFences"],
+        [61, "ThreadTransferBaselines"],
+        [62, "ThreadCheckoutClaims"],
+        [63, "ThreadTransferRuntime"],
+        [64, "CheckoutOperations"],
+        [65, "ThreadTransferReadiness"],
+        [66, "ThreadMoveQueue"],
+        [67, "ThreadNativeCheckpoints"],
+        [68, "ThreadAttachmentCheckpoints"],
+        [69, "FrozenThreadCheckpoints"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT project_id FROM orchestration_command_receipts`, [
         { project_id: null },

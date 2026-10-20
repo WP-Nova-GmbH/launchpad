@@ -4646,6 +4646,9 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
       });
       assert.isTrue(Option.isNone(yield* snapshotQuery.getThreadShellById(threadId)));
 
+      // This projection-only fixture has no processes; acknowledge their cleanup before reusing the id.
+      yield* sql`DELETE FROM thread_cleanup_fences WHERE thread_id = ${threadId}`;
+
       // Retry from the same draft reuses the thread id.
       yield* createThread("cmd-retry-create-2", "Second attempt");
 

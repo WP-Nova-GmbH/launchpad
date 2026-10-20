@@ -1,3 +1,7 @@
+import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { readInstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
+import { readThreadVmInitialState } from "../relay/ThreadVmInitialStateRecord.ts";
+import { makeThreadVmRepositoryAccess } from "./ThreadVmRepositoryAccess.ts";
 import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
 import { markSharedThreadDatabase } from "../persistence/Migrations.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -43,6 +47,8 @@ const decodeStored = Schema.decodeUnknownSync(Schema.fromJsonString(StoredPolicy
 const encodeStored = Schema.encodeSync(Schema.fromJsonString(StoredPolicy));
 
 export interface RepositoryAccessShape {
+  /** When present, even another thread in the same project is outside the audience. */
+  readonly threadId?: ThreadId;
   readonly status: Effect.Effect<{
     readonly enabled: boolean;
     readonly ready: boolean;
@@ -107,6 +113,11 @@ export class RepositoryAccess extends Context.Reference<RepositoryAccessShape>(
 
 export const make = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore;
+  const vm = yield* readInstalledThreadVm().pipe(Effect.orDie);
+  if (vm) {
+    const initial = yield* readThreadVmInitialState().pipe(Effect.orDie);
+    return yield* makeThreadVmRepositoryAccess(vm, initial?.receipt ?? null).pipe(Effect.orDie);
+  }
   const sql = yield* SqlClient.SqlClient;
   const query = yield* ProjectionSnapshotQuery;
   const projects = yield* ProjectionProjectRepository;
@@ -283,6 +294,23 @@ export const make = Effect.gen(function* () {
       yield* persist();
     }),
     requireCommand: Effect.fn("RepositoryAccess.requireCommand")(function* (actor, command) {
+      // The relay is the sole durable writer after first portable enrollment.
+      // This check is evaluated for every request because a thread may enroll
+      // while this server and its WebSocket connections remain open.
+      if ("threadId" in command) {
+        yield* makeThreadExecutionFence(sql)
+          .assertDirectClientAllowed(command.threadId, command.type)
+          .pipe(
+            Effect.mapError(
+              (error) =>
+                new EnvironmentAuthorizationError({
+                  message: error.message,
+                  requiredScope: AuthOrchestrationReadScope,
+                  reason: "portable-thread",
+                }),
+            ),
+          );
+      }
       const membership = yield* member(actor);
       if (membership === undefined) return;
       // External shared sends must enter the durable queue. Trusted queue/provider
@@ -384,7 +412,12 @@ export function stampCommandAuthor(
     command.type === "thread.prompt.remove" ||
     command.type === "thread.prompt.steer" ||
     command.type === "thread.queue.pause" ||
-    command.type === "thread.queue.resume"
+    command.type === "thread.queue.resume" ||
+    command.type === "thread.queue.resolve" ||
+    command.type === "thread.queue.reorder" ||
+    command.type === "thread.move.enqueue" ||
+    command.type === "thread.move.edit" ||
+    command.type === "thread.move.cancel"
   ) {
     const { author: _author, ...rest } = command;
     return { ...rest, ...(actor.user === undefined ? {} : { author: actor.user }) };

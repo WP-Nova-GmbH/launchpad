@@ -52,7 +52,7 @@ export class MachineLimits extends Context.Service<
       MachineLimitExceeded | MachineLimitPersistenceError | Machines.MachinePersistenceError
     >;
   }
->()("t3code-relay/machines/MachineLimits") {}
+>()("launchpad-relay/machines/MachineLimits") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

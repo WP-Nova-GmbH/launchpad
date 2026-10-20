@@ -1,0 +1,157 @@
+diff --git a/packages/db/pkg/buildretention/store.go b/packages/db/pkg/buildretention/store.go
+index b970ed0cd..27e6e85de 100644
+--- a/packages/db/pkg/buildretention/store.go
++++ b/packages/db/pkg/buildretention/store.go
+@@ -97,16 +97,24 @@ func withCatalog(ctx context.Context, db *client.Client, live bool, collect func
+ 	if busy {
+ 		return ErrBusy
+ 	}
+-	roots, err := tx.Query(ctx, `SELECT DISTINCT build_id FROM (
++	// Snapshot assignments are an append-only history. Resume chooses the newest
++	// successful default assignment, not every past build. Retain tied tips because
++	// upstream lookup has no tie breaker, and retain a paused tip even if its env was
++	// soft-deleted: only confirmed execution cleanup removes the snapshot record.
++	roots, err := tx.Query(ctx, `WITH snapshot_tips AS (
++        SELECT a.build_id, rank() OVER (PARTITION BY a.env_id,a.tag ORDER BY a.created_at DESC) AS tip
++        FROM public.env_build_assignments a
++        JOIN public.envs e ON e.id=a.env_id AND e.source='snapshot'
++        JOIN public.env_builds b ON b.id=a.build_id AND b.status_group='ready'
++        WHERE e.deleted_at IS NULL OR EXISTS(SELECT 1 FROM public.snapshots s WHERE s.env_id=e.id)
++    ) SELECT DISTINCT build_id FROM (
+         SELECT a.build_id FROM public.env_build_assignments a
+-            JOIN public.envs e ON e.id=a.env_id AND e.deleted_at IS NULL
++            JOIN public.envs e ON e.id=a.env_id AND e.deleted_at IS NULL AND e.source <> 'snapshot'
+             JOIN public.env_builds b ON b.id=a.build_id AND b.status_group='ready'
+         UNION SELECT b.id FROM public.env_builds b
+-            JOIN public.envs e ON e.id=b.env_id AND e.deleted_at IS NULL
++            JOIN public.envs e ON e.id=b.env_id AND e.deleted_at IS NULL AND e.source NOT IN ('snapshot','snapshot_template')
+             WHERE b.status_group='ready'
+-        UNION SELECT b.id FROM public.snapshots s
+-            JOIN public.envs e ON e.id=s.env_id AND e.deleted_at IS NULL
+-            JOIN public.env_builds b ON b.env_id=s.env_id AND b.status_group='ready'
++        UNION SELECT build_id FROM snapshot_tips WHERE tip=1
+         UNION SELECT s.build_id FROM public.snapshot_templates s
+             JOIN public.envs e ON e.id=s.env_id AND e.deleted_at IS NULL
+         UNION SELECT p.build_id FROM public.sandbox_restore_pins p
+diff --git a/packages/db/pkg/buildretention/store_test.go b/packages/db/pkg/buildretention/store_test.go
+index b62c3da32..138bbc45b 100644
+--- a/packages/db/pkg/buildretention/store_test.go
++++ b/packages/db/pkg/buildretention/store_test.go
+@@ -4,12 +4,14 @@ import (
+ 	"context"
+ 	"errors"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/google/uuid"
+ 	"github.com/jackc/pgx/v5/pgconn"
++	"github.com/jackc/pgx/v5/pgtype"
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+@@ -178,3 +180,101 @@ func TestPinnedCatalogRefusesRebasedExecutionsEvenAfterCreateRetry(t *testing.T)
+ 	require.ErrorIs(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(Catalog) error { called = true; return nil }), ErrBusy)
+ 	require.False(t, called)
+ }
++
++// Use the production snapshot SQL: it appends assignments and keeps one internal
++// snapshot env across captures, the behavior simplified build fixtures can miss.
++func appendSnapshot(t *testing.T, db *testutils.Database, team uuid.UUID, base, sandbox string, source uuid.UUID) queries.UpsertSnapshotRow {
++	t.Helper()
++	row, err := db.SqlcClient.UpsertSnapshot(t.Context(), queries.UpsertSnapshotParams{
++		TemplateID: "snapshot-" + uuid.NewString(), TeamID: team, SandboxID: sandbox,
++		BaseTemplateID: base, StartedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
++		OriginNodeID: "test-node", Vcpu: 2, RamMb: 2048, FreeDiskSizeMb: 512,
++		KernelVersion: "6.1.0", FirecrackerVersion: "1.4.0", Status: "building", SourceBuildID: source,
++	})
++	require.NoError(t, err)
++	return row
++}
++
++func TestPinnedCatalogSnapshotHistoryReleasesOnlySupersededUnpinnedBuilds(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	base := testutils.CreateTestTemplate(t, db, team)
++	boot := testutils.CreateTestBuild(t, t.Context(), db, base, "uploaded")
++	sandbox := uuid.NewString()
++	first := appendSnapshot(t, db, team, base, sandbox, boot)
++	require.NoError(t, db.SqlcClient.UpdateEnvBuildStatus(t.Context(), queries.UpdateEnvBuildStatusParams{BuildID: first.BuildID, Status: "uploaded"}))
++	saved, err := db.SqlcClient.CreateSnapshotTemplateEnv(t.Context(), queries.CreateSnapshotTemplateEnvParams{
++		SnapshotID: "saved-" + uuid.NewString(), TeamID: team, SandboxID: sandbox, BuildID: &first.BuildID, Tag: "default",
++	})
++	require.NoError(t, err)
++	second := appendSnapshot(t, db, team, base, sandbox, boot)
++	require.Equal(t, first.TemplateID, second.TemplateID)
++	called := false
++	require.ErrorIs(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(Catalog) error { called = true; return nil }), ErrBusy)
++	require.False(t, called, "an incomplete newer snapshot must block deletion")
++	require.NoError(t, db.SqlcClient.UpdateEnvBuildStatus(t.Context(), queries.UpdateEnvBuildStatusParams{BuildID: second.BuildID, Status: "uploaded"}))
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.env_build_assignments SET created_at='2026-10-01T00:00:00Z' WHERE build_id=$1", first.BuildID))
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(c Catalog) error {
++		require.ElementsMatch(t, []uuid.UUID{boot, first.BuildID, second.BuildID}, c.Roots)
++		return nil
++	}))
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.envs SET deleted_at=now() WHERE id=$1", saved))
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(c Catalog) error {
++		require.ElementsMatch(t, []uuid.UUID{boot, second.BuildID}, c.Roots)
++		require.Contains(t, c.Candidates, first.BuildID, "historical snapshot bytes should now be eligible")
++		return nil
++	}))
++	// The resumed VM may still boot from the older disk; registration protects it
++	// independently of the current snapshot tip and the retired backup's env.
++	registry := executions.Store{DB: db.SqlcClient}
++	require.NoError(t, registry.Register(t.Context(), queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sandbox, ExecutionID: uuid.New(), NodeID: "test-node"}, first.BuildID, true))
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(c Catalog) error {
++		require.ElementsMatch(t, []uuid.UUID{boot, first.BuildID, second.BuildID}, c.Roots)
++		return nil
++	}))
++}
++
++func TestPinnedCatalogFailedLatestSnapshotKeepsPreviousResumeDisk(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	base := testutils.CreateTestTemplate(t, db, team)
++	boot := testutils.CreateTestBuild(t, t.Context(), db, base, "uploaded")
++	sandbox := uuid.NewString()
++	first := appendSnapshot(t, db, team, base, sandbox, boot)
++	require.NoError(t, db.SqlcClient.UpdateEnvBuildStatus(t.Context(), queries.UpdateEnvBuildStatusParams{BuildID: first.BuildID, Status: "uploaded"}))
++	failed := appendSnapshot(t, db, team, base, sandbox, boot)
++	require.NoError(t, db.SqlcClient.UpdateEnvBuildStatus(t.Context(), queries.UpdateEnvBuildStatusParams{BuildID: failed.BuildID, Status: "failed"}))
++	latest, err := db.SqlcClient.GetLastSnapshot(t.Context(), sandbox)
++	require.NoError(t, err)
++	require.Equal(t, first.BuildID, latest.EnvBuild.ID)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.envs SET deleted_at=now() WHERE id=$1", first.TemplateID))
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(c Catalog) error {
++		require.ElementsMatch(t, []uuid.UUID{boot, first.BuildID}, c.Roots)
++		require.Contains(t, c.Candidates, failed.BuildID)
++		return nil
++	}))
++	// Positive stop cleanup deletes the snapshot record; soft deletion alone did not.
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "DELETE FROM public.snapshots WHERE sandbox_id=$1", sandbox))
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(c Catalog) error {
++		require.ElementsMatch(t, []uuid.UUID{boot}, c.Roots)
++		return nil
++	}))
++}
++
++func TestPinnedCatalogSnapshotTimestampTiesRetainEveryPossibleResumeTip(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	base := testutils.CreateTestTemplate(t, db, team)
++	boot := testutils.CreateTestBuild(t, t.Context(), db, base, "uploaded")
++	sandbox := uuid.NewString()
++	first := appendSnapshot(t, db, team, base, sandbox, boot)
++	second := appendSnapshot(t, db, team, base, sandbox, boot)
++	for _, build := range []uuid.UUID{first.BuildID, second.BuildID} {
++		require.NoError(t, db.SqlcClient.UpdateEnvBuildStatus(t.Context(), queries.UpdateEnvBuildStatusParams{BuildID: build, Status: "uploaded"}))
++	}
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.env_build_assignments SET created_at='2026-10-01T00:00:00Z' WHERE env_id=$1", first.TemplateID))
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(c Catalog) error {
++		require.ElementsMatch(t, []uuid.UUID{boot, first.BuildID, second.BuildID}, c.Roots)
++		return nil
++	}))
++}
+

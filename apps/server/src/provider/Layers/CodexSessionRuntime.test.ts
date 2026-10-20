@@ -22,6 +22,7 @@ import {
   makeMemoryConsolidationNotificationFilter,
   openCodexThread,
   readCodexThread,
+  readCodexConversationSource,
   rollbackCodexThread,
   toMcpElicitationResponse,
 } from "./CodexSessionRuntime.ts";
@@ -1039,6 +1040,79 @@ describe("openCodexThread", () => {
     }),
   );
 
+  it.effect("never starts a fresh conversation when an existing conversation is required", () =>
+    Effect.gen(function* () {
+      const missingThread = new CodexErrors.CodexAppServerRequestError({
+        code: -32603,
+        errorMessage: "thread not found",
+      });
+      const error = yield* openCodexThread({
+        client: {
+          request: () => Effect.die("A transferred conversation must not start a new thread"),
+          raw: { request: () => Effect.fail(missingThread) },
+        },
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/destination",
+        requestedModel: undefined,
+        serviceTier: undefined,
+        resumeThreadId: "saved-thread",
+        resumePolicy: "require-existing",
+      }).pipe(Effect.flip);
+
+      NodeAssert.equal(error, missingThread);
+    }),
+  );
+
+  it.effect("requires a native thread ID for strict continuation", () =>
+    Effect.gen(function* () {
+      const error = yield* openCodexThread({
+        client: {
+          request: () => Effect.die("Missing identity must not start a new thread"),
+          raw: { request: () => Effect.die("Missing identity must not reach Codex") },
+        },
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/destination",
+        requestedModel: undefined,
+        serviceTier: undefined,
+        resumeThreadId: undefined,
+        resumePolicy: "require-existing",
+      }).pipe(Effect.flip);
+
+      NodeAssert.ok(isCodexAppServerRequestError(error));
+      NodeAssert.match(error.errorMessage, /without its native thread ID/);
+    }),
+  );
+
+  it.effect("checks the resumed identity before allowing strict continuation", () =>
+    Effect.gen(function* () {
+      for (const returnedId of ["saved-thread", "different-thread"]) {
+        const result = yield* openCodexThread({
+          client: {
+            request: () => Effect.die("Strict continuation must not start a new thread"),
+            raw: {
+              request: () => Effect.succeed(makeThreadOpenResponse(returnedId)),
+            },
+          },
+          threadId: ThreadId.make("thread-1"),
+          runtimeMode: "full-access",
+          cwd: "/tmp/destination",
+          requestedModel: undefined,
+          serviceTier: undefined,
+          resumeThreadId: "saved-thread",
+          resumePolicy: "require-existing",
+        }).pipe(Effect.result);
+
+        if (returnedId === "saved-thread") {
+          NodeAssert.equal(result._tag, "Success");
+        } else {
+          NodeAssert.equal(result._tag, "Failure");
+        }
+      }
+    }),
+  );
+
   it.effect("propagates non-recoverable resume failures", () =>
     Effect.gen(function* () {
       const client = {
@@ -1068,4 +1142,51 @@ describe("openCodexThread", () => {
       NodeAssert.equal(error.errorMessage, "timed out waiting for server");
     }),
   );
+});
+
+describe("native checkpoint source metadata", () => {
+  const nativeId = "01900000-0000-7000-8000-000000000001";
+  it.effect("retains the same native identity and its server-reported rollout", () =>
+    Effect.gen(function* () {
+      const result = yield* readCodexConversationSource(
+        {
+          raw: {
+            request: () =>
+              Effect.succeed({
+                thread: {
+                  id: nativeId,
+                  path: "/private/provider/sessions/rollout.jsonl",
+                  historyMode: "paginated",
+                },
+              }),
+          },
+        },
+        nativeId,
+      );
+      NodeAssert.deepEqual(result, {
+        threadId: nativeId,
+        rolloutPath: "/private/provider/sessions/rollout.jsonl",
+      });
+    }),
+  );
+  for (const thread of [
+    {
+      id: "01900000-0000-7000-8000-000000000002",
+      path: "/session.jsonl",
+      historyMode: "paginated",
+    },
+    { id: nativeId, path: "/session.jsonl", historyMode: "legacy" },
+    { id: nativeId, historyMode: "paginated" },
+  ])
+    it.effect(`rejects an incompatible native source: ${JSON.stringify(thread)}`, () =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          readCodexConversationSource(
+            { raw: { request: () => Effect.succeed({ thread }) } },
+            nativeId,
+          ),
+        );
+        NodeAssert.ok(isCodexAppServerRequestError(error));
+      }),
+    );
 });

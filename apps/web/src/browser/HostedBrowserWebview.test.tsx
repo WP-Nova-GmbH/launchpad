@@ -5,6 +5,7 @@ import {
   ThreadId,
   type ClientSettings,
   type DesktopPreviewBridge,
+  type PreviewSessionSnapshot,
 } from "@t3tools/contracts";
 import { act } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
@@ -19,6 +20,9 @@ const mocks = vi.hoisted(() => ({
   getPreviewConfig: vi.fn<DesktopPreviewBridge["getPreviewConfig"]>(),
   activeRecordings: new Set<string>(),
 }));
+
+vi.mock("~/env", () => ({ isElectron: true }));
+vi.mock("~/hooks/useTheme", () => ({ useTheme: () => ({ resolvedTheme: "dark" }) }));
 
 vi.mock("~/localApi", () => ({
   ensureLocalApi: () => ({ persistence: mocks }),
@@ -49,6 +53,13 @@ import {
 import { useBrowserSurfaceStore } from "./browserSurfaceStore";
 import * as desktopTabLifetime from "./desktopTabLifetime";
 import { HostedBrowserWebview } from "./HostedBrowserWebview";
+import { ElectronBrowserHost } from "./ElectronBrowserHost";
+import { AppAtomRegistryProvider } from "~/rpc/atomRegistry";
+import {
+  applyPreviewServerSnapshot,
+  reconcilePreviewServerSessions,
+  resetPreviewStateForTests,
+} from "~/previewStateStore";
 
 let renderer: ReactTestRenderer | undefined;
 
@@ -63,6 +74,7 @@ function deferred<A>() {
 }
 
 beforeEach(() => {
+  resetPreviewStateForTests();
   __resetClientSettingsPersistenceForTests();
   useBrowserSurfaceStore.setState({ activityByTabId: {}, byTabId: {} });
   mocks.getClientSettings.mockReset();
@@ -92,6 +104,7 @@ afterEach(async () => {
   renderer = undefined;
   await vi.advanceTimersByTimeAsync(0);
   vi.useRealTimers();
+  resetPreviewStateForTests();
   __resetClientSettingsPersistenceForTests();
   useBrowserSurfaceStore.setState({ activityByTabId: {}, byTabId: {} });
   vi.restoreAllMocks();
@@ -196,5 +209,84 @@ describe("HostedBrowserWebview settings hydration", () => {
     expect(mocks.registerWebview).toHaveBeenCalledExactlyOnceWith(runtimeTabId, 41);
     expect(mocks.closeTab).not.toHaveBeenCalled();
     expect(mocks.setClientSettings).not.toHaveBeenCalled();
+  });
+});
+
+describe("ElectronBrowserHost initial navigation", () => {
+  it("redeems a one-time link only once when the first server epoch arrives", async () => {
+    mocks.getClientSettings.mockResolvedValue(DEFAULT_CLIENT_SETTINGS);
+    await act(() => ensureClientSettingsHydrated());
+    const threadRef = {
+      environmentId: EnvironmentId.make("cold-preview-environment"),
+      threadId: ThreadId.make("cold-preview-thread"),
+    };
+    const url = "http://owned.preview.localhost:18610/__launchpad_preview#one-time-ticket";
+    const snapshot: PreviewSessionSnapshot = {
+      threadId: threadRef.threadId,
+      tabId: "first-tab",
+      navStatus: { _tag: "Loading", url, title: "" },
+      canGoBack: false,
+      canGoForward: false,
+      updatedAt: "2026-10-15T10:44:08.000Z",
+    };
+    let redemption: "unused" | "connected" | "expired" = "unused";
+    const loadedUrls: string[] = [];
+    await act(() => {
+      renderer = create(
+        <AppAtomRegistryProvider>
+          <ElectronBrowserHost />
+        </AppAtomRegistryProvider>,
+        {
+          createNodeMock: (element) => {
+            if (element.type !== "webview") {
+              return { scrollLeft: 0, scrollTop: 0, scrollTo: () => undefined };
+            }
+            // A new native webview loads its src; remounting replays the ticket.
+            loadedUrls.push((element.props as { readonly src: string }).src);
+            redemption = redemption === "unused" ? "connected" : "expired";
+            return Object.assign(new EventTarget(), { getWebContentsId: () => 42 });
+          },
+        },
+      );
+    });
+    await act(() => applyPreviewServerSnapshot(threadRef, snapshot));
+    await act(() =>
+      reconcilePreviewServerSessions(threadRef, {
+        sessions: [snapshot],
+        serverEpoch: "first-process",
+        revision: 1,
+      }),
+    );
+    expect(loadedUrls).toEqual([url]);
+    expect(redemption).toBe("connected");
+    await act(() =>
+      reconcilePreviewServerSessions(threadRef, {
+        sessions: [
+          {
+            ...snapshot,
+            navStatus: {
+              _tag: "Success",
+              url: "http://owned.preview.localhost:18610/",
+              title: "Owned app",
+            },
+          },
+        ],
+        serverEpoch: "first-process",
+        revision: 2,
+      }),
+    );
+    expect(loadedUrls).toEqual([url]);
+    expect(mocks.closeTab).not.toHaveBeenCalled();
+
+    await act(() =>
+      reconcilePreviewServerSessions(threadRef, {
+        sessions: [
+          { ...snapshot, navStatus: { _tag: "Loading", url: "https://example.com/", title: "" } },
+        ],
+        serverEpoch: "restarted-process",
+        revision: 1,
+      }),
+    );
+    expect(loadedUrls).toEqual([url, "https://example.com/"]);
   });
 });

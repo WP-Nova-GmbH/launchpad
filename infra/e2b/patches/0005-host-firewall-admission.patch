@@ -1,0 +1,113 @@
+--- a/packages/orchestrator/pkg/cfg/model.go
++++ b/packages/orchestrator/pkg/cfg/model.go
+@@ -76,6 +76,7 @@
+ }
+ 
+ type Config struct {
++	LaunchpadRequireHostFirewall bool `env:"LAUNCHPAD_REQUIRE_HOST_FIREWALL" envDefault:"false"`
+ 	BuilderConfig
+ 
+ 	RestorePreparationEnabled bool `env:"RESTORE_PREPARATION_ENABLED" envDefault:"false"`
+--- a/packages/orchestrator/pkg/server/sandboxes.go
++++ b/packages/orchestrator/pkg/server/sandboxes.go
+@@ -26,6 +26,7 @@
+ 	"google.golang.org/protobuf/types/known/emptypb"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+ 
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/hostfirewall"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/envdbin"
+@@ -335,6 +336,11 @@
+ 	fsOnly = meta.IsFilesystemOnly()
+ 	filesystemBooted = filesystemBoot(meta, req)
+ 
++	if s.config.LaunchpadRequireHostFirewall {
++		if err := hostfirewall.Check(ctx, "/usr/local/libexec/launchpad-host-firewall"); err != nil {
++			return nil, status.Error(codes.FailedPrecondition, "required Launchpad guest firewall is not ready")
++		}
++	}
+ 	if beforeGuestStart != nil {
+ 		if err := beforeGuestStart(); err != nil {
+ 			return nil, err
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -793,3 +793,17 @@
+ Cross-service contracts are all generated: OpenAPI specs in `spec/`, gRPC protos in
+ `packages/orchestrator/*.proto` and `packages/envd/spec/`, SQL in `packages/db/queries/`.
+ Run `make generate` after changing any of them.
++
++### Launchpad host firewall admission
++
++Dedicated Launchpad nodes enable `LAUNCHPAD_REQUIRE_HOST_FIREWALL`. Immediately
++before Create starts a guest (including prepared activation), the host runs
++`/usr/local/libexec/launchpad-host-firewall check` with a bounded deadline.
++Missing installation or rules changed since the systemd service applied them
++refuse new execution; existing admitted workloads continue. The root-owned
++service must apply the pinned guest firewall on each host boot before E2B
++starts. Its receipt records both policy bytes and active nftables rules, excluding
++only counters and kernel-assigned handles. Service-active alone is insufficient:
++a later ruleset flush must make admission fail. Ordinary upstream nodes retain
++the default-off setting. This guard is independent of API team admission and
++does not make external management ports safe to expose publicly.
+--- /dev/null
++++ b/packages/orchestrator/pkg/hostfirewall/check.go
+@@ -0,0 +1,21 @@
++// Package hostfirewall enforces the operator-installed guest boundary before boot.
++package hostfirewall
++
++import (
++	"context"
++	"fmt"
++	"os/exec"
++	"time"
++)
++
++// Check invokes the installed read-only attestation immediately before guest
++// start. Missing installation, changed rules and an uncertain check all refuse
++// new execution; existing workloads are not killed by a readiness failure.
++func Check(ctx context.Context, binary string) error {
++	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
++	defer cancel()
++	if err := exec.CommandContext(ctx, binary, "check").Run(); err != nil {
++		return fmt.Errorf("host guest-firewall check failed: %w", err)
++	}
++	return nil
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/hostfirewall/check_test.go
+@@ -0,0 +1,34 @@
++package hostfirewall
++
++import (
++	"context"
++	"github.com/stretchr/testify/require"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestCheckRefusesMissingFailedOrCancelledAttestation(t *testing.T) {
++	for _, result := range []string{"exit 0", "exit 1"} {
++		t.Run(result, func(t *testing.T) {
++			binary := filepath.Join(t.TempDir(), "check")
++			require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\ntest \"$1\" = check || exit 9\n"+result+"\n"), 0o700))
++			err := Check(t.Context(), binary)
++			if result == "exit 0" {
++				require.NoError(t, err)
++			} else {
++				require.Error(t, err)
++			}
++		})
++	}
++	require.Error(t, Check(t.Context(), filepath.Join(t.TempDir(), "missing")))
++	dir := t.TempDir()
++	binary := filepath.Join(dir, "check")
++	marker := filepath.Join(dir, "started")
++	require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o700))
++	ctx, cancel := context.WithCancel(t.Context())
++	cancel()
++	require.Error(t, Check(ctx, binary))
++	_, err := os.Stat(marker)
++	require.True(t, os.IsNotExist(err), "cancelled admission must not run the check")
++}

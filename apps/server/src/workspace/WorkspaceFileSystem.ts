@@ -25,6 +25,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
+import { CheckoutAccess } from "./CheckoutAccess.ts";
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
 
@@ -343,4 +344,32 @@ export const make = Effect.gen(function* () {
   return WorkspaceFileSystem.of({ readFile, writeFile });
 });
 
-export const layer = Layer.effect(WorkspaceFileSystem, make);
+export const guarded = Effect.gen(function* () {
+  const raw = yield* make;
+  const access = yield* CheckoutAccess;
+  return WorkspaceFileSystem.of({
+    ...raw,
+    writeFile: (input) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const mapHold = (cause: unknown) =>
+            new WorkspaceFileSystemOperationError({
+              workspaceRoot: input.cwd,
+              relativePath: input.relativePath,
+              resolvedPath: input.cwd,
+              operationPath: input.cwd,
+              operation: "write-file",
+              cause,
+            });
+          const operationId = yield* access
+            .begin({ paths: [input.cwd], kind: "write-file" })
+            .pipe(Effect.mapError(mapHold));
+          // A failed filesystem call has returned, so its write is no longer in flight.
+          const result = yield* Effect.exit(raw.writeFile(input));
+          yield* access.complete(operationId).pipe(Effect.mapError(mapHold));
+          return yield* result;
+        }),
+      ),
+  });
+});
+export const layer = Layer.effect(WorkspaceFileSystem, guarded);

@@ -6,6 +6,9 @@ import type { EnvironmentId, ThreadId, ThreadPromptQueue, TurnId } from "@t3tool
 import {
   promptAttributionLabel,
   queuedPromptEditConflict,
+  queuedMoveLabel,
+  moveQueueEntryNext,
+  moveQueueEntryLater,
   type QueuedPromptEdit,
 } from "@t3tools/client-runtime/state/threads";
 import { useState } from "react";
@@ -54,6 +57,8 @@ export function SharedPromptQueue({
   supportsPreparation?: boolean;
   hasStartedTurn?: boolean;
 }) {
+  const cancelMove = useAtomCommand(threadEnvironment.cancelMove, { reportFailure: false });
+  const reorderQueue = useAtomCommand(threadEnvironment.reorderQueue, { reportFailure: false });
   const editPrompt = useAtomCommand(threadEnvironment.editPrompt, { reportFailure: false });
   const removePrompt = useAtomCommand(threadEnvironment.removePrompt, { reportFailure: false });
   const steerPrompt = useAtomCommand(threadEnvironment.steerPrompt, { reportFailure: false });
@@ -66,7 +71,11 @@ export function SharedPromptQueue({
   const [edit, setEdit] = useState<QueuedPromptEdit | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const current = queue.entries.find((entry) => entry.messageId === edit?.messageId);
+  const candidate = queue.entries.find((entry) => entry.messageId === edit?.messageId);
+  const current = candidate?.kind === "move" ? undefined : candidate;
+  const firstMoveIndex = queue.entries.findIndex((entry) => entry.kind === "move");
+  const canReorder =
+    queue.handoff === null && queue.entries.every((entry) => entry.state === "pending");
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
   const disabled = unavailable || busy;
   const preparation = queue.preparation;
@@ -228,54 +237,57 @@ export function SharedPromptQueue({
           ))}
         </View>
       ) : null}
-      {queue.entries.map((entry, index) => (
-        <View key={entry.messageId} className="mb-2 gap-1 rounded-lg border border-border p-2">
-          <Text className="text-sm text-foreground">
-            {index + 1}. {entry.text || "Attachments"}
-          </Text>
-          {entry.attachments.length > 0 ? (
-            <Text className="text-xs text-foreground-muted">
-              Files: {entry.attachments.map((attachment) => attachment.name).join(", ")}
+      {queue.entries.map((entry, index) =>
+        entry.kind === "move" ? (
+          <View key={entry.messageId} className="mb-2 gap-1 rounded-lg border border-border p-2">
+            <Text className="text-sm text-foreground">
+              {index + 1}. {queuedMoveLabel(entry)}
             </Text>
-          ) : null}
-          <Text className="text-xs text-foreground-muted">{promptAttributionLabel(entry)}</Text>
-          {entry.state === "pending" ? (
+            <Text className="text-xs text-foreground-muted">
+              {entry.detail ??
+                (entry.state === "pending"
+                  ? "Waiting in queue"
+                  : entry.state === "cancelling"
+                    ? "Cancelling move…"
+                    : "Moving thread…")}
+            </Text>
             <View className="mt-1 flex-row flex-wrap gap-2">
               <QueueButton
-                label="Edit"
-                disabled={disabled}
-                onPress={() => {
-                  setEdit({
-                    messageId: entry.messageId,
-                    revision: entry.revision,
-                    text: entry.text,
-                  });
-                  setError(null);
-                }}
-              />
-              <QueueButton
-                label="Steer now"
-                disabled={disabled || activeTurnId === null}
-                onPress={() => {
-                  if (activeTurnId)
-                    void run(() =>
-                      steerPrompt(
-                        request({
-                          threadId,
-                          messageId: entry.messageId,
-                          expectedRevision: entry.revision,
-                          expectedTurnId: activeTurnId,
-                        }),
-                      ),
-                    );
-                }}
-              />
-              <QueueButton
-                label="Remove"
-                disabled={disabled}
+                label="Move next"
+                disabled={disabled || !canReorder || index === 0}
                 onPress={() =>
                   void run(() =>
-                    removePrompt(
+                    reorderQueue(
+                      request({
+                        threadId,
+                        expectedRevision: queue.revision,
+                        order: moveQueueEntryNext(queue.entries, entry.messageId),
+                      }),
+                    ),
+                  )
+                }
+              />
+              <QueueButton
+                label="Move down"
+                disabled={disabled || !canReorder || index + 1 === queue.entries.length}
+                onPress={() =>
+                  void run(() =>
+                    reorderQueue(
+                      request({
+                        threadId,
+                        expectedRevision: queue.revision,
+                        order: moveQueueEntryLater(queue.entries, entry.messageId),
+                      }),
+                    ),
+                  )
+                }
+              />
+              <QueueButton
+                label="Cancel move"
+                disabled={disabled || entry.state === "cancelling"}
+                onPress={() =>
+                  void run(() =>
+                    cancelMove(
                       request({
                         threadId,
                         messageId: entry.messageId,
@@ -286,13 +298,107 @@ export function SharedPromptQueue({
                 }
               />
             </View>
-          ) : (
-            <Text className="text-xs text-foreground-muted">
-              {entry.state === "unknown" ? "Delivery outcome unknown" : "Sending to agent…"}
+          </View>
+        ) : (
+          <View key={entry.messageId} className="mb-2 gap-1 rounded-lg border border-border p-2">
+            <Text className="text-sm text-foreground">
+              {index + 1}. {entry.text || "Attachments"}
             </Text>
-          )}
-        </View>
-      ))}
+            {entry.attachments.length > 0 ? (
+              <Text className="text-xs text-foreground-muted">
+                Files: {entry.attachments.map((attachment) => attachment.name).join(", ")}
+              </Text>
+            ) : null}
+            <Text className="text-xs text-foreground-muted">{promptAttributionLabel(entry)}</Text>
+            {entry.state === "pending" ? (
+              <View className="mt-1 flex-row flex-wrap gap-2">
+                <QueueButton
+                  label="Edit"
+                  disabled={disabled}
+                  onPress={() => {
+                    setEdit({
+                      messageId: entry.messageId,
+                      revision: entry.revision,
+                      text: entry.text,
+                    });
+                    setError(null);
+                  }}
+                />
+                <QueueButton
+                  label="Steer now"
+                  disabled={
+                    disabled ||
+                    activeTurnId === null ||
+                    (firstMoveIndex >= 0 && index > firstMoveIndex)
+                  }
+                  onPress={() => {
+                    if (activeTurnId)
+                      void run(() =>
+                        steerPrompt(
+                          request({
+                            threadId,
+                            messageId: entry.messageId,
+                            expectedRevision: entry.revision,
+                            expectedTurnId: activeTurnId,
+                          }),
+                        ),
+                      );
+                  }}
+                />
+                <QueueButton
+                  label="Move next"
+                  disabled={disabled || !canReorder || index === 0}
+                  onPress={() =>
+                    void run(() =>
+                      reorderQueue(
+                        request({
+                          threadId,
+                          expectedRevision: queue.revision,
+                          order: moveQueueEntryNext(queue.entries, entry.messageId),
+                        }),
+                      ),
+                    )
+                  }
+                />
+                <QueueButton
+                  label="Move down"
+                  disabled={disabled || !canReorder || index + 1 === queue.entries.length}
+                  onPress={() =>
+                    void run(() =>
+                      reorderQueue(
+                        request({
+                          threadId,
+                          expectedRevision: queue.revision,
+                          order: moveQueueEntryLater(queue.entries, entry.messageId),
+                        }),
+                      ),
+                    )
+                  }
+                />
+                <QueueButton
+                  label="Remove"
+                  disabled={disabled}
+                  onPress={() =>
+                    void run(() =>
+                      removePrompt(
+                        request({
+                          threadId,
+                          messageId: entry.messageId,
+                          expectedRevision: entry.revision,
+                        }),
+                      ),
+                    )
+                  }
+                />
+              </View>
+            ) : (
+              <Text className="text-xs text-foreground-muted">
+                {entry.state === "unknown" ? "Delivery outcome unknown" : "Sending to agent…"}
+              </Text>
+            )}
+          </View>
+        ),
+      )}
       {edit ? (
         <View className="mb-3 gap-2">
           <TextInput

@@ -1,3 +1,9 @@
+import { isThreadVmPreviewHost } from "./threadVmPreviewHost.ts";
+import {
+  connectThreadVmIfBound,
+  getThreadVmStatusIfBound,
+} from "../threads/ThreadVmClientConnection.ts";
+import { threadVmCredentialAllows } from "./threadVmCredentialAccess.ts";
 import * as UserDirectory from "../tenancy/UserDirectory.ts";
 import { createClerkClient, verifyToken } from "@clerk/backend";
 import { sql as drizzleSql } from "drizzle-orm";
@@ -21,6 +27,7 @@ import * as HttpTraceContext from "effect/unstable/http/HttpTraceContext";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as HttpApiError from "effect/unstable/httpapi/HttpApiError";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
+import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import { httpHeaderRedactionLayer } from "@t3tools/shared/httpObservability";
 
 import {
@@ -125,7 +132,7 @@ const decodeManagedTunnelRecoveryProof = Schema.decodeUnknownEffect(
   RelayManagedEndpointRecoveryProofPayload,
 );
 
-const appendRelayCredentialResponseHeaders = HttpEffect.appendPreResponseHandler(
+export const appendRelayCredentialResponseHeaders = HttpEffect.appendPreResponseHandler(
   (_request, response) =>
     Effect.succeed(
       HttpServerResponse.setHeaders(response, {
@@ -157,26 +164,31 @@ const appendRelayTraceContextResponseHeader = Effect.gen(function* () {
   );
 }).pipe(Effect.ignore);
 
-export const relayCors = HttpRouter.middleware(
-  Effect.fnUntraced(function* <E, R>(
-    httpEffect: Effect.Effect<
-      HttpServerResponse.HttpServerResponse,
-      E,
-      HttpServerRequest.HttpServerRequest | R
-    >,
-  ) {
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    if (request.method === "OPTIONS") {
-      return HttpServerResponse.empty({
-        status: 204,
-        headers: relayCorsPreflightHeaders,
-      });
-    }
-    const response = yield* httpEffect;
-    return HttpServerResponse.setHeaders(response, relayCorsHeaders);
-  }),
-  { global: true },
-);
+export const makeRelayCors = (previewBaseUrl?: string) =>
+  HttpRouter.middleware(
+    Effect.fnUntraced(function* <E, R>(
+      httpEffect: Effect.Effect<
+        HttpServerResponse.HttpServerResponse,
+        E,
+        HttpServerRequest.HttpServerRequest | R
+      >,
+    ) {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      // A preview is a separate application origin, with its own CORS and authorization.
+      if (isThreadVmPreviewHost(request, previewBaseUrl)) return yield* httpEffect;
+      if (request.method === "OPTIONS") {
+        return HttpServerResponse.empty({
+          status: 204,
+          headers: relayCorsPreflightHeaders,
+        });
+      }
+      const response = yield* httpEffect;
+      return HttpServerResponse.setHeaders(response, relayCorsHeaders);
+    }),
+    { global: true },
+  );
+
+export const relayCors = makeRelayCors();
 
 export const relayNotFoundRoute = HttpRouter.add(
   "*",
@@ -198,6 +210,10 @@ export const relayDocsRedirectRoute = HttpRouter.add(
 // contains the exact child span that stalled, and the response still carries
 // the traceparent back to the client.
 export const RELAY_REQUEST_DEADLINE_MS = 9_000;
+// Bounded file uploads and full checkpoint verification need more time than interactive requests.
+export const RELAY_CHECKPOINT_REQUEST_DEADLINE_MS = 120_000;
+// Move verification streams a bounded archive (up to 64 GiB) in a background worker.
+export const RELAY_MOVE_REQUEST_DEADLINE_MS = 55 * 60_000;
 
 const relayRequestDeadline = <E, R>(
   httpEffect: Effect.Effect<
@@ -205,31 +221,53 @@ const relayRequestDeadline = <E, R>(
     E,
     HttpServerRequest.HttpServerRequest | R
   >,
+  previewBaseUrl?: string,
 ) =>
-  httpEffect.pipe(
-    Effect.timeoutOption(Duration.millis(RELAY_REQUEST_DEADLINE_MS)),
-    Effect.flatMap(
-      Option.match({
-        onNone: () =>
-          Effect.gen(function* () {
-            const request = yield* HttpServerRequest.HttpServerRequest;
-            yield* Effect.logError("relay request exceeded deadline", {
-              "http.method": request.method,
-              "http.url": request.url,
-              "relay.request.deadline_ms": RELAY_REQUEST_DEADLINE_MS,
-            });
-            yield* Effect.annotateCurrentSpan({
-              "relay.request.deadline_exceeded": true,
-            });
-            return HttpServerResponse.jsonUnsafe(
-              { error: "relay_request_deadline_exceeded" },
-              { status: 504 },
-            );
-          }),
-        onSome: Effect.succeed,
-      }),
-    ),
-  );
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    // Preview handlers bound their own upstream handshake and response lifetimes.
+    if (isThreadVmPreviewHost(request, previewBaseUrl)) return yield* httpEffect;
+    const path = request.url.split("?", 1)[0]!;
+    const checkpointRequest =
+      (request.method === "PUT" &&
+        /^\/v1\/environments\/[^/]+\/threads\/[^/]+\/artifacts\/[0-9a-f-]{36}$/u.test(path)) ||
+      (request.method === "POST" &&
+        /^\/v1\/environments\/[^/]+\/threads\/[^/]+\/checkpoints\/(?:native|attachments)$/u.test(
+          path,
+        ));
+    const movePublish =
+      request.method === "POST" &&
+      /^\/v1\/environments\/[^/]+\/threads\/[^/]+\/moves\/[0-9a-f-]{36}\/publish$/u.test(path);
+    const deadline = movePublish
+      ? RELAY_MOVE_REQUEST_DEADLINE_MS
+      : checkpointRequest
+        ? RELAY_CHECKPOINT_REQUEST_DEADLINE_MS
+        : RELAY_REQUEST_DEADLINE_MS;
+    return yield* httpEffect.pipe(
+      Effect.timeoutOption(Duration.millis(deadline)),
+      Effect.flatMap(
+        Option.match({
+          onNone: () =>
+            Effect.gen(function* () {
+              const request = yield* HttpServerRequest.HttpServerRequest;
+              yield* Effect.logError("relay request exceeded deadline", {
+                "http.method": request.method,
+                "http.url": request.url,
+                "relay.request.deadline_ms": deadline,
+              });
+              yield* Effect.annotateCurrentSpan({
+                "relay.request.deadline_exceeded": true,
+              });
+              return HttpServerResponse.jsonUnsafe(
+                { error: "relay_request_deadline_exceeded" },
+                { status: 504 },
+              );
+            }),
+          onSome: Effect.succeed,
+        }),
+      ),
+    );
+  });
 
 export const traceRelayHttpRequest = <E, R>(
   httpEffect: Effect.Effect<
@@ -237,10 +275,13 @@ export const traceRelayHttpRequest = <E, R>(
     E,
     HttpServerRequest.HttpServerRequest | R
   >,
+  previewBaseUrl?: string,
 ) =>
   // HttpMiddleware finalizes its span on the dispatcher; do not close a request-scoped exporter first.
   HttpMiddleware.tracer(
-    appendRelayTraceContextResponseHeader.pipe(Effect.andThen(relayRequestDeadline(httpEffect))),
+    appendRelayTraceContextResponseHeader.pipe(
+      Effect.andThen(relayRequestDeadline(httpEffect, previewBaseUrl)),
+    ),
   ).pipe(Effect.ensuring(Effect.yieldNow));
 
 export const traceRelayHttpRequestWith = <E, R, LayerError, LayerRequirements>(
@@ -250,8 +291,9 @@ export const traceRelayHttpRequestWith = <E, R, LayerError, LayerRequirements>(
     HttpServerRequest.HttpServerRequest | R
   >,
   tracerLayer: Layer.Layer<never, LayerError, LayerRequirements>,
+  previewBaseUrl?: string,
 ) =>
-  traceRelayHttpRequest(httpEffect).pipe(
+  traceRelayHttpRequest(httpEffect, previewBaseUrl).pipe(
     Effect.provide(Layer.merge(tracerLayer, httpHeaderRedactionLayer)),
   );
 
@@ -322,6 +364,17 @@ export const relayEnvironmentAuthLayer = Layer.effect(
         );
         if (principal._tag === "None") {
           return yield* relayAuthInvalidError("not_authorized");
+        }
+        if (principal.value.threadVm) {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          if (
+            !threadVmCredentialAllows(
+              { ...principal.value, threadVm: principal.value.threadVm },
+              request.method,
+              request.url,
+            )
+          )
+            return yield* relayAuthInvalidError("not_authorized");
         }
         yield* Effect.annotateCurrentSpan({
           "relay.auth.mode": "environment_credential",
@@ -1095,6 +1148,7 @@ export const tokenApi = HttpApiBuilder.group(
   "token",
   Effect.fnUntraced(function* (handlers) {
     const config = yield* RelayConfiguration.RelayConfiguration;
+    const resourceAliases = yield* RelayConfiguration.RelayTokenResourceAliases;
     const crypto = yield* Crypto.Crypto;
     const dpopProofs = yield* DpopProofs.DpopProofReplay;
     const relayTokens = yield* RelayTokens.RelayTokens;
@@ -1112,7 +1166,13 @@ export const tokenApi = HttpApiBuilder.group(
           "relay.oauth.client_id": args.payload.client_id,
           "relay.oauth.scopes": args.payload.scope,
         });
-        if (args.payload.resource !== issuer || requestedScopes === null) {
+        const alias =
+          resourceAliases.length > 0 ? normalizeSecureRelayUrl(args.payload.resource) : null;
+        if (
+          (args.payload.resource !== issuer &&
+            (alias === null || !resourceAliases.includes(alias))) ||
+          requestedScopes === null
+        ) {
           return yield* new HttpApiError.Unauthorized({});
         }
 
@@ -1174,6 +1234,21 @@ export const dpopClientApi = HttpApiBuilder.group(
             const clientProofKeyThumbprint = yield* requireDpopThumbprint(proofKeyThumbprint, {
               expectedAccessToken: token,
             }).pipe(Effect.provideService(DpopProofs.DpopProofReplay, dpopProofs));
+            const vmConnection = yield* connectThreadVmIfBound({
+              userId,
+              environmentId: params.environmentId,
+              clientProofKeyThumbprint,
+              ...(payload.deviceId ? { deviceId: payload.deviceId } : {}),
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new EnvironmentConnector.EnvironmentMintResponseInvalid({
+                    environmentId: params.environmentId,
+                    operation: "connect",
+                  }),
+              ),
+            );
+            if (vmConnection) return vmConnection;
             return yield* connector.connect({
               userId,
               environmentId: params.environmentId,
@@ -1219,6 +1294,19 @@ export const dpopClientApi = HttpApiBuilder.group(
             yield* requireDpopThumbprint(proofKeyThumbprint, {
               expectedAccessToken: token,
             }).pipe(Effect.provideService(DpopProofs.DpopProofReplay, dpopProofs));
+            const vmStatus = yield* getThreadVmStatusIfBound({
+              userId,
+              environmentId: params.environmentId,
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new EnvironmentConnector.EnvironmentMintResponseInvalid({
+                    environmentId: params.environmentId,
+                    operation: "status",
+                  }),
+              ),
+            );
+            if (vmStatus) return vmStatus;
             return yield* connector.status({
               userId,
               environmentId: params.environmentId,

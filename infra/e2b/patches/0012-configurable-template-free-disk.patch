@@ -1,0 +1,11 @@
+--- a/packages/shared/pkg/featureflags/flags.go
++++ b/packages/shared/pkg/featureflags/flags.go
+@@ -465,7 +465,7 @@
+ 	ExpirationIndexHealerFlag = NewBoolFlag("expiration-index-healer", true)
+ 
+ 	// BuildEnsureFreeDiskSpace grows the rootfs after build steps and before finalize.
+-	BuildEnsureFreeDiskSpace = NewBoolFlag("build-ensure-free-disk-space", false)
++	BuildEnsureFreeDiskSpace = NewBoolFlag("build-ensure-free-disk-space", envBoolOr("BUILD_ENSURE_FREE_DISK_SPACE", false))
+ )
+ 
+ // envdTimeoutFallbackMs reads ENVD_TIMEOUT (Go duration string, e.g. "10s")

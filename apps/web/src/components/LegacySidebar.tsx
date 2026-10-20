@@ -1,3 +1,4 @@
+import { PortableThreadLibrary } from "./chat/PortableThreadLibrary";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { Spinner } from "~/components/ui/spinner";
@@ -116,7 +117,8 @@ import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
 
-import { useThreadActions } from "../hooks/useThreadActions";
+import { requiresThreadDeleteConfirmation, useThreadActions } from "../hooks/useThreadActions";
+import { THREAD_DELETE_WARNING } from "@t3tools/client-runtime/relay/threadVmControls";
 import { projectEnvironment } from "../state/projects";
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { useEnvironment, useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
@@ -1960,12 +1962,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
       if (clicked !== "delete") return;
 
-      if (appSettingsConfirmThreadDelete) {
+      if (
+        selectedThreadEntries.some(({ threadRef }) =>
+          requiresThreadDeleteConfirmation(threadRef, appSettingsConfirmThreadDelete),
+        )
+      ) {
         const confirmed = await api.dialogs.confirm(
-          [
-            `Delete ${count} thread${count === 1 ? "" : "s"}?`,
-            "This permanently clears conversation history for these threads.",
-          ].join("\n"),
+          [`Delete ${count} thread${count === 1 ? "" : "s"}?`, THREAD_DELETE_WARNING].join("\n"),
           { variant: "destructive" },
         );
         if (!confirmed) return;
@@ -2322,12 +2325,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
       if (clicked !== "delete") return;
-      if (appSettingsConfirmThreadDelete) {
+      if (requiresThreadDeleteConfirmation(threadRef, appSettingsConfirmThreadDelete)) {
         const confirmed = await api.dialogs.confirm(
-          [
-            `Delete thread "${thread.title}"?`,
-            "This permanently clears conversation history for this thread.",
-          ].join("\n"),
+          [`Delete thread "${thread.title}"?`, THREAD_DELETE_WARNING].join("\n"),
           { variant: "destructive" },
         );
         if (!confirmed) {
@@ -3806,6 +3806,7 @@ export default function LegacySidebar() {
         attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
         projectsLength={projects.length}
       />
+      <PortableThreadLibrary />
       <SidebarChromeFooter />
     </>
   );

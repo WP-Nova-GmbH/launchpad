@@ -1,0 +1,73 @@
+diff --git a/packages/orchestrator/pkg/sandbox/block/memfd.go b/packages/orchestrator/pkg/sandbox/block/memfd.go
+--- a/packages/orchestrator/pkg/sandbox/block/memfd.go
++++ b/packages/orchestrator/pkg/sandbox/block/memfd.go
+@@ -161,7 +161,14 @@
+ 			return fmt.Errorf("memfd slice [%d,%d): %w", r.Start, r.Start+r.Size, err)
+ 		}
+ 
+-		copy((*cache.mmap)[cacheOff:cacheOff+r.Size], src)
++		// Both mappings can fault (for example, a full disk backing the sparse
++		// cache). Fail this snapshot instead of crashing the host and its VMs.
++		if err := RunFaultSafe(ctx, func() error {
++			copy((*cache.mmap)[cacheOff:cacheOff+r.Size], src)
++			return nil
++		}); err != nil {
++			return fmt.Errorf("copy memfd range [%d,%d): %w", r.Start, r.Start+r.Size, err)
++		}
+ 		cache.setIsCached(cacheOff, r.Size)
+ 		cacheOff += r.Size
+ 	}
+diff --git a/packages/orchestrator/pkg/sandbox/block/memfd_fault_test.go b/packages/orchestrator/pkg/sandbox/block/memfd_fault_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/block/memfd_fault_test.go
+@@ -0,0 +1,49 @@
++//go:build linux
++
++package block
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/RoaringBitmap/roaring/v2"
++	"github.com/stretchr/testify/require"
++	"golang.org/x/sys/unix"
++
++	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
++)
++
++// The copy runs on the same background path used by Pause. A mapped-file fault
++// must fail its completion receipt and reads, not crash every VM on the host.
++func TestMemfdCopyFaultFailsReceipt(t *testing.T) {
++	for _, faultSide := range []string{"source", "destination"} {
++		t.Run(faultSide, func(t *testing.T) {
++			const pageSize = 4096
++			fd, err := unix.MemfdCreate("snapshot-fault-test", unix.MFD_CLOEXEC)
++			require.NoError(t, err)
++			require.NoError(t, unix.Ftruncate(fd, pageSize))
++			source, err := NewFromFd(fd)
++			require.NoError(t, err)
++			path := filepath.Join(t.TempDir(), "cache")
++			cache, err := NewCache(pageSize, pageSize, path, false)
++			require.NoError(t, err)
++			defer cache.Close()
++			// Mapping beyond EOF reliably raises the same SIGBUS as a failed backing
++			// allocation, without filling the host disk or depending on timing.
++			if faultSide == "source" {
++				require.NoError(t, unix.Ftruncate(fd, 0))
++			} else {
++				require.NoError(t, os.Truncate(path, 0))
++			}
++			copied := &MemfdCache{cache: cache, done: utils.NewSetOnce[struct{}]()}
++			go copied.runCopy(context.Background(), source, roaring.BitmapOf(0), pageSize)
++			var fault *MemoryFaultError
++			require.ErrorAs(t, copied.Wait(t.Context()), &fault)
++			require.False(t, cache.isCached(0, pageSize), "failed copy must not advertise a complete range")
++			_, err = copied.ReadAt(make([]byte, 1), 0)
++			require.ErrorAs(t, err, &fault)
++		})
++	}
++}

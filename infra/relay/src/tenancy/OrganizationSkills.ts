@@ -65,7 +65,7 @@ export class OrganizationSkills extends Context.Service<
       readonly name: string;
     }) => Effect.Effect<boolean, OrganizationSkillPersistenceError>;
   }
->()("t3code-relay/tenancy/OrganizationSkills") {}
+>()("launchpad-relay/tenancy/OrganizationSkills") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

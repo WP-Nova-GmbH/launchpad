@@ -2,7 +2,6 @@ import * as Crypto from "effect/Crypto";
 import { Atom } from "effect/unstable/reactivity";
 import {
   WS_METHODS,
-  ORCHESTRATION_WS_METHODS,
   type EnvironmentId,
   type OrchestrationShellSnapshot,
 } from "@t3tools/contracts";
@@ -16,6 +15,15 @@ import {
   createEnvironmentRpcCommand,
 } from "./runtime.ts";
 import {
+  type EnqueueThreadMoveInput,
+  enqueueThreadMove,
+  getThreadCommandReceipt,
+  type EditThreadMoveInput,
+  editThreadMove,
+  type CancelThreadMoveInput,
+  cancelThreadMove,
+  type ReorderThreadQueueInput,
+  reorderThreadQueue,
   type ArchiveThreadInput,
   type ResolveThreadQueueInput,
   resolveThreadQueue,
@@ -86,6 +94,10 @@ import {
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 
 export type {
+  EnqueueThreadMoveInput,
+  EditThreadMoveInput,
+  CancelThreadMoveInput,
+  ReorderThreadQueueInput,
   RetryThreadPreparationInput,
   EnqueueThreadPromptInput,
   EditThreadPromptInput,
@@ -132,6 +144,30 @@ export function createThreadEnvironmentAtoms<R, E>(
       JSON.stringify([environmentId, input.threadId]),
   };
   const commands = {
+    reorderQueue: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread.queue.reorder",
+      execute: (input: ReorderThreadQueueInput) => reorderThreadQueue(input),
+      scheduler,
+      concurrency,
+    }),
+    cancelMove: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread.move.cancel",
+      execute: (input: CancelThreadMoveInput) => cancelThreadMove(input),
+      scheduler,
+      concurrency,
+    }),
+    editMove: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread.move.edit",
+      execute: (input: EditThreadMoveInput) => editThreadMove(input),
+      scheduler,
+      concurrency,
+    }),
+    enqueueMove: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread.move.enqueue",
+      execute: (input: EnqueueThreadMoveInput) => enqueueThreadMove(input),
+      scheduler,
+      concurrency,
+    }),
     retryPreparation: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread.preparation.retry",
       execute: (input: RetryThreadPreparationInput) => retryThreadPreparation(input),
@@ -290,7 +326,14 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     startTurn: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:start-turn",
-      execute: (input: StartThreadTurnInput) => startThreadTurn(input),
+      execute: (input: StartThreadTurnInput, registry, environmentId) =>
+        registry
+          .get(snapshotAtom(environmentId))
+          ?.threads.some(
+            (thread) => thread.id === input.threadId && thread.promptQueueSummary !== undefined,
+          )
+          ? enqueueThreadPrompt(input)
+          : startThreadTurn(input),
       scheduler,
       concurrency,
     }),
@@ -330,9 +373,9 @@ export function createThreadEnvironmentAtoms<R, E>(
       scheduler,
       concurrency,
     }),
-    getCommandReceipt: createEnvironmentRpcCommand(runtime, {
+    getCommandReceipt: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:command-receipt",
-      tag: ORCHESTRATION_WS_METHODS.getCommandReceipt,
+      execute: getThreadCommandReceipt,
     }),
     uploadFeedback: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:commands:thread:upload-feedback",

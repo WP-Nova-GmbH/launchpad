@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -103,6 +104,10 @@ const storeFailure = (tag: "AlreadyExists" | "PermissionDenied") =>
 const unusedSecretStoreOperation = () => Effect.die("unused secret-store operation");
 const decodeManagedTunnelRecoveryRegistration = Schema.decodeUnknownEffect(
   Schema.fromJsonString(RelayManagedEndpointRecoveryRegistrationRequest),
+);
+
+const decodeManagedTunnelLinkRequest = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ managedTunnelsEnabled: Schema.Boolean })),
 );
 
 function makeSecretStore(
@@ -469,6 +474,127 @@ describe("releaseManagedTunnelOnShutdown", () => {
     [RELAY_URL_SECRET, "https://relay.example.test"],
     [CLOUD_CLI_DESIRED_LINK_SECRET, "managed"],
   ] as const;
+
+  it.effect(
+    "keeps cached link secrets and makes no provisioning requests when tunnels are disabled",
+    () => {
+      const { store, values } = makeMemorySecretStore(managedLinkSecrets);
+      const initial = new Map(values);
+      const applyConfigCalls: Array<unknown> = [];
+      const requests: Array<HttpClientRequest.HttpClientRequest> = [];
+      const disabled = {
+        _tag: "EnvironmentCloudEndpointUnavailableError",
+        endpointRuntimeStatus: { status: "disabled" },
+      };
+      return Effect.gen(function* () {
+        expect(yield* startManagedCloudTunnelIfOriginConfirmed("http://127.0.0.1:3773")).toBe(
+          false,
+        );
+        expect(
+          yield* Effect.flip(registerManagedCloudTunnelRecovery("http://127.0.0.1:3773")),
+        ).toMatchObject(disabled);
+        expect(
+          yield* Effect.flip(recoverManagedCloudTunnel("http://127.0.0.1:3773")),
+        ).toMatchObject(disabled);
+        expect(
+          yield* Effect.flip(reconcileDesiredCloudLink("http://127.0.0.1:3773")),
+        ).toMatchObject(disabled);
+        expect(yield* releaseManagedTunnelOnShutdown()).toBe(false);
+        expect(requests).toEqual([]);
+        expect(applyConfigCalls).toEqual([]);
+        expect(values).toEqual(initial);
+      }).pipe(
+        provideReleaseHarness({ store, applyConfigCalls, requests }),
+        Effect.provide(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({ env: { T3CODE_DISABLE_MANAGED_TUNNELS: "1" } }),
+          ),
+        ),
+      );
+    },
+  );
+
+  it.effect("still links a publish-only identity when managed tunnels are disabled", () => {
+    const { store, values } = makeMemorySecretStore([
+      [CLOUD_CLI_DESIRED_LINK_SECRET, "publish_only"],
+    ]);
+    const applyConfigCalls: Array<unknown> = [];
+    const requests: Array<HttpClientRequest.HttpClientRequest> = [];
+    const mintKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { format: "pem", type: "spki" },
+      privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    });
+    const descriptor = {
+      environmentId: EnvironmentId.make("env_123"),
+      label: "Test environment",
+      platform: { os: "linux", arch: "arm64" },
+      serverVersion: "0.0.0-test",
+      capabilities: { repositoryIdentity: true },
+    } as const;
+    return Effect.gen(function* () {
+      expect(yield* reconcileDesiredCloudLink("http://127.0.0.1:3773")).toBe("publish_only");
+      expect(requests.map((request) => request.url)).toEqual([
+        "http://127.0.0.1:8610/v1/client/environment-link-challenges",
+        "http://127.0.0.1:8610/v1/client/environment-links",
+      ]);
+      for (const request of requests) {
+        const body = request.body;
+        expect(body._tag).toBe("Uint8Array");
+        if (body._tag === "Uint8Array") {
+          expect(
+            yield* decodeManagedTunnelLinkRequest(new TextDecoder().decode(body.body)),
+          ).toMatchObject({
+            managedTunnelsEnabled: false,
+          });
+        }
+      }
+      expect(applyConfigCalls).toEqual([null]);
+      expect(new TextDecoder().decode(values.get(CLOUD_LINKED_USER_ID))).toBe("user-123");
+      expect(new TextDecoder().decode(values.get(RELAY_ENVIRONMENT_CREDENTIAL_SECRET))).toBe(
+        "environment-credential",
+      );
+    }).pipe(
+      Effect.provideService(
+        ServerEnvironment.ServerEnvironment,
+        ServerEnvironment.ServerEnvironment.of({
+          getEnvironmentId: Effect.succeed(descriptor.environmentId),
+          getDescriptor: Effect.succeed(descriptor),
+        }),
+      ),
+      provideReleaseHarness({
+        store,
+        applyConfigCalls,
+        requests,
+        respond: () =>
+          requests.length === 1
+            ? Response.json({ challenge: "test-challenge", expiresAt: "2030-01-01T00:00:00Z" })
+            : Response.json({
+                ok: true,
+                cloudUserId: "user-123",
+                environmentId: "env_123",
+                endpoint: {
+                  httpBaseUrl: "http://127.0.0.1:3773",
+                  wsBaseUrl: "ws://127.0.0.1:3773",
+                  providerKind: "manual",
+                },
+                endpointRuntime: null,
+                relayIssuer: "http://127.0.0.1:8610",
+                environmentCredential: "environment-credential",
+                cloudMintPublicKey: mintKeyPair.publicKey,
+              }),
+      }),
+      Effect.provide(
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({
+            env: {
+              T3CODE_DISABLE_MANAGED_TUNNELS: "1",
+              T3CODE_RELAY_URL: "http://127.0.0.1:8610",
+            },
+          }),
+        ),
+      ),
+    );
+  });
 
   it.effect("does not recreate a link that was unlinked while startup registration retried", () => {
     const { store, values } = makeMemorySecretStore(managedLinkSecrets);

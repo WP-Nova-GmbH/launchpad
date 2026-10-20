@@ -36,6 +36,7 @@ export function useOpenLink(threadRef: ScopedThreadRef | null | undefined): (
     readonly event?: { readonly metaKey: boolean; readonly ctrlKey: boolean };
     /** Thread to open beside when it is not the hook's own, e.g. a sidebar row's. */
     readonly threadRef?: ScopedThreadRef | undefined;
+    readonly recordHistory?: boolean;
   },
 ) => Promise<void> {
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
@@ -52,7 +53,7 @@ export function useOpenLink(threadRef: ScopedThreadRef | null | undefined): (
         const result = await openUrlInPreview({ threadRef: targetThreadRef, url, openPreview });
         if (isAtomCommandInterrupted(result)) return;
         if (result._tag === "Success") {
-          recordVisitForThread(targetThreadRef, url);
+          if (options.recordHistory !== false) recordVisitForThread(targetThreadRef, url);
           return;
         }
         const failure = squashAtomCommandFailure(result);

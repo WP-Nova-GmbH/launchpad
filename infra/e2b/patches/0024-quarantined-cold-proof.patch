@@ -1,0 +1,2576 @@
+--- a/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux.go
+@@ -34,6 +34,7 @@
+ // and no reference to source blocks. Its owner must retain it while a running
+ // sandbox or snapshot still references BuildID. Publication is not permission to boot.
+ type PreparedDisk struct {
++	ColdProbe       *ColdProbeReceipt `json:"coldProbe,omitempty"`
+ 	Version         int               `json:"version"`
+ 	BuildID         uuid.UUID         `json:"build_id"`
+ 	SourceBuildID   uuid.UUID         `json:"source_build_id"`
+@@ -296,6 +297,9 @@
+ 	if hex.EncodeToString(hash.Sum(nil)) != result.RootfsSHA256 {
+ 		return fail(ErrPreparedDiskCorrupt)
+ 	}
++	if result.ColdProbe != nil && !validProbeReceipt(result, result.ColdProbe) {
++		return fail(ErrColdProbeUnverified)
++	}
+ 	return result, disk, nil
+ }
+ 
+--- a/packages/orchestrator/pkg/server/restore_disk.go
++++ b/packages/orchestrator/pkg/server/restore_disk.go
+@@ -85,8 +85,9 @@
+ 	if sourceID == destinationID || req.GetMaxDiskBytes() <= 0 {
+ 		return nil, status.Error(codes.InvalidArgument, "invalid restore reservation")
+ 	}
+-	// Bound preparation time and NBD/verifier concurrency with the existing
+-	// start semaphore. No guest resources or CPU are allocated by this path.
++	// Bound offline preparation concurrency with the existing start semaphore.
++	// An enabled cold probe has separately recorded host resources; it is never
++	// a serving sandbox or a user quota allocation.
+ 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+ 	defer cancel()
+ 	if !s.startingSandboxes.TryAcquire(1) {
+@@ -101,6 +102,14 @@
+ 	disk, err := s.sandboxFactory.PrepareRestoreDisk(ctx, directory, destinationID, source, req.GetMaxDiskBytes(), req.GetBootstrap())
+ 	if err != nil {
+ 		return nil, restoreDiskError(err)
++	}
++	if s.config.RestoreColdProbeEnabled {
++		disk, err = rootfs.VerifyPreparedDiskCold(ctx, directory, destinationID, rootfs.ColdProbeSettings{
++			ScriptPath: s.config.RestoreColdProbeScript, BuildDirectory: s.config.RestoreColdProbeBuild,
++		})
++		if err != nil {
++			return nil, restoreDiskError(err)
++		}
+ 	}
+ 	return restoreDiskResponse(disk)
+ }
+--- a/packages/orchestrator/pkg/cfg/model.go
++++ b/packages/orchestrator/pkg/cfg/model.go
+@@ -98,7 +98,10 @@
+ 	LaunchpadRequireHostFirewall bool `env:"LAUNCHPAD_REQUIRE_HOST_FIREWALL" envDefault:"false"`
+ 	BuilderConfig
+ 
+-	RestorePreparationEnabled bool `env:"RESTORE_PREPARATION_ENABLED" envDefault:"false"`
++	RestorePreparationEnabled bool   `env:"RESTORE_PREPARATION_ENABLED" envDefault:"false"`
++	RestoreColdProbeEnabled   bool   `env:"RESTORE_COLD_PROBE_ENABLED" envDefault:"false"`
++	RestoreColdProbeScript    string `env:"RESTORE_COLD_PROBE_SCRIPT" envDefault:"/opt/launchpad-probe/quarantine-probe.py"`
++	RestoreColdProbeBuild     string `env:"RESTORE_COLD_PROBE_BUILD" envDefault:"/opt/launchpad-probe/build"`
+ 
+ 	ClickhouseConnectionString  string            `env:"CLICKHOUSE_CONNECTION_STRING"`
+ 	ClickhouseConnectionStrings []string          `env:"CLICKHOUSE_CONNECTION_STRINGS" envSeparator:";"`
+--- a/packages/orchestrator/Dockerfile
++++ b/packages/orchestrator/Dockerfile
+@@ -30,6 +30,7 @@
+ COPY ./shared/pkg ./shared/pkg
+ COPY ./clickhouse/pkg ./clickhouse/pkg
+ 
++COPY ./orchestrator/launchpad-probe ./orchestrator/launchpad-probe
+ COPY ./orchestrator/pkg ./orchestrator/pkg
+ COPY ./orchestrator/cmd ./orchestrator/cmd
+ COPY ./orchestrator/main.go ./orchestrator/main.go
+@@ -42,10 +43,18 @@
+ # Use Docker's TARGETARCH (set by --platform) so GOARCH matches the container platform.
+ RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg/mod make build-local COMMIT_SHA=${COMMIT_SHA} VERSION=${VERSION} BUILD_ARCH=${TARGETARCH}
+ 
++RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg/mod go test -race ./launchpad-probe/quarantine \
++    && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o bin/probe-init ./launchpad-probe/quarantine \
++    && go run ./launchpad-probe/receipt.go
++
+ FROM scratch AS artifacts
+ 
+ COPY --from=builder /build/orchestrator/bin/clean-nfs-cache .
+ COPY --from=builder /build/orchestrator/bin/orchestrator .
++COPY --from=builder /build/orchestrator/launchpad-probe /launchpad-probe
++COPY --from=builder /build/orchestrator/bin/probe-init /launchpad-probe/build/init
++COPY --from=builder /build/orchestrator/launchpad-probe/quarantine/init_linux.go /launchpad-probe/build/init_linux.go
++COPY --from=builder /build/orchestrator/bin/probe-build.json /launchpad-probe/build/build.json
+ 
+ FROM debian:${DEBIAN_RUNTIME_TAG} AS runtime
+ 
+@@ -53,6 +62,8 @@
+ 
+ RUN apt-get update \
+     && apt-get install -y --no-install-recommends \
++        python3 \
++        cpio \
+         ca-certificates \
+         bash \
+         util-linux \
+@@ -65,4 +76,11 @@
+ 
+ COPY --from=builder /build/orchestrator/bin/orchestrator /usr/local/bin/orchestrator
+ 
++COPY --from=builder /build/orchestrator/launchpad-probe /opt/launchpad-probe
++COPY --from=builder /build/orchestrator/bin/probe-init /opt/launchpad-probe/build/init
++COPY --from=builder /build/orchestrator/launchpad-probe/quarantine/init_linux.go /opt/launchpad-probe/build/init_linux.go
++COPY --from=builder /build/orchestrator/bin/probe-build.json /opt/launchpad-probe/build/build.json
++
++RUN python3 /opt/launchpad-probe/quarantine-probe.test.py
++
+ ENTRYPOINT ["/usr/local/bin/orchestrator"]
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -63,6 +63,51 @@
+ func (e GeneralRegistryType) Valid() bool {
+ 	switch e {
+ 	case Registry:
++		return true
++	default:
++		return false
++	}
++}
++
++// Defines values for LaunchpadColdProbeReceiptMountOnly.
++const (
++	LaunchpadColdProbeReceiptMountOnlyTrue LaunchpadColdProbeReceiptMountOnly = true
++)
++
++// Valid indicates whether the value is a known member of the LaunchpadColdProbeReceiptMountOnly enum.
++func (e LaunchpadColdProbeReceiptMountOnly) Valid() bool {
++	switch e {
++	case LaunchpadColdProbeReceiptMountOnlyTrue:
++		return true
++	default:
++		return false
++	}
++}
++
++// Defines values for LaunchpadColdProbeReceiptPhysicalStopConfirmed.
++const (
++	LaunchpadColdProbeReceiptPhysicalStopConfirmedTrue LaunchpadColdProbeReceiptPhysicalStopConfirmed = true
++)
++
++// Valid indicates whether the value is a known member of the LaunchpadColdProbeReceiptPhysicalStopConfirmed enum.
++func (e LaunchpadColdProbeReceiptPhysicalStopConfirmed) Valid() bool {
++	switch e {
++	case LaunchpadColdProbeReceiptPhysicalStopConfirmedTrue:
++		return true
++	default:
++		return false
++	}
++}
++
++// Defines values for LaunchpadColdProbeReceiptVersion.
++const (
++	N1 LaunchpadColdProbeReceiptVersion = 1
++)
++
++// Valid indicates whether the value is a known member of the LaunchpadColdProbeReceiptVersion enum.
++func (e LaunchpadColdProbeReceiptVersion) Valid() bool {
++	switch e {
++	case N1:
+ 		return true
+ 	default:
+ 		return false
+@@ -579,6 +624,27 @@
+ 	ValueLength int `json:"valueLength"`
+ }
+ 
++// LaunchpadColdProbeReceipt defines model for LaunchpadColdProbeReceipt.
++type LaunchpadColdProbeReceipt struct {
++	InitSHA256 string `json:"initSHA256"`
++
++	// MountOnly Certifies cold filesystem availability, not independently retained native state.
++	MountOnly             LaunchpadColdProbeReceiptMountOnly             `json:"mountOnly"`
++	PhysicalStopConfirmed LaunchpadColdProbeReceiptPhysicalStopConfirmed `json:"physicalStopConfirmed"`
++	PreparedBuildID       openapi_types.UUID                             `json:"preparedBuildID"`
++	RootfsSHA256          string                                         `json:"rootfsSHA256"`
++	Version               LaunchpadColdProbeReceiptVersion               `json:"version"`
++}
++
++// LaunchpadColdProbeReceiptMountOnly Certifies cold filesystem availability, not independently retained native state.
++type LaunchpadColdProbeReceiptMountOnly bool
++
++// LaunchpadColdProbeReceiptPhysicalStopConfirmed defines model for LaunchpadColdProbeReceipt.PhysicalStopConfirmed.
++type LaunchpadColdProbeReceiptPhysicalStopConfirmed bool
++
++// LaunchpadColdProbeReceiptVersion defines model for LaunchpadColdProbeReceipt.Version.
++type LaunchpadColdProbeReceiptVersion int
++
+ // LaunchpadRestoreRequest defines model for LaunchpadRestoreRequest.
+ type LaunchpadRestoreRequest struct {
+ 	// Bootstrap Single-use enrollment data; version must be 1. Omit for verification-only preparation.
+@@ -592,6 +658,7 @@
+ 
+ // LaunchpadRestoreStatus defines model for LaunchpadRestoreStatus.
+ type LaunchpadRestoreStatus struct {
++	ColdProbe       *LaunchpadColdProbeReceipt  `json:"coldProbe,omitempty"`
+ 	Error           *string                     `json:"error,omitempty"`
+ 	ExecutionID     openapi_types.UUID          `json:"executionID"`
+ 	Generation      string                      `json:"generation"`
+@@ -26197,7 +26264,7 @@
+ // const string: with thousands of chunks the chained `+` fold is several
+ // times slower for the Go compiler than parsing a slice literal.
+ var swaggerSpec = []string{
+-	"7L3rcts41ij6KiidXdXJPrTsOEnXdFLfD8dOuj2Ti8t2ktlfJycbIiEJYxLgAKBtTSpV5yHOE54n2YWF",
++	"7L3rcts41ij6Kiidr6qTfWjZcZKu6aTmh2MnPZ7JxWU7yeyvk5MPIiEJYxLgAKBtTSpV5yHOE54n2YWF",
+ 	"C0ERpCjf4qRV/aNjkcRlYd2xLl9HKS9KzghTcvTs62hOcEYE/POfb8mlOuVnhOm/MiJTQUtFORs9G+1X",
+ 	"QnKBFEdTotI5UnOCGLlUqMQzgvgUCSKrXMkE0SkquCCIXFKpRslIpnNSYD2iWpRk9GwklaBsNvr2LRn9",
+ 	"85QrnB9XjOlfWpO+rYoJETC6eQVJzLIJvyQSFVilc/2TXsmU5ooImaAJmeq5SzyjDOtREJUIl2VOSTZG",
+@@ -26208,315 +26275,318 @@
+ 	"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",
+ }
+ 
+ // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -96,6 +96,12 @@
+ 		Generation: op.Generation, SandboxID: op.SandboxID, ExecutionID: op.ExecutionID, PreparedBuildID: op.PreparedBuildID,
+ 		Error: op.LastError}
+ 	if len(op.Manifest) > 0 {
++		var prepared struct {
++			ColdProbe *api.LaunchpadColdProbeReceipt `json:"coldProbe"`
++		}
++		if json.Unmarshal(op.Manifest, &prepared) == nil {
++			result.ColdProbe = prepared.ColdProbe
++		}
+ 		sum := sha256.Sum256(op.Manifest)
+ 		result.ManifestSHA256 = new(hex.EncodeToString(sum[:]))
+ 	}
+--- a/spec/openapi.yml
++++ b/spec/openapi.yml
+@@ -265,10 +265,35 @@
+           minimum: 60
+           maximum: 3600
+           default: 600
++    LaunchpadColdProbeReceipt:
++      type: object
++      required: [version, preparedBuildID, rootfsSHA256, initSHA256, physicalStopConfirmed, mountOnly]
++      properties:
++        version:
++          type: integer
++          enum: [1]
++        preparedBuildID:
++          type: string
++          format: uuid
++        rootfsSHA256:
++          type: string
++          pattern: '^[0-9a-f]{64}$'
++        initSHA256:
++          type: string
++          pattern: '^[0-9a-f]{64}$'
++        physicalStopConfirmed:
++          type: boolean
++          enum: [true]
++        mountOnly:
++          type: boolean
++          enum: [true]
++          description: Certifies cold filesystem availability, not independently retained native state.
+     LaunchpadRestoreStatus:
+       type: object
+       required: [operationID, state, generation, sandboxID, executionID, preparedBuildID]
+       properties:
++        coldProbe:
++          $ref: '#/components/schemas/LaunchpadColdProbeReceipt'
+         operationID:
+           type: string
+           format: uuid
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/cold_probe_linux.go
+@@ -0,0 +1,211 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"syscall"
++	"time"
++
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/google/uuid"
++	"golang.org/x/sys/unix"
++)
++
++var ErrColdProbeUnverified = errors.New("quarantined cold recovery is unverified")
++
++type ColdProbeReceipt struct {
++	Version               int       `json:"version"`
++	PreparedBuildID       uuid.UUID `json:"preparedBuildID"`
++	RootfsSHA256          string    `json:"rootfsSHA256"`
++	InitSHA256            string    `json:"initSHA256"`
++	PhysicalStopConfirmed bool      `json:"physicalStopConfirmed"`
++	MountOnly             bool      `json:"mountOnly"`
++}
++
++type ColdProbeSettings struct {
++	ScriptPath     string
++	BuildDirectory string
++}
++
++func validProbeReceipt(disk PreparedDisk, receipt *ColdProbeReceipt) bool {
++	if receipt == nil || receipt.Version != 1 || receipt.PreparedBuildID != disk.BuildID ||
++		receipt.RootfsSHA256 != disk.RootfsSHA256 || !receipt.PhysicalStopConfirmed || !receipt.MountOnly {
++		return false
++	}
++	digest, err := hex.DecodeString(receipt.InitSHA256)
++	return err == nil && len(digest) == sha256.Size
++}
++
++// The caller retains the source pin and disk reservation until this completes.
++// The trusted helper reserves its own bounded host cgroup, never a user VM slot.
++func VerifyPreparedDiskCold(ctx context.Context, directory string, buildID uuid.UUID, settings ColdProbeSettings) (PreparedDisk, error) {
++	return verifyPreparedDiskCold(ctx, directory, buildID, func(ctx context.Context, disk PreparedDisk) (*ColdProbeReceipt, error) {
++		if !filepath.IsAbs(settings.ScriptPath) || !filepath.IsAbs(settings.BuildDirectory) {
++			return nil, ErrColdProbeUnverified
++		}
++		script, err := os.Lstat(settings.ScriptPath)
++		if err != nil || !script.Mode().IsRegular() || script.Mode().Perm()&022 != 0 {
++			return nil, ErrColdProbeUnverified
++		}
++		output := filepath.Join(directory, buildID.String()+".cold-probe")
++		// A lost controller reply may leave a process alive. Its durable operation
++		// receipt must prove physical stop before a new attempt can be admitted.
++		if _, err := os.Lstat(output); err == nil {
++			var operation struct {
++				PhysicalStopConfirmed bool   `json:"physicalStopConfirmed"`
++				DiskSHA256            string `json:"diskSha256"`
++				Format                string `json:"format"`
++			}
++			raw, err := os.ReadFile(filepath.Join(output, "operation.json"))
++			if err != nil || len(raw) > 65536 || json.Unmarshal(raw, &operation) != nil || operation.DiskSHA256 != disk.RootfsSHA256 || operation.Format != "launchpad-disk-probe-operation-v1" {
++				return nil, ErrColdProbeUnverified
++			}
++			if !operation.PhysicalStopConfirmed {
++				if err := runColdProbeHelper(ctx, settings.ScriptPath, "reconcile", output); err != nil {
++					return nil, err
++				}
++				raw, err = os.ReadFile(filepath.Join(output, "operation.json"))
++				if err != nil || len(raw) > 65536 || json.Unmarshal(raw, &operation) != nil || !operation.PhysicalStopConfirmed {
++					return nil, ErrColdProbeUnverified
++				}
++			}
++			receipt, err := readHelperProbeReceipt(output, disk)
++			if err == nil {
++				return receipt, nil
++			}
++			// Keep failed evidence; only this confirmed stopped attempt can be retired.
++			if err := os.Rename(output, output+".failed-"+uuid.NewString()); err != nil {
++				return nil, err
++			}
++		} else if !errors.Is(err, os.ErrNotExist) {
++			return nil, err
++		}
++		required := filepath.Join(directory, buildID.String()+".probe-files.json")
++		if err := os.WriteFile(required, []byte("[]"), 0600); err != nil {
++			return nil, err
++		}
++		if err := runColdProbeHelper(ctx, settings.ScriptPath, "--direct", "--mount-only", "--disk", filepath.Join(directory, buildID.String(), storage.RootfsName), "--disk-sha256", disk.RootfsSHA256, "--required-files", required, "--probe-build", settings.BuildDirectory, "--output", output, "--timeout", "300"); err != nil {
++			return nil, err
++		}
++		return readHelperProbeReceipt(output, disk)
++	})
++}
++
++func runColdProbeHelper(ctx context.Context, script string, args ...string) error {
++	cmd := exec.CommandContext(ctx, "python3", append([]string{script}, args...)...)
++	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
++	cmd.WaitDelay = 35 * time.Second
++	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
++	if err := cmd.Run(); err != nil {
++		return ErrColdProbeUnverified
++	}
++	return nil
++}
++
++func readHelperProbeReceipt(output string, disk PreparedDisk) (*ColdProbeReceipt, error) {
++	raw, err := os.ReadFile(filepath.Join(output, "verified.json"))
++	if err != nil || len(raw) > 65536 {
++		return nil, ErrColdProbeUnverified
++	}
++	var result struct {
++		Format                string `json:"format"`
++		DiskSHA256            string `json:"diskSha256"`
++		InitSHA256            string `json:"initSha256"`
++		PhysicalStopConfirmed bool   `json:"physicalStopConfirmed"`
++		MountOnly             bool   `json:"mountOnly"`
++		Receipt               struct {
++			Verified      bool   `json:"verified"`
++			Phase         string `json:"phase"`
++			UserProcesses []int  `json:"userProcesses"`
++			Files         int    `json:"files"`
++			MountOnly     bool   `json:"mountOnly"`
++		} `json:"receipt"`
++	}
++	if json.Unmarshal(raw, &result) != nil || result.Format != "launchpad-disk-probe-result-v1" || !result.Receipt.Verified || result.Receipt.Phase != "quarantine" || len(result.Receipt.UserProcesses) != 1 || result.Receipt.UserProcesses[0] != 1 || result.Receipt.Files != 0 || !result.Receipt.MountOnly {
++		return nil, ErrColdProbeUnverified
++	}
++	receipt := &ColdProbeReceipt{Version: 1, PreparedBuildID: disk.BuildID, RootfsSHA256: result.DiskSHA256, InitSHA256: result.InitSHA256, PhysicalStopConfirmed: result.PhysicalStopConfirmed, MountOnly: result.MountOnly}
++	if !validProbeReceipt(disk, receipt) {
++		return nil, ErrColdProbeUnverified
++	}
++	return receipt, nil
++}
++
++func verifyPreparedDiskCold(ctx context.Context, directory string, buildID uuid.UUID, probe func(context.Context, PreparedDisk) (*ColdProbeReceipt, error)) (PreparedDisk, error) {
++	if buildID == uuid.Nil {
++		return PreparedDisk{}, ErrColdProbeUnverified
++	}
++	lock, err := os.OpenFile(filepath.Join(directory, buildID.String()+".lock"), os.O_RDWR, 0600)
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	defer lock.Close()
++	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
++		return PreparedDisk{}, ErrPreparedDiskBusy
++	}
++	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
++	if _, err := readRestoreActivation(directory, buildID); err == nil {
++		return PreparedDisk{}, ErrRestoreActivationStarted
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return PreparedDisk{}, err
++	}
++	disk, opened, err := OpenPreparedDisk(ctx, directory, buildID)
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	defer opened.Close()
++	if disk.ColdProbe != nil {
++		if !validProbeReceipt(disk, disk.ColdProbe) {
++			return PreparedDisk{}, ErrColdProbeUnverified
++		}
++		manifest, err := os.Open(filepath.Join(directory, buildID.String(), "prepared.json"))
++		if err != nil {
++			return PreparedDisk{}, err
++		}
++		if err := errors.Join(manifest.Sync(), manifest.Close(), syncPreparedDirectory(filepath.Join(directory, buildID.String()))); err != nil {
++			return PreparedDisk{}, err
++		}
++		return disk, nil
++	}
++	receipt, err := probe(ctx, disk)
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	if ctx.Err() != nil {
++		return PreparedDisk{}, ctx.Err()
++	}
++	if !validProbeReceipt(disk, receipt) {
++		return PreparedDisk{}, ErrColdProbeUnverified
++	}
++	disk.ColdProbe = receipt
++	manifest, err := json.Marshal(disk)
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	candidate, err := os.CreateTemp(filepath.Join(directory, buildID.String()), ".cold-manifest-")
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	defer os.Remove(candidate.Name())
++	_, writeErr := candidate.Write(manifest)
++	err = errors.Join(writeErr, candidate.Sync(), candidate.Close())
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	if err := os.Rename(candidate.Name(), filepath.Join(directory, buildID.String(), "prepared.json")); err != nil {
++		return PreparedDisk{}, err
++	}
++	if err := syncPreparedDirectory(filepath.Join(directory, buildID.String())); err != nil {
++		return PreparedDisk{}, err
++	}
++	return disk, nil
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/cold_probe_linux_test.go
+@@ -0,0 +1,177 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func coldProbeFixture(t *testing.T) (string, PreparedDisk) {
++	t.Helper()
++	directory, source, sourceID, meta, original := preparedDiskFixture(t)
++	disk, err := PrepareDisk(t.Context(), directory, uuid.New(), sourceID, source, meta, int64(len(original)), nil, func(context.Context, block.Device) error { return nil })
++	require.NoError(t, err)
++	return directory, disk
++}
++func coldReceipt(disk PreparedDisk) *ColdProbeReceipt {
++	return &ColdProbeReceipt{Version: 1, PreparedBuildID: disk.BuildID, RootfsSHA256: disk.RootfsSHA256, InitSHA256: strings.Repeat("a", 64), PhysicalStopConfirmed: true, MountOnly: true}
++}
++func TestColdProbeBoundPublicationAndRetry(t *testing.T) {
++	directory, disk := coldProbeFixture(t)
++	calls := 0
++	probe := func(context.Context, PreparedDisk) (*ColdProbeReceipt, error) { calls++; return coldReceipt(disk), nil }
++	verified, err := verifyPreparedDiskCold(t.Context(), directory, disk.BuildID, probe)
++	require.NoError(t, err)
++	require.NotNil(t, verified.ColdProbe)
++	reopened, opened, err := OpenPreparedDisk(t.Context(), directory, disk.BuildID)
++	require.NoError(t, err)
++	require.NoError(t, opened.Close())
++	require.Equal(t, verified, reopened)
++	_, err = verifyPreparedDiskCold(t.Context(), directory, disk.BuildID, probe)
++	require.NoError(t, err)
++	require.Equal(t, 1, calls)
++}
++func TestColdProbeFailsClosedAndRetainsDisk(t *testing.T) {
++	for _, name := range []string{"unavailable", "foreign-disk", "foreign-build", "not-stopped", "not-mount-only", "bad-init", "cancelled"} {
++		t.Run(name, func(t *testing.T) {
++			directory, disk := coldProbeFixture(t)
++			ctx, cancel := context.WithCancel(t.Context())
++			defer cancel()
++			_, err := verifyPreparedDiskCold(ctx, directory, disk.BuildID, func(context.Context, PreparedDisk) (*ColdProbeReceipt, error) {
++				receipt := coldReceipt(disk)
++				switch name {
++				case "unavailable":
++					return nil, ErrColdProbeUnverified
++				case "foreign-disk":
++					receipt.RootfsSHA256 = strings.Repeat("b", 64)
++				case "foreign-build":
++					receipt.PreparedBuildID = uuid.New()
++				case "not-stopped":
++					receipt.PhysicalStopConfirmed = false
++				case "not-mount-only":
++					receipt.MountOnly = false
++				case "bad-init":
++					receipt.InitSHA256 = "unknown"
++				case "cancelled":
++					cancel()
++				}
++				return receipt, nil
++			})
++			require.Error(t, err)
++			unchanged, opened, err := OpenPreparedDisk(t.Context(), directory, disk.BuildID)
++			require.NoError(t, err)
++			require.NoError(t, opened.Close())
++			require.Nil(t, unchanged.ColdProbe)
++		})
++	}
++}
++func TestColdProbeExcludesCancelAndActivation(t *testing.T) {
++	directory, disk := coldProbeFixture(t)
++	_, err := verifyPreparedDiskCold(t.Context(), directory, disk.BuildID, func(context.Context, PreparedDisk) (*ColdProbeReceipt, error) {
++		require.ErrorIs(t, CancelPreparedDisk(t.Context(), directory, disk.BuildID), ErrPreparedDiskBusy)
++		return coldReceipt(disk), nil
++	})
++	require.NoError(t, err)
++	require.NoError(t, CancelPreparedDisk(t.Context(), directory, disk.BuildID))
++	_, err = verifyPreparedDiskCold(t.Context(), directory, disk.BuildID, func(context.Context, PreparedDisk) (*ColdProbeReceipt, error) {
++		t.Fatal("cancelled disk booted")
++		return nil, nil
++	})
++	require.ErrorIs(t, err, ErrPreparedDiskCancelled)
++}
++func TestColdProbeRejectsCorruptPersistedReceipt(t *testing.T) {
++	directory, disk := coldProbeFixture(t)
++	disk.ColdProbe = coldReceipt(disk)
++	disk.ColdProbe.PhysicalStopConfirmed = false
++	raw, err := json.Marshal(disk)
++	require.NoError(t, err)
++	require.NoError(t, os.WriteFile(filepath.Join(directory, disk.BuildID.String(), "prepared.json"), raw, 0600))
++	_, _, err = OpenPreparedDisk(t.Context(), directory, disk.BuildID)
++	require.ErrorIs(t, err, ErrColdProbeUnverified)
++}
++func TestColdProbeUncertainControllerCannotRepeat(t *testing.T) {
++	directory, disk := coldProbeFixture(t)
++	output := filepath.Join(directory, disk.BuildID.String()+".cold-probe")
++	require.NoError(t, os.Mkdir(output, 0700))
++	require.NoError(t, os.WriteFile(filepath.Join(output, "operation.json"), []byte(`{"physicalStopConfirmed":false}`), 0600))
++	script := filepath.Join(t.TempDir(), "unexpected.py")
++	require.NoError(t, os.WriteFile(script, []byte("raise Exception('must not be launched')"), 0600))
++	_, err := VerifyPreparedDiskCold(t.Context(), directory, disk.BuildID, ColdProbeSettings{ScriptPath: script, BuildDirectory: directory})
++	require.True(t, errors.Is(err, ErrColdProbeUnverified))
++}
++
++// Opt-in proof on the dedicated Linux host. The source is an already verified,
++// disposable filesystem-only build; this path never mutates or deletes it.
++func TestColdProbeDedicatedHost(t *testing.T) {
++	sourcePath := os.Getenv("LAUNCHPAD_COLD_PROBE_TEST_SOURCE")
++	if sourcePath == "" {
++		t.Skip("dedicated host fixture not supplied")
++	}
++	output := os.Getenv("LAUNCHPAD_COLD_PROBE_TEST_OUTPUT")
++	require.NotEmpty(t, output)
++	raw, err := os.ReadFile(filepath.Join(filepath.Dir(sourcePath), "metadata.json"))
++	require.NoError(t, err)
++	var meta metadata.Template
++	require.NoError(t, json.Unmarshal(raw, &meta))
++	require.True(t, meta.IsFilesystemOnly())
++	require.True(t, meta.IsFsQuiesced())
++	sourceID, err := uuid.Parse(meta.Template.BuildID)
++	require.NoError(t, err)
++	source, err := block.NewLocal(sourcePath, header.RootfsBlockSize, sourceID)
++	require.NoError(t, err)
++	defer source.Close()
++	size, err := source.Size(t.Context())
++	require.NoError(t, err)
++	buildID := uuid.New()
++	disk, err := PrepareDisk(t.Context(), output, buildID, sourceID, source, meta, size, nil, func(context.Context, block.Device) error { return nil })
++	require.NoError(t, err)
++	settings := ColdProbeSettings{ScriptPath: os.Getenv("LAUNCHPAD_COLD_PROBE_TEST_SCRIPT"), BuildDirectory: os.Getenv("LAUNCHPAD_COLD_PROBE_TEST_BUILD")}
++	verified, err := VerifyPreparedDiskCold(t.Context(), output, buildID, settings)
++	require.NoError(t, err)
++	require.True(t, validProbeReceipt(disk, verified.ColdProbe))
++	again, err := VerifyPreparedDiskCold(t.Context(), output, buildID, settings)
++	require.NoError(t, err)
++	require.Equal(t, verified, again)
++	receipt, err := json.Marshal(verified.ColdProbe)
++	require.NoError(t, err)
++	t.Logf("PASS product cold recovery, persisted exact disk receipt and retry: %s", receipt)
++	_, err = os.Stat(sourcePath)
++	require.NoError(t, err)
++}
++
++func TestColdProbeDedicatedRecovery(t *testing.T) {
++	rawID := os.Getenv("LAUNCHPAD_COLD_PROBE_RECOVERY_BUILD")
++	if rawID == "" {
++		t.Skip("dedicated recovery fixture not supplied")
++	}
++	id, err := uuid.Parse(rawID)
++	require.NoError(t, err)
++	directory := os.Getenv("LAUNCHPAD_COLD_PROBE_TEST_OUTPUT")
++	disk, err := VerifyPreparedDiskCold(t.Context(), directory, id, ColdProbeSettings{ScriptPath: os.Getenv("LAUNCHPAD_COLD_PROBE_TEST_SCRIPT"), BuildDirectory: os.Getenv("LAUNCHPAD_COLD_PROBE_TEST_BUILD")})
++	require.NoError(t, err)
++	require.True(t, validProbeReceipt(disk, disk.ColdProbe))
++	retired, err := filepath.Glob(filepath.Join(directory, id.String()+".cold-probe.failed-*"))
++	require.NoError(t, err)
++	require.Len(t, retired, 1)
++	raw, err := os.ReadFile(filepath.Join(retired[0], "operation.json"))
++	require.NoError(t, err)
++	var old struct {
++		PhysicalStopConfirmed bool `json:"physicalStopConfirmed"`
++		Reconciled            bool `json:"reconciled"`
++	}
++	require.NoError(t, json.Unmarshal(raw, &old))
++	require.True(t, old.PhysicalStopConfirmed)
++	require.True(t, old.Reconciled)
++	t.Log("PASS vanished controller physically reconciled before replacement probe; exact disk certified and source retained")
++}
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_cold_probe_test.go
+@@ -0,0 +1,41 @@
++package handlers
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"github.com/e2b-dev/infra/packages/api/internal/api"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestColdProbeStatusCarriesImmutableManifestReceipt(t *testing.T) {
++	buildID := uuid.New()
++	proof := api.LaunchpadColdProbeReceipt{Version: 1, PreparedBuildID: buildID, RootfsSHA256: strings.Repeat("a", 64), InitSHA256: strings.Repeat("b", 64), PhysicalStopConfirmed: true, MountOnly: true}
++	manifest, err := json.Marshal(struct {
++		ColdProbe api.LaunchpadColdProbeReceipt `json:"coldProbe"`
++	}{proof})
++	require.NoError(t, err)
++	op := queries.SandboxRestoreOperation{OperationID: uuid.New(), PreparedBuildID: buildID, State: "prepared", Manifest: manifest}
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	(&APIStore{}).restoreStatus(c, 200, op)
++	var status api.LaunchpadRestoreStatus
++	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &status))
++	require.Equal(t, &proof, status.ColdProbe)
++	digest := sha256.Sum256(manifest)
++	require.Equal(t, hex.EncodeToString(digest[:]), *status.ManifestSHA256)
++	recorder = httptest.NewRecorder()
++	c, _ = gin.CreateTestContext(recorder)
++	op.Manifest = []byte(`{"version":1}`)
++	(&APIStore{}).restoreStatus(c, 200, op)
++	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &status))
++	var clean api.LaunchpadRestoreStatus
++	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &clean))
++	require.Nil(t, clean.ColdProbe)
++}
+--- /dev/null
++++ b/packages/orchestrator/launchpad-probe/quarantine/init_linux.go
+@@ -0,0 +1,203 @@
++//go:build linux
++
++// The probe is an initrd PID 1. It never executes code from the recovered disk.
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++)
++
++type File struct {
++	Path   string `json:"path"`
++	Size   int64  `json:"size"`
++	SHA256 string `json:"sha256"`
++}
++type Config struct {
++	Nonce     string `json:"nonce"`
++	MountOnly bool   `json:"mountOnly"`
++	Files     []File `json:"files"`
++}
++type Receipt struct {
++	Format        string `json:"format"`
++	Phase         string `json:"phase"`
++	Nonce         string `json:"nonce"`
++	Verified      bool   `json:"verified"`
++	Files         int    `json:"files"`
++	MountOnly     bool   `json:"mountOnly"`
++	UserProcesses []int  `json:"userProcesses"`
++	Error         string `json:"error,omitempty"`
++}
++
++// Required files come from the verified recovery catalog, not from saved guest code.
++func validateConfig(c Config) error {
++	if len(c.Nonce) != 32 {
++		return fmt.Errorf("invalid trusted probe nonce")
++	}
++	if _, e := hex.DecodeString(c.Nonce); e != nil {
++		return e
++	}
++	if (!c.MountOnly && len(c.Files) < 1) || len(c.Files) > 256 {
++		return fmt.Errorf("invalid trusted probe file count")
++	}
++	seen := map[string]bool{}
++	var total int64
++	for _, f := range c.Files {
++		if !strings.HasPrefix(f.Path, "/") || f.Path == "/" || filepath.Clean(f.Path) != f.Path || strings.ContainsRune(f.Path, 0) || f.Size < 0 || f.Size > 64*1024*1024 || len(f.SHA256) != 64 || seen[f.Path] {
++			return fmt.Errorf("invalid required file")
++		}
++		if _, e := hex.DecodeString(f.SHA256); e != nil {
++			return e
++		}
++		seen[f.Path] = true
++		total += f.Size
++	}
++	if total > 256*1024*1024 {
++		return fmt.Errorf("required native files exceed probe limit")
++	}
++	return nil
++}
++func verifyFiles(root string, files []File) error {
++	for _, f := range files {
++		current := root
++		for _, part := range strings.Split(strings.TrimPrefix(f.Path, "/"), "/") {
++			current = filepath.Join(current, part)
++			info, e := os.Lstat(current)
++			if e != nil {
++				return e
++			}
++			if info.Mode()&os.ModeSymlink != 0 {
++				return fmt.Errorf("linked recovered file")
++			}
++		}
++		info, e := os.Lstat(current)
++		if e != nil {
++			return e
++		}
++		if !info.Mode().IsRegular() {
++			return fmt.Errorf("required file is not regular")
++		}
++		file, e := os.Open(current)
++		if e != nil {
++			return e
++		}
++		info, e = file.Stat()
++		if e != nil {
++			file.Close()
++			return e
++		}
++		if !info.Mode().IsRegular() || info.Size() != f.Size {
++			file.Close()
++			return fmt.Errorf("required file size mismatch")
++		}
++		hash := sha256.New()
++		n, e := io.Copy(hash, io.LimitReader(file, f.Size+1))
++		closeErr := file.Close()
++		if e != nil {
++			return e
++		}
++		if closeErr != nil {
++			return closeErr
++		}
++		if n != f.Size || hex.EncodeToString(hash.Sum(nil)) != f.SHA256 {
++			return fmt.Errorf("required file checksum mismatch")
++		}
++	}
++	return nil
++}
++func run() (Receipt, error) {
++	r := Receipt{Format: "launchpad-disk-probe-v1", Phase: "quarantine", UserProcesses: []int{}}
++	if os.Getpid() != 1 {
++		return r, fmt.Errorf("the trusted probe must be PID 1")
++	}
++	for _, m := range []struct{ src, target, kind string }{{"proc", "/proc", "proc"}, {"sysfs", "/sys", "sysfs"}, {"devtmpfs", "/dev", "devtmpfs"}} {
++		if e := os.MkdirAll(m.target, 0700); e != nil {
++			return r, e
++		}
++		if e := syscall.Mount(m.src, m.target, m.kind, syscall.MS_NOSUID|syscall.MS_NOEXEC, ""); e != nil {
++			return r, e
++		}
++	}
++	b, e := os.ReadFile("/proof.json")
++	if e != nil {
++		return r, e
++	}
++	var c Config
++	if e = json.Unmarshal(b, &c); e != nil {
++		return r, e
++	}
++	r.Nonce = c.Nonce
++	r.MountOnly = c.MountOnly
++	if e = validateConfig(c); e != nil {
++		return r, e
++	}
++	if e = os.MkdirAll("/recovered", 0700); e != nil {
++		return r, e
++	}
++	flags := uintptr(syscall.MS_RDONLY | syscall.MS_NOEXEC | syscall.MS_NOSUID | syscall.MS_NODEV)
++	if e = syscall.Mount("/dev/vda", "/recovered", "ext4", flags, "noload"); e != nil {
++		return r, e
++	}
++	var st syscall.Statfs_t
++	if e = syscall.Statfs("/recovered", &st); e != nil {
++		return r, e
++	}
++	if uint64(st.Flags)&uint64(flags) != uint64(flags) {
++		return r, fmt.Errorf("recovered disk mount lacks quarantine flags")
++	}
++	if e = verifyFiles("/recovered", c.Files); e != nil {
++		return r, e
++	}
++	r.Files = len(c.Files)
++	entries, e := os.ReadDir("/proc")
++	if e != nil {
++		return r, e
++	}
++	for _, p := range entries {
++		pid, e := strconv.Atoi(p.Name())
++		if e != nil {
++			continue
++		}
++		cmd, e := os.ReadFile(filepath.Join("/proc", p.Name(), "cmdline"))
++		if os.IsNotExist(e) {
++			continue
++		}
++		if e != nil {
++			return r, e
++		}
++		if len(cmd) > 0 {
++			r.UserProcesses = append(r.UserProcesses, pid)
++		}
++	}
++	if len(r.UserProcesses) != 1 || r.UserProcesses[0] != 1 {
++		return r, fmt.Errorf("unexpected userspace process in quarantine")
++	}
++	// A write must fail even for the privileged probe. No startup service is loaded.
++	if file, e := os.OpenFile("/recovered/launchpad-quarantine-write-canary", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600); e == nil {
++		file.Close()
++		return r, fmt.Errorf("recovered disk is writable")
++	} else if !errors.Is(e, syscall.EROFS) {
++		return r, e
++	}
++	r.Verified = true
++	return r, nil
++}
++func main() {
++	r, e := run()
++	if e != nil {
++		r.Error = e.Error()
++	}
++	b, _ := json.Marshal(r)
++	fmt.Println("[launchpad-disk-probe-v1]" + string(b))
++	syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
++	select {}
++}
+--- /dev/null
++++ b/packages/orchestrator/launchpad-probe/quarantine/init_linux_test.go
+@@ -0,0 +1,142 @@
++//go:build linux
++
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"os"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"testing"
++)
++
++func fixture(t *testing.T) (string, File) {
++	t.Helper()
++	root := t.TempDir()
++	data := []byte("a retained native fact")
++	path := filepath.Join(root, "native")
++	if e := os.WriteFile(path, data, 0600); e != nil {
++		t.Fatal(e)
++	}
++	h := sha256.Sum256(data)
++	return root, File{Path: "/native", Size: int64(len(data)), SHA256: hex.EncodeToString(h[:])}
++}
++func TestRequiredFiles(t *testing.T) {
++	for _, kind := range []string{"intact", "corrupt", "truncated", "missing", "linked-file", "linked-parent", "fifo"} {
++		t.Run(kind, func(t *testing.T) {
++			root, f := fixture(t)
++			path := filepath.Join(root, "native")
++			switch kind {
++			case "corrupt":
++				if e := os.WriteFile(path, []byte("a corrupted native fact"), 0600); e != nil {
++					t.Fatal(e)
++				}
++			case "truncated":
++				if e := os.Truncate(path, 3); e != nil {
++					t.Fatal(e)
++				}
++			case "missing":
++				if e := os.Remove(path); e != nil {
++					t.Fatal(e)
++				}
++			case "linked-file":
++				outside := filepath.Join(t.TempDir(), "source")
++				data, e := os.ReadFile(path)
++				if e != nil {
++					t.Fatal(e)
++				}
++				if e = os.WriteFile(outside, data, 0600); e != nil {
++					t.Fatal(e)
++				}
++				if e = os.Remove(path); e != nil {
++					t.Fatal(e)
++				}
++				if e = os.Symlink(outside, path); e != nil {
++					t.Fatal(e)
++				}
++			case "linked-parent":
++				if e := os.Symlink(root, filepath.Join(root, "link")); e != nil {
++					t.Fatal(e)
++				}
++				f.Path = "/link/native"
++			case "fifo":
++				if e := os.Remove(path); e != nil {
++					t.Fatal(e)
++				}
++				if e := syscall.Mkfifo(path, 0600); e != nil {
++					t.Fatal(e)
++				}
++			}
++			err := verifyFiles(root, []File{f})
++			if (err == nil) != (kind == "intact") {
++				t.Fatalf("%s: unexpected verification result %v", kind, err)
++			}
++		})
++	}
++}
++func TestProbeConfiguration(t *testing.T) {
++	_, f := fixture(t)
++	base := Config{Nonce: strings.Repeat("a", 32), Files: []File{f}}
++	if e := validateConfig(base); e != nil {
++		t.Fatal(e)
++	}
++	for _, kind := range []string{"traversal", "relative", "root", "nul", "size", "hash", "duplicate", "count", "aggregate", "nonce"} {
++		t.Run(kind, func(t *testing.T) {
++			c := base
++			c.Files = append([]File(nil), base.Files...)
++			switch kind {
++			case "traversal":
++				c.Files[0].Path = "/dir/../native"
++			case "relative":
++				c.Files[0].Path = "native"
++			case "root":
++				c.Files[0].Path = "/"
++			case "nul":
++				c.Files[0].Path = "/native\x00"
++			case "size":
++				c.Files[0].Size = 64*1024*1024 + 1
++			case "hash":
++				c.Files[0].SHA256 = strings.Repeat("z", 64)
++			case "duplicate":
++				c.Files = append(c.Files, c.Files[0])
++			case "count":
++				c.Files = nil
++			case "aggregate":
++				c.Files = nil
++				for i := 0; i < 5; i++ {
++					entry := f
++					entry.Path = "/" + string(rune('a'+i))
++					entry.Size = 64 * 1024 * 1024
++					c.Files = append(c.Files, entry)
++				}
++			case "nonce":
++				c.Nonce = strings.Repeat("z", 32)
++			}
++			if validateConfig(c) == nil {
++				t.Fatalf("invalid %s config was accepted", kind)
++			}
++		})
++	}
++}
++func TestProbeRefusesOrdinaryProcess(t *testing.T) {
++	if os.Getpid() == 1 {
++		t.Skip("only run this test outside the guest init process")
++	}
++	r, e := run()
++	if e == nil || r.Verified {
++		t.Fatal("ordinary process must not produce a verified recovery receipt")
++	}
++}
++
++func TestMountOnlyProbeRequiresExplicitMode(t *testing.T) {
++	c := Config{Nonce: strings.Repeat("a", 32)}
++	if validateConfig(c) == nil {
++		t.Fatal("empty native catalog accepted without explicit mount-only mode")
++	}
++	c.MountOnly = true
++	if err := validateConfig(c); err != nil {
++		t.Fatal(err)
++	}
++}
+--- /dev/null
++++ b/packages/orchestrator/launchpad-probe/quarantine-probe.py
+@@ -0,0 +1,453 @@
++#!/usr/bin/env python3
++"""Cold-boot a quiesced prepared disk without executing its programs or exposing network access.
++
++This verifier does not commit placement, delete source data, or authorize ordinary
++runner startup. Its caller must hold the disk pin. A protected host budget reserves probe capacity.
++"""
++import argparse
++import contextlib
++import fcntl
++import signal
++import hashlib
++import http.client
++import json
++import os
++from pathlib import Path
++import re
++import secrets
++import shutil
++import socket
++import sys
++import subprocess
++import time
++import tempfile
++import uuid
++
++
++CGROUP_ROOT = Path("/sys/fs/cgroup/launchpad-quarantine-probes")
++CAPACITY_LOCK = Path("/run/launchpad-quarantine-probes.lock")
++SOCKET_ROOT = Path("/run/launchpad-quarantine-probes")
++NORMAL_CGROUP_ROOT = Path("/sys/fs/cgroup/e2b")
++HOST_BUDGET = Path("/etc/launchpad-e2b-host-capacity.json")
++MEMINFO = Path("/proc/meminfo")
++MIB = 1024 ** 2
++PROBE_MEMORY_MIB = 5120
++PROFILE_CPUS = 2
++
++
++def memory_info():
++    result = {}
++    for line in MEMINFO.read_text().splitlines():
++        fields = line.split()
++        if fields[0] in {"MemTotal:", "MemAvailable:"}:
++            if len(fields) != 3 or fields[2] != "kB":
++                raise ValueError("Unknown physical memory accounting")
++            result[fields[0][:-1]] = int(fields[1]) * 1024
++    if set(result) != {"MemTotal", "MemAvailable"}:
++        raise ValueError("Missing physical memory accounting")
++    return result
++
++
++def capacity_budget(max_running_vms, reserve_memory_mib, reserve_cpu_count):
++    # Five GiB includes the four-GiB guest and its host process. The same
++    # conservative profile is used for ordinary allocations and one cold probe.
++    if (any(type(value) is not int for value in (max_running_vms, reserve_memory_mib, reserve_cpu_count))
++            or max_running_vms < 1 or reserve_memory_mib < 2048 or reserve_cpu_count < 1):
++        raise ValueError("Invalid host capacity budget")
++    normal_memory = max_running_vms * PROBE_MEMORY_MIB * MIB
++    normal_cpu = max_running_vms * PROFILE_CPUS
++    physical = memory_info()
++    cpus = len(os.sched_getaffinity(0))
++    if (normal_memory + (PROBE_MEMORY_MIB + reserve_memory_mib) * MIB > physical["MemTotal"]
++            or normal_cpu + PROFILE_CPUS + reserve_cpu_count > cpus):
++        raise ValueError("Host cannot reserve the configured VMs, cold probe and system headroom")
++    return {"format": "launchpad-host-capacity-v1", "maxRunningVms": max_running_vms,
++            "reserveMemoryMiB": reserve_memory_mib, "reserveCpuCount": reserve_cpu_count,
++            "normalMemoryMaxBytes": normal_memory, "normalCpuCount": normal_cpu,
++            "probeMemoryMaxBytes": PROBE_MEMORY_MIB * MIB, "probeCpuCount": PROFILE_CPUS}
++
++
++def configure_capacity(arguments):
++    parser = argparse.ArgumentParser(description="Reserve one cold-probe profile outside ordinary VM capacity")
++    parser.add_argument("--max-running-vms", type=int, required=True)
++    parser.add_argument("--reserve-memory-mib", type=int, default=3072)
++    parser.add_argument("--reserve-cpu-count", type=int, default=1)
++    args = parser.parse_args(arguments)
++    budget = capacity_budget(args.max_running_vms, args.reserve_memory_mib, args.reserve_cpu_count)
++    with CAPACITY_LOCK.open("a+") as capacity_lock:
++        fcntl.flock(capacity_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        for root in (NORMAL_CGROUP_ROOT, CGROUP_ROOT):
++            if root.is_symlink():
++                raise ValueError("Unowned host capacity cgroup")
++            if root.exists() and ("populated 0" not in (root / "cgroup.events").read_text() or any(child.is_dir() for child in root.iterdir())):
++                raise RuntimeError("Stop ordinary and quarantine VMs before changing the host budget")
++        if memory_info()["MemAvailable"] < budget["normalMemoryMaxBytes"]:
++            raise RuntimeError("Insufficient host memory headroom to configure VM capacity")
++        for root, memory, cpus in ((NORMAL_CGROUP_ROOT, budget["normalMemoryMaxBytes"], budget["normalCpuCount"]),
++                                   (CGROUP_ROOT, budget["probeMemoryMaxBytes"], budget["probeCpuCount"])):
++            root.mkdir(mode=0o700, parents=True, exist_ok=True)
++            (root / "memory.max").write_text(str(memory))
++            (root / "memory.swap.max").write_text("0")
++            (root / "cpu.max").write_text(f"{cpus * 100000} 100000")
++            (root / "cgroup.subtree_control").write_text("+cpu +memory")
++        # A crash while changing limits leaves a mismatch, never a valid budget.
++        HOST_BUDGET.parent.mkdir(parents=True, exist_ok=True)
++        write_private(HOST_BUDGET, budget)
++    print(f"Host capacity configured: {budget['maxRunningVms']} ordinary VM(s) plus one cold probe.")
++
++
++def cpu_limit_matches(value, cpus):
++    # E2B reinitializes the scheduling period on startup; compare the enforced
++    # CPU quota rather than one spelling of the same limit.
++    fields = value.split()
++    if len(fields) != 2:
++        return False
++    try:
++        quota, period = map(int, fields)
++    except ValueError:
++        return False
++    return 1000 <= period <= 1000000 and quota == cpus * period
++
++
++def load_capacity_budget():
++    info = HOST_BUDGET.lstat()
++    if (HOST_BUDGET.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077
++            or not HOST_BUDGET.is_file() or info.st_size > 4096):
++        raise ValueError("Unowned host capacity budget")
++    budget = json.loads(HOST_BUDGET.read_text())
++    if budget != capacity_budget(budget["maxRunningVms"], budget["reserveMemoryMiB"], budget["reserveCpuCount"]):
++        raise ValueError("Host capacity budget differs from its supported profile")
++    return budget
++
++
++def restore_capacity():
++    # Cgroup limits live in kernel memory. Restore the retained operator profile
++    # before Docker starts after boot; never overwrite an occupied reservation.
++    budget = load_capacity_budget()
++    configure_capacity(["--max-running-vms", str(budget["maxRunningVms"]),
++                        "--reserve-memory-mib", str(budget["reserveMemoryMiB"]),
++                        "--reserve-cpu-count", str(budget["reserveCpuCount"])])
++
++
++def require_capacity():
++    budget = load_capacity_budget()
++    for root, memory, cpus in ((NORMAL_CGROUP_ROOT, budget["normalMemoryMaxBytes"], budget["normalCpuCount"]),
++                               (CGROUP_ROOT, budget["probeMemoryMaxBytes"], budget["probeCpuCount"])):
++        if (root.is_symlink() or root.stat().st_uid != os.getuid()
++                or (root / "memory.max").read_text().strip() != str(memory)
++                or (root / "memory.swap.max").read_text().strip() != "0"
++                or not cpu_limit_matches((root / "cpu.max").read_text(), cpus)):
++            raise ValueError("Host capacity cgroup limits differ from the protected budget")
++    # The lock blocks new ordinary admissions, but existing VMs can grow after
++    # this inspection. Reserve their entire remaining parent-cgroup allowance,
++    # including an empty pre-clone reservation whose writer has not started yet.
++    remaining_normal = 0
++    if any(child.is_dir() for child in NORMAL_CGROUP_ROOT.iterdir()):
++        current = int((NORMAL_CGROUP_ROOT / "memory.current").read_text().strip())
++        if not 0 <= current <= budget["normalMemoryMaxBytes"]:
++            raise ValueError("Unknown ordinary VM memory usage")
++        remaining_normal = budget["normalMemoryMaxBytes"] - current
++    if memory_info()["MemAvailable"] < (PROBE_MEMORY_MIB + budget["reserveMemoryMiB"]) * MIB + remaining_normal:
++        raise RuntimeError("Waiting for temporary VM verification capacity")
++    return budget
++
++
++def checksum(path):
++    with Path(path).open("rb") as source:
++        return hashlib.file_digest(source, "sha256").hexdigest()
++
++
++def write_private(path, value):
++    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".receipt-")
++    try:
++        with os.fdopen(fd, "w") as target:
++            target.write(json.dumps(value) + "\n")
++            target.flush()
++            os.fsync(target.fileno())
++        os.replace(temporary, path)
++        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
++        try:
++            os.fsync(directory)
++        finally:
++            os.close(directory)
++    finally:
++        Path(temporary).unlink(missing_ok=True)
++
++
++def publish_operation_directory(output, state):
++    """Publish the protected intent before creating any execution resources."""
++    output.parent.mkdir(parents=True, exist_ok=True)
++    staging = Path(tempfile.mkdtemp(dir=output.parent, prefix=".probe-journal-"))
++    try:
++        write_private(staging / "operation.json", state)
++        if output.exists() or output.is_symlink():
++            raise FileExistsError("Probe output already exists")
++        os.rename(staging, output)
++        directory = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
++        try:
++            os.fsync(directory)
++        finally:
++            os.close(directory)
++    finally:
++        # Only the unpublished directory created by this call can be removed.
++        if staging.exists():
++            shutil.rmtree(staging)
++
++
++def create_probe_socket(state):
++    """Unix sockets have a short kernel limit, independent of the storage path."""
++    expected = SOCKET_ROOT / str(uuid.UUID(state["operationId"]))
++    if state.get("socketDirectory") != str(expected):
++        raise ValueError("Unowned probe socket directory")
++    SOCKET_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
++    info = SOCKET_ROOT.lstat()
++    if SOCKET_ROOT.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
++        raise ValueError("Unowned probe socket root")
++    expected.mkdir(mode=0o700)
++    return expected / "fc.sock"
++
++
++def cleanup_probe_socket(state):
++    # Earlier receipts did not allocate a separate socket directory.
++    if "socketDirectory" not in state:
++        return
++    expected = SOCKET_ROOT / str(uuid.UUID(state["operationId"]))
++    if state["socketDirectory"] != str(expected):
++        raise ValueError("Unowned probe socket directory")
++    if expected.exists():
++        info = expected.lstat()
++        if expected.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
++            raise ValueError("Unowned probe socket directory")
++        (expected / "fc.sock").unlink(missing_ok=True)
++        expected.rmdir()
++
++
++def reconcile(output):
++    """Reconcile only a protected, recorded direct-probe cgroup; never certify its disk."""
++    output = Path(output).resolve(strict=True)
++    private = output.stat()
++    if private.st_uid != os.getuid() or private.st_mode & 0o077:
++        raise ValueError("Unowned probe receipt directory")
++    operation_path = output / "operation.json"
++    if operation_path.stat().st_size > 65536:
++        raise ValueError("Oversized probe operation")
++    state = json.loads(operation_path.read_text())
++    operation = str(uuid.UUID(state["operationId"]))
++    expected = CGROUP_ROOT / operation
++    if (state.get("format") != "launchpad-disk-probe-operation-v1" or
++            state.get("executionMode") != "direct" or state.get("cgroupPath") != str(expected)):
++        raise ValueError("Unowned probe cgroup")
++    with CAPACITY_LOCK.open("a+") as capacity_lock:
++        # A live controller keeps this lock. Its disappearance is not a stop receipt.
++        fcntl.flock(capacity_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        if expected.exists():
++            (expected / "cgroup.kill").write_text("1")
++            deadline = time.monotonic() + 30
++            while "populated 1" in (expected / "cgroup.events").read_text():
++                if time.monotonic() >= deadline:
++                    raise RuntimeError("Quarantine VM physical stop unconfirmed")
++                time.sleep(0.05)
++            expected.rmdir()
++        cleanup_probe_socket(state)
++        state["physicalStopConfirmed"] = True
++        state["reconciled"] = True
++        write_private(operation_path, state)
++    print("Recorded quarantine process physically reconciled; no recovery certificate created.")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--disk", type=Path, required=True, help="Quiesced full prepared ext4 image")
++    parser.add_argument("--disk-sha256", required=True, help="Verified published disk checksum")
++    parser.add_argument("--required-files", type=Path, required=True, help="JSON array of path, size and sha256 entries from the verified catalog")
++    parser.add_argument("--probe-build", type=Path, required=True)
++    parser.add_argument("--output", type=Path, required=True, help="New private proof directory")
++    parser.add_argument("--timeout", type=int, default=180)
++    parser.add_argument("--direct", action="store_true", help="Use a private cgroup and network namespace without a Docker socket")
++    parser.add_argument("--mount-only", action="store_true", help="Verify cold filesystem availability; does not certify native conversation files")
++    args = parser.parse_args()
++    if not 30 <= args.timeout <= 300 or re.fullmatch(r"[0-9a-f]{64}", args.disk_sha256) is None:
++        parser.error("Invalid probe budget or disk checksum")
++    if not args.direct:
++        parser.error("Cold verification requires --direct host capacity admission")
++    lock_path = Path(__file__).with_name("runtime.lock.json")
++    lock = json.loads(lock_path.read_text())
++    build = args.probe_build.resolve(strict=True)
++    receipt = json.loads((build / "build.json").read_text())
++    image = lock["baseImages"]["golang:${GOLANG_VERSION}-${DEBIAN_VERSION}"]
++    if receipt.get("format") != "launchpad-disk-probe-build-v1" or receipt.get("platform") != "linux/arm64" or receipt.get("image") != image:
++        raise ValueError("Unverified probe build")
++    for filename, expected in [(build / "init", receipt["initSha256"]),
++                               (build / "init_linux.go", receipt["sourceSha256"]),
++                               (Path(__file__).with_name("quarantine") / "init_linux.go", receipt["sourceSha256"]),
++                               (lock_path, receipt["runtimeLockSha256"])]:
++        if checksum(filename) != expected:
++            raise ValueError("Trusted probe build differs from the verified source")
++    kernel = Path("/fc-kernels") / lock["artifacts"]["kernel"]["version"] / "arm64/vmlinux.bin"
++    firecracker = Path("/fc-versions") / lock["artifacts"]["firecracker"]["version"] / "arm64/firecracker"
++    for filename, key in [(kernel, "kernel"), (firecracker, "firecracker")]:
++        if checksum(filename) != lock["artifacts"][key]["sha256"]:
++            raise ValueError("Pinned boot asset differs from the verified runtime")
++    disk = args.disk.resolve(strict=True)
++    metadata_path = disk.parent / "metadata.json"
++    metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else json.loads((disk.parent / "prepared.json").read_text())["metadata"]
++    if metadata.get("filesystem_only") is not True or metadata.get("fs_quiesced") is not True:
++        raise ValueError("Probe requires a quiesced prepared filesystem-only disk")
++    if not disk.is_file() or checksum(disk) != args.disk_sha256:
++        raise ValueError("Published recovery disk checksum mismatch")
++    before = disk.stat()
++    if args.required_files.stat().st_size > 1_048_576:
++        raise ValueError("Required-file manifest is too large")
++    required_bytes = args.required_files.read_bytes()
++    required_sha256 = hashlib.sha256(required_bytes).hexdigest()
++    required = json.loads(required_bytes)
++    if not isinstance(required, list) or not (0 if args.mount_only else 1) <= len(required) <= 256:
++        raise ValueError("Invalid required-file manifest")
++    with contextlib.ExitStack() as stack:
++        output = args.output.resolve()
++        operation = str(uuid.uuid4())
++        name = "launchpad-disk-probe-" + operation
++        state = {"format": "launchpad-disk-probe-operation-v1", "operationId": operation,
++                 "containerName": name, "diskSha256": args.disk_sha256,
++                 "socketDirectory": str(SOCKET_ROOT / operation),
++                 "physicalStopConfirmed": False, "temporaryCpuCount": 2, "temporaryMemoryMB": 5120, "guestMemoryMB": 4096}
++        capacity_lock = stack.enter_context(CAPACITY_LOCK.open("a+"))
++        # One host reservation covers every prepared-build directory. A lock
++        # beside each output would allow unrelated builds to probe concurrently.
++        fcntl.flock(capacity_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        state["executionMode"] = "direct"
++        state["cgroupPath"] = str(CGROUP_ROOT / operation)
++        state["hostCapacityBudget"] = require_capacity()
++        publish_operation_directory(output, state)
++        initrd = output / "initrd"
++        initrd.mkdir(mode=0o700)
++        shutil.copyfile(build / "init", initrd / "init")
++        (initrd / "init").chmod(0o700)
++        nonce = secrets.token_hex(16)
++        write_private(initrd / "proof.json", {"nonce": nonce, "files": required, "mountOnly": args.mount_only})
++        with (output / "initrd.cpio").open("wb") as target:
++            subprocess.run(["cpio", "--create", "--format=newc", "--quiet"], cwd=initrd,
++                           input=b"init\nproof.json\n", stdout=target, check=True)
++        socket_path = SOCKET_ROOT / operation / "fc.sock"
++
++        class UnixHTTP(http.client.HTTPConnection):
++            def connect(self):
++                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++                self.sock.settimeout(self.timeout)
++                self.sock.connect(str(socket_path))
++
++        def api(path, body):
++            client = UnixHTTP("localhost", timeout=30)
++            try:
++                client.request("PUT", path, json.dumps(body), {"Content-Type": "application/json"})
++                response = client.getresponse()
++                response.read()
++                if response.status != 204:
++                    raise RuntimeError(f"Quarantine boot configuration failed: {path} ({response.status})")
++            finally:
++                client.close()
++
++        direct = None
++        group = None
++        boot_log = None
++        def terminate(_signal, _frame):
++            raise InterruptedError("Quarantine controller interrupted")
++        signal.signal(signal.SIGTERM, terminate)
++        capacity = CGROUP_ROOT
++        capacity.mkdir(mode=0o700, exist_ok=True)
++        # An orphan is still using the reservation. Never interpret a missing
++        # controller as permission to allocate another verification VM.
++        if "populated 1" in (capacity / "cgroup.events").read_text():
++            raise RuntimeError("Quarantine capacity requires physical reconciliation")
++        (capacity / "memory.max").write_text(str(5 * 1024**3))
++        (capacity / "memory.swap.max").write_text("0")
++        (capacity / "cpu.max").write_text("200000 100000")
++        (capacity / "cgroup.subtree_control").write_text("+cpu +memory")
++        group = capacity / operation
++        group.mkdir(mode=0o700)
++        result = None
++        started = time.monotonic()
++        try:
++            socket_path = create_probe_socket(state)
++            def join_group():
++                (group / "cgroup.procs").write_text(str(os.getpid()))
++            boot_log = (output / "boot.log").open("wb")
++            direct = subprocess.Popen(["unshare", "--net", "--", str(firecracker), "--api-sock", str(socket_path)],
++                                      stdin=subprocess.DEVNULL, stdout=boot_log, stderr=subprocess.STDOUT,
++                                      preexec_fn=join_group)
++            state["processId"] = direct.pid
++            write_private(output / "operation.json", state)
++            deadline = time.monotonic() + 15
++            while not socket_path.exists():
++                if time.monotonic() >= deadline:
++                    raise RuntimeError("Quarantine Firecracker API did not start")
++                time.sleep(0.02)
++            # The pinned kernel embeds bpfilter_umh, a userspace helper unnecessary in
++            # a NIC-less probe. Exclude its initcall so the only userspace code is our PID 1.
++            api("/boot-source", {"kernel_image_path": str(kernel), "initrd_path": str(output / "initrd.cpio"),
++                                 "boot_args": "console=ttyS0 quiet loglevel=1 rdinit=/init panic=1 reboot=k pci=off random.trust_cpu=on initcall_blacklist=load_umh"})
++            api("/machine-config", {"vcpu_count": 2, "mem_size_mib": 4096, "smt": False, "track_dirty_pages": False})
++            api("/drives/recovered", {"drive_id": "recovered", "path_on_host": str(disk), "is_root_device": False, "is_read_only": True})
++            state["phase"] = "booting"
++            write_private(output / "operation.json", state)
++            api("/actions", {"action_type": "InstanceStart"})
++            state["phase"] = "running"
++            write_private(output / "operation.json", state)
++            if direct is not None:
++                direct.wait(timeout=args.timeout)
++                boot_log.close()
++                boot_log = None
++                logs = (output / "boot.log").read_bytes()[-65536:]
++            matches = re.findall(rb"\[launchpad-disk-probe-v1\](\{[^\r\n]*\})", logs)
++            if len(matches) != 1:
++                raise RuntimeError("Trusted recovery receipt missing or ambiguous")
++            result = json.loads(matches[0])
++            if (result.get("format") != "launchpad-disk-probe-v1" or result.get("nonce") != nonce
++                    or result.get("phase") != "quarantine" or result.get("verified") is not True
++                    or result.get("userProcesses") != [1] or result.get("files") != len(required)
++                    or result.get("mountOnly") is not args.mount_only):
++                raise RuntimeError("Quarantined recovery verification failed")
++            after = disk.stat()
++            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
++                raise RuntimeError("Saved disk changed during verification")
++        finally:
++            if group is not None:
++                # This exact private cgroup was created and recorded before spawn.
++                # Kill its descendants too; a wait on the launcher alone is insufficient.
++                (group / "cgroup.kill").write_text("1")
++                if direct is not None:
++                    direct.wait(timeout=30)
++                if "populated 1" in (group / "cgroup.events").read_text():
++                    raise RuntimeError("Quarantine VM physical stop unconfirmed")
++                group.rmdir()
++                state["physicalStopConfirmed"] = True
++                write_private(output / "operation.json", state)
++            if boot_log is not None:
++                boot_log.close()
++            cleanup_probe_socket(state)
++        if not state["physicalStopConfirmed"]:
++            raise RuntimeError("Quarantine VM physical stop unconfirmed")
++        if checksum(args.required_files) != required_sha256:
++            raise RuntimeError("Required-file catalog changed during verification")
++        write_private(output / "verified.json", {"format": "launchpad-disk-probe-result-v1", "operationId": operation,
++                      "diskSha256": args.disk_sha256, "initSha256": receipt["initSha256"],
++                      "requiredFilesSha256": required_sha256, "physicalStopConfirmed": True,
++                      "mountOnly": args.mount_only,
++                      "durationSeconds": time.monotonic() - started, "receipt": result})
++        print("Quarantined recovery verified; probe physically stopped; saved disk preserved.")
++
++
++if __name__ == "__main__":
++    if len(sys.argv) > 1 and sys.argv[1] == "configure-capacity":
++        configure_capacity(sys.argv[2:])
++    elif len(sys.argv) == 2 and sys.argv[1] == "restore-capacity":
++        restore_capacity()
++    elif len(sys.argv) == 2 and sys.argv[1] == "check-capacity":
++        with CAPACITY_LOCK.open("a+") as capacity_lock:
++            fcntl.flock(capacity_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            require_capacity()
++        print("Host cold-probe capacity and physical headroom verified.")
++    elif len(sys.argv) == 3 and sys.argv[1] == "reconcile":
++        reconcile(sys.argv[2])
++    else:
++        main()
+--- /dev/null
++++ b/packages/orchestrator/launchpad-probe/quarantine-probe.test.py
+@@ -0,0 +1,291 @@
++import contextlib
++import fcntl
++import importlib.util
++import io
++import json
++from pathlib import Path
++import tempfile
++import socket
++import unittest
++from unittest import mock
++import uuid
++
++spec = importlib.util.spec_from_file_location("probe", Path(__file__).with_name("quarantine-probe.py"))
++probe = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(probe)
++
++
++class ProbeJournalTests(unittest.TestCase):
++    def setUp(self):
++        self.directory = tempfile.TemporaryDirectory(dir="/tmp", prefix="lp-")
++        self.addCleanup(self.directory.cleanup)
++        self.root = Path(self.directory.name)
++        self.groups = self.root / "groups"
++        self.groups.mkdir()
++        self.capacity = self.root / "host-capacity.lock"
++        self.patch = mock.patch.multiple(probe, CGROUP_ROOT=self.groups, CAPACITY_LOCK=self.capacity, SOCKET_ROOT=self.root / "sockets")
++        self.patch.start()
++        self.addCleanup(self.patch.stop)
++
++    def record(self, name="prepared-a"):
++        output = self.root / name / "proof"
++        operation = str(uuid.uuid4())
++        state = {"format": "launchpad-disk-probe-operation-v1", "operationId": operation,
++                 "executionMode": "direct", "cgroupPath": str(self.groups / operation),
++                 "diskSha256": "a" * 64, "physicalStopConfirmed": False}
++        probe.publish_operation_directory(output, state)
++        return output, state
++
++    def reconcile(self, output):
++        with contextlib.redirect_stdout(io.StringIO()):
++            probe.reconcile(output)
++
++    def test_crash_before_spawn_can_reconcile_without_certifying_disk(self):
++        output, state = self.record()
++        self.assertFalse(Path(state["cgroupPath"]).exists())
++        self.reconcile(output)
++        receipt = json.loads((output / "operation.json").read_text())
++        self.assertTrue(receipt["physicalStopConfirmed"])
++        self.assertTrue(receipt["reconciled"])
++        self.assertFalse((output / "verified.json").exists())
++
++    def test_live_controller_blocks_reconciliation_for_every_build(self):
++        first, _ = self.record("prepared-a")
++        second, _ = self.record("prepared-b")
++        with self.capacity.open("a+") as held:
++            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            for output in [first, second]:
++                with self.assertRaises(BlockingIOError):
++                    self.reconcile(output)
++                self.assertFalse(json.loads((output / "operation.json").read_text())["physicalStopConfirmed"])
++        self.reconcile(second)
++
++    def test_existing_journal_is_never_replaced(self):
++        output, state = self.record()
++        with self.assertRaises(FileExistsError):
++            probe.publish_operation_directory(output, {"operationId": "replacement"})
++        self.assertEqual(state, json.loads((output / "operation.json").read_text()))
++        self.assertEqual([], list(output.parent.glob(".probe-journal-*")))
++
++    def test_failed_publication_exposes_no_incomplete_operation(self):
++        output = self.root / "proof"
++        with mock.patch.object(probe, "write_private", side_effect=OSError("disk sync failed")):
++            with self.assertRaises(OSError):
++                probe.publish_operation_directory(output, {"operationId": "incomplete"})
++        self.assertFalse(output.exists())
++        self.assertEqual([], list(self.root.glob(".probe-journal-*")))
++
++    def test_foreign_cgroup_is_not_stopped_or_certified(self):
++        output, state = self.record()
++        state["cgroupPath"] = str(self.root / "foreign")
++        probe.write_private(output / "operation.json", state)
++        with self.assertRaises(ValueError):
++            self.reconcile(output)
++        self.assertFalse(json.loads((output / "operation.json").read_text())["physicalStopConfirmed"])
++        self.assertFalse((output / "verified.json").exists())
++
++    def test_parent_sync_failure_leaves_a_recoverable_complete_journal(self):
++        output = self.root / "proof"
++        operation = str(uuid.uuid4())
++        state = {"format": "launchpad-disk-probe-operation-v1", "operationId": operation,
++                 "executionMode": "direct", "cgroupPath": str(self.groups / operation),
++                 "physicalStopConfirmed": False}
++        actual = probe.os.fsync
++        calls = 0
++        def sync(fd):
++            nonlocal calls
++            calls += 1
++            if calls == 3:
++                raise OSError("parent sync failed")
++            return actual(fd)
++        with mock.patch.object(probe.os, "fsync", side_effect=sync):
++            with self.assertRaises(OSError):
++                probe.publish_operation_directory(output, state)
++        self.assertEqual(state, json.loads((output / "operation.json").read_text()))
++        self.reconcile(output)
++        self.assertFalse((output / "verified.json").exists())
++
++
++    def test_long_storage_path_uses_a_short_private_socket(self):
++        output, state = self.record("very-long-storage-directory-" * 8)
++        state["socketDirectory"] = str(probe.SOCKET_ROOT / state["operationId"])
++        probe.write_private(output / "operation.json", state)
++        path = probe.create_probe_socket(state)
++        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
++            listener.bind(str(path))
++            self.assertLess(len(str(path).encode()), 104)
++            self.assertTrue(path.exists())
++        # A crash after socket allocation but before VM spawn is still recoverable.
++        self.reconcile(output)
++        self.assertFalse(path.parent.exists())
++        self.assertFalse((output / "verified.json").exists())
++
++    def test_socket_cleanup_never_follows_a_foreign_record(self):
++        output, state = self.record()
++        foreign = self.root / "foreign-socket"
++        foreign.mkdir()
++        state["socketDirectory"] = str(foreign)
++        with self.assertRaises(ValueError):
++            probe.cleanup_probe_socket(state)
++        self.assertTrue(foreign.exists())
++
++
++class ProbeCapacityTests(unittest.TestCase):
++    def setUp(self):
++        temporary = tempfile.TemporaryDirectory(prefix="lp-capacity-")
++        self.addCleanup(temporary.cleanup)
++        self.root = Path(temporary.name)
++        self.normal = self.root / "normal"
++        self.probes = self.root / "probes"
++        self.budget_file = self.root / "budget.json"
++        self.patch = mock.patch.multiple(probe, NORMAL_CGROUP_ROOT=self.normal,
++            CGROUP_ROOT=self.probes, HOST_BUDGET=self.budget_file,
++            CAPACITY_LOCK=self.root / "capacity.lock")
++        self.patch.start()
++        self.addCleanup(self.patch.stop)
++        self.memory = mock.patch.object(probe, "memory_info", return_value={
++            "MemTotal": 16 * 1024 ** 3, "MemAvailable": 12 * 1024 ** 3})
++        self.memory_mock = self.memory.start()
++        self.addCleanup(self.memory.stop)
++        self.cpu = mock.patch.object(probe.os, "sched_getaffinity", return_value=set(range(8)), create=True)
++        self.cpu_mock = self.cpu.start()
++        self.addCleanup(self.cpu.stop)
++        for root in (self.normal, self.probes):
++            root.mkdir()
++            (root / "cgroup.events").write_text("populated 0\n")
++
++    def configure(self):
++        with contextlib.redirect_stdout(io.StringIO()):
++            probe.configure_capacity(["--max-running-vms", "1"])
++
++    def test_budget_reserves_one_probe_outside_ordinary_vm_capacity(self):
++        self.configure()
++        budget = probe.require_capacity()
++        self.assertEqual(budget["maxRunningVms"], 1)
++        self.assertEqual(budget["normalMemoryMaxBytes"], 5 * 1024 ** 3)
++        self.assertEqual(budget["probeMemoryMaxBytes"], 5 * 1024 ** 3)
++        self.assertEqual(budget["normalCpuCount"], 2)
++        self.assertEqual(0, self.budget_file.stat().st_mode & 0o077)
++
++    def test_impossible_physical_budget_is_refused_before_any_limit_changes(self):
++        for arguments in ((3, 3072, 1), (1, 1024, 1), (True, 3072, 1)):
++            with self.assertRaises(ValueError):
++                probe.capacity_budget(*arguments)
++        self.cpu_mock.return_value = set(range(4))
++        with self.assertRaises(ValueError):
++            self.configure()
++        self.assertFalse(self.budget_file.exists())
++        self.assertFalse((self.normal / "memory.max").exists())
++
++    def test_guest_presence_blocks_reconfiguration(self):
++        for root in (self.normal, self.probes):
++            (root / "cgroup.events").write_text("populated 1\n")
++            with self.assertRaises(RuntimeError):
++                self.configure()
++            (root / "cgroup.events").write_text("populated 0\n")
++        self.assertFalse(self.budget_file.exists())
++        self.assertFalse((self.normal / "memory.max").exists())
++
++    def test_empty_normal_reservation_blocks_budget_edits(self):
++        (self.normal / "sbx-reserved").mkdir()
++        with self.assertRaises(RuntimeError):
++            self.configure()
++        self.assertFalse(self.budget_file.exists())
++
++    def test_global_controller_lock_blocks_budget_edits(self):
++        with probe.CAPACITY_LOCK.open("a+") as lock:
++            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            with self.assertRaises(BlockingIOError):
++                self.configure()
++        self.assertFalse(self.budget_file.exists())
++
++    def test_probe_requires_current_physical_headroom(self):
++        self.configure()
++        self.memory_mock.return_value = {"MemTotal": 16 * 1024 ** 3,
++            "MemAvailable": 7 * 1024 ** 3}
++        with self.assertRaisesRegex(RuntimeError, "Waiting for temporary"):
++            probe.require_capacity()
++        self.assertFalse((self.root / "operation.json").exists())
++        self.assertFalse((self.root / "verified.json").exists())
++
++    def test_existing_vm_growth_is_reserved_even_before_its_process_starts(self):
++        self.configure()
++        (self.normal / "sbx-reserved").mkdir()
++        (self.normal / "memory.current").write_text(str(1024 ** 3))
++        self.memory_mock.return_value = {"MemTotal": 16 * 1024 ** 3,
++            "MemAvailable": 9 * 1024 ** 3}
++        with self.assertRaisesRegex(RuntimeError, "Waiting for temporary"):
++            probe.require_capacity()
++        self.memory_mock.return_value["MemAvailable"] = 13 * 1024 ** 3
++        self.assertEqual(probe.require_capacity()["maxRunningVms"], 1)
++
++    def test_changed_host_limits_are_never_treated_as_reserved_capacity(self):
++        self.configure()
++        for root in (self.normal, self.probes):
++            for name, value in (("memory.max", "max"), ("memory.swap.max", "max"),
++                                ("cpu.max", "max 100000")):
++                target = root / name
++                old = target.read_text()
++                target.write_text(value)
++                with self.assertRaises(ValueError):
++                    probe.require_capacity()
++                target.write_text(old)
++        self.assertEqual(probe.require_capacity()["maxRunningVms"], 1)
++
++    def test_reboot_restores_saved_capacity_before_vm_admission(self):
++        self.configure()
++        original = self.budget_file.read_text()
++        for root in (self.normal, self.probes):
++            for child in root.iterdir():
++                child.unlink()
++            root.rmdir()
++        with contextlib.redirect_stdout(io.StringIO()):
++            probe.restore_capacity()
++        self.assertEqual(probe.require_capacity()["maxRunningVms"], 1)
++        self.assertEqual(self.budget_file.read_text(), original)
++
++    def test_boot_restore_refuses_existing_vm_reservation(self):
++        self.configure()
++        (self.normal / "sbx-reserved").mkdir()
++        (self.normal / "cpu.max").write_text("max 100000")
++        original = self.budget_file.read_text()
++        with self.assertRaises(RuntimeError):
++            probe.restore_capacity()
++        self.assertEqual((self.normal / "cpu.max").read_text(), "max 100000")
++        self.assertEqual(self.budget_file.read_text(), original)
++
++    def test_equivalent_cpu_period_survives_host_restart(self):
++        self.configure()
++        for root in (self.normal, self.probes):
++            (root / "cpu.max").write_text("400000 200000")
++        self.assertEqual(probe.require_capacity()["maxRunningVms"], 1)
++        for value in ("400001 200000", "199999 100000", "max 100000",
++                      "-200000 -100000", "2000 1000 extra", "0 0", "20000000 10000000"):
++            (self.normal / "cpu.max").write_text(value)
++            with self.subTest(value=value), self.assertRaises(ValueError):
++                probe.require_capacity()
++
++    def test_forged_or_public_budget_is_refused(self):
++        with self.assertRaises(FileNotFoundError):
++            probe.require_capacity()
++        self.configure()
++        self.budget_file.chmod(0o644)
++        with self.assertRaisesRegex(ValueError, "Unowned"):
++            probe.require_capacity()
++        self.budget_file.chmod(0o600)
++        budget = json.loads(self.budget_file.read_text())
++        budget["probeMemoryMaxBytes"] = 1
++        probe.write_private(self.budget_file, budget)
++        with self.assertRaises(ValueError):
++            probe.require_capacity()
++
++    def test_failed_budget_publication_keeps_probe_unavailable(self):
++        with mock.patch.object(probe, "write_private", side_effect=OSError("sync failed")):
++            with self.assertRaises(OSError):
++                self.configure()
++        with self.assertRaises(FileNotFoundError):
++            probe.require_capacity()
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/packages/orchestrator/launchpad-probe/receipt.go
+@@ -0,0 +1,38 @@
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"os"
++	"runtime"
++)
++
++func sum(path string) string {
++	b, e := os.ReadFile(path)
++	if e != nil {
++		panic(e)
++	}
++	h := sha256.Sum256(b)
++	return hex.EncodeToString(h[:])
++}
++func main() {
++	var lock struct {
++		BaseImages map[string]string `json:"baseImages"`
++	}
++	raw, e := os.ReadFile("launchpad-probe/runtime.lock.json")
++	if e != nil {
++		panic(e)
++	}
++	if e = json.Unmarshal(raw, &lock); e != nil {
++		panic(e)
++	}
++	r := map[string]any{"format": "launchpad-disk-probe-build-v1", "platform": "linux/" + runtime.GOARCH, "image": lock.BaseImages["golang:${GOLANG_VERSION}-${DEBIAN_VERSION}"], "sourceSha256": sum("launchpad-probe/quarantine/init_linux.go"), "initSha256": sum("bin/probe-init"), "runtimeLockSha256": sum("launchpad-probe/runtime.lock.json")}
++	b, e := json.Marshal(r)
++	if e != nil {
++		panic(e)
++	}
++	if e = os.WriteFile("bin/probe-build.json", append(b, '\n'), 0600); e != nil {
++		panic(e)
++	}
++}
+--- /dev/null
++++ b/packages/orchestrator/launchpad-probe/runtime.lock.json
+@@ -0,0 +1,100 @@
++{
++  "schemaVersion": 1,
++  "source": {
++    "repository": "https://github.com/e2b-dev/runtime",
++    "commit": "1599d6e79e302449e9285dae33d5ce04e3182254",
++    "archiveUrl": "https://codeload.github.com/e2b-dev/runtime/legacy.tar.gz/1599d6e79e302449e9285dae33d5ce04e3182254",
++    "archiveSha256": "c41792b1400d65e2a3b1c2a37ef2fddd21bf24d11df7388654b5b4be73d6dea5",
++    "archiveDirectory": "e2b-dev-runtime-1599d6e"
++  },
++  "sdkVersion": "2.46.1",
++  "goVersion": "1.26.8",
++  "baseImages": {
++    "golang:${GOLANG_VERSION}-${DEBIAN_VERSION}": "golang:1.26.8-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d",
++    "golang:${GOLANG_VERSION}-alpine${ALPINE_VERSION}": "golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c",
++    "debian:${DEBIAN_RUNTIME_TAG}": "debian:bookworm-20260824-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
++    "alpine:${ALPINE_VERSION}": "alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6"
++  },
++  "embed": {
++    "composeSha256": "399a76c21f5a365335cb32be284426ea76a807872b5fcd481d07e7171c761556",
++    "defaultsSha256": "8ba4df5a2890de616b48376f744b2588cdcacc4f252fdc524174faeaaa3628dd",
++    "platform": "linux/arm64",
++    "prebuiltSourceRevisionsVerified": false,
++    "images": {
++      "api": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/api/api:v0.14.202609170000-908833e4c12",
++        "digest": "sha256:e131ee5abc41104eb37b8fcac9bcc5ff2b76adc401bf358dc368a3c5753f5493"
++      },
++      "db-migrator": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/api/db-migrator:v0.14.202609170000-908833e4c12",
++        "digest": "sha256:5237676bc29eaecc150a90fa402cbf7cdd0568b3775f9f2eb7a59b41ecce2d52"
++      },
++      "dashboard-api": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/dashboard-api/dashboard-api:v0.7.202609170000-908833e4c12",
++        "digest": "sha256:d7a865ea78071eaa09a370d7130f36c305de98ece717224e075a3e64a20c5624"
++      },
++      "client-proxy": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/client-proxy/client-proxy:v0.3.202609130627-59497eb9134",
++        "digest": "sha256:f9ca12355225126dc3903b909a3c6bcbb331acb9363c27ac576b164e3db5eefd"
++      },
++      "clickhouse-migrator": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/clickhouse-migrator/clickhouse-migrator:v0.4.202609130627-59497eb9134",
++        "digest": "sha256:3e1c9ea34f73069695b54e0cee479639f68dcce5d42f3e6da31f5f4c331f23ea"
++      },
++      "seed": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/embed/seed:v0.3.202609120109-ad1cddd091b",
++        "digest": "sha256:866acff1fe1f288b403e6b2cfde5fe8cc731092818547bc9f0d85a574fc03f93"
++      },
++      "node-e2b": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/embed/node-e2b:v0.3.202609120109-ad1cddd091b",
++        "digest": "sha256:22d6271c8ea6fa2585054b403679bcfe9494148725837a53e173fb1c9587da41"
++      },
++      "tools": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/embed/tools:v0.3.202609120109-ad1cddd091b",
++        "digest": "sha256:c565bc6b9562a54b656604f138e2cde507968a300339d822786431620a2e0fda"
++      },
++      "dashboard": {
++        "tag": "us-docker.pkg.dev/e2b-artifacts/dashboard/dashboard:v0.2.1",
++        "digest": "sha256:1bce1bad793333c870d7fe696bb6e1f509e7268b524dd0c82ec8d45336be52b1"
++      },
++      "postgres": {
++        "tag": "postgres:18.6-alpine",
++        "digest": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
++      },
++      "redis": {
++        "tag": "redis:7.4.6",
++        "digest": "sha256:a9cc41d6d01da2aa26c219e4f99ecbeead955a7b656c1c499cce8922311b2514"
++      },
++      "clickhouse": {
++        "tag": "clickhouse/clickhouse-server:25.8.30.16",
++        "digest": "sha256:f3f6c013eee7f922b130078afc77626e72d37b4071b85ba92a675aa002d59e34"
++      },
++      "vector": {
++        "tag": "timberio/vector:0.51.1-alpine",
++        "digest": "sha256:2d16ae87ec395508366f3c064899d374fbe04de6e64c3a613ed64aedbee034b4"
++      }
++    }
++  },
++  "artifacts": {
++    "orchestrator": {
++      "version": "v0.16.202609212023-35cc85a6c61",
++      "sha256": "9146470a088ffbf18fa35069f60e38f80651fa1d92eaa8f66ce15ab048419947"
++    },
++    "envd": {
++      "version": "v0.9.202609130627-59497eb9134",
++      "sha256": "713b31989288fccc2f86892bb32917eacbf81a2f344aa1462abf53702df92624"
++    },
++    "kernel": {
++      "version": "vmlinux-6.1.177_5008931",
++      "sha256": "3e134b55a6e4feec481f6f3a2813d42860e28c273eeb91c02df0661322e61dab"
++    },
++    "firecracker": {
++      "version": "v1.14-0.2.0",
++      "sha256": "66a8347a08741e47f850da1720cc6153a6998a2c9e87666958261afbcc9ba05e"
++    },
++    "busybox": {
++      "version": "1.36.1",
++      "sha256": "eddab48ed02fe55034a3f9321c6d4f9db10d699bc92880bd334d94a5c55363e3"
++    }
++  }
++}

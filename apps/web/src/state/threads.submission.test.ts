@@ -56,10 +56,22 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function registry() {
+function registry(shared = true, queued = false) {
   const result = AtomRegistry.make();
   vi.spyOn(result, "get").mockReturnValue({
-    environment: { capabilities: { sharedPromptQueue: true, sharedPreparation: true } },
+    environment: { capabilities: { sharedPromptQueue: shared, sharedPreparation: shared } },
+    threads: queued
+      ? [
+          {
+            id: input.threadId,
+            promptQueueSummary: {
+              count: 1,
+              enabled: false,
+              pauseReason: { code: "stopped", detail: "Waiting move" },
+            },
+          },
+        ]
+      : [],
   });
   return result;
 }
@@ -112,6 +124,27 @@ describe("shared startTurn ownership", () => {
       expect(useSharedPromptSubmissions.getState().entries).toEqual([]);
     },
   );
+
+  it("journals a followup behind a paused local move when the environment capability is false", async () => {
+    const enqueue = vi
+      .spyOn(threadEnvironment.enqueuePrompt, "run")
+      .mockResolvedValue(AsyncResult.success({ sequence: 2 }));
+    const result = runAtomCommand(
+      registry(false, true),
+      threadEnvironment.startTurn,
+      { environmentId, input },
+      { reportFailure: false, reportDefect: false },
+    );
+    expect(hasSharedPromptSubmission(environmentId, input.threadId, input.message.messageId)).toBe(
+      true,
+    );
+    expect((await result)._tag).toBe("Success");
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(enqueue.mock.calls[0]?.[1].input.message).toEqual(input.message);
+    expect(hasSharedPromptSubmission(environmentId, input.threadId, input.message.messageId)).toBe(
+      false,
+    );
+  });
 
   it("does not take ownership or dispatch if journal persistence fails", async () => {
     vi.spyOn(localStorage, "setItem").mockImplementation(() => {

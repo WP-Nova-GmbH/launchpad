@@ -1,3 +1,18 @@
+import { ProviderEventBarrier } from "../ProviderEventBarrier.ts";
+import { exportCodexConversation } from "../Drivers/CodexConversationTransfer.ts";
+import { installPortableCodexHome } from "../Drivers/PortableCodexHome.ts";
+import * as NodeCrypto from "node:crypto";
+import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
+import { attachmentRelativePath } from "../../attachmentStore.ts";
+import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
+import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import { ThreadExecution } from "../../relay/ThreadExecution.ts";
+import { makeThreadExecutionRelay } from "../../relay/ThreadExecutionRelay.ts";
+import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
+import {
+  threadExecutionTestLayer,
+  threadExecutionTestLayerForDatabase,
+} from "../testUtils/threadExecutionTestLayer.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -20,6 +35,8 @@ import {
   EventId,
   MessageId,
   OrchestrationThreadShell,
+  OrchestrationEvent,
+  type ChatAttachment,
   ProjectId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   ProviderDriverKind,
@@ -41,6 +58,8 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
@@ -428,6 +447,10 @@ const hasMetricSnapshot = (
 
 function makeProviderServiceLayer(
   input: {
+    readonly vmWorkloads?: boolean;
+    readonly nativeHistory?: boolean;
+    readonly configLayer?: typeof serverConfigTestLayer;
+    readonly executionLayer?: Layer.Layer<ThreadExecution | SqlClient.SqlClient>;
     readonly directory?: ProviderSessionDirectory.ProviderSessionDirectory["Service"];
     readonly supportsConversationRollback?: boolean;
     readonly analyticsLayer?: Layer.Layer<AnalyticsService.AnalyticsService>;
@@ -457,14 +480,22 @@ function makeProviderServiceLayer(
       ? ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer))
       : Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, input.directory);
 
+  const configLayer = input.configLayer ?? serverConfigTestLayer;
+  const historyLayer = input.nativeHistory
+    ? OrchestrationEventStoreLive.pipe(Layer.provide(SqlitePersistenceMemory))
+    : Layer.empty;
   const layer = it.layer(
     Layer.mergeAll(
       makeProviderServiceLive().pipe(
+        Layer.provide(input.executionLayer ?? SqlitePersistenceMemory),
+        Layer.provide(historyLayer),
+        Layer.provide(Layer.succeed(VmWorkloadTracking, input.vmWorkloads ?? false)),
+        Layer.provide(input.executionLayer ?? threadExecutionTestLayer),
         Layer.provide(NodeServices.layer),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
-        Layer.provide(serverConfigTestLayer),
+        Layer.provide(configLayer),
         Layer.provideMerge(input.analyticsLayer ?? AnalyticsService.layerTest),
         Layer.provide(
           Layer.succeed(
@@ -473,6 +504,10 @@ function makeProviderServiceLayer(
           ),
         ),
       ),
+      input.executionLayer ?? Layer.empty,
+      historyLayer,
+      configLayer,
+      SqlitePersistenceMemory,
       directoryLayer,
 
       runtimeRepositoryLayer,
@@ -652,6 +687,8 @@ for (const [enabled, completed] of [
         const scope = yield* Scope.make();
         const services = yield* Layer.build(
           makeProviderServiceLive().pipe(
+            Layer.provide(threadExecutionTestLayer),
+            Layer.provide(SqlitePersistenceMemory),
             Layer.provide(NodeServices.layer),
             Layer.provide(
               Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory),
@@ -772,6 +809,8 @@ it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = Layer.mergeAll(
       makeProviderServiceLive().pipe(
+        Layer.provide(threadExecutionTestLayer),
+        Layer.provide(SqlitePersistenceMemory),
         Layer.provide(NodeServices.layer),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
@@ -815,6 +854,8 @@ it.effect("ProviderServiceLive flushes deferred completions during shutdown", ()
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = Layer.mergeAll(
       makeProviderServiceLive().pipe(
+        Layer.provide(threadExecutionTestLayer),
+        Layer.provide(SqlitePersistenceMemory),
         Layer.provide(NodeServices.layer),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
@@ -952,6 +993,8 @@ it.effect("ProviderServiceLive rejects new sessions for disabled providers", () 
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(threadExecutionTestLayer),
+      Layer.provide(SqlitePersistenceMemory),
       Layer.provide(NodeServices.layer),
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
@@ -1036,6 +1079,8 @@ it.effect(
         Layer.provide(runtimeRepositoryLayer),
       );
       const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(threadExecutionTestLayer),
+        Layer.provide(SqlitePersistenceMemory),
         Layer.provide(NodeServices.layer),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
@@ -1106,6 +1151,8 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(threadExecutionTestLayer),
+      Layer.provide(SqlitePersistenceMemory),
       Layer.provide(NodeServices.layer),
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
@@ -1543,6 +1590,8 @@ it.effect(
         Layer.provide(runtimeRepositoryLayer),
       );
       const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(threadExecutionTestLayer),
+        Layer.provide(SqlitePersistenceMemory),
         Layer.provide(NodeServices.layer),
         Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
         Layer.provide(directoryLayer),
@@ -1603,6 +1652,8 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
         close: () => Effect.void,
       },
     }).pipe(
+      Layer.provide(threadExecutionTestLayer),
+      Layer.provide(SqlitePersistenceMemory),
       Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -1664,6 +1715,8 @@ it.effect("ProviderServiceLive keeps persisted resumable sessions on startup", (
     }).pipe(Effect.provide(directoryLayer));
 
     const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(threadExecutionTestLayer),
+      Layer.provide(SqlitePersistenceMemory),
       Layer.provide(NodeServices.layer),
       Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
       Layer.provide(directoryLayer),
@@ -1730,6 +1783,8 @@ it.effect(
         Layer.provide(runtimeRepositoryLayer),
       );
       const firstProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(threadExecutionTestLayerForDatabase.pipe(Layer.provide(persistenceLayer))),
+        Layer.provide(persistenceLayer),
         Layer.provide(NodeServices.layer),
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
@@ -1791,6 +1846,8 @@ it.effect(
         Layer.provide(runtimeRepositoryLayer),
       );
       const secondProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(threadExecutionTestLayerForDatabase.pipe(Layer.provide(persistenceLayer))),
+        Layer.provide(persistenceLayer),
         Layer.provide(NodeServices.layer),
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
@@ -3350,6 +3407,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
         Layer.provide(runtimeRepositoryLayer),
       );
       const firstProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(threadExecutionTestLayer),
+        Layer.provide(SqlitePersistenceMemory),
         Layer.provide(NodeServices.layer),
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
@@ -3390,6 +3449,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
         Layer.provide(runtimeRepositoryLayer),
       );
       const secondProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(threadExecutionTestLayer),
+        Layer.provide(SqlitePersistenceMemory),
         Layer.provide(NodeServices.layer),
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
@@ -3460,6 +3521,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
           Layer.provide(runtimeRepositoryLayer),
         );
         const firstProviderLayer = makeProviderServiceLive().pipe(
+          Layer.provide(threadExecutionTestLayer),
+          Layer.provide(SqlitePersistenceMemory),
           Layer.provide(NodeServices.layer),
           Layer.provide(
             Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
@@ -3495,6 +3558,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
           Layer.provide(runtimeRepositoryLayer),
         );
         const secondProviderLayer = makeProviderServiceLive().pipe(
+          Layer.provide(threadExecutionTestLayer),
+          Layer.provide(SqlitePersistenceMemory),
           Layer.provide(NodeServices.layer),
           Layer.provide(
             Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
@@ -5315,6 +5380,8 @@ describe("agent browser access", () => {
             return undefined;
           }),
       }).pipe(
+        Layer.provide(threadExecutionTestLayer),
+        Layer.provide(SqlitePersistenceMemory),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(options?.withoutOrchestration ? Layer.empty : projectionLayer),
@@ -5444,5 +5511,859 @@ describe("agent browser access", () => {
       );
       assert.deepEqual(issued, [{ threadId, capabilities: ["preview", "pull-requests"] }]);
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
+
+const portableProviderLayer = Layer.effect(
+  ThreadExecution,
+  Effect.gen(function* () {
+    return makeThreadExecutionRelay(yield* SqlClient.SqlClient, {
+      admit: () => Effect.succeed({ completed: false, newlyAdmitted: true }),
+      complete: () => Effect.void,
+    });
+  }),
+).pipe(Layer.provideMerge(SqlitePersistenceMemory), Layer.orDie);
+const portableProviders = makeProviderServiceLayer({ executionLayer: portableProviderLayer });
+portableProviders.layer("Portable provider execution", (it) => {
+  const enroll = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const sql = yield* SqlClient.SqlClient;
+    const fence = makeThreadExecutionFence(sql);
+    const owner = {
+      threadId,
+      projectId: "project",
+      environmentId: "environment",
+      relayUrl: "https://relay.test",
+      generation: 1,
+      operationId: "enroll",
+    };
+    yield* fence.prepare(owner);
+    yield* fence.activate(owner);
+    return {
+      sql,
+      fence,
+      owner,
+      move: { ...owner, operationId: "move", previousOperationId: "enroll" },
+    };
+  });
+  it.effect("draining denies native starts and prompt delivery while allowing stop", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("portable-provider-drain");
+      const { fence, move } = yield* enroll(threadId);
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+      });
+      const starts = portableProviders.codex.startSession.mock.calls.length;
+      const sends = portableProviders.codex.sendTurn.mock.calls.length;
+      yield* fence.beginDrain(move);
+      const rejected = yield* Effect.flip(
+        provider.sendTurn({
+          threadId,
+          input: "must not run",
+          delivery: { attemptId: "draining", mode: "next-turn" },
+        }),
+      );
+      assert.equal(rejected._tag, "ProviderExecutionError");
+      if (rejected._tag === "ProviderExecutionError") assert.isFalse(rejected.uncertain);
+      assert.equal(
+        (yield* Effect.result(
+          provider.startSession(threadId, {
+            threadId,
+            providerInstanceId: codexInstanceId,
+            runtimeMode: "full-access",
+          }),
+        ))._tag,
+        "Failure",
+      );
+      assert.equal(portableProviders.codex.startSession.mock.calls.length, starts);
+      assert.equal(portableProviders.codex.sendTurn.mock.calls.length, sends);
+      yield* provider.stopSession({ threadId });
+      assert.isFalse(yield* portableProviders.codex.adapter.hasSession(threadId));
+      // An adapter's stop reply does not prove all tool children stopped.
+      assert.equal((yield* Effect.result(fence.freeze(move)))._tag, "Failure");
+    }),
+  );
+  it.effect("the same admitted prompt is never sent twice", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("portable-provider-duplicate");
+      yield* enroll(threadId);
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+      });
+      const sends = portableProviders.codex.sendTurn.mock.calls.length;
+      const input = {
+        threadId,
+        input: "execute once",
+        delivery: { attemptId: "one-attempt", mode: "next-turn" as const },
+      };
+      yield* provider.sendTurn(input);
+      const duplicate = yield* Effect.flip(provider.sendTurn(input));
+      assert.equal(duplicate._tag, "ProviderExecutionError");
+      if (duplicate._tag === "ProviderExecutionError") assert.isTrue(duplicate.uncertain);
+      assert.equal(portableProviders.codex.sendTurn.mock.calls.length, sends + 1);
+    }),
+  );
+  it.effect("a held thread cannot restart an absent provider through recovery", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("portable-provider-recovery");
+      const { fence, move } = yield* enroll(threadId);
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+      });
+      yield* portableProviders.codex.adapter.stopSession(threadId);
+      const starts = portableProviders.codex.startSession.mock.calls.length;
+      yield* fence.beginDrain(move);
+      assert.equal((yield* Effect.result(provider.interruptTurn({ threadId })))._tag, "Failure");
+      assert.equal(portableProviders.codex.startSession.mock.calls.length, starts);
+    }),
+  );
+});
+
+const vmOnly = makeProviderServiceLayer({ vmWorkloads: true });
+vmOnly.layer("ProviderService thread VM", (it) => {
+  it.effect("blocks an unsupported provider before starting its untracked SDK", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("vm-unsupported-provider");
+      const result = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("claudeAgent"),
+          providerInstanceId: claudeAgentInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(result));
+      if (Exit.isFailure(result))
+        assert.instanceOf(Cause.squash(result.cause), ProviderValidationError);
+      assert.equal(vmOnly.claude.startSession.mock.calls.length, 0);
+      assert.equal(vmOnly.codex.startSession.mock.calls.length, 0);
+    }),
+  );
+});
+
+const nativeCheckpointAdapter = makeFakeCodexAdapter();
+let nativeCheckpointExports = 0;
+const nativeIdForCheckpoint = "01900000-0000-7000-8000-000000000001";
+
+const nativeCheckpointFacade = makeProviderServiceLayer({
+  nativeHistory: true,
+  configLayer: ServerConfig.layerTest(process.cwd(), { prefix: "native-checkpoint-facade-" }).pipe(
+    Layer.provide(NodeServices.layer),
+  ),
+  registry: makeStaticInstanceRegistry([
+    [
+      ProviderInstanceId.make("codex"),
+      {
+        ...nativeCheckpointAdapter.adapter,
+        checkpointConversation: (input) =>
+          Effect.sync(() => {
+            nativeCheckpointExports++;
+            const directory = NodePath.join(input.artifactRoot, "native");
+            NodeFS.mkdirSync(directory, { recursive: true });
+            NodeFS.writeFileSync(
+              NodePath.join(directory, "manifest.json"),
+              '{"threadId":"' + nativeIdForCheckpoint + '"}',
+            );
+            NodeFS.writeFileSync(NodePath.join(directory, "rollout.jsonl"), "retained native turn");
+            return { directory, nativeThreadId: nativeIdForCheckpoint };
+          }).pipe(Effect.tap(() => nativeCheckpointAdapter.adapter.stopSession(input.threadId))),
+      },
+    ],
+  ]),
+});
+const encodeImportedRuntime = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeCheckpointEvent = Schema.decodeUnknownSync(OrchestrationEvent);
+const checkpointHistoryFixture = Effect.fnUntraced(function* (threadId: ThreadId) {
+  const events = yield* OrchestrationEventStore,
+    config = yield* ServerConfig.ServerConfig;
+  const attachment: ChatAttachment = {
+    type: "file",
+    name: "notes.txt",
+    mimeType: "text/plain",
+    sizeBytes: 5,
+    id: `${threadId}-00000000-0000-4000-8000-000000000001-txt`,
+  };
+  const at = "2026-10-05T10:00:00.000Z";
+  const append = (type: string, payload: unknown, suffix: string) =>
+    events.append(
+      decodeCheckpointEvent({
+        type,
+        sequence: 0,
+        eventId: `${threadId}-${suffix}`,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: at,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        payload,
+      }),
+    );
+  yield* append(
+    "thread.created",
+    {
+      threadId,
+      projectId: "project",
+      title: "Retained history",
+      modelSelection: { provider: "codex", model: "gpt-5", instanceId: "codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: "main",
+      worktreePath: null,
+      createdAt: at,
+      updatedAt: at,
+    },
+    "created",
+  );
+  yield* append(
+    "thread.message-sent",
+    {
+      threadId,
+      messageId: `${threadId}-message`,
+      role: "user",
+      text: "attachment",
+      attachments: [attachment],
+      streaming: false,
+      createdAt: at,
+      updatedAt: at,
+    },
+    "message",
+  );
+  const file = NodePath.join(config.attachmentsDir, attachmentRelativePath(attachment)!);
+  NodeFS.writeFileSync(file, "notes");
+  return { attachment, file };
+});
+nativeCheckpointFacade.layer("ProviderService native checkpoint", (it) => {
+  for (const scenario of [
+    "ordinary",
+    "unenrolled",
+    "new-generation",
+    "wrong-turn",
+    "pending-turn",
+  ] as const) {
+    it.effect(`first local frozen capture after provider stop: ${scenario}`, () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService,
+          sql = yield* SqlClient.SqlClient,
+          directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const threadId = asThreadId(`first-local-frozen-${scenario}`);
+        yield* checkpointHistoryFixture(threadId);
+        const turnId = TurnId.make("first-local-settled-turn"),
+          operationId = NodeCrypto.randomUUID();
+        yield* directory.upsert({
+          threadId,
+          provider: CODEX_DRIVER,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          status: "stopped",
+          resumeCursor: { threadId: nativeIdForCheckpoint },
+          runtimePayload: { cwd: fixtureCwd("first-local-frozen") },
+        });
+        yield* sql`INSERT INTO projection_turns (thread_id,turn_id,state,requested_at,completed_at,checkpoint_status,checkpoint_files_json)
+          VALUES (${threadId},${turnId},'completed','2026-10-05T10:00:00.000Z','2026-10-05T10:01:00.000Z',${scenario === "pending-turn" ? "pending" : "ready"},'[]')`;
+        const [head] = yield* sql<{
+          sequence: number;
+        }>`SELECT MAX(sequence) AS sequence FROM orchestration_events WHERE stream_id=${threadId}`;
+        yield* sql`INSERT INTO thread_execution_fences(thread_id,relay_url,environment_id,project_id,generation,operation_id,phase,frozen_sequence)
+          VALUES (${threadId},'https://relay.invalid','environment','project',${scenario === "new-generation" ? 2 : 1},${operationId},'frozen',${head!.sequence})`;
+        if (scenario !== "unenrolled")
+          yield* sql`INSERT INTO thread_local_enrollments(thread_id,operation_id,project_id,relay_url,environment_id,canonical_key,actor_user_id,phase)
+            VALUES (${threadId},${NodeCrypto.randomUUID()},'project','https://relay.invalid','environment','github:test/repo','owner','active')`;
+        const exports = nativeCheckpointExports,
+          starts = nativeCheckpointAdapter.startSession.mock.calls.length;
+        const result = yield* Effect.result(
+          provider.checkpointConversation!({
+            threadId,
+            turnId: scenario === "wrong-turn" ? TurnId.make("unsettled-turn") : turnId,
+            captureOperationId: operationId,
+          }),
+        );
+        assert.equal(result._tag, scenario === "ordinary" ? "Success" : "Failure");
+        assert.equal(nativeCheckpointAdapter.startSession.mock.calls.length, starts);
+        assert.equal(nativeCheckpointExports, exports + (scenario === "ordinary" ? 1 : 0));
+        if (scenario === "ordinary") {
+          const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+          assert.equal(binding.status, "stopped");
+          assert.deepEqual(binding.resumeCursor, {
+            threadId: nativeIdForCheckpoint,
+            resumePolicy: "require-existing",
+          });
+          const [point] = yield* sql<{
+            id: string;
+            sequence: number;
+          }>`SELECT native_thread_id AS id,source_sequence AS sequence FROM thread_native_checkpoints WHERE thread_id=${threadId}`;
+          assert.equal(point?.id, nativeIdForCheckpoint);
+          assert.equal(point?.sequence, head!.sequence);
+          yield* provider.checkpointConversation!({
+            threadId,
+            turnId,
+            captureOperationId: operationId,
+          });
+          assert.equal(nativeCheckpointExports, exports + 1);
+        }
+      }),
+    );
+  }
+
+  for (const scenario of [
+    "unchanged",
+    "newer-work",
+    "changed-rollout",
+    "changed-runtime",
+    "wrong-turn",
+  ] as const) {
+    it.effect(
+      scenario === "unchanged"
+        ? "an imported thread can freeze again before its first destination turn without reopening Codex"
+        : `rejects an imported frozen checkpoint with ${scenario}`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const provider = yield* ProviderService.ProviderService,
+              sql = yield* SqlClient.SqlClient,
+              config = yield* ServerConfig.ServerConfig,
+              fs = yield* FileSystem.FileSystem,
+              path = yield* Path.Path,
+              directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+            const threadId = asThreadId(`imported-native-frozen-facade-${scenario}`);
+            yield* checkpointHistoryFixture(threadId);
+            const root = yield* fs.makeTempDirectoryScoped({ prefix: "imported-native-facade-" }),
+              home = path.join(root, "source"),
+              rollout = path.join(
+                home,
+                "sessions",
+                "2026",
+                "10",
+                "01",
+                `rollout-2026-10-01T12-00-00-${nativeIdForCheckpoint}.jsonl`,
+              );
+            yield* fs.makeDirectory(path.dirname(rollout), { recursive: true });
+            yield* fs.writeFileString(
+              rollout,
+              `{"type":"session_meta","payload":{"id":"${nativeIdForCheckpoint}","cli_version":"0.159.3","history_mode":"paginated"}}\n{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"remember imported native history"}]}}\n`,
+            );
+            const archive = yield* exportCodexConversation({
+              codexHome: home,
+              rolloutPath: rollout,
+              threadId: nativeIdForCheckpoint,
+              artifactRoot: path.join(root, "artifacts"),
+            });
+            const importOperationId = NodeCrypto.randomUUID(),
+              operationId = NodeCrypto.randomUUID(),
+              turnId = TurnId.make("actual-source-settled-turn");
+            const installed = yield* installPortableCodexHome({
+              stateDir: config.stateDir,
+              threadId,
+              operationId: importOperationId,
+              providerInstanceId: "codex",
+              transferSha256: "a".repeat(64),
+              manifest: archive.manifest,
+              rolloutPath: path.join(archive.directory, "rollout.jsonl"),
+              codexVersion: "0.159.3",
+            });
+            yield* directory.upsert({
+              threadId,
+              provider: CODEX_DRIVER,
+              providerInstanceId: codexInstanceId,
+              adapterKey: "codex",
+              runtimeMode: "full-access",
+              status: "stopped",
+              resumeCursor: installed.resumeCursor,
+              runtimePayload: null,
+            });
+            const [head] = yield* sql<{
+              sequence: number;
+            }>`SELECT MAX(sequence) AS sequence FROM orchestration_events WHERE aggregate_kind='thread' AND stream_id=${threadId}`;
+            const at = "2026-10-07T10:00:00.000Z";
+            yield* sql`INSERT OR IGNORE INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES ('project','Project',${root},'[]',${at},${at})`;
+            yield* sql`INSERT INTO projection_threads(thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at) VALUES (${threadId},'project','Imported thread','{"provider":"codex","model":"gpt-5","instanceId":"codex"}','full-access','default',${at},${at})`;
+            yield* sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,completed_at,checkpoint_files_json) VALUES (${threadId},${turnId},'completed',${at},${at},'[]')`;
+            const nativeJson = yield* encodeImportedRuntime({
+              providerInstanceId: "codex",
+              ...installed.resumeCursor,
+            });
+            if (scenario === "newer-work") {
+              yield* (yield* OrchestrationEventStore).append(
+                decodeCheckpointEvent({
+                  type: "thread.message-sent",
+                  sequence: 0,
+                  eventId: `${threadId}-new-assistant`,
+                  aggregateKind: "thread",
+                  aggregateId: threadId,
+                  occurredAt: at,
+                  commandId: null,
+                  causationEventId: null,
+                  correlationId: null,
+                  metadata: {},
+                  payload: {
+                    threadId,
+                    messageId: `${threadId}-assistant`,
+                    role: "assistant",
+                    text: "new destination work",
+                    attachments: [],
+                    streaming: false,
+                    createdAt: at,
+                    updatedAt: at,
+                  },
+                }),
+              );
+            }
+            const [freezeHead] = yield* sql<{
+              sequence: number;
+            }>`SELECT MAX(sequence) AS sequence FROM orchestration_events WHERE aggregate_kind='thread' AND stream_id=${threadId}`;
+            yield* sql`INSERT INTO thread_execution_fences(thread_id,relay_url,environment_id,project_id,generation,operation_id,phase,frozen_sequence) VALUES (${threadId},'https://relay.invalid','destination','project',2,${operationId},'frozen',${freezeHead!.sequence})`;
+            yield* sql`INSERT INTO thread_transfer_baselines(operation_id,thread_id,generation,manifest_sha256,history_sha256,receipts_sha256,source_environment_id,source_sequence,destination_sequence,native_runtime_json) VALUES (${importOperationId},${threadId},2,${"a".repeat(64)},${"b".repeat(64)},${"c".repeat(64)},'source',2,${head!.sequence},${nativeJson})`;
+            const starts = nativeCheckpointAdapter.startSession.mock.calls.length,
+              exports = nativeCheckpointExports;
+            yield* fs.remove(home, { recursive: true });
+            if (scenario === "changed-rollout") {
+              const installedRollout = path.join(
+                installed.homePath,
+                "sessions",
+                "2026",
+                "10",
+                "01",
+                archive.manifest.rolloutName,
+              );
+              yield* fs.writeFileString(
+                installedRollout,
+                '{"type":"event_msg","payload":{"type":"task_started"}}\n',
+                { flag: "a" },
+              );
+            }
+            if (scenario === "changed-runtime")
+              yield* directory.upsert({
+                threadId,
+                provider: CODEX_DRIVER,
+                providerInstanceId: codexInstanceId,
+                runtimePayload: { activeTurnId: "new-work" },
+              });
+            if (scenario !== "unchanged") {
+              const error = yield* Effect.flip(
+                provider.checkpointConversation!({
+                  threadId,
+                  turnId: scenario === "wrong-turn" ? TurnId.make("not-the-settled-turn") : turnId,
+                  captureOperationId: operationId,
+                }),
+              );
+              assert.equal(error._tag, "ProviderAdapterProcessError");
+              assert.equal(nativeCheckpointAdapter.startSession.mock.calls.length, starts);
+              assert.equal(nativeCheckpointExports, exports);
+              assert.equal(
+                (yield* sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${threadId}`)
+                  .length,
+                0,
+              );
+              return;
+            }
+            yield* provider.checkpointConversation!({
+              threadId,
+              turnId,
+              captureOperationId: operationId,
+            });
+            yield* provider.checkpointConversation!({
+              threadId,
+              turnId,
+              captureOperationId: operationId,
+            });
+            assert.equal(nativeCheckpointAdapter.startSession.mock.calls.length, starts);
+            assert.equal(nativeCheckpointExports, exports);
+            assert.equal(
+              Option.getOrThrow(yield* directory.getBinding(threadId)).status,
+              "stopped",
+            );
+            const [point] = yield* sql<{
+              generation: number;
+              turnId: string;
+              directory: string;
+            }>`SELECT generation,turn_id AS "turnId",directory FROM thread_native_checkpoints WHERE thread_id=${threadId}`;
+            assert.equal(point?.generation, 2);
+            assert.equal(point?.turnId, turnId);
+            assert(
+              (yield* fs.readFileString(path.join(point!.directory, "rollout.jsonl"))).includes(
+                "remember imported native history",
+              ),
+            );
+            assert.equal(yield* fs.exists(path.join(point!.directory, "auth.json")), false);
+          }),
+        ),
+    );
+  }
+
+  it.effect("ordinary threads keep their active provider without a recovery archive", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("ordinary-native-checkpoint");
+      const exportsBefore = nativeCheckpointExports;
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: "full-access",
+        cwd: fixtureCwd("native-ordinary"),
+      });
+      yield* provider.checkpointConversation!({ threadId, turnId: TurnId.make("ordinary-turn") });
+      assert.equal(nativeCheckpointExports, exportsBefore);
+      assert.equal(yield* nativeCheckpointAdapter.adapter.hasSession(threadId), true);
+    }),
+  );
+  it.effect("an attachment failure retains native state and retries without reopening Codex", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService,
+        sql = yield* SqlClient.SqlClient,
+        directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("native-checkpoint-attachment-retry");
+      const history = yield* checkpointHistoryFixture(threadId);
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: "full-access",
+        cwd: fixtureCwd("native-attachment-retry"),
+        resumeCursor: { threadId: nativeIdForCheckpoint },
+      });
+      yield* sql`INSERT INTO thread_execution_fences (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+        VALUES (${threadId}, 'https://relay.invalid', 'environment', 'project', 1, 'enroll', 'active')`;
+      NodeFS.unlinkSync(history.file);
+      const input = { threadId, turnId: TurnId.make("attachment-retry-turn") };
+      const exportsBefore = nativeCheckpointExports;
+      const starts = nativeCheckpointAdapter.startSession.mock.calls.length;
+      const error = yield* Effect.flip(provider.checkpointConversation!(input));
+      assert.equal(error._tag, "ProviderAdapterProcessError");
+      assert.equal(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "stopped");
+      assert.equal(
+        (yield* sql`SELECT directory FROM thread_native_checkpoints WHERE thread_id=${threadId}`)
+          .length,
+        1,
+      );
+      assert.equal(
+        (yield* sql`SELECT directory FROM thread_attachment_checkpoints WHERE thread_id=${threadId}`)
+          .length,
+        0,
+      );
+      NodeFS.writeFileSync(history.file, "notes");
+      yield* provider.checkpointConversation!(input);
+      assert.equal(nativeCheckpointExports, exportsBefore + 1);
+      assert.equal(nativeCheckpointAdapter.startSession.mock.calls.length, starts);
+      const [saved] = yield* sql<{
+        directory: string;
+        published: string | null;
+      }>`SELECT directory, published_artifact_id AS published
+        FROM thread_attachment_checkpoints WHERE thread_id=${threadId}`;
+      assert(saved);
+      assert.equal(saved.published, null);
+      assert.equal(
+        NodeFS.readFileSync(
+          NodePath.join(saved.directory, attachmentRelativePath(history.attachment)!),
+          "utf8",
+        ),
+        "notes",
+      );
+    }),
+  );
+  it.effect(
+    "portable capture retains strict resume and a stopped binding, and retries without reopening",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService,
+          sql = yield* SqlClient.SqlClient;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const threadId = asThreadId("native-checkpoint-facade");
+        yield* checkpointHistoryFixture(threadId);
+        yield* provider.startSession(threadId, {
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          cwd: fixtureCwd("native-portable"),
+          resumeCursor: { threadId: nativeIdForCheckpoint },
+        });
+        yield* sql`INSERT INTO thread_execution_fences (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+      VALUES (${threadId}, 'https://relay.invalid', 'environment', 'project', 1, 'enroll', 'active')`;
+        const input = { threadId, turnId: TurnId.make("settled-native-turn") };
+        const exportsBefore = nativeCheckpointExports;
+        yield* provider.checkpointConversation!(input);
+        const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        assert.equal(binding.status, "stopped");
+        assert.deepEqual(binding.resumeCursor, {
+          threadId: nativeIdForCheckpoint,
+          resumePolicy: "require-existing",
+        });
+        yield* provider.checkpointConversation!(input);
+        assert.equal(nativeCheckpointExports, exportsBefore + 1);
+        const [point] = yield* sql<{
+          publishedArtifactId: string | null;
+        }>`SELECT published_artifact_id AS "publishedArtifactId" FROM thread_native_checkpoints WHERE thread_id = ${threadId}`;
+        assert.equal(point?.publishedArtifactId, null);
+      }),
+  );
+  it.effect(
+    "a final frozen checkpoint retains later chat state without reopening the stopped provider",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService,
+          sql = yield* SqlClient.SqlClient,
+          events = yield* OrchestrationEventStore,
+          directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const threadId = asThreadId("frozen-native-facade");
+        const history = yield* checkpointHistoryFixture(threadId);
+        yield* provider.startSession(threadId, {
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          cwd: fixtureCwd("frozen-native"),
+          resumeCursor: { threadId: nativeIdForCheckpoint },
+        });
+        yield* sql`INSERT INTO thread_execution_fences(thread_id,relay_url,environment_id,project_id,generation,operation_id,phase)
+        VALUES (${threadId},'https://relay.invalid','environment','project',1,'enroll','active')`;
+        const turnId = TurnId.make("last-settled-turn");
+        yield* provider.checkpointConversation!({ threadId, turnId });
+        const exports = nativeCheckpointExports,
+          starts = nativeCheckpointAdapter.startSession.mock.calls.length;
+        const attachment = {
+          ...history.attachment,
+          id: `${threadId}-00000000-0000-4000-8000-000000000002-txt`,
+        };
+        const config = yield* ServerConfig.ServerConfig;
+        const file = NodePath.join(config.attachmentsDir, attachmentRelativePath(attachment)!);
+        NodeFS.writeFileSync(file, "later");
+        const at = "2026-10-05T10:00:00.000Z";
+        const event = yield* events.append(
+          decodeCheckpointEvent({
+            type: "thread.message-sent",
+            sequence: 0,
+            eventId: `${threadId}-later`,
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            occurredAt: at,
+            commandId: null,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            payload: {
+              threadId,
+              messageId: "later",
+              role: "user",
+              text: "later",
+              attachments: [attachment],
+              streaming: false,
+              createdAt: at,
+              updatedAt: at,
+            },
+          }),
+        );
+        const captureOperationId = NodeCrypto.randomUUID();
+        yield* sql`UPDATE thread_execution_fences SET phase='frozen',operation_id=${captureOperationId},frozen_sequence=${event.sequence}
+        WHERE thread_id=${threadId}`;
+        NodeFS.unlinkSync(file);
+        yield* Effect.flip(
+          provider.checkpointConversation!({ threadId, turnId, captureOperationId }),
+        );
+        NodeFS.writeFileSync(file, "later");
+        yield* provider.checkpointConversation!({ threadId, turnId, captureOperationId });
+        yield* provider.checkpointConversation!({ threadId, turnId, captureOperationId });
+        assert.equal(nativeCheckpointExports, exports);
+        assert.equal(nativeCheckpointAdapter.startSession.mock.calls.length, starts);
+        assert.equal(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "stopped");
+        const points = yield* sql<{
+          turnId: string;
+          capture: string | null;
+          sequence: number;
+        }>`SELECT turn_id AS "turnId",
+        capture_operation_id AS capture,source_sequence AS sequence FROM thread_native_checkpoints WHERE thread_id=${threadId}`;
+        assert.equal(points.length, 2);
+        assert(points.every((point) => point.turnId === turnId));
+        assert.equal(
+          points.find((point) => point.capture === captureOperationId)?.sequence,
+          event.sequence,
+        );
+        const [chat] = yield* sql<{
+          directory: string;
+        }>`SELECT directory FROM thread_attachment_checkpoints
+        WHERE thread_id=${threadId} AND checkpoint_id=${`frozen:${captureOperationId}`}`;
+        assert(chat);
+        assert.equal(
+          NodeFS.readFileSync(
+            NodePath.join(chat.directory, attachmentRelativePath(attachment)!),
+            "utf8",
+          ),
+          "later",
+        );
+      }),
+  );
+});
+
+const stoppedOriginal = makeFakeCodexAdapter(CODEX_DRIVER),
+  stoppedReplacement = makeFakeCodexAdapter(CODEX_DRIVER);
+const stoppedInstance = ProviderInstanceId.make("codex-stopped-output");
+let replaceDuringStop = false;
+const stoppedRegistry = makeStaticInstanceRegistry([[stoppedInstance, stoppedOriginal.adapter]]);
+const stoppedDrain = vi.fn(
+    (_threadId: ThreadId): Effect.Effect<void, ProviderAdapterValidationError> => Effect.void,
+  ),
+  replacementDrain = vi.fn((_threadId: ThreadId) => Effect.void);
+const outputDrainLayer = makeProviderServiceLayer({
+  registry: {
+    ...stoppedRegistry,
+    getByInstance: () =>
+      Effect.succeed(
+        replaceDuringStop
+          ? { ...stoppedReplacement.adapter, drainRuntimeEvents: replacementDrain }
+          : { ...stoppedOriginal.adapter, drainRuntimeEvents: stoppedDrain },
+      ),
+  },
+});
+outputDrainLayer.layer("stopped output uses its original adapter", (it) => {
+  it.effect("retains the output drain failure when recovery cannot flush", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("stopped-output-failure");
+      replaceDuringStop = false;
+      stoppedDrain.mockClear();
+      const failure = new ProviderAdapterValidationError({
+        provider: CODEX_DRIVER,
+        operation: "test.adapter.drain",
+        issue: "The original event has not been persisted.",
+      });
+      stoppedDrain.mockImplementationOnce(() => Effect.fail(failure));
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: stoppedInstance,
+        runtimeMode: "full-access",
+      });
+      const error = yield* provider.flushRuntimeEvents!(threadId).pipe(Effect.flip);
+      assert.equal(
+        error._tag === "ProviderValidationError" ? error.operation : null,
+        "ProviderService.flushRuntimeEvents",
+      );
+      assert.equal(error.cause, failure);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+  it.effect("waits for the original stream and does not drain a replacement after Stop", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService,
+        directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("stopped-output-replacement");
+      replaceDuringStop = false;
+      stoppedDrain.mockClear();
+      replacementDrain.mockClear();
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: stoppedInstance,
+        runtimeMode: "full-access",
+      });
+      const entered = yield* Deferred.make<void>(),
+        finished = yield* Deferred.make<void>();
+      stoppedOriginal.stopSession.mockImplementationOnce(() =>
+        Effect.sync(() => {
+          replaceDuringStop = true;
+        }),
+      );
+      stoppedDrain.mockImplementationOnce(() =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finished))),
+      );
+      const stopping = yield* provider
+        .stopSession({ threadId })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(entered);
+      assert.notEqual(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "stopped");
+      assert.equal(replacementDrain.mock.calls.length, 0);
+      yield* Deferred.succeed(finished, undefined);
+      yield* Fiber.join(stopping);
+      const stopped = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(stopped.status, "stopped");
+      assert.deepEqual(
+        stopped.runtimePayload &&
+          typeof stopped.runtimePayload === "object" &&
+          "stoppedRuntimeEventsDrained" in stopped.runtimePayload
+          ? stopped.runtimePayload.stoppedRuntimeEventsDrained
+          : null,
+        true,
+      );
+      const ingestion = yield* Stream.runForEach(provider.streamIngestionEvents!, (event) =>
+        event instanceof ProviderEventBarrier
+          ? Deferred.succeed(event.done, undefined)
+          : Effect.void,
+      ).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* provider.flushRuntimeEvents!(threadId);
+      assert.equal(stoppedDrain.mock.calls.length, 1);
+      assert.equal(replacementDrain.mock.calls.length, 0);
+      yield* Fiber.interrupt(ingestion);
+    }),
+  );
+});
+
+const idleHarnessAdapter = makeFakeCodexAdapter(CODEX_DRIVER);
+let idleHarnessSignals = 0;
+const idleHarnessRegistry = makeStaticInstanceRegistry([
+  [
+    ProviderInstanceId.make("codex"),
+    {
+      ...idleHarnessAdapter.adapter,
+      stopIdleVmSession: (_threadId, _operationId, admit) =>
+        admit(
+          Effect.sync(() => {
+            idleHarnessSignals++;
+            return { admitted: true };
+          }),
+        ).pipe(
+          Effect.map((result) => result.admitted),
+          Effect.orDie,
+        ),
+    },
+  ],
+]);
+const idleHarnessFacade = makeProviderServiceLayer({
+  vmWorkloads: true,
+  registry: idleHarnessRegistry,
+});
+idleHarnessFacade.layer("owned idle provider admission", (it) => {
+  it.effect("requires the exact draining owner before admitting any native signal", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService,
+        sql = yield* SqlClient.SqlClient;
+      const threadId = asThreadId("owned-idle-provider-admission");
+      yield* provider.startSession(threadId, {
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: "full-access",
+        cwd: fixtureCwd("idle-provider-admission"),
+      });
+      yield* sql`INSERT INTO thread_execution_fences(thread_id,relay_url,environment_id,project_id,generation,operation_id,phase)
+      VALUES(${threadId},'https://relay.invalid','environment','project',4,'pause-current','draining')`;
+      const exact = {
+        threadId,
+        environmentId: "environment",
+        generation: 4,
+        operationId: "pause-current",
+      };
+      const before = idleHarnessSignals;
+      for (const input of [
+        { ...exact, generation: 3 },
+        { ...exact, environmentId: "other" },
+        { ...exact, operationId: "old-pause" },
+      ]) {
+        assert.equal(yield* provider.stopIdleVmSession!(input), false);
+        assert.equal(idleHarnessSignals, before);
+        assert.equal(yield* idleHarnessAdapter.adapter.hasSession(threadId), true);
+      }
+      for (const phase of ["active", "frozen", "retired"]) {
+        yield* sql`UPDATE thread_execution_fences SET phase=${phase} WHERE thread_id=${threadId}`;
+        assert.equal(yield* provider.stopIdleVmSession!(exact), false);
+        assert.equal(idleHarnessSignals, before);
+      }
+      yield* sql`UPDATE thread_execution_fences SET phase='draining' WHERE thread_id=${threadId}`;
+      assert.equal(yield* provider.stopIdleVmSession!(exact), true);
+      assert.equal(idleHarnessSignals, before + 1);
+      assert.equal(yield* idleHarnessAdapter.adapter.hasSession(threadId), false);
+    }),
   );
 });

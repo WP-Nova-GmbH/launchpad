@@ -2,6 +2,8 @@ import {
   CommandId,
   ORCHESTRATION_WS_METHODS,
   type ClientOrchestrationCommand,
+  type OrchestrationGetCommandReceiptInput,
+  type OrchestrationGetCommandReceiptResult,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -15,6 +17,8 @@ import {
   currentSession,
   request,
 } from "../rpc/client.ts";
+
+import { ThreadCommandRouting, type RelayCommandSubmission } from "./commandRouting.ts";
 
 type CommandType = ClientOrchestrationCommand["type"];
 type CommandOf<T extends CommandType> = Extract<ClientOrchestrationCommand, { readonly type: T }>;
@@ -51,6 +55,10 @@ export type UnlinkThreadPullRequestInput = CommandInput<"thread.pull-request.unl
 export type SetThreadRuntimeModeInput = CommandInput<"thread.runtime-mode.set">;
 export type SetThreadInteractionModeInput = CommandInput<"thread.interaction-mode.set">;
 export type StartThreadTurnInput = CommandInput<"thread.turn.start">;
+export type EnqueueThreadMoveInput = CommandInput<"thread.move.enqueue">;
+export type EditThreadMoveInput = CommandInput<"thread.move.edit">;
+export type CancelThreadMoveInput = CommandInput<"thread.move.cancel">;
+export type ReorderThreadQueueInput = CommandInput<"thread.queue.reorder">;
 export type EnqueueThreadPromptInput = CommandInput<"thread.prompt.enqueue">;
 export type EditThreadPromptInput = CommandInput<"thread.prompt.edit">;
 export type RemoveThreadPromptInput = CommandInput<"thread.prompt.remove">;
@@ -68,9 +76,13 @@ export type RevertThreadCheckpointInput = CommandInput<"thread.checkpoint.revert
 };
 export type StopThreadSessionInput = CommandInput<"thread.session.stop">;
 
+export type CommandSubmission =
+  | EnvironmentRpcSuccess<typeof ORCHESTRATION_WS_METHODS.dispatchCommand>
+  | RelayCommandSubmission;
+
 type DispatchTag = typeof ORCHESTRATION_WS_METHODS.dispatchCommand;
 type CommandEffect = Effect.Effect<
-  EnvironmentRpcSuccess<DispatchTag>,
+  CommandSubmission,
   EnvironmentRpcFailure<DispatchTag> | EnvironmentRpcUnavailableError,
   Crypto.Crypto | EnvironmentSupervisor
 >;
@@ -98,9 +110,17 @@ function timestampedCommandMetadata(input: {
   });
 }
 
-function dispatch(command: ClientOrchestrationCommand) {
-  return request(ORCHESTRATION_WS_METHODS.dispatchCommand, command);
-}
+const dispatch = Effect.fn("EnvironmentCommands.dispatch")(function* (
+  command: ClientOrchestrationCommand,
+) {
+  const routing = yield* ThreadCommandRouting;
+  if ("threadId" in command && routing) {
+    const supervisor = yield* EnvironmentSupervisor;
+    if (routing.isPortable(command.threadId, supervisor.target.environmentId))
+      return yield* routing.dispatch(command, supervisor.target.environmentId);
+  }
+  return yield* request(ORCHESTRATION_WS_METHODS.dispatchCommand, command);
+});
 
 export const createProject: (input: CreateProjectInput) => CommandEffect = Effect.fn(
   "EnvironmentCommands.createProject",
@@ -321,8 +341,11 @@ export const startThreadTurn: (input: StartThreadTurnInput) => CommandEffect = E
   "EnvironmentCommands.startThreadTurn",
 )(function* (input) {
   const metadata = yield* timestampedCommandMetadata(input);
-  const session = yield* currentSession();
+  const routing = yield* ThreadCommandRouting;
   const supervisor = yield* EnvironmentSupervisor;
+  if (routing?.isPortable(input.threadId, supervisor.target.environmentId))
+    return yield* dispatch({ ...input, type: "thread.prompt.enqueue", ...metadata });
+  const session = yield* currentSession();
   const config = yield* session.initialConfig.pipe(
     Effect.mapError(
       () =>
@@ -471,3 +494,61 @@ export const stopThreadSession: (input: StopThreadSessionInput) => CommandEffect
     createdAt: metadata.createdAt,
   });
 });
+
+export const enqueueThreadMove: (input: EnqueueThreadMoveInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.enqueueThreadMove",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.move.enqueue", ...metadata });
+});
+
+export const editThreadMove: (input: EditThreadMoveInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.editThreadMove",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.move.edit", ...metadata });
+});
+
+export const cancelThreadMove: (input: CancelThreadMoveInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.cancelThreadMove",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.move.cancel", ...metadata });
+});
+
+export const reorderThreadQueue: (input: ReorderThreadQueueInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.reorderThreadQueue",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({ ...input, type: "thread.queue.reorder", ...metadata });
+});
+
+/** Receipt reads follow portable ownership without opening an environment connection. */
+export const getThreadCommandReceipt = Effect.fn("EnvironmentCommands.getThreadCommandReceipt")(
+  function* (input: typeof OrchestrationGetCommandReceiptInput.Type) {
+    const routing = yield* ThreadCommandRouting;
+    const supervisor = yield* EnvironmentSupervisor;
+    if (routing?.isPortable(input.threadId, supervisor.target.environmentId)) {
+      const receipt = yield* routing.receipt(
+        input.threadId,
+        input.commandId,
+        supervisor.target.environmentId,
+      );
+      return receipt ? { relay: receipt } : { status: "unknown" as const };
+    }
+    return yield* request(ORCHESTRATION_WS_METHODS.getCommandReceipt, input);
+  },
+);
+
+/** Durable relay admission transfers ownership of a saved prompt before environment execution. */
+export function threadCommandAcceptance(
+  receipt: typeof OrchestrationGetCommandReceiptResult.Type | RelayCommandSubmission,
+  expectedCommandId?: CommandId,
+): typeof OrchestrationGetCommandReceiptResult.Type {
+  if (!("relay" in receipt)) return receipt;
+  if (expectedCommandId !== undefined && receipt.relay.commandId !== expectedCommandId)
+    return { status: "unknown" };
+  return receipt.relay.receipt?.status === "rejected"
+    ? receipt.relay.receipt
+    : { status: "accepted" };
+}

@@ -205,7 +205,7 @@ export class EnvironmentConnector extends Context.Service<
       readonly instruction: string;
     }) => Effect.Effect<EnvironmentDispatchJobResult, EnvironmentConnectorError>;
   }
->()("t3code-relay/environments/EnvironmentConnector") {}
+>()("launchpad-relay/environments/EnvironmentConnector") {}
 
 const decodeMintResponseProof = Schema.decodeUnknownEffect(
   RelayEnvironmentMintResponseProofPayload,
@@ -253,52 +253,6 @@ const currentTraceId = Effect.currentSpan.pipe(
 const withoutRedirects = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }));
 
-const LOCAL_MACHINE_ENDPOINT_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
-
-function normalizeEndpointHostname(hostname: string): string {
-  return hostname.toLowerCase().replace(/^\[(.*)\]$/u, "$1");
-}
-
-function isAllowedLocalMachineEndpoint(
-  endpoint: EnvironmentLinks.RelayLinkedEnvironmentRecord["endpoint"],
-): boolean {
-  try {
-    const http = new URL(endpoint.httpBaseUrl);
-    const ws = new URL(endpoint.wsBaseUrl);
-    const httpHostname = normalizeEndpointHostname(http.hostname);
-    const wsHostname = normalizeEndpointHostname(ws.hostname);
-    const httpPort = Number(http.port);
-    const wsPort = Number(ws.port);
-    const noCredentials =
-      http.username.length === 0 &&
-      http.password.length === 0 &&
-      ws.username.length === 0 &&
-      ws.password.length === 0;
-    const noSuffix =
-      (http.pathname === "" || http.pathname === "/") &&
-      (ws.pathname === "" || ws.pathname === "/" || ws.pathname === "/ws") &&
-      http.search.length === 0 &&
-      http.hash.length === 0 &&
-      ws.search.length === 0 &&
-      ws.hash.length === 0;
-    return (
-      endpoint.providerKind === "manual" &&
-      http.protocol === "http:" &&
-      ws.protocol === "ws:" &&
-      LOCAL_MACHINE_ENDPOINT_HOSTNAMES.has(httpHostname) &&
-      httpHostname === wsHostname &&
-      Number.isInteger(httpPort) &&
-      httpPort > 0 &&
-      httpPort <= 65_535 &&
-      httpPort === wsPort &&
-      noCredentials &&
-      noSuffix
-    );
-  } catch {
-    return false;
-  }
-}
-
 const verifyWithEnvironmentKeys = Effect.fnUntraced(function* <A, E>(input: {
   readonly token: string;
   readonly typ: string;
@@ -322,7 +276,7 @@ const verifyWithEnvironmentKeys = Effect.fnUntraced(function* <A, E>(input: {
   return null;
 });
 
-function verifyEnvironmentResponse(input: {
+export function verifyEnvironmentResponse(input: {
   readonly response: RelayEnvironmentMintResponse;
   readonly environmentId: string;
   readonly requestNonce: string;
@@ -386,7 +340,7 @@ function verifyEnvironmentDispatchJobResponse(input: {
   );
 }
 
-function verifyEnvironmentHealthResponse(input: {
+export function verifyEnvironmentHealthResponse(input: {
   readonly response: RelayEnvironmentHealthResponse;
   readonly environmentId: string;
   readonly requestNonce: string;
@@ -535,17 +489,6 @@ const make = Effect.gen(function* () {
       readonly link: EnvironmentAccess;
       readonly allocation: ManagedEndpointAllocations.ManagedEndpointAllocation | null;
     }) {
-      if (
-        settings.allowLocalMachineEndpoints === true &&
-        input.link.source === "machine" &&
-        isAllowedLocalMachineEndpoint(input.link.endpoint)
-      ) {
-        yield* Effect.annotateCurrentSpan({
-          "relay.authorization.endpoint_provider_kind": input.link.endpoint.providerKind,
-          "relay.authorization.local_machine_endpoint": true,
-        });
-        return input.link.endpoint;
-      }
       if (input.link.endpoint.providerKind !== "cloudflare_tunnel") {
         yield* Effect.annotateCurrentSpan({
           "relay.authorization.endpoint_provider_kind": input.link.endpoint.providerKind,

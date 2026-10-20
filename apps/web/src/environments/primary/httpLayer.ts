@@ -37,7 +37,7 @@ export function makePrimaryEnvironmentHttpLayer() {
       if (isSameOriginBrowserPrimary()) {
         return Layer.merge(
           baseLayer,
-          Layer.succeed(FetchHttpClient.RequestInit, { credentials: "include" }),
+          Layer.succeed(FetchHttpClient.RequestInit, { credentials: "same-origin" }),
         );
       }
 

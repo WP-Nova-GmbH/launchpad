@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { threadCommandAcceptance } from "@t3tools/client-runtime/operations";
 import type {
   EnvironmentProject,
   EnvironmentThreadShell,
@@ -829,7 +830,9 @@ export function useThreadOutboxDrain(): void {
       }
       const { reportFailure } = makeDeliveryHelpers(queuedMessage);
 
-      const sharedQueue = serverConfig.environment.capabilities.sharedPromptQueue === true;
+      const sharedQueue =
+        serverConfig.environment.capabilities.sharedPromptQueue === true ||
+        thread.promptQueueSummary !== undefined;
       if (!sharedQueue && !modelSelectionsEqual(settings.modelSelection, thread.modelSelection)) {
         const updateResult = await updateThreadMetadata({
           environmentId: queuedMessage.environmentId,
@@ -1271,7 +1274,8 @@ export function useThreadOutboxDrain(): void {
       // instead of removing it.
       const serverConfig = serverConfigs.get(nextQueuedMessage.environmentId);
       const needsAcceptanceCheck =
-        serverConfig?.environment.capabilities.sharedPromptQueue === true &&
+        (serverConfig?.environment.capabilities.sharedPromptQueue === true ||
+          thread?.promptQueueSummary !== undefined) &&
         nextQueuedMessage.submissionProtocol !== "unattempted" &&
         (nextQueuedMessage.submissionProtocol !== "shared" ||
           nextQueuedMessage.transportAttempted === true);
@@ -1366,7 +1370,9 @@ export function useThreadOutboxDrain(): void {
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[nextQueuedMessage.messageId]) {
           return true;
         }
-        const sharedQueue = serverConfig?.environment.capabilities.sharedPromptQueue === true;
+        const sharedQueue =
+          serverConfig?.environment.capabilities.sharedPromptQueue === true ||
+          thread?.promptQueueSummary !== undefined;
         const protocol = nextQueuedMessage.submissionProtocol;
         if (needsAcceptanceCheck || (protocol === "shared" && deliveryAction === "remove")) {
           const receiptRevision = threadOutboxRevision(nextQueuedMessage.messageId);
@@ -1388,13 +1394,14 @@ export function useThreadOutboxDrain(): void {
               );
             return false;
           }
-          if (receipt.value.status === "accepted") {
+          const acceptance = threadCommandAcceptance(receipt.value, nextQueuedMessage.commandId);
+          if (acceptance.status === "accepted") {
             return completeQueuedMessageReceipt(nextQueuedMessage, receiptRevision);
           }
-          if (receipt.value.status === "rejected") {
+          if (acceptance.status === "rejected") {
             return restoreQueuedMessage(
               nextQueuedMessage,
-              receipt.value.detail ?? "The server rejected this prompt. Your draft is preserved.",
+              acceptance.detail ?? "The server rejected this prompt. Your draft is preserved.",
             );
           }
           // A missing receipt is not proof of nonacceptance: history may have

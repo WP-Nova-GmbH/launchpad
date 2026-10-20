@@ -1,4 +1,7 @@
-import { RepositoryPolicyControl } from "../tenancy/RepositoryPolicies.ts";
+import {
+  RepositoryPolicyControl,
+  RepositoryPolicyControlError,
+} from "../tenancy/RepositoryPolicies.ts";
 import * as NodeCrypto from "node:crypto";
 import * as NodeCryptoLayer from "@effect/platform-node/NodeCrypto";
 
@@ -205,12 +208,11 @@ function connectorTestLayer(
     request: HttpClientRequest.HttpClientRequest,
   ) => Effect.Effect<HttpClientResponse.HttpClientResponse>,
   options?: {
-    readonly policySync?: () => Effect.Effect<void, Error>;
+    readonly policySync?: () => Effect.Effect<void, RepositoryPolicyControlError>;
     readonly links?: EnvironmentLinks.EnvironmentLinks["Service"];
     readonly allocations?: ManagedEndpointAllocations.ManagedEndpointAllocations["Service"];
     readonly machine?: Machines.MachineRecord | null;
     readonly membershipOrganizationId?: string | null;
-    readonly allowLocalMachineEndpoints?: boolean;
     readonly identities?: ReadonlyMap<string, RelayUserIdentity>;
   },
 ) {
@@ -286,14 +288,7 @@ function connectorTestLayer(
         }),
       ),
     ),
-    Layer.provide(
-      RelayConfiguration.layer({
-        ...settings,
-        ...(options?.allowLocalMachineEndpoints === undefined
-          ? {}
-          : { allowLocalMachineEndpoints: options.allowLocalMachineEndpoints }),
-      }),
-    ),
+    Layer.provide(RelayConfiguration.layer(settings)),
     Layer.provide(Layer.succeed(HttpClient.HttpClient, HttpClient.make(execute))),
   );
 }
@@ -490,16 +485,12 @@ describe("EnvironmentConnector", () => {
     );
   });
 
-  it.effect("checks a relay-provisioned Docker machine through its local endpoint in dev", () => {
+  it.effect("rejects a retired Docker machine loopback endpoint before sending a request", () => {
     const seenUrls: Array<string> = [];
     const execute = (request: HttpClientRequest.HttpClientRequest) =>
       Effect.sync(() => {
-        const healthRequest = decodeHealthRequestBody(requestBodyText(request));
         seenUrls.push(request.url);
-        return HttpClientResponse.fromWeb(
-          request,
-          Response.json(signHealthResponse(healthRequest), { status: 200 }),
-        );
+        throw new Error("unexpected request");
       });
     const machine: Machines.MachineRecord = {
       machineId: "machine-local",
@@ -522,21 +513,20 @@ describe("EnvironmentConnector", () => {
 
     return Effect.gen(function* () {
       const connector = yield* EnvironmentConnector.EnvironmentConnector;
-      const result = yield* connector.status({
-        userId: "user_member",
-        environmentId: "env-connector-test",
-      });
-
-      expect(seenUrls).toEqual(["http://127.0.0.1:23000/api/t3-connect/health"]);
-      expect(result).toMatchObject({
-        environmentId: "env-connector-test",
-        endpoint: {
-          httpBaseUrl: "http://127.0.0.1:23000",
-          wsBaseUrl: "ws://127.0.0.1:23000",
-          providerKind: "manual",
-        },
-        status: "online",
-      });
+      const result = yield* Effect.result(
+        connector.status({
+          userId: "user_member",
+          environmentId: "env-connector-test",
+        }),
+      );
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toMatchObject({
+          operation: "status",
+          reason: "endpoint_provider_not_managed",
+        });
+      }
+      expect(seenUrls).toEqual([]);
     }).pipe(
       Effect.provide(
         connectorTestLayer(execute, {
@@ -547,7 +537,6 @@ describe("EnvironmentConnector", () => {
           allocations: makeAllocations(null),
           machine,
           membershipOrganizationId: "organization-1",
-          allowLocalMachineEndpoints: true,
         }),
       ),
     );
@@ -606,7 +595,6 @@ describe("EnvironmentConnector", () => {
           allocations: makeAllocations(null),
           machine,
           membershipOrganizationId: "organization-1",
-          allowLocalMachineEndpoints: true,
         }),
       ),
     );
@@ -1456,7 +1444,11 @@ describe("EnvironmentConnector.resolveAccess", () => {
           machine: enrolledMachine,
           membershipOrganizationId: "organization-1",
           policySync: () =>
-            Effect.fail(new Error("Old server does not support repository policy.")),
+            Effect.fail(
+              new RepositoryPolicyControlError({
+                message: "Old server does not support repository policy.",
+              }),
+            ),
         }),
       ),
     ),

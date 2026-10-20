@@ -1,3 +1,4 @@
+import * as CheckoutAccess from "../../workspace/CheckoutAccess.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -65,6 +66,7 @@ import {
 } from "../../provider/Services/ProviderService.ts";
 import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
 import { ProviderValidationError } from "../../provider/Errors.ts";
+import { ProviderAdapterProcessError } from "../../provider/Errors.ts";
 import { ServerConfig } from "../../config.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as WorkspacePaths from "../../workspace/WorkspacePaths.ts";
@@ -298,6 +300,7 @@ describe("CheckpointReactor", () => {
     ) => VcsProcessTimeoutError | VcsProcessSpawnError | undefined;
     readonly workspaceRefresh?: (cwd: string) => Effect.Effect<void>;
     readonly hasSession?: boolean;
+    readonly nativeCheckpoint?: NonNullable<ProviderServiceShape["checkpointConversation"]>;
     readonly seedFilesystemCheckpoints?: boolean;
     readonly initializeGit?: boolean;
     readonly projectWorkspaceRoot?: string;
@@ -374,7 +377,14 @@ describe("CheckpointReactor", () => {
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(RuntimeReceiptBusTest),
-      Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
+      Layer.provideMerge(
+        Layer.succeed(ProviderService, {
+          ...provider.service,
+          ...(options?.nativeCheckpoint
+            ? { checkpointConversation: options.nativeCheckpoint }
+            : {}),
+        }),
+      ),
       Layer.provideMerge(Layer.mock(PullRequestService)({ refreshAfterTurn })),
       Layer.provideMerge(vcsStatusBroadcasterLayer),
       Layer.provideMerge(
@@ -399,6 +409,7 @@ describe("CheckpointReactor", () => {
       ),
       Layer.provideMerge(WorkspacePaths.layer),
       Layer.provideMerge(VcsProcess.layerLocal),
+      Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
       Layer.provide(OrganizationSourceControlCredentials.layerNone),
       Layer.provideMerge(ServerConfigLayer),
       Layer.provideMerge(NodeServices.layer),
@@ -581,6 +592,79 @@ describe("CheckpointReactor", () => {
         expect(thread.promptQueue?.finalizedTurnId).toBe(turnId);
         expect(thread.promptQueue?.enabled).toBe(state === "completed");
         if (state === "failed") expect(thread.promptQueue?.pauseReason?.code).toBe("usage-limit");
+      }),
+  );
+
+  effectIt.effect(
+    "native checkpoint failure pauses the queue after a completed provider turn",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            initializeGit: false,
+            seedFilesystemCheckpoints: false,
+            hasSession: false,
+            nativeCheckpoint: () =>
+              Effect.fail(
+                new ProviderAdapterProcessError({
+                  provider: "codex",
+                  threadId: "thread-1",
+                  detail: "native checkpoint unavailable",
+                }),
+              ),
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const createdAt = "2026-01-01T00:00:00.000Z";
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.enqueue",
+          commandId: CommandId.make("non-git-enqueue"),
+          threadId,
+          message: { messageId: MessageId.make("non-git-message"), text: "work", attachments: [] },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt,
+        });
+        const attemptId = CommandId.make("non-git-claim");
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.claim",
+          commandId: attemptId,
+          threadId,
+          messageId: MessageId.make("non-git-message"),
+          expectedRevision: 1,
+          expectedControlRevision: 0,
+          createdAt,
+        });
+        const turnId = asTurnId("non-git-turn");
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.admit",
+          commandId: CommandId.make("non-git-admit"),
+          threadId,
+          attemptId,
+          turnId,
+          evidence: "provider-ack",
+          createdAt,
+        });
+        harness.provider.emit({
+          type: "turn.completed",
+          eventId: EventId.make("non-git-completed"),
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          turnId,
+          createdAt,
+          payload: {
+            state: "completed",
+          },
+        });
+        yield* Effect.promise(() => harness.drain());
+        const thread = (yield* Effect.promise(() => harness.readModel())).threads[0]!;
+        expect(thread.promptQueue?.awaitingTurnId).toBe(null);
+        expect(thread.promptQueue?.finalizedTurnId).toBe(turnId);
+        expect(thread.promptQueue?.enabled).toBe(false);
+        expect(thread.promptQueue?.pauseReason?.code).toBe("checkpoint-error");
+        expect(
+          thread.activities.some((activity) => activity.kind === "checkpoint.capture.failed"),
+        ).toBe(true);
       }),
   );
 

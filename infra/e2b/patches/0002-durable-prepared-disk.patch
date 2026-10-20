@@ -1,0 +1,2366 @@
+--- a/packages/orchestrator/pkg/sandbox/reboot.go
++++ b/packages/orchestrator/pkg/sandbox/reboot.go
+@@ -20,6 +20,7 @@
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/envdbin"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc/cputemplate"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/filesystemtools"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
+ 	buildenvd "github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/envd"
+@@ -660,7 +661,9 @@
+ 		// envd-less sandbox; instead fail the boot so CreateSandbox tears down and
+ 		// the dirty overlay is discarded. Every other failure left the original in
+ 		// place, so it stays best-effort and boots the original.
+-		unrecoverable := errors.Is(err, rootfs.ErrOfflineSwapUnrecoverable)
++		// A detached checker still holding the device is unsafe even if the
++		// original envd bytes remain intact. Never downgrade that to best effort.
++		unrecoverable := errors.Is(err, rootfs.ErrOfflineSwapUnrecoverable) || errors.Is(err, filesystemtools.ErrQuarantined)
+ 		result := "success"
+ 		switch {
+ 		case err == nil:
+@@ -704,7 +707,7 @@
+ 			)
+ 		case unrecoverable:
+ 			result = "unrecoverable"
+-			runtime.Logger().Error(ctx, "offline envd swap left the rootfs without a usable envd; failing boot to discard the overlay",
++			runtime.Logger().Error(ctx, "offline envd swap left the rootfs unsafe to boot; discarding the overlay",
+ 				zap.String("target", path),
+ 				zap.String("built_with", from),
+ 				zap.Error(err),
+@@ -756,7 +759,7 @@
+ 			metric.WithAttributes(attribute.String("result", result)))
+ 
+ 		if unrecoverable {
+-			return fmt.Errorf("offline envd upgrade left rootfs unbootable: %w", err)
++			return fmt.Errorf("offline envd upgrade left rootfs unsafe to boot: %w", err)
+ 		}
+ 
+ 		// Best-effort: swallow a recoverable failure so the cold boot proceeds on
+--- a/packages/orchestrator/pkg/sandbox/reboot_offline_gate_test.go
++++ b/packages/orchestrator/pkg/sandbox/reboot_offline_gate_test.go
+@@ -18,6 +18,7 @@
+ 
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/envdbin"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/filesystemtools"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
+@@ -356,6 +357,7 @@
+ 		{name: "stat unreadable", err: rootfs.ErrStatUnparseable},
+ 		{name: "source retired mid-swap", err: rootfs.ErrSwapSourceMissing},
+ 		{name: "host fault", err: errors.New("debugfs exited 1")},
++		{name: "detached tool stop uncertain", err: filesystemtools.ErrQuarantined, wantErr: true},
+ 		{
+ 			// The original was not restored, so the rootfs may have no usable envd.
+ 			name: "unrecoverable", err: rootfs.ErrOfflineSwapUnrecoverable, wantErr: true,
+@@ -381,7 +383,7 @@
+ 			err := preBoot(t.Context(), filepath.Join(dir, "rootfs.ext4"))
+ 			require.Equal(t, 1, swap.calls)
+ 			if tc.wantErr {
+-				require.ErrorIs(t, err, rootfs.ErrOfflineSwapUnrecoverable,
++				require.ErrorIs(t, err, tc.err,
+ 					"an unbootable rootfs must fail the boot so the overlay is discarded")
+ 
+ 				return
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/filesystemtools/guard_linux.go
+@@ -0,0 +1,240 @@
++//go:build linux
++
++// Package filesystemtools reserves NBD devices across the lifetime of detached
++// systemd filesystem tools, including a crash of their orchestrator client.
++package filesystemtools
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"time"
++
++	"github.com/google/uuid"
++)
++
++const Directory = "/run/e2b-filesystem-tools"
++
++var ErrQuarantined = errors.New("filesystem tool device remains quarantined until host reconciliation")
++
++var deviceName = regexp.MustCompile(`^nbd[0-9]+$`)
++var unitName = regexp.MustCompile(`^e2b-fs-tool-[0-9a-f-]{36}\.service$`)
++var legacyUnitName = regexp.MustCompile(`^(fs-check-[0-9a-f-]{36}|envd-swap-[a-z0-9-]+-nbd[0-9]+)\.service$`)
++
++type command func(context.Context, string, ...string) ([]byte, error)
++
++type Guard struct {
++	directory  string
++	cgroupRoot string
++	command    command
++}
++
++func Host() Guard { return newGuard(Directory, "/sys/fs/cgroup", runCommand) }
++
++func newGuard(directory, cgroupRoot string, command command) Guard {
++	return Guard{directory: directory, cgroupRoot: cgroupRoot, command: command}
++}
++
++func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
++	cmd := exec.CommandContext(ctx, name, args...)
++	cmd.WaitDelay = 5 * time.Second
++	return cmd.Output()
++}
++
++type Lease struct {
++	Unit  string
++	guard Guard
++	path  string
++}
++
++// Begin is called before systemd-run. An empty directory is also a reservation:
++// death between mkdir and creation of the unit marker must not expose the slot.
++func (g Guard) Begin(device string) (*Lease, error) {
++	name := strings.TrimPrefix(device, "/dev/")
++	if device != "/dev/"+name || !deviceName.MatchString(name) {
++		return nil, errors.New("invalid filesystem tool device")
++	}
++	if err := os.MkdirAll(g.directory, 0o700); err != nil {
++		return nil, err
++	}
++	path := filepath.Join(g.directory, name)
++	if err := os.Mkdir(path, 0o700); err != nil {
++		return nil, errors.Join(ErrQuarantined, fmt.Errorf("reserve filesystem tool device: %w", err))
++	}
++	unit := "e2b-fs-tool-" + uuid.NewString() + ".service"
++	if err := os.WriteFile(filepath.Join(path, unit), nil, 0o600); err != nil {
++		// Keep the reservation if local storage itself is uncertain.
++		return nil, err
++	}
++	return &Lease{Unit: unit, guard: g, path: path}, nil
++}
++
++// Reserved is deliberately only a filesystem lookup on the allocation path.
++// The marker outlives the controller, but a host reboot kills all tools and
++// clears /run together. Never clear markers merely because their creator died.
++func Reserved(directory, device string) (bool, error) {
++	if directory == "" {
++		directory = Directory
++	}
++	if !deviceName.MatchString(device) {
++		return false, errors.New("invalid filesystem tool device")
++	}
++	_, err := os.Lstat(filepath.Join(directory, device))
++	if errors.Is(err, os.ErrNotExist) {
++		return false, nil
++	}
++	return err == nil, err
++}
++
++// Finish only releases a successful, fully waited launcher. A failed launcher
++// may have submitted a delayed start; even a momentary absent unit is not proof
++// that that request cannot still run. Such slots remain unavailable until the
++// next exclusive host startup. Callers must propagate this error before boot.
++func (l *Lease) Finish(ctx context.Context, completed bool) error {
++	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
++	defer cancel()
++	err := errors.Join(l.revoke(), l.guard.stop(stopCtx, l.Unit))
++	if !completed || err != nil {
++		return errors.Join(ErrQuarantined, err)
++	}
++	return l.remove()
++}
++
++// StartCondition prevents a delayed systemd start from opening a recycled device
++// after reconciliation has revoked this exact invocation. systemd evaluates the
++// host path before starting the jailed process; it is never mounted into the jail.
++func (l *Lease) StartCondition() string {
++	return "--property=ConditionPathExists=" + filepath.Join(l.path, l.Unit)
++}
++
++func (l *Lease) revoke() error {
++	path := filepath.Join(l.path, l.Unit)
++	if err := os.Rename(path, path+".revoked"); err != nil {
++		if errors.Is(err, os.ErrNotExist) {
++			if _, statErr := os.Stat(path + ".revoked"); statErr == nil {
++				return nil
++			}
++		}
++		return err
++	}
++	return nil
++}
++
++func (l *Lease) remove() error {
++	if err := os.Remove(filepath.Join(l.path, l.Unit+".revoked")); err != nil {
++		return err
++	}
++	return os.Remove(l.path)
++}
++
++// Reconcile runs before any startup NBD reclaim/allocation, with the previous
++// controller stopped (the node already requires a single orchestrator). Also
++// stop pre-upgrade tools which did not leave a marker. Uncertain cleanup prevents
++// startup; continuing with a fresh pool would lose the in-memory reservations.
++func (g Guard) Reconcile(ctx context.Context) error {
++	out, err := g.command(ctx, "systemctl", "list-units", "--all", "--no-legend", "--plain", "--no-pager", "--type=service", "e2b-fs-tool-*.service", "fs-check-*.service", "envd-swap-*.service")
++	if err != nil {
++		return errors.New("cannot enumerate filesystem tool units")
++	}
++	for line := range strings.SplitSeq(string(out), "\n") {
++		fields := strings.Fields(line)
++		if len(fields) == 0 {
++			continue
++		}
++		unit := fields[0]
++		if !unitName.MatchString(unit) && !legacyUnitName.MatchString(unit) {
++			return errors.New("unexpected filesystem tool unit")
++		}
++		if err := g.stop(ctx, unit); err != nil {
++			return err
++		}
++	}
++	entries, err := os.ReadDir(g.directory)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	for _, entry := range entries {
++		if !entry.IsDir() || !deviceName.MatchString(entry.Name()) {
++			return errors.New("invalid filesystem tool reservation")
++		}
++		path := filepath.Join(g.directory, entry.Name())
++		markers, err := os.ReadDir(path)
++		if err != nil {
++			return err
++		}
++		for _, marker := range markers {
++			unit := strings.TrimSuffix(marker.Name(), ".revoked")
++			if !marker.Type().IsRegular() || !unitName.MatchString(unit) {
++				return errors.New("invalid filesystem tool marker")
++			}
++			lease := &Lease{Unit: unit, guard: g, path: path}
++			if err := lease.revoke(); err != nil {
++				return err
++			}
++			if err := g.stop(ctx, unit); err != nil {
++				return err
++			}
++			if err := os.Remove(filepath.Join(path, unit+".revoked")); err != nil {
++				return err
++			}
++		}
++		if err := os.Remove(path); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (g Guard) stop(ctx context.Context, unit string) error {
++	// The stop request may report 'not loaded' for a collected unit. Only the
++	// structured state below can turn that into a confirmed absence.
++	_, _ = g.command(ctx, "systemctl", "stop", "--quiet", unit)
++	out, showErr := g.command(ctx, "systemctl", "show", "--property=LoadState,ActiveState,MainPID,ControlPID,ControlGroup,Job", unit)
++	fields := map[string]string{}
++	for line := range strings.SplitSeq(string(out), "\n") {
++		k, v, ok := strings.Cut(line, "=")
++		if ok {
++			fields[k] = v
++		}
++	}
++	if fields["LoadState"] != "not-found" && (showErr != nil || fields["LoadState"] != "loaded") {
++		return errors.New("cannot confirm filesystem tool unit state")
++	}
++	if (fields["ActiveState"] != "inactive" && fields["ActiveState"] != "failed") || fields["MainPID"] != "0" || fields["ControlPID"] != "0" {
++		return errors.New("filesystem tool is still running")
++	}
++	if job, ok := fields["Job"]; !ok || job != "" {
++		return errors.New("filesystem tool job remains pending")
++	}
++	cgroup, ok := fields["ControlGroup"]
++	if !ok {
++		return errors.New("filesystem tool cgroup is unknown")
++	}
++	if cgroup == "" {
++		return nil
++	}
++	if !strings.HasPrefix(cgroup, "/") || filepath.Clean(cgroup) != cgroup || cgroup == "/" {
++		return errors.New("invalid filesystem tool cgroup")
++	}
++	events, err := os.ReadFile(filepath.Join(g.cgroupRoot, strings.TrimPrefix(cgroup, "/"), "cgroup.events"))
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		return errors.New("cannot confirm filesystem tool cgroup is empty")
++	}
++	for line := range strings.SplitSeq(string(events), "\n") {
++		if line == "populated 0" {
++			return nil
++		}
++	}
++	return errors.New("filesystem tool cgroup remains populated")
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/filesystemtools/guard_linux_test.go
+@@ -0,0 +1,147 @@
++//go:build linux
++
++package filesystemtools
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++const absentUnit = "LoadState=not-found\nActiveState=inactive\nMainPID=0\nControlPID=0\nControlGroup=\nJob=\n"
++
++func testGuard(t *testing.T, state string) Guard {
++	t.Helper()
++	return newGuard(t.TempDir(), t.TempDir(), func(_ context.Context, _ string, args ...string) ([]byte, error) {
++		switch args[0] {
++		case "show":
++			return []byte(state), nil
++		case "list-units":
++			return nil, nil
++		default:
++			return nil, errors.New("unit not loaded")
++		}
++	})
++}
++
++func TestSuccessfulToolReleasesOnlyAfterConfirmedStop(t *testing.T) {
++	t.Parallel()
++	g := testGuard(t, absentUnit)
++	lease, err := g.Begin("/dev/nbd2")
++	require.NoError(t, err)
++	_, err = g.Begin("/dev/nbd2")
++	require.Error(t, err, "a second tool must not overlap the first")
++	require.NoError(t, lease.Finish(t.Context(), true))
++	reserved, err := Reserved(g.directory, "nbd2")
++	require.NoError(t, err)
++	require.False(t, reserved)
++}
++
++func TestUncertainLauncherKeepsDeviceUntilRestartReconciliation(t *testing.T) {
++	t.Parallel()
++	g := testGuard(t, absentUnit)
++	lease, err := g.Begin("/dev/nbd2")
++	require.NoError(t, err)
++	require.ErrorIs(t, lease.Finish(t.Context(), false), ErrQuarantined)
++	reserved, err := Reserved(g.directory, "nbd2")
++	require.NoError(t, err)
++	require.True(t, reserved, "an absent unit alone cannot exclude a delayed start")
++	require.NoError(t, g.Reconcile(t.Context()))
++	reserved, err = Reserved(g.directory, "nbd2")
++	require.NoError(t, err)
++	require.False(t, reserved)
++}
++
++func TestUnconfirmedStopsRetainReservation(t *testing.T) {
++	t.Parallel()
++	for _, state := range []string{
++		"", strings.Replace(absentUnit, "MainPID=0", "MainPID=42", 1),
++		strings.Replace(absentUnit, "ControlPID=0", "ControlPID=42", 1),
++		strings.Replace(absentUnit, "Job=", "Job=17", 1),
++		strings.Replace(absentUnit, "ActiveState=inactive", "ActiveState=deactivating", 1),
++		strings.Replace(absentUnit, "ControlGroup=\n", "", 1),
++	} {
++		t.Run(state, func(t *testing.T) {
++			g := testGuard(t, state)
++			lease, err := g.Begin("/dev/nbd2")
++			require.NoError(t, err)
++			require.ErrorIs(t, lease.Finish(t.Context(), true), ErrQuarantined)
++			require.Error(t, g.Reconcile(t.Context()))
++			reserved, err := Reserved(g.directory, "nbd2")
++			require.NoError(t, err)
++			require.True(t, reserved)
++		})
++	}
++}
++
++func TestPopulatedCgroupPreventsReuseEvenWithZeroMainPID(t *testing.T) {
++	t.Parallel()
++	g := testGuard(t, strings.Replace(absentUnit, "ControlGroup=", "ControlGroup=/system.slice/test.service", 1))
++	group := filepath.Join(g.cgroupRoot, "system.slice/test.service")
++	require.NoError(t, os.MkdirAll(group, 0o700))
++	events := filepath.Join(group, "cgroup.events")
++	require.NoError(t, os.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0o600))
++	lease, err := g.Begin("/dev/nbd2")
++	require.NoError(t, err)
++	require.ErrorIs(t, lease.Finish(t.Context(), true), ErrQuarantined)
++	require.Error(t, g.Reconcile(t.Context()))
++	require.NoError(t, os.WriteFile(events, []byte("populated 0\nfrozen 0\n"), 0o600))
++	require.NoError(t, g.Reconcile(t.Context()))
++}
++
++func TestStartupEnumerationFailureDoesNotClearMarkers(t *testing.T) {
++	t.Parallel()
++	g := testGuard(t, absentUnit)
++	_, err := g.Begin("/dev/nbd2")
++	require.NoError(t, err)
++	g.command = func(context.Context, string, ...string) ([]byte, error) {
++		return nil, errors.New("systemd unavailable")
++	}
++	require.Error(t, g.Reconcile(t.Context()))
++	reserved, err := Reserved(g.directory, "nbd2")
++	require.NoError(t, err)
++	require.True(t, reserved)
++}
++
++func TestRestartStopsUnmarkedLegacyUnitsBeforeDeviceRelease(t *testing.T) {
++	t.Parallel()
++	g := testGuard(t, absentUnit)
++	unit := "envd-swap-bootstrap-write-nbd2.service"
++	stopped := false
++	g.command = func(_ context.Context, _ string, args ...string) ([]byte, error) {
++		switch args[0] {
++		case "list-units":
++			return []byte(unit + " loaded active running\n"), nil
++		case "stop":
++			stopped = args[len(args)-1] == unit
++			return nil, nil
++		default:
++			require.True(t, stopped)
++			return []byte(absentUnit), nil
++		}
++	}
++	require.NoError(t, g.Reconcile(t.Context()))
++	require.True(t, stopped)
++}
++
++func TestInterruptedRegistrationAndMalformedMarkerFailSafe(t *testing.T) {
++	t.Parallel()
++	g := testGuard(t, absentUnit)
++	path := filepath.Join(g.directory, "nbd2")
++	require.NoError(t, os.Mkdir(path, 0o700))
++	reserved, err := Reserved(g.directory, "nbd2")
++	require.NoError(t, err)
++	require.True(t, reserved)
++	require.NoError(t, g.Reconcile(t.Context()))
++	require.NoError(t, os.Mkdir(path, 0o700))
++	require.NoError(t, os.WriteFile(filepath.Join(path, "unexpected"), nil, 0o600))
++	require.Error(t, g.Reconcile(t.Context()))
++	reserved, err = Reserved(g.directory, "nbd2")
++	require.NoError(t, err)
++	require.True(t, reserved)
++}
+--- a/packages/orchestrator/pkg/sandbox/nbd/pool.go
++++ b/packages/orchestrator/pkg/sandbox/nbd/pool.go
+@@ -12,6 +12,8 @@
+ 	"strings"
+ 	"sync"
+ 	"time"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/filesystemtools"
+ 
+ 	"github.com/bits-and-blooms/bitset"
+ 	"go.opentelemetry.io/otel"
+@@ -87,7 +89,8 @@
+ 
+ 	// sysBlockDir is where device state is read from; the /sys/block default
+ 	// is overridden only by tests.
+-	sysBlockDir string
++	sysBlockDir        string
++	filesystemToolsDir string
+ }
+ 
+ func NewDevicePool(maxSlotsReady int) (*DevicePool, error) {
+@@ -220,6 +223,13 @@
+ // https://superuser.com/questions/919895/how-to-get-a-list-of-connected-nbd-devices-on-ubuntu
+ // https://github.com/NetworkBlockDevice/nbd/blob/17043b068f4323078637314258158aebbfff0a6c/nbd-client.c#L254
+ func (d *DevicePool) isDeviceFree(slot DeviceSlot) (bool, error) {
++	reserved, err := filesystemtools.Reserved(d.filesystemToolsDir, fmt.Sprintf("nbd%d", slot))
++	if err != nil {
++		return false, err
++	}
++	if reserved {
++		return false, nil
++	}
+ 	connected, err := isDeviceConnectedIn(d.sysBlockDir, slot)
+ 	if err != nil {
+ 		return false, err
+@@ -333,6 +343,13 @@
+ }
+ 
+ func (d *DevicePool) release(ctx context.Context, idx DeviceSlot) error {
++	reserved, err := filesystemtools.Reserved(d.filesystemToolsDir, fmt.Sprintf("nbd%d", idx))
++	if err != nil {
++		return errors.Join(filesystemtools.ErrQuarantined, err)
++	}
++	if reserved {
++		return filesystemtools.ErrQuarantined
++	}
+ 	free, err := d.isDeviceFree(idx)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to check if device is free: %w", err)
+@@ -379,6 +396,11 @@
+ 			return nil
+ 		}
+ 
++		// An uncertain detached tool quarantines the slot until startup.
++		// Retain its bit, but let callers finish teardown without an infinite wait.
++		if errors.Is(err, filesystemtools.ErrQuarantined) {
++			return err
++		}
+ 		if !opt.infiniteRetry {
+ 			return err
+ 		}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/nbd/pool_filesystem_tools_test.go
+@@ -0,0 +1,37 @@
++//go:build linux
++
++package nbd
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/filesystemtools"
++	"github.com/stretchr/testify/require"
++)
++
++func TestFilesystemToolReservationPreventsRecycledDevice(t *testing.T) {
++	t.Parallel()
++	pool := retryingPool()
++	pool.sysBlockDir = t.TempDir()
++	pool.filesystemToolsDir = t.TempDir()
++	for _, name := range []string{"nbd0", "nbd1"} {
++		require.NoError(t, os.Mkdir(filepath.Join(pool.sysBlockDir, name), 0o700))
++		require.NoError(t, os.WriteFile(filepath.Join(pool.sysBlockDir, name, "size"), []byte("0\n"), 0o600))
++	}
++	marker := filepath.Join(pool.filesystemToolsDir, "nbd0")
++	require.NoError(t, os.Mkdir(marker, 0o700))
++	pool.usedSlots.Set(0)
++	require.ErrorIs(t, pool.ReleaseDevice(t.Context(), 0, WithInfiniteRetry()), filesystemtools.ErrQuarantined)
++	require.True(t, pool.usedSlots.Test(0))
++	// A fresh controller has lost that bitset. The durable reservation still wins.
++	pool.usedSlots.Clear(0)
++	slot, err := pool.getFreeDeviceSlot()
++	require.NoError(t, err)
++	require.Equal(t, DeviceSlot(1), *slot)
++	require.NoError(t, os.Remove(marker))
++	slot, err = pool.getFreeDeviceSlot()
++	require.NoError(t, err)
++	require.Equal(t, DeviceSlot(0), *slot)
++}
+--- a/packages/orchestrator/pkg/sandbox/rootfs/fs_recover_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/fs_recover_linux.go
+@@ -15,7 +15,7 @@
+ 	"strconv"
+ 	"time"
+ 
+-	"github.com/google/uuid"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/filesystemtools"
+ )
+ 
+ // e2fsckPath is the absolute path used both for the jailed replay and the support
+@@ -256,6 +256,9 @@
+ // because journal replay cannot tell an unmountable filesystem apart from a
+ // transient fault (see ErrRecoveryFailed).
+ func classifyE2fsckResult(runErr error, rcOut []byte, timedOut bool, journal journalState) (RecoverOutcome, RecoverReason, error) {
++	if errors.Is(runErr, filesystemtools.ErrQuarantined) {
++		return RecoverOutcomeFailed, RecoverReasonNoSentinel, fmt.Errorf("%w: %w", ErrRecoveryFailed, runErr)
++	}
+ 	rc, ok := e2fsckRC(rcOut)
+ 	if !ok {
+ 		// No result — fail CLOSED by default; only a positively-identified launch
+@@ -426,7 +429,11 @@
+ 		return nil, fmt.Errorf("%w %q", errDeviceRefused, devicePath)
+ 	}
+ 
+-	unit := "fs-check-" + uuid.NewString()
++	lease, err := filesystemtools.Host().Begin(devicePath)
++	if err != nil {
++		return nil, err
++	}
++	unit := lease.Unit
+ 
+ 	// Tool arguments are positional; e2fsck's stdout goes to stderr so only the sentinel reaches
+ 	// stdout. The `1>&2` dup cannot fail, so printf always echoes the wrapped
+@@ -435,7 +442,7 @@
+ 	// jail read-only.
+ 	script := `"$@" 1>&2; printf '__E2FSCK_RC__%d__' "$?"`
+ 	args := append(jailProperties(unit, timeout, devicePath),
+-		"--", "/bin/sh", "-c", script, "e2fsck", e2fsckPath,
++		lease.StartCondition(), "--", "/bin/sh", "-c", script, "e2fsck", e2fsckPath,
+ 	)
+ 	args = append(args, toolArgs...)
+ 	args = append(args, devicePath)
+@@ -449,15 +456,11 @@
+ 	// expiry Go SIGKILLs the client, then WaitDelay forces Wait to return rather
+ 	// than block on the copy goroutines forever.
+ 	cmd.WaitDelay = 10 * time.Second
+-	err := cmd.Run()
+-	// Only err != nil can leave a unit alive server-side (a completed script exits 0
+-	// via the trailing printf, so err == nil means --wait/--collect already reaped
+-	// it). RuntimeMaxSec bounds such a unit anyway; the stop is synchronous so e2fsck
+-	// is confirmed gone before a failed create's NBD slot recycles. Error ignored.
+-	if err != nil {
+-		stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+-		_ = exec.CommandContext(stopCtx, "systemctl", "stop", "--quiet", unit+".service").Run()
+-		stopCancel()
++	err = cmd.Run()
++	if cleanupErr := lease.Finish(ctx, err == nil); cleanupErr != nil {
++		// Do not return a successful sentinel: callers must refuse this disk
++		// while a detached verifier could still be using it.
++		return nil, errors.Join(err, cleanupErr)
+ 	}
+ 
+ 	return rcOut.Bytes(), err
+--- a/packages/orchestrator/pkg/sandbox/rootfs/fs_recover_linux_test.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/fs_recover_linux_test.go
+@@ -7,10 +7,13 @@
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"syscall"
+ 	"testing"
+ 	"time"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/filesystemtools"
+ 
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -290,3 +293,14 @@
+ 		w.Close()
+ 	}
+ }
++
++func TestQuarantinedRecoveryNeverBoots(t *testing.T) {
++	t.Parallel()
++	cmd := exec.Command("sh", "-c", "exit 1")
++	runErr := errors.Join(cmd.Run(), filesystemtools.ErrQuarantined)
++	for _, sentinel := range [][]byte{nil, []byte("__E2FSCK_RC__0__")} {
++		outcome, _, err := classifyE2fsckResult(runErr, sentinel, false, journalClean)
++		require.ErrorIs(t, err, ErrRecoveryFailed)
++		require.Equal(t, RecoverOutcomeFailed, outcome)
++	}
++}
+--- a/packages/orchestrator/pkg/sandbox/rootfs/jail_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/jail_linux.go
+@@ -24,6 +24,8 @@
+ 		"--unit=" + unit,
+ 		fmt.Sprintf("--property=RuntimeMaxSec=%d", int(runtimeMax.Seconds())),
+ 		"--property=KillSignal=SIGKILL",
++		"--property=KillMode=control-group",
++		"--property=ExitType=cgroup",
+ 		"--property=TimeoutStopSec=10s",
+ 		"--property=DynamicUser=yes",
+ 		"--property=SupplementaryGroups=disk",
+--- a/packages/orchestrator/pkg/factories/run.go
++++ b/packages/orchestrator/pkg/factories/run.go
+@@ -49,6 +49,7 @@
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
+ 	blockmetrics "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/metrics"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/filesystemtools"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
+ 	networkv2 "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network/v2"
+@@ -777,6 +778,15 @@
+ 		closers = append(closers, closer{"egress proxy", egressSetup.Close})
+ 	}
+ 
++	// Detached filesystem tools may survive a controller crash, including on
++	// template-only nodes. Always reconcile before any NBD reclaim or pool.
++	toolCtx, toolCancel := context.WithTimeout(ctx, 2*time.Minute)
++	toolErr := filesystemtools.Host().Reconcile(toolCtx)
++	toolCancel()
++	if toolErr != nil {
++		logger.L().Fatal(ctx, "cannot safely reclaim filesystem tool devices", zap.Error(toolErr))
++	}
++
+ 	// Sandbox-runtime reclaim must run before NewStorageLocal below: reclaim
+ 	// deletes leaked ns-* from /run/netns, and NewStorageLocal snapshots the
+ 	// remaining namespaces as foreign at construction.
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/filesystemtools/guard_integration_test.go
+@@ -0,0 +1,105 @@
++//go:build linux && integration
++
++package filesystemtools
++
++import (
++	"bufio"
++	"context"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestFilesystemToolControllerHelper(t *testing.T) {
++	if os.Getenv("E2B_TOOL_CRASH_HELPER") != "1" {
++		t.Skip("subprocess helper")
++	}
++	g := newGuard(os.Getenv("E2B_TOOL_GUARD_DIR"), "/sys/fs/cgroup", runCommand)
++	lease, err := g.Begin("/dev/nbd2047")
++	require.NoError(t, err)
++	cmd := exec.Command("systemd-run", "--wait", "--pipe", "--collect", "--quiet", "--unit="+lease.Unit,
++		"--property=KillMode=control-group", "--property=ExitType=cgroup", "--property=RuntimeMaxSec=120", lease.StartCondition(),
++		"--", "/bin/sh", "-c", `exec 3> "$1"; printf 'READY\n'; exec sleep 120`, "tool", os.Getenv("E2B_TOOL_CANARY"))
++	cmd.Stdout = os.Stdout
++	cmd.Stderr = os.Stderr
++	err = cmd.Run()
++	require.NoError(t, lease.Finish(t.Context(), err == nil))
++	require.NoError(t, err)
++}
++
++// A real systemd service and its open file descriptor must survive the helper's
++// death, remain reserved, and be stopped before the reservation is removed.
++// No VM, tenant disk, or existing orchestrator process is touched.
++func TestFilesystemToolSurvivesControllerDeath(t *testing.T) {
++	if os.Getenv("E2B_OFFLINE_RESTORE_TEST") != "1" {
++		t.Skip("requires dedicated Linux systemd host")
++	}
++	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
++	defer cancel()
++	g := newGuard(t.TempDir(), "/sys/fs/cgroup", runCommand)
++	canary := filepath.Join(t.TempDir(), "held-open")
++	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestFilesystemToolControllerHelper$")
++	cmd.Env = append(os.Environ(), "E2B_TOOL_CRASH_HELPER=1", "E2B_TOOL_GUARD_DIR="+g.directory, "E2B_TOOL_CANARY="+canary)
++	stdout, err := cmd.StdoutPipe()
++	require.NoError(t, err)
++	cmd.Stderr = io.Discard
++	cmd.WaitDelay = time.Second
++	require.NoError(t, cmd.Start())
++	defer func() { _ = cmd.Process.Kill() }()
++	// This is the service's receipt, not a sleep assumed to indicate readiness.
++	line, err := bufio.NewReader(stdout).ReadString('\n')
++	require.NoError(t, err)
++	require.Equal(t, "READY\n", line)
++	markers, err := os.ReadDir(filepath.Join(g.directory, "nbd2047"))
++	require.NoError(t, err)
++	require.Len(t, markers, 1)
++	unit := markers[0].Name()
++	t.Cleanup(func() { _ = g.stop(context.Background(), unit) })
++	require.NoError(t, cmd.Process.Kill())
++	require.Error(t, cmd.Wait())
++	state, err := runCommand(ctx, "systemctl", "show", "--property=ActiveState,MainPID", unit)
++	require.NoError(t, err)
++	require.Contains(t, string(state), "ActiveState=active")
++	require.NotContains(t, string(state), "MainPID=0\n")
++	reserved, err := Reserved(g.directory, "nbd2047")
++	require.NoError(t, err)
++	require.True(t, reserved)
++	// Limit enumeration to this test's captured unit; all stop/state operations
++	// still go through real systemd, without affecting other host workloads.
++	g.command = func(ctx context.Context, name string, args ...string) ([]byte, error) {
++		if args[0] == "list-units" {
++			return []byte(unit + " loaded active running\n"), nil
++		}
++		return runCommand(ctx, name, args...)
++	}
++	require.NoError(t, g.Reconcile(ctx))
++	reserved, err = Reserved(g.directory, "nbd2047")
++	require.NoError(t, err)
++	require.False(t, reserved)
++	state, err = runCommand(ctx, "systemctl", "show", "--property=ActiveState,MainPID,ControlPID", unit)
++	require.NoError(t, err)
++	require.Contains(t, string(state), "ActiveState=inactive")
++	require.Contains(t, string(state), "MainPID=0\n")
++	require.Contains(t, string(state), "ControlPID=0\n")
++	// Replay the old launch after reconciliation. Its revoked condition must
++	// prevent execution even though systemd accepts the transient unit request.
++	late := canary + ".late"
++	oldLease := Lease{Unit: unit, guard: g, path: filepath.Join(g.directory, "nbd2047")}
++	output, err := runCommand(ctx, "systemd-run", "--wait", "--pipe", "--collect", "--quiet", "--unit="+unit,
++		oldLease.StartCondition(), "--", "/usr/bin/touch", late)
++	require.NoError(t, err, "%s", output)
++	_, err = os.Stat(late)
++	require.ErrorIs(t, err, os.ErrNotExist)
++	// A new invocation on the same device gets a distinct condition path.
++	next, err := g.Begin("/dev/nbd2047")
++	require.NoError(t, err)
++	require.NotEqual(t, unit, next.Unit)
++	require.False(t, strings.Contains(next.StartCondition(), unit))
++	require.NoError(t, next.Finish(ctx, true))
++}
+--- a/packages/orchestrator/pkg/sandbox/rootfs/envd_swap_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/envd_swap_linux.go
+@@ -18,6 +18,8 @@
+ 	"strconv"
+ 	"strings"
+ 	"time"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/filesystemtools"
+ 
+ 	"go.opentelemetry.io/otel/attribute"
+ 	"go.opentelemetry.io/otel/trace"
+@@ -731,6 +733,11 @@
+ 		return nil, fmt.Errorf("refusing to run debugfs on unexpected device path %q", devicePath)
+ 	}
+ 
++	// A bind at the host path can inherit inaccessible 0700 ancestors in the
++	// empty root. Use a fixed jail-local mount point without exposing or
++	// relaxing any host parent directory. Scripts contain trusted host paths.
++	const jailStage = "/debugfs-stage"
++	script = strings.ReplaceAll(script, stageDir+string(filepath.Separator), jailStage+"/")
+ 	scriptPath := filepath.Join(stageDir, "cmds-"+phase)
+ 	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+ 		return nil, fmt.Errorf("write debugfs script: %w", err)
+@@ -741,30 +748,34 @@
+ 		return nil, fmt.Errorf("chmod debugfs script: %w", err)
+ 	}
+ 
+-	unit := "envd-swap-" + phase + "-" + filepath.Base(devicePath)
+-
+-	// The staging directory is bind-mounted read-write so `write`/`-f` sources
+-	// and `dump` targets resolve unchanged inside the empty jail root.
+-	args := append(jailProperties(unit, EnvdSwapTimeout, devicePath, stageDir),
+-		"--",
++	lease, err := filesystemtools.Host().Begin(devicePath)
++	if err != nil {
++		return nil, err
++	}
++	unit := lease.Unit
++
++	// Sources and dump targets resolve through the private jail-local bind.
++	args := append(jailProperties(unit, EnvdSwapTimeout, devicePath, stageDir+":"+jailStage),
++		lease.StartCondition(), "--",
+ 		"/usr/sbin/debugfs",
+ 	)
+ 	if writable {
+ 		args = append(args, "-w")
+ 	}
+-	args = append(args, "-f", scriptPath, devicePath)
++	args = append(args, "-f", filepath.Join(jailStage, "cmds-"+phase), devicePath)
+ 
+ 	out := &cappedBuffer{limit: maxSwapOutput}
+ 	cmd := exec.CommandContext(ctx, "systemd-run", args...)
+ 	cmd.Stdout = out
+ 	cmd.Stderr = out
+-	err := cmd.Run()
+-
+-	// Force the transient unit down before returning so debugfs can never outlive
+-	// this call and write concurrently with the boot/export that follows.
+-	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+-	defer stopCancel()
+-	_ = exec.CommandContext(stopCtx, "systemctl", "stop", "--quiet", unit+".service").Run()
++	cmd.WaitDelay = 10 * time.Second
++	err = cmd.Run()
++	if cleanupErr := lease.Finish(ctx, err == nil); cleanupErr != nil {
++		if err != nil {
++			return nil, errors.Join(newDebugfsRunError(phase, err, len(out.Bytes())), cleanupErr)
++		}
++		return nil, cleanupErr
++	}
+ 
+ 	if err != nil {
+ 		return out.Bytes(), newDebugfsRunError(phase, err, len(out.Bytes()))
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux.go
+@@ -0,0 +1,259 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++
++	"github.com/google/uuid"
++	"golang.org/x/sys/unix"
++)
++
++var ErrRestoreActivationStarted = errors.New("restore activation has started")
++
++// RestoreActivation survives lost replies and process restarts independently of
++// the temporary disk. Booting is an irreversible intent: absence from the live
++// registry is not permission to repeat it. Only an explicit, confirmed stop may
++// reconcile a failed activation; it never reuses this execution identity.
++type RestoreActivation struct {
++	Version       int             `json:"version"`
++	RequestSHA256 string          `json:"request_sha256"`
++	State         string          `json:"state"`
++	Response      json.RawMessage `json:"response,omitempty"`
++}
++
++type RestoreActivationLock struct {
++	directory string
++	buildID   uuid.UUID
++	lock      *os.File
++	record    RestoreActivation
++}
++
++func activationPath(directory string, buildID uuid.UUID) string {
++	return filepath.Join(directory, buildID.String()+".activation.json")
++}
++
++func readRestoreActivation(directory string, buildID uuid.UUID) (RestoreActivation, error) {
++	var result RestoreActivation
++	raw, err := os.ReadFile(activationPath(directory, buildID))
++	if err != nil {
++		return result, err
++	}
++	if len(raw) > 1<<20 {
++		return result, ErrPreparedDiskCorrupt
++	}
++	if err := json.Unmarshal(raw, &result); err != nil {
++		return result, ErrPreparedDiskCorrupt
++	}
++	if result.Version != 1 || len(result.RequestSHA256) != 64 {
++		return result, ErrPreparedDiskCorrupt
++	}
++	switch result.State {
++	case "accepted", "booting":
++		if len(result.Response) != 0 {
++			return result, ErrPreparedDiskCorrupt
++		}
++	case "active":
++		if len(result.Response) == 0 {
++			return result, ErrPreparedDiskCorrupt
++		}
++	default:
++		return result, ErrPreparedDiskCorrupt
++	}
++	return result, nil
++}
++
++// LockRestoreActivation checks the exact verified disk before accepting a new
++// immutable boot request. The request is hashed, never stored (it may contain
++// an envd credential). Callers must already own the durable activation intent.
++func LockRestoreActivation(ctx context.Context, directory string, buildID uuid.UUID,
++	manifestSHA string, request []byte,
++) (_ *RestoreActivationLock, err error) {
++	if buildID == uuid.Nil || len(manifestSHA) != 64 || len(request) == 0 {
++		return nil, ErrPreparedDiskConflict
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if err := os.MkdirAll(directory, 0o700); err != nil {
++		return nil, err
++	}
++	file, err := os.OpenFile(filepath.Join(directory, buildID.String()+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
++	if err != nil {
++		return nil, err
++	}
++	h := &RestoreActivationLock{directory: directory, buildID: buildID, lock: file}
++	defer func() {
++		if err != nil {
++			h.Close()
++		}
++	}()
++	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
++		if errors.Is(err, unix.EWOULDBLOCK) {
++			return nil, ErrPreparedDiskBusy
++		}
++		return nil, err
++	}
++	if err := checkPreparedCancellation(directory, buildID); err != nil {
++		return nil, err
++	}
++	digest := sha256.New()
++	digest.Write([]byte(manifestSHA))
++	digest.Write(request)
++	requestSHA := hex.EncodeToString(digest.Sum(nil))
++	record, err := readRestoreActivation(directory, buildID)
++	if err == nil {
++		if record.RequestSHA256 != requestSHA {
++			return nil, ErrPreparedDiskConflict
++		}
++		h.record = record
++		return h, nil
++	}
++	if !errors.Is(err, os.ErrNotExist) {
++		return nil, err
++	}
++	manifest, disk, err := OpenPreparedDisk(ctx, directory, buildID)
++	if err != nil {
++		return nil, err
++	}
++	if err := disk.Close(); err != nil {
++		return nil, err
++	}
++	_, actualSHA, err := PreparedManifest(manifest)
++	if err != nil {
++		return nil, err
++	}
++	if actualSHA != manifestSHA {
++		return nil, ErrPreparedDiskConflict
++	}
++	if manifest.BootstrapSHA256 == "" {
++		return nil, errors.New("verification-only disk cannot be activated")
++	}
++	h.record = RestoreActivation{Version: 1, RequestSHA256: requestSHA, State: "accepted"}
++	if err := h.persist(); err != nil {
++		return nil, err
++	}
++	return h, nil
++}
++
++func (h *RestoreActivationLock) Record() RestoreActivation { return h.record }
++
++func (h *RestoreActivationLock) Close() error {
++	if h.lock == nil {
++		return nil
++	}
++	err := errors.Join(unix.Flock(int(h.lock.Fd()), unix.LOCK_UN), h.lock.Close())
++	h.lock = nil
++	return err
++}
++
++func (h *RestoreActivationLock) persist() error {
++	if h.lock == nil {
++		return ErrPreparedDiskBusy
++	}
++	data, err := json.Marshal(h.record)
++	if err != nil {
++		return err
++	}
++	path := activationPath(h.directory, h.buildID)
++	temporary := path + ".tmp"
++	if err := os.Remove(temporary); err != nil && !errors.Is(err, os.ErrNotExist) {
++		return err
++	}
++	if err := writePreparedFile(temporary, data); err != nil {
++		return err
++	}
++	if err := os.Rename(temporary, path); err != nil {
++		return err
++	}
++	return syncPreparedDirectory(h.directory)
++}
++
++// BeginBoot must run immediately before the only guest-start attempt, after
++// preflight/capacity failures. A crash after this fsync requires inspection, not
++// another invocation of the boot callback.
++func (h *RestoreActivationLock) BeginBoot() error {
++	if h.lock == nil || h.record.State != "accepted" {
++		return ErrRestoreActivationStarted
++	}
++	h.record.State = "booting"
++	return h.persist()
++}
++
++func (h *RestoreActivationLock) Complete(response json.RawMessage) error {
++	if h.lock == nil || h.record.State != "booting" || !json.Valid(response) {
++		return ErrPreparedDiskConflict
++	}
++	h.record.State = "active"
++	h.record.Response = response
++	return h.persist()
++}
++
++// RequireActivatedBuild prevents ordinary Create/resume routes from bypassing
++// prepared activation. Small receipts remain after private disks are released.
++func RequireActivatedBuild(directory string, buildID uuid.UUID) error {
++	if err := checkPreparedCancellation(directory, buildID); err != nil {
++		return err
++	}
++	record, err := readRestoreActivation(directory, buildID)
++	if err == nil {
++		if record.State == "active" {
++			return nil
++		}
++		return ErrRestoreActivationStarted
++	}
++	if !errors.Is(err, os.ErrNotExist) {
++		return err
++	}
++	for _, suffix := range []string{"", ".preparing"} {
++		_, err := os.Stat(filepath.Join(directory, buildID.String()+suffix))
++		if err == nil {
++			return ErrRestoreActivationStarted
++		}
++		if !errors.Is(err, os.ErrNotExist) {
++			return err
++		}
++	}
++	return nil
++}
++
++// ReleaseActivatedDisk drops the redundant verified copy only after its boot
++// receipt is durable. The immutable published build and small activation record
++// remain; their lifetime now belongs to normal sandbox/snapshot storage.
++func ReleaseActivatedDisk(ctx context.Context, directory string, buildID uuid.UUID) error {
++	if buildID == uuid.Nil {
++		return ErrPreparedDiskCorrupt
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	lock, err := os.OpenFile(filepath.Join(directory, buildID.String()+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
++	if err != nil {
++		return err
++	}
++	defer lock.Close()
++	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
++		if errors.Is(err, unix.EWOULDBLOCK) {
++			return ErrPreparedDiskBusy
++		}
++		return err
++	}
++	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
++	record, err := readRestoreActivation(directory, buildID)
++	if err != nil {
++		return err
++	}
++	if record.State != "active" {
++		return ErrRestoreActivationStarted
++	}
++	if err := os.RemoveAll(filepath.Join(directory, buildID.String())); err != nil {
++		return err
++	}
++	return syncPreparedDirectory(directory)
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux_test.go
+@@ -0,0 +1,99 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func activationFixture(t *testing.T, bootstrap []byte) (string, uuid.UUID, string) {
++	t.Helper()
++	directory, source, sourceID, meta, original := preparedDiskFixture(t)
++	id := uuid.New()
++	disk, err := PrepareDisk(t.Context(), directory, id, sourceID, source, meta, int64(len(original)), bootstrap,
++		func(context.Context, block.Device) error { return nil })
++	require.NoError(t, err)
++	_, digest, err := PreparedManifest(disk)
++	require.NoError(t, err)
++	return directory, id, digest
++}
++
++func TestRestoreActivationRecoversLostReplyWithoutSecondBoot(t *testing.T) {
++	t.Parallel()
++	directory, id, digest := activationFixture(t, []byte(`{"version":1,"ticket":"single-use"}`))
++	require.ErrorIs(t, RequireActivatedBuild(directory, id), ErrRestoreActivationStarted)
++	first, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("immutable boot config"))
++	require.NoError(t, err)
++	require.Equal(t, "accepted", first.Record().State)
++	require.NoError(t, first.BeginBoot())
++	require.ErrorIs(t, first.BeginBoot(), ErrRestoreActivationStarted)
++	require.NoError(t, first.Close()) // Simulate losing process/reply immediately after boot intent.
++	retry, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("immutable boot config"))
++	require.NoError(t, err)
++	require.Equal(t, "booting", retry.Record().State)
++	require.ErrorIs(t, retry.BeginBoot(), ErrRestoreActivationStarted)
++	require.NoError(t, retry.Complete(json.RawMessage(`{"ready":true}`)))
++	require.NoError(t, retry.Close())
++	require.NoError(t, RequireActivatedBuild(directory, id))
++	require.NoError(t, ReleaseActivatedDisk(t.Context(), directory, id)) // Storage ownership transferred.
++	require.NoError(t, ReleaseActivatedDisk(t.Context(), directory, id))
++	afterCleanup, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("immutable boot config"))
++	require.NoError(t, err)
++	require.Equal(t, "active", afterCleanup.Record().State)
++	require.JSONEq(t, `{"ready":true}`, string(afterCleanup.Record().Response))
++	require.ErrorIs(t, afterCleanup.BeginBoot(), ErrRestoreActivationStarted)
++	require.NoError(t, afterCleanup.Close())
++	require.NoError(t, RequireActivatedBuild(directory, id))
++}
++
++func TestRestoreActivationBindsRequestAndSerializesCancellation(t *testing.T) {
++	t.Parallel()
++	directory, id, digest := activationFixture(t, []byte(`{"version":1}`))
++	first, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("original config"))
++	require.NoError(t, err)
++	_, err = LockRestoreActivation(t.Context(), directory, id, digest, []byte("original config"))
++	require.ErrorIs(t, err, ErrPreparedDiskBusy)
++	require.ErrorIs(t, CancelPreparedDisk(t.Context(), directory, id), ErrPreparedDiskBusy)
++	require.NoError(t, first.Close())
++	_, err = LockRestoreActivation(t.Context(), directory, id, digest, []byte("changed config"))
++	require.ErrorIs(t, err, ErrPreparedDiskConflict)
++	require.ErrorIs(t, CancelPreparedDisk(t.Context(), directory, id), ErrRestoreActivationStarted)
++	retry, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("original config"))
++	require.NoError(t, err)
++	require.Equal(t, "accepted", retry.Record().State, "preflight failure permits another attempt before boot intent")
++	require.NoError(t, retry.Close())
++}
++
++func TestRestoreActivationRejectsCancelledAndVerificationOnlyDisks(t *testing.T) {
++	t.Parallel()
++	for _, cancelled := range []bool{false, true} {
++		directory, id, digest := activationFixture(t, nil)
++		if cancelled {
++			require.NoError(t, CancelPreparedDisk(t.Context(), directory, id))
++		}
++		_, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("config"))
++		require.Error(t, err)
++		if cancelled {
++			require.ErrorIs(t, err, ErrPreparedDiskCancelled)
++		}
++		_, err = os.Stat(activationPath(directory, id))
++		require.ErrorIs(t, err, os.ErrNotExist)
++	}
++}
++
++func TestRestoreOrdinaryBuildGate(t *testing.T) {
++	t.Parallel()
++	directory := t.TempDir()
++	require.NoError(t, RequireActivatedBuild(directory, uuid.New()))
++	id := uuid.New()
++	require.NoError(t, CancelPreparedDisk(t.Context(), directory, id))
++	require.ErrorIs(t, RequireActivatedBuild(directory, id), ErrPreparedDiskCancelled)
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux.go
+@@ -0,0 +1,370 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++
++	"github.com/google/uuid"
++	"golang.org/x/sys/unix"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++)
++
++var (
++	ErrPreparedDiskCancelled = errors.New("prepared disk was cancelled")
++	ErrPreparedDiskBusy      = errors.New("prepared disk is being written")
++	ErrPreparedDiskConflict  = errors.New("prepared disk belongs to a different preparation")
++	ErrPreparedDiskCorrupt   = errors.New("prepared disk integrity check failed")
++)
++
++// PreparedDisk is a self-contained, verified filesystem; it holds no saved RAM
++// and no reference to source blocks. Its owner must retain it while a running
++// sandbox or snapshot still references BuildID. Publication is not permission to boot.
++type PreparedDisk struct {
++	Version         int               `json:"version"`
++	BuildID         uuid.UUID         `json:"build_id"`
++	SourceBuildID   uuid.UUID         `json:"source_build_id"`
++	RequestSHA256   string            `json:"request_sha256"`
++	BootstrapSHA256 string            `json:"bootstrap_sha256,omitempty"`
++	RootfsSHA256    string            `json:"rootfs_sha256"`
++	Size            int64             `json:"size"`
++	Metadata        metadata.Template `json:"metadata"`
++}
++
++// PrepareDisk verifies a private COW copy, then flattens it into a durable disk.
++// The caller pins the immutable source and reserves up to twice its disk size
++// before calling. verify must release its NBD handle and all writers before it
++// returns. No guest execution, identity revocation or source writes happen here.
++// The API operation owns buildID and must serialize activation/cancellation with
++// publication. Reusing it with a different source/metadata is rejected.
++func PrepareDisk(ctx context.Context, directory string, buildID, sourceBuildID uuid.UUID,
++	source block.ReadonlyDevice, meta metadata.Template, maxDiskBytes int64, bootstrap []byte,
++	verify func(context.Context, block.Device) error,
++) (result PreparedDisk, err error) {
++	if buildID == uuid.Nil || sourceBuildID == uuid.Nil || buildID == sourceBuildID || verify == nil {
++		return result, errors.New("invalid prepared disk identity or verifier")
++	}
++	if err := ctx.Err(); err != nil {
++		return result, err
++	}
++	bootstrapHash := ""
++	if len(bootstrap) > 0 {
++		if err := validateRestoreBootstrap(bootstrap); err != nil {
++			return result, err
++		}
++		digest := sha256.Sum256(bootstrap)
++		bootstrapHash = hex.EncodeToString(digest[:])
++	}
++	size, err := source.Size(ctx)
++	if err != nil {
++		return result, err
++	}
++	if source.BlockSize() != header.RootfsBlockSize || size <= 0 || size%header.RootfsBlockSize != 0 || size > maxDiskBytes {
++		return result, errors.New("prepared disk exceeds its reservation or has invalid geometry")
++	}
++	request, err := json.Marshal(struct {
++		BootstrapSHA256 string
++		Source          uuid.UUID
++		Size            int64
++		Metadata        metadata.Template
++	}{bootstrapHash, sourceBuildID, size, meta})
++	if err != nil {
++		return result, err
++	}
++	digest := sha256.Sum256(request)
++	requestHash := hex.EncodeToString(digest[:])
++	if err := os.MkdirAll(directory, 0o700); err != nil {
++		return result, err
++	}
++	lock, err := os.OpenFile(filepath.Join(directory, buildID.String()+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
++	if err != nil {
++		return result, err
++	}
++	defer lock.Close()
++	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
++		if errors.Is(err, unix.EWOULDBLOCK) {
++			return result, ErrPreparedDiskBusy
++		}
++		return result, err
++	}
++	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
++	if err := checkPreparedCancellation(directory, buildID); err != nil {
++		return result, err
++	}
++	destination := filepath.Join(directory, buildID.String())
++	if _, err := os.Lstat(destination); err == nil {
++		existing, disk, err := OpenPreparedDisk(ctx, directory, buildID)
++		if err != nil {
++			return result, err
++		}
++		defer disk.Close()
++		if existing.RequestSHA256 != requestHash {
++			return result, ErrPreparedDiskConflict
++		}
++		return existing, nil
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return result, err
++	}
++
++	// An interrupted attempt is disposable until its directory is published.
++	staging := destination + ".preparing"
++	if err := os.RemoveAll(staging); err != nil {
++		return result, err
++	}
++	if err := os.Mkdir(staging, 0o700); err != nil {
++		return result, err
++	}
++	defer func() { err = errors.Join(err, os.RemoveAll(staging)) }()
++	cache, err := block.NewCache(size, source.BlockSize(), filepath.Join(staging, "private.cow"), false)
++	if err != nil {
++		return result, err
++	}
++	overlay := block.NewOverlay(source, cache)
++	defer func() {
++		if overlay != nil {
++			err = errors.Join(err, overlay.Close())
++		}
++	}()
++	if err := verify(ctx, overlay); err != nil {
++		return result, err
++	}
++	if err := ctx.Err(); err != nil {
++		return result, err
++	}
++
++	diskPath := filepath.Join(staging, storage.RootfsName)
++	diskHash, err := copyPreparedDisk(ctx, diskPath, overlay, size)
++	if err != nil {
++		return result, err
++	}
++	// Close the private cache before publishing; its path belongs to staging.
++	if err := overlay.Close(); err != nil {
++		return result, err
++	}
++	overlay = nil
++	meta = meta.MarkFilesystemOnly(true).MarkFsQuiesced(true)
++	meta.Template.BuildID = buildID.String()
++	meta.Prefetch = nil
++	result = PreparedDisk{Version: 1, BuildID: buildID, SourceBuildID: sourceBuildID,
++		RequestSHA256: requestHash, BootstrapSHA256: bootstrapHash, RootfsSHA256: diskHash, Size: size, Metadata: meta}
++	manifest, err := json.Marshal(result)
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	if err := writePreparedFile(filepath.Join(staging, "prepared.json"), manifest); err != nil {
++		return PreparedDisk{}, err
++	}
++	if err := syncPreparedDirectory(staging); err != nil {
++		return PreparedDisk{}, err
++	}
++	if err := ctx.Err(); err != nil {
++		return PreparedDisk{}, err
++	}
++	if err := os.Rename(staging, destination); err != nil {
++		return PreparedDisk{}, err
++	}
++	// If this fails, publication is uncertain: retain the destination and let a
++	// retry inspect it. Never remove a possibly committed prepared disk.
++	if err := syncPreparedDirectory(directory); err != nil {
++		return PreparedDisk{}, err
++	}
++	return result, nil
++}
++
++func copyPreparedDisk(ctx context.Context, path string, source block.ReadonlyDevice, size int64) (sum string, err error) {
++	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
++	if err != nil {
++		return "", err
++	}
++	defer func() { err = errors.Join(err, out.Close()) }()
++	hash := sha256.New()
++	buf := make([]byte, 1<<20)
++	for offset := int64(0); offset < size; {
++		if err := ctx.Err(); err != nil {
++			return "", err
++		}
++		chunk := buf[:min(int64(len(buf)), size-offset)]
++		n, err := source.ReadAt(ctx, chunk, offset)
++		if err != nil {
++			return "", err
++		}
++		if n != len(chunk) {
++			return "", io.ErrUnexpectedEOF
++		}
++		if _, err := out.Write(chunk); err != nil {
++			return "", err
++		}
++		_, _ = hash.Write(chunk)
++		offset += int64(n)
++	}
++	if err := out.Sync(); err != nil {
++		return "", err
++	}
++	return hex.EncodeToString(hash.Sum(nil)), nil
++}
++
++// OpenPreparedDisk rechecks all bytes before handing a disk to the activation
++// path. The returned device is read-only; normal sandbox COW owns future writes.
++func OpenPreparedDisk(ctx context.Context, directory string, buildID uuid.UUID) (PreparedDisk, *block.Local, error) {
++	var result PreparedDisk
++	if buildID == uuid.Nil {
++		return result, nil, ErrPreparedDiskCorrupt
++	}
++	if err := checkPreparedCancellation(directory, buildID); err != nil {
++		return result, nil, err
++	}
++	path := filepath.Join(directory, buildID.String())
++	file, err := os.Open(filepath.Join(path, "prepared.json"))
++	if err != nil {
++		return result, nil, err
++	}
++	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
++	decoder.DisallowUnknownFields()
++	decodeErr := decoder.Decode(&result)
++	if decodeErr == nil {
++		var extra any
++		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
++			decodeErr = ErrPreparedDiskCorrupt
++		}
++	}
++	closeErr := file.Close()
++	if err := errors.Join(decodeErr, closeErr); err != nil {
++		return PreparedDisk{}, nil, errors.Join(ErrPreparedDiskCorrupt, err)
++	}
++	if result.Version != 1 || result.BuildID != buildID || result.SourceBuildID == uuid.Nil ||
++		result.Metadata.Template.BuildID != buildID.String() || !result.Metadata.IsFilesystemOnly() ||
++		!result.Metadata.IsFsQuiesced() || result.Size <= 0 || result.Size%header.RootfsBlockSize != 0 {
++		return PreparedDisk{}, nil, ErrPreparedDiskCorrupt
++	}
++	disk, err := block.NewLocal(filepath.Join(path, storage.RootfsName), header.RootfsBlockSize, buildID)
++	if err != nil {
++		return PreparedDisk{}, nil, err
++	}
++	fail := func(err error) (PreparedDisk, *block.Local, error) {
++		return PreparedDisk{}, nil, errors.Join(err, disk.Close())
++	}
++	size, err := disk.Size(ctx)
++	if err != nil {
++		return fail(err)
++	}
++	if size != result.Size {
++		return fail(ErrPreparedDiskCorrupt)
++	}
++	hash := sha256.New()
++	buf := make([]byte, 1<<20)
++	for offset := int64(0); offset < size; {
++		if err := ctx.Err(); err != nil {
++			return fail(err)
++		}
++		chunk := buf[:min(int64(len(buf)), size-offset)]
++		n, err := disk.ReadAt(ctx, chunk, offset)
++		if err != nil {
++			return fail(errors.Join(ErrPreparedDiskCorrupt, err))
++		}
++		if n != len(chunk) {
++			return fail(ErrPreparedDiskCorrupt)
++		}
++		_, _ = hash.Write(chunk)
++		offset += int64(n)
++	}
++	if hex.EncodeToString(hash.Sum(nil)) != result.RootfsSHA256 {
++		return fail(ErrPreparedDiskCorrupt)
++	}
++	return result, disk, nil
++}
++
++func writePreparedFile(path string, contents []byte) (err error) {
++	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
++	if err != nil {
++		return err
++	}
++	defer func() { err = errors.Join(err, file.Close()) }()
++	if _, err := file.Write(contents); err != nil {
++		return err
++	}
++	return file.Sync()
++}
++
++func syncPreparedDirectory(path string) error {
++	dir, err := os.Open(path)
++	if err != nil {
++		return fmt.Errorf("open prepared disk directory: %w", err)
++	}
++	return errors.Join(dir.Sync(), dir.Close())
++}
++
++// CancelPreparedDisk records a durable tombstone before removing private files.
++// The caller must first win cancellation in the durable operation store. A
++// delayed PrepareDisk RPC then cannot recreate a cancelled allocation, even
++// after the orchestrator restarts. Live verifier handles prevent cleanup.
++func CancelPreparedDisk(ctx context.Context, directory string, buildID uuid.UUID) error {
++	if buildID == uuid.Nil {
++		return ErrPreparedDiskCorrupt
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if err := os.MkdirAll(directory, 0o700); err != nil {
++		return err
++	}
++	lock, err := os.OpenFile(filepath.Join(directory, buildID.String()+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
++	if err != nil {
++		return err
++	}
++	defer lock.Close()
++	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
++		if errors.Is(err, unix.EWOULDBLOCK) {
++			return ErrPreparedDiskBusy
++		}
++		return err
++	}
++	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
++	if _, err := readRestoreActivation(directory, buildID); err == nil {
++		return ErrRestoreActivationStarted
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return err
++	}
++	// The marker's presence alone is authoritative. It is never removed. Sync
++	// even an existing marker: the previous caller may have lost power after
++	// creating it and before confirming durability.
++	marker, err := os.OpenFile(filepath.Join(directory, buildID.String()+".cancelled"), os.O_CREATE|os.O_RDWR, 0o600)
++	if err != nil {
++		return err
++	}
++	if err := errors.Join(marker.Sync(), marker.Close()); err != nil {
++		return err
++	}
++	if err := syncPreparedDirectory(directory); err != nil {
++		return err
++	}
++	if err := os.RemoveAll(filepath.Join(directory, buildID.String())); err != nil {
++		return err
++	}
++	if err := os.RemoveAll(filepath.Join(directory, buildID.String()+".preparing")); err != nil {
++		return err
++	}
++	return syncPreparedDirectory(directory)
++}
++
++func checkPreparedCancellation(directory string, buildID uuid.UUID) error {
++	_, err := os.Lstat(filepath.Join(directory, buildID.String()+".cancelled"))
++	if err == nil {
++		return ErrPreparedDiskCancelled
++	}
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	return err
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/restore_bootstrap_linux.go
+@@ -0,0 +1,160 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"os/user"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	RestoreBootstrapPath     = "/launchpad-restore.json"
++	MaxRestoreBootstrapBytes = 16 << 10
++)
++
++var ErrRestoreBootstrap = errors.New("restore bootstrap could not be installed safely")
++var bootstrapOwner = regexp.MustCompile(`(?m)^User:\s*0\s+Group:\s*0\s`)
++var bootstrapLinks = regexp.MustCompile(`(?m)^Links:\s*([0-9]+)\s`)
++var bootstrapStagePath = regexp.MustCompile(`^/[a-zA-Z0-9_./-]+$`)
++
++// WriteRestoreBootstrap installs bounded JSON in the destination's root
++// directory using trusted jailed debugfs, never guest tools or a host kernel
++// mount. Call only on a private offline disk; failure discards that copy. The
++// caller supplies a one-use enrollment ticket, never a reusable management key.
++// Its contents and debugfs output must not be logged or returned in errors.
++func WriteRestoreBootstrap(ctx context.Context, devicePath, stageRoot string, document []byte) error {
++	if err := validateRestoreBootstrap(document); err != nil {
++		return err
++	}
++	if !nbdDevicePath.MatchString(devicePath) || !bootstrapStagePath.MatchString(stageRoot) {
++		return ErrRestoreBootstrap
++	}
++	group, err := user.LookupGroup("disk")
++	if err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	gid, err := strconv.Atoi(group.Gid)
++	if err != nil {
++		return ErrRestoreBootstrap
++	}
++	stage, err := os.MkdirTemp(stageRoot, ".restore-bootstrap-")
++	if err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	defer os.RemoveAll(stage)
++	// The jail already runs with SupplementaryGroups=disk. Keep enrollment
++	// material unreadable to other host users, unlike the public envd binary.
++	if err = os.Chown(stage, -1, gid); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	if err = os.Chmod(stage, 0o750); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	input := filepath.Join(stage, "bootstrap.json")
++	if err = os.WriteFile(input, document, 0o640); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	if err = os.Chown(input, -1, gid); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	if err = os.Chmod(input, 0o640); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	run := func(phase, script string, writable bool) ([]byte, error) {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		// Let the bounded systemd unit finish a mutation even if the caller
++		// disconnects. PrepareDisk checks cancellation before publishing.
++		toolCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), EnvdSwapTimeout+30*time.Second)
++		defer cancel()
++		return runDebugfs(toolCtx, devicePath, stage, phase, script, writable)
++	}
++	stat, err := run("bootstrap-stat", "stat "+RestoreBootstrapPath+"\n", false)
++	if err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	exists := !envdAbsent(string(stat))
++	if exists && !bootstrapRegularFile(stat) {
++		return ErrRestoreBootstrap
++	}
++	script := ""
++	if exists {
++		script = "rm " + RestoreBootstrapPath + "\n"
++	}
++	script += "write " + input + " " + RestoreBootstrapPath + "\nset_inode_field " + RestoreBootstrapPath + " mode 0100600\nset_inode_field " + RestoreBootstrapPath + " uid 0\nset_inode_field " + RestoreBootstrapPath + " gid 0\n"
++	if _, err = run("bootstrap-write", script, true); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	stat, err = run("bootstrap-check", "stat "+RestoreBootstrapPath+"\n", false)
++	if err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	size, sizeErr := parseEnvdSize(string(stat))
++	if !bootstrapRegularFile(stat) || sizeErr != nil || size != int64(len(document)) || !bootstrapPrivateRootFile(stat) {
++		return ErrRestoreBootstrap
++	}
++	output := filepath.Join(stage, "readback.json")
++	if err = os.WriteFile(output, nil, 0o660); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	if err = os.Chown(output, -1, gid); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	if err = os.Chmod(output, 0o660); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	if _, err = run("bootstrap-readback", "dump "+RestoreBootstrapPath+" "+output+"\n", false); err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	actual, err := os.ReadFile(output)
++	if err != nil {
++		return errors.Join(ErrRestoreBootstrap, err)
++	}
++	if !bytes.Equal(actual, document) {
++		return ErrRestoreBootstrap
++	}
++	return nil
++}
++
++func validateRestoreBootstrap(document []byte) error {
++	if len(document) == 0 || len(document) > MaxRestoreBootstrapBytes {
++		return ErrRestoreBootstrap
++	}
++	var object map[string]json.RawMessage
++	if err := json.Unmarshal(document, &object); err != nil || object == nil {
++		return ErrRestoreBootstrap
++	}
++	var version int
++	if err := json.Unmarshal(object["version"], &version); err != nil || version != 1 {
++		return fmt.Errorf("%w: unsupported format", ErrRestoreBootstrap)
++	}
++	return nil
++}
++
++func bootstrapRegularFile(stat []byte) bool {
++	if !strings.Contains(string(stat), "Type: regular") {
++		return false
++	}
++	links := bootstrapLinks.FindSubmatch(stat)
++	return len(links) == 2 && string(links[1]) == "1"
++}
++
++func bootstrapPrivateRootFile(stat []byte) bool {
++	mode := debugfsModeRe.FindSubmatch(stat)
++	if len(mode) != 2 || !bootstrapOwner.Match(stat) {
++		return false
++	}
++	parsed, err := strconv.ParseUint(string(mode[1]), 8, 32)
++	return err == nil && parsed == 0o600
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/restore_bootstrap_linux_test.go
+@@ -0,0 +1,26 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"bytes"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestRestoreBootstrapRejectsUnboundedOrUnknownFormat(t *testing.T) {
++	t.Parallel()
++	for _, document := range [][]byte{nil, []byte(`null`), []byte(`[]`), []byte(`{"version":2}`), []byte(`{"version":1} garbage`), bytes.Repeat([]byte("x"), MaxRestoreBootstrapBytes+1)} {
++		require.ErrorIs(t, WriteRestoreBootstrap(t.Context(), "/dev/nbd0", t.TempDir(), document), ErrRestoreBootstrap)
++	}
++	require.ErrorIs(t, WriteRestoreBootstrap(t.Context(), "/dev/sda", t.TempDir(), []byte(`{"version":1}`)), ErrRestoreBootstrap)
++}
++
++func TestRestoreBootstrapRejectsLinksAndUnknownInodes(t *testing.T) {
++	t.Parallel()
++	require.True(t, bootstrapRegularFile([]byte("Inode: 12   Type: regular   Mode: 0600\nLinks: 1   Blockcount: 8\n")))
++	for _, stat := range []string{"", "Type: symlink\nLinks: 1   Blockcount: 0\n", "Type: directory\nLinks: 2   Blockcount: 8\n", "Type: regular\nLinks: 2   Blockcount: 8\n", "Type: regular\nLinks: 10   Blockcount: 8\n"} {
++		require.False(t, bootstrapRegularFile([]byte(stat)))
++	}
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux_test.go
+@@ -0,0 +1,208 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++)
++
++func preparedDiskFixture(t *testing.T) (string, *block.Local, uuid.UUID, metadata.Template, []byte) {
++	t.Helper()
++	directory := t.TempDir()
++	original := bytes.Repeat([]byte{0x31}, int(header.RootfsBlockSize)*4)
++	path := filepath.Join(directory, "original.ext4")
++	require.NoError(t, os.WriteFile(path, original, 0o600))
++	sourceID := uuid.New()
++	source, err := block.NewLocal(path, header.RootfsBlockSize, sourceID)
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, source.Close()) })
++	return filepath.Join(directory, "prepared"), source, sourceID,
++		metadata.Template{Version: metadata.CurrentVersion, Template: metadata.TemplateMetadata{BuildID: sourceID.String(), KernelVersion: "test-kernel"}}, original
++}
++
++func TestPreparedDiskSurvivesSourceLossAndRetry(t *testing.T) {
++	t.Parallel()
++	directory, source, sourceID, meta, original := preparedDiskFixture(t)
++	buildID := uuid.New()
++	corrected := bytes.Repeat([]byte{0x42}, int(header.RootfsBlockSize))
++	calls := 0
++	verify := func(ctx context.Context, disk block.Device) error {
++		calls++
++		_, err := disk.WriteAt(corrected, 0)
++		return err
++	}
++	saved, err := PrepareDisk(t.Context(), directory, buildID, sourceID, source, meta, int64(len(original)), nil, verify)
++	require.NoError(t, err)
++	require.True(t, saved.Metadata.IsFilesystemOnly())
++	require.Equal(t, buildID.String(), saved.Metadata.Template.BuildID)
++	again, err := PrepareDisk(t.Context(), directory, buildID, sourceID, source, meta, int64(len(original)), nil, verify)
++	require.NoError(t, err)
++	require.Equal(t, saved, again)
++	require.Equal(t, 1, calls)
++	unchanged, err := os.ReadFile(source.Path())
++	require.NoError(t, err)
++	require.Equal(t, original, unchanged)
++	require.NoError(t, os.Remove(source.Path()))
++	reopened, disk, err := OpenPreparedDisk(t.Context(), directory, buildID)
++	require.NoError(t, err)
++	defer disk.Close()
++	require.Equal(t, saved, reopened)
++	result := make([]byte, len(original))
++	_, err = disk.ReadAt(t.Context(), result, 0)
++	require.NoError(t, err)
++	expected := bytes.Clone(original)
++	copy(expected, corrected)
++	require.Equal(t, expected, result)
++	entries, err := os.ReadDir(filepath.Join(directory, buildID.String()))
++	require.NoError(t, err)
++	require.Len(t, entries, 2, "only the flat disk and its manifest remain")
++}
++
++func TestPreparedDiskRejectsChangedRequestAndCorruption(t *testing.T) {
++	t.Parallel()
++	directory, source, sourceID, meta, original := preparedDiskFixture(t)
++	buildID := uuid.New()
++	verify := func(context.Context, block.Device) error { return nil }
++	_, err := PrepareDisk(t.Context(), directory, buildID, sourceID, source, meta, int64(len(original)), nil, verify)
++	require.NoError(t, err)
++	_, err = PrepareDisk(t.Context(), directory, buildID, sourceID, source, meta, int64(len(original)), []byte(`{"version":1,"generation":"changed"}`), verify)
++	require.ErrorIs(t, err, ErrPreparedDiskConflict, "enrollment changes require a new preparation")
++	meta.Template.KernelVersion = "different-kernel"
++	_, err = PrepareDisk(t.Context(), directory, buildID, sourceID, source, meta, int64(len(original)), nil, verify)
++	require.ErrorIs(t, err, ErrPreparedDiskConflict)
++	path := filepath.Join(directory, buildID.String(), storage.RootfsName)
++	file, err := os.OpenFile(path, os.O_WRONLY, 0)
++	require.NoError(t, err)
++	_, err = file.WriteAt([]byte{0xff}, 0)
++	require.NoError(t, err)
++	require.NoError(t, file.Close())
++	_, _, err = OpenPreparedDisk(t.Context(), directory, buildID)
++	require.ErrorIs(t, err, ErrPreparedDiskCorrupt)
++}
++
++func TestPreparedDiskFailureNeverPublishes(t *testing.T) {
++	t.Parallel()
++	for _, mode := range []string{"verifier", "cancel", "capacity"} {
++		t.Run(mode, func(t *testing.T) {
++			directory, source, sourceID, meta, original := preparedDiskFixture(t)
++			buildID := uuid.New()
++			ctx, cancel := context.WithCancel(t.Context())
++			defer cancel()
++			limit := int64(len(original))
++			if mode == "capacity" {
++				limit--
++			}
++			_, err := PrepareDisk(ctx, directory, buildID, sourceID, source, meta, limit, nil,
++				func(context.Context, block.Device) error {
++					if mode == "cancel" {
++						cancel()
++						return nil
++					}
++					if mode == "capacity" {
++						t.Fatal("capacity must be checked before verification")
++					}
++					return errors.New("check failed")
++				})
++			require.Error(t, err)
++			_, err = os.Stat(filepath.Join(directory, buildID.String()))
++			require.ErrorIs(t, err, os.ErrNotExist)
++			_, err = os.Stat(filepath.Join(directory, buildID.String()+".preparing"))
++			require.ErrorIs(t, err, os.ErrNotExist)
++			result, err := os.ReadFile(source.Path())
++			require.NoError(t, err)
++			require.Equal(t, original, result)
++		})
++	}
++}
++
++func TestPreparedDiskRetryReclaimsInterruptedStaging(t *testing.T) {
++	t.Parallel()
++	directory, source, sourceID, meta, original := preparedDiskFixture(t)
++	buildID := uuid.New()
++	staging := filepath.Join(directory, buildID.String()+".preparing")
++	require.NoError(t, os.MkdirAll(staging, 0o700))
++	require.NoError(t, os.WriteFile(filepath.Join(staging, storage.RootfsName), []byte("partial"), 0o600))
++	_, err := PrepareDisk(t.Context(), directory, buildID, sourceID, source, meta, int64(len(original)), nil,
++		func(context.Context, block.Device) error { return nil })
++	require.NoError(t, err)
++	_, disk, err := OpenPreparedDisk(t.Context(), directory, buildID)
++	require.NoError(t, err)
++	require.NoError(t, disk.Close())
++}
++
++func TestPreparedDiskConcurrentPreparationDoesNotOverwrite(t *testing.T) {
++	t.Parallel()
++	directory, source, sourceID, meta, original := preparedDiskFixture(t)
++	buildID := uuid.New()
++	entered, release := make(chan struct{}), make(chan struct{})
++	first := make(chan error, 1)
++	go func() {
++		_, err := PrepareDisk(t.Context(), directory, buildID, sourceID, source, meta, int64(len(original)), nil,
++			func(context.Context, block.Device) error { close(entered); <-release; return nil })
++		first <- err
++	}()
++	<-entered
++	_, err := PrepareDisk(t.Context(), directory, buildID, sourceID, source, meta, int64(len(original)), nil,
++		func(context.Context, block.Device) error { t.Error("second verifier must not run"); return nil })
++	close(release)
++	require.ErrorIs(t, err, ErrPreparedDiskBusy)
++	require.NoError(t, <-first)
++}
++
++func TestPreparedDiskCancellationCannotBeResurrected(t *testing.T) {
++	t.Parallel()
++	for _, prepared := range []bool{false, true} {
++		t.Run(fmt.Sprint(prepared), func(t *testing.T) {
++			directory, source, sourceID, meta, original := preparedDiskFixture(t)
++			id := uuid.New()
++			verify := func(context.Context, block.Device) error { return nil }
++			if prepared {
++				_, err := PrepareDisk(t.Context(), directory, id, sourceID, source, meta, int64(len(original)), nil, verify)
++				require.NoError(t, err)
++			}
++			require.NoError(t, CancelPreparedDisk(t.Context(), directory, id))
++			require.NoError(t, CancelPreparedDisk(t.Context(), directory, id))
++			_, _, err := OpenPreparedDisk(t.Context(), directory, id)
++			require.ErrorIs(t, err, ErrPreparedDiskCancelled)
++			_, err = PrepareDisk(t.Context(), directory, id, sourceID, source, meta, int64(len(original)), nil, func(context.Context, block.Device) error { t.Error("cancelled verifier ran"); return nil })
++			require.ErrorIs(t, err, ErrPreparedDiskCancelled)
++			unchanged, err := os.ReadFile(source.Path())
++			require.NoError(t, err)
++			require.Equal(t, original, unchanged)
++			_, err = os.Stat(filepath.Join(directory, id.String()))
++			require.ErrorIs(t, err, os.ErrNotExist)
++		})
++	}
++}
++
++func TestPreparedDiskCancellationWaitsForVerifier(t *testing.T) {
++	t.Parallel()
++	directory, source, sourceID, meta, original := preparedDiskFixture(t)
++	id := uuid.New()
++	entered, release := make(chan struct{}), make(chan struct{})
++	done := make(chan error, 1)
++	go func() {
++		_, err := PrepareDisk(t.Context(), directory, id, sourceID, source, meta, int64(len(original)), nil, func(context.Context, block.Device) error { close(entered); <-release; return nil })
++		done <- err
++	}()
++	<-entered
++	err := CancelPreparedDisk(t.Context(), directory, id)
++	close(release)
++	require.ErrorIs(t, err, ErrPreparedDiskBusy)
++	require.NoError(t, <-done)
++	require.NoError(t, CancelPreparedDisk(t.Context(), directory, id))
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/publish_prepared_disk_linux.go
+@@ -0,0 +1,70 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++
++	"github.com/google/uuid"
++
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++)
++
++func PreparedManifest(disk PreparedDisk) ([]byte, string, error) {
++	data, err := json.Marshal(disk)
++	if err != nil {
++		return nil, "", err
++	}
++	digest := sha256.Sum256(data)
++	return data, hex.EncodeToString(digest[:]), nil
++}
++
++// PublishPreparedDisk transfers the independent rootfs into the runtime's normal
++// immutable build storage. It never boots anything. Call only after a durable
++// activation intent has won; no public template assignment may expose this
++// build before that commit. Metadata is the last object published.
++func PublishPreparedDisk(ctx context.Context, directory string, buildID uuid.UUID, expectedManifest string,
++	store storage.StorageProvider, provenance storage.ObjectMetadata,
++) (result PreparedDisk, err error) {
++	result, disk, err := OpenPreparedDisk(ctx, directory, buildID)
++	if err != nil {
++		return result, err
++	}
++	defer func() { err = errors.Join(err, disk.Close()) }()
++	_, digest, err := PreparedManifest(result)
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	if digest != expectedManifest {
++		return PreparedDisk{}, ErrPreparedDiskConflict
++	}
++	paths := storage.Paths{BuildID: buildID.String()}
++	object, err := store.OpenSeekable(ctx, paths.Rootfs())
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	_, _, err = object.StoreFile(ctx, disk.Path(), storage.WithMetadata(provenance))
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	if _, _, _, err = header.StoreHeader(ctx, store, paths.RootfsHeader(), disk.Header(), storage.WithMetadata(provenance)); err != nil {
++		return PreparedDisk{}, err
++	}
++	meta, err := json.Marshal(result.Metadata)
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	blob, err := store.OpenBlob(ctx, paths.Metadata())
++	if err != nil {
++		return PreparedDisk{}, err
++	}
++	if err = blob.Put(ctx, meta, storage.WithMetadata(provenance)); err != nil {
++		return PreparedDisk{}, err
++	}
++	return result, nil
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/publish_prepared_disk_linux_test.go
+@@ -0,0 +1,70 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++)
++
++func TestPublishPreparedDiskTransfersIndependentStorage(t *testing.T) {
++	t.Parallel()
++	directory, source, sourceID, meta, original := preparedDiskFixture(t)
++	id := uuid.New()
++	manifest, err := PrepareDisk(t.Context(), directory, id, sourceID, source, meta, int64(len(original)), nil, func(context.Context, block.Device) error { return nil })
++	require.NoError(t, err)
++	_, digest, err := PreparedManifest(manifest)
++	require.NoError(t, err)
++	store, err := storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: t.TempDir()})
++	require.NoError(t, err)
++	paths := storage.Paths{BuildID: id.String()}
++	_, err = PublishPreparedDisk(t.Context(), directory, id, strings.Repeat("0", 64), store, nil)
++	require.ErrorIs(t, err, ErrPreparedDiskConflict)
++	blob, err := store.OpenBlob(t.Context(), paths.Metadata())
++	require.NoError(t, err)
++	exists, err := blob.Exists(t.Context())
++	require.NoError(t, err)
++	require.False(t, exists, "mismatched manifest cannot publish a bootable build")
++	for range 2 {
++		published, err := PublishPreparedDisk(t.Context(), directory, id, digest, store, nil)
++		require.NoError(t, err)
++		require.Equal(t, manifest, published)
++	}
++	require.NoError(t, CancelPreparedDisk(t.Context(), directory, id))
++	require.NoError(t, os.Remove(source.Path()))
++	h, _, err := header.LoadHeader(t.Context(), store, paths.RootfsHeader())
++	require.NoError(t, err)
++	require.Equal(t, id, h.Metadata.BuildId)
++	require.Equal(t, id, h.Metadata.BaseBuildId, "live storage has no dependency on the source allocation")
++	object, err := store.OpenBlob(t.Context(), paths.Rootfs())
++	require.NoError(t, err)
++	var data bytes.Buffer
++	_, err = object.WriteTo(t.Context(), &data)
++	require.NoError(t, err)
++	require.Equal(t, original, data.Bytes())
++	data.Reset()
++	_, err = blob.WriteTo(t.Context(), &data)
++	require.NoError(t, err)
++	var boot metadata.Template
++	require.NoError(t, json.Unmarshal(data.Bytes(), &boot))
++	require.True(t, boot.IsFilesystemOnly())
++	require.True(t, boot.IsFsQuiesced())
++	require.Equal(t, id.String(), boot.Template.BuildID)
++	memory, err := store.OpenBlob(t.Context(), paths.Memfile())
++	require.NoError(t, err)
++	exists, err = memory.Exists(t.Context())
++	require.NoError(t, err)
++	require.False(t, exists, "prepared publication must not retain saved RAM")
++}
+--- a/packages/orchestrator/pkg/sandbox/rootfs/prepare_restore_integration_test.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepare_restore_integration_test.go
+@@ -5,6 +5,7 @@
+ import (
+ 	"context"
+ 	"crypto/sha256"
++	"errors"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -15,6 +16,7 @@
+ 
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
+@@ -80,3 +82,128 @@
+ 	require.NoError(t, err)
+ 	require.Equal(t, checksum, sha256.Sum256(after), "verification or failed preparation changed the source")
+ }
++
++func TestPreparedDiskOfflineSurvivesSourceDeletion(t *testing.T) {
++	if os.Getenv("E2B_OFFLINE_RESTORE_TEST") != "1" {
++		t.Skip("set E2B_OFFLINE_RESTORE_TEST=1 on the dedicated compute test host")
++	}
++	dir := t.TempDir()
++	original := filepath.Join(dir, "source.ext4")
++	file, err := os.Create(original)
++	require.NoError(t, err)
++	require.NoError(t, file.Truncate(64<<20))
++	require.NoError(t, file.Close())
++	output, err := exec.CommandContext(t.Context(), "mkfs.ext4", "-F", "-q", original).CombinedOutput()
++	require.NoError(t, err, "%s", output)
++	marker := filepath.Join(dir, "marker")
++	require.NoError(t, os.WriteFile(marker, []byte("saved without booting"), 0o600))
++	output, err = exec.CommandContext(t.Context(), "debugfs", "-w", "-R", "write "+marker+" /source-canary", original).CombinedOutput()
++	require.NoError(t, err, "%s", output)
++	oldBootstrap := filepath.Join(dir, "old-bootstrap.json")
++	require.NoError(t, os.WriteFile(oldBootstrap, []byte(`{"version":1,"generation":"source","enrollmentTicket":"old-ticket"}`), 0o600))
++	output, err = exec.CommandContext(t.Context(), "debugfs", "-w", "-R", "write "+oldBootstrap+" "+RestoreBootstrapPath, original).CombinedOutput()
++	require.NoError(t, err, "%s", output)
++	before, err := os.ReadFile(original)
++	require.NoError(t, err)
++	sourceID, destinationID := uuid.New(), uuid.New()
++	base, err := block.NewLocal(original, header.RootfsBlockSize, sourceID)
++	require.NoError(t, err)
++	defer base.Close()
++	flags, err := featureflags.NewClient()
++	require.NoError(t, err)
++	defer flags.Close(context.WithoutCancel(t.Context()))
++	pool, err := nbd.NewDevicePool(1)
++	require.NoError(t, err)
++	ctx, cancel := context.WithCancel(t.Context())
++	defer cancel()
++	go pool.Populate(ctx)
++	defer pool.Close(context.WithoutCancel(ctx))
++	directory := filepath.Join(dir, "prepared")
++	saved, err := PrepareDisk(ctx, directory, destinationID, sourceID, base,
++		metadata.Template{Version: metadata.CurrentVersion, Template: metadata.TemplateMetadata{BuildID: sourceID.String()}}, 64<<20, []byte(`{"version":1,"generation":"destination-1","enrollmentTicket":"single-use-test-ticket"}`),
++		func(ctx context.Context, disk block.Device) (err error) {
++			mount := nbd.NewDirectPathMount(disk, pool, flags, logger.NewNopLogger())
++			index, err := mount.Open(ctx)
++			if err != nil {
++				return err
++			}
++			defer func() { err = errors.Join(err, mount.Close(context.WithoutCancel(ctx))) }()
++			if err := PrepareRestoreFilesystem(ctx, nbd.GetDevicePath(index)); err != nil {
++				return err
++			}
++			if err := WriteRestoreBootstrap(ctx, nbd.GetDevicePath(index), directory, []byte(`{"version":1,"generation":"destination-1","enrollmentTicket":"single-use-test-ticket"}`)); err != nil {
++				return err
++			}
++			if err := PrepareRestoreFilesystem(ctx, nbd.GetDevicePath(index)); err != nil {
++				return err
++			}
++			return mount.Flush(ctx)
++		})
++	require.NoError(t, err)
++	after, err := os.ReadFile(original)
++	require.NoError(t, err)
++	require.Equal(t, sha256.Sum256(before), sha256.Sum256(after))
++	require.NoError(t, os.Remove(original))
++	reopened, disk, err := OpenPreparedDisk(ctx, directory, destinationID)
++	require.NoError(t, err)
++	defer disk.Close()
++	require.Equal(t, saved, reopened)
++	output, err = exec.CommandContext(ctx, "debugfs", "-R", "cat /source-canary", disk.Path()).CombinedOutput()
++	require.NoError(t, err)
++	require.Contains(t, string(output), "saved without booting")
++	output, err = exec.CommandContext(ctx, "debugfs", "-R", "cat "+RestoreBootstrapPath, disk.Path()).CombinedOutput()
++	require.NoError(t, err)
++	require.Contains(t, string(output), `"generation":"destination-1"`)
++	require.NotContains(t, string(output), "old-ticket")
++
++}
++
++func TestRestoreBootstrapRejectsSymlinkOffline(t *testing.T) {
++	if os.Getenv("E2B_OFFLINE_RESTORE_TEST") != "1" {
++		t.Skip("requires dedicated Linux test host")
++	}
++	dir := t.TempDir()
++	image := filepath.Join(dir, "source.ext4")
++	file, err := os.Create(image)
++	require.NoError(t, err)
++	require.NoError(t, file.Truncate(64<<20))
++	require.NoError(t, file.Close())
++	output, err := exec.CommandContext(t.Context(), "mkfs.ext4", "-F", "-q", image).CombinedOutput()
++	require.NoError(t, err, "%s", output)
++	output, err = exec.CommandContext(t.Context(), "debugfs", "-w", "-R", "symlink "+RestoreBootstrapPath+" /lost+found", image).CombinedOutput()
++	require.NoError(t, err, "%s", output)
++	before, err := os.ReadFile(image)
++	require.NoError(t, err)
++	sourceID := uuid.New()
++	source, err := block.NewLocal(image, header.RootfsBlockSize, sourceID)
++	require.NoError(t, err)
++	defer source.Close()
++	flags, err := featureflags.NewClient()
++	require.NoError(t, err)
++	defer flags.Close(context.WithoutCancel(t.Context()))
++	pool, err := nbd.NewDevicePool(1)
++	require.NoError(t, err)
++	ctx, cancel := context.WithCancel(t.Context())
++	defer cancel()
++	go pool.Populate(ctx)
++	defer pool.Close(context.WithoutCancel(ctx))
++	_, err = PrepareDisk(ctx, filepath.Join(dir, "prepared"), uuid.New(), sourceID, source,
++		metadata.Template{Version: metadata.CurrentVersion, Template: metadata.TemplateMetadata{BuildID: sourceID.String()}}, 64<<20, []byte(`{"version":1,"generation":"new"}`),
++		func(ctx context.Context, disk block.Device) (err error) {
++			mount := nbd.NewDirectPathMount(disk, pool, flags, logger.NewNopLogger())
++			index, err := mount.Open(ctx)
++			if err != nil {
++				return err
++			}
++			defer func() { err = errors.Join(err, mount.Close(context.WithoutCancel(ctx))) }()
++			device := nbd.GetDevicePath(index)
++			output, err := exec.CommandContext(ctx, "debugfs", "-R", "stat "+RestoreBootstrapPath, device).CombinedOutput()
++			require.NoError(t, err)
++			require.Contains(t, string(output), "Type: symlink", "symlink fixture must exist")
++			return WriteRestoreBootstrap(ctx, device, dir, []byte(`{"version":1,"generation":"new"}`))
++		})
++	require.ErrorIs(t, err, ErrRestoreBootstrap)
++	after, err := os.ReadFile(image)
++	require.NoError(t, err)
++	require.Equal(t, sha256.Sum256(before), sha256.Sum256(after))
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/prepare_restore.go
+@@ -0,0 +1,58 @@
++//go:build linux
++
++package sandbox
++
++import (
++	"context"
++	"errors"
++
++	"github.com/google/uuid"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
++	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
++)
++
++// PrepareRestoreDisk publishes a verified, independent rootfs without allocating
++// guest RAM, networking or a Firecracker process. The operation coordinator owns
++// source pins, the destination build ID and the temporary storage reservation.
++func (f *Factory) PrepareRestoreDisk(ctx context.Context, directory string, buildID uuid.UUID,
++	source template.Template, reservedDiskBytes int64, bootstrap []byte,
++) (rootfs.PreparedDisk, error) {
++	sourceBuildID, err := uuid.Parse(source.Files().BuildID)
++	if err != nil {
++		return rootfs.PreparedDisk{}, err
++	}
++	meta, err := source.Metadata()
++	if err != nil {
++		return rootfs.PreparedDisk{}, err
++	}
++	disk, err := source.Rootfs()
++	if err != nil {
++		return rootfs.PreparedDisk{}, err
++	}
++	return rootfs.PrepareDisk(ctx, directory, buildID, sourceBuildID, disk, meta, reservedDiskBytes, bootstrap,
++		func(ctx context.Context, copy block.Device) (err error) {
++			mount := f.NewDirectPathMount(copy, logger.L())
++			index, err := mount.Open(ctx)
++			if err != nil {
++				return err
++			}
++			defer func() { err = errors.Join(err, mount.Close(context.WithoutCancel(ctx))) }()
++			if err := rootfs.PrepareRestoreFilesystem(ctx, nbd.GetDevicePath(index)); err != nil {
++				return err
++			}
++			if len(bootstrap) > 0 {
++				if err := rootfs.WriteRestoreBootstrap(ctx, nbd.GetDevicePath(index), directory, bootstrap); err != nil {
++					return err
++				}
++				if err := rootfs.PrepareRestoreFilesystem(ctx, nbd.GetDevicePath(index)); err != nil {
++					return err
++				}
++			}
++			// Flush kernel/device writeback before flattening the replayed copy.
++			return mount.Flush(ctx)
++		})
++}

@@ -1,3 +1,5 @@
+import { ThreadMoveControls } from "./chat/ThreadMoveControls";
+import { ThreadVmControls } from "./chat/ThreadVmControls";
 import { useLoadBalancedEnvironment } from "../hooks/useLoadBalancedEnvironment";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import type { UsageLimitSourceSnapshots } from "@t3tools/contracts";
@@ -373,6 +375,7 @@ import { MessagesTimeline } from "./chat/MessagesTimeline";
 import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
 import { resolveTimelineIsAtEnd, worktreeSetupAgentStarted } from "./chat/MessagesTimeline.logic";
 import { resolveComposerTimelineInset, resolveScrollToEndClearance } from "./composerFooterLayout";
+import { PortableThreadCommandStatus } from "./chat/PortableThreadCommandStatus";
 import { ChatHeader } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { expandedImageKey, type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -2601,7 +2604,8 @@ export default function ChatView(props: ChatViewProps) {
     : (primaryEnvironment?.serverConfig ?? null);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
   const supportsSharedPromptQueue =
-    serverConfig?.environment.capabilities.sharedPromptQueue === true;
+    serverConfig?.environment.capabilities.sharedPromptQueue === true ||
+    activeThread?.promptQueue !== undefined;
   const supportsSharedPreparation =
     serverConfig?.environment.capabilities.sharedPreparation === true;
   const sharedPreparation = activeThread?.promptQueue?.preparation;
@@ -10045,6 +10049,12 @@ export default function ChatView(props: ChatViewProps) {
           />
         </WorkspacePageHeader>
 
+        <PortableThreadCommandStatus
+          environmentId={activeThread.environmentId}
+          threadId={activeThread.id}
+        />
+        <ThreadVmControls environmentId={activeThread.environmentId} threadId={activeThread.id} />
+        <ThreadMoveControls environmentId={activeThread.environmentId} threadId={activeThread.id} />
         {/* Main content area with optional plan sidebar */}
         <div className="flex min-h-0 min-w-0 flex-1">
           {/* Chat column */}

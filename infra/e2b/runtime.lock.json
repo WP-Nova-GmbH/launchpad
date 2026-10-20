@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/e2b-dev/runtime",
+    "commit": "1599d6e79e302449e9285dae33d5ce04e3182254",
+    "archiveUrl": "https://codeload.github.com/e2b-dev/runtime/legacy.tar.gz/1599d6e79e302449e9285dae33d5ce04e3182254",
+    "archiveSha256": "c41792b1400d65e2a3b1c2a37ef2fddd21bf24d11df7388654b5b4be73d6dea5",
+    "archiveDirectory": "e2b-dev-runtime-1599d6e"
+  },
+  "sdkVersion": "2.46.1",
+  "goVersion": "1.26.8",
+  "baseImages": {
+    "golang:${GOLANG_VERSION}-${DEBIAN_VERSION}": "golang:1.26.8-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d",
+    "golang:${GOLANG_VERSION}-alpine${ALPINE_VERSION}": "golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c",
+    "debian:${DEBIAN_RUNTIME_TAG}": "debian:bookworm-20260824-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
+    "alpine:${ALPINE_VERSION}": "alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6"
+  },
+  "embed": {
+    "composeSha256": "399a76c21f5a365335cb32be284426ea76a807872b5fcd481d07e7171c761556",
+    "defaultsSha256": "8ba4df5a2890de616b48376f744b2588cdcacc4f252fdc524174faeaaa3628dd",
+    "platform": "linux/arm64",
+    "prebuiltSourceRevisionsVerified": false,
+    "images": {
+      "api": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/api/api:v0.14.202609170000-908833e4c12",
+        "digest": "sha256:e131ee5abc41104eb37b8fcac9bcc5ff2b76adc401bf358dc368a3c5753f5493"
+      },
+      "db-migrator": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/api/db-migrator:v0.14.202609170000-908833e4c12",
+        "digest": "sha256:5237676bc29eaecc150a90fa402cbf7cdd0568b3775f9f2eb7a59b41ecce2d52"
+      },
+      "dashboard-api": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/dashboard-api/dashboard-api:v0.7.202609170000-908833e4c12",
+        "digest": "sha256:d7a865ea78071eaa09a370d7130f36c305de98ece717224e075a3e64a20c5624"
+      },
+      "client-proxy": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/client-proxy/client-proxy:v0.3.202609130627-59497eb9134",
+        "digest": "sha256:f9ca12355225126dc3903b909a3c6bcbb331acb9363c27ac576b164e3db5eefd"
+      },
+      "clickhouse-migrator": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/clickhouse-migrator/clickhouse-migrator:v0.4.202609130627-59497eb9134",
+        "digest": "sha256:3e1c9ea34f73069695b54e0cee479639f68dcce5d42f3e6da31f5f4c331f23ea"
+      },
+      "seed": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/embed/seed:v0.3.202609120109-ad1cddd091b",
+        "digest": "sha256:866acff1fe1f288b403e6b2cfde5fe8cc731092818547bc9f0d85a574fc03f93"
+      },
+      "node-e2b": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/embed/node-e2b:v0.3.202609120109-ad1cddd091b",
+        "digest": "sha256:22d6271c8ea6fa2585054b403679bcfe9494148725837a53e173fb1c9587da41"
+      },
+      "tools": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/embed/tools:v0.3.202609120109-ad1cddd091b",
+        "digest": "sha256:c565bc6b9562a54b656604f138e2cde507968a300339d822786431620a2e0fda"
+      },
+      "dashboard": {
+        "tag": "us-docker.pkg.dev/e2b-artifacts/dashboard/dashboard:v0.2.1",
+        "digest": "sha256:1bce1bad793333c870d7fe696bb6e1f509e7268b524dd0c82ec8d45336be52b1"
+      },
+      "postgres": {
+        "tag": "postgres:18.6-alpine",
+        "digest": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+      },
+      "redis": {
+        "tag": "redis:7.4.6",
+        "digest": "sha256:a9cc41d6d01da2aa26c219e4f99ecbeead955a7b656c1c499cce8922311b2514"
+      },
+      "clickhouse": {
+        "tag": "clickhouse/clickhouse-server:25.8.30.16",
+        "digest": "sha256:f3f6c013eee7f922b130078afc77626e72d37b4071b85ba92a675aa002d59e34"
+      },
+      "vector": {
+        "tag": "timberio/vector:0.51.1-alpine",
+        "digest": "sha256:2d16ae87ec395508366f3c064899d374fbe04de6e64c3a613ed64aedbee034b4"
+      }
+    }
+  },
+  "artifacts": {
+    "orchestrator": {
+      "version": "v0.16.202609212023-35cc85a6c61",
+      "sha256": "9146470a088ffbf18fa35069f60e38f80651fa1d92eaa8f66ce15ab048419947"
+    },
+    "envd": {
+      "version": "v0.9.202609130627-59497eb9134",
+      "sha256": "713b31989288fccc2f86892bb32917eacbf81a2f344aa1462abf53702df92624"
+    },
+    "kernel": {
+      "version": "vmlinux-6.1.177_5008931",
+      "sha256": "3e134b55a6e4feec481f6f3a2813d42860e28c273eeb91c02df0661322e61dab"
+    },
+    "firecracker": {
+      "version": "v1.14-0.2.0",
+      "sha256": "66a8347a08741e47f850da1720cc6153a6998a2c9e87666958261afbcc9ba05e"
+    },
+    "busybox": {
+      "version": "1.36.1",
+      "sha256": "eddab48ed02fe55034a3f9321c6d4f9db10d699bc92880bd334d94a5c55363e3"
+    }
+  }
+}

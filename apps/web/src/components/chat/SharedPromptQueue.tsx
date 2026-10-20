@@ -5,6 +5,9 @@ import {
 import type { ScopedThreadRef, ThreadPromptQueue, TurnId } from "@t3tools/contracts";
 import {
   queuedPromptEditConflict,
+  queuedMoveLabel,
+  moveQueueEntryNext,
+  moveQueueEntryLater,
   type QueuedPromptEdit,
 } from "@t3tools/client-runtime/state/threads";
 import { useAtomValue } from "@effect/atom-react";
@@ -33,6 +36,8 @@ export function SharedPromptQueue({
   supportsPreparation?: boolean;
   canWorkLocally?: boolean;
 }) {
+  const cancelMove = useAtomCommand(threadEnvironment.cancelMove, { reportFailure: false });
+  const reorderQueue = useAtomCommand(threadEnvironment.reorderQueue, { reportFailure: false });
   const editPrompt = useAtomCommand(threadEnvironment.editPrompt, { reportFailure: false });
   const removePrompt = useAtomCommand(threadEnvironment.removePrompt, { reportFailure: false });
   const steerPrompt = useAtomCommand(threadEnvironment.steerPrompt, { reportFailure: false });
@@ -52,7 +57,11 @@ export function SharedPromptQueue({
   useLayoutEffect(() => {
     if (editingMessageId) editorRef.current?.focus();
   }, [editingMessageId]);
-  const current = queue.entries.find((entry) => entry.messageId === edit?.messageId);
+  const candidate = queue.entries.find((entry) => entry.messageId === edit?.messageId);
+  const current = candidate?.kind === "move" ? undefined : candidate;
+  const firstMoveIndex = queue.entries.findIndex((entry) => entry.kind === "move");
+  const canReorder =
+    queue.handoff === null && queue.entries.every((entry) => entry.state === "pending");
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
   const disabled = busy || unavailable;
   const preparation = queue.preparation;
@@ -266,60 +275,164 @@ export function SharedPromptQueue({
         </div>
       ) : null}
       <ol>
-        {queue.entries.map((entry, index) => (
-          <SharedPromptQueueRow
-            key={entry.messageId}
-            entry={entry}
-            index={index}
-            isNext={
-              index === 0 &&
-              entry.state === "pending" &&
-              queue.enabled &&
-              queue.pauseReason === null &&
-              !preparing &&
-              queue.handoff === null
-            }
-            disabled={disabled}
-            canSteer={activeTurnId !== null && !preparing}
-            viewerId={account?.accountId}
-            editorRef={editorRef}
-            onEdit={() => {
-              if (edit?.messageId === entry.messageId) {
-                return;
+        {queue.entries.map((entry, index) =>
+          entry.kind === "move" ? (
+            <li key={entry.messageId} className="border-t border-border/60 py-2 text-xs">
+              <p>
+                {index + 1}. {queuedMoveLabel(entry)}
+              </p>
+              <p role="status" className="text-muted-foreground">
+                {entry.detail ??
+                  (entry.state === "pending"
+                    ? "Waiting in queue"
+                    : entry.state === "cancelling"
+                      ? "Cancelling move…"
+                      : "Moving thread…")}
+              </p>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="xs"
+                  variant="ghost-muted"
+                  disabled={disabled || !canReorder || index === 0}
+                  onClick={() =>
+                    void run(() =>
+                      reorderQueue(
+                        request({
+                          ...input,
+                          expectedRevision: queue.revision,
+                          order: moveQueueEntryNext(queue.entries, entry.messageId),
+                        }),
+                      ),
+                    )
+                  }
+                >
+                  Move next
+                </Button>
+                <Button
+                  size="xs"
+                  variant="ghost-muted"
+                  disabled={disabled || !canReorder || index === queue.entries.length - 1}
+                  onClick={() =>
+                    void run(() =>
+                      reorderQueue(
+                        request({
+                          ...input,
+                          expectedRevision: queue.revision,
+                          order: moveQueueEntryLater(queue.entries, entry.messageId),
+                        }),
+                      ),
+                    )
+                  }
+                >
+                  Move down
+                </Button>
+                <Button
+                  size="xs"
+                  variant="ghost-muted"
+                  disabled={disabled || entry.state === "cancelling"}
+                  onClick={() =>
+                    void run(() =>
+                      cancelMove(
+                        request({
+                          ...input,
+                          messageId: entry.messageId,
+                          expectedRevision: entry.revision,
+                        }),
+                      ),
+                    )
+                  }
+                >
+                  Cancel move
+                </Button>
+              </div>
+            </li>
+          ) : (
+            <SharedPromptQueueRow
+              key={entry.messageId}
+              entry={entry}
+              index={index}
+              isNext={
+                index === 0 &&
+                entry.state === "pending" &&
+                queue.enabled &&
+                queue.pauseReason === null &&
+                !preparing &&
+                queue.handoff === null
               }
-              setEdit({ messageId: entry.messageId, revision: entry.revision, text: entry.text });
-              setError(null);
-            }}
-            onSteer={() => {
-              if (activeTurnId)
+              disabled={disabled}
+              canSteer={
+                activeTurnId !== null &&
+                !preparing &&
+                (firstMoveIndex < 0 || index < firstMoveIndex)
+              }
+              onMoveNext={
+                canReorder && index > 0
+                  ? () =>
+                      void run(() =>
+                        reorderQueue(
+                          request({
+                            ...input,
+                            expectedRevision: queue.revision,
+                            order: moveQueueEntryNext(queue.entries, entry.messageId),
+                          }),
+                        ),
+                      )
+                  : undefined
+              }
+              onMoveDown={
+                canReorder && index + 1 < queue.entries.length
+                  ? () =>
+                      void run(() =>
+                        reorderQueue(
+                          request({
+                            ...input,
+                            expectedRevision: queue.revision,
+                            order: moveQueueEntryLater(queue.entries, entry.messageId),
+                          }),
+                        ),
+                      )
+                  : undefined
+              }
+              viewerId={account?.accountId}
+              editorRef={editorRef}
+              onEdit={() => {
+                if (edit?.messageId === entry.messageId) {
+                  return;
+                }
+                setEdit({ messageId: entry.messageId, revision: entry.revision, text: entry.text });
+                setError(null);
+              }}
+              onSteer={() => {
+                if (activeTurnId)
+                  void run(
+                    () =>
+                      steerPrompt(
+                        request({
+                          ...input,
+                          messageId: entry.messageId,
+                          expectedRevision: entry.revision,
+                          expectedTurnId: activeTurnId,
+                        }),
+                      ),
+                    () => sectionRef.current?.focus({ preventScroll: true }),
+                  );
+              }}
+              onRemove={() =>
                 void run(
                   () =>
-                    steerPrompt(
+                    removePrompt(
                       request({
                         ...input,
                         messageId: entry.messageId,
                         expectedRevision: entry.revision,
-                        expectedTurnId: activeTurnId,
                       }),
                     ),
                   () => sectionRef.current?.focus({ preventScroll: true }),
-                );
-            }}
-            onRemove={() =>
-              void run(
-                () =>
-                  removePrompt(
-                    request({
-                      ...input,
-                      messageId: entry.messageId,
-                      expectedRevision: entry.revision,
-                    }),
-                  ),
-                () => sectionRef.current?.focus({ preventScroll: true }),
-              )
-            }
-          />
-        ))}
+                )
+              }
+            />
+          ),
+        )}
       </ol>
       {edit ? (
         <div className="mt-3 space-y-2">

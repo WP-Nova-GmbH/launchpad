@@ -80,13 +80,35 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+export interface ProviderConversationCheckpointInput {
+  readonly threadId: ThreadId;
+  readonly artifactRoot: string;
+  readonly referencedFiles: ReadonlyArray<string>;
+  /** First enrollment may retain a stopped local conversation with no earlier native checkpoint.
+   * The coordinator has already frozen ownership; this source is read without resuming a writer. */
+  readonly stoppedSource?: { readonly nativeThreadId: string; readonly cwd: string };
+}
+
 export interface ProviderAdapterShape<TError> {
+  /** Private VM recovery; false preserves a busy or unproven native writer. */
+  readonly stopIdleVmSession?: (
+    threadId: ThreadId,
+    operationId: string,
+    admit: import("../../vmWorkload.ts").VmHarnessStopAdmission,
+  ) => Effect.Effect<boolean, TError>;
+  /** Flush adapter output after its native writer has stopped. Codex moves require this receipt. */
+  readonly drainRuntimeEvents?: (threadId: ThreadId) => Effect.Effect<void, TError>;
   /**
    * Provider kind implemented by this adapter.
    */
   readonly provider: ProviderDriverKind;
   readonly capabilities: ProviderAdapterCapabilities;
 
+  /** Resume validation in a private runtime, physically closed before returning.
+   * Its bootstrap events never enter this adapter's normal ingestion stream. */
+  readonly probeSession?: (
+    input: ProviderSessionStartInput,
+  ) => Effect.Effect<ProviderSession, TError>;
   /**
    * Start a provider-backed session.
    */
@@ -155,6 +177,12 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     numTurns: number,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
+
+  /** Close a settled native writer and export only its conversation, without credentials.
+   * Omitted means this provider cannot support portable thread recovery. */
+  readonly checkpointConversation?: (
+    input: ProviderConversationCheckpointInput,
+  ) => Effect.Effect<{ readonly directory: string; readonly nativeThreadId: string }, TError>;
 
   /**
    * Upload a thread to the provider when the adapter supports feedback.

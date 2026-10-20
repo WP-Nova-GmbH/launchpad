@@ -85,6 +85,11 @@ export class GithubApp extends Context.Service<
     readonly mintInstallationToken: (input: {
       readonly installationId: string;
     }) => Effect.Effect<GithubInstallationToken, GithubAppNotConfigured | GithubRequestFailed>;
+    /** A VM may borrow access to exactly one bound repository, never the installation. */
+    readonly mintRepositoryToken: (input: {
+      readonly installationId: string;
+      readonly canonicalKey: string;
+    }) => Effect.Effect<GithubInstallationToken, GithubAppNotConfigured | GithubRequestFailed>;
     /** Every account the App is installed on, as GitHub reports it. */
     readonly listInstallations: Effect.Effect<
       ReadonlyArray<GithubInstallationAccount>,
@@ -100,7 +105,7 @@ export class GithubApp extends Context.Service<
       readonly privateKey: string;
     }) => Effect.Effect<GithubAppDescription, GithubRequestFailed>;
   }
->()("t3code-relay/tenancy/GithubApp") {}
+>()("launchpad-relay/tenancy/GithubApp") {}
 
 export interface GithubAppDescription {
   readonly appId: string;
@@ -126,6 +131,13 @@ function toInstallationAccount(raw: unknown): GithubInstallationAccount | null {
 }
 
 const GITHUB_API = "https://api.github.com";
+const decodeRepositoryToken = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    token: Schema.String.check(Schema.isMinLength(1)),
+    expires_at: Schema.String,
+    repositories: Schema.Array(Schema.Struct({ full_name: Schema.String })),
+  }),
+);
 
 function base64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -253,8 +265,9 @@ export const make = Effect.gen(function* () {
     readonly method?: "GET" | "POST";
     readonly token: string;
     readonly operation: GithubRequestFailed["operation"];
+    readonly body?: { readonly repositories: ReadonlyArray<string> };
   }) {
-    const httpRequest = (input.method === "POST" ? HttpClientRequest.post : HttpClientRequest.get)(
+    let httpRequest = (input.method === "POST" ? HttpClientRequest.post : HttpClientRequest.get)(
       `${GITHUB_API}${input.path}`,
     ).pipe(
       HttpClientRequest.setHeaders({
@@ -264,6 +277,14 @@ export const make = Effect.gen(function* () {
         "x-github-api-version": "2022-11-28",
       }),
     );
+    if (input.body) {
+      httpRequest = yield* HttpClientRequest.bodyJson(input.body)(httpRequest).pipe(
+        Effect.mapError(
+          () =>
+            new GithubRequestFailed({ operation: input.operation, cause: "Invalid request body" }),
+        ),
+      );
+    }
     const response = yield* httpClient
       .execute(httpRequest)
       .pipe(
@@ -364,6 +385,58 @@ export const make = Effect.gen(function* () {
     }),
 
     mintInstallationToken: installationToken,
+
+    mintRepositoryToken: Effect.fn("relay.github.repository_token")(function* (input) {
+      const match = /^github\.com\/([a-zA-Z0-9-]+)\/([a-zA-Z0-9_.-]+)$/.exec(input.canonicalKey);
+      const repository = match?.[2];
+      if (
+        !repository ||
+        repository === "." ||
+        repository === ".." ||
+        !/^[1-9][0-9]*$/.test(input.installationId)
+      ) {
+        return yield* new GithubRequestFailed({
+          operation: "mint-token",
+          cause: "Invalid repository scope",
+        });
+      }
+      const app = yield* credentials;
+      const jwt = yield* appJwt({
+        appId: app.appId,
+        privateKeyPem: Redacted.value(app.privateKey),
+      });
+      const body = yield* request({
+        path: `/app/installations/${input.installationId}/access_tokens`,
+        method: "POST",
+        token: jwt,
+        operation: "mint-token",
+        body: { repositories: [repository] },
+      });
+      // A missing or unexpected scope must never become an installation-wide fallback.
+      // Discard decoder diagnostics: the upstream body contains the bearer token.
+      const parsed = yield* decodeRepositoryToken(body).pipe(
+        Effect.mapError(
+          () =>
+            new GithubRequestFailed({
+              operation: "mint-token",
+              cause: "Invalid scoped token response",
+            }),
+        ),
+      );
+      if (
+        parsed.repositories.length !== 1 ||
+        `github.com/${parsed.repositories[0]?.full_name}`.toLowerCase() !==
+          input.canonicalKey.toLowerCase() ||
+        !Number.isFinite(Date.parse(parsed.expires_at)) ||
+        Date.parse(parsed.expires_at) <= (yield* DateTime.now).epochMilliseconds
+      ) {
+        return yield* new GithubRequestFailed({
+          operation: "mint-token",
+          cause: "Unexpected repository token scope or expiry",
+        });
+      }
+      return { token: parsed.token, expiresAt: parsed.expires_at };
+    }),
 
     listInstallations: Effect.gen(function* () {
       const app = yield* credentials;

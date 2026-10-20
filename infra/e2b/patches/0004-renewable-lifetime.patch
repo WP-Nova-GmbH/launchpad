@@ -1,0 +1,1251 @@
+--- a/packages/api/internal/cfg/model.go
++++ b/packages/api/internal/cfg/model.go
+@@ -11,6 +11,7 @@
+ 
+ 	"github.com/caarlos0/env/v11"
+ 	"github.com/golang-jwt/jwt/v5"
++	"github.com/google/uuid"
+ 
+ 	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
+ )
+@@ -31,6 +32,10 @@
+ )
+ 
+ type Config struct {
++	// Only operators can grant renewable continuous lifetime to a dedicated team.
++	// Already admitted allocations retain their recorded policy until retired.
++	LaunchpadRenewableLifetimeTeams []string `env:"LAUNCHPAD_RENEWABLE_LIFETIME_TEAMS" envSeparator:","`
++
+ 	// Dedicated-host restore admission is opt-in and team scoped. Removing a
+ 	// team blocks new work; already admitted operations still reconcile.
+ 	LaunchpadRestoreTeams         []string `env:"LAUNCHPAD_RESTORE_TEAMS" envSeparator:","`
+@@ -293,6 +298,14 @@
+ 	}
+ )
+ 
++// AllowsRenewableLifetime never trusts guest metadata or a request flag.
++func (c Config) AllowsRenewableLifetime(teamID uuid.UUID) bool {
++	if teamID == uuid.Nil {
++		return false
++	}
++	return slices.Contains(c.LaunchpadRenewableLifetimeTeams, teamID.String())
++}
++
+ func Parse() (Config, error) {
+ 	config, err := env.ParseAsWithOptions[Config](env.Options{
+ 		FuncMap: parserFuncs,
+@@ -301,6 +314,14 @@
+ 		return Config{}, err
+ 	}
+ 
++	for i, value := range config.LaunchpadRenewableLifetimeTeams {
++		id, err := uuid.Parse(strings.TrimSpace(value))
++		if err != nil || id == uuid.Nil {
++			return config, errors.New("invalid renewable lifetime team ID")
++		}
++		config.LaunchpadRenewableLifetimeTeams[i] = id.String()
++	}
++
+ 	if config.AuthDBConnectionString == "" {
+ 		config.AuthDBConnectionString = config.PostgresConnectionString
+ 	}
+--- a/packages/api/internal/orchestrator/orchestrator.go
++++ b/packages/api/internal/orchestrator/orchestrator.go
+@@ -5,6 +5,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"slices"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -56,6 +57,7 @@
+ }
+ 
+ type Orchestrator struct {
++	renewableLifetimeTeams        []string
+ 	httpClient                    *http.Client
+ 	nodeDiscovery                 servicediscovery.Discoverer
+ 	sandboxStore                  *sandbox.Store
+@@ -183,21 +185,22 @@
+ 	skipNomadSync := localRegistryOwnsOrchestrators
+ 
+ 	o := Orchestrator{
+-		httpClient:           httpClient,
+-		analytics:            analyticsInstance,
+-		posthogClient:        posthogClient,
+-		nodeDiscovery:        nodeDiscovery,
+-		nodes:                smap.New[*nodemanager.Node](),
+-		placementAlgorithm:   bestOfKAlgorithm,
+-		scoreHugepages:       config.BestOfKHugepageMemory,
+-		featureFlagsClient:   featureFlags,
+-		accessTokenGenerator: accessTokenGenerator,
+-		routingCatalog:       routingCatalog,
+-		sqlcDB:               sqlcDB,
+-		snapshotCache:        snapshotCache,
+-		tel:                  tel,
+-		clusters:             clusters,
+-		redisStorage:         redisStorage,
++		renewableLifetimeTeams: slices.Clone(config.LaunchpadRenewableLifetimeTeams),
++		httpClient:             httpClient,
++		analytics:              analyticsInstance,
++		posthogClient:          posthogClient,
++		nodeDiscovery:          nodeDiscovery,
++		nodes:                  smap.New[*nodemanager.Node](),
++		placementAlgorithm:     bestOfKAlgorithm,
++		scoreHugepages:         config.BestOfKHugepageMemory,
++		featureFlagsClient:     featureFlags,
++		accessTokenGenerator:   accessTokenGenerator,
++		routingCatalog:         routingCatalog,
++		sqlcDB:                 sqlcDB,
++		snapshotCache:          snapshotCache,
++		tel:                    tel,
++		clusters:               clusters,
++		redisStorage:           redisStorage,
+ 
+ 		createdCounter: createdCounter,
+ 
+--- a/packages/api/internal/orchestrator/create_instance.go
++++ b/packages/api/internal/orchestrator/create_instance.go
+@@ -14,6 +14,7 @@
+ 
+ 	"github.com/e2b-dev/infra/packages/api/internal"
+ 	"github.com/e2b-dev/infra/packages/api/internal/api"
++	"github.com/e2b-dev/infra/packages/api/internal/cfg"
+ 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
+ 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+@@ -46,6 +47,7 @@
+ type SandboxDataFetcher func(ctx context.Context) (SandboxMetadata, *api.APIError)
+ 
+ type SandboxMetadata struct {
++	RenewableLifetime   bool
+ 	Metadata            map[string]string
+ 	EnvVars             map[string]string
+ 	Build               queries.EnvBuild
+@@ -323,9 +325,16 @@
+ 		}
+ 	}
+ 
++	renewable := (cfg.Config{LaunchpadRenewableLifetimeTeams: o.renewableLifetimeTeams}).AllowsRenewableLifetime(team.ID)
++	// A paused allocation keeps its admitted policy. A fork is new admission,
++	// and cannot inherit an exception from its parent's saved configuration.
++	if isResume && sbxData.SnapshotSandboxID == sandboxID && sbxData.RenewableLifetime {
++		renewable = true
++	}
+ 	sbxRequest := &orchestrator.SandboxCreateRequest{
+ 		Sandbox: &orchestrator.SandboxConfig{
+ 			BaseTemplateId:          sbxData.BaseTemplateID,
++			RenewableLifetime:       renewable,
+ 			TemplateId:              sbxData.TemplateID,
+ 			Alias:                   &sbxData.Alias,
+ 			TeamId:                  team.ID.String(),
+@@ -487,6 +496,7 @@
+ 		sbxData.Iam,
+ 	)
+ 	sbx.FirecrackerVersionResolved = resolvedFCVersion
++	sbx.RenewableLifetime = renewable
+ 
+ 	// An orchestrator that predates the filesystem_boot field ignores it and
+ 	// memory-restores; only the echo proves the demand was honored. Kill the
+--- a/packages/api/internal/orchestrator/keep_alive.go
++++ b/packages/api/internal/orchestrator/keep_alive.go
+@@ -24,12 +24,9 @@
+ 			return sbx, &sandbox.NotRunningError{SandboxID: sandboxID, State: sbx.State}
+ 		}
+ 
+-		// Calculate the maximum TTL that can be set without exceeding the max instance length
+-		ttl := getMaxAllowedTTL(now, sbx.StartTime, duration, sbx.MaxInstanceLength)
+-		endTime := now.Add(ttl)
+-
+-		if time.Since(sbx.StartTime) > sbx.MaxInstanceLength {
+-			return sbx, errMaxInstanceLengthExceeded
++		endTime, err := renewalEndTime(now, sbx, duration)
++		if err != nil {
++			return sbx, err
+ 		}
+ 
+ 		if !allowShorter && endTime.Before(sbx.EndTime) {
+@@ -78,3 +75,21 @@
+ 
+ 	return min(timeLeft, duration)
+ }
++
++// Renewable lifetime removes only the absolute age clamp. Every grant remains
++// finite and bounded by the captured team limit; an elapsed lease cannot be revived.
++func renewalEndTime(now time.Time, sbx sandbox.Sandbox, duration time.Duration) (time.Time, error) {
++	if duration <= 0 || sbx.MaxInstanceLength <= 0 {
++		return time.Time{}, errMaxInstanceLengthExceeded
++	}
++	if sbx.RenewableLifetime {
++		if !now.Before(sbx.EndTime) {
++			return time.Time{}, errMaxInstanceLengthExceeded
++		}
++		return now.Add(min(duration, sbx.MaxInstanceLength)), nil
++	}
++	if now.Sub(sbx.StartTime) > sbx.MaxInstanceLength {
++		return time.Time{}, errMaxInstanceLengthExceeded
++	}
++	return now.Add(getMaxAllowedTTL(now, sbx.StartTime, duration, sbx.MaxInstanceLength)), nil
++}
+--- a/packages/api/internal/orchestrator/pause_instance.go
++++ b/packages/api/internal/orchestrator/pause_instance.go
+@@ -158,6 +158,7 @@
+ 		AutoPause:           sbx.AutoPause,
+ 		Config: &types.PausedSandboxConfig{
+ 			Version:                 types.PausedSandboxConfigVersion,
++			RenewableLifetime:       sbx.RenewableLifetime,
+ 			Network:                 sbx.Network,
+ 			AutoResume:              sbx.AutoResume,
+ 			VolumeMounts:            sbx.VolumeMounts,
+--- a/packages/api/internal/orchestrator/restore.go
++++ b/packages/api/internal/orchestrator/restore.go
+@@ -99,7 +99,8 @@
+ 	sbx := sandbox.Sandbox{
+ 		SandboxID: op.SandboxID, TemplateID: op.SandboxID, BaseTemplateID: op.SourceTemplateID,
+ 		ClientID: response.GetClientId(), ExecutionID: op.ExecutionID.String(), TeamID: op.TeamID, BuildID: op.PreparedBuildID,
+-		Metadata: config.GetMetadata(), MaxInstanceLength: time.Duration(config.GetMaxSandboxLength()) * time.Hour,
++		RenewableLifetime: config.GetRenewableLifetime(),
++		Metadata:          config.GetMetadata(), MaxInstanceLength: time.Duration(config.GetMaxSandboxLength()) * time.Hour,
+ 		StartTime: request.GetStartTime().AsTime(), EndTime: request.GetEndTime().AsTime(),
+ 		VCpu: config.GetVcpu(), RamMB: config.GetRamMb(), TotalDiskSizeMB: config.GetTotalDiskSizeMb(),
+ 		KernelVersion: config.GetKernelVersion(), FirecrackerVersion: response.GetResolvedFirecrackerVersion(), FirecrackerVersionResolved: true,
+--- a/packages/api/internal/handlers/sandbox_resume.go
++++ b/packages/api/internal/handlers/sandbox_resume.go
+@@ -361,6 +361,7 @@
+ 		// snapshot: there is no resume-time override for it. Changing the kind
+ 		// requires creating a new sandbox with the desired autoPauseMemory.
+ 		var autoPauseFilesystemOnly bool
++		var renewableLifetime bool
+ 		// A fork (snapshotSandboxID != sandboxID) inherits the parent sandbox's IAM
+ 		// configuration from the snapshot, the same as a resume. The resumed/forked
+ 		// execution still gets a freshly generated execution ID upstream, so no
+@@ -371,6 +372,7 @@
+ 			autoResume = snap.Config.AutoResume
+ 			volumes = snap.Config.VolumeMounts
+ 			autoPauseFilesystemOnly = snap.Config.AutoPauseFilesystemOnly
++			renewableLifetime = snap.Config.RenewableLifetime
+ 			iam = snap.Config.Iam
+ 		}
+ 
+@@ -392,6 +394,7 @@
+ 			SnapshotSandboxID:       snapshotSandboxID,
+ 			FilesystemBoot:          filesystemBoot,
+ 			FilesystemOnlySnapshot:  snapshotIsFilesystemOnly(snap),
++			RenewableLifetime:       renewableLifetime,
+ 		}, nil
+ 	}
+ }
+--- a/packages/api/internal/handlers/launchpad_restore_worker.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker.go
+@@ -162,6 +162,7 @@
+ 			if err != nil {
+ 				return err
+ 			}
++			request.Sandbox.RenewableLifetime = a.config.AllowsRenewableLifetime(op.TeamID)
+ 			raw, err := protojson.Marshal(request)
+ 			if err != nil {
+ 				return err
+--- a/packages/api/internal/sandbox/sandboxtypes/sandbox.go
++++ b/packages/api/internal/sandbox/sandboxtypes/sandbox.go
+@@ -79,6 +79,10 @@
+ }
+ 
+ type Sandbox struct {
++	// False/missing retains the ordinary absolute lifetime limit. True permits
++	// successive finite leases; it never disables EndTime or explicit lifecycle actions.
++	RenewableLifetime bool `json:"renewableLifetime,omitempty"`
++
+ 	SandboxID  string  `json:"sandboxID"`
+ 	TemplateID string  `json:"templateID"`
+ 	ClientID   string  `json:"clientID"`
+--- a/packages/api/internal/sandbox/store.go
++++ b/packages/api/internal/sandbox/store.go
+@@ -79,7 +79,7 @@
+ 
+ 	endTime := sandbox.EndTime
+ 
+-	if endTime.Sub(sandbox.StartTime) > sandbox.MaxInstanceLength {
++	if !sandbox.RenewableLifetime && endTime.Sub(sandbox.StartTime) > sandbox.MaxInstanceLength {
+ 		sandbox.EndTime = sandbox.StartTime.Add(sandbox.MaxInstanceLength)
+ 	}
+ 
+--- a/packages/api/internal/sandbox/store_test.go
++++ b/packages/api/internal/sandbox/store_test.go
+@@ -362,3 +362,26 @@
+ 		}
+ 	})
+ }
++
++func TestAddPreservesAdmittedRenewableLease(t *testing.T) {
++	storage := newTestStorage(t)
++	store := NewStore(storage, &NoOpReservationStorage{}, Callbacks{
++		AddSandboxToRoutingTable: func(context.Context, Sandbox) {},
++	})
++	for _, renewable := range []bool{false, true} {
++		sbx := createTestSandbox()
++		sbx.SandboxID = uuid.NewString()
++		sbx.StartTime = time.Now().Add(-48 * time.Hour)
++		sbx.MaxInstanceLength = time.Hour
++		sbx.EndTime = time.Now().Add(time.Minute)
++		sbx.RenewableLifetime = renewable
++		require.NoError(t, store.Add(t.Context(), sbx, nil))
++		stored, err := storage.Get(t.Context(), sbx.TeamID, sbx.SandboxID)
++		require.NoError(t, err)
++		if renewable {
++			require.Equal(t, sbx.EndTime.UnixMilli(), stored.EndTime.UnixMilli())
++		} else {
++			require.Equal(t, sbx.StartTime.Add(time.Hour).UnixMilli(), stored.EndTime.UnixMilli())
++		}
++	}
++}
+--- a/packages/db/pkg/types/types.go
++++ b/packages/db/pkg/types/types.go
+@@ -143,6 +143,9 @@
+ }
+ 
+ type PausedSandboxConfig struct {
++	// Captured operator policy; a missing field remains bounded.
++	RenewableLifetime bool `json:"renewableLifetime,omitempty"`
++
+ 	Version      string                      `json:"version"`
+ 	Network      *SandboxNetworkConfig       `json:"network,omitempty"`
+ 	AutoResume   *SandboxAutoResumeConfig    `json:"autoResume,omitempty"`
+--- a/packages/orchestrator/orchestrator.proto
++++ b/packages/orchestrator/orchestrator.proto
+@@ -65,6 +65,10 @@
+   // Sandbox workload identity configuration requested at create time. Absent on
+   // older serialized configs, which decode as no workload identity.
+   optional SandboxIam iam = 27;
++
++  // Operator-authorized continuous lifetime, carried through persisted config.
++  // The current end_time is still a finite lease and pause/delete still stop it.
++  bool renewable_lifetime = 28;
+ }
+ 
+ // Sandbox workload identity configuration. A non-empty tokens map defines the
+--- a/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
++++ b/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
+@@ -66,9 +66,12 @@
+ 	EventsTtlDays int64 `protobuf:"varint,26,opt,name=events_ttl_days,json=eventsTtlDays,proto3" json:"events_ttl_days,omitempty"`
+ 	// Sandbox workload identity configuration requested at create time. Absent on
+ 	// older serialized configs, which decode as no workload identity.
+-	Iam           *SandboxIam `protobuf:"bytes,27,opt,name=iam,proto3,oneof" json:"iam,omitempty"`
+-	unknownFields protoimpl.UnknownFields
+-	sizeCache     protoimpl.SizeCache
++	Iam *SandboxIam `protobuf:"bytes,27,opt,name=iam,proto3,oneof" json:"iam,omitempty"`
++	// Operator-authorized continuous lifetime, carried through persisted config.
++	// The current end_time is still a finite lease and pause/delete still stop it.
++	RenewableLifetime bool `protobuf:"varint,28,opt,name=renewable_lifetime,json=renewableLifetime,proto3" json:"renewable_lifetime,omitempty"`
++	unknownFields     protoimpl.UnknownFields
++	sizeCache         protoimpl.SizeCache
+ }
+ 
+ func (x *SandboxConfig) Reset() {
+@@ -288,6 +291,13 @@
+ 		return x.Iam
+ 	}
+ 	return nil
++}
++
++func (x *SandboxConfig) GetRenewableLifetime() bool {
++	if x != nil {
++		return x.RenewableLifetime
++	}
++	return false
+ }
+ 
+ // Sandbox workload identity configuration. A non-empty tokens map defines the
+@@ -1926,7 +1936,7 @@
+ 
+ const file_orchestrator_proto_rawDesc = "" +
+ 	"\n" +
+-	"\x12orchestrator.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xb1\n" +
++	"\x12orchestrator.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe0\n" +
+ 	"\n" +
+ 	"\rSandboxConfig\x12\x1f\n" +
+ 	"\vtemplate_id\x18\x01 \x01(\tR\n" +
+@@ -1961,7 +1971,8 @@
+ 	"autoResume\x88\x01\x01\x12;\n" +
+ 	"\x1aauto_pause_filesystem_only\x18\x19 \x01(\bR\x17autoPauseFilesystemOnly\x12&\n" +
+ 	"\x0fevents_ttl_days\x18\x1a \x01(\x03R\reventsTtlDays\x12\"\n" +
+-	"\x03iam\x18\x1b \x01(\v2\v.SandboxIamH\x05R\x03iam\x88\x01\x01\x1a:\n" +
++	"\x03iam\x18\x1b \x01(\v2\v.SandboxIamH\x05R\x03iam\x88\x01\x01\x12-\n" +
++	"\x12renewable_lifetime\x18\x1c \x01(\bR\x11renewableLifetime\x1a:\n" +
+ 	"\fEnvVarsEntry\x12\x10\n" +
+ 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+ 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a;\n" +
+--- a/packages/orchestrator/pkg/sandbox/sandbox.go
++++ b/packages/orchestrator/pkg/sandbox/sandbox.go
+@@ -145,6 +145,7 @@
+ 	VolumeMounts []VolumeMountConfig
+ 
+ 	MaxSandboxLengthHours int64
++	RenewableLifetime     bool
+ 
+ 	// mu protects mutable sub-fields of Network (Egress, Ingress).
+ 	// The Network pointer itself is set once at construction and never replaced.
+--- a/packages/orchestrator/pkg/sandbox/process_metadata.go
++++ b/packages/orchestrator/pkg/sandbox/process_metadata.go
+@@ -9,13 +9,15 @@
+ )
+ 
+ type ProcessMetadata struct {
+-	SandboxID      string
+-	LifecycleID    string
+-	StartedAt      time.Time
+-	MaxLengthHours int64
+-	Temporary      bool
+-	Build          bool
+-	Tracked        bool
++	SandboxID         string
++	LifecycleID       string
++	StartedAt         time.Time
++	MaxLengthHours    int64
++	RenewableLifetime bool
++	EndAt             time.Time
++	Temporary         bool
++	Build             bool
++	Tracked           bool
+ }
+ 
+ // Network entries supply metadata for lost lifecycles, but do not prove lifecycle ownership.
+@@ -37,13 +39,15 @@
+ 			continue
+ 		}
+ 		result[sbx.files.SandboxFirecrackerSocketPath()] = ProcessMetadata{
+-			SandboxID:      sbx.Runtime.SandboxID,
+-			LifecycleID:    sbx.LifecycleID,
+-			StartedAt:      sbx.GetExecutionStartedAt(),
+-			MaxLengthHours: sbx.Config.MaxSandboxLengthHours,
+-			Temporary:      sbx.skipStartupMetrics,
+-			Build:          sbx.Runtime.SandboxType == sandboxtypes.SandboxTypeBuild,
+-			Tracked:        tracked,
++			SandboxID:         sbx.Runtime.SandboxID,
++			LifecycleID:       sbx.LifecycleID,
++			StartedAt:         sbx.GetExecutionStartedAt(),
++			MaxLengthHours:    sbx.Config.MaxSandboxLengthHours,
++			RenewableLifetime: sbx.Config.RenewableLifetime,
++			EndAt:             sbx.GetEndAt(),
++			Temporary:         sbx.skipStartupMetrics,
++			Build:             sbx.Runtime.SandboxType == sandboxtypes.SandboxTypeBuild,
++			Tracked:           tracked,
+ 		}
+ 	}
+ 
+--- a/packages/orchestrator/pkg/server/sandboxes.go
++++ b/packages/orchestrator/pkg/server/sandboxes.go
+@@ -312,6 +312,7 @@
+ 
+ 		VolumeMounts:          volumeMounts,
+ 		MaxSandboxLengthHours: req.GetSandbox().GetMaxSandboxLength(),
++		RenewableLifetime:     req.GetSandbox().GetRenewableLifetime(),
+ 	})
+ 	childSpan.SetAttributes(
+ 		telemetry.WithFirecrackerVersion(config.FirecrackerConfig.FirecrackerVersion),
+--- a/packages/orchestrator/pkg/metrics/firecracker.go
++++ b/packages/orchestrator/pkg/metrics/firecracker.go
+@@ -207,7 +207,14 @@
+ 		}
+ 
+ 		if !info.Temporary && !info.Build {
+-			if info.StartedAt.IsZero() || info.MaxLengthHours <= 0 || info.MaxLengthHours > math.MaxInt64/int64(time.Hour) {
++			if info.RenewableLifetime {
++				if info.EndAt.IsZero() {
++					result.unknownMax++
++				} else if now.After(info.EndAt) {
++					observation.overMax = true
++					result.overMax++
++				}
++			} else if info.StartedAt.IsZero() || info.MaxLengthHours <= 0 || info.MaxLengthHours > math.MaxInt64/int64(time.Hour) {
+ 				result.unknownMax++
+ 			} else if now.After(info.StartedAt.Add(time.Duration(info.MaxLengthHours) * time.Hour)) {
+ 				observation.overMax = true
+--- /dev/null
++++ b/packages/api/internal/cfg/renewable_lifetime_test.go
+@@ -0,0 +1,17 @@
++package cfg
++
++import (
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++	"testing"
++)
++
++func TestRenewableLifetimeRequiresExplicitOperatorTeam(t *testing.T) {
++	t.Parallel()
++	team, other := uuid.New(), uuid.New()
++	require.False(t, (Config{}).AllowsRenewableLifetime(team))
++	cfg := Config{LaunchpadRenewableLifetimeTeams: []string{team.String()}}
++	require.True(t, cfg.AllowsRenewableLifetime(team))
++	require.False(t, cfg.AllowsRenewableLifetime(other))
++	require.False(t, cfg.AllowsRenewableLifetime(uuid.Nil))
++}
+--- /dev/null
++++ b/packages/api/internal/orchestrator/renewable_lifetime_test.go
+@@ -0,0 +1,82 @@
++package orchestrator
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/e2b-dev/infra/packages/api/internal/api"
++	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
++	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
++	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestRenewableLifetimeKeepsFiniteLeaseBeyondAbsoluteAge(t *testing.T) {
++	t.Parallel()
++	now := time.Unix(1800000000, 0)
++	sbx := sandbox.Sandbox{StartTime: now.Add(-48 * time.Hour), EndTime: now.Add(time.Minute), MaxInstanceLength: time.Hour, RenewableLifetime: true}
++	end, err := renewalEndTime(now, sbx, 10*time.Minute)
++	require.NoError(t, err)
++	require.Equal(t, now.Add(10*time.Minute), end)
++	end, err = renewalEndTime(now, sbx, 48*time.Hour)
++	require.NoError(t, err)
++	require.Equal(t, now.Add(time.Hour), end, "a renewable grant is still capped")
++	for _, duration := range []time.Duration{0, -time.Second} {
++		_, err = renewalEndTime(now, sbx, duration)
++		require.Error(t, err)
++	}
++	sbx.EndTime = now
++	_, err = renewalEndTime(now, sbx, time.Minute)
++	require.Error(t, err, "an elapsed finite lease cannot be revived")
++	sbx.EndTime = now.Add(time.Minute)
++	sbx.RenewableLifetime = false
++	_, err = renewalEndTime(now, sbx, time.Minute)
++	require.ErrorIs(t, err, errMaxInstanceLengthExceeded, "ordinary teams keep their absolute cap")
++}
++
++func TestRenewableLifetimeAdmissionAndPausePersistence(t *testing.T) {
++	for _, tc := range []struct {
++		name                             string
++		allow, resume, saved, fork, want bool
++	}{
++		{name: "ordinary metadata cannot opt in"},
++		{name: "operator grants new allocation", allow: true, want: true},
++		{name: "resume retains admission after allowlist removal", resume: true, saved: true, want: true},
++		{name: "fork cannot inherit exception", resume: true, saved: true, fork: true},
++		{name: "old snapshot stays bounded", resume: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			o := newCreateSandboxTestOrchestrator(t)
++			team := testTeam()
++			if tc.allow {
++				o.renewableLifetimeTeams = []string{team.ID.String()}
++			}
++			id := "lease-" + uuid.NewString()
++			source := id
++			if tc.fork {
++				source = "another-sandbox"
++			}
++			now := time.Now()
++			sbx, apiErr := o.CreateSandbox(t.Context(), id, uuid.NewString(), team,
++				func(context.Context) (SandboxMetadata, *api.APIError) {
++					return SandboxMetadata{TemplateID: "tpl", BaseTemplateID: "tpl", Build: testBuild(),
++						Metadata:          map[string]string{"launchpad.managed": "thread-vm-v1", "renewableLifetime": "true"},
++						RenewableLifetime: tc.saved, SnapshotSandboxID: source}, nil
++				}, now, now.Add(time.Hour), time.Hour, tc.resume, false, sandbox.CreationMetadata{IsResume: tc.resume})
++			require.Nil(t, apiErr)
++			require.Equal(t, tc.want, sbx.RenewableLifetime)
++			stored, err := o.sandboxStore.Get(t.Context(), team.ID, id)
++			require.NoError(t, err)
++			require.Equal(t, tc.want, stored.RenewableLifetime)
++			snapshot := buildUpsertSnapshotParams(stored, &nodemanager.Node{ID: "node-1"}, false)
++			data, err := json.Marshal(snapshot.Config)
++			require.NoError(t, err)
++			var reopened dbtypes.PausedSandboxConfig
++			require.NoError(t, json.Unmarshal(data, &reopened))
++			require.Equal(t, tc.want, reopened.RenewableLifetime)
++		})
++	}
++}
+--- a/packages/orchestrator/pkg/metrics/firecracker_test.go
++++ b/packages/orchestrator/pkg/metrics/firecracker_test.go
+@@ -296,3 +296,19 @@
+ 		require.EqualValues(t, 0, trackerValues(t, reader)[telemetry.FirecrackerTrackerLastSuccessAge])
+ 	})
+ }
++
++func TestTrackerUsesRenewableLeaseInsteadOfProcessAge(t *testing.T) {
++	t.Parallel()
++	now := time.Unix(1800000000, 0)
++	metadata := map[string]sandbox.ProcessMetadata{"socket": {
++		Tracked: true, StartedAt: now.Add(-48 * time.Hour), MaxLengthHours: 1,
++		RenewableLifetime: true, EndAt: now.Add(time.Minute),
++	}}
++	c, reader := testTracker(t, func(context.Context) ([]firecrackerProcess, error) {
++		return []firecrackerProcess{{identity: processIdentity{pid: 1, startTicks: 1}, socket: "socket", age: 48 * time.Hour}}, nil
++	}, func() map[string]sandbox.ProcessMetadata { return metadata })
++	c.sample(t.Context(), now)
++	require.Zero(t, trackerValues(t, reader)[telemetry.FirecrackerProcessesOverMaxLength])
++	c.sample(t.Context(), now.Add(2*time.Minute))
++	require.EqualValues(t, 1, trackerValues(t, reader)[telemetry.FirecrackerProcessesOverMaxLength])
++}
+--- /dev/null
++++ b/packages/shared/pkg/sandbox-catalog/lease_redis.go
+@@ -0,0 +1,126 @@
++package sandbox_catalog
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/redis/go-redis/v9"
++)
++
++var ErrRouteLeaseExpired = errors.New("sandbox route lease has expired")
++var ErrRouteLeaseStopped = errors.New("sandbox route execution has stopped")
++var ErrRouteLeaseSuperseded = errors.New("sandbox route lease revision was superseded")
++
++// A route may expire before an older, longer renewal reaches Redis. Keep its
++// execution/revision fence until the latest deadline ever issued by the owner,
++// independently of the current route TTL. A stopped execution can never publish
++// again; another execution cannot overwrite a still-owned route.
++var publishLease = redis.NewScript(`
++local clock = redis.call('TIME')
++local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
++local ends = tonumber(ARGV[4])
++if ends <= now then return -2 end
++local fence = redis.call('HMGET', KEYS[2], 'revision', 'stopped', 'until', 'request')
++if fence[2] == '1' then return -1 end
++local revision = tonumber(ARGV[3])
++local previous = tonumber(fence[1] or '0')
++if previous > revision then return -3 end
++local request = ARGV[2] .. ':' .. ARGV[4] .. ':' .. ARGV[5]
++if previous == revision and fence[4] and fence[4] ~= request then
++ return redis.error_reply('route lease revision conflicts with its request')
++end
++local route = redis.call('GET', KEYS[1])
++if route then
++ local ok, info = pcall(cjson.decode, route)
++ if not (ok and type(info) == 'table' and type(info.execution_id) == 'string') then
++  return redis.error_reply('invalid sandbox route')
++ end
++ if (info.execution_id ~= ARGV[1] or info.lifecycle_id ~= ARGV[6]) then return 0 end
++end
++local untilAt = math.max(tonumber(ARGV[5]), tonumber(fence[3] or '0'))
++redis.call('HSET', KEYS[2], 'revision', ARGV[3], 'until', untilAt, 'request', request)
++redis.call('PEXPIREAT', KEYS[2], untilAt)
++redis.call('SET', KEYS[1], ARGV[2], 'PXAT', ends)
++return 1
++`)
++
++var stopLease = redis.NewScript(`
++local untilAt = math.max(tonumber(ARGV[2]), tonumber(redis.call('HGET', KEYS[2], 'until') or '0'))
++redis.call('HSET', KEYS[2], 'stopped', '1', 'until', untilAt)
++redis.call('PEXPIREAT', KEYS[2], untilAt)
++local route = redis.call('GET', KEYS[1])
++if route then
++ local ok, info = pcall(cjson.decode, route)
++ if not (ok and type(info) == 'table' and type(info.execution_id) == 'string') then
++  return redis.error_reply('invalid sandbox route')
++ end
++ if info.execution_id == ARGV[1] and info.lifecycle_id == ARGV[3] then redis.call('DEL', KEYS[1]) end
++end
++return 1
++`)
++
++func (c *RedisSandboxCatalog) leaseKeys(sandboxID, executionID, lifecycleID string) ([]string, error) {
++	if sandboxID == "" || executionID == "" || lifecycleID == "" || strings.ContainsAny(sandboxID+executionID+lifecycleID, "{}") {
++		return nil, errors.New("invalid sandbox route identity")
++	}
++	route := c.getCatalogKey(sandboxID)
++	// The untagged route key hashes as a whole. Using that same string inside
++	// braces makes both keys belong to the same slot on Redis Cluster.
++	return []string{route, c.keyPrefix + "lease:{" + route + "}:" + executionID + ":" + lifecycleID}, nil
++}
++
++// PublishLease is used only by a live execution's serialized routing owner.
++// revision increases for every changed deadline, and fenceUntil is the greatest
++// expiry it has ever issued (including requests whose response was lost).
++func (c *RedisSandboxCatalog) PublishLease(ctx context.Context, sandboxID string, info *SandboxInfo, revision int64, endAt, fenceUntil time.Time) error {
++	if info == nil || revision <= 0 || revision > 1<<53-1 || !endAt.After(time.UnixMilli(0)) || fenceUntil.Before(endAt) {
++		return errors.New("invalid sandbox route lease")
++	}
++	keys, err := c.leaseKeys(sandboxID, info.ExecutionID, info.LifecycleID)
++	if err != nil {
++		return err
++	}
++	data, err := json.Marshal(info)
++	if err != nil {
++		return err
++	}
++	ctx, cancel := context.WithTimeout(ctx, catalogRedisTimeout)
++	defer cancel()
++	result, err := publishLease.Run(ctx, c.redisClient, keys, info.ExecutionID, data, revision, endAt.UnixMilli(), fenceUntil.UnixMilli(), info.LifecycleID).Int()
++	if err != nil {
++		return fmt.Errorf("publish sandbox route lease: %w", err)
++	}
++	switch result {
++	case 1:
++		return nil
++	case 0:
++		return ErrSandboxExecutionMismatch
++	case -1:
++		return ErrRouteLeaseStopped
++	case -2:
++		return ErrRouteLeaseExpired
++	case -3:
++		return ErrRouteLeaseSuperseded
++	default:
++		return errors.New("unexpected sandbox route lease result")
++	}
++}
++
++// StopLease revokes even an absent route, since a publish request with an unknown
++// outcome may still arrive. The fence expires only after every issued lease has.
++func (c *RedisSandboxCatalog) StopLease(ctx context.Context, sandboxID, executionID, lifecycleID string, fenceUntil time.Time) error {
++	keys, err := c.leaseKeys(sandboxID, executionID, lifecycleID)
++	if err != nil {
++		return err
++	}
++	if !fenceUntil.After(time.UnixMilli(0)) {
++		return errors.New("invalid route revocation deadline")
++	}
++	ctx, cancel := context.WithTimeout(ctx, catalogRedisTimeout)
++	defer cancel()
++	return stopLease.Run(ctx, c.redisClient, keys, executionID, fenceUntil.UnixMilli(), lifecycleID).Err()
++}
+--- /dev/null
++++ b/packages/shared/pkg/sandbox-catalog/lease_redis_test.go
+@@ -0,0 +1,93 @@
++package sandbox_catalog
++
++import (
++	"testing"
++	"time"
++
++	redis_utils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
++	"github.com/stretchr/testify/require"
++)
++
++func TestRouteLeaseOrderingAndRevocation(t *testing.T) {
++	client := redis_utils.SetupInstance(t)
++	catalog := NewRedisSandboxRoutingCatalog(client)
++	ctx := t.Context()
++	now, err := client.Time(ctx).Result()
++	require.NoError(t, err)
++	later := now.Add(time.Hour)
++	shorter := now.Add(time.Minute)
++	old := leaseSandboxInfo("old", "node-1")
++	next := leaseSandboxInfo("next", "node-1")
++	const id = "renewable-routing"
++	require.NoError(t, catalog.PublishLease(ctx, id, old, 1, later, later))
++	require.NoError(t, catalog.PublishLease(ctx, id, old, 2, shorter, later))
++	require.ErrorIs(t, catalog.PublishLease(ctx, id, old, 1, later, later), ErrRouteLeaseSuperseded)
++	require.Error(t, catalog.PublishLease(ctx, id, old, 2, later, later), "same revision cannot change its deadline")
++	ttl, err := client.PTTL(ctx, catalog.getCatalogKey(id)).Result()
++	require.NoError(t, err)
++	require.LessOrEqual(t, ttl, time.Minute)
++	keys, err := catalog.leaseKeys(id, old.ExecutionID, old.LifecycleID)
++	require.NoError(t, err)
++	fenceTTL, err := client.PTTL(ctx, keys[1]).Result()
++	require.NoError(t, err)
++	require.Greater(t, fenceTTL, ttl, "the ordering fence outlives a shortened route")
++	// Simulate expiry of the shorter route. A delayed older grant still cannot
++	// recreate it, even though its own requested deadline is still in the future.
++	require.NoError(t, client.Del(ctx, catalog.getCatalogKey(id)).Err())
++	require.ErrorIs(t, catalog.PublishLease(ctx, id, old, 1, later, later), ErrRouteLeaseSuperseded)
++	require.NoError(t, catalog.PublishLease(ctx, id, old, 3, later, later), "a live owner can recover a lost route")
++	require.ErrorIs(t, catalog.PublishLease(ctx, id, next, 1, later, later), ErrSandboxExecutionMismatch)
++	require.NoError(t, catalog.StopLease(ctx, id, old.ExecutionID, old.LifecycleID, later))
++	require.ErrorIs(t, catalog.PublishLease(ctx, id, old, 4, later, later), ErrRouteLeaseStopped)
++	require.NoError(t, catalog.PublishLease(ctx, id, next, 1, later, later))
++	require.NoError(t, catalog.StopLease(ctx, id, old.ExecutionID, old.LifecycleID, later))
++	got, err := catalog.GetSandbox(ctx, id)
++	require.NoError(t, err)
++	require.Equal(t, next.ExecutionID, got.ExecutionID)
++	require.NoError(t, catalog.StopLease(ctx, id, next.ExecutionID, next.LifecycleID, later))
++	require.ErrorIs(t, catalog.PublishLease(ctx, id, old, 5, later, later), ErrRouteLeaseStopped)
++	require.ErrorIs(t, catalog.PublishLease(ctx, id, next, 2, later, later), ErrRouteLeaseStopped)
++}
++
++func TestRouteLeaseLostInitialPublishAndStop(t *testing.T) {
++	client := redis_utils.SetupInstance(t)
++	catalog := NewRedisSandboxRoutingCatalog(client)
++	ctx := t.Context()
++	now, err := client.Time(ctx).Result()
++	require.NoError(t, err)
++	end := now.Add(time.Minute)
++	info := leaseSandboxInfo("execution", "node-1")
++	require.NoError(t, catalog.StopLease(ctx, "never-published", info.ExecutionID, info.LifecycleID, end))
++	require.ErrorIs(t, catalog.PublishLease(ctx, "never-published", info, 1, end, end), ErrRouteLeaseStopped)
++	require.ErrorIs(t, catalog.PublishLease(ctx, "expired", info, 1, now.Add(-time.Second), end), ErrRouteLeaseExpired)
++	require.NoError(t, catalog.PublishLease(ctx, "retry", info, 1, end, end))
++	require.NoError(t, catalog.PublishLease(ctx, "retry", info, 1, end, end), "identical retry after a lost reply succeeds")
++	require.Error(t, catalog.PublishLease(ctx, "bad-revision", info, 0, end, end))
++	require.Error(t, catalog.PublishLease(ctx, "bad-fence", info, 1, end, now))
++}
++
++func leaseSandboxInfo(executionID, node string) *SandboxInfo {
++	info := testSandboxInfo(executionID, node)
++	info.LifecycleID = "lifecycle-" + executionID
++	return info
++}
++
++func TestRouteLeaseCheckpointKeepsExecutionWithNewLifecycle(t *testing.T) {
++	client := redis_utils.SetupInstance(t)
++	catalog := NewRedisSandboxRoutingCatalog(client)
++	ctx := t.Context()
++	now, err := client.Time(ctx).Result()
++	require.NoError(t, err)
++	end := now.Add(time.Hour)
++	old := leaseSandboxInfo("same-execution", "node-1")
++	replacement := leaseSandboxInfo("same-execution", "node-1")
++	replacement.LifecycleID = "checkpoint-replacement"
++	require.NoError(t, catalog.PublishLease(ctx, "checkpoint", old, 1, end, end))
++	require.NoError(t, catalog.StopLease(ctx, "checkpoint", old.ExecutionID, old.LifecycleID, end))
++	require.NoError(t, catalog.PublishLease(ctx, "checkpoint", replacement, 1, end, end))
++	require.NoError(t, catalog.StopLease(ctx, "checkpoint", old.ExecutionID, old.LifecycleID, end))
++	require.ErrorIs(t, catalog.PublishLease(ctx, "checkpoint", old, 2, end, end), ErrRouteLeaseStopped)
++	got, err := catalog.GetSandbox(ctx, "checkpoint")
++	require.NoError(t, err)
++	require.Equal(t, replacement.LifecycleID, got.LifecycleID)
++}
+--- a/packages/orchestrator/pkg/routing/publisher.go
++++ b/packages/orchestrator/pkg/routing/publisher.go
+@@ -2,8 +2,8 @@
+ // (sandbox:routing:{sandboxID}) that client-proxy can read to reach the node.
+ //
+ // The record exists exactly while the sandbox is in the live registry: it is
+-// written on MarkRunning and deleted on MarkStopping. Both are best-effort: a
+-// failed write is logged and counted, the sandbox keeps running. See
++// written on MarkRunning, renewed for accepted leases, and revoked on MarkStopping.
++// Failed writes are logged, counted and retried while their deadline is valid. See
+ // docs/ARCHITECTURE.md, "Sandbox routing records".
+ package routing
+ 
+@@ -26,11 +26,10 @@
+ 
+ var _ sandbox.MapSubscriber = (*Publisher)(nil)
+ 
+-// Store is the subset of the Redis catalog the publisher needs. DeleteSandboxStrict
+-// returns the Redis error, so the delete counter reports real failures.
++// Store atomically orders route writes and revocation for one execution.
+ type Store interface {
+-	StoreSandbox(ctx context.Context, sandboxID string, info *catalog.SandboxInfo, expiration time.Duration) error
+-	DeleteSandboxStrict(ctx context.Context, sandboxID string, executionID string) error
++	PublishLease(context.Context, string, *catalog.SandboxInfo, int64, time.Time, time.Time) error
++	StopLease(context.Context, string, string, string, time.Time) error
+ }
+ 
+ var _ Store = (*catalog.RedisSandboxCatalog)(nil)
+@@ -43,16 +42,23 @@
+ // OnInsert starts, would skip the delete and leave a route to a dead sandbox
+ // until its TTL.
+ type routeState struct {
+-	mu       sync.Mutex
+-	inserted bool // OnInsert ran; OnStopping owns the removal from routes
+-	written  bool // StoreSandbox was called (result unknown on timeout, so still delete)
+-	stopped  bool // OnStopping ran; a later OnInsert must not write
++	mu          sync.Mutex
++	inserted    bool // OnInsert ran; OnStopping owns the removal from routes
++	written     bool // StoreSandbox was called (result unknown on timeout, so still delete)
++	stopped     bool // OnStopping ran; a later OnInsert must not write
++	sandbox     *sandbox.Sandbox
++	info        *catalog.SandboxInfo
++	revision    int64
++	endAt       time.Time
++	fenceUntil  time.Time
++	nextAttempt time.Time
+ }
+ 
+ // Publisher writes the routing record for every sandbox that becomes live on
+ // this node and deletes it when the sandbox stops.
+ type Publisher struct {
+ 	store Store
++	now   func() time.Time
+ 
+ 	orchestratorID string
+ 	nodeIP         string
+@@ -85,6 +91,7 @@
+ 
+ 	return &Publisher{
+ 		store:          store,
++		now:            time.Now,
+ 		orchestratorID: orchestratorID,
+ 		nodeIP:         nodeIP,
+ 		routes:         map[string]*routeState{},
+@@ -108,7 +115,9 @@
+ 
+ 	if state.stopped {
+ 		// MarkStopping already ran for this lifecycle; nothing to route to.
+-		p.remove(key)
++		if !state.inserted {
++			p.remove(key)
++		}
+ 
+ 		return
+ 	}
+@@ -117,37 +126,21 @@
+ 	// entry per live sandbox.
+ 	state.inserted = true
+ 
+-	info := &catalog.SandboxInfo{
+-		OrchestratorID:   p.orchestratorID,
+-		OrchestratorIP:   p.nodeIP,
+-		ExecutionID:      sbx.Runtime.ExecutionID,
+-		StartedAt:        sbx.GetStartedAt(),
++	state.sandbox = sbx
++	state.info = &catalog.SandboxInfo{
++		OrchestratorID: p.orchestratorID, OrchestratorIP: p.nodeIP,
++		ExecutionID: sbx.Runtime.ExecutionID, LifecycleID: sbx.LifecycleID, StartedAt: sbx.GetStartedAt(),
+ 		MaxLengthInHours: sbx.Config.MaxSandboxLengthHours,
+ 	}
+-
+-	// Same TTL the API uses today: the full max length from now. MarkStopping
+-	// deletes the record earlier in every normal path.
+-	expiration := time.Duration(info.MaxLengthInHours) * time.Hour
+-
+-	// Set before the call: a timeout after Redis applied the SET must still be
+-	// followed by a delete on stop.
+-	state.written = true
+-
+-	err := telemetry.Observe0(ctx, tracer, "routing-publish", func(ctx context.Context) error {
+-		return p.store.StoreSandbox(ctx, sbx.Runtime.SandboxID, info, expiration)
+-	})
+-	if err != nil {
+-		p.publishCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", "error")))
+-		logger.L().Error(ctx, "failed to publish sandbox routing record",
+-			logger.WithSandboxID(sbx.Runtime.SandboxID),
+-			logger.WithLifecycleID(sbx.LifecycleID),
+-			zap.Error(err),
+-		)
+-
+-		return
+-	}
+-
+-	p.publishCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", "ok")))
++	// Ordinary allocations retain the previous full-lifetime routing TTL.
++	// Renewable allocations instead follow their currently accepted finite lease.
++	now := p.now()
++	state.endAt = now.Add(time.Duration(state.info.MaxLengthInHours) * time.Hour)
++	if sbx.Config.RenewableLifetime {
++		state.endAt = sbx.GetEndAt()
++	}
++	p.publishLocked(ctx, state, now)
++
+ }
+ 
+ // OnStopping deletes the routing record this publisher wrote for the lifecycle.
+@@ -172,26 +165,96 @@
+ 		return
+ 	}
+ 
++	if !state.written {
++		p.remove(key)
++		return
++	}
++	p.stopLocked(ctx, key, state, p.now())
++
++}
++
++// Run reconciles routes with one bounded host loop, not one goroutine per VM.
++func (p *Publisher) Run(ctx context.Context) error {
++	ticker := time.NewTicker(5 * time.Second)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return nil
++		case <-ticker.C:
++			p.refresh(ctx, p.now())
++		}
++	}
++}
++
++func (p *Publisher) refresh(ctx context.Context, now time.Time) {
++	p.mu.Lock()
++	states := make(map[string]*routeState, len(p.routes))
++	for key, state := range p.routes {
++		states[key] = state
++	}
++	p.mu.Unlock()
++	for key, state := range states {
++		state.mu.Lock()
++		if state.inserted && !state.nextAttempt.IsZero() && !now.Before(state.nextAttempt) {
++			if state.stopped {
++				p.stopLocked(ctx, key, state, now)
++			} else {
++				p.publishLocked(ctx, state, now)
++			}
++		}
++		state.mu.Unlock()
++	}
++}
++
++func (p *Publisher) publishLocked(ctx context.Context, state *routeState, now time.Time) {
++	if state.sandbox.Config.RenewableLifetime {
++		state.endAt = state.sandbox.GetEndAt()
++	}
++	if !state.endAt.After(now) {
++		state.nextAttempt = now.Add(5 * time.Second)
++		return
++	}
++	state.revision++
++	if state.endAt.After(state.fenceUntil) {
++		state.fenceUntil = state.endAt
++	}
++	// Capture every issued deadline before I/O; a timed-out write may still land.
++	state.written = true
++	err := telemetry.Observe0(ctx, tracer, "routing-publish", func(ctx context.Context) error {
++		return p.store.PublishLease(ctx, state.sandbox.Runtime.SandboxID, state.info, state.revision, state.endAt, state.fenceUntil)
++	})
++	if err != nil {
++		state.nextAttempt = now.Add(5 * time.Second)
++		p.publishCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", "error")))
++		logger.L().Error(ctx, "failed to publish sandbox routing lease; reconciliation will retry",
++			logger.WithSandboxID(state.sandbox.Runtime.SandboxID), zap.Error(err))
++		return
++	}
++	state.nextAttempt = time.Time{}
++	if state.sandbox.Config.RenewableLifetime {
++		state.nextAttempt = now.Add(5 * time.Second)
++	}
++	p.publishCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", "ok")))
++}
++
++func (p *Publisher) stopLocked(ctx context.Context, key string, state *routeState, now time.Time) {
++	if !state.fenceUntil.After(now) {
++		// All previously issued writes now fail Redis's absolute-expiry check.
++		p.remove(key)
++		return
++	}
++	err := telemetry.Observe0(ctx, tracer, "routing-delete", func(ctx context.Context) error {
++		return p.store.StopLease(ctx, state.sandbox.Runtime.SandboxID, state.info.ExecutionID, state.info.LifecycleID, state.fenceUntil)
++	})
++	if err != nil {
++		state.nextAttempt = now.Add(5 * time.Second)
++		p.deleteCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", "error")))
++		logger.L().Error(ctx, "failed to revoke sandbox routing lease; reconciliation will retry",
++			logger.WithSandboxID(state.sandbox.Runtime.SandboxID), zap.Error(err))
++		return
++	}
+ 	p.remove(key)
+-
+-	if !state.written {
+-		return
+-	}
+-
+-	err := telemetry.Observe0(ctx, tracer, "routing-delete", func(ctx context.Context) error {
+-		return p.store.DeleteSandboxStrict(ctx, sbx.Runtime.SandboxID, sbx.Runtime.ExecutionID)
+-	})
+-	if err != nil {
+-		p.deleteCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", "error")))
+-		logger.L().Error(ctx, "failed to delete sandbox routing record; it expires via TTL",
+-			logger.WithSandboxID(sbx.Runtime.SandboxID),
+-			logger.WithLifecycleID(sbx.LifecycleID),
+-			zap.Error(err),
+-		)
+-
+-		return
+-	}
+-
+ 	p.deleteCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", "ok")))
+ }
+ 
+--- a/packages/orchestrator/pkg/routing/publisher_test.go
++++ b/packages/orchestrator/pkg/routing/publisher_test.go
+@@ -95,6 +95,7 @@
+ 	t.Helper()
+ 
+ 	p, err := New(noopmetric.NewMeterProvider(), c, "orch-1", "10.1.2.3")
++	p.now = func() time.Time { return routingTestNow }
+ 	require.NoError(t, err)
+ 
+ 	return p
+@@ -265,7 +266,7 @@
+ 	require.Empty(t, p.routes)
+ }
+ 
+-func TestPublisher_DeleteErrorForgetsLifecycle(t *testing.T) {
++func TestPublisher_DeleteErrorRetainsLifecycleForRetry(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	c := newMemoryCatalog()
+@@ -276,8 +277,12 @@
+ 	c.deleteErr = errors.New("redis down")
+ 	p.OnStopping(t.Context(), sbx)
+ 
+-	// The record stays (it expires via TTL); the publisher does not keep state for it.
++	// A failed revocation remains pending, so a lost Redis connection is retried.
+ 	require.True(t, c.has())
++	require.Len(t, p.routes, 1)
++	c.deleteErr = nil
++	p.refresh(t.Context(), routingTestNow.Add(5*time.Second))
++	require.False(t, c.has())
+ 	require.Empty(t, p.routes)
+ }
+ 
+@@ -304,3 +309,77 @@
+ 	_, err = c.GetSandbox(t.Context(), "sbx-1")
+ 	require.ErrorIs(t, err, catalog.ErrSandboxNotFound)
+ }
++
++var routingTestNow = time.Unix(1800000000, 0)
++
++func (c *memoryCatalog) PublishLease(ctx context.Context, id string, info *catalog.SandboxInfo, _ int64, endAt, _ time.Time) error {
++	return c.StoreSandbox(ctx, id, info, endAt.Sub(routingTestNow))
++}
++func (c *memoryCatalog) StopLease(_ context.Context, id, execution, lifecycle string, _ time.Time) error {
++	if c.deleteErr != nil {
++		return c.deleteErr
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if info, ok := c.records[id]; ok && info.ExecutionID == execution && info.LifecycleID == lifecycle {
++		delete(c.records, id)
++	}
++	return nil
++}
++
++func TestPublisherRenewsAcceptedDeadlineAndRecoversMissingRoute(t *testing.T) {
++	t.Parallel()
++	c := newMemoryCatalog()
++	p := newPublisher(t, c)
++	sbx := testSandbox(t, testSandboxID, "lc-renewable", sandboxtypes.SandboxTypeSandbox)
++	sbx.Config.RenewableLifetime = true
++	sbx.SetEndAt(routingTestNow.Add(time.Minute))
++	p.OnInsert(t.Context(), sbx)
++	require.Equal(t, time.Minute, c.ttls[testSandboxID])
++	sbx.SetEndAt(routingTestNow.Add(10 * time.Minute))
++	p.refresh(t.Context(), routingTestNow.Add(5*time.Second))
++	require.Equal(t, 10*time.Minute, c.ttls[testSandboxID])
++	// A later periodic refresh repairs an absent route without waking the VM.
++	c.records = map[string]*catalog.SandboxInfo{}
++	p.refresh(t.Context(), routingTestNow.Add(10*time.Second))
++	require.True(t, c.has())
++	sbx.SetEndAt(routingTestNow.Add(30 * time.Second))
++	p.refresh(t.Context(), routingTestNow.Add(15*time.Second))
++	state := p.routes[lifecycleKey(sbx)]
++	require.Equal(t, routingTestNow.Add(10*time.Minute), state.fenceUntil)
++	require.Equal(t, 30*time.Second, c.ttls[testSandboxID])
++	p.OnStopping(t.Context(), sbx)
++	p.refresh(t.Context(), routingTestNow.Add(20*time.Second))
++	require.False(t, c.has())
++}
++
++func TestPublisherRetriesFailedInitialPublish(t *testing.T) {
++	t.Parallel()
++	c := newMemoryCatalog()
++	c.storeErr = errors.New("connection unavailable")
++	p := newPublisher(t, c)
++	sbx := testSandbox(t, testSandboxID, "lc-retry", sandboxtypes.SandboxTypeSandbox)
++	p.OnInsert(t.Context(), sbx)
++	require.False(t, c.has())
++	c.storeErr = nil
++	p.refresh(t.Context(), routingTestNow.Add(5*time.Second))
++	require.True(t, c.has())
++	p.OnStopping(t.Context(), sbx)
++	require.False(t, c.has())
++}
++
++func TestPublisherCheckpointReplacementKeepsStableExecution(t *testing.T) {
++	c := newMemoryCatalog()
++	p := newPublisher(t, c)
++	first := testSandbox(t, "sbx-1", "old", sandboxtypes.SandboxTypeSandbox)
++	replacement := testSandbox(t, "sbx-1", "new", sandboxtypes.SandboxTypeSandbox)
++	p.OnInsert(t.Context(), first)
++	c.deleteErr = errors.New("lost stop reply")
++	p.OnStopping(t.Context(), first)
++	c.deleteErr = nil
++	p.OnInsert(t.Context(), replacement)
++	p.refresh(t.Context(), routingTestNow.Add(5*time.Second))
++	got, err := c.GetSandbox(t.Context(), "sbx-1")
++	require.NoError(t, err)
++	require.Equal(t, "new", got.LifecycleID)
++}
+--- a/packages/orchestrator/pkg/factories/run.go
++++ b/packages/orchestrator/pkg/factories/run.go
+@@ -712,6 +712,7 @@
+ 			logger.L().Fatal(ctx, "failed to create sandbox routing publisher", zap.Error(err))
+ 		}
+ 		sandboxes.Subscribe(routingPublisher)
++		startService("sandbox routing reconciliation", func() error { return routingPublisher.Run(ctx) })
+ 	} else {
+ 		logger.L().Warn(ctx, "redis disabled; orchestrator sandbox routing records are not published")
+ 	}
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -484,23 +484,43 @@
+ | API-owned (legacy, unread) | `sandbox:catalog:{sandboxID}` | API (cloud) or the cluster edge from gRPC metadata (BYOC) | after `Create` returns | before `Pause`/`Kill` is sent to the node |
+ | Orchestrator-owned | `sandbox:routing:{sandboxID}` | orchestrator, `packages/orchestrator/pkg/routing` | on `MarkRunning` (sandbox enters the live map, envd is ready) | on `MarkStopping` (kill, pause, checkpoint, crash) |
+ 
+-**The orchestrator-owned record is the routing source.** The orchestrator writes
+-`sandbox:routing:{id}` on `MarkRunning` and deletes it on `MarkStopping`. A failed write is logged
+-and counted (`orchestrator.routing.publish.total{result=error}`); the sandbox keeps running. Build
+-sandboxes are skipped. The delete is guarded by `execution_id` in a Lua script, so a stale
+-lifecycle never removes the record of a newer execution. client-proxy has no fallback to the
+-API-owned record on a miss: a miss goes to the auto-resume path (`ResumeSandbox` gRPC to the API).
+-
+-The API-owned record is still written but no longer read. It is kept until the writers in the API
+-and the cluster edge are removed.
+-
+-Deploy order: every orchestrator on a cluster must run a build that publishes the record for one
+-maximum sandbox length before client-proxy is upgraded past the flag-gated builds. Otherwise
+-requests for sandboxes started before the orchestrator upgrade miss the record and go to the
+-resume path.
+-
+-The TTL of both records is `sandbox_max_length_in_hours` from the write time. The record is
+-deleted earlier in every normal stop path.
++**The orchestrator-owned record is the routing source.** The host publishes it on
++`MarkRunning`, then revokes it on `MarkStopping`. Client-proxy has no fallback to
++the unread API-owned record; a miss goes to the auto-resume path. Build sandboxes
++are never published. The legacy API/cluster-edge writers remain unchanged until
++removed together; they are not part of the renewable connectivity guarantee.
++
++Ordinary allocations retain their full maximum-lifetime route TTL. Allocations
++admitted with `renewable_lifetime` instead follow the current finite `endAt`.
++A single host reconciliation loop republishes those leases every five seconds,
++and retries failed initial publication and revocation. Errors remain visible in
++logs and routing counters. A route is not proof that a guest is running; the
++live registry still owns execution.
++
++Each publication has an increasing revision and an absolute deadline. Redis
++atomically rejects older revisions, a stopped lifecycle, expired grants, and a
++route owned by another execution/lifecycle. Checkpoint replacement keeps the API
++execution ID but receives a new lifecycle ID; revocation must distinguish them. The per-lifecycle fence lives until the
++largest deadline ever issued, including requests whose outcome is unknown. It
++must outlive a shortened route: otherwise an older delayed renewal could bring
++that route back. Revocation is retained and retried until confirmed or every
++previously issued grant has expired. Route and fence keys share a Redis Cluster
++slot. Redis state loss is a runtime-service failure, outside relay-outage survival.
++
++Renewable lifetime is an operator-only API admission policy via
++`LAUNCHPAD_RENEWABLE_LIFETIME_TEAMS`. The API persists the decision in Redis,
++paused configuration and the orchestrator create contract. A metadata label
++cannot grant it; missing fields remain bounded. Same-allocation resume preserves
++an existing grant after allowlist removal; a fork needs a fresh admission. Removing
++a team blocks new grants, not active busy work. Drain allocations explicitly
++before retiring that team's policy. Restored disk activation captures the policy
++in its immutable create request. Every renewal stays finite and bounded by the
++captured team limit. The host keeper must continue renewing: `endAt`, explicit
++pause/delete, and expired-lease rejection still apply.
++
++Deploy the matching API and orchestrator before admitting renewable allocations.
++The policy alone is not the product readiness gate; a rebuild must pass the
++lifetime-boundary and fresh-connection proof with the keeper enabled.
+ 
+ ### Volume content
+ 
+--- a/packages/shared/pkg/sandbox-catalog/catalog.go
++++ b/packages/shared/pkg/sandbox-catalog/catalog.go
+@@ -12,6 +12,7 @@
+ 	OrchestratorID string `json:"orchestrator_id"`
+ 	OrchestratorIP string `json:"orchestrator_ip"` // used only for cases where orchestrator is not registered in edge pool
+ 
++	LifecycleID      string    `json:"lifecycle_id,omitempty"` // changes when checkpoint replaces a process
+ 	ExecutionID      string    `json:"execution_id"`
+ 	StartedAt        time.Time `json:"sandbox_started_at"`          // when sandbox was started
+ 	MaxLengthInHours int64     `json:"sandbox_max_length_in_hours"` // how long can sandbox can possibly run (in hours)

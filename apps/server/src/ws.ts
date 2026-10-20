@@ -26,6 +26,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
+  AuthOrchestrationReadScope,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
   type AuthEnvironmentScope,
@@ -114,6 +115,7 @@ import {
 } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { makeThreadExecutionFence } from "./persistence/ThreadExecutionFence.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import {
   makeCreationDispatcher,
@@ -160,7 +162,10 @@ import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
-import { importRecentAgentThreads } from "./project/AgentSessionImporter.ts";
+import {
+  importRecentAgentThreads,
+  importRecentAgentThreadsWithProgress,
+} from "./project/AgentSessionImporter.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -580,7 +585,7 @@ const makeWsRpcLayer = (
       const filterSnapshot = <
         A extends {
           readonly projects: ReadonlyArray<{ readonly id: ProjectId }>;
-          readonly threads: ReadonlyArray<{ readonly projectId: ProjectId }>;
+          readonly threads: ReadonlyArray<{ readonly id: ThreadId; readonly projectId: ProjectId }>;
         },
       >(
         snapshot: A,
@@ -589,7 +594,11 @@ const makeWsRpcLayer = (
           Effect.map((ids) => ({
             ...snapshot,
             projects: snapshot.projects.filter((p) => ids === undefined || ids.has(p.id)),
-            threads: snapshot.threads.filter((t) => ids === undefined || ids.has(t.projectId)),
+            threads: snapshot.threads.filter(
+              (t) =>
+                (ids === undefined || ids.has(t.projectId)) &&
+                (access.threadId === undefined || access.threadId === t.id),
+            ),
           })),
         );
       const crypto = yield* Crypto.Crypto;
@@ -618,10 +627,10 @@ const makeWsRpcLayer = (
       const dispatchFromClient: OrchestrationEngine.OrchestrationEngineShape["dispatch"] = (
         command,
       ) =>
-        orchestrationEngine.dispatch(
-          command,
-          hasClientOrigin ? { origin: clientOrigin } : undefined,
-        );
+        orchestrationEngine.dispatch(command, {
+          directClientCommand: true,
+          ...(hasClientOrigin ? { origin: clientOrigin } : {}),
+        });
       const recordClientCommandAnalytics = (command: OrchestrationCommand) => {
         switch (command.type) {
           case "thread.create":
@@ -1108,6 +1117,12 @@ const makeWsRpcLayer = (
           if (!(yield* access.status).enabled) return true;
           if (item.kind === "thread-removed") return visibleThreads.delete(item.threadId);
           if (item.kind === "project-removed") return visibleProjects.delete(item.projectId);
+          if (
+            item.kind === "thread-upserted" &&
+            access.threadId !== undefined &&
+            item.thread.id !== access.threadId
+          )
+            return false;
           const projectId =
             item.kind === "project-upserted" ? item.project.id : item.thread.projectId;
           const allowed = yield* access.requireProject(currentSession, projectId).pipe(
@@ -2061,6 +2076,22 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
+              // Replay is also a client write path. Portable commands must enter
+              // the relay inbox before any local receipt or dispatch is considered.
+              if ("threadId" in command) {
+                yield* makeThreadExecutionFence(sql)
+                  .assertDirectClientAllowed(command.threadId, command.type)
+                  .pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new EnvironmentAuthorizationError({
+                          message: error.message,
+                          requiredScope: AuthOrchestrationReadScope,
+                          reason: "portable-thread",
+                        }),
+                    ),
+                  );
+              }
               const replay = yield* access.withFence(
                 replayAuthorizedOrchestrationCommand(currentSession, command),
               );
@@ -2268,10 +2299,17 @@ const makeWsRpcLayer = (
             ORCHESTRATION_WS_METHODS.searchThreads,
             access.projectIds(currentSession).pipe(
               Effect.flatMap((ids) =>
-                projectionSnapshotQuery.searchThreads(
-                  input,
-                  ids === undefined ? undefined : [...ids],
-                ),
+                projectionSnapshotQuery
+                  .searchThreads(input, ids === undefined ? undefined : [...ids])
+                  .pipe(
+                    Effect.map((result) => ({
+                      ...result,
+                      matches: result.matches.filter(
+                        (match) =>
+                          access.threadId === undefined || match.threadId === access.threadId,
+                      ),
+                    })),
+                  ),
               ),
               Effect.mapError(
                 (cause) =>
@@ -2483,6 +2521,16 @@ const makeWsRpcLayer = (
                 isThreadDetailEvent(event);
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
+                Stream.tap((event) =>
+                  event.aggregateId === input.threadId && event.type === "thread.placement-imported"
+                    ? Effect.fail(
+                        new OrchestrationGetSnapshotError({
+                          message: "Thread moved; reload its imported history.",
+                          cause: input.threadId,
+                        }),
+                      )
+                    : Effect.void,
+                ),
                 Stream.filter(isThisThreadDetailEvent),
                 Stream.map((event) => ({
                   kind: "event" as const,
@@ -2525,7 +2573,7 @@ const makeWsRpcLayer = (
                   liveStream.pipe(
                     Stream.runForEachArray(liveBuffer.offerAll),
                     Effect.raceFirst(liveBuffer.failed),
-                    Effect.catchTags({ OrchestrationGetSnapshotError: () => Effect.void }),
+                    Effect.catchTags({ OrchestrationGetSnapshotError: liveBuffer.close }),
                   ),
                   { startImmediately: true },
                 );
@@ -3782,6 +3830,28 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "workspace" },
             input,
           ),
+        [WS_METHODS.agentSessionsImportWithProgress]: (input) =>
+          observeRpcStream(
+            WS_METHODS.agentSessionsImportWithProgress,
+            importRecentAgentThreadsWithProgress(input).pipe(
+              Stream.provideService(AgentSessionScanner.AgentSessionScanner, agentSessionScanner),
+              Stream.provideService(
+                OrchestrationEngine.OrchestrationEngineService,
+                orchestrationEngine,
+              ),
+              Stream.provideService(
+                ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+                projectionSnapshotQuery,
+              ),
+              Stream.provideService(Crypto.Crypto, crypto),
+              Stream.provideService(
+                ProviderSessionDirectory.ProviderSessionDirectory,
+                providerSessionDirectory,
+              ),
+            ),
+            { "rpc.aggregate": "workspace" },
+            input,
+          ),
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,
@@ -4178,8 +4248,8 @@ const makeWsRpcLayer = (
                       return yield* lifetime.guard(Effect.void);
                     }
                     ready = true;
-                    yield* Queue.offerAll(queue, pending);
-                    pending.length = 0;
+                    // Queue retains offered arrays; detach this buffer before reusing it.
+                    yield* Queue.offerAll(queue, pending.splice(0));
                   }
                 }),
               );

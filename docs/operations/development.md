@@ -109,6 +109,9 @@ commands, including shutdown and reset. The project name isolates containers and
 volumes; the port must also be free. Each running relay needs its own `DEV_RELAY_PORT`, with
 the corresponding `T3CODE_RELAY_URL` in that worktree's root `.env`.
 
+For the planned VM backend, see [E2B host setup](./e2b-host-setup.md). It covers a
+native Linux compute host and an optional Lima host for Mac development.
+
 ### State and ports
 
 Linked worktrees default to their own `.t3/userdata`, even when `T3CODE_HOME` is set.

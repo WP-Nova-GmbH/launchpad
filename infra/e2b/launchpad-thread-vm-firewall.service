@@ -1,0 +1,14 @@
+[Unit]
+Description=Launchpad thread VM guest firewall
+After=network-pre.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/launchpad-host-firewall apply
+ExecReload=/usr/local/libexec/launchpad-host-firewall apply
+TimeoutStartSec=15
+
+[Install]
+WantedBy=multi-user.target

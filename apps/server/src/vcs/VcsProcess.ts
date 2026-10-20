@@ -1,3 +1,6 @@
+import { CheckoutAccess } from "../workspace/CheckoutAccess.ts";
+import * as Redacted from "effect/Redacted";
+import { privateThreadVmGitArgs, privateThreadVmSourceControlEnv } from "./threadVmCredentials.ts";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -153,12 +156,35 @@ export const make = Effect.gen(function* () {
     // runner's push credential is granted (ADR-0009). It resolves to null when
     // no runner credential is configured, leaving the inherited environment
     // exactly as it was.
-    const resolvedEnv = yield* resolveRunnerEnv(input.env);
+    const privateVm = organizationCredentials.threadVm;
+    const needsGithubToken = input.command === "gh" && !input.args.includes("--version");
+    const vmToken =
+      privateVm && needsGithubToken
+        ? yield* privateVm.github.pipe(
+            Effect.mapError(
+              () =>
+                new VcsProcessExitError({
+                  ...baseError,
+                  exitCode: 1,
+                  detail: "Repository access is unavailable for this thread VM.",
+                  failureKind: "authentication",
+                }),
+            ),
+          )
+        : null;
+    const resolvedEnv = privateVm
+      ? privateThreadVmSourceControlEnv(
+          input.env ?? globalThis.process.env,
+          vmToken ? Redacted.value(vmToken) : null,
+        )
+      : yield* resolveRunnerEnv(input.env);
+    const args =
+      privateVm && input.command === "git" ? privateThreadVmGitArgs(input.args) : input.args;
 
     const result = yield* processRunner
       .run({
         command: input.command,
-        args: input.args,
+        args,
         cwd: input.cwd,
         ...(input.spawnCwd !== undefined ? { spawnCwd: input.spawnCwd } : {}),
         ...(input.stdin !== undefined ? { stdin: input.stdin } : {}),
@@ -259,7 +285,54 @@ export const make = Effect.gen(function* () {
   return VcsProcess.of({ run });
 });
 
-export const layer = Layer.effect(VcsProcess, make).pipe(Layer.provide(ProcessRunner.layer));
+/** Production process boundary: even background Git must respect a frozen checkout. */
+export const guarded = Effect.gen(function* () {
+  const raw = yield* make;
+  const access = yield* CheckoutAccess;
+  return VcsProcess.of({
+    run: (input) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const mapHold = (error: { readonly message: string }) =>
+            new VcsProcessExitError({
+              operation: input.operation,
+              command: input.command,
+              cwd: input.cwd,
+              argumentCount: input.args.length,
+              exitCode: 1,
+              detail: error.message,
+              failureKind: "command-failed",
+            });
+          const operationId = yield* access
+            .begin({
+              paths: input.spawnCwd === undefined ? [input.cwd] : [input.cwd, input.spawnCwd],
+              kind: "vcs",
+            })
+            .pipe(Effect.mapError(mapHold));
+          // Timeout/interruption/read failures do not establish that the process stopped.
+          // Retain those records until the workload supervisor supplies stop evidence.
+          const output = yield* restore(raw.run(input)).pipe(
+            Effect.catchTags({
+              VcsProcessExitError: (error) =>
+                access
+                  .complete(operationId)
+                  .pipe(Effect.mapError(mapHold), Effect.andThen(Effect.fail(error))),
+              VcsProcessSpawnError: (error) =>
+                access
+                  .complete(operationId)
+                  .pipe(Effect.mapError(mapHold), Effect.andThen(Effect.fail(error))),
+            }),
+          );
+          yield* access.complete(operationId).pipe(Effect.mapError(mapHold));
+          return output;
+        }),
+      ),
+  });
+});
+export const layer = Layer.effect(VcsProcess, guarded).pipe(Layer.provide(ProcessRunner.layer));
 
 /** VcsProcess with no organization behind it: tests and non-executor tooling. */
-export const layerLocal = layer.pipe(Layer.provide(OrganizationSourceControlCredentials.layerNone));
+export const layerLocal = Layer.effect(VcsProcess, make).pipe(
+  Layer.provide(ProcessRunner.layer),
+  Layer.provide(OrganizationSourceControlCredentials.layerNone),
+);

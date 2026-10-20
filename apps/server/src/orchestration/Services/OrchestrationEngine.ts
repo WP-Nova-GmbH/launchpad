@@ -45,6 +45,13 @@ export interface DeletionPreconditions {
 
 export interface OrchestrationDispatchOptions {
   readonly origin?: OrchestrationClientOrigin;
+  /** Rechecked in the event transaction; enrolled threads accept only relay inbox delivery. */
+  readonly directClientCommand?: true;
+  /** Bind a held provider-output command to its original pre-persistence ownership. */
+  readonly expectedThreadOwnership?: {
+    readonly environmentId: string;
+    readonly generation: number;
+  } | null;
   readonly deletionPreconditions?: DeletionPreconditions;
   /** Serialize a preflight rejection with duplicate commands and their receipts. */
   readonly rejection?: { readonly detail: string; readonly projectId: ProjectId };

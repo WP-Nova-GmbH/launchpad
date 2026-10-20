@@ -90,6 +90,41 @@ function isResolvableContextWindowActivity(activity: OrchestrationThreadActivity
   return typeof usedTokens === "number" && Number.isFinite(usedTokens) && usedTokens >= 0;
 }
 
+/** Initialize the same detail model for a retained relay history and a live stream. */
+export function threadFromCreatedEvent(
+  event: Extract<OrchestrationEvent, { readonly type: "thread.created" }>,
+): OrchestrationThread {
+  return {
+    id: event.payload.threadId,
+    projectId: event.payload.projectId,
+    title: event.payload.title,
+    modelSelection: event.payload.modelSelection,
+    runtimeMode: event.payload.runtimeMode,
+    interactionMode: event.payload.interactionMode,
+    branch: event.payload.branch,
+    worktreePath: event.payload.worktreePath,
+    branchPullRequest: null,
+    latestTurn: null,
+    createdAt: event.payload.createdAt,
+    updatedAt: event.payload.updatedAt,
+    archivedAt: null,
+    settledOverride: null,
+    settledAt: null,
+    unsettledAt: null,
+    activeOrderKey: null,
+    autoSettleDisabledAt: null,
+    snoozedUntil: null,
+    snoozedAt: null,
+    deletedAt: null,
+    pullRequests: [],
+    messages: [],
+    proposedPlans: [],
+    activities: [],
+    checkpoints: [],
+    session: null,
+  };
+}
+
 /**
  * Apply a single orchestration event to an `OrchestrationThread`, returning
  * the updated thread, a deletion signal, or an "unchanged" marker when the
@@ -111,38 +146,14 @@ export function applyThreadDetailEvent(
       return { kind: "unchanged" };
 
     // ── Thread lifecycle ────────────────────────────────────────────
+    case "thread.placement-imported":
+      // The stream replaces history with a fresh snapshot at this boundary.
+      return { kind: "unchanged" };
+
     case "thread.created":
       return {
         kind: "updated",
-        thread: {
-          id: event.payload.threadId,
-          projectId: event.payload.projectId,
-          title: event.payload.title,
-          modelSelection: event.payload.modelSelection,
-          runtimeMode: event.payload.runtimeMode,
-          interactionMode: event.payload.interactionMode,
-          branch: event.payload.branch,
-          worktreePath: event.payload.worktreePath,
-          branchPullRequest: null,
-          latestTurn: null,
-          createdAt: event.payload.createdAt,
-          updatedAt: event.payload.updatedAt,
-          archivedAt: null,
-          settledOverride: null,
-          settledAt: null,
-          unsettledAt: null,
-          activeOrderKey: null,
-          autoSettleDisabledAt: null,
-          snoozedUntil: null,
-          snoozedAt: null,
-          deletedAt: null,
-          pullRequests: [],
-          messages: [],
-          proposedPlans: [],
-          activities: [],
-          checkpoints: [],
-          session: null,
-        },
+        thread: threadFromCreatedEvent(event),
       };
 
     case "thread.deleted":

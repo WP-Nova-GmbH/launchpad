@@ -1,4 +1,15 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
+import { makeThreadHistorySync } from "../../relay/ThreadHistorySync.ts";
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCrypto from "node:crypto";
+import * as Schema from "effect/Schema";
+import { OrchestrationEvent as EventSchema } from "@t3tools/contracts";
+import { OrchestrationCommandReceipt } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
+import {
+  ThreadHistoryBaselineImporter,
+  type ThreadHistoryBaselineInput,
+} from "../../relay/ThreadHistoryBaseline.ts";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -6,6 +17,7 @@ import * as NodePath from "node:path";
 import {
   ApprovalRequestId,
   EventId,
+  EnvironmentId,
   CheckpointRef,
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -20,6 +32,7 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Metric from "effect/Metric";
@@ -30,6 +43,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { TestClock } from "effect/testing";
 import { describe, expect, it, vi } from "vite-plus/test";
 
+import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import * as OrchestrationCommandReceipts from "../../persistence/Services/OrchestrationCommandReceipts.ts";
@@ -43,6 +57,8 @@ import {
   type OrchestrationEventStoreShape,
 } from "../../persistence/Services/OrchestrationEventStore.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
+import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
+import type { ProviderInstance } from "../../provider/ProviderDriver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
@@ -95,7 +111,7 @@ function makeOrchestrationLayer(
   return Layer.mergeAll(
     OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
-      Layer.provide(pipeline),
+      Layer.provideMerge(pipeline),
     ),
     OrchestrationProjectionSnapshotQueryLive,
   ).pipe(
@@ -121,14 +137,45 @@ async function createOrchestrationSystem(
   databasePath?: string,
   repositoryIdentityResolver?: RepositoryIdentityResolver.RepositoryIdentityResolver["Service"],
   rejectProjection?: (event: OrchestrationEvent) => boolean,
+  providers?: Pick<ProviderInstanceRegistry["Service"], "getInstance">,
 ) {
+  const layer = makeOrchestrationLayer(databasePath, repositoryIdentityResolver, rejectProjection);
   const runtime = ManagedRuntime.make(
-    makeOrchestrationLayer(databasePath, repositoryIdentityResolver, rejectProjection),
+    providers
+      ? layer.pipe(Layer.provideMerge(Layer.mock(ProviderInstanceRegistry)(providers)))
+      : layer,
   );
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
+  const fence = await runtime.runPromise(Effect.map(SqlClient.SqlClient, makeThreadExecutionFence));
   return {
+    fence,
+    sql: await runtime.runPromise(SqlClient.SqlClient),
     engine,
+    attachmentDirectory: () =>
+      runtime.runPromise(Effect.map(ServerConfig, (config) => config.attachmentsDir)),
+    rebuildProjections: () =>
+      runtime.runPromise(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`UPDATE projection_state SET last_applied_sequence = 0`;
+          yield* (yield* OrchestrationProjectionPipeline).bootstrap;
+        }),
+      ),
+    importBaseline: (input: ThreadHistoryBaselineInput) =>
+      runtime.runPromise(
+        Effect.flatMap(ThreadHistoryBaselineImporter, (importer) => importer.install(input)),
+      ),
+    importedEvents: (input: ThreadHistoryBaselineInput) =>
+      runtime.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const stream = yield* engine.subscribeDomainEvents;
+            const result = yield* (yield* ThreadHistoryBaselineImporter).install(input);
+            return { result, events: yield* Stream.runCollect(stream.pipe(Stream.take(1))) };
+          }),
+        ),
+      ),
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     readShell: () => runtime.runPromise(snapshotQuery.getShellSnapshot()),
     readThread: (threadId: ThreadId) =>
@@ -168,6 +215,453 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("registers unrelated canonical roots while retaining uncertain checkout operations", async () => {
+    const root = await NodeFSP.realpath(
+      await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "project-registration-")),
+    );
+    const held = NodePath.join(root, "held");
+    const unrelated = NodePath.join(root, "unrelated");
+    const lookalike = NodePath.join(root, "held-other");
+    const alias = NodePath.join(root, "alias");
+    const sibling = NodePath.join(root, "sibling");
+    const siblingAlias = NodePath.join(root, "sibling-alias");
+    for (const directory of [held, unrelated, lookalike, sibling]) await NodeFSP.mkdir(directory);
+    await NodeFSP.symlink(held, alias);
+    await NodeFSP.symlink(sibling, siblingAlias);
+    const system = await createOrchestrationSystem(undefined, {
+      resolve: () => Effect.succeed(null),
+    });
+    let serial = 0;
+    const create = (workspaceRoot: string) =>
+      system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          projectId: ProjectId.make(`registration-${++serial}`),
+          commandId: CommandId.make(`registration-${serial}`),
+          title: "Project",
+          workspaceRoot,
+          defaultModelSelection: null,
+          createdAt: now(),
+        }),
+      );
+    try {
+      await create(held);
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          threadId: ThreadId.make("registration-sibling"),
+          projectId: ProjectId.make("registration-1"),
+          commandId: CommandId.make("registration-sibling"),
+          title: "Sibling",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: "sibling",
+          worktreePath: sibling,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        Effect.gen(function* () {
+          yield* system.sql`INSERT INTO checkout_operations(operation_id,kind) VALUES ('uncertain','vcs')`;
+          yield* system.sql`INSERT INTO checkout_operation_paths(operation_id,path) VALUES ('uncertain',${held})`;
+          yield* system.sql`INSERT INTO checkout_operation_projects(operation_id,project_id) VALUES ('uncertain','registration-1')`;
+        }),
+      );
+      await create(unrelated);
+      await create(lookalike);
+      for (const directory of [
+        held,
+        alias,
+        NodePath.join(alias, "not-created"),
+        sibling,
+        siblingAlias,
+        NodePath.join(siblingAlias, "not-created"),
+        root,
+        NodePath.parse(root).root,
+      ])
+        await expect(create(directory)).rejects.toThrow("checkout operations");
+      // Metadata/path changes on an existing project keep their existing guard.
+      await expect(
+        system.run(
+          system.engine.dispatch({
+            type: "project.meta.update",
+            projectId: ProjectId.make("registration-2"),
+            commandId: CommandId.make("registration-change-existing-path"),
+            workspaceRoot: lookalike,
+          }),
+        ),
+      ).rejects.toThrow("checkout operations");
+      expect(
+        await system.run(system.sql`SELECT operation_id,kind FROM checkout_operations`),
+      ).toEqual([{ operation_id: "uncertain", kind: "vcs" }]);
+      expect((await system.readModel()).projects).toHaveLength(3);
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps new aliases of reserved installations blocked without blocking an unrelated project", async () => {
+    const root = await NodeFSP.realpath(
+      await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "project-installation-")),
+    );
+    const repository = NodePath.join(root, "repository"),
+      checkout = NodePath.join(root, "checkout"),
+      unrelated = NodePath.join(root, "unrelated");
+    for (const directory of [repository, checkout, unrelated]) await NodeFSP.mkdir(directory);
+    const alias = NodePath.join(root, "alias");
+    await NodeFSP.symlink(checkout, alias);
+    const system = await createOrchestrationSystem(undefined, {
+      resolve: () => Effect.succeed(null),
+    });
+    let serial = 0;
+    const create = (workspaceRoot: string) =>
+      system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          projectId: ProjectId.make(`installation-${++serial}`),
+          commandId: CommandId.make(`installation-${serial}`),
+          title: "Project",
+          workspaceRoot,
+          defaultModelSelection: null,
+          createdAt: now(),
+        }),
+      );
+    try {
+      await create(repository);
+      await system.run(
+        system.fence.prepare({
+          threadId: "moving",
+          projectId: "installation-1",
+          environmentId: "destination",
+          relayUrl: "https://relay.example",
+          generation: 2,
+          operationId: "install",
+        }),
+      );
+      await system.run(system.sql`INSERT INTO thread_checkout_claims
+        (operation_id,thread_id,generation,project_id,repository_root,checkout_path,mode,branch,manifest_sha256,workspace_sha256,inspection_json,phase)
+        VALUES ('install','moving',2,'installation-1',${repository},${checkout},'worktree','move',${"a".repeat(64)},${"b".repeat(64)},'{}','installing')`);
+      await create(unrelated);
+      for (const directory of [repository, checkout, alias, NodePath.join(repository, "new"), root])
+        await expect(create(directory)).rejects.toThrow(/checkout|reserved/);
+      expect(
+        await system.run(
+          system.sql`SELECT phase FROM thread_checkout_claims WHERE operation_id='install'`,
+        ),
+      ).toEqual([{ phase: "installing" }]);
+      expect((await system.readModel()).projects).toHaveLength(2);
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks unregistered linked worktrees during uncertain work but allows an independent clone", async () => {
+    const root = await NodeFSP.realpath(
+      await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "project-linked-registration-")),
+    );
+    const main = NodePath.join(root, "main"),
+      linked = NodePath.join(root, "linked"),
+      clone = NodePath.join(root, "clone"),
+      alias = NodePath.join(root, "alias");
+    await NodeFSP.mkdir(main);
+    const git = (cwd: string, args: ReadonlyArray<string>) =>
+      NodeChildProcess.execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_COUNT: "0",
+          GIT_AUTHOR_NAME: "Test",
+          GIT_AUTHOR_EMAIL: "test@localhost",
+          GIT_COMMITTER_NAME: "Test",
+          GIT_COMMITTER_EMAIL: "test@localhost",
+        },
+        stdio: "pipe",
+      });
+    git(main, ["init", "-b", "main"]);
+    await NodeFSP.writeFile(NodePath.join(main, "baseline.txt"), "public fixture\n");
+    git(main, ["add", "."]);
+    git(main, ["commit", "-m", "base"]);
+    git(main, ["worktree", "add", "-b", "linked", linked]);
+    git(root, ["clone", "--no-local", main, clone]);
+    await NodeFSP.mkdir(NodePath.join(linked, "nested"));
+    await NodeFSP.symlink(linked, alias);
+    expect((await NodeFSP.stat(NodePath.join(linked, ".git"))).isFile()).toBe(true);
+    expect((await NodeFSP.stat(NodePath.join(clone, ".git"))).isDirectory()).toBe(true);
+    const system = await createOrchestrationSystem(undefined, {
+      resolve: () => Effect.succeed(null),
+    });
+    let serial = 0;
+    const create = (workspaceRoot: string) =>
+      system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          projectId: ProjectId.make(`linked-registration-${++serial}`),
+          commandId: CommandId.make(`linked-registration-${serial}`),
+          title: "Project",
+          workspaceRoot,
+          defaultModelSelection: null,
+          createdAt: now(),
+        }),
+      );
+    try {
+      await create(main);
+      await system.run(
+        Effect.gen(function* () {
+          yield* system.sql`INSERT INTO checkout_operations(operation_id,kind) VALUES ('linked-uncertain','vcs')`;
+          yield* system.sql`INSERT INTO checkout_operation_paths(operation_id,path) VALUES ('linked-uncertain',${main})`;
+          yield* system.sql`INSERT INTO checkout_operation_projects(operation_id,project_id) VALUES ('linked-uncertain','linked-registration-1')`;
+        }),
+      );
+      await create(clone);
+      for (const directory of [linked, alias, NodePath.join(linked, "nested")])
+        await expect(create(directory)).rejects.toThrow("checkout operations");
+      // The reverse direction also matters when the admitted worktree was
+      // never registered and therefore has no operation-project association.
+      await system.run(
+        Effect.gen(function* () {
+          yield* system.sql`DELETE FROM checkout_operations WHERE operation_id='linked-uncertain'`;
+          yield* system.sql`INSERT INTO checkout_operations(operation_id,kind) VALUES ('unregistered-linked','vcs')`;
+          yield* system.sql`INSERT INTO checkout_operation_paths(operation_id,path) VALUES ('unregistered-linked',${linked})`;
+        }),
+      );
+      await expect(create(main)).rejects.toThrow("checkout operations");
+      const independentChild = NodePath.join(clone, "nested");
+      await NodeFSP.mkdir(independentChild);
+      await create(independentChild);
+      expect((await system.readModel()).projects).toHaveLength(3);
+      expect(await system.run(system.sql`SELECT operation_id FROM checkout_operations`)).toEqual([
+        { operation_id: "unregistered-linked" },
+      ]);
+      // Shared metadata writes also protect the other worktrees.
+      await system.run(
+        Effect.gen(function* () {
+          yield* system.sql`DELETE FROM checkout_operations WHERE operation_id='unregistered-linked'`;
+          yield* system.sql`INSERT INTO checkout_operations(operation_id,kind) VALUES ('metadata-write','write-file')`;
+          yield* system.sql`INSERT INTO checkout_operation_paths(operation_id,path) VALUES ('metadata-write',${NodePath.join(main, ".git", "config")})`;
+        }),
+      );
+      await expect(create(linked)).rejects.toThrow("checkout operations");
+      await system.run(
+        Effect.gen(function* () {
+          yield* system.sql`DELETE FROM checkout_operations WHERE operation_id='metadata-write'`;
+          yield* system.fence.prepare({
+            threadId: "linked-install",
+            projectId: "linked-registration-1",
+            environmentId: "destination",
+            relayUrl: "https://relay.example",
+            generation: 2,
+            operationId: "linked-install",
+          });
+          yield* system.sql`INSERT INTO thread_checkout_claims
+          (operation_id,thread_id,generation,project_id,repository_root,checkout_path,mode,branch,manifest_sha256,workspace_sha256,inspection_json,phase)
+          VALUES ('linked-install','linked-install',2,'linked-registration-1',${main},${main},'main','main',${"a".repeat(64)},${"b".repeat(64)},'{}','installing')`;
+        }),
+      );
+      await expect(create(linked)).rejects.toThrow("checkout operations");
+      expect(
+        await system.run(
+          system.sql`SELECT phase FROM thread_checkout_claims WHERE operation_id='linked-install'`,
+        ),
+      ).toEqual([{ phase: "installing" }]);
+      // Test-only completion of this synthetic installation leaves a separate
+      // frozen thread as the sole source of the shared-metadata hold.
+      await system.run(
+        system.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id='linked-install'`,
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          threadId: ThreadId.make("linked-frozen"),
+          projectId: ProjectId.make("linked-registration-1"),
+          commandId: CommandId.make("linked-frozen"),
+          title: "Frozen",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: "main",
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.fence.prepare({
+          threadId: "linked-frozen",
+          projectId: "linked-registration-1",
+          environmentId: "destination",
+          relayUrl: "https://relay.example",
+          generation: 2,
+          operationId: "linked-frozen",
+        }),
+      );
+      await expect(create(linked)).rejects.toThrow("checkout operations");
+      const independentOther = NodePath.join(clone, "another");
+      await NodeFSP.mkdir(independentOther);
+      await create(independentOther);
+      expect((await system.readModel()).projects).toHaveLength(4);
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when an uncertain checkout operation has no recorded path", async () => {
+    const system = await createOrchestrationSystem(undefined, {
+      resolve: () => Effect.succeed(null),
+    });
+    try {
+      await system.run(
+        system.sql`INSERT INTO checkout_operations(operation_id,kind) VALUES ('unknown-path','vcs')`,
+      );
+      await expect(
+        system.run(
+          system.engine.dispatch({
+            type: "project.create",
+            projectId: ProjectId.make("unknown-operation-project"),
+            commandId: CommandId.make("unknown-operation-project"),
+            title: "Project",
+            workspaceRoot: NodeOS.tmpdir(),
+            defaultModelSelection: null,
+            createdAt: now(),
+          }),
+        ),
+      ).rejects.toThrow("checkout operations");
+      expect((await system.readModel()).projects).toHaveLength(0);
+      expect(await system.run(system.sql`SELECT operation_id FROM checkout_operations`)).toEqual([
+        { operation_id: "unknown-path" },
+      ]);
+    } finally {
+      await system.dispose();
+    }
+  });
+
+  effectIt.effect("starts queued turn timing at admission without counting its paused wait", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(now()));
+      const timestamp = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+      const engine = yield* OrchestrationEngineService;
+      const snapshots = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("queued-clock-project");
+      const threadId = ThreadId.make("queued-clock-thread");
+      const messageId = MessageId.make("queued-clock-message");
+      const turnId = TurnId.make("queued-clock-turn");
+      const enqueuedAt = yield* timestamp;
+      yield* engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("queued-clock-project"),
+        projectId,
+        title: "Queued clock",
+        workspaceRoot: "/tmp/queued-clock",
+        createdAt: enqueuedAt,
+      });
+      yield* engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("queued-clock-thread"),
+        projectId,
+        threadId,
+        title: "Queued clock",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: enqueuedAt,
+      });
+      yield* engine.dispatch({
+        type: "thread.queue.pause",
+        commandId: CommandId.make("queued-clock-pause"),
+        threadId,
+        createdAt: enqueuedAt,
+      });
+      yield* engine.dispatch({
+        type: "thread.prompt.enqueue",
+        commandId: CommandId.make("queued-clock-enqueue"),
+        threadId,
+        message: { messageId, text: "Run after the paused wait.", attachments: [] },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: enqueuedAt,
+      });
+      yield* TestClock.adjust("5 minutes");
+      const queued = Option.getOrThrow(yield* snapshots.getThreadDetailById(threadId));
+      yield* engine.dispatch({
+        type: "thread.queue.resume",
+        commandId: CommandId.make("queued-clock-resume"),
+        threadId,
+        expectedRevision: queued.promptQueue!.revision,
+        createdAt: yield* timestamp,
+      });
+      const resumed = Option.getOrThrow(yield* snapshots.getThreadDetailById(threadId));
+      const attemptId = CommandId.make("queued-clock-claim");
+      yield* engine.dispatch({
+        type: "thread.prompt.claim",
+        commandId: attemptId,
+        threadId,
+        messageId,
+        expectedRevision: resumed.promptQueue!.entries[0]!.revision,
+        expectedControlRevision: resumed.promptQueue!.revision,
+        createdAt: yield* timestamp,
+      });
+      yield* TestClock.adjust("1 second");
+      const admittedAt = yield* timestamp;
+      yield* engine.dispatch({
+        type: "thread.prompt.admit",
+        commandId: CommandId.make("queued-clock-admit"),
+        threadId,
+        attemptId,
+        turnId,
+        evidence: "provider-ack",
+        createdAt: admittedAt,
+      });
+      const session = {
+        threadId,
+        providerName: "codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: "full-access" as const,
+        lastError: null,
+      };
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("queued-clock-running"),
+        threadId,
+        session: { ...session, status: "running", activeTurnId: turnId, updatedAt: admittedAt },
+        createdAt: admittedAt,
+      });
+      yield* TestClock.adjust("17 seconds");
+      const completedAt = yield* timestamp;
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("queued-clock-completed"),
+        threadId,
+        session: { ...session, status: "ready", activeTurnId: null, updatedAt: completedAt },
+        createdAt: completedAt,
+      });
+      const [turn] = yield* sql<{
+        requestedAt: string;
+        startedAt: string;
+        completedAt: string;
+      }>`SELECT requested_at AS "requestedAt",started_at AS "startedAt",completed_at AS "completedAt"
+          FROM projection_turns WHERE thread_id=${threadId} AND turn_id=${turnId}`;
+      expect(turn).toEqual({ requestedAt: admittedAt, startedAt: admittedAt, completedAt });
+      expect(Date.parse(turn!.completedAt) - Date.parse(turn!.startedAt)).toBe(17_000);
+      const thread = Option.getOrThrow(yield* snapshots.getThreadDetailById(threadId));
+      expect(thread.messages.find((message) => message.id === messageId)).toMatchObject({
+        createdAt: enqueuedAt,
+        updatedAt: admittedAt,
+      });
+      const events = yield* Stream.runCollect(engine.readEvents(0));
+      const admitted = events.find((event) => event.type === "thread.turn-start-requested");
+      expect(admitted?.occurredAt).toBe(admittedAt);
+      expect(admitted?.payload.createdAt).toBe(admittedAt);
+    }).pipe(Effect.provide(makeOrchestrationLayer())),
+  );
+
   it("accepts one native answer while preserving the shared queue pause", async () => {
     const system = await createOrchestrationSystem();
     const projectId = ProjectId.make("native-question-project");
@@ -2794,4 +3288,1190 @@ describe("atomic shared preparation acceptance", () => {
       await system.dispose();
     }
   });
+});
+
+describe("portable thread command fences", () => {
+  it("prevents a direct turn from bypassing a newly queued local move", async () => {
+    const system = await createOrchestrationSystem(undefined, undefined, undefined, {
+      getInstance: () =>
+        Effect.succeed({ enabled: true, driverKind: "codex" } as unknown as ProviderInstance),
+    });
+    const projectId = ProjectId.make("local-queue-project");
+    const threadId = ThreadId.make("local-queue-thread");
+    try {
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("local-project"),
+          projectId,
+          title: "Local",
+          workspaceRoot: "/tmp/local-queue-project",
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("local-thread"),
+          threadId,
+          projectId,
+          title: "Local",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      const direct = {
+        type: "thread.turn.start" as const,
+        commandId: CommandId.make("legacy-local-turn"),
+        threadId,
+        message: {
+          messageId: MessageId.make("legacy-local-message"),
+          role: "user" as const,
+          text: "Before VM move",
+          attachments: [],
+        },
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        createdAt: now(),
+      };
+      await system.run(system.engine.dispatch(direct, { directClientCommand: true }));
+      // A stale client may have passed preflight before another client queues the move.
+      await system.run(system.fence.assertDirectClientAllowed(threadId, "thread.turn.start"));
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.move.enqueue",
+          commandId: CommandId.make("local-move"),
+          threadId,
+          messageId: MessageId.make("local-move"),
+          destination: { kind: "vm" },
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch(
+          {
+            type: "thread.queue.pause",
+            commandId: CommandId.make("pause-local-move"),
+            threadId,
+            createdAt: now(),
+          },
+          { directClientCommand: true },
+        ),
+      );
+      const before = await system.run(system.engine.latestSequence);
+      const stale = {
+        ...direct,
+        commandId: CommandId.make("bypass-local-move"),
+        message: { ...direct.message, messageId: MessageId.make("bypass-local-message") },
+      };
+      await expect(
+        system.run(system.engine.dispatch(stale, { directClientCommand: true })),
+      ).rejects.toMatchObject({
+        _tag: "ThreadExecutionFenceError",
+        detail: expect.stringContaining("shared queue"),
+      });
+      expect(await system.run(system.engine.latestSequence)).toBe(before);
+      expect(await system.run(system.fence.get(threadId))).toBeNull();
+      const waiting = Option.getOrThrow(await system.readThread(threadId));
+      expect(waiting.promptQueue?.enabled).toBe(false);
+      expect(waiting.promptQueue?.entries.map((entry) => entry.messageId)).toEqual(["local-move"]);
+      expect(waiting.messages.map((message) => message.id)).toEqual(["legacy-local-message"]);
+      await system.run(
+        system.engine.dispatch(
+          {
+            ...stale,
+            type: "thread.prompt.enqueue",
+            commandId: CommandId.make("queued-local-followup"),
+          },
+          { directClientCommand: true },
+        ),
+      );
+      const queued = Option.getOrThrow(await system.readThread(threadId));
+      expect(queued.promptQueue?.enabled).toBe(false);
+      expect(queued.promptQueue?.entries.map((entry) => entry.messageId)).toEqual([
+        "local-move",
+        "bypass-local-message",
+      ]);
+      expect(queued.messages.map((message) => message.id)).toEqual(["legacy-local-message"]);
+      const events = await system.run(Stream.runCollect(system.engine.readEvents(before)));
+      expect(events.some((event) => event.type === "thread.turn-start-requested")).toBe(false);
+    } finally {
+      await system.dispose();
+    }
+  });
+
+  it("blocks direct project deletion for active and draining portable threads while retaining local and trusted deletion", async () => {
+    for (const phase of ["active", "draining"] as const) {
+      const system = await createOrchestrationSystem();
+      const create = async (suffix: string) => {
+        const projectId = ProjectId.make(`project-delete-${phase}-${suffix}`);
+        const threadId = ThreadId.make(`thread-delete-${phase}-${suffix}`);
+        await system.run(
+          system.engine.dispatch({
+            type: "project.create",
+            commandId: CommandId.make(`create-${projectId}`),
+            projectId,
+            title: suffix,
+            workspaceRoot: `/tmp/${projectId}`,
+            createdAt: now(),
+          }),
+        );
+        await system.run(
+          system.engine.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`create-${threadId}`),
+            threadId,
+            projectId,
+            title: suffix,
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt: now(),
+          }),
+        );
+        return { projectId, threadId };
+      };
+      try {
+        const portable = await create("portable");
+        const owner = {
+          ...portable,
+          relayUrl: "https://relay.example",
+          environmentId: "here",
+          generation: 1,
+          operationId: "enrollment",
+        };
+        await system.run(system.fence.prepare(owner));
+        await system.run(system.fence.activate(owner));
+        if (phase === "draining")
+          await system.run(
+            system.fence.beginDrain({
+              ...owner,
+              operationId: "move",
+              previousOperationId: "enrollment",
+            }),
+          );
+        const before = await system.run(system.engine.latestSequence);
+        const source = await system.run(system.fence.get(portable.threadId));
+        const command = {
+          type: "project.delete" as const,
+          projectId: portable.projectId,
+          force: true,
+          commandId: CommandId.make(`direct-delete-${phase}`),
+        };
+        await expect(
+          system.run(system.engine.dispatch(command, { directClientCommand: true })),
+        ).rejects.toMatchObject({
+          _tag: "ThreadExecutionFenceError",
+          detail: expect.stringContaining("managed threads through Launchpad Connect"),
+        });
+        expect(await system.run(system.engine.latestSequence)).toBe(before);
+        expect(await system.run(system.fence.get(portable.threadId))).toEqual(source);
+        expect(Option.getOrThrow(await system.readThread(portable.threadId)).deletedAt).toBeNull();
+        expect(Option.isNone(await system.receipt(command.commandId))).toBe(true);
+        const local = await create("local");
+        await system.run(
+          system.engine.dispatch(
+            {
+              type: "project.delete",
+              projectId: local.projectId,
+              force: true,
+              commandId: CommandId.make(`local-delete-${phase}`),
+            },
+            { directClientCommand: true },
+          ),
+        );
+        expect(Option.isNone(await system.readThread(local.threadId))).toBe(true);
+        await system.run(
+          system.engine.dispatch({
+            ...command,
+            commandId: CommandId.make(`trusted-delete-${phase}`),
+          }),
+        );
+        expect(Option.isNone(await system.readThread(portable.threadId))).toBe(true);
+      } finally {
+        await system.dispose();
+      }
+    }
+  });
+
+  it("keeps a frozen thread immutable across restart without rejecting its queued command permanently", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-portable-fence-"));
+    const database = NodePath.join(directory, "state.sqlite");
+    let system = await createOrchestrationSystem(database);
+    const projectId = ProjectId.make("portable-project");
+    const threadId = ThreadId.make("portable-thread");
+    const enrollment = {
+      threadId,
+      projectId,
+      relayUrl: "https://relay.example",
+      environmentId: "here",
+      generation: 1,
+      operationId: "enroll",
+    };
+    const move = { ...enrollment, operationId: "move", previousOperationId: "enroll" };
+    const update = {
+      type: "thread.meta.update" as const,
+      commandId: CommandId.make("pending-update"),
+      threadId,
+      title: "After abort",
+    };
+    try {
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("portable-project-create"),
+          projectId,
+          title: "Portable",
+          workspaceRoot: directory,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("portable-thread-create"),
+          threadId,
+          projectId,
+          title: "Original",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      await system.run(system.fence.prepare(enrollment));
+      await system.run(system.fence.activate(enrollment));
+      await expect(
+        system.run(system.engine.dispatch(update, { directClientCommand: true })),
+      ).rejects.toMatchObject({ _tag: "ThreadExecutionFenceError" });
+      expect(Option.isNone(await system.receipt(update.commandId))).toBe(true);
+      await system.run(system.fence.beginDrain(move));
+      const cursor = await system.run(system.fence.freeze(move));
+      await system.dispose();
+      system = await createOrchestrationSystem(database);
+      await expect(system.run(system.engine.dispatch(update))).rejects.toMatchObject({
+        _tag: "ThreadExecutionFenceError",
+      });
+      expect(Option.isNone(await system.receipt(update.commandId))).toBe(true);
+      await expect(
+        system.run(
+          system.engine.dispatch(update, {
+            rejection: { projectId, detail: "preflight denied" },
+          }),
+        ),
+      ).rejects.toMatchObject({ _tag: "ThreadExecutionFenceError" });
+      expect(Option.isNone(await system.receipt(update.commandId))).toBe(true);
+      await expect(
+        system.run(
+          system.engine.dispatch({
+            type: "project.delete",
+            commandId: CommandId.make("delete-held-project"),
+            projectId,
+            force: true,
+          }),
+        ),
+      ).rejects.toMatchObject({ _tag: "ThreadExecutionFenceError" });
+      expect(await system.run(system.engine.latestSequence)).toBe(cursor);
+      expect(Option.getOrThrow(await system.readThread(threadId)).title).toBe("Original");
+      // The relay has now confirmed cancellation and destination removal.
+      await system.run(system.fence.activate(move));
+      await system.run(system.engine.dispatch(update));
+      expect(Option.getOrThrow(await system.readThread(threadId)).title).toBe("After abort");
+      const receipt = await system.receipt(update.commandId);
+      expect(Option.isSome(receipt) && receipt.value.status).toBe("accepted");
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const decodeBaselineReceipt = Schema.decodeUnknownSync(OrchestrationCommandReceipt);
+const baselineDigest = <A>(rows: ReadonlyArray<A>, encode: (row: A) => string) => {
+  const bytes = new TextEncoder().encode(rows.map((row) => `${encode(row)}\n`).join(""));
+  return {
+    sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+    size: bytes.length,
+  };
+};
+const sealBaseline = (input: ThreadHistoryBaselineInput): ThreadHistoryBaselineInput => ({
+  ...input,
+  source: {
+    ...input.source,
+    eventCount: input.events.length,
+    receiptCount: input.receipts.length,
+    sourceSequence: input.events.at(-1)!.sequence,
+    events: baselineDigest(input.events, Schema.encodeSync(Schema.fromJsonString(EventSchema))),
+    receipts: baselineDigest(
+      input.receipts,
+      Schema.encodeSync(Schema.fromJsonString(OrchestrationCommandReceipt)),
+    ),
+  },
+});
+async function baselineFixture(
+  rejectProjection?: (event: OrchestrationEvent) => boolean,
+  databasePath?: string,
+) {
+  const system = await createOrchestrationSystem(databasePath, undefined, rejectProjection);
+  const projectId = ProjectId.make("baseline-destination-project");
+  const threadId = ThreadId.make("baseline-thread");
+  await system.run(
+    system.engine.dispatch({
+      type: "project.create",
+      commandId: CommandId.make("baseline-project"),
+      projectId,
+      title: "Destination",
+      workspaceRoot: "/tmp/baseline-destination",
+      createdAt: now(),
+    }),
+  );
+  const destination = {
+    threadId,
+    projectId,
+    environmentId: "destination",
+    relayUrl: "https://relay.example",
+    generation: 2,
+    operationId: "baseline-move",
+    branch: "main",
+    worktreePath: "/tmp/baseline-checkout",
+  };
+  await system.run(system.fence.prepare(destination));
+  const decode = Schema.decodeUnknownSync(EventSchema);
+  const event = (index: number): OrchestrationEvent =>
+    decode({
+      type: index === 0 ? "thread.created" : "thread.message-sent",
+      sequence: 100 + index * 5,
+      eventId: `baseline-event-${index}`,
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: now(),
+      commandId: `baseline-command-${index}`,
+      causationEventId: null,
+      correlationId: null,
+      metadata: {},
+      payload:
+        index === 0
+          ? {
+              threadId,
+              projectId: "source-project",
+              title: "Moved history",
+              modelSelection: { instanceId: "codex", model: "gpt-5" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: "main",
+              worktreePath: "/original/path",
+              createdAt: now(),
+              updatedAt: now(),
+            }
+          : {
+              threadId,
+              messageId: `baseline-message-${index}`,
+              role: "user",
+              text: `Original message ${index}`,
+              author: { userId: "alice", displayName: "Alice", imageUrl: null },
+              turnId: null,
+              streaming: false,
+              createdAt: now(),
+              updatedAt: now(),
+            },
+    });
+  const receipts = ["accepted", "rejected"].map((status) =>
+    decodeBaselineReceipt({
+      commandId: `baseline-${status}`,
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      projectId: "source-project",
+      acceptedAt: now(),
+      resultSequence: 999,
+      status,
+      error: status === "rejected" ? "Original rejection" : null,
+    }),
+  );
+  const input = sealBaseline({
+    version: 1,
+    manifestSha256: "a".repeat(64),
+    source: {
+      format: "launchpad-history-v1",
+      threadId,
+      environmentId: "source",
+      generation: 1,
+      operationId: destination.operationId,
+      sourceSequence: 0,
+      eventCount: 0,
+      receiptCount: 0,
+      events: { sha256: "a".repeat(64), size: 0 },
+      receipts: { sha256: "a".repeat(64), size: 0 },
+    },
+    destination,
+    events: Array.from({ length: 4 }, (_, index) => event(index)),
+    receipts,
+    importedAt: now(),
+  });
+  return { system, input, threadId, projectId };
+}
+describe("portable thread baseline import", () => {
+  it("imports authors and complete history with local sequences, publishes only the boundary, and deduplicates old commands", async () => {
+    const f = await baselineFixture();
+    try {
+      const result = await f.system.importedEvents(f.input);
+      expect(result.events.map((event) => event.type)).toEqual(["thread.placement-imported"]);
+      const mirrored: OrchestrationEvent[] = [];
+      await f.system.run(
+        makeThreadHistorySync(f.system.sql, f.system.engine, {
+          append: (_owner, event) =>
+            Effect.sync(() => {
+              mirrored.push(event);
+            }),
+          confirmThrough: () => Effect.void,
+        }).synchronize(f.threadId),
+      );
+      expect(mirrored.map((event) => event.type)).toEqual(["thread.placement-imported"]);
+      expect(mirrored[0]?.eventId).toBe(result.events[0]?.eventId);
+      const thread = Option.getOrThrow(await f.system.readThread(f.threadId));
+      expect(thread.projectId).toBe(f.projectId);
+      expect(thread.worktreePath).toBe(f.input.destination.worktreePath);
+      expect(thread.messages.map((message) => message.author?.displayName)).toEqual([
+        "Alice",
+        "Alice",
+        "Alice",
+      ]);
+      const stored = await f.system.run(
+        Stream.runCollect(
+          f.system.engine.readThreadEvents({
+            threadId: f.threadId,
+            fromSequenceExclusive: 0,
+            toSequenceInclusive: result.result.sequence,
+            limit: 100,
+          }),
+        ),
+      );
+      expect(stored.slice(0, 4).map((event) => event.eventId)).toEqual(
+        f.input.events.map((event) => event.eventId),
+      );
+      expect(stored[0]!.sequence).not.toBe(f.input.events[0]!.sequence);
+      const duplicate = {
+        type: "thread.meta.update" as const,
+        commandId: CommandId.make("baseline-accepted"),
+        threadId: f.threadId,
+        title: "Must not run",
+      };
+      expect(await f.system.run(f.system.engine.dispatch(duplicate))).toEqual(result.result);
+      await expect(
+        f.system.run(
+          f.system.engine.dispatch({
+            ...duplicate,
+            commandId: CommandId.make("baseline-rejected"),
+          }),
+        ),
+      ).rejects.toThrow("Original rejection");
+      expect(Option.getOrThrow(await f.system.readThread(f.threadId)).title).toBe("Moved history");
+      await expect(
+        f.system.run(
+          f.system.engine.dispatch({
+            ...duplicate,
+            commandId: CommandId.make("new-before-activation"),
+          }),
+        ),
+      ).rejects.toThrow();
+      expect((await f.system.run(f.system.fence.get(f.threadId)))?.phase).toBe("frozen");
+      await f.system.run(f.system.fence.activate(f.input.destination));
+      await f.system.run(
+        f.system.engine.dispatch({
+          ...duplicate,
+          commandId: CommandId.make("after-activation"),
+          title: "Runs once",
+        }),
+      );
+      expect(Option.getOrThrow(await f.system.readThread(f.threadId)).title).toBe("Runs once");
+    } finally {
+      await f.system.dispose();
+    }
+  });
+  it("retries an imported baseline without duplicating history and rejects a changed archive", async () => {
+    const f = await baselineFixture();
+    try {
+      const first = await f.system.importBaseline(f.input);
+      expect(await f.system.importBaseline(f.input)).toEqual(first);
+      await expect(
+        f.system.importBaseline({ ...f.input, manifestSha256: "b".repeat(64) }),
+      ).rejects.toThrow("different archive");
+      await expect(
+        f.system.importBaseline({ ...f.input, events: f.input.events.slice(0, -1) }),
+      ).rejects.toThrow("incomplete");
+      expect(Option.getOrThrow(await f.system.readThread(f.threadId)).messages).toHaveLength(3);
+    } finally {
+      await f.system.dispose();
+    }
+  });
+  it("rolls back every event, projection and receipt if the final projection fails", async () => {
+    const f = await baselineFixture((event) => event.type === "thread.placement-imported");
+    try {
+      await expect(f.system.importBaseline(f.input)).rejects.toThrow("destination remains frozen");
+      expect(Option.isNone(await f.system.readThread(f.threadId))).toBe(true);
+      expect(Option.isNone(await f.system.receipt(CommandId.make("baseline-accepted")))).toBe(true);
+      expect(await f.system.run(f.system.engine.latestSequence)).toBe(1);
+      expect((await f.system.run(f.system.fence.get(f.threadId)))?.phase).toBe("frozen");
+    } finally {
+      await f.system.dispose();
+    }
+  });
+  it("rejects modified content, foreign events and command receipt collisions", async () => {
+    const f = await baselineFixture();
+    try {
+      await expect(
+        f.system.importBaseline({
+          ...f.input,
+          events: f.input.events.map((event) => ({
+            ...event,
+            occurredAt: "2026-02-01T00:00:00.000Z",
+          })),
+        }),
+      ).rejects.toThrow("manifest");
+      const foreign = sealBaseline({
+        ...f.input,
+        events: f.input.events.map((event, index) =>
+          index === 1 ? { ...event, aggregateId: ThreadId.make("foreign") } : event,
+        ),
+      });
+      await expect(f.system.importBaseline(foreign)).rejects.toThrow("crosses a thread");
+      const receiptCollision = sealBaseline({
+        ...f.input,
+        receipts: [
+          { ...f.input.receipts[0]!, commandId: CommandId.make("baseline-project") },
+          f.input.receipts[1]!,
+        ],
+      });
+      await expect(f.system.importBaseline(receiptCollision)).rejects.toThrow(
+        "conflicts with an existing receipt",
+      );
+      expect(Option.isNone(await f.system.readThread(f.threadId))).toBe(true);
+    } finally {
+      await f.system.dispose();
+    }
+  });
+});
+
+describe("portable thread baseline recovery", () => {
+  it("imports only new history on a return move and refuses a divergent prefix", async () => {
+    const f = await baselineFixture();
+    try {
+      const first = await f.system.importBaseline(f.input);
+      const inherited = await f.system.run(
+        Stream.runCollect(
+          f.system.engine.readThreadEvents({
+            threadId: f.threadId,
+            fromSequenceExclusive: 0,
+            toSequenceInclusive: first.sequence,
+            limit: 100,
+          }),
+        ),
+      );
+      await f.system.run(f.system.fence.retire(f.input.destination));
+      const destination = {
+        ...f.input.destination,
+        generation: 4,
+        operationId: "return-move",
+        worktreePath: "/tmp/return-checkout",
+      };
+      await f.system.run(f.system.fence.prepare(destination));
+      const priorMessage = f.input.events[1]!;
+      if (priorMessage.type !== "thread.message-sent") throw new Error("message fixture");
+      const input = sealBaseline({
+        ...f.input,
+        manifestSha256: "b".repeat(64),
+        destination,
+        source: { ...f.input.source, generation: 3, operationId: destination.operationId },
+        events: [
+          ...inherited,
+          {
+            ...priorMessage,
+            sequence: 1000,
+            eventId: EventId.make("return-message-event"),
+            payload: {
+              ...priorMessage.payload,
+              messageId: MessageId.make("return-message"),
+              text: "Written on Linux",
+            },
+          },
+        ],
+      });
+      const divergent = sealBaseline({
+        ...input,
+        events: input.events.map((event, index) =>
+          index === 0 ? { ...event, occurredAt: "2026-02-01T00:00:00.000Z" } : event,
+        ),
+      });
+      await expect(f.system.importBaseline(divergent)).rejects.toThrow("diverged");
+      const result = await f.system.importBaseline(input);
+      const thread = Option.getOrThrow(await f.system.readThread(f.threadId));
+      expect(thread.messages).toHaveLength(4);
+      expect(thread.messages.at(-1)?.text).toBe("Written on Linux");
+      expect(thread.worktreePath).toBe("/tmp/return-checkout");
+      const all = await f.system.run(
+        Stream.runCollect(
+          f.system.engine.readThreadEvents({
+            threadId: f.threadId,
+            fromSequenceExclusive: 0,
+            toSequenceInclusive: result.sequence,
+            limit: 100,
+          }),
+        ),
+      );
+      expect(all).toHaveLength(7);
+      expect(new Set(all.map((event) => event.eventId)).size).toBe(7);
+      expect(
+        (
+          await f.system.run(
+            f.system.engine.getThreadReplayStats({
+              threadId: f.threadId,
+              fromSequenceExclusive: first.sequence,
+              toSequenceInclusive: result.sequence,
+              maxEvents: 100,
+            }),
+          )
+        ).hasCreateEvent,
+      ).toBe(true);
+    } finally {
+      await f.system.dispose();
+    }
+  });
+  it("retains imported history, frozen ownership and repeat-import receipts across restart", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-baseline-restart-"));
+    const databasePath = NodePath.join(directory, "state.sqlite");
+    const f = await baselineFixture(undefined, databasePath);
+    let system = f.system;
+    try {
+      const result = await system.importBaseline(f.input);
+      await system.dispose();
+      system = await createOrchestrationSystem(databasePath);
+      expect(await system.importBaseline(f.input)).toEqual(result);
+      const thread = Option.getOrThrow(await system.readThread(f.threadId));
+      expect(thread.projectId).toBe(f.projectId);
+      expect(thread.messages).toHaveLength(3);
+      expect((await system.run(system.fence.get(f.threadId)))?.phase).toBe("frozen");
+      expect(
+        Option.getOrThrow(await system.receipt(CommandId.make("baseline-accepted"))).resultSequence,
+      ).toBe(result.sequence);
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
+  });
+  it("protects another thread's message when an archive reuses its message ID", async () => {
+    const f = await baselineFixture();
+    try {
+      const foreign = ThreadId.make("other-thread");
+      await f.system.run(
+        f.system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("other-create"),
+          threadId: foreign,
+          projectId: f.projectId,
+          title: "Other",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      await f.system.run(
+        f.system.engine.dispatch({
+          type: "thread.message.assistant.delta",
+          commandId: CommandId.make("other-message"),
+          threadId: foreign,
+          messageId: MessageId.make("baseline-message-1"),
+          delta: "Belongs to another thread",
+          createdAt: now(),
+        }),
+      );
+      await expect(f.system.importBaseline(f.input)).rejects.toThrow("another destination thread");
+      expect(Option.isNone(await f.system.readThread(f.threadId))).toBe(true);
+      expect(Option.getOrThrow(await f.system.readThread(foreign)).messages[0]?.text).toBe(
+        "Belongs to another thread",
+      );
+    } finally {
+      await f.system.dispose();
+    }
+  });
+});
+
+it("keeps transferred historical attachments when projections are rebuilt", async () => {
+  const f = await baselineFixture();
+  try {
+    const attachmentDirectory = await f.system.attachmentDirectory();
+    const attachmentId = `${f.threadId}-00000000-0000-4000-8000-000000000001`;
+    await NodeFSP.mkdir(attachmentDirectory, { recursive: true });
+    const file = NodePath.join(attachmentDirectory, `${attachmentId}.png`);
+    await NodeFSP.writeFile(file, "historical file");
+    const event = f.input.events[1]!;
+    if (event.type !== "thread.message-sent") throw new Error("message fixture");
+    const input = sealBaseline({
+      ...f.input,
+      events: [
+        f.input.events[0]!,
+        {
+          ...event,
+          payload: {
+            ...event.payload,
+            attachments: [
+              {
+                type: "image",
+                id: attachmentId,
+                name: "history.png",
+                mimeType: "image/png",
+                sizeBytes: 15,
+              },
+            ],
+          },
+        },
+        {
+          ...event,
+          sequence: 150,
+          eventId: EventId.make("old-revert"),
+          type: "thread.reverted",
+          payload: { threadId: f.threadId, turnCount: 0 },
+        },
+      ],
+    });
+    await f.system.importBaseline(input);
+    expect(Option.getOrThrow(await f.system.readThread(f.threadId)).messages).toHaveLength(0);
+    await f.system.rebuildProjections();
+    expect(await NodeFSP.readFile(file, "utf8")).toBe("historical file");
+    expect(Option.getOrThrow(await f.system.readThread(f.threadId)).projectId).toBe(f.projectId);
+  } finally {
+    await f.system.dispose();
+  }
+});
+
+it("moves an authored pending prompt between two real engine databases without re-enqueuing it", async () => {
+  const f = await baselineFixture();
+  const destination = await createOrchestrationSystem();
+  try {
+    await f.system.importBaseline(f.input);
+    await f.system.run(f.system.fence.activate(f.input.destination));
+    const command = {
+      type: "thread.prompt.enqueue" as const,
+      commandId: CommandId.make("queued-move-command"),
+      threadId: f.threadId,
+      message: {
+        messageId: MessageId.make("queued-move-message"),
+        text: "Run after the move",
+        attachments: [],
+      },
+      author: { userId: "bob", displayName: "Bob", imageUrl: null },
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      createdAt: now(),
+    };
+    await f.system.run(f.system.engine.dispatch(command));
+    const head = await f.system.run(f.system.engine.latestSequence);
+    const history = await f.system.run(
+      Stream.runCollect(
+        f.system.engine.readThreadEvents({
+          threadId: f.threadId,
+          fromSequenceExclusive: 0,
+          toSequenceInclusive: head,
+          limit: 100,
+        }),
+      ),
+    );
+    const owner = {
+      ...f.input.destination,
+      operationId: "second-real-engine-move",
+      environmentId: "second-environment",
+      generation: 3,
+    };
+    await destination.run(
+      destination.engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("destination-create-project"),
+        projectId: f.projectId,
+        title: "Other machine",
+        workspaceRoot: "/tmp/other-machine",
+        createdAt: now(),
+      }),
+    );
+    await destination.run(destination.fence.prepare(owner));
+    const receipts = await Promise.all(
+      [...f.input.receipts.map((receipt) => receipt.commandId), command.commandId].map((id) =>
+        f.system.receipt(id),
+      ),
+    );
+    const input = sealBaseline({
+      ...f.input,
+      destination: owner,
+      source: {
+        ...f.input.source,
+        environmentId: "destination",
+        generation: 2,
+        operationId: owner.operationId,
+      },
+      events: history,
+      receipts: receipts.map(Option.getOrThrow),
+    });
+    const imported = await destination.importBaseline(input);
+    expect(await destination.run(destination.engine.dispatch(command))).toEqual(imported);
+    const queue = Option.getOrThrow(await destination.readThread(f.threadId)).promptQueue;
+    expect(queue?.entries).toHaveLength(1);
+    expect(queue?.entries[0]?.author?.displayName).toBe("Bob");
+    expect(queue?.entries[0]?.messageId).toBe(command.message.messageId);
+    expect((await destination.run(destination.fence.get(f.threadId)))?.phase).toBe("frozen");
+  } finally {
+    await destination.dispose();
+    await f.system.dispose();
+  }
+});
+
+it("activates a moved checkout only after matching files and history are installed", async () => {
+  const f = await baselineFixture();
+  const target = f.input.destination;
+  const setPhase = (phase: string) =>
+    f.system.run(
+      Effect.gen(function* () {
+        const sql = f.system.sql;
+        yield* sql`UPDATE thread_checkout_claims SET phase = ${phase} WHERE operation_id = ${target.operationId}`;
+      }),
+    );
+  try {
+    await f.system.run(
+      Effect.gen(function* () {
+        const sql = f.system.sql;
+        yield* sql`INSERT INTO thread_checkout_claims
+        (operation_id, thread_id, generation, project_id, repository_root, checkout_path, mode, branch,
+        manifest_sha256, workspace_sha256, inspection_json, phase) VALUES (${target.operationId}, ${target.threadId},
+        ${target.generation}, ${target.projectId}, '/tmp/baseline-destination', ${target.worktreePath},
+        'worktree', ${target.branch}, ${f.input.manifestSha256}, ${"b".repeat(64)}, 'null', 'reserved')`;
+        yield* sql`INSERT INTO thread_checkout_claim_projects (operation_id, project_id)
+        VALUES (${target.operationId}, ${target.projectId})`;
+      }),
+    );
+    await expect(f.system.importBaseline(f.input)).rejects.toThrow("installed checkout");
+    await expect(f.system.run(f.system.fence.activate(target))).rejects.toThrow(
+      "installation must finish",
+    );
+    await setPhase("installed");
+    await expect(f.system.run(f.system.fence.activate(target))).rejects.toThrow(
+      "installation must finish",
+    );
+    await expect(
+      f.system.importBaseline({
+        ...f.input,
+        destination: { ...target, worktreePath: "/wrong/checkout" },
+      }),
+    ).rejects.toThrow("installed checkout");
+    await f.system.importBaseline(f.input);
+    await expect(f.system.run(f.system.fence.activate(target))).rejects.toThrow(
+      "Destination setup",
+    );
+    // The setup worker is exercised separately against real checkout files. Here
+    // inject its durable receipt to prove activation reads it atomically.
+    await f.system.run(
+      Effect.gen(function* () {
+        const sql = f.system.sql;
+        yield* sql`UPDATE thread_transfer_baselines SET native_runtime_json = 'null' WHERE operation_id = ${target.operationId}`;
+        yield* sql`INSERT INTO thread_transfer_readiness (operation_id, manifest_sha256, native_runtime_json, setup_sha256, phase)
+        VALUES (${target.operationId}, ${f.input.manifestSha256}, 'null', ${"c".repeat(64)}, 'started')`;
+      }),
+    );
+    await expect(f.system.run(f.system.fence.activate(target))).rejects.toThrow(
+      "Destination setup",
+    );
+    await f.system.run(
+      Effect.gen(function* () {
+        const sql = f.system.sql;
+        yield* sql`UPDATE thread_transfer_readiness SET phase = 'ready' WHERE operation_id = ${target.operationId}`;
+      }),
+    );
+    await f.system.run(f.system.fence.activate(target));
+    expect(
+      await f.system.run(
+        Effect.gen(function* () {
+          const sql = f.system.sql;
+          return yield* sql`SELECT phase FROM thread_checkout_claims WHERE operation_id = ${target.operationId}`;
+        }),
+      ),
+    ).toEqual([{ phase: "released" }]);
+    await f.system.run(
+      f.system.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("after-checkout-activation"),
+        threadId: f.threadId,
+        title: "Running at destination",
+      }),
+    );
+    expect(Option.getOrThrow(await f.system.readThread(f.threadId)).title).toBe(
+      "Running at destination",
+    );
+  } finally {
+    await f.system.dispose();
+  }
+});
+
+it("commits native continuation with the baseline and rejects a changed cursor on retry", async () => {
+  const f = await baselineFixture();
+  try {
+    const nativeRuntime = {
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      threadId: "native-thread",
+      resumePolicy: "require-existing" as const,
+      portableStateId: "c".repeat(64),
+    };
+    const input = { ...f.input, nativeRuntime };
+    const first = await f.system.importBaseline(input);
+    expect(await f.system.importBaseline(input)).toEqual(first);
+    const rows = await f.system.run(f.system.sql<{
+      cursor: string;
+      status: string;
+    }>`SELECT resume_cursor_json AS cursor, status
+      FROM provider_session_runtime WHERE thread_id = ${f.threadId}`);
+    expect(decodeUnknownJson(rows[0]!.cursor)).toEqual({
+      threadId: nativeRuntime.threadId,
+      resumePolicy: "require-existing",
+      portableStateId: nativeRuntime.portableStateId,
+    });
+    expect(rows[0]!.status).toBe("stopped");
+    await expect(
+      f.system.importBaseline({
+        ...input,
+        nativeRuntime: { ...nativeRuntime, portableStateId: "d".repeat(64) },
+      }),
+    ).rejects.toThrow("different archive");
+    await expect(f.system.importBaseline(f.input)).rejects.toThrow("different archive");
+    expect((await f.system.run(f.system.fence.get(f.threadId)))?.phase).toBe("frozen");
+  } finally {
+    await f.system.dispose();
+  }
+});
+it("rolls native installation and history back together when the completion receipt fails", async () => {
+  const f = await baselineFixture();
+  try {
+    await f.system.run(f.system
+      .sql`CREATE TRIGGER fail_transfer_receipt BEFORE INSERT ON thread_transfer_baselines
+      BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END`);
+    await expect(
+      f.system.importBaseline({
+        ...f.input,
+        nativeRuntime: {
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          threadId: "native-thread",
+          resumePolicy: "require-existing",
+          portableStateId: "c".repeat(64),
+        },
+      }),
+    ).rejects.toThrow();
+    expect(
+      await f.system.run(
+        f.system.sql`SELECT 1 FROM provider_session_runtime WHERE thread_id = ${f.threadId}`,
+      ),
+    ).toHaveLength(0);
+    expect(Option.isNone(await f.system.readThread(f.threadId))).toBe(true);
+    expect((await f.system.run(f.system.fence.get(f.threadId)))?.phase).toBe("frozen");
+  } finally {
+    await f.system.dispose();
+  }
+});
+
+describe("queued move provider admission", () => {
+  effectIt.effect(
+    "accepts default VM and named normal moves but rejects incompatible VM events before commit",
+    () => {
+      const provider = (driverKind: string) =>
+        ({
+          enabled: true,
+          driverKind,
+        }) as unknown as ProviderInstance;
+      const registry: ProviderInstanceRegistry["Service"] = {
+        getInstance: (id) =>
+          Effect.succeed(
+            provider(id === "codex" || id === "custom-codex" ? "codex" : "claudeAgent"),
+          ),
+        listInstances: Effect.succeed([]),
+        listUnavailable: Effect.succeed([]),
+        streamChanges: Stream.empty,
+        subscribeChanges: Effect.die("unused"),
+      };
+      const layer = makeOrchestrationLayer().pipe(
+        Layer.provideMerge(Layer.succeed(ProviderInstanceRegistry, registry)),
+      );
+      const projectId = ProjectId.make("queue-provider-project");
+      const threadId = ThreadId.make("queue-provider-thread");
+      return Effect.gen(function* () {
+        const engine = yield* OrchestrationEngineService;
+        yield* engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("queue-provider-project"),
+          projectId,
+          title: "Test",
+          workspaceRoot: "/tmp/queue-provider",
+          createdAt: now(),
+        });
+        yield* engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("queue-provider-thread"),
+          threadId,
+          projectId,
+          title: "Test",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "test" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        });
+        yield* engine.dispatch({
+          type: "thread.move.enqueue",
+          commandId: CommandId.make("to-vm"),
+          threadId,
+          messageId: MessageId.make("move"),
+          destination: { kind: "vm" },
+          createdAt: now(),
+        });
+        const invalid = yield* Effect.result(
+          engine.dispatch({
+            type: "thread.prompt.enqueue",
+            commandId: CommandId.make("bad-prompt"),
+            threadId,
+            message: { messageId: MessageId.make("bad"), text: "run", attachments: [] },
+            modelSelection: { instanceId: ProviderInstanceId.make("claude"), model: "test" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            createdAt: now(),
+          }),
+        );
+        expect(invalid._tag).toBe("Failure");
+        const detail = yield* Effect.flatMap(ProjectionSnapshotQuery, (query) =>
+          query.getThreadDetailById(threadId),
+        );
+        expect(
+          Option.isSome(detail)
+            ? detail.value.promptQueue?.entries.map((entry) => entry.messageId)
+            : [],
+        ).toEqual(["move"]);
+        const destination = {
+          kind: "environment" as const,
+          environmentId: EnvironmentId.make("normal-target"),
+          projectId,
+        };
+        const localMove = yield* engine.dispatch({
+          type: "thread.move.enqueue",
+          commandId: CommandId.make("leave-vm"),
+          threadId,
+          messageId: MessageId.make("leave-vm"),
+          destination,
+          createdAt: now(),
+        });
+        const namedPrompt = yield* engine.dispatch({
+          type: "thread.prompt.enqueue",
+          commandId: CommandId.make("named-after-local"),
+          threadId,
+          message: { messageId: MessageId.make("named-after-local"), text: "run", attachments: [] },
+          modelSelection: { instanceId: ProviderInstanceId.make("custom-codex"), model: "test" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: now(),
+        });
+        const currentQueue = yield* Effect.flatMap(ProjectionSnapshotQuery, (query) =>
+          query.getThreadDetailById(threadId),
+        );
+        for (const command of [
+          {
+            type: "thread.queue.reorder",
+            commandId: CommandId.make("named-before-leave-vm"),
+            threadId,
+            expectedRevision: Option.getOrThrow(currentQueue).promptQueue?.revision ?? -1,
+            order: [
+              MessageId.make("move"),
+              MessageId.make("named-after-local"),
+              MessageId.make("leave-vm"),
+            ],
+            createdAt: now(),
+          },
+          {
+            type: "thread.meta.update",
+            commandId: CommandId.make("named-vm-model"),
+            threadId,
+            modelSelection: { instanceId: ProviderInstanceId.make("custom-codex"), model: "test" },
+          },
+        ] satisfies OrchestrationCommand[]) {
+          expect(yield* Effect.flip(engine.dispatch(command))).toMatchObject({
+            _tag: "OrchestrationCommandInvariantError",
+            detail: "Private VMs currently require the default Codex provider.",
+          });
+        }
+        expect(yield* Stream.runCollect(engine.readEvents(namedPrompt.sequence))).toEqual([]);
+        expect(localMove.sequence).toBeLessThan(namedPrompt.sequence);
+
+        const namedThreadId = ThreadId.make("named-provider-thread");
+        yield* engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("named-provider-thread"),
+          threadId: namedThreadId,
+          projectId,
+          title: "Named Codex",
+          modelSelection: { instanceId: ProviderInstanceId.make("custom-codex"), model: "test" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        });
+        const accepted = yield* engine.dispatch({
+          type: "thread.move.enqueue",
+          commandId: CommandId.make("named-normal-move"),
+          threadId: namedThreadId,
+          messageId: MessageId.make("named-normal-move"),
+          destination,
+          createdAt: now(),
+        });
+        for (const command of [
+          {
+            type: "thread.move.enqueue",
+            commandId: CommandId.make("named-vm-move"),
+            threadId: namedThreadId,
+            messageId: MessageId.make("named-vm-move"),
+            destination: { kind: "vm" },
+            createdAt: now(),
+          },
+          {
+            type: "thread.move.edit",
+            commandId: CommandId.make("named-vm-edit"),
+            threadId: namedThreadId,
+            messageId: MessageId.make("named-normal-move"),
+            expectedRevision: 1,
+            destination: { kind: "vm" },
+            createdAt: now(),
+          },
+        ] satisfies OrchestrationCommand[]) {
+          expect(yield* Effect.flip(engine.dispatch(command))).toMatchObject({
+            _tag: "OrchestrationCommandInvariantError",
+            detail: "Private VMs currently require the default Codex provider.",
+          });
+        }
+        // No accepted event can reach the move worker, quota admission or allocation.
+        expect(yield* Stream.runCollect(engine.readEvents(accepted.sequence))).toEqual([]);
+        const namedDetail = yield* Effect.flatMap(ProjectionSnapshotQuery, (query) =>
+          query.getThreadDetailById(namedThreadId),
+        );
+        expect(
+          Option.isSome(namedDetail)
+            ? namedDetail.value.promptQueue?.entries.map((entry) => [
+                entry.messageId,
+                entry.kind === "move" ? entry.destination.kind : entry.kind,
+              ])
+            : [],
+        ).toEqual([["named-normal-move", "environment"]]);
+      }).pipe(Effect.provide(layer));
+    },
+  );
 });

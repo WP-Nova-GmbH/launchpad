@@ -1,0 +1,173 @@
+--- a/packages/db/pkg/executions/store.go
++++ b/packages/db/pkg/executions/store.go
+@@ -47,6 +47,19 @@
+ 		p.TeamID, p.SandboxID, p.ExecutionID, p.ClusterID, p.NodeID).Scan(&existing); err != nil {
+ 		return err
+ 	}
++	var current *uuid.UUID
++	var hasAttempts bool
++	if err := tx.QueryRow(ctx, `SELECT current_execution_id,
++        EXISTS(SELECT 1 FROM public.sandbox_execution_attempts a WHERE a.team_id=f.team_id AND a.sandbox_id=f.sandbox_id)
++        FROM public.sandbox_execution_fences f WHERE team_id=$1 AND sandbox_id=$2`, p.TeamID, p.SandboxID).Scan(&current, &hasAttempts); err != nil {
++		return err
++	}
++	// A missing route or memory snapshot does not release an active execution.
++	// Only initial admission, its exact retries, or a certified pause can start
++	// another attempt; legacy registrations with no current owner stay unknown.
++	if !existing && state == "active" && ((current == nil && hasAttempts) || (current != nil && *current != p.ExecutionID)) {
++		return ErrFenced
++	}
+ 	if existing {
+ 		if state == "paused" {
+ 			return ErrFenced
+@@ -59,10 +72,6 @@
+ 			return ErrBuildConflict
+ 		}
+ 		if err != nil {
+-			return err
+-		}
+-		var current *uuid.UUID
+-		if err := tx.QueryRow(ctx, `SELECT current_execution_id FROM public.sandbox_execution_fences WHERE team_id=$1 AND sandbox_id=$2`, p.TeamID, p.SandboxID).Scan(&current); err != nil {
+ 			return err
+ 		}
+ 		if current != nil && *current != p.ExecutionID {
+--- /dev/null
++++ b/packages/db/pkg/executions/registration_guard_test.go
+@@ -0,0 +1,137 @@
++package executions_test
++
++import (
++	"errors"
++	"sync"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestExecutionRegistrationRequiresCurrentIdentityUntilCertifiedPause(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	first := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host-a"}
++	base := uuid.New()
++	require.NoError(t, store.Register(t.Context(), first, base, true), "initial admission is allowed")
++	require.NoError(t, store.Register(t.Context(), first, base, true), "a lost reply retries the same identity")
++	secondHost := first
++	secondHost.NodeID = "host-b"
++	require.NoError(t, store.Register(t.Context(), secondHost, base, true), "placement retries retain every possible host for the same execution")
++	next := first
++	next.ExecutionID = uuid.New()
++	assertOriginal := func() {
++		attempts, err := db.SqlcClient.ListExecutionAttempts(t.Context(), queries.ListExecutionAttemptsParams{TeamID: team, SandboxID: first.SandboxID})
++		require.NoError(t, err)
++		require.Len(t, attempts, 2)
++		for _, attempt := range attempts {
++			require.Equal(t, first.ExecutionID, attempt.ExecutionID)
++		}
++		_, tx, err := db.SqlcClient.WithTx(t.Context())
++		require.NoError(t, err)
++		defer tx.Rollback(t.Context())
++		var current uuid.UUID
++		var state string
++		var roots int
++		require.NoError(t, tx.QueryRow(t.Context(), `SELECT state,current_execution_id,
++		    (SELECT count(*) FROM sandbox_execution_build_roots r WHERE r.team_id=f.team_id AND r.sandbox_id=f.sandbox_id)
++		    FROM sandbox_execution_fences f WHERE team_id=$1 AND sandbox_id=$2`, team, first.SandboxID).Scan(&state, &current, &roots))
++		require.Equal(t, "active", state)
++		require.Equal(t, first.ExecutionID, current)
++		require.Equal(t, 2, roots, "a refused replacement must not create build roots")
++	}
++	require.ErrorIs(t, store.Register(t.Context(), next, base, true), executions.ErrFenced, "a new physical execution cannot overwrite the active owner")
++	assertOriginal()
++
++	template := testutils.CreateTestTemplate(t, db, team)
++	snapshot := testutils.UpsertTestSnapshot(t, t.Context(), db, "memory-"+uuid.NewString(), first.SandboxID, team, template)
++	confirmed := false
++	require.ErrorIs(t, store.MarkPaused(t.Context(), team, first.SandboxID, first.ExecutionID, snapshot.BuildID, func([]queries.SandboxExecutionAttempt) error {
++		confirmed = true
++		return nil
++	}), executions.ErrPausedDisk, "a memory snapshot is not a certified filesystem pause")
++	require.False(t, confirmed)
++	require.ErrorIs(t, store.Register(t.Context(), next, snapshot.BuildID, true), executions.ErrFenced)
++	assertOriginal()
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE snapshots SET config='{"filesystemOnly":true}',metadata='{"launchpad.managed":"thread-vm-v1"}' WHERE sandbox_id=$1`, first.SandboxID))
++	uncertain := errors.New("one original host has no stop certificate")
++	require.ErrorIs(t, store.MarkPaused(t.Context(), team, first.SandboxID, first.ExecutionID, snapshot.BuildID, func(attempts []queries.SandboxExecutionAttempt) error {
++		require.Len(t, attempts, 2)
++		return uncertain
++	}), uncertain)
++	require.ErrorIs(t, store.Register(t.Context(), next, snapshot.BuildID, true), executions.ErrFenced, "a failed stop confirmation cannot authorize a replacement")
++	assertOriginal()
++	require.NoError(t, store.MarkPaused(t.Context(), team, first.SandboxID, first.ExecutionID, snapshot.BuildID, func(attempts []queries.SandboxExecutionAttempt) error {
++		require.Len(t, attempts, 2)
++		return nil
++	}))
++	require.NoError(t, store.Register(t.Context(), next, snapshot.BuildID, true), "a certified pause admits a fresh execution")
++	require.NoError(t, store.Register(t.Context(), next, snapshot.BuildID, true), "the new execution still supports lost replies")
++	require.ErrorIs(t, store.Register(t.Context(), first, base, true), executions.ErrFenced, "the retired execution cannot regain ownership")
++	_, err := store.BeginStop(t.Context(), team, first.SandboxID)
++	require.NoError(t, err)
++	_, err = db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: first.SandboxID})
++	require.NoError(t, err)
++	require.ErrorIs(t, store.Register(t.Context(), next, snapshot.BuildID, true), executions.ErrFenced, "cancelled/stopped creation cannot restart")
++}
++
++func TestExecutionRegistrationSerializesDifferentInitialIdentities(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	first := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}
++	second := first
++	second.ExecutionID = uuid.New()
++	identities := []queries.InsertExecutionAttemptParams{first, second}
++	results := make([]error, len(identities))
++	ready := make(chan struct{})
++	var work sync.WaitGroup
++	for index := range identities {
++		work.Go(func() {
++			<-ready
++			results[index] = store.Register(t.Context(), identities[index], uuid.New(), true)
++		})
++	}
++	close(ready)
++	work.Wait()
++	winner := -1
++	for index, result := range results {
++		if result == nil {
++			require.Equal(t, -1, winner, "only one physical identity may win initial admission")
++			winner = index
++		} else {
++			require.ErrorIs(t, result, executions.ErrFenced)
++		}
++	}
++	require.NotEqual(t, -1, winner)
++	attempts, err := db.SqlcClient.ListExecutionAttempts(t.Context(), queries.ListExecutionAttemptsParams{TeamID: team, SandboxID: first.SandboxID})
++	require.NoError(t, err)
++	require.Len(t, attempts, 1)
++	require.Equal(t, identities[winner].ExecutionID, attempts[0].ExecutionID)
++}
++
++func TestExecutionRegistrationDoesNotInventOwnerForLegacyAttempts(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	legacy := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "legacy-host"}
++	require.NoError(t, db.SqlcClient.EnsureExecutionFence(t.Context(), queries.EnsureExecutionFenceParams{TeamID: team, SandboxID: legacy.SandboxID}))
++	require.NoError(t, db.SqlcClient.InsertExecutionAttempt(t.Context(), legacy))
++	for _, sameExecution := range []bool{false, true} {
++		next := legacy
++		next.NodeID = "new-host"
++		if !sameExecution {
++			next.ExecutionID = uuid.New()
++		}
++		require.ErrorIs(t, store.Register(t.Context(), next, uuid.New(), true), executions.ErrFenced, "an unknown legacy owner must not be backfilled on another host")
++	}
++	attempts, err := db.SqlcClient.ListExecutionAttempts(t.Context(), queries.ListExecutionAttemptsParams{TeamID: team, SandboxID: legacy.SandboxID})
++	require.NoError(t, err)
++	require.Len(t, attempts, 1)
++	require.Equal(t, legacy.ExecutionID, attempts[0].ExecutionID)
++}

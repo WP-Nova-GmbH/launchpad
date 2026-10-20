@@ -45,6 +45,13 @@ export type ProviderCompactionResult =
  * ProviderServiceShape - Service API for provider session and turn orchestration.
  */
 export interface ProviderServiceShape {
+  /** Internal recovery only; the exact source fence guards the physical stop. */
+  readonly stopIdleVmSession?: (input: {
+    readonly threadId: ThreadId;
+    readonly environmentId: string;
+    readonly generation: number;
+    readonly operationId: string;
+  }) => Effect.Effect<boolean, ProviderServiceError>;
   /**
    * Start a provider session.
    */
@@ -129,6 +136,13 @@ export interface ProviderServiceShape {
     readonly numTurns: number;
   }) => Effect.Effect<void, ProviderServiceError>;
 
+  /** Retain a settled turn, or a fresh final point under an already frozen operation. */
+  readonly checkpointConversation?: (input: {
+    readonly threadId: ThreadId;
+    readonly turnId: TurnId;
+    readonly captureOperationId?: string;
+  }) => Effect.Effect<void, ProviderServiceError>;
+
   /**
    * Upload a thread and return the provider's shareable feedback identifier.
    */
@@ -142,6 +156,12 @@ export interface ProviderServiceShape {
    * Fan-out is owned by ProviderService (not by a standalone event-bus service).
    */
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
+  /** Internal ingestion stream includes receipts; public observers receive only provider events. */
+  readonly streamIngestionEvents?: Stream.Stream<
+    import("../ProviderEventBarrier.ts").ProviderIngestionEvent
+  >;
+  /** Wait for stopped adapter output and its orchestration writes before freezing history. */
+  readonly flushRuntimeEvents?: (threadId: ThreadId) => Effect.Effect<void, ProviderServiceError>;
 }
 
 /**

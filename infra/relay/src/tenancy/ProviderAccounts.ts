@@ -82,7 +82,7 @@ export class ProviderAccounts extends Context.Service<
       readonly provider: RelayProviderAccountProvider;
     }) => Effect.Effect<boolean, ProviderAccountPersistenceError>;
   }
->()("t3code-relay/tenancy/ProviderAccounts") {}
+>()("launchpad-relay/tenancy/ProviderAccounts") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

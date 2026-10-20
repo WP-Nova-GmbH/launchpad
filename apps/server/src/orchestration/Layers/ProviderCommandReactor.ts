@@ -42,6 +42,7 @@ import {
   ProviderAdapterValidationError,
   ProviderValidationError,
   ProviderWorkspaceMissingError,
+  ProviderExecutionError,
 } from "../../provider/Errors.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
@@ -72,6 +73,7 @@ const isProviderAdapterProcessError = Schema.is(ProviderAdapterProcessError);
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationError);
 const isProviderValidationError = Schema.is(ProviderValidationError);
+const isProviderExecutionError = Schema.is(ProviderExecutionError);
 const isProviderWorkspaceMissingError = Schema.is(ProviderWorkspaceMissingError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 
@@ -414,6 +416,7 @@ const make = Effect.gen(function* () {
     if (isProviderAdapterValidationError(failReason?.error)) {
       return failReason.error.issue;
     }
+    if (isProviderExecutionError(failReason?.error)) return failReason.error.message;
     if (isProviderWorkspaceMissingError(failReason?.error)) {
       return failReason.error.message;
     }
@@ -1599,7 +1602,15 @@ const make = Effect.gen(function* () {
       const queue = thread?.promptQueue;
       const handoff = queue?.handoff;
       const prompt = queue?.entries.find((entry) => entry.messageId === handoff?.messageId);
-      if (!thread || !queue || !handoff || handoff.attemptId !== attemptId || !prompt) return;
+      if (
+        !thread ||
+        !queue ||
+        !handoff ||
+        handoff.attemptId !== attemptId ||
+        !prompt ||
+        prompt.kind === "move"
+      )
+        return;
       const release = (detail: string, pause = false) =>
         Effect.flatMap(promptNow, (createdAt) =>
           orchestrationEngine.dispatch({
@@ -1918,11 +1929,17 @@ const make = Effect.gen(function* () {
             return;
           }
           const failure = Cause.findErrorOption(cause);
+          const executionFailure =
+            Option.isSome(failure) && isProviderExecutionError(failure.value)
+              ? failure.value
+              : undefined;
           const provenRejected =
-            !crossedProviderBoundary ||
-            (Option.isSome(failure) &&
-              (isProviderAdapterValidationError(failure.value) ||
-                isProviderValidationError(failure.value)));
+            executionFailure !== undefined
+              ? !executionFailure.uncertain
+              : !crossedProviderBoundary ||
+                (Option.isSome(failure) &&
+                  (isProviderAdapterValidationError(failure.value) ||
+                    isProviderValidationError(failure.value)));
           const current = yield* readPromptThread(threadId);
           if (provenRejected && current?.promptQueue?.handoff?.attemptId === attemptId) {
             yield* orchestrationEngine.dispatch({
@@ -1985,6 +2002,7 @@ const make = Effect.gen(function* () {
     const head = queue.entries[0];
     if (
       !head ||
+      head.kind === "move" ||
       !queue.enabled ||
       (queue.preparation !== undefined && queue.preparation.state !== "ready") ||
       head.state !== "pending" ||
@@ -2020,14 +2038,35 @@ const make = Effect.gen(function* () {
     }
     const session = thread.session;
     if (!session || session.status === "stopped") {
-      return yield* appendProviderFailureActivity({
-        threadId: event.payload.threadId,
-        kind: "provider.turn.interrupt.failed",
-        summary: "Provider turn interrupt failed",
-        detail: "No active provider session is bound to this thread.",
-        turnId: event.payload.turnId ?? null,
-        createdAt: event.payload.createdAt,
-      });
+      // Queue pause also requests an interrupt when the provider is already stopped.
+      return;
+    }
+    if (
+      session.status === "ready" &&
+      session.activeTurnId === null &&
+      event.payload.turnId === undefined &&
+      !thread.hasPendingApprovals &&
+      !thread.hasPendingUserInput &&
+      !thread.backgroundLiveness &&
+      !compactingThreadIds.has(thread.id)
+    ) {
+      const current = yield* resolveThreadDetail(thread.id);
+      const queue = current?.promptQueue;
+      if (
+        current?.session?.status === "ready" &&
+        current.session.activeTurnId === null &&
+        (!current.latestTurn ||
+          (current.latestTurn.state !== "running" && current.latestTurn.completedAt !== null)) &&
+        !compactingThreadIds.has(thread.id) &&
+        !queue?.handoff &&
+        !queue?.awaitingTurnId &&
+        !queue?.admissions.length &&
+        (!queue?.preparation || queue.preparation.settled) &&
+        (!queue || queue.entries.every((entry) => entry.state === "pending"))
+      ) {
+        // Interrupting a missing idle runtime would recover it just to stop no turn.
+        return;
+      }
     }
 
     const recoverInterruptFailure = (cause: Cause.Cause<unknown>) => {
@@ -2412,24 +2451,28 @@ const make = Effect.gen(function* () {
     // Subscribe before returning, even while event handling waits for server activation.
     const recoverPromptQueues = Effect.gen(function* () {
       const snapshot = yield* projectionSnapshotQuery.getCommandReadModel();
-      for (const thread of snapshot.threads) {
-        const queue = thread.promptQueue;
-        if (!queue) continue;
-        const attempts = queue.handoff
-          ? [queue.handoff.attemptId]
-          : queue.admissions.map((admission) => admission.attemptId);
-        for (const attemptId of attempts)
-          yield* orchestrationEngine.dispatch({
-            type: "thread.prompt.unknown",
-            commandId: yield* serverCommandId("prompt-recovery"),
-            threadId: thread.id,
-            attemptId,
-            detail:
-              "The server restarted during provider work. Review provider history, then explicitly resolve delivery before resuming.",
-            createdAt: yield* promptNow,
-          });
-        if (attempts.length === 0) yield* advancePromptQueue(thread.id);
-      }
+      for (const thread of snapshot.threads)
+        yield* Effect.gen(function* () {
+          const queue = thread.promptQueue;
+          if (!queue) return;
+          const attempts = queue.handoff
+            ? [queue.handoff.attemptId]
+            : queue.admissions.map((admission) => admission.attemptId);
+          for (const attemptId of attempts)
+            yield* orchestrationEngine.dispatch({
+              type: "thread.prompt.unknown",
+              commandId: yield* serverCommandId("prompt-recovery"),
+              threadId: thread.id,
+              attemptId,
+              detail:
+                "The server restarted during provider work. Review provider history, then explicitly resolve delivery before resuming.",
+              createdAt: yield* promptNow,
+            });
+          if (attempts.length === 0) yield* advancePromptQueue(thread.id);
+        }).pipe(
+          // A held/moved thread must not prevent recovery of other threads or stop the live consumer.
+          Effect.catchTag("ThreadExecutionFenceError", () => Effect.void),
+        );
     });
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     yield* forkParked(

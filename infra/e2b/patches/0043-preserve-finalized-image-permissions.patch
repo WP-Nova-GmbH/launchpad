@@ -1,0 +1,57 @@
+--- a/packages/orchestrator/pkg/template/build/phases/finalize/configure.sh
++++ b/packages/orchestrator/pkg/template/build/phases/finalize/configure.sh
+@@ -91,8 +91,8 @@
+ mkdir -p /home/user
+ chown -R user:user /home/user
+ 
+-echo "Give 777 permission to /usr/local"
+-chmod -R 777 /usr/local
++# Preserve image-defined /usr/local permissions: helpers that certify stopped
++# workloads must not become writable by the workloads they inspect.
+ 
+ echo "Create /code directory"
+ mkdir -p /code
+--- a/packages/orchestrator/pkg/template/build/phases/finalize/configure_test.go
++++ b/packages/orchestrator/pkg/template/build/phases/finalize/configure_test.go
+@@ -338,3 +338,41 @@
+ 
+ 	return ""
+ }
++
++// Finalization runs after the Dockerfile and must retain the modes its author chose.
++func TestFinalConfigurationPreservesImageExecutableModes(t *testing.T) {
++	t.Parallel()
++	root := t.TempDir()
++	local := filepath.Join(root, "usr", "local")
++	executables := map[string]os.FileMode{
++		filepath.Join(local, "bin", "launchpad-workload"): 0o755,
++		filepath.Join(local, "lib", "codex", "codex"):     0o555,
++	}
++	for name, mode := range executables {
++		require.NoError(t, os.MkdirAll(filepath.Dir(name), 0o755))
++		require.NoError(t, os.WriteFile(name, []byte("image executable"), mode))
++		require.NoError(t, os.Chmod(name, mode))
++	}
++	start := strings.Index(configureScriptFile, `echo "Give 'user' ownership to /home/user"`)
++	require.NotEqual(t, -1, start, "final directory configuration block missing")
++	block := strings.NewReplacer(
++		"/home/user", filepath.Join(root, "home", "user"),
++		"/usr/local", local,
++		"/code", filepath.Join(root, "code"),
++	).Replace(configureScriptFile[start:])
++	bash, err := exec.LookPath("bash")
++	require.NoError(t, err)
++	// Ownership is exercised by the Linux guest. This harness only needs its mode changes.
++	out, err := exec.CommandContext(t.Context(), bash, "-c", "set -euo pipefail\nchown() { :; }\n"+block).CombinedOutput()
++	require.NoErrorf(t, err, "final directory configuration failed:\n%s", out)
++	for name, mode := range executables {
++		info, err := os.Stat(name)
++		require.NoError(t, err)
++		require.Equal(t, mode, info.Mode().Perm(), name)
++	}
++	info, err := os.Stat(filepath.Join(local, "bin"))
++	require.NoError(t, err)
++	require.Equal(t, os.FileMode(0o755), info.Mode().Perm(), "image executable directory mode widened")
++	require.DirExists(t, filepath.Join(root, "home", "user"))
++	require.DirExists(t, filepath.Join(root, "code"))
++}

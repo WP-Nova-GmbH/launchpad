@@ -1,0 +1,186 @@
+--- a/packages/api/cmd/launchpad-build-collector/main.go
++++ b/packages/api/cmd/launchpad-build-collector/main.go
+@@ -22,13 +22,15 @@
+ )
+ 
+ type settings struct {
+-	DatabaseURL string `json:"databaseURL"`
+-	StoragePath string `json:"storagePath"`
+-	APIURL      string `json:"apiURL"`
+-	APIKey      string `json:"apiKey"`
++	DatabaseURL    string      `json:"databaseURL"`
++	StoragePath    string      `json:"storagePath"`
++	APIURL         string      `json:"apiURL"`
++	APIKey         string      `json:"apiKey"`
++	ApprovedBuilds []uuid.UUID `json:"-"`
+ }
+ type result struct {
+ 	DryRun             bool        `json:"dryRun"`
++	ApprovedBuilds     []uuid.UUID `json:"approvedBuilds,omitempty"`
+ 	RetainedBuilds     int         `json:"retainedBuilds"`
+ 	UnreferencedBuilds []uuid.UUID `json:"unreferencedBuilds"`
+ 	DeletedBuilds      []uuid.UUID `json:"deletedBuilds"`
+@@ -66,6 +68,20 @@
+ }
+ func collect(ctx context.Context, input settings, apply, live bool) (result, error) {
+ 	out := result{DryRun: !apply, UnreferencedBuilds: []uuid.UUID{}, DeletedBuilds: []uuid.UUID{}}
++	var approved map[uuid.UUID]struct{}
++	if input.ApprovedBuilds != nil {
++		approved = make(map[uuid.UUID]struct{}, len(input.ApprovedBuilds))
++		for _, id := range input.ApprovedBuilds {
++			if id == uuid.Nil {
++				return out, fmt.Errorf("approved build identities must be nonzero UUIDs")
++			}
++			approved[id] = struct{}{}
++		}
++		for id := range approved {
++			out.ApprovedBuilds = append(out.ApprovedBuilds, id)
++		}
++		slices.SortFunc(out.ApprovedBuilds, func(a, b uuid.UUID) int { return slices.Compare(a[:], b[:]) })
++	}
+ 	if err := verifyAdmission(ctx, input, live); err != nil {
+ 		return out, err
+ 	}
+@@ -92,6 +108,13 @@
+ 		}
+ 		out.RetainedBuilds = len(retained)
+ 		for _, id := range catalog.Candidates {
++			// Apply the operator's scope to this locked catalog, so retirement
++			// after a dry run cannot widen the later deletion.
++			if approved != nil {
++				if _, ok := approved[id]; !ok {
++					continue
++				}
++			}
+ 			if _, keep := retained[id]; !keep {
+ 				out.UnreferencedBuilds = append(out.UnreferencedBuilds, id)
+ 			}
+@@ -110,6 +133,15 @@
+ func run() int {
+ 	apply := flag.Bool("apply", false, "Delete unreferenced build objects; default only reports them")
+ 	live := flag.Bool("live", false, "Permit durably pinned live executions; legacy unknown boots still block")
++	var approved []uuid.UUID
++	flag.Func("approved-build", "Limit collection to this reviewed build UUID; repeat for additional builds", func(value string) error {
++		id, err := uuid.Parse(value)
++		if err != nil || id == uuid.Nil {
++			return fmt.Errorf("approved build identities must be nonzero UUIDs")
++		}
++		approved = append(approved, id)
++		return nil
++	})
+ 	flag.Parse()
+ 	decoder := json.NewDecoder(io.LimitReader(os.Stdin, 64*1024))
+ 	decoder.DisallowUnknownFields()
+@@ -121,6 +153,7 @@
+ 	if decoder.Decode(&extra) != io.EOF {
+ 		return 2
+ 	}
++	input.ApprovedBuilds = approved
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+ 	defer cancel()
+ 	out, err := collect(ctx, input, *apply, *live)
+--- a/packages/api/cmd/launchpad-build-collector/main_test.go
++++ b/packages/api/cmd/launchpad-build-collector/main_test.go
+@@ -143,3 +143,102 @@
+ 	_, err = collect(t.Context(), input, true, true)
+ 	require.Error(t, err)
+ }
++
++func TestApprovedCollectionCannotWidenAfterNewRetirement(t *testing.T) {
++	for _, live := range []bool{false, true} {
++		name := "idle"
++		if live {
++			name = "live"
++		}
++		t.Run(name, func(t *testing.T) {
++			db := testutils.SetupDatabase(t)
++			team := testutils.CreateTestTeam(t, db)
++			rootEnv := testutils.CreateTestTemplate(t, db, team)
++			root := testutils.CreateTestBuild(t, t.Context(), db, rootEnv, "uploaded")
++			testutils.CreateTestBuildAssignment(t, t.Context(), db, rootEnv, root, "default")
++			retiredEnv := testutils.CreateTestTemplate(t, db, team)
++			ancestor := testutils.CreateTestBuild(t, t.Context(), db, retiredEnv, "uploaded")
++			approvedDead := testutils.CreateTestBuild(t, t.Context(), db, retiredEnv, "uploaded")
++			require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.envs SET deleted_at=now() WHERE id=$1", retiredEnv))
++			laterEnv := testutils.CreateTestTemplate(t, db, team)
++			laterDead := testutils.CreateTestBuild(t, t.Context(), db, laterEnv, "uploaded")
++			testutils.CreateTestBuildAssignment(t, t.Context(), db, laterEnv, laterDead, "default")
++			if live {
++				p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "live-host"}
++				require.NoError(t, (executions.Store{DB: db.SqlcClient}).Register(t.Context(), p, root, true))
++			}
++			source := t.TempDir()
++			store, err := storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: source})
++			require.NoError(t, err)
++			putRoot := func(id, parent uuid.UUID) {
++				paths := storage.Paths{BuildID: id.String()}
++				data, err := json.Marshal(metadata.Template{Version: metadata.CurrentVersion, Template: metadata.TemplateMetadata{BuildID: id.String()}, FilesystemOnly: true})
++				require.NoError(t, err)
++				blob, err := store.OpenBlob(t.Context(), paths.Metadata())
++				require.NoError(t, err)
++				require.NoError(t, blob.Put(t.Context(), data))
++				h, err := header.NewHeader(&header.Metadata{Version: 3, BuildId: id, BlockSize: 4096, Size: 4096}, []header.BuildMap{{Length: 4096, BuildId: parent}})
++				require.NoError(t, err)
++				_, _, _, err = header.StoreHeader(t.Context(), store, paths.RootfsHeader(), h)
++				require.NoError(t, err)
++			}
++			putRoot(root, ancestor)
++			putRoot(laterDead, laterDead)
++			for _, id := range []uuid.UUID{ancestor, approvedDead, laterDead} {
++				blob, err := store.OpenBlob(t.Context(), id.String()+"/rootfs")
++				require.NoError(t, err)
++				require.NoError(t, blob.Put(t.Context(), []byte("kept bytes")))
++			}
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				require.Equal(t, "proof-key", r.Header.Get("X-API-Key"))
++				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"version": 1, "buildCollectionAdmission": true, "executionBuildRoots": true, "liveBuildCollection": true}))
++			}))
++			t.Cleanup(server.Close)
++			input := settings{DatabaseURL: db.ConnStr(), StoragePath: source, APIURL: server.URL, APIKey: "proof-key", ApprovedBuilds: []uuid.UUID{root, ancestor, approvedDead, approvedDead}}
++			out, err := collect(t.Context(), input, false, live)
++			require.NoError(t, err)
++			require.Equal(t, 3, out.RetainedBuilds)
++			require.ElementsMatch(t, []uuid.UUID{root, ancestor, approvedDead}, out.ApprovedBuilds)
++			require.Equal(t, []uuid.UUID{approvedDead}, out.UnreferencedBuilds)
++
++			// A build that becomes collectable between review and apply must
++			// remain untouched unless the operator approved that build too.
++			require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.envs SET deleted_at=now() WHERE id=$1", laterEnv))
++			emptyScope := input
++			emptyScope.ApprovedBuilds = []uuid.UUID{}
++			out, err = collect(t.Context(), emptyScope, true, live)
++			require.NoError(t, err)
++			require.Empty(t, out.UnreferencedBuilds)
++			require.Empty(t, out.DeletedBuilds)
++			out, err = collect(t.Context(), input, true, live)
++			require.NoError(t, err)
++			require.Equal(t, 2, out.RetainedBuilds)
++			require.Equal(t, []uuid.UUID{approvedDead}, out.UnreferencedBuilds)
++			require.Equal(t, []uuid.UUID{approvedDead}, out.DeletedBuilds)
++			for _, id := range []uuid.UUID{ancestor, laterDead} {
++				blob, err := store.OpenBlob(t.Context(), id.String()+"/rootfs")
++				require.NoError(t, err)
++				data, err := storage.GetBlob(t.Context(), blob)
++				require.NoError(t, err)
++				require.Equal(t, "kept bytes", string(data))
++			}
++			// Omitting approval retains the existing automatic collector policy.
++			blob, err := store.OpenBlob(t.Context(), laterDead.String()+"/rootfs")
++			require.NoError(t, err)
++			input.ApprovedBuilds = nil
++			out, err = collect(t.Context(), input, true, live)
++			require.NoError(t, err)
++			require.Contains(t, out.DeletedBuilds, laterDead)
++			require.NotContains(t, out.DeletedBuilds, ancestor)
++			require.NotContains(t, out.DeletedBuilds, root)
++			exists, err := blob.Exists(t.Context())
++			require.NoError(t, err)
++			require.False(t, exists)
++		})
++	}
++}
++
++func TestApprovedCollectionRejectsZeroBuildIdentity(t *testing.T) {
++	_, err := collect(t.Context(), settings{ApprovedBuilds: []uuid.UUID{uuid.Nil}}, true, true)
++	require.ErrorContains(t, err, "nonzero UUIDs")
++}

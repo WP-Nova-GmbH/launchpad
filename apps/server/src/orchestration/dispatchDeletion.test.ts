@@ -26,6 +26,7 @@ import { PersistenceSqlError } from "../persistence/Errors.ts";
 import { ServerConfig } from "../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
+import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { ProjectionThreadRepositoryLive } from "../persistence/Layers/ProjectionThreads.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
@@ -97,6 +98,7 @@ const makeHarness = Effect.gen(function* () {
   const fence = yield* Semaphore.make(1);
   const allowed = yield* Ref.make(true);
   const authorizations: string[] = [];
+  const managedThreads = new Set<ThreadId>();
   const requireAccess = Ref.get(allowed).pipe(
     Effect.flatMap((value) =>
       value
@@ -115,9 +117,16 @@ const makeHarness = Effect.gen(function* () {
     withFence: fence.withPermit,
     requirePersistedProject: () => requireAccess,
     requireCommand: (_actor, command) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         authorizations.push(command.type);
-      }).pipe(Effect.andThen(requireAccess)),
+        yield* requireAccess;
+        if ("threadId" in command && managedThreads.has(command.threadId))
+          return yield* new EnvironmentAuthorizationError({
+            message: "Send this thread's commands through the relay inbox.",
+            requiredScope: AuthOrchestrationReadScope,
+            reason: "portable-thread",
+          });
+      }),
   };
   const drains = yield* Queue.unbounded<{
     threadId: ThreadId;
@@ -281,6 +290,7 @@ const makeHarness = Effect.gen(function* () {
     access,
     allowed,
     authorizations,
+    managedThreads,
     drains,
     drainHandler,
     create,
@@ -384,6 +394,99 @@ describe("creation dispatch cleanup fence", () => {
 });
 
 describe("deletion dispatch preflight", () => {
+  it.effect("marks project deletes as client commands when a transport supplies no options", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      const threadId = ThreadId.make("project-delete-transport-default");
+      yield* h.engine.dispatch(createThread(threadId, "create-transport-default"));
+      const fence = makeThreadExecutionFence(yield* SqlClient.SqlClient);
+      const owner = {
+        threadId,
+        projectId,
+        relayUrl: "https://relay.example",
+        environmentId: "here",
+        generation: 1,
+        operationId: "enrollment",
+      };
+      yield* fence.prepare(owner);
+      yield* fence.activate(owner);
+      const before = yield* h.query.getCommandReadModel();
+      const command = {
+        type: "project.delete" as const,
+        projectId,
+        force: true,
+        commandId: CommandId.make("transport-project-delete"),
+      };
+      const error = yield* h.dispatch(actor, command).pipe(Effect.flip);
+      expect(error._tag).toBe("ThreadExecutionFenceError");
+      expect(error.message).toContain("managed threads through Launchpad Connect");
+      expect((yield* h.query.getCommandReadModel()).snapshotSequence).toBe(before.snapshotSequence);
+      expect((yield* h.read(threadId)).deletedAt).toBeNull();
+      expect((yield* fence.get(threadId))?.phase).toBe("active");
+      expect(yield* Queue.size(h.drains)).toBe(0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a project cascade before stopping any managed or local thread", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      const local = yield* h.seed("local-project-delete");
+      const managed = yield* h.seed("managed-project-delete", true);
+      yield* h.settle(managed, true);
+      h.managedThreads.add(managed);
+      const before = yield* h.query.getCommandReadModel();
+      const command = {
+        type: "project.delete" as const,
+        projectId,
+        force: true,
+        commandId: CommandId.make("refuse-portable-project-delete"),
+      };
+      const error = yield* h.dispatch(actor, command).pipe(Effect.flip);
+      expect(error.message).toContain("managed threads through Launchpad Connect");
+      expect(yield* Queue.size(h.drains)).toBe(0);
+      expect((yield* h.query.getCommandReadModel()).snapshotSequence).toBe(before.snapshotSequence);
+      for (const id of [local, managed])
+        expect(yield* h.read(id)).toEqual(before.threads.find((t) => t.id === id));
+      expect(
+        Option.isNone(yield* h.receipts.getByCommandId({ commandId: command.commandId })),
+      ).toBe(true);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("rechecks captured thread ownership when enrollment occurs during setup shutdown", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      const threadId = yield* h.seed("enrolled-during-project-delete");
+      const stopped = yield* Deferred.make<void>();
+      yield* Ref.set(h.drainHandler, (id) =>
+        Deferred.await(stopped).pipe(Effect.andThen(h.settle(id, true)), Effect.orDie),
+      );
+      const command = {
+        type: "project.delete" as const,
+        projectId,
+        force: true,
+        commandId: CommandId.make("project-delete-enrollment-race"),
+      };
+      const deletion = yield* h.dispatch(actor, command).pipe(Effect.result, Effect.forkChild);
+      yield* Queue.take(h.drains);
+      yield* h.access.withFence(Effect.sync(() => h.managedThreads.add(threadId)));
+      yield* Deferred.succeed(stopped, undefined);
+      const result = yield* Fiber.join(deletion);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure")
+        expect(result.failure.message).toContain("managed threads through Launchpad Connect");
+      expect((yield* h.read(threadId)).deletedAt).toBeNull();
+      expect(
+        (yield* h.query.getCommandReadModel()).projects.find((project) => project.id === projectId)
+          ?.deletedAt,
+      ).toBeNull();
+      expect(
+        Option.getOrThrow(yield* h.receipts.getByCommandId({ commandId: command.commandId }))
+          .status,
+      ).toBe("rejected");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("deduplicates overlapping Delete requests after the same scoped shutdown", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness;

@@ -3,6 +3,7 @@ import {
   CommandId,
   MessageId,
   type OrchestrationEvent,
+  type OrchestrationCommand,
   OrchestrationProposedPlanId,
   CheckpointRef,
   classifyTaskAgentKind,
@@ -27,10 +28,16 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import { ProviderEventBarrier } from "../../provider/ProviderEventBarrier.ts";
+import { ProviderValidationError } from "../../provider/Errors.ts";
+import type { OrchestrationDispatchError } from "../Errors.ts";
+import * as Deferred from "effect/Deferred";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { formatTokens } from "@t3tools/shared/usageFormat";
 
@@ -129,6 +136,12 @@ type TurnStartRequestedDomainEvent = Extract<
 >;
 
 type ProviderDiffEvent = Extract<ProviderRuntimeEvent, { type: "turn.diff.updated" }>;
+
+interface HeldProviderCommand {
+  readonly command: OrchestrationCommand;
+  readonly ownership: { readonly environmentId: string; readonly generation: number } | null;
+  readonly done: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
+}
 
 type RuntimeIngestionInput =
   | {
@@ -1046,7 +1059,56 @@ const make = Effect.gen(function* () {
   const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
   const threadPlanProgress = yield* ThreadPlanProgressService;
   const crypto = yield* Crypto.Crypto;
-  const orchestrationEngine = yield* OrchestrationEngineService;
+  const engine = yield* OrchestrationEngineService;
+  const heldCommands = yield* Queue.unbounded<HeldProviderCommand>();
+  const orchestrationEngine = {
+    ...engine,
+    dispatch: (command: OrchestrationCommand) =>
+      engine.dispatch(command).pipe(
+        Effect.catchTag("ThreadExecutionFenceError", (error) =>
+          Effect.gen(function* () {
+            if (error.ownership === undefined || !("threadId" in command)) return yield* error;
+            const done = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
+            yield* Queue.offer(heldCommands, { command, ownership: error.ownership, done });
+            // Suspend at the exact failed command: its payload/ID and earlier
+            // event effects survive. Replaying a whole event could duplicate text.
+            return yield* Deferred.await(done);
+          }),
+        ),
+      ),
+  };
+  const retryHeldCommand = (held: HeldProviderCommand) =>
+    engine.dispatch(held.command, { expectedThreadOwnership: held.ownership }).pipe(
+      Effect.catch((error) =>
+        error._tag === "ThreadExecutionFenceError" && error.ownership !== undefined
+          ? Queue.offer(heldCommands, held).pipe(Effect.andThen(Effect.fail(error)))
+          : Deferred.fail(held.done, error).pipe(Effect.andThen(Effect.fail(error))),
+      ),
+      Effect.flatMap((result) => Deferred.succeed(held.done, result)),
+    );
+  // Newly arriving output also resumes a checkout that finished meanwhile; a
+  // first user turn need not wait for the later pause/move flush barrier.
+  const retryHeldOnInput = Queue.poll(heldCommands).pipe(
+    Effect.flatMap((held) =>
+      Option.isSome(held) ? retryHeldCommand(held.value).pipe(Effect.ignore) : Effect.void,
+    ),
+  );
+  // A barrier drives held commands before waiting for the worker that owns
+  // them. Only a still-reserved checkout remains pending; permanent rejection
+  // resumes the original event through its normal failure path so other threads drain.
+  const drainHeldCommands = (
+    drain: Effect.Effect<void>,
+  ): Effect.Effect<void, OrchestrationDispatchError> =>
+    Effect.raceFirst(
+      drain,
+      Queue.take(heldCommands).pipe(
+        Effect.flatMap((held) =>
+          retryHeldCommand(held).pipe(
+            Effect.andThen(Effect.suspend(() => drainHeldCommands(drain))),
+          ),
+        ),
+      ),
+    );
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
   const projectionThreadMessages = yield* ProjectionThreadMessageRepository;
@@ -2670,24 +2732,56 @@ const make = Effect.gen(function* () {
     }
   };
 
+  const ingestionFailures = new Map<string, Map<string, Cause.Cause<unknown>>>();
   const logIngestionFailure =
-    (source: string, event: { readonly eventId: string; readonly type: string }) =>
+    (
+      source: string,
+      event: { readonly eventId: string; readonly type: string },
+      threadId?: string,
+    ) =>
     <E, R>(effect: Effect.Effect<void, E, R>) =>
       effect.pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            if (!threadId) return;
+            const failures = ingestionFailures.get(threadId);
+            failures?.delete(`${source}:${event.eventId}`);
+            if (failures?.size === 0) ingestionFailures.delete(threadId);
+          }),
+        ),
         Effect.catchCauseIf(
           (cause) => !Cause.hasInterruptsOnly(cause),
           (cause) =>
-            Effect.logWarning("provider runtime ingestion failed to process event", {
-              source,
-              eventId: event.eventId,
-              eventType: event.type,
-              cause: Cause.pretty(cause),
-            }),
+            Effect.sync(() => {
+              if (!threadId) return;
+              const failures = ingestionFailures.get(threadId) ?? new Map();
+              failures.set(`${source}:${event.eventId}`, cause);
+              ingestionFailures.set(threadId, failures);
+            }).pipe(
+              Effect.andThen(
+                Effect.logWarning("provider runtime ingestion failed to process event", {
+                  source,
+                  eventId: event.eventId,
+                  eventType: event.type,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+            ),
         ),
       );
 
   const worker = yield* makeDrainableWorker((input: RuntimeIngestionInput) =>
-    processInput(input).pipe(logIngestionFailure(input.source, input.event)),
+    processInput(input).pipe(
+      logIngestionFailure(
+        input.source,
+        input.event,
+        input.source === "domain"
+          ? "threadId" in input.event.payload
+            ? input.event.payload.threadId
+            : undefined
+          : input.event.threadId,
+      ),
+    ),
   );
 
   // Repository detection for a diff goes through VCS subprocesses, which can
@@ -2705,16 +2799,51 @@ const make = Effect.gen(function* () {
     yield* worker.enqueue({ source: "diff", event });
   });
   const diffWorker = yield* makeDrainableWorker((event: ProviderDiffEvent) =>
-    detectProviderDiffRepository(event).pipe(logIngestionFailure("diff", event)),
+    detectProviderDiffRepository(event).pipe(
+      logIngestionFailure("diff-detection", event, event.threadId),
+    ),
   );
 
   const start: ProviderRuntimeIngestionShape["start"] = () =>
     Effect.gen(function* () {
       yield* forkParked(
-        Stream.runForEach(providerService.streamEvents, (event) =>
-          event.type === "turn.diff.updated"
-            ? diffWorker.enqueue(event)
-            : worker.enqueue({ source: "runtime", event }),
+        Stream.runForEach(
+          providerService.streamIngestionEvents ?? providerService.streamEvents,
+          (event) =>
+            event instanceof ProviderEventBarrier
+              ? Effect.gen(function* () {
+                  yield* diffWorker.drain;
+                  const drained = yield* drainHeldCommands(worker.drain).pipe(Effect.exit);
+                  if (Exit.isFailure(drained)) {
+                    yield* Deferred.fail(
+                      event.done,
+                      new ProviderValidationError({
+                        operation: "ProviderRuntimeIngestion.flush",
+                        issue: "A provider event could not be persisted.",
+                        cause: drained.cause,
+                      }),
+                    );
+                    return;
+                  }
+                  const failures = ingestionFailures.get(event.threadId);
+                  if (failures?.size)
+                    yield* Deferred.fail(
+                      event.done,
+                      new ProviderValidationError({
+                        operation: "ProviderRuntimeIngestion.flush",
+                        issue: "A provider event could not be persisted.",
+                        cause: failures.values().next().value,
+                      }),
+                    );
+                  else yield* Deferred.succeed(event.done, undefined);
+                })
+              : retryHeldOnInput.pipe(
+                  Effect.andThen(
+                    event.type === "turn.diff.updated"
+                      ? diffWorker.enqueue(event)
+                      : worker.enqueue({ source: "runtime", event }),
+                  ),
+                ),
         ),
       );
       yield* forkParked(

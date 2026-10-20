@@ -3,6 +3,7 @@ import { useEffect } from "react";
 
 export type HardwareKeyboardCommand =
   | ThreadJumpKeybindingCommand
+  | "threadVms"
   | "commandPalette"
   | "paletteNext"
   | "palettePrevious"

@@ -86,6 +86,7 @@ import {
   SettingsOpenSourceLicensesRouteScreen,
 } from "./features/settings/SettingsOpenSourceLicensesRouteScreen";
 import { SettingsProjectGroupingRouteScreen } from "./features/settings/SettingsProjectGroupingRouteScreen";
+import { SettingsThreadVmsRouteScreen } from "./features/settings/SettingsThreadVmsRouteScreen";
 import { SettingsProjectOverviewRouteScreen } from "./features/settings/SettingsProjectOverviewRouteScreen";
 import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
@@ -268,6 +269,11 @@ const SettingsContentStack = createNativeStackNavigator({
       options: {
         title: "Organization",
       },
+    }),
+    SettingsThreadVms: createNativeStackScreen({
+      screen: SettingsThreadVmsRouteScreen,
+      linking: "thread-vms",
+      options: { title: "Thread VMs" },
     }),
     SettingsProjectOverview: createNativeStackScreen({
       screen: SettingsProjectOverviewRouteScreen,

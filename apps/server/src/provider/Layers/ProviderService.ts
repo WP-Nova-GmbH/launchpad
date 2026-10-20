@@ -1,3 +1,8 @@
+import { ProviderEventBarrier, type ProviderIngestionEvent } from "../ProviderEventBarrier.ts";
+import { exportUnstartedPortableCodexConversation } from "../Drivers/PortableCodexHome.ts";
+import { assertThreadTransferRuntime } from "../../persistence/ThreadTransferRuntime.ts";
+import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import { VmWorkloadError, type VmHarnessStopAdmission } from "../../vmWorkload.ts";
 /**
  * ProviderServiceLive - Cross-provider orchestration layer.
  *
@@ -9,6 +14,18 @@
  *
  * @module ProviderServiceLive
  */
+import { CodexResumeCursorSchema } from "./CodexSessionRuntime.ts";
+import { makeThreadAttachmentCheckpoint } from "../../relay/ThreadAttachmentCheckpoint.ts";
+import {
+  makeThreadNativeCheckpoint,
+  digestNativeCheckpointArchive,
+} from "../../relay/ThreadNativeCheckpoint.ts";
+import { collectThreadAttachmentReferences } from "../../relay/ThreadAttachmentReferences.ts";
+import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
+import { ThreadExecution } from "../../relay/ThreadExecution.ts";
+import { makeProviderExecution } from "../ProviderExecution.ts";
 import * as NodeUtil from "node:util";
 import {
   EventId,
@@ -74,6 +91,7 @@ import {
 } from "../../observability/Metrics.ts";
 import {
   ProviderAdapterRequestError,
+  ProviderAdapterProcessError,
   type ProviderAdapterError,
   type ProviderServiceError,
   ProviderValidationError,
@@ -335,6 +353,8 @@ function turnEffort(modelSelection: ProviderSendTurnInput["modelSelection"]): st
   );
 }
 
+const decodeCheckpointCursor = Schema.decodeUnknownEffect(CodexResumeCursorSchema);
+
 type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["Service"]> =
   ProviderService.ProviderService["Service"][Name];
 
@@ -398,6 +418,7 @@ function toRuntimePayloadFromSession(
   },
 ): Record<string, unknown> {
   return {
+    stoppedRuntimeEventsDrained: null,
     cwd: session.cwd ?? null,
     model: session.model ?? null,
     activeTurnId: session.activeTurnId ?? null,
@@ -475,8 +496,13 @@ const correlateRuntimeEventWithInstance = (
 const makeProviderService = Effect.fn("makeProviderService")(function* (
   options?: ProviderServiceLiveOptions,
 ) {
+  const vmWorkloads = yield* VmWorkloadTracking;
   const analytics = yield* Effect.service(AnalyticsService.AnalyticsService);
+  const admitExecution = makeProviderExecution(yield* ThreadExecution);
   const serverConfig = yield* ServerConfig.ServerConfig;
+  const checkpointSql = yield* SqlClient.SqlClient;
+  const nativeCheckpoints = makeThreadNativeCheckpoint(checkpointSql);
+  const checkpointEvents = yield* Effect.serviceOption(OrchestrationEventStore);
   const eventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
   // Options-provided logger wins (test overrides); otherwise we take whatever
   // the `ProviderEventLoggers` tag exposes — `undefined` means "no canonical
@@ -494,7 +520,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
   const fileSystem = yield* FileSystem.FileSystem;
   const pathService = yield* Path.Path;
-  const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const runtimeEventPubSub = yield* PubSub.unbounded<ProviderIngestionEvent>();
   const pendingCompactions = new Map<ThreadId, PendingCompaction>();
   const timedOutNativeCompactions = new Set<ThreadId>();
   const settleCompaction = (threadId: ThreadId, pending: PendingCompaction, terminal: string) =>
@@ -1268,6 +1294,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     });
     return yield* Effect.gen(function* () {
       const adapter = yield* registry.getByInstance(bindingInstanceId);
+      if (vmWorkloads && adapter.provider !== "codex")
+        return yield* toValidationError(
+          input.operation,
+          "Thread VMs currently support only Codex.",
+        );
       const hasResumeCursor =
         input.binding.resumeCursor !== null && input.binding.resumeCursor !== undefined;
       const hasActiveSession = yield* adapter.hasSession(input.binding.threadId);
@@ -1300,6 +1331,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
+      yield* admitExecution(input.binding.threadId, "recover-session");
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
       const resumed = yield* adapter
         .startSession({
@@ -1447,6 +1479,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return yield* Effect.gen(function* () {
         const instanceInfo = yield* registry.getInstanceInfo(resolvedInstanceId);
         const resolvedProvider = instanceInfo.driverKind;
+        if (vmWorkloads && resolvedProvider !== "codex")
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            "Thread VMs currently support only Codex.",
+          );
         metricProvider = resolvedProvider;
         if (parsed.provider !== undefined && parsed.provider !== resolvedProvider) {
           return yield* toValidationError(
@@ -1531,6 +1568,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
+        yield* admitExecution(threadId, "start-session");
         yield* prepareMcpSession(threadId, resolvedInstanceId);
         const session = yield* adapter
           .startSession({
@@ -1815,6 +1853,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 metadata: turnMetadata,
               });
             if (!hooks) {
+              yield* admitExecution(input.threadId, "send-turn", input.delivery?.attemptId);
               const turn = yield* routed.adapter.sendTurn(input);
               yield* associate(turn);
               yield* persistAdmission(turn);
@@ -1845,6 +1884,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 }),
             };
             return yield* (hooks.beforeDispatch ?? Effect.void).pipe(
+              Effect.andThen(
+                admitExecution(input.threadId, "send-turn", input.delivery?.attemptId),
+              ),
               Effect.andThen(() => routed.adapter.sendTurn(input, admissionCallbacks)),
               Effect.tap(() =>
                 admitted
@@ -1958,7 +2000,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           pendingCompactions.delete(threadId);
         }
       });
-      const awaitNativeCompaction = (start: Effect.Effect<void, ProviderAdapterError>) =>
+      const awaitNativeCompaction = (start: Effect.Effect<void, ProviderServiceError>) =>
         start.pipe(
           Effect.andThen(Deferred.await(completion)),
           Effect.timeout(COMPACTION_COMPLETION_TIMEOUT),
@@ -1997,17 +2039,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       > =
         compaction.type === "native"
           ? awaitNativeCompaction(
-              compaction
-                .start(routed.threadId, modelSelection, hooks?.beforeDispatch)
-                .pipe(
-                  Effect.tap(
-                    () =>
-                      hooks?.onAdmitted(
-                        { threadId, turnId: TurnId.make(`compaction:${requestId}`) },
-                        "provider-ack",
-                      ) ?? Effect.void,
-                  ),
+              admitExecution(threadId, "compact", requestId).pipe(
+                Effect.andThen(() =>
+                  compaction.start(routed.threadId, modelSelection, hooks?.beforeDispatch),
                 ),
+                Effect.tap(
+                  () =>
+                    hooks?.onAdmitted(
+                      { threadId, turnId: TurnId.make(`compaction:${requestId}`) },
+                      "provider-ack",
+                    ) ?? Effect.void,
+                ),
+              ),
             ).pipe(Effect.map((terminal) => ({ terminal, result: { type: "native" as const } })))
           : Effect.gen(function* () {
               let admittedTurn: ProviderTurnStartResult | undefined;
@@ -2132,6 +2175,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       let metricProvider = "unknown";
       return yield* Effect.gen(function* () {
+        yield* admitExecution(input.threadId, "approval", input.requestId);
         const routed = yield* resolveRoutableSession({
           threadId: input.threadId,
           operation: "ProviderService.respondToRequest",
@@ -2171,6 +2215,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     });
     let metricProvider = "unknown";
     return yield* Effect.gen(function* () {
+      yield* admitExecution(input.threadId, "user-input", input.requestId);
       const routed = yield* resolveRoutableSession({
         threadId: input.threadId,
         operation: "ProviderService.respondToUserInput",
@@ -2230,6 +2275,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             );
           }
           yield* routed.adapter.stopSession(routed.threadId);
+          // Keep the exact adapter selected for Stop. Settings may replace the registry entry during shutdown.
+          // Only drain its raw output here: the full ingestion barrier can call Stop itself.
+          if (routed.adapter.drainRuntimeEvents)
+            yield* routed.adapter.drainRuntimeEvents(routed.threadId);
         }
         const pendingCompaction = pendingCompactions.get(input.threadId);
         if (pendingCompaction !== undefined) {
@@ -2238,12 +2287,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         timedOutNativeCompactions.delete(input.threadId);
         yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
         yield* clearMcpSession(input.threadId);
+        const previous = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+        const wasDrained =
+          previous?.status === "stopped" &&
+          previous.runtimePayload !== null &&
+          typeof previous.runtimePayload === "object" &&
+          "stoppedRuntimeEventsDrained" in previous.runtimePayload &&
+          previous.runtimePayload.stoppedRuntimeEventsDrained === true;
         yield* directory.upsert({
           threadId: input.threadId,
           provider: routed.adapter.provider,
           providerInstanceId: routed.instanceId,
           status: "stopped",
           runtimePayload: {
+            stoppedRuntimeEventsDrained: routed.isActive
+              ? !!routed.adapter.drainRuntimeEvents
+              : wasDrained,
             activeTurnId: null,
             continueAfterServerUpdate: null,
             continueAfterServerUpdatePrepared: null,
@@ -2263,6 +2322,46 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     },
   );
+
+  const stopIdleVmSession: NonNullable<ProviderService.ProviderServiceShape["stopIdleVmSession"]> =
+    Effect.fn("ProviderService.stopIdleVmSession")(function* (input) {
+      if (!vmWorkloads) return false;
+      const routed = yield* resolveRoutableSession({
+        threadId: input.threadId,
+        operation: "ProviderService.stopIdleVmSession",
+        allowRecovery: false,
+      });
+      if (!routed.isActive) return true;
+      if (
+        routed.instanceId !== "codex" ||
+        routed.adapter.provider !== "codex" ||
+        !routed.adapter.stopIdleVmSession
+      )
+        return false;
+      // Keep the single SQLite ownership writer locked only across kernel admission.
+      // Native output/ingestion drains after release, so it cannot deadlock on SQL.
+      const admit: VmHarnessStopAdmission = (signal) =>
+        checkpointSql
+          .withTransaction(
+            Effect.gen(function* () {
+              const fence = yield* makeThreadExecutionFence(checkpointSql).get(input.threadId);
+              if (
+                !fence ||
+                fence.phase !== "draining" ||
+                fence.operationId !== input.operationId ||
+                fence.generation !== input.generation ||
+                fence.environmentId !== input.environmentId
+              )
+                return { admitted: false };
+              return yield* signal;
+            }),
+          )
+          .pipe(Effect.mapError(() => new VmWorkloadError()));
+      if (!(yield* routed.adapter.stopIdleVmSession(routed.threadId, input.operationId, admit)))
+        return false;
+      yield* stopSession({ threadId: input.threadId });
+      return true;
+    });
 
   const listSessions: ProviderServiceMethod<"listSessions"> = Effect.fn("listSessions")(
     function* () {
@@ -2386,6 +2485,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     let metricProvider = "unknown";
     return yield* Effect.gen(function* () {
       yield* assertConversationRollbackSupported(input.threadId);
+      yield* admitExecution(input.threadId, "rollback");
       const routed = yield* resolveRoutableSession({
         threadId: input.threadId,
         operation: "ProviderService.rollbackConversation",
@@ -2463,6 +2563,268 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return yield* uploadFeedback(input);
     },
   );
+
+  const checkpointConversation: NonNullable<ProviderServiceMethod<"checkpointConversation">> =
+    Effect.fn("ProviderService.checkpointConversation")(function* (input) {
+      return yield* nativeCheckpoints
+        .capture(
+          { ...input, artifactRoot: pathService.join(serverConfig.stateDir, "native-checkpoints") },
+          (artifactRoot) =>
+            Effect.gen(function* () {
+              const routed = yield* resolveRoutableSession({
+                threadId: input.threadId,
+                operation: "checkpointConversation",
+                allowRecovery: false,
+              });
+              if (
+                pendingCompactions.has(input.threadId) ||
+                timedOutNativeCompactions.has(input.threadId)
+              )
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "Native compaction still needs to settle before checkpointing.",
+                );
+              if (input.captureOperationId !== undefined) {
+                const binding = yield* directory.getBinding(input.threadId);
+                const fence = yield* makeThreadExecutionFence(checkpointSql).get(input.threadId);
+                const point = fence
+                  ? yield* nativeCheckpoints.get(input.threadId, fence.generation, input.turnId)
+                  : null;
+                if (
+                  routed.isActive ||
+                  routed.adapter.provider !== "codex" ||
+                  Option.isNone(binding) ||
+                  binding.value.status !== "stopped" ||
+                  !fence ||
+                  (point &&
+                    (point.environmentId !== fence.environmentId ||
+                      point.captureOperationId !== null ||
+                      point.turnId !== input.turnId))
+                )
+                  return yield* toValidationError(
+                    "checkpointConversation",
+                    "Final recovery requires a stopped Codex binding and its settled native checkpoint.",
+                  );
+                const cursor = yield* decodeCheckpointCursor(binding.value.resumeCursor);
+                if (!point) {
+                  const cwd = readPersistedCwd(binding.value.runtimePayload);
+                  const [local] = yield* checkpointSql`SELECT 1 FROM thread_local_enrollments
+                    WHERE thread_id=${input.threadId} AND phase='active'
+                    AND environment_id=${fence.environmentId} AND project_id=${fence.projectId}
+                    AND relay_url=${fence.relayUrl}`;
+                  const [latestLocal] = yield* checkpointSql<{
+                    turnId: string;
+                  }>`SELECT turn_id AS "turnId" FROM projection_turns
+                    WHERE thread_id=${input.threadId} AND completed_at IS NOT NULL
+                    AND state IN ('completed','failed','interrupted')
+                    ORDER BY requested_at DESC,row_id DESC LIMIT 1`;
+                  const unsettled =
+                    yield* checkpointSql`SELECT 1 FROM projection_turns WHERE thread_id=${input.threadId}
+                    AND (completed_at IS NULL OR state IN ('pending','running') OR checkpoint_status='pending') LIMIT 1`;
+                  if (
+                    fence.generation === 1 &&
+                    local &&
+                    !cursor.portableStateId &&
+                    cwd &&
+                    latestLocal?.turnId === input.turnId &&
+                    !unsettled.length &&
+                    routed.adapter.checkpointConversation &&
+                    Option.isSome(checkpointEvents)
+                  ) {
+                    const attachments = yield* collectThreadAttachmentReferences(
+                      input.threadId,
+                      checkpointEvents.value.readAggregateRange({
+                        aggregateKind: "thread",
+                        aggregateId: input.threadId,
+                        fromSequenceExclusive: 0,
+                        toSequenceInclusive: fence.frozenSequence!,
+                      }),
+                    );
+                    const archive = yield* routed.adapter.checkpointConversation({
+                      threadId: input.threadId,
+                      artifactRoot,
+                      stoppedSource: { nativeThreadId: cursor.threadId, cwd },
+                      referencedFiles: attachments.flatMap((attachment) => {
+                        const file = resolveAttachmentPath({
+                          attachmentsDir: serverConfig.attachmentsDir,
+                          attachment,
+                        });
+                        return file ? [file] : [];
+                      }),
+                    });
+                    if (archive.nativeThreadId !== cursor.threadId)
+                      return yield* toValidationError(
+                        "checkpointConversation",
+                        "The stopped native conversation identity changed.",
+                      );
+                    yield* directory.upsert({
+                      ...binding.value,
+                      resumeCursor: { ...cursor, resumePolicy: "require-existing" },
+                    });
+                    return archive;
+                  }
+                  const [baseline] = yield* checkpointSql<{
+                    operationId: string;
+                    sequence: number;
+                  }>`SELECT operation_id AS "operationId",destination_sequence AS sequence FROM thread_transfer_baselines WHERE thread_id=${input.threadId} AND generation=${fence.generation} AND native_runtime_json IS NOT NULL ORDER BY destination_sequence DESC LIMIT 1`;
+                  const [settled] = yield* checkpointSql<{
+                    turnId: string;
+                  }>`SELECT turn_id AS "turnId" FROM projection_turns WHERE thread_id=${input.threadId} AND completed_at IS NOT NULL AND state NOT IN ('pending','running') ORDER BY requested_at DESC,row_id DESC LIMIT 1`;
+                  if (
+                    !baseline ||
+                    !cursor.portableStateId ||
+                    cursor.resumePolicy !== "require-existing" ||
+                    settled?.turnId !== input.turnId
+                  )
+                    return yield* toValidationError(
+                      "checkpointConversation",
+                      "Final recovery needs its verified imported native state and actual settled source turn.",
+                    );
+                  const [laterWork] =
+                    yield* checkpointSql`SELECT 1 FROM orchestration_events WHERE aggregate_kind='thread' AND stream_id=${input.threadId} AND sequence>${baseline.sequence} AND (event_type IN ('thread.turn-start-requested','thread.session-set') OR (event_type='thread.message-sent' AND json_extract(payload_json,'$.role')='assistant')) LIMIT 1`;
+                  if (laterWork)
+                    return yield* toValidationError(
+                      "checkpointConversation",
+                      "Destination provider work must have its own settled checkpoint before final recovery.",
+                    );
+                  yield* assertThreadTransferRuntime(checkpointSql, baseline.operationId);
+                  const archive = yield* exportUnstartedPortableCodexConversation({
+                    stateDir: serverConfig.stateDir,
+                    threadId: input.threadId,
+                    providerInstanceId: routed.instanceId,
+                    nativeThreadId: cursor.threadId,
+                    portableStateId: cursor.portableStateId,
+                    artifactRoot,
+                  });
+                  return {
+                    directory: archive.directory,
+                    nativeThreadId: archive.manifest.threadId,
+                  };
+                }
+                const [latest] = yield* checkpointSql<{
+                  turnId: string;
+                }>`SELECT turn_id AS "turnId" FROM thread_native_checkpoints
+                  WHERE thread_id=${input.threadId} AND generation=${fence!.generation} AND capture_operation_id IS NULL
+                  ORDER BY source_sequence DESC LIMIT 1`;
+                if (
+                  cursor.threadId !== point.nativeThreadId ||
+                  cursor.resumePolicy !== "require-existing" ||
+                  latest?.turnId !== input.turnId
+                )
+                  return yield* toValidationError(
+                    "checkpointConversation",
+                    "The stopped native conversation does not match its latest settled checkpoint.",
+                  );
+                // Settled capture closed the provider writer. Preserve those exact native bytes while
+                // the final point captures the newer chat watermark; never reopen a provider to save it.
+                if ((yield* digestNativeCheckpointArchive(point.directory)) !== point.archiveSha256)
+                  return yield* toValidationError(
+                    "checkpointConversation",
+                    "The settled native checkpoint is damaged.",
+                  );
+                const archiveDirectory = pathService.join(artifactRoot, "conversation");
+                yield* fileSystem.copy(point.directory, archiveDirectory);
+                if (
+                  (yield* digestNativeCheckpointArchive(point.directory)) !== point.archiveSha256 ||
+                  (yield* digestNativeCheckpointArchive(archiveDirectory)) !== point.archiveSha256
+                )
+                  return yield* toValidationError(
+                    "checkpointConversation",
+                    "The settled native checkpoint changed during final capture.",
+                  );
+                return { directory: archiveDirectory, nativeThreadId: point.nativeThreadId };
+              }
+              const capture = routed.adapter.checkpointConversation;
+              if (!capture || !routed.isActive || Option.isNone(checkpointEvents))
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "A settled native conversation and its retained history are required for recovery.",
+                );
+              const session = (yield* routed.adapter.listSessions()).find(
+                (s) => s.threadId === input.threadId,
+              );
+              if (!session || routed.adapter.provider !== "codex")
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "Portable recovery currently requires a native Codex session.",
+                );
+              const cursor = yield* decodeCheckpointCursor(session.resumeCursor);
+              yield* upsertSessionBinding(
+                {
+                  ...session,
+                  providerInstanceId: routed.instanceId,
+                  resumeCursor: { ...cursor, resumePolicy: "require-existing" },
+                },
+                input.threadId,
+              );
+              const attachments = yield* collectThreadAttachmentReferences(
+                input.threadId,
+                checkpointEvents.value.readAggregateRange({
+                  aggregateKind: "thread",
+                  aggregateId: input.threadId,
+                  fromSequenceExclusive: 0,
+                  toSequenceInclusive: Number.MAX_SAFE_INTEGER,
+                }),
+              );
+              const referencedFiles = attachments.flatMap((attachment) => {
+                const file = resolveAttachmentPath({
+                  attachmentsDir: serverConfig.attachmentsDir,
+                  attachment,
+                });
+                return file ? [file] : [];
+              });
+              return yield* capture({
+                threadId: input.threadId,
+                artifactRoot,
+                referencedFiles,
+              }).pipe(
+                Effect.onExit(() =>
+                  routed.adapter
+                    .hasSession(input.threadId)
+                    .pipe(
+                      Effect.flatMap((active) =>
+                        active ? Effect.void : stopSession({ threadId: input.threadId }),
+                      ),
+                    ),
+                ),
+              );
+            }),
+        )
+        .pipe(
+          Effect.tap(
+            Effect.fnUntraced(function* (point) {
+              if (!point) return;
+              if (Option.isNone(checkpointEvents))
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "Retained thread history is required to save chat attachments.",
+                );
+              yield* makeThreadAttachmentCheckpoint(checkpointSql, checkpointEvents.value).capture({
+                threadId: input.threadId,
+                generation: point.generation,
+                turnId: input.turnId,
+                ...(input.captureOperationId === undefined
+                  ? {}
+                  : { captureOperationId: input.captureOperationId }),
+                artifactRoot: pathService.join(serverConfig.stateDir, "attachment-checkpoints"),
+                attachmentsDir: serverConfig.attachmentsDir,
+              });
+            }),
+          ),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, pathService),
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterProcessError({
+                provider: "codex",
+                threadId: input.threadId,
+                detail: cause.message,
+                cause,
+              }),
+          ),
+          Effect.asVoid,
+        );
+    });
 
   const runStopAll = Effect.fn("runStopAll")(function* () {
     // Continuation is project-scopable, so decide it per session's project;
@@ -2576,17 +2938,63 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     respondToRequest,
     respondToUserInput,
     stopSession,
+    stopIdleVmSession,
     listSessions,
     getCapabilities,
     getInstanceInfo,
     assertConversationRollbackSupported,
     rollbackConversation,
     uploadFeedback,
+    checkpointConversation,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.
-    get streamEvents(): ProviderServiceMethod<"streamEvents"> {
+    flushRuntimeEvents: (threadId) =>
+      Effect.gen(function* () {
+        const binding = yield* directory.getBinding(threadId);
+        const stoppedAndDrained =
+          Option.isSome(binding) &&
+          binding.value.status === "stopped" &&
+          binding.value.runtimePayload !== null &&
+          typeof binding.value.runtimePayload === "object" &&
+          "stoppedRuntimeEventsDrained" in binding.value.runtimePayload &&
+          binding.value.runtimePayload.stoppedRuntimeEventsDrained === true;
+        if (Option.isSome(binding) && !stoppedAndDrained) {
+          const instanceId = yield* requireBindingInstanceId(
+            "ProviderService.flushRuntimeEvents",
+            binding.value,
+          );
+          const adapter = yield* registry.getByInstance(instanceId);
+          if (!adapter.drainRuntimeEvents)
+            return yield* new ProviderValidationError({
+              operation: "ProviderService.flushRuntimeEvents",
+              issue: "This adapter cannot confirm stopped output.",
+            });
+          yield* adapter.drainRuntimeEvents(threadId);
+        }
+        const done = yield* Deferred.make<void, ProviderValidationError>();
+        yield* PubSub.publish(runtimeEventPubSub, new ProviderEventBarrier(threadId, done));
+        yield* Deferred.await(done);
+      }).pipe(
+        Effect.timeout("30 seconds"),
+        Effect.mapError(
+          (cause) =>
+            new ProviderValidationError({
+              operation: "ProviderService.flushRuntimeEvents",
+              issue: "Stopped provider output has not finished ingestion.",
+              cause,
+            }),
+        ),
+      ),
+    get streamIngestionEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);
+    },
+    get streamEvents(): ProviderServiceMethod<"streamEvents"> {
+      return Stream.fromPubSub(runtimeEventPubSub).pipe(
+        Stream.filter(
+          (event): event is ProviderRuntimeEvent => !(event instanceof ProviderEventBarrier),
+        ),
+      );
     },
   } satisfies ProviderService.ProviderService["Service"];
 });

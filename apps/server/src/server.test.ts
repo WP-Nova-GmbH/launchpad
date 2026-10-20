@@ -1,3 +1,4 @@
+import * as CheckoutAccess from "./workspace/CheckoutAccess.ts";
 import * as GitHubCliAvailability from "./sourceControl/GitHubCliAvailability.ts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
@@ -27,6 +28,7 @@ import {
   type OrchestrationThreadStreamItem,
   type OrchestrationThreadActivity,
   type OrchestrationThreadShell,
+  type TerminalAttachStreamEvent,
   TerminalNotRunningError,
   type OrchestrationCommand,
   type OrchestrationEvent,
@@ -65,6 +67,7 @@ import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -1274,6 +1277,7 @@ const buildAppUnderTest = (options?: {
         ),
         Layer.provideMerge(ServerSecretStore.layer),
         Layer.provide(workspaceAndProjectServicesLayer),
+        Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
         Layer.provideMerge(
           options?.layers?.httpClient === undefined
             ? FetchHttpClient.layer
@@ -6321,23 +6325,33 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("keeps agent session import project failures structured over websocket rpc", () =>
-    Effect.gen(function* () {
-      yield* buildAppUnderTest();
+  it.effect.each([false, true])(
+    "keeps agent session import project failures structured over websocket rpc (progress=%s)",
+    (progress) =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest();
 
-      const projectId = ProjectId.make("missing-import-project");
-      const wsUrl = yield* getWsServerUrl("/ws");
-      const error = yield* Effect.scoped(
-        withWsRpcClient(wsUrl, (client) =>
-          client[WS_METHODS.agentSessionsImport]({ projectId }).pipe(Effect.flip),
-        ),
-      );
+        const projectId = ProjectId.make("missing-import-project");
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const error = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            progress
+              ? client[WS_METHODS.agentSessionsImportWithProgress]({ projectId }).pipe(
+                  Stream.runDrain,
+                  Effect.flip,
+                )
+              : client[WS_METHODS.agentSessionsImport]({ projectId }).pipe(
+                  Effect.asVoid,
+                  Effect.flip,
+                ),
+          ),
+        );
 
-      assert.equal(error._tag, "AgentSessionImportProjectNotFoundError");
-      if (error._tag === "AgentSessionImportProjectNotFoundError") {
-        assert.equal(error.projectId, projectId);
-      }
-    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+        assert.equal(error._tag, "AgentSessionImportProjectNotFoundError");
+        if (error._tag === "AgentSessionImportProjectNotFoundError") {
+          assert.equal(error.projectId, projectId);
+        }
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("returns scanner skip counts over websocket rpc", () =>
@@ -6409,7 +6423,30 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               scan.candidates.map((candidate) => candidate.path),
               [workspaceRoot],
             );
-            return yield* client[WS_METHODS.agentSessionsImport]({ projectId });
+            const result = yield* client[WS_METHODS.agentSessionsImport]({ projectId });
+            const events = yield* client[WS_METHODS.agentSessionsImportWithProgress]({
+              projectId,
+            }).pipe(Stream.runCollect);
+            assert.isTrue(
+              events.some((event) => event.type === "progress" && event.progress.reading !== null),
+            );
+            assert.deepEqual(
+              Array.from(events).filter(
+                (event) => event.type === "complete" || event.progress.reading === null,
+              ),
+              [
+                {
+                  type: "progress",
+                  progress: { importedCount: 0, skippedCount: 0, reading: null },
+                },
+                {
+                  type: "progress",
+                  progress: { importedCount: 0, skippedCount: 1, reading: null },
+                },
+                { type: "complete", result: { importedCount: 0, skippedCount: 1 } },
+              ],
+            );
+            return result;
           }),
         ),
       );
@@ -10400,6 +10437,114 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect(
+    "subscribeThread reloads imported history using the real persisted baseline boundary",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore;
+        const thread = {
+          ...makeDefaultOrchestrationReadModel().threads[0]!,
+          title: "Imported conversation",
+        };
+        const base = makeLiveToolActivityEvent(0, "tool.completed");
+        const boundary = yield* store.append({
+          ...base,
+          type: "thread.placement-imported",
+          payload: {
+            threadId: defaultThreadId,
+            projectId: thread.projectId,
+            branch: thread.branch,
+            worktreePath: thread.worktreePath,
+            updatedAt: base.occurredAt,
+          },
+        });
+        yield* buildAppUnderTest({
+          layers: {
+            orchestrationEngine: {
+              latestSequence: Effect.succeed(boundary.sequence),
+              getThreadReplayStats: ({ threadId, ...range }) =>
+                store.getAggregateReplayStats({
+                  ...range,
+                  aggregateKind: "thread",
+                  aggregateId: threadId,
+                }),
+              readThreadEvents: () => Stream.die("Imported history must be replaced by a snapshot"),
+            },
+            projectionSnapshotQuery: {
+              getThreadDetailSnapshot: () =>
+                Effect.succeedSome({ snapshotSequence: boundary.sequence, thread }),
+            },
+          },
+        });
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const items = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+              afterSequence: boundary.sequence - 1,
+              requestCompletionMarker: true,
+            }).pipe(
+              Stream.takeUntil((item) => item.kind === "synchronized"),
+              Stream.runCollect,
+            ),
+          ),
+        );
+        const first = items[0];
+        assertTrue(first?.kind === "snapshot");
+        assert.equal(first.snapshot.thread.title, "Imported conversation");
+        assert.deepEqual(items[1], { kind: "synchronized" });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeHttpServer.layerTest,
+            OrchestrationEventStoreLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
+          ),
+        ),
+      ),
+  );
+
+  it.effect("subscribeThread closes a live stream when a new baseline replaces its history", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const events = yield* PubSub.unbounded<OrchestrationEvent>();
+        const loaded = yield* Deferred.make<void>();
+        const thread = makeDefaultOrchestrationReadModel().threads[0]!;
+        yield* buildAppUnderTest({
+          layers: {
+            orchestrationEngine: { streamDomainEvents: Stream.fromPubSub(events) },
+            projectionSnapshotQuery: {
+              getThreadDetailSnapshot: () => Effect.succeedSome({ snapshotSequence: 1, thread }),
+            },
+          },
+        });
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const listening = yield* withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({ threadId: defaultThreadId }).pipe(
+            Stream.tap((item) =>
+              item.kind === "snapshot" ? Deferred.succeed(loaded, undefined) : Effect.void,
+            ),
+            Stream.runDrain,
+          ),
+        ).pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(loaded);
+        const base = makeLiveToolActivityEvent(2, "tool.completed");
+        const boundary: OrchestrationEvent = {
+          ...base,
+          type: "thread.placement-imported",
+          payload: {
+            threadId: defaultThreadId,
+            projectId: thread.projectId,
+            branch: null,
+            worktreePath: null,
+            updatedAt: base.occurredAt,
+          },
+        };
+        yield* PubSub.publish(events, boundary);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(listening)));
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("subscribeThread resets cached history when its ID is created again", () =>
     Effect.gen(function* () {
       const thread = {
@@ -13234,6 +13379,85 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           }),
         ),
       );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("keeps an authorized terminal attachment alive for output after setup", () =>
+    Effect.gen(function* () {
+      const subscribed =
+        yield* Deferred.make<(event: TerminalAttachStreamEvent) => Effect.Effect<void>>();
+      const snapshotSeen = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const snapshot = {
+        threadId: defaultThreadId,
+        terminalId: "default",
+        cwd: "/workspace/project",
+        worktreePath: null,
+        status: "running" as const,
+        pid: 1234,
+        history: "shell prompt> ",
+        exitCode: null,
+        exitSignal: null,
+        label: "Terminal",
+        updatedAt: "2026-10-19T16:00:00.000Z",
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: {
+            status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+            requireMember: () => Effect.void,
+            projectIds: () => Effect.succeed(new Set([defaultProjectId])),
+            requireThread: (_actor, id) => Effect.sync(() => assert.equal(id, defaultThreadId)),
+            requireProject: (_actor, id) => Effect.sync(() => assert.equal(id, defaultProjectId)),
+          },
+          projectionSnapshotQuery: {
+            getThreadSubscriptionAnchor: () =>
+              Effect.succeedSome({
+                projectId: defaultProjectId,
+                creationSequence: 1,
+                snapshotSequence: 1,
+              }),
+          },
+          orchestrationEngine: { subscribeDomainEvents: Effect.succeed(Stream.never) },
+          terminalManager: {
+            attachStream: (_input, listener) =>
+              Effect.gen(function* () {
+                yield* listener({ type: "snapshot", snapshot });
+                yield* Deferred.succeed(subscribed, listener);
+                return () => Deferred.doneUnsafe(closed, Effect.void);
+              }),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const pending = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.terminalAttach]({
+            threadId: defaultThreadId,
+            terminalId: "default",
+          }).pipe(
+            Stream.tap((event) =>
+              event.type === "snapshot" ? Deferred.succeed(snapshotSeen, undefined) : Effect.void,
+            ),
+            Stream.take(2),
+            Stream.runCollect,
+          ),
+        ),
+      ).pipe(Effect.forkScoped);
+      const deliver = yield* Deferred.await(subscribed);
+      yield* Deferred.await(snapshotSeen).pipe(Effect.raceFirst(Fiber.join(pending)));
+      const output = {
+        type: "output" as const,
+        threadId: defaultThreadId,
+        terminalId: "default",
+        data: "later output\r\n",
+      };
+      yield* deliver(output);
+      assert.deepEqual(Array.from(yield* Fiber.join(pending)), [
+        { type: "snapshot", snapshot },
+        output,
+      ]);
+      yield* Deferred.await(closed);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

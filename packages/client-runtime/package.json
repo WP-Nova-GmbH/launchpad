@@ -103,6 +103,10 @@
       "types": "./src/voice-input/index.ts",
       "default": "./src/voice-input/index.ts"
     },
+    "./relay/portableThreads": {
+      "types": "./src/relay/portableThreads.ts",
+      "default": "./src/relay/portableThreads.ts"
+    },
     "./relay": {
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"
@@ -310,7 +314,27 @@
     "./device/duo-control": {
       "types": "./src/device/duoControl.ts",
       "default": "./src/device/duoControl.ts"
-    }
+    },
+    "./relay/threadVmControls": {
+      "types": "./src/relay/threadVmControls.ts",
+      "default": "./src/relay/threadVmControls.ts"
+    },
+    "./relay/threadMoveSubmission": {
+      "types": "./src/relay/threadMoveSubmission.ts",
+      "default": "./src/relay/threadMoveSubmission.ts"
+    },
+    "./relay/portableThreadHistory": {
+      "types": "./src/relay/portableThreadHistory.ts",
+      "default": "./src/relay/portableThreadHistory.ts"
+    },
+    "./relay/portableThreadLibrary": {
+      "types": "./src/relay/portableThreadLibrary.ts",
+      "default": "./src/relay/portableThreadLibrary.ts"
+    },
+    "./relay/threadVmCreation": "./src/relay/threadVmCreation.ts",
+    "./relay/threadQueueControlSubmission": "./src/relay/threadQueueControlSubmission.ts",
+    "./relay/threadVmActionSubmission": "./src/relay/threadVmActionSubmission.ts",
+    "./relay/threadVmActionController": "./src/relay/threadVmActionController.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

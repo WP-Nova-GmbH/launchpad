@@ -29,7 +29,6 @@ import { currentTraceId } from "../observability.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as EnvironmentCredentials from "../environments/EnvironmentCredentials.ts";
 import * as ManagedEndpointProvider from "../environments/ManagedEndpointProvider.ts";
-import * as MachineComputeProvider from "../machines/MachineComputeProvider.ts";
 import * as MachineEnroller from "../machines/MachineEnroller.ts";
 import * as MachineLimits from "../machines/MachineLimits.ts";
 import * as Machines from "../machines/Machines.ts";
@@ -93,9 +92,8 @@ const machineEnrollUnavailable = Effect.fnUntraced(function* () {
 });
 
 /**
- * The shared front half of both machine-creation paths: quota, a fresh seed
- * stored only as its hash, and the record. What happens to the seed afterwards
- * is what distinguishes them — a compute driver receives it, or the admin does.
+ * Reserves manual enrollment with a fresh seed stored only as its hash.
+ * The admin receives the seed once and starts the server on their own computer.
  */
 const mintMachineRecord = Effect.fnUntraced(function* (input: {
   readonly organizationId: string;
@@ -138,55 +136,21 @@ const mintMachineRecord = Effect.fnUntraced(function* (input: {
 });
 
 export const provisionMachineRecord = Effect.fn("relay.api.machines.provisionMachineRecord")(
-  function* (input: {
+  function* (_input: {
     readonly organizationId: string;
     readonly createdByUserId: string;
     readonly label: string;
     readonly role: RelayMachineRole;
   }) {
-    const machines = yield* Machines.Machines;
-    const computeProvider = yield* MachineComputeProvider.MachineComputeProvider;
-    const config = yield* RelayConfiguration.RelayConfiguration;
-    const { created, seed } = yield* mintMachineRecord({
-      ...input,
-      computeKind: computeProvider.kind,
-    });
-    const machineId = created.machineId;
-    // The record exists before the compute so enrollment can never race an
-    // unknown seed; a driver failure removes the never-enrolled record rather
-    // than leaving a machine that can never call home.
-    const compute = yield* computeProvider
-      .create({
-        machineId,
-        organizationId: input.organizationId,
-        role: input.role,
-        label: input.label,
-        relayUrl: normalizeRelayIssuer(config.relayIssuer),
-        seed,
-      })
-      .pipe(
-        Effect.tapError((error) =>
-          Effect.logWarning("machine compute creation failed", {
-            machineId,
-            errorTag: error._tag,
-          }).pipe(Effect.andThen(machines.remove({ machineId }).pipe(Effect.ignore))),
-        ),
-        Effect.catchTags({
-          MachineComputeNotConfigured: () => machineComputeUnavailable("not_configured"),
-          MachineComputeRequestFailed: () => machineComputeUnavailable("request_failed"),
-        }),
-      );
-    yield* machines.recordComputeRef({ machineId, computeRef: compute.computeRef });
-    const settled = yield* machines.getById({ machineId });
-    return toApiMachine(settled ?? { ...created, computeRef: compute.computeRef });
+    // Keep the old route explicit for older clients; no quota, seed or compute
+    // is allocated by a request for the retired per-organization model.
+    return yield* machineComputeUnavailable("retired");
   },
 );
 
 /**
- * The self-hosted variant of provisioning: same record, same seed mechanics,
- * no compute driver. The seed leaves the relay exactly once, in this response
- * — like an invitation token, the admin delivers it to the machine themselves
- * (ADR-0002's self-hosted case).
+ * Enroll an existing computer. The invitation seed leaves the relay in this
+ * response for the admin to deliver to that computer (ADR-0002).
  */
 export const connectMachineRecord = Effect.fn("relay.api.machines.connectMachineRecord")(
   function* (input: {
@@ -208,7 +172,6 @@ export const connectMachineRecord = Effect.fn("relay.api.machines.connectMachine
 export const deprovisionMachineRecord = Effect.fn("relay.api.machines.deprovisionMachineRecord")(
   function* (input: { readonly organizationId: string; readonly machineId: string }) {
     const machines = yield* Machines.Machines;
-    const computeProvider = yield* MachineComputeProvider.MachineComputeProvider;
     const managedEndpointProvider = yield* ManagedEndpointProvider.ManagedEndpointProvider;
     const credentials = yield* EnvironmentCredentials.EnvironmentCredentials;
 
@@ -216,11 +179,14 @@ export const deprovisionMachineRecord = Effect.fn("relay.api.machines.deprovisio
     if (!machine || machine.organizationId !== input.organizationId) {
       return yield* tenancyNotFound("machine_not_found");
     }
+    // Old managed compute cannot be proved gone by the manual-machine path.
+    // Refuse before tombstoning its record or revoking its live identity.
+    if (machine.computeKind !== "self_hosted") return yield* machineComputeUnavailable("retired");
     const ownerKey = Machines.machineEndpointOwnerKey(machine.organizationId);
     // Teardown is ordered so a failure part-way leaves a retryable state:
-    // tombstone first (auth dies with it), then credentials, then endpoint,
-    // then compute. Deprovisioning an already-deprovisioned machine re-runs
-    // the external teardown, which is how a failed Cloudflare or driver call
+    // tombstone first (auth dies with it), then credentials, then endpoint.
+    // Deprovisioning an already-deprovisioned machine re-runs
+    // the external teardown, which is how a failed Cloudflare call
     // gets finished on retry.
     const deprovisionTarget =
       machine.environmentId === null
@@ -253,16 +219,6 @@ export const deprovisionMachineRecord = Effect.fn("relay.api.machines.deprovisio
           Effect.catchTag("ManagedEndpointDeprovisioningFailed", () =>
             relayInternalErrorResponse("upstream_unavailable"),
           ),
-        );
-    }
-    if (machine.computeRef !== null) {
-      yield* computeProvider
-        .destroy({ computeKind: machine.computeKind, computeRef: machine.computeRef })
-        .pipe(
-          Effect.catchTags({
-            MachineComputeNotConfigured: () => machineComputeUnavailable("not_configured"),
-            MachineComputeRequestFailed: () => machineComputeUnavailable("request_failed"),
-          }),
         );
     }
     return { ok: true };

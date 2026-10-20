@@ -1,0 +1,1691 @@
+diff --git a/packages/api/internal/api/api.gen.go b/packages/api/internal/api/api.gen.go
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -108,6 +108,21 @@
+ func (e LaunchpadColdProbeReceiptVersion) Valid() bool {
+ 	switch e {
+ 	case N1:
++		return true
++	default:
++		return false
++	}
++}
++
++// Defines values for LaunchpadCreationStopReceiptPhysicallyStopped.
++const (
++	LaunchpadCreationStopReceiptPhysicallyStoppedTrue LaunchpadCreationStopReceiptPhysicallyStopped = true
++)
++
++// Valid indicates whether the value is a known member of the LaunchpadCreationStopReceiptPhysicallyStopped enum.
++func (e LaunchpadCreationStopReceiptPhysicallyStopped) Valid() bool {
++	switch e {
++	case LaunchpadCreationStopReceiptPhysicallyStoppedTrue:
+ 		return true
+ 	default:
+ 		return false
+@@ -645,6 +660,26 @@
+ // LaunchpadColdProbeReceiptVersion defines model for LaunchpadColdProbeReceipt.Version.
+ type LaunchpadColdProbeReceiptVersion int
+ 
++// LaunchpadCreationIdentity defines model for LaunchpadCreationIdentity.
++type LaunchpadCreationIdentity struct {
++	Cancelled   bool               `json:"cancelled"`
++	Metadata    map[string]string  `json:"metadata"`
++	OperationID openapi_types.UUID `json:"operationID"`
++	SandboxID   *string            `json:"sandboxID"`
++}
++
++// LaunchpadCreationStopReceipt defines model for LaunchpadCreationStopReceipt.
++type LaunchpadCreationStopReceipt struct {
++	Cancelled         bool                                          `json:"cancelled"`
++	Metadata          map[string]string                             `json:"metadata"`
++	OperationID       openapi_types.UUID                            `json:"operationID"`
++	PhysicallyStopped LaunchpadCreationStopReceiptPhysicallyStopped `json:"physicallyStopped"`
++	SandboxID         *string                                       `json:"sandboxID"`
++}
++
++// LaunchpadCreationStopReceiptPhysicallyStopped defines model for LaunchpadCreationStopReceipt.PhysicallyStopped.
++type LaunchpadCreationStopReceiptPhysicallyStopped bool
++
+ // LaunchpadRestoreRequest defines model for LaunchpadRestoreRequest.
+ type LaunchpadRestoreRequest struct {
+ 	// Bootstrap Single-use enrollment data; version must be 1. Omit for verification-only preparation.
+@@ -675,12 +710,13 @@
+ 
+ // LaunchpadRuntimeCapabilities defines model for LaunchpadRuntimeCapabilities.
+ type LaunchpadRuntimeCapabilities struct {
+-	PrivatePreviewHeaderBoundary bool `json:"privatePreviewHeaderBoundary"`
+-	PausedSnapshots              bool `json:"pausedSnapshots"`
+ 	BuildCollectionAdmission     bool `json:"buildCollectionAdmission"`
+ 	DiskRestore                  bool `json:"diskRestore"`
++	DurableCreationIdentity      bool `json:"durableCreationIdentity"`
+ 	ExecutionBuildRoots          bool `json:"executionBuildRoots"`
+ 	LiveBuildCollection          bool `json:"liveBuildCollection"`
++	PausedSnapshots              bool `json:"pausedSnapshots"`
++	PrivatePreviewHeaderBoundary bool `json:"privatePreviewHeaderBoundary"`
+ 	QuiescedSnapshots            bool `json:"quiescedSnapshots"`
+ 	RenewableLifetime            bool `json:"renewableLifetime"`
+ 	Version                      int  `json:"version"`
+@@ -2820,6 +2856,12 @@
+ 	// GetLaunchpadCapabilities performs a GET /extensions/launchpad/v1/capabilities (the `GetLaunchpadCapabilities` operationId) request.
+ 	GetLaunchpadCapabilities(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+ 
++	// CancelLaunchpadCreation performs a DELETE /extensions/launchpad/v1/creations/{operationID} (the `CancelLaunchpadCreation` operationId) request.
++	CancelLaunchpadCreation(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
++
++	// GetLaunchpadCreation performs a GET /extensions/launchpad/v1/creations/{operationID} (the `GetLaunchpadCreation` operationId) request.
++	GetLaunchpadCreation(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
++
+ 	// StopLaunchpadExecution performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
+ 	StopLaunchpadExecution(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*http.Response, error)
+ 
+@@ -3940,6 +3982,32 @@
+ // GetLaunchpadCapabilities performs a GET /extensions/launchpad/v1/capabilities (the `GetLaunchpadCapabilities` operationId) request.
+ func (c *Client) GetLaunchpadCapabilities(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+ 	req, err := NewGetLaunchpadCapabilitiesRequest(c.Server)
++	if err != nil {
++		return nil, err
++	}
++	req = req.WithContext(ctx)
++	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
++		return nil, err
++	}
++	return c.Client.Do(req)
++}
++
++// CancelLaunchpadCreation performs a DELETE /extensions/launchpad/v1/creations/{operationID} (the `CancelLaunchpadCreation` operationId) request.
++func (c *Client) CancelLaunchpadCreation(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
++	req, err := NewCancelLaunchpadCreationRequest(c.Server, operationID)
++	if err != nil {
++		return nil, err
++	}
++	req = req.WithContext(ctx)
++	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
++		return nil, err
++	}
++	return c.Client.Do(req)
++}
++
++// GetLaunchpadCreation performs a GET /extensions/launchpad/v1/creations/{operationID} (the `GetLaunchpadCreation` operationId) request.
++func (c *Client) GetLaunchpadCreation(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
++	req, err := NewGetLaunchpadCreationRequest(c.Server, operationID)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -6537,6 +6605,74 @@
+ 	return req, nil
+ }
+ 
++// NewCancelLaunchpadCreationRequest constructs an http.Request for the CancelLaunchpadCreation method
++func NewCancelLaunchpadCreationRequest(server string, operationID openapi_types.UUID) (*http.Request, error) {
++	var err error
++
++	var pathParam0 string
++
++	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "operationID", operationID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
++	if err != nil {
++		return nil, err
++	}
++
++	serverURL, err := url.Parse(server)
++	if err != nil {
++		return nil, err
++	}
++
++	operationPath := fmt.Sprintf("/extensions/launchpad/v1/creations/%s", pathParam0)
++	if operationPath[0] == '/' {
++		operationPath = "." + operationPath
++	}
++
++	queryURL, err := serverURL.Parse(operationPath)
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
++	if err != nil {
++		return nil, err
++	}
++
++	return req, nil
++}
++
++// NewGetLaunchpadCreationRequest constructs an http.Request for the GetLaunchpadCreation method
++func NewGetLaunchpadCreationRequest(server string, operationID openapi_types.UUID) (*http.Request, error) {
++	var err error
++
++	var pathParam0 string
++
++	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "operationID", operationID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
++	if err != nil {
++		return nil, err
++	}
++
++	serverURL, err := url.Parse(server)
++	if err != nil {
++		return nil, err
++	}
++
++	operationPath := fmt.Sprintf("/extensions/launchpad/v1/creations/%s", pathParam0)
++	if operationPath[0] == '/' {
++		operationPath = "." + operationPath
++	}
++
++	queryURL, err := serverURL.Parse(operationPath)
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
++	if err != nil {
++		return nil, err
++	}
++
++	return req, nil
++}
++
+ // NewStopLaunchpadExecutionRequest constructs an http.Request for the StopLaunchpadExecution method
+ func NewStopLaunchpadExecutionRequest(server string, sandboxID string) (*http.Request, error) {
+ 	var err error
+@@ -9708,6 +9844,16 @@
+ 	//
+ 	// Returns a wrapper object for the known response body format(s).
+ 	GetLaunchpadCapabilitiesWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetLaunchpadCapabilitiesResponse, error)
++
++	// CancelLaunchpadCreationWithResponse performs a DELETE /extensions/launchpad/v1/creations/{operationID} (the `CancelLaunchpadCreation` operationId) request.
++	//
++	// Returns a wrapper object for the known response body format(s).
++	CancelLaunchpadCreationWithResponse(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*CancelLaunchpadCreationResponse, error)
++
++	// GetLaunchpadCreationWithResponse performs a GET /extensions/launchpad/v1/creations/{operationID} (the `GetLaunchpadCreation` operationId) request.
++	//
++	// Returns a wrapper object for the known response body format(s).
++	GetLaunchpadCreationWithResponse(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*GetLaunchpadCreationResponse, error)
+ 
+ 	// StopLaunchpadExecutionWithResponse performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
+ 	//
+@@ -12131,6 +12277,88 @@
+ 
+ // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+ func (r GetLaunchpadCapabilitiesResponse) ContentType() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Header.Get("Content-Type")
++	}
++	return ""
++}
++
++type CancelLaunchpadCreationResponse struct {
++	Body         []byte
++	HTTPResponse *http.Response
++	// JSON200 the response for an HTTP 200 `application/json` response
++	JSON200 *LaunchpadCreationStopReceipt
++}
++
++// GetJSON200 returns the response for an HTTP 200 `application/json` response
++func (r CancelLaunchpadCreationResponse) GetJSON200() *LaunchpadCreationStopReceipt {
++	return r.JSON200
++}
++
++// GetBody returns the raw response body bytes
++func (r CancelLaunchpadCreationResponse) GetBody() []byte {
++	return r.Body
++}
++
++// Status returns HTTPResponse.Status
++func (r CancelLaunchpadCreationResponse) Status() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Status
++	}
++	return http.StatusText(0)
++}
++
++// StatusCode returns HTTPResponse.StatusCode
++func (r CancelLaunchpadCreationResponse) StatusCode() int {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.StatusCode
++	}
++	return 0
++}
++
++// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
++func (r CancelLaunchpadCreationResponse) ContentType() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Header.Get("Content-Type")
++	}
++	return ""
++}
++
++type GetLaunchpadCreationResponse struct {
++	Body         []byte
++	HTTPResponse *http.Response
++	// JSON200 the response for an HTTP 200 `application/json` response
++	JSON200 *LaunchpadCreationIdentity
++}
++
++// GetJSON200 returns the response for an HTTP 200 `application/json` response
++func (r GetLaunchpadCreationResponse) GetJSON200() *LaunchpadCreationIdentity {
++	return r.JSON200
++}
++
++// GetBody returns the raw response body bytes
++func (r GetLaunchpadCreationResponse) GetBody() []byte {
++	return r.Body
++}
++
++// Status returns HTTPResponse.Status
++func (r GetLaunchpadCreationResponse) Status() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Status
++	}
++	return http.StatusText(0)
++}
++
++// StatusCode returns HTTPResponse.StatusCode
++func (r GetLaunchpadCreationResponse) StatusCode() int {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.StatusCode
++	}
++	return 0
++}
++
++// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
++func (r GetLaunchpadCreationResponse) ContentType() string {
+ 	if r.HTTPResponse != nil {
+ 		return r.HTTPResponse.Header.Get("Content-Type")
+ 	}
+@@ -16951,6 +17179,28 @@
+ 	return ParseGetLaunchpadCapabilitiesResponse(rsp)
+ }
+ 
++// CancelLaunchpadCreationWithResponse performs a DELETE /extensions/launchpad/v1/creations/{operationID} (the `CancelLaunchpadCreation` operationId) request.
++//
++// Returns a wrapper object for the known response body format(s).
++func (c *ClientWithResponses) CancelLaunchpadCreationWithResponse(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*CancelLaunchpadCreationResponse, error) {
++	rsp, err := c.CancelLaunchpadCreation(ctx, operationID, reqEditors...)
++	if err != nil {
++		return nil, err
++	}
++	return ParseCancelLaunchpadCreationResponse(rsp)
++}
++
++// GetLaunchpadCreationWithResponse performs a GET /extensions/launchpad/v1/creations/{operationID} (the `GetLaunchpadCreation` operationId) request.
++//
++// Returns a wrapper object for the known response body format(s).
++func (c *ClientWithResponses) GetLaunchpadCreationWithResponse(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*GetLaunchpadCreationResponse, error) {
++	rsp, err := c.GetLaunchpadCreation(ctx, operationID, reqEditors...)
++	if err != nil {
++		return nil, err
++	}
++	return ParseGetLaunchpadCreationResponse(rsp)
++}
++
+ // StopLaunchpadExecutionWithResponse performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
+ //
+ // Returns a wrapper object for the known response body format(s).
+@@ -19574,6 +19824,58 @@
+ 	switch {
+ 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+ 		var dest LaunchpadRuntimeCapabilities
++		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
++			return nil, err
++		}
++		response.JSON200 = &dest
++
++	}
++
++	return response, nil
++}
++
++// ParseCancelLaunchpadCreationResponse parses an HTTP response from a CancelLaunchpadCreationWithResponse call
++func ParseCancelLaunchpadCreationResponse(rsp *http.Response) (*CancelLaunchpadCreationResponse, error) {
++	bodyBytes, err := io.ReadAll(rsp.Body)
++	defer func() { _ = rsp.Body.Close() }()
++	if err != nil {
++		return nil, err
++	}
++
++	response := &CancelLaunchpadCreationResponse{
++		Body:         bodyBytes,
++		HTTPResponse: rsp,
++	}
++
++	switch {
++	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
++		var dest LaunchpadCreationStopReceipt
++		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
++			return nil, err
++		}
++		response.JSON200 = &dest
++
++	}
++
++	return response, nil
++}
++
++// ParseGetLaunchpadCreationResponse parses an HTTP response from a GetLaunchpadCreationWithResponse call
++func ParseGetLaunchpadCreationResponse(rsp *http.Response) (*GetLaunchpadCreationResponse, error) {
++	bodyBytes, err := io.ReadAll(rsp.Body)
++	defer func() { _ = rsp.Body.Close() }()
++	if err != nil {
++		return nil, err
++	}
++
++	response := &GetLaunchpadCreationResponse{
++		Body:         bodyBytes,
++		HTTPResponse: rsp,
++	}
++
++	switch {
++	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
++		var dest LaunchpadCreationIdentity
+ 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+ 			return nil, err
+ 		}
+@@ -23570,6 +23872,12 @@
+ 
+ 	// (GET /extensions/launchpad/v1/capabilities)
+ 	GetLaunchpadCapabilities(c *gin.Context)
++
++	// (DELETE /extensions/launchpad/v1/creations/{operationID})
++	CancelLaunchpadCreation(c *gin.Context, operationID openapi_types.UUID)
++
++	// (GET /extensions/launchpad/v1/creations/{operationID})
++	GetLaunchpadCreation(c *gin.Context, operationID openapi_types.UUID)
+ 
+ 	// (DELETE /extensions/launchpad/v1/executions/{sandboxID})
+ 	StopLaunchpadExecution(c *gin.Context, sandboxID string)
+@@ -24497,6 +24805,56 @@
+ 	siw.Handler.GetLaunchpadCapabilities(c)
+ }
+ 
++// CancelLaunchpadCreation operation middleware
++func (siw *ServerInterfaceWrapper) CancelLaunchpadCreation(c *gin.Context) {
++
++	var err error
++	_ = err
++
++	// ------------- Path parameter "operationID" -------------
++	var operationID openapi_types.UUID
++
++	err = runtime.BindStyledParameterWithOptions("simple", "operationID", c.Param("operationID"), &operationID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
++	if err != nil {
++		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter operationID: %w", err), http.StatusBadRequest)
++		return
++	}
++
++	for _, middleware := range siw.HandlerMiddlewares {
++		middleware(c)
++		if c.IsAborted() {
++			return
++		}
++	}
++
++	siw.Handler.CancelLaunchpadCreation(c, operationID)
++}
++
++// GetLaunchpadCreation operation middleware
++func (siw *ServerInterfaceWrapper) GetLaunchpadCreation(c *gin.Context) {
++
++	var err error
++	_ = err
++
++	// ------------- Path parameter "operationID" -------------
++	var operationID openapi_types.UUID
++
++	err = runtime.BindStyledParameterWithOptions("simple", "operationID", c.Param("operationID"), &operationID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
++	if err != nil {
++		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter operationID: %w", err), http.StatusBadRequest)
++		return
++	}
++
++	for _, middleware := range siw.HandlerMiddlewares {
++		middleware(c)
++		if c.IsAborted() {
++			return
++		}
++	}
++
++	siw.Handler.GetLaunchpadCreation(c, operationID)
++}
++
+ // StopLaunchpadExecution operation middleware
+ func (siw *ServerInterfaceWrapper) StopLaunchpadExecution(c *gin.Context) {
+ 
+@@ -26179,6 +26537,8 @@
+ 		ErrorHandler:       errorHandler,
+ 	}
+ 
++	router.DELETE(options.BaseURL+"/extensions/launchpad/v1/creations/:operationID", wrapper.CancelLaunchpadCreation)
++	router.GET(options.BaseURL+"/extensions/launchpad/v1/creations/:operationID", wrapper.GetLaunchpadCreation)
+ 	router.DELETE(options.BaseURL+"/extensions/launchpad/v1/executions/:sandboxID", wrapper.StopLaunchpadExecution)
+ 	router.GET(options.BaseURL+"/extensions/launchpad/v1/capabilities", wrapper.GetLaunchpadCapabilities)
+ 	router.DELETE(options.BaseURL+"/extensions/launchpad/v1/restores/:operationID", wrapper.DeleteLaunchpadRestore)
+@@ -26266,32 +26626,32 @@
+ // const string: with thousands of chunks the chained `+` fold is several
+ // times slower for the Go compiler than parsing a slice literal.
+ var swaggerSpec = []string{
+-	"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",
+@@ -26299,296 +26659,300 @@
+ 	"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",
+ }
+ 
+ // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,
+diff --git a/packages/api/internal/handlers/launchpad_creation.go b/packages/api/internal/handlers/launchpad_creation.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_creation.go
+@@ -0,0 +1,44 @@
++package handlers
++
++import (
++	"errors"
++	"net/http"
++
++	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
++)
++
++// GetLaunchpadCreation retains the original identity even if boot failed before routing publication.
++func (a *APIStore) GetLaunchpadCreation(c *gin.Context, operationID uuid.UUID) {
++	row, err := (executions.Store{DB: a.sqlcDB}).GetCreation(c.Request.Context(), auth.MustGetTeamID(c), operationID)
++	if err != nil {
++		if errors.Is(err, pgx.ErrNoRows) {
++			a.sendAPIStoreError(c, http.StatusNotFound, "Managed creation operation not found")
++		} else {
++			a.sendAPIStoreError(c, http.StatusServiceUnavailable, "Managed creation identity is unavailable")
++		}
++		return
++	}
++	c.JSON(http.StatusOK, row)
++}
++
++// CancelLaunchpadCreation seals before stopping, including requests still travelling to this API.
++// A response is a physical-stop receipt only after every assigned host has confirmed shutdown.
++func (a *APIStore) CancelLaunchpadCreation(c *gin.Context, operationID uuid.UUID) {
++	team := auth.MustGetTeamID(c)
++	row, err := (executions.Store{DB: a.sqlcDB}).SealCreation(c.Request.Context(), team, operationID)
++	if err != nil {
++		a.sendAPIStoreError(c, http.StatusServiceUnavailable, "Managed creation could not be cancelled")
++		return
++	}
++	if row.SandboxID != nil {
++		if status, message := a.stopLaunchpadExecution(c.Request.Context(), team, *row.SandboxID); status != 0 {
++			a.sendAPIStoreError(c, status, message)
++			return
++		}
++	}
++	c.JSON(http.StatusOK, gin.H{"operationID": operationID, "sandboxID": row.SandboxID, "metadata": row.Metadata, "cancelled": true, "physicallyStopped": true})
++}
+diff --git a/packages/api/internal/handlers/launchpad_creation_test.go b/packages/api/internal/handlers/launchpad_creation_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_creation_test.go
+@@ -0,0 +1,74 @@
++package handlers
++
++import (
++	"context"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestCreationCancelBeforeHostAdmissionAndAfterRestart(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	other := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	op := uuid.New()
++	sandboxID := uuid.NewString()
++	labels := map[string]string{"launchpad.managed": "thread-vm-v1", "launchpad.operation_id": op.String(), "launchpad.allocation_id": uuid.NewString(), "launchpad.thread_id": uuid.NewString(), "launchpad.generation": "2"}
++	require.NoError(t, store.CaptureCreation(t.Context(), team, sandboxID, labels))
++	server := &APIStore{sqlcDB: db.SqlcClient}
++	ctx, res := restoreHTTPContext(t, team, nil)
++	server.GetLaunchpadCreation(ctx, op)
++	require.Equal(t, 200, res.Code)
++	require.Contains(t, res.Body.String(), sandboxID)
++	ctx, res = restoreHTTPContext(t, other, nil)
++	server.GetLaunchpadCreation(ctx, op)
++	require.Equal(t, 404, res.Code)
++	ctx, res = restoreHTTPContext(t, team, nil)
++	server.CancelLaunchpadCreation(ctx, op)
++	require.Equal(t, 200, res.Code)
++	require.Contains(t, res.Body.String(), `"physicallyStopped":true`)
++	require.Contains(t, res.Body.String(), sandboxID)
++	state, err := db.SqlcClient.LockExecutionFence(t.Context(), queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
++	require.NoError(t, err)
++	require.Equal(t, "stopped", state)
++	restarted := &APIStore{sqlcDB: db.SqlcClient}
++	ctx, res = restoreHTTPContext(t, team, nil)
++	restarted.CancelLaunchpadCreation(ctx, op)
++	require.Equal(t, 200, res.Code)
++	require.ErrorIs(t, store.CaptureCreation(t.Context(), team, uuid.NewString(), labels), executions.ErrCreationConflict)
++}
++
++func TestCreationCancellationSealsRequestsThatHaveNotArrived(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	other := testutils.CreateTestTeam(t, db)
++	op := uuid.New()
++	server := &APIStore{sqlcDB: db.SqlcClient}
++	ctx, res := restoreHTTPContext(t, team, nil)
++	server.CancelLaunchpadCreation(ctx, op)
++	require.Equal(t, 200, res.Code)
++	require.JSONEq(t, `{"operationID":"`+op.String()+`","sandboxID":null,"metadata":{},"cancelled":true,"physicallyStopped":true}`, res.Body.String())
++	labels := map[string]string{"launchpad.managed": "thread-vm-v1", "launchpad.operation_id": op.String(), "launchpad.allocation_id": uuid.NewString(), "launchpad.thread_id": uuid.NewString(), "launchpad.generation": "1"}
++	store := executions.Store{DB: db.SqlcClient}
++	require.ErrorIs(t, store.CaptureCreation(t.Context(), team, uuid.NewString(), labels), executions.ErrCreationConflict)
++	require.NoError(t, store.CaptureCreation(t.Context(), other, uuid.NewString(), labels))
++}
++
++func TestCreationStopRefusesLegacyIdentityWithoutHostEvidence(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	sandboxID := uuid.NewString()
++	require.NoError(t, db.SqlcClient.EnsureExecutionFence(t.Context(), queries.EnsureExecutionFenceParams{TeamID: team, SandboxID: sandboxID}))
++	server := &APIStore{sqlcDB: db.SqlcClient}
++	ctx, res := restoreHTTPContext(t, team, nil)
++	server.StopLaunchpadExecution(ctx, sandboxID)
++	require.Equal(t, 503, res.Code)
++	state, err := db.SqlcClient.LockExecutionFence(context.Background(), queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
++	require.NoError(t, err)
++	require.Equal(t, "active", state)
++}
+diff --git a/packages/api/internal/handlers/launchpad_execution.go b/packages/api/internal/handlers/launchpad_execution.go
+--- a/packages/api/internal/handlers/launchpad_execution.go
++++ b/packages/api/internal/handlers/launchpad_execution.go
+@@ -22,55 +22,57 @@
+ // StopLaunchpadExecution does not infer shutdown from an expired routing entry.
+ // Its permanent admission fence and host list survive both API and host restart.
+ func (a *APIStore) StopLaunchpadExecution(c *gin.Context, sandboxID string) {
+-	team := auth.MustGetTeamID(c)
+-	ctx := c.Request.Context()
++	if status, message := a.stopLaunchpadExecution(c.Request.Context(), auth.MustGetTeamID(c), sandboxID); status != 0 {
++		a.sendAPIStoreError(c, status, message)
++		return
++	}
++	c.JSON(http.StatusOK, gin.H{"sandboxID": sandboxID, "physicallyStopped": true})
++}
++
++func (a *APIStore) stopLaunchpadExecution(ctx context.Context, team uuid.UUID, sandboxID string) (int, string) {
++	store := executions.Store{DB: a.sqlcDB}
+ 	// A saved receipt remains valid after the host goes offline. Its permanent
+ 	// registry tombstone already prevents all later managed starts/resumes.
+ 	state, err := a.sqlcDB.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
+ 	if err == nil && state == "stopped" {
+-		if err := (executions.Store{DB: a.sqlcDB}).CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
+-			a.sendAPIStoreError(c, 503, "Stopped snapshot cleanup is incomplete")
+-			return
++		if err := store.CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
++			return 503, "Stopped snapshot cleanup is incomplete"
+ 		}
+-		c.JSON(http.StatusOK, gin.H{"sandboxID": sandboxID, "physicallyStopped": true})
+-		return
++		return 0, ""
+ 	}
+-	attempts, err := (executions.Store{DB: a.sqlcDB}).BeginStop(ctx, team, sandboxID)
++	attempts, err := store.BeginStop(ctx, team, sandboxID)
+ 	if err != nil {
+ 		if errors.Is(err, pgx.ErrNoRows) {
+-			a.sendAPIStoreError(c, http.StatusNotFound, "Registered execution not found")
+-			return
++			return http.StatusNotFound, "Registered execution not found"
+ 		}
+-		a.sendAPIStoreError(c, http.StatusServiceUnavailable, "Execution fence is unavailable")
+-		return
++		return http.StatusServiceUnavailable, "Execution fence is unavailable"
+ 	}
+-	if err := confirmExecutionStops(ctx, attempts, a.orchestrator.RestoreClient); err != nil {
+-		a.sendAPIStoreError(c, http.StatusServiceUnavailable, "Physical execution stop is unconfirmed")
+-		return
++	if len(attempts) > 0 {
++		if err := confirmExecutionStops(ctx, attempts, a.orchestrator.RestoreClient); err != nil {
++			return http.StatusServiceUnavailable, "Physical execution stop is unconfirmed"
++		}
++
++		// The database fence prevents a new resume while the routing/snapshot records
++		// are cleaned. Cleanup failure stays retryable; no false success is returned.
++		err = a.orchestrator.RemoveSandbox(ctx, team, sandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionKill, Reason: sandbox.KillReasonRequest})
++		if err != nil && !errors.Is(err, orchestrator.ErrSandboxNotFound) {
++			return 503, "Stopped execution cleanup is incomplete"
++		}
++		err = a.deleteSnapshot(ctx, sandboxID, team)
++		if err != nil && !errors.Is(err, db.ErrSnapshotNotFound) {
++			return 503, "Stopped snapshot cleanup is incomplete"
++		}
+ 	}
+-
+-	// The database fence prevents a new resume while the routing/snapshot records
+-	// are cleaned. Cleanup failure stays retryable; no false success is returned.
+-	err = a.orchestrator.RemoveSandbox(ctx, team, sandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionKill, Reason: sandbox.KillReasonRequest})
+-	if err != nil && !errors.Is(err, orchestrator.ErrSandboxNotFound) {
+-		a.sendAPIStoreError(c, 503, "Stopped execution cleanup is incomplete")
+-		return
+-	}
+-	err = a.deleteSnapshot(ctx, sandboxID, team)
+-	if err != nil && !errors.Is(err, db.ErrSnapshotNotFound) {
+-		a.sendAPIStoreError(c, 503, "Stopped snapshot cleanup is incomplete")
+-		return
+-	}
++	// Zero attempts are allowed by BeginStop only for an identity captured before
++	// any host RPC. The committed fence has already prevented a late boot.
+ 	count, err := a.sqlcDB.ConfirmExecutionStopped(ctx, queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: sandboxID})
+ 	if err != nil || count != 1 {
+-		a.sendAPIStoreError(c, 503, "Physical stop receipt could not be saved")
+-		return
++		return 503, "Physical stop receipt could not be saved"
+ 	}
+-	if err := (executions.Store{DB: a.sqlcDB}).CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
+-		a.sendAPIStoreError(c, 503, "Stopped snapshot cleanup is incomplete")
+-		return
++	if err := store.CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
++		return 503, "Stopped snapshot cleanup is incomplete"
+ 	}
+-	c.JSON(http.StatusOK, gin.H{"sandboxID": sandboxID, "physicallyStopped": true})
++	return 0, ""
+ }
+ 
+ func confirmExecutionStops(ctx context.Context, attempts []queries.SandboxExecutionAttempt, connect func(context.Context, uuid.UUID, string) (rpc.SandboxServiceClient, context.Context, error)) error {
+diff --git a/packages/api/internal/handlers/launchpad_restore.go b/packages/api/internal/handlers/launchpad_restore.go
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -33,7 +33,7 @@
+ 		a.sendAPIStoreError(c, http.StatusForbidden, "Launchpad restore is not enabled for this team")
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{PrivatePreviewHeaderBoundary: true, Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
++	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{DurableCreationIdentity: true, PrivatePreviewHeaderBoundary: true, Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
+ }
+ 
+ func canonicalRestoreRequest(body api.LaunchpadRestoreRequest) ([]byte, error) {
+diff --git a/packages/api/internal/handlers/sandbox_create.go b/packages/api/internal/handlers/sandbox_create.go
+--- a/packages/api/internal/handlers/sandbox_create.go
++++ b/packages/api/internal/handlers/sandbox_create.go
+@@ -27,6 +27,7 @@
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+ 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
+ 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
+@@ -379,6 +380,20 @@
+ 		}, nil
+ 	}
+ 
++	if metadata["launchpad.managed"] == "thread-vm-v1" {
++		if err := (executions.Store{DB: a.sqlcDB}).CaptureCreation(ctx, teamInfo.Team.ID, sandboxID, metadata); err != nil {
++			switch {
++			case errors.Is(err, executions.ErrCreationConflict):
++				a.sendAPIStoreError(c, http.StatusConflict, "Managed creation operation is already assigned or cancelled")
++			case errors.Is(err, executions.ErrCreationIdentity):
++				a.sendAPIStoreError(c, http.StatusBadRequest, "Invalid managed creation identity")
++			default:
++				a.sendAPIStoreError(c, http.StatusServiceUnavailable, "Managed creation identity could not be saved")
++			}
++			return
++		}
++	}
++
+ 	sbx, createErr := a.startSandbox(
+ 		ctx,
+ 		sandboxID,
+diff --git a/packages/db/migrations/20261008120000_creation_operation_identity.sql b/packages/db/migrations/20261008120000_creation_operation_identity.sql
+new file mode 100644
+--- /dev/null
++++ b/packages/db/migrations/20261008120000_creation_operation_identity.sql
+@@ -0,0 +1,13 @@
++-- +goose Up
++CREATE TABLE public.sandbox_creation_operations (
++ team_id uuid NOT NULL REFERENCES public.teams(id) ON DELETE CASCADE,
++ operation_id uuid NOT NULL,
++ sandbox_id text,
++ metadata jsonb NOT NULL DEFAULT '{}',
++ cancelled boolean NOT NULL DEFAULT false,
++ PRIMARY KEY (team_id, operation_id),
++ UNIQUE (team_id, sandbox_id)
++);
++
++-- +goose Down
++DROP TABLE public.sandbox_creation_operations;
+diff --git a/packages/db/pkg/executions/creation.go b/packages/db/pkg/executions/creation.go
+new file mode 100644
+--- /dev/null
++++ b/packages/db/pkg/executions/creation.go
+@@ -0,0 +1,118 @@
++package executions
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"strconv"
++
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
++)
++
++var ErrCreationConflict = errors.New("creation operation is already assigned or sealed")
++var ErrCreationIdentity = errors.New("invalid managed creation identity")
++
++type CreationIdentity struct {
++	OperationID uuid.UUID         `json:"operationID"`
++	SandboxID   *string           `json:"sandboxID"`
++	Metadata    map[string]string `json:"metadata"`
++	Cancelled   bool              `json:"cancelled"`
++}
++
++// CaptureCreation records identity and the admission fence before any host RPC.
++// A second request for the same operation cannot allocate another sandbox ID.
++func (s Store) CaptureCreation(ctx context.Context, team uuid.UUID, sandboxID string, metadata map[string]string) error {
++	op, err := uuid.Parse(metadata["launchpad.operation_id"])
++	generation, gerr := strconv.ParseUint(metadata["launchpad.generation"], 10, 64)
++	if err != nil || op == uuid.Nil || team == uuid.Nil || sandboxID == "" || gerr != nil || generation == 0 || metadata["launchpad.managed"] != "thread-vm-v1" {
++		return ErrCreationIdentity
++	}
++	selected := make(map[string]string, 5)
++	for _, key := range []string{"launchpad.managed", "launchpad.allocation_id", "launchpad.operation_id", "launchpad.thread_id", "launchpad.generation"} {
++		value := metadata[key]
++		if value == "" || len(value) > 256 {
++			return ErrCreationIdentity
++		}
++		selected[key] = value
++	}
++	raw, err := json.Marshal(selected)
++	if err != nil {
++		return err
++	}
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	var assigned string
++	err = tx.QueryRow(ctx, `INSERT INTO public.sandbox_creation_operations(team_id,operation_id,sandbox_id,metadata)
++ VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING sandbox_id`, team, op, sandboxID, string(raw)).Scan(&assigned)
++	if errors.Is(err, pgx.ErrNoRows) {
++		return ErrCreationConflict
++	}
++	if err != nil {
++		return err
++	}
++	if err = db.EnsureExecutionFence(ctx, queries.EnsureExecutionFenceParams{TeamID: team, SandboxID: sandboxID}); err != nil {
++		return err
++	}
++	return tx.Commit(ctx)
++}
++
++func (s Store) GetCreation(ctx context.Context, team, operation uuid.UUID) (CreationIdentity, error) {
++	_, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return CreationIdentity{}, err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	row := CreationIdentity{OperationID: operation}
++	var raw []byte
++	err = tx.QueryRow(ctx, `SELECT sandbox_id,metadata,cancelled FROM public.sandbox_creation_operations WHERE team_id=$1 AND operation_id=$2`, team, operation).Scan(&row.SandboxID, &raw, &row.Cancelled)
++	if err != nil {
++		return CreationIdentity{}, err
++	}
++	err = json.Unmarshal(raw, &row.Metadata)
++	return row, err
++}
++
++// SealCreation closes the operation even when its create request has not arrived.
++// An assigned ID still needs a physical-stop receipt; this tombstone alone is not one.
++func (s Store) SealCreation(ctx context.Context, team, operation uuid.UUID) (CreationIdentity, error) {
++	if team == uuid.Nil || operation == uuid.Nil {
++		return CreationIdentity{}, ErrCreationIdentity
++	}
++	_, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return CreationIdentity{}, err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	row := CreationIdentity{OperationID: operation}
++	var raw []byte
++	err = tx.QueryRow(ctx, `INSERT INTO public.sandbox_creation_operations(team_id,operation_id,cancelled) VALUES($1,$2,true)
++ ON CONFLICT(team_id,operation_id) DO UPDATE SET cancelled=true
++ RETURNING sandbox_id,metadata,cancelled`, team, operation).Scan(&row.SandboxID, &raw, &row.Cancelled)
++	if err != nil {
++		return CreationIdentity{}, err
++	}
++	if err = json.Unmarshal(raw, &row.Metadata); err != nil {
++		return CreationIdentity{}, err
++	}
++	if err = tx.Commit(ctx); err != nil {
++		return CreationIdentity{}, err
++	}
++	return row, nil
++}
++
++// HasCapturedCreation distinguishes a registered pre-boot intent from unknown legacy executions.
++func (s Store) HasCapturedCreation(ctx context.Context, team uuid.UUID, sandboxID string) (bool, error) {
++	_, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return false, err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	var found bool
++	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.sandbox_creation_operations WHERE team_id=$1 AND sandbox_id=$2)`, team, sandboxID).Scan(&found)
++	return found, err
++}
+diff --git a/packages/db/pkg/executions/creation_test.go b/packages/db/pkg/executions/creation_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/db/pkg/executions/creation_test.go
+@@ -0,0 +1,79 @@
++package executions_test
++
++import (
++	"context"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
++	"github.com/stretchr/testify/require"
++	"sync"
++	"testing"
++)
++
++func creationMetadata(op uuid.UUID) map[string]string {
++	return map[string]string{"launchpad.managed": "thread-vm-v1", "launchpad.operation_id": op.String(), "launchpad.allocation_id": uuid.NewString(), "launchpad.thread_id": uuid.NewString(), "launchpad.generation": "2", "unrelated.secret": "must-not-persist"}
++}
++
++func TestCreationIdentitySurvivesFailedBootAndRestart(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	other := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	op := uuid.New()
++	sid := uuid.NewString()
++	metadata := creationMetadata(op)
++	require.NoError(t, store.CaptureCreation(t.Context(), team, sid, metadata))
++	// No routing record, host RPC or successful VM create ever occurs.
++	reopened := executions.Store{DB: db.SqlcClient}
++	identity, err := reopened.GetCreation(t.Context(), team, op)
++	require.NoError(t, err)
++	require.Equal(t, sid, *identity.SandboxID)
++	require.Equal(t, metadata["launchpad.thread_id"], identity.Metadata["launchpad.thread_id"])
++	require.NotContains(t, identity.Metadata, "unrelated.secret")
++	_, err = reopened.GetCreation(t.Context(), other, op)
++	require.ErrorIs(t, err, pgx.ErrNoRows)
++	require.ErrorIs(t, reopened.CaptureCreation(t.Context(), team, uuid.NewString(), metadata), executions.ErrCreationConflict)
++	sealed, err := reopened.SealCreation(t.Context(), team, op)
++	require.NoError(t, err)
++	require.True(t, sealed.Cancelled)
++	require.Equal(t, sid, *sealed.SandboxID)
++	require.ErrorIs(t, reopened.CaptureCreation(t.Context(), team, uuid.NewString(), metadata), executions.ErrCreationConflict)
++	attempts, err := store.BeginStop(t.Context(), team, sid)
++	require.NoError(t, err)
++	require.Empty(t, attempts)
++	known, err := store.HasCapturedCreation(t.Context(), team, sid)
++	require.NoError(t, err)
++	require.True(t, known)
++	require.ErrorIs(t, store.Register(t.Context(), queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sid, ExecutionID: uuid.New(), NodeID: "late-host"}, uuid.New(), true), executions.ErrFenced)
++}
++
++func TestCreationSealRacesAndRejectsEveryLateCreate(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	for range 8 {
++		op := uuid.New()
++		sid := uuid.NewString()
++		metadata := creationMetadata(op)
++		start := make(chan struct{})
++		var wg sync.WaitGroup
++		var capturedErr, sealedErr error
++		var sealed executions.CreationIdentity
++		wg.Go(func() { <-start; capturedErr = store.CaptureCreation(context.Background(), team, sid, metadata) })
++		wg.Go(func() { <-start; sealed, sealedErr = store.SealCreation(context.Background(), team, op) })
++		close(start)
++		wg.Wait()
++		require.NoError(t, sealedErr)
++		require.True(t, sealed.Cancelled)
++		if capturedErr == nil {
++			require.NotNil(t, sealed.SandboxID)
++			require.Equal(t, sid, *sealed.SandboxID)
++		} else {
++			require.ErrorIs(t, capturedErr, executions.ErrCreationConflict)
++			require.Nil(t, sealed.SandboxID)
++		}
++		require.ErrorIs(t, store.CaptureCreation(t.Context(), team, uuid.NewString(), metadata), executions.ErrCreationConflict)
++	}
++}
+diff --git a/packages/db/pkg/executions/store.go b/packages/db/pkg/executions/store.go
+--- a/packages/db/pkg/executions/store.go
++++ b/packages/db/pkg/executions/store.go
+@@ -103,7 +103,17 @@
+ 		return nil, err
+ 	}
+ 	if len(attempts) == 0 {
+-		return nil, errors.New("execution registry contains no physical identities")
++		// Only a durable intent written before every possible host RPC proves
++		// that a sandbox with no registered hosts has never started. The fence
++		// is held until commit, so late registrations cannot cross this stop.
++		var captured bool
++		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.sandbox_creation_operations
++		    WHERE team_id=$1 AND sandbox_id=$2)`, team, sandboxID).Scan(&captured); err != nil {
++			return nil, err
++		}
++		if !captured {
++			return nil, errors.New("execution registry contains no physical identities")
++		}
+ 	}
+ 	if err := tx.Commit(ctx); err != nil {
+ 		return nil, err
+diff --git a/spec/openapi.yml b/spec/openapi.yml
+--- a/spec/openapi.yml
++++ b/spec/openapi.yml
+@@ -316,9 +316,34 @@
+           type: string
+         sandbox:
+           $ref: '#/components/schemas/Sandbox'
++    LaunchpadCreationIdentity:
++      type: object
++      required: [operationID, sandboxID, metadata, cancelled]
++      properties:
++        operationID:
++          type: string
++          format: uuid
++        sandboxID:
++          type: string
++          nullable: true
++        metadata:
++          type: object
++          additionalProperties:
++            type: string
++        cancelled:
++          type: boolean
++    LaunchpadCreationStopReceipt:
++      allOf:
++        - $ref: '#/components/schemas/LaunchpadCreationIdentity'
++        - type: object
++          required: [physicallyStopped]
++          properties:
++            physicallyStopped:
++              type: boolean
++              enum: [true]
+     LaunchpadRuntimeCapabilities:
+       type: object
+-      required: [version, privatePreviewHeaderBoundary, diskRestore, renewableLifetime, quiescedSnapshots, pausedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection]
++      required: [version, privatePreviewHeaderBoundary, diskRestore, renewableLifetime, quiescedSnapshots, pausedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection, durableCreationIdentity]
+       properties:
+         version:
+           type: integer
+@@ -337,6 +362,8 @@
+         executionBuildRoots:
+           type: boolean
+         liveBuildCollection:
++          type: boolean
++        durableCreationIdentity:
+           type: boolean
+     Rig:
+       description: An orchestrator node pool backed by one cloud scaling group
+@@ -2794,6 +2821,40 @@
+   - name: secrets
+ 
+ paths:
++  /extensions/launchpad/v1/creations/{operationID}:
++    parameters:
++      - name: operationID
++        in: path
++        required: true
++        schema:
++          type: string
++          format: uuid
++    get:
++      operationId: getLaunchpadCreation
++      security:
++        - ApiKeyAuth: []
++      responses:
++        '200':
++          description: Durable pre-boot managed creation identity
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/LaunchpadCreationIdentity'
++        default:
++          description: Unknown identity, unavailable registry, or unauthorized request
++    delete:
++      operationId: cancelLaunchpadCreation
++      security:
++        - ApiKeyAuth: []
++      responses:
++        '200':
++          description: Operation is permanently sealed and every possible execution is physically stopped
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/LaunchpadCreationStopReceipt'
++        default:
++          description: Unauthorized request, unavailable registry, or physical stop not confirmed
+   /extensions/launchpad/v1/executions/{sandboxID}:
+     delete:
+       operationId: stopLaunchpadExecution

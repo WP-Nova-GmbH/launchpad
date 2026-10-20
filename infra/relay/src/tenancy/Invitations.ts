@@ -104,7 +104,7 @@ export class Invitations extends Context.Service<
       readonly acceptedByUserId: string;
     }) => Effect.Effect<boolean, InvitationPersistenceError>;
   }
->()("t3code-relay/tenancy/Invitations") {}
+>()("launchpad-relay/tenancy/Invitations") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

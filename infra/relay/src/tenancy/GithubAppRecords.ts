@@ -49,7 +49,7 @@ export class GithubAppRecords extends Context.Service<
       readonly createdByUserId: string;
     }) => Effect.Effect<GithubAppRecord, GithubAppPersistenceError>;
   }
->()("t3code-relay/tenancy/GithubAppRecords") {}
+>()("launchpad-relay/tenancy/GithubAppRecords") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;

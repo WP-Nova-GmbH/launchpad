@@ -1,0 +1,2 @@
+ALTER TABLE "relay_thread_vm_backups" ADD COLUMN "failed_probe_stopped_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_backups" ADD CONSTRAINT "relay_thread_vm_backups_failed_probe_stop" CHECK ("failed_probe_stopped_at" IS NULL OR "phase" IN ('failed','retiring','retired'));

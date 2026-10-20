@@ -1,0 +1,251 @@
+diff --git a/dist/NodeChildProcessSpawner.d.ts b/dist/NodeChildProcessSpawner.d.ts
+index 76585ba0fa85ae90cb4151c319977f2beb369c4c..d8a85077d50232c91b7e4cfb372fb91fe57fe63b 100644
+--- a/dist/NodeChildProcessSpawner.d.ts
++++ b/dist/NodeChildProcessSpawner.d.ts
+@@ -24,11 +24,14 @@
+  * @since 4.0.0
+  */
+ import type * as Arr from "effect/Array";
++import * as Context from "effect/Context";
+ import * as FileSystem from "effect/FileSystem";
+ import * as Layer from "effect/Layer";
+ import * as Path from "effect/Path";
+ import * as ChildProcess from "effect/unstable/process/ChildProcess";
+ import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
++/** Private owned-harness teardown; ordinary spawns retain group cleanup. */
++export declare const ProcessOnlyCleanup: Context.Reference<boolean>;
+ /**
+  * Layer that provides the `NodeChildProcessSpawner` implementation.
+  *
+diff --git a/dist/NodeChildProcessSpawner.js b/dist/NodeChildProcessSpawner.js
+index 95d97c58cd42c5f10c445c289f792df668b1d153..6f49e55f2c68165619ac3c106d5e75b058b0663b 100644
+--- a/dist/NodeChildProcessSpawner.js
++++ b/dist/NodeChildProcessSpawner.js
+@@ -1,3 +1,4 @@
++import * as Context from "effect/Context";
+ import * as Deferred from "effect/Deferred";
+ import * as Duration from "effect/Duration";
+ import * as Effect from "effect/Effect";
+@@ -27,14 +28,17 @@ const toPlatformError = (method, error, command) => {
+   }, "");
+   return handleErrnoException("ChildProcess", method)(error, [commandStr]);
+ };
++/** Private owned-harness teardown can preserve detached children. Defaults remain group-wide. */
++export const ProcessOnlyCleanup = Context.Reference("@effect/platform-node-shared/ProcessOnlyCleanup", { defaultValue: () => false });
++
+ const processGroupGraceMillis = 1_000;
+ const processGroupPollIntervalMillis = 10;
+ /** The leader has not exited, or a member of its process group still exists. */
+-const isProcessAlive = (childProcess, exitSignal) => {
++const isProcessAlive = (childProcess, exitSignal, processOnly = false) => {
+   if (!Deferred.isDoneUnsafe(exitSignal)) {
+     return true;
+   }
+-  if (globalThis.process.platform === "win32") {
++  if (processOnly || globalThis.process.platform === "win32") {
+     return false;
+   }
+   try {
+@@ -315,7 +319,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+     return Effect.void;
+   });
+   /** Waits for the leader and its process group, bounded by native time. */
+-  const awaitProcessExit = (childProcess, exitSignal, timeoutMillis) => Effect.callback(resume => {
++  const awaitProcessExit = (childProcess, exitSignal, timeoutMillis, processOnly = false) => Effect.callback(resume => {
+     const deadline = Date.now() + timeoutMillis;
+     let timer;
+     const stop = () => {
+@@ -324,7 +328,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+     };
+     const poll = () => {
+       clearTimeout(timer);
+-      if (Date.now() >= deadline || !isProcessAlive(childProcess, exitSignal)) {
++      if (Date.now() >= deadline || !isProcessAlive(childProcess, exitSignal, processOnly)) {
+         stop();
+         resume(Effect.void);
+         return;
+@@ -336,16 +340,16 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+     poll();
+     return Effect.sync(stop);
+   });
+-  const terminateProcessGroup = Effect.fnUntraced(function* (command, childProcess, exitSignal, options) {
+-    const signalGroup = signal => killProcessGroup(command, childProcess, signal).pipe(Effect.catch(() => killProcess(command, childProcess, signal)));
++  const terminateProcessGroup = Effect.fnUntraced(function* (command, childProcess, exitSignal, options, processOnly = false) {
++    const signalGroup = signal => processOnly ? killProcess(command, childProcess, signal) : killProcessGroup(command, childProcess, signal).pipe(Effect.catch(() => killProcess(command, childProcess, signal)));
+     yield* signalGroup(options?.killSignal ?? "SIGTERM");
+     if (Predicate.isUndefined(options?.forceKillAfter)) {
+-      yield* awaitProcessExit(childProcess, exitSignal, processGroupGraceMillis);
++      yield* awaitProcessExit(childProcess, exitSignal, processGroupGraceMillis, processOnly);
+     } else {
+-      yield* awaitProcessExit(childProcess, exitSignal, Duration.toMillis(options.forceKillAfter));
+-      if (isProcessAlive(childProcess, exitSignal)) {
++      yield* awaitProcessExit(childProcess, exitSignal, Duration.toMillis(options.forceKillAfter), processOnly);
++      if (isProcessAlive(childProcess, exitSignal, processOnly)) {
+         yield* signalGroup("SIGKILL");
+-        yield* awaitProcessExit(childProcess, exitSignal, processGroupGraceMillis);
++        yield* awaitProcessExit(childProcess, exitSignal, processGroupGraceMillis, processOnly);
+       }
+     }
+     yield* Deferred.await(exitSignal);
+@@ -383,6 +387,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+           const stdoutConfig = resolveOutputOption(cmd.options, "stdout");
+           const stderrConfig = resolveOutputOption(cmd.options, "stderr");
+           const resolvedAdditionalFds = resolveAdditionalFds(cmd.options);
++          const processOnly = yield* ProcessOnlyCleanup;
+           let isReferenced = true;
+           const cwd = yield* resolveWorkingDirectory(cmd.options);
+           const env = resolveEnvironment(cmd.options);
+@@ -395,7 +400,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+             const exited = yield* Deferred.isDone(exitSignal);
+             if (exited) {
+               const [code] = yield* Deferred.await(exitSignal);
+-              if (code !== 0 && Predicate.isNotNull(code)) {
++              if (!processOnly && code !== 0 && Predicate.isNotNull(code)) {
+                 yield* Effect.ignore(killProcessGroup(cmd, childProcess, cmd.options.killSignal ?? "SIGTERM"));
+               }
+               return;
+@@ -403,11 +408,11 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+             if (!isReferenced) {
+               return;
+             }
+-            yield* Effect.ignore(terminateProcessGroup(cmd, childProcess, exitSignal, cmd.options));
++            yield* Effect.ignore(terminateProcessGroup(cmd, childProcess, exitSignal, cmd.options, processOnly));
+           }));
+           const pid = ProcessId(childProcess.pid);
+           childProcess.on("exit", code => {
+-            if (code !== 0 && Predicate.isNotNull(code)) {
++            if (!processOnly && code !== 0 && Predicate.isNotNull(code)) {
+               killProcessGroupOnExit(childProcess, cmd.options.killSignal ?? "SIGTERM");
+             }
+           });
+@@ -445,7 +450,7 @@ const make = /*#__PURE__*/Effect.gen(function* () {
+             const error = new globalThis.Error(`Process interrupted due to receipt of signal: '${signal}'`);
+             return Effect.fail(toPlatformError("exitCode", error, cmd));
+           });
+-          const kill = options => terminateProcessGroup(cmd, childProcess, exitSignal, options);
++          const kill = options => terminateProcessGroup(cmd, childProcess, exitSignal, options, processOnly);
+           return makeHandle({
+             pid,
+             exitCode,
+diff --git a/src/NodeChildProcessSpawner.ts b/src/NodeChildProcessSpawner.ts
+index 2077379773283926b715e29d6b6431bf7ba20ff9..17a832316e3c80fd40fb5d2694147b797cba716e 100644
+--- a/src/NodeChildProcessSpawner.ts
++++ b/src/NodeChildProcessSpawner.ts
+@@ -24,6 +24,7 @@
+  * @since 4.0.0
+  */
+ import type * as Arr from "effect/Array"
++import * as Context from "effect/Context"
+ import * as Deferred from "effect/Deferred"
+ import * as Duration from "effect/Duration"
+ import * as Effect from "effect/Effect"
+@@ -73,15 +74,18 @@ const toPlatformError = (
+ type ExitCodeWithSignal = readonly [code: number | null, signal: NodeJS.Signals | null]
+ type ExitSignal = Deferred.Deferred<ExitCodeWithSignal>
+ 
++/** Private owned-harness teardown can preserve detached children. Defaults remain group-wide. */
++export const ProcessOnlyCleanup = Context.Reference<boolean>("@effect/platform-node-shared/ProcessOnlyCleanup", { defaultValue: () => false })
++
+ const processGroupGraceMillis = 1_000
+ const processGroupPollIntervalMillis = 10
+ 
+ /** The leader has not exited, or a member of its process group still exists. */
+-const isProcessAlive = (childProcess: NodeChildProcess.ChildProcess, exitSignal: ExitSignal): boolean => {
++const isProcessAlive = (childProcess: NodeChildProcess.ChildProcess, exitSignal: ExitSignal, processOnly = false): boolean => {
+   if (!Deferred.isDoneUnsafe(exitSignal)) {
+     return true
+   }
+-  if (globalThis.process.platform === "win32") {
++  if (processOnly || globalThis.process.platform === "win32") {
+     return false
+   }
+   try {
+@@ -443,7 +447,8 @@ const make = Effect.gen(function*() {
+   const awaitProcessExit = (
+     childProcess: NodeChildProcess.ChildProcess,
+     exitSignal: ExitSignal,
+-    timeoutMillis: number
++    timeoutMillis: number,
++    processOnly = false
+   ): Effect.Effect<void> =>
+     Effect.callback<void>((resume) => {
+       const deadline = Date.now() + timeoutMillis
+@@ -454,7 +459,7 @@ const make = Effect.gen(function*() {
+       }
+       const poll = () => {
+         clearTimeout(timer)
+-        if (Date.now() >= deadline || !isProcessAlive(childProcess, exitSignal)) {
++        if (Date.now() >= deadline || !isProcessAlive(childProcess, exitSignal, processOnly)) {
+           stop()
+           resume(Effect.void)
+           return
+@@ -471,20 +476,21 @@ const make = Effect.gen(function*() {
+     command: ChildProcess.StandardCommand,
+     childProcess: NodeChildProcess.ChildProcess,
+     exitSignal: ExitSignal,
+-    options: ChildProcess.KillOptions | undefined
++    options: ChildProcess.KillOptions | undefined,
++    processOnly = false
+   ) {
+     const signalGroup = (signal: NodeJS.Signals) =>
+-      killProcessGroup(command, childProcess, signal).pipe(
++      processOnly ? killProcess(command, childProcess, signal) : killProcessGroup(command, childProcess, signal).pipe(
+         Effect.catch(() => killProcess(command, childProcess, signal))
+       )
+     yield* signalGroup(options?.killSignal ?? "SIGTERM")
+     if (Predicate.isUndefined(options?.forceKillAfter)) {
+-      yield* awaitProcessExit(childProcess, exitSignal, processGroupGraceMillis)
++      yield* awaitProcessExit(childProcess, exitSignal, processGroupGraceMillis, processOnly)
+     } else {
+-      yield* awaitProcessExit(childProcess, exitSignal, Duration.toMillis(options.forceKillAfter))
+-      if (isProcessAlive(childProcess, exitSignal)) {
++      yield* awaitProcessExit(childProcess, exitSignal, Duration.toMillis(options.forceKillAfter), processOnly)
++      if (isProcessAlive(childProcess, exitSignal, processOnly)) {
+         yield* signalGroup("SIGKILL")
+-        yield* awaitProcessExit(childProcess, exitSignal, processGroupGraceMillis)
++        yield* awaitProcessExit(childProcess, exitSignal, processGroupGraceMillis, processOnly)
+       }
+     }
+     yield* Deferred.await(exitSignal)
+@@ -531,6 +537,7 @@ const make = Effect.gen(function*() {
+         const stdoutConfig = resolveOutputOption(cmd.options, "stdout")
+         const stderrConfig = resolveOutputOption(cmd.options, "stderr")
+         const resolvedAdditionalFds = resolveAdditionalFds(cmd.options)
++        const processOnly = yield* ProcessOnlyCleanup
+         let isReferenced = true
+ 
+         const cwd = yield* resolveWorkingDirectory(cmd.options)
+@@ -543,7 +550,7 @@ const make = Effect.gen(function*() {
+             const exited = yield* Deferred.isDone(exitSignal)
+             if (exited) {
+               const [code] = yield* Deferred.await(exitSignal)
+-              if (code !== 0 && Predicate.isNotNull(code)) {
++              if (!processOnly && code !== 0 && Predicate.isNotNull(code)) {
+                 yield* Effect.ignore(killProcessGroup(cmd, childProcess, cmd.options.killSignal ?? "SIGTERM"))
+               }
+               return
+@@ -551,13 +558,13 @@ const make = Effect.gen(function*() {
+             if (!isReferenced) {
+               return
+             }
+-            yield* Effect.ignore(terminateProcessGroup(cmd, childProcess, exitSignal, cmd.options))
++            yield* Effect.ignore(terminateProcessGroup(cmd, childProcess, exitSignal, cmd.options, processOnly))
+           })
+         )
+ 
+         const pid = ProcessId(childProcess.pid!)
+         childProcess.on("exit", (code) => {
+-          if (code !== 0 && Predicate.isNotNull(code)) {
++          if (!processOnly && code !== 0 && Predicate.isNotNull(code)) {
+             killProcessGroupOnExit(childProcess, cmd.options.killSignal ?? "SIGTERM")
+           }
+         })
+@@ -589,7 +596,7 @@ const make = Effect.gen(function*() {
+           return Effect.fail(toPlatformError("exitCode", error, cmd))
+         })
+         const kill = (options?: ChildProcess.KillOptions | undefined) =>
+-          terminateProcessGroup(cmd, childProcess, exitSignal, options)
++          terminateProcessGroup(cmd, childProcess, exitSignal, options, processOnly)
+ 
+         return makeHandle({
+           pid,

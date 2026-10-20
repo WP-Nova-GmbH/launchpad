@@ -1,0 +1,296 @@
+--- a/packages/orchestrator/pkg/sandbox/fc/process.go
++++ b/packages/orchestrator/pkg/sandbox/fc/process.go
+@@ -332,7 +332,7 @@
+ 	}()
+ 
+ 	// Wait for the FC process to start so we can use FC API
+-	err = socket.Wait(startCtx, p.firecrackerSocketPath)
++	err = waitForFCAPISocket(startCtx, p.firecrackerSocketPath, p.Exit.Done())
+ 	if err != nil {
+ 		errMsg := fmt.Errorf("error waiting for fc socket: %w", err)
+ 
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/fc/api_socket.go
+@@ -0,0 +1,70 @@
++//go:build linux
++
++package fc
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"time"
++)
++
++var errFCAPIProcessExited = errors.New("firecracker exited before its API socket became ready")
++
++func waitForFCAPISocket(ctx context.Context, path string, exited <-chan struct{}) error {
++	var dialer net.Dialer
++	return waitForFCAPISocketWithDial(ctx, path, exited, dialer.DialContext)
++}
++
++// A Unix socket file appears at bind, before listen. Probe the FC listener without
++// sending a request; UFFD's separate, single-accept socket keeps its existing wait.
++func waitForFCAPISocketWithDial(
++	ctx context.Context,
++	path string,
++	exited <-chan struct{},
++	dial func(context.Context, string, string) (net.Conn, error),
++) error {
++	waitCtx, cancel := context.WithCancelCause(ctx)
++	defer cancel(nil)
++	go func() {
++		select {
++		case <-exited:
++			cancel(errFCAPIProcessExited)
++		case <-waitCtx.Done():
++		}
++	}()
++	cause := func() error {
++		select {
++		case <-exited:
++			return errFCAPIProcessExited
++		default:
++			return context.Cause(waitCtx)
++		}
++	}
++	failure := func(err error) error {
++		return fmt.Errorf("waiting for firecracker API socket %q: %w", path, err)
++	}
++	ticker := time.NewTicker(10 * time.Millisecond)
++	defer ticker.Stop()
++	for {
++		if err := cause(); err != nil {
++			return failure(err)
++		}
++		connection, err := dial(waitCtx, "unix", path)
++		if connection != nil {
++			_ = connection.Close()
++		}
++		if stopped := cause(); stopped != nil {
++			return failure(stopped)
++		}
++		if err == nil {
++			return nil
++		}
++		select {
++		case <-waitCtx.Done():
++			return failure(cause())
++		case <-ticker.C:
++		}
++	}
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/fc/api_socket_test.go
+@@ -0,0 +1,209 @@
++//go:build linux
++
++package fc
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++)
++
++func boundFCAPISocket(t *testing.T) (string, int) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "api.sock")
++	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = syscall.Close(fd) })
++	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(path); err != nil {
++		t.Fatal(err)
++	}
++	return path, fd
++}
++
++func listenFCAPISocket(t *testing.T, fd int) net.Listener {
++	t.Helper()
++	if err := syscall.Listen(fd, 1); err != nil {
++		t.Fatal(err)
++	}
++	duplicate, err := syscall.Dup(fd)
++	if err != nil {
++		t.Fatal(err)
++	}
++	file := os.NewFile(uintptr(duplicate), "bound-api")
++	defer file.Close()
++	listener, err := net.FileListener(file)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = listener.Close() })
++	return listener
++}
++
++func probeEOF(listener net.Listener) <-chan error {
++	done := make(chan error, 1)
++	go func() {
++		connection, err := listener.Accept()
++		if err != nil {
++			done <- err
++			return
++		}
++		defer connection.Close()
++		var b [1]byte
++		_, err = connection.Read(b[:])
++		if errors.Is(err, io.EOF) {
++			done <- nil
++		} else {
++			done <- err
++		}
++	}()
++	return done
++}
++
++func TestFCAPIWaitWaitsForListener(t *testing.T) {
++	path, fd := boundFCAPISocket(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	exited := make(chan struct{})
++	firstProbe := make(chan error, 1)
++	done := make(chan error, 1)
++	var dialer net.Dialer
++	go func() {
++		done <- waitForFCAPISocketWithDial(ctx, path, exited, func(ctx context.Context, network, address string) (net.Conn, error) {
++			connection, err := dialer.DialContext(ctx, network, address)
++			select {
++			case firstProbe <- err:
++			default:
++			}
++			return connection, err
++		})
++	}()
++	select {
++	case err := <-done:
++		t.Fatalf("socket file was accepted before listen: %v", err)
++	case err := <-firstProbe:
++		if err == nil {
++			t.Fatal("bound socket unexpectedly accepted a connection")
++		}
++	}
++	select {
++	case err := <-done:
++		t.Fatalf("readiness returned before listen: %v", err)
++	default:
++	}
++	listener := listenFCAPISocket(t, fd)
++	closed := probeEOF(listener)
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	if err := <-closed; err != nil {
++		t.Fatalf("probe was not closed: %v", err)
++	}
++}
++
++func TestFCAPIWaitReadyClosesProbe(t *testing.T) {
++	path, fd := boundFCAPISocket(t)
++	closed := probeEOF(listenFCAPISocket(t, fd))
++	if err := waitForFCAPISocket(context.Background(), path, make(chan struct{})); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-closed; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestFCAPIWaitCancellation(t *testing.T) {
++	path, _ := boundFCAPISocket(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	probed := make(chan struct{}, 1)
++	done := make(chan error, 1)
++	var dialer net.Dialer
++	go func() {
++		done <- waitForFCAPISocketWithDial(ctx, path, make(chan struct{}), func(ctx context.Context, network, address string) (net.Conn, error) {
++			connection, err := dialer.DialContext(ctx, network, address)
++			select {
++			case probed <- struct{}{}:
++			default:
++			}
++			return connection, err
++		})
++	}()
++	<-probed
++	cancel()
++	if err := <-done; !errors.Is(err, context.Canceled) {
++		t.Fatalf("cancellation lost: %v", err)
++	}
++}
++
++func TestFCAPIWaitClosedProcessDoesNotProbe(t *testing.T) {
++	exited := make(chan struct{})
++	close(exited)
++	called := false
++	err := waitForFCAPISocketWithDial(context.Background(), "unused", exited, func(context.Context, string, string) (net.Conn, error) {
++		called = true
++		return nil, nil
++	})
++	if !errors.Is(err, errFCAPIProcessExited) || called {
++		t.Fatalf("exited process admitted: %v, probe=%v", err, called)
++	}
++}
++
++func TestFCAPIWaitExitCancelsInFlightProbe(t *testing.T) {
++	exited := make(chan struct{})
++	entered := make(chan struct{})
++	done := make(chan error, 1)
++	go func() {
++		done <- waitForFCAPISocketWithDial(context.Background(), "unused", exited, func(ctx context.Context, _, _ string) (net.Conn, error) {
++			close(entered)
++			<-ctx.Done()
++			return nil, ctx.Err()
++		})
++	}()
++	<-entered
++	close(exited)
++	if err := <-done; !errors.Is(err, errFCAPIProcessExited) {
++		t.Fatalf("process exit lost: %v", err)
++	}
++}
++
++func TestFCAPIWaitStoppedAtConnectClosesProbe(t *testing.T) {
++	for _, processExit := range []bool{true, false} {
++		t.Run(map[bool]string{true: "process exit", false: "context cancellation"}[processExit], func(t *testing.T) {
++			path, fd := boundFCAPISocket(t)
++			closed := probeEOF(listenFCAPISocket(t, fd))
++			exited := make(chan struct{})
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			var dialer net.Dialer
++			err := waitForFCAPISocketWithDial(ctx, path, exited, func(ctx context.Context, network, address string) (net.Conn, error) {
++				connection, err := dialer.DialContext(ctx, network, address)
++				if processExit {
++					close(exited)
++				} else {
++					cancel()
++				}
++				return connection, err
++			})
++			want := errFCAPIProcessExited
++			if !processExit {
++				want = context.Canceled
++			}
++			if !errors.Is(err, want) {
++				t.Fatalf("stopped startup reported ready: %v", err)
++			}
++			if err := <-closed; err != nil {
++				t.Fatal(err)
++			}
++		})
++	}
++}

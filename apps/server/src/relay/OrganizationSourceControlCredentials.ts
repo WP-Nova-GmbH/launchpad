@@ -9,11 +9,18 @@
  * (ADR-0015). The token lives in memory only, is refreshed before it expires,
  * and is handed to child processes one spawn at a time by `VcsProcess`.
  *
- * On a personal machine the service is simply not provided, and nothing here
- * runs.
+ * Private thread VMs use the separate repository-scoped branch below; they never
+ * receive the organization-wide token. Personal environments keep ambient logins.
  *
  * @module relay/OrganizationSourceControlCredentials
  */
+import {
+  mintThreadVmRepositoryCredential,
+  readThreadVmRepository,
+  ThreadVmRepositoryCredentialError,
+} from "./ThreadVmRepositoryCredentials.ts";
+import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
+import * as Redacted from "effect/Redacted";
 import { RelayApi } from "@t3tools/contracts/relay";
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import * as Cause from "effect/Cause";
@@ -50,6 +57,10 @@ export class OrganizationSourceControlCredentials extends Context.Service<
      * caller keeps whatever ambient credentials the machine has.
      */
     readonly github: Effect.Effect<OrganizationGithubCredential | null>;
+    /** Present in an enrolled private thread VM; takes precedence over every broad credential. */
+    readonly threadVm: {
+      readonly github: Effect.Effect<Redacted.Redacted<string>, ThreadVmRepositoryCredentialError>;
+    } | null;
   }
 >()("t3/relay/OrganizationSourceControlCredentials") {}
 
@@ -77,17 +88,39 @@ export const make = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
   const httpClient = yield* HttpClient.HttpClient;
+  const identity = { getEnvironmentId: serverEnvironment.getEnvironmentId };
+  const vm = yield* readInstalledThreadVm().pipe(
+    Effect.mapError(() => new ThreadVmRepositoryCredentialError()),
+  );
+  if (vm !== null) {
+    if (vm.environmentId !== (yield* identity.getEnvironmentId))
+      return yield* new ThreadVmRepositoryCredentialError();
+    return OrganizationSourceControlCredentials.of({
+      github: Effect.succeed(null),
+      threadVm: {
+        // Move import installs the binding after server services are constructed.
+        // Resolve it for each request so missing or stale bindings never use broad credentials.
+        github: Effect.gen(function* () {
+          const repository = yield* readThreadVmRepository();
+          if (repository === null) return yield* new ThreadVmRepositoryCredentialError();
+          return (yield* mintThreadVmRepositoryCredential(repository)).token;
+        }).pipe(
+          Effect.provideService(ServerSecretStore.ServerSecretStore, secrets),
+          Effect.provideService(ServerEnvironment.ServerEnvironmentIdentity, identity),
+          Effect.provideService(HttpClient.HttpClient, httpClient),
+        ),
+      },
+    });
+  }
   const stateRef = yield* Ref.make<CredentialState>({ _tag: "empty" });
   const refreshLock = yield* Semaphore.make(1);
 
   const unavailable = (retryAfter: Duration.Duration) =>
     DateTime.now.pipe(
-      Effect.map(
-        (now): CredentialState => ({
-          _tag: "unavailable",
-          retryAtMillis: now.epochMilliseconds + Duration.toMillis(retryAfter),
-        }),
-      ),
+      Effect.map((now): CredentialState => ({
+        _tag: "unavailable",
+        retryAtMillis: now.epochMilliseconds + Duration.toMillis(retryAfter),
+      })),
     );
 
   const mint = Effect.fn("OrganizationSourceControlCredentials.mint")(
@@ -154,7 +187,7 @@ export const make = Effect.gen(function* () {
     }),
   );
 
-  return OrganizationSourceControlCredentials.of({ github });
+  return OrganizationSourceControlCredentials.of({ github, threadVm: null });
 });
 
 export const layer = Layer.effect(OrganizationSourceControlCredentials, make).pipe(
@@ -164,5 +197,5 @@ export const layer = Layer.effect(OrganizationSourceControlCredentials, make).pi
 /** No organization behind this process: tests, and tooling that never runs as an executor. */
 export const layerNone = Layer.succeed(
   OrganizationSourceControlCredentials,
-  OrganizationSourceControlCredentials.of({ github: Effect.succeed(null) }),
+  OrganizationSourceControlCredentials.of({ github: Effect.succeed(null), threadVm: null }),
 );

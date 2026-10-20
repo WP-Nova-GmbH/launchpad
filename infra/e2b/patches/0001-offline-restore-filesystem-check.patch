@@ -1,0 +1,305 @@
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -599,6 +599,14 @@
+   separate opt-in full-filesystem repair path. Gated by the `preboot-fs-recovery` flag, separate
+   from `fs-only-resume-api` because it also changes the behavior of existing filesystem-only cold
+   boots.
++- **Prepared-restore filesystem check**: `rootfs.PrepareRestoreFilesystem` operates
++  only on an unmounted private COW disk, before any guest execution. It requires a
++  confirmed journal replay followed by a jailed, read-only full `e2fsck -f -n`
++  scan. Unavailable tooling, timeout, cancellation or a non-clean result rejects
++  preparation; the ordinary resume recovery policy is unchanged. This is a disk
++  verification primitive, not a restore API or an ownership commit. Callers still
++  need durable artifact ownership, source pins, identity preparation and explicit
++  activation before using it for managed restores.
+ - **Envd live-upgrade on resume**: the orchestrator can upgrade the sandbox's envd to a newer
+   node-local build during resume (gated by the `envd-upgrade-target` flag in
+   `packages/shared/pkg/featureflags`), via envd's `POST /upgrade` (see the envd section). It is
+--- a/packages/orchestrator/pkg/sandbox/rootfs/fs_recover_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/fs_recover_linux.go
+@@ -416,22 +416,29 @@
+ //
+ // Returns (sentinel stdout, run error).
+ func runE2fsck(ctx context.Context, devicePath string) ([]byte, error) {
++	return runJailedE2fsck(ctx, devicePath, FsRecoverTimeout, "-p", "-E", "journal_only")
++}
++
++// runJailedE2fsck shares the same confinement for journal replay and a full
++// read-only restore check. Tool arguments are fixed by these two callers.
++func runJailedE2fsck(ctx context.Context, devicePath string, timeout time.Duration, toolArgs ...string) ([]byte, error) {
+ 	if !nbdDevicePath.MatchString(devicePath) {
+ 		return nil, fmt.Errorf("%w %q", errDeviceRefused, devicePath)
+ 	}
+ 
+-	unit := "fs-recover-" + uuid.NewString()
+-
+-	// $0 is the device; e2fsck's stdout goes to stderr so only the sentinel reaches
++	unit := "fs-check-" + uuid.NewString()
++
++	// Tool arguments are positional; e2fsck's stdout goes to stderr so only the sentinel reaches
+ 	// stdout. The `1>&2` dup cannot fail, so printf always echoes the wrapped
+ 	// command's real exit; a fallible redirect (e.g. `>/dev/null`) could run printf
+ 	// on the shell's own exit and boot an fs e2fsck never opened. /usr binds are
+ 	// jail read-only.
+-	script := e2fsckPath + ` -p -E journal_only "$0" 1>&2; printf '__E2FSCK_RC__%d__' "$?"`
+-	args := append(jailProperties(unit, FsRecoverTimeout, devicePath),
+-		"--",
+-		"/bin/sh", "-c", script, devicePath,
++	script := `"$@" 1>&2; printf '__E2FSCK_RC__%d__' "$?"`
++	args := append(jailProperties(unit, timeout, devicePath),
++		"--", "/bin/sh", "-c", script, "e2fsck", e2fsckPath,
+ 	)
++	args = append(args, toolArgs...)
++	args = append(args, devicePath)
+ 
+ 	rcOut := &cappedBuffer{limit: 4 << 10}
+ 	cmd := exec.CommandContext(ctx, "systemd-run", args...)
+--- a/packages/orchestrator/pkg/sandbox/rootfs/jail_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/jail_linux.go
+@@ -60,7 +60,10 @@
+ 		// visible, plus any tool-specific bind below.
+ 		"--property=TemporaryFileSystem=/",
+ 		"--property=BindReadOnlyPaths=/usr",
+-		"--property=BindReadOnlyPaths=/usr/lib64:/lib64",
++		// ARM64 Ubuntu has its loader under /usr/lib and no /usr/lib64.
++		// Bind the extra loader directory when present; do not fail the jail
++		// before the checker starts on hosts which do not use it.
++		"--property=BindReadOnlyPaths=-/usr/lib64:/lib64",
+ 		"--property=BindReadOnlyPaths=/usr/lib:/lib",
+ 		"--property=BindReadOnlyPaths=/usr/bin:/bin",
+ 		"--property=BindReadOnlyPaths=/usr/sbin:/sbin",
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepare_restore_linux.go
+@@ -0,0 +1,67 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"time"
++)
++
++// FsVerifyTimeout bounds a full read-only scan, which is more expensive than
++// journal replay. Neither a timeout nor unavailable host tooling verifies a disk.
++const FsVerifyTimeout = 5 * time.Minute
++
++var ErrRestoreFilesystemUnverified = errors.New("prepared restore filesystem could not be verified")
++
++// PrepareRestoreFilesystem recovers and checks an unmounted, private COW copy of
++// a saved rootfs without executing any guest code or mounting it in the host
++// kernel. The caller owns the NBD device and must exclude concurrent writers.
++// Never pass the source VM's live disk: journal replay writes to this copy.
++// Success verifies filesystem structure, not application-level data integrity.
++func PrepareRestoreFilesystem(ctx context.Context, devicePath string) error {
++	if !nbdDevicePath.MatchString(devicePath) {
++		return fmt.Errorf("%w %q", errDeviceRefused, devicePath)
++	}
++
++	return prepareRestoreFilesystem(ctx, devicePath, RecoverFilesystem,
++		func(ctx context.Context, path string) ([]byte, error) {
++			return runJailedE2fsck(ctx, path, FsVerifyTimeout, "-f", "-n")
++		})
++}
++
++func prepareRestoreFilesystem(
++	ctx context.Context,
++	devicePath string,
++	recover func(context.Context, string) (RecoverOutcome, RecoverReason, error),
++	check func(context.Context, string) ([]byte, error),
++) error {
++	if err := ctx.Err(); err != nil {
++		return errors.Join(ErrRestoreFilesystemUnverified, err)
++	}
++
++	outcome, reason, err := recover(ctx, devicePath)
++	if err != nil || outcome != RecoverOutcomeReplayed {
++		return errors.Join(ErrRestoreFilesystemUnverified,
++			fmt.Errorf("journal recovery not verified: %s (%s)", outcome, reason), err)
++	}
++	if err := ctx.Err(); err != nil {
++		return errors.Join(ErrRestoreFilesystemUnverified, err)
++	}
++
++	checkCtx, cancel := context.WithTimeout(ctx, FsVerifyTimeout)
++	defer cancel()
++	result, runErr := check(checkCtx, devicePath)
++	if err := errors.Join(runErr, checkCtx.Err()); err != nil {
++		return errors.Join(ErrRestoreFilesystemUnverified, err)
++	}
++	code, present := e2fsckRC(result)
++	// The scan is read-only. Even "corrected errors" is not an acceptable result:
++	// it would mean the checker ran in a different mode than the one we requested.
++	if !present || code != 0 {
++		return fmt.Errorf("%w: full scan exit code %d (result present: %t)", ErrRestoreFilesystemUnverified, code, present)
++	}
++
++	return nil
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepare_restore_linux_test.go
+@@ -0,0 +1,77 @@
++//go:build linux
++
++package rootfs
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestPrepareRestoreFilesystem(t *testing.T) {
++	t.Parallel()
++
++	for _, tc := range []struct {
++		name        string
++		outcome     RecoverOutcome
++		recoveryErr error
++		checkOutput []byte
++		checkErr    error
++		wantCheck   bool
++		wantSuccess bool
++	}{
++		{name: "verified", outcome: RecoverOutcomeReplayed, checkOutput: rcStream(0), wantCheck: true, wantSuccess: true},
++		{name: "recovery could not launch", outcome: RecoverOutcomeFailedOpen},
++		{name: "recovery failed", outcome: RecoverOutcomeFailed, recoveryErr: errors.New("device unavailable")},
++		{name: "unrepaired filesystem", outcome: RecoverOutcomeReplayed, checkOutput: rcStream(4), wantCheck: true},
++		{name: "check could not launch", outcome: RecoverOutcomeReplayed, checkErr: errors.New("systemd unavailable"), wantCheck: true},
++		{name: "missing result", outcome: RecoverOutcomeReplayed, wantCheck: true},
++		{name: "check unexpectedly wrote", outcome: RecoverOutcomeReplayed, checkOutput: rcStream(1), wantCheck: true},
++		{name: "success text with failed process", outcome: RecoverOutcomeReplayed, checkOutput: rcStream(0), checkErr: errors.New("interrupted"), wantCheck: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			checked := false
++			err := prepareRestoreFilesystem(t.Context(), "/dev/nbd0",
++				func(context.Context, string) (RecoverOutcome, RecoverReason, error) {
++					return tc.outcome, "", tc.recoveryErr
++				},
++				func(context.Context, string) ([]byte, error) {
++					checked = true
++					return tc.checkOutput, tc.checkErr
++				})
++			require.Equal(t, tc.wantCheck, checked)
++			if tc.wantSuccess {
++				require.NoError(t, err)
++			} else {
++				require.ErrorIs(t, err, ErrRestoreFilesystemUnverified)
++			}
++		})
++	}
++}
++
++func TestPrepareRestoreFilesystemCancelled(t *testing.T) {
++	t.Parallel()
++	ctx, cancel := context.WithCancel(t.Context())
++	checked := false
++	err := prepareRestoreFilesystem(ctx, "/dev/nbd0",
++		func(context.Context, string) (RecoverOutcome, RecoverReason, error) {
++			cancel()
++			return RecoverOutcomeReplayed, RecoverReasonNothingToDo, nil
++		},
++		func(context.Context, string) ([]byte, error) {
++			checked = true
++			return rcStream(0), nil
++		})
++	require.ErrorIs(t, err, context.Canceled)
++	require.False(t, checked)
++}
++
++func TestPrepareRestoreFilesystemRefusesOtherDevices(t *testing.T) {
++	t.Parallel()
++	for _, path := range []string{"/dev/sda", "/tmp/disk.img", "/dev/nbd0/../sda"} {
++		require.ErrorIs(t, PrepareRestoreFilesystem(t.Context(), path), errDeviceRefused)
++	}
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepare_restore_integration_test.go
+@@ -0,0 +1,82 @@
++//go:build linux && integration
++
++package rootfs
++
++import (
++	"context"
++	"crypto/sha256"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
++	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
++	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++)
++
++// Run only on a dedicated Linux host with NBD, systemd and e2fsprogs. No guest
++// filesystem is mounted and no Firecracker process or guest networking is started.
++func TestPrepareRestoreFilesystemOffline(t *testing.T) {
++	if os.Getenv("E2B_OFFLINE_RESTORE_TEST") != "1" {
++		t.Skip("set E2B_OFFLINE_RESTORE_TEST=1 on the dedicated compute test host")
++	}
++
++	dir := t.TempDir()
++	original := filepath.Join(dir, "source.ext4")
++	file, err := os.Create(original)
++	require.NoError(t, err)
++	require.NoError(t, file.Truncate(64<<20))
++	require.NoError(t, file.Close())
++	output, err := exec.CommandContext(t.Context(), "mkfs.ext4", "-F", "-q", original).CombinedOutput()
++	require.NoError(t, err, "%s", output)
++	before, err := os.ReadFile(original)
++	require.NoError(t, err)
++	checksum := sha256.Sum256(before)
++
++	base, err := block.NewLocal(original, header.RootfsBlockSize, uuid.New())
++	require.NoError(t, err)
++	defer base.Close()
++	cache, err := block.NewCache(64<<20, header.RootfsBlockSize, filepath.Join(dir, "private.cow"), false)
++	require.NoError(t, err)
++	overlay := block.NewOverlay(base, cache)
++	defer overlay.Close()
++
++	flags, err := featureflags.NewClient()
++	require.NoError(t, err)
++	pool, err := nbd.NewDevicePool(1)
++	require.NoError(t, err)
++	ctx, cancel := context.WithCancel(t.Context())
++	defer cancel()
++	go pool.Populate(ctx)
++	defer pool.Close(context.WithoutCancel(ctx))
++	mount := nbd.NewDirectPathMount(overlay, pool, flags, logger.NewNopLogger())
++	index, err := mount.Open(ctx)
++	require.NoError(t, err)
++	defer func() { require.NoError(t, mount.Close(context.WithoutCancel(ctx))) }()
++	devicePath := nbd.GetDevicePath(index)
++
++	require.NoError(t, PrepareRestoreFilesystem(ctx, devicePath))
++	// Corrupt only the private copy. A broken destination must fail without
++	// damaging the recovery source, which remains usable for another attempt.
++	// Break the root directory link count while keeping its inode checksum
++	// valid. Journal replay does not walk directory references; a full scan does.
++	output, err = exec.CommandContext(ctx, "debugfs", "-w", "-R",
++		"set_inode_field / links_count 42", devicePath).CombinedOutput()
++	require.NoError(t, err, "%s", output)
++	output, err = exec.CommandContext(ctx, "debugfs", "-R", "stat /", devicePath).CombinedOutput()
++	require.NoError(t, err)
++	require.Contains(t, string(output), "Links: 42", "fixture corruption was not applied")
++	outcome, _, err := RecoverFilesystem(ctx, devicePath)
++	require.NoError(t, err)
++	require.Equal(t, RecoverOutcomeReplayed, outcome)
++	require.ErrorIs(t, PrepareRestoreFilesystem(ctx, devicePath), ErrRestoreFilesystemUnverified)
++	after, err := os.ReadFile(original)
++	require.NoError(t, err)
++	require.Equal(t, checksum, sha256.Sum256(after), "verification or failed preparation changed the source")
++}

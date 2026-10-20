@@ -13,6 +13,7 @@ import {
   ClientSurface,
   CommandId,
   EventId,
+  EnvironmentId,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
@@ -914,6 +915,7 @@ export const ThreadPromptPauseReason = Schema.Struct({
 export type ThreadPromptPauseReason = typeof ThreadPromptPauseReason.Type;
 
 export const ThreadPromptQueueEntry = Schema.Struct({
+  kind: Schema.optional(Schema.Literal("prompt")),
   messageId: MessageId,
   text: Schema.String,
   attachments: Schema.Array(ChatAttachment),
@@ -932,6 +934,32 @@ export const ThreadPromptQueueEntry = Schema.Struct({
   state: Schema.Literals(["pending", "delivering", "unknown"]),
 });
 export type ThreadPromptQueueEntry = typeof ThreadPromptQueueEntry.Type;
+export const ThreadMoveDestination = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("vm") }),
+  Schema.Struct({
+    kind: Schema.Literal("environment"),
+    environmentId: EnvironmentId,
+    projectId: ProjectId,
+  }),
+]);
+export type ThreadMoveDestination = typeof ThreadMoveDestination.Type;
+export const ThreadMoveQueueEntry = Schema.Struct({
+  kind: Schema.Literal("move"),
+  // Queue identities historically use messageId; a move never creates a chat message.
+  messageId: MessageId,
+  destination: ThreadMoveDestination,
+  author: Schema.optional(AuthSessionUser),
+  editedBy: Schema.optional(AuthSessionUser),
+  revision: NonNegativeInt,
+  acceptedSequence: NonNegativeInt,
+  createdAt: IsoDateTime,
+  state: Schema.Literals(["pending", "moving", "blocked", "cancelling"]),
+  operationId: Schema.optional(CommandId),
+  detail: Schema.optional(Schema.String),
+});
+export type ThreadMoveQueueEntry = typeof ThreadMoveQueueEntry.Type;
+export const ThreadQueueEntry = Schema.Union([ThreadMoveQueueEntry, ThreadPromptQueueEntry]);
+export type ThreadQueueEntry = typeof ThreadQueueEntry.Type;
 export const ThreadPromptHandoff = Schema.Struct({
   attemptId: CommandId,
   messageId: MessageId,
@@ -958,7 +986,7 @@ export const ThreadPromptAdmission = Schema.Struct({
 export const ThreadPromptQueue = Schema.Struct({
   preparation: Schema.optional(ThreadPreparation),
   ...ThreadPromptQueueControl.fields,
-  entries: Schema.Array(ThreadPromptQueueEntry),
+  entries: Schema.Array(ThreadQueueEntry),
   handoff: Schema.NullOr(ThreadPromptHandoff),
   awaitingTurnId: Schema.NullOr(TurnId),
   admissions: Schema.Array(ThreadPromptAdmission),
@@ -974,7 +1002,8 @@ export const ThreadPromptQueueSummary = Schema.Struct({
 export const ThreadPromptQueueChangedPayload = Schema.Struct({
   preparation: Schema.optional(ThreadPreparation),
   threadId: ThreadId,
-  entry: Schema.optional(ThreadPromptQueueEntry),
+  entry: Schema.optional(ThreadQueueEntry),
+  order: Schema.optional(Schema.Array(MessageId)),
   removedMessageId: Schema.optional(MessageId),
   control: Schema.optional(ThreadPromptQueueControl),
   handoff: Schema.optional(Schema.NullOr(ThreadPromptHandoff)),
@@ -1077,7 +1106,15 @@ export const OrchestrationProjectShell = Schema.Struct({
 });
 export type OrchestrationProjectShell = typeof OrchestrationProjectShell.Type;
 
+export const ThreadRelayRouting = Schema.Struct({
+  relayUrl: TrimmedNonEmptyString,
+  generation: NonNegativeInt,
+  phase: Schema.Literals(["active", "draining", "frozen", "retired"]),
+});
+export type ThreadRelayRouting = typeof ThreadRelayRouting.Type;
+
 export const OrchestrationThreadShell = Schema.Struct({
+  relayRouting: Schema.optional(ThreadRelayRouting),
   promptQueueSummary: Schema.optional(ThreadPromptQueueSummary),
   id: ThreadId,
   projectId: ProjectId,
@@ -1549,12 +1586,69 @@ const ThreadPromptSteerCommand = Schema.Struct({
   expectedTurnId: TurnId,
   author: Schema.optional(AuthSessionUser),
 });
-const ThreadQueuePauseCommand = Schema.Struct({
+export const ThreadMoveEnqueueCommand = Schema.Struct({
+  type: Schema.Literal("thread.move.enqueue"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  destination: ThreadMoveDestination,
+  position: Schema.optional(Schema.Literals(["next", "last"])),
+  author: Schema.optional(AuthSessionUser),
+});
+const ThreadMoveEditCommand = Schema.Struct({
+  type: Schema.Literal("thread.move.edit"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  destination: ThreadMoveDestination,
+  author: Schema.optional(AuthSessionUser),
+});
+const ThreadMoveCancelCommand = Schema.Struct({
+  type: Schema.Literal("thread.move.cancel"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  author: Schema.optional(AuthSessionUser),
+});
+// Only the move worker emits pending notices and acknowledges relay-owned moves.
+// Clients can request cancellation but cannot acknowledge completion.
+const ThreadMoveClaimCommand = Schema.Struct({
+  type: Schema.Literal("thread.move.claim"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  expectedControlRevision: NonNegativeInt,
+});
+const ThreadMoveProgressCommand = Schema.Struct({
+  type: Schema.Literal("thread.move.progress"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  // Pending-head notices do not claim a move or acquire an ownership operation.
+  operationId: Schema.optional(CommandId),
+  expectedRevision: NonNegativeInt,
+  detail: Schema.String,
+  blocked: Schema.Boolean,
+});
+const ThreadMoveFinishCommand = Schema.Struct({
+  type: Schema.Literal("thread.move.finish"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  operationId: CommandId,
+  expectedRevision: NonNegativeInt,
+  outcome: Schema.Literals(["completed", "cancelled"]),
+});
+const ThreadQueueReorderCommand = Schema.Struct({
+  type: Schema.Literal("thread.queue.reorder"),
+  ...PromptCommandFields,
+  expectedRevision: NonNegativeInt,
+  order: Schema.Array(MessageId),
+  author: Schema.optional(AuthSessionUser),
+});
+export const ThreadQueuePauseCommand = Schema.Struct({
   type: Schema.Literal("thread.queue.pause"),
   ...PromptCommandFields,
   author: Schema.optional(AuthSessionUser),
 });
-const ThreadQueueResumeCommand = Schema.Struct({
+export const ThreadQueueResumeCommand = Schema.Struct({
   type: Schema.Literal("thread.queue.resume"),
   ...PromptCommandFields,
   expectedRevision: NonNegativeInt,
@@ -1731,6 +1825,10 @@ const ThreadSessionStopCommand = Schema.Struct({
 });
 
 const DispatchableClientOrchestrationCommand = Schema.Union([
+  ThreadMoveEnqueueCommand,
+  ThreadMoveEditCommand,
+  ThreadMoveCancelCommand,
+  ThreadQueueReorderCommand,
   ThreadPromptEnqueueCommand,
   ThreadPromptEditCommand,
   ThreadPromptRemoveCommand,
@@ -1774,6 +1872,10 @@ export type DispatchableClientOrchestrationCommand =
   typeof DispatchableClientOrchestrationCommand.Type;
 
 export const ClientOrchestrationCommand = Schema.Union([
+  ThreadMoveEnqueueCommand,
+  ThreadMoveEditCommand,
+  ThreadMoveCancelCommand,
+  ThreadQueueReorderCommand,
   ClientThreadPromptEnqueueCommand,
   ClientThreadPromptEditCommand,
   ThreadPromptRemoveCommand,
@@ -1814,6 +1916,45 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadSessionStopCommand,
 ]);
 export type ClientOrchestrationCommand = typeof ClientOrchestrationCommand.Type;
+
+/** Existing-thread inbox commands. Move requests join the queue; ownership acknowledgements use the move protocol. */
+export const PortableThreadCommand = Schema.Union([
+  ThreadMoveEnqueueCommand,
+  ThreadMoveEditCommand,
+  ThreadMoveCancelCommand,
+  ThreadQueueReorderCommand,
+  ClientThreadPromptEnqueueCommand,
+  ClientThreadPromptEditCommand,
+  ThreadPromptRemoveCommand,
+  ThreadPromptSteerCommand,
+  ThreadQueuePauseCommand,
+  ThreadQueueResumeCommand,
+  ThreadQueueResolveCommand,
+  ThreadPreparationRetryCommand,
+  ThreadArchiveCommand,
+  ThreadUnarchiveCommand,
+  ThreadSettleCommand,
+  ThreadUnsettleCommand,
+  ThreadSnoozeCommand,
+  ThreadUnsnoozeCommand,
+  ThreadPinCommand,
+  ThreadUnpinCommand,
+  ThreadAutoSettleSetCommand,
+  ThreadMetaUpdateCommand,
+  ThreadPullRequestLinkCommand,
+  ThreadPullRequestUnlinkCommand,
+  ThreadRuntimeModeSetCommand,
+  ThreadInteractionModeSetCommand,
+  ClientThreadTurnStartCommand,
+  ThreadTurnInterruptCommand,
+  ThreadApprovalRespondCommand,
+  ThreadUserInputRespondCommand,
+  ThreadUserInputDismissCommand,
+  ThreadCheckpointRevertCommand,
+  ThreadConversationRevertCommand,
+  ThreadSessionStopCommand,
+]);
+export type PortableThreadCommand = typeof PortableThreadCommand.Type;
 
 const ThreadSessionSetCommand = Schema.Struct({
   type: Schema.Literal("thread.session.set"),
@@ -1986,6 +2127,9 @@ const ThreadPullRequestLinkSyncCommand = Schema.Struct({
 });
 
 const InternalOrchestrationCommand = Schema.Union([
+  ThreadMoveClaimCommand,
+  ThreadMoveProgressCommand,
+  ThreadMoveFinishCommand,
   ThreadPreparationUpdateCommand,
   ThreadPromptClaimCommand,
   ThreadPromptAdmitCommand,
@@ -2026,6 +2170,7 @@ export const OrchestrationEventType = Schema.Literals([
   "project.meta-updated",
   "project.deleted",
   "thread.created",
+  "thread.placement-imported",
   "thread.deleted",
   "thread.archived",
   "thread.unarchived",
@@ -2107,6 +2252,14 @@ export const ThreadCreatedPayload = Schema.Struct({
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadPlacementImportedPayload = Schema.Struct({
+  threadId: ThreadId,
+  projectId: ProjectId,
+  branch: Schema.NullOr(TrimmedNonEmptyString),
+  worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   updatedAt: IsoDateTime,
 });
 
@@ -2404,6 +2557,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.created"),
     payload: ThreadCreatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.placement-imported"),
+    payload: ThreadPlacementImportedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

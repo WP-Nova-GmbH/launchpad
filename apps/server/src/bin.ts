@@ -1,3 +1,13 @@
+import {
+  threadVmEnrollmentCommand,
+  threadVmProviderAuthCommand,
+  threadVmRestoreIdentityCommand,
+  threadVmRestoreCleanupCommand,
+  threadVmRestoreImportCommand,
+  threadVmSetupCommand,
+  threadVmServeCommand,
+  threadVmGitCredentialCommand,
+} from "./cli/threadVm.ts";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
@@ -71,6 +81,14 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
       serviceLauncherCommand,
       claudeHistoryCommand,
       servicePreflightCommand,
+      threadVmEnrollmentCommand,
+      threadVmProviderAuthCommand,
+      threadVmRestoreIdentityCommand,
+      threadVmRestoreCleanupCommand,
+      threadVmRestoreImportCommand,
+      threadVmSetupCommand,
+      threadVmServeCommand,
+      threadVmGitCredentialCommand,
       sshHelperCommand,
       themeCommand,
       triageCommand,

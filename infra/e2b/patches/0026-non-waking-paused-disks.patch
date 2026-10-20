@@ -1,0 +1,529 @@
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -675,6 +675,7 @@
+ 
+ // LaunchpadRuntimeCapabilities defines model for LaunchpadRuntimeCapabilities.
+ type LaunchpadRuntimeCapabilities struct {
++	PausedSnapshots          bool `json:"pausedSnapshots"`
+ 	BuildCollectionAdmission bool `json:"buildCollectionAdmission"`
+ 	DiskRestore              bool `json:"diskRestore"`
+ 	ExecutionBuildRoots      bool `json:"executionBuildRoots"`
+--- a/packages/api/internal/handlers/launchpad_capabilities_test.go
++++ b/packages/api/internal/handlers/launchpad_capabilities_test.go
+@@ -47,8 +47,22 @@
+ 			require.Equal(t, tc.renewable, capabilities.RenewableLifetime)
+ 			require.True(t, capabilities.DiskRestore)
+ 			require.True(t, capabilities.QuiescedSnapshots)
++			require.True(t, capabilities.PausedSnapshots)
+ 			require.True(t, capabilities.ExecutionBuildRoots)
+ 			require.False(t, capabilities.LiveBuildCollection, "unknown host cannot claim guarded live storage")
+ 		})
+ 	}
+ }
++
++func TestLaunchpadPausedSnapshotAlias(t *testing.T) {
++	operation := uuid.New().String()
++	for _, prefix := range []string{"launchpad-backup-", "launchpad-final-"} {
++		require.True(t, launchpadPausedSnapshotAlias(prefix+operation))
++		for _, invalid := range []string{"", "other", "{" + operation + "}", operation + "-extra"} {
++			require.False(t, launchpadPausedSnapshotAlias(prefix+invalid))
++		}
++	}
++	for _, alias := range []string{operation, "another-" + operation, "launchpad-final-other-" + operation} {
++		require.False(t, launchpadPausedSnapshotAlias(alias))
++	}
++}
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -33,7 +33,7 @@
+ 		a.sendAPIStoreError(c, http.StatusForbidden, "Launchpad restore is not enabled for this team")
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{Version: 1, DiskRestore: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
++	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
+ }
+ 
+ func canonicalRestoreRequest(body api.LaunchpadRestoreRequest) ([]byte, error) {
+--- a/packages/api/internal/handlers/snapshot_template_create.go
++++ b/packages/api/internal/handlers/snapshot_template_create.go
+@@ -5,6 +5,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"strings"
+ 
+ 	"github.com/gin-gonic/gin"
+ 	"go.opentelemetry.io/otel/trace"
+@@ -15,12 +16,26 @@
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+ 	"github.com/e2b-dev/infra/packages/api/internal/utils"
+ 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+ 	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
++	"github.com/google/uuid"
+ )
++
++// Both periodic backups and final saves retain the same immutable paused disk.
++// Only operation-scoped names may use this non-waking path.
++func launchpadPausedSnapshotAlias(alias string) bool {
++	for _, prefix := range []string{"launchpad-backup-", "launchpad-final-"} {
++		if suffix, ok := strings.CutPrefix(alias, prefix); ok {
++			parsed, err := uuid.Parse(suffix)
++			return err == nil && parsed.String() == suffix
++		}
++	}
++	return false
++}
+ 
+ func (a *APIStore) PostSandboxesSandboxIDSnapshots(c *gin.Context, sandboxID api.SandboxID) {
+ 	ctx := c.Request.Context()
+@@ -102,7 +117,21 @@
+ 
+ 	sbx, err := a.orchestrator.GetSandbox(ctx, teamID, sandboxID)
+ 	if err != nil {
+-		if errors.Is(err, sandbox.ErrNotFound) {
++		if errors.Is(err, sandbox.ErrNotFound) && a.restoreAdmissionEnabled(teamID) &&
++			opts.Alias != nil && opts.Namespace != nil && opts.Tag == id.DefaultTag &&
++			launchpadPausedSnapshotAlias(*opts.Alias) {
++			templateID, retainErr := (executions.Store{DB: a.sqlcDB}).RetainPausedDisk(ctx, teamID, sandboxID, *opts.Namespace, *opts.Alias)
++			if retainErr != nil {
++				a.sendAPIStoreError(c, http.StatusConflict, "A confirmed paused disk is unavailable; keep the sandbox")
++				return
++			}
++			// Cache invalidation is harmless on an idempotent retry. The build
++			// stays immutable and no host/guest execution method is called.
++			a.templateCache.InvalidateAlias(context.WithoutCancel(ctx), opts.Namespace, *opts.Alias)
++			a.templateCache.Invalidate(context.WithoutCancel(ctx), templateID, &opts.Tag)
++			name := id.WithNamespace(*opts.Namespace, *opts.Alias)
++			c.JSON(http.StatusCreated, api.SnapshotInfo{SnapshotID: id.WithTag(name, opts.Tag), Names: []string{name}})
++		} else if errors.Is(err, sandbox.ErrNotFound) {
+ 			a.sendAPIStoreError(c, http.StatusNotFound, utils.SandboxNotFoundMsg(sandboxID))
+ 		} else {
+ 			telemetry.ReportError(ctx, "error getting sandbox for snapshot", err)
+--- a/packages/api/internal/orchestrator/pause_instance.go
++++ b/packages/api/internal/orchestrator/pause_instance.go
+@@ -13,6 +13,7 @@
+ 
+ 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+@@ -74,6 +75,39 @@
+ 		return fmt.Errorf("error pausing sandbox: %w", err)
+ 	}
+ 
++	// Record the exact physically stopped execution only after the filesystem
++	// snapshot is published successfully. A Redis miss alone is not a pause proof.
++	if filesystemOnly && sbx.Metadata["launchpad.managed"] == "thread-vm-v1" {
++		executionID, err := uuid.Parse(sbx.ExecutionID)
++		if err != nil {
++			return err
++		}
++		proofCtx, cancel := detachedBuildStatusCtx(ctx)
++		defer cancel()
++		confirm := func(attempts []queries.SandboxExecutionAttempt) error {
++			for _, attempt := range attempts {
++				client, child, err := o.RestoreClient(proofCtx, attempt.ClusterID, attempt.NodeID)
++				if err != nil {
++					return err
++				}
++				receipt, err := client.StopExecution(child, &orchestrator.StopExecutionRequest{
++					TeamId: attempt.TeamID.String(), SandboxId: attempt.SandboxID,
++					ExecutionId: attempt.ExecutionID.String(), RegisteredBeforeStart: true,
++				})
++				if err != nil {
++					return err
++				}
++				if !receipt.GetPhysicallyStopped() || receipt.GetTeamId() != attempt.TeamID.String() ||
++					receipt.GetSandboxId() != attempt.SandboxID || receipt.GetExecutionId() != attempt.ExecutionID.String() {
++					return errors.New("pause physical stop is unconfirmed")
++				}
++			}
++			return nil
++		}
++		if err := (executions.Store{DB: o.sqlcDB}).MarkPaused(proofCtx, sbx.TeamID, sbx.SandboxID, executionID, result.BuildID, confirm); err != nil {
++			return err
++		}
++	}
+ 	o.snapshotCache.Invalidate(context.WithoutCancel(ctx), sbx.SandboxID)
+ 
+ 	return nil
+--- a/packages/db/pkg/executions/store.go
++++ b/packages/db/pkg/executions/store.go
+@@ -36,7 +36,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	if state != "active" {
++	if state != "active" && state != "paused" {
+ 		return ErrFenced
+ 	}
+ 	// The fence row serializes concurrent registrations for this sandbox. Never
+@@ -48,6 +48,9 @@
+ 		return err
+ 	}
+ 	if existing {
++		if state == "paused" {
++			return ErrFenced
++		}
+ 		var recorded uuid.UUID
+ 		err := tx.QueryRow(ctx, `SELECT build_id FROM public.sandbox_execution_build_roots
+             WHERE team_id=$1 AND sandbox_id=$2 AND execution_id=$3 AND cluster_id=$4 AND node_id=$5`,
+@@ -58,6 +61,13 @@
+ 		if err != nil {
+ 			return err
+ 		}
++		var current *uuid.UUID
++		if err := tx.QueryRow(ctx, `SELECT current_execution_id FROM public.sandbox_execution_fences WHERE team_id=$1 AND sandbox_id=$2`, p.TeamID, p.SandboxID).Scan(&current); err != nil {
++			return err
++		}
++		if current != nil && *current != p.ExecutionID {
++			return ErrFenced
++		}
+ 	} else {
+ 		if err := db.InsertExecutionAttempt(ctx, p); err != nil {
+ 			return err
+@@ -67,6 +77,9 @@
+ 			p.TeamID, p.SandboxID, p.ExecutionID, p.ClusterID, p.NodeID, buildID, collectWhileLive); err != nil {
+ 			return err
+ 		}
++	}
++	if _, err := tx.Exec(ctx, `UPDATE public.sandbox_execution_fences SET state='active', current_execution_id=$3, paused_build_id=NULL WHERE team_id=$1 AND sandbox_id=$2`, p.TeamID, p.SandboxID, p.ExecutionID); err != nil {
++		return err
+ 	}
+ 	return tx.Commit(ctx)
+ }
+--- a/packages/db/queries/execution_fences.sql
++++ b/packages/db/queries/execution_fences.sql
+@@ -6,7 +6,7 @@
+ INSERT INTO public.sandbox_execution_attempts(team_id,sandbox_id,execution_id,cluster_id,node_id)
+ VALUES (sqlc.arg(team_id),sqlc.arg(sandbox_id),sqlc.arg(execution_id),sqlc.arg(cluster_id),sqlc.arg(node_id)) ON CONFLICT DO NOTHING;
+ -- name: FenceSandboxExecution :exec
+-UPDATE public.sandbox_execution_fences SET state='stopping' WHERE team_id=sqlc.arg(team_id) AND sandbox_id=sqlc.arg(sandbox_id) AND state='active';
++UPDATE public.sandbox_execution_fences SET state='stopping' WHERE team_id=sqlc.arg(team_id) AND sandbox_id=sqlc.arg(sandbox_id) AND state IN ('active','paused');
+ -- name: ListExecutionAttempts :many
+ SELECT * FROM public.sandbox_execution_attempts WHERE team_id=sqlc.arg(team_id) AND sandbox_id=sqlc.arg(sandbox_id) ORDER BY execution_id,cluster_id,node_id;
+ -- name: ConfirmExecutionStopped :execrows
+--- a/packages/db/queries/execution_fences.sql.go
++++ b/packages/db/queries/execution_fences.sql.go
+@@ -43,7 +43,7 @@
+ }
+ 
+ const fenceSandboxExecution = `-- name: FenceSandboxExecution :exec
+-UPDATE public.sandbox_execution_fences SET state='stopping' WHERE team_id=$1 AND sandbox_id=$2 AND state='active'
++UPDATE public.sandbox_execution_fences SET state='stopping' WHERE team_id=$1 AND sandbox_id=$2 AND state IN ('active','paused')
+ `
+ 
+ type FenceSandboxExecutionParams struct {
+--- a/spec/openapi.yml
++++ b/spec/openapi.yml
+@@ -318,7 +318,7 @@
+           $ref: '#/components/schemas/Sandbox'
+     LaunchpadRuntimeCapabilities:
+       type: object
+-      required: [version, diskRestore, renewableLifetime, quiescedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection]
++      required: [version, diskRestore, renewableLifetime, quiescedSnapshots, pausedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection]
+       properties:
+         version:
+           type: integer
+@@ -327,6 +327,8 @@
+         renewableLifetime:
+           type: boolean
+         quiescedSnapshots:
++          type: boolean
++        pausedSnapshots:
+           type: boolean
+         buildCollectionAdmission:
+           type: boolean
+--- /dev/null
++++ b/packages/db/migrations/20261007160000_paused_disk_receipts.sql
+@@ -0,0 +1,15 @@
++-- +goose Up
++ALTER TABLE public.sandbox_execution_fences
++    DROP CONSTRAINT sandbox_execution_fences_state_check,
++    ADD CONSTRAINT sandbox_execution_fences_state_check CHECK (state IN ('active','paused','stopping','stopped')),
++    ADD COLUMN current_execution_id uuid,
++    ADD COLUMN paused_build_id uuid;
++-- Existing executions intentionally have no pause receipt. They become eligible
++-- only after a registered execution completes a filesystem-only pause.
++-- +goose Down
++UPDATE public.sandbox_execution_fences SET state='active' WHERE state='paused';
++ALTER TABLE public.sandbox_execution_fences
++    DROP CONSTRAINT sandbox_execution_fences_state_check,
++    ADD CONSTRAINT sandbox_execution_fences_state_check CHECK (state IN ('active','stopping','stopped')),
++    DROP COLUMN current_execution_id,
++    DROP COLUMN paused_build_id;
+--- /dev/null
++++ b/packages/db/pkg/executions/paused_disk.go
+@@ -0,0 +1,134 @@
++package executions
++
++import (
++	"context"
++	"errors"
++
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
++)
++
++var ErrPausedDisk = errors.New("no confirmed paused disk matches this request")
++
++// MarkPaused is called after a successful filesystem-only pause RPC and durable
++// build publication. A late pause reply cannot overwrite a newer execution.
++func (s Store) MarkPaused(ctx context.Context, team uuid.UUID, sandbox string, execution, build uuid.UUID, confirm func([]queries.SandboxExecutionAttempt) error) error {
++	if confirm == nil {
++		return ErrPausedDisk
++	}
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandbox})
++	if err != nil {
++		return err
++	}
++	if state != "active" && state != "paused" {
++		return ErrFenced
++	}
++	result, err := tx.Exec(ctx, `UPDATE public.sandbox_execution_fences f
++        SET state='paused', paused_build_id=$4
++        WHERE team_id=$1 AND sandbox_id=$2 AND current_execution_id=$3
++        AND (paused_build_id IS NULL OR paused_build_id=$4)
++        AND EXISTS(SELECT 1 FROM public.sandbox_execution_build_roots r
++            WHERE r.team_id=f.team_id AND r.sandbox_id=f.sandbox_id AND r.execution_id=$3)
++        AND EXISTS(SELECT 1 FROM public.snapshots s
++            JOIN public.env_build_assignments a ON a.env_id=s.env_id AND a.tag='default'
++            JOIN public.env_builds b ON b.id=a.build_id
++            WHERE s.team_id=f.team_id AND s.sandbox_id=f.sandbox_id AND b.id=$4
++              AND b.status_group='ready' AND s.config->>'filesystemOnly'='true'
++              AND s.metadata->>'launchpad.managed'='thread-vm-v1')`, team, sandbox, execution, build)
++	if err != nil {
++		return err
++	}
++	if result.RowsAffected() != 1 {
++		return ErrPausedDisk
++	}
++	attempts, err := db.ListExecutionAttempts(ctx, queries.ListExecutionAttemptsParams{TeamID: team, SandboxID: sandbox})
++	if err != nil {
++		return err
++	}
++	if len(attempts) == 0 {
++		return ErrPausedDisk
++	}
++	if err := confirm(attempts); err != nil {
++		return err
++	}
++	return tx.Commit(ctx)
++}
++
++// RetainPausedDisk atomically names the immutable disk already saved by pause.
++// It has no host RPC or boot path. Admission and physical collection share this
++// fence/catalog locking protocol; resuming clears the receipt before booting.
++func (s Store) RetainPausedDisk(ctx context.Context, team uuid.UUID, sandbox, namespace, alias string) (string, error) {
++	if team == uuid.Nil || sandbox == "" || namespace == "" || alias == "" {
++		return "", ErrPausedDisk
++	}
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return "", err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandbox})
++	if err != nil {
++		return "", err
++	}
++	if state != "paused" {
++		return "", ErrPausedDisk
++	}
++	// Same alias cannot refer to two source sandboxes under concurrent requests.
++	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 83))`, namespace+"/"+alias); err != nil {
++		return "", err
++	}
++	var build uuid.UUID
++	var node string
++	var cluster *uuid.UUID
++	err = tx.QueryRow(ctx, `SELECT b.id,s.origin_node_id,e.cluster_id
++        FROM public.sandbox_execution_fences f
++        JOIN public.snapshots s ON s.team_id=f.team_id AND s.sandbox_id=f.sandbox_id
++        JOIN public.active_envs e ON e.id=s.env_id AND e.team_id=f.team_id
++        JOIN LATERAL (SELECT a.build_id FROM public.env_build_assignments a
++            JOIN public.env_builds b ON b.id=a.build_id AND b.status_group='ready'
++            WHERE a.env_id=s.env_id AND a.tag='default' ORDER BY a.created_at DESC LIMIT 1) tip ON true
++        JOIN public.env_builds b ON b.id=tip.build_id AND b.id=f.paused_build_id
++        WHERE f.team_id=$1 AND f.sandbox_id=$2 AND f.current_execution_id IS NOT NULL
++          AND s.config->>'filesystemOnly'='true' AND s.metadata->>'launchpad.managed'='thread-vm-v1'`, team, sandbox).Scan(&build, &node, &cluster)
++	if errors.Is(err, pgx.ErrNoRows) {
++		return "", ErrPausedDisk
++	}
++	if err != nil {
++		return "", err
++	}
++	var existing, source string
++	var recorded uuid.UUID
++	err = tx.QueryRow(ctx, `SELECT e.id,st.sandbox_id,st.build_id FROM public.env_aliases a
++        JOIN public.active_envs e ON e.id=a.env_id AND e.team_id=$3 AND e.source='snapshot_template'
++        JOIN public.snapshot_templates st ON st.env_id=e.id
++        WHERE a.namespace=$1 AND a.alias=$2`, namespace, alias, team).Scan(&existing, &source, &recorded)
++	if err == nil {
++		if source != sandbox || recorded != build {
++			return "", ErrPausedDisk
++		}
++		return existing, tx.Commit(ctx)
++	}
++	if !errors.Is(err, pgx.ErrNoRows) {
++		return "", err
++	}
++	// Generate inside this transaction; retry sees the committed alias, never
++	// overwrites it or adds a second mutable build assignment.
++	template := "lp" + uuid.NewString()[0:8] + uuid.NewString()[0:8]
++	env, err := db.CreateSnapshotTemplateEnv(ctx, queries.CreateSnapshotTemplateEnvParams{
++		SnapshotID: template, TeamID: team, ClusterID: cluster, SandboxID: sandbox,
++		OriginNodeID: &node, BuildID: &build, Tag: "default",
++	})
++	if err != nil {
++		return "", err
++	}
++	if err := db.CreateTemplateAlias(ctx, queries.CreateTemplateAliasParams{Alias: alias, TemplateID: env, Namespace: &namespace}); err != nil {
++		return "", err
++	}
++	return env, tx.Commit(ctx)
++}
+--- /dev/null
++++ b/packages/db/pkg/executions/paused_disk_test.go
+@@ -0,0 +1,128 @@
++package executions_test
++
++import (
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestPausedDiskRequiresEveryPhysicalStopBeforePublishingItsReceipt(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	namespace := testutils.GetTeamSlug(t, t.Context(), db, team)
++	base := testutils.CreateTestTemplate(t, db, team)
++	sbx := "paused-" + uuid.NewString()
++	snap := testutils.UpsertTestSnapshot(t, t.Context(), db, "disk-"+uuid.NewString(), sbx, team, base)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE snapshots SET config='{"filesystemOnly":true}',metadata='{"launchpad.managed":"thread-vm-v1"}' WHERE sandbox_id=$1`, sbx))
++	store := executions.Store{DB: db.SqlcClient}
++	attempt := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sbx, ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host-a"}
++	build := uuid.New()
++	require.NoError(t, store.Register(t.Context(), attempt, build, true))
++	second := attempt
++	second.NodeID = "host-b"
++	require.NoError(t, store.Register(t.Context(), second, build, true))
++	require.ErrorIs(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, nil), executions.ErrPausedDisk)
++	uncertain := errors.New("second host is unavailable")
++	err := store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error {
++		require.Len(t, attempts, 2)
++		return uncertain
++	})
++	require.ErrorIs(t, err, uncertain)
++	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
++	require.ErrorIs(t, err, executions.ErrPausedDisk)
++	require.NoError(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error {
++		require.Len(t, attempts, 2)
++		return nil
++	}))
++	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
++	require.NoError(t, err)
++}
++
++func TestPausedDiskRetainsOneIndependentBuildWithoutBooting(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	other := testutils.CreateTestTeam(t, db)
++	namespace := testutils.GetTeamSlug(t, t.Context(), db, team)
++	base := testutils.CreateTestTemplate(t, db, team)
++	sbx := "paused-" + uuid.NewString()
++	snap := testutils.UpsertTestSnapshot(t, t.Context(), db, "disk-"+uuid.NewString(), sbx, team, base)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE snapshots SET config='{"filesystemOnly":true}',metadata='{"launchpad.managed":"thread-vm-v1"}' WHERE sandbox_id=$1`, sbx))
++	store := executions.Store{DB: db.SqlcClient}
++	attempt := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sbx, ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}
++	require.NoError(t, store.Register(t.Context(), attempt, uuid.New(), true))
++	alias := "launchpad-backup-" + uuid.NewString()
++	_, err := store.RetainPausedDisk(t.Context(), team, sbx, namespace, alias)
++	require.ErrorIs(t, err, executions.ErrPausedDisk, "routing absence or a snapshot alone is insufficient")
++	require.Error(t, store.MarkPaused(t.Context(), other, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }))
++	require.ErrorIs(t, store.MarkPaused(t.Context(), team, sbx, uuid.New(), snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }), executions.ErrPausedDisk)
++	require.ErrorIs(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, uuid.New(), func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }), executions.ErrPausedDisk)
++	require.NoError(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }))
++	require.NoError(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }))
++	require.ErrorIs(t, store.Register(t.Context(), attempt, uuid.New(), true), executions.ErrFenced, "old execution cannot reactivate itself")
++	var group sync.WaitGroup
++	results := make([]string, 4)
++	errors := make([]error, 4)
++	for i := range results {
++		group.Go(func() { results[i], errors[i] = store.RetainPausedDisk(t.Context(), team, sbx, namespace, alias) })
++	}
++	group.Wait()
++	for i := range results {
++		require.NoError(t, errors[i])
++		require.Equal(t, results[0], results[i])
++	}
++	_, err = store.RetainPausedDisk(t.Context(), other, sbx, namespace, alias)
++	require.Error(t, err)
++	// A new explicit resume clears the receipt before any boot RPC.
++	resumed := attempt
++	resumed.ExecutionID = uuid.New()
++	require.NoError(t, store.Register(t.Context(), resumed, snap.BuildID, true))
++	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
++	require.ErrorIs(t, err, executions.ErrPausedDisk)
++	require.ErrorIs(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }), executions.ErrPausedDisk, "late pause response cannot freeze the resumed guest")
++	// Delete the source pause record; its independent template still points at
++	// the same immutable build, retaining it in the storage catalog.
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `DELETE FROM snapshots WHERE sandbox_id=$1`, sbx))
++	templates, err := db.SqlcClient.ListTeamSnapshotTemplates(t.Context(), queries.ListTeamSnapshotTemplatesParams{TeamID: team, CursorID: "zzzzzzzzzzzzzzzzzzzzzzzz", CursorTime: time.Now().Add(time.Hour), PageLimit: 100})
++	require.NoError(t, err)
++	require.Len(t, templates, 1)
++	require.Equal(t, results[0], templates[0].SnapshotID)
++	require.Equal(t, snap.BuildID, templates[0].BuildID)
++}
++
++func TestPausedDiskRejectsMemorySnapshotsChangedTipsAndAliasCollisions(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	namespace := testutils.GetTeamSlug(t, t.Context(), db, team)
++	base := testutils.CreateTestTemplate(t, db, team)
++	sbx := "paused-" + uuid.NewString()
++	snap := testutils.UpsertTestSnapshot(t, t.Context(), db, "disk-"+uuid.NewString(), sbx, team, base)
++	store := executions.Store{DB: db.SqlcClient}
++	attempt := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sbx, ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}
++	require.NoError(t, store.Register(t.Context(), attempt, uuid.New(), true))
++	require.ErrorIs(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }), executions.ErrPausedDisk)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE snapshots SET config='{"filesystemOnly":true}',metadata='{"launchpad.managed":"thread-vm-v1"}' WHERE sandbox_id=$1`, sbx))
++	require.NoError(t, store.MarkPaused(t.Context(), team, sbx, attempt.ExecutionID, snap.BuildID, func(attempts []queries.SandboxExecutionAttempt) error { require.Len(t, attempts, 1); return nil }))
++	alias := "launchpad-backup-" + uuid.NewString()
++	testutils.CreateTestTemplateAliasWithName(t, db, base, alias, &namespace)
++	_, err := store.RetainPausedDisk(t.Context(), team, sbx, namespace, alias)
++	require.Error(t, err, "existing ordinary template must not be overwritten")
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_builds SET status='failed' WHERE id=$1`, snap.BuildID))
++	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
++	require.ErrorIs(t, err, executions.ErrPausedDisk)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_builds SET status='success' WHERE id=$1`, snap.BuildID))
++	// A different published tip cannot inherit the prior pause acknowledgement.
++	newer := testutils.UpsertTestSnapshot(t, t.Context(), db, snap.TemplateID, sbx, team, base)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_build_assignments SET created_at=created_at+interval '1 second' WHERE build_id=$1`, newer.BuildID))
++	_, err = store.RetainPausedDisk(t.Context(), team, sbx, namespace, "launchpad-backup-"+uuid.NewString())
++	require.ErrorIs(t, err, executions.ErrPausedDisk)
++	_, err = store.BeginStop(t.Context(), team, sbx)
++	require.NoError(t, err)
++	require.ErrorIs(t, store.Register(t.Context(), attempt, uuid.New(), true), executions.ErrFenced)
++}

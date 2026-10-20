@@ -33,6 +33,7 @@ import {
   type OrchestrationSession,
   type OrchestrationThreadActivity,
   type OrchestrationThreadShell,
+  type ThreadRelayRouting,
   ModelSelection,
   ProjectId,
   ThreadLinkedPullRequest,
@@ -2660,6 +2661,15 @@ pending_approval_requests AS (
         }),
       );
 
+  const listRelayRouting = Effect.fn("ProjectionSnapshotQuery.listRelayRouting")(function* (
+    threadId?: string,
+  ) {
+    const rows = yield* sql<ThreadRelayRouting & { threadId: string }>`SELECT
+      thread_id AS "threadId", relay_url AS "relayUrl", generation, phase FROM thread_execution_fences
+      ${threadId === undefined ? sql`` : sql`WHERE thread_id = ${threadId}`}`;
+    return new Map(rows.map(({ threadId, ...route }) => [threadId, route] as const));
+  });
+
   const getShellSnapshot: ProjectionSnapshotQueryShape["getShellSnapshot"] = () =>
     sql
       .withTransaction(
@@ -2751,6 +2761,7 @@ pending_approval_requests AS (
               );
               const pullRequestsByThread = groupPullRequestRowsByThread(pullRequestRows);
 
+              const relayRouting = yield* listRelayRouting();
               const queueSummaries = yield* listPromptQueueSummaries(sql);
               const snapshot = {
                 snapshotSequence: computeSnapshotSequence(stateRows),
@@ -2766,6 +2777,9 @@ pending_approval_requests AS (
                     ? Result.succeed({
                         ...(queueSummaries.has(row.threadId)
                           ? { promptQueueSummary: queueSummaries.get(row.threadId) }
+                          : {}),
+                        ...(relayRouting.has(row.threadId)
+                          ? { relayRouting: relayRouting.get(row.threadId) }
                           : {}),
                         id: row.threadId,
                         projectId: row.projectId,
@@ -2921,6 +2935,7 @@ pending_approval_requests AS (
                 sessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
               );
 
+              const relayRouting = yield* listRelayRouting();
               const queueSummaries = yield* listPromptQueueSummaries(sql);
               const snapshot = {
                 snapshotSequence: computeSnapshotSequence(stateRows),
@@ -2934,6 +2949,9 @@ pending_approval_requests AS (
                 threads: threadRows.map((row): OrchestrationThreadShell => ({
                   ...(queueSummaries.has(row.threadId)
                     ? { promptQueueSummary: queueSummaries.get(row.threadId) }
+                    : {}),
+                  ...(relayRouting.has(row.threadId)
+                    ? { relayRouting: relayRouting.get(row.threadId) }
                     : {}),
                   id: row.threadId,
                   projectId: row.projectId,
@@ -3322,8 +3340,14 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThreadShell>();
       }
 
+      const route = (yield* listRelayRouting(threadId).pipe(
+        Effect.mapError(
+          toPersistenceSqlError("ProjectionSnapshotQuery.getThreadShellById:relayRouting"),
+        ),
+      )).get(threadId);
       const promptQueueSummary = yield* getPromptQueueSummary(sql, threadId);
       return Option.some({
+        ...(route ? { relayRouting: route } : {}),
         ...(promptQueueSummary ? { promptQueueSummary } : {}),
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,

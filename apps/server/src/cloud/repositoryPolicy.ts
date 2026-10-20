@@ -79,9 +79,10 @@ export const applyRepositoryPolicyProof = Effect.fn("cloud.applyRepositoryPolicy
   ),
 );
 
-/** Startup calls this after enrollment. Until it succeeds only trusted accepted work runs. */
+/** Managed executors synchronize organization policy; private VMs authorize their one thread separately. */
 export const synchronizeRepositoryPolicy = Effect.gen(function* () {
   const access = yield* RepositoryAccess;
+  if (access.threadId !== undefined) return;
   if (!(yield* access.status).enabled) return;
   const secrets = yield* ServerSecretStore;
   const read = (name: string) =>

@@ -72,6 +72,21 @@ import Migration0056 from "./Migrations/056_ProjectionThreadMessageAuthor.ts";
 import Migration0057 from "./Migrations/057_SharedPromptQueue.ts";
 import Migration0058 from "./Migrations/058_CommandReceiptProjectScope.ts";
 import Migration0059 from "./Migrations/059_ThreadCleanupFences.ts";
+import Migration0060 from "./Migrations/060_ThreadExecutionFences.ts";
+import Migration0061 from "./Migrations/061_ThreadTransferBaselines.ts";
+import Migration0062 from "./Migrations/062_ThreadCheckoutClaims.ts";
+import Migration0063 from "./Migrations/063_ThreadTransferRuntime.ts";
+import Migration0064 from "./Migrations/064_CheckoutOperations.ts";
+import Migration0065 from "./Migrations/065_ThreadTransferReadiness.ts";
+import Migration0066 from "./Migrations/066_ThreadMoveQueue.ts";
+import Migration0067 from "./Migrations/067_ThreadNativeCheckpoints.ts";
+import Migration0068 from "./Migrations/068_ThreadAttachmentCheckpoints.ts";
+import Migration0069 from "./Migrations/069_FrozenThreadCheckpoints.ts";
+import Migration0070 from "./Migrations/070_ThreadTransferAborts.ts";
+import Migration0071 from "./Migrations/071_ThreadTransferSetupOutput.ts";
+import Migration0074 from "./Migrations/074_ThreadLocalEnrollmentAbort.ts";
+import Migration0073 from "./Migrations/073_ThreadLocalEnrollment.ts";
+import Migration0072 from "./Migrations/072_ThreadVmMoveCheckout.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -143,6 +158,21 @@ const migrationEntries = [
   [57, "SharedPromptQueue", Migration0057],
   [58, "CommandReceiptProjectScope", Migration0058],
   [59, "ThreadCleanupFences", Migration0059],
+  [60, "ThreadExecutionFences", Migration0060],
+  [61, "ThreadTransferBaselines", Migration0061],
+  [62, "ThreadCheckoutClaims", Migration0062],
+  [63, "ThreadTransferRuntime", Migration0063],
+  [64, "CheckoutOperations", Migration0064],
+  [65, "ThreadTransferReadiness", Migration0065],
+  [66, "ThreadMoveQueue", Migration0066],
+  [67, "ThreadNativeCheckpoints", Migration0067],
+  [68, "ThreadAttachmentCheckpoints", Migration0068],
+  [69, "FrozenThreadCheckpoints", Migration0069],
+  [70, "ThreadTransferAborts", Migration0070],
+  [71, "ThreadTransferSetupOutput", Migration0071],
+  [72, "ThreadVmMoveCheckout", Migration0072],
+  [73, "ThreadLocalEnrollment", Migration0073],
+  [74, "ThreadLocalEnrollmentAbort", Migration0074],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -235,6 +265,42 @@ const verifyMigrationHistory = Effect.gen(function* () {
   );
   const mismatches: Array<string> = [];
   for (const { migration_id, name } of recorded) {
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_TransferAbortReaderV1" &&
+      recorded.some(
+        (migration) => migration.migration_id === 70 && migration.name === "ThreadTransferAborts",
+      )
+    )
+      continue;
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_FrozenCheckpointReaderV1" &&
+      [
+        [60, "ThreadExecutionFences"],
+        [66, "ThreadMoveQueue"],
+        [69, "FrozenThreadCheckpoints"],
+      ].every(([id, label]) =>
+        recorded.some((migration) => migration.migration_id === id && migration.name === label),
+      )
+    )
+      continue;
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_ThreadMoveQueueReaderV1" &&
+      recorded.some(
+        (migration) => migration.migration_id === 66 && migration.name === "ThreadMoveQueue",
+      )
+    )
+      continue;
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_PortableThreadReaderV1" &&
+      recorded.some(
+        (migration) => migration.migration_id === 60 && migration.name === "ThreadExecutionFences",
+      )
+    )
+      continue;
     if (
       migration_id === 1 &&
       name === "OrchestrationEvents_ThreadCleanupReaderV1" &&

@@ -1,3 +1,5 @@
+import * as CheckoutAccess from "./CheckoutAccess.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFSP from "node:fs/promises";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -32,6 +34,7 @@ const TestLayer = Layer.empty.pipe(
       prefix: "t3-workspace-entries-test-",
     }),
   ),
+  Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
   Layer.provideMerge(NodeServices.layer),
 );
 

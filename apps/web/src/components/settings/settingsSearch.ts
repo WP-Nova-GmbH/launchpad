@@ -836,6 +836,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/organization",
   },
   {
+    id: "organization-thread-vms",
+    title: "Thread VMs",
+    to: "/settings/organization",
+    searchTerms: ["sandbox vm quota idle pause delete backup retention weekdays time zone"],
+  },
+  {
     id: "organization-machines",
     title: "Machines",
     to: "/settings/organization",

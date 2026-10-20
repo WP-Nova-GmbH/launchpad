@@ -1,0 +1,2302 @@
+--- a/packages/orchestrator/pkg/cfg/model.go
++++ b/packages/orchestrator/pkg/cfg/model.go
+@@ -21,16 +21,17 @@
+ const DefaultBusyboxVersion = "1.36.1"
+ 
+ type BuilderConfig struct {
+-	DomainName             string `env:"DOMAIN_NAME"              envDefault:""`
+-	FirecrackerVersionsDir string `env:"FIRECRACKER_VERSIONS_DIR" envDefault:"/fc-versions"`
+-	BusyboxVersion         string `env:"BUSYBOX_VERSION"          envDefault:"1.36.1"`
+-	HostBusyboxDir         string `env:"HOST_BUSYBOX_DIR"         envDefault:"/fc-busybox"`
+-	HostEnvdPath           string `env:"HOST_ENVD_PATH"           envDefault:"/fc-envd/envd"`
+-	HostKernelsDir         string `env:"HOST_KERNELS_DIR"         envDefault:"/fc-kernels"`
+-	OrchestratorBaseDir    string `env:"ORCHESTRATOR_BASE_PATH"   envDefault:"/orchestrator"`
+-	SandboxDir             string `env:"SANDBOX_DIR"              envDefault:"/fc-vm"`
+-	SharedChunkCacheDir    string `env:"SHARED_CHUNK_CACHE_PATH"`
+-	TemplatesDir           string `env:"TEMPLATES_DIR,expand"     envDefault:"${ORCHESTRATOR_BASE_PATH}/build-templates"`
++	LaunchpadRequireExecutionFence bool   `env:"LAUNCHPAD_REQUIRE_EXECUTION_FENCE" envDefault:"false"`
++	DomainName                     string `env:"DOMAIN_NAME"              envDefault:""`
++	FirecrackerVersionsDir         string `env:"FIRECRACKER_VERSIONS_DIR" envDefault:"/fc-versions"`
++	BusyboxVersion                 string `env:"BUSYBOX_VERSION"          envDefault:"1.36.1"`
++	HostBusyboxDir                 string `env:"HOST_BUSYBOX_DIR"         envDefault:"/fc-busybox"`
++	HostEnvdPath                   string `env:"HOST_ENVD_PATH"           envDefault:"/fc-envd/envd"`
++	HostKernelsDir                 string `env:"HOST_KERNELS_DIR"         envDefault:"/fc-kernels"`
++	OrchestratorBaseDir            string `env:"ORCHESTRATOR_BASE_PATH"   envDefault:"/orchestrator"`
++	SandboxDir                     string `env:"SANDBOX_DIR"              envDefault:"/fc-vm"`
++	SharedChunkCacheDir            string `env:"SHARED_CHUNK_CACHE_PATH"`
++	TemplatesDir                   string `env:"TEMPLATES_DIR,expand"     envDefault:"${ORCHESTRATOR_BASE_PATH}/build-templates"`
+ 
+ 	DefaultCacheDir string `env:"DEFAULT_CACHE_DIR,expand" envDefault:"${ORCHESTRATOR_BASE_PATH}/build"`
+ 
+--- a/packages/orchestrator/pkg/sandbox/sandbox.go
++++ b/packages/orchestrator/pkg/sandbox/sandbox.go
+@@ -960,8 +960,16 @@
+ 		}
+ 	}
+ 
++	executionReservation, err := f.reserveExecution(runtime, sandboxFiles.SandboxCgroupName())
++	if err != nil {
++		return nil, fmt.Errorf("reserve physical execution: %w", err)
++	}
++	defer func() { e = errors.Join(e, abortExecution(ctx, executionReservation)) }()
+ 	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName())
+ 	defer releaseCgroupFD(ctx, cgroupHandle, runtime.SandboxID)
++	if f.config.LaunchpadRequireExecutionFence && cgroupFD == cgroup.NoCgroupFD {
++		return nil, errors.New("physical execution fencing requires an enforced cgroup")
++	}
+ 
+ 	cleanup.Add(ctx, func(ctx context.Context) error {
+ 		return cgroupHandle.Remove(ctx)
+@@ -1088,6 +1096,12 @@
+ 
+ 	// Stop the sandbox first if it is still running, otherwise do nothing
+ 	cleanup.AddPriority(ctx, sbx.Stop)
++
++	if executionReservation != nil {
++		if err := executionReservation.Commit(); err != nil {
++			return nil, fmt.Errorf("commit physical execution: %w", err)
++		}
++	}
+ 
+ 	go func() {
+ 		defer execSpan.End()
+@@ -1526,8 +1540,16 @@
+ 	}
+ 
+ 	// Create cgroup for sandbox resource accounting
++	executionReservation, err := f.reserveExecution(runtime, sandboxFiles.SandboxCgroupName())
++	if err != nil {
++		return nil, fmt.Errorf("reserve physical execution: %w", err)
++	}
++	defer func() { e = errors.Join(e, abortExecution(ctx, executionReservation)) }()
+ 	cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName())
+ 	defer releaseCgroupFD(ctx, cgroupHandle, runtime.SandboxID)
++	if f.config.LaunchpadRequireExecutionFence && cgroupFD == cgroup.NoCgroupFD {
++		return nil, errors.New("physical execution fencing requires an enforced cgroup")
++	}
+ 
+ 	cleanup.Add(ctx, func(ctx context.Context) error {
+ 		return cgroupHandle.Remove(ctx)
+@@ -1744,6 +1766,12 @@
+ 		)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to wait for sandbox start: %w", err)
++		}
++	}
++
++	if executionReservation != nil {
++		if err := executionReservation.Commit(); err != nil {
++			return nil, fmt.Errorf("commit physical execution: %w", err)
+ 		}
+ 	}
+ 
+--- a/packages/orchestrator/pkg/sandbox/cgroup/manager.go
++++ b/packages/orchestrator/pkg/sandbox/cgroup/manager.go
+@@ -7,6 +7,7 @@
+ 	"io"
+ 	"os"
+ 	"path/filepath"
++	"regexp"
+ 	"slices"
+ 	"strconv"
+ 	"strings"
+@@ -118,6 +119,17 @@
+ 	return h.kill(ctx)
+ }
+ 
++// KillExisting is only for exact cgroup identities from the durable execution
++// journal, after the journal has fenced future clones. Absence then proves that
++// this group cannot contain processes; an accounting noop is never accepted.
++func KillExisting(ctx context.Context, name string) error {
++	if !regexp.MustCompile(`^sbx-[a-zA-Z0-9-]{1,124}$`).MatchString(name) {
++		return errors.New("invalid sandbox cgroup identity")
++	}
++	handle := &CgroupHandle{path: filepath.Join(RootCgroupPath, name)}
++	return handle.kill(ctx)
++}
++
+ func (h *CgroupHandle) kill(ctx context.Context) error {
+ 	if h == nil || h.noop {
+ 		return nil
+--- a/packages/orchestrator/orchestrator.proto
++++ b/packages/orchestrator/orchestrator.proto
+@@ -300,7 +300,23 @@
+   bool reconcile_only = 3;
+ }
+ 
++message StopExecutionRequest {
++  // Only set for a durable API registry entry written before its create RPC.
++  bool registered_before_start = 4;
++  string team_id = 1;
++  string sandbox_id = 2;
++  string execution_id = 3;
++}
++
++message StopExecutionResponse {
++  string team_id = 1;
++  string sandbox_id = 2;
++  string execution_id = 3;
++  bool physically_stopped = 4;
++}
++
+ service SandboxService {
++  rpc StopExecution(StopExecutionRequest) returns (StopExecutionResponse);
+   rpc ReleaseRestoreDisk(RestoreDiskRequest) returns (google.protobuf.Empty);
+   rpc ActivateRestoreDisk(RestoreDiskActivateRequest) returns (SandboxCreateResponse);
+   rpc PrepareRestoreDisk(RestoreDiskPrepareRequest) returns (RestoreDiskResponse);
+--- a/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
++++ b/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
+@@ -1937,6 +1937,143 @@
+ func (x *RestoreDiskActivateRequest) GetReconcileOnly() bool {
+ 	if x != nil {
+ 		return x.ReconcileOnly
++	}
++	return false
++}
++
++type StopExecutionRequest struct {
++	state protoimpl.MessageState `protogen:"open.v1"`
++	// Only set for a durable API registry entry written before its create RPC.
++	RegisteredBeforeStart bool   `protobuf:"varint,4,opt,name=registered_before_start,json=registeredBeforeStart,proto3" json:"registered_before_start,omitempty"`
++	TeamId                string `protobuf:"bytes,1,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
++	SandboxId             string `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	ExecutionId           string `protobuf:"bytes,3,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
++	unknownFields         protoimpl.UnknownFields
++	sizeCache             protoimpl.SizeCache
++}
++
++func (x *StopExecutionRequest) Reset() {
++	*x = StopExecutionRequest{}
++	mi := &file_orchestrator_proto_msgTypes[27]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *StopExecutionRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*StopExecutionRequest) ProtoMessage() {}
++
++func (x *StopExecutionRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_orchestrator_proto_msgTypes[27]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use StopExecutionRequest.ProtoReflect.Descriptor instead.
++func (*StopExecutionRequest) Descriptor() ([]byte, []int) {
++	return file_orchestrator_proto_rawDescGZIP(), []int{27}
++}
++
++func (x *StopExecutionRequest) GetRegisteredBeforeStart() bool {
++	if x != nil {
++		return x.RegisteredBeforeStart
++	}
++	return false
++}
++
++func (x *StopExecutionRequest) GetTeamId() string {
++	if x != nil {
++		return x.TeamId
++	}
++	return ""
++}
++
++func (x *StopExecutionRequest) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *StopExecutionRequest) GetExecutionId() string {
++	if x != nil {
++		return x.ExecutionId
++	}
++	return ""
++}
++
++type StopExecutionResponse struct {
++	state             protoimpl.MessageState `protogen:"open.v1"`
++	TeamId            string                 `protobuf:"bytes,1,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
++	SandboxId         string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
++	ExecutionId       string                 `protobuf:"bytes,3,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
++	PhysicallyStopped bool                   `protobuf:"varint,4,opt,name=physically_stopped,json=physicallyStopped,proto3" json:"physically_stopped,omitempty"`
++	unknownFields     protoimpl.UnknownFields
++	sizeCache         protoimpl.SizeCache
++}
++
++func (x *StopExecutionResponse) Reset() {
++	*x = StopExecutionResponse{}
++	mi := &file_orchestrator_proto_msgTypes[28]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *StopExecutionResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*StopExecutionResponse) ProtoMessage() {}
++
++func (x *StopExecutionResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_orchestrator_proto_msgTypes[28]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use StopExecutionResponse.ProtoReflect.Descriptor instead.
++func (*StopExecutionResponse) Descriptor() ([]byte, []int) {
++	return file_orchestrator_proto_rawDescGZIP(), []int{28}
++}
++
++func (x *StopExecutionResponse) GetTeamId() string {
++	if x != nil {
++		return x.TeamId
++	}
++	return ""
++}
++
++func (x *StopExecutionResponse) GetSandboxId() string {
++	if x != nil {
++		return x.SandboxId
++	}
++	return ""
++}
++
++func (x *StopExecutionResponse) GetExecutionId() string {
++	if x != nil {
++		return x.ExecutionId
++	}
++	return ""
++}
++
++func (x *StopExecutionResponse) GetPhysicallyStopped() bool {
++	if x != nil {
++		return x.PhysicallyStopped
+ 	}
+ 	return false
+ }
+@@ -2138,8 +2275,21 @@
+ 	"\x1aRestoreDiskActivateRequest\x12'\n" +
+ 	"\x0fmanifest_sha256\x18\x01 \x01(\tR\x0emanifestSha256\x12-\n" +
+ 	"\x06create\x18\x02 \x01(\v2\x15.SandboxCreateRequestR\x06create\x12%\n" +
+-	"\x0ereconcile_only\x18\x03 \x01(\bR\rreconcileOnly2\xc6\x05\n" +
+-	"\x0eSandboxService\x12A\n" +
++	"\x0ereconcile_only\x18\x03 \x01(\bR\rreconcileOnly\"\xa9\x01\n" +
++	"\x14StopExecutionRequest\x126\n" +
++	"\x17registered_before_start\x18\x04 \x01(\bR\x15registeredBeforeStart\x12\x17\n" +
++	"\ateam_id\x18\x01 \x01(\tR\x06teamId\x12\x1d\n" +
++	"\n" +
++	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12!\n" +
++	"\fexecution_id\x18\x03 \x01(\tR\vexecutionId\"\xa1\x01\n" +
++	"\x15StopExecutionResponse\x12\x17\n" +
++	"\ateam_id\x18\x01 \x01(\tR\x06teamId\x12\x1d\n" +
++	"\n" +
++	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12!\n" +
++	"\fexecution_id\x18\x03 \x01(\tR\vexecutionId\x12-\n" +
++	"\x12physically_stopped\x18\x04 \x01(\bR\x11physicallyStopped2\x86\x06\n" +
++	"\x0eSandboxService\x12>\n" +
++	"\rStopExecution\x12\x15.StopExecutionRequest\x1a\x16.StopExecutionResponse\x12A\n" +
+ 	"\x12ReleaseRestoreDisk\x12\x13.RestoreDiskRequest\x1a\x16.google.protobuf.Empty\x12J\n" +
+ 	"\x13ActivateRestoreDisk\x12\x1b.RestoreDiskActivateRequest\x1a\x16.SandboxCreateResponse\x12F\n" +
+ 	"\x12PrepareRestoreDisk\x12\x1a.RestoreDiskPrepareRequest\x1a\x14.RestoreDiskResponse\x12?\n" +
+@@ -2165,7 +2315,7 @@
+ 	return file_orchestrator_proto_rawDescData
+ }
+ 
+-var file_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
++var file_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+ var file_orchestrator_proto_goTypes = []any{
+ 	(*SandboxConfig)(nil),                // 0: SandboxConfig
+ 	(*SandboxIam)(nil),                   // 1: SandboxIam
+@@ -2194,70 +2344,74 @@
+ 	(*RestoreDiskRequest)(nil),           // 24: RestoreDiskRequest
+ 	(*RestoreDiskResponse)(nil),          // 25: RestoreDiskResponse
+ 	(*RestoreDiskActivateRequest)(nil),   // 26: RestoreDiskActivateRequest
+-	nil,                                  // 27: SandboxConfig.EnvVarsEntry
+-	nil,                                  // 28: SandboxConfig.MetadataEntry
+-	nil,                                  // 29: SandboxIam.TokensEntry
+-	nil,                                  // 30: SandboxNetworkTransform.HeadersEntry
+-	nil,                                  // 31: SandboxNetworkEgressConfig.RulesEntry
+-	nil,                                  // 32: SandboxCheckpointRequest.MetadataEntry
+-	(*timestamppb.Timestamp)(nil),        // 33: google.protobuf.Timestamp
+-	(*emptypb.Empty)(nil),                // 34: google.protobuf.Empty
++	(*StopExecutionRequest)(nil),         // 27: StopExecutionRequest
++	(*StopExecutionResponse)(nil),        // 28: StopExecutionResponse
++	nil,                                  // 29: SandboxConfig.EnvVarsEntry
++	nil,                                  // 30: SandboxConfig.MetadataEntry
++	nil,                                  // 31: SandboxIam.TokensEntry
++	nil,                                  // 32: SandboxNetworkTransform.HeadersEntry
++	nil,                                  // 33: SandboxNetworkEgressConfig.RulesEntry
++	nil,                                  // 34: SandboxCheckpointRequest.MetadataEntry
++	(*timestamppb.Timestamp)(nil),        // 35: google.protobuf.Timestamp
++	(*emptypb.Empty)(nil),                // 36: google.protobuf.Empty
+ }
+ var file_orchestrator_proto_depIdxs = []int32{
+-	27, // 0: SandboxConfig.env_vars:type_name -> SandboxConfig.EnvVarsEntry
+-	28, // 1: SandboxConfig.metadata:type_name -> SandboxConfig.MetadataEntry
++	29, // 0: SandboxConfig.env_vars:type_name -> SandboxConfig.EnvVarsEntry
++	30, // 1: SandboxConfig.metadata:type_name -> SandboxConfig.MetadataEntry
+ 	5,  // 2: SandboxConfig.network:type_name -> SandboxNetworkConfig
+ 	4,  // 3: SandboxConfig.volumeMounts:type_name -> SandboxVolumeMount
+ 	3,  // 4: SandboxConfig.auto_resume:type_name -> SandboxAutoResumeConfig
+ 	1,  // 5: SandboxConfig.iam:type_name -> SandboxIam
+-	29, // 6: SandboxIam.tokens:type_name -> SandboxIam.TokensEntry
++	31, // 6: SandboxIam.tokens:type_name -> SandboxIam.TokensEntry
+ 	9,  // 7: SandboxNetworkConfig.egress:type_name -> SandboxNetworkEgressConfig
+ 	11, // 8: SandboxNetworkConfig.ingress:type_name -> SandboxNetworkIngressConfig
+-	30, // 9: SandboxNetworkTransform.headers:type_name -> SandboxNetworkTransform.HeadersEntry
++	32, // 9: SandboxNetworkTransform.headers:type_name -> SandboxNetworkTransform.HeadersEntry
+ 	6,  // 10: SandboxNetworkRule.transform:type_name -> SandboxNetworkTransform
+ 	7,  // 11: SandboxNetworkDomainRules.rules:type_name -> SandboxNetworkRule
+-	31, // 12: SandboxNetworkEgressConfig.rules:type_name -> SandboxNetworkEgressConfig.RulesEntry
++	33, // 12: SandboxNetworkEgressConfig.rules:type_name -> SandboxNetworkEgressConfig.RulesEntry
+ 	10, // 13: SandboxNetworkEgressConfig.egress_proxy_tls:type_name -> SandboxNetworkEgressProxyTLS
+ 	0,  // 14: SandboxCreateRequest.sandbox:type_name -> SandboxConfig
+-	33, // 15: SandboxCreateRequest.start_time:type_name -> google.protobuf.Timestamp
+-	33, // 16: SandboxCreateRequest.end_time:type_name -> google.protobuf.Timestamp
++	35, // 15: SandboxCreateRequest.start_time:type_name -> google.protobuf.Timestamp
++	35, // 16: SandboxCreateRequest.end_time:type_name -> google.protobuf.Timestamp
+ 	17, // 17: SandboxCreateResponse.scheduling_metadata:type_name -> SchedulingMetadata
+-	33, // 18: SandboxUpdateRequest.end_time:type_name -> google.protobuf.Timestamp
++	35, // 18: SandboxUpdateRequest.end_time:type_name -> google.protobuf.Timestamp
+ 	9,  // 19: SandboxUpdateRequest.egress:type_name -> SandboxNetworkEgressConfig
+ 	17, // 20: SandboxPauseResponse.scheduling_metadata:type_name -> SchedulingMetadata
+-	32, // 21: SandboxCheckpointRequest.metadata:type_name -> SandboxCheckpointRequest.MetadataEntry
++	34, // 21: SandboxCheckpointRequest.metadata:type_name -> SandboxCheckpointRequest.MetadataEntry
+ 	17, // 22: SandboxCheckpointResponse.scheduling_metadata:type_name -> SchedulingMetadata
+ 	0,  // 23: RunningSandbox.config:type_name -> SandboxConfig
+-	33, // 24: RunningSandbox.start_time:type_name -> google.protobuf.Timestamp
+-	33, // 25: RunningSandbox.end_time:type_name -> google.protobuf.Timestamp
++	35, // 24: RunningSandbox.start_time:type_name -> google.protobuf.Timestamp
++	35, // 25: RunningSandbox.end_time:type_name -> google.protobuf.Timestamp
+ 	21, // 26: SandboxListResponse.sandboxes:type_name -> RunningSandbox
+ 	12, // 27: RestoreDiskActivateRequest.create:type_name -> SandboxCreateRequest
+ 	2,  // 28: SandboxIam.TokensEntry.value:type_name -> SandboxIamToken
+ 	8,  // 29: SandboxNetworkEgressConfig.RulesEntry.value:type_name -> SandboxNetworkDomainRules
+-	24, // 30: SandboxService.ReleaseRestoreDisk:input_type -> RestoreDiskRequest
+-	26, // 31: SandboxService.ActivateRestoreDisk:input_type -> RestoreDiskActivateRequest
+-	23, // 32: SandboxService.PrepareRestoreDisk:input_type -> RestoreDiskPrepareRequest
+-	24, // 33: SandboxService.InspectRestoreDisk:input_type -> RestoreDiskRequest
+-	24, // 34: SandboxService.CancelRestoreDisk:input_type -> RestoreDiskRequest
+-	12, // 35: SandboxService.Create:input_type -> SandboxCreateRequest
+-	14, // 36: SandboxService.Update:input_type -> SandboxUpdateRequest
+-	34, // 37: SandboxService.List:input_type -> google.protobuf.Empty
+-	15, // 38: SandboxService.Delete:input_type -> SandboxDeleteRequest
+-	16, // 39: SandboxService.Pause:input_type -> SandboxPauseRequest
+-	19, // 40: SandboxService.Checkpoint:input_type -> SandboxCheckpointRequest
+-	34, // 41: SandboxService.ReleaseRestoreDisk:output_type -> google.protobuf.Empty
+-	13, // 42: SandboxService.ActivateRestoreDisk:output_type -> SandboxCreateResponse
+-	25, // 43: SandboxService.PrepareRestoreDisk:output_type -> RestoreDiskResponse
+-	25, // 44: SandboxService.InspectRestoreDisk:output_type -> RestoreDiskResponse
+-	34, // 45: SandboxService.CancelRestoreDisk:output_type -> google.protobuf.Empty
+-	13, // 46: SandboxService.Create:output_type -> SandboxCreateResponse
+-	34, // 47: SandboxService.Update:output_type -> google.protobuf.Empty
+-	22, // 48: SandboxService.List:output_type -> SandboxListResponse
+-	34, // 49: SandboxService.Delete:output_type -> google.protobuf.Empty
+-	18, // 50: SandboxService.Pause:output_type -> SandboxPauseResponse
+-	20, // 51: SandboxService.Checkpoint:output_type -> SandboxCheckpointResponse
+-	41, // [41:52] is the sub-list for method output_type
+-	30, // [30:41] is the sub-list for method input_type
++	27, // 30: SandboxService.StopExecution:input_type -> StopExecutionRequest
++	24, // 31: SandboxService.ReleaseRestoreDisk:input_type -> RestoreDiskRequest
++	26, // 32: SandboxService.ActivateRestoreDisk:input_type -> RestoreDiskActivateRequest
++	23, // 33: SandboxService.PrepareRestoreDisk:input_type -> RestoreDiskPrepareRequest
++	24, // 34: SandboxService.InspectRestoreDisk:input_type -> RestoreDiskRequest
++	24, // 35: SandboxService.CancelRestoreDisk:input_type -> RestoreDiskRequest
++	12, // 36: SandboxService.Create:input_type -> SandboxCreateRequest
++	14, // 37: SandboxService.Update:input_type -> SandboxUpdateRequest
++	36, // 38: SandboxService.List:input_type -> google.protobuf.Empty
++	15, // 39: SandboxService.Delete:input_type -> SandboxDeleteRequest
++	16, // 40: SandboxService.Pause:input_type -> SandboxPauseRequest
++	19, // 41: SandboxService.Checkpoint:input_type -> SandboxCheckpointRequest
++	28, // 42: SandboxService.StopExecution:output_type -> StopExecutionResponse
++	36, // 43: SandboxService.ReleaseRestoreDisk:output_type -> google.protobuf.Empty
++	13, // 44: SandboxService.ActivateRestoreDisk:output_type -> SandboxCreateResponse
++	25, // 45: SandboxService.PrepareRestoreDisk:output_type -> RestoreDiskResponse
++	25, // 46: SandboxService.InspectRestoreDisk:output_type -> RestoreDiskResponse
++	36, // 47: SandboxService.CancelRestoreDisk:output_type -> google.protobuf.Empty
++	13, // 48: SandboxService.Create:output_type -> SandboxCreateResponse
++	36, // 49: SandboxService.Update:output_type -> google.protobuf.Empty
++	22, // 50: SandboxService.List:output_type -> SandboxListResponse
++	36, // 51: SandboxService.Delete:output_type -> google.protobuf.Empty
++	18, // 52: SandboxService.Pause:output_type -> SandboxPauseResponse
++	20, // 53: SandboxService.Checkpoint:output_type -> SandboxCheckpointResponse
++	42, // [42:54] is the sub-list for method output_type
++	30, // [30:42] is the sub-list for method input_type
+ 	30, // [30:30] is the sub-list for extension type_name
+ 	30, // [30:30] is the sub-list for extension extendee
+ 	0,  // [0:30] is the sub-list for field type_name
+@@ -2282,7 +2436,7 @@
+ 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+ 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_orchestrator_proto_rawDesc), len(file_orchestrator_proto_rawDesc)),
+ 			NumEnums:      0,
+-			NumMessages:   33,
++			NumMessages:   35,
+ 			NumExtensions: 0,
+ 			NumServices:   1,
+ 		},
+--- a/packages/shared/pkg/grpc/orchestrator/orchestrator_grpc.pb.go
++++ b/packages/shared/pkg/grpc/orchestrator/orchestrator_grpc.pb.go
+@@ -20,6 +20,7 @@
+ const _ = grpc.SupportPackageIsVersion9
+ 
+ const (
++	SandboxService_StopExecution_FullMethodName       = "/SandboxService/StopExecution"
+ 	SandboxService_ReleaseRestoreDisk_FullMethodName  = "/SandboxService/ReleaseRestoreDisk"
+ 	SandboxService_ActivateRestoreDisk_FullMethodName = "/SandboxService/ActivateRestoreDisk"
+ 	SandboxService_PrepareRestoreDisk_FullMethodName  = "/SandboxService/PrepareRestoreDisk"
+@@ -37,6 +38,7 @@
+ //
+ // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+ type SandboxServiceClient interface {
++	StopExecution(ctx context.Context, in *StopExecutionRequest, opts ...grpc.CallOption) (*StopExecutionResponse, error)
+ 	ReleaseRestoreDisk(ctx context.Context, in *RestoreDiskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+ 	ActivateRestoreDisk(ctx context.Context, in *RestoreDiskActivateRequest, opts ...grpc.CallOption) (*SandboxCreateResponse, error)
+ 	PrepareRestoreDisk(ctx context.Context, in *RestoreDiskPrepareRequest, opts ...grpc.CallOption) (*RestoreDiskResponse, error)
+@@ -60,6 +62,16 @@
+ 	return &sandboxServiceClient{cc}
+ }
+ 
++func (c *sandboxServiceClient) StopExecution(ctx context.Context, in *StopExecutionRequest, opts ...grpc.CallOption) (*StopExecutionResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(StopExecutionResponse)
++	err := c.cc.Invoke(ctx, SandboxService_StopExecution_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ func (c *sandboxServiceClient) ReleaseRestoreDisk(ctx context.Context, in *RestoreDiskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+ 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+ 	out := new(emptypb.Empty)
+@@ -174,6 +186,7 @@
+ // All implementations must embed UnimplementedSandboxServiceServer
+ // for forward compatibility.
+ type SandboxServiceServer interface {
++	StopExecution(context.Context, *StopExecutionRequest) (*StopExecutionResponse, error)
+ 	ReleaseRestoreDisk(context.Context, *RestoreDiskRequest) (*emptypb.Empty, error)
+ 	ActivateRestoreDisk(context.Context, *RestoreDiskActivateRequest) (*SandboxCreateResponse, error)
+ 	PrepareRestoreDisk(context.Context, *RestoreDiskPrepareRequest) (*RestoreDiskResponse, error)
+@@ -197,6 +210,9 @@
+ // pointer dereference when methods are called.
+ type UnimplementedSandboxServiceServer struct{}
+ 
++func (UnimplementedSandboxServiceServer) StopExecution(context.Context, *StopExecutionRequest) (*StopExecutionResponse, error) {
++	return nil, status.Error(codes.Unimplemented, "method StopExecution not implemented")
++}
+ func (UnimplementedSandboxServiceServer) ReleaseRestoreDisk(context.Context, *RestoreDiskRequest) (*emptypb.Empty, error) {
+ 	return nil, status.Error(codes.Unimplemented, "method ReleaseRestoreDisk not implemented")
+ }
+@@ -251,6 +267,24 @@
+ 	s.RegisterService(&SandboxService_ServiceDesc, srv)
+ }
+ 
++func _SandboxService_StopExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(StopExecutionRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServiceServer).StopExecution(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: SandboxService_StopExecution_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServiceServer).StopExecution(ctx, req.(*StopExecutionRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
+ func _SandboxService_ReleaseRestoreDisk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+ 	in := new(RestoreDiskRequest)
+ 	if err := dec(in); err != nil {
+@@ -457,6 +491,10 @@
+ 	HandlerType: (*SandboxServiceServer)(nil),
+ 	Methods: []grpc.MethodDesc{
+ 		{
++			MethodName: "StopExecution",
++			Handler:    _SandboxService_StopExecution_Handler,
++		},
++		{
+ 			MethodName: "ReleaseRestoreDisk",
+ 			Handler:    _SandboxService_ReleaseRestoreDisk_Handler,
+ 		},
+--- /dev/null
++++ b/packages/orchestrator/pkg/server/stop_execution.go
+@@ -0,0 +1,45 @@
++//go:build linux
++
++package server
++
++import (
++	"context"
++	"errors"
++	"os"
++
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/execution"
++	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++)
++
++// StopExecution is addressed by the API's durable node/execution tuple, never
++// by a routing lookup alone. The journal fences checkpoint/recovery starts and
++// confirms every recorded lifecycle's cgroup is empty before acknowledging.
++func (s *Server) StopExecution(ctx context.Context, in *rpc.StopExecutionRequest) (*rpc.StopExecutionResponse, error) {
++	release := s.info.TrackWork()
++	defer release()
++	if !s.config.LaunchpadRequireExecutionFence {
++		return nil, status.Error(codes.Unimplemented, "physical execution fencing is disabled")
++	}
++	store, err := sandbox.ExecutionStore(s.config.BuilderConfig)
++	if err != nil {
++		return nil, status.Error(codes.Unavailable, "execution journal unavailable")
++	}
++	stop := store.Stop
++	if in.GetRegisteredBeforeStart() {
++		stop = store.StopRegistered
++	}
++	record, err := stop(ctx, execution.Identity{TeamID: in.GetTeamId(), SandboxID: in.GetSandboxId(), ExecutionID: in.GetExecutionId()})
++	if err != nil {
++		if errors.Is(err, os.ErrNotExist) {
++			return nil, status.Error(codes.FailedPrecondition, "physical execution identity is unknown; stop is not confirmed")
++		}
++		return nil, status.Error(codes.Unavailable, "physical execution stop is not confirmed")
++	}
++	// Kernel termination wakes the normal FC exit waiter. Leave cleanup to its
++	// existing lifecycle guard; a later lifecycle cannot pass the journal fence.
++	return &rpc.StopExecutionResponse{TeamId: record.TeamID, SandboxId: record.SandboxID, ExecutionId: record.ExecutionID, PhysicallyStopped: record.State == "stopped"}, nil
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/execution_fence.go
+@@ -0,0 +1,52 @@
++//go:build linux
++
++package sandbox
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/execution"
++	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
++)
++
++// ExecutionStore is shared by startup and the stop RPC. Its directory must be
++// persistent and must not live in the disposable template/build cache.
++func ExecutionStore(config cfg.BuilderConfig) (*execution.Store, error) {
++	if !config.LaunchpadRequireExecutionFence {
++		return nil, errors.New("physical execution fencing is disabled")
++	}
++	bootID, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
++	if err != nil {
++		return nil, err
++	}
++	return execution.New(filepath.Join(config.OrchestratorBaseDir, "executions"), strings.TrimSpace(string(bootID)), cgroup.KillExisting)
++}
++
++func (f *Factory) reserveExecution(runtime sandboxtypes.RuntimeMetadata, group string) (*execution.Reservation, error) {
++	if !f.config.LaunchpadRequireExecutionFence {
++		return nil, nil
++	}
++	store, err := ExecutionStore(f.config)
++	if err != nil {
++		return nil, err
++	}
++	return store.Reserve(execution.Identity{TeamID: runtime.TeamID, SandboxID: runtime.SandboxID, ExecutionID: runtime.ExecutionID}, group)
++}
++
++// Startup cleanup must run even if the request was canceled. Abort keeps the
++// record uncertain when physical cleanup cannot be established.
++func abortExecution(ctx context.Context, reservation *execution.Reservation) error {
++	if reservation == nil {
++		return nil
++	}
++	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
++	defer cancel()
++	return reservation.Abort(cleanupCtx)
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/execution/journal.go
+@@ -0,0 +1,253 @@
++// Package execution records the physical identity needed to stop a VM after
++// its orchestrator restarts. A missing API route is never a stop receipt.
++package execution
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++
++	"golang.org/x/sys/unix"
++)
++
++var ErrAlreadyReserved = errors.New("execution identity has already been reserved")
++var identifier = regexp.MustCompile(`^[a-zA-Z0-9-]{1,128}$`)
++
++type Identity struct {
++	TeamID      string `json:"teamId"`
++	SandboxID   string `json:"sandboxId"`
++	ExecutionID string `json:"executionId"`
++}
++
++type Record struct {
++	Version int `json:"version"`
++	Identity
++	Groups []Group `json:"groups"`
++	State  string  `json:"state"`
++}
++
++type Group struct {
++	CgroupName string `json:"cgroupName"`
++	BootID     string `json:"bootId"`
++}
++
++type Store struct {
++	directory string
++	bootID    string
++	killGroup func(context.Context, string) error
++}
++
++// New requires a real kernel boot identity and a cgroup killer that waits for
++// populated=0. It must not be supplied with the optional accounting noop.
++func New(directory, bootID string, killGroup func(context.Context, string) error) (*Store, error) {
++	if !identifier.MatchString(bootID) || killGroup == nil {
++		return nil, errors.New("physical execution tracking requires boot identity and cgroup enforcement")
++	}
++	if err := os.MkdirAll(directory, 0700); err != nil {
++		return nil, err
++	}
++	return &Store{directory: directory, bootID: bootID, killGroup: killGroup}, nil
++}
++
++func (s *Store) lock(id Identity) (*os.File, error) {
++	if !identifier.MatchString(id.TeamID) || !identifier.MatchString(id.SandboxID) || !identifier.MatchString(id.ExecutionID) {
++		return nil, errors.New("invalid physical execution identity")
++	}
++	file, err := os.OpenFile(filepath.Join(s.directory, id.ExecutionID+".lock"), os.O_CREATE|os.O_RDWR, 0600)
++	if err != nil {
++		return nil, err
++	}
++	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
++		file.Close()
++		return nil, err
++	}
++	return file, nil
++}
++func unlock(file *os.File) { _ = unix.Flock(int(file.Fd()), unix.LOCK_UN); _ = file.Close() }
++func (s *Store) read(id Identity) (Record, error) {
++	var record Record
++	data, err := os.ReadFile(filepath.Join(s.directory, id.ExecutionID+".json"))
++	if err != nil {
++		return record, err
++	}
++	if err := json.Unmarshal(data, &record); err != nil {
++		return record, err
++	}
++	if record.Version != 1 || record.Identity != id || (len(record.Groups) == 0 && record.State != "stopped") ||
++		(record.State != "reserved" && record.State != "running" && record.State != "stopping" && record.State != "stopped") {
++		return record, errors.New("physical execution record is invalid or belongs to another owner")
++	}
++	seen := make(map[string]bool)
++	for _, group := range record.Groups {
++		if !identifier.MatchString(group.BootID) || !strings.HasPrefix(group.CgroupName, "sbx-"+id.SandboxID+"-") || !identifier.MatchString(group.CgroupName) || seen[group.CgroupName] {
++			return record, errors.New("invalid or duplicated physical execution cgroup")
++		}
++		seen[group.CgroupName] = true
++	}
++	return record, nil
++}
++func (s *Store) save(record Record) error {
++	data, err := json.Marshal(record)
++	if err != nil {
++		return err
++	}
++	file, err := os.CreateTemp(s.directory, record.ExecutionID+".pending-")
++	if err != nil {
++		return err
++	}
++	defer os.Remove(file.Name())
++	defer file.Close()
++	if _, err := file.Write(data); err != nil {
++		return err
++	}
++	if err := file.Sync(); err != nil {
++		return err
++	}
++	if err := file.Close(); err != nil {
++		return err
++	}
++	if err := os.Rename(file.Name(), filepath.Join(s.directory, record.ExecutionID+".json")); err != nil {
++		return err
++	}
++	directory, err := os.Open(s.directory)
++	if err != nil {
++		return err
++	}
++	defer directory.Close()
++	return directory.Sync()
++}
++
++type Reservation struct {
++	store  *Store
++	record Record
++	lock   *os.File
++}
++
++// Reserve persists intent and holds the cross-process lock before cgroup
++// creation/clone. Call Commit after startup, or Abort on every failure. All
++// Firecracker processes must enter this recorded cgroup atomically at clone.
++func (s *Store) Reserve(id Identity, cgroupName string) (*Reservation, error) {
++	if !strings.HasPrefix(cgroupName, "sbx-"+id.SandboxID+"-") || !identifier.MatchString(cgroupName) {
++		return nil, errors.New("invalid execution cgroup")
++	}
++	lock, err := s.lock(id)
++	if err != nil {
++		return nil, err
++	}
++	record, err := s.read(id)
++	if err != nil && !os.IsNotExist(err) {
++		unlock(lock)
++		return nil, err
++	}
++	if os.IsNotExist(err) {
++		record = Record{Version: 1, Identity: id, State: "running"}
++	}
++	if record.State != "running" {
++		unlock(lock)
++		return nil, ErrAlreadyReserved
++	}
++	for _, group := range record.Groups {
++		if group.CgroupName == cgroupName {
++			unlock(lock)
++			return nil, ErrAlreadyReserved
++		}
++	}
++	record.Groups = append(record.Groups, Group{CgroupName: cgroupName, BootID: s.bootID})
++	record.State = "reserved"
++	if err := s.save(record); err != nil {
++		unlock(lock)
++		return nil, err
++	}
++	return &Reservation{store: s, record: record, lock: lock}, nil
++}
++func (r *Reservation) Commit() error {
++	if r.lock == nil {
++		return errors.New("execution reservation already released")
++	}
++	record := r.record
++	record.State = "running"
++	if err := r.store.save(record); err != nil {
++		return err
++	}
++	r.record = record
++	unlock(r.lock)
++	r.lock = nil
++	return nil
++}
++
++// Abort never publishes a stop receipt until the cgroup is empty. On failure
++// the durable reservation survives for reconciliation by this exact identity.
++func (r *Reservation) Abort(ctx context.Context) error {
++	if r.lock == nil {
++		return nil
++	}
++	defer func() { unlock(r.lock); r.lock = nil }()
++	group := r.record.Groups[len(r.record.Groups)-1]
++	if err := r.store.killGroup(ctx, group.CgroupName); err != nil {
++		return err
++	}
++	// Startup cleanup only stops this attempted lifecycle. A checkpoint may
++	// have another live lifecycle under the same execution identity.
++	record := r.record
++	record.State = "running"
++	return r.store.save(record)
++}
++func (s *Store) stop(ctx context.Context, record Record) (Record, error) {
++	if record.State == "stopped" {
++		return record, nil
++	}
++	// Fence future checkpoint/recovery clones before touching processes. A failed
++	// kill must never reopen admission while a caller retries termination.
++	if record.State != "stopping" {
++		record.State = "stopping"
++		if err := s.save(record); err != nil {
++			return record, err
++		}
++	}
++	// A different kernel boot proves the original execution cannot still run.
++	// Never kill a possibly reused cgroup on the new boot.
++	for _, group := range record.Groups {
++		if group.BootID == s.bootID {
++			if err := s.killGroup(ctx, group.CgroupName); err != nil {
++				return record, fmt.Errorf("physical execution is not confirmed stopped: %w", err)
++			}
++		}
++	}
++	record.State = "stopped"
++	if err := s.save(record); err != nil {
++		return record, err
++	}
++	return record, nil
++}
++func (s *Store) Stop(ctx context.Context, id Identity) (Record, error) {
++	return s.stopIdentity(ctx, id, false)
++}
++
++// StopRegistered is only for API registry entries durably inserted before a
++// fenced-runtime create RPC. Missing here means that clone has not passed its
++// reservation yet; publishing the tombstone under the same lock prevents a
++// delayed RPC from starting. Never use this for legacy/unregistered VMs.
++func (s *Store) StopRegistered(ctx context.Context, id Identity) (Record, error) {
++	return s.stopIdentity(ctx, id, true)
++}
++func (s *Store) stopIdentity(ctx context.Context, id Identity, registered bool) (Record, error) {
++	lock, err := s.lock(id)
++	if err != nil {
++		return Record{}, err
++	}
++	defer unlock(lock)
++	record, err := s.read(id)
++	if registered && os.IsNotExist(err) {
++		record = Record{Version: 1, Identity: id, State: "stopped"}
++		return record, s.save(record)
++	}
++	if err != nil {
++		return Record{}, err
++	}
++	return s.stop(ctx, record)
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/execution/journal_test.go
+@@ -0,0 +1,182 @@
++package execution
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func testIdentity() Identity {
++	return Identity{TeamID: "team-1", SandboxID: "sandbox-1", ExecutionID: "execution-1"}
++}
++
++func TestPhysicalStopSurvivesLostReplyAndRestart(t *testing.T) {
++	directory := t.TempDir()
++	calls := 0
++	kill := func(context.Context, string) error { calls++; return nil }
++	source, err := New(directory, "boot-1", kill)
++	require.NoError(t, err)
++	reservation, err := source.Reserve(testIdentity(), "sbx-sandbox-1-random")
++	require.NoError(t, err)
++	require.NoError(t, reservation.Commit())
++	record, err := source.Stop(t.Context(), testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, "stopped", record.State)
++	restarted, err := New(directory, "boot-1", kill)
++	require.NoError(t, err)
++	record, err = restarted.Stop(t.Context(), testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, "stopped", record.State)
++	require.Equal(t, 1, calls, "lost replies must reuse the durable receipt")
++	_, err = restarted.Reserve(testIdentity(), "sbx-sandbox-1-new")
++	require.ErrorIs(t, err, ErrAlreadyReserved)
++}
++
++func TestInterruptedStartupRequiresStopEvidence(t *testing.T) {
++	directory := t.TempDir()
++	failed := true
++	calls := 0
++	store, err := New(directory, "boot-1", func(context.Context, string) error {
++		calls++
++		if failed {
++			return errors.New("cgroup still populated")
++		}
++		return nil
++	})
++	require.NoError(t, err)
++	reservation, err := store.Reserve(testIdentity(), "sbx-sandbox-1-random")
++	require.NoError(t, err)
++	// Simulate process death after clone but before Commit: the kernel releases
++	// the lock, while the spawned VM remains in its pre-recorded cgroup.
++	unlock(reservation.lock)
++	reservation.lock = nil
++	_, err = store.Stop(t.Context(), testIdentity())
++	require.ErrorContains(t, err, "not confirmed stopped")
++	record, err := store.read(testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, "stopping", record.State)
++	_, err = store.Reserve(testIdentity(), "sbx-sandbox-1-again")
++	require.ErrorIs(t, err, ErrAlreadyReserved)
++	failed = false
++	record, err = store.Stop(t.Context(), testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, "stopped", record.State)
++	require.Equal(t, 2, calls)
++}
++
++func TestKernelRestartCannotKillNewBootProcesses(t *testing.T) {
++	directory := t.TempDir()
++	source, err := New(directory, "boot-before", func(context.Context, string) error { return nil })
++	require.NoError(t, err)
++	r, err := source.Reserve(testIdentity(), "sbx-sandbox-1-random")
++	require.NoError(t, err)
++	require.NoError(t, r.Commit())
++	restarted, err := New(directory, "boot-after", func(context.Context, string) error {
++		t.Fatal("old identity must not kill a new boot's processes")
++		return nil
++	})
++	require.NoError(t, err)
++	receipt, err := restarted.Stop(t.Context(), testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, "stopped", receipt.State)
++}
++
++func TestUnknownWrongOwnerAndCorruptRecordsDoNotProveStop(t *testing.T) {
++	directory := t.TempDir()
++	calls := 0
++	store, err := New(directory, "boot-1", func(context.Context, string) error { calls++; return nil })
++	require.NoError(t, err)
++	_, err = store.Stop(t.Context(), testIdentity())
++	require.ErrorIs(t, err, os.ErrNotExist)
++	r, err := store.Reserve(testIdentity(), "sbx-sandbox-1-random")
++	require.NoError(t, err)
++	require.NoError(t, r.Commit())
++	wrong := testIdentity()
++	wrong.TeamID = "other-team"
++	_, err = store.Stop(t.Context(), wrong)
++	require.ErrorContains(t, err, "another owner")
++	require.NoError(t, os.WriteFile(filepath.Join(directory, "execution-1.json"), []byte("partial"), 0600))
++	_, err = store.Stop(t.Context(), testIdentity())
++	require.Error(t, err)
++	require.Zero(t, calls)
++}
++
++func TestAbortKeepsUncertainReservationForReconciliation(t *testing.T) {
++	store, err := New(t.TempDir(), "boot-1", func(context.Context, string) error { return errors.New("cannot inspect cgroup") })
++	require.NoError(t, err)
++	r, err := store.Reserve(testIdentity(), "sbx-sandbox-1-random")
++	require.NoError(t, err)
++	require.Error(t, r.Abort(t.Context()))
++	record, err := store.read(testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, "reserved", record.State)
++	_, err = store.Reserve(testIdentity(), "sbx-sandbox-1-another")
++	require.ErrorIs(t, err, ErrAlreadyReserved)
++}
++
++func TestCheckpointLifecyclesAreAllStoppedBeforeExecutionIsFenced(t *testing.T) {
++	var killed []string
++	store, err := New(t.TempDir(), "boot-1", func(_ context.Context, name string) error { killed = append(killed, name); return nil })
++	require.NoError(t, err)
++	for _, name := range []string{"sbx-sandbox-1-before", "sbx-sandbox-1-after"} {
++		r, err := store.Reserve(testIdentity(), name)
++		require.NoError(t, err)
++		require.NoError(t, r.Commit())
++	}
++	_, err = store.Stop(t.Context(), testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, []string{"sbx-sandbox-1-before", "sbx-sandbox-1-after"}, killed)
++	_, err = store.Reserve(testIdentity(), "sbx-sandbox-1-late")
++	require.ErrorIs(t, err, ErrAlreadyReserved)
++}
++
++func TestFailedCheckpointStartupDoesNotKillPriorLifecycle(t *testing.T) {
++	var killed []string
++	store, err := New(t.TempDir(), "boot-1", func(_ context.Context, name string) error { killed = append(killed, name); return nil })
++	require.NoError(t, err)
++	old, err := store.Reserve(testIdentity(), "sbx-sandbox-1-before")
++	require.NoError(t, err)
++	require.NoError(t, old.Commit())
++	failed, err := store.Reserve(testIdentity(), "sbx-sandbox-1-failed")
++	require.NoError(t, err)
++	require.NoError(t, failed.Abort(t.Context()))
++	require.Equal(t, []string{"sbx-sandbox-1-failed"}, killed)
++	retry, err := store.Reserve(testIdentity(), "sbx-sandbox-1-retry")
++	require.NoError(t, err)
++	require.NoError(t, retry.Commit())
++	_, err = store.Stop(t.Context(), testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, []string{"sbx-sandbox-1-failed", "sbx-sandbox-1-before", "sbx-sandbox-1-failed", "sbx-sandbox-1-retry"}, killed)
++}
++
++func TestStopCannotOvertakeUnfinishedClone(t *testing.T) {
++	store, err := New(t.TempDir(), "boot-1", func(context.Context, string) error { return nil })
++	require.NoError(t, err)
++	pending, err := store.Reserve(testIdentity(), "sbx-sandbox-1-pending")
++	require.NoError(t, err)
++	_, err = store.Stop(t.Context(), testIdentity())
++	require.Error(t, err, "stop must retry instead of confirming absence before clone")
++	require.NoError(t, pending.Commit())
++	_, err = store.Stop(t.Context(), testIdentity())
++	require.NoError(t, err)
++	_, err = store.Reserve(testIdentity(), "sbx-sandbox-1-late")
++	require.ErrorIs(t, err, ErrAlreadyReserved)
++}
++
++func TestRegisteredUnstartedExecutionFencesDelayedCreate(t *testing.T) {
++	calls := 0
++	store, err := New(t.TempDir(), "boot-1", func(context.Context, string) error { calls++; return nil })
++	require.NoError(t, err)
++	receipt, err := store.StopRegistered(t.Context(), testIdentity())
++	require.NoError(t, err)
++	require.Equal(t, "stopped", receipt.State)
++	require.Zero(t, calls)
++	_, err = store.Reserve(testIdentity(), "sbx-sandbox-1-delayed")
++	require.ErrorIs(t, err, ErrAlreadyReserved)
++	_, err = store.Stop(t.Context(), testIdentity())
++	require.NoError(t, err, "saved never-started fence is a repeatable stop receipt")
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/execution/journal_integration_test.go
+@@ -0,0 +1,69 @@
++//go:build integration && linux
++
++package execution_test
++
++import (
++	"bufio"
++	"context"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/execution"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++// Run on the dedicated compute host. This creates and kills only its own
++// cgroup and the shell/child launched atomically into it by this test.
++func TestPhysicalExecutionStopKillsRealProcessTreeAfterJournalRestart(t *testing.T) {
++	require.Equal(t, 0, os.Geteuid(), "physical stop proof requires the dedicated Linux host")
++	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
++	require.NoError(t, err)
++	directory := t.TempDir()
++	id := execution.Identity{TeamID: uuid.NewString(), SandboxID: "stop-proof-" + uuid.NewString(), ExecutionID: uuid.NewString()}
++	group := "sbx-" + id.SandboxID + "-" + uuid.NewString()
++	source, err := execution.New(directory, strings.TrimSpace(string(boot)), cgroup.KillExisting)
++	require.NoError(t, err)
++	reservation, err := source.Reserve(id, group)
++	require.NoError(t, err)
++	defer reservation.Abort(context.Background())
++	groupPath := filepath.Join(cgroup.RootCgroupPath, group)
++	require.NoError(t, os.Mkdir(groupPath, 0700))
++	defer os.Remove(groupPath)
++	defer cgroup.KillExisting(context.Background(), group)
++	fd, err := os.Open(groupPath)
++	require.NoError(t, err)
++	defer fd.Close()
++	command := exec.Command("/bin/sh", "-c", "sleep 600 & echo ready; wait")
++	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd.Fd())}
++	output, err := command.StdoutPipe()
++	require.NoError(t, err)
++	require.NoError(t, command.Start())
++	defer command.Process.Kill()
++	scanner := bufio.NewScanner(output)
++	require.True(t, scanner.Scan())
++	require.Equal(t, "ready", scanner.Text())
++	require.NoError(t, reservation.Commit())
++	// Neither the restart nor the loss of an HTTP reply carries a PID. Recover
++	// solely from the persisted pre-clone cgroup identity.
++	restarted, err := execution.New(directory, strings.TrimSpace(string(boot)), cgroup.KillExisting)
++	require.NoError(t, err)
++	receipt, err := restarted.Stop(t.Context(), id)
++	require.NoError(t, err)
++	require.Equal(t, "stopped", receipt.State)
++	require.Error(t, command.Wait(), "the original shell must have been killed")
++	events, err := os.ReadFile(filepath.Join(groupPath, "cgroup.events"))
++	require.NoError(t, err)
++	require.Contains(t, string(events), "populated 0")
++	third, err := execution.New(directory, strings.TrimSpace(string(boot)), func(context.Context, string) error { t.Fatal("receipt retry must not kill again"); return nil })
++	require.NoError(t, err)
++	_, err = third.Stop(t.Context(), id)
++	require.NoError(t, err)
++	_, err = third.Reserve(id, group+"-late")
++	require.ErrorIs(t, err, execution.ErrAlreadyReserved)
++}
+--- a/packages/orchestrator/pkg/server/sandboxes.go
++++ b/packages/orchestrator/pkg/server/sandboxes.go
+@@ -136,6 +136,9 @@
+ }
+ 
+ func (s *Server) createSandbox(ctx context.Context, req *orchestrator.SandboxCreateRequest, beforeGuestStart func() error) (_ *orchestrator.SandboxCreateResponse, createErr error) {
++	if req.GetSandbox().GetMetadata()["launchpad.managed"] == "thread-vm-v1" && !s.config.LaunchpadRequireExecutionFence {
++		return nil, status.Error(codes.FailedPrecondition, "managed execution requires physical fencing")
++	}
+ 	releaseWork := s.info.TrackWork()
+ 	defer releaseWork()
+ 
+--- a/packages/orchestrator/pkg/server/prefetch_harvest.go
++++ b/packages/orchestrator/pkg/server/prefetch_harvest.go
+@@ -196,6 +196,12 @@
+ 	buildID string,
+ 	objectMetadata storage.ObjectMetadata,
+ ) {
++	// Harvest boots an unregistered copy after Pause has returned. The execution
++	// registry cannot fence that separate identity, so a fenced host must not run
++	// this optional optimization until its child execution is also tracked.
++	if s.config.LaunchpadRequireExecutionFence {
++		return
++	}
+ 	// Flag checks run synchronously (ctx still carries the per-sandbox LD
+ 	// context the Pause handler attached) before we detach into a goroutine.
+ 	if !s.featureFlags.BoolFlag(ctx, featureflags.PauseResumePrefetchHarvestFlag) {
+--- a/spec/openapi.yml
++++ b/spec/openapi.yml
+@@ -2754,6 +2754,32 @@
+   - name: secrets
+ 
+ paths:
++  /extensions/launchpad/v1/executions/{sandboxID}:
++    delete:
++      operationId: stopLaunchpadExecution
++      security:
++        - ApiKeyAuth: []
++      parameters:
++        - name: sandboxID
++          in: path
++          required: true
++          schema:
++            type: string
++      responses:
++        '200':
++          description: Every registered execution is fenced and physically stopped
++          content:
++            application/json:
++              schema:
++                type: object
++                required: [sandboxID, physicallyStopped]
++                properties:
++                  sandboxID:
++                    type: string
++                  physicallyStopped:
++                    type: boolean
++        default:
++          description: Unknown identity, unauthorized request, or stop not confirmed
+   /extensions/launchpad/v1/capabilities:
+     get:
+       operationId: getLaunchpadCapabilities
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -2744,6 +2744,9 @@
+ 	// GetLaunchpadCapabilities performs a GET /extensions/launchpad/v1/capabilities (the `GetLaunchpadCapabilities` operationId) request.
+ 	GetLaunchpadCapabilities(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+ 
++	// StopLaunchpadExecution performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
++	StopLaunchpadExecution(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*http.Response, error)
++
+ 	// DeleteLaunchpadRestore performs a DELETE /extensions/launchpad/v1/restores/{operationID} (the `DeleteLaunchpadRestore` operationId) request.
+ 	DeleteLaunchpadRestore(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
+ 
+@@ -3861,6 +3864,19 @@
+ // GetLaunchpadCapabilities performs a GET /extensions/launchpad/v1/capabilities (the `GetLaunchpadCapabilities` operationId) request.
+ func (c *Client) GetLaunchpadCapabilities(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+ 	req, err := NewGetLaunchpadCapabilitiesRequest(c.Server)
++	if err != nil {
++		return nil, err
++	}
++	req = req.WithContext(ctx)
++	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
++		return nil, err
++	}
++	return c.Client.Do(req)
++}
++
++// StopLaunchpadExecution performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
++func (c *Client) StopLaunchpadExecution(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*http.Response, error) {
++	req, err := NewStopLaunchpadExecutionRequest(c.Server, sandboxID)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -6445,6 +6461,40 @@
+ 	return req, nil
+ }
+ 
++// NewStopLaunchpadExecutionRequest constructs an http.Request for the StopLaunchpadExecution method
++func NewStopLaunchpadExecutionRequest(server string, sandboxID string) (*http.Request, error) {
++	var err error
++
++	var pathParam0 string
++
++	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "sandboxID", sandboxID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
++	if err != nil {
++		return nil, err
++	}
++
++	serverURL, err := url.Parse(server)
++	if err != nil {
++		return nil, err
++	}
++
++	operationPath := fmt.Sprintf("/extensions/launchpad/v1/executions/%s", pathParam0)
++	if operationPath[0] == '/' {
++		operationPath = "." + operationPath
++	}
++
++	queryURL, err := serverURL.Parse(operationPath)
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
++	if err != nil {
++		return nil, err
++	}
++
++	return req, nil
++}
++
+ // NewDeleteLaunchpadRestoreRequest constructs an http.Request for the DeleteLaunchpadRestore method
+ func NewDeleteLaunchpadRestoreRequest(server string, operationID openapi_types.UUID) (*http.Request, error) {
+ 	var err error
+@@ -9582,6 +9632,11 @@
+ 	//
+ 	// Returns a wrapper object for the known response body format(s).
+ 	GetLaunchpadCapabilitiesWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetLaunchpadCapabilitiesResponse, error)
++
++	// StopLaunchpadExecutionWithResponse performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
++	//
++	// Returns a wrapper object for the known response body format(s).
++	StopLaunchpadExecutionWithResponse(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*StopLaunchpadExecutionResponse, error)
+ 
+ 	// DeleteLaunchpadRestoreWithResponse performs a DELETE /extensions/launchpad/v1/restores/{operationID} (the `DeleteLaunchpadRestore` operationId) request.
+ 	//
+@@ -12000,6 +12055,53 @@
+ 
+ // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+ func (r GetLaunchpadCapabilitiesResponse) ContentType() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Header.Get("Content-Type")
++	}
++	return ""
++}
++
++type StopLaunchpadExecutionResponse struct {
++	Body         []byte
++	HTTPResponse *http.Response
++	// JSON200 the response for an HTTP 200 `application/json` response
++	JSON200 *struct {
++		PhysicallyStopped bool   `json:"physicallyStopped"`
++		SandboxID         string `json:"sandboxID"`
++	}
++}
++
++// GetJSON200 returns the response for an HTTP 200 `application/json` response
++func (r StopLaunchpadExecutionResponse) GetJSON200() *struct {
++	PhysicallyStopped bool   `json:"physicallyStopped"`
++	SandboxID         string `json:"sandboxID"`
++} {
++	return r.JSON200
++}
++
++// GetBody returns the raw response body bytes
++func (r StopLaunchpadExecutionResponse) GetBody() []byte {
++	return r.Body
++}
++
++// Status returns HTTPResponse.Status
++func (r StopLaunchpadExecutionResponse) Status() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Status
++	}
++	return http.StatusText(0)
++}
++
++// StatusCode returns HTTPResponse.StatusCode
++func (r StopLaunchpadExecutionResponse) StatusCode() int {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.StatusCode
++	}
++	return 0
++}
++
++// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
++func (r StopLaunchpadExecutionResponse) ContentType() string {
+ 	if r.HTTPResponse != nil {
+ 		return r.HTTPResponse.Header.Get("Content-Type")
+ 	}
+@@ -16773,6 +16875,17 @@
+ 	return ParseGetLaunchpadCapabilitiesResponse(rsp)
+ }
+ 
++// StopLaunchpadExecutionWithResponse performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
++//
++// Returns a wrapper object for the known response body format(s).
++func (c *ClientWithResponses) StopLaunchpadExecutionWithResponse(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*StopLaunchpadExecutionResponse, error) {
++	rsp, err := c.StopLaunchpadExecution(ctx, sandboxID, reqEditors...)
++	if err != nil {
++		return nil, err
++	}
++	return ParseStopLaunchpadExecutionResponse(rsp)
++}
++
+ // DeleteLaunchpadRestoreWithResponse performs a DELETE /extensions/launchpad/v1/restores/{operationID} (the `DeleteLaunchpadRestore` operationId) request.
+ //
+ // Returns a wrapper object for the known response body format(s).
+@@ -19385,6 +19498,35 @@
+ 	switch {
+ 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+ 		var dest LaunchpadRuntimeCapabilities
++		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
++			return nil, err
++		}
++		response.JSON200 = &dest
++
++	}
++
++	return response, nil
++}
++
++// ParseStopLaunchpadExecutionResponse parses an HTTP response from a StopLaunchpadExecutionWithResponse call
++func ParseStopLaunchpadExecutionResponse(rsp *http.Response) (*StopLaunchpadExecutionResponse, error) {
++	bodyBytes, err := io.ReadAll(rsp.Body)
++	defer func() { _ = rsp.Body.Close() }()
++	if err != nil {
++		return nil, err
++	}
++
++	response := &StopLaunchpadExecutionResponse{
++		Body:         bodyBytes,
++		HTTPResponse: rsp,
++	}
++
++	switch {
++	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
++		var dest struct {
++			PhysicallyStopped bool   `json:"physicallyStopped"`
++			SandboxID         string `json:"sandboxID"`
++		}
+ 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+ 			return nil, err
+ 		}
+@@ -23352,6 +23494,9 @@
+ 
+ 	// (GET /extensions/launchpad/v1/capabilities)
+ 	GetLaunchpadCapabilities(c *gin.Context)
++
++	// (DELETE /extensions/launchpad/v1/executions/{sandboxID})
++	StopLaunchpadExecution(c *gin.Context, sandboxID string)
+ 
+ 	// (DELETE /extensions/launchpad/v1/restores/{operationID})
+ 	DeleteLaunchpadRestore(c *gin.Context, operationID openapi_types.UUID)
+@@ -24276,6 +24421,31 @@
+ 	siw.Handler.GetLaunchpadCapabilities(c)
+ }
+ 
++// StopLaunchpadExecution operation middleware
++func (siw *ServerInterfaceWrapper) StopLaunchpadExecution(c *gin.Context) {
++
++	var err error
++	_ = err
++
++	// ------------- Path parameter "sandboxID" -------------
++	var sandboxID string
++
++	err = runtime.BindStyledParameterWithOptions("simple", "sandboxID", c.Param("sandboxID"), &sandboxID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
++	if err != nil {
++		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter sandboxID: %w", err), http.StatusBadRequest)
++		return
++	}
++
++	for _, middleware := range siw.HandlerMiddlewares {
++		middleware(c)
++		if c.IsAborted() {
++			return
++		}
++	}
++
++	siw.Handler.StopLaunchpadExecution(c, sandboxID)
++}
++
+ // DeleteLaunchpadRestore operation middleware
+ func (siw *ServerInterfaceWrapper) DeleteLaunchpadRestore(c *gin.Context) {
+ 
+@@ -25933,6 +26103,7 @@
+ 		ErrorHandler:       errorHandler,
+ 	}
+ 
++	router.DELETE(options.BaseURL+"/extensions/launchpad/v1/executions/:sandboxID", wrapper.StopLaunchpadExecution)
+ 	router.GET(options.BaseURL+"/extensions/launchpad/v1/capabilities", wrapper.GetLaunchpadCapabilities)
+ 	router.DELETE(options.BaseURL+"/extensions/launchpad/v1/restores/:operationID", wrapper.DeleteLaunchpadRestore)
+ 	router.GET(options.BaseURL+"/extensions/launchpad/v1/restores/:operationID", wrapper.GetLaunchpadRestore)
+@@ -26257,85 +26428,87 @@
+ 	"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",
+ }
+ 
+ // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_execution.go
+@@ -0,0 +1,86 @@
++package handlers
++
++import (
++	"context"
++	"errors"
++	"net/http"
++
++	"github.com/google/uuid"
++
++	"github.com/gin-gonic/gin"
++	"github.com/jackc/pgx/v5"
++
++	"github.com/e2b-dev/infra/packages/api/internal/db"
++	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
++	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
++	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++)
++
++// StopLaunchpadExecution does not infer shutdown from an expired routing entry.
++// Its permanent admission fence and host list survive both API and host restart.
++func (a *APIStore) StopLaunchpadExecution(c *gin.Context, sandboxID string) {
++	team := auth.MustGetTeamID(c)
++	ctx := c.Request.Context()
++	// A saved receipt remains valid after the host goes offline. Its permanent
++	// registry tombstone already prevents all later managed starts/resumes.
++	state, err := a.sqlcDB.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
++	if err == nil && state == "stopped" {
++		c.JSON(http.StatusOK, gin.H{"sandboxID": sandboxID, "physicallyStopped": true})
++		return
++	}
++	attempts, err := (executions.Store{DB: a.sqlcDB}).BeginStop(ctx, team, sandboxID)
++	if err != nil {
++		if errors.Is(err, pgx.ErrNoRows) {
++			a.sendAPIStoreError(c, http.StatusNotFound, "Registered execution not found")
++			return
++		}
++		a.sendAPIStoreError(c, http.StatusServiceUnavailable, "Execution fence is unavailable")
++		return
++	}
++	if err := confirmExecutionStops(ctx, attempts, a.orchestrator.RestoreClient); err != nil {
++		a.sendAPIStoreError(c, http.StatusServiceUnavailable, "Physical execution stop is unconfirmed")
++		return
++	}
++
++	// The database fence prevents a new resume while the routing/snapshot records
++	// are cleaned. Cleanup failure stays retryable; no false success is returned.
++	err = a.orchestrator.RemoveSandbox(ctx, team, sandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionKill, Reason: sandbox.KillReasonRequest})
++	if err != nil && !errors.Is(err, orchestrator.ErrSandboxNotFound) {
++		a.sendAPIStoreError(c, 503, "Stopped execution cleanup is incomplete")
++		return
++	}
++	err = a.deleteSnapshot(ctx, sandboxID, team)
++	if err != nil && !errors.Is(err, db.ErrSnapshotNotFound) {
++		a.sendAPIStoreError(c, 503, "Stopped snapshot cleanup is incomplete")
++		return
++	}
++	count, err := a.sqlcDB.ConfirmExecutionStopped(ctx, queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: sandboxID})
++	if err != nil || count != 1 {
++		a.sendAPIStoreError(c, 503, "Physical stop receipt could not be saved")
++		return
++	}
++	c.JSON(http.StatusOK, gin.H{"sandboxID": sandboxID, "physicallyStopped": true})
++}
++
++func confirmExecutionStops(ctx context.Context, attempts []queries.SandboxExecutionAttempt, connect func(context.Context, uuid.UUID, string) (rpc.SandboxServiceClient, context.Context, error)) error {
++	if len(attempts) == 0 {
++		return errors.New("no registered execution")
++	}
++	for _, attempt := range attempts {
++		client, child, err := connect(ctx, attempt.ClusterID, attempt.NodeID)
++		if err != nil {
++			return err
++		}
++		receipt, err := client.StopExecution(child, &rpc.StopExecutionRequest{TeamId: attempt.TeamID.String(), SandboxId: attempt.SandboxID, ExecutionId: attempt.ExecutionID.String(), RegisteredBeforeStart: true})
++		if err != nil {
++			return err
++		}
++		if !receipt.GetPhysicallyStopped() || receipt.GetTeamId() != attempt.TeamID.String() || receipt.GetSandboxId() != attempt.SandboxID || receipt.GetExecutionId() != attempt.ExecutionID.String() {
++			return errors.New("physical execution receipt does not match the registered attempt")
++		}
++	}
++	return nil
++}
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_execution_test.go
+@@ -0,0 +1,99 @@
++package handlers
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc"
++)
++
++type executionStopClient struct {
++	rpc.SandboxServiceClient
++	stop func(*rpc.StopExecutionRequest) (*rpc.StopExecutionResponse, error)
++}
++
++func (c executionStopClient) StopExecution(_ context.Context, request *rpc.StopExecutionRequest, _ ...grpc.CallOption) (*rpc.StopExecutionResponse, error) {
++	return c.stop(request)
++}
++
++func TestExecutionStopRejectsMissingMismatchedAndFailedHostReceipts(t *testing.T) {
++	attempt := queries.SandboxExecutionAttempt{TeamID: uuid.New(), SandboxID: "sandbox-test", ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host-a"}
++	cases := []struct {
++		name   string
++		result *rpc.StopExecutionResponse
++		err    error
++	}{
++		{name: "missing"},
++		{name: "not stopped", result: &rpc.StopExecutionResponse{TeamId: attempt.TeamID.String(), SandboxId: attempt.SandboxID, ExecutionId: attempt.ExecutionID.String()}},
++		{name: "wrong team", result: &rpc.StopExecutionResponse{TeamId: uuid.NewString(), SandboxId: attempt.SandboxID, ExecutionId: attempt.ExecutionID.String(), PhysicallyStopped: true}},
++		{name: "wrong execution", result: &rpc.StopExecutionResponse{TeamId: attempt.TeamID.String(), SandboxId: attempt.SandboxID, ExecutionId: uuid.NewString(), PhysicallyStopped: true}},
++		{name: "wrong sandbox", result: &rpc.StopExecutionResponse{TeamId: attempt.TeamID.String(), SandboxId: "other", ExecutionId: attempt.ExecutionID.String(), PhysicallyStopped: true}},
++		{name: "lost reply", err: errors.New("reply lost")},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			connect := func(ctx context.Context, cluster uuid.UUID, node string) (rpc.SandboxServiceClient, context.Context, error) {
++				require.Equal(t, attempt.ClusterID, cluster)
++				require.Equal(t, attempt.NodeID, node)
++				return executionStopClient{stop: func(in *rpc.StopExecutionRequest) (*rpc.StopExecutionResponse, error) {
++					require.True(t, in.GetRegisteredBeforeStart())
++					require.Equal(t, attempt.ExecutionID.String(), in.GetExecutionId())
++					return tc.result, tc.err
++				}}, ctx, nil
++			}
++			require.Error(t, confirmExecutionStops(t.Context(), []queries.SandboxExecutionAttempt{attempt}, connect))
++		})
++	}
++}
++
++func TestExecutionStopConfirmsEveryRegisteredHostOnRetry(t *testing.T) {
++	first := queries.SandboxExecutionAttempt{TeamID: uuid.New(), SandboxID: "sandbox-test", ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host-a"}
++	second := first
++	second.NodeID = "host-b"
++	var called []string
++	connect := func(ctx context.Context, _ uuid.UUID, node string) (rpc.SandboxServiceClient, context.Context, error) {
++		called = append(called, node)
++		return executionStopClient{stop: func(in *rpc.StopExecutionRequest) (*rpc.StopExecutionResponse, error) {
++			return &rpc.StopExecutionResponse{TeamId: in.GetTeamId(), SandboxId: in.GetSandboxId(), ExecutionId: in.GetExecutionId(), PhysicallyStopped: true}, nil
++		}}, ctx, nil
++	}
++	attempts := []queries.SandboxExecutionAttempt{first, second}
++	require.NoError(t, confirmExecutionStops(t.Context(), attempts, connect))
++	require.NoError(t, confirmExecutionStops(t.Context(), attempts, connect))
++	require.Equal(t, []string{"host-a", "host-b", "host-a", "host-b"}, called)
++	require.Error(t, confirmExecutionStops(t.Context(), nil, connect))
++}
++
++func TestExecutionReceiptReplaysWithoutHostAndRemainsTeamScoped(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	other := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "offline-host"}
++	require.NoError(t, store.Register(t.Context(), p))
++	_, err := store.BeginStop(t.Context(), team, p.SandboxID)
++	require.NoError(t, err)
++	n, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: p.SandboxID})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, n)
++	// No orchestrator exists in this API instance: a lost reply must be recoverable
++	// from the durable final receipt even while its former host is offline.
++	server := &APIStore{sqlcDB: db.SqlcClient}
++	ctx, response := restoreHTTPContext(t, team, nil)
++	server.StopLaunchpadExecution(ctx, p.SandboxID)
++	require.Equal(t, 200, response.Code)
++	require.JSONEq(t, `{"sandboxID":"`+p.SandboxID+`","physicallyStopped":true}`, response.Body.String())
++	ctx, response = restoreHTTPContext(t, other, nil)
++	server.StopLaunchpadExecution(ctx, p.SandboxID)
++	require.Equal(t, 404, response.Code)
++	ctx, response = restoreHTTPContext(t, team, nil)
++	server.StopLaunchpadExecution(ctx, "never-registered")
++	require.Equal(t, 404, response.Code)
++}
+--- a/packages/api/internal/orchestrator/create_instance.go
++++ b/packages/api/internal/orchestrator/create_instance.go
+@@ -7,6 +7,8 @@
+ 	"net/http"
+ 	"time"
+ 
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/google/uuid"
+ 	"go.opentelemetry.io/otel/attribute"
+ 	"go.opentelemetry.io/otel/metric"
+ 	"go.uber.org/zap"
+@@ -418,7 +420,17 @@
+ 
+ 	allLabels, labelFilteringEnabled := o.generateRequiredNodeLabels(ctx, sandboxID, team, sbxData)
+ 
+-	placed, err := placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels)
++	var executionAdmission []func(context.Context, *nodemanager.Node) error
++	if sbxData.Metadata["launchpad.managed"] == "thread-vm-v1" {
++		executionAdmission = append(executionAdmission, func(ctx context.Context, target *nodemanager.Node) error {
++			id, err := uuid.Parse(executionID)
++			if err != nil {
++				return err
++			}
++			return (executions.Store{DB: o.sqlcDB}).Register(ctx, queries.InsertExecutionAttemptParams{TeamID: team.Team.ID, SandboxID: sandboxID, ExecutionID: id, ClusterID: target.ClusterID, NodeID: target.ID})
++		})
++	}
++	placed, err := placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels, executionAdmission...)
+ 	if err != nil {
+ 		if isResume && placed.TimedOut {
+ 			// Remap by the snapshot's own sandbox ID: when forking, the started
+@@ -528,7 +540,11 @@
+ 		}
+ 	}
+ 
+-	err = o.sandboxStore.Add(ctx, sbx, &creationMeta)
++	if sbxData.Metadata["launchpad.managed"] == "thread-vm-v1" {
++		err = (executions.Store{DB: o.sqlcDB}).Publish(ctx, team.Team.ID, sandboxID, func() error { return o.sandboxStore.Add(ctx, sbx, &creationMeta) })
++	} else {
++		err = o.sandboxStore.Add(ctx, sbx, &creationMeta)
++	}
+ 	if err != nil {
+ 		telemetry.ReportError(ctx, "failed to add sandbox to store", err)
+ 
+--- a/packages/api/internal/orchestrator/placement/placement.go
++++ b/packages/api/internal/orchestrator/placement/placement.go
+@@ -49,8 +49,9 @@
+ 	cpu CPURequirement,
+ 	labelFilteringEnabled bool,
+ 	requiredLabels []string,
++	beforeCreate ...func(context.Context, *nodemanager.Node) error,
+ ) (PlacementResult, error) {
+-	return placeSandbox(ctx, algorithm, clusterNodes, preferredNode, sbxRequest, cpu, requiredFeatures(sbxRequest), labelFilteringEnabled, requiredLabels, defaultRefusalBackoff)
++	return placeSandbox(ctx, algorithm, clusterNodes, preferredNode, sbxRequest, cpu, requiredFeatures(sbxRequest), labelFilteringEnabled, requiredLabels, defaultRefusalBackoff, beforeCreate...)
+ }
+ 
+ func placeSandbox(
+@@ -64,6 +65,7 @@
+ 	labelFilteringEnabled bool,
+ 	requiredLabels []string,
+ 	backoff refusalBackoff,
++	beforeCreate ...func(context.Context, *nodemanager.Node) error,
+ ) (PlacementResult, error) {
+ 	ctx, span := tracer.Start(ctx, "place-sandbox")
+ 	defer span.End()
+@@ -156,6 +158,11 @@
+ 			telemetry.ReportEvent(ctx, "Placing sandbox on the node", telemetry.WithNodeID(node.ID))
+ 		}
+ 
++		for _, admit := range beforeCreate {
++			if err := admit(ctx, node); err != nil {
++				return failed(err)
++			}
++		}
+ 		node.PlacementMetrics.StartPlacing(sbxRequest.GetSandbox().GetSandboxId(), resources)
+ 
+ 		ctx, span := tracer.Start(ctx, "create-sandbox")
+--- a/packages/api/internal/orchestrator/restore.go
++++ b/packages/api/internal/orchestrator/restore.go
+@@ -12,6 +12,7 @@
+ 	"github.com/e2b-dev/infra/packages/api/internal/api"
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+ 	teamtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
+@@ -85,6 +86,9 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	if err := (executions.Store{DB: o.sqlcDB}).Register(ctx, queries.InsertExecutionAttemptParams{TeamID: op.TeamID, SandboxID: op.SandboxID, ExecutionID: op.ExecutionID, ClusterID: op.ClusterID, NodeID: op.NodeID}); err != nil {
++		return err
++	}
+ 	response, err := client.ActivateRestoreDisk(child, &rpc.RestoreDiskActivateRequest{Create: request, ManifestSha256: digest, ReconcileOnly: reconcileOnly})
+ 	if err != nil {
+ 		if restoreresult.IsExpired(err, op.PreparedBuildID.String()) {
+@@ -125,7 +129,7 @@
+ 	}
+ 	// A failed registration keeps the durable activation pending. Never launch an
+ 	// asynchronous kill here: a late kill could destroy a successfully retried VM.
+-	if err := o.sandboxStore.Add(ctx, sbx, nil); err != nil {
++	if err := (executions.Store{DB: o.sqlcDB}).Publish(ctx, op.TeamID, op.SandboxID, func() error { return o.sandboxStore.Add(ctx, sbx, nil) }); err != nil {
+ 		return err
+ 	}
+ 	return o.sandboxStore.ReleaseRestore(ctx, op.TeamID, op.SandboxID, op.OperationID)
+--- /dev/null
++++ b/packages/db/migrations/20261002121500_physical_execution_registry.sql
+@@ -0,0 +1,19 @@
++-- +goose Up
++CREATE TABLE public.sandbox_execution_fences (
++    team_id uuid NOT NULL REFERENCES public.teams(id),
++    sandbox_id text NOT NULL,
++    state text NOT NULL DEFAULT 'active' CHECK (state IN ('active','stopping','stopped')),
++    PRIMARY KEY (team_id, sandbox_id)
++);
++CREATE TABLE public.sandbox_execution_attempts (
++    team_id uuid NOT NULL,
++    sandbox_id text NOT NULL,
++    execution_id uuid NOT NULL,
++    cluster_id uuid NOT NULL,
++    node_id text NOT NULL,
++    PRIMARY KEY (team_id, sandbox_id, execution_id, cluster_id, node_id),
++    FOREIGN KEY (team_id, sandbox_id) REFERENCES public.sandbox_execution_fences(team_id, sandbox_id)
++);
++-- +goose Down
++DROP TABLE public.sandbox_execution_attempts;
++DROP TABLE public.sandbox_execution_fences;
+--- /dev/null
++++ b/packages/db/queries/execution_fences.sql
+@@ -0,0 +1,13 @@
++-- name: EnsureExecutionFence :exec
++INSERT INTO public.sandbox_execution_fences(team_id,sandbox_id) VALUES (sqlc.arg(team_id),sqlc.arg(sandbox_id)) ON CONFLICT DO NOTHING;
++-- name: LockExecutionFence :one
++SELECT state FROM public.sandbox_execution_fences WHERE team_id=sqlc.arg(team_id) AND sandbox_id=sqlc.arg(sandbox_id) FOR UPDATE;
++-- name: InsertExecutionAttempt :exec
++INSERT INTO public.sandbox_execution_attempts(team_id,sandbox_id,execution_id,cluster_id,node_id)
++VALUES (sqlc.arg(team_id),sqlc.arg(sandbox_id),sqlc.arg(execution_id),sqlc.arg(cluster_id),sqlc.arg(node_id)) ON CONFLICT DO NOTHING;
++-- name: FenceSandboxExecution :exec
++UPDATE public.sandbox_execution_fences SET state='stopping' WHERE team_id=sqlc.arg(team_id) AND sandbox_id=sqlc.arg(sandbox_id) AND state='active';
++-- name: ListExecutionAttempts :many
++SELECT * FROM public.sandbox_execution_attempts WHERE team_id=sqlc.arg(team_id) AND sandbox_id=sqlc.arg(sandbox_id) ORDER BY execution_id,cluster_id,node_id;
++-- name: ConfirmExecutionStopped :execrows
++UPDATE public.sandbox_execution_fences SET state='stopped' WHERE team_id=sqlc.arg(team_id) AND sandbox_id=sqlc.arg(sandbox_id) AND state IN ('stopping','stopped');
+--- /dev/null
++++ b/packages/db/queries/execution_fences.sql.go
+@@ -0,0 +1,132 @@
++// Code generated by sqlc. DO NOT EDIT.
++// versions:
++//   sqlc v1.31.1
++// source: execution_fences.sql
++
++package queries
++
++import (
++	"context"
++
++	"github.com/google/uuid"
++)
++
++const confirmExecutionStopped = `-- name: ConfirmExecutionStopped :execrows
++UPDATE public.sandbox_execution_fences SET state='stopped' WHERE team_id=$1 AND sandbox_id=$2 AND state IN ('stopping','stopped')
++`
++
++type ConfirmExecutionStoppedParams struct {
++	TeamID    uuid.UUID
++	SandboxID string
++}
++
++func (q *Queries) ConfirmExecutionStopped(ctx context.Context, arg ConfirmExecutionStoppedParams) (int64, error) {
++	result, err := q.db.Exec(ctx, confirmExecutionStopped, arg.TeamID, arg.SandboxID)
++	if err != nil {
++		return 0, err
++	}
++	return result.RowsAffected(), nil
++}
++
++const ensureExecutionFence = `-- name: EnsureExecutionFence :exec
++INSERT INTO public.sandbox_execution_fences(team_id,sandbox_id) VALUES ($1,$2) ON CONFLICT DO NOTHING
++`
++
++type EnsureExecutionFenceParams struct {
++	TeamID    uuid.UUID
++	SandboxID string
++}
++
++func (q *Queries) EnsureExecutionFence(ctx context.Context, arg EnsureExecutionFenceParams) error {
++	_, err := q.db.Exec(ctx, ensureExecutionFence, arg.TeamID, arg.SandboxID)
++	return err
++}
++
++const fenceSandboxExecution = `-- name: FenceSandboxExecution :exec
++UPDATE public.sandbox_execution_fences SET state='stopping' WHERE team_id=$1 AND sandbox_id=$2 AND state='active'
++`
++
++type FenceSandboxExecutionParams struct {
++	TeamID    uuid.UUID
++	SandboxID string
++}
++
++func (q *Queries) FenceSandboxExecution(ctx context.Context, arg FenceSandboxExecutionParams) error {
++	_, err := q.db.Exec(ctx, fenceSandboxExecution, arg.TeamID, arg.SandboxID)
++	return err
++}
++
++const insertExecutionAttempt = `-- name: InsertExecutionAttempt :exec
++INSERT INTO public.sandbox_execution_attempts(team_id,sandbox_id,execution_id,cluster_id,node_id)
++VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING
++`
++
++type InsertExecutionAttemptParams struct {
++	TeamID      uuid.UUID
++	SandboxID   string
++	ExecutionID uuid.UUID
++	ClusterID   uuid.UUID
++	NodeID      string
++}
++
++func (q *Queries) InsertExecutionAttempt(ctx context.Context, arg InsertExecutionAttemptParams) error {
++	_, err := q.db.Exec(ctx, insertExecutionAttempt,
++		arg.TeamID,
++		arg.SandboxID,
++		arg.ExecutionID,
++		arg.ClusterID,
++		arg.NodeID,
++	)
++	return err
++}
++
++const listExecutionAttempts = `-- name: ListExecutionAttempts :many
++SELECT team_id, sandbox_id, execution_id, cluster_id, node_id FROM public.sandbox_execution_attempts WHERE team_id=$1 AND sandbox_id=$2 ORDER BY execution_id,cluster_id,node_id
++`
++
++type ListExecutionAttemptsParams struct {
++	TeamID    uuid.UUID
++	SandboxID string
++}
++
++func (q *Queries) ListExecutionAttempts(ctx context.Context, arg ListExecutionAttemptsParams) ([]SandboxExecutionAttempt, error) {
++	rows, err := q.db.Query(ctx, listExecutionAttempts, arg.TeamID, arg.SandboxID)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	var items []SandboxExecutionAttempt
++	for rows.Next() {
++		var i SandboxExecutionAttempt
++		if err := rows.Scan(
++			&i.TeamID,
++			&i.SandboxID,
++			&i.ExecutionID,
++			&i.ClusterID,
++			&i.NodeID,
++		); err != nil {
++			return nil, err
++		}
++		items = append(items, i)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	return items, nil
++}
++
++const lockExecutionFence = `-- name: LockExecutionFence :one
++SELECT state FROM public.sandbox_execution_fences WHERE team_id=$1 AND sandbox_id=$2 FOR UPDATE
++`
++
++type LockExecutionFenceParams struct {
++	TeamID    uuid.UUID
++	SandboxID string
++}
++
++func (q *Queries) LockExecutionFence(ctx context.Context, arg LockExecutionFenceParams) (string, error) {
++	row := q.db.QueryRow(ctx, lockExecutionFence, arg.TeamID, arg.SandboxID)
++	var state string
++	err := row.Scan(&state)
++	return state, err
++}
+--- a/packages/db/queries/models.go
++++ b/packages/db/queries/models.go
+@@ -73,6 +73,14 @@
+ 	TeamID             *uuid.UUID
+ }
+ 
++type SandboxExecutionAttempt struct {
++	TeamID      uuid.UUID
++	SandboxID   string
++	ExecutionID uuid.UUID
++	ClusterID   uuid.UUID
++	NodeID      string
++}
++
+ type SandboxRestoreOperation struct {
+ 	TeamID            uuid.UUID
+ 	OperationID       uuid.UUID
+--- /dev/null
++++ b/packages/db/pkg/executions/store.go
+@@ -0,0 +1,88 @@
++// Package executions records every possible host before a managed VM can boot.
++// Routing/Redis expiry never erases the identities needed to stop that VM.
++package executions
++
++import (
++	"context"
++	"errors"
++	"github.com/e2b-dev/infra/packages/db/client"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++)
++
++var ErrFenced = errors.New("sandbox execution is permanently fenced")
++
++type Store struct{ DB *client.Client }
++
++func (s Store) Register(ctx context.Context, p queries.InsertExecutionAttemptParams) error {
++	if p.TeamID == uuid.Nil || p.ExecutionID == uuid.Nil || p.SandboxID == "" || p.NodeID == "" {
++		return errors.New("invalid execution identity")
++	}
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	if err := db.EnsureExecutionFence(ctx, queries.EnsureExecutionFenceParams{TeamID: p.TeamID, SandboxID: p.SandboxID}); err != nil {
++		return err
++	}
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: p.TeamID, SandboxID: p.SandboxID})
++	if err != nil {
++		return err
++	}
++	if state != "active" {
++		return ErrFenced
++	}
++	if err := db.InsertExecutionAttempt(ctx, p); err != nil {
++		return err
++	}
++	return tx.Commit(ctx)
++}
++
++func (s Store) BeginStop(ctx context.Context, team uuid.UUID, sandboxID string) ([]queries.SandboxExecutionAttempt, error) {
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return nil, err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	// Unknown/legacy executions never become a false successful stop. Only
++	// registrations made before fenced-runtime RPCs are eligible here.
++	if _, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID}); err != nil {
++		return nil, err
++	}
++	if err := db.FenceSandboxExecution(ctx, queries.FenceSandboxExecutionParams{TeamID: team, SandboxID: sandboxID}); err != nil {
++		return nil, err
++	}
++	attempts, err := db.ListExecutionAttempts(ctx, queries.ListExecutionAttemptsParams{TeamID: team, SandboxID: sandboxID})
++	if err != nil {
++		return nil, err
++	}
++	if len(attempts) == 0 {
++		return nil, errors.New("execution registry contains no physical identities")
++	}
++	if err := tx.Commit(ctx); err != nil {
++		return nil, err
++	}
++	return attempts, nil
++}
++
++// Publish holds the same admission lock until the routing record is installed.
++// Stop therefore either rejects a late publication or observes and removes it.
++func (s Store) Publish(ctx context.Context, team uuid.UUID, sandboxID string, publish func() error) error {
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
++	if err != nil {
++		return err
++	}
++	if state != "active" {
++		return ErrFenced
++	}
++	if err := publish(); err != nil {
++		return err
++	}
++	return tx.Commit(ctx)
++}
+--- /dev/null
++++ b/packages/db/pkg/executions/store_test.go
+@@ -0,0 +1,93 @@
++package executions_test
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
++	"github.com/stretchr/testify/require"
++
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++)
++
++func TestExecutionRegistryPersistsEveryAttemptAndPermanentlyFencesAdmission(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	other := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	first := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "node-a"}
++	require.NoError(t, store.Register(t.Context(), first))
++	require.NoError(t, store.Register(t.Context(), first))
++	second := first
++	second.NodeID = "node-b"
++	require.NoError(t, store.Register(t.Context(), second))
++	_, err := store.BeginStop(t.Context(), other, first.SandboxID)
++	require.ErrorIs(t, err, pgx.ErrNoRows)
++	_, err = store.BeginStop(t.Context(), team, "unknown")
++	require.ErrorIs(t, err, pgx.ErrNoRows)
++	attempts, err := store.BeginStop(t.Context(), team, first.SandboxID)
++	require.NoError(t, err)
++	require.Len(t, attempts, 2)
++	reopened := executions.Store{DB: db.SqlcClient}
++	require.ErrorIs(t, reopened.Register(t.Context(), first), executions.ErrFenced)
++	published := false
++	require.ErrorIs(t, reopened.Publish(t.Context(), team, first.SandboxID, func() error { published = true; return nil }), executions.ErrFenced)
++	require.False(t, published, "a late create reply must not republish a stopped VM")
++
++	n, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: first.SandboxID})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, n)
++	replay, err := reopened.BeginStop(t.Context(), team, first.SandboxID)
++	require.NoError(t, err)
++	require.Equal(t, attempts, replay)
++	second.ExecutionID = uuid.New()
++	require.ErrorIs(t, reopened.Register(t.Context(), second), executions.ErrFenced)
++
++	// Stop races admission. Every registration that wins must be in the stop
++	// host list; a registration that loses must fail before the create RPC.
++	raced := first
++	raced.SandboxID = uuid.NewString()
++	raced.ExecutionID = uuid.New()
++	require.NoError(t, store.Register(t.Context(), raced))
++	next := raced
++	next.NodeID = "node-race"
++	ready := make(chan struct{})
++	var group sync.WaitGroup
++	var registerErr, stopErr error
++	var captured []queries.SandboxExecutionAttempt
++	group.Go(func() { <-ready; registerErr = store.Register(context.Background(), next) })
++	group.Go(func() { <-ready; captured, stopErr = store.BeginStop(context.Background(), team, raced.SandboxID) })
++	close(ready)
++	group.Wait()
++	require.NoError(t, stopErr)
++	if registerErr == nil {
++		require.Len(t, captured, 2)
++	} else {
++		require.True(t, errors.Is(registerErr, executions.ErrFenced))
++		require.Len(t, captured, 1)
++	}
++	// A publication already holding the lock must finish before stop returns.
++	publication := first
++	publication.SandboxID = uuid.NewString()
++	publication.ExecutionID = uuid.New()
++	require.NoError(t, store.Register(t.Context(), publication))
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	done := make(chan error, 1)
++	go func() {
++		done <- store.Publish(t.Context(), team, publication.SandboxID, func() error { close(entered); <-release; return nil })
++	}()
++	<-entered
++	stopped := make(chan error, 1)
++	go func() { _, err := store.BeginStop(t.Context(), team, publication.SandboxID); stopped <- err }()
++	close(release)
++	require.NoError(t, <-done)
++	require.NoError(t, <-stopped)
++	require.ErrorIs(t, store.Publish(t.Context(), team, publication.SandboxID, func() error { t.Fatal("fenced publication executed"); return nil }), executions.ErrFenced)
++
++}

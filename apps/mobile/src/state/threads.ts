@@ -1,3 +1,16 @@
+import { createThreadVmActionJournal } from "@t3tools/client-runtime/relay/threadVmActionSubmission";
+import { createThreadQueueControlJournal } from "@t3tools/client-runtime/relay/threadQueueControlSubmission";
+import { portableThreadIntentStorage } from "./thread-move-submissions";
+import {
+  createPortableThreadLibraryAtoms,
+  createPortableThreadChatCommand,
+} from "@t3tools/client-runtime/relay/portableThreadLibrary";
+import {
+  createThreadVmControlAtoms,
+  withPortableThreadDeletion,
+} from "@t3tools/client-runtime/relay/threadVmControls";
+import * as Crypto from "expo-crypto";
+import { createPortableThreadCommandAtoms } from "@t3tools/client-runtime/relay/portableThreads";
 import { useAtomValue } from "@effect/atom-react";
 import {
   createEnvironmentThreadDetailAtoms,
@@ -14,11 +27,32 @@ import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { environmentSnapshotAtom } from "./shell";
+import { orchestrationEnvironment } from "./orchestration";
 
-export const threadEnvironment = createThreadEnvironmentAtoms(
+export const portableThreadLibrary = createPortableThreadLibraryAtoms(connectionAtomRuntime);
+export const threadVmActionJournal = createThreadVmActionJournal(portableThreadIntentStorage);
+export const threadVmControls = createThreadVmControlAtoms(
+  connectionAtomRuntime,
+  environmentSnapshotAtom,
+  portableThreadLibrary.routeAtom,
+  (environmentId) => orchestrationEnvironment.archivedShellSnapshot({ environmentId, input: {} }),
+  (environmentId, threadId) => environmentThreadDetails.detailAtom({ environmentId, threadId }),
+);
+
+const baseThreadEnvironment = createThreadEnvironmentAtoms(
   connectionAtomRuntime,
   environmentSnapshotAtom,
 );
+export const threadEnvironment = {
+  ...baseThreadEnvironment,
+  delete: withPortableThreadDeletion(
+    baseThreadEnvironment.delete,
+    threadVmControls.action,
+    threadVmActionJournal,
+    threadVmControls.routeAtom,
+    Crypto.randomUUID,
+  ),
+};
 export const environmentThreads = createEnvironmentThreadStateAtoms(connectionAtomRuntime);
 export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(
   environmentThreads.stateAtom,
@@ -46,3 +80,14 @@ export function useEnvironmentThread(
     () => EMPTY_ENVIRONMENT_THREAD_STATE,
   ) as EnvironmentThreadState;
 }
+
+export const portableThreadCommands = createPortableThreadCommandAtoms(
+  connectionAtomRuntime,
+  environmentSnapshotAtom,
+);
+
+export const openPortableThreadChat = createPortableThreadChatCommand(connectionAtomRuntime);
+
+export const threadQueueControlJournal = createThreadQueueControlJournal(
+  portableThreadIntentStorage,
+);

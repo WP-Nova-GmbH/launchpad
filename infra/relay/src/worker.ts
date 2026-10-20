@@ -1,3 +1,28 @@
+import { threadVmPreviewRoutes } from "./http/ThreadVmPreviewProxy.ts";
+import { threadVmPreviewCloudflare } from "./http/ThreadVmPreviewCloudflare.ts";
+import { threadMovesApi } from "./http/ThreadMovesApi.ts";
+import { threadArtifactsApi } from "./http/ThreadArtifactsApi.ts";
+import { threadVmsApi } from "./http/ThreadVmsApi.ts";
+import {
+  loadThreadVmRuntimeSettings,
+  ThreadVmRuntimeConfiguration,
+  reconcileThreadVmProvisioning,
+  reconcileThreadVmActivity,
+  reconcileThreadVmPauses,
+  reconcileThreadVmResumes,
+  reconcileThreadVmLeases,
+  reconcileThreadVmBackups,
+  reconcileThreadArtifacts,
+} from "./threads/ThreadVmRuntime.ts";
+import {
+  makeThreadArtifactObjects,
+  ThreadArtifactObjectStorage,
+} from "./threads/ThreadArtifactObjects.ts";
+import { threadVmEnrollmentApi } from "./http/ThreadVmEnrollmentApi.ts";
+import { threadEnvironmentApi } from "./http/ThreadEnvironmentApi.ts";
+import { threadCommandsApi } from "./http/ThreadCommandsApi.ts";
+import { threadHistoryApi } from "./http/ThreadHistoryApi.ts";
+import { threadVmPolicyApi } from "./http/ThreadVmPolicyApi.ts";
 import { repositoryAccessServerApi } from "./http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "./tenancy/RepositoryPolicies.ts";
 import * as Alchemy from "alchemy";
@@ -11,6 +36,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
+import * as RemovalPolicy from "alchemy/RemovalPolicy";
 import * as Stream from "effect/Stream";
 import * as Etag from "effect/unstable/http/Etag";
 import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
@@ -30,7 +56,7 @@ import {
   RELAY_HTTP_ROUTER_CONFIG,
   relayClientAuthLayer,
   relayDpopClientAuthLayer,
-  relayCors,
+  makeRelayCors,
   relayDocsRedirectRoute,
   relayEnvironmentAuthLayer,
   relayNotFoundRoute,
@@ -85,8 +111,6 @@ import * as ManagedEndpointProvider from "./environments/ManagedEndpointProvider
 import * as ManagedEndpointReaper from "./environments/ManagedEndpointReaper.ts";
 import * as ManagedTunnelLimits from "./environments/ManagedTunnelLimits.ts";
 import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
-import * as HetznerComputeProvider from "./machines/HetznerComputeProvider.ts";
-import * as MachineComputeProvider from "./machines/MachineComputeProvider.ts";
 import * as MachineEnroller from "./machines/MachineEnroller.ts";
 import * as MachineLimits from "./machines/MachineLimits.ts";
 import * as Machines from "./machines/Machines.ts";
@@ -133,6 +157,14 @@ const relayApiLayer = Layer.mergeAll(
   mobileApi,
   clientApi,
   organizationApi,
+  threadVmPolicyApi,
+  threadHistoryApi,
+  threadCommandsApi,
+  threadArtifactsApi,
+  threadMovesApi,
+  threadEnvironmentApi,
+  threadVmEnrollmentApi,
+  threadVmsApi,
   repositoriesApi,
   organizationProjectsApi,
   machinesApi,
@@ -153,6 +185,9 @@ const CloudMintKeyPair = Alchemy.KeyPair("CloudMintKeyPair");
 const ApnsDeliveryJobSigningSecret = Alchemy.makeRandom("ApnsDeliveryJobSigningSecret", {
   bytes: 32,
 });
+const ThreadArtifactsBucket = Cloudflare.R2.Bucket("ThreadArtifactsBucket").pipe(
+  RemovalPolicy.retain(),
+);
 
 export class Api extends Cloudflare.Worker<Api, {}>()("Api") {}
 
@@ -217,26 +252,9 @@ export const ApiLive = Api.make(
       Config.option,
     );
 
-    // Optional: a deployment without a Hetzner token cannot create machine
-    // compute and says so instead of pretending.
-    const hetznerApiToken = yield* Config.Redacted("HETZNER_API_TOKEN").pipe(Config.option);
-    const hetznerSettings: Omit<HetznerComputeProvider.HetznerComputeSettings, "apiToken"> = {
-      serverType: yield* Config.String("HETZNER_SERVER_TYPE").pipe(Config.withDefault("cx22")),
-      image: yield* Config.String("HETZNER_IMAGE").pipe(Config.withDefault("ubuntu-24.04")),
-      location: yield* Config.String("HETZNER_LOCATION").pipe(Config.withDefault("fsn1")),
-      sshKeys: (yield* Config.String("HETZNER_SSH_KEYS").pipe(Config.withDefault("")))
-        .split(",")
-        .map((key) => key.trim())
-        .filter((key) => key.length > 0),
-      bootstrapUrl: yield* Config.String("MACHINE_BOOTSTRAP_URL").pipe(
-        Config.withDefault(
-          "https://raw.githubusercontent.com/WP-Nova-GmbH/launchpad/main/infra/relay/scripts/machine-bootstrap.sh",
-        ),
-      ),
-      sourceGitUrl: yield* Config.String("MACHINE_SOURCE_GIT_URL").pipe(
-        Config.withDefault("https://github.com/WP-Nova-GmbH/launchpad.git"),
-      ),
-    };
+    const executorSourceGitUrl = yield* Config.String("MACHINE_SOURCE_GIT_URL").pipe(
+      Config.withDefault("https://github.com/WP-Nova-GmbH/launchpad.git"),
+    );
     // Executors follow this ref of the same source they were bootstrapped from.
     const executorSourceRef = yield* Config.String("MACHINE_SOURCE_GIT_REF").pipe(
       Config.withDefault("main"),
@@ -262,7 +280,9 @@ export const ApiLive = Api.make(
     // 3. Runtime layers and app construction
     //
     const alchemyRuntimeContext: Alchemy.BaseRuntimeContext = yield* Cloudflare.Worker;
+    const artifactBucket = yield* Cloudflare.R2.ReadWriteBucket(ThreadArtifactsBucket);
 
+    const threadVmSettings = yield* loadThreadVmRuntimeSettings;
     const loadSettings = Effect.gen(function* () {
       return RelayConfiguration.RelayConfiguration.of({
         relayIssuer: relayPublicOrigin,
@@ -286,7 +306,7 @@ export const ApiLive = Api.make(
             : undefined,
         managedEndpointBaseDomain: yield* managedEndpointZoneName,
         managedEndpointNamespace: stage,
-        executorSource: { gitUrl: hetznerSettings.sourceGitUrl, ref: executorSourceRef },
+        executorSource: { gitUrl: executorSourceGitUrl, ref: executorSourceRef },
         managedEndpointCleanupMode,
       });
     });
@@ -299,7 +319,7 @@ export const ApiLive = Api.make(
       }).pipe(Effect.map(makeRelayTraceLayer)),
     );
 
-    const runtimeLayer = Layer.empty
+    const runtimeLayer = Layer.succeed(ThreadVmRuntimeConfiguration, { settings: threadVmSettings })
       .pipe(
         Layer.provideMerge(MobileRegistrations.layer),
         Layer.provideMerge(AgentActivityPublisher.layer),
@@ -307,14 +327,6 @@ export const ApiLive = Api.make(
         Layer.provideMerge(RepositoryPolicies.controlLayer),
         Layer.provideMerge(EnvironmentLinker.layer),
         Layer.provideMerge(MachineEnroller.layer),
-        Layer.provideMerge(
-          Option.isSome(hetznerApiToken)
-            ? HetznerComputeProvider.layerHetzner({
-                apiToken: hetznerApiToken.value,
-                ...hetznerSettings,
-              })
-            : MachineComputeProvider.layerUnavailable,
-        ),
         Layer.provideMerge(MachineLimits.layer),
         Layer.provideMerge(
           Layer.merge(EnvironmentPublishSignatures.layer, ManagedEndpointReaper.layer),
@@ -382,6 +394,12 @@ export const ApiLive = Api.make(
       )
       .pipe(
         // Split only because `pipe` takes at most twenty arguments.
+        Layer.provideMerge(
+          Layer.succeed(
+            ThreadArtifactObjectStorage,
+            makeThreadArtifactObjects(artifactBucket, alchemyRuntimeContext),
+          ),
+        ),
         Layer.provideMerge(LiveActivities.layer),
         Layer.provideMerge(DeliveryAttempts.layer),
         Layer.provideMerge(RelayTokens.layer),
@@ -443,6 +461,89 @@ export const ApiLive = Api.make(
         ),
     );
 
+    if (threadVmSettings) {
+      yield* Cloudflare.Workers.cron("* * * * *", () =>
+        reconcileThreadVmProvisioning(threadVmSettings).pipe(
+          Effect.timeout("90 seconds"),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.logWarning(
+                  "Thread VM provisioning is pending; durable claims will be retried.",
+                ),
+          ),
+          Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
+        ),
+      );
+      yield* Cloudflare.Workers.cron("* * * * *", () =>
+        reconcileThreadVmActivity(threadVmSettings).pipe(
+          Effect.timeout("45 seconds"),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("Thread VM activity inspection will retry."),
+          ),
+          Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
+        ),
+      );
+      yield* Cloudflare.Workers.cron("* * * * *", () =>
+        reconcileThreadVmPauses(threadVmSettings).pipe(
+          Effect.timeout("45 seconds"),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("Thread VM pause reconciliation will retry."),
+          ),
+          Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
+        ),
+      );
+      yield* Cloudflare.Workers.cron("* * * * *", () =>
+        reconcileThreadVmResumes(threadVmSettings).pipe(
+          Effect.timeout("45 seconds"),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("Thread VM resume reconciliation will retry."),
+          ),
+          Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
+        ),
+      );
+      yield* Cloudflare.Workers.cron("* * * * *", () =>
+        reconcileThreadVmLeases(threadVmSettings).pipe(
+          Effect.timeout("45 seconds"),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("Thread VM lease renewal will retry."),
+          ),
+          Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
+        ),
+      );
+      yield* Cloudflare.Workers.cron("* * * * *", () =>
+        reconcileThreadVmBackups(threadVmSettings).pipe(
+          Effect.timeout("2 minutes"),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("Thread VM backup reconciliation will retry."),
+          ),
+          Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
+        ),
+      );
+    }
+
+    yield* Cloudflare.Workers.cron("*/5 * * * *", () =>
+      reconcileThreadArtifacts().pipe(
+        Effect.timeout("2 minutes"),
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.interrupt
+            : Effect.logWarning("Thread artifact cleanup will retry."),
+        ),
+        Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
+      ),
+    );
+
     yield* Cloudflare.Workers.cron("*/5 * * * *", () =>
       Effect.all(
         [
@@ -491,7 +592,7 @@ export const ApiLive = Api.make(
       ),
     );
 
-    const fetch = Layer.merge(
+    const fetch = Layer.mergeAll(
       Layer.mergeAll(
         HttpApiBuilder.layer(RelayApi, { openapiPath: "/openapi.json" }).pipe(
           Layer.provide(appLayer),
@@ -499,13 +600,24 @@ export const ApiLive = Api.make(
         HttpApiScalar.layer(RelayApi, { path: "/docs" }),
         relayDocsRedirectRoute,
         githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
-      ).pipe(Layer.provide([Etag.layerWeak, httpPlatformNotSupportedLayer, relayCors])),
+      ).pipe(
+        Layer.provide([
+          Etag.layerWeak,
+          httpPlatformNotSupportedLayer,
+          makeRelayCors(threadVmSettings?.previewBaseUrl),
+        ]),
+      ),
       relayNotFoundRoute,
+      threadVmPreviewRoutes.pipe(
+        Layer.provide(Layer.merge(runtimeLayer, threadVmPreviewCloudflare)),
+      ),
     ).pipe(
       HttpRouter.toHttpEffect,
       Effect.provideService(HttpRouter.RouterConfig, RELAY_HTTP_ROUTER_CONFIG),
       withoutCapturedParentSpan,
-      Effect.flatMap((httpEffect) => traceRelayHttpRequestWith(httpEffect, relayTraceLayer)),
+      Effect.flatMap((httpEffect) =>
+        traceRelayHttpRequestWith(httpEffect, relayTraceLayer, threadVmSettings?.previewBaseUrl),
+      ),
     );
 
     return { fetch };
@@ -516,6 +628,7 @@ export const ApiLive = Api.make(
         Layer.provideMerge(Cloudflare.Workers.CronEventSourceLive),
         Layer.provideMerge(Cloudflare.Queues.WriteQueueBinding),
         Layer.provideMerge(Cloudflare.Queues.EventSourceLive),
+        Layer.provideMerge(Cloudflare.R2.ReadWriteBucketBinding),
         Layer.provideMerge(Cloudflare.Tunnel.ReadWriteTunnelBinding),
         Layer.provideMerge(Cloudflare.DNS.ReadWriteDnsHttp),
       ),

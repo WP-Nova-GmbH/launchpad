@@ -1,5 +1,6 @@
 import {
   AuthOrchestrationReadScope,
+  AuthOrchestrationOperateScope,
   EnvironmentAuthorizationError,
   type CommandId,
   type ClientOrchestrationCommand,
@@ -123,6 +124,12 @@ export const readAuthorizedCommandReceipt = Effect.fn("CommandReceiptAccess.read
 /** Authorize persisted replay scope before the engine can return an old receipt. */
 export const authorizeOrchestrationCommand = Effect.fn("CommandReceiptAccess.authorizeCommand")(
   function* (actor: RepositoryActor, command: OrchestrationCommand) {
+    if (command.type === "thread.move.enqueue" && !actor.user) {
+      return yield* new EnvironmentAuthorizationError({
+        message: "Sign in to Launchpad Connect before moving this thread.",
+        requiredScope: AuthOrchestrationOperateScope,
+      });
+    }
     const access = yield* RepositoryAccess;
     if (!(yield* access.status).enabled) return yield* access.requireCommand(actor, command);
     yield* access.requireMember(actor);

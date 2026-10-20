@@ -150,7 +150,7 @@ export class Repositories extends Context.Service<
       readonly userId: string;
     }) => Effect.Effect<void, RepositoryPersistenceError>;
   }
->()("t3code-relay/tenancy/Repositories") {}
+>()("launchpad-relay/tenancy/Repositories") {}
 
 export const make = Effect.gen(function* () {
   const db = yield* RelayDb.RelayDb;
