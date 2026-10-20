@@ -27,12 +27,25 @@ const fixture = vi.hoisted(() => ({
   definitions: vi.fn<() => Promise<ReadonlyArray<RepositoryWorkflow>>>(),
   page: vi.fn<(query: WorkflowJobPageQuery) => Promise<WorkflowJobPage>>(),
   navigate: vi.fn(),
+  refreshCatalog: vi.fn(),
   tab: "runs",
   supported: false,
+  authStatus: "ready" as "loading" | "error" | "ready",
+  signedIn: true,
   save: vi.fn<(payload: typeof SaveRepositoryWorkflow.Type) => Promise<RepositoryWorkflow>>(),
 }));
 vi.mock("@clerk/react", () => ({
-  useAuth: () => ({ isLoaded: true, isSignedIn: true, userId: "account" }),
+  useAuth: () => ({
+    isLoaded: fixture.authStatus === "ready",
+    isSignedIn: fixture.signedIn,
+    userId: fixture.signedIn ? "account" : null,
+  }),
+  ClerkLoading: ({ children }: PropsWithChildren) =>
+    fixture.authStatus === "loading" ? children : null,
+  ClerkFailed: ({ children }: PropsWithChildren) =>
+    fixture.authStatus === "error" ? children : null,
+  ClerkLoaded: ({ children }: PropsWithChildren) =>
+    fixture.authStatus === "ready" ? children : null,
 }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
@@ -44,6 +57,7 @@ vi.mock("../../cloud/managedRelayState", () => ({
   useManagedRelayOrganizationCatalog: () => ({
     data: catalog,
     accountId: "account",
+    refresh: fixture.refreshCatalog,
     isPending: false,
     error: null,
   }),
@@ -216,9 +230,12 @@ beforeEach(() => {
   fixture.definitions.mockReset();
   fixture.page.mockReset();
   fixture.navigate.mockReset();
+  fixture.refreshCatalog.mockReset();
   fixture.save.mockReset();
   fixture.tab = "runs";
   fixture.supported = false;
+  fixture.authStatus = "ready";
+  fixture.signedIn = true;
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, "account");
 });
@@ -227,6 +244,44 @@ afterEach(async () => {
   renderer = undefined;
   vi.unstubAllGlobals();
 });
+it("replaces failed sign-in loading with an error and lets the user retry", async () => {
+  const reload = vi.fn();
+  vi.stubGlobal("window", { location: { reload } });
+  fixture.authStatus = "loading";
+  fixture.signedIn = false;
+  const page = () => (
+    <AppAtomRegistryProvider>
+      <WorkflowsPage />
+    </AppAtomRegistryProvider>
+  );
+  await act(async () => {
+    renderer = create(page());
+  });
+  expect(
+    renderer!.root.findAllByType("svg").filter((node) => node.props.role === "status"),
+  ).toHaveLength(1);
+
+  fixture.authStatus = "error";
+  await act(async () => renderer!.update(page()));
+  expect(content()).toContain("Could not load Launchpad Connect sign-in");
+  expect(
+    renderer!.root.findAllByType("div").filter((node) => node.props.role === "alert"),
+  ).toHaveLength(1);
+  expect(
+    renderer!.root.findAllByType("svg").filter((node) => node.props.role === "status"),
+  ).toHaveLength(0);
+  expect(fixture.definitions).not.toHaveBeenCalled();
+  await press("Retry", false);
+  expect(reload).toHaveBeenCalledOnce();
+
+  fixture.authStatus = "ready";
+  await act(async () => renderer!.update(page()));
+  expect(content()).toContain("Sign in to Launchpad Connect to manage repository workflows.");
+  expect(
+    renderer!.root.findAllByType("div").filter((node) => node.props.role === "alert"),
+  ).toHaveLength(0);
+});
+
 it.effect(
   "recovers workflow names and metadata errors from Runs refresh while retaining the selected list view",
   () =>
