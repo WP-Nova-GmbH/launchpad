@@ -413,6 +413,55 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       }),
     );
 
+    it.effect("uses the current image when a queued VM request gets capacity", () =>
+      Effect.gen(function* () {
+        const hostId = NodeCrypto.randomUUID();
+        const first = yield* makeProvisionFixture({}, hostId);
+        const queued = yield* makeProvisionFixture({}, hostId);
+        const capacity = makeThreadVmCapacityStore(first.sql);
+        yield* capacity.configure(hostId, 1);
+        yield* first.worker().runOne();
+        const templateId = "template:build-current";
+        expect(yield* queued.worker(queued.compute, templateId).runOne()).toBe(false);
+        expect(queued.creates()).toBe(0);
+        yield* first.allocations.recordPowerState({
+          capacityOperationId: first.operationId,
+          allocationId: first.allocationId,
+          computeRef: `vm-${first.allocationId}`,
+          state: "paused",
+        });
+        // A request deferred by the previous relay also recovers without being requeued.
+        yield* queued.sql`UPDATE relay_thread_vm_provisions SET error_code='template_changed'
+          WHERE allocation_id=${queued.allocationId}`;
+        yield* queued
+          .worker(
+            {
+              ...queued.compute,
+              create: (input) =>
+                Effect.gen(function* () {
+                  const allocation = yield* queued.allocations
+                    .get(queued.allocationId)
+                    .pipe(Effect.orDie);
+                  expect(allocation?.templateId).toBe(templateId);
+                  return yield* queued.compute.create(input);
+                }),
+            },
+            templateId,
+          )
+          .runOne();
+        expect(queued.creates()).toBe(1);
+        expect(yield* queued.provisions.get(queued.allocationId)).toMatchObject({
+          phase: "created",
+          templateId,
+          errorCode: null,
+        });
+        expect((yield* capacity.get(queued.operationId))?.state).toBe("started");
+        expect((yield* first.allocations.get(first.allocationId))?.templateId).toBe(
+          "template:immutable-build",
+        );
+      }),
+    );
+
     it.effect(
       "keeps physical capacity after a lost create and rejects false deletion confirmation",
       () =>
@@ -751,6 +800,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
           phase: "created",
           computeRef: `vm-${f.allocationId}`,
+          templateId: "template:immutable-build",
         });
       }),
     );
@@ -761,7 +811,11 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         yield* makeThreadVmCapacityStore(f.sql).admitNext(f.hostId);
         const first = yield* f.provisions.claim("old-worker", f.hostId);
         expect(first?.allocationId).toBe(f.allocationId);
-        yield* f.provisions.beginCreate({ allocationId: f.allocationId, claimId: "old-worker" });
+        yield* f.provisions.beginCreate({
+          allocationId: f.allocationId,
+          claimId: "old-worker",
+          templateId: "template:immutable-build",
+        });
         yield* f.sql`UPDATE relay_thread_vm_provisions SET claim_until = clock_timestamp() - interval '1 second' WHERE allocation_id = ${f.allocationId}`;
         yield* f.worker().runOne();
         expect(f.creates()).toBe(0);
@@ -925,7 +979,11 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             const f = yield* provisionFixture;
             yield* makeThreadVmCapacityStore(f.sql).admitNext(f.hostId);
             yield* f.provisions.claim("creator", f.hostId);
-            yield* f.provisions.beginCreate({ allocationId: f.allocationId, claimId: "creator" });
+            yield* f.provisions.beginCreate({
+              allocationId: f.allocationId,
+              claimId: "creator",
+              templateId: "template:immutable-build",
+            });
             yield* f.provisions.defer({
               allocationId: f.allocationId,
               claimId: "creator",
@@ -967,7 +1025,11 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         const f = yield* provisionFixture;
         yield* makeThreadVmCapacityStore(f.sql).admitNext(f.hostId);
         yield* f.provisions.claim("initial", f.hostId);
-        yield* f.provisions.beginCreate({ allocationId: f.allocationId, claimId: "initial" });
+        yield* f.provisions.beginCreate({
+          allocationId: f.allocationId,
+          claimId: "initial",
+          templateId: "template:immutable-build",
+        });
         yield* f.provisions.defer({
           allocationId: f.allocationId,
           claimId: "initial",
@@ -1132,7 +1194,11 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         yield* setup.enqueue(input);
         yield* capacity.admitNext(input.hostId);
         yield* provisions.claim("setup-test", input.hostId);
-        yield* provisions.beginCreate({ allocationId: input.allocationId, claimId: "setup-test" });
+        yield* provisions.beginCreate({
+          allocationId: input.allocationId,
+          claimId: "setup-test",
+          templateId: input.templateId,
+        });
         yield* provisions.recordCreated({
           allocationId: input.allocationId,
           claimId: "setup-test",

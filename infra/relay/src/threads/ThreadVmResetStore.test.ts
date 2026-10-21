@@ -95,7 +95,11 @@ const created = Effect.fnUntraced(function* (f: Effect.Success<ReturnType<typeof
   yield* capacity.admitNext(f.hostId);
   const claimId = NodeCrypto.randomUUID();
   yield* provisions.claim(claimId, f.hostId);
-  yield* provisions.beginCreate({ allocationId: f.input.allocationId, claimId });
+  yield* provisions.beginCreate({
+    allocationId: f.input.allocationId,
+    claimId,
+    templateId: f.input.templateId,
+  });
   const computeRef = "reset-" + f.input.allocationId;
   yield* provisions.recordCreated({ allocationId: f.input.allocationId, claimId, computeRef });
   return { computeRef, provisions };
@@ -591,7 +595,11 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               ).runOne();
               expect((yield* f.resets.get(f.input.operationId))?.phase).toBe("cancelled");
               yield* Effect.flip(
-                provisions.beginCreate({ allocationId: f.input.allocationId, claimId: staleClaim }),
+                provisions.beginCreate({
+                  allocationId: f.input.allocationId,
+                  claimId: staleClaim,
+                  templateId: f.input.templateId,
+                }),
               );
               expect(
                 yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId),
@@ -621,7 +629,11 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               yield* makeThreadVmCapacityStore(f.sql).admitNext(f.hostId);
               const claimId = NodeCrypto.randomUUID();
               yield* provisions.claim(claimId, f.hostId);
-              yield* provisions.beginCreate({ allocationId: f.input.allocationId, claimId });
+              yield* provisions.beginCreate({
+                allocationId: f.input.allocationId,
+                claimId,
+                templateId: f.input.templateId,
+              });
               yield* f.resets.requestCancellation(f.input.operationId);
               yield* makeThreadVmResetCancellationWorker(
                 f.sql,

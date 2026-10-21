@@ -44,10 +44,6 @@ export function makeThreadVmProvisionWorker(
       yield* store.cancelUnstarted(claim);
       return true;
     }
-    if (row.phase === "pending" && row.templateId !== templateId) {
-      yield* store.defer({ ...claim, errorCode: "template_changed" });
-      return true;
-    }
     const reconcile = Effect.gen(function* () {
       if (
         row.phase === "creating" &&
@@ -69,7 +65,7 @@ export function makeThreadVmProvisionWorker(
           row.threadId,
           "read",
           allocation.ownerUserId,
-          () => store.beginCreate(claim).pipe(Effect.as(true)),
+          () => store.beginCreate({ ...claim, templateId }).pipe(Effect.as(true)),
         ).pipe(
           Effect.catchTag("RelayTenancyNotFoundError", () =>
             store.rejectUnstarted(claim).pipe(Effect.as(false)),

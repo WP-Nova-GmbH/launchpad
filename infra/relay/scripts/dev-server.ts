@@ -10,7 +10,6 @@ import { threadMovesApi } from "../src/http/ThreadMovesApi.ts";
 import { threadArtifactsApi } from "../src/http/ThreadArtifactsApi.ts";
 import { threadVmsApi } from "../src/http/ThreadVmsApi.ts";
 import {
-  loadThreadVmRuntimeSettings,
   ThreadVmRuntimeConfiguration,
   reconcileThreadVmProvisioning,
   reconcileThreadVmActivity,
@@ -74,6 +73,7 @@ import * as PgClient from "@effect/sql-pg/PgClient";
 import { RelayApi } from "@t3tools/contracts/relay";
 
 import { loadOrCreateDevCloudMintKeyPair } from "./dev-cloud-mint-key-pair.ts";
+import { loadDevThreadVmRuntimeSettings } from "./dev-thread-vm-template.ts";
 
 import {
   RELAY_HTTP_ROUTER_CONFIG,
@@ -329,12 +329,8 @@ const managedEndpointClientsLayer =
         }),
       ).pipe(Layer.provide(FetchHttpClient.layer));
 
-const runtimeLayerBase = Layer.effect(
-  ThreadVmRuntimeConfiguration,
-  loadThreadVmRuntimeSettings.pipe(Effect.map((settings) => ({ settings }))),
-)
+const runtimeLayerBase = MobileRegistrations.layer
   .pipe(
-    Layer.provideMerge(MobileRegistrations.layer),
     Layer.provideMerge(AgentActivityPublisher.layer),
     Layer.provideMerge(
       EnvironmentConnector.layer.pipe(Layer.provideMerge(RepositoryPolicies.controlLayer)),
@@ -530,7 +526,7 @@ const managedEndpointSweepLayer =
 
 const main = Effect.gen(function* () {
   const nodeHttp = yield* Effect.promise(() => import("node:http"));
-  const threadVmSettings = yield* loadThreadVmRuntimeSettings;
+  const threadVmSettings = yield* loadDevThreadVmRuntimeSettings;
   yield* Effect.logInfo("Development relay listening", { port, issuer: relayIssuer, databaseUrl });
   // Handler requirements are deferred to the serve step rather than discharged
   // by the group layers, so this is where the runtime has to be supplied.
@@ -650,9 +646,9 @@ const main = Effect.gen(function* () {
       // Delegated thread ids exceed the router's default path parameter limit.
       Layer.provide(Layer.succeed(HttpRouter.RouterConfig, RELAY_HTTP_ROUTER_CONFIG)),
       Layer.provide(runtimeLayer),
-      Layer.provide(NodeServices.layer),
+      Layer.provide(Layer.succeed(ThreadVmRuntimeConfiguration, { settings: threadVmSettings })),
     ),
   );
 });
 
-NodeRuntime.runMain(main);
+NodeRuntime.runMain(main.pipe(Effect.provide(NodeServices.layer)));

@@ -38,7 +38,11 @@ export const finalSaveCatalogFixture = Effect.fnUntraced(function* (
   yield* provisions.enqueue({ allocationId, operationId: allocationId, generation: 1, hostId });
   yield* capacity.admitNext(hostId);
   yield* provisions.claim("final-test", hostId);
-  yield* provisions.beginCreate({ allocationId, claimId: "final-test" });
+  yield* provisions.beginCreate({
+    allocationId,
+    claimId: "final-test",
+    templateId: "template:build-verified",
+  });
   yield* provisions.recordCreated({ allocationId, claimId: "final-test", computeRef });
   yield* f.sql`INSERT INTO relay_environment_credentials(credential_id,environment_id,environment_public_key,credential_hash,created_at,updated_at) VALUES(${credentialId},${f.sourceEnvironmentId},'test-key',${credentialId},'now','now')`;
   yield* f.sql`INSERT INTO relay_thread_vm_bindings(environment_id,allocation_id,thread_id,repository_id,generation,environment_public_key,credential_id) VALUES(${f.sourceEnvironmentId},${allocationId},${f.threadId},'repo',1,'test-key',${credentialId})`;

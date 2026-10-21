@@ -164,8 +164,8 @@ The runner uses a packaged Linux ARM64 CLI archive from the existing
 and resource monitor. It does not install the Launchpad monorepo in a guest.
 `infra/e2b/template/Dockerfile` adds Git, GitHub CLI, Python, Node, pnpm and the
 Codex version used by the native-conversation transfer checks. Those development
-tools are separate from the server's bundled dependencies. The operator-owned
-`infra/e2b/template/versions.json` selects the standard resources: 2 vCPUs,
+tools are separate from the server's bundled dependencies. The build script
+selects the standard resources: 2 vCPUs,
 4 GiB RAM and 20 GiB initially free disk. The image requests 21 GiB from E2B because
 its ext4 growth is best-effort and filesystem metadata consumes some of the added
 space. The runner smoke check requires at least 20 GiB available to its non-root user. Install this checkout's dependencies
@@ -175,17 +175,25 @@ also requires `BUILD_ENSURE_FREE_DISK_SPACE=true` from the supplied Compose
 override: upstream leaves this build phase disabled without LaunchDarkly. The guest smoke test
 checks the resulting resources; the requested disk target is not a total-disk cap.
 
-With a matching archive available, run from the Launchpad checkout on the build
-machine. Set `E2B_API_KEY` there, then supply the self-hosted API explicitly:
+With a matching archive available, set `E2B_API_URL` and `E2B_API_KEY` in
+`infra/relay/.env`, then run from the Launchpad checkout:
 
 ```sh
-node infra/relay/scripts/e2b-build-template.mjs \
-  --api-url http://127.0.0.1:3000 \
-  --name launchpad-arm64 \
+vp run build:vm-template \
   --server-archive /absolute/path/to/linux-arm64-release.tar.gz \
-  --server-sha256 <archive-sha256> \
-  --output /absolute/path/to/new-template-build.json
+  --server-sha256 <archive-sha256>
 ```
+
+The command uses the Dockerfile's pinned tools and saves the selected image to
+`infra/relay/.t3/e2b-template.json`. The Node dev relay reads that file at startup,
+including the exact build identity; no template IDs need to be copied into `.env`.
+Restart the relay after a successful build to use the new selection. Failed
+builds preserve the previous selection. Detailed build receipts are kept in
+`infra/relay/.t3/e2b-builds`; `--output` can choose a new receipt path instead.
+When the builder and relay run on separate machines, copy the selection file to
+the relay and set `E2B_TEMPLATE_FILE` to its absolute path on both machines.
+An existing successful build receipt can also be used as `E2B_TEMPLATE_FILE`
+without rebuilding. The selection must belong to the relay's configured `E2B_API_URL`.
 
 Linux `node-pty` must be compiled for the target CPU: the npm package contains
 Mac/Windows prebuilds only. Prefer packaging the CLI on Linux. When cross-packaging,
@@ -223,8 +231,8 @@ additional host storage for build caches, saved disks, and actual project data.
 
 The build stages only the verified archive and its checksum. It does not copy local
 provider profiles, checkout files or credentials. The receipt records the template
-and build IDs and a unique `templateRef` tag on success. Configure the relay with
-that reference, keeping the tag assigned to its recorded build. Inspect the same
+and build IDs and a unique `templateRef` tag on success. Keep that tag assigned to
+its recorded build; the relay verifies it before provisioning. Inspect the same
 named template after a failed or
 interrupted build before retrying. Use `--skip-cache` when rebuilding after a
 failed snapshot or a host disk-full incident; a new receipt is still required.
@@ -234,8 +242,8 @@ the base image, Node download, Codex and pnpm versions are pinned.
 The template intentionally does not auto-start the server. The provisioning worker
 must install thread-scoped enrollment/import state and establish execution ownership
 before starting `launchpad-server`. Building a template alone does not satisfy those
-gates or enable VM mode in the app. Verify the resulting guest before configuring
-the relay to use its template reference. From a checkout with relay dependencies
+gates or enable VM mode in the app. Verify the resulting guest before enabling
+relay provisioning. From a checkout with relay dependencies
 installed, run the opt-in smoke test on the trusted build host:
 
 ```sh
@@ -286,11 +294,13 @@ E2B_MAX_RUNNING_VMS=1
 E2B_API_URL=http://127.0.0.1:3000
 E2B_SANDBOX_URL=http://127.0.0.1:3002
 E2B_API_KEY=<host-team-key>
-E2B_TEMPLATE_REF=<templateRef from the build receipt>
-E2B_TEMPLATE_BUILD_ID=<buildId from the build receipt>
 E2B_HOST_ADDRESSES=<host IPv4 and IPv6 addresses, comma separated>
 E2B_PUBLIC_RELAY_URL=https://<isolated-test-relay-hostname>
 ```
+
+The Node dev relay uses the selection file saved by `build:vm-template`.
+Existing Cloudflare Worker deployments continue to support their explicit
+`E2B_TEMPLATE_REF` and `E2B_TEMPLATE_BUILD_ID` configuration.
 
 The loopback compute URLs above apply when the relay runs on the compute host.
 Elsewhere, use a trusted management route; do not publish E2B control ports for
@@ -304,6 +314,8 @@ the standard template, independent of users' VM quotas. Reservations survive
 worker crashes and uncertain creation. A confirmed pause releases running
 capacity while preserving the user's allocation slot; resume queues a new
 reservation. Lowering the host limit holds new requests without evicting VMs.
+Queued creations use the image selected when creation starts, including after a
+rebuild and relay restart. Existing VMs keep their original image.
 
 Automatic pause, backup, inactivity deletion, and quota replacement remain disabled by default.
 Keep `RELAY_THREAD_VM_AUTO_PAUSE_ENABLED`, `RELAY_THREAD_VM_AUTO_BACKUP_ENABLED`,

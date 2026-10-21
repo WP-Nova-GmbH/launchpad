@@ -8,6 +8,27 @@ import * as NodeUtil from "node:util";
 import { Template } from "e2b";
 
 const templateDirectory = NodeURL.fileURLToPath(new URL("../../e2b/template/", import.meta.url));
+const relayDirectory = NodeURL.fileURLToPath(new URL("../", import.meta.url));
+const standardResources = {
+  cpuCount: 2,
+  memoryMB: 4096,
+  minFreeDiskMb: 21504,
+  minUsableDiskMb: 20480,
+};
+
+async function writeJsonAtomically(path, value) {
+  await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${NodeCrypto.randomUUID()}.tmp`;
+  try {
+    await NodeFSP.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await NodeFSP.rename(temporary, path);
+  } finally {
+    await NodeFSP.rm(temporary, { force: true });
+  }
+}
 
 export async function prepareTemplateContext(archive, expectedSha256) {
   if (!/^[a-f0-9]{64}$/.test(expectedSha256))
@@ -53,49 +74,35 @@ export function validateBuildTarget(apiUrl, name) {
   return url.href.replace(/\/$/, "");
 }
 
-// Keep the standard size in the operator-owned template manifest. The pinned
-// SDK patch forwards minFreeDiskMb to E2B's existing template-build API.
-export function validateTemplateResources(resources) {
-  const { cpuCount, memoryMB, minFreeDiskMb } = resources ?? {};
-  if (
-    ![cpuCount, memoryMB, minFreeDiskMb].every((value) => Number.isSafeInteger(value) && value > 0)
-  )
-    throw new Error(
-      "Template resources must specify positive integer cpuCount, memoryMB and minFreeDiskMb.",
-    );
-  return { cpuCount, memoryMB, minFreeDiskMb };
-}
-
 export async function buildTemplate(args, apiKey) {
-  const apiUrl = validateBuildTarget(args["api-url"], args.name);
+  const name = args.name ?? "launchpad-arm64";
+  const apiUrl = validateBuildTarget(args["api-url"] ?? process.env.E2B_API_URL, name);
   if (!apiKey?.trim()) throw new Error("E2B_API_KEY is required on the build host.");
+  const buildTag = `build-${NodeCrypto.randomUUID()}`;
+  const output = NodePath.resolve(
+    args.output ?? NodePath.join(relayDirectory, ".t3", "e2b-builds", `${buildTag}.json`),
+  );
+  const selectedFile = process.env.E2B_TEMPLATE_FILE?.trim();
+  if (selectedFile && !NodePath.isAbsolute(selectedFile))
+    throw new Error("E2B_TEMPLATE_FILE must be an absolute path.");
+  const selectionPath = NodePath.resolve(
+    selectedFile || NodePath.join(relayDirectory, ".t3", "e2b-template.json"),
+  );
+  if (output === selectionPath)
+    throw new Error("The build receipt and selected template must use separate files.");
   const context = await prepareTemplateContext(args["server-archive"], args["server-sha256"]);
   try {
     const dockerfile = await NodeFSP.readFile(
       NodePath.join(templateDirectory, "Dockerfile"),
       "utf8",
     );
-    const versions = JSON.parse(
-      await NodeFSP.readFile(NodePath.join(templateDirectory, "versions.json"), "utf8"),
-    );
-    validateTemplateResources(versions.resources);
-    const usableDisk = versions.resources.minUsableDiskMb;
-    if (
-      !Number.isSafeInteger(usableDisk) ||
-      usableDisk <= 0 ||
-      usableDisk > versions.resources.minFreeDiskMb
-    )
-      throw new Error(
-        "Specify a positive usable disk minimum no greater than the E2B growth target.",
-      );
-    const buildTag = `build-${NodeCrypto.randomUUID()}`;
     const manifest = {
       schemaVersion: 1,
       buildTag,
       state: "building",
       apiUrl,
-      name: args.name,
-      versions,
+      name,
+      resources: standardResources,
       skipCache: args["skip-cache"] === true,
       serverSha256: args["server-sha256"],
       activitySha256: NodeCrypto.createHash("sha256")
@@ -111,23 +118,41 @@ export async function buildTemplate(args, apiKey) {
     };
     // Reserve a new local receipt before the remote operation. On failure retain
     // it so the operator can inspect that exact template instead of guessing.
-    await NodeFSP.writeFile(args.output, `${JSON.stringify(manifest, null, 2)}\n`, {
+    await NodeFSP.mkdir(NodePath.dirname(output), { recursive: true, mode: 0o700 });
+    await NodeFSP.writeFile(output, `${JSON.stringify(manifest, null, 2)}\n`, {
       flag: "wx",
       mode: 0o600,
     });
     const template = Template({ fileContextPath: context }).fromDockerfile(dockerfile);
-    const result = await Template.build(template, args.name, {
+    const result = await Template.build(template, name, {
       apiUrl,
       apiKey,
-      ...validateTemplateResources(versions.resources),
+      cpuCount: standardResources.cpuCount,
+      memoryMB: standardResources.memoryMB,
+      // The pinned SDK patch forwards this to E2B's template-build API.
+      minFreeDiskMb: standardResources.minFreeDiskMb,
       tags: [buildTag],
       skipCache: args["skip-cache"] === true,
       onBuildLogs: (entry) => process.stdout.write(`${entry}\n`),
     });
-    await NodeFSP.writeFile(
-      args.output,
-      `${JSON.stringify({ ...manifest, state: "built", ...result, templateRef: `${result.templateId}:${buildTag}` }, null, 2)}\n`,
-    );
+    if (
+      !result ||
+      ![result.templateId, result.buildId].every(
+        (value) => typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(value),
+      ) ||
+      !Array.isArray(result.tags) ||
+      !result.tags.includes(buildTag)
+    )
+      throw new Error("The completed build returned an invalid template identity.");
+    const selection = {
+      schemaVersion: 1,
+      state: "built",
+      apiUrl,
+      templateRef: `${result.templateId}:${buildTag}`,
+      buildId: result.buildId,
+    };
+    await writeJsonAtomically(output, { ...result, ...manifest, ...selection });
+    await writeJsonAtomically(selectionPath, selection);
     return result;
   } finally {
     await NodeFSP.rm(context, { recursive: true, force: true });
@@ -135,6 +160,8 @@ export async function buildTemplate(args, apiKey) {
 }
 
 if (import.meta.main) {
+  const environmentFile = NodePath.join(relayDirectory, ".env");
+  if (NodeFS.existsSync(environmentFile)) process.loadEnvFile(environmentFile);
   const { values } = NodeUtil.parseArgs({
     options: {
       "skip-cache": { type: "boolean", default: false },
@@ -146,18 +173,16 @@ if (import.meta.main) {
       ),
     },
   });
-  if (
-    ["api-url", "name", "server-archive", "server-sha256", "output"].some((key) => !values[key])
-  ) {
+  if (["server-archive", "server-sha256"].some((key) => !values[key])) {
     process.stderr.write(
-      "Required: --api-url --name --server-archive --server-sha256 --output (new manifest file). Optional: --skip-cache. Set E2B_API_KEY only on the build host.\n",
+      "Required: --server-archive --server-sha256. Optional: --api-url (defaults to E2B_API_URL), --name (launchpad-arm64), --output (new build receipt), --skip-cache. Configure E2B_API_KEY in infra/relay/.env or the build environment.\n",
     );
     process.exitCode = 2;
   } else {
     try {
       const result = await buildTemplate(values, process.env.E2B_API_KEY);
       process.stdout.write(
-        `Built ${result.templateId}/${result.buildId}. Verify it before configuring the relay.\n`,
+        `Built and selected ${result.templateId}/${result.buildId}. The relay will use it on restart.\n`,
       );
     } catch (error) {
       process.stderr.write(

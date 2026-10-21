@@ -30,7 +30,7 @@ NodeAssert.ok(
   "The recorded build tag changed or disappeared.",
 );
 await NodeFSP.mkdir(values.output, { mode: 0o700 });
-const resources = receipt.versions.resources;
+const resources = receipt.resources ?? receipt.versions?.resources;
 NodeAssert.match(receipt.workloadSha256, /^[a-f0-9]{64}$/);
 NodeAssert.match(receipt.workloadServiceSha256, /^[a-f0-9]{64}$/);
 NodeAssert.ok(

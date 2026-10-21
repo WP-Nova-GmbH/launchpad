@@ -103,15 +103,24 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
   const beginCreate = Effect.fn("relay.thread_vm_provision.begin_create")(function* (input: {
     allocationId: string;
     claimId: string;
+    templateId: string;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const row = yield* locked(input);
         if (row.phase !== "pending" || row.allocationState !== "creating")
           return yield* conflict("VM creation is already attempted or cancelled");
+        // Choose the current image at first creation, then retain it for recovery and enrollment.
+        yield* sql`UPDATE relay_thread_vm_allocations SET template_id = ${input.templateId}
+          WHERE allocation_id = ${input.allocationId}`;
         yield* capacity.beginExecution(row.operationId);
         yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'creating', creation_identity_fenced = true WHERE allocation_id = ${input.allocationId}`;
-        return { ...row, phase: "creating" as const, creationIdentityFenced: true };
+        return {
+          ...row,
+          templateId: input.templateId,
+          phase: "creating" as const,
+          creationIdentityFenced: true,
+        };
       }),
     );
   });
@@ -135,11 +144,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
   const defer = Effect.fn("relay.thread_vm_provision.defer")(function* (input: {
     allocationId: string;
     claimId: string;
-    errorCode:
-      | "create_uncertain"
-      | "compute_unavailable"
-      | "identity_conflict"
-      | "template_changed";
+    errorCode: "create_uncertain" | "compute_unavailable" | "identity_conflict";
   }) {
     const rows = yield* sql`UPDATE relay_thread_vm_provisions SET error_code = ${input.errorCode},
       retry_at = clock_timestamp() + interval '30 seconds', claim_id = NULL, claim_until = NULL

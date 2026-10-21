@@ -24,6 +24,7 @@
     "icons:export:android": "node scripts/export-android-icons.ts",
     "build": "vp run --filter './apps/*' build",
     "build:server": "vp run --filter t3 build",
+    "build:vm-template": "node infra/relay/scripts/e2b-build-template.mjs",
     "build:web": "vp run --filter @t3tools/web build",
     "build:marketing": "vp run --filter @t3tools/marketing build",
     "build:desktop": "vp run --filter @t3tools/desktop --filter t3 build",
