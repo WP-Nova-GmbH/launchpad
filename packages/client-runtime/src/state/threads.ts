@@ -233,10 +233,14 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       ? Option.none<OrchestrationThreadDetailSnapshot>()
       : loadedCache;
   const cachedThread = Option.map(cached, (snapshot) => snapshot.thread);
+  const initialSequence =
+    retained?.sequence ??
+    Option.match(cached, { onNone: () => 0, onSome: (snapshot) => snapshot.snapshotSequence });
   const initialState: EnvironmentThreadState = retained
-    ? cachedThreadState(retained.state)
+    ? { ...cachedThreadState(retained.state), snapshotSequence: initialSequence }
     : {
         data: cachedThread,
+        snapshotSequence: initialSequence,
         status: statusWithoutLiveData(cachedThread),
         error: Option.none(),
         // A cached windowed snapshot restores its page cursor so "load earlier"
@@ -249,9 +253,6 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   }
   // Seed the resume cursor from the cached snapshot so a warm cache can catch up
   // via `afterSequence` instead of re-downloading the full thread body.
-  const initialSequence =
-    retained?.sequence ??
-    Option.match(cached, { onNone: () => 0, onSome: (snapshot) => snapshot.snapshotSequence });
   const lastSequence = yield* SubscriptionRef.make(initialSequence);
   let committed: ThreadResumeSnapshot = {
     state: initialState,
@@ -441,8 +442,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (isThreadRevoked(environmentId, threadId)) return;
     rememberThreadProject(environmentId, thread);
     const waiting = yield* Ref.get(awaitingCompletion);
+    const snapshotSequence = yield* SubscriptionRef.get(lastSequence);
     yield* SubscriptionRef.update(state, (current) => ({
       data: Option.some(thread),
+      snapshotSequence,
       // Buffered values from the failed attempt can still arrive after its error.
       status: Option.isSome(current.error)
         ? ("cached" as const)
@@ -456,7 +459,6 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     // payloads. The server remains the source of truth while a turn is active;
     // persist once it settles so cache encoding stays off the streaming path.
     if (shouldPersistThread(thread)) {
-      const snapshotSequence = yield* SubscriptionRef.get(lastSequence);
       yield* offerThreadPersistence(thread, snapshotSequence);
     }
   });

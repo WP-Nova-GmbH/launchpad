@@ -319,10 +319,15 @@
       "types": "./src/relay/threadVmControls.ts",
       "default": "./src/relay/threadVmControls.ts"
     },
+    "./relay/threadRunOn": {
+      "types": "./src/relay/threadRunOn.ts",
+      "default": "./src/relay/threadRunOn.ts"
+    },
     "./relay/threadMoveSubmission": {
       "types": "./src/relay/threadMoveSubmission.ts",
       "default": "./src/relay/threadMoveSubmission.ts"
     },
+    "./relay/threadMoveRecovery": "./src/relay/threadMoveRecovery.ts",
     "./relay/portableThreadHistory": {
       "types": "./src/relay/portableThreadHistory.ts",
       "default": "./src/relay/portableThreadHistory.ts"

@@ -1,4 +1,4 @@
-import { ThreadMoveControls } from "./ThreadMoveControls";
+import { ThreadRunOnControl } from "./ThreadMoveControls";
 import { ThreadVmControls } from "./ThreadVmControls";
 import type { WorktreeSetupCardProps } from "./worktree-setup-card";
 import type { ComposerTextPaste } from "../../native/T3ComposerEditor.types";
@@ -1089,10 +1089,6 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                 environmentId={props.environmentId}
                 threadId={props.selectedThread.id}
               />
-              <ThreadMoveControls
-                environmentId={props.environmentId}
-                threadId={props.selectedThread.id}
-              />
               {props.promptQueue ? (
                 <SharedPromptQueue
                   key={`${props.environmentId}:${props.selectedThread.id}`}
@@ -1113,6 +1109,14 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                   }
                 />
               ) : null}
+              <ThreadRunOnControl
+                environmentId={props.environmentId}
+                thread={props.selectedThread}
+                unavailable={
+                  props.connectionStateLabel !== "connected" || props.threadSyncStatus !== "live"
+                }
+                onReconnect={props.onReconnectEnvironment}
+              />
               {/* Hidden (not unmounted) while a user-input request owns the
                 composer slot, so composer drafts and editor state survive.
                 A rejected creation has no thread to send to; the failure card

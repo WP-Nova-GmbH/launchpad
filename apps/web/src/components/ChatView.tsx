@@ -1,4 +1,3 @@
-import { ThreadMoveControls } from "./chat/ThreadMoveControls";
 import { ThreadVmControls } from "./chat/ThreadVmControls";
 import { useLoadBalancedEnvironment } from "../hooks/useLoadBalancedEnvironment";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
@@ -2488,6 +2487,7 @@ export default function ChatView(props: ChatViewProps) {
   const showComposerEnvironmentIndicator = shouldShowEnvironmentIndicator({
     activeEnvironment: activeEnvironmentOption,
     canPickEnvironment: hasMultipleEnvironments,
+    existingThread: routeKind === "server",
   });
 
   const openPullRequestDialog = useCallback(
@@ -10054,7 +10054,6 @@ export default function ChatView(props: ChatViewProps) {
           threadId={activeThread.id}
         />
         <ThreadVmControls environmentId={activeThread.environmentId} threadId={activeThread.id} />
-        <ThreadMoveControls environmentId={activeThread.environmentId} threadId={activeThread.id} />
         {/* Main content area with optional plan sidebar */}
         <div className="flex min-h-0 min-w-0 flex-1">
           {/* Chat column */}
@@ -10434,6 +10433,7 @@ export default function ChatView(props: ChatViewProps) {
                                 environmentId={activeThread.environmentId}
                                 threadId={activeThread.id}
                                 showGitControls={isGitRepo}
+                                existingThread={routeKind === "server"}
                                 {...(routeKind === "draft" && draftId ? { draftId } : {})}
                                 onEnvModeChange={onEnvModeChange}
                                 startFromOrigin={startFromOrigin}

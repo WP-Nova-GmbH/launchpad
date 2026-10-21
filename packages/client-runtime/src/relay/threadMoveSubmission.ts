@@ -1,20 +1,36 @@
 import {
   ThreadMoveEnqueueCommand,
-  type EnvironmentId,
+  CommandId,
+  EnvironmentId,
   type ThreadId,
   type ThreadMoveDestination,
+  type ThreadQueueEntry,
   type ExecutionEnvironmentDescriptor,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import type { RelayThreadVmStatus } from "@t3tools/contracts/relay";
+import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Schema from "effect/Schema";
 import { threadCommandAcceptance, type CommandSubmission } from "../operations/commands.ts";
 import type { EnvironmentProject } from "../state/models.ts";
 import { projectKey } from "../state/entities.ts";
 import type { ConnectionTarget } from "../connection/model.ts";
 
+const ExecutionProof = Schema.Struct({
+  commandId: CommandId,
+  environmentId: EnvironmentId,
+  generation: Schema.Int.check(Schema.isGreaterThan(0)),
+  sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type ThreadMoveExecutionProof = typeof ExecutionProof.Type;
 const Submission = Schema.Struct({
   command: ThreadMoveEnqueueCommand,
+  originEnvironmentId: EnvironmentId,
+  accepted: Schema.optional(Schema.Literal(true)),
+  acceptedSequence: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  acceptedViaRelay: Schema.optional(Schema.Literal(true)),
+  sourceGeneration: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
+  executionProof: Schema.optional(ExecutionProof),
   rejection: Schema.optional(Schema.String),
 });
 const codec = Schema.fromJsonString(Submission);
@@ -26,6 +42,7 @@ export interface ThreadMoveSubmissionScope {
   readonly relayUrl: string;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
+  readonly sourceGeneration?: number;
 }
 export interface ThreadMoveSubmissionStorage {
   readonly read: (key: string) => Promise<string | null>;
@@ -34,10 +51,30 @@ export interface ThreadMoveSubmissionStorage {
   /** Platform lock spans the read and write, including other browser tabs. */
   readonly withLock: <A>(key: string, action: () => Promise<A>) => Promise<A>;
 }
-const storageKey = (scope: ThreadMoveSubmissionScope) =>
-  `launchpad.thread-move.v1:${JSON.stringify([scope.accountId, scope.relayUrl, scope.environmentId, scope.threadId])}`;
+export interface ThreadMoveSubmissionObservation {
+  readonly entries: ReadonlyArray<ThreadQueueEntry>;
+  /** Cursor paired with this environment's thread detail, never the shell cursor. */
+  readonly projection?: {
+    readonly environmentId: string;
+    readonly generation: number;
+    readonly snapshotSequence: number;
+  };
+  /** An exact command receipt read directly from the confirmed current environment. */
+  readonly executionProof?: ThreadMoveExecutionProof;
+  /** Fresh relay placement identifies the owner whose receipt and detail can be compared. */
+  readonly placement?: {
+    readonly environmentId: string;
+    readonly generation: number;
+    readonly operationId: string | null;
+  };
+}
+const storageKey = (scope: ThreadMoveSubmissionScope) => {
+  const relayUrl = normalizeSecureRelayUrl(scope.relayUrl);
+  if (!relayUrl) throw new Error("Configure Launchpad Connect before moving this thread.");
+  return `launchpad.thread-move.v2:${JSON.stringify([scope.accountId, relayUrl, scope.threadId])}`;
+};
 
-/** Persist before sending. Unknown replies retain the exact IDs, destination and timing across restart. */
+/** Retain the intent through admission until the queue or a completed move takes over. */
 export function createThreadMoveSubmissionJournal(storage: ThreadMoveSubmissionStorage) {
   const read = async (scope: ThreadMoveSubmissionScope) => {
     const raw = await storage.read(storageKey(scope));
@@ -57,16 +94,47 @@ export function createThreadMoveSubmissionJournal(storage: ThreadMoveSubmissionS
         throw new Error("Relay acknowledged a different move.");
       const current = await read(scope);
       const outcome = threadCommandAcceptance(receipt);
-      // Another tab may already have removed this exact, accepted intent.
+      // Another tab may already have observed this exact move in the queue.
       if (current === null && outcome.status === "accepted") return outcome;
       if (current?.command.commandId !== submission.command.commandId)
         throw new Error("Saved move changed while checking acceptance.");
-      if (outcome.status === "accepted") await storage.remove(storageKey(scope));
-      else if (outcome.status === "rejected")
+      // A late admission reply cannot erase an already confirmed rejection.
+      if (current.rejection) return { status: "rejected" as const, detail: current.rejection };
+      if (outcome.status === "accepted") {
+        const acceptedSequence =
+          current.acceptedSequence ??
+          ("relay" in receipt
+            ? receipt.relay.receipt?.status === "accepted"
+              ? receipt.relay.receipt.sequence
+              : undefined
+            : receipt.sequence);
+        const acceptedViaRelay =
+          current.acceptedSequence !== undefined
+            ? current.acceptedViaRelay === true
+            : "relay" in receipt;
+        if (
+          !current.accepted ||
+          acceptedSequence !== current.acceptedSequence ||
+          acceptedViaRelay !== (current.acceptedViaRelay === true)
+        )
+          await storage.write(
+            storageKey(scope),
+            encode({
+              ...current,
+              accepted: true,
+              ...(acceptedSequence !== undefined ? { acceptedSequence } : {}),
+              acceptedViaRelay: acceptedViaRelay ? true : undefined,
+            }),
+          );
+      } else if (outcome.status === "rejected")
         await storage.write(
           storageKey(scope),
           encode({
-            ...current,
+            command: current.command,
+            originEnvironmentId: current.originEnvironmentId,
+            ...(current.sourceGeneration !== undefined
+              ? { sourceGeneration: current.sourceGeneration }
+              : {}),
             rejection: outcome.detail ?? "The server rejected this move.",
           }),
         );
@@ -75,6 +143,53 @@ export function createThreadMoveSubmissionJournal(storage: ThreadMoveSubmissionS
   return {
     read,
     reconcile,
+    observe: (
+      scope: ThreadMoveSubmissionScope,
+      submitted: ThreadMoveSubmission,
+      observation: ThreadMoveSubmissionObservation,
+    ) =>
+      storage.withLock(storageKey(scope), async () => {
+        const stored = await read(scope);
+        if (!stored || stored.command.commandId !== submitted.command.commandId) return stored;
+        let current = stored;
+        const queued = observation.entries.some(
+          (entry) => entry.kind === "move" && entry.messageId === stored.command.messageId,
+        );
+        const placement = observation.placement;
+        const incomingProof = observation.executionProof;
+        if (
+          !current.rejection &&
+          incomingProof?.commandId === current.command.commandId &&
+          placement?.operationId === null &&
+          incomingProof.environmentId === placement.environmentId &&
+          incomingProof.generation === placement.generation &&
+          incomingProof.generation >= (current.sourceGeneration ?? 1) &&
+          (!current.executionProof ||
+            incomingProof.generation > current.executionProof.generation ||
+            (incomingProof.generation === current.executionProof.generation &&
+              incomingProof.environmentId === current.executionProof.environmentId &&
+              incomingProof.sequence === current.executionProof.sequence))
+        )
+          current = { ...current, accepted: true, executionProof: incomingProof };
+        const proof = current.executionProof;
+        const projection = observation.projection;
+        const caughtUp =
+          proof !== undefined &&
+          proof.commandId === current.command.commandId &&
+          placement?.operationId === null &&
+          proof.environmentId === placement.environmentId &&
+          proof.generation === placement.generation &&
+          projection?.environmentId === proof.environmentId &&
+          projection.generation === proof.generation &&
+          projection.snapshotSequence >= proof.sequence;
+        if (queued || (!current.rejection && caughtUp)) {
+          await storage.remove(storageKey(scope));
+          return null;
+        }
+        if (encode(current) !== encode(stored))
+          await storage.write(storageKey(scope), encode(current));
+        return encode(current) === encode(submitted) ? submitted : current;
+      }),
     discardRejected: (scope: ThreadMoveSubmissionScope) =>
       storage.withLock(storageKey(scope), async () => {
         const current = await read(scope);
@@ -90,13 +205,26 @@ export function createThreadMoveSubmissionJournal(storage: ThreadMoveSubmissionS
         command: typeof ThreadMoveEnqueueCommand.Type,
       ) => Promise<Parameters<typeof threadCommandAcceptance>[0]>,
       isCurrent: () => boolean,
+      options?: { readonly allowExisting?: boolean },
     ) => {
       const submission = await storage.withLock<ThreadMoveSubmission>(
         storageKey(scope),
         async () => {
           const previous = await read(scope);
-          if (previous) return previous;
-          const next = { command: create() };
+          if (previous) {
+            if (options?.allowExisting === false)
+              throw new Error(
+                "Another move is already saved. Check it before choosing a destination.",
+              );
+            return previous;
+          }
+          const next = {
+            command: create(),
+            originEnvironmentId: scope.environmentId,
+            ...(scope.sourceGeneration !== undefined
+              ? { sourceGeneration: scope.sourceGeneration }
+              : {}),
+          };
           if (next.command.threadId !== scope.threadId)
             throw new Error("Move targets another thread.");
           await storage.write(storageKey(scope), encode(next));
@@ -106,6 +234,7 @@ export function createThreadMoveSubmissionJournal(storage: ThreadMoveSubmissionS
       if (!isCurrent()) throw new Error("Sign in again before sending this saved move.");
       if (submission.rejection)
         return { status: "rejected" as const, detail: submission.rejection };
+      if (submission.accepted) return { status: "accepted" as const };
       let result: Parameters<typeof threadCommandAcceptance>[0];
       try {
         const accepted = await send(submission.command);

@@ -2,6 +2,7 @@ import * as Crypto from "effect/Crypto";
 import { Atom } from "effect/unstable/reactivity";
 import {
   WS_METHODS,
+  ORCHESTRATION_WS_METHODS,
   type EnvironmentId,
   type OrchestrationShellSnapshot,
 } from "@t3tools/contracts";
@@ -376,6 +377,11 @@ export function createThreadEnvironmentAtoms<R, E>(
     getCommandReceipt: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:command-receipt",
       execute: getThreadCommandReceipt,
+    }),
+    // Recovery compares this receipt only with the same environment's thread detail.
+    getLocalCommandReceipt: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:thread:local-command-receipt",
+      tag: ORCHESTRATION_WS_METHODS.getCommandReceipt,
     }),
     uploadFeedback: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:commands:thread:upload-feedback",

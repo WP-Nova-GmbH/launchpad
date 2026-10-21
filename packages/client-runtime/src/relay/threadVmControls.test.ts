@@ -289,7 +289,7 @@ describe("VM host availability", () => {
           );
           expect(result._tag).toBe("Failure");
           expect(h.registry.get(view).unavailableReason).toBe(
-            "Could not check VM host. Reopen Move thread to retry.",
+            "Could not check VM host. Reopen Run on to retry.",
           );
         }
       }),
@@ -590,6 +590,551 @@ describe("completed thread location handoff", () => {
     generation: 1,
     operationId: "moving",
   };
+  const activeSnapshot: OrchestrationShellSnapshot = {
+    ...snapshot,
+    threads: [
+      { ...snapshot.threads[0]!, relayRouting: { relayUrl, generation: 1, phase: "active" } },
+    ],
+  };
+  const checkInput = { environmentId, threadId, accountId: "owner", relayUrl };
+
+  it.effect(
+    "confirms cancellation after the claimed queue move disappears, then stops tracking",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          const queue: ThreadPromptQueue = {
+            enabled: true,
+            revision: 1,
+            pauseReason: null,
+            handoff: null,
+            awaitingTurnId: null,
+            admissions: [],
+            finalizedTurnId: null,
+            entries: [
+              {
+                kind: "move",
+                state: "cancelling",
+                operationId: CommandId.make(placement.operationId),
+                messageId: MessageId.make("cancelled-move"),
+                destination: { kind: "vm" },
+                revision: 1,
+                acceptedSequence: 1,
+                createdAt: at,
+              },
+            ],
+          };
+          for (const outcome of ["stable", "pending", "denied"] as const) {
+            let cancelled = false,
+              reads = 0;
+            const detail = Atom.make<Pick<OrchestrationThread, "promptQueue"> | null>({
+              promptQueue: queue,
+            });
+            const h = yield* harness(
+              async () => {
+                reads++;
+                if (cancelled && reads === 3 && outcome === "denied")
+                  return Response.json({ error: "Access removed" }, { status: 403 });
+                const pending = !cancelled || (reads === 3 && outcome === "pending");
+                return Response.json({
+                  ...placement,
+                  operationId: pending ? placement.operationId : null,
+                });
+              },
+              activeSnapshot,
+              null,
+              detail,
+            );
+            const view = h.controls.locationViewAtom(environmentId, threadId),
+              query = h.controls.locationQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, view);
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+            expect(h.registry.get(view)?.movePending).toBe(true);
+            cancelled = true;
+            h.registry.set(detail, { promptQueue: { ...queue, revision: 2, entries: [] } });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+              Effect.result,
+            );
+            expect(reads).toBe(3);
+            if (outcome === "pending") {
+              expect(h.registry.get(view)?.movePending).toBe(true);
+              yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+              expect(reads).toBe(4);
+            } else if (outcome === "denied") {
+              expect(h.registry.get(view)?.error).toBeTruthy();
+              expect(h.registry.get(view)?.movePending).toBe(false);
+              yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+              expect(reads).toBe(3);
+              yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+              expect(reads).toBe(4);
+            }
+            expect(h.registry.get(view)).toBeNull();
+            expect(
+              h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId))
+                ?.operationId,
+            ).toBeNull();
+            const finalReads = reads;
+            yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+            expect(reads).toBe(finalReads);
+          }
+        }),
+      ),
+  );
+
+  it.effect("keeps tracking a move when an explicit check supersedes the automatic lookup", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let reads = 0;
+        const destination = {
+          ...placement,
+          environmentId: "mac",
+          generation: 2,
+          operationId: null,
+        };
+        const h = yield* harness(async () => {
+          const request = ++reads;
+          if (request === 1) {
+            requested.resolve();
+            await release.promise;
+          }
+          return Response.json(
+            request === 1
+              ? placement
+              : request === 2
+                ? { ...destination, operationId: "activating" }
+                : destination,
+          );
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => requested.promise);
+        expect(
+          (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))._tag,
+        ).toBe("Success");
+        release.resolve();
+        expect(
+          (yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+            Effect.result,
+          ))._tag,
+        ).toBe("Failure");
+        expect(h.registry.get(view)).toMatchObject({ movePending: true, error: null });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        expect(reads).toBe(3);
+        expect(h.registry.get(view)?.destination).toEqual({
+          environmentId: "mac",
+          threadId,
+          generation: 2,
+        });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(4_000));
+        expect(reads).toBe(3);
+      }),
+    ),
+  );
+
+  it.effect("publishes explicit recovery after the cached active source misses cutover", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        let reads = 0;
+        const destination = {
+          ...placement,
+          environmentId: "mac",
+          generation: 2,
+          operationId: null,
+        };
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json(destination);
+        }, activeSnapshot);
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        expect(h.registry.get(view)).toBeNull();
+        expect(
+          (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))._tag,
+        ).toBe("Success");
+        expect(h.registry.get(view)).toMatchObject({
+          recoveryRequested: true,
+          destination: { environmentId: "mac", threadId, generation: 2 },
+          placement: destination,
+        });
+        expect(
+          h.registry.get(h.controls.confirmedLocationAtom(EnvironmentId.make("mac"), threadId)),
+        ).toEqual(destination);
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+        expect(reads).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "rechecks pending recovery and accepts ready and new operations at the same generation",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let reads = 0;
+          const h = yield* harness(
+            async () =>
+              Response.json({
+                ...placement,
+                environmentId: "mac",
+                generation: 2,
+                operationId: ++reads === 2 ? null : `move-${reads}`,
+              }),
+            activeSnapshot,
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          for (const pending of [true, false, true]) {
+            expect(
+              (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))
+                ._tag,
+            ).toBe("Success");
+            expect(h.registry.get(view)).toMatchObject({
+              recoveryRequested: true,
+              movePending: pending,
+            });
+            expect(h.registry.get(view)?.destination?.generation ?? null).toBe(pending ? null : 2);
+          }
+          expect(reads).toBe(3);
+        }),
+      ),
+  );
+
+  it.effect("does not let an older pending response replace a newer ready response", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* harness(async () => {
+          if (++reads === 1) {
+            requested.resolve();
+            await release.promise;
+            return Response.json({ ...placement, environmentId: "mac", generation: 2 });
+          }
+          return Response.json({
+            ...placement,
+            environmentId: "mac",
+            generation: 2,
+            operationId: null,
+          });
+        }, activeSnapshot);
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        const older = h.controls.checkLocation.run(h.registry, checkInput);
+        yield* Effect.promise(() => requested.promise);
+        expect(
+          (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))._tag,
+        ).toBe("Success");
+        release.resolve();
+        expect((yield* Effect.promise(() => older))._tag).toBe("Failure");
+        expect(h.registry.get(view)).toMatchObject({
+          movePending: false,
+          destination: { generation: 2 },
+        });
+      }),
+    ),
+  );
+
+  it.effect("ignores a later lower generation without replacing the confirmed destination", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let reads = 0;
+        const h = yield* harness(
+          async () =>
+            Response.json({
+              ...placement,
+              environmentId: "mac",
+              generation: ++reads === 1 ? 3 : 2,
+              operationId: null,
+            }),
+          activeSnapshot,
+        );
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+        expect(
+          (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))._tag,
+        ).toBe("Failure");
+        expect(h.registry.get(view)?.destination?.generation).toBe(3);
+      }),
+    ),
+  );
+
+  it.effect(
+    "clears successful recovery after access is removed and permits an explicit retry",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let reads = 0;
+          const h = yield* harness(
+            async () =>
+              ++reads === 2
+                ? Response.json({ error: "Access removed" }, { status: 403 })
+                : Response.json({
+                    ...placement,
+                    environmentId: "mac",
+                    generation: reads + 1,
+                    operationId: null,
+                  }),
+            activeSnapshot,
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+          expect(h.registry.get(view)?.destination?.generation).toBe(2);
+          expect(
+            (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))
+              ._tag,
+          ).toBe("Failure");
+          expect(h.registry.get(view)?.error).toBeTruthy();
+          expect(h.registry.get(view)?.destination).toBeNull();
+          expect(
+            h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId)),
+          ).toBeNull();
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+          expect(reads).toBe(2);
+          yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+          expect(h.registry.get(view)?.destination?.generation).toBe(4);
+        }),
+      ),
+  );
+
+  it.effect("hides successful recovery once the current active location is confirmed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(
+          async () => Response.json({ ...placement, operationId: null }),
+          activeSnapshot,
+        );
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+        expect(h.registry.get(view)).toBeNull();
+        expect(
+          h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId))?.environmentId,
+        ).toBe(environmentId);
+      }),
+    ),
+  );
+
+  it.effect("discards explicit recovery when the signed-in session changes while loading", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const h = yield* harness(async () => {
+          requested.resolve();
+          await release.promise;
+          return Response.json({
+            ...placement,
+            environmentId: "mac",
+            generation: 2,
+            operationId: null,
+          });
+        }, activeSnapshot);
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        const pending = h.controls.checkLocation.run(h.registry, checkInput);
+        yield* Effect.promise(() => requested.promise);
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "other",
+          readClerkToken: () => Effect.succeed("other-token"),
+        });
+        release.resolve();
+        expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+        expect(h.registry.get(view)).toBeNull();
+        expect(
+          h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId)),
+        ).toBeNull();
+      }),
+    ),
+  );
+
+  it.effect("keeps an explicit result when an older automatic lookup completes later", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* harness(async () => {
+          if (++reads === 1) {
+            requested.resolve();
+            await release.promise;
+            return Response.json(placement);
+          }
+          return Response.json({
+            ...placement,
+            environmentId: "mac",
+            generation: 3,
+            operationId: null,
+          });
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        const automatic = yield* AtomRegistry.getResult(h.registry, query, {
+          suspendOnWaiting: true,
+        }).pipe(Effect.result, Effect.forkScoped);
+        yield* Effect.promise(() => requested.promise);
+        yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+        release.resolve();
+        yield* Fiber.join(automatic);
+        expect(h.registry.get(view)).toMatchObject({ error: null, destination: { generation: 3 } });
+      }),
+    ),
+  );
+
+  it.effect(
+    "invalidates a successful location and late checks when the configured relay changes",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const registry = AtomRegistry.make();
+          yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+          registry.set(managedRelaySessionAtom, {
+            accountId: "owner",
+            readClerkToken: () => Effect.succeed("owner-token"),
+          });
+          const configured = Atom.make(relayUrl),
+            source = Atom.make(activeSnapshot),
+            requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          let reads = 0;
+          const controls = createThreadVmControlAtoms(
+            Atom.runtime((get) =>
+              tenancyLayer({ relayUrl: get(configured) }).pipe(
+                Layer.provide(
+                  remoteHttpClientLayer(async () => {
+                    if (++reads === 2) {
+                      requested.resolve();
+                      await release.promise;
+                    }
+                    return Response.json({
+                      ...placement,
+                      environmentId: "mac",
+                      generation: 2,
+                      operationId: null,
+                    });
+                  }),
+                ),
+              ),
+            ),
+            () => source,
+          );
+          const view = controls.locationViewAtom(environmentId, threadId),
+            confirmed = controls.confirmedLocationAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(registry, view);
+          yield* Effect.promise(() => controls.checkLocation.run(registry, checkInput));
+          expect(registry.get(confirmed)?.generation).toBe(2);
+          const pending = controls.checkLocation.run(registry, checkInput);
+          yield* Effect.promise(() => requested.promise);
+          registry.set(configured, "https://another-relay.example.test");
+          release.resolve();
+          expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+          expect(registry.get(confirmed)).toBeNull();
+          expect(registry.get(view)).toBeNull();
+        }),
+      ),
+  );
+
+  it.effect(
+    "rejects a late recovery after the source route generation changes without leaving it loading",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const registry = AtomRegistry.make();
+          yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+          registry.set(managedRelaySessionAtom, {
+            accountId: "owner",
+            readClerkToken: () => Effect.succeed("owner-token"),
+          });
+          const source = Atom.make(activeSnapshot),
+            requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          const controls = createThreadVmControlAtoms(
+            Atom.runtime(
+              tenancyLayer({ relayUrl }).pipe(
+                Layer.provide(
+                  remoteHttpClientLayer(async () => {
+                    requested.resolve();
+                    await release.promise;
+                    return Response.json({
+                      ...placement,
+                      environmentId: "mac",
+                      generation: 2,
+                      operationId: null,
+                    });
+                  }),
+                ),
+              ),
+            ),
+            () => source,
+          );
+          const view = controls.locationViewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(registry, view);
+          const pending = controls.checkLocation.run(registry, checkInput);
+          yield* Effect.promise(() => requested.promise);
+          registry.set(source, {
+            ...activeSnapshot,
+            threads: [
+              {
+                ...activeSnapshot.threads[0]!,
+                relayRouting: { relayUrl, generation: 3, phase: "active" },
+              },
+            ],
+          });
+          release.resolve();
+          expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+          expect(registry.get(view)?.destination).toBeNull();
+          expect(registry.get(view)?.isPending).toBe(false);
+          expect(registry.get(view)?.error).toBeTruthy();
+        }),
+      ),
+  );
+
+  it.effect("explicit recovery reads fresh placement and rejects another account", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let reads = 0;
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json({ ...placement, generation: reads, operationId: null });
+        });
+        const input = { environmentId, threadId, accountId: "owner", relayUrl };
+        for (const generation of [1, 2]) {
+          const result = yield* Effect.promise(() =>
+            h.controls.checkLocation.run(h.registry, input),
+          );
+          expect(result._tag).toBe("Success");
+          if (result._tag === "Success") expect(result.value.generation).toBe(generation);
+        }
+        const denied = yield* Effect.promise(() =>
+          h.controls.checkLocation.run(h.registry, { ...input, accountId: "other" }),
+        );
+        expect(denied._tag).toBe("Failure");
+        const changedRelay = yield* Effect.promise(() =>
+          h.controls.checkLocation.run(h.registry, {
+            ...input,
+            relayUrl: "https://another-relay.example.test",
+          }),
+        );
+        expect(changedRelay._tag).toBe("Failure");
+        expect(reads).toBe(2);
+      }),
+    ),
+  );
   it.effect("recovers a cold stale route with no source snapshot using one relay read", () =>
     Effect.scoped(
       Effect.gen(function* () {

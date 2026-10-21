@@ -9,6 +9,7 @@ import {
   ThreadId,
   type ClientOrchestrationCommand,
   type OrchestrationShellSnapshot,
+  type OrchestrationGetCommandReceiptInput,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -59,6 +60,7 @@ const SNAPSHOT: OrchestrationShellSnapshot = {
 };
 
 const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (portable = false) {
+  const receiptRequests: Array<typeof OrchestrationGetCommandReceiptInput.Type> = [];
   const requests = yield* Queue.unbounded<{
     command: ClientOrchestrationCommand;
     reply: Deferred.Deferred<{ sequence: number }, Error>;
@@ -71,6 +73,12 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (porta
           environment: { capabilities: { sharedPromptQueue: false } },
         }),
         client: {
+          [ORCHESTRATION_WS_METHODS.getCommandReceipt]: (
+            input: typeof OrchestrationGetCommandReceiptInput.Type,
+          ) => {
+            receiptRequests.push(input);
+            return Effect.succeed({ status: "accepted" as const, sequence: 23 });
+          },
           [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command: ClientOrchestrationCommand) =>
             Effect.gen(function* () {
               const reply = yield* Deferred.make<{ sequence: number }, Error>();
@@ -116,10 +124,36 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (porta
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const visibleAtom = commands.snapshotAtom(ENVIRONMENT_ID);
   registry.mount(visibleAtom);
-  return { registry, commands, snapshotAtom, visibleAtom, requests };
+  return { registry, commands, snapshotAtom, visibleAtom, requests, receiptRequests };
 });
 
 describe("remote thread lifecycle commands", () => {
+  it.effect(
+    "reads an environment-local recovery receipt even when portable reads use the relay",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeHarness(true);
+          const target = {
+            environmentId: ENVIRONMENT_ID,
+            input: { threadId: THREAD_ID, commandId: CommandId.make("saved-move") },
+          };
+          const routed = yield* Effect.promise(() =>
+            h.commands.getCommandReceipt.run(h.registry, target),
+          );
+          expect(routed).toMatchObject({ _tag: "Success", value: { status: "unknown" } });
+          expect(h.receiptRequests).toEqual([]);
+          const local = yield* Effect.promise(() =>
+            h.commands.getLocalCommandReceipt.run(h.registry, target),
+          );
+          expect(local).toMatchObject({
+            _tag: "Success",
+            value: { status: "accepted", sequence: 23 },
+          });
+          expect(h.receiptRequests).toEqual([target.input]);
+        }),
+      ),
+  );
   it.effect("does not leave a queued relay change looking applied in the sidebar", () =>
     Effect.scoped(
       Effect.gen(function* () {

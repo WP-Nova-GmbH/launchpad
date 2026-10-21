@@ -17,6 +17,7 @@ import type {
   RelayThreadDeletionRequest,
   RelayThreadVmProviderAuthBinding,
   RelayThreadVmProviderAuth,
+  RelayPortableThreadPlacement,
 } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Schema from "effect/Schema";
@@ -31,7 +32,11 @@ import {
 } from "../state/runtime.ts";
 import type { createThreadVmActionJournal } from "./threadVmActionSubmission.ts";
 import { ManagedRelayTenancyClient } from "./managedRelayTenancy.ts";
-import { managedRelaySessionAtom, readManagedRelaySnapshotState } from "./managedRelayState.ts";
+import {
+  managedRelaySessionAtom,
+  readManagedRelaySnapshotState,
+  type ManagedRelaySession,
+} from "./managedRelayState.ts";
 
 import {
   portableThreadClientRouteAtom,
@@ -58,7 +63,7 @@ function threadVmHostUnavailableReason(state: {
   readonly error: string | null;
 }) {
   if (state.isPending) return "Checking VM host…";
-  if (state.error) return "Could not check VM host. Reopen Move thread to retry.";
+  if (state.error) return "Could not check VM host. Reopen Run on to retry.";
   return state.data === true ? null : "VM host not configured";
 }
 
@@ -368,6 +373,190 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       });
     return { relay, clerkToken, session };
   });
+  const configuredRelayAtom = runtime.atom(
+    Effect.map(ManagedRelayTenancyClient, (relay) => normalizeSecureRelayUrl(relay.relayUrl)),
+  );
+  type LocationState = {
+    session: ManagedRelaySession;
+    relayUrl: string;
+    request: number;
+    generation: number;
+    recoveryRequested: boolean;
+    /** Confirm the final placement even after a claimed move leaves the queue. */
+    trackingMove: boolean;
+    placement: RelayPortableThreadPlacement | null;
+    error: string | null;
+    isPending: boolean;
+  };
+  const locationStateAtom = Atom.family((_threadId: ThreadId) =>
+    Atom.make<LocationState | null>(null).pipe(Atom.keepAlive),
+  );
+  const scopedLocationAtom = Atom.family((key: string) =>
+    Atom.make((get) => {
+      const [, threadId] = decodeKey(key),
+        state = get(locationStateAtom(threadId)),
+        configured = readManagedRelaySnapshotState(get(configuredRelayAtom));
+      return state?.session === get(managedRelaySessionAtom) &&
+        !configured.isPending &&
+        !configured.error &&
+        state?.relayUrl === configured.data
+        ? state
+        : null;
+    }),
+  );
+  const confirmedLocationAtom = Atom.family((key: string) =>
+    Atom.make((get) => {
+      const state = get(scopedLocationAtom(key)),
+        route = get(routeAtom(key));
+      return state &&
+        !state.error &&
+        !state.isPending &&
+        (state.placement?.generation ?? 0) >= (route?.generation ?? 0)
+        ? state.placement
+        : null;
+    }),
+  );
+  // All location reads share ordering, including same-generation activation updates.
+  let locationRequest = 0;
+  const readLocation = Effect.fnUntraced(function* (
+    registry: AtomRegistry.AtomRegistry,
+    key: string,
+    expectedAccount?: string,
+    recoveryRelay?: string,
+    explicit = false,
+  ) {
+    const session = registry.get(managedRelaySessionAtom),
+      relay = yield* ManagedRelayTenancyClient;
+    if (!session || (expectedAccount !== undefined && session.accountId !== expectedAccount))
+      return yield* new OrchestrationDispatchCommandError({
+        message: "Connect to this thread’s Launchpad Connect account first.",
+      });
+    const relayUrl = normalizeSecureRelayUrl(relay.relayUrl),
+      configuredRelay = yield* AtomRegistry.getResult(registry, configuredRelayAtom, {
+        suspendOnWaiting: true,
+      });
+    if (
+      !relayUrl ||
+      configuredRelay !== relayUrl ||
+      registry.get(managedRelaySessionAtom) !== session ||
+      (recoveryRelay && normalizeSecureRelayUrl(recoveryRelay) !== relayUrl)
+    )
+      return yield* new OrchestrationDispatchCommandError({
+        message: "The Launchpad Connect relay changed. Reopen this thread before checking it.",
+      });
+    const [environmentId, threadId] = decodeKey(key),
+      route = registry.get(routeAtom(key)),
+      atom = locationStateAtom(threadId),
+      previous = registry.get(atom),
+      sameScope = previous?.session === session && previous.relayUrl === relayUrl,
+      request = ++locationRequest;
+    const queuedMove = () =>
+      threadDetailAtom
+        ? inFlightMove(registry.get(threadDetailAtom(environmentId, threadId))?.promptQueue)
+        : false;
+    const started = {
+      session,
+      relayUrl,
+      request,
+      generation: Math.max(sameScope ? previous.generation : 0, route?.generation ?? 0),
+      recoveryRequested: explicit || (sameScope && previous.recoveryRequested),
+      trackingMove: queuedMove() || (sameScope && previous.trackingMove),
+      placement: sameScope ? previous.placement : null,
+      error: null,
+      isPending: true,
+    };
+    if (explicit) registry.set(atom, started);
+    const isCurrent = () => {
+      const currentRoute = registry.get(routeAtom(key));
+      const configured = readManagedRelaySnapshotState(registry.get(configuredRelayAtom));
+      return (
+        registry.get(managedRelaySessionAtom) === session &&
+        !configured.isPending &&
+        configured.data === relayUrl &&
+        currentRoute?.generation === route?.generation &&
+        normalizeSecureRelayUrl(currentRoute?.relayUrl ?? relayUrl) ===
+          normalizeSecureRelayUrl(route?.relayUrl ?? relayUrl) &&
+        (registry.get(atom)?.request ?? 0) <= request
+      );
+    };
+    const placement = yield* Effect.gen(function* () {
+      const { clerkToken } = yield* authorize(registry, key, expectedAccount, recoveryRelay);
+      return yield* relay.getPortableThreadPlacement({ clerkToken, threadId });
+    }).pipe(
+      Effect.tapError((error) =>
+        Effect.sync(() => {
+          if (!isCurrent()) return;
+          registry.update(atom, (current) => ({
+            ...started,
+            generation: sameScope
+              ? (current?.generation ?? started.generation)
+              : started.generation,
+            placement: null,
+            trackingMove: false,
+            error: readManagedRelaySnapshotState(AsyncResult.fail(error)).error,
+            isPending: false,
+          }));
+        }),
+      ),
+    );
+    if (!isCurrent()) {
+      if (
+        registry.get(atom)?.request === request &&
+        registry.get(managedRelaySessionAtom) === session
+      )
+        registry.update(
+          atom,
+          (current) =>
+            current && {
+              ...current,
+              placement: null,
+              error: "This thread’s location changed while checking it. Check again.",
+              isPending: false,
+            },
+        );
+      return yield* new OrchestrationDispatchCommandError({
+        message: "Your account or this thread’s location changed while checking it. Check again.",
+      });
+    }
+    const latest = registry.get(atom);
+    if (
+      placement.threadId !== threadId ||
+      placement.generation < Math.max(started.generation, sameScope ? (latest?.generation ?? 0) : 0)
+    ) {
+      if (explicit) registry.set(atom, { ...started, isPending: false });
+      return yield* new OrchestrationDispatchCommandError({
+        message: "This thread’s location changed while checking it. Check again.",
+      });
+    }
+    registry.set(atom, {
+      ...started,
+      placement,
+      generation: placement.generation,
+      trackingMove: started.trackingMove && (queuedMove() || placement.operationId !== null),
+      isPending: false,
+    });
+    return placement;
+  });
+  const checkLocation = createRuntimeCommand(runtime, {
+    label: "check thread location",
+    execute: Effect.fnUntraced(function* (
+      input: {
+        environmentId: EnvironmentId;
+        threadId: ThreadId;
+        accountId: string;
+        relayUrl: string;
+      },
+      registry,
+    ) {
+      return yield* readLocation(
+        registry,
+        keyFor(input.environmentId, input.threadId),
+        input.accountId,
+        input.relayUrl,
+        true,
+      );
+    }),
+  });
   const bootstrapKey = Schema.fromJsonString(
     Schema.Tuple([EnvironmentId, ThreadId, Schema.Number]),
   );
@@ -514,15 +703,11 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           const queue = threadDetailAtom
             ? get(threadDetailAtom(environmentId, threadId))?.promptQueue
             : undefined;
-          if (route.phase === "active" && !inFlightMove(queue)) return null;
           const registry = yield* AtomRegistry.AtomRegistry;
-          const { relay, clerkToken } = yield* authorize(registry, key);
-          const placement = yield* relay.getPortableThreadPlacement({ clerkToken, threadId });
-          if (
-            registry.get(managedRelaySessionAtom) !== session ||
-            registry.get(routeAtom(key))?.generation !== route.generation
-          )
-            return null;
+          // Read without subscribing: this query publishes the same recovery state.
+          const trackingMove = registry.get(scopedLocationAtom(key))?.trackingMove;
+          if (route.phase === "active" && !inFlightMove(queue) && !trackingMove) return null;
+          const placement = yield* readLocation(registry, key);
           return { session, placement };
         }),
       )
@@ -541,15 +726,12 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           if (!session) return null;
           const registry = yield* AtomRegistry.AtomRegistry;
           const configuredRelay = yield* ManagedRelayTenancyClient;
-          const { relay, clerkToken } = yield* authorize(
+          const placement = yield* readLocation(
             registry,
             key,
             session.accountId,
             configuredRelay.relayUrl,
           );
-          const [, threadId] = decodeKey(key);
-          const placement = yield* relay.getPortableThreadPlacement({ clerkToken, threadId });
-          if (registry.get(managedRelaySessionAtom) !== session) return null;
           return { session, placement };
         }),
       )
@@ -560,15 +742,26 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       const session = get(managedRelaySessionAtom);
       if (!session) return null;
       const [, threadId] = decodeKey(key);
-      const state = readManagedRelaySnapshotState(get(unavailableLocationQueryAtom(key)));
-      const value = state.data?.session === session ? state.data.placement : null;
+      const query = readManagedRelaySnapshotState(get(unavailableLocationQueryAtom(key))),
+        recovery = get(scopedLocationAtom(key)),
+        state = recovery ?? query,
+        value = recovery
+          ? recovery.placement
+          : query.data?.session === session
+            ? query.data.placement
+            : null;
       return {
         accountId: session.accountId,
+        placement: !state.error && !state.isPending ? value : null,
+        recoveryRequested: recovery?.recoveryRequested ?? false,
         error: state.error,
         isPending: state.isPending,
         movePending: value?.operationId != null,
         destination:
-          !state.error && value?.threadId === threadId && value.operationId === null
+          !state.error &&
+          !state.isPending &&
+          value?.threadId === threadId &&
+          value.operationId === null
             ? {
                 environmentId: EnvironmentId.make(value.environmentId),
                 threadId,
@@ -584,36 +777,66 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     Atom.make((get) => {
       const session = get(managedRelaySessionAtom),
         route = get(routeAtom(key));
-      if (!session || !route) return null;
+      if (!session) return null;
       const [environmentId, threadId] = decodeKey(key);
       const queue = threadDetailAtom
         ? get(threadDetailAtom(environmentId, threadId))?.promptQueue
         : undefined;
-      if (route.phase === "active" && !inFlightMove(queue)) return null;
-      const initial = readManagedRelaySnapshotState(get(locationQueryAtom(key)));
-      const current = initial.data?.session === session ? initial.data.placement : null;
-      // A claimed queue move can precede relay admission. Keep following its
-      // source until cutover; stop on confirmation, cancellation or access failure.
-      const state =
+      const recovery = get(scopedLocationAtom(key));
+      const autoLookup =
+        !!route &&
+        (route.phase !== "active" || inFlightMove(queue) || recovery?.trackingMove === true);
+      // Keep the base query mounted even when a newer check supplies the placement;
+      // publishing completion must not dispose its in-progress read.
+      const initial = route ? readManagedRelaySnapshotState(get(locationQueryAtom(key))) : null;
+      // A superseded query may fail while a newer check still confirms a live move.
+      const current = recovery
+        ? recovery.placement
+        : initial?.data?.session === session
+          ? initial.data.placement
+          : null;
+      const query =
+        autoLookup &&
         current &&
-        !initial.error &&
+        !(recovery ? recovery.error : initial?.error) &&
         (current.operationId !== null ||
           (inFlightMove(queue) &&
             current.environmentId === environmentId &&
-            current.generation === route.generation))
+            current.generation === route?.generation))
           ? readManagedRelaySnapshotState(get(movingLocationQueryAtom(key)))
           : initial;
-      const value = state.data?.session === session ? state.data.placement : null;
+      if (!autoLookup && !recovery?.recoveryRequested && !recovery?.error) return null;
+      const state = recovery ?? query,
+        value = recovery
+          ? recovery.placement
+          : query?.data?.session === session
+            ? query.data.placement
+            : null,
+        error = state?.error ?? null,
+        isPending = state?.isPending ?? false;
+      if (
+        !isPending &&
+        !error &&
+        value?.environmentId === environmentId &&
+        value.generation === route?.generation &&
+        value.operationId === null &&
+        route.phase === "active" &&
+        !inFlightMove(queue)
+      )
+        return null;
       return {
         accountId: session.accountId,
-        error: state.error,
-        isPending: state.isPending,
+        placement: !error && !isPending ? value : null,
+        recoveryRequested: recovery?.recoveryRequested ?? false,
+        error,
+        isPending,
         movePending: value?.operationId != null,
         destination:
-          !state.error &&
+          !error &&
+          !isPending &&
           value?.threadId === threadId &&
           value.operationId === null &&
-          value.generation > route.generation &&
+          value.generation > (route?.generation ?? 0) &&
           value.environmentId !== environmentId
             ? {
                 environmentId: EnvironmentId.make(value.environmentId),
@@ -843,6 +1066,9 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       registry.refresh(unavailableLocationQueryAtom(key));
     },
     action,
+    checkLocation,
+    confirmedLocationAtom: (environmentId: EnvironmentId, threadId: ThreadId) =>
+      confirmedLocationAtom(keyFor(environmentId, threadId)),
     checkBackupRecovery,
     openPreview,
     providerAuthAction,

@@ -6,6 +6,7 @@ import {
   ThreadId,
   ProjectId,
   ThreadMoveEnqueueCommand,
+  type ThreadQueueEntry,
 } from "@t3tools/contracts";
 import {
   createThreadMoveSubmissionJournal,
@@ -30,6 +31,15 @@ const command = (id = "original"): typeof ThreadMoveEnqueueCommand.Type => ({
   destination: { kind: "vm" },
   position: "next",
   createdAt: "2026-10-07T00:00:00Z",
+});
+const queuedMove = (move = command()): ThreadQueueEntry => ({
+  kind: "move",
+  messageId: move.messageId,
+  destination: move.destination,
+  state: "pending",
+  revision: 1,
+  acceptedSequence: 10,
+  createdAt: move.createdAt,
 });
 function storage() {
   const values = new Map<string, string>(),
@@ -82,7 +92,17 @@ describe("durable queued move submission", () => {
     );
     expect(accepted).toEqual({ status: "accepted" });
     expect(sent).toEqual(["original", "original"]);
-    expect(await restarted.read(scope)).toBeNull();
+    expect(await restarted.read(scope)).toEqual({
+      command: command(),
+      originEnvironmentId: scope.environmentId,
+      accepted: true,
+      acceptedViaRelay: true,
+    });
+    expect(
+      await restarted.observe(scope, (await restarted.read(scope))!, {
+        entries: [queuedMove()],
+      }),
+    ).toBeNull();
   });
   it("does not contact an environment if the account changes during persistence", async () => {
     const f = storage(),
@@ -174,6 +194,469 @@ describe("durable queued move submission", () => {
     );
     expect(sent).toEqual(["first", "first"]);
     expect((await journal.read(scope))?.command.commandId).toBe("first");
+  });
+  it("keeps relay admission across reload and does not send a second selection before projection", async () => {
+    const f = storage(),
+      journal = createThreadMoveSubmissionJournal(f.storage);
+    const sent: string[] = [];
+    await journal.submit(
+      scope,
+      command,
+      async (move) => {
+        sent.push(move.commandId);
+        return { relay: { commandId: move.commandId, position: 1, receipt: null } };
+      },
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    const restarted = createThreadMoveSubmissionJournal(f.storage),
+      saved = (await restarted.read(scope))!;
+    expect(saved).toEqual({
+      command: command(),
+      originEnvironmentId: scope.environmentId,
+      accepted: true,
+      acceptedViaRelay: true,
+    });
+    expect(await restarted.observe(scope, saved, { entries: [] })).toBe(saved);
+    await restarted.submit(
+      scope,
+      () => command("another-destination"),
+      async (move) => {
+        sent.push(move.commandId);
+        return { sequence: 2 };
+      },
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    expect(sent).toEqual(["original"]);
+    expect(await restarted.read(scope)).toEqual(saved);
+    expect(await restarted.observe(scope, saved, { entries: [queuedMove()] })).toBeNull();
+  });
+  it.each(["unknown", "accepted"] as const)(
+    "rejects a new selection if another tab saved a %s request after the picker opened",
+    async (status) => {
+      const f = storage(),
+        firstTab = createThreadMoveSubmissionJournal(f.storage),
+        staleTab = createThreadMoveSubmissionJournal(f.storage),
+        sent: string[] = [];
+      expect(await staleTab.read(scope)).toBeNull();
+      await firstTab.submit(
+        scope,
+        command,
+        async (move) => {
+          sent.push(move.commandId);
+          if (status === "unknown") throw new Error("Reply lost");
+          return { relay: { commandId: move.commandId, position: 1, receipt: null } };
+        },
+        async () => ({ status: "unknown" }),
+        () => true,
+      );
+      const first = await firstTab.read(scope);
+      await expect(
+        staleTab.submit(
+          scope,
+          () => command("different-destination"),
+          async (move) => {
+            sent.push(move.commandId);
+            return { sequence: 2 };
+          },
+          async () => ({ status: "unknown" }),
+          () => true,
+          { allowExisting: false },
+        ),
+      ).rejects.toThrow("Another move is already saved");
+      expect(sent).toEqual(["original"]);
+      expect(await firstTab.read(scope)).toEqual(first);
+    },
+  );
+  it.each(["direct", "relay"] as const)(
+    "retains %s admission until an exact owner-local receipt and its paired detail catch up",
+    async (transport) => {
+      const f = storage(),
+        journal = createThreadMoveSubmissionJournal(f.storage),
+        source = { ...scope, sourceGeneration: 4 };
+      await journal.submit(
+        source,
+        command,
+        async () =>
+          transport === "direct"
+            ? { sequence: 10 }
+            : {
+                relay: {
+                  commandId: command().commandId,
+                  position: 1,
+                  receipt: { status: "accepted", sequence: 10 },
+                },
+              },
+        async () => ({ status: "unknown" }),
+        () => true,
+      );
+      const restarted = createThreadMoveSubmissionJournal(f.storage),
+        saved = (await restarted.read(source))!,
+        placement = { environmentId: source.environmentId, generation: 4, operationId: null },
+        projection = { environmentId: source.environmentId, generation: 4, snapshotSequence: 10 },
+        executionProof = {
+          commandId: command().commandId,
+          environmentId: source.environmentId,
+          generation: 4,
+          sequence: 10,
+        };
+      expect(saved.acceptedSequence).toBe(10);
+      expect(saved.sourceGeneration).toBe(4);
+      expect(await restarted.observe(source, saved, { entries: [], placement, projection })).toBe(
+        saved,
+      );
+      const waiting = await restarted.observe(source, saved, {
+        entries: [],
+        placement,
+        executionProof,
+        projection: { ...projection, snapshotSequence: 9 },
+      });
+      expect(waiting?.executionProof).toEqual(executionProof);
+      expect(await restarted.read(source)).toEqual(waiting);
+      // Readiness stays live: only its paired cursor crosses the receipt sequence.
+      expect(
+        await restarted.observe(source, waiting!, { entries: [], placement, projection }),
+      ).toBeNull();
+      expect(await restarted.read(source)).toBeNull();
+    },
+  );
+  it("uses the command's exact queue identity and does not rewrite multiple queued moves", async () => {
+    const f = storage(),
+      journal = createThreadMoveSubmissionJournal(f.storage);
+    await journal.submit(
+      scope,
+      command,
+      async () => ({ sequence: 10 }),
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    const saved = (await journal.read(scope))!,
+      otherMove = queuedMove(command("other"));
+    expect(await journal.observe(scope, saved, { entries: [otherMove] })).toEqual(saved);
+    const entries = [otherMove, queuedMove()];
+    expect(await journal.observe(scope, saved, { entries })).toBeNull();
+    expect(entries.map((entry) => entry.messageId)).toEqual(["other", "original"]);
+  });
+  it.each(["unknown", "admitted"] as const)(
+    "keeps a %s request across another participant's move, navigation, reload and tabs",
+    async (status) => {
+      const f = storage(),
+        journal = createThreadMoveSubmissionJournal(f.storage),
+        source = { ...scope, sourceGeneration: 4 },
+        destination = {
+          ...scope,
+          relayUrl: "https://RELAY.example.test/",
+          environmentId: EnvironmentId.make("destination"),
+          sourceGeneration: 5,
+        };
+      await journal.submit(
+        source,
+        command,
+        async () => {
+          if (status === "unknown") throw new Error("Reply lost");
+          return { relay: { commandId: command().commandId, position: 1, receipt: null } };
+        },
+        async () => ({ status: "unknown" }),
+        () => true,
+      );
+      const saved = (await journal.read(source))!;
+      expect(
+        await journal.observe(source, saved, {
+          entries: [],
+          placement: { environmentId: destination.environmentId, generation: 5, operationId: null },
+          projection: { environmentId: source.environmentId, generation: 4, snapshotSequence: 999 },
+        }),
+      ).toBe(saved);
+      const anotherTab = createThreadMoveSubmissionJournal(f.storage);
+      expect(await anotherTab.read(destination)).toEqual(saved);
+      await expect(
+        anotherTab.submit(
+          destination,
+          () => command("different"),
+          async () => {
+            throw new Error("Must not send");
+          },
+          async () => ({ status: "unknown" }),
+          () => true,
+          { allowExisting: false },
+        ),
+      ).rejects.toThrow("Another move is already saved");
+      expect(saved.originEnvironmentId).toBe(source.environmentId);
+      expect(saved.sourceGeneration).toBe(4);
+      expect(
+        await anotherTab.observe(destination, saved, { entries: [queuedMove(command("other"))] }),
+      ).toBe(saved);
+      expect(await anotherTab.observe(destination, saved, { entries: [queuedMove()] })).toBeNull();
+      expect(await journal.read(source)).toBeNull();
+    },
+  );
+  it("never mixes command receipts, environments, generations or an in-progress owner", async () => {
+    const f = storage(),
+      journal = createThreadMoveSubmissionJournal(f.storage),
+      destination = {
+        ...scope,
+        environmentId: EnvironmentId.make("destination"),
+        sourceGeneration: 5,
+      };
+    await journal.submit(
+      scope,
+      command,
+      async () => ({ relay: { commandId: command().commandId, position: 1, receipt: null } }),
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    const saved = (await journal.read(destination))!,
+      placement = { environmentId: destination.environmentId, generation: 5, operationId: null },
+      projection = {
+        environmentId: destination.environmentId,
+        generation: 5,
+        snapshotSequence: 100,
+      },
+      executionProof = {
+        commandId: command().commandId,
+        environmentId: destination.environmentId,
+        generation: 5,
+        sequence: 10,
+      };
+    for (const observation of [
+      {
+        placement,
+        projection,
+        executionProof: { ...executionProof, commandId: CommandId.make("other") },
+      },
+      {
+        placement,
+        projection,
+        executionProof: { ...executionProof, environmentId: scope.environmentId },
+      },
+      { placement, projection, executionProof: { ...executionProof, generation: 4 } },
+      { placement: { ...placement, operationId: "moving" }, projection, executionProof },
+    ])
+      expect(await journal.observe(destination, saved, { entries: [], ...observation })).toBe(
+        saved,
+      );
+    const proved = (await journal.observe(destination, saved, {
+      entries: [],
+      placement,
+      executionProof,
+    }))!;
+    expect(proved.executionProof).toEqual(executionProof);
+    for (const changedProjection of [
+      { ...projection, environmentId: scope.environmentId },
+      { ...projection, generation: 4 },
+      { ...projection, generation: 6 },
+    ])
+      expect(
+        await journal.observe(destination, proved, {
+          entries: [],
+          placement,
+          projection: changedProjection,
+        }),
+      ).toBe(proved);
+    expect(
+      await journal.observe(destination, proved, {
+        entries: [],
+        placement: { ...placement, generation: 6 },
+        projection,
+      }),
+    ).toBe(proved);
+    expect(
+      await journal.observe(destination, proved, { entries: [], placement, projection }),
+    ).toBeNull();
+  });
+  it("keeps newer execution evidence when an old machine's read arrives late", async () => {
+    const f = storage(),
+      journal = createThreadMoveSubmissionJournal(f.storage);
+    await journal.submit(
+      scope,
+      command,
+      async () => ({ sequence: 10 }),
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    const saved = (await journal.read(scope))!,
+      proof = {
+        commandId: command().commandId,
+        environmentId: EnvironmentId.make("destination"),
+        generation: 6,
+        sequence: 20,
+      },
+      placement = {
+        environmentId: proof.environmentId,
+        generation: proof.generation,
+        operationId: null,
+      };
+    const waiting = (await journal.observe(scope, saved, {
+      entries: [],
+      placement,
+      executionProof: proof,
+    }))!;
+    expect(waiting.executionProof).toEqual(proof);
+    const old = { ...proof, environmentId: scope.environmentId, generation: 4, sequence: 10 };
+    expect(
+      await journal.observe(scope, saved, {
+        entries: [],
+        placement: { ...placement, environmentId: old.environmentId, generation: old.generation },
+        executionProof: old,
+      }),
+    ).toEqual(waiting);
+    expect(
+      await journal.observe(scope, waiting, {
+        entries: [],
+        placement,
+        projection: { ...placement, snapshotSequence: 20 },
+      }),
+    ).toBeNull();
+  });
+  it("retains a late rejection for explicit discard without letting an earlier admission erase it", async () => {
+    const f = storage(),
+      journal = createThreadMoveSubmissionJournal(f.storage);
+    await journal.submit(
+      scope,
+      command,
+      async () => ({ relay: { commandId: command().commandId, position: 1, receipt: null } }),
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    const saved = (await journal.read(scope))!;
+    await journal.reconcile(scope, saved, {
+      relay: {
+        commandId: saved.command.commandId,
+        position: 1,
+        receipt: { status: "rejected", detail: "Repository access removed" },
+      },
+    });
+    const rejected = (await journal.read(scope))!;
+    expect(rejected).toEqual({
+      command: command(),
+      originEnvironmentId: scope.environmentId,
+      rejection: "Repository access removed",
+    });
+    expect(
+      await journal.reconcile(scope, saved, {
+        relay: { commandId: saved.command.commandId, position: 1, receipt: null },
+      }),
+    ).toEqual({ status: "rejected", detail: "Repository access removed" });
+    expect(await journal.observe(scope, rejected, { entries: [] })).toEqual(rejected);
+    await journal.discardRejected(scope);
+    expect(await journal.read(scope)).toBeNull();
+  });
+  it("preserves the original source, IDs, destination and timing when retrying from another machine", async () => {
+    const f = storage(),
+      journal = createThreadMoveSubmissionJournal(f.storage),
+      source = { ...scope, sourceGeneration: 4 },
+      destination = {
+        ...scope,
+        environmentId: EnvironmentId.make("destination"),
+        sourceGeneration: 5,
+      },
+      last = { ...command(), position: "last" as const };
+    await journal.submit(
+      source,
+      () => last,
+      async () => {
+        throw new Error("Reply lost");
+      },
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    const restarted = createThreadMoveSubmissionJournal(f.storage),
+      sent: Array<typeof ThreadMoveEnqueueCommand.Type> = [];
+    await restarted.submit(
+      destination,
+      () => command("new-next"),
+      async (move) => {
+        sent.push(move);
+        return { relay: { commandId: move.commandId, position: 2, receipt: null } };
+      },
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    expect(sent).toEqual([last]);
+    expect(await restarted.read(destination)).toEqual({
+      command: last,
+      originEnvironmentId: source.environmentId,
+      sourceGeneration: 4,
+      accepted: true,
+      acceptedViaRelay: true,
+    });
+  });
+  it("does not clear another account's request or a newer intent when observation arrives late", async () => {
+    const f = storage(),
+      journal = createThreadMoveSubmissionJournal(f.storage),
+      anotherScope = { ...scope, accountId: "bob" };
+    for (const target of [scope, anotherScope])
+      await journal.submit(
+        target,
+        command,
+        async () => ({ sequence: 10 }),
+        async () => ({ status: "unknown" }),
+        () => true,
+      );
+    const original = (await journal.read(scope))!;
+    await journal.observe(scope, original, { entries: [queuedMove()] });
+    expect((await journal.read(anotherScope))?.accepted).toBe(true);
+    await journal.submit(
+      scope,
+      () => command("newer"),
+      async () => ({ sequence: 20 }),
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    expect(
+      (
+        await journal.observe(scope, original, {
+          entries: [],
+          executionProof: {
+            commandId: original.command.commandId,
+            environmentId: scope.environmentId,
+            generation: 4,
+            sequence: 10,
+          },
+          placement: { environmentId: scope.environmentId, generation: 4, operationId: null },
+          projection: { environmentId: scope.environmentId, generation: 4, snapshotSequence: 999 },
+        })
+      )?.command.commandId,
+    ).toBe("newer");
+    expect((await journal.read(scope))?.command.commandId).toBe("newer");
+  });
+  it("retains unknown admission until exact execution is proved and rejects earlier-generation evidence", async () => {
+    const f = storage(),
+      journal = createThreadMoveSubmissionJournal(f.storage),
+      source = { ...scope, sourceGeneration: 5 };
+    await journal.submit(
+      source,
+      command,
+      async () => {
+        throw new Error("Reply lost");
+      },
+      async () => ({ status: "unknown" }),
+      () => true,
+    );
+    const saved = (await journal.read(source))!,
+      executionProof = {
+        commandId: command().commandId,
+        environmentId: scope.environmentId,
+        generation: 4,
+        sequence: 10,
+      };
+    expect(
+      await journal.observe(source, saved, {
+        entries: [],
+        executionProof,
+        placement: { environmentId: scope.environmentId, generation: 4, operationId: null },
+        projection: { environmentId: scope.environmentId, generation: 4, snapshotSequence: 999 },
+      }),
+    ).toBe(saved);
+    const currentProof = { ...executionProof, generation: 5 };
+    const waiting = await journal.observe(source, saved, {
+      entries: [],
+      executionProof: currentProof,
+      placement: { environmentId: scope.environmentId, generation: 5, operationId: null },
+    });
+    expect(waiting?.accepted).toBe(true);
+    expect(waiting?.executionProof).toEqual(currentProof);
   });
   it("offers only the same repository on other environments without comparing machine paths", () => {
     const project = (environmentId: string, canonicalKey: string): EnvironmentProject => ({
