@@ -99,6 +99,7 @@ import * as MobileRegistrations from "../agentActivity/MobileRegistrations.ts";
 import { currentTraceId, withSpanAttributes } from "../observability.ts";
 import { tenancyForbidden } from "./tenancyErrors.ts";
 import * as RelayDb from "../db.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 
 // Delegated thread IDs carry escaped command provenance and exceed the router's
 // default 100-character path parameter limit. Match the environment server.
@@ -477,12 +478,17 @@ export const healthApi = HttpApiBuilder.group(
   "health",
   Effect.fnUntraced(function* (handlers) {
     const db = yield* RelayDb.RelayDb;
+    const { settings } = yield* ThreadVmRuntimeConfiguration;
     return handlers.handle(
       "health",
       Effect.fn("relay.api.health")(
         function* () {
           yield* db.execute(drizzleSql`SELECT 1`);
-          return { ok: true, service: "relay" as const };
+          return {
+            ok: true,
+            service: "relay" as const,
+            threadVmConfigured: settings !== undefined,
+          };
         },
         Effect.catch(() => relayInternalErrorResponse("database_unavailable")),
       ),

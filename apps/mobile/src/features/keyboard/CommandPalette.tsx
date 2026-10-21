@@ -253,7 +253,7 @@ export function CommandPalette(props: {
           }),
       },
     ];
-    if (vmSession && process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED === "1")
+    if (vmSession)
       actions.push({
         key: "threadVms",
         kind: "action",

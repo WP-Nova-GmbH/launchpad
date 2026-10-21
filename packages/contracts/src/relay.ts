@@ -2385,6 +2385,7 @@ export type RelayPublishResponse = typeof RelayPublishResponse.Type;
 export const RelayHealthResponse = Schema.Struct({
   ok: Schema.Boolean,
   service: Schema.Literal("relay"),
+  threadVmConfigured: Schema.optionalKey(Schema.Boolean),
 });
 export type RelayHealthResponse = typeof RelayHealthResponse.Type;
 

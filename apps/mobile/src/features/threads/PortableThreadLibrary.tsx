@@ -453,7 +453,7 @@ function SavedConversation({
     />
   );
 }
-function EnabledPortableThreadLibrary() {
+export function PortableThreadLibraryOverlay() {
   const session = useAtomValue(managedRelaySessionAtom),
     open = useAtomValue(portableThreadLibrary.openAtom);
   const setOpen = useAtomSet(portableThreadLibrary.openAtom);
@@ -477,16 +477,8 @@ function EnabledPortableThreadLibrary() {
     </>
   );
 }
-export function PortableThreadLibraryOverlay() {
-  return process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED === "1" ? (
-    <EnabledPortableThreadLibrary />
-  ) : null;
-}
-
 export function PortableThreadLibrary() {
   const session = useAtomValue(managedRelaySessionAtom);
   const setOpen = useAtomSet(portableThreadLibrary.openAtom);
-  return session && process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED === "1" ? (
-    <Action onPress={() => setOpen(true)}>VM threads</Action>
-  ) : null;
+  return session ? <Action onPress={() => setOpen(true)}>VM threads</Action> : null;
 }

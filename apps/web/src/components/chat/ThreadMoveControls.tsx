@@ -133,7 +133,6 @@ export function CurrentThreadLocation(props: {
   threadId: ThreadId;
   recoverUnavailable?: boolean;
 }) {
-  if (import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED !== "1") return null;
   return <FollowThreadLocation {...props} />;
 }
 
@@ -204,6 +203,7 @@ function MovePicker({
   const config = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const projects = useAtomValue(environmentProjects.projectsAtom);
   const vm = useAtomValue(threadVmControls.viewAtom(environmentId, threadId));
+  const host = useAtomValue(threadVmControls.hostConfigurationAtom);
   const { environments } = useEnvironments();
   const thread = snapshot?.threads.find((item) => item.id === threadId);
   const source = projects.find(
@@ -282,6 +282,8 @@ function MovePicker({
                 scope,
                 () => {
                   if (!destination) throw new Error("Choose a destination for this repository.");
+                  if (destination.kind === "vm" && host.unavailableReason)
+                    throw new Error(host.unavailableReason);
                   if (destination.kind === "vm" && !vmSupported)
                     throw new Error("Private VMs currently require the default Codex provider.");
                   return {
@@ -328,7 +330,15 @@ function MovePicker({
     `${environments.find((item) => item.environmentId === target.project.environmentId)?.label ?? target.project.environmentId} / ${target.project.title}`;
   return (
     <section aria-label="Move thread" className="border-b border-border px-3 py-2 text-xs">
-      <Button size="xs" variant="ghost-muted" onClick={() => setExpanded(!expanded)}>
+      <Button
+        size="xs"
+        variant="ghost-muted"
+        onClick={() => {
+          if (!expanded && !host.isPending)
+            appAtomRegistry.refresh(threadVmControls.hostConfigurationQueryAtom);
+          setExpanded(!expanded);
+        }}
+      >
         Move thread
       </Button>
       {expanded || saved || error ? (
@@ -374,7 +384,7 @@ function MovePicker({
                     size="xs"
                     variant={selected === "vm" ? "secondary" : "ghost-muted"}
                     aria-pressed={selected === "vm"}
-                    disabled={disabled || !vmSupported}
+                    disabled={disabled || !vmSupported || host.unavailableReason !== null}
                     onClick={() => setSelected("vm")}
                   >
                     Private VM
@@ -393,6 +403,9 @@ function MovePicker({
                   </Button>
                 ))}
               </div>
+              {!vm?.data?.status?.allocation && host.unavailableReason ? (
+                <p role="status">{host.unavailableReason}</p>
+              ) : null}
               <div className="flex gap-2" role="group" aria-label="Move timing">
                 <Button
                   size="xs"
@@ -431,7 +444,10 @@ function MovePicker({
                 variant="secondary"
                 disabled={
                   disabled ||
-                  (!saved && (!destination || (destination.kind === "vm" && !vmSupported)))
+                  (!saved &&
+                    (!destination ||
+                      (destination.kind === "vm" &&
+                        (!vmSupported || host.unavailableReason !== null))))
                 }
                 onClick={() => void run("send")}
               >
@@ -462,7 +478,6 @@ function MovePicker({
 
 export function ThreadMoveControls(props: { environmentId: EnvironmentId; threadId: ThreadId }) {
   const session = useAtomValue(managedRelaySessionAtom);
-  if (import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED !== "1") return null;
   return (
     <MovePicker
       key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${props.environmentId}:${props.threadId}`}

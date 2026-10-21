@@ -548,7 +548,7 @@ function SavedConversation({
     </div>
   );
 }
-function EnabledPortableThreadLibrary() {
+export function PortableThreadLibraryOverlay() {
   const session = useAtomValue(managedRelaySessionAtom),
     open = useAtomValue(portableThreadLibrary.openAtom);
   const setOpen = useAtomSet(portableThreadLibrary.openAtom);
@@ -565,16 +565,10 @@ function EnabledPortableThreadLibrary() {
     </Dialog>
   );
 }
-export function PortableThreadLibraryOverlay() {
-  return import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED === "1" ? (
-    <EnabledPortableThreadLibrary />
-  ) : null;
-}
-
 export function PortableThreadLibrary() {
   const session = useAtomValue(managedRelaySessionAtom);
   const setOpen = useAtomSet(portableThreadLibrary.openAtom);
-  return session && import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED === "1" ? (
+  return session ? (
     <Button size="sm" variant="ghost" onClick={() => setOpen(true)}>
       VM threads
     </Button>

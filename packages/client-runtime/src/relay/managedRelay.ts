@@ -96,6 +96,7 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "unregister relay mobile device",
   "register relay live activity",
   "read relay agent activity snapshot",
+  "read relay health",
   "read relay organization",
   "read thread VM policy",
   "read thread VM status",
@@ -170,6 +171,7 @@ export const ManagedRelayRequestAction = Schema.Literals([
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
 export const ManagedRelayRequestActivity = Schema.Literals([
+  "Relay health read",
   "Relay DPoP access token exchange",
   "Relay environment listing",
   "Relay client device listing",

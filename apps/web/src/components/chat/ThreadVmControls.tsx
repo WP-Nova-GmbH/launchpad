@@ -75,7 +75,7 @@ function Field({
   );
 }
 
-function EnabledThreadVmControls({
+export function ThreadVmControls({
   environmentId,
   threadId,
 }: {
@@ -661,9 +661,4 @@ function ThreadVmControlPanel({
       {readError || error ? <Note>{error ?? readError}</Note> : null}
     </Panel>
   );
-}
-
-export function ThreadVmControls(props: { environmentId: EnvironmentId; threadId: ThreadId }) {
-  if (import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED !== "1") return null;
-  return <EnabledThreadVmControls {...props} />;
 }

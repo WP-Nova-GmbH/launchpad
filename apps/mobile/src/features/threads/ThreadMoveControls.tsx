@@ -128,7 +128,6 @@ export function CurrentThreadLocation(props: {
   threadId: ThreadId;
   recoverUnavailable?: boolean;
 }) {
-  if (process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED !== "1") return null;
   return <FollowThreadLocation {...props} />;
 }
 
@@ -170,6 +169,7 @@ function MovePicker({
   const config = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const projects = useAtomValue(environmentProjects.projectsAtom);
   const vm = useAtomValue(threadVmControls.viewAtom(environmentId, threadId));
+  const host = useAtomValue(threadVmControls.hostConfigurationAtom);
   const { environments } = useEnvironments();
   const thread = snapshot?.threads.find((item) => item.id === threadId);
   const source = projects.find(
@@ -248,6 +248,8 @@ function MovePicker({
                 scope,
                 () => {
                   if (!destination) throw new Error("Choose a destination for this repository.");
+                  if (destination.kind === "vm" && host.unavailableReason)
+                    throw new Error(host.unavailableReason);
                   if (destination.kind === "vm" && !vmSupported)
                     throw new Error("Private VMs currently require the default Codex provider.");
                   return {
@@ -294,7 +296,14 @@ function MovePicker({
     `${environments.find((item) => item.environmentId === target.project.environmentId)?.label ?? target.project.environmentId} / ${target.project.title}`;
   return (
     <View className="gap-2 px-3 py-2">
-      <Action label="Move thread" onPress={() => setExpanded(!expanded)} />
+      <Action
+        label="Move thread"
+        onPress={() => {
+          if (!expanded && !host.isPending)
+            appAtomRegistry.refresh(threadVmControls.hostConfigurationQueryAtom);
+          setExpanded(!expanded);
+        }}
+      />
       {expanded || saved || error ? (
         <View className="gap-2">
           <Text className="text-xs text-foreground-muted">
@@ -337,7 +346,7 @@ function MovePicker({
                 <Action
                   label="Private VM"
                   selected={selected === "vm"}
-                  disabled={disabled || !vmSupported}
+                  disabled={disabled || !vmSupported || host.unavailableReason !== null}
                   onPress={() => setSelected("vm")}
                 />
               ) : null}
@@ -350,6 +359,11 @@ function MovePicker({
                   onPress={() => setSelected(target.key)}
                 />
               ))}
+              {!vm?.data?.status?.allocation && host.unavailableReason ? (
+                <Text accessibilityLiveRegion="polite" className="text-xs">
+                  {host.unavailableReason}
+                </Text>
+              ) : null}
               <View className="flex-row gap-2">
                 <Action
                   label="After current turn"
@@ -377,7 +391,10 @@ function MovePicker({
               label={saved ? "Retry saved move" : "Queue move"}
               disabled={
                 disabled ||
-                (!saved && (!destination || (destination.kind === "vm" && !vmSupported)))
+                (!saved &&
+                  (!destination ||
+                    (destination.kind === "vm" &&
+                      (!vmSupported || host.unavailableReason !== null))))
               }
               onPress={() => void run("send")}
             />
@@ -401,7 +418,6 @@ function MovePicker({
 }
 export function ThreadMoveControls(props: { environmentId: EnvironmentId; threadId: ThreadId }) {
   const session = useAtomValue(managedRelaySessionAtom);
-  if (process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED !== "1") return null;
   return (
     <MovePicker
       key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${props.environmentId}:${props.threadId}`}

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as OpenApi from "effect/unstable/httpapi/OpenApi";
 import * as Schema from "effect/Schema";
 
-import { RelayApi, RelayDeviceRegistrationRequest } from "./relay.ts";
+import { RelayApi, RelayDeviceRegistrationRequest, RelayHealthResponse } from "./relay.ts";
 
 const decodeDevice = Schema.decodeUnknownExit(RelayDeviceRegistrationRequest);
 const device = {
@@ -18,6 +18,31 @@ const device = {
     notifyOnFailure: true,
   },
 };
+
+describe("relay health compatibility", () => {
+  const decodeHealth = Schema.decodeUnknownSync(RelayHealthResponse);
+
+  it("accepts older relays without VM capability metadata", () => {
+    expect(decodeHealth({ ok: true, service: "relay" })).toEqual({
+      ok: true,
+      service: "relay",
+    });
+  });
+
+  it.each([true, false])("preserves explicit VM host configuration (%s)", (configured) => {
+    expect(decodeHealth({ ok: true, service: "relay", threadVmConfigured: configured })).toEqual({
+      ok: true,
+      service: "relay",
+      threadVmConfigured: configured,
+    });
+  });
+
+  it("rejects malformed VM capability metadata", () => {
+    expect(() =>
+      decodeHealth({ ok: true, service: "relay", threadVmConfigured: "true" }),
+    ).toThrow();
+  });
+});
 
 describe("mobile device platforms", () => {
   it.each([

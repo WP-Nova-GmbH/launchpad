@@ -52,6 +52,16 @@ const inFlightMove = (queue: ThreadPromptQueue | undefined) =>
 export const THREAD_DELETE_WARNING =
   "This permanently deletes conversation history and attachments. Any dedicated VM and saved workspaces are also deleted. Work stored only in the VM is lost. Archive the thread to keep it.";
 
+function threadVmHostUnavailableReason(state: {
+  readonly data: boolean | null;
+  readonly isPending: boolean;
+  readonly error: string | null;
+}) {
+  if (state.isPending) return "Checking VM host…";
+  if (state.error) return "Could not check VM host. Reopen Move thread to retry.";
+  return state.data === true ? null : "VM host not configured";
+}
+
 export function threadVmBackupRecoveryUnavailable(reason: string | null | undefined) {
   switch (reason) {
     case "operation_in_progress":
@@ -292,6 +302,19 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     threadId: ThreadId,
   ) => Atom.Atom<Pick<OrchestrationThread, "promptQueue"> | null>,
 ) {
+  const hostConfigurationQueryAtom = runtime
+    .atom(
+      Effect.gen(function* () {
+        const relay = yield* ManagedRelayTenancyClient;
+        if (!normalizeSecureRelayUrl(relay.relayUrl)) return false;
+        return (yield* relay.getHealth()).threadVmConfigured === true;
+      }),
+    )
+    .pipe(Atom.setIdleTTL(0));
+  const hostConfigurationAtom = Atom.make((get) => {
+    const state = readManagedRelaySnapshotState(get(hostConfigurationQueryAtom));
+    return { ...state, unavailableReason: threadVmHostUnavailableReason(state) };
+  }).pipe(Atom.setIdleTTL(0));
   const keyFor = (environmentId: EnvironmentId, threadId: ThreadId) =>
     encodeKey([environmentId, threadId]);
   const deletionAtom = Atom.family((_key: string) =>
@@ -805,6 +828,8 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     }),
   });
   return {
+    hostConfigurationQueryAtom,
+    hostConfigurationAtom,
     refresh(registry: AtomRegistry.AtomRegistry, environmentId: EnvironmentId, threadId: ThreadId) {
       const key = keyFor(environmentId, threadId),
         route = registry.get(routeAtom(key));

@@ -215,6 +215,88 @@ const harness = Effect.fnUntraced(function* (
   return { registry, controls, query };
 });
 
+describe("VM host availability", () => {
+  it.effect(
+    "uses the relay capability without signing in and treats older relays as unconfigured",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          for (const configured of [true, false, undefined]) {
+            let requests = 0;
+            const h = yield* harness(async (url, init) => {
+              const request = new Request(url, init);
+              expect(request.url).toBe(`${relayUrl}/health`);
+              expect(request.method).toBe("GET");
+              expect(request.headers.get("authorization")).toBeNull();
+              requests++;
+              return Response.json({ ok: true, service: "relay", threadVmConfigured: configured });
+            });
+            h.registry.set(managedRelaySessionAtom, null);
+            const query = h.controls.hostConfigurationQueryAtom,
+              view = h.controls.hostConfigurationAtom;
+            yield* AtomRegistry.mount(h.registry, view);
+            expect(
+              yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }),
+            ).toBe(configured === true);
+            const expected = configured === true ? null : "VM host not configured";
+            expect(h.registry.get(view).unavailableReason).toBe(expected);
+            expect(h.registry.get(view).unavailableReason).toBe(expected);
+            expect(requests).toBe(1);
+          }
+        }),
+      ),
+  );
+
+  it.effect("disables new VM moves during refresh and reflects changed relay configuration", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const response = Promise.withResolvers<Response>();
+        let requests = 0;
+        const h = yield* harness(async () => {
+          requests++;
+          return requests === 1
+            ? Response.json({ ok: true, service: "relay", threadVmConfigured: true })
+            : response.promise;
+        });
+        const query = h.controls.hostConfigurationQueryAtom,
+          view = h.controls.hostConfigurationAtom;
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view).unavailableReason).toBeNull();
+        h.registry.refresh(query);
+        expect(h.registry.get(view).unavailableReason).toBe("Checking VM host…");
+        response.resolve(Response.json({ ok: true, service: "relay", threadVmConfigured: false }));
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view).unavailableReason).toBe("VM host not configured");
+        expect(requests).toBe(2);
+      }),
+    ),
+  );
+
+  it.effect("distinguishes a failed capability check from an unconfigured host", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const reply of [
+          () => Response.json({ error: "unavailable" }, { status: 503 }),
+          () => Response.json({ ok: true, service: "relay", threadVmConfigured: "true" }),
+        ]) {
+          const h = yield* harness(async () => reply());
+          const query = h.controls.hostConfigurationQueryAtom,
+            view = h.controls.hostConfigurationAtom;
+          yield* AtomRegistry.mount(h.registry, view);
+          const result = yield* Effect.result(
+            AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }),
+          );
+          expect(result._tag).toBe("Failure");
+          expect(h.registry.get(view).unavailableReason).toBe(
+            "Could not check VM host. Reopen Move thread to retry.",
+          );
+        }
+      }),
+    ),
+  );
+});
+
 const guestSnapshot: OrchestrationShellSnapshot = {
   ...snapshot,
   threads: snapshot.threads.map((thread) => ({

@@ -596,7 +596,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         });
         return;
       }
-      if (command === "threadVms.open" && import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED === "1") {
+      if (command === "threadVms.open") {
         event.preventDefault();
         event.stopPropagation();
         if (event.repeat) return;
@@ -1999,7 +1999,7 @@ function OpenCommandPaletteDialog(props: {
   ]);
 
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
-  if (vmSession && import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED === "1")
+  if (vmSession)
     actionItems.push({
       kind: "action",
       value: "action:vm-threads",

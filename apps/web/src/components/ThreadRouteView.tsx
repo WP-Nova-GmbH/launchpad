@@ -138,7 +138,6 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const environmentHasAnyThreads = environmentThreadRefs.length > 0 || environmentHasDraftThreads;
   const recoverUnavailable =
     target.kind === "server" &&
-    import.meta.env.VITE_THREAD_VM_CONTROLS_ENABLED === "1" &&
     relaySession !== null &&
     serverThreadShell === null &&
     ((environments.isReady && !environments.presentationById.has(target.threadRef.environmentId)) ||

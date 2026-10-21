@@ -14,6 +14,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   RelayApi,
+  type RelayHealthResponse,
   type ThreadVmPolicyRecord,
   type RelayThreadVmStatus,
   type RelayThreadVmProviderAuth,
@@ -99,6 +100,7 @@ export class ManagedRelayTenancyClient extends Context.Service<
   ManagedRelayTenancyClient,
   {
     readonly relayUrl: string;
+    readonly getHealth: () => Effect.Effect<RelayHealthResponse, ManagedRelayClientError>;
     /** Also what creates the caller's organization the first time they ask. */
     readonly getOrganization: (input: {
       readonly clerkToken: string;
@@ -401,6 +403,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     });
   return ManagedRelayTenancyClient.of({
     relayUrl,
+    getHealth: unavailable("clientRuntime.managedRelayTenancy.getHealth"),
     getOrganization: unavailable("clientRuntime.managedRelayTenancy.getOrganization"),
     renameOrganization: unavailable("clientRuntime.managedRelayTenancy.renameOrganization"),
     listMembers: unavailable("clientRuntime.managedRelayTenancy.listMembers"),
@@ -518,6 +521,18 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
 
   return ManagedRelayTenancyClient.of({
     relayUrl,
+    getHealth: Effect.fnUntraced(
+      function* () {
+        return yield* client.health
+          .health({})
+          .pipe(
+            Effect.mapError(relayRequestError("read relay health")),
+            timeoutRelayRequest("Relay health read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getHealth"),
+      withRelayClientTracing,
+    ),
     getOrganization: Effect.fnUntraced(
       function* (input) {
         return yield* client.organization

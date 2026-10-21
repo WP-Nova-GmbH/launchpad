@@ -104,7 +104,7 @@ export function HardwareKeyboardCommandProvider({
     const commands = new Set<HardwareKeyboardCommand>(getRegisteredHardwareKeyboardCommands());
     commands.add("newTask");
     commands.add("commandPalette");
-    if (process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED === "1") commands.add("threadVms");
+    commands.add("threadVms");
     if (pathname !== "/" && !pathname.startsWith("/threads/")) {
       for (const command of commands) {
         if (command.startsWith("thread.jump.")) commands.delete(command);
@@ -122,7 +122,7 @@ export function HardwareKeyboardCommandProvider({
 
   const onCommand = useCallback(
     (command: HardwareKeyboardCommand) => {
-      if (command === "threadVms" && process.env.EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED === "1") {
+      if (command === "threadVms") {
         setPaletteOpen(false);
         setVmLibraryOpen(true);
         return;

@@ -320,11 +320,12 @@ integration deployment until that deployment has passed cold restore, expired-di
 reset with explicit queue resume, and physical deletion/retention checks. A passing
 native portability script alone does not verify these product flows.
 
-Build isolated web/desktop clients with `VITE_THREAD_VM_CONTROLS_ENABLED=1` and
-mobile with `EXPO_PUBLIC_THREAD_VM_CONTROLS_ENABLED=1` to exercise the controls.
+VM controls are visible in web, desktop and mobile clients without a build flag.
+The Private VM option is disabled with "VM host not configured" until the relay
+has a VM host configured.
 Complete an authenticated local-to-VM-to-local move through the relay and verify
 saved history, attachments, queue order and private previews on all three clients
-before shipping these switches. Keep existing enrolled threads coordinated during
+before enabling these lifecycle switches. Keep existing enrolled threads coordinated during
 rollback: disabling new provisioning does not return execution ownership to an old
 computer. Reconcile admitted operations and physical-stop receipts before changing
 the runtime or its storage.
