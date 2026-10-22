@@ -9,17 +9,17 @@ import * as NodeSqlite from "node:sqlite";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
-import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import type { ProcessRunner } from "../processRunner.ts";
+import { workspaceGit } from "./ThreadWorkspaceGit.ts";
+import {
+  workspaceFailure,
+  type ThreadWorkspaceTransferError,
+} from "./ThreadWorkspaceTransferError.ts";
 
 import { WorkspaceFile } from "@t3tools/contracts/threadTransfer";
 export { WorkspaceFile } from "@t3tools/contracts/threadTransfer";
-export class ThreadWorkspaceTransferError extends Schema.TaggedError<ThreadWorkspaceTransferError>()(
-  "ThreadWorkspaceTransferError",
-  { message: Schema.String },
-) {}
-export const workspaceFailure = (message: string) => new ThreadWorkspaceTransferError({ message });
-const excluded = new Set(["node_modules", ".t3"]);
+export { ThreadWorkspaceTransferError, workspaceFailure } from "./ThreadWorkspaceTransferError.ts";
 const foldPath = (value: string) => value.normalize("NFD").toLowerCase();
 
 /** Keep the format portable between the supported Mac and Linux filesystems. */
@@ -34,7 +34,7 @@ export function safeWorkspacePath(value: string) {
           part === "." ||
           part === ".." ||
           part.toLowerCase() === ".git" ||
-          excluded.has(part.toLowerCase()) ||
+          part.toLowerCase() === ".t3" ||
           /[\\:]/.test(part) ||
           [...part].some((char) => char.charCodeAt(0) < 32) ||
           /[. ]$/.test(part),
@@ -114,26 +114,50 @@ export const scanWorkspaceFiles = Effect.fn("scanWorkspaceFiles")(function* (roo
   const path = yield* Path.Path;
   const files: WorkspaceFile[] = [];
   const sqlite = new Set<string>();
+  const excludedPaths: string[] = [];
+  let dependencyPaths: Set<string> | undefined;
   const walk = Effect.fnUntraced(function* (
     relative: string,
+    inDependencies = false,
   ): Effect.fn.Return<
     void,
     ThreadWorkspaceTransferError | import("effect/PlatformError").PlatformError,
-    FileSystem.FileSystem | Path.Path
+    FileSystem.FileSystem | Path.Path | ProcessRunner
   > {
     const directory = path.join(root, relative);
     const before = yield* lstat(directory);
     if (!before.isDirectory() || (yield* fs.realPath(directory)) !== directory)
       return yield* workspaceFailure("A workspace directory changed into a link during transfer.");
     for (const name of (yield* fs.readDirectory(directory)).sort()) {
-      if (excluded.has(name.toLowerCase())) continue;
+      const entry = relative ? `${relative}/${name}` : name;
+      const dependency = inDependencies || name.toLowerCase() === "node_modules";
+      if (name.toLowerCase() === ".t3") {
+        excludedPaths.push(entry);
+        continue;
+      }
+      if (dependency) {
+        // Tracked node_modules fixtures are source. Only indexed paths and their parents travel.
+        if (!dependencyPaths) {
+          dependencyPaths = new Set();
+          const tracked = (yield* workspaceGit(root, ["ls-files", "-z"])).stdout;
+          for (const file of tracked.split("\0").filter(Boolean)) {
+            const parts = file.split("/");
+            if (!parts.some((part) => part.toLowerCase() === "node_modules")) continue;
+            for (let i = 1; i <= parts.length; i++)
+              dependencyPaths.add(parts.slice(0, i).join("/"));
+          }
+        }
+        if (!dependencyPaths.has(entry)) {
+          excludedPaths.push(entry);
+          continue;
+        }
+      }
       if (name.toLowerCase() === ".git") {
         if (!relative) continue;
         return yield* workspaceFailure(
           "Nested repositories and submodules must be removed or handled before moving.",
         );
       }
-      const entry = relative ? `${relative}/${name}` : name;
       if (!safeWorkspacePath(entry))
         return yield* workspaceFailure("A workspace filename cannot be transferred safely.");
       const full = path.join(root, entry);
@@ -142,7 +166,7 @@ export const scanWorkspaceFiles = Effect.fn("scanWorkspaceFiles")(function* (roo
         files.push({ kind: "symlink", path: entry, target: yield* fs.readLink(full) });
       else if (stat.isDirectory()) {
         files.push({ kind: "directory", path: entry });
-        yield* walk(entry);
+        yield* walk(entry, dependency);
       } else if (stat.isFile()) {
         if (name === "PG_VERSION" || name === "WiredTiger")
           return yield* workspaceFailure(
@@ -170,7 +194,7 @@ export const scanWorkspaceFiles = Effect.fn("scanWorkspaceFiles")(function* (roo
   });
   yield* walk("");
   yield* validateWorkspaceFiles(files);
-  return { files, sqlite };
+  return { files, sqlite, excludedPaths: excludedPaths.sort() };
 });
 
 export const copyWorkspaceFiles = Effect.fn("copyWorkspaceFiles")(function* (

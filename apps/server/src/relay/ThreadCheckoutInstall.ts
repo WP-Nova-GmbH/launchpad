@@ -379,7 +379,8 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
             const setupOutput = readiness?.output
               ? yield* decodeThreadTransferSetupOutput(readiness.output)
               : null;
-            const current = (yield* scanWorkspaceFiles(claim.checkoutPath)).files;
+            const scan = yield* scanWorkspaceFiles(claim.checkoutPath);
+            const current = scan.files;
             const allowed = [
               ...input.workspace.files,
               ...(backup?.files ?? []),
@@ -393,20 +394,12 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
               return yield* workspaceFailure(
                 "The checkout has new local files or edits; rollback remains held.",
               );
-            for (const directory of [
-              "",
-              ...current.filter((f) => f.kind === "directory").map((f) => f.path),
-            ])
-              if (
-                (yield* fs.readDirectory(path.join(claim.checkoutPath, directory))).some(
-                  (name) =>
-                    ["node_modules", ".t3"].includes(name.toLowerCase()) &&
-                    !setupOutput?.excludedPaths.includes(directory ? `${directory}/${name}` : name),
-                )
-              )
-                return yield* workspaceFailure(
-                  "Additional checkout data needs cleanup before rollback.",
-                );
+            if (
+              scan.excludedPaths.some((relative) => !setupOutput?.excludedPaths.includes(relative))
+            )
+              return yield* workspaceFailure(
+                "Additional checkout data needs cleanup before rollback.",
+              );
             const changed = yield* sql`UPDATE thread_checkout_claims SET phase = 'rolling-back'
             WHERE operation_id = ${input.operationId} AND phase IN ('installing', 'installed', 'rolling-back')
             AND EXISTS (SELECT 1 FROM thread_execution_fences WHERE thread_id = ${input.threadId}

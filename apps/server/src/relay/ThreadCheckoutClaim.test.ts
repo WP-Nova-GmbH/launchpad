@@ -14,10 +14,15 @@ import { makeThreadCheckoutInstaller } from "./ThreadCheckoutInstall.ts";
 import { makeThreadCheckoutClaims } from "./ThreadCheckoutClaim.ts";
 import { exportThreadWorkspace, importThreadWorkspace } from "./ThreadWorkspaceTransfer.ts";
 import { makeThreadExecutionRelay } from "./ThreadExecutionRelay.ts";
+import {
+  captureThreadTransferSetupOutput,
+  decodeThreadTransferSetupOutput,
+} from "./ThreadTransferSetupOutput.ts";
 
 const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const fixture = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  yield* sql`DELETE FROM thread_transfer_readiness`;
   yield* sql`DELETE FROM thread_checkout_claim_projects`;
   yield* sql`DELETE FROM thread_checkout_claims`;
   yield* sql`DELETE FROM thread_execution_work`;
@@ -498,6 +503,109 @@ it.layer(layer)("destination checkout claims", (it) => {
       expect((yield* f.fence.get("thread"))?.phase).toBe("frozen");
     }),
   );
+  for (const setup of [false, true])
+    it.effect(
+      `restores tracked dependency fixtures on main-checkout cancellation${setup ? " and preserves generated setup entries" : " without setup"}`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const fixturePath = "fixtures/node_modules/tracked/example.js";
+          yield* f.fs.makeDirectory(f.path.dirname(f.path.join(f.source, fixturePath)), {
+            recursive: true,
+          });
+          yield* f.fs.writeFileString(f.path.join(f.source, fixturePath), "original fixture\n");
+          yield* f.git(f.source, ["add", fixturePath]);
+          yield* f.git(f.source, ["commit", "-m", "dependency fixture"]);
+          yield* f.git(f.destination, ["fetch", "origin"]);
+          yield* f.git(f.destination, ["reset", "--hard", "origin/work"]);
+          const originalHead = yield* f.git(f.destination, ["rev-parse", "HEAD"]);
+          yield* f.fs.writeFileString(f.path.join(f.source, fixturePath), "incoming fixture\n");
+          yield* f.git(f.source, ["commit", "-am", "incoming fixture"]);
+          const archive = yield* exportThreadWorkspace({
+            threadId: "thread",
+            workspaceRoot: f.source,
+            artifactRoot: f.path.join(f.root, "fixture-artifacts"),
+          });
+          const staged = yield* importThreadWorkspace({
+            threadId: "thread",
+            manifest: archive.manifest,
+            artifactDirectory: archive.directory,
+            destinationRoot: f.path.join(f.root, "fixture-staging"),
+          });
+          const input = {
+            ...f.input,
+            workspace: archive.manifest,
+            stagedWorkspaceRoot: staged.workspaceRoot,
+            artifactDirectory: archive.directory,
+            recoveryRoot: f.path.join(f.root, "recovery"),
+          };
+          const installer = makeThreadCheckoutInstaller(f.sql);
+          const installed = yield* installer.install(input);
+          expect(installed.mode).toBe("main");
+          expect(yield* f.fs.readFileString(f.path.join(f.destination, fixturePath))).toBe(
+            "incoming fixture\n",
+          );
+          const generated = [
+            ".t3/runtime.txt",
+            "node_modules/runtime/state.json",
+            "fixtures/node_modules/generated/local.txt",
+            "fixtures/node_modules/tracked/runtime-cache.txt",
+          ];
+          if (setup) {
+            for (const relative of generated) {
+              yield* f.fs.makeDirectory(f.path.dirname(f.path.join(f.destination, relative)), {
+                recursive: true,
+              });
+              yield* f.fs.writeFileString(f.path.join(f.destination, relative), relative);
+            }
+            const output = yield* captureThreadTransferSetupOutput(f.destination);
+            const receipt = yield* decodeThreadTransferSetupOutput(output);
+            expect(receipt.excludedPaths).toEqual([
+              ".t3",
+              "fixtures/node_modules/generated",
+              "fixtures/node_modules/tracked/runtime-cache.txt",
+              "node_modules",
+            ]);
+            expect(receipt.files.some((file) => file.path === fixturePath)).toBe(true);
+            expect(receipt.files.some((file) => generated.includes(file.path))).toBe(false);
+            yield* f.sql`INSERT INTO thread_transfer_readiness
+              (operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase,setup_started,setup_output_json)
+              VALUES (${input.operationId},${input.manifestSha256},'{}',${"c".repeat(64)},'ready',1,${output})`;
+            const unexpected = f.path.join(
+              f.destination,
+              "fixtures/node_modules/tracked/new-local-file.txt",
+            );
+            yield* f.fs.writeFileString(unexpected, "new local data");
+            expect((yield* Effect.flip(installer.rollback(input))).message).toContain(
+              "Additional checkout data",
+            );
+            expect(yield* f.fs.readFileString(unexpected)).toBe("new local data");
+            expect((yield* f.claims.get(input.operationId))?.phase).toBe("installed");
+            yield* f.fs.remove(unexpected);
+          }
+          yield* installer.rollback(input);
+          yield* installer.rollback(input);
+          expect(yield* f.git(f.destination, ["rev-parse", "HEAD"])).toBe(originalHead);
+          expect(yield* f.git(f.destination, ["status", "--porcelain=v1"])).toBe("");
+          expect(yield* f.fs.readFileString(f.path.join(f.destination, fixturePath))).toBe(
+            "original fixture\n",
+          );
+          if (setup) {
+            const recovery = (yield* f.fs.readDirectory(f.root)).find((name) =>
+              name.startsWith(".launchpad-move-recovery-"),
+            );
+            expect(recovery).toBeDefined();
+            for (const relative of generated) {
+              expect(yield* f.fs.exists(f.path.join(f.destination, relative))).toBe(false);
+              expect(yield* f.fs.readFileString(f.path.join(f.root, recovery!, relative))).toBe(
+                relative,
+              );
+            }
+            expect(yield* f.fs.exists(f.path.join(f.root, recovery!, fixturePath))).toBe(false);
+          }
+          expect((yield* f.claims.get(input.operationId))?.releaseReason).toBe("cancelled");
+        }),
+    );
   it.effect("cancels the move's linked worktree while preserving an occupied main checkout", () =>
     Effect.gen(function* () {
       const f = yield* fixture;

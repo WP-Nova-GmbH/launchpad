@@ -11,7 +11,7 @@ import { ThreadId } from "@t3tools/contracts";
 import { checkpointRefForThreadTurn } from "../checkpointing/Utils.ts";
 import { ProcessRunner, layer as ProcessRunnerLayer } from "../processRunner.ts";
 import { exportThreadWorkspace, importThreadWorkspace } from "./ThreadWorkspaceTransfer.ts";
-import { workspaceFileHash } from "./ThreadWorkspaceFiles.ts";
+import { scanWorkspaceFiles, workspaceFileHash } from "./ThreadWorkspaceFiles.ts";
 
 const fixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -145,6 +145,61 @@ it.layer(testLayer)("portable workspace", (it) => {
         expect(
           yield* f.git(["for-each-ref", "--format=%(refname)"], imported.workspaceRoot),
         ).not.toContain(f.otherRef);
+      }),
+  );
+  it.effect(
+    "preserves tracked node_modules fixtures and their edits without copying dependencies",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const directory = ".repos/tool/test/fixtures/node_modules/@fixtures/package";
+        const file = `${directory}/index.js`;
+        const removed = `${directory}/package.json`;
+        const added = `${directory}/new.js`;
+        yield* f.fs.makeDirectory(f.path.join(f.source, directory), { recursive: true });
+        yield* f.fs.writeFileString(f.path.join(f.source, file), "committed fixture\n");
+        yield* f.fs.writeFileString(f.path.join(f.source, removed), "{}\n");
+        yield* f.git(["add", "--force", "--", file, removed]);
+        yield* f.git(["commit", "--only", "-m", "fixture", "--", file, removed]);
+        yield* f.fs.writeFileString(f.path.join(f.source, file), "staged fixture\n");
+        yield* f.fs.writeFileString(f.path.join(f.source, added), "new fixture\n");
+        yield* f.git(["add", "--force", "--", file, added]);
+        yield* f.fs.writeFileString(f.path.join(f.source, file), "unstaged fixture\n");
+        yield* f.fs.remove(f.path.join(f.source, removed));
+        yield* f.fs.writeFileString(
+          f.path.join(f.source, directory, "generated.txt"),
+          "dependency data",
+        );
+        const dependency = ".repos/tool/test/fixtures/node_modules/installed-package";
+        yield* f.fs.makeDirectory(f.path.join(f.source, dependency));
+        yield* f.fs.writeFileString(
+          f.path.join(f.source, dependency, "index.js"),
+          "installed package",
+        );
+        const staged = yield* f.git(["diff", "--cached", "--binary"]);
+        const unstaged = yield* f.git(["diff", "--binary"]);
+        const artifact = yield* exportThreadWorkspace(f.input);
+        yield* f.fs.remove(f.source, { recursive: true });
+        const imported = yield* importThreadWorkspace(f.request(artifact));
+        expect(yield* f.fs.readFileString(f.path.join(imported.workspaceRoot, file))).toBe(
+          "unstaged fixture\n",
+        );
+        expect(yield* f.fs.readFileString(f.path.join(imported.workspaceRoot, added))).toBe(
+          "new fixture\n",
+        );
+        for (const excluded of [
+          removed,
+          `${directory}/generated.txt`,
+          dependency,
+          "node_modules",
+          ".t3",
+        ])
+          expect(yield* f.fs.exists(f.path.join(imported.workspaceRoot, excluded))).toBe(false);
+        expect(yield* f.git(["diff", "--cached", "--binary"], imported.workspaceRoot)).toBe(staged);
+        expect(yield* f.git(["diff", "--binary"], imported.workspaceRoot)).toBe(unstaged);
+        expect((yield* scanWorkspaceFiles(imported.workspaceRoot)).files).toEqual(
+          artifact.manifest.files,
+        );
       }),
   );
   it.effect(
@@ -305,6 +360,7 @@ it.layer(testLayer)("portable workspace", (it) => {
         for (const extra of [
           { kind: "directory", path: "../outside" },
           { kind: "directory", path: ".git/hooks" },
+          { kind: "directory", path: ".t3" },
           { kind: "directory", path: "README.md" },
           { kind: "directory", path: "readme.MD" },
           {

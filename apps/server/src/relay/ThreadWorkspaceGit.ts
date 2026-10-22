@@ -1,6 +1,6 @@
 import * as Effect from "effect/Effect";
 import { ProcessRunner } from "../processRunner.ts";
-import { workspaceFailure } from "./ThreadWorkspaceFiles.ts";
+import { workspaceFailure } from "./ThreadWorkspaceTransferError.ts";
 
 export const workspaceGit = Effect.fnUntraced(function* (
   cwd: string,

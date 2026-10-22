@@ -15,8 +15,9 @@ const excludedPath = Schema.String.check(
     const parts = value.split("/");
     const name = parts.pop()?.toLowerCase();
     return (
-      (name === "node_modules" || name === ".t3") &&
-      (parts.length === 0 || safeWorkspacePath(parts.join("/")))
+      (safeWorkspacePath(value) &&
+        value.split("/").some((part) => part.toLowerCase() === "node_modules")) ||
+      (name === ".t3" && (parts.length === 0 || safeWorkspacePath(parts.join("/"))))
     );
   }),
 );
@@ -32,24 +33,12 @@ const encodeOutput = Schema.encodeEffect(Schema.fromJsonString(ThreadTransferSet
 /** Record only after the setup process has exited. Uncertain startup has no
  * receipt, so cancellation retains its fence instead of assuming it stopped. */
 export const captureThreadTransferSetupOutput = Effect.fnUntraced(function* (root: string) {
-  const fs = yield* FileSystem.FileSystem,
-    path = yield* Path.Path;
-  const { files } = yield* scanWorkspaceFiles(root);
-  const excludedPaths: string[] = [];
-  for (const directory of [
-    "",
-    ...files.filter((file) => file.kind === "directory").map((file) => file.path),
-  ]) {
-    for (const name of yield* fs.readDirectory(path.join(root, directory))) {
-      if (["node_modules", ".t3"].includes(name.toLowerCase()))
-        excludedPaths.push(directory ? `${directory}/${name}` : name);
-    }
-  }
-  return yield* encodeOutput({ files, excludedPaths: excludedPaths.sort() });
+  const { files, excludedPaths } = yield* scanWorkspaceFiles(root);
+  return yield* encodeOutput({ files, excludedPaths: [...excludedPaths].sort() });
 });
 
-/** Preserve generated dependency/runtime folders outside the checkout. Rename
- * stays on the same filesystem and retries never delete an unrecognized folder. */
+/** Preserve generated dependency/runtime entries outside the checkout. Rename
+ * stays on the same filesystem and retries never delete an unrecognized entry. */
 export const retainThreadTransferSetupDirectories = Effect.fnUntraced(function* (input: {
   checkoutPath: string;
   operationId: string;
