@@ -165,6 +165,8 @@ for (const lost of [
   "cancel-setup",
   "cancel-edit",
   "cancel-uncertain",
+  "cancel-report",
+  "source-export",
   "enroll-prepare",
   "enroll-receipts",
   "enroll-confirm",
@@ -268,8 +270,20 @@ for (const lost of [
                   }),
               ),
             get: () => current,
+            failed: (_owner, detail) =>
+              lost === "cancel-report"
+                ? Effect.fail(failure())
+                : Effect.sync(() => {
+                    expect(["preparing", "frozen", "ready"]).toContain(remote?.phase);
+                    return (remote = {
+                      ...remote!,
+                      failureDetail: remote!.failureDetail ?? detail,
+                    });
+                  }),
             freeze: (_owner, input) =>
-              Effect.sync(() => (remote = { ...remote!, ...input, phase: "frozen" })),
+              Effect.sync(
+                () => (remote = { ...remote!, ...input, phase: "frozen", failureDetail: null }),
+              ),
             upload: (owner, file, body) =>
               Effect.gen(function* () {
                 activeUploads++;
@@ -337,7 +351,8 @@ for (const lost of [
                 ),
               );
             },
-            ready: () => Effect.sync(() => (remote = { ...remote!, phase: "ready" })),
+            ready: () =>
+              Effect.sync(() => (remote = { ...remote!, phase: "ready", failureDetail: null })),
             commit: () =>
               Effect.gen(function* () {
                 if (remote!.recoveryVerified !== true) return yield* failure();
@@ -591,6 +606,18 @@ for (const lost of [
               ]);
             }
             let source = yield* makeThreadMoveWorker(transport, history, commands);
+            const sourceQueue = queue.pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            if (lost === "source-export") {
+              yield* fs.rename(src, `${src}-saved`);
+              const error = yield* Effect.flip(source.source(threadId));
+              expect(remote?.phase).toBe("preparing");
+              expect(remote?.failureDetail).toBeTruthy();
+              expect((yield* queue).entries[0]?.state).toBe("moving");
+              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              expect(error._tag).not.toBe("ThreadMoveError");
+              expect(commits).toBe(0);
+              return;
+            }
             if (lost === "recovery-publish" || lost === "recovery-ready") {
               expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
               expect(remote?.manifestArtifactId).not.toBeNull();
@@ -658,9 +685,22 @@ for (const lost of [
                 operationId: remote!.operationId,
               };
               if (lost.startsWith("cancel-")) {
-                expect((yield* Effect.flip(destination.destination(owner)))._tag).toBe(
-                  "ThreadTransferReadinessError",
-                );
+                const error = yield* Effect.flip(destination.destination(owner));
+                expect(error._tag).toBe("ThreadTransferReadinessError");
+                expect(error.message).toContain("Destination project setup failed");
+                if (lost !== "cancel-report") {
+                  expect(remote?.failureDetail).toBe(error.message);
+                  const beforeFailure = yield* sourceQueue;
+                  yield* source.source(threadId);
+                  expect(yield* sourceQueue).toEqual(beforeFailure);
+                  expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+                  expect(commits).toBe(0);
+                  const retryError = yield* Effect.flip(destination.destination(owner));
+                  expect(retryError.message).toContain("has not been confirmed complete");
+                  expect(remote?.failureDetail).toBe(error.message);
+                  yield* source.source(threadId);
+                  expect(yield* sourceQueue).toEqual(beforeFailure);
+                } else expect(remote?.failureDetail).toBeNull();
                 expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
                 expect(yield* fs.readFileString(path.join(dst, "README"))).toBe("setup edit\n");
                 remote = { ...remote!, phase: "aborting" };
@@ -816,6 +856,7 @@ for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as co
               pending: unused,
               begin: unused,
               get: unused,
+              failed: unused,
               freeze: unused,
               upload: unused,
               ready: unused,
@@ -1089,6 +1130,7 @@ for (const kind of ["terminal", "setup"] as const)
             begin: unused,
             beginVm: unused,
             get: unused,
+            failed: unused,
             freeze: unused,
             upload: unused,
             ready: unused,

@@ -12,7 +12,6 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ProcessRunner } from "../processRunner.ts";
-import { CODEX_CONVERSATION_TRANSFER_VERSION } from "../provider/Drivers/CodexConversationTransfer.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { captureThreadTransferSetupOutput } from "./ThreadTransferSetupOutput.ts";
 import { makeThreadCheckoutClaims } from "./ThreadCheckoutClaim.ts";
@@ -125,13 +124,9 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
         "The destination cannot validate Codex without publishing provider output.",
       );
     const status = yield* instance.snapshot.refresh;
-    if (
-      !status.installed ||
-      status.auth.status !== "authenticated" ||
-      status.version !== CODEX_CONVERSATION_TRANSFER_VERSION
-    )
+    if (!status.installed || status.auth.status !== "authenticated")
       return yield* fail(
-        "The destination requires the verified Codex version and a configured sign-in.",
+        "The destination requires Codex to be installed with a configured sign-in.",
       );
     if (yield* instance.adapter.hasSession(input.threadId))
       return yield* fail("A provider session is already using the destination thread.");
@@ -165,38 +160,42 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
         return false;
       }),
     );
-    if (alreadyReady) return;
-    const recordSetupOutput = Effect.gen(function* () {
-      const output = yield* captureThreadTransferSetupOutput(claim.checkoutPath);
-      const rows = yield* sql`UPDATE thread_transfer_readiness SET setup_output_json=${output}
+    if (!alreadyReady) {
+      const recordSetupOutput = Effect.gen(function* () {
+        const output = yield* captureThreadTransferSetupOutput(claim.checkoutPath);
+        const rows = yield* sql`UPDATE thread_transfer_readiness SET setup_output_json=${output}
         WHERE operation_id=${input.operationId} AND phase='started' AND setup_output_json IS NULL RETURNING operation_id`;
-      if (!rows.length) return yield* fail("Destination setup output changed before its receipt.");
-    });
-    if (script !== null) {
-      const runner = yield* ProcessRunner;
-      const started = yield* sql`UPDATE thread_transfer_readiness SET setup_started=1
-        WHERE operation_id=${input.operationId} AND phase='started' AND setup_started=0 RETURNING operation_id`;
-      if (!started.length)
-        return yield* fail("Destination setup already started; do not replay it.");
-      const result = yield* runner.run({
-        command: "bash",
-        args: ["-c", script],
-        cwd: claim.checkoutPath,
-        env: projectScriptRuntimeEnv({
-          project: { cwd: claim.repositoryRoot },
-          worktreePath: claim.checkoutPath,
-        }),
-        timeout: "15 minutes",
-        maxOutputBytes: 65536,
-        outputMode: "truncate",
+        if (!rows.length)
+          return yield* fail("Destination setup output changed before its receipt.");
       });
-      yield* recordSetupOutput;
-      if (result.code !== 0 || result.timedOut)
-        return yield* fail("Destination project setup failed. The source is still retained.");
+      if (script !== null) {
+        const runner = yield* ProcessRunner;
+        const started = yield* sql`UPDATE thread_transfer_readiness SET setup_started=1
+        WHERE operation_id=${input.operationId} AND phase='started' AND setup_started=0 RETURNING operation_id`;
+        if (!started.length)
+          return yield* fail("Destination setup already started; do not replay it.");
+        const result = yield* runner.run({
+          command: "bash",
+          args: ["-c", script],
+          cwd: claim.checkoutPath,
+          env: projectScriptRuntimeEnv({
+            project: { cwd: claim.repositoryRoot },
+            worktreePath: claim.checkoutPath,
+          }),
+          timeout: "15 minutes",
+          maxOutputBytes: 65536,
+          outputMode: "truncate",
+        });
+        yield* recordSetupOutput;
+        if (result.code !== 0 || result.timedOut)
+          return yield* fail("Destination project setup failed. The source is still retained.");
+      }
+      if (script === null) yield* recordSetupOutput;
     }
-    if (script === null) yield* recordSetupOutput;
     if ((yield* fs.realPath(claim.checkoutPath)) !== claim.checkoutPath)
       return yield* fail("The moved checkout path changed during setup.");
+    // A setup receipt can be reused; compatibility must be checked against the
+    // current provider runtime again before committing destination ownership.
     if (native) {
       yield* Effect.gen(function* () {
         const session = yield* probeSession({
@@ -211,7 +210,11 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
             resumePolicy: native.resumePolicy,
             portableStateId: native.portableStateId,
           },
-        });
+        }).pipe(
+          Effect.mapError((error) =>
+            fail(`Codex could not resume the transferred conversation: ${error.message}`),
+          ),
+        );
         const cursor = session.resumeCursor;
         if (
           session.threadId !== input.threadId ||
@@ -240,10 +243,12 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
           current.runtimeMode !== baseline.runtimeMode
         )
           return yield* fail("Destination conversation changed during setup.");
-        const ready = yield* sql`UPDATE thread_transfer_readiness SET phase = 'ready'
+        if (!alreadyReady) {
+          const ready = yield* sql`UPDATE thread_transfer_readiness SET phase = 'ready'
         WHERE operation_id = ${input.operationId} AND phase = 'started' RETURNING operation_id`;
-        if (!ready.length)
-          return yield* fail("Destination setup no longer owns its completion record.");
+          if (!ready.length)
+            return yield* fail("Destination setup no longer owns its completion record.");
+        }
       }),
     );
   },

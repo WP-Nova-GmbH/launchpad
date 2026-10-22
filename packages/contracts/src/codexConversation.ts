@@ -5,8 +5,8 @@ export const NativeThreadId = Schema.String.check(
 export const RolloutName = Schema.String.check(
   Schema.isPattern(/^rollout-\d{4}-\d{2}-\d{2}T[\d-]+-[\da-f-]+(?:_[\da-f-]+)?\.jsonl$/i),
 );
-// Native rollout storage is not a stable interchange format. Extend this only
-// after repeating the native resume/compaction proof on both host platforms.
+// Runner image and portability-proof default, not a transfer compatibility gate.
+// Transfers retain the source version and require a successful destination resume.
 export const CODEX_CONVERSATION_TRANSFER_VERSION = "0.159.3";
 
 const ReferencedFile = Schema.Struct({
@@ -22,7 +22,7 @@ const ReferencedFile = Schema.Struct({
 export const CodexConversationManifest = Schema.Struct({
   format: Schema.Literals(["codex-rollout-v1", "codex-rollout-v2", "codex-rollout-v3"]),
   threadId: NativeThreadId,
-  codexVersion: Schema.Literal(CODEX_CONVERSATION_TRANSFER_VERSION),
+  codexVersion: Schema.NonEmptyString.check(Schema.isMaxLength(128)),
   historyMode: Schema.Literal("paginated"),
   rolloutName: RolloutName,
   sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/)),

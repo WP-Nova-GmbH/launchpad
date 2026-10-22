@@ -63,6 +63,9 @@ export const RelayPortableThreadPlacement = Schema.Struct({
   projectId: TrimmedNonEmptyString,
   generation: PositiveInt,
   operationId: Schema.NullOr(TrimmedNonEmptyString),
+  moveFailureDetail: Schema.optional(
+    Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(2000))),
+  ),
 });
 export type RelayPortableThreadPlacement = typeof RelayPortableThreadPlacement.Type;
 export const RelayPortableThreadSummary = Schema.Struct({

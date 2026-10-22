@@ -15,6 +15,7 @@ import {
   getPortableThreadMove,
   pendingPortableThreadMoves,
   freezePortableThreadMove,
+  reportPortableThreadMoveFailure,
   readyPortableThreadMove,
   commitPortableThreadMove,
   activatePortableThreadMove,
@@ -301,6 +302,67 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         });
       return { owner, enrollment, move, manifest, prepare };
     }
+
+    it.effect("retains the first move failure without granting destination ownership", () =>
+      run((store, sql) =>
+        Effect.gen(function* () {
+          const { enrollment, move, owner, manifest } = fixture();
+          yield* store.enroll(enrollment);
+          yield* store.beginMove(move);
+          const destination = { ...move, environmentId: "vm", generation: 2 };
+          expect(
+            (yield* store.reportFailure({ ...move, ...owner, detail: "Source export failed." }))
+              .failureDetail,
+          ).toBe("Source export failed.");
+          for (const input of [
+            { ...destination, environmentId: "unrelated" },
+            { ...destination, generation: 1 },
+          ])
+            expect(
+              yield* Effect.flip(store.reportFailure({ ...input, detail: "Wrong participant" })),
+            ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+          expect((yield* store.get(move.threadId))?.environmentId).toBe("local");
+          expect((yield* store.get(move.threadId))?.generation).toBe(1);
+          yield* makeThreadJournalStore(sql).confirmThrough({
+            ...owner,
+            sourceSequence: manifest.sourceCursor,
+          });
+          expect(
+            (yield* store.sourceFrozen({ ...move, ...owner, ...manifest })).failureDetail,
+          ).toBe(null);
+          const failed = yield* store.reportFailure({
+            ...destination,
+            detail: "Codex cannot resume this history.",
+          });
+          expect(failed).toMatchObject({
+            phase: "frozen",
+            failureDetail: "Codex cannot resume this history.",
+          });
+          expect(
+            (yield* store.reportFailure({ ...destination, detail: "Setup already started." }))
+              .failureDetail,
+          ).toBe(failed.failureDetail);
+          expect(
+            (yield* store.sourceFrozen({ ...move, ...owner, ...manifest })).failureDetail,
+          ).toBe(failed.failureDetail);
+          expect((yield* store.get(move.threadId))?.environmentId).toBe("local");
+          expect(
+            (yield* store.destinationReady({ ...destination, ...manifest })).failureDetail,
+          ).toBe(null);
+          yield* publishMoveFixture(sql, move);
+          yield* store.reportFailure({ ...destination, detail: "Commit did not complete." });
+          expect(yield* Effect.flip(store.commitMove(move))).toMatchObject({
+            _tag: "ThreadPlacementConflict",
+          });
+          expect((yield* store.get(move.threadId))?.environmentId).toBe("local");
+          yield* store.destinationReady({ ...destination, ...manifest });
+          expect((yield* store.commitMove(move)).failureDetail).toBe(null);
+          expect(
+            yield* Effect.flip(store.reportFailure({ ...destination, detail: "Too late." })),
+          ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+        }),
+      ),
+    );
 
     const makeProvisionFixture = (
       identity: { organizationId?: string; repositoryId?: string } = {},
@@ -6492,16 +6554,73 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
               limit: 50,
             }).pipe(asDestination),
           ).toEqual({ entries: [begun], next: null });
+          const sourceFailure = yield* reportPortableThreadMoveFailure({
+            ...src,
+            detail: "Source history export failed.",
+          }).pipe(asSource);
+          expect(sourceFailure).toMatchObject({
+            phase: "preparing",
+            failureDetail: "Source history export failed.",
+          });
+          expect(
+            yield* Effect.flip(
+              reportPortableThreadMoveFailure({
+                ...dst,
+                generation: 1,
+                detail: "Wrong generation",
+              }).pipe(asDestination),
+            ),
+          ).toMatchObject({ _tag: "RelayTenancyNotFoundError" });
+          expect(
+            yield* Effect.flip(
+              reportPortableThreadMoveFailure({
+                ...src,
+                environmentId: stranger.environmentId,
+                detail: "Not a participant",
+              }).pipe(Effect.provideService(RelayEnvironmentPrincipal, stranger)),
+            ),
+          ).toMatchObject({ _tag: "RelayTenancyNotFoundError" });
           expect(yield* Effect.flip(store.admit({ ...src, workId: "too-late" }))).toMatchObject({
             _tag: "ThreadPlacementConflict",
           });
           const manifest = { sourceCursor: 31, manifestSha256: "a".repeat(64) };
           yield* makeThreadJournalStore(sql).confirmThrough({ ...src, sourceSequence: 31 });
-          yield* freezePortableThreadMove({ ...src, ...manifest }).pipe(asSource);
+          expect(
+            (yield* freezePortableThreadMove({ ...src, ...manifest }).pipe(asSource)).failureDetail,
+          ).toBe(null);
+          yield* reportPortableThreadMoveFailure({
+            ...dst,
+            detail: "Codex cannot resume this history.",
+          }).pipe(asDestination);
+          const failed = yield* reportPortableThreadMoveFailure({
+            ...dst,
+            detail: "Setup has already started.",
+          }).pipe(asDestination);
+          expect(failed.failureDetail).toBe("Codex cannot resume this history.");
+          expect((yield* getPortableThreadMove(src).pipe(asSource)).failureDetail).toBe(
+            failed.failureDetail,
+          );
+          expect(
+            (yield* getPortableThreadPlacement(threadId).pipe(
+              Effect.provideService(RelayClientPrincipal, { userId: ownerUserId, token: "test" }),
+            )).moveFailureDetail,
+          ).toBe(failed.failureDetail);
+          expect(
+            (yield* pendingPortableThreadMoves({
+              environmentId: source.environmentId,
+              after: null,
+              limit: 50,
+            }).pipe(asSource)).entries,
+          ).toEqual([failed]);
+          expect((yield* store.get(threadId))?.environmentId).toBe(source.environmentId);
+          expect((yield* store.get(threadId))?.generation).toBe(1);
           expect(
             yield* Effect.flip(readyPortableThreadMove({ ...src, ...manifest }).pipe(asSource)),
           ).toMatchObject({ _tag: "RelayTenancyNotFoundError" });
-          yield* readyPortableThreadMove({ ...dst, ...manifest }).pipe(asDestination);
+          expect(
+            (yield* readyPortableThreadMove({ ...dst, ...manifest }).pipe(asDestination))
+              .failureDetail,
+          ).toBe(null);
           expect(yield* Effect.flip(commitPortableThreadMove(src).pipe(asSource))).toMatchObject({
             _tag: "RelayTenancyConflictError",
           });
@@ -6514,6 +6633,11 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           yield* sql`UPDATE relay_environment_links SET revoked_at=NULL WHERE environment_id=${destination.environmentId}`;
           const committed = yield* commitPortableThreadMove(src).pipe(asSource);
           expect(committed.phase).toBe("committed");
+          expect(
+            yield* Effect.flip(
+              reportPortableThreadMoveFailure({ ...dst, detail: "Too late" }).pipe(asDestination),
+            ),
+          ).toMatchObject({ _tag: "RelayTenancyConflictError" });
           expect(yield* commitPortableThreadMove(src).pipe(asSource)).toEqual(committed);
           expect((yield* store.get(threadId))?.generation).toBe(2);
           expect(yield* Effect.flip(abortPortableThreadMove(src).pipe(asSource))).toMatchObject({
@@ -6525,6 +6649,11 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           expect((yield* activatePortableThreadMove(dst).pipe(asDestination)).phase).toBe(
             "completed",
           );
+          expect(
+            (yield* getPortableThreadPlacement(threadId).pipe(
+              Effect.provideService(RelayClientPrincipal, { userId: ownerUserId, token: "test" }),
+            )).moveFailureDetail,
+          ).toBeNull();
           expect((yield* activatePortableThreadMove(dst).pipe(asDestination)).phase).toBe(
             "completed",
           );

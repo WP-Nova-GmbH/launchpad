@@ -598,6 +598,128 @@ describe("completed thread location handoff", () => {
   };
   const checkInput = { environmentId, threadId, accountId: "owner", relayUrl };
 
+  it.effect("shows a pending move failure and keeps polling until it clears and completes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        const detail = "Codex could not resume the transferred conversation: incompatible history.";
+        let reads = 0;
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json(
+            reads < 3
+              ? { ...placement, moveFailureDetail: reads === 1 ? detail : null }
+              : {
+                  ...placement,
+                  environmentId: "mac",
+                  generation: 2,
+                  operationId: null,
+                  moveFailureDetail: "An old failure must not follow a completed move.",
+                },
+          );
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)).toMatchObject({
+          movePending: true,
+          error: null,
+          moveFailureDetail: detail,
+          placement: { operationId: placement.operationId },
+        });
+        expect(
+          h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId)),
+        ).toMatchObject({ operationId: placement.operationId });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        expect(reads).toBe(2);
+        expect(h.registry.get(view)).toMatchObject({
+          movePending: true,
+          error: null,
+          moveFailureDetail: null,
+        });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        expect(reads).toBe(3);
+        expect(h.registry.get(view)).toMatchObject({
+          movePending: false,
+          moveFailureDetail: null,
+          destination: { environmentId: "mac", generation: 2 },
+        });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+        expect(reads).toBe(3);
+      }),
+    ),
+  );
+
+  it.effect("hides a failure belonging to another claimed move", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const queue: ThreadPromptQueue = {
+          enabled: true,
+          revision: 1,
+          pauseReason: null,
+          handoff: null,
+          awaitingTurnId: null,
+          admissions: [],
+          finalizedTurnId: null,
+          entries: [
+            {
+              kind: "move",
+              state: "moving",
+              operationId: CommandId.make("new-move"),
+              messageId: MessageId.make("new-move-entry"),
+              destination: { kind: "vm" },
+              revision: 1,
+              acceptedSequence: 1,
+              createdAt: at,
+            },
+          ],
+        };
+        const h = yield* harness(
+          async () => Response.json({ ...placement, moveFailureDetail: "Old move failed." }),
+          activeSnapshot,
+          null,
+          Atom.make<Pick<OrchestrationThread, "promptQueue"> | null>({ promptQueue: queue }),
+        );
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.locationQueryAtom(environmentId, threadId),
+          {
+            suspendOnWaiting: true,
+          },
+        );
+        expect(h.registry.get(view)).toMatchObject({ movePending: true, moveFailureDetail: null });
+      }),
+    ),
+  );
+
+  it.effect("hides a cached move failure as soon as the signed-in account changes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const release = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* harness(async () => {
+          if (++reads > 1) await release.promise;
+          return Response.json({ ...placement, moveFailureDetail: "Private move failure." });
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.moveFailureDetail).toBe("Private move failure.");
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "other",
+          readClerkToken: () => Effect.succeed("other-token"),
+        });
+        expect(h.registry.get(view)?.moveFailureDetail ?? null).toBeNull();
+        release.resolve();
+      }),
+    ),
+  );
+
   it.effect(
     "confirms cancellation after the claimed queue move disappears, then stops tracking",
     () =>

@@ -67,7 +67,19 @@ const revert = (prefix: ReturnType<typeof root>, endOrdinal = 3) =>
     ) + row(endOrdinal + 1, "response_item", { type: "message", role: "user", content: [] }),
   );
 
-describe("pinned native Codex history closure", () => {
+describe("native Codex history closure", () => {
+  it("preserves different source versions throughout a conversation's native history", () => {
+    const parent = parseCodexNativeRollout(
+      name(rootId),
+      row(0, "session_meta", metadata(rootId, { cli_version: "0.163.0-alpha.10.2" })) + spawn(1),
+    );
+    const result = selectCodexNativeHistory(parent.name, [parent, child()]);
+    expect(result.rollouts.map((rollout) => rollout.metadata.cli_version)).toEqual([
+      "0.163.0-alpha.10.2",
+      "0.159.3",
+    ]);
+  });
+
   it("carries the current root, its existing child, and only the required immutable prefix", () => {
     const prefix = root(
       row(3, "response_item", { type: "message", role: "user", content: ["removed turn"] }),
@@ -192,7 +204,10 @@ describe("pinned native Codex history closure", () => {
   });
 
   it("rejects corrupt record ordering, unsafe filenames, and wrong conversation IDs", () => {
-    const good = root();
+    const good = parseCodexNativeRollout(
+      name(rootId),
+      root().text.replace("0.159.3", "0.163.0-alpha.10.2"),
+    );
     expect(() => parseCodexNativeRollout("../" + good.name, good.text)).toThrow();
     expect(() =>
       parseCodexNativeRollout(good.name, good.text.replace('"ordinal":2', '"ordinal":3')),

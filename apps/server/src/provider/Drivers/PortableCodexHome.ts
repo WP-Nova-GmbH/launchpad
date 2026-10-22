@@ -94,8 +94,6 @@ export const installPortableCodexHome = Effect.fn("installPortableCodexHome")(fu
     transferSha256: input.transferSha256,
     native: input.manifest,
   });
-  if (input.codexVersion !== descriptor.native.codexVersion)
-    return yield* fail("Codex continuation requires the verified transfer version.");
   const encoded = yield* encodeHome(descriptor);
   const portableStateId = hash(encoded);
   yield* fs.makeDirectory(input.stateDir, { recursive: true, mode: 0o700 });

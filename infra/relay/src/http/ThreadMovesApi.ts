@@ -326,6 +326,18 @@ export const freezePortableThreadMove = Effect.fn("relay.api.thread_moves.freeze
   );
 }, Effect.catchTags(failures));
 
+export const reportPortableThreadMoveFailure = Effect.fn("relay.api.thread_moves.failed")(
+  function* (input: Participant & { detail: string }) {
+    const sql = (yield* RelayDb).$client;
+    return yield* response(
+      yield* withThreadMoveParticipant(input, "either", true, () =>
+        makeThreadPlacementStore(sql).reportFailure(input),
+      ),
+    );
+  },
+  Effect.catchTags(failures),
+);
+
 export const publishPortableThreadMove = Effect.fn("relay.api.thread_moves.publish")(
   function* (input: Participant & { manifestArtifactId: string }) {
     const sql = (yield* RelayDb).$client;
@@ -454,6 +466,9 @@ export const threadMovesApi = HttpApiBuilder.group(RelayApi, "threadMoves", (han
       beginPortableThreadVmMove({ ...params, ...payload }),
     )
     .handle("get", ({ params, payload }) => getPortableThreadMove({ ...params, ...payload }))
+    .handle("failed", ({ params, payload }) =>
+      reportPortableThreadMoveFailure({ ...params, ...payload }),
+    )
     .handle("freeze", ({ params, payload }) => freezePortableThreadMove({ ...params, ...payload }))
     .handle("publish", ({ params, payload }) =>
       publishPortableThreadMove({ ...params, ...payload }),

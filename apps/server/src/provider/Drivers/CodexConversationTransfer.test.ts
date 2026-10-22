@@ -11,9 +11,11 @@ import * as Schema from "effect/Schema";
 
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import { exportCodexConversation, importCodexConversation } from "./CodexConversationTransfer.ts";
+import { parseCodexNativeRollout } from "./CodexNativeHistory.ts";
 
 const nativeId = "01900000-0000-7000-8000-000000000001";
 const version = "0.159.3";
+const newerVersion = "0.163.0-alpha.10.2";
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
@@ -206,6 +208,37 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
       }),
   );
 
+  it.effect("preserves mixed source versions while transferring a native history graph", () =>
+    Effect.gen(function* () {
+      const f = yield* graphFixture;
+      yield* f.fs.writeFileString(
+        f.head,
+        (yield* f.fs.readFileString(f.head)).replace(version, newerVersion),
+      );
+      yield* f.fs.writeFileString(
+        f.child,
+        (yield* f.fs.readFileString(f.child)).replace(version, "0.160.0"),
+      );
+      const exported = yield* exportCodexConversation(f.input);
+      expect(exported.manifest.codexVersion).toBe(newerVersion);
+      const imported = yield* importCodexConversation({
+        manifest: exported.manifest,
+        rolloutPath: f.path.join(exported.directory, "rollout.jsonl"),
+        destinationRoot: f.path.join(f.root, "destination"),
+        codexVersion: version,
+      });
+      expect(yield* f.fs.readFileString(imported.rolloutPath)).toContain(newerVersion);
+      const nativeVersions: string[] = [];
+      for (const file of imported.rolloutPaths) {
+        const text = yield* f.fs.readFileString(file);
+        nativeVersions.push(
+          parseCodexNativeRollout(f.path.basename(file), text).metadata.cli_version,
+        );
+      }
+      expect(nativeVersions.sort()).toEqual([version, "0.160.0", newerVersion].sort());
+    }),
+  );
+
   it.effect(
     "blocks a missing child before publishing and a missing prefix before installation",
     () =>
@@ -237,7 +270,7 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
       }),
   );
 
-  it.effect("refuses a graph manifest with an omitted child or changed selected head", () =>
+  it.effect("refuses a graph manifest with omitted history or conflicting root metadata", () =>
     Effect.gen(function* () {
       const f = yield* graphFixture;
       const exported = yield* exportCodexConversation(f.input);
@@ -252,6 +285,7 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
           ...exported.manifest,
           heads: { ...exported.manifest.heads, [nativeId]: f.path.basename(f.rolloutPath) },
         },
+        { ...exported.manifest, codexVersion: newerVersion },
       ])
         expect(
           yield* Effect.flip(
@@ -463,20 +497,52 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
     }),
   );
 
-  for (const [from, to] of [
-    [version, "0.100.0"],
-    ["paginated", "legacy"],
-  ] as const) {
-    it.effect(`refuses the unverified native format ${to}`, () =>
-      Effect.gen(function* () {
-        const f = yield* fixture;
-        yield* f.fs.writeFileString(f.rolloutPath, f.contents.replace(from, to));
-        const error = yield* Effect.flip(exportCodexConversation(f.input));
-        expect(error.message).toContain("has not been verified");
-        expect(yield* f.fs.exists(f.input.artifactRoot)).toBe(false);
-      }),
-    );
-  }
+  it.effect("refuses the unverified legacy native format", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.fs.writeFileString(f.rolloutPath, f.contents.replace("paginated", "legacy"));
+      const error = yield* Effect.flip(exportCodexConversation(f.input));
+      expect(error.message).toContain("has not been verified");
+      expect(yield* f.fs.exists(f.input.artifactRoot)).toBe(false);
+    }),
+  );
+
+  it.effect("retains the source version when materializing history for a different runtime", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const contents = f.contents.replace(version, newerVersion);
+      yield* f.fs.writeFileString(f.rolloutPath, contents);
+      const exported = yield* exportCodexConversation(f.input);
+      expect(exported.manifest.codexVersion).toBe(newerVersion);
+      const imported = yield* importCodexConversation({
+        manifest: exported.manifest,
+        rolloutPath: f.path.join(exported.directory, "rollout.jsonl"),
+        destinationRoot: f.path.join(f.root, "destination"),
+        codexVersion: version,
+      });
+      expect(yield* f.fs.readFileString(imported.rolloutPath)).toBe(contents);
+      expect(yield* f.fs.readFileString(f.rolloutPath)).toBe(contents);
+    }),
+  );
+
+  it.effect("rejects a manifest source version that disagrees with its history", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const exported = yield* exportCodexConversation(f.input);
+      const destinationRoot = f.path.join(f.root, "destination");
+      const error = yield* Effect.flip(
+        importCodexConversation({
+          manifest: { ...exported.manifest, codexVersion: newerVersion },
+          rolloutPath: f.path.join(exported.directory, "rollout.jsonl"),
+          destinationRoot,
+          codexVersion: newerVersion,
+        }),
+      );
+      expect(error.message).toContain("manifest identity mismatch");
+      expect(yield* f.fs.readDirectory(destinationRoot)).toEqual([]);
+      expect(yield* f.fs.readFileString(f.rolloutPath)).toBe(f.contents);
+    }),
+  );
   it.effect(
     "retains native history in a fresh home without credentials or other conversations",
     () =>
@@ -756,8 +822,10 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
   it.effect("rejects corrupt native records even when the artifact checksum matches", () =>
     Effect.gen(function* () {
       const f = yield* fixture;
+      yield* f.fs.writeFileString(f.rolloutPath, f.contents.replace(version, newerVersion));
       const exported = yield* exportCodexConversation(f.input);
-      const corrupted = f.contents + '{"type":"response_item","payload":';
+      const corrupted =
+        f.contents.replace(version, newerVersion) + '{"type":"response_item","payload":';
       const rolloutPath = f.path.join(exported.directory, "rollout.jsonl");
       yield* f.fs.writeFileString(rolloutPath, corrupted);
       const destinationRoot = f.path.join(f.root, "destination");
@@ -772,7 +840,9 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
       }).pipe(Effect.flip);
       expect(error.message).toContain("native record");
       expect(yield* f.fs.readDirectory(destinationRoot)).toEqual([]);
-      expect(yield* f.fs.readFileString(f.rolloutPath)).toEqual(f.contents);
+      expect(yield* f.fs.readFileString(f.rolloutPath)).toEqual(
+        f.contents.replace(version, newerVersion),
+      );
     }),
   );
 
@@ -823,7 +893,8 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
 
   describe("import compatibility", () => {
     for (const mutation of [
-      { codexVersion: "a-different-version" },
+      { manifest: { codexVersion: "" } },
+      { manifest: { codexVersion: "v".repeat(129) } },
       { manifest: { rolloutName: "../../auth.json" } },
       { manifest: { format: "unknown-format" } },
       { manifest: { threadId: "01900000-0000-7000-8000-000000000002" } },
@@ -837,7 +908,7 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
             manifest: { ...exported.manifest, ...mutation.manifest },
             rolloutPath: f.path.join(exported.directory, "rollout.jsonl"),
             destinationRoot,
-            codexVersion: mutation.codexVersion ?? version,
+            codexVersion: version,
           }).pipe(Effect.flip);
           expect(yield* f.fs.exists(destinationRoot)).toBe(false);
         }),

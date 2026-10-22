@@ -138,6 +138,9 @@ const harness = Effect.gen(function* () {
     setVersion: (version: string | null) => {
       status = { ...status, version };
     },
+    setInstalled: (installed: boolean) => {
+      status = { ...status, installed };
+    },
     waitSuccess: auth.subscribe(`thread-vm-auth:move:allocation:2`).pipe(
       Stream.filter((s) => s.phase === "succeeded"),
       Stream.runHead,
@@ -209,13 +212,24 @@ describe("pending VM provider sign-in", () => {
     }).pipe(Effect.scoped, Effect.provide(base)),
   );
 
-  it.effect("reports missing or incompatible Codex without starting login", () =>
+  it.effect("allows sign-in with a different installed Codex version", () =>
     Effect.gen(function* () {
       const f = yield* harness;
-      f.setVersion("0.1.0");
+      f.setVersion("0.163.0-alpha.10.2");
+      const state = yield* f.run({ ...input, action: "start" });
+      yield* Deferred.await(f.started);
+      expect(state.requirement).toBe("sign_in_required");
+      expect(f.attempts()).toBe(1);
+    }).pipe(Effect.scoped, Effect.provide(base)),
+  );
+
+  it.effect("reports missing Codex without starting login", () =>
+    Effect.gen(function* () {
+      const f = yield* harness;
+      f.setInstalled(false);
       const state = yield* f.run({ ...input, action: "start" });
       expect(state.requirement).toBe("provider_unavailable");
-      expect(state.auth.message).toContain("0.159.3");
+      expect(state.auth.message).toContain("installed Codex");
       expect(f.attempts()).toBe(0);
     }).pipe(Effect.scoped, Effect.provide(base)),
   );

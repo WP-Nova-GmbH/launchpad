@@ -53,6 +53,19 @@ const inFlightMove = (queue: ThreadPromptQueue | undefined) =>
     (entry) =>
       entry.kind === "move" && entry.state !== "pending" && entry.operationId !== undefined,
   ) === true;
+const moveFailureDetail = (
+  placement: RelayPortableThreadPlacement | null,
+  queue?: ThreadPromptQueue,
+) =>
+  placement?.operationId != null &&
+  !queue?.entries.some(
+    (entry) =>
+      entry.kind === "move" &&
+      entry.operationId !== undefined &&
+      entry.operationId !== placement.operationId,
+  )
+    ? (placement.moveFailureDetail ?? null)
+    : null;
 
 export const THREAD_DELETE_WARNING =
   "This permanently deletes conversation history and attachments. Any dedicated VM and saved workspaces are also deleted. Work stored only in the VM is lost. Archive the thread to keep it.";
@@ -113,7 +126,7 @@ export function threadVmProviderAuthPresentation(value: {
   const message =
     requirement === "provider_unavailable"
       ? (auth.message ??
-        "This VM needs the supported Codex version before preparation can continue.")
+        "This VM needs an installed and configured Codex provider before preparation can continue.")
       : finished
         ? "Signed in to Codex. The VM is finishing preparation."
         : auth.phase === "failed"
@@ -741,7 +754,10 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     Atom.make((get) => {
       const session = get(managedRelaySessionAtom);
       if (!session) return null;
-      const [, threadId] = decodeKey(key);
+      const [environmentId, threadId] = decodeKey(key);
+      const queue = threadDetailAtom
+        ? get(threadDetailAtom(environmentId, threadId))?.promptQueue
+        : undefined;
       const query = readManagedRelaySnapshotState(get(unavailableLocationQueryAtom(key))),
         recovery = get(scopedLocationAtom(key)),
         state = recovery ?? query,
@@ -755,6 +771,8 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         placement: !state.error && !state.isPending ? value : null,
         recoveryRequested: recovery?.recoveryRequested ?? false,
         error: state.error,
+        moveFailureDetail:
+          !state.error && !state.isPending ? moveFailureDetail(value, queue) : null,
         isPending: state.isPending,
         movePending: value?.operationId != null,
         destination:
@@ -829,6 +847,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         placement: !error && !isPending ? value : null,
         recoveryRequested: recovery?.recoveryRequested ?? false,
         error,
+        moveFailureDetail: !error && !isPending ? moveFailureDetail(value, queue) : null,
         isPending,
         movePending: value?.operationId != null,
         destination:

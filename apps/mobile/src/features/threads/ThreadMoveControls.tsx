@@ -536,13 +536,16 @@ function ThreadMachinePicker({
       : label;
   };
   const presentation = threadRunOnStatus({ queue, saved });
-  const progress = location?.destination
-    ? `Thread moved → ${currentLabel}`
-    : presentation
-      ? `${presentation.title}${presentation.destination ? ` → ${destinationLabel(presentation.destination)}` : ""}`
-      : location?.movePending
-        ? "Moving thread…"
-        : null;
+  const visibleError = error ?? location?.moveFailureDetail ?? null;
+  const progress = location?.moveFailureDetail
+    ? "Move needs attention"
+    : location?.destination
+      ? `Thread moved → ${currentLabel}`
+      : presentation
+        ? `${presentation.title}${presentation.destination ? ` → ${destinationLabel(presentation.destination)}` : ""}`
+        : location?.movePending
+          ? "Moving thread…"
+          : null;
   const ensureCurrent = () => {
     if (!isCurrent())
       throw new Error("Your account changed. Reopen this thread to check the move.");
@@ -854,9 +857,9 @@ function ThreadMachinePicker({
               ) : !outstanding && !currentIsVm && vmBlocker && !host.isPending ? (
                 <Action label="View VM setup instructions" onPress={setup} />
               ) : null}
-              {error ? (
+              {visibleError ? (
                 <Text accessibilityRole="alert" className="text-sm text-destructive">
-                  {error}
+                  {visibleError}
                 </Text>
               ) : null}
             </ScrollView>

@@ -162,9 +162,10 @@ for builds that copy the runner archive. Keep generated API keys out of Git.
 The runner uses a packaged Linux ARM64 CLI archive from the existing
 [release pipeline](release.md), including its web client, native runtime dependencies
 and resource monitor. It does not install the Launchpad monorepo in a guest.
-`infra/e2b/template/Dockerfile` adds Git, GitHub CLI, Python, Node, pnpm and the
-Codex version used by the native-conversation transfer checks. Those development
-tools are separate from the server's bundled dependencies. The build script
+`infra/e2b/template/Dockerfile` adds Git, GitHub CLI, Python, Node, pnpm and Codex.
+Conversation moves validate the saved history and require the destination Codex
+to resume it successfully; the source and destination versions do not have to match.
+Those development tools are separate from the server's bundled dependencies. The build script
 selects the standard resources: 2 vCPUs,
 4 GiB RAM and 20 GiB initially free disk. The image requests 21 GiB from E2B because
 its ext4 growth is best-effort and filesystem metadata consumes some of the added

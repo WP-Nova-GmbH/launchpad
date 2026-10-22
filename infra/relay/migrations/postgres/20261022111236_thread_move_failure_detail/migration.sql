@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_moves" ADD COLUMN "failure_detail" varchar(2000);

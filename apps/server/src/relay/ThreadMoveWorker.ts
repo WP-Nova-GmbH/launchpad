@@ -59,6 +59,19 @@ const decodeModel = Schema.decodeEffect(Schema.fromJsonString(ModelSelection));
 const decodeArchive = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferArchiveManifest));
 const decodeSession = Schema.decodeUnknownEffect(OrchestrationSession);
 const decodeChunks = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferChunkManifest));
+const hasErrorDetail = Schema.is(Schema.Struct({ detail: Schema.NonEmptyString }));
+const hasErrorMessage = Schema.is(Schema.Struct({ message: Schema.NonEmptyString }));
+const failureDetail = (error: unknown) =>
+  (hasErrorDetail(error)
+    ? error.detail
+    : hasErrorMessage(error)
+      ? error.message
+      : "The thread move could not be prepared."
+  )
+    .trim()
+    .split(/[\r\n]/u)[0]!
+    .slice(0, 2000)
+    .trim() || "The thread move could not be prepared.";
 
 /** One durable operation drives each queued move. Slow transfer work runs in its
  * own server worker; the relay inbox and history loops remain responsive. */
@@ -158,6 +171,23 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       outcome,
       createdAt: yield* now,
     });
+  });
+  const reportFailure = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    error: unknown,
+    side: "source" | "destination",
+  ) {
+    const detail = failureDetail(error);
+    const move = yield* transport.get(owner);
+    yield* assertThreadMoveIdentity(owner, move);
+    if (
+      !["preparing", "frozen", "ready"].includes(move.phase) ||
+      owner.environmentId !==
+        (side === "source" ? move.sourceEnvironmentId : move.destinationEnvironmentId)
+    )
+      return;
+    const reported = yield* transport.failed(owner, detail);
+    yield* assertThreadMoveIdentity(owner, reported);
   });
   const source = Effect.fn("ThreadMoveWorker.source")(function* (threadId: string) {
     const state = yield* readQueue(threadId);
@@ -282,6 +312,9 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       yield* finish(owner, "cancelled");
       return;
     }
+    // Failure details live in relay placement state. Appending local queue
+    // events here would invalidate the immutable source sequence being moved.
+    if (move.failureDetail && move.phase !== "preparing") return;
     if (move.phase === "ready") {
       if (move.manifestArtifactId !== null && move.recoveryVerified !== true) {
         const receipt = yield* transport.publish(owner, move.manifestArtifactId);
@@ -340,7 +373,9 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       if (!stopped.stopped) return;
     }
     yield* execution.confirmProcessesStopped(threadId, tracked ? "vm" : "provider");
-    const saved = yield* sourceArchive(owner);
+    const saved = yield* sourceArchive(owner).pipe(
+      Effect.tapError((error) => reportFailure(owner, error, "source").pipe(Effect.ignore)),
+    );
     // Reused archives must still match the exact frozen placement and event head.
     const current = yield* fences.get(threadId);
     if (
@@ -655,7 +690,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       threadId: ThreadId.make(owner.threadId),
       manifestSha256: saved.sha256,
     }).pipe(Effect.provideContext(context));
-    if (move.phase === "frozen") {
+    if (move.phase === "frozen" || move.phase === "ready") {
       const ready = yield* transport.ready(owner, {
         sourceCursor: move.sourceCursor,
         manifestSha256: saved.sha256,
@@ -673,5 +708,11 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     yield* fences.activate(owner);
     yield* finish(owner, "completed");
   });
-  return { source, destination };
+  return {
+    source,
+    destination: (owner: ThreadMoveOwner) =>
+      destination(owner).pipe(
+        Effect.tapError((error) => reportFailure(owner, error, "destination").pipe(Effect.ignore)),
+      ),
+  };
 });

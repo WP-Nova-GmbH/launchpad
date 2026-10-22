@@ -545,6 +545,7 @@ function RunOnPicker({
   const vmSupported = threadMoveProviderSupported(provider, "vm");
   const status = threadRunOnStatus({ queue, saved });
   const movePending = location?.movePending === true;
+  const visibleError = error ?? location?.moveFailureDetail ?? null;
   const destinationLabel = (destination: ThreadMoveDestination) => {
     if (destination.kind === "vm") return "Private VM";
     const destinationEnvironment = environments.find(
@@ -864,9 +865,9 @@ function RunOnPicker({
                   : "Choose a machine to move this thread. Moves next when the queue can run; reorder it in the queue to move later."}
               </p>
             )}
-            {error ? (
+            {visibleError ? (
               <p role="alert" className="text-destructive">
-                {error}
+                {visibleError}
               </p>
             ) : null}
           </div>
@@ -876,6 +877,16 @@ function RunOnPicker({
         <span role="status" className="text-xs text-muted-foreground">
           Moved
         </span>
+      ) : visibleError ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={<span role="status" />}
+            className="max-w-48 truncate text-xs text-destructive"
+          >
+            Move needs attention
+          </TooltipTrigger>
+          <TooltipPopup>{visibleError}</TooltipPopup>
+        </Tooltip>
       ) : status ? (
         <Tooltip>
           <TooltipTrigger
@@ -895,16 +906,6 @@ function RunOnPicker({
         <span role="status" className="truncate text-xs text-muted-foreground">
           Moving thread…
         </span>
-      ) : error ? (
-        <Tooltip>
-          <TooltipTrigger
-            render={<span role="status" />}
-            className="max-w-48 truncate text-xs text-destructive"
-          >
-            Move needs attention
-          </TooltipTrigger>
-          <TooltipPopup>{error}</TooltipPopup>
-        </Tooltip>
       ) : null}
     </div>
   );

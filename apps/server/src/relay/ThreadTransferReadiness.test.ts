@@ -17,6 +17,7 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { layer as RunnerLayer } from "../processRunner.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import { ProviderAdapterRequestError } from "../provider/Errors.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
 
@@ -28,8 +29,10 @@ const fixture = Effect.fnUntraced(function* (options?: {
   native?: boolean;
   wrongIdentity?: boolean;
   authenticated?: boolean;
+  installed?: boolean;
   version?: string;
   liveSession?: boolean;
+  resumeFailure?: string;
 }) {
   const fs = yield* FileSystem.FileSystem,
     path = yield* Path.Path,
@@ -87,7 +90,7 @@ const fixture = Effect.fnUntraced(function* (options?: {
     instanceId,
     driver: driverKind,
     enabled: true,
-    installed: true,
+    installed: options?.installed ?? true,
     version: options?.version ?? "0.159.3",
     status: "ready",
     auth: { status: options?.authenticated === false ? "unauthenticated" : "authenticated" },
@@ -96,6 +99,7 @@ const fixture = Effect.fnUntraced(function* (options?: {
     slashCommands: [],
     skills: [],
   };
+  let resumeFailure = options?.resumeFailure;
   const unused = () => Effect.die("Unexpected provider operation during readiness");
   const instance: ProviderInstance = {
     instanceId,
@@ -129,9 +133,17 @@ const fixture = Effect.fnUntraced(function* (options?: {
         Effect.gen(function* () {
           expect(request.cwd).toBe(root);
           expect(request.resumeCursor).toEqual(cursor);
-          expect(yield* fs.readFileString(path.join(root, "setup-count"))).toBe("setup\n");
+          expect(yield* fs.readFileString(path.join(root, "setup-count")).pipe(Effect.orDie)).toBe(
+            "setup\n",
+          );
           calls.push("resume");
           calls.push("stop");
+          if (resumeFailure)
+            return yield* new ProviderAdapterRequestError({
+              provider: "codex",
+              method: "thread/resume",
+              detail: resumeFailure,
+            });
           return {
             provider: driverKind,
             threadId,
@@ -142,7 +154,7 @@ const fixture = Effect.fnUntraced(function* (options?: {
             createdAt: at,
             updatedAt: at,
           };
-        }).pipe(Effect.orDie),
+        }),
       stopSession: () =>
         Effect.sync(() => {
           calls.push("stop");
@@ -179,6 +191,10 @@ const fixture = Effect.fnUntraced(function* (options?: {
     authenticate: () => {
       status = { ...status, auth: { status: "authenticated" } };
     },
+    changeRuntime: (version: string, failure?: string) => {
+      status = { ...status, version };
+      resumeFailure = failure;
+    },
   };
 });
 it.layer(
@@ -194,9 +210,12 @@ it.layer(
         expect(f.calls).toEqual(["credentials", "resume", "stop"]);
         expect(yield* f.phase).toEqual([{ phase: "ready" }]);
         expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("frozen");
+        yield* f.sql`CREATE TEMP TRIGGER keep_setup_receipt BEFORE UPDATE ON thread_transfer_readiness
+          BEGIN SELECT RAISE(ABORT, 'setup receipt must not be rewritten'); END`;
         yield* f.prepare;
-        expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials"]);
+        expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials", "resume", "stop"]);
         expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
+        yield* f.sql`DROP TRIGGER keep_setup_receipt`;
         yield* f.fence.activate(f.input);
         expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("active");
       }),
@@ -214,7 +233,15 @@ it.layer(
         yield* f.prepare;
         expect(f.calls).toEqual(["credentials", "credentials", "resume", "stop"]);
         yield* f.prepare;
-        expect(f.calls).toEqual(["credentials", "credentials", "resume", "stop", "credentials"]);
+        expect(f.calls).toEqual([
+          "credentials",
+          "credentials",
+          "resume",
+          "stop",
+          "credentials",
+          "resume",
+          "stop",
+        ]);
         expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
       }),
   );
@@ -237,7 +264,7 @@ it.layer(
       yield* Effect.flip(f.fence.activate(f.input));
     }),
   );
-  for (const options of [{ authenticated: false }, { version: "0.159.4" }, { liveSession: true }]) {
+  for (const options of [{ authenticated: false }, { installed: false }, { liveSession: true }]) {
     it.effect(`blocks setup when prerequisites fail: ${encode(options)}`, () =>
       Effect.gen(function* () {
         const f = yield* fixture(options);
@@ -247,6 +274,47 @@ it.layer(
       }),
     );
   }
+  it.effect("accepts another Codex version when it resumes the transferred conversation", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture({ version: "0.163.0-alpha.10.2" });
+      yield* f.prepare;
+      expect(f.calls).toEqual(["credentials", "resume", "stop"]);
+      expect(yield* f.phase).toEqual([{ phase: "ready" }]);
+      expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("frozen");
+      yield* f.fence.activate(f.input);
+      expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("active");
+    }),
+  );
+  it.effect("keeps a failed native resume fenced and preserves the Codex error", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        version: "0.163.0-alpha.10.2",
+        resumeFailure: "This history contains an unsupported event type.",
+      });
+      const error = yield* Effect.flip(f.prepare);
+      expect(error.message).toContain("Codex could not resume the transferred conversation");
+      expect(error.message).toContain("This history contains an unsupported event type.");
+      expect(f.calls).toEqual(["credentials", "resume", "stop"]);
+      expect(yield* f.phase).toEqual([{ phase: "started" }]);
+      expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("frozen");
+      yield* Effect.flip(f.fence.activate(f.input));
+      expect((yield* Effect.flip(f.prepare)).message).toContain("do not replay");
+      expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials"]);
+    }),
+  );
+  it.effect("rechecks native resume after a runtime update without replaying setup", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.prepare;
+      f.changeRuntime("0.163.0-alpha.10.2", "This runtime cannot resume the transferred history.");
+      const error = yield* Effect.flip(f.prepare);
+      expect(error.message).toContain("This runtime cannot resume the transferred history.");
+      expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials", "resume", "stop"]);
+      expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
+      expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("frozen");
+      expect(yield* f.phase).toEqual([{ phase: "ready" }]);
+    }),
+  );
   it.effect(
     "checks credentials but does not invent native history for a never-started conversation",
     () =>

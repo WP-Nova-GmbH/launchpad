@@ -9,7 +9,6 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { ServerConfig } from "../config.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
-import { CODEX_CONVERSATION_TRANSFER_VERSION } from "../provider/Drivers/CodexConversationTransfer.ts";
 import { ProviderAuthService } from "../provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { readInstalledThreadVm, type InstalledThreadVm } from "./ThreadVmEnrollment.ts";
@@ -73,10 +72,7 @@ export const controlThreadVmProviderAuth = Effect.fn("ThreadVmProviderAuth.contr
   )
     return unavailable("This VM needs an enabled Codex provider with device sign-in support.");
   const status = yield* instance.snapshot.refresh;
-  if (!status.installed || status.version !== CODEX_CONVERSATION_TRANSFER_VERSION)
-    return unavailable(
-      `This VM needs Codex ${CODEX_CONVERSATION_TRANSFER_VERSION}. Update the runner image and reset the VM.`,
-    );
+  if (!status.installed) return unavailable("This VM needs an installed Codex provider.");
   const service = yield* ProviderAuthService;
   // Stable across HTTP/E2B retries and relay restarts, private to this exact guest operation.
   const owner = `thread-vm-auth:${binding.operationId}:${binding.allocationId}:${binding.generation}`;

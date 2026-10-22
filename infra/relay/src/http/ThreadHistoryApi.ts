@@ -85,7 +85,17 @@ export const listPortableThreads = Effect.fn("relay.api.thread_history.list")(
 
 export const getPortableThreadPlacement = Effect.fn("relay.api.thread_history.placement")(
   function* (threadId: string) {
-    return yield* withPrivateThreadAccess(threadId, "read", Effect.succeed);
+    return yield* withPrivateThreadAccess(threadId, "read", (placement) =>
+      Effect.gen(function* () {
+        const sql = (yield* RelayDb).$client;
+        const [move] = placement.operationId
+          ? yield* sql<{ failureDetail: string | null }>`SELECT failure_detail AS "failureDetail"
+              FROM relay_thread_moves WHERE operation_id=${placement.operationId}
+                AND thread_id=${threadId} AND phase IN ('preparing','frozen','ready')`
+          : [];
+        return { ...placement, moveFailureDetail: move?.failureDetail ?? null };
+      }),
+    );
   },
 );
 export const getPortableThreadHistory = Effect.fn("relay.api.thread_history.read")(

@@ -45,7 +45,6 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeOS from "node:os";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
-import * as ProcessRunner from "../../processRunner.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
   resolvePortableCodexHome,
@@ -2275,7 +2274,6 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const crypto = yield* Crypto.Crypto;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const processRunner = yield* ProcessRunner.make();
   const serverConfig = yield* Effect.service(ServerConfig);
   const nativeEventLogger =
     options?.nativeEventLogger ??
@@ -2332,26 +2330,6 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 nativeThreadId: cursor.threadId,
                 portableStateId: cursor.portableStateId!,
               });
-              const version = yield* processRunner.run({
-                command: expandHomePath(codexConfig.binaryPath),
-                args: ["--version"],
-                cwd: input.cwd ?? process.cwd(),
-                ...(options?.environment ? { env: options.environment } : {}),
-                timeout: "10 seconds",
-                maxOutputBytes: 4096,
-              });
-              if (
-                version.code !== 0 ||
-                version.timedOut ||
-                version.stdoutTruncated ||
-                version.stdout.trim() !== `codex-cli ${home.codexVersion}`
-              )
-                return yield* new ProviderAdapterValidationError({
-                  provider: PROVIDER,
-                  operation: "startSession",
-                  issue:
-                    "The configured Codex version has not been verified for this transferred conversation.",
-                });
               yield* preparePortableCodexAuthentication({
                 homePath: home.homePath,
                 configuredHomePath: path.resolve(

@@ -84,6 +84,10 @@ export function makeThreadMoveTransport<E, R>(
       request(owner, (client, params) =>
         client.threadMoves.get({ params, payload: { generation: owner.generation } }),
       ),
+    failed: (owner: ThreadMoveOwner, detail: string) =>
+      request(owner, (client, params) =>
+        client.threadMoves.failed({ params, payload: { generation: owner.generation, detail } }),
+      ),
     freeze: (owner: ThreadMoveOwner, input: { sourceCursor: number; manifestSha256: string }) =>
       request(owner, (client, params) =>
         client.threadMoves.freeze({ params, payload: { generation: owner.generation, ...input } }),

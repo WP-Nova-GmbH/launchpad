@@ -14,7 +14,7 @@ const HistoryPosition = Schema.Struct({
 const Metadata = Schema.Struct({
   id: Id,
   session_id: Id,
-  cli_version: Schema.Literal("0.159.3"),
+  cli_version: Schema.NonEmptyString.check(Schema.isMaxLength(128)),
   history_mode: Schema.Literal("paginated"),
   parent_thread_id: Schema.optionalKey(Schema.NullOr(Id)),
   forked_from_id: Schema.optionalKey(Schema.NullOr(Id)),
@@ -127,7 +127,7 @@ const canonicalAgentPath = (value: string) =>
     .every((part) => part !== "" && part !== "." && part !== "..") &&
   !value.endsWith("/");
 
-/** A successful pinned spawn receipt identifies the canonical child path. Native
+/** A successful native spawn receipt identifies the canonical child path. Native
  * arguments can be opaque; matching arbitrary UUIDs or copying a provider home
  * would neither prove completeness nor scope the transfer to this conversation. */
 const childTasks = (records: ReadonlyArray<CodexNativeRollout["records"][number]>) => {

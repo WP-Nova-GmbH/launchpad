@@ -329,7 +329,7 @@ validationLayer("CodexAdapterLive validation", (it) => {
     ),
   );
   it.effect(
-    "resumes installed native history with the destination account and blocks version drift",
+    "probes transferred history with the configured Codex across versions and rejects failed resume",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -349,7 +349,11 @@ validationLayer("CodexAdapterLive validation", (it) => {
           const rollout =
             (yield* encodeUnknownJson({
               type: "session_meta",
-              payload: { id: nativeId, cli_version: "0.159.3", history_mode: "paginated" },
+              payload: {
+                id: nativeId,
+                cli_version: "0.163.0-alpha.10.2",
+                history_mode: "paginated",
+              },
             })) + "\n";
           yield* fs.writeFileString(rolloutPath, rollout);
           const installed = yield* installPortableCodexHome({
@@ -363,7 +367,7 @@ validationLayer("CodexAdapterLive validation", (it) => {
             manifest: {
               format: "codex-rollout-v1",
               threadId: nativeId,
-              codexVersion: "0.159.3",
+              codexVersion: "0.163.0-alpha.10.2",
               historyMode: "paginated",
               rolloutName: `rollout-2026-10-01T12-00-00-${nativeId}.jsonl`,
               sha256: NodeCrypto.createHash("sha256").update(rollout).digest("hex"),
@@ -390,6 +394,7 @@ validationLayer("CodexAdapterLive validation", (it) => {
             resumeCursor: installed.resumeCursor,
           };
           yield* adapter.startSession(input);
+          NodeAssert.equal(factory.lastRuntime?.options.binaryPath, binaryPath);
           NodeAssert.equal(factory.lastRuntime?.options.homePath, installed.homePath);
           NodeAssert.deepStrictEqual(
             factory.lastRuntime?.options.resumeCursor,
@@ -400,42 +405,73 @@ validationLayer("CodexAdapterLive validation", (it) => {
             "destination-only-token-fixture",
           );
           yield* adapter.stopSession(input.threadId);
-          const count = factory.factory.mock.calls.length;
           yield* writeVersion("0.160.0");
-          const mismatch = yield* Effect.flip(adapter.startSession(input));
-          NodeAssert.equal(mismatch._tag, "ProviderAdapterValidationError");
-          NodeAssert.equal(factory.factory.mock.calls.length, count);
-          yield* writeVersion("0.159.3");
+          yield* adapter.probeSession(input);
+          NodeAssert.equal(factory.lastRuntime?.options.binaryPath, binaryPath);
+          NodeAssert.deepStrictEqual(
+            factory.lastRuntime?.options.resumeCursor,
+            installed.resumeCursor,
+          );
+          NodeAssert.equal(factory.lastRuntime?.sendTurnImpl.mock.calls.length, 0);
+          NodeAssert.equal(factory.lastRuntime?.closeImpl.mock.calls.length, 1);
+          NodeAssert.equal(yield* adapter.hasSession(input.threadId), false);
+          const count = factory.factory.mock.calls.length;
           const requestLog = path.join(root, "requests");
           yield* fs.writeFileString(
             binaryPath,
             `#!/usr/bin/env node
 const fs = require("node:fs");
-if (process.argv.includes("--version")) { process.stdout.write("codex-cli 0.159.3\\n"); }
+if (process.argv.includes("--version")) { process.stdout.write("codex-cli 0.160.0\\n"); }
 else {
   require("node:readline").createInterface({input: process.stdin}).on("line", line => {
     const message = JSON.parse(line);
     fs.appendFileSync(process.env.MOCK_REQUESTS, message.method + "\\n");
     if (message.method === "initialize") process.stdout.write(JSON.stringify({id: message.id, result: {
-      userAgent: "test", codexHome: process.cwd(), platformFamily: "unix", platformOs: "macos"
+      userAgent: "test", codexHome: process.env.MOCK_WRONG_HOME ? process.cwd() : process.env.CODEX_HOME,
+      platformFamily: "unix", platformOs: "macos"
     }}) + "\\n");
+    if (message.method === "thread/resume") process.stdout.write(JSON.stringify({id: message.id,
+      ...(process.env.MOCK_RESUME_ERROR
+        ? { error: { code: -32603, message: "thread not found: incompatible native history" } }
+        : { result: { cwd: process.cwd(), model: "gpt-5.3-codex", thread: { id: message.params.threadId } } })
+    }) + "\\n");
   });
 }
 `,
             { mode: 0o700 },
           );
-          const realAdapter = yield* makeCodexAdapter(
-            decodeCodexSettings({ binaryPath, homePath: account }),
-            {
-              environment: { ...process.env, MOCK_REQUESTS: requestLog },
-            },
-          ).pipe(
-            Effect.provideService(ServerConfig, { ...config, stateDir: path.join(root, "state") }),
-          );
-          const wrongHome = yield* Effect.flip(realAdapter.startSession(input));
+          const realAdapter = (environment: Record<string, string> = {}) =>
+            makeCodexAdapter(decodeCodexSettings({ binaryPath, homePath: account }), {
+              environment: { ...process.env, MOCK_REQUESTS: requestLog, ...environment },
+            }).pipe(
+              Effect.provideService(ServerConfig, {
+                ...config,
+                stateDir: path.join(root, "state"),
+              }),
+            );
+          const wrongHomeAdapter = yield* realAdapter({ MOCK_WRONG_HOME: "1" });
+          const wrongHome = yield* Effect.flip(wrongHomeAdapter.probeSession(input));
           NodeAssert.equal(wrongHome._tag, "ProviderAdapterValidationError", wrongHome.message);
           NodeAssert.equal(yield* fs.readFileString(requestLog), "initialize\n");
-          yield* writeVersion("0.159.3");
+          yield* fs.writeFileString(requestLog, "");
+          const compatible = yield* realAdapter();
+          const probed = yield* compatible.probeSession(input);
+          NodeAssert.deepStrictEqual(probed.resumeCursor, installed.resumeCursor);
+          NodeAssert.equal(yield* compatible.hasSession(input.threadId), false);
+          NodeAssert.equal(
+            yield* fs.readFileString(requestLog),
+            "initialize\ninitialized\nthread/resume\n",
+          );
+          yield* fs.writeFileString(requestLog, "");
+          const incompatible = yield* realAdapter({ MOCK_RESUME_ERROR: "1" });
+          const failed = yield* Effect.flip(incompatible.probeSession(input));
+          NodeAssert.equal(failed._tag, "ProviderAdapterProcessError");
+          NodeAssert.match(failed.message, /incompatible native history/);
+          NodeAssert.equal(yield* incompatible.hasSession(input.threadId), false);
+          NodeAssert.equal(
+            yield* fs.readFileString(requestLog),
+            "initialize\ninitialized\nthread/resume\n",
+          );
           yield* fs.remove(path.join(installed.homePath, "sessions"), { recursive: true });
           yield* Effect.flip(adapter.startSession(input));
           NodeAssert.equal(factory.factory.mock.calls.length, count);

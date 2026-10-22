@@ -112,8 +112,7 @@ const fixture = Effect.fnUntraced(function* (options: { lfs?: boolean; submodule
     [THREAD_VM_IDENTITY_SECRET, new TextEncoder().encode(encode(vm))],
   ]);
   const calls: Array<ProcessRunInput> = [];
-  let version = "codex-cli 0.159.3",
-    loginCode = 0,
+  let loginCode = 0,
     truncateTree = false,
     fetchWait = Effect.void;
   const fetchEntered = yield* Deferred.make<void>();
@@ -145,10 +144,7 @@ const fixture = Effect.fnUntraced(function* (options: { lfs?: boolean; submodule
           Effect.gen(function* () {
             calls.push(request);
             if (request.command === "codex")
-              return output(
-                request.args[0] === "--version" ? version : "",
-                request.args[0] === "login" ? loginCode : 0,
-              );
+              return output("", request.args[0] === "login" ? loginCode : 0);
             if (request.args.includes("fetch")) {
               yield* Deferred.succeed(fetchEntered, undefined);
               yield* fetchWait;
@@ -189,9 +185,6 @@ const fixture = Effect.fnUntraced(function* (options: { lfs?: boolean; submodule
     bytes,
     run,
     fetchEntered,
-    setVersion: (value: string) => {
-      version = value;
-    },
     setLoginCode: (value: number) => {
       loginCode = value;
     },
@@ -336,7 +329,7 @@ describe("uploaded VM reset workspace", () => {
       }),
     ),
   );
-  it.effect("rejects stale identity, an incompatible provider version and existing work", () =>
+  it.effect("rejects stale identity and existing work", () =>
     test(
       Effect.gen(function* () {
         const f = yield* fixture();
@@ -346,9 +339,6 @@ describe("uploaded VM reset workspace", () => {
             .pipe(Effect.flip)).code,
           "identity_changed",
         );
-        f.setVersion("codex-cli 0.159.4");
-        assert.equal((yield* f.run().pipe(Effect.flip)).code, "provider_version_mismatch");
-        f.setVersion("codex-cli 0.159.3");
         yield* f.fs.makeDirectory(f.workspace);
         yield* f.fs.writeFileString(`${f.workspace}/keep`, "work");
         assert.equal((yield* f.run().pipe(Effect.flip)).code, "workspace_not_empty");

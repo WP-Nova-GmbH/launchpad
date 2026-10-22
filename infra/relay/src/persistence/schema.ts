@@ -619,6 +619,7 @@ export const relayThreadMoves = pgTable(
       >(),
     sourceCursor: integer("source_cursor"),
     manifestSha256: varchar("manifest_sha256", { length: 64 }),
+    failureDetail: varchar("failure_detail", { length: 2000 }),
   },
   (table) => [
     check(

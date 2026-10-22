@@ -28,6 +28,7 @@ export interface ThreadMove {
     | "aborted";
   readonly sourceCursor: number | null;
   readonly manifestSha256: string | null;
+  readonly failureDetail?: string | null;
 }
 interface Admission {
   readonly environmentId: string;
@@ -111,7 +112,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
       yield* sql<ThreadMove>`SELECT operation_id AS "operationId", thread_id AS "threadId",
       actor_user_id AS "actorUserId", source_environment_id AS "sourceEnvironmentId", expected_generation AS "expectedGeneration",
       destination_environment_id AS "destinationEnvironmentId", destination_project_id AS "destinationProjectId",
-      phase, source_cursor AS "sourceCursor", manifest_sha256 AS "manifestSha256"
+      phase, source_cursor AS "sourceCursor", manifest_sha256 AS "manifestSha256", failure_detail AS "failureDetail"
       FROM relay_thread_moves WHERE operation_id = ${input.operationId} AND thread_id = ${input.threadId}`;
     if (!row) return yield* conflict("Move does not exist for this thread");
     return row;
@@ -261,6 +262,35 @@ export function makeThreadPlacementStore(sql: PgClient) {
     );
   });
 
+  const reportFailure = Effect.fn("relay.thread_placement.report_failure")(function* (
+    input: MoveIdentity & Owner & { readonly detail: string },
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const placement = yield* lock(input.threadId);
+        const move = yield* getMove(input);
+        const participant =
+          (input.environmentId === move.sourceEnvironmentId &&
+            input.generation === move.expectedGeneration) ||
+          (input.environmentId === move.destinationEnvironmentId &&
+            input.generation === move.expectedGeneration + 1);
+        if (
+          !participant ||
+          placement.operationId !== input.operationId ||
+          placement.environmentId !== move.sourceEnvironmentId ||
+          placement.generation !== move.expectedGeneration ||
+          !["preparing", "frozen", "ready"].includes(move.phase)
+        )
+          return yield* conflict("Move no longer accepts participant failure reports");
+        const detail = input.detail.trim();
+        if (!detail || detail.length > 2000) return yield* conflict("Invalid move failure detail");
+        yield* sql`UPDATE relay_thread_moves SET failure_detail = COALESCE(failure_detail,${detail})
+          WHERE operation_id = ${input.operationId}`;
+        return yield* getMove(input);
+      }),
+    );
+  });
+
   const sourceFrozen = Effect.fn("relay.thread_placement.source_frozen")(function* (
     input: MoveIdentity &
       Owner & { readonly sourceCursor: number; readonly manifestSha256: string },
@@ -295,7 +325,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
             AND generation = ${input.generation} AND source_sequence >= ${input.sourceCursor}`;
         if (!mirrored)
           return yield* conflict("Source history has not been mirrored through the freeze");
-        yield* sql`UPDATE relay_thread_moves SET phase = 'frozen', source_cursor = ${input.sourceCursor}, manifest_sha256 = ${input.manifestSha256}
+        yield* sql`UPDATE relay_thread_moves SET phase = 'frozen', source_cursor = ${input.sourceCursor}, manifest_sha256 = ${input.manifestSha256}, failure_detail = NULL
         WHERE operation_id = ${input.operationId}`;
         return yield* getMove(input);
       }),
@@ -321,7 +351,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
           move.manifestSha256 !== input.manifestSha256
         )
           return yield* conflict("Destination does not match the frozen source");
-        yield* sql`UPDATE relay_thread_moves SET phase = 'ready' WHERE operation_id = ${input.operationId}`;
+        yield* sql`UPDATE relay_thread_moves SET phase = 'ready', failure_detail = NULL WHERE operation_id = ${input.operationId}`;
         return yield* getMove(input);
       }),
     );
@@ -335,7 +365,11 @@ export function makeThreadPlacementStore(sql: PgClient) {
         const placement = yield* lock(input.threadId);
         const move = yield* getMove(input);
         if (move.phase === "committed" || move.phase === "completed") return move;
-        if (placement.operationId !== input.operationId || move.phase !== "ready")
+        if (
+          placement.operationId !== input.operationId ||
+          move.phase !== "ready" ||
+          move.failureDetail
+        )
           return yield* conflict("Move is not ready to commit");
         yield* requireOwner(placement, {
           threadId: input.threadId,
@@ -364,7 +398,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
         if (unfinished) return yield* conflict("Source work has not fully reconciled");
         yield* sql`UPDATE relay_thread_placements SET environment_id = ${move.destinationEnvironmentId},
         project_id = ${move.destinationProjectId}, generation = generation + 1 WHERE thread_id = ${input.threadId}`;
-        yield* sql`UPDATE relay_thread_moves SET phase = 'committed' WHERE operation_id = ${input.operationId}`;
+        yield* sql`UPDATE relay_thread_moves SET phase = 'committed', failure_detail = NULL WHERE operation_id = ${input.operationId}`;
         return yield* getMove(input);
       }),
     );
@@ -433,6 +467,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
     admit,
     completeWork,
     beginMove,
+    reportFailure,
     sourceFrozen,
     destinationReady,
     commitMove,

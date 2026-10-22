@@ -1,9 +1,4 @@
-import {
-  CodexConversationManifest,
-  CODEX_CONVERSATION_TRANSFER_VERSION,
-  NativeThreadId,
-  RolloutName,
-} from "@t3tools/contracts/relay";
+import { CodexConversationManifest, NativeThreadId, RolloutName } from "@t3tools/contracts/relay";
 import * as NodeCrypto from "node:crypto";
 
 import * as Effect from "effect/Effect";
@@ -24,7 +19,7 @@ const SessionMetadata = Schema.Struct({
   payload: Schema.Struct({
     id: NativeThreadId,
     session_id: Schema.optionalKey(NativeThreadId),
-    cli_version: Schema.String,
+    cli_version: Schema.NonEmptyString.check(Schema.isMaxLength(128)),
     history_mode: Schema.optionalKey(Schema.Literals(["legacy", "paginated"])),
     parent_thread_id: Schema.optionalKey(Schema.NullOr(NativeThreadId)),
     history_base: Schema.optionalKey(Schema.Unknown),
@@ -97,7 +92,7 @@ const NativeMessage = Schema.Struct({
 const isNativeMessage = Schema.is(NativeMessage);
 const NativeText = Schema.Struct({ type: Schema.Literal("input_text"), text: Schema.String });
 const isNativeText = Schema.is(NativeText);
-// Pinned paginated rollouts embed local-image provenance beside inline image
+// Paginated rollouts embed local-image provenance beside inline image
 // bytes. Match a complete native marker, never arbitrary path mentions in prose.
 const imageMarker = /^<image name=\[[^<>\r\n]{1,512}\] path="([^"<>\r\n]+)">$/u;
 const markerPath = (text: string) => imageMarker.exec(text)?.[1];
@@ -445,12 +440,9 @@ export const exportCodexConversation = Effect.fn("exportCodexConversation")(func
   if (metadata.payload.session_id === input.threadId)
     return yield* exportCodexHistoryGraph({ ...input, codexHome: home, rolloutPath: source });
   yield* requireStandaloneHistory(metadata);
-  if (
-    metadata.payload.cli_version !== CODEX_CONVERSATION_TRANSFER_VERSION ||
-    metadata.payload.history_mode !== "paginated"
-  ) {
+  if (metadata.payload.history_mode !== "paginated") {
     return yield* new CodexConversationTransferError({
-      message: "This Codex version or native history format has not been verified for transfer.",
+      message: "This native Codex history format has not been verified for transfer.",
     });
   }
   if (metadata.payload.id !== input.threadId) {
@@ -495,7 +487,7 @@ export const exportCodexConversation = Effect.fn("exportCodexConversation")(func
     const manifest: CodexConversationManifest = {
       format: files.length ? "codex-rollout-v2" : "codex-rollout-v1",
       threadId: metadata.payload.id,
-      codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
+      codexVersion: metadata.payload.cli_version,
       historyMode: "paginated",
       rolloutName,
       sha256,
@@ -522,11 +514,6 @@ export const importCodexConversation = Effect.fn("importCodexConversation")(func
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const manifest = yield* decodeManifest(input.manifest);
-  if (manifest.codexVersion !== input.codexVersion) {
-    return yield* new CodexConversationTransferError({
-      message: "Codex conversation transfer requires matching, verified Codex versions.",
-    });
-  }
   if (manifest.format === "codex-rollout-v3")
     return yield* importCodexHistoryGraph({ ...input, manifest });
   if (manifest.heads !== undefined || manifest.rollouts !== undefined) return yield* fileFailure();
@@ -692,7 +679,8 @@ const exportCodexHistoryGraph = Effect.fnUntraced(function* (input: {
     const manifest: CodexConversationManifest = {
       format: "codex-rollout-v3",
       threadId: input.threadId,
-      codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
+      codexVersion: selected.rollouts.find((rollout) => rollout.name === rootName)!.metadata
+        .cli_version,
       historyMode: "paginated",
       rolloutName: rootName,
       sha256: root.sha256,
@@ -762,6 +750,8 @@ const importCodexHistoryGraph = Effect.fnUntraced(function* (input: {
   );
   if (
     selected.rootId !== manifest.threadId ||
+    rollouts.find((rollout) => rollout.name === manifest.rolloutName)?.metadata.cli_version !==
+      manifest.codexVersion ||
     selected.rollouts.length !== rollouts.length ||
     selected.heads.size !== Object.keys(manifest.heads).length ||
     [...selected.heads].some(([id, name]) => manifest.heads![id] !== name)

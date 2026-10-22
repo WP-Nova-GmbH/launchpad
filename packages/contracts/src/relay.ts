@@ -3350,6 +3350,7 @@ export const RelayThreadArtifactsGroup = HttpApiGroup.make("threadArtifacts")
   .middleware(RelayEnvironmentAuth);
 
 /** A durable handoff; elapsed time or a missing reply never grants execution. */
+const RelayThreadMoveFailureDetail = TrimmedNonEmptyString.check(Schema.isMaxLength(2000));
 export const RelayThreadMove = Schema.Struct({
   manifestArtifactId: Schema.NullOr(RelayThreadArtifactId),
   recoveryVerified: Schema.optional(Schema.Boolean),
@@ -3371,6 +3372,7 @@ export const RelayThreadMove = Schema.Struct({
   ]),
   sourceCursor: Schema.NullOr(NonNegativeInt),
   manifestSha256: Schema.NullOr(RelayThreadArtifactHash),
+  failureDetail: Schema.optional(Schema.NullOr(RelayThreadMoveFailureDetail)),
 });
 export type RelayThreadMove = typeof RelayThreadMove.Type;
 const RelayThreadMoveParams = Schema.Struct({
@@ -3444,6 +3446,19 @@ export const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
       {
         params: RelayThreadMoveParams,
         payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "failed",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/failed",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          detail: RelayThreadMoveFailureDetail,
+        }),
         success: RelayThreadMove,
         error: RelayTenancyErrors,
       },

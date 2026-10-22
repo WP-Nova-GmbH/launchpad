@@ -8,7 +8,6 @@ import * as Schema from "effect/Schema";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { ProcessRunner } from "../processRunner.ts";
-import { CODEX_CONVERSATION_TRANSFER_VERSION } from "../provider/Drivers/CodexConversationTransfer.ts";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 
 export const ThreadVmWorkspaceInput = RelayThreadVmWorkspaceInput;
@@ -35,7 +34,6 @@ export class ThreadVmWorkspaceError extends Schema.TaggedError<ThreadVmWorkspace
       "workspace_not_empty",
       "repository_unavailable",
       "unsupported_git_dependencies",
-      "provider_version_mismatch",
       "setup_failed",
     ]),
   },
@@ -135,9 +133,6 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
           ),
         );
     yield* run("git", ["check-ref-format", "--branch", input.branch], "repository_unavailable");
-    const version = yield* run("codex", ["--version"], "provider_version_mismatch");
-    if (version.trim() !== `codex-cli ${CODEX_CONVERSATION_TRANSFER_VERSION}`)
-      return yield* failure("provider_version_mismatch");
     // Reset restores local data while the prompt queue remains paused. Provider
     // sign-in can happen through the fresh environment's normal settings later.
     const record = {

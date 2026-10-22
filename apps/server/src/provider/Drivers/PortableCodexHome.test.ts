@@ -351,14 +351,20 @@ it.layer(NodeServices.layer)("portable Codex homes", (it) => {
       yield* Effect.flip(resolvePortableCodexHome({ ...request, portableStateId: "../source" }));
     }),
   );
-  it.effect("requires compatible Codex versions even on an installation retry", () =>
+  it.effect("installs and reopens native history on a different destination Codex version", () =>
     Effect.gen(function* () {
       const f = yield* fixture;
-      yield* installPortableCodexHome(f.input);
+      const installed = yield* installPortableCodexHome({ ...f.input, codexVersion: "0.160.0" });
       expect(
-        (yield* Effect.flip(installPortableCodexHome({ ...f.input, codexVersion: "0.0.0" })))
-          .message,
-      ).toContain("verified transfer version");
+        yield* installPortableCodexHome({ ...f.input, codexVersion: "0.163.0-alpha.10.2" }),
+      ).toEqual(installed);
+      expect(
+        yield* resolvePortableCodexHome({
+          ...f.input,
+          nativeThreadId: nativeId,
+          portableStateId: installed.resumeCursor.portableStateId,
+        }),
+      ).toEqual({ homePath: installed.homePath, codexVersion: "0.159.3" });
     }),
   );
   it.effect("does not replace missing native history with the configured provider home", () =>
