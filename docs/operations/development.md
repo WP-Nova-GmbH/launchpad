@@ -27,6 +27,7 @@ Choose the command for the surface you are working on:
 | Command                | What it starts                                                                                  |
 | ---------------------- | ----------------------------------------------------------------------------------------------- |
 | `vp run dev:desktop`   | Electron, the web development server, and a desktop-managed backend.                            |
+| `vp run dev:vm`        | Desktop, local relay and a reusable Cloudflare relay tunnel; requires the configured E2B host.  |
 | `vp run dev`           | The browser app and backend.                                                                    |
 | `vp run dev:share`     | The browser app and backend shared over Tailscale; see sharing below.                           |
 | `vp run dev:mobile`    | Metro for an installed Expo development client; requires a separate reachable backend.          |
@@ -35,6 +36,7 @@ Choose the command for the surface you are working on:
 
 Desktop development builds the backend before opening Electron; allow the initial build to
 finish. The desktop app starts its own backend, so `dev:desktop` is sufficient for that surface.
+For VM moves, use the [VM development setup](vm-development.md).
 Linux also needs the [native desktop prerequisites](#linux-appimage-prerequisites).
 
 For browser development, open the complete pairing URL printed by the dev runner, including
@@ -109,8 +111,9 @@ commands, including shutdown and reset. The project name isolates containers and
 volumes; the port must also be free. Each running relay needs its own `DEV_RELAY_PORT`, with
 the corresponding `T3CODE_RELAY_URL` in that worktree's root `.env`.
 
-For the planned VM backend, see [E2B host setup](./e2b-host-setup.md). It covers a
-native Linux compute host and an optional Lima host for Mac development.
+For VM setup and thread moves, see [VM development](./vm-development.md). The
+[E2B host setup](./e2b-host-setup.md) covers the underlying Linux host and optional
+Lima host for Mac development.
 
 ### State and ports
 

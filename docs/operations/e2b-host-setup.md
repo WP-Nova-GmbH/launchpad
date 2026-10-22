@@ -8,6 +8,12 @@ This guide prepares an upstream E2B sandbox for development and validation.
 Starting E2B does not yet enable VM mode in Launchpad. Product integration and the
 remaining recovery checks are in progress; this stack is for development, not user workloads.
 
+## Start desktop with VM support
+
+Follow the short [VM development guide](vm-development.md) to configure the relay,
+build a runner image, start the relay tunnel and move a local thread. The
+host preparation and image build requirements are detailed below.
+
 ## macOS development only
 
 Skip this section on native Linux. For the local ARM64 setup, use Apple M3 or newer
@@ -103,24 +109,27 @@ sudo docker compose version
 
 Expect `4096` for page size, both devices, Docker Engine 27+ and Compose 2.24+.
 Check upstream resource requirements when sizing sandbox memory reservations.
-For the 4 GiB Launchpad template below, use `HUGEPAGES=6144` for builds in the E2B Compose
-`.env` before running its host setup. That requests 12 GiB in 2 MiB pages on the
-24 GiB development host. Snapshot memory exports can outlive one build step while
-the next step restores its VM. Allow for two 4 GiB reservations plus headroom;
-a 6 GiB pool failed with `mmap memfd: cannot allocate memory` despite free ordinary RAM.
-Size this pool for concurrent builds and running sandboxes,
-and leave ordinary RAM for the host services. Verify the actual reservation with
-`grep Huge /proc/meminfo` after host setup; a requested pool is not proof it was allocated.
-If an idle host cannot allocate the requested pool, reserve it at boot before
-starting Docker. Increasing the setting on a running host can fail because memory
-is fragmented, even after compaction.
+The 4 GiB Launchpad template needs at least 12 GiB of unreserved hugepage memory
+while building: snapshot exports can outlive one step while the next restores its
+VM. A 6 GiB pool failed with `mmap memfd: cannot allocate memory` despite free
+ordinary RAM. On macOS with both E2B URLs forwarded through loopback,
+`dev:vm` and `build:vm-template` temporarily grow and verify the existing
+`launchpad-e2b` Lima pool after Linux packaging finishes. They restore the original
+pool after build success, failure or cancellation, without changing the saved
+E2B Compose configuration.
 
-The build pool and running capacity are separate checks. On the 16 GiB development
-host, reserving 10 GiB for builds left too little ordinary memory for the cold-probe
-capacity check. Restore the serving pool after builds, or give the dedicated host
-more RAM before configuring concurrent VM and recovery capacity. Do not lower the
-capacity check to make admission pass. The lifecycle development host uses 24 GiB
-with a 6 GiB serving pool and a temporary 12 GiB build pool. After changing host
+For other hosts, size build memory manually. On an idle host, `HUGEPAGES=6144`
+requests 12 GiB in 2 MiB pages; allow more for concurrent builds and running
+sandboxes, while leaving ordinary RAM for host services. Verify the actual
+reservation with `grep Huge /proc/meminfo`; a requested pool is not proof it was
+allocated. If an idle host cannot allocate the pool, reserve it at boot before
+starting Docker. Increasing it on a running host can fail because memory is
+fragmented, even after compaction.
+
+The build pool and running capacity are separate checks. Restore the serving pool
+after manual builds, or give the host more RAM before configuring concurrent VM
+and recovery capacity. Do not lower the capacity check to make admission pass.
+The development host uses 24 GiB with a 6 GiB serving pool. After changing host
 resources, check the retained VM catalog, firewall, protected cgroups and service
 health before admitting work. Keep service connection ports in the saved Compose
 configuration; temporary forwarding processes do not survive host restart.
@@ -155,13 +164,51 @@ For dashboard access and SDK configuration, follow upstream
 and [Ports](https://github.com/e2b-dev/runtime/blob/main/embed/compose/README.md#ports).
 Keep Lima's explicit port allowlist in place when connecting Mac clients. The
 template upload endpoint returns a URL on port 5008, so that forward is required
-for builds that copy the runner archive. Keep generated API keys out of Git.
+for builds that copy the runner archive.
+
+### Retrieve the E2B API key
+
+The first startup generates a team API key for this self-hosted installation;
+no E2B cloud account is needed. E2B stores it in the `seed-state` Docker volume
+as `/run/e2b/team-api-key` inside containers that mount that volume.
+
+On macOS, enter the dedicated Linux host first:
+
+```sh
+limactl shell --workdir=/ launchpad-e2b
+```
+
+Change to the existing E2B installation's Compose directory. For the standard
+upstream stack, read the `E2B_API_KEY` export from:
+
+```sh
+sudo docker compose logs ready
+```
+
+The Launchpad runtime started in [Build the runtime for development](#build-the-runtime-for-development)
+does not start `ready`. Read the same key through its running `launchpad-keepalive`
+service instead, using the same Compose files and project name used at startup:
+
+```sh
+sudo docker compose -f compose.yaml -f runtime.override.json -f compose.override.yaml \
+  exec -T launchpad-keepalive cat /run/e2b/team-api-key
+```
+
+Copy the key value into `E2B_API_KEY` in `infra/relay/.env`. The template build
+command loads that file automatically; existing shell variables take precedence.
+Keep the key out of Git.
+See upstream [Secrets](https://github.com/e2b-dev/runtime/blob/main/embed/compose/README.md#secrets)
+for key storage and rotation.
 
 ## Build the Launchpad runner template
 
-The runner uses a packaged Linux ARM64 CLI archive from the existing
-[release pipeline](release.md), including its web client, native runtime dependencies
-and resource monitor. It does not install the Launchpad monorepo in a guest.
+The runner uses a packaged Linux ARM64 CLI archive, including its web client,
+native runtime dependencies and resource monitor. The development command builds
+that archive from the current checkout in one temporary Debian Bookworm container
+on the running Linux host. On macOS it uses the dedicated `launchpad-e2b` Lima
+host; on native Linux it uses local Docker. It does not start Lima or E2B, and
+removes its container and temporary build files afterward. The thread VM receives
+the packaged server, not the Launchpad monorepo.
 `infra/e2b/template/Dockerfile` adds Git, GitHub CLI, Python, Node, pnpm and Codex.
 Conversation moves validate the saved history and require the destination Codex
 to resume it successfully; the source and destination versions do not have to match.
@@ -176,11 +223,20 @@ also requires `BUILD_ENSURE_FREE_DISK_SPACE=true` from the supplied Compose
 override: upstream leaves this build phase disabled without LaunchDarkly. The guest smoke test
 checks the resulting resources; the requested disk target is not a total-disk cap.
 
-With a matching archive available, set `E2B_API_URL` and `E2B_API_KEY` in
-`infra/relay/.env`, then run from the Launchpad checkout:
+Set `E2B_API_URL`, `E2B_SANDBOX_URL` and `E2B_API_KEY` in `infra/relay/.env`, then run from the
+Launchpad checkout to package the current code and build a new runner image:
 
 ```sh
-vp run build:vm-template \
+vp run build:vm-template
+```
+
+`vp run dev:vm` does this automatically when no image is selected, and reuses
+the selection on later starts. Use `build:vm-template` explicitly after changing
+the server or runner tools. For an existing packaged archive, the lower-level
+builder remains available:
+
+```sh
+node infra/relay/scripts/e2b-build-template.mjs \
   --server-archive /absolute/path/to/linux-arm64-release.tar.gz \
   --server-sha256 <archive-sha256>
 ```
@@ -190,18 +246,17 @@ The command uses the Dockerfile's pinned tools and saves the selected image to
 including the exact build identity; no template IDs need to be copied into `.env`.
 Restart the relay after a successful build to use the new selection. Failed
 builds preserve the previous selection. Detailed build receipts are kept in
-`infra/relay/.t3/e2b-builds`; `--output` can choose a new receipt path instead.
+`infra/relay/.t3/e2b-builds`; the lower-level builder accepts `--output` to choose
+a new receipt path instead.
 When the builder and relay run on separate machines, copy the selection file to
 the relay and set `E2B_TEMPLATE_FILE` to its absolute path on both machines.
 An existing successful build receipt can also be used as `E2B_TEMPLATE_FILE`
 without rebuilding. The selection must belong to the relay's configured `E2B_API_URL`.
 
-Linux `node-pty` must be compiled for the target CPU: the npm package contains
-Mac/Windows prebuilds only. Prefer packaging the CLI on Linux. When cross-packaging,
-pass `--node-pty-dir` to `scripts/build-cli-archive.ts` with a package directory
-containing the same `node-pty` version and its Linux `build/Release/pty.node`. The
-packager verifies its version, ELF format and CPU architecture before including it.
-The runner smoke test must still load the module and open a real terminal.
+Automatic packaging compiles Linux `node-pty` for ARM64 and checks the packaged
+server before using it. Prebuilt archives must also contain a matching Linux
+native module; Mac and Windows prebuilds cannot run in the guest. The runner
+smoke test must still load the module and open a real terminal.
 
 The E2B team's build-time disk allowance must also fit the runner. The seeded
 512 MiB allowance is too small: use at least 4096 MiB for `disk_mb` and 2048 MiB
@@ -230,12 +285,12 @@ Check the effective values in `public.team_limits` before building. The standard
 `max_disk_size_mb` for the tools plus that free space (at least 25600 MiB). Allocate
 additional host storage for build caches, saved disks, and actual project data.
 
-The build stages only the verified archive and its checksum. It does not copy local
+The E2B template upload stages only the verified archive and its checksum. It does not copy local
 provider profiles, checkout files or credentials. The receipt records the template
 and build IDs and a unique `templateRef` tag on success. Keep that tag assigned to
 its recorded build; the relay verifies it before provisioning. Inspect the same
 named template after a failed or
-interrupted build before retrying. Use `--skip-cache` when rebuilding after a
+interrupted build before retrying. Use the lower-level builder's `--skip-cache` when rebuilding after a
 failed snapshot or a host disk-full incident; a new receipt is still required.
 OS package repositories remain live even though
 the base image, Node download, Codex and pnpm versions are pinned.
