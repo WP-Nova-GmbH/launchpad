@@ -78,7 +78,7 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
                 code: "failed",
                 detail: thread.session.lastError ?? "The last turn failed. Resume to continue.",
               })
-            : !busy && thread.latestTurn
+            : !busy && thread.latestTurn && command.type !== "thread.move.enqueue"
               ? pause({
                   code: "stopped",
                   detail:

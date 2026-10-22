@@ -794,6 +794,100 @@ const enqueueMove = (id = "move") => ({
 });
 
 it.layer(NodeServices.layer)("moves in the shared queue", (it) => {
+  it.effect("starts an idle thread's first move without resuming the queue", () =>
+    Effect.gen(function* () {
+      const original = yield* readModelWithThread;
+      const idle = {
+        ...original,
+        threads: original.threads.map((thread) => ({
+          ...thread,
+          latestTurn: {
+            turnId: TurnId.make("completed-turn"),
+            state: "completed" as const,
+            requestedAt: createdAt,
+            startedAt: createdAt,
+            completedAt: createdAt,
+            assistantMessageId: null,
+          },
+        })),
+      };
+      expect(idle.threads[0]!.promptQueue).toBeUndefined();
+      let state = yield* apply(idle, { ...enqueueMove(), position: "next" });
+      expect(queue(state).enabled).toBe(true);
+      expect(queue(state).pauseReason).toBeNull();
+      state = yield* apply(state, {
+        type: "thread.move.claim",
+        threadId,
+        commandId: CommandId.make("first-move"),
+        messageId: MessageId.make("move"),
+        expectedRevision: 1,
+        expectedControlRevision: 0,
+        createdAt,
+      });
+      expect(queue(state).entries[0]).toMatchObject({ state: "moving", operationId: "first-move" });
+
+      const prompted = yield* apply(idle, enqueue("first-prompt"));
+      expect(queue(prompted).enabled).toBe(false);
+      expect(queue(prompted).pauseReason?.code).toBe("stopped");
+    }),
+  );
+
+  it.effect("keeps an existing empty paused queue paused when scheduling a move", () =>
+    Effect.gen(function* () {
+      const paused = yield* apply(yield* readModelWithThread, {
+        type: "thread.queue.pause",
+        commandId: CommandId.make("pause-empty-queue"),
+        threadId,
+        createdAt,
+      });
+      expect(queue(paused).entries).toEqual([]);
+      const state = yield* apply(paused, { ...enqueueMove(), position: "next" });
+      expect(queue(state).enabled).toBe(false);
+      expect(queue(state).pauseReason).toEqual(queue(paused).pauseReason);
+      expect(queue(state).revision).toBe(queue(paused).revision);
+      expect(
+        yield* Effect.flip(
+          apply(state, {
+            type: "thread.move.claim",
+            threadId,
+            commandId: CommandId.make("paused-move"),
+            messageId: MessageId.make("move"),
+            expectedRevision: 1,
+            expectedControlRevision: queue(state).revision,
+            createdAt,
+          }),
+        ),
+      ).toMatchObject({ _tag: "OrchestrationCommandInvariantError" });
+    }),
+  );
+
+  it.effect("keeps an errored session paused when its first queue entry is a move", () =>
+    Effect.gen(function* () {
+      const errored = yield* apply(yield* readModelWithThread, {
+        type: "thread.session.set",
+        threadId,
+        commandId: CommandId.make("failed-session"),
+        createdAt,
+        session: {
+          threadId,
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          status: "error",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: "The previous turn failed.",
+          updatedAt: createdAt,
+        },
+      });
+      const state = yield* apply(errored, enqueueMove());
+      expect(queue(state).enabled).toBe(false);
+      expect(queue(state).pauseReason).toMatchObject({
+        code: "failed",
+        detail: "The previous turn failed.",
+      });
+    }),
+  );
+
   it.effect("inserts a move next atomically without replacing a claimed prompt", () =>
     Effect.gen(function* () {
       let state = yield* apply(yield* readModelWithThread, enqueue("first"));
