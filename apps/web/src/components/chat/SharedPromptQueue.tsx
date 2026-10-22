@@ -2,7 +2,16 @@ import {
   squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
-import type { ScopedThreadRef, ThreadPromptQueue, TurnId } from "@t3tools/contracts";
+import {
+  CommandId,
+  type ScopedThreadRef,
+  type ThreadMoveQueueEntry,
+  type ThreadPromptQueue,
+  type TurnId,
+} from "@t3tools/contracts";
+import { createThreadMoveCancellation } from "@t3tools/client-runtime/relay/threadMoveSubmission";
+import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
+import { portableCommandStatesAtom } from "@t3tools/client-runtime/relay/portableThreads";
 import {
   queuedPromptEditConflict,
   queuedMoveLabel,
@@ -13,7 +22,9 @@ import {
 import { useAtomValue } from "@effect/atom-react";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { Clock3Icon, PauseIcon, PlayIcon } from "lucide-react";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { randomUUID } from "../../lib/utils";
+import { threadMoveRelayUrl } from "../../state/thread-move-submissions";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
@@ -21,22 +32,38 @@ import { Textarea } from "../ui/textarea";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { SharedPromptQueueRow } from "./SharedPromptQueueRow";
 
-export function SharedPromptQueue({
-  threadRef,
-  queue,
-  activeTurnId,
-  unavailable = false,
-  supportsPreparation = false,
-  canWorkLocally = false,
-}: {
+type SharedPromptQueueProps = {
   threadRef: ScopedThreadRef;
   queue: ThreadPromptQueue;
   activeTurnId: TurnId | null;
   unavailable?: boolean;
   supportsPreparation?: boolean;
   canWorkLocally?: boolean;
-}) {
+};
+
+export function SharedPromptQueue(props: SharedPromptQueueProps) {
+  const account = useAtomValue(managedRelaySessionAtom);
+  const scope = JSON.stringify([
+    account?.accountId ?? null,
+    threadMoveRelayUrl(),
+    props.threadRef.environmentId,
+    props.threadRef.threadId,
+  ]);
+  return <SharedPromptQueueContent key={scope} {...props} />;
+}
+
+function SharedPromptQueueContent({
+  threadRef,
+  queue,
+  activeTurnId,
+  unavailable = false,
+  supportsPreparation = false,
+  canWorkLocally = false,
+}: SharedPromptQueueProps) {
   const cancelMove = useAtomCommand(threadEnvironment.cancelMove, { reportFailure: false });
+  const getCommandReceipt = useAtomCommand(threadEnvironment.getCommandReceipt, {
+    reportFailure: false,
+  });
   const reorderQueue = useAtomCommand(threadEnvironment.reorderQueue, { reportFailure: false });
   const editPrompt = useAtomCommand(threadEnvironment.editPrompt, { reportFailure: false });
   const removePrompt = useAtomCommand(threadEnvironment.removePrompt, { reportFailure: false });
@@ -48,11 +75,53 @@ export function SharedPromptQueue({
     reportFailure: false,
   });
   const account = useAtomValue(managedRelaySessionAtom);
+  const portableCommands = useAtomValue(portableCommandStatesAtom);
+  const [cancellation] = useState(createThreadMoveCancellation);
+  const [, setCancellationRevision] = useState(0);
+  const cancellationRelayUrl = threadMoveRelayUrl();
+  const cancellationScope = JSON.stringify([
+    account?.accountId ?? null,
+    cancellationRelayUrl,
+    threadRef.environmentId,
+    threadRef.threadId,
+  ]);
+  const mounted = useRef(true);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
   const [edit, setEdit] = useState<QueuedPromptEdit | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    const { changed, rejection } = cancellation.observe(
+      cancellationScope,
+      queue.entries,
+      portableCommands.filter(
+        (command) =>
+          command.accountId === account?.accountId &&
+          normalizeSecureRelayUrl(command.relayUrl) === cancellationRelayUrl &&
+          command.environmentId === threadRef.environmentId &&
+          command.threadId === threadRef.threadId,
+      ),
+    );
+    // oxlint-disable-next-line react/set-state-in-effect -- Queue projections and command receipts reconcile the external cancellation tracker.
+    if (changed) setCancellationRevision((value) => value + 1);
+    if (rejection) setError(rejection);
+  }, [
+    cancellation,
+    cancellationScope,
+    cancellationRelayUrl,
+    queue.entries,
+    portableCommands,
+    account?.accountId,
+    threadRef.environmentId,
+    threadRef.threadId,
+  ]);
   const editingMessageId = edit?.messageId;
   useLayoutEffect(() => {
     if (editingMessageId) editorRef.current?.focus();
@@ -90,6 +159,58 @@ export function SharedPromptQueue({
   };
   const input = { threadId: threadRef.threadId };
   const request = <T,>(value: T) => ({ environmentId: threadRef.environmentId, input: value });
+  const requestCancellation = async (entry: ThreadMoveQueueEntry) => {
+    const isCurrent = () => mounted.current;
+    const command = cancellation.prepare(cancellationScope, entry, () => ({
+      ...input,
+      messageId: entry.messageId,
+      expectedRevision: entry.revision,
+      commandId: CommandId.make(randomUUID()),
+      createdAt: new Date().toISOString(),
+    }));
+    if (!command) return;
+    setCancellationRevision((value) => value + 1);
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await cancelMove(request(command));
+      if (!isCurrent()) return;
+      if (result._tag === "Success") {
+        const outcome = cancellation.acknowledge(cancellationScope, command, result.value);
+        if (outcome?.status === "rejected")
+          setError(outcome.detail ?? "The cancellation request was rejected.");
+      } else {
+        cancellation.failed(cancellationScope, command);
+        const failure = squashAtomCommandFailure(result);
+        const receipt = await getCommandReceipt(
+          request({ threadId: command.threadId, commandId: command.commandId }),
+        );
+        if (!isCurrent()) return;
+        const outcome =
+          receipt._tag === "Success"
+            ? cancellation.acknowledge(cancellationScope, command, receipt.value)
+            : null;
+        if (receipt._tag === "Success" && outcome === null) return;
+        if (outcome?.status !== "accepted")
+          setError(
+            outcome?.status === "rejected"
+              ? (outcome.detail ?? "The cancellation request was rejected.")
+              : failure instanceof Error
+                ? failure.message
+                : "Could not confirm cancellation.",
+          );
+      }
+    } catch {
+      if (!isCurrent()) return;
+      cancellation.failed(cancellationScope, command);
+      setError("Could not confirm cancellation. Retry to send the same request.");
+    } finally {
+      if (isCurrent()) {
+        setBusy(false);
+        setCancellationRevision((value) => value + 1);
+      }
+    }
+  };
   if (queue.entries.length === 0 && queue.pauseReason === null && edit === null && !preparing)
     return null;
   return (
@@ -282,12 +403,14 @@ export function SharedPromptQueue({
                 {index + 1}. {queuedMoveLabel(entry)}
               </p>
               <p role="status" className="text-muted-foreground">
-                {entry.detail ??
-                  (entry.state === "pending"
-                    ? "Waiting in queue"
-                    : entry.state === "cancelling"
-                      ? "Cancelling move…"
-                      : "Moving thread…")}
+                {cancellation.phase(cancellationScope, entry.messageId) === "requested"
+                  ? "Cancellation requested. Waiting for the environment to stop the move."
+                  : (entry.detail ??
+                    (entry.state === "pending"
+                      ? "Waiting in queue"
+                      : entry.state === "cancelling"
+                        ? "Cancelling move…"
+                        : "Moving thread…"))}
               </p>
               <div className="mt-2 flex gap-2">
                 <Button
@@ -329,20 +452,22 @@ export function SharedPromptQueue({
                 <Button
                   size="xs"
                   variant="ghost-muted"
-                  disabled={disabled || entry.state === "cancelling"}
-                  onClick={() =>
-                    void run(() =>
-                      cancelMove(
-                        request({
-                          ...input,
-                          messageId: entry.messageId,
-                          expectedRevision: entry.revision,
-                        }),
-                      ),
+                  disabled={
+                    disabled ||
+                    entry.state === "cancelling" ||
+                    ["sending", "requested"].includes(
+                      cancellation.phase(cancellationScope, entry.messageId) ?? "",
                     )
                   }
+                  onClick={() => void requestCancellation(entry)}
                 >
-                  Cancel move
+                  {cancellation.phase(cancellationScope, entry.messageId) === "requested"
+                    ? "Cancellation requested"
+                    : entry.state === "cancelling"
+                      ? "Cancelling move…"
+                      : cancellation.phase(cancellationScope, entry.messageId) === "unknown"
+                        ? "Retry cancellation"
+                        : "Cancel move"}
                 </Button>
               </div>
             </li>

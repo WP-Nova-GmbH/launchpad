@@ -15,6 +15,7 @@ import { normalizeDispatchCommand } from "../orchestration/Normalizer.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import { makeThreadCommandSync } from "./ThreadCommandSync.ts";
 import { ThreadExecution } from "./ThreadExecution.ts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -34,6 +35,109 @@ export class ThreadRelayCoordinator extends Context.Service<
     readonly moves: Effect.Success<ReturnType<typeof makeThreadMoveWorker>>;
   }
 >()("t3/relay/ThreadRelayCoordinator") {}
+
+/** Reconcile each move independently so one broken transfer cannot strand other threads. */
+export const makeThreadMoveSweep = Effect.fn("ThreadRelayCoordinator.makeMoveSweep")(function* (
+  authority: Pick<Effect.Success<typeof makeThreadExecutionAuthority>, "discoveryOwner"> & {
+    readonly moves: Pick<Effect.Success<typeof makeThreadExecutionAuthority>["moves"], "pending">;
+  },
+  enrollment: Effect.Success<ReturnType<typeof makeThreadLocalEnrollmentWorker>>,
+  moves: Pick<Effect.Success<ReturnType<typeof makeThreadMoveWorker>>, "source" | "destination">,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  // Incoming moves may not have a local thread yet. Discover them through
+  // this environment's configured credential, then reconcile local frozen
+  // destinations too (a lost activation/abort reply drops them from pending).
+  // The parked worker repeats this pass; constructing it must not start reconciliation.
+  // @effect-diagnostics-next-line returnEffectInGen:off
+  return Effect.gen(function* () {
+    const discovery = yield* authority.discoveryOwner;
+    if (!discovery) return;
+    const incoming = new Map<string, import("./ThreadMoveTransport.ts").ThreadMoveOwner>();
+    let after: string | null = null;
+    for (let page = 0; page < 10; page++) {
+      const pending: {
+        entries: ReadonlyArray<import("@t3tools/contracts/relay").RelayThreadMove>;
+        next: string | null;
+      } = yield* authority.moves.pending(discovery, after);
+      for (const move of pending.entries)
+        if (move.destinationEnvironmentId === discovery.environmentId)
+          incoming.set(move.operationId, {
+            threadId: move.threadId,
+            operationId: move.operationId,
+            environmentId: discovery.environmentId,
+            generation: move.expectedGeneration + 1,
+            relayUrl: discovery.relayUrl,
+          });
+      if (pending.next === null) break;
+      after = pending.next;
+    }
+    const candidates = yield* sql<{
+      threadId: string;
+    }>`SELECT q.thread_id AS "threadId" FROM projection_thread_prompt_queues q
+      LEFT JOIN thread_execution_fences f USING(thread_id) WHERE (f.phase IS NULL OR f.phase!='retired')
+      AND (json_extract(q.state_json,'$.entries[0].kind')='move' OR EXISTS
+        (SELECT 1 FROM thread_local_enrollments e WHERE e.thread_id=q.thread_id AND e.phase='pending'))`;
+    yield* Effect.forEach(
+      candidates,
+      ({ threadId }) =>
+        enrollment.synchronize(threadId, discovery).pipe(
+          Effect.flatMap((ready) => (ready ? moves.source(threadId) : Effect.void)),
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterrupts(cause),
+            (cause) =>
+              Cause.hasDies(cause)
+                ? Effect.logWarning("Thread move source reconciliation failed; will retry", {
+                    threadId,
+                    cause,
+                  })
+                : Effect.logDebug("Thread move awaiting source confirmation", { threadId }),
+          ),
+        ),
+      { concurrency: 1, discard: true },
+    );
+    const local = yield* sql<{
+      threadId: string;
+    }>`SELECT thread_id AS "threadId" FROM thread_execution_fences
+      WHERE phase='frozen' AND generation>1`;
+    for (const { threadId } of local) {
+      const owner = yield* makeThreadExecutionFence(sql).get(threadId);
+      if (
+        owner &&
+        owner.environmentId === discovery.environmentId &&
+        owner.relayUrl === discovery.relayUrl
+      )
+        incoming.set(owner.operationId, owner);
+    }
+    yield* Effect.forEach(
+      incoming.values(),
+      (owner) =>
+        moves.destination(owner).pipe(
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterrupts(cause),
+            (cause) =>
+              Cause.hasDies(cause)
+                ? Effect.logWarning("Thread move destination reconciliation failed; will retry", {
+                    threadId: owner.threadId,
+                    cause,
+                  })
+                : Effect.logDebug("Thread move awaiting destination confirmation", {
+                    threadId: owner.threadId,
+                  }),
+          ),
+        ),
+      { concurrency: 1, discard: true },
+    );
+  }).pipe(
+    Effect.catchCauseIf(
+      (cause) => !Cause.hasInterrupts(cause),
+      (cause) =>
+        Cause.hasDies(cause)
+          ? Effect.logWarning("Thread move discovery failed; will retry", { cause })
+          : Effect.logDebug("Thread move discovery will retry"),
+    ),
+  );
+});
 
 export const layer = Layer.effect(
   ThreadRelayCoordinator,
@@ -145,74 +249,7 @@ export const layer = Layer.effect(
         { concurrency: 1, discard: true },
       );
     }).pipe(Effect.catch(() => Effect.logDebug("Portable checkpoint sweep will retry")));
-    // Incoming moves may not have a local thread yet. Discover them through
-    // this environment's configured credential, then reconcile local frozen
-    // destinations too (a lost activation/abort reply drops them from pending).
-    const moveSweep = Effect.gen(function* () {
-      const discovery = yield* authority.discoveryOwner;
-      if (!discovery) return;
-      const incoming = new Map<string, import("./ThreadMoveTransport.ts").ThreadMoveOwner>();
-      let after: string | null = null;
-      for (let page = 0; page < 10; page++) {
-        const pending: {
-          entries: ReadonlyArray<import("@t3tools/contracts/relay").RelayThreadMove>;
-          next: string | null;
-        } = yield* authority.moves.pending(discovery, after);
-        for (const move of pending.entries)
-          if (move.destinationEnvironmentId === discovery.environmentId)
-            incoming.set(move.operationId, {
-              threadId: move.threadId,
-              operationId: move.operationId,
-              environmentId: discovery.environmentId,
-              generation: move.expectedGeneration + 1,
-              relayUrl: discovery.relayUrl,
-            });
-        if (pending.next === null) break;
-        after = pending.next;
-      }
-      const candidates = yield* sql<{
-        threadId: string;
-      }>`SELECT q.thread_id AS "threadId" FROM projection_thread_prompt_queues q
-        LEFT JOIN thread_execution_fences f USING(thread_id) WHERE (f.phase IS NULL OR f.phase!='retired')
-        AND (json_extract(q.state_json,'$.entries[0].kind')='move' OR EXISTS
-          (SELECT 1 FROM thread_local_enrollments e WHERE e.thread_id=q.thread_id AND e.phase='pending'))`;
-      yield* Effect.forEach(
-        candidates,
-        ({ threadId }) =>
-          enrollment.synchronize(threadId, discovery).pipe(
-            Effect.flatMap((ready) => (ready ? moves.source(threadId) : Effect.void)),
-            Effect.catch(() =>
-              Effect.logDebug("Thread move awaiting source confirmation", { threadId }),
-            ),
-          ),
-        { concurrency: 1, discard: true },
-      );
-      const local = yield* sql<{
-        threadId: string;
-      }>`SELECT thread_id AS "threadId" FROM thread_execution_fences
-        WHERE phase='frozen' AND generation>1`;
-      for (const { threadId } of local) {
-        const owner = yield* makeThreadExecutionFence(sql).get(threadId);
-        if (
-          owner &&
-          owner.environmentId === discovery.environmentId &&
-          owner.relayUrl === discovery.relayUrl
-        )
-          incoming.set(owner.operationId, owner);
-      }
-      yield* Effect.forEach(
-        incoming.values(),
-        (owner) =>
-          moves.destination(owner).pipe(
-            Effect.catch(() =>
-              Effect.logDebug("Thread move awaiting destination confirmation", {
-                threadId: owner.threadId,
-              }),
-            ),
-          ),
-        { concurrency: 1, discard: true },
-      );
-    }).pipe(Effect.catch(() => Effect.logDebug("Thread move discovery will retry")));
+    const moveSweep = yield* makeThreadMoveSweep(authority, enrollment, moves);
     const finalSaveSweep = Effect.gen(function* () {
       const vm = yield* readInstalledThreadVm();
       if (!vm) return;

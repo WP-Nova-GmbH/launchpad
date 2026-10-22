@@ -15,6 +15,7 @@ import { threadCommandAcceptance, type CommandSubmission } from "../operations/c
 import type { EnvironmentProject } from "../state/models.ts";
 import { projectKey } from "../state/entities.ts";
 import type { ConnectionTarget } from "../connection/model.ts";
+export { createThreadMoveCancellation } from "./threadMoveCancellation.ts";
 
 const ExecutionProof = Schema.Struct({
   commandId: CommandId,
