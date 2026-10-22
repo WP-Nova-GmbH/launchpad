@@ -71,6 +71,11 @@ RUN chmod 0755 /usr/local/bin/launchpad-workload /usr/local/bin/launchpad-activi
  && mkdir -p /etc/systemd/system/multi-user.target.wants \
  && ln -s /etc/systemd/system/launchpad-workloads.service /etc/systemd/system/multi-user.target.wants/launchpad-workloads.service
 
+# Project dependency installs may compile native modules through node-gyp.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV HOME=/home/user \
     T3CODE_HOME=/home/user/.launchpad \
     CODEX_HOME=/home/user/.codex \
@@ -79,5 +84,8 @@ ENV HOME=/home/user \
     T3CODE_EXECUTOR_SELF_UPDATE=0
 USER user
 WORKDIR /workspace
-RUN launchpad-server --version && test -r /opt/launchpad/server/client/index.html
+RUN launchpad-server --version \
+ && test -r /opt/launchpad/server/client/index.html \
+ && make --version \
+ && c++ --version
 # No server autostart: enrollment/import and the ownership fence precede activation.

@@ -21,6 +21,7 @@ import { readManagedRelaySnapshotState, managedRelaySessionAtom } from "./manage
 import {
   portableThreadClientRouteAtom,
   resolvePortableThreadClientRoute,
+  verifyPortableThreadClientRoute,
 } from "./portableThreadLibrary.ts";
 
 export interface PortableCommandState {
@@ -68,6 +69,44 @@ export const portableThreadCommandLayer = (registry: AtomRegistry.AtomRegistry) 
             routes.set(key, route);
         }
       };
+      const clientRoute = Effect.fnUntraced(function* (
+        threadId: ThreadId,
+        environmentId: EnvironmentId,
+      ) {
+        const current = () =>
+          resolvePortableThreadClientRoute(
+            routes.get(routeKey(threadId, environmentId)) ?? null,
+            registry.get(portableThreadClientRouteAtom(environmentId, threadId)),
+          );
+        const route = current();
+        const session = registry.get(managedRelaySessionAtom);
+        if (
+          route &&
+          session &&
+          normalizeSecureRelayUrl(relay.relayUrl) &&
+          normalizeSecureRelayUrl(route.relayUrl) !== normalizeSecureRelayUrl(relay.relayUrl)
+        ) {
+          // An environment can reach the same relay through a different transport.
+          // Verify its exact placement through the configured client relay first.
+          yield* verifyPortableThreadClientRoute(registry, {
+            environmentId,
+            threadId,
+            generation: route.generation,
+            session,
+          }).pipe(
+            Effect.provideService(ManagedRelayTenancyClient, relay),
+            Effect.mapError((cause) =>
+              cause._tag === "OrchestrationDispatchCommandError"
+                ? cause
+                : new OrchestrationDispatchCommandError({
+                    message: "Could not verify this thread's relay connection.",
+                    cause,
+                  }),
+            ),
+          );
+        }
+        return current();
+      });
       const dispatch = Effect.fn("PortableThreadCommands.dispatch")(function* (
         command: ClientOrchestrationCommand,
         environmentId: EnvironmentId,
@@ -76,10 +115,7 @@ export const portableThreadCommandLayer = (registry: AtomRegistry.AtomRegistry) 
           return yield* new OrchestrationDispatchCommandError({
             message: "This is not a thread command.",
           });
-        const route = resolvePortableThreadClientRoute(
-          routes.get(routeKey(command.threadId, environmentId)) ?? null,
-          registry.get(portableThreadClientRouteAtom(environmentId, command.threadId)),
-        );
+        const route = yield* clientRoute(command.threadId, environmentId);
         if (
           !route ||
           !normalizeSecureRelayUrl(relay.relayUrl) ||
@@ -112,7 +148,7 @@ export const portableThreadCommandLayer = (registry: AtomRegistry.AtomRegistry) 
               }),
           ),
         );
-        if (!clerkToken || registry.get(managedRelaySessionAtom)?.accountId !== session.accountId)
+        if (!clerkToken || registry.get(managedRelaySessionAtom) !== session)
           return yield* new OrchestrationDispatchCommandError({
             message: "Sign in again before changing this thread.",
           });
@@ -169,10 +205,7 @@ export const portableThreadCommandLayer = (registry: AtomRegistry.AtomRegistry) 
         dispatch,
         receipt: Effect.fn("PortableThreadCommands.receipt")(
           function* (threadId, commandId, environmentId) {
-            const route = resolvePortableThreadClientRoute(
-              routes.get(routeKey(threadId, environmentId)) ?? null,
-              registry.get(portableThreadClientRouteAtom(environmentId, threadId)),
-            );
+            const route = yield* clientRoute(threadId, environmentId);
             if (
               !route ||
               !normalizeSecureRelayUrl(relay.relayUrl) ||

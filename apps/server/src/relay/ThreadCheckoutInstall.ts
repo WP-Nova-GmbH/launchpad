@@ -1,9 +1,6 @@
-// @effect-diagnostics-next-line nodeBuiltinImport:off
-import * as NodeFSP from "node:fs/promises";
 import * as NodeUtil from "node:util";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
-import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -25,6 +22,7 @@ import {
   retainThreadTransferSetupDirectories,
 } from "./ThreadTransferSetupOutput.ts";
 import { workspaceGit as git, workspaceGitText as gitText } from "./ThreadWorkspaceGit.ts";
+import { physicalFs, workspaceFileSystem } from "./ThreadWorkspaceFileSystem.ts";
 
 const decodeManifest = Schema.decodeUnknownEffect(Schema.fromJsonString(ThreadWorkspaceManifest));
 
@@ -32,7 +30,7 @@ const flushWorkspace = Effect.fnUntraced(function* (
   root: string,
   manifest: ThreadWorkspaceManifest,
 ) {
-  const fs = yield* FileSystem.FileSystem;
+  const fs = yield* workspaceFileSystem;
   const path = yield* Path.Path;
   const gitDir = yield* fs.realPath(yield* gitText(root, ["rev-parse", "--absolute-git-dir"]));
   // Close each handle immediately; large repositories must not exhaust FDs.
@@ -59,7 +57,7 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
       readonly freshCheckoutRoot?: string;
     },
   ) {
-    const fs = yield* FileSystem.FileSystem;
+    const fs = yield* workspaceFileSystem;
     const path = yield* Path.Path;
     const claim = yield* input.freshCheckoutRoot
       ? claims.reserveFresh(input, input.freshCheckoutRoot)
@@ -176,7 +174,7 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
           ))
             if (file.kind === "directory") {
               yield* Effect.tryPromise({
-                try: () => NodeFSP.rmdir(path.join(claim.checkoutPath, file.path)),
+                try: () => physicalFs.promises.rmdir(path.join(claim.checkoutPath, file.path)),
                 catch: () =>
                   workspaceFailure(
                     "The old checkout directory changed; installation remains held.",
@@ -243,7 +241,7 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
   const reconcile = Effect.fn("ThreadCheckoutInstaller.reconcile")(function* (
     input: ThreadCheckoutRequest,
   ) {
-    const fs = yield* FileSystem.FileSystem;
+    const fs = yield* workspaceFileSystem;
     const claim = yield* claims.reserve(input);
     yield* claims.verifyLocation(input.operationId);
     if (claim.phase === "installed") return claim;
@@ -291,7 +289,7 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
   const rollback = Effect.fn("ThreadCheckoutInstaller.rollback")(function* (
     input: ThreadCheckoutRequest & { readonly recoveryRoot: string },
   ) {
-    const fs = yield* FileSystem.FileSystem;
+    const fs = yield* workspaceFileSystem;
     const path = yield* Path.Path;
     const prior = yield* claims.get(input.operationId);
     if (
@@ -428,7 +426,7 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
                 const filename = path.join(claim.checkoutPath, file.path);
                 if (file.kind === "directory")
                   yield* Effect.tryPromise({
-                    try: () => NodeFSP.rmdir(filename),
+                    try: () => physicalFs.promises.rmdir(filename),
                     catch: () =>
                       workspaceFailure(
                         "Directory changed during rollback; keep the recovery hold.",

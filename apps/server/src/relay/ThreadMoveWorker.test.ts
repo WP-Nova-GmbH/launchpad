@@ -166,6 +166,7 @@ for (const lost of [
   "cancel-edit",
   "cancel-uncertain",
   "cancel-report",
+  "destination-auth",
   "source-export",
   "enroll-prepare",
   "enroll-receipts",
@@ -672,10 +673,31 @@ for (const lost of [
                 append: () => Effect.void,
                 confirmThrough: () => Effect.void,
               });
+              let destinationAuthenticated = false;
+              const destinationInstance: ProviderInstance = {
+                ...instance,
+                snapshot: {
+                  ...instance.snapshot,
+                  refresh: Effect.sync(() => ({
+                    ...status,
+                    auth: {
+                      status: destinationAuthenticated ? "authenticated" : "unauthenticated",
+                    },
+                  })),
+                },
+              };
               let destination = yield* makeThreadMoveWorker(
                 transport,
                 destinationHistory,
                 commands,
+              ).pipe(
+                Effect.provide(
+                  lost === "destination-auth"
+                    ? Layer.mock(ProviderInstanceRegistry)({
+                        getInstance: () => Effect.succeed(destinationInstance),
+                      })
+                    : Layer.empty,
+                ),
               );
               const owner = {
                 threadId,
@@ -695,8 +717,17 @@ for (const lost of [
                   expect(yield* sourceQueue).toEqual(beforeFailure);
                   expect((yield* fences.get(threadId))?.phase).toBe("frozen");
                   expect(commits).toBe(0);
-                  const retryError = yield* Effect.flip(destination.destination(owner));
-                  expect(retryError.message).toContain("has not been confirmed complete");
+                  const waiting = yield* makeThreadMoveWorker(
+                    transport,
+                    destinationHistory,
+                    commands,
+                  ).pipe(
+                    Effect.provideService(FileSystem.FileSystem, {
+                      ...fs,
+                      exists: () => Effect.die("A failed move must not read its archive again"),
+                    }),
+                  );
+                  yield* waiting.destination(owner);
                   expect(remote?.failureDetail).toBe(error.message);
                   yield* source.source(threadId);
                   expect(yield* sourceQueue).toEqual(beforeFailure);
@@ -749,6 +780,18 @@ for (const lost of [
                   }),
                 );
                 destination = yield* makeThreadMoveWorker(transport, destinationHistory, commands);
+              }
+              if (lost === "destination-auth") {
+                const error = yield* Effect.flip(destination.destination(owner));
+                expect(error.message).toContain("configured sign-in");
+                expect(remote?.failureDetail).toBe(error.message);
+                expect(
+                  yield* destinationSql`SELECT phase FROM thread_transfer_readiness
+                    WHERE operation_id=${owner.operationId}`,
+                ).toEqual([]);
+                expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
+                expect(commits).toBe(0);
+                destinationAuthenticated = true;
               }
               yield* destination.destination(owner);
               expect(remote?.phase).toBe("completed");

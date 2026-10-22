@@ -11,7 +11,12 @@ import { ThreadId } from "@t3tools/contracts";
 import { checkpointRefForThreadTurn } from "../checkpointing/Utils.ts";
 import { ProcessRunner, layer as ProcessRunnerLayer } from "../processRunner.ts";
 import { exportThreadWorkspace, importThreadWorkspace } from "./ThreadWorkspaceTransfer.ts";
-import { scanWorkspaceFiles, workspaceFileHash } from "./ThreadWorkspaceFiles.ts";
+import {
+  scanWorkspaceFiles,
+  validateWorkspaceFiles,
+  workspaceFileHash,
+  type WorkspaceFile,
+} from "./ThreadWorkspaceFiles.ts";
 
 const fixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -100,6 +105,135 @@ const fixture = Effect.gen(function* () {
 });
 const testLayer = ProcessRunnerLayer.pipe(Layer.provideMerge(NodeServices.layer));
 it.layer(testLayer)("portable workspace", (it) => {
+  it.effect("accepts bounded internal symlink chains with dangling targets", () =>
+    Effect.gen(function* () {
+      const files: WorkspaceFile[] = Array.from({ length: 40 }, (_, index) => ({
+        kind: "symlink",
+        path: `link-${index}`,
+        target: index === 39 ? "missing/file" : `link-${index + 1}`,
+      }));
+      yield* validateWorkspaceFiles(files);
+    }),
+  );
+  const rejectedLinks: ReadonlyArray<{
+    name: string;
+    files: ReadonlyArray<WorkspaceFile>;
+    message: string;
+  }> = [
+    {
+      name: "self cycle",
+      files: [{ kind: "symlink", path: "loop", target: "loop" }],
+      message: "cycle",
+    },
+    {
+      name: "two-link cycle",
+      files: [
+        { kind: "symlink", path: "first", target: "second" },
+        { kind: "symlink", path: "second", target: "first" },
+      ],
+      message: "cycle",
+    },
+    {
+      name: "excessive link depth",
+      files: Array.from({ length: 41 }, (_, index) => ({
+        kind: "symlink",
+        path: `link-${index}`,
+        target: index === 40 ? "missing/file" : `link-${index + 1}`,
+      })),
+      message: "depth",
+    },
+    ...["parent", "PARENT"].map((target) => ({
+      name: `escape after expanding ${target} before dot-dot`,
+      files: [
+        { kind: "directory" as const, path: "nested" },
+        { kind: "symlink" as const, path: "nested/parent", target: ".." },
+        { kind: "symlink" as const, path: "escape", target: `nested/${target}/../outside` },
+      ],
+      message: "outside",
+    })),
+    {
+      name: "escape through a Unicode alias before dot-dot",
+      files: [
+        { kind: "symlink", path: "é", target: "." },
+        { kind: "symlink", path: "escape", target: "e\u0301/../outside" },
+      ],
+      message: "outside",
+    },
+    ...["/etc/passwd", ".git/config", ".t3/state.sqlite"].map((target) => ({
+      name: `chain reaching ${target}`,
+      files: [
+        { kind: "symlink" as const, path: "first", target: "second" },
+        { kind: "symlink" as const, path: "second", target },
+      ],
+      message: "outside",
+    })),
+    {
+      name: "materialization through a symlink parent",
+      files: [
+        { kind: "directory", path: "real" },
+        { kind: "symlink", path: "alias", target: "real" },
+        { kind: "directory", path: "alias/child" },
+      ],
+      message: "parent",
+    },
+  ];
+  for (const { name, files, message } of rejectedLinks)
+    it.effect(`blocks ${name} in the workspace manifest`, () =>
+      Effect.gen(function* () {
+        expect((yield* Effect.flip(validateWorkspaceFiles(files))).message).toContain(message);
+      }),
+    );
+  it.effect("preserves internal framework symlink chains through a complete workspace move", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const framework = "Framework.framework";
+      yield* f.fs.makeDirectory(f.path.join(f.source, framework, "Versions/A/Resources"), {
+        recursive: true,
+      });
+      yield* f.fs.writeFileString(
+        f.path.join(f.source, framework, "Versions/A/Binary"),
+        "framework executable\n",
+      );
+      yield* f.fs.writeFileString(
+        f.path.join(f.source, framework, "Versions/A/Resources/Info.plist"),
+        "framework metadata\n",
+      );
+      for (const [name, target] of [
+        ["Versions/Current", "A"],
+        ["Binary", "Versions/Current/Binary"],
+        ["Resources", "Versions/Current/Resources"],
+      ])
+        yield* f.fs.symlink(target!, f.path.join(f.source, framework, name!));
+      yield* f.fs.symlink(
+        `${framework}/Resources/../Binary`,
+        f.path.join(f.source, "framework-alias"),
+      );
+      yield* f.fs.symlink(
+        `${framework}/Resources/missing-file`,
+        f.path.join(f.source, "dangling-alias"),
+      );
+      const artifact = yield* exportThreadWorkspace(f.input);
+      yield* f.fs.remove(f.source, { recursive: true });
+      const imported = yield* importThreadWorkspace(f.request(artifact));
+      expect(
+        yield* f.fs.readFileString(f.path.join(imported.workspaceRoot, framework, "Binary")),
+      ).toBe("framework executable\n");
+      expect(
+        yield* f.fs.readFileString(f.path.join(imported.workspaceRoot, "framework-alias")),
+      ).toBe("framework executable\n");
+      expect(
+        yield* f.fs.readFileString(
+          f.path.join(imported.workspaceRoot, framework, "Resources/Info.plist"),
+        ),
+      ).toBe("framework metadata\n");
+      expect(
+        yield* f.fs.readLink(f.path.join(imported.workspaceRoot, framework, "Versions/Current")),
+      ).toBe("A");
+      expect(yield* f.fs.readLink(f.path.join(imported.workspaceRoot, "dangling-alias"))).toBe(
+        `${framework}/Resources/missing-file`,
+      );
+    }),
+  );
   it.effect(
     "keeps committed, staged, unstaged, ignored and executable files after deleting the source",
     () =>

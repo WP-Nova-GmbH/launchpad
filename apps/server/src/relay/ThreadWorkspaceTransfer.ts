@@ -1,10 +1,10 @@
 import * as NodeUtil from "node:util";
 import * as Encoding from "effect/Encoding";
 import * as Effect from "effect/Effect";
-import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { workspaceGit as git, workspaceGitText as gitText } from "./ThreadWorkspaceGit.ts";
+import { workspaceFileSystem } from "./ThreadWorkspaceFileSystem.ts";
 import {
   copyWorkspaceFiles,
   materializeWorkspaceFiles,
@@ -25,7 +25,7 @@ const headRef = "refs/t3/transfer/head";
 const indexRef = "refs/t3/transfer/index";
 
 const readSourceState = Effect.fnUntraced(function* (cwd: string, threadId: string) {
-  const fs = yield* FileSystem.FileSystem;
+  const fs = yield* workspaceFileSystem;
   const path = yield* Path.Path;
   const top = yield* gitText(cwd, ["rev-parse", "--show-toplevel"]);
   if ((yield* fs.realPath(top)) !== cwd)
@@ -109,7 +109,7 @@ export const exportThreadWorkspace = Effect.fn("exportThreadWorkspace")(function
   readonly workspaceRoot: string;
   readonly artifactRoot: string;
 }) {
-  const fs = yield* FileSystem.FileSystem;
+  const fs = yield* workspaceFileSystem;
   const path = yield* Path.Path;
   const root = yield* fs.realPath(input.workspaceRoot);
   const requestedArtifactRoot = path.resolve(input.artifactRoot);
@@ -214,7 +214,7 @@ export const importThreadWorkspace = Effect.fn("importThreadWorkspace")(function
   readonly artifactDirectory: string;
   readonly destinationRoot: string;
 }) {
-  const fs = yield* FileSystem.FileSystem;
+  const fs = yield* workspaceFileSystem;
   const path = yield* Path.Path;
   const manifest = yield* decodeManifest(input.manifest);
   if (manifest.threadId !== input.threadId)

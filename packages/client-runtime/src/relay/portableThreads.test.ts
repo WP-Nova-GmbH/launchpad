@@ -23,6 +23,7 @@ import {
   enqueueThreadMove,
   threadCommandAcceptance,
   pauseThreadQueue,
+  cancelThreadMove,
   startThreadTurn,
 } from "../operations/commands.ts";
 import { ThreadCommandRouting } from "../operations/commandRouting.ts";
@@ -272,8 +273,12 @@ describe("portable command routing", () => {
   it.effect("never forwards a token to a relay named by the environment", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const h = yield* harness(async () => {
-          throw new Error("No HTTP allowed");
+        const calls: string[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          expect(new URL(request.url).origin).toBe(relayUrl);
+          calls.push(request.method + " " + new URL(request.url).pathname);
+          return Response.json(placementSummary("unrelated-environment").placement);
         });
         let tokenReads = 0;
         h.registry.set(managedRelaySessionAtom, {
@@ -302,13 +307,124 @@ describe("portable command routing", () => {
           );
           expect(
             (yield* Effect.flip(pauseThreadQueue({ threadId, commandId, createdAt }))).message,
-          ).toContain("this thread's relay");
-          expect(tokenReads).toBe(0);
+          ).toContain("location changed");
+          expect(tokenReads).toBe(1);
+          expect(calls).toEqual(["GET /v1/threads/portable/placement"]);
           expect(h.direct).toEqual([]);
         }).pipe(Effect.provide(h.layer));
       }),
     ),
   );
+
+  for (const first of ["cancel", "receipt"] as const) {
+    it.effect(`verifies a frozen source's relay alias before its first ${first}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            expect(new URL(request.url).origin).toBe(relayUrl);
+            expect(request.headers.get("authorization")).toBe("Bearer token");
+            const path = new URL(request.url).pathname;
+            calls.push(request.method + " " + path);
+            if (path.endsWith("/placement")) return Response.json(placementSummary().placement);
+            if (request.method === "POST") {
+              const payload = await request.json();
+              expect(payload.command.type).toBe("thread.move.cancel");
+              expect(payload.command.expectedRevision).toBe(2);
+            }
+            return Response.json(pending);
+          });
+          const frozen: OrchestrationShellSnapshot = {
+            ...snapshot,
+            threads: snapshot.threads.map((thread) => ({
+              ...thread,
+              relayRouting: {
+                relayUrl: "http://127.0.0.1:8610",
+                generation: 1,
+                phase: "frozen",
+              },
+            })),
+          };
+          yield* Effect.gen(function* () {
+            const routing = yield* ThreadCommandRouting;
+            routing!.remember(frozen, environmentId);
+            const cancel = cancelThreadMove({
+              threadId,
+              commandId,
+              createdAt,
+              messageId: MessageId.make("moving-entry"),
+              expectedRevision: 2,
+            });
+            const receipt = routing!.receipt(threadId, commandId, environmentId);
+            if (first === "cancel") {
+              expect(yield* cancel).toEqual({ relay: pending });
+              expect(yield* receipt).toEqual(pending);
+            } else {
+              expect(yield* receipt).toEqual(pending);
+              expect(yield* cancel).toEqual({ relay: pending });
+            }
+          }).pipe(Effect.provide(h.layer));
+          const controls = createThreadVmControlAtoms(Atom.runtime(h.relay), () =>
+            Atom.make(frozen),
+          );
+          expect(h.registry.get(controls.routeAtom(environmentId, threadId))).toEqual({
+            relayUrl,
+            generation: 1,
+            phase: "frozen",
+          });
+          expect(calls[0]).toBe("GET /v1/threads/portable/placement");
+          expect(calls.filter((call) => call.endsWith("/placement"))).toHaveLength(1);
+          expect(calls).toContain("POST /v1/threads/portable/commands");
+          expect(h.direct).toEqual([]);
+        }),
+      ),
+    );
+  }
+
+  for (const mismatch of ["account", "session", "generation", "environment"] as const) {
+    it.effect(`refuses alias cancellation when the verified ${mismatch} changes`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          let registry: AtomRegistry.AtomRegistry;
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            expect(new URL(request.url).origin).toBe(relayUrl);
+            calls.push(request.method + " " + new URL(request.url).pathname);
+            if (mismatch === "account" || mismatch === "session")
+              registry.set(managedRelaySessionAtom, {
+                accountId: mismatch === "session" ? "account" : "another-account",
+                readClerkToken: () => Effect.succeed("another-token"),
+              });
+            return Response.json(
+              placementSummary(
+                mismatch === "environment" ? "another-environment" : environmentId,
+                mismatch === "generation" ? 2 : 1,
+              ).placement,
+            );
+          });
+          registry = h.registry;
+          yield* Effect.gen(function* () {
+            const routing = yield* ThreadCommandRouting;
+            routing!.remember(guestSnapshot, environmentId);
+            const result = yield* Effect.result(
+              cancelThreadMove({
+                threadId,
+                commandId,
+                createdAt,
+                messageId: MessageId.make("moving-entry"),
+                expectedRevision: 2,
+              }),
+            );
+            expect(result._tag).toBe("Failure");
+          }).pipe(Effect.provide(h.layer));
+          expect(calls).toEqual(["GET /v1/threads/portable/placement"]);
+          expect(h.direct).toEqual([]);
+        }),
+      ),
+    );
+  }
 
   it.effect(
     "uses an authenticated placement's client transport for controls, commands and reads",
@@ -381,8 +497,14 @@ describe("portable command routing", () => {
           for (const mismatch of ["session", "generation", "environment", "relay"] as const) {
             let tokenReads = 0,
               proofRead = false;
-            const h = yield* harness(async () => {
-              if (proofRead) throw new Error("An unverified route must not send HTTP");
+            const verificationCalls: string[] = [];
+            const h = yield* harness(async (url, init) => {
+              if (proofRead) {
+                const request = new Request(url, init);
+                expect(new URL(request.url).origin).toBe(relayUrl);
+                verificationCalls.push(request.method + " " + new URL(request.url).pathname);
+                return Response.json({}, { status: 404 });
+              }
               return Response.json({
                 entries: [
                   placementSummary(
@@ -449,7 +571,11 @@ describe("portable command routing", () => {
                 }),
               ))._tag,
             ).toBe("Failure");
-            expect(tokenReads).toBe(0);
+            expect(tokenReads).toBe(2);
+            expect(verificationCalls).toEqual([
+              "GET /v1/threads/portable/placement",
+              "GET /v1/threads/portable/placement",
+            ]);
             expect(h.direct).toEqual([]);
           }
         }),

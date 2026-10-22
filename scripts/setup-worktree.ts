@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - runs before `vp i`, so only Node built-ins exist.
+// @effect-diagnostics nodeBuiltinImport:off - runs before dependency installation, so only Node built-ins exist.
 /**
  * Worktree setup, run by the t3.json "Setup Worktree" action as
  * `node scripts/setup-worktree.ts`. Plain Node keeps one command working in
@@ -8,6 +8,7 @@
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 const ENV_FILES = [".env", NodePath.join("infra", "relay", ".env")];
@@ -18,11 +19,28 @@ if (!projectRoot) {
 }
 const worktree = NodePath.dirname(import.meta.dirname);
 
-// `shell` resolves `vp` through PATH, including Windows command shims.
-const install = NodeChildProcess.spawnSync("vp i", {
+// Preserve Vite+ hosts; clean runners can bootstrap the local CLI with pnpm.
+// `shell` resolves commands through PATH, including Windows command shims.
+const hasVitePlus =
+  NodeChildProcess.spawnSync("vp --version", { cwd: worktree, shell: true, stdio: "ignore" })
+    .status === 0;
+const constrainedMemory = NodeOS.totalmem() <= 6 * 1024 ** 3;
+const installCommand = hasVitePlus ? "vp i" : "pnpm install";
+// Small runners cannot afford re-resolving the graph or many parallel tarball workers.
+const installOptions = constrainedMemory
+  ? ` --frozen-lockfile${hasVitePlus ? " --" : ""} --network-concurrency=4 --child-concurrency=1`
+  : "";
+const install = NodeChildProcess.spawnSync(`${installCommand}${installOptions}`, {
   cwd: worktree,
   shell: true,
   stdio: "inherit",
+  env: constrainedMemory
+    ? {
+        ...process.env,
+        NODE_OPTIONS: process.env.NODE_OPTIONS ?? "--max-old-space-size=1536",
+        PNPM_MAX_WORKERS: process.env.PNPM_MAX_WORKERS ?? "1",
+      }
+    : process.env,
 });
 if (install.status !== 0) process.exit(install.status ?? 1);
 

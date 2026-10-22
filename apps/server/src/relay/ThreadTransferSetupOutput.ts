@@ -1,8 +1,8 @@
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
-import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { workspaceFileSystem } from "./ThreadWorkspaceFileSystem.ts";
 import {
   WorkspaceFile,
   safeWorkspacePath,
@@ -44,7 +44,7 @@ export const retainThreadTransferSetupDirectories = Effect.fnUntraced(function* 
   operationId: string;
   excludedPaths: ReadonlyArray<string>;
 }) {
-  const fs = yield* FileSystem.FileSystem,
+  const fs = yield* workspaceFileSystem,
     path = yield* Path.Path;
   const token = NodeCrypto.createHash("sha256").update(input.operationId).digest("hex");
   const directory = path.join(

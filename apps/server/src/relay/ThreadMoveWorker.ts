@@ -616,6 +616,11 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     if (move.phase === "preparing") return;
     if (move.phase === "aborting" || move.phase === "aborted")
       return yield* rollbackDestination(owner, move);
+    if (move.failureDetail) {
+      const started = yield* sql`SELECT 1 FROM thread_transfer_readiness
+        WHERE operation_id=${owner.operationId} AND phase='started' LIMIT 1`;
+      if (started.length) return;
+    }
     if (!move.manifestArtifactId || !move.manifestSha256 || move.sourceCursor === null) return;
     const saved = yield* destinationArchive(owner, move.manifestArtifactId, move.manifestSha256);
     if (

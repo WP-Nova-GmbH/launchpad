@@ -52,7 +52,9 @@ export function threadVmCredentialAllows(
     if (parts.length === 8) return true;
     return (
       parts.length === 9 &&
-      ["begin", "freeze", "publish", "ready", "commit", "activate", "abort"].includes(parts[8]!)
+      ["begin", "freeze", "failed", "publish", "ready", "commit", "activate", "abort"].includes(
+        parts[8]!,
+      )
     );
   }
   if (method === "PUT")

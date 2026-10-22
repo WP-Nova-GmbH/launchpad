@@ -1,9 +1,6 @@
 import * as NodeCrypto from "node:crypto";
-// FileSystem.stat follows links; traversal must inspect the link itself.
 // @effect-diagnostics-next-line nodeBuiltinImport:off
-import * as NodeFSP from "node:fs/promises";
-// @effect-diagnostics-next-line nodeBuiltinImport:off
-import * as NodeFS from "node:fs";
+import type * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as NodeSqlite from "node:sqlite";
 import * as Effect from "effect/Effect";
@@ -12,6 +9,7 @@ import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 import type { ProcessRunner } from "../processRunner.ts";
 import { workspaceGit } from "./ThreadWorkspaceGit.ts";
+import { physicalFs, workspaceFileSystem } from "./ThreadWorkspaceFileSystem.ts";
 import {
   workspaceFailure,
   type ThreadWorkspaceTransferError,
@@ -43,7 +41,7 @@ export function safeWorkspacePath(value: string) {
 }
 
 export const workspaceFileHash = Effect.fnUntraced(function* (file: string) {
-  const fs = yield* FileSystem.FileSystem;
+  const fs = yield* workspaceFileSystem;
   const hash = NodeCrypto.createHash("sha256");
   let size = 0;
   yield* fs.stream(file).pipe(
@@ -60,7 +58,7 @@ export const workspaceFileHash = Effect.fnUntraced(function* (file: string) {
 // lstat is essential here: directory symlinks are data, never traversal instructions.
 const lstat = (file: string) =>
   Effect.tryPromise({
-    try: () => NodeFSP.lstat(file, { bigint: true }),
+    try: () => physicalFs.promises.lstat(file, { bigint: true }),
     catch: () => workspaceFailure("Workspace changed or became unreadable during transfer."),
   });
 const signature = (stat: NodeFS.BigIntStats) =>
@@ -70,39 +68,62 @@ export const validateWorkspaceFiles = Effect.fnUntraced(function* (
   files: ReadonlyArray<WorkspaceFile>,
 ) {
   const paths = new Map<string, WorkspaceFile>();
-  const folded = new Set<string>();
+  const folded = new Map<string, WorkspaceFile>();
   for (const file of files) {
     if (!safeWorkspacePath(file.path) || paths.has(file.path) || folded.has(foldPath(file.path)))
       return yield* workspaceFailure(
         "Workspace paths are unsafe, duplicated, or collide on the destination filesystem.",
       );
     paths.set(file.path, file);
-    folded.add(foldPath(file.path));
+    folded.set(foldPath(file.path), file);
   }
-  const path = yield* Path.Path.pipe(Effect.provide(Path.layer));
+  const targetParts = (target: string) =>
+    !target || target.startsWith("/") || target.includes("\\") || target.includes("\0")
+      ? null
+      : target.split("/").toReversed();
   for (const file of files) {
-    const parent = path.dirname(file.path);
-    if (parent !== "." && paths.get(parent)?.kind !== "directory")
+    const parent = file.path.split("/").slice(0, -1);
+    if (parent.length && paths.get(parent.join("/"))?.kind !== "directory")
       return yield* workspaceFailure("Workspace entries have a missing or non-directory parent.");
     if (file.kind === "symlink") {
-      const target = path.normalize(path.join(parent, file.target));
-      if (
-        !file.target ||
-        file.target.startsWith("/") ||
-        file.target.includes("\\") ||
-        file.target.includes("\0") ||
-        (target !== "." && !safeWorkspacePath(target))
-      )
+      const remaining = targetParts(file.target);
+      if (remaining === null)
         return yield* workspaceFailure(
           "A workspace symlink points outside the transferable repository.",
         );
-      // A chain through another symlink can escape despite a lexically safe first hop.
-      const parts = target.split("/");
-      for (let i = 1; i <= parts.length; i++) {
-        if (paths.get(parts.slice(0, i).join("/"))?.kind === "symlink")
+      const resolved = [...parent];
+      let followed = 1;
+      // Expand links before processing later '..' components, as the filesystem does.
+      while (remaining.length) {
+        const part = remaining.pop()!;
+        if (!part || part === ".") continue;
+        if (part === "..") {
+          if (!resolved.length)
+            return yield* workspaceFailure(
+              "A workspace symlink points outside the transferable repository.",
+            );
+          resolved.pop();
+          continue;
+        }
+        if (!safeWorkspacePath(part))
           return yield* workspaceFailure(
-            "Chained workspace symlinks are not supported for transfer.",
+            "A workspace symlink points outside the transferable repository.",
           );
+        resolved.push(part);
+        // Treat case/Unicode aliases conservatively for the supported Mac filesystem.
+        const next = folded.get(foldPath(resolved.join("/")));
+        if (next?.kind !== "symlink") continue;
+        if (++followed > 40)
+          return yield* workspaceFailure(
+            "A workspace symlink contains a cycle or exceeds the supported link depth.",
+          );
+        const target = targetParts(next.target);
+        if (target === null)
+          return yield* workspaceFailure(
+            "A workspace symlink points outside the transferable repository.",
+          );
+        resolved.pop();
+        for (const component of target) remaining.push(component);
       }
     }
   }
@@ -110,7 +131,7 @@ export const validateWorkspaceFiles = Effect.fnUntraced(function* (
 
 /** Writers must already be stopped. Repeated signatures/hashes detect changes; they cannot freeze external writers. */
 export const scanWorkspaceFiles = Effect.fn("scanWorkspaceFiles")(function* (root: string) {
-  const fs = yield* FileSystem.FileSystem;
+  const fs = yield* workspaceFileSystem;
   const path = yield* Path.Path;
   const files: WorkspaceFile[] = [];
   const sqlite = new Set<string>();
@@ -202,7 +223,7 @@ export const copyWorkspaceFiles = Effect.fn("copyWorkspaceFiles")(function* (
   artifact: string,
   scan: Effect.Success<ReturnType<typeof scanWorkspaceFiles>>,
 ) {
-  const fs = yield* FileSystem.FileSystem;
+  const fs = yield* workspaceFileSystem;
   const path = yield* Path.Path;
   yield* fs.makeDirectory(path.join(artifact, "objects"), { mode: 0o700 });
   const output: WorkspaceFile[] = [];
@@ -278,7 +299,7 @@ export const materializeWorkspaceFiles = Effect.fn("materializeWorkspaceFiles")(
   artifact: string,
   destination: string,
 ) {
-  const fs = yield* FileSystem.FileSystem;
+  const fs = yield* workspaceFileSystem;
   const path = yield* Path.Path;
   yield* validateWorkspaceFiles(files);
   for (const file of [...files].sort(
@@ -292,7 +313,7 @@ export const materializeWorkspaceFiles = Effect.fn("materializeWorkspaceFiles")(
       if ((yield* fs.realPath(source)) !== source || !(yield* lstat(source)).isFile())
         return yield* workspaceFailure("Workspace object is not a regular artifact file.");
       yield* Effect.tryPromise({
-        try: () => NodeFSP.copyFile(source, target, NodeFS.constants.COPYFILE_EXCL),
+        try: () => physicalFs.promises.copyFile(source, target, physicalFs.constants.COPYFILE_EXCL),
         catch: () =>
           workspaceFailure(
             "A destination file appeared during installation; it was not overwritten.",
