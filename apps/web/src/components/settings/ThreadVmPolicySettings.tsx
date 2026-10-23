@@ -8,8 +8,9 @@ import {
   threadVmPolicyDraft,
   type ThreadVmPolicyDraft,
 } from "@t3tools/client-runtime/relay";
-import type { ThreadVmPolicyRecord } from "@t3tools/contracts/relay";
+import type { ThreadVmCapabilities, ThreadVmPolicyRecord } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import { threadVmCapabilityLabel } from "@t3tools/client-runtime/relay/threadVmControls";
 import { MonitorIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { decodedRelayClientError } from "../../cloud/linkEnvironment";
@@ -27,6 +28,7 @@ export function ThreadVmPolicySettings({ isAdmin }: { readonly isAdmin: boolean 
 
 function ThreadVmPolicyEditor({ isAdmin }: { readonly isAdmin: boolean }) {
   const { getToken } = useAuth();
+  const [capabilities, setCapabilities] = useState<ThreadVmCapabilities | null>(null);
   const [record, setRecord] = useState<ThreadVmPolicyRecord | null>(null);
   const [draft, setDraft] = useState<ThreadVmPolicyDraft | null>(null);
   const [busy, setBusy] = useState(false);
@@ -42,13 +44,18 @@ function ThreadVmPolicyEditor({ isAdmin }: { readonly isAdmin: boolean }) {
       const clerkToken = await getToken(resolveRelayClerkTokenOptions());
       if (!clerkToken) throw new Error("Sign in to Launchpad Connect first.");
       if (request !== epoch.current) return;
-      const next = await runtime.runPromise(
+      const [next, health] = await runtime.runPromise(
         ManagedRelayTenancy.ManagedRelayTenancyClient.pipe(
-          Effect.flatMap((client) => client.getThreadVmPolicy({ clerkToken })),
+          Effect.flatMap((client) =>
+            Effect.all([client.getThreadVmPolicy({ clerkToken }), client.getHealth()], {
+              concurrency: 2,
+            }),
+          ),
           Effect.mapError(decodedRelayClientError("Could not read the VM policy")),
         ),
       );
       if (request !== epoch.current) return;
+      setCapabilities(health.threadVmCapabilities ?? null);
       setRecord(next);
       setDraft(threadVmPolicyDraft(next.policy));
     } catch (cause) {
@@ -115,6 +122,28 @@ function ThreadVmPolicyEditor({ isAdmin }: { readonly isAdmin: boolean }) {
           ? "These limits apply to everyone in your organization."
           : "An organization admin can change these limits."}
       </p>
+      <div className="grid gap-2 px-3 py-2 sm:px-4">
+        <p className="text-sm text-muted-foreground">
+          The relay enables VM automation separately from these limits. Changing a number does not
+          turn a worker on.
+        </p>
+        {(
+          [
+            ["configured", "VM host"],
+            ["autoPause", "Pause inactive VMs"],
+            ["autoBackup", "Automatic workspace backups"],
+            ["autoDelete", "Save and stop inactive VMs"],
+            ["replacement", "Replace an idle VM at the limit"],
+          ] as const
+        ).map(([key, label]) => (
+          <div key={key} className="flex justify-between gap-3 text-sm">
+            <span>{label}</span>
+            <span className="text-muted-foreground">
+              {threadVmCapabilityLabel(capabilities, key)}
+            </span>
+          </div>
+        ))}
+      </div>
       {draft ? (
         <>
           {THREAD_VM_POLICY_FIELDS.map((field) => (
@@ -143,7 +172,7 @@ function ThreadVmPolicyEditor({ isAdmin }: { readonly isAdmin: boolean }) {
           ))}
           <SettingsRow
             title="Calendar time zone"
-            description="Weekday deletion and saved disk expiry use this time zone."
+            description="Idle deletion counts Monday–Friday. Saved workspace retention counts calendar days in this time zone."
             control={
               <div className="w-48">
                 <Input

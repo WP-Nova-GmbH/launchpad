@@ -1,4 +1,5 @@
 import { configureThreadVmMoveRepository } from "./ThreadVmRepositoryBinding.ts";
+import { makeThreadMoveProgress } from "./ThreadMoveProgress.ts";
 import { prepareThreadVmMoveWorkspace } from "./ThreadVmMoveWorkspace.ts";
 import * as NodeCrypto from "node:crypto";
 import {
@@ -373,6 +374,10 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       if (!stopped.stopped) return;
     }
     yield* execution.confirmProcessesStopped(threadId, tracked ? "vm" : "provider");
+    const progress = makeThreadMoveProgress(move.progress ?? [], owner.environmentId, (report) =>
+      transport.progress(owner, report),
+    );
+    if (move.manifestArtifactId === null) yield* progress.stage("capturing");
     const saved = yield* sourceArchive(owner).pipe(
       Effect.tapError((error) => reportFailure(owner, error, "source").pipe(Effect.ignore)),
     );
@@ -412,12 +417,17 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       }
       return;
     }
+    yield* progress.stage("packing");
     const packed = yield* packThreadTransferArchive({
       archiveDirectory: saved.directory,
       scratchRoot: path.join(root, "chunks"),
       expectedManifestSha256: saved.sha256,
     });
     yield* Effect.gen(function* () {
+      yield* progress.stage("uploading", {
+        bytes: packed.uploads.reduce((sum, file) => sum + file.sizeBytes, 0),
+        artifacts: packed.uploads.length,
+      });
       yield* Effect.forEach(
         packed.uploads,
         Effect.fnUntraced(function* (file) {
@@ -439,6 +449,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
             receipt.state !== "complete"
           )
             return yield* fail(threadId, "The move upload receipt does not match its saved bytes.");
+          yield* progress.verified(file.artifactId, file.sizeBytes);
         }),
         { concurrency: 4, discard: true },
       );
@@ -454,6 +465,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     owner: ThreadMoveOwner,
     manifestArtifactId: string,
     expectedSha256: string,
+    progress: ReturnType<typeof makeThreadMoveProgress>,
   ) {
     const target = operationPath(owner, "destination");
     if (yield* fs.exists(target)) {
@@ -510,8 +522,13 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
               return yield* fail(owner.threadId, "The move index has invalid or repeated chunks.");
             ids.add(chunk.artifactId);
           }
+        const chunks = manifest.files.flatMap((file) => file.chunks);
+        yield* progress.stage("downloading", {
+          bytes: chunks.reduce((sum, chunk) => sum + chunk.sizeBytes, 0),
+          artifacts: chunks.length,
+        });
         yield* Effect.forEach(
-          manifest.files.flatMap((file) => file.chunks),
+          chunks,
           Effect.fnUntraced(function* (chunk) {
             const digest = NodeCrypto.createHash("sha256");
             let written = 0;
@@ -542,6 +559,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
             );
             if (written !== chunk.sizeBytes || digest.digest("hex") !== chunk.sha256)
               return yield* fail(owner.threadId, "A move chunk failed verification.");
+            yield* progress.verified(chunk.artifactId, written);
           }),
           { concurrency: 4, discard: true },
         );
@@ -622,13 +640,23 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       if (started.length) return;
     }
     if (!move.manifestArtifactId || !move.manifestSha256 || move.sourceCursor === null) return;
-    const saved = yield* destinationArchive(owner, move.manifestArtifactId, move.manifestSha256);
+    const progress = makeThreadMoveProgress(move.progress ?? [], owner.environmentId, (report) =>
+      transport.progress(owner, report),
+    );
+    yield* progress.stage("downloading");
+    const saved = yield* destinationArchive(
+      owner,
+      move.manifestArtifactId,
+      move.manifestSha256,
+      progress,
+    );
     if (
       saved.manifest.history.environmentId !== move.sourceEnvironmentId ||
       saved.manifest.history.sourceSequence !== move.sourceCursor
     )
       return yield* fail(owner.threadId, "The destination archive has a different frozen source.");
     if (!tracked) yield* fences.prepare({ ...owner, projectId: move.destinationProjectId });
+    yield* progress.stage("installing");
     const selected = yield* stageThreadTransferArchive({
       owner: { ...saved.manifest.history },
       expectedSha256: saved.sha256,
@@ -690,11 +718,13 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       yield* configureThreadVmMoveRepository(owner, freshCheckoutRoot).pipe(
         Effect.provideContext(context),
       );
+    yield* progress.stage("setup");
     yield* prepareThreadTransfer({
       ...owner,
       threadId: ThreadId.make(owner.threadId),
       manifestSha256: saved.sha256,
     }).pipe(Effect.provideContext(context));
+    yield* progress.stage("activating");
     if (move.phase === "frozen" || move.phase === "ready") {
       const ready = yield* transport.ready(owner, {
         sourceCursor: move.sourceCursor,

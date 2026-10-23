@@ -100,6 +100,51 @@ it.effect("waits for a large move upload receipt after two minutes", () =>
   }),
 );
 
+it.effect(
+  "reports informational progress with the participant generation and a small acknowledgement",
+  () =>
+    Effect.gen(function* () {
+      const report = {
+        attempt: 1,
+        revision: 2,
+        stage: "uploading" as const,
+        completedBytes: 64,
+        totalBytes: 128,
+        completedArtifacts: 1,
+        totalArtifacts: 2,
+      };
+      const transport = makeThreadMoveTransport(
+        (participant) =>
+          makeExecutorRelayApiClient({
+            url: participant.relayUrl,
+            issuer: participant.relayUrl,
+            environmentCredential: "current-credential",
+          }),
+        () => Effect.die("Progress does not upload an artifact"),
+      );
+      const result = yield* transport.progress(owner, report).pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.sync(() => {
+              expect(request.url).toBe(
+                `${owner.relayUrl}/v1/environments/${owner.environmentId}/threads/${owner.threadId}/moves/${owner.operationId}/progress`,
+              );
+              expect(request.headers.authorization).toBe("Bearer current-credential");
+              if (request.body._tag !== "Uint8Array") throw new Error("Expected JSON body");
+              expect(decodeJson(new TextDecoder().decode(request.body.body))).toEqual({
+                generation: owner.generation,
+                ...report,
+              });
+              return HttpClientResponse.fromWeb(request, Response.json({ accepted: true }));
+            }),
+          ),
+        ),
+      );
+      expect(result).toEqual({ accepted: true });
+    }),
+);
+
 it.effect("still bounds a move upload whose receipt never arrives", () =>
   Effect.gen(function* () {
     const started = yield* Deferred.make<void>();

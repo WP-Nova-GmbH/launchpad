@@ -1,3 +1,8 @@
+import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { MovedThreadDraftRecovery } from "./MovedThreadDraftRecovery";
+import { threadMoveProgressPresentation } from "@t3tools/client-runtime/relay/threadVmControls";
+import { handoffMovedThreadDraft, type MovedThreadDraftConflict } from "../../composerDraftStore";
+import { recoverMovedDraftFile } from "../../lib/movedThreadDraft";
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigate } from "@tanstack/react-router";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
@@ -8,7 +13,10 @@ import {
   type ThreadMoveSubmission,
   type ThreadMoveSubmissionScope,
 } from "@t3tools/client-runtime/relay/threadMoveSubmission";
-import { threadRunOnStatus } from "@t3tools/client-runtime/relay/threadRunOn";
+import {
+  threadRunOnStatus,
+  threadRunOnTargetAvailability,
+} from "@t3tools/client-runtime/relay/threadRunOn";
 import {
   recoverThreadMove,
   threadMoveObservation,
@@ -36,7 +44,8 @@ import {
 import { environmentProjects } from "../../state/projects";
 import { useThreadShell } from "../../state/entities";
 import { serverEnvironment } from "../../state/server";
-import { useEnvironments } from "../../state/environments";
+import { useEnvironments, type EnvironmentPresentation } from "../../state/environments";
+import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { randomUUID } from "../../lib/utils";
@@ -50,6 +59,7 @@ import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
 import { environmentCatalog } from "../../connection/catalog";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ComposerControl } from "./ComposerControl";
+import { ThreadVmMenuActions, useThreadVmUi } from "./ThreadVmControls";
 import { useComposerMenuProps } from "./composerEventScope";
 
 function FollowThreadLocation({
@@ -73,6 +83,10 @@ function FollowThreadLocation({
     [busy, setBusy] = useState(false),
     [checking, setChecking] = useState(false),
     [error, setError] = useState<string | null>(null);
+  const [draftConflict, setDraftConflict] = useState<MovedThreadDraftConflict | null>(null);
+  const draftChoice = useRef<
+    { use: "source" | "destination"; conflict: MovedThreadDraftConflict } | undefined
+  >(undefined);
   const destinationId = state?.destination?.environmentId,
     generation = state?.destination?.generation;
   const mounted = useRef(true);
@@ -113,16 +127,48 @@ function FollowThreadLocation({
               ? failure.message
               : "Could not connect to the current location.",
           );
-        } else
+        } else {
+          const stillCurrent = () => {
+            const proofs = appAtomRegistry.get(portableThreadPlacementsAtom);
+            const placement = proofs?.placements.get(threadId);
+            return (
+              !cancelled &&
+              appAtomRegistry.get(managedRelaySessionAtom) === session &&
+              proofs?.session === session &&
+              threadMoveRelayUrl() === relayUrl &&
+              proofs.relayUrl === relayUrl &&
+              placement?.operationId === null &&
+              placement.environmentId === destinationId &&
+              placement.generation === generation
+            );
+          };
+          const handoff = await handoffMovedThreadDraft({
+            source: { environmentId, threadId },
+            destination: result.value,
+            recoverFile: recoverMovedDraftFile,
+            stillCurrent,
+            ...(draftChoice.current ? { choice: draftChoice.current } : {}),
+          });
+          if (!stillCurrent()) return;
+          if (handoff.conflict) {
+            setDraftConflict(handoff.conflict);
+            return;
+          }
+          setDraftConflict(null);
+          draftChoice.current = undefined;
           await navigate({ to: "/$environmentId/$threadId", params: result.value, replace: true });
+        }
       })
-      .catch(() => {
-        if (!cancelled)
+      .catch((cause) => {
+        if (!cancelled) {
+          draftChoice.current = undefined;
+          setDraftConflict(null);
           setError(
-            attempt > 0
-              ? "Still could not open the current location. Try again after checking its connection."
+            cause instanceof Error
+              ? cause.message
               : "Could not open the current location. Try again.",
           );
+        }
       })
       .finally(() => {
         if (!cancelled) setBusy(false);
@@ -130,7 +176,18 @@ function FollowThreadLocation({
     return () => {
       cancelled = true;
     };
-  }, [destinationId, generation, session, threadId, attempt, checking, open, navigate]);
+  }, [
+    destinationId,
+    generation,
+    session,
+    relayUrl,
+    environmentId,
+    threadId,
+    attempt,
+    checking,
+    open,
+    navigate,
+  ]);
   if (
     !state ||
     (!recoverUnavailable && !state.recoveryRequested && !state.destination && !state.error)
@@ -154,10 +211,36 @@ function FollowThreadLocation({
           {error ?? state.error}
         </p>
       ) : null}
+      {draftConflict ? (
+        <div className="space-y-2 py-2">
+          <p className="font-medium">Both locations have an unsent draft</p>
+          <p>Choose which draft to open. The other stays saved at the previous location.</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {(["source", "destination"] as const).map((use) => (
+              <div key={use} className="rounded-md border border-border p-2">
+                <p className="line-clamp-3 whitespace-pre-wrap">
+                  {draftConflict[use].prompt || "Attachments and context"}
+                </p>
+                <Button
+                  size="xs"
+                  variant="secondary"
+                  onClick={() => {
+                    draftChoice.current = { use, conflict: draftConflict };
+                    setDraftConflict(null);
+                    setAttempt((value) => value + 1);
+                  }}
+                >
+                  {use === "source" ? "Use incoming draft" : "Keep destination draft"}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
       <Button
         size="xs"
         variant="secondary"
-        disabled={busy || checking || state.isPending || !session || !relayUrl}
+        disabled={busy || checking || state.isPending || !!draftConflict || !session || !relayUrl}
         onClick={async () => {
           if (!session || !relayUrl) return;
           setChecking(true);
@@ -197,6 +280,40 @@ function FollowThreadLocation({
   );
 }
 
+function ThreadMoveProgressCard({
+  environmentId,
+  threadId,
+}: {
+  environmentId: EnvironmentId;
+  threadId: ThreadId;
+}) {
+  const location = useAtomValue(threadVmControls.locationViewAtom(environmentId, threadId));
+  const queue = useAtomValue(
+    environmentThreadDetails.stateAtom({ environmentId, threadId }),
+    (state) => Option.getOrNull(state.data)?.promptQueue,
+  );
+  const progress = threadMoveProgressPresentation(location?.placement);
+  const moving = queue?.entries.find((entry) => entry.kind === "move" && entry.state !== "pending");
+  if (!location?.movePending || location.moveFailureDetail || !progress) return null;
+  const cancelling = moving?.state === "cancelling";
+  return (
+    <div
+      className="mx-3 my-2 grid gap-1 rounded-xl border border-border bg-muted/20 px-3 py-2 text-xs"
+      role="status"
+    >
+      <p className="font-medium">{cancelling ? "Cancelling move…" : progress.label}</p>
+      {!cancelling && progress.detail ? (
+        <p className="text-muted-foreground">{progress.detail}</p>
+      ) : null}
+      <p className="text-muted-foreground">
+        {cancelling
+          ? "Waiting for both locations to confirm cancellation."
+          : "Your conversation and files move together. Manage or cancel the move in the queue."}
+      </p>
+    </div>
+  );
+}
+
 export function CurrentThreadLocation(props: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
@@ -204,10 +321,14 @@ export function CurrentThreadLocation(props: {
 }) {
   const session = useAtomValue(managedRelaySessionAtom);
   return (
-    <FollowThreadLocation
-      key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${props.environmentId}:${props.threadId}:${props.recoverUnavailable === true}`}
-      {...props}
-    />
+    <>
+      <ThreadMoveProgressCard environmentId={props.environmentId} threadId={props.threadId} />
+      <MovedThreadDraftRecovery environmentId={props.environmentId} threadId={props.threadId} />
+      <FollowThreadLocation
+        key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${props.environmentId}:${props.threadId}:${props.recoverUnavailable === true}`}
+        {...props}
+      />
+    </>
   );
 }
 
@@ -302,6 +423,39 @@ function DestinationRow({
   );
 }
 
+function MachineDestinationRow({
+  target,
+  environment,
+  disabled,
+  onMove,
+  onCheck,
+}: {
+  target: ReturnType<typeof threadMoveProjectTargets>[number];
+  environment: EnvironmentPresentation | undefined;
+  disabled: boolean;
+  onMove: () => void;
+  onCheck: () => void;
+}) {
+  const connection = useEnvironmentQuery(
+    environmentCatalog.stateAtom(target.project.environmentId),
+  );
+  const availability = threadRunOnTargetAvailability({
+    phase: environment?.connection.phase,
+    failureReason: connection.data?.lastFailure?.reason,
+  });
+  return (
+    <DestinationRow
+      label={
+        environment?.serverConfig?.environment.label ?? environment?.label ?? "Selected machine"
+      }
+      detail={availability.detail ?? `${target.project.title} · ${target.project.workspaceRoot}`}
+      machine={resolveEnvironmentMachineKind(environment?.serverConfig ?? null)}
+      disabled={disabled || availability.action === null}
+      onClick={availability.action === "check" ? onCheck : onMove}
+    />
+  );
+}
+
 function RunOnPicker({
   environmentId,
   threadId,
@@ -342,6 +496,8 @@ function RunOnPicker({
     [saved, setSaved] = useState<ThreadMoveSubmission | null>(null),
     [ready, setReady] = useState(!session || !relayUrl),
     [error, setError] = useState<string | null>(null);
+  const runOnTrigger = useRef<HTMLButtonElement | null>(null);
+  const vmUi = useThreadVmUi();
   const submitting = useRef(false);
   const mounted = useRef(true);
   useEffect(() => {
@@ -529,7 +685,10 @@ function RunOnPicker({
     (item) => item.environmentId === environmentId && item.id === thread?.projectId,
   );
   const isVm = config?.environment.threadVm?.threadId === threadId;
-  const label = currentConfig?.environment.label ?? currentEnvironment?.label ?? "Current machine";
+  const label =
+    currentConfig?.environment.threadVm?.threadId === threadId
+      ? "Private VM"
+      : (currentConfig?.environment.label ?? currentEnvironment?.label ?? "Current machine");
   const machine = resolveEnvironmentMachineKind(currentConfig ?? null);
   const canonicalKey =
     source && thread
@@ -544,6 +703,7 @@ function RunOnPicker({
   const codexSupported = threadMoveProviderSupported(provider, "environment");
   const vmSupported = threadMoveProviderSupported(provider, "vm");
   const status = threadRunOnStatus({ queue, saved });
+  const detailedProgress = threadMoveProgressPresentation(location?.placement);
   const movePending = location?.movePending === true;
   const visibleError = error ?? location?.moveFailureDetail ?? null;
   const destinationLabel = (destination: ThreadMoveDestination) => {
@@ -692,9 +852,10 @@ function RunOnPicker({
         }}
       >
         <PopoverTrigger
+          ref={vmUi?.trigger ?? runOnTrigger}
           render={<ComposerControl size="xs" />}
           className="min-w-0"
-          aria-label={`Run on: ${label}`}
+          aria-label={`Run on: ${label}${currentConfig?.environment.threadVm?.threadId === threadId && vmUi ? ` · ${vmUi.caption}` : ""}`}
           data-composer-shortcut="composer.host"
         >
           <EnvironmentMachineIcon kind={machine} className="size-3 shrink-0" aria-hidden="true" />
@@ -707,6 +868,15 @@ function RunOnPicker({
               className="block w-full min-w-0 max-w-[240px] truncate group-data-[compact]/composer-context:opacity-0"
             >
               {label}
+              {currentConfig?.environment.threadVm?.threadId === threadId && vmUi ? (
+                <>
+                  <span
+                    aria-hidden="true"
+                    className={`mx-1.5 inline-block size-1.5 rounded-full ${vmUi.tone === "success" ? "bg-success" : vmUi.tone === "danger" ? "bg-destructive" : "bg-muted-foreground"}`}
+                  />
+                  {vmUi.caption}
+                </>
+              ) : null}
             </span>
           </span>
           <ChevronDownIcon className="size-3 shrink-0 opacity-50" aria-hidden="true" />
@@ -754,20 +924,24 @@ function RunOnPicker({
                 (item) => item.environmentId === target.project.environmentId,
               );
               return (
-                <DestinationRow
+                <MachineDestinationRow
                   key={target.key}
-                  label={
-                    targetEnvironment?.serverConfig?.environment.label ??
-                    targetEnvironment?.label ??
-                    "Selected machine"
-                  }
-                  detail={`${target.project.title} · ${target.project.workspaceRoot}`}
-                  machine={resolveEnvironmentMachineKind(targetEnvironment?.serverConfig ?? null)}
+                  target={target}
+                  environment={targetEnvironment}
                   disabled={disabled}
-                  onClick={() => void run("send", target.destination)}
+                  onMove={() => void run("send", target.destination)}
+                  onCheck={() => {
+                    void reconnect(target.project.environmentId).then((result) => {
+                      if (result._tag === "Failure")
+                        setError(
+                          "Could not connect to this machine. Check its connection settings.",
+                        );
+                    });
+                  }}
                 />
               );
             })}
+          <ThreadVmMenuActions onAction={() => setOpen(false)} />
           <div className="mt-2 space-y-2 border-t border-border px-1 pb-1 pt-3 text-xs text-muted-foreground">
             {movedAway ? (
               <p role="status">
@@ -777,9 +951,15 @@ function RunOnPicker({
             ) : status ? (
               <>
                 <p className={status.warning ? "text-warning-foreground" : undefined} role="status">
-                  {status.title} → {destinationLabel(status.destination)}
+                  {detailedProgress && !status.warning ? detailedProgress.label : status.title} →{" "}
+                  {destinationLabel(status.destination)}
                 </p>
-                <p>{status.detail}</p>
+                <p>
+                  {detailedProgress && !status.warning ? detailedProgress.label : status.detail}
+                </p>
+                {detailedProgress?.detail && !status.warning ? (
+                  <p>{detailedProgress.detail}</p>
+                ) : null}
                 {saved ? (
                   <div className="flex flex-wrap gap-2">
                     {saved.rejection ? (
@@ -816,7 +996,9 @@ function RunOnPicker({
               </>
             ) : movePending ? (
               <p role="status">
-                This thread is moving. Wait for the move to finish before choosing another machine.
+                {detailedProgress
+                  ? `${detailedProgress.label}${detailedProgress.detail ? ` · ${detailedProgress.detail}` : ""}`
+                  : "This thread is moving. Wait for the move to finish before choosing another machine."}
               </p>
             ) : blocker ? (
               <>
@@ -904,7 +1086,7 @@ function RunOnPicker({
         </Tooltip>
       ) : movePending ? (
         <span role="status" className="truncate text-xs text-muted-foreground">
-          Moving thread…
+          {detailedProgress?.label ?? "Moving thread…"}
         </span>
       ) : null}
     </div>

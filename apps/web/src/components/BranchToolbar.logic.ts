@@ -111,7 +111,9 @@ export function resolveCurrentWorkspaceLabel(activeWorktreePath: string | null):
 export function resolveLockedWorkspaceLabel(
   activeWorktreePath: string | null,
   effectiveEnvMode: EnvMode,
+  isVmWorkspace = false,
 ): string {
+  if (isVmWorkspace) return "VM workspace";
   if (activeWorktreePath) return "Worktree";
   return effectiveEnvMode === "worktree" ? resolveEnvModeLabel("worktree") : "Local checkout";
 }

@@ -1,3 +1,4 @@
+import { makeThreadCurrentQueueStore } from "./ThreadCurrentQueueStore.ts";
 import { OrchestrationCommandReceipt } from "@t3tools/contracts/threadTransfer";
 import { RelayThreadPersistedReceipt, type RelayThreadInboxEntry } from "@t3tools/contracts/relay";
 import type { PgClient } from "@effect/sql-pg/PgClient";
@@ -318,6 +319,7 @@ export function makeThreadJournalStore(sql: PgClient) {
         const cursor = (tail?.cursor ?? 0) + 1;
         yield* sql`INSERT INTO relay_thread_history (thread_id, cursor, environment_id, source_sequence, event_json)
         VALUES (${input.threadId}, ${cursor}, ${input.environmentId}, ${input.event.sequence}, ${event}::jsonb)`;
+        yield* makeThreadCurrentQueueStore(sql).append(input.threadId, cursor, input.event);
         return cursor;
       }),
     );

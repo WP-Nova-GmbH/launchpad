@@ -9,6 +9,7 @@ import type { RelayThreadDeletionRequest, RelayThreadDeletion } from "@t3tools/c
  */
 import type {
   PortableThreadCommand,
+  CommandId,
   ThreadId,
   RepositoryAccessRemovalStatus,
 } from "@t3tools/contracts";
@@ -39,6 +40,7 @@ import {
   type RelayPortableThreadPlacement,
   type RelayPortableThreadPage,
   type RelayThreadHistoryPage,
+  type RelayThreadCurrentQueue,
   type RelayThreadCommandReceipt,
   type RelayThreadPendingCommandPage,
   type RelayConnectMachineResponse,
@@ -212,6 +214,11 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly threadId: ThreadId;
       readonly attachmentId: string;
     }) => Effect.Effect<Uint8Array, ManagedRelayClientError>;
+    readonly getPortableThreadCurrentQueue: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly commandId?: CommandId;
+    }) => Effect.Effect<RelayThreadCurrentQueue, ManagedRelayClientError>;
     readonly getPortableThreadHistory: (input: {
       readonly clerkToken: string;
       readonly threadId: ThreadId;
@@ -441,6 +448,9 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     ),
     downloadPortableThreadAttachment: unavailable(
       "clientRuntime.managedRelayTenancy.downloadPortableThreadAttachment",
+    ),
+    getPortableThreadCurrentQueue: unavailable(
+      "clientRuntime.managedRelayTenancy.getPortableThreadCurrentQueue",
     ),
     getPortableThreadHistory: unavailable(
       "clientRuntime.managedRelayTenancy.getPortableThreadHistory",
@@ -943,6 +953,22 @@ export const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       },
       timeoutRelayRequest("Saved thread attachment download"),
       Effect.withSpan("clientRuntime.managedRelayTenancy.downloadPortableThreadAttachment"),
+      withRelayClientTracing,
+    ),
+    getPortableThreadCurrentQueue: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadHistory
+          .getCurrentQueue({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            query: input.commandId ? { commandId: input.commandId } : {},
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read current thread queue")),
+            timeoutRelayRequest("Current thread queue read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getPortableThreadCurrentQueue"),
       withRelayClientTracing,
     ),
     getPortableThreadHistory: Effect.fnUntraced(

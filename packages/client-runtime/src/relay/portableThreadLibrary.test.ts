@@ -1,11 +1,30 @@
 import { describe, expect, it } from "@effect/vitest";
-import { CommandId, ThreadId, OrchestrationEvent, ProviderInstanceId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentId,
+  ProjectId,
+  ThreadId,
+  OrchestrationEvent,
+  ProviderInstanceId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
 import * as Fiber from "effect/Fiber";
-import { Atom, AtomRegistry } from "effect/unstable/reactivity";
-import { createPortableThreadLibraryAtoms } from "./portableThreadLibrary.ts";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
+import { vi } from "vite-plus/test";
+import { layer as wakeupsLayer, type ConnectionWakeup } from "../connection/wakeups.ts";
+import { layer as connectivityLayer } from "../connection/connectivity.ts";
+import * as Option from "effect/Option";
+import { RelayConnectionTarget, type SupervisorConnectionState } from "../connection/model.ts";
+import type { NetworkStatus } from "../connection/model.ts";
+import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import {
+  createPortableThreadLibraryAtoms,
+  portableThreadOverviewLabel,
+  portableThreadOverviewAction,
+} from "./portableThreadLibrary.ts";
 import {
   applyPortableThreadHistoryPage,
   emptyPortableThreadHistory,
@@ -13,6 +32,15 @@ import {
 import { layer as tenancyLayer } from "./managedRelayTenancy.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import { managedRelaySessionAtom } from "./managedRelayState.ts";
+import {
+  createPortableThreadNavigationRefreshAtom,
+  createPortableThreadPresentationAtom,
+  portableThreadPlacementsAtom,
+  rememberPortableThreadPlacement,
+} from "./portableThreadPresentation.ts";
+import type { EnvironmentThreadShell } from "../state/models.ts";
+import type { EnvironmentCatalogState } from "../state/connections.ts";
+import { AVAILABLE_CONNECTION_STATE } from "../connection/model.ts";
 
 const threadId = ThreadId.make("saved-thread"),
   at = "2026-10-07T12:00:00.000Z";
@@ -105,13 +133,115 @@ const harness = Effect.fnUntraced(function* (
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const session = { accountId: "owner", readClerkToken: () => Effect.succeed("test-token") };
   registry.set(managedRelaySessionAtom, session);
-  const library = createPortableThreadLibraryAtoms(
-    Atom.runtime(tenancyLayer({ relayUrl }).pipe(Layer.provide(remoteHttpClientLayer(fetchFn)))),
+  const wakeups = yield* Queue.unbounded<ConnectionWakeup>();
+  const network = yield* Queue.unbounded<NetworkStatus>();
+  const runtime = Atom.runtime(
+    Layer.mergeAll(
+      tenancyLayer({ relayUrl }).pipe(Layer.provide(remoteHttpClientLayer(fetchFn))),
+      wakeupsLayer({ changes: Stream.fromQueue(wakeups) }),
+      connectivityLayer({ status: Effect.succeed("online"), changes: Stream.fromQueue(network) }),
+    ),
   );
-  return { registry, session, library };
+  const library = createPortableThreadLibraryAtoms(runtime);
+  return { registry, session, library, runtime, wakeups, network };
 });
 
 describe("retained conversation view", () => {
+  it("uses effective capabilities for overview recovery actions", () => {
+    const vm = {
+      state: "saved" as const,
+      projectName: null,
+      activity: "unknown" as const,
+      observedAt: null,
+      lastWorkAt: null,
+      lastVerifiedBackupAt: null,
+      savedDiskExpiresAt: null,
+      savedDiskOperationId: "saved",
+    };
+    const capabilities = {
+      configured: true,
+      autoPause: false,
+      autoBackup: false,
+      autoDelete: false,
+      replacement: false,
+      restore: false,
+      reset: false,
+      permanentDelete: false,
+      privatePreview: false,
+    };
+    expect(portableThreadOverviewAction({ ...summary, vm }, null)).toBe("Manage VM");
+    expect(portableThreadOverviewAction({ ...summary, vm }, capabilities)).toBe("Manage VM");
+    expect(
+      portableThreadOverviewAction({ ...summary, vm }, { ...capabilities, restore: true }),
+    ).toBe("Restore VM");
+    expect(
+      portableThreadOverviewAction({ ...summary, vm: { ...vm, state: "paused" } }, capabilities),
+    ).toBe("Resume VM");
+    expect(
+      portableThreadOverviewAction(
+        { ...summary, placement: { ...summary.placement, operationId: "move" }, vm },
+        { ...capabilities, restore: true },
+      ),
+    ).toBe("Manage VM");
+  });
+
+  it("does not invent a running VM when overview state is missing or returned to a machine", () => {
+    expect(portableThreadOverviewLabel(summary)).toBe("Status unavailable");
+    expect(
+      portableThreadOverviewLabel({
+        ...summary,
+        vm: {
+          state: "on_machine",
+          projectName: null,
+          activity: "unknown",
+          observedAt: null,
+          lastWorkAt: null,
+          lastVerifiedBackupAt: null,
+          savedDiskExpiresAt: null,
+        },
+      }),
+    ).toBe("On machine");
+  });
+  it.effect("reads current queue without downloading or completing conversation history", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const calls: string[] = [];
+        const queue = {
+          enabled: false,
+          revision: 7,
+          pauseReason: null,
+          entries: [],
+          handoff: null,
+          awaitingTurnId: null,
+          admissions: [],
+          finalizedTurnId: null,
+        };
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          calls.push(new URL(request.url).pathname);
+          return Response.json({
+            threadId,
+            generation: 3,
+            cursor: 25001,
+            appliedCommandId: null,
+            queue,
+          });
+        });
+        expect(
+          (yield* Effect.promise(() => h.library.loadQueue.run(h.registry, { threadId })))._tag,
+        ).toBe("Success");
+        expect(h.registry.get(h.library.queueAtom(threadId))).toMatchObject({
+          cursor: 25001,
+          queue: { revision: 7, enabled: false },
+        });
+        expect(h.registry.get(h.library.detailAtom(threadId))).toBeNull();
+        expect(calls).toEqual(["/v1/threads/saved-thread/queue"]);
+        h.registry.set(managedRelaySessionAtom, null);
+        expect(h.registry.get(h.library.queueAtom(threadId))).toBeNull();
+      }),
+    ),
+  );
+
   it("keeps messages, authors and attachments across a placement boundary with lower source numbers", () => {
     const history = applyPortableThreadHistoryPage(emptyPortableThreadHistory(), threadId, {
       entries,
@@ -325,6 +455,418 @@ describe("retained conversation view", () => {
           "Failure",
         );
         expect(reads).toBe(0);
+      }),
+    ),
+  );
+});
+
+const navigationShell = (environment: string, generation = 1): EnvironmentThreadShell => ({
+  id: threadId,
+  environmentId: EnvironmentId.make(environment),
+  projectId: ProjectId.make("project"),
+  title: "Saved conversation",
+  modelSelection: summary.modelSelection,
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+  latestTurn: null,
+  createdAt: at,
+  updatedAt: at,
+  archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
+  pullRequests: [],
+  session: null,
+  latestUserMessageAt: null,
+  hasPendingApprovals: false,
+  hasPendingUserInput: false,
+  hasActionableProposedPlan: false,
+  relayRouting: { relayUrl: "https://relay.example.test", generation, phase: "active" },
+});
+
+describe("portable location freshness", () => {
+  it.effect("coalesces a complete paginated scan and one trailing refresh", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const arrived = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const calls: Array<string | null> = [];
+        const second = { ...summary, placement: { ...summary.placement, threadId: "other" } };
+        const h = yield* harness(async (url, init) => {
+          const after = new URL(new Request(url, init).url).searchParams.get("after");
+          calls.push(after);
+          if (calls.length === 2) {
+            arrived.resolve();
+            await release.promise;
+          }
+          return Response.json({
+            entries: [after ? second : summary],
+            next: after ? null : "next-page",
+          });
+        });
+        const first = h.library.refreshIndex.run(h.registry, undefined);
+        yield* Effect.promise(() => arrived.promise);
+        expect(h.registry.get(h.library.indexAtom)).toBeNull();
+        const again = h.library.refreshIndex.run(h.registry, undefined);
+        expect(h.library.refreshIndex.run(h.registry, undefined)).toBe(again);
+        release.resolve();
+        expect((yield* Effect.promise(() => first))._tag).toBe("Success");
+        expect(calls).toEqual([null, "next-page", null, "next-page"]);
+        expect(h.registry.get(h.library.indexAtom)?.entries).toHaveLength(2);
+      }),
+    ),
+  );
+
+  it.effect(
+    "retains the last authenticated list after a failed refresh and retries explicitly",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let fail = false;
+          const h = yield* harness(async () =>
+            fail
+              ? new Response("offline", { status: 503 })
+              : Response.json({ entries: [summary], next: null }),
+          );
+          yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+          const previous = h.registry.get(h.library.indexAtom);
+          fail = true;
+          expect(
+            (yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined)))._tag,
+          ).toBe("Failure");
+          expect(h.registry.get(h.library.indexAtom)).toBe(previous);
+          expect(h.registry.get(portableThreadPlacementsAtom)?.placements.get(threadId)).toEqual(
+            summary.placement,
+          );
+          fail = false;
+          expect(
+            (yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined)))._tag,
+          ).toBe("Success");
+        }),
+      ),
+  );
+
+  it.effect(
+    "rejects a late index move state after a newer direct read at the same generation",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const arrived = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          const moving = { ...summary, placement: { ...summary.placement, operationId: "moving" } };
+          const h = yield* harness(async (url, init) => {
+            if (new Request(url, init).url.includes("/portable")) {
+              arrived.resolve();
+              await release.promise;
+              return Response.json({ entries: [moving], next: null });
+            }
+            return Response.json(summary.placement);
+          });
+          const index = h.library.loadIndex.run(h.registry, {});
+          yield* Effect.promise(() => arrived.promise);
+          yield* Effect.promise(() => h.library.refreshPlacement.run(h.registry, { threadId }));
+          release.resolve();
+          yield* Effect.promise(() => index);
+          expect(
+            h.registry.get(portableThreadPlacementsAtom)?.placements.get(threadId)?.operationId,
+          ).toBeNull();
+          expect(h.registry.get(h.library.indexAtom)?.entries[0]?.placement.operationId).toBeNull();
+        }),
+      ),
+  );
+
+  it.effect(
+    "refreshes a closed chat on queue/routing changes while ignoring titles and timestamps",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let calls = 0;
+          const h = yield* harness(async () => {
+            calls++;
+            return Response.json({
+              entries: [
+                {
+                  ...summary,
+                  placement: {
+                    ...summary.placement,
+                    environmentId: calls > 1 ? "vm" : "offline",
+                    generation: calls > 1 ? 2 : 1,
+                    previousLocations:
+                      calls > 1 ? [{ environmentId: "offline", generation: 1 }] : [],
+                  },
+                },
+              ],
+              next: null,
+            });
+          });
+          const shells = Atom.make([navigationShell("offline")]);
+          const catalog = Atom.make<EnvironmentCatalogState>({ isReady: true, entries: new Map() });
+          const refresh = createPortableThreadNavigationRefreshAtom(h.runtime, h.library, {
+            shellsAtom: shells,
+            catalogAtom: catalog,
+            connectionStateAtom: () => Atom.make(AsyncResult.success(AVAILABLE_CONNECTION_STATE)),
+            relayUrl: () => "https://relay.example.test",
+          });
+          const navigation = createPortableThreadPresentationAtom({
+            shellsAtom: shells,
+            relayUrl: () => "https://relay.example.test",
+            indexLoadedAtom: refresh,
+          });
+          h.registry.mount(navigation);
+          yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+          // Settle the deliberate shared refresh above before measuring incremental changes.
+          const reads = calls;
+          h.registry.set(shells, [
+            {
+              ...navigationShell("offline"),
+              title: "Streaming title",
+              updatedAt: "2026-10-22T19:00:00Z",
+            },
+          ]);
+          yield* Effect.yieldNow;
+          expect(calls).toBe(reads);
+          h.registry.set(shells, [
+            {
+              ...navigationShell("offline"),
+              promptQueueSummary: { count: 1, enabled: true, pauseReason: null },
+            },
+            navigationShell("vm", 2),
+          ]);
+          yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+          expect(calls).toBeGreaterThan(reads);
+          expect(h.registry.get(navigation)).toHaveLength(1);
+          expect(h.registry.get(navigation)[0]?.environmentId).toBe("vm");
+        }),
+      ),
+  );
+  it.effect("retries a failed navigation read on foreground and network recovery", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let fail = true;
+        let calls = 0;
+        let arrived = Promise.withResolvers<void>();
+        const h = yield* harness(async () => {
+          calls++;
+          arrived.resolve();
+          return fail
+            ? new Response("offline", { status: 503 })
+            : Response.json({ entries: [summary], next: null });
+        });
+        const refresh = createPortableThreadNavigationRefreshAtom(h.runtime, h.library, {
+          shellsAtom: Atom.make([]),
+          catalogAtom: Atom.make<EnvironmentCatalogState>({ isReady: true, entries: new Map() }),
+          connectionStateAtom: () => Atom.make(AsyncResult.success(AVAILABLE_CONNECTION_STATE)),
+          relayUrl: () => "https://relay.example.test",
+        });
+        h.registry.mount(refresh);
+        yield* Effect.promise(() => arrived.promise);
+        yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+        expect(h.registry.get(h.library.indexAtom)).toBeNull();
+        fail = false;
+        const previousCalls = calls;
+        arrived = Promise.withResolvers<void>();
+        yield* Queue.offer(h.wakeups, "application-active");
+        yield* Effect.promise(() => arrived.promise);
+        yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+        expect(calls).toBeGreaterThan(previousCalls);
+        expect(h.registry.get(h.library.indexAtom)?.entries).toHaveLength(1);
+        arrived = Promise.withResolvers<void>();
+        yield* Queue.offer(h.network, "offline");
+        yield* Queue.offer(h.network, "online");
+        yield* Effect.promise(() => arrived.promise);
+        yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+        expect(h.registry.get(h.library.indexAtom)?.entries).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "follows a known move after the source disconnects, refreshes its VM summary once, then stops targeted reads",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let locationReads = 0;
+          const firstRead = Promise.withResolvers<void>();
+          const completed = Promise.withResolvers<void>();
+          const h = yield* harness(async (url, init) => {
+            const path = new URL(new Request(url, init).url).pathname;
+            if (path.endsWith("/placement")) {
+              locationReads++;
+              firstRead.resolve();
+              return Response.json({
+                ...summary.placement,
+                environmentId: locationReads > 1 ? "vm" : "offline",
+                generation: locationReads > 1 ? 2 : 1,
+                operationId: locationReads > 1 ? null : "move",
+                previousLocations: [{ environmentId: "offline", generation: 1 }],
+              });
+            }
+            return Response.json({
+              entries: [
+                {
+                  ...summary,
+                  placement: {
+                    ...summary.placement,
+                    environmentId: locationReads > 1 ? "vm" : "offline",
+                    generation: locationReads > 1 ? 2 : 1,
+                    operationId: locationReads > 1 ? null : "move",
+                    previousLocations: [{ environmentId: "offline", generation: 1 }],
+                  },
+                  vm: {
+                    state: locationReads > 1 ? "running" : "moving",
+                    projectName: "Project",
+                    activity: "idle",
+                    observedAt: null,
+                    lastWorkAt: null,
+                    lastVerifiedBackupAt: null,
+                    savedDiskExpiresAt: null,
+                  },
+                },
+              ],
+              next: null,
+            });
+          });
+          const shells = Atom.make([navigationShell("offline")]);
+          const connection = Atom.make<AsyncResult.AsyncResult<SupervisorConnectionState, never>>(
+            AsyncResult.success<SupervisorConnectionState>({
+              ...AVAILABLE_CONNECTION_STATE,
+              phase: "connected",
+            }),
+          );
+          const catalog = Atom.make<EnvironmentCatalogState>({
+            isReady: true,
+            entries: new Map([
+              [
+                EnvironmentId.make("offline"),
+                {
+                  target: new RelayConnectionTarget({
+                    environmentId: EnvironmentId.make("offline"),
+                    label: "Source",
+                  }),
+                  profile: Option.none(),
+                  enabled: true,
+                },
+              ],
+            ]),
+          });
+          const refresh = createPortableThreadNavigationRefreshAtom(h.runtime, h.library, {
+            shellsAtom: shells,
+            catalogAtom: catalog,
+            connectionStateAtom: () => connection,
+            relayUrl: () => "https://relay.example.test",
+          });
+          const navigation = createPortableThreadPresentationAtom({
+            shellsAtom: shells,
+            relayUrl: () => "https://relay.example.test",
+            indexLoadedAtom: refresh,
+          });
+          h.registry.subscribe(portableThreadPlacementsAtom, (proofs) => {
+            if (
+              proofs?.placements.get(threadId)?.generation === 2 &&
+              proofs.summaries.get(threadId)?.state === "running"
+            )
+              completed.resolve();
+          });
+          h.registry.mount(refresh);
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(0));
+          yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(0));
+          yield* Effect.promise(() => firstRead.promise);
+          h.registry.set(
+            connection,
+            AsyncResult.success<SupervisorConnectionState>({
+              ...AVAILABLE_CONNECTION_STATE,
+              phase: "offline",
+              network: "offline",
+            }),
+          );
+          yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(1500));
+          yield* Effect.promise(() => completed.promise);
+          const readsAtCompletion = locationReads;
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6000));
+          expect(locationReads).toBe(readsAtCompletion);
+          expect(h.registry.get(navigation)[0]?.portableLocation).toMatchObject({
+            environmentId: "vm",
+            label: "Private VM · unavailable",
+            machine: "cloud",
+          });
+          expect(
+            h.registry.get(portableThreadPlacementsAtom)?.placements.get(threadId),
+          ).toMatchObject({
+            environmentId: "vm",
+            generation: 2,
+            operationId: null,
+          });
+        }),
+      ),
+  );
+  it.effect("refreshes the VM summary when a direct check discovers a fast completed move", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let moved = false;
+        const completed = Promise.withResolvers<void>();
+        const currentPlacement = () => ({
+          ...summary.placement,
+          environmentId: moved ? "vm" : "offline",
+          generation: moved ? 2 : 1,
+          previousLocations: moved ? [{ environmentId: "offline", generation: 1 }] : [],
+        });
+        const h = yield* harness(async () =>
+          Response.json({
+            entries: [
+              {
+                ...summary,
+                placement: currentPlacement(),
+                vm: {
+                  state: moved ? "running" : "on_machine",
+                  projectName: "Project",
+                  activity: "idle",
+                  observedAt: null,
+                  lastWorkAt: null,
+                  lastVerifiedBackupAt: null,
+                  savedDiskExpiresAt: null,
+                },
+              },
+            ],
+            next: null,
+          }),
+        );
+        const shells = Atom.make([navigationShell("offline")]);
+        const refresh = createPortableThreadNavigationRefreshAtom(h.runtime, h.library, {
+          shellsAtom: shells,
+          catalogAtom: Atom.make<EnvironmentCatalogState>({ isReady: true, entries: new Map() }),
+          connectionStateAtom: () => Atom.make(AsyncResult.success(AVAILABLE_CONNECTION_STATE)),
+          relayUrl: () => "https://relay.example.test",
+        });
+        const navigation = createPortableThreadPresentationAtom({
+          shellsAtom: shells,
+          relayUrl: () => "https://relay.example.test",
+          indexLoadedAtom: refresh,
+        });
+        h.registry.mount(navigation);
+        yield* Effect.promise(() => h.library.refreshIndex.run(h.registry, undefined));
+        h.registry.subscribe(portableThreadPlacementsAtom, (proofs) => {
+          if (proofs?.summaries.get(threadId)?.state === "running") completed.resolve();
+        });
+        moved = true;
+        expect(
+          rememberPortableThreadPlacement(
+            h.registry,
+            h.session,
+            "https://relay.example.test",
+            currentPlacement(),
+          ),
+        ).toBe(true);
+        yield* Effect.promise(() => completed.promise);
+        expect(h.registry.get(navigation)[0]?.portableLocation).toMatchObject({
+          environmentId: "vm",
+          label: "Private VM · unavailable",
+          machine: "cloud",
+        });
       }),
     ),
   );

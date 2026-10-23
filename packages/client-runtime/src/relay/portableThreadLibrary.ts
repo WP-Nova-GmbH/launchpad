@@ -1,10 +1,23 @@
 import {
+  beginPortableThreadPlacementRead,
+  isPortableThreadPlacementReadCurrent,
+  isPortableThreadPlacementReadScopeCurrent,
+  portableThreadPlacementsAtom,
+  rememberPortableThreadPlacement,
+} from "./portableThreadPresentation.ts";
+import {
   EnvironmentId,
   ThreadId,
+  type CommandId,
   OrchestrationDispatchCommandError,
   type ThreadRelayRouting,
 } from "@t3tools/contracts";
-import type { RelayPortableThreadSummary } from "@t3tools/contracts/relay";
+import type {
+  RelayPortableThreadSummary,
+  RelayThreadCurrentQueue,
+  RelayThreadVmAllowance,
+  ThreadVmCapabilities,
+} from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -13,7 +26,7 @@ import { EnvironmentRegistry } from "../connection/registry.ts";
 import { RelayConnectionRegistration } from "../connection/catalog.ts";
 import { RelayConnectionTarget } from "../connection/model.ts";
 import { Atom, AtomRegistry } from "effect/unstable/reactivity";
-import { createRuntimeCommand } from "../state/runtime.ts";
+import { createAtomCommandScheduler, createRuntimeCommand } from "../state/runtime.ts";
 import { ManagedRelayTenancyClient } from "./managedRelayTenancy.ts";
 import { managedRelaySessionAtom, type ManagedRelaySession } from "./managedRelayState.ts";
 import {
@@ -77,12 +90,13 @@ const authorize = Effect.fnUntraced(function* (registry: AtomRegistry.AtomRegist
     return yield* new OrchestrationDispatchCommandError({
       message: "Sign in to Launchpad Connect to read saved threads.",
     });
+  const request = beginPortableThreadPlacementRead(registry, session, relay.relayUrl);
   const clerkToken = yield* session.readClerkToken();
   if (!clerkToken || registry.get(managedRelaySessionAtom) !== session)
     return yield* new OrchestrationDispatchCommandError({
       message: "Your account changed. Sign in again.",
     });
-  return { relay, clerkToken, session };
+  return { relay, clerkToken, session, request };
 });
 
 /** A cold deep link verifies only its exact placement; it never connects or wakes the VM. */
@@ -100,7 +114,7 @@ export const verifyPortableThreadClientRoute = Effect.fnUntraced(function* (
       message: "Your account or this thread’s location changed. Refresh before opening chat.",
     });
   if (registry.get(managedRelaySessionAtom) !== input.session) return yield* changed();
-  const { relay, clerkToken, session } = yield* authorize(registry);
+  const { relay, clerkToken, session, request } = yield* authorize(registry);
   const placement = yield* relay.getPortableThreadPlacement({
     clerkToken,
     threadId: input.threadId,
@@ -112,6 +126,17 @@ export const verifyPortableThreadClientRoute = Effect.fnUntraced(function* (
     placement.generation !== input.generation
   )
     return yield* changed();
+  if (
+    !rememberPortableThreadPlacement(
+      registry,
+      session,
+      relay.relayUrl,
+      placement,
+      undefined,
+      request,
+    )
+  )
+    return;
   rememberVerifiedRelay(registry, input.environmentId, input.threadId, {
     session,
     relayUrl: relay.relayUrl,
@@ -124,6 +149,7 @@ export interface PortableThreadIndexState {
   readonly relayUrl: string;
   readonly entries: ReadonlyArray<RelayPortableThreadSummary>;
   readonly next: string | null;
+  readonly allowance?: RelayThreadVmAllowance;
 }
 export interface PortableThreadDetailState {
   readonly session: ManagedRelaySession;
@@ -137,6 +163,15 @@ export function createPortableThreadLibraryAtoms<R, E>(
 ) {
   const openAtom = Atom.make(false).pipe(Atom.keepAlive);
   const indexStateAtom = Atom.make<PortableThreadIndexState | null>(null);
+  const queueStateAtom = Atom.family((_threadId: ThreadId) =>
+    Atom.make<{ session: ManagedRelaySession; current: RelayThreadCurrentQueue } | null>(null),
+  );
+  const queueAtom = Atom.family((threadId: ThreadId) =>
+    Atom.make((get) => {
+      const state = get(queueStateAtom(threadId));
+      return state?.session === get(managedRelaySessionAtom) ? (state?.current ?? null) : null;
+    }),
+  );
   const detailStateAtom = Atom.family((_threadId: ThreadId) =>
     Atom.make<PortableThreadDetailState | null>(null),
   );
@@ -152,42 +187,155 @@ export function createPortableThreadLibraryAtoms<R, E>(
       return session && state?.session === session ? state : null;
     }),
   );
+  const indexScheduler = createAtomCommandScheduler();
+  const readIndex = Effect.fnUntraced(function* (
+    input: { after?: string },
+    registry: AtomRegistry.AtomRegistry,
+    complete = false,
+  ) {
+    const { relay, clerkToken, session, request: firstRead } = yield* authorize(registry);
+    const previous = registry.get(indexAtom);
+    if (input.after !== undefined && previous?.next !== input.after)
+      return yield* new OrchestrationDispatchCommandError({
+        message: "Refresh the saved thread list before loading more.",
+      });
+    let after = input.after;
+    let entries = input.after === undefined ? [] : [...(previous?.entries ?? [])];
+    let state: PortableThreadIndexState;
+    let request = firstRead;
+    do {
+      // A failed read retains the last authenticated view until lifecycle/manual retry.
+      const page = yield* relay.listPortableThreads({
+        clerkToken,
+        limit: 100,
+        ...(after === undefined ? {} : { after }),
+      });
+      if (!isPortableThreadPlacementReadScopeCurrent(registry, session, relay.relayUrl))
+        return null;
+      for (const { placement, vm } of page.entries) {
+        if (
+          rememberPortableThreadPlacement(registry, session, relay.relayUrl, placement, vm, request)
+        )
+          rememberVerifiedRelay(registry, placement.environmentId, placement.threadId, {
+            session,
+            relayUrl: relay.relayUrl,
+            generation: placement.generation,
+          });
+      }
+      entries.push(...page.entries);
+      state = {
+        session,
+        relayUrl: relay.relayUrl,
+        entries,
+        next: page.next,
+        ...(page.allowance ? { allowance: page.allowance } : {}),
+      };
+      after = complete ? (page.next ?? undefined) : undefined;
+      if (after !== undefined)
+        request = beginPortableThreadPlacementRead(registry, session, relay.relayUrl);
+    } while (after !== undefined);
+    // A direct location check may have completed after an earlier index page.
+    const proofs = registry.get(portableThreadPlacementsAtom);
+    if (proofs?.session === session && proofs.relayUrl === normalizeSecureRelayUrl(relay.relayUrl))
+      state = {
+        ...state,
+        entries: entries.map(({ vm: _vm, ...entry }) => {
+          const vm = proofs.summaries.get(entry.placement.threadId);
+          return {
+            ...entry,
+            placement: proofs.placements.get(entry.placement.threadId) ?? entry.placement,
+            ...(vm ? { vm } : {}),
+          };
+        }),
+      };
+    state = {
+      ...state,
+      entries: [
+        ...new Map(state.entries.map((entry) => [entry.placement.threadId, entry])).values(),
+      ],
+    };
+    registry.set(indexStateAtom, state);
+    return state;
+  });
   const loadIndex = createRuntimeCommand(runtime, {
     label: "read portable threads",
+    scheduler: indexScheduler,
     concurrency: { mode: "serial", key: (_input: { after?: string }) => "index" },
     execute: Effect.fnUntraced(function* (input: { after?: string }, registry) {
-      const { relay, clerkToken, session } = yield* authorize(registry);
-      const previous = registry.get(indexAtom);
-      if (input.after !== undefined && previous?.next !== input.after)
-        return yield* new OrchestrationDispatchCommandError({
-          message: "Refresh the saved thread list before loading more.",
-        });
-      const page = yield* relay
-        .listPortableThreads({
-          clerkToken,
-          limit: 100,
-          ...(input.after === undefined ? {} : { after: input.after }),
-        })
-        .pipe(
-          Effect.onError(() =>
-            Effect.sync(() => {
-              if (registry.get(managedRelaySessionAtom) === session)
-                registry.set(indexStateAtom, null);
-            }),
-          ),
-        );
-      if (registry.get(managedRelaySessionAtom) !== session) return null;
-      const entries =
-        input.after === undefined ? page.entries : [...(previous?.entries ?? []), ...page.entries];
-      const state = { session, relayUrl: relay.relayUrl, entries, next: page.next };
-      registry.set(indexStateAtom, state);
-      for (const { placement } of page.entries)
-        rememberVerifiedRelay(registry, placement.environmentId, placement.threadId, {
+      return yield* readIndex(input, registry);
+    }),
+  });
+  const refreshIndexCommand = createRuntimeCommand(runtime, {
+    label: "refresh portable thread locations",
+    scheduler: indexScheduler,
+    concurrency: { mode: "serial", key: (_input: void) => "index" },
+    execute: Effect.fnUntraced(function* (_input: void, registry) {
+      return yield* readIndex({}, registry, true);
+    }),
+  });
+  const refreshing = new WeakMap<
+    AtomRegistry.AtomRegistry,
+    {
+      dirty: boolean;
+      promise: ReturnType<typeof refreshIndexCommand.run>;
+    }
+  >();
+  const refreshIndex: typeof refreshIndexCommand = {
+    label: refreshIndexCommand.label,
+    run(registry, input) {
+      const pending = refreshing.get(registry);
+      if (pending) {
+        pending.dirty = true;
+        return pending.promise;
+      }
+      const pendingRefresh = {
+        dirty: false,
+        promise: refreshIndexCommand.run(registry, input),
+      };
+      const initial = pendingRefresh.promise;
+      pendingRefresh.promise = (async () => {
+        try {
+          let result = await initial;
+          while (pendingRefresh.dirty) {
+            pendingRefresh.dirty = false;
+            result = await refreshIndexCommand.run(registry, input);
+          }
+          return result;
+        } finally {
+          refreshing.delete(registry);
+        }
+      })();
+      refreshing.set(registry, pendingRefresh);
+      return pendingRefresh.promise;
+    },
+  };
+  const refreshPlacement = createRuntimeCommand(runtime, {
+    label: "refresh moving thread location",
+    concurrency: { mode: "singleFlight", key: (input: { threadId: ThreadId }) => input.threadId },
+    execute: Effect.fnUntraced(function* (input, registry) {
+      const { relay, clerkToken, session, request } = yield* authorize(registry);
+      const placement = yield* relay.getPortableThreadPlacement({
+        clerkToken,
+        threadId: input.threadId,
+      });
+      if (
+        placement.threadId !== input.threadId ||
+        !rememberPortableThreadPlacement(
+          registry,
           session,
-          relayUrl: relay.relayUrl,
-          generation: placement.generation,
-        });
-      return state;
+          relay.relayUrl,
+          placement,
+          undefined,
+          request,
+        )
+      )
+        return null;
+      rememberVerifiedRelay(registry, placement.environmentId, placement.threadId, {
+        session,
+        relayUrl: relay.relayUrl,
+        generation: placement.generation,
+      });
+      return placement;
     }),
   });
   const loadHistory = createRuntimeCommand(runtime, {
@@ -237,6 +385,37 @@ export function createPortableThreadLibraryAtoms<R, E>(
       const state = { session, history: next, hasMore: page.entries.length === 200 };
       registry.set(detailStateAtom(input.threadId), state);
       return state;
+    }),
+  });
+  const loadQueue = createRuntimeCommand(runtime, {
+    label: "read current thread queue",
+    concurrency: {
+      mode: "serial",
+      key: (input: { threadId: ThreadId; commandId?: CommandId }) => input.threadId,
+    },
+    execute: Effect.fnUntraced(function* (input, registry) {
+      const { relay, clerkToken, session } = yield* authorize(registry);
+      const current = yield* relay.getPortableThreadCurrentQueue({
+        clerkToken,
+        threadId: input.threadId,
+        ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+      });
+      if (registry.get(managedRelaySessionAtom) !== session) return null;
+      registry.set(queueStateAtom(input.threadId), { session, current });
+      return current;
+    }),
+  });
+  const queueReceipt = createRuntimeCommand(runtime, {
+    label: "read saved queue receipt",
+    concurrency: {
+      mode: "serial",
+      key: (input: { threadId: ThreadId; commandId: string }) => input.threadId,
+    },
+    execute: Effect.fnUntraced(function* (input, registry) {
+      const { relay, clerkToken, session } = yield* authorize(registry);
+      const receipt = yield* relay.getPortableThreadCommandReceipt({ clerkToken, ...input });
+      if (registry.get(managedRelaySessionAtom) !== session) return null;
+      return receipt;
     }),
   });
   const queueControl = createRuntimeCommand(runtime, {
@@ -290,10 +469,15 @@ export function createPortableThreadLibraryAtoms<R, E>(
   return {
     openAtom,
     queueControl,
+    queueReceipt,
+    queueAtom,
+    loadQueue,
     downloadAttachment,
     indexAtom,
     detailAtom,
     loadIndex,
+    refreshIndex,
+    refreshPlacement,
     loadHistory,
     routeAtom: (
       environmentId: EnvironmentId,
@@ -314,7 +498,7 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
   registry: AtomRegistry.AtomRegistry,
   connections: Pick<EnvironmentRegistry["Service"], "entries" | "register" | "setEnabled">,
 ) {
-  const { relay, clerkToken, session } = yield* authorize(registry);
+  const { relay, clerkToken, session, request: firstRead } = yield* authorize(registry);
   const currentAccount = () => registry.get(managedRelaySessionAtom) === session;
   const changed = () =>
     new OrchestrationDispatchCommandError({
@@ -324,6 +508,13 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
   const placement = yield* relay.getPortableThreadPlacement(auth);
   if (
     !currentAccount() ||
+    !isPortableThreadPlacementReadCurrent(
+      registry,
+      session,
+      relay.relayUrl,
+      input.threadId,
+      firstRead,
+    ) ||
     placement.threadId !== input.threadId ||
     placement.operationId !== null ||
     (input.expectedPlacement &&
@@ -356,9 +547,19 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
       message: "Restore or reset the saved workspace before opening chat.",
     });
   // Reads can overlap a move. Never register the stale source from the library row.
+  if (!isPortableThreadPlacementReadScopeCurrent(registry, session, relay.relayUrl))
+    return yield* changed();
+  const request = beginPortableThreadPlacementRead(registry, session, relay.relayUrl);
   const latest = yield* relay.getPortableThreadPlacement(auth);
   if (
     !currentAccount() ||
+    !isPortableThreadPlacementReadCurrent(
+      registry,
+      session,
+      relay.relayUrl,
+      input.threadId,
+      request,
+    ) ||
     latest.threadId !== input.threadId ||
     latest.environmentId !== placement.environmentId ||
     latest.generation !== placement.generation ||
@@ -379,6 +580,10 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
     yield* connections.setEnabled(environmentId, true);
   }
   if (!currentAccount()) return yield* changed();
+  if (
+    !rememberPortableThreadPlacement(registry, session, relay.relayUrl, latest, undefined, request)
+  )
+    return yield* changed();
   rememberVerifiedRelay(registry, environmentId, input.threadId, {
     session,
     relayUrl: relay.relayUrl,
@@ -400,4 +605,46 @@ export function createPortableThreadChatCommand<R, E>(
       return yield* openPortableThreadChat(input, registry, yield* EnvironmentRegistry);
     }),
   });
+}
+
+/** Overview reads never inspect or wake compute. Missing summaries stay unknown. */
+export function portableThreadOverviewLabel(summary: RelayPortableThreadSummary) {
+  switch (summary.vm?.state) {
+    case "on_machine":
+      return "On machine";
+    case "preparing":
+      return "Preparing VM";
+    case "running":
+      return "Private VM · running";
+    case "paused":
+      return "Private VM · paused";
+    case "saving":
+      return "Saving workspace";
+    case "saved":
+      return "Saved workspace";
+    case "expired":
+      return "Saved workspace expired";
+    case "moving":
+      return "Moving thread";
+    default:
+      return "Status unavailable";
+  }
+}
+
+export function portableThreadOverviewAction(
+  summary: RelayPortableThreadSummary,
+  capabilities: ThreadVmCapabilities | null,
+) {
+  if (summary.placement.operationId !== null) return "Manage VM";
+  switch (summary.vm?.state) {
+    case "running":
+    case "on_machine":
+      return "Open chat";
+    case "paused":
+      return capabilities?.configured ? "Resume VM" : "Manage VM";
+    case "saved":
+      return summary.vm.savedDiskOperationId && capabilities?.restore ? "Restore VM" : "Manage VM";
+    default:
+      return "Manage VM";
+  }
 }

@@ -1,3 +1,4 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { PortableThreadLibrary } from "./chat/PortableThreadLibrary";
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
@@ -4057,6 +4058,9 @@ export default function Sidebar() {
         const clicked = await settlePromise(() =>
           api.contextMenu.show(
             buildThreadActionMenuItems({
+              canCreateThread: canCreateThreadInEnvironment(
+                serverConfigs.get(thread.environmentId),
+              ),
               branch: thread.branch ?? null,
               projectFilter: threadProjectGroup
                 ? {
@@ -4386,6 +4390,7 @@ export default function Sidebar() {
           activeThread: newThreadContext.activeThread ?? undefined,
           defaultProjectRef: newThreadContext.defaultProjectRef,
           handleNewThread: newThreadContext.handleNewThread,
+          canCreateThreadInProject: newThreadContext.canCreateThreadInProject,
         });
         return;
       }
@@ -4603,9 +4608,15 @@ export default function Sidebar() {
                             `${thread.environmentId}:${thread.projectId}`,
                           ) ?? null
                         }
-                        environmentLabel={environmentLabelById.get(thread.environmentId) ?? null}
+                        environmentLabel={
+                          thread.portableLocation?.label ??
+                          environmentLabelById.get(thread.environmentId) ??
+                          null
+                        }
                         environmentMachine={
-                          environmentMachineById.get(thread.environmentId) ?? "server"
+                          thread.portableLocation?.machine ??
+                          environmentMachineById.get(thread.environmentId) ??
+                          "server"
                         }
                         providerEntryByInstanceId={
                           providerEntriesByEnvironment.get(thread.environmentId) ??
@@ -4740,10 +4751,14 @@ export default function Sidebar() {
                             }
                             currentEnvironmentId={primaryEnvironmentId}
                             environmentLabel={
-                              environmentLabelById.get(thread.environmentId) ?? null
+                              thread.portableLocation?.label ??
+                              environmentLabelById.get(thread.environmentId) ??
+                              null
                             }
                             environmentMachine={
-                              environmentMachineById.get(thread.environmentId) ?? "server"
+                              thread.portableLocation?.machine ??
+                              environmentMachineById.get(thread.environmentId) ??
+                              "server"
                             }
                             project={
                               projectByKey.get(`${thread.environmentId}:${thread.projectId}`) ??

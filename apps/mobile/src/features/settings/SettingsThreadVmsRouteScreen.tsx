@@ -8,7 +8,8 @@ import {
   threadVmPolicyDraft,
   type ThreadVmPolicyDraft,
 } from "@t3tools/client-runtime/relay";
-import type { ThreadVmPolicyRecord } from "@t3tools/contracts/relay";
+import type { ThreadVmCapabilities, ThreadVmPolicyRecord } from "@t3tools/contracts/relay";
+import { threadVmCapabilityLabel } from "@t3tools/client-runtime/relay/threadVmControls";
 import * as Effect from "effect/Effect";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { View } from "react-native";
@@ -52,6 +53,7 @@ function ConfiguredThreadVmsSettings() {
 function SignedInThreadVmsSettings() {
   const insets = useSafeAreaInsets();
   const { getToken, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
+  const [capabilities, setCapabilities] = useState<ThreadVmCapabilities | null>(null);
   const [record, setRecord] = useState<ThreadVmPolicyRecord | null>(null);
   const [draft, setDraft] = useState<ThreadVmPolicyDraft | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -68,11 +70,15 @@ function SignedInThreadVmsSettings() {
       const clerkToken = await getToken(resolveRelayClerkTokenOptions());
       if (!clerkToken) throw new Error("Sign in to Launchpad Connect first.");
       if (request !== epoch.current) return;
-      const [membership, next] = await runtime.runPromise(
+      const [membership, next, health] = await runtime.runPromise(
         ManagedRelayTenancy.ManagedRelayTenancyClient.pipe(
           Effect.flatMap((client) =>
             Effect.all(
-              [client.getOrganization({ clerkToken }), client.getThreadVmPolicy({ clerkToken })],
+              [
+                client.getOrganization({ clerkToken }),
+                client.getThreadVmPolicy({ clerkToken }),
+                client.getHealth(),
+              ],
               { concurrency: 2 },
             ),
           ),
@@ -82,6 +88,7 @@ function SignedInThreadVmsSettings() {
       if (request !== epoch.current) return;
       if (membership.organization.organizationId !== next.organizationId)
         throw new Error("Your organization changed. Reload the VM policy.");
+      setCapabilities(health.threadVmCapabilities ?? null);
       setRecord(next);
       setDraft(threadVmPolicyDraft(next.policy));
       setIsAdmin(membership.role === "admin");
@@ -153,6 +160,28 @@ function SignedInThreadVmsSettings() {
               ? "These limits apply to everyone in your organization."
               : "An organization admin can change these limits."}
           </Text>
+          <SettingsSection title="Relay automation">
+            <Text className="p-4 text-sm text-foreground-muted">
+              The relay enables VM automation separately from these limits. Changing a number does
+              not turn a worker on.
+            </Text>
+            {(
+              [
+                ["configured", "VM host"],
+                ["autoPause", "Pause inactive VMs"],
+                ["autoBackup", "Automatic workspace backups"],
+                ["autoDelete", "Save and stop inactive VMs"],
+                ["replacement", "Replace an idle VM at the limit"],
+              ] as const
+            ).map(([key, label]) => (
+              <View key={key} className="flex-row justify-between gap-3 p-4">
+                <Text className="flex-1 text-sm text-foreground">{label}</Text>
+                <Text className="text-sm text-foreground-muted">
+                  {threadVmCapabilityLabel(capabilities, key)}
+                </Text>
+              </View>
+            ))}
+          </SettingsSection>
           {draft ? (
             <SettingsSection title="VM policy">
               {THREAD_VM_POLICY_FIELDS.map((field) => (
@@ -175,7 +204,8 @@ function SignedInThreadVmsSettings() {
               <View className="gap-2 p-4">
                 <Text className="text-lg text-foreground">Calendar time zone</Text>
                 <Text className="text-sm text-foreground-muted">
-                  Weekday deletion and saved disk expiry use this time zone.
+                  Idle deletion counts Monday–Friday. Saved workspace retention counts calendar days
+                  in this time zone.
                 </Text>
                 <AppTextInput
                   accessibilityLabel="Calendar time zone"

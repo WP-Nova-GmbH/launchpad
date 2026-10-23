@@ -9,7 +9,11 @@ export function makeThreadVmReplacementStore(sql: PgClient) {
       threadId: string;
       state: "running" | "paused";
       title: string | null;
-    }>`SELECT a.allocation_id AS "allocationId", a.thread_id AS "threadId", a.state,title.value AS title
+      lastWorkAt: string | null;
+      lastVerifiedBackupAt: string | null;
+    }>`SELECT a.allocation_id AS "allocationId", a.thread_id AS "threadId", a.state,title.value AS title,
+      to_char(v.last_work_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "lastWorkAt",
+      (SELECT to_char(max(verified_at) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') FROM relay_thread_vm_backups WHERE allocation_id=a.allocation_id AND phase='verified') AS "lastVerifiedBackupAt"
       FROM relay_thread_vm_allocations a
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
       JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id

@@ -192,6 +192,9 @@ stays paused until you resume it. Use **Run on** again to move back to an eligib
 If Launchpad cannot verify that local terminal or setup processes have stopped, the move stays
 queued with an explanation. Cancel the move to continue working locally.
 Fresh VMs need their own Codex sign-in; follow the sign-in step in the thread to let preparation continue.
+Unsent drafts follow the thread on the device making the move. If both locations have a draft,
+choose which one to continue; Launchpad keeps the other copy. Reattach any files whose original
+machine is no longer reachable before sending them.
 After a saved workspace expires, **Reset VM** preserves the conversation and recreates the workspace
 at the Git commit uploaded during the move. Changes made inside the VM are discarded, and queued
 prompts stay paused until you resume them.
@@ -201,7 +204,10 @@ Recovery restores the selected workspace backup and the independently saved conv
 workspace changes made after the backup may be lost. Queued prompts remain paused.
 When the conversation or attachments are not completely saved, recovery stays unavailable
 and keeps the existing data.
+The **VM threads** overview can read saved conversations without starting a VM. Resume or restore
+the VM only when you want to work in it. Restoring a workspace keeps the prompt queue paused.
 
 Admins can configure the organization's VM limits and inactivity policy in
 **Settings → Organization → Thread VMs**. The timezone controls which days count toward
-weekday retention; Saturdays and Sundays are excluded. Other members can view the current policy.
+idle deletion; Saturdays and Sundays are excluded. Saved workspace retention uses calendar days.
+Settings show which automatic actions the relay has enabled. Other members can view the current policy.

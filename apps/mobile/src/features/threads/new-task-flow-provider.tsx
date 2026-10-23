@@ -1,3 +1,4 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
@@ -24,7 +25,12 @@ import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import * as Arr from "effect/Array";
 import { pipe } from "effect/Function";
 
-import { useEnvironmentServerConfig, useProjects, useThreadShells } from "../../state/entities";
+import {
+  useEnvironmentServerConfig,
+  useProjects,
+  useThreadShells,
+  useServerConfigs,
+} from "../../state/entities";
 import type { TurnCommandMetadata } from "../../lib/commandMetadata";
 import type { DraftComposerAttachment } from "../../lib/composerImages";
 import type { ModelOption, ProviderGroup } from "../../lib/modelOptions";
@@ -226,7 +232,15 @@ type NewTaskFlowContextValue = {
 const NewTaskFlowContext = React.createContext<NewTaskFlowContextValue | null>(null);
 
 export function NewTaskFlowProvider(props: React.PropsWithChildren) {
-  const projects = useProjects();
+  const allProjects = useProjects();
+  const configs = useServerConfigs();
+  const projects = useMemo(
+    () =>
+      allProjects.filter((project) =>
+        canCreateThreadInEnvironment(configs.get(project.environmentId)),
+      ),
+    [allProjects, configs],
+  );
   const threads = useThreadShells();
   const { savedConnectionsById } = useSavedRemoteConnections();
   const groupingSettings = useMobileProjectGroupingSettings();
@@ -697,11 +711,12 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
 
   const setProject = useCallback(
     (project: EnvironmentProject) => {
+      if (!canCreateThreadInEnvironment(configs.get(project.environmentId))) return;
       carryDraftContentTo(project);
       setSelectedEnvironmentId(project.environmentId);
       setSelectedProjectKey(scopedProjectKey(project.environmentId, project.id));
     },
-    [carryDraftContentTo],
+    [carryDraftContentTo, configs],
   );
 
   const openDraft = useCallback(

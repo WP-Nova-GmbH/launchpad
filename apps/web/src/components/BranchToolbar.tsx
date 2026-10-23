@@ -1,3 +1,5 @@
+import { useAtomValue } from "@effect/atom-react";
+import { serverEnvironment } from "../state/server";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
@@ -93,6 +95,7 @@ interface BranchToolbarProps {
 }
 
 interface MobileRunContextSelectorProps {
+  isVmWorkspace: boolean;
   forceNewWorktree: boolean;
   autoEnvironmentLabel?: string | undefined;
   onAutoEnvironment?: (() => void) | undefined;
@@ -112,6 +115,7 @@ interface MobileRunContextSelectorProps {
 }
 
 const MobileRunContextSelector = memo(function MobileRunContextSelector({
+  isVmWorkspace,
   forceNewWorktree,
   autoEnvironmentLabel,
   onAutoEnvironment,
@@ -140,14 +144,16 @@ const MobileRunContextSelector = memo(function MobileRunContextSelector({
       : activeWorktreePath
         ? FolderGitIcon
         : FolderIcon;
-  const workspaceLabel = forceNewWorktree
-    ? resolveEnvModeLabel("worktree")
-    : envModeLocked
-      ? resolveLockedWorkspaceLabel(activeWorktreePath, effectiveEnvMode)
-      : effectiveEnvMode === "worktree"
-        ? resolveEnvModeLabel("worktree")
-        : resolveCurrentWorkspaceLabel(activeWorktreePath);
-  const isLocked = envLocked || envModeLocked;
+  const workspaceLabel = isVmWorkspace
+    ? "VM workspace"
+    : forceNewWorktree
+      ? resolveEnvModeLabel("worktree")
+      : envModeLocked
+        ? resolveLockedWorkspaceLabel(activeWorktreePath, effectiveEnvMode)
+        : effectiveEnvMode === "worktree"
+          ? resolveEnvModeLabel("worktree")
+          : resolveCurrentWorkspaceLabel(activeWorktreePath);
+  const isLocked = isVmWorkspace || envLocked || envModeLocked;
   const workspaceIcon = (
     <Tooltip>
       <TooltipTrigger render={<span className="inline-flex shrink-0" />}>
@@ -529,6 +535,8 @@ export const BranchToolbar = memo(function BranchToolbar({
   composerControlsHostRef,
   contextStripVisible = true,
 }: BranchToolbarProps) {
+  const config = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+  const isVmWorkspace = config?.environment.threadVm?.threadId === threadId;
   const branchSelectorRef = useRef<BranchToolbarBranchSelectorHandle>(null);
   const threadRef = useMemo(
     () => scopeThreadRef(environmentId, threadId),
@@ -643,6 +651,7 @@ export const BranchToolbar = memo(function BranchToolbar({
       {showGitControls ? (
         <div className="contents @3xl/composer-surface:hidden">
           <MobileRunContextSelector
+            isVmWorkspace={isVmWorkspace}
             forceNewWorktree={forceNewWorktree}
             autoEnvironmentLabel={autoEnvironmentLabel}
             onAutoEnvironment={onAutoEnvironment}
@@ -691,6 +700,7 @@ export const BranchToolbar = memo(function BranchToolbar({
           )}
           {showGitControls ? (
             <BranchToolbarEnvModeSelector
+              isVmWorkspace={isVmWorkspace}
               forceNewWorktree={forceNewWorktree}
               envLocked={envModeLocked}
               effectiveEnvMode={effectiveEnvMode}

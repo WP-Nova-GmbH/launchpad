@@ -1,3 +1,4 @@
+import { makeThreadCurrentQueueStore } from "./ThreadCurrentQueueStore.ts";
 import { restoreBootOperationId } from "../machines/E2BThreadVmRestoreAttempt.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -523,6 +524,10 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
           Effect.scoped(
             Effect.gen(function* () {
               const f = yield* fixture();
+              yield* makeThreadCurrentQueueStore(f.sql).read(f.threadId);
+              expect(
+                yield* f.sql`SELECT 1 FROM relay_thread_current_queues WHERE thread_id=${f.threadId}`,
+              ).toHaveLength(1);
               yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
               let absent = false,
                 stops = 0;
@@ -573,6 +578,9 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               expect(remaining?.count).toBe(0);
               expect(
                 yield* f.sql`SELECT 1 FROM relay_thread_history WHERE thread_id=${f.threadId}`,
+              ).toHaveLength(0);
+              expect(
+                yield* f.sql`SELECT 1 FROM relay_thread_current_queues WHERE thread_id=${f.threadId}`,
               ).toHaveLength(0);
               expect(yield* worker.runOne()).toBe(false);
             }),

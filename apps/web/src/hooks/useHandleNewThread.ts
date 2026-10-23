@@ -1,3 +1,4 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { useAtomValue } from "@effect/atom-react";
 import {
   scopedProjectKey,
@@ -77,6 +78,9 @@ export function useNewThreadHandler() {
       // prepared checkout, a task to write — addresses that one rather than looking the project
       // up again and finding whichever draft it happens to hold.
     ): Promise<{ draftId: DraftId; threadId: ThreadId } | null> => {
+      if (!canCreateThreadInEnvironment(environmentServerConfigs.get(projectRef.environmentId))) {
+        return Promise.resolve(null);
+      }
       const projects = readProjects();
       const targetServerSettings =
         environmentServerConfigs.get(projectRef.environmentId)?.settings ?? DEFAULT_SERVER_SETTINGS;
@@ -451,7 +455,15 @@ export function useHandleNewThread() {
         : useComposerDraftStore.getState().getDraftSession(routeTarget.draftId)
       : null,
   );
-  const projects = useProjects();
+  const allProjects = useProjects();
+  const configs = useAtomValue(environmentServerConfigsAtom);
+  const projects = useMemo(
+    () =>
+      allProjects.filter((project) =>
+        canCreateThreadInEnvironment(configs.get(project.environmentId)),
+      ),
+    [allProjects, configs],
+  );
   const orderedProjects = useMemo(() => {
     return orderItemsByPreferredIds({
       items: projects,
@@ -464,10 +476,15 @@ export function useHandleNewThread() {
     });
   }, [projectOrder, projects]);
   const handleNewThread = useNewThreadHandler();
+  const canCreateThreadInProject = useCallback(
+    (ref: ScopedProjectRef) => canCreateThreadInEnvironment(configs.get(ref.environmentId)),
+    [configs],
+  );
 
   return {
     activeDraftThread,
     activeThread,
+    canCreateThreadInProject,
     defaultProjectRef: orderedProjects[0]
       ? scopeProjectRef(orderedProjects[0].environmentId, orderedProjects[0].id)
       : null,

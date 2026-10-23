@@ -271,6 +271,7 @@ for (const lost of [
                   }),
               ),
             get: () => current,
+            progress: () => Effect.succeed({ accepted: true }),
             failed: (_owner, detail) =>
               lost === "cancel-report"
                 ? Effect.fail(failure())
@@ -899,6 +900,7 @@ for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as co
               pending: unused,
               begin: unused,
               get: unused,
+              progress: unused,
               failed: unused,
               freeze: unused,
               upload: unused,
@@ -1173,6 +1175,7 @@ for (const kind of ["terminal", "setup"] as const)
             begin: unused,
             beginVm: unused,
             get: unused,
+            progress: unused,
             failed: unused,
             freeze: unused,
             upload: unused,

@@ -18,6 +18,7 @@ import type {
   RelayThreadVmProviderAuthBinding,
   RelayThreadVmProviderAuth,
   RelayPortableThreadPlacement,
+  ThreadVmCapabilities,
 } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Schema from "effect/Schema";
@@ -43,6 +44,13 @@ import {
   resolvePortableThreadClientRoute,
   verifyPortableThreadClientRoute,
 } from "./portableThreadLibrary.ts";
+
+import {
+  beginPortableThreadPlacementRead,
+  isPortableThreadPlacementReadCurrent,
+  rememberPortableThreadPlacement,
+  portableThreadPlacementsAtom,
+} from "./portableThreadPresentation.ts";
 
 const controlKey = Schema.fromJsonString(Schema.Tuple([EnvironmentId, ThreadId]));
 const encodeKey = Schema.encodeSync(controlKey);
@@ -94,12 +102,18 @@ export function threadVmBackupRecoveryUnavailable(reason: string | null | undefi
 }
 
 /** Fresh VMs use Codex's own device sign-in while their workspace remains fenced. */
-export function threadVmProviderAuthPresentation(value: {
-  readonly requirement: "sign_in_required" | "authenticated" | "provider_unavailable";
-  readonly auth: ProviderAuthState;
-}) {
+export function threadVmProviderAuthPresentation(
+  value: {
+    readonly requirement: "sign_in_required" | "authenticated" | "provider_unavailable";
+    readonly auth: ProviderAuthState;
+  },
+  now?: number,
+) {
   const { auth, requirement } = value;
-  const active = ["starting", "waiting", "verifying"].includes(auth.phase);
+  const expiresAt = auth.expiresAt === null ? null : Date.parse(auth.expiresAt);
+  const expired =
+    expiresAt !== null && (now === undefined || !Number.isFinite(expiresAt) || expiresAt <= now);
+  const active = !expired && ["starting", "waiting", "verifying"].includes(auth.phase);
   const finished = requirement === "authenticated" || auth.phase === "succeeded";
   const interaction = auth.interaction;
   const candidate =
@@ -129,27 +143,32 @@ export function threadVmProviderAuthPresentation(value: {
         "This VM needs an installed and configured Codex provider before preparation can continue.")
       : finished
         ? "Signed in to Codex. The VM is finishing preparation."
-        : auth.phase === "failed"
-          ? (auth.message ?? "Codex sign-in failed. Try again to continue preparing this VM.")
-          : auth.phase === "cancelled"
-            ? "Sign-in was cancelled. The VM is still waiting; sign in again to continue."
-            : auth.phase === "starting"
-              ? "Starting Codex sign-in…"
-              : auth.phase === "verifying"
-                ? "Checking your Codex sign-in…"
-                : auth.phase === "waiting"
-                  ? "Finish signing in on Codex’s sign-in page. The VM will continue automatically."
-                  : "Sign in to Codex for this VM. Preparation continues when sign-in finishes.";
+        : expired
+          ? "This Codex sign-in code expired. Start sign-in again to get a new code."
+          : auth.phase === "failed"
+            ? (auth.message ?? "Codex sign-in failed. Try again to continue preparing this VM.")
+            : auth.phase === "cancelled"
+              ? "Sign-in was cancelled. The VM is still waiting; sign in again to continue."
+              : auth.phase === "starting"
+                ? "Starting Codex sign-in…"
+                : auth.phase === "verifying"
+                  ? "Checking your Codex sign-in…"
+                  : auth.phase === "waiting"
+                    ? "Finish signing in on Codex’s sign-in page. The VM will continue automatically."
+                    : "Sign in to Codex for this VM. Preparation continues when sign-in finishes.";
   return {
     title:
       requirement === "provider_unavailable"
         ? "Codex needs attention"
         : finished
           ? "Codex signed in"
-          : auth.phase === "cancelled"
-            ? "Codex sign-in cancelled"
-            : "Codex sign-in needed",
+          : expired
+            ? "Codex sign-in expired"
+            : auth.phase === "cancelled"
+              ? "Codex sign-in cancelled"
+              : "Codex sign-in needed",
     message,
+    expired,
     url,
     userCode:
       url && active && !finished && interaction?.type === "deviceCode"
@@ -158,7 +177,7 @@ export function threadVmProviderAuthPresentation(value: {
     canStart: requirement === "sign_in_required" && !active && !finished,
     canCancel: active && !finished && auth.flowId !== null,
     startLabel:
-      auth.phase === "failed" || auth.phase === "cancelled"
+      expired || auth.phase === "failed" || auth.phase === "cancelled"
         ? "Retry Codex sign-in"
         : "Sign in to Codex",
   };
@@ -249,7 +268,12 @@ export type ThreadVmControlAction =
 
 /** Presentation depends on confirmed relay state, never a speculative local power state. */
 export function threadVmStatusLabel(status: RelayThreadVmStatus) {
-  if (status.pendingProviderAuth) return "Preparing VM — checking Codex sign-in";
+  if (status.restore?.errorCode) return "VM restore needs attention";
+  if (status.reset?.errorCode) return "VM reset needs attention";
+  if (status.finalSave?.errorCode) return "Saving VM needs attention";
+  if (status.setupPhase === "failed" && !status.pendingProviderAuth)
+    return "VM setup needs attention";
+  if (status.pendingProviderAuth) return "Sign in to Codex";
   if (status.replacement?.phase === "awaiting_choice") return "VM limit reached";
   if (status.replacement?.phase === "waiting") return "Saving the selected VM before replacement";
   if (status.finalSave)
@@ -286,7 +310,7 @@ export function threadVmStatusLabel(status: RelayThreadVmStatus) {
         return "Restoring saved VM";
     }
   }
-  if (status.resumePhase && status.resumePhase !== "completed") return "Waiting to resume VM";
+  if (status.resumePhase && status.resumePhase !== "completed") return "Resume requested";
   if (status.pausePhase === "pending" || status.pausePhase === "sealed") return "Pausing VM";
   if (status.savedDisk?.phase === "expired") return "Saved workspace expired";
   if (status.savedDisk?.phase === "expiring") return "Saved workspace is expiring";
@@ -301,7 +325,271 @@ export function threadVmStatusLabel(status: RelayThreadVmStatus) {
     return "Preparing VM";
   if (status.allocation?.state === "paused") return "VM paused";
   if (status.allocation?.state === "deleting") return "Stopping VM";
-  return status.activity === "busy" ? "VM working" : "VM running";
+  if (status.allocation?.state === "running" && status.setupPhase === "ready")
+    return status.activity === "busy" ? "VM working" : "VM ready";
+  return "VM status unavailable";
+}
+
+export type ThreadVmPrimaryAction =
+  | "resume"
+  | "restore"
+  | "reset"
+  | "sign_in"
+  | "replace"
+  | "cancel_setup"
+  | "cancel_restore"
+  | "cancel_reset"
+  | "check";
+
+/** Numeric policy values do not enable relay workers. */
+export function threadVmCapabilityLabel(
+  capabilities: ThreadVmCapabilities | null,
+  capability: keyof ThreadVmCapabilities,
+) {
+  return capabilities === null
+    ? "Status unknown"
+    : capabilities[capability]
+      ? "Enabled"
+      : "Inactive";
+}
+
+/** A single presentation model is shared by the chat, VM overview and mobile client. */
+export function threadVmPresentation(input: {
+  readonly status: RelayThreadVmStatus | null;
+  readonly error?: string | null;
+  readonly pendingRequest?: boolean;
+  readonly queuePaused?: boolean;
+  readonly capabilities?: ThreadVmCapabilities | null;
+  readonly providerAuth?: RelayThreadVmProviderAuth | null;
+}) {
+  const { status } = input;
+  const held = !!(
+    input.pendingRequest ||
+    status?.pendingProviderAuth ||
+    status?.pausePhase === "pending" ||
+    status?.pausePhase === "sealed" ||
+    status?.finalSave ||
+    status?.restore ||
+    status?.reset ||
+    status?.replacement ||
+    (status?.resumePhase && status.resumePhase !== "completed")
+  );
+  const activePause = status?.pausePhase === "pending" || status?.pausePhase === "sealed";
+  const ready =
+    !input.error &&
+    status?.allocation?.state === "running" &&
+    status.setupPhase === "ready" &&
+    !held &&
+    !activePause;
+  const failed = !!(
+    input.error ||
+    (status?.pendingProviderAuth && input.providerAuth?.requirement === "provider_unavailable") ||
+    status?.restore?.errorCode ||
+    status?.reset?.errorCode ||
+    status?.finalSave?.errorCode ||
+    (status?.setupPhase === "failed" && !status.pendingProviderAuth)
+  );
+  const label = input.error
+    ? "VM status unavailable"
+    : status?.pendingProviderAuth && input.providerAuth?.requirement === "provider_unavailable"
+      ? "Codex needs attention"
+      : status?.pendingProviderAuth && input.providerAuth?.requirement === "authenticated"
+        ? "Preparing VM"
+        : status
+          ? threadVmStatusLabel(status)
+          : "VM status unavailable";
+  let primary: { type: ThreadVmPrimaryAction; label: string } | null = null;
+  if (input.error || !status) primary = { type: "check", label: "Check status" };
+  else if (status.pendingProviderAuth)
+    primary =
+      input.providerAuth?.requirement === "authenticated"
+        ? null
+        : input.providerAuth?.requirement === "provider_unavailable"
+          ? { type: "check", label: "Check status" }
+          : {
+              type: "sign_in",
+              label: ["waiting", "verifying"].includes(input.providerAuth?.auth.phase ?? "")
+                ? "Finish Codex sign-in"
+                : "Sign in to Codex",
+            };
+  else if (status.replacement?.phase === "awaiting_choice")
+    primary = { type: "replace", label: "Choose a VM to replace" };
+  else if (
+    status.restore &&
+    status.restore.canCancel !== false &&
+    ["pending", "preparing", "prepared", "boot_preparing", "boot_prepared"].includes(
+      status.restore.phase,
+    )
+  )
+    primary = { type: "cancel_restore", label: "Cancel restore" };
+  else if (status.reset && ["pending", "creating"].includes(status.reset.phase))
+    primary = { type: "cancel_reset", label: "Cancel reset" };
+  else if (!held && status.setupPhase === "failed")
+    primary = { type: "cancel_setup", label: "Cancel VM setup" };
+  else if (!held && !activePause && status.allocation?.state === "paused")
+    primary = { type: "resume", label: "Resume VM" };
+  else if (!held && status.savedDisk?.phase === "available" && status.savedDisk.operationId)
+    primary = { type: "restore", label: "Restore VM" };
+  else if (!held && status.savedDisk?.phase === "expired" && status.repository)
+    primary = { type: "reset", label: "Reset VM…" };
+  else if (label === "VM status unavailable") primary = { type: "check", label: "Check status" };
+  const detail =
+    input.error ??
+    (status?.pendingProviderAuth
+      ? input.providerAuth?.requirement === "provider_unavailable"
+        ? (input.providerAuth.auth.message ??
+          "Codex is unavailable in this VM. Its runner needs attention before preparation can continue.")
+        : input.providerAuth?.requirement === "authenticated"
+          ? "Codex is signed in. VM preparation continues automatically."
+          : "Sign in to Codex inside this VM. Your Launchpad Connect account is already connected."
+      : status?.setupPhase === "failed" && !status.pendingProviderAuth
+        ? "Preparation stopped. Cancel this setup before trying another move. Your conversation is kept."
+        : status?.restore?.errorCode || status?.reset?.errorCode || status?.finalSave?.errorCode
+          ? "The last step could not be confirmed. Your saved data is kept; check status or use the available cancellation."
+          : status?.allocation?.state === "paused"
+            ? "The conversation is available. Resume the VM when you need to continue working."
+            : status?.savedDisk?.phase === "available"
+              ? "The VM is stopped. Restore its saved workspace to continue."
+              : status?.savedDisk?.phase === "expired"
+                ? "The saved workspace expired. Reset from the original uploaded commit; the conversation is kept."
+                : ready && input.queuePaused
+                  ? "The VM is ready. Queued messages stay paused until you resume the queue."
+                  : status?.resumePhase && status.resumePhase !== "completed"
+                    ? "The relay accepted your request. Waiting for the VM to confirm it is ready."
+                    : null);
+  const capability =
+    primary?.type === "restore"
+      ? "restore"
+      : primary?.type === "reset"
+        ? "reset"
+        : primary?.type === "replace"
+          ? "replacement"
+          : primary?.type === "resume"
+            ? "configured"
+            : null;
+  const disabledReason =
+    capability && input.capabilities !== undefined
+      ? input.capabilities === null
+        ? "Relay capability status is unknown. Check status before continuing."
+        : !input.capabilities[capability]
+          ? "This VM action is inactive on the relay."
+          : null
+      : null;
+  return {
+    disabledReason,
+    label: ready && input.queuePaused ? "VM ready · queue paused" : label,
+    tone: failed
+      ? ("danger" as const)
+      : ready
+        ? ("success" as const)
+        : primary
+          ? ("attention" as const)
+          : ("neutral" as const),
+    detail,
+    primary,
+    held,
+    ready,
+    canPreview:
+      ready &&
+      !failed &&
+      (input.capabilities === undefined || input.capabilities?.privatePreview === true),
+    canRecoverBackup:
+      !input.error &&
+      (input.capabilities === undefined || input.capabilities?.restore === true) &&
+      !held &&
+      !!status?.lastVerifiedBackupAt &&
+      (status.allocation?.state === "running" || status.allocation?.state === "paused"),
+    canDelete:
+      !!status &&
+      !input.error &&
+      !held &&
+      (input.capabilities === undefined || input.capabilities?.permanentDelete === true),
+    canCancelSetup: !held && ["pending", "running", "failed"].includes(status?.setupPhase ?? ""),
+    canCancelRestore:
+      !!status?.restore &&
+      status.restore.canCancel !== false &&
+      ["pending", "preparing", "prepared", "boot_preparing", "boot_prepared"].includes(
+        status.restore.phase,
+      ),
+    canCancelReset: !!status?.reset && ["pending", "creating"].includes(status.reset.phase),
+  };
+}
+
+/** Byte counts come from verified transfer receipts, with no guessed overall percentage. */
+export function threadMoveProgressPresentation(
+  placement: RelayPortableThreadPlacement | null | undefined,
+) {
+  if (!placement?.operationId || placement.moveFailureDetail) return null;
+  const snapshots =
+    placement.moveProgress?.filter(
+      (progress) =>
+        progress.operationId === placement.operationId && progress.threadId === placement.threadId,
+    ) ?? [];
+  const destination = snapshots.filter((progress) => progress.participant === "destination");
+  const progress = [...(destination.length ? destination : snapshots)].sort(
+    (a, b) =>
+      b.attempt - a.attempt || b.revision - a.revision || b.updatedAt.localeCompare(a.updatedAt),
+  )[0];
+  if (!progress) return null;
+  const labels = {
+    capturing: "Saving conversation",
+    packing: "Preparing files",
+    uploading: "Uploading files",
+    downloading: "Downloading files",
+    installing: "Restoring files and conversation",
+    setup: "Preparing project",
+    activating: "Opening the new location",
+  };
+  const bytes = (value: number) =>
+    value >= 1_048_576
+      ? `${(value / 1_048_576).toFixed(1)} MB`
+      : value >= 1024
+        ? `${Math.round(value / 1024)} KB`
+        : `${value} B`;
+  return {
+    label: labels[progress.stage],
+    detail:
+      progress.totalBytes === null
+        ? null
+        : `${bytes(progress.completedBytes)} of ${bytes(progress.totalBytes)} verified`,
+    stage: progress.stage,
+  };
+}
+
+/** A refreshed status must still permit the command selected by the user. */
+export function threadVmActionUnavailableReason(
+  action: ThreadVmControlAction,
+  status: RelayThreadVmStatus,
+) {
+  if (
+    "payload" in action &&
+    "expectedGeneration" in action.payload &&
+    action.payload.expectedGeneration !== status.generation &&
+    !(action.type === "restore" && status.restore?.operationId === action.payload.operationId) &&
+    !(action.type === "reset" && status.reset?.operationId === action.payload.operationId)
+  )
+    return "This thread’s VM changed. Check its current status before trying again.";
+  const presentation = threadVmPresentation({ status });
+  if (action.type === "resume" && status.allocation?.state !== "paused" && !status.resumePhase)
+    return "This VM is no longer paused. Check its current status.";
+  if (
+    action.type === "reset" &&
+    status.reset?.operationId !== action.payload.operationId &&
+    presentation.primary?.type !== "reset"
+  )
+    return "Reset is available only after the saved workspace expires.";
+  if (
+    action.type === "restore" &&
+    status.restore?.operationId !== action.payload.operationId &&
+    status.replacement?.requestId !== action.payload.operationId &&
+    presentation.primary?.type !== "restore"
+  )
+    return "This saved workspace is no longer available to restore.";
+  if (action.type === "cancel_restore" && status.restore?.operationId !== action.operationId)
+    return "This restore request changed. Check its current status.";
+  if (action.type === "cancel_reset" && status.reset?.operationId !== action.operationId)
+    return "This reset request changed. Check its current status.";
+  return null;
 }
 
 /** Only mounted thread views refresh. All reads are relay-only and never wake compute. */
@@ -320,6 +608,18 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     threadId: ThreadId,
   ) => Atom.Atom<Pick<OrchestrationThread, "promptQueue"> | null>,
 ) {
+  const capabilitiesQueryAtom = runtime
+    .atom(
+      Effect.gen(function* () {
+        const relay = yield* ManagedRelayTenancyClient;
+        if (!normalizeSecureRelayUrl(relay.relayUrl)) return null;
+        return (yield* relay.getHealth()).threadVmCapabilities ?? null;
+      }),
+    )
+    .pipe(Atom.setIdleTTL(0));
+  const capabilitiesAtom = Atom.make((get) =>
+    readManagedRelaySnapshotState(get(capabilitiesQueryAtom)),
+  ).pipe(Atom.setIdleTTL(0));
   const hostConfigurationQueryAtom = runtime
     .atom(
       Effect.gen(function* () {
@@ -409,12 +709,30 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       const [, threadId] = decodeKey(key),
         state = get(locationStateAtom(threadId)),
         configured = readManagedRelaySnapshotState(get(configuredRelayAtom));
-      return state?.session === get(managedRelaySessionAtom) &&
-        !configured.isPending &&
-        !configured.error &&
-        state?.relayUrl === configured.data
-        ? state
-        : null;
+      if (
+        state?.session !== get(managedRelaySessionAtom) ||
+        configured.isPending ||
+        configured.error ||
+        state?.relayUrl !== configured.data
+      )
+        return null;
+      const proofs = get(portableThreadPlacementsAtom);
+      const placement =
+        proofs?.session === state.session &&
+        proofs.relayUrl === state.relayUrl &&
+        (proofs.reads.get(threadId) ?? 0) >= state.request
+          ? proofs.placements.get(threadId)
+          : null;
+      return placement
+        ? {
+            ...state,
+            placement,
+            generation: placement.generation,
+            trackingMove: placement.operationId !== null,
+            error: null,
+            isPending: false,
+          }
+        : state;
     }),
   );
   const confirmedLocationAtom = Atom.family((key: string) =>
@@ -429,8 +747,6 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         : null;
     }),
   );
-  // All location reads share ordering, including same-generation activation updates.
-  let locationRequest = 0;
   const readLocation = Effect.fnUntraced(function* (
     registry: AtomRegistry.AtomRegistry,
     key: string,
@@ -462,7 +778,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       atom = locationStateAtom(threadId),
       previous = registry.get(atom),
       sameScope = previous?.session === session && previous.relayUrl === relayUrl,
-      request = ++locationRequest;
+      request = beginPortableThreadPlacementRead(registry, session, relay.relayUrl);
     const queuedMove = () =>
       threadDetailAtom
         ? inFlightMove(registry.get(threadDetailAtom(environmentId, threadId))?.promptQueue)
@@ -489,7 +805,8 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         currentRoute?.generation === route?.generation &&
         normalizeSecureRelayUrl(currentRoute?.relayUrl ?? relayUrl) ===
           normalizeSecureRelayUrl(route?.relayUrl ?? relayUrl) &&
-        (registry.get(atom)?.request ?? 0) <= request
+        (registry.get(atom)?.request ?? 0) <= request &&
+        isPortableThreadPlacementReadCurrent(registry, session, relayUrl, threadId, request)
       );
     };
     const placement = yield* Effect.gen(function* () {
@@ -541,6 +858,12 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         message: "This thread’s location changed while checking it. Check again.",
       });
     }
+    if (
+      !rememberPortableThreadPlacement(registry, session, relayUrl, placement, undefined, request)
+    )
+      return yield* new OrchestrationDispatchCommandError({
+        message: "This thread’s location changed while checking it. Check again.",
+      });
     registry.set(atom, {
       ...started,
       placement,
@@ -871,6 +1194,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       const session = get(managedRelaySessionAtom),
         route = get(routeAtom(key));
       if (!session || !route) return null;
+      const [environmentId, threadId] = decodeKey(key);
       const state = readManagedRelaySnapshotState(get(queryAtom(key)));
       const providerAuth = state.data?.status?.pendingProviderAuth
         ? readManagedRelaySnapshotState(get(providerAuthPollAtom(key)))
@@ -889,6 +1213,9 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         providerAuthError: providerAuth?.error ?? null,
         providerAuthPending: providerAuth?.isPending ?? false,
         accountId: session.accountId,
+        queuePaused: threadDetailAtom
+          ? get(threadDetailAtom(environmentId, threadId))?.promptQueue?.enabled === false
+          : false,
       };
     }).pipe(Atom.setIdleTTL(0)),
   );
@@ -914,6 +1241,25 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         );
       const auth = { clerkToken, threadId: input.threadId };
       const value = input.action;
+      const previouslyRead =
+        value.type === "delete"
+          ? null
+          : readManagedRelaySnapshotState(registry.get(queryAtom(key))).data?.status;
+      const fresh = value.type === "delete" ? null : yield* relay.getThreadVmStatus(auth);
+      if (
+        fresh &&
+        previouslyRead &&
+        fresh.generation !== previouslyRead.generation &&
+        (value.type === "resume" || value.type === "cancel_setup")
+      )
+        return yield* new OrchestrationDispatchCommandError({
+          message: "This thread’s VM changed. Check its current status before trying again.",
+        });
+      const unavailable = fresh ? threadVmActionUnavailableReason(value, fresh) : null;
+      if (unavailable || registry.get(managedRelaySessionAtom) !== session)
+        return yield* new OrchestrationDispatchCommandError({
+          message: unavailable ?? "Your account changed. Check this thread again.",
+        });
       const result = yield* Effect.gen(function* () {
         switch (value.type) {
           case "resume":
@@ -1070,6 +1416,8 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     }),
   });
   return {
+    capabilitiesQueryAtom,
+    capabilitiesAtom,
     hostConfigurationQueryAtom,
     hostConfigurationAtom,
     refresh(registry: AtomRegistry.AtomRegistry, environmentId: EnvironmentId, threadId: ThreadId) {
@@ -1080,6 +1428,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           bootstrapAtom(encodeBootstrapKey([environmentId, threadId, route.generation])),
         );
       registry.refresh(queryAtom(key));
+      registry.refresh(capabilitiesQueryAtom);
       registry.refresh(providerAuthQueryAtom(key));
       registry.refresh(locationQueryAtom(key));
       registry.refresh(unavailableLocationQueryAtom(key));

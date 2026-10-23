@@ -635,6 +635,22 @@ export const relayThreadMoves = pgTable(
   ],
 );
 
+export const relayThreadMoveProgress = pgTable(
+  "relay_thread_move_progress",
+  {
+    operationId: varchar("operation_id", { length: 64 })
+      .notNull()
+      .references(() => relayThreadMoves.operationId, { onDelete: "cascade" }),
+    environmentId: varchar("environment_id", { length: 191 }).notNull(),
+    generation: integer("generation").notNull(),
+    attempt: bigint("attempt", { mode: "number" }).notNull(),
+    revision: bigint("revision", { mode: "number" }).notNull(),
+    stage: integer("stage").notNull(),
+    snapshot: jsonb("snapshot").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.operationId, table.environmentId] })],
+);
+
 /** Work IDs survive moves: a lost reply must never admit the same work at a new owner. */
 export const relayThreadExecutionAdmissions = pgTable(
   "relay_thread_execution_admissions",
@@ -1332,6 +1348,9 @@ export const relayThreadHistory = pgTable(
       .on(table.threadId, table.sourceSequence)
       .where(sql`${table.eventJson}->>'type'='thread.deleted'`),
     uniqueIndex("idx_relay_thread_history_source").on(table.environmentId, table.sourceSequence),
+    index("idx_relay_thread_history_queue_event")
+      .on(table.threadId, sql`(${table.eventJson}->>'eventId')`)
+      .where(sql`${table.eventJson}->>'type'='thread.prompt-queue-changed'`),
     index("idx_relay_thread_history_thread_source").on(
       table.threadId,
       table.environmentId,
@@ -1900,3 +1919,5 @@ export const relayThreadVmPreviews = pgTable(
     ),
   ],
 );
+
+export { relayThreadCurrentQueues } from "./threadQueueSchema.ts";

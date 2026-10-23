@@ -545,6 +545,12 @@ describe("resolveCurrentWorkspaceLabel", () => {
 });
 
 describe("resolveLockedWorkspaceLabel", () => {
+  it("names the dedicated VM workspace for checkout and transferred worktree paths", () => {
+    expect(resolveLockedWorkspaceLabel(null, "local", true)).toBe("VM workspace");
+    expect(resolveLockedWorkspaceLabel("/workspace/worktree", "worktree", true)).toBe(
+      "VM workspace",
+    );
+  });
   it("uses a shorter label for the main repo checkout", () => {
     expect(resolveLockedWorkspaceLabel(null, "local")).toBe("Local checkout");
   });

@@ -87,3 +87,30 @@ export function threadRunOnStatus({
     warning: true,
   } as const;
 }
+
+/** An unconnected machine can be checked; confirmed offline or denied hosts cannot be selected. */
+export function threadRunOnTargetAvailability(input: {
+  readonly phase: import("../connection/presentation.ts").EnvironmentConnectionPhase | undefined;
+  readonly failureReason?:
+    | import("../connection/model.ts").ConnectionAttemptError["reason"]
+    | null
+    | undefined;
+}) {
+  if (input.failureReason === "permission" || input.failureReason === "authentication")
+    return { action: null, detail: "Access required" } as const;
+  switch (input.phase) {
+    case "connected":
+      return { action: "select", detail: null } as const;
+    case "connecting":
+    case "reconnecting":
+      return { action: null, detail: "Connecting…" } as const;
+    case "offline":
+      return { action: null, detail: "Offline" } as const;
+    case "unsupported":
+      return { action: null, detail: "Update this environment before moving a thread" } as const;
+    case "available":
+      return { action: "check", detail: "Not connected · Check connection" } as const;
+    default:
+      return { action: "check", detail: "Connection unknown · Check connection" } as const;
+  }
+}

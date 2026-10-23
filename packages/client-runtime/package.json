@@ -315,6 +315,7 @@
       "types": "./src/device/duoControl.ts",
       "default": "./src/device/duoControl.ts"
     },
+    "./relay/portableThreadPresentation": "./src/relay/portableThreadPresentation.ts",
     "./relay/threadVmControls": {
       "types": "./src/relay/threadVmControls.ts",
       "default": "./src/relay/threadVmControls.ts"

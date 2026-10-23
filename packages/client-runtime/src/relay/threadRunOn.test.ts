@@ -8,7 +8,7 @@ import {
   type ThreadPromptQueueEntry,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-import { threadRunOnStatus } from "./threadRunOn.ts";
+import { threadRunOnStatus, threadRunOnTargetAvailability } from "./threadRunOn.ts";
 import type { ThreadMoveSubmission } from "./threadMoveSubmission.ts";
 
 const move: ThreadMoveQueueEntry = {
@@ -92,5 +92,22 @@ describe("threadRunOnStatus", () => {
       threadRunOnStatus({ queue: null, saved: { ...saved, rejection: "Host offline" } }),
     ).toMatchObject({ phase: "rejected", detail: "Host offline" });
     expect(threadRunOnStatus({ queue: null, saved: null })).toBeNull();
+  });
+});
+
+describe("move target connections", () => {
+  it("offers connection checks for unconnected, unknown, and failed connections", () => {
+    for (const phase of [undefined, "available", "error"] as const)
+      expect(threadRunOnTargetAvailability({ phase }).action).toBe("check");
+    expect(threadRunOnTargetAvailability({ phase: "connected" }).action).toBe("select");
+  });
+  it("disables known offline, connecting, unsupported, and denied targets", () => {
+    for (const phase of ["offline", "connecting", "reconnecting", "unsupported"] as const)
+      expect(threadRunOnTargetAvailability({ phase }).action).toBeNull();
+    for (const failureReason of ["authentication", "permission"] as const)
+      expect(threadRunOnTargetAvailability({ phase: "error", failureReason })).toEqual({
+        action: null,
+        detail: "Access required",
+      });
   });
 });

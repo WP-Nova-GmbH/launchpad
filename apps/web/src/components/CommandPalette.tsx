@@ -1,5 +1,7 @@
 "use client";
 
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+
 import { PortableThreadLibraryOverlay } from "./chat/PortableThreadLibrary";
 import { portableThreadLibrary } from "../state/threads";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
@@ -773,8 +775,13 @@ function OpenCommandPaletteDialog(props: {
   const desktopLocalBootstraps = useDesktopLocalBootstraps();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const availableSettingsSearchItems = useAvailableSettingsSearchItems();
-  const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread } =
-    useHandleNewThread();
+  const {
+    activeDraftThread,
+    activeThread,
+    defaultProjectRef,
+    handleNewThread,
+    canCreateThreadInProject,
+  } = useHandleNewThread();
   const projects = useProjects();
   const referenceThreadRef =
     pathname === "/pull-requests"
@@ -787,7 +794,8 @@ function OpenCommandPaletteDialog(props: {
         ? scopeThreadRef(activeThread.environmentId, activeThread.id)
         : null;
   const openPanelPullRequestUrl = useOpenPanelPullRequestUrl(referenceThreadRef);
-  const activeThreadServerConfig = useServerConfigs().get(
+  const serverConfigs = useServerConfigs();
+  const activeThreadServerConfig = serverConfigs.get(
     activeThread?.environmentId ?? ("" as EnvironmentId),
   );
   const activeThreadReferenceCopyTarget =
@@ -1318,7 +1326,9 @@ function OpenCommandPaletteDialog(props: {
     () =>
       enumerateCommandPaletteItems(
         buildProjectActionItems({
-          projects: pickerProjects,
+          projects: pickerProjects.filter((project) =>
+            canCreateThreadInEnvironment(serverConfigs.get(project.environmentId)),
+          ),
           valuePrefix: "new-thread-in",
           searchTerms: (project) => {
             const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
@@ -1374,6 +1384,7 @@ function OpenCommandPaletteDialog(props: {
       contextualProjectRef,
       handleNewThread,
       pickerProjects,
+      serverConfigs,
       projectEnvironmentLocationById,
       projectGroupByTargetKey,
     ],
@@ -2017,7 +2028,7 @@ function OpenCommandPaletteDialog(props: {
       projectPickerEntries.find((entry) => entry.isPreferred)?.group.displayName ??
       (currentProjectId ? (projectTitleById.get(currentProjectId) ?? null) : null);
 
-    if (activeProjectTitle) {
+    if (activeProjectTitle && canCreateThreadInEnvironment(activeThreadServerConfig)) {
       actionItems.push({
         kind: "action",
         value: "action:new-thread",
@@ -2035,6 +2046,7 @@ function OpenCommandPaletteDialog(props: {
             activeThread: activeThread ?? undefined,
             defaultProjectRef,
             handleNewThread,
+            canCreateThreadInProject,
           });
         },
       });

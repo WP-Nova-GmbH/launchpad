@@ -488,6 +488,17 @@ export const healthApi = HttpApiBuilder.group(
             ok: true,
             service: "relay" as const,
             threadVmConfigured: settings !== undefined,
+            threadVmCapabilities: {
+              configured: settings !== undefined,
+              autoPause: settings?.autoPauseEnabled ?? false,
+              autoBackup: settings?.autoBackupEnabled ?? false,
+              autoDelete: !!settings?.autoDeleteEnabled && settings.autoBackupEnabled,
+              replacement: !!settings?.replacementEnabled && settings.autoBackupEnabled,
+              restore: settings?.restoreEnabled ?? false,
+              reset: settings?.resetEnabled ?? false,
+              permanentDelete: settings?.permanentDeleteEnabled ?? false,
+              privatePreview: !!settings?.previewBaseUrl,
+            },
           };
         },
         Effect.catch(() => relayInternalErrorResponse("database_unavailable")),

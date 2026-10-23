@@ -1,6 +1,10 @@
+import {
+  createPortableThreadPresentationAtom,
+  createPortableThreadNavigationRefreshAtom,
+} from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { createThreadVmActionJournal } from "@t3tools/client-runtime/relay/threadVmActionSubmission";
 import { createThreadQueueControlJournal } from "@t3tools/client-runtime/relay/threadQueueControlSubmission";
-import { portableThreadIntentStorage } from "./thread-move-submissions";
+import { portableThreadIntentStorage, threadMoveRelayUrl } from "./thread-move-submissions";
 import {
   createPortableThreadLibraryAtoms,
   createPortableThreadChatCommand,
@@ -60,6 +64,23 @@ export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(
 export const environmentThreadShells = createEnvironmentThreadShellAtoms({
   catalogValueAtom: environmentCatalog.catalogValueAtom,
   snapshotAtom: threadEnvironment.snapshotAtom,
+});
+
+const navigationPlacementIndexAtom = createPortableThreadNavigationRefreshAtom(
+  connectionAtomRuntime,
+  portableThreadLibrary,
+  {
+    shellsAtom: environmentThreadShells.threadShellsAtom,
+    catalogAtom: environmentCatalog.catalogValueAtom,
+    connectionStateAtom: environmentCatalog.stateAtom,
+    relayUrl: threadMoveRelayUrl,
+  },
+);
+
+export const navigationThreadShellsAtom = createPortableThreadPresentationAtom({
+  shellsAtom: environmentThreadShells.threadShellsAtom,
+  relayUrl: threadMoveRelayUrl,
+  indexLoadedAtom: navigationPlacementIndexAtom,
 });
 
 const EMPTY_THREAD_STATE_ATOM = Atom.make(AsyncResult.success(EMPTY_ENVIRONMENT_THREAD_STATE)).pipe(

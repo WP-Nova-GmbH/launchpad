@@ -18,7 +18,11 @@ vi.mock("./atom-registry", async () => {
 });
 vi.mock("./threads", async () => {
   const { Atom } = await import("effect/unstable/reactivity");
-  return { environmentThreadShells: { threadShellsAtom: Atom.make([]).pipe(Atom.keepAlive) } };
+  const source = Atom.make([]).pipe(Atom.keepAlive);
+  return {
+    environmentThreadShells: { threadShellsAtom: source },
+    navigationThreadShellsAtom: source,
+  };
 });
 vi.mock("./server", async () => {
   const { Atom } = await import("effect/unstable/reactivity");

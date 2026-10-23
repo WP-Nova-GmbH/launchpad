@@ -1,3 +1,5 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { useEnvironmentServerConfig } from "../../state/entities";
 import {
   THREAD_LIST_V2_MONO_FONT as MONO_FONT,
   THREAD_LIST_V2_ROW_CONTENT_CLASS_NAME,
@@ -764,6 +766,11 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     ],
     [arrangementMenuItems, titleMenuItems],
   );
+  const environmentLabel = thread.portableLocation?.label ?? props.environmentLabel;
+  const environmentMachine = thread.portableLocation?.machine ?? props.environmentMachine;
+  const canCreateThread = canCreateThreadInEnvironment(
+    useEnvironmentServerConfig(thread.environmentId),
+  );
   const handleMenuAction = useCallback(
     ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
       if (nativeEvent.event === "new-thread-on-branch") onNewThreadOnBranch(thread);
@@ -961,7 +968,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
           >
             {thread.session.lastError}
           </Text>
-        ) : thread.branch || props.environmentLabel ? (
+        ) : thread.branch || environmentLabel ? (
           /* "branch · machine" share one truncating line. The machine sits
              last so a tight fit cuts the repetitive label, not the branch —
              and machine-only fills the row for non-git projects. The glyph
@@ -991,8 +998,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                   {thread.branch}
                 </Text>
               ) : null}
-              {thread.branch && props.environmentLabel ? "  ·  " : null}
-              {props.environmentLabel ? (
+              {thread.branch && environmentLabel ? "  ·  " : null}
+              {environmentLabel ? (
                 <Text
                   className={cn(
                     "text-xs",
@@ -1001,13 +1008,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                       : rowAppearance.tertiaryForegroundClassName,
                   )}
                 >
-                  {props.environmentLabel}
+                  {environmentLabel}
                 </Text>
               ) : null}
             </Text>
-            {props.environmentLabel && props.environmentMachine ? (
+            {environmentLabel && environmentMachine ? (
               <EnvironmentMachineSymbol
-                kind={props.environmentMachine}
+                kind={environmentMachine}
                 size={11}
                 tintColorClassName={
                   selected
@@ -1198,7 +1205,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         {(close) => (
           <ControlPillMenu
             actions={[
-              ...(thread.branch
+              ...(thread.branch && canCreateThread
                 ? [
                     {
                       id: "new-thread-on-branch",

@@ -12,18 +12,56 @@ import type {
   RelayThreadVmBackupRecoveryCandidate,
 } from "@t3tools/contracts/relay";
 import {
-  threadVmStatusLabel,
+  threadVmPresentation,
   threadVmProviderAuthPresentation,
   threadVmBackupRecoveryUnavailable,
   type ThreadVmControlAction,
 } from "@t3tools/client-runtime/relay/threadVmControls";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { useCallback, useContext, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { threadVmControls, threadVmActionJournal } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import {
+  AlertDialog,
+  AlertDialogPopup,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+} from "../ui/alert-dialog";
+type ThreadVmUi = {
+  label: string;
+  caption: string;
+  tone: "danger" | "success" | "attention" | "neutral";
+  notice: ReactNode;
+  progressOnly?: boolean;
+  actions: (close: () => void, standalone?: boolean) => ReactNode;
+  trigger: RefObject<HTMLButtonElement | null>;
+};
+const ThreadVmUiContext = createContext<ThreadVmUi | null>(null);
+export const useThreadVmUi = () => useContext(ThreadVmUiContext);
+export function ThreadVmNotice({ moving = false }: { moving?: boolean }) {
+  const ui = useThreadVmUi();
+  return moving && ui?.progressOnly ? null : (ui?.notice ?? null);
+}
+export function ThreadVmMenuActions({ onAction }: { onAction: () => void }) {
+  return useThreadVmUi()?.actions(onAction) ?? null;
+}
+
 function Panel({ children }: { children: ReactNode }) {
   return <div className="flex flex-wrap items-center gap-2 px-3 py-2 text-xs">{children}</div>;
 }
@@ -56,6 +94,28 @@ function ActionButton({
     </Button>
   );
 }
+function MenuAction({
+  label,
+  onPress,
+  disabled,
+  danger,
+}: {
+  label: string;
+  onPress: () => void;
+  disabled: boolean;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onPress}
+      className={`w-full rounded-md px-2 py-2 text-left text-xs hover:bg-accent disabled:pointer-events-none disabled:opacity-50 ${danger ? "text-destructive" : "text-foreground"}`}
+    >
+      {label}
+    </button>
+  );
+}
 function Field({
   label,
   value,
@@ -75,61 +135,76 @@ function Field({
   );
 }
 
-export function ThreadVmControls({
+/** Standalone recovery remains available when the VM cannot open a live chat. */
+export function ThreadVmControls(props: { environmentId: EnvironmentId; threadId: ThreadId }) {
+  return (
+    <ThreadVmControlsProvider {...props}>
+      <StandaloneVmControls />
+    </ThreadVmControlsProvider>
+  );
+}
+function StandaloneVmControls() {
+  const ui = useThreadVmUi();
+  if (!ui) return null;
+  return (
+    <div className="grid gap-2">
+      {ui.notice ?? (
+        <p className="text-sm font-medium" role="status">
+          {ui.label}
+        </p>
+      )}
+      {ui.actions(() => {}, true)}
+    </div>
+  );
+}
+export function ThreadVmControlsProvider({
   environmentId,
   threadId,
+  children,
 }: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
+  children: ReactNode;
 }) {
-  const registry = useContext(RegistryContext);
   const view = useAtomValue(threadVmControls.viewAtom(environmentId, threadId));
-  if (!view) return null;
-  const data = view.data;
-  if (!data?.status && !data?.deletion)
-    return view.error ? (
-      <Panel>
-        <Note>{view.error}</Note>
-        <ActionButton
-          label="Retry"
-          disabled={view.isPending}
-          onPress={() => threadVmControls.refresh(registry, environmentId, threadId)}
-        />
-      </Panel>
-    ) : null;
-  if (data.deletion)
-    return (
-      <Panel>
-        <Note>
-          {data.deletion.phase === "completed"
-            ? "Thread permanently deleted."
-            : "Thread deleted. Removing its VM and saved data…"}
-        </Note>
-      </Panel>
-    );
-  const status = data.status!;
-  if (
-    !status.allocation &&
-    !status.savedDisk &&
-    !status.reset &&
-    !status.restore &&
-    !status.replacement &&
-    !status.pendingProviderAuth
-  )
-    return null;
+  const session = useAtomValue(managedRelaySessionAtom);
+  const data = view?.data;
+  const status = data?.status;
+  const activeStatus =
+    !data?.deletion &&
+    status &&
+    (status.allocation ||
+      status.savedDisk ||
+      status.reset ||
+      status.restore ||
+      status.replacement ||
+      status.pendingProviderAuth)
+      ? status
+      : null;
+  // Keep the chat subtree mounted when a local thread first acquires a VM.
   return (
     <ThreadVmControlPanel
-      key={`${view.accountId}:${environmentId}:${threadId}`}
+      key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${environmentId}:${threadId}`}
       environmentId={environmentId}
       threadId={threadId}
-      status={status}
-      candidates={data.candidates}
-      readError={view.error}
-      accountId={view.accountId}
-      providerAuth={view.providerAuth}
-      providerAuthError={view.providerAuthError}
-      providerAuthPending={view.providerAuthPending}
-    />
+      status={activeStatus}
+      candidates={data?.candidates ?? []}
+      readError={view?.error ?? null}
+      deletionNote={
+        data?.deletion
+          ? data.deletion.phase === "completed"
+            ? "Thread permanently deleted."
+            : "Thread deleted. Removing its VM and saved data…"
+          : null
+      }
+      accountId={view?.accountId ?? session?.accountId ?? ""}
+      providerAuth={view?.providerAuth ?? null}
+      providerAuthError={view?.providerAuthError ?? null}
+      providerAuthPending={view?.providerAuthPending ?? false}
+      queuePaused={view?.queuePaused ?? false}
+    >
+      {children}
+    </ThreadVmControlPanel>
   );
 }
 
@@ -154,7 +229,17 @@ function VmCodexSignIn({
   const openLink = useOpenLink(null);
   const [busy, setBusy] = useState(false),
     [error, setError] = useState<string | null>(null);
-  const presentation = value ? threadVmProviderAuthPresentation(value) : null;
+  const [now, setNow] = useState(() => Date.now());
+  const expiresAt = value?.auth.expiresAt;
+  useEffect(() => {
+    if (!expiresAt) return;
+    const timer = setTimeout(
+      () => setNow(Date.now()),
+      Math.max(0, Date.parse(expiresAt) - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [expiresAt]);
+  const presentation = value ? threadVmProviderAuthPresentation(value, now) : null;
   const run = async (action: Parameters<typeof dispatch>[0]["action"]) => {
     if (busy) return;
     setBusy(true);
@@ -201,6 +286,17 @@ function VmCodexSignIn({
         </p>
       ) : null}
       <div className="flex flex-wrap gap-2">
+        {presentation?.userCode ? (
+          <ActionButton
+            label="Copy code"
+            disabled={busy}
+            onPress={() => {
+              void navigator.clipboard
+                .writeText(presentation.userCode!)
+                .catch(() => setError("Could not copy the code. Select and copy it above."));
+            }}
+          />
+        ) : null}
         {presentation?.canStart ? (
           <ActionButton
             label={presentation.startLabel}
@@ -241,23 +337,30 @@ function ThreadVmControlPanel({
   environmentId,
   threadId,
   status,
+  deletionNote,
   candidates,
   readError,
   accountId,
   providerAuth,
   providerAuthError,
   providerAuthPending,
+  children,
+  queuePaused,
 }: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
-  status: RelayThreadVmStatus;
+  status: RelayThreadVmStatus | null;
+  deletionNote: string | null;
   candidates: ReadonlyArray<RelayThreadVmReplacementCandidate>;
   readError: string | null;
   accountId: string;
   providerAuth: RelayThreadVmProviderAuth | null;
   providerAuthError: string | null;
   providerAuthPending: boolean;
+  children: ReactNode;
+  queuePaused: boolean;
 }) {
+  const registry = useContext(RegistryContext);
   const dispatch = useAtomCommand(threadVmControls.action, { reportFailure: false });
   const preview = useAtomCommand(threadVmControls.openPreview, { reportFailure: false });
   const checkBackup = useAtomCommand(threadVmControls.checkBackupRecovery, {
@@ -267,10 +370,28 @@ function ThreadVmControlPanel({
   const [previewPort, setPreviewPort] = useState("3000");
   const openLink = useOpenLink({ environmentId, threadId });
 
-  const [expanded, setExpanded] = useState(false),
-    [busy, setBusy] = useState(false),
+  const [busy, setBusy] = useState(false),
     [error, setError] = useState<string | null>(null);
-  const [confirm, setConfirm] = useState<"reset" | "delete" | string | null>(null);
+  const [confirm, setConfirm] = useState<string | null>(null);
+  const dialogRevision = useRef(0);
+  const hasStatus = status !== null;
+  const dialogOpen = hasStatus && confirm !== null;
+  useLayoutEffect(() => {
+    if (!hasStatus && confirm !== null) {
+      dialogRevision.current++;
+      setConfirm(null);
+    }
+  }, [hasStatus, confirm]);
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  const openConfirmation = (kind: string) => {
+    dialogRevision.current++;
+    setError(null);
+    setConfirm(kind);
+  };
+  const closeConfirmation = () => {
+    dialogRevision.current++;
+    setConfirm(null);
+  };
   const session = useAtomValue(managedRelaySessionAtom);
   const submit = useCallback(
     async (input: Parameters<typeof dispatch>[0]) => {
@@ -289,10 +410,12 @@ function ThreadVmControlPanel({
   const pending = lifecycle.entries.find((entry) => entry.threadId === threadId);
   const openPreview = async () => {
     if (busy) return;
+    const openedAt = dialogRevision.current;
     setBusy(true);
     setError(null);
     try {
       const result = await preview({ environmentId, threadId, port: Number(previewPort) });
+      if (dialogRevision.current !== openedAt) return;
       if (result._tag === "Failure") {
         const failure = squashAtomCommandFailure(result);
         setError(
@@ -302,7 +425,7 @@ function ThreadVmControlPanel({
       }
       await openLink(result.value.url, { recordHistory: false });
     } catch {
-      setError("The VM preview could not be opened.");
+      if (dialogRevision.current === openedAt) setError("The VM preview could not be opened.");
     } finally {
       setBusy(false);
     }
@@ -312,15 +435,18 @@ function ThreadVmControlPanel({
     setError(null);
     if (await lifecycle.run({ environmentId, threadId, action })) setConfirm(null);
   };
-  const held = !!(
-    pending ||
-    status.finalSave ||
-    status.restore ||
-    status.reset ||
-    status.replacement ||
-    (status.resumePhase && status.resumePhase !== "completed")
-  );
+  const capabilities = useAtomValue(threadVmControls.capabilitiesAtom);
+  const presentation = threadVmPresentation({
+    status,
+    error: readError,
+    pendingRequest: !!pending,
+    queuePaused,
+    providerAuth,
+    capabilities: capabilities.error || capabilities.isPending ? null : capabilities.data,
+  });
+  const { held } = presentation;
   const restore = () => {
+    if (!status) return;
     if (!status.savedDisk?.operationId) return;
     void run({
       type: "restore",
@@ -333,7 +459,9 @@ function ThreadVmControlPanel({
     });
   };
   const checkBackupRecovery = async () => {
-    if (busy || !status.allocation) return;
+    if (busy || !status || !status.allocation) return;
+    openConfirmation("backup");
+    const openedAt = dialogRevision.current;
     setBusy(true);
     setError(null);
     setBackup(null);
@@ -346,15 +474,17 @@ function ThreadVmControlPanel({
         sourceAllocationId: status.allocation.allocationId,
       });
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      if (dialogRevision.current !== openedAt) return;
       setBackup(result.value);
-      setConfirm("backup");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not check the saved backup.");
+      if (dialogRevision.current === openedAt)
+        setError(cause instanceof Error ? cause.message : "Could not check the saved backup.");
     } finally {
       setBusy(false);
     }
   };
   const selectedBackup =
+    status &&
     backup?.available &&
     backup.generation === status.generation &&
     backup.sourceAllocationId === status.allocation?.allocationId &&
@@ -369,6 +499,7 @@ function ThreadVmControlPanel({
         }
       : null;
   const reset = () => {
+    if (!status) return;
     if (!status.repository) {
       setError("This thread has no retained repository upload to reset from.");
       return;
@@ -386,6 +517,7 @@ function ThreadVmControlPanel({
     });
   };
   const remove = () => {
+    if (!status) return;
     void run({
       type: "delete",
       payload: {
@@ -396,37 +528,58 @@ function ThreadVmControlPanel({
     });
   };
 
-  const cancelRestore =
-    status.restore &&
-    status.restore.canCancel !== false &&
-    ["pending", "preparing", "prepared", "boot_preparing", "boot_prepared"].includes(
-      status.restore.phase,
-    );
-  const cancelReset = status.reset && ["pending", "creating"].includes(status.reset.phase);
-  return (
-    <Panel>
-      <ActionButton
-        label={
-          providerAuth
-            ? threadVmProviderAuthPresentation(providerAuth).title
-            : threadVmStatusLabel(status)
-        }
-        disabled={busy || lifecycle.busy || !lifecycle.ready}
-        onPress={() => setExpanded(!expanded)}
-      />
-      {status.pendingProviderAuth ? (
-        <VmCodexSignIn
-          key={`${accountId}:${status.pendingProviderAuth.allocationId}:${status.pendingProviderAuth.operationId}`}
-          environmentId={environmentId}
-          threadId={threadId}
-          accountId={accountId}
-          binding={status.pendingProviderAuth}
-          value={providerAuth}
-          readError={providerAuthError}
-          loading={providerAuthPending}
-        />
+  const disabled = busy || lifecycle.busy || !lifecycle.ready;
+  const primary = () => {
+    if (!status) {
+      threadVmControls.refresh(registry, environmentId, threadId);
+      return;
+    }
+    switch (presentation.primary?.type) {
+      case "resume":
+        void run({ type: "resume" });
+        break;
+      case "restore":
+        restore();
+        break;
+      case "reset":
+        openConfirmation("reset");
+        break;
+      case "cancel_restore":
+        if (status.restore)
+          void run({ type: "cancel_restore", operationId: status.restore.operationId });
+        break;
+      case "cancel_reset":
+        if (status.reset) void run({ type: "cancel_reset", operationId: status.reset.operationId });
+        break;
+      case "cancel_setup":
+        void run({ type: "cancel_setup" });
+        break;
+      case "check":
+        threadVmControls.refresh(registry, environmentId, threadId);
+        break;
+      case "sign_in":
+      case "replace":
+        openConfirmation(presentation.primary.type === "sign_in" ? "sign_in" : "replacement");
+        break;
+    }
+  };
+  const requestFeedback = (
+    <>
+      {error || lifecycle.error ? (
+        <Panel>
+          {error ? (
+            <p role="alert" className="text-destructive">
+              {error}
+            </p>
+          ) : null}
+          {lifecycle.error ? (
+            <p role="alert" className="text-destructive">
+              {lifecycle.error}
+            </p>
+          ) : null}
+        </Panel>
       ) : null}
-      {pending && (
+      {pending ? (
         <Panel>
           <Note>
             {pending.action.type === "delete"
@@ -435,13 +588,17 @@ function ThreadVmControlPanel({
           </Note>
           <ActionButton
             label="Retry saved VM request"
-            disabled={busy || lifecycle.busy || !lifecycle.ready}
-            onPress={() => void lifecycle.run(pending)}
+            disabled={disabled}
+            onPress={() => {
+              void lifecycle.run(pending).then((accepted) => {
+                if (accepted) setConfirm(null);
+              });
+            }}
           />
           {pending.action.type === "restore_backup" ? (
             <ActionButton
               label="Cancel saved recovery request"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
+              disabled={disabled}
               onPress={() => {
                 if (pending.action.type === "restore_backup")
                   void run({ type: "cancel_backup_recovery", payload: pending.action.payload });
@@ -449,216 +606,368 @@ function ThreadVmControlPanel({
             />
           ) : null}
         </Panel>
-      )}
-      {lifecycle.error && <Note>{lifecycle.error}</Note>}
-      {status.restore?.errorCode && !status.pendingProviderAuth ? (
-        <Note>
-          Recovery could not confirm the last step. It keeps retrying the same request and preserves
-          your saved data.
-        </Note>
       ) : null}
-      {expanded ? (
-        <Panel>
-          {status.allocation?.state === "running" &&
-          !status.pausePhase &&
-          !status.restore &&
-          !status.reset ? (
-            <Panel>
-              <Field
-                label="App port"
-                value={previewPort}
-                disabled={busy || lifecycle.busy || !lifecycle.ready}
-                onChange={setPreviewPort}
-              />
-              <ActionButton
-                label="Open private preview"
-                disabled={busy || lifecycle.busy || !lifecycle.ready}
-                onPress={() => void openPreview()}
-              />
-            </Panel>
-          ) : null}
-          {status.lastVerifiedBackupAt ? (
-            <Note>Last verified backup: {status.lastVerifiedBackupAt}</Note>
-          ) : null}
-          {!held &&
-          (status.allocation?.state === "running" || status.allocation?.state === "paused") &&
-          status.lastVerifiedBackupAt ? (
+    </>
+  );
+  const perform = (close: () => void, action: () => void) => () => {
+    close();
+    action();
+  };
+  const actions = (close: () => void, standalone = false) => (
+    <div className="grid gap-1 border-t border-border pt-2" aria-label="VM actions">
+      {presentation.primary && !deletionNote && !standalone ? (
+        <MenuAction
+          label={presentation.primary.label}
+          disabled={
+            disabled ||
+            (presentation.primary.type !== "replace" && presentation.disabledReason !== null)
+          }
+          onPress={perform(close, primary)}
+        />
+      ) : null}
+      {presentation.canPreview ? (
+        <MenuAction
+          label="Open preview…"
+          disabled={disabled}
+          onPress={perform(close, () => openConfirmation("preview"))}
+        />
+      ) : null}
+      {presentation.canRecoverBackup ? (
+        <MenuAction
+          label="Recover from backup…"
+          disabled={disabled}
+          onPress={perform(close, () => void checkBackupRecovery())}
+        />
+      ) : null}
+      {presentation.canCancelRestore &&
+      status?.restore &&
+      presentation.primary?.type !== "cancel_restore" ? (
+        <MenuAction
+          label="Cancel restore"
+          disabled={disabled}
+          onPress={perform(
+            close,
+            () => void run({ type: "cancel_restore", operationId: status?.restore!.operationId }),
+          )}
+        />
+      ) : null}
+      {presentation.canCancelReset &&
+      status?.reset &&
+      presentation.primary?.type !== "cancel_reset" ? (
+        <MenuAction
+          label="Cancel reset"
+          disabled={disabled}
+          onPress={perform(
+            close,
+            () => void run({ type: "cancel_reset", operationId: status?.reset!.operationId }),
+          )}
+        />
+      ) : null}
+      {presentation.canCancelSetup && presentation.primary?.type !== "cancel_setup" ? (
+        <MenuAction
+          label="Cancel VM setup"
+          disabled={disabled}
+          onPress={perform(close, () => void run({ type: "cancel_setup" }))}
+        />
+      ) : null}
+      {status?.replacement ? (
+        <MenuAction
+          label="Cancel VM request"
+          disabled={disabled}
+          onPress={perform(
+            close,
+            () =>
+              void run({ type: "cancel_replacement", requestId: status?.replacement!.requestId }),
+          )}
+        />
+      ) : null}
+      {standalone && presentation.canDelete ? (
+        <MenuAction
+          label="Permanently delete thread"
+          danger
+          disabled={disabled}
+          onPress={() => openConfirmation("delete")}
+        />
+      ) : null}
+      <Button
+        variant="ghost-muted"
+        size="xs"
+        disabled={busy || lifecycle.busy}
+        onClick={() => threadVmControls.refresh(registry, environmentId, threadId)}
+      >
+        Refresh status
+      </Button>
+    </div>
+  );
+  const notice =
+    (status || readError || pending || deletionNote) &&
+    (!presentation.ready || error || lifecycle.error || pending) ? (
+      <div
+        className="mb-2 rounded-lg border border-border bg-background px-3 py-2 text-xs"
+        aria-label="VM needs attention"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="min-w-0 flex-1" role="status">
+            {deletionNote ?? presentation.label}
+          </p>
+          {presentation.primary && !deletionNote ? (
             <ActionButton
-              label="Recover from backup…"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() => void checkBackupRecovery()}
-            />
-          ) : null}
-          {status.savedDisk ? (
-            <Note>Saved workspace expires: {status.savedDisk.expiresAt}</Note>
-          ) : null}
-          {!held && status.allocation?.state === "paused" ? (
-            <ActionButton
-              label="Resume VM"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() => void run({ type: "resume" })}
-            />
-          ) : null}
-          {!held && status.savedDisk?.phase === "available" && status.savedDisk.operationId ? (
-            <ActionButton
-              label="Restore VM"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={restore}
-            />
-          ) : null}
-          {!held && status.savedDisk?.phase === "expired" && status.repository ? (
-            <ActionButton
-              label="Reset VM"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() => setConfirm("reset")}
-            />
-          ) : null}
-          {cancelRestore && status.restore ? (
-            <ActionButton
-              label="Cancel restore"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() =>
-                void run({ type: "cancel_restore", operationId: status.restore!.operationId })
+              label={presentation.primary.label}
+              disabled={
+                disabled ||
+                (presentation.primary.type !== "replace" && presentation.disabledReason !== null)
               }
+              onPress={primary}
             />
           ) : null}
-          {cancelReset && status.reset ? (
-            <ActionButton
-              label="Cancel reset"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() =>
-                void run({ type: "cancel_reset", operationId: status.reset!.operationId })
-              }
-            />
-          ) : null}
-          {!held && ["pending", "running", "failed"].includes(status.setupPhase ?? "") ? (
-            <ActionButton
-              label="Cancel VM setup"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() => void run({ type: "cancel_setup" })}
-            />
-          ) : null}
-          {status.replacement?.phase === "awaiting_choice" ? (
+        </div>
+        {presentation.disabledReason || presentation.detail ? (
+          <Note>{presentation.disabledReason ?? presentation.detail}</Note>
+        ) : null}
+        {!dialogOpen ? requestFeedback : null}
+      </div>
+    ) : null;
+  const ui = useMemo(
+    () =>
+      status || readError || pending || deletionNote
+        ? {
+            label: deletionNote ?? presentation.label,
+            caption: presentation.ready
+              ? "Ready"
+              : presentation.label.replace(/^VM /, "").replace(/ VM$/, ""),
+            tone: presentation.tone,
+            notice,
+            progressOnly:
+              presentation.tone === "neutral" &&
+              !error &&
+              !lifecycle.error &&
+              !pending &&
+              !deletionNote,
+            actions,
+            trigger,
+          }
+        : null,
+    [
+      status,
+      readError,
+      pending,
+      deletionNote,
+      presentation.label,
+      presentation.ready,
+      presentation.tone,
+      notice,
+      error,
+      lifecycle.error,
+      actions,
+      trigger,
+    ],
+  );
+  return (
+    <ThreadVmUiContext value={ui}>
+      {children}
+      <AlertDialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          if (!open) closeConfirmation();
+        }}
+      >
+        <AlertDialogPopup variant="scrollable" finalFocus={trigger}>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirm === "preview"
+                ? "Open private preview"
+                : confirm === "sign_in"
+                  ? "Sign in to Codex"
+                  : confirm === "replacement"
+                    ? "Choose a VM to replace"
+                    : confirm === "delete"
+                      ? "Permanently delete thread?"
+                      : confirm === "reset"
+                        ? "Reset VM?"
+                        : confirm === "backup"
+                          ? "Recover from backup?"
+                          : "Replace this VM?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirm === "preview"
+                ? "Enter the port your application is listening on inside this VM."
+                : confirm === "sign_in"
+                  ? "Sign in to Codex inside the destination VM to finish preparation."
+                  : confirm === "replacement"
+                    ? "Your VM allowance is full. Choose a VM to save and stop. The least recently active choice is listed first."
+                    : confirm === "delete"
+                      ? "This removes the conversation, attachments, VM and all saved workspaces. This cannot be undone."
+                      : confirm === "reset"
+                        ? "Keep the conversation and rebuild from the original uploaded Git commit. Workspace changes inside the VM are discarded. The queue stays paused."
+                        : confirm === "backup"
+                          ? "The conversation is kept. Workspace changes after the selected backup may be lost. The queue stays paused."
+                          : "Save and stop the selected VM before using its slot. Replacement waits until its backup is verified and stopping is confirmed."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="min-h-0 overflow-y-auto overscroll-contain">
             <Panel>
-              <Note>
-                Your VM limit is reached. Choose an idle VM to save and stop. The first available
-                choice is the least recently active.
-              </Note>
-              {candidates.map((candidate) => (
-                <ActionButton
-                  key={candidate.allocationId}
-                  label={`Replace ${candidate.title ?? "thread " + candidate.threadId.slice(0, 8)} (${candidate.state})`}
-                  disabled={busy || lifecycle.busy || !lifecycle.ready}
-                  onPress={() => setConfirm(candidate.allocationId)}
+              {confirm === "preview" ? (
+                <>
+                  <Field
+                    label="App port"
+                    value={previewPort}
+                    disabled={disabled}
+                    onChange={setPreviewPort}
+                  />
+                  <ActionButton
+                    label="Open private preview"
+                    disabled={disabled || !presentation.canPreview}
+                    onPress={() => void openPreview()}
+                  />
+                </>
+              ) : confirm === "sign_in" && status?.pendingProviderAuth ? (
+                <VmCodexSignIn
+                  key={`${accountId}:${status?.pendingProviderAuth.allocationId}:${status?.pendingProviderAuth.operationId}`}
+                  environmentId={environmentId}
+                  threadId={threadId}
+                  accountId={accountId}
+                  binding={status?.pendingProviderAuth}
+                  value={providerAuth}
+                  readError={providerAuthError}
+                  loading={providerAuthPending}
                 />
-              ))}
-              {!candidates.length ? <Note>No idle VM can be replaced right now.</Note> : null}
-            </Panel>
-          ) : null}
-          {status.replacement ? (
-            <ActionButton
-              label="Cancel VM request"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() =>
-                void run({ type: "cancel_replacement", requestId: status.replacement!.requestId })
-              }
-            />
-          ) : null}
-          {!held ? (
-            <ActionButton
-              label="Permanently delete thread"
-              danger
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() => setConfirm("delete")}
-            />
-          ) : null}
-          {confirm === "backup" && !held ? (
-            <Panel>
-              {selectedBackup ? (
+              ) : confirm === "sign_in" ? (
+                <Note>{presentation.label}. This VM no longer needs Codex sign-in.</Note>
+              ) : confirm === "replacement" && status?.replacement?.phase !== "awaiting_choice" ? (
+                <Note>This VM request changed. Close this dialog to check its current status.</Note>
+              ) : confirm === "replacement" ? (
+                <>
+                  {candidates.map((candidate, index) => (
+                    <div
+                      key={candidate.allocationId}
+                      className="flex w-full items-center justify-between gap-3 rounded-lg border border-border p-3"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate font-medium">
+                          {candidate.title ?? "Untitled thread"}
+                        </p>
+                        <p className="text-muted-foreground">
+                          {candidate.state}
+                          {index === 0 ? " · Least recently active" : ""}
+                        </p>
+                        <p className="text-muted-foreground">
+                          {candidate.lastWorkAt
+                            ? `Last work: ${new Date(candidate.lastWorkAt).toLocaleString()}`
+                            : "Last work unknown"}
+                        </p>
+                      </div>
+                      <ActionButton
+                        label="Replace…"
+                        disabled={disabled || presentation.disabledReason !== null}
+                        onPress={() => openConfirmation(candidate.allocationId)}
+                      />
+                    </div>
+                  ))}
+                  {!candidates.length ? (
+                    <Note>
+                      All VMs are busy or no saved workspace can be verified. Cancel this request or
+                      wait until a VM is available.
+                    </Note>
+                  ) : null}
+                  {status?.replacement ? (
+                    <ActionButton
+                      label="Cancel VM request"
+                      disabled={disabled}
+                      onPress={() =>
+                        void run({
+                          type: "cancel_replacement",
+                          requestId: status?.replacement!.requestId,
+                        })
+                      }
+                    />
+                  ) : null}
+                </>
+              ) : confirm === "backup" && !held && status ? (
+                busy ? (
+                  <Note>Checking the saved backup…</Note>
+                ) : selectedBackup ? (
+                  <>
+                    <Note>
+                      Verified workspace from {new Date(selectedBackup.capturedAt).toLocaleString()}
+                      .
+                    </Note>
+                    <ActionButton
+                      label="Restore this backup"
+                      disabled={disabled || capabilities.data?.restore !== true}
+                      onPress={() =>
+                        void run({
+                          type: "restore_backup",
+                          payload: {
+                            operationId: randomUUID(),
+                            allocationId: randomUUID(),
+                            expectedGeneration: status?.generation,
+                            backup: selectedBackup,
+                          },
+                        })
+                      }
+                    />
+                  </>
+                ) : (
+                  <>
+                    <Note>{threadVmBackupRecoveryUnavailable(backup?.blockedReason)}</Note>
+                    <ActionButton
+                      label="Retry backup check"
+                      disabled={disabled}
+                      onPress={() => void checkBackupRecovery()}
+                    />
+                  </>
+                )
+              ) : confirm === "reset" && !held && status ? (
+                <>
+                  {status?.repository ? (
+                    <Note>
+                      {status?.repository.branch} · {status?.repository.revision.slice(0, 12)}
+                    </Note>
+                  ) : null}
+                  <ActionButton
+                    label="Reset VM"
+                    disabled={disabled || capabilities.data?.reset !== true}
+                    onPress={reset}
+                  />
+                </>
+              ) : confirm === "delete" && !held && status ? (
+                <ActionButton
+                  label="Permanently delete thread"
+                  danger
+                  disabled={disabled || capabilities.data?.permanentDelete !== true}
+                  onPress={remove}
+                />
+              ) : confirm &&
+                status?.replacement?.phase === "awaiting_choice" &&
+                candidates.some((candidate) => candidate.allocationId === confirm) ? (
                 <>
                   <Note>
-                    Restore the workspace backup from{" "}
-                    {new Date(selectedBackup.capturedAt).toLocaleString()}? Workspace changes after
-                    that backup may be lost. The saved conversation is kept, and queued messages
-                    stay paused until you resume them.
+                    {candidates.find((candidate) => candidate.allocationId === confirm)?.title ??
+                      "Selected VM"}
                   </Note>
                   <ActionButton
-                    label="Restore this backup"
-                    disabled={busy || lifecycle.busy || !lifecycle.ready}
+                    label="Save and replace VM"
+                    disabled={disabled || capabilities.data?.replacement !== true}
                     onPress={() =>
                       void run({
-                        type: "restore_backup",
-                        payload: {
-                          operationId: randomUUID(),
-                          allocationId: randomUUID(),
-                          expectedGeneration: status.generation,
-                          backup: selectedBackup,
-                        },
+                        type: "select_replacement",
+                        requestId: status?.replacement!.requestId,
+                        victimAllocationId: confirm,
                       })
                     }
                   />
                 </>
-              ) : (
-                <Note>{threadVmBackupRecoveryUnavailable(backup?.blockedReason)}</Note>
-              )}
+              ) : null}
             </Panel>
-          ) : confirm === "reset" && !held ? (
-            <Panel>
-              <Note>
-                Reset keeps this conversation and leaves the queue paused. The new VM returns to the
-                Git commit uploaded when this thread moved from your machine. Changes made inside
-                the VM are discarded.
-              </Note>
-              {status.repository && (
-                <Note>
-                  {status.repository.branch} · {status.repository.revision.slice(0, 12)}
-                </Note>
-              )}
-              <ActionButton
-                label="Reset VM"
-                disabled={busy || lifecycle.busy || !lifecycle.ready}
-                onPress={reset}
-              />
-            </Panel>
-          ) : confirm === "delete" && !held ? (
-            <Panel>
-              <Note>
-                Permanently delete this thread, its VM, conversation, attachments and saved
-                workspace? This cannot be undone.
-              </Note>
-              <ActionButton
-                label="Confirm permanent deletion"
-                danger
-                disabled={busy || lifecycle.busy || !lifecycle.ready}
-                onPress={remove}
-              />
-            </Panel>
-          ) : confirm && status.replacement?.phase === "awaiting_choice" ? (
-            <Panel>
-              <Note>Save and stop this VM, then use its slot for the waiting request?</Note>
-              <ActionButton
-                label="Confirm replacement"
-                disabled={busy || lifecycle.busy || !lifecycle.ready}
-                onPress={() =>
-                  void run({
-                    type: "select_replacement",
-                    requestId: status.replacement!.requestId,
-                    victimAllocationId: confirm,
-                  })
-                }
-              />
-            </Panel>
-          ) : null}
-          {confirm ? (
-            <ActionButton
-              label="Back"
-              disabled={busy || lifecycle.busy || !lifecycle.ready}
-              onPress={() => setConfirm(null)}
-            />
-          ) : null}
-        </Panel>
-      ) : null}
-      {readError || error ? <Note>{error ?? readError}</Note> : null}
-    </Panel>
+            {requestFeedback}
+          </div>
+          <AlertDialogFooter>
+            <Button variant="outline" onClick={closeConfirmation}>
+              Close
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+    </ThreadVmUiContext>
   );
 }

@@ -1,7 +1,11 @@
 export { ThreadVmRestoreBoot } from "./threadVm.ts";
 import { OrchestrationCommandReceipt, ThreadWorkspaceManifest } from "./threadTransfer.ts";
+import { ThreadMoveProgressReport, ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
+export { ThreadMoveProgressReport, ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
 import {
   RelayPortableThreadPlacement,
+  RelayThreadCurrentQueue,
+  ThreadVmCapabilities,
   RelayThreadHistoryPage,
   RelayPortableThreadPage,
   RelayThreadCommandReceipt,
@@ -33,6 +37,7 @@ import * as OpenApi from "effect/unstable/httpapi/OpenApi";
 import {
   DpopFailureReason,
   IsoDateTime,
+  CommandId,
   EnvironmentId,
   NonNegativeInt,
   ProjectId,
@@ -1928,6 +1933,8 @@ export const RelayThreadVmSetup = Schema.Struct({
 });
 export type RelayThreadVmSetup = typeof RelayThreadVmSetup.Type;
 export const RelayThreadVmReplacementCandidate = Schema.Struct({
+  lastWorkAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+  lastVerifiedBackupAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
   title: Schema.optionalKey(Schema.NullOr(Schema.String)),
   allocationId: Schema.String,
   threadId: ThreadId,
@@ -2386,6 +2393,7 @@ export const RelayHealthResponse = Schema.Struct({
   ok: Schema.Boolean,
   service: Schema.Literal("relay"),
   threadVmConfigured: Schema.optionalKey(Schema.Boolean),
+  threadVmCapabilities: Schema.optionalKey(ThreadVmCapabilities),
 });
 export type RelayHealthResponse = typeof RelayHealthResponse.Type;
 
@@ -3373,6 +3381,7 @@ export const RelayThreadMove = Schema.Struct({
   sourceCursor: Schema.NullOr(NonNegativeInt),
   manifestSha256: Schema.NullOr(RelayThreadArtifactHash),
   failureDetail: Schema.optional(Schema.NullOr(RelayThreadMoveFailureDetail)),
+  progress: Schema.optional(Schema.Array(ThreadMoveProgressSnapshot)),
 });
 export type RelayThreadMove = typeof RelayThreadMove.Type;
 const RelayThreadMoveParams = Schema.Struct({
@@ -3381,6 +3390,16 @@ const RelayThreadMoveParams = Schema.Struct({
 });
 export const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
   .add(
+    HttpApiEndpoint.post(
+      "progress",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/progress",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, ...ThreadMoveProgressReport.fields }),
+        success: Schema.Struct({ accepted: Schema.Literal(true) }),
+        error: RelayTenancyErrors,
+      },
+    ),
     HttpApiEndpoint.post("pending", "/v1/environments/:environmentId/thread-moves", {
       params: Schema.Struct({ environmentId: EnvironmentId }),
       payload: Schema.Struct({
@@ -3611,6 +3630,13 @@ export const RelayThreadHistoryGroup = HttpApiGroup.make("threadHistory")
       }),
       headers: RelayBearerRequestHeaders,
       success: HttpApiSchema.StreamUint8Array({ contentType: "application/octet-stream" }),
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getCurrentQueue", "/v1/threads/:threadId/queue", {
+      params: Schema.Struct({ threadId: ThreadId }),
+      headers: RelayBearerRequestHeaders,
+      query: Schema.Struct({ commandId: Schema.optional(CommandId) }),
+      success: RelayThreadCurrentQueue,
       error: RelayTenancyErrors,
     }),
     HttpApiEndpoint.get("getHistory", "/v1/threads/:threadId/history", {
@@ -4282,6 +4308,10 @@ export {
   RelayThreadHistoryPage,
   RelayPortableThreadSummary,
   RelayPortableThreadPage,
+  RelayThreadCurrentQueue,
+  ThreadVmCapabilities,
+  RelayPortableThreadVmSummary,
+  RelayThreadVmAllowance,
   RelayThreadCommandReceipt,
   RelayThreadInboxEntry,
   RelayThreadPersistedReceipt,

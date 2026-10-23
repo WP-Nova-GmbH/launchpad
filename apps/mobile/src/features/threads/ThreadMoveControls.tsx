@@ -1,3 +1,12 @@
+import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { MovedThreadDraftRecovery } from "./MovedThreadDraftRecovery";
+import { threadMoveProgressPresentation } from "@t3tools/client-runtime/relay/threadVmControls";
+import {
+  handoffMovedThreadDraft,
+  type MovedThreadDraftConflict,
+} from "../../state/use-composer-drafts";
+import { scopedThreadKey } from "../../lib/scopedEntities";
+import { ThreadVmMenuActions, useThreadVmUi } from "./ThreadVmControls";
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigation } from "@react-navigation/native";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
@@ -12,7 +21,10 @@ import {
   threadMoveObservation,
   threadMoveSnapshotReached,
 } from "@t3tools/client-runtime/relay/threadMoveRecovery";
-import { threadRunOnStatus } from "@t3tools/client-runtime/relay/threadRunOn";
+import {
+  threadRunOnStatus,
+  threadRunOnTargetAvailability,
+} from "@t3tools/client-runtime/relay/threadRunOn";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   CommandId,
@@ -43,10 +55,15 @@ import {
 } from "../../state/threads";
 import { environmentProjects } from "../../state/projects";
 import { serverEnvironment } from "../../state/server";
-import { useEnvironments } from "../../state/environments";
+import {
+  useEnvironments,
+  useEnvironmentConnectionState,
+  type EnvironmentPresentation,
+} from "../../state/environments";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { hasCloudPublicConfig } from "../cloud/publicConfig";
+import { environmentCatalog } from "../../connection/catalog";
 
 function FollowThreadLocation({
   environmentId,
@@ -69,6 +86,10 @@ function FollowThreadLocation({
     [busy, setBusy] = useState(false),
     [checking, setChecking] = useState(false),
     [error, setError] = useState<string | null>(null);
+  const [draftConflict, setDraftConflict] = useState<MovedThreadDraftConflict | null>(null);
+  const draftChoice = useRef<
+    { use: "source" | "destination"; conflict: MovedThreadDraftConflict } | undefined
+  >(undefined);
   const mounted = useRef(true);
   const destinationId = state?.destination?.environmentId,
     generation = state?.destination?.generation;
@@ -111,7 +132,7 @@ function FollowThreadLocation({
           expectedPlacement: { environmentId: destinationId, generation },
         });
       })
-      .then((result) => {
+      .then(async (result) => {
         if (!result || cancelled || appAtomRegistry.get(managedRelaySessionAtom) !== session)
           return;
         if (result._tag === "Failure") {
@@ -121,15 +142,47 @@ function FollowThreadLocation({
               ? failure.message
               : "Could not connect to the current location.",
           );
-        } else navigation.navigate("Thread", result.value);
+        } else {
+          const stillCurrent = () => {
+            const proofs = appAtomRegistry.get(portableThreadPlacementsAtom);
+            const placement = proofs?.placements.get(threadId);
+            return (
+              !cancelled &&
+              appAtomRegistry.get(managedRelaySessionAtom) === session &&
+              proofs?.session === session &&
+              threadMoveRelayUrl() === relayUrl &&
+              proofs.relayUrl === relayUrl &&
+              placement?.operationId === null &&
+              placement.environmentId === destinationId &&
+              placement.generation === generation
+            );
+          };
+          const handoff = await handoffMovedThreadDraft({
+            sourceKey: scopedThreadKey(environmentId, threadId),
+            destinationKey: scopedThreadKey(result.value.environmentId, threadId),
+            stillCurrent,
+            ...(draftChoice.current ? { choice: draftChoice.current } : {}),
+          });
+          if (!stillCurrent()) return;
+          if (handoff.conflict) {
+            setDraftConflict(handoff.conflict);
+            return;
+          }
+          setDraftConflict(null);
+          draftChoice.current = undefined;
+          navigation.navigate("Thread", result.value);
+        }
       })
-      .catch(() => {
-        if (!cancelled)
+      .catch((cause) => {
+        if (!cancelled) {
+          draftChoice.current = undefined;
+          setDraftConflict(null);
           setError(
-            attempt > 0
-              ? "Still could not open the current location. Try again after checking its connection."
+            cause instanceof Error
+              ? cause.message
               : "Could not open the current location. Try again.",
           );
+        }
       })
       .finally(() => {
         if (!cancelled) setBusy(false);
@@ -137,7 +190,18 @@ function FollowThreadLocation({
     return () => {
       cancelled = true;
     };
-  }, [destinationId, generation, session, threadId, checking, attempt, open, navigation]);
+  }, [
+    destinationId,
+    generation,
+    session,
+    relayUrl,
+    environmentId,
+    threadId,
+    checking,
+    attempt,
+    open,
+    navigation,
+  ]);
   if (
     !state ||
     (!recoverUnavailable && !state.recoveryRequested && !state.destination && !state.error)
@@ -159,8 +223,35 @@ function FollowThreadLocation({
       {error || state.error ? (
         <Text className="text-xs text-destructive">{error ?? state.error}</Text>
       ) : null}
+      {draftConflict ? (
+        <View className="gap-2 py-2">
+          <Text className="text-sm font-semibold">Both locations have an unsent draft</Text>
+          <Text className="text-xs">
+            Choose which draft to open. The other stays saved at the previous location.
+          </Text>
+          {(["source", "destination"] as const).map((use) => (
+            <Pressable
+              key={use}
+              accessibilityRole="button"
+              className="gap-1 rounded-lg border border-border p-3"
+              onPress={() => {
+                draftChoice.current = { use, conflict: draftConflict };
+                setDraftConflict(null);
+                setAttempt((value) => value + 1);
+              }}
+            >
+              <Text numberOfLines={3} className="text-xs">
+                {draftConflict[use].text || "Attachments and context"}
+              </Text>
+              <Text className="text-sm text-primary">
+                {use === "source" ? "Use incoming draft" : "Keep destination draft"}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
       <Pressable
-        disabled={busy || checking || state.isPending || !session || !relayUrl}
+        disabled={busy || checking || state.isPending || !!draftConflict || !session || !relayUrl}
         accessibilityRole="button"
         onPress={async () => {
           if (busy || checking || !session || !relayUrl) return;
@@ -202,6 +293,40 @@ function FollowThreadLocation({
   );
 }
 
+function ThreadMoveProgressCard({
+  environmentId,
+  threadId,
+}: {
+  environmentId: EnvironmentId;
+  threadId: ThreadId;
+}) {
+  const location = useAtomValue(threadVmControls.locationViewAtom(environmentId, threadId));
+  const queue = useAtomValue(
+    environmentThreadDetails.stateAtom({ environmentId, threadId }),
+    (state) => Option.getOrNull(state.data)?.promptQueue,
+  );
+  const progress = threadMoveProgressPresentation(location?.placement);
+  const moving = queue?.entries.find((entry) => entry.kind === "move" && entry.state !== "pending");
+  if (!location?.movePending || location.moveFailureDetail || !progress) return null;
+  const cancelling = moving?.state === "cancelling";
+  return (
+    <View
+      className="mx-3 my-2 grid gap-1 rounded-xl border border-border bg-muted/20 px-3 py-2 text-xs"
+      accessibilityLiveRegion="polite"
+    >
+      <Text className="font-medium">{cancelling ? "Cancelling move…" : progress.label}</Text>
+      {!cancelling && progress.detail ? (
+        <Text className="text-muted-foreground">{progress.detail}</Text>
+      ) : null}
+      <Text className="text-muted-foreground">
+        {cancelling
+          ? "Waiting for both locations to confirm cancellation."
+          : "Your conversation and files move together. Manage or cancel the move in the queue."}
+      </Text>
+    </View>
+  );
+}
+
 export function CurrentThreadLocation(props: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
@@ -209,10 +334,14 @@ export function CurrentThreadLocation(props: {
 }) {
   const session = useAtomValue(managedRelaySessionAtom);
   return (
-    <FollowThreadLocation
-      key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${props.environmentId}:${props.threadId}:${props.recoverUnavailable === true}`}
-      {...props}
-    />
+    <>
+      <ThreadMoveProgressCard environmentId={props.environmentId} threadId={props.threadId} />
+      <MovedThreadDraftRecovery environmentId={props.environmentId} threadId={props.threadId} />
+      <FollowThreadLocation
+        key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${props.environmentId}:${props.threadId}:${props.recoverUnavailable === true}`}
+        {...props}
+      />
+    </>
   );
 }
 
@@ -237,6 +366,44 @@ function Action({
     >
       <Text className="text-sm font-t3-medium text-foreground">{label}</Text>
     </Pressable>
+  );
+}
+
+function MachineDestinationRow({
+  target,
+  environment,
+  disabled,
+  onMove,
+  onCheck,
+}: {
+  target: ReturnType<typeof threadMoveProjectTargets>[number];
+  environment: EnvironmentPresentation | undefined;
+  disabled: boolean;
+  onMove: () => void;
+  onCheck: () => void;
+}) {
+  const connection = useEnvironmentConnectionState(target.project.environmentId);
+  const availability = threadRunOnTargetAvailability({
+    phase: environment?.connection.phase,
+    failureReason: connection.data?.lastFailure?.reason,
+  });
+  return (
+    <MaterialListRow
+      title={environment?.serverConfig?.environment.label ?? environment?.label ?? "Machine"}
+      subtitle={availability.detail ?? `${target.project.title} · ${target.project.workspaceRoot}`}
+      accessibilityRole="radio"
+      accessibilityState={{ checked: false }}
+      leading={
+        <EnvironmentMachineSymbol
+          kind={resolveEnvironmentMachineKind(environment?.serverConfig ?? null)}
+          size={20}
+          tintColorClassName="accent-icon-muted"
+        />
+      }
+      trailing={null}
+      disabled={disabled || availability.action === null}
+      onPress={availability.action === "check" ? onCheck : onMove}
+    />
   );
 }
 
@@ -290,6 +457,7 @@ function ThreadMachinePicker({
   const targets = source
     ? threadMoveProjectTargets(source, projects, environments, canonicalKey)
     : [];
+  const reconnect = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
   const enqueue = useAtomCommand(threadEnvironment.enqueueMove, { reportFailure: false });
   const receipt = useAtomCommand(threadEnvironment.getCommandReceipt, { reportFailure: false });
   const localReceipt = useAtomCommand(threadEnvironment.getLocalCommandReceipt, {
@@ -482,10 +650,11 @@ function ThreadMachinePicker({
   ]);
 
   const currentIsVm = currentConfig?.environment.threadVm?.threadId === threadId;
-  const currentLabel =
-    currentConfig?.environment.label ??
-    environments.find((item) => item.environmentId === currentEnvironmentId)?.label ??
-    "Environment";
+  const currentLabel = currentIsVm
+    ? "Private VM"
+    : (currentConfig?.environment.label ??
+      environments.find((item) => item.environmentId === currentEnvironmentId)?.label ??
+      "Environment");
   const selectedProvider = config?.providers.find(
     // Composer settings can name a draft provider that has not run on this thread.
     (provider) => provider.instanceId === providerInstanceId,
@@ -537,15 +706,18 @@ function ThreadMachinePicker({
   };
   const presentation = threadRunOnStatus({ queue, saved });
   const visibleError = error ?? location?.moveFailureDetail ?? null;
+  const detailedProgress = threadMoveProgressPresentation(location?.placement);
   const progress = location?.moveFailureDetail
     ? "Move needs attention"
     : location?.destination
       ? `Thread moved → ${currentLabel}`
-      : presentation
-        ? `${presentation.title}${presentation.destination ? ` → ${destinationLabel(presentation.destination)}` : ""}`
-        : location?.movePending
-          ? "Moving thread…"
-          : null;
+      : detailedProgress && !presentation?.warning
+        ? `${detailedProgress.label}${detailedProgress.detail ? ` · ${detailedProgress.detail}` : ""}`
+        : presentation
+          ? `${presentation.title}${presentation.destination ? ` → ${destinationLabel(presentation.destination)}` : ""}`
+          : location?.movePending
+            ? "Moving thread…"
+            : null;
   const ensureCurrent = () => {
     if (!isCurrent())
       throw new Error("Your account changed. Reopen this thread to check the move.");
@@ -638,6 +810,8 @@ function ThreadMachinePicker({
       setBusy(false);
     }
   };
+  const vmUi = useThreadVmUi();
+  const pendingVmAction = useRef<(() => void) | null>(null);
   const close = () => setOpenedLocation(null);
   const openSignIn = () =>
     navigation.navigate("SettingsSheet", {
@@ -670,9 +844,9 @@ function ThreadMachinePicker({
   return (
     <View className="gap-1 px-3 py-1">
       <ComposerInlineControl
-        accessibilityLabel={`Run on: ${currentLabel}`}
+        accessibilityLabel={`Run on: ${currentLabel}${currentIsVm && vmUi ? ` · ${vmUi.caption}` : ""}`}
         accessibilityHint="Choose where this thread runs"
-        label={currentLabel}
+        label={currentIsVm && vmUi ? `${currentLabel} · ${vmUi.caption}` : currentLabel}
         maxWidth="100%"
         iconNode={currentIcon}
         onPress={() => {
@@ -694,6 +868,9 @@ function ThreadMachinePicker({
         transparent={Platform.OS === "android"}
         onRequestClose={close}
         onDismiss={() => {
+          const action = pendingVmAction.current;
+          pendingVmAction.current = null;
+          action?.();
           if (!signInAfterDismiss.current) return;
           signInAfterDismiss.current = false;
           openSignIn();
@@ -741,7 +918,7 @@ function ThreadMachinePicker({
               <View className="overflow-hidden rounded-2xl">
                 <MaterialListRow
                   title={currentLabel}
-                  subtitle={currentIsVm ? "Current location · Private VM" : "Current location"}
+                  subtitle={currentIsVm ? "Current location · VM workspace" : "Current location"}
                   accessibilityRole="radio"
                   accessibilityState={{ checked: true }}
                   leading={currentIcon}
@@ -773,30 +950,34 @@ function ThreadMachinePicker({
                     (item) => item.environmentId === target.project.environmentId,
                   );
                   return (
-                    <MaterialListRow
+                    <MachineDestinationRow
                       key={target.key}
-                      title={
-                        environment?.serverConfig?.environment.label ??
-                        environment?.label ??
-                        "Machine"
-                      }
-                      subtitle={`${target.project.title} · ${target.project.workspaceRoot}`}
-                      accessibilityRole="radio"
-                      accessibilityState={{ checked: false }}
-                      leading={
-                        <EnvironmentMachineSymbol
-                          kind={resolveEnvironmentMachineKind(environment?.serverConfig ?? null)}
-                          size={20}
-                          tintColorClassName="accent-icon-muted"
-                        />
-                      }
-                      trailing={null}
+                      target={target}
+                      environment={environment}
                       disabled={disabled}
-                      onPress={() => void run("send", target.destination)}
+                      onMove={() => void run("send", target.destination)}
+                      onCheck={() => {
+                        void reconnect(target.project.environmentId).then((result) => {
+                          if (result._tag === "Failure")
+                            setError(
+                              "Could not connect to this machine. Check its connection settings.",
+                            );
+                        });
+                      }}
                     />
                   );
                 })}
               </View>
+              <ThreadVmMenuActions
+                onAction={(action) => {
+                  close();
+                  if (Platform.OS === "ios")
+                    pendingVmAction.current = () => {
+                      if (isCurrent()) action();
+                    };
+                  else action();
+                }}
+              />
               <Text className="text-sm text-foreground-muted">
                 {outstanding
                   ? "Resolve the current move before choosing another machine."

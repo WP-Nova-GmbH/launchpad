@@ -1,3 +1,5 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { useServerConfigs } from "../../state/entities";
 import {
   type EnvironmentId,
   type EditorId,
@@ -195,6 +197,9 @@ export const ChatHeader = memo(function ChatHeader({
   );
   if (!actionsCollapsed && actionsOpen) setActionsOpen(false);
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const canCreateThread = canCreateThreadInEnvironment(
+    useServerConfigs().get(activeThreadEnvironmentId),
+  );
   const activeProjectName = activeProject?.title;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const fileScripts = useT3ProjectFileScripts(
@@ -415,7 +420,10 @@ export const ChatHeader = memo(function ChatHeader({
                   render={
                     <button
                       type="button"
-                      aria-label={`New thread in ${activeProjectName}`}
+                      aria-label={
+                        canCreateThread ? `New thread in ${activeProjectName}` : activeProjectName
+                      }
+                      disabled={!canCreateThread}
                       onClick={onNewThreadInProject}
                       className="inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                     />
@@ -426,7 +434,9 @@ export const ChatHeader = memo(function ChatHeader({
                     {activeProjectName}
                   </WorkspaceBreadcrumbText>
                 </TooltipTrigger>
-                <TooltipPopup side="top">New thread in {activeProjectName}</TooltipPopup>
+                <TooltipPopup side="top">
+                  {canCreateThread ? `New thread in ${activeProjectName}` : "VM workspace"}
+                </TooltipPopup>
               </Tooltip>
             </WorkspaceBreadcrumbItem>
             <WorkspaceBreadcrumbSeparator>

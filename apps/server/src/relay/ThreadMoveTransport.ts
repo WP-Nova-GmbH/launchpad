@@ -1,5 +1,9 @@
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import type { RelayThreadMove, RelayThreadArtifactReceipt } from "@t3tools/contracts/relay";
+import type {
+  RelayThreadMove,
+  RelayThreadArtifactReceipt,
+  ThreadMoveProgressReport,
+} from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -83,6 +87,13 @@ export function makeThreadMoveTransport<E, R>(
     get: (owner: ThreadMoveOwner) =>
       request(owner, (client, params) =>
         client.threadMoves.get({ params, payload: { generation: owner.generation } }),
+      ),
+    progress: (owner: ThreadMoveOwner, report: ThreadMoveProgressReport) =>
+      request(owner, (client, params) =>
+        client.threadMoves.progress({
+          params,
+          payload: { generation: owner.generation, ...report },
+        }),
       ),
     failed: (owner: ThreadMoveOwner, detail: string) =>
       request(owner, (client, params) =>

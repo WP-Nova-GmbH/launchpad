@@ -159,6 +159,7 @@ import { makeLocalThreadArtifactObjects } from "./ThreadArtifactLocalObjects.ts"
 import { ThreadArtifactObjectStorage, ThreadArtifactObjectError } from "./ThreadArtifactObjects.ts";
 import type { SandboxInfo } from "e2b";
 import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
+import { makeThreadMoveProgressStore } from "./ThreadMoveProgressStore.ts";
 
 // Opt-in real Postgres coverage. The runner must create a dedicated disposable database.
 const decodeClientCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
@@ -302,6 +303,72 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         });
       return { owner, enrollment, move, manifest, prepare };
     }
+
+    it.effect(
+      "keeps only monotonic progress from the exact move participants and ignores terminal updates",
+      () =>
+        run((store, sql) =>
+          Effect.gen(function* () {
+            const { enrollment, move } = fixture();
+            yield* store.enroll(enrollment);
+            const journal = yield* store.beginMove(move);
+            const progress = makeThreadMoveProgressStore(sql);
+            const report = {
+              environmentId: "local",
+              generation: 1,
+              attempt: 1,
+              revision: 1,
+              stage: "uploading" as const,
+              completedBytes: 10,
+              totalBytes: 20,
+              completedArtifacts: 1,
+              totalArtifacts: 2,
+            };
+            yield* progress.report(journal, report);
+            for (const stale of [
+              { ...report, revision: 1, completedBytes: 20 },
+              { ...report, revision: 2, completedBytes: 5 },
+              { ...report, revision: 2, stage: "capturing" as const },
+              { ...report, revision: 2, environmentId: "unrelated" },
+              { ...report, revision: 2, generation: 2 },
+              { ...report, revision: 2, stage: "installing" as const },
+            ])
+              yield* progress.report(journal, stale);
+            expect(yield* progress.read(move.operationId)).toMatchObject([
+              { revision: 1, completedBytes: 10 },
+            ]);
+            yield* progress.report(journal, {
+              ...report,
+              attempt: 2,
+              completedBytes: 0,
+              completedArtifacts: 0,
+            });
+            yield* progress.report(journal, {
+              ...report,
+              revision: 99,
+              completedBytes: 20,
+              completedArtifacts: 2,
+            });
+            expect(yield* progress.read(move.operationId)).toMatchObject([
+              { attempt: 2, revision: 1, completedBytes: 0 },
+            ]);
+            yield* progress.report(journal, {
+              ...report,
+              environmentId: "vm",
+              generation: 2,
+              stage: "downloading",
+            });
+            expect(yield* progress.read(move.operationId)).toHaveLength(2);
+            const cancelling = yield* store.requestAbort(move);
+            yield* progress.report(cancelling, { ...report, attempt: 3 });
+            expect(
+              (yield* progress.read(move.operationId)).find((row) => row.environmentId === "local")
+                ?.attempt,
+            ).toBe(2);
+            expect((yield* store.get(move.threadId))?.environmentId).toBe("local");
+          }),
+        ),
+    );
 
     it.effect("retains the first move failure without granting destination ownership", () =>
       run((store, sql) =>
@@ -1524,6 +1591,18 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           yield* f.sql`INSERT INTO relay_repository_aliases(canonical_key,repository_id,organization_id,created_at) VALUES(${f.input.canonicalKey},${f.input.repositoryId},${f.input.organizationId},'now')`;
           yield* f.sql`INSERT INTO relay_thread_artifacts(artifact_id,thread_id,operation_id,kind,sha256,size_bytes,storage_key,state) VALUES(${f.input.allocationId},${f.input.threadId},${f.input.allocationId},'manifest',${"b".repeat(64)},1,'test-manifest','complete')`;
           yield* f.sql`INSERT INTO relay_thread_move_checkpoints(operation_id,thread_id,manifest_artifact_id,artifact_count,workspace_branch,workspace_revision) VALUES(${f.input.allocationId},${f.input.threadId},${f.input.allocationId},1,'topic',${"c".repeat(40)})`;
+          const repositoryUpload = {
+            operationId: f.input.allocationId,
+            threadId: f.input.threadId,
+            sourceEnvironmentId: "previous-local-owner",
+            generation: 1,
+            branch: "topic",
+            revision: "c".repeat(40),
+            objectFormat: "sha1",
+            bundle: { sha256: "d".repeat(64), sizeBytes: 0, chunks: [] },
+          };
+          yield* f.sql`UPDATE relay_thread_move_checkpoints SET repository_retained=true,
+            repository_upload=${f.sql.json(repositoryUpload)} WHERE operation_id=${f.input.allocationId}`;
           let inspections = 0;
           const activity = makeThreadVmActivityWorker(
             f.sql,
@@ -1559,7 +1638,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           yield* f.sql`UPDATE relay_thread_move_checkpoints SET workspace_branch=NULL WHERE operation_id=${f.input.allocationId}`;
           expect(
             (yield* makeThreadVmStatusStore(f.sql).read(f.input.threadId, 2)).repository?.branch,
-          ).toBe("");
+          ).toBe("main");
           yield* f.sql`INSERT INTO relay_repository_aliases(canonical_key,repository_id,organization_id,created_at) VALUES(${f.input.canonicalKey + "-other"},${f.input.repositoryId},${f.input.organizationId},'now')`;
           expect(
             (yield* makeThreadVmStatusStore(f.sql).read(f.input.threadId, 2)).repository,
@@ -3232,6 +3311,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             sandboxId: `compute-${f.input.allocationId}`,
             identity: {
               operationId: f.input.allocationId,
+              templateId: "template:build-verified",
               scope: {
                 allocationId: f.input.allocationId,
                 threadId,

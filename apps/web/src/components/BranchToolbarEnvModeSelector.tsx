@@ -24,6 +24,7 @@ const PREVIOUS_WORKTREE_SELECT_VALUE = "previous-worktree";
 
 interface BranchToolbarEnvModeSelectorProps {
   forceNewWorktree?: boolean;
+  isVmWorkspace?: boolean;
   envLocked: boolean;
   effectiveEnvMode: EnvMode;
   activeWorktreePath: string | null;
@@ -35,6 +36,7 @@ interface BranchToolbarEnvModeSelectorProps {
 
 export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSelector({
   forceNewWorktree = false,
+  isVmWorkspace = false,
   envLocked,
   effectiveEnvMode,
   activeWorktreePath,
@@ -56,7 +58,7 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
     [activeWorktreePath, previousWorktreeLabel, showPreviousWorktree],
   );
 
-  if (envLocked || forceNewWorktree) {
+  if (isVmWorkspace || envLocked || forceNewWorktree) {
     return (
       <Tooltip>
         <TooltipTrigger
@@ -79,14 +81,14 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
               data-composer-label-motion
               className="block w-full min-w-0 max-w-[240px] truncate transition-opacity duration-180 ease-drawer group-data-[compact]/composer-context:opacity-0 motion-reduce:transition-none"
             >
-              {resolveLockedWorkspaceLabel(activeWorktreePath, effectiveEnvMode)}
+              {resolveLockedWorkspaceLabel(activeWorktreePath, effectiveEnvMode, isVmWorkspace)}
             </span>
           </span>
         </TooltipTrigger>
         <TooltipPopup>
           {forceNewWorktree
             ? "Each model starts in its own worktree."
-            : resolveLockedWorkspaceLabel(activeWorktreePath, effectiveEnvMode)}
+            : resolveLockedWorkspaceLabel(activeWorktreePath, effectiveEnvMode, isVmWorkspace)}
         </TooltipPopup>
       </Tooltip>
     );

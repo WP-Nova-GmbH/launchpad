@@ -41,6 +41,28 @@ describe("relay health VM capability", () => {
   for (const testCase of [
     { name: "reports an unconfigured host", settings: undefined, databaseFails: false },
     { name: "reports a configured host without exposing settings", settings, databaseFails: false },
+    {
+      name: "reports only effective enabled features",
+      settings: {
+        ...settings,
+        autoPauseEnabled: true,
+        autoBackupEnabled: true,
+        restoreEnabled: true,
+        permanentDeleteEnabled: true,
+        previewBaseUrl: "https://preview.example.test",
+      },
+      databaseFails: false,
+    },
+    {
+      name: "keeps backup-dependent workers inactive when backups are disabled",
+      settings: {
+        ...settings,
+        autoDeleteEnabled: true,
+        replacementEnabled: true,
+        autoBackupEnabled: false,
+      },
+      databaseFails: false,
+    },
     { name: "preserves database failure responses", settings, databaseFails: true },
   ]) {
     it.effect(testCase.name, () =>
@@ -92,6 +114,19 @@ describe("relay health VM capability", () => {
             ok: true,
             service: "relay",
             threadVmConfigured: testCase.settings !== undefined,
+            threadVmCapabilities: {
+              configured: testCase.settings !== undefined,
+              autoPause: testCase.settings?.autoPauseEnabled ?? false,
+              autoBackup: testCase.settings?.autoBackupEnabled ?? false,
+              autoDelete:
+                !!testCase.settings?.autoDeleteEnabled && testCase.settings.autoBackupEnabled,
+              replacement:
+                !!testCase.settings?.replacementEnabled && testCase.settings.autoBackupEnabled,
+              restore: testCase.settings?.restoreEnabled ?? false,
+              reset: testCase.settings?.resetEnabled ?? false,
+              permanentDelete: testCase.settings?.permanentDeleteEnabled ?? false,
+              privatePreview: !!testCase.settings?.previewBaseUrl,
+            },
           });
         }
       }).pipe(Effect.scoped),

@@ -1,5 +1,5 @@
 import { ThreadRunOnControl } from "./ThreadMoveControls";
-import { ThreadVmControls } from "./ThreadVmControls";
+import { ThreadVmControlsProvider, ThreadVmNotice } from "./ThreadVmControls";
 import type { WorktreeSetupCardProps } from "./worktree-setup-card";
 import type { ComposerTextPaste } from "../../native/T3ComposerEditor.types";
 import { type EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
@@ -1076,97 +1076,106 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
 
               {presenceLabel !== null ? (
                 <View className="items-center pb-1">
-                  <Text className="font-t3-medium text-xs text-neutral-600 dark:text-neutral-400">
+                  <Text className="font-t3-medium text-xs text-foreground-muted">
                     {presenceLabel}
                   </Text>
                 </View>
               ) : null}
-              <PortableThreadCommandStatus
+              <ThreadVmControlsProvider
                 environmentId={props.environmentId}
                 threadId={props.selectedThread.id}
-              />
-              <ThreadVmControls
-                environmentId={props.environmentId}
-                threadId={props.selectedThread.id}
-              />
-              {props.promptQueue ? (
-                <SharedPromptQueue
-                  key={`${props.environmentId}:${props.selectedThread.id}`}
+              >
+                <PortableThreadCommandStatus
                   environmentId={props.environmentId}
                   threadId={props.selectedThread.id}
-                  queue={props.promptQueue}
-                  supportsPreparation={
-                    props.serverConfig?.environment.capabilities.sharedPreparation === true
+                />
+                <ThreadVmNotice
+                  moving={
+                    props.promptQueue?.entries.some(
+                      (entry) => entry.kind === "move" && entry.state !== "pending",
+                    ) === true
                   }
-                  hasStartedTurn={props.selectedThread.latestTurn !== null}
-                  activeTurnId={
-                    props.selectedThread.session?.status === "running"
-                      ? props.selectedThread.session.activeTurnId
-                      : null
-                  }
+                />
+                {props.promptQueue ? (
+                  <SharedPromptQueue
+                    key={`${props.environmentId}:${props.selectedThread.id}`}
+                    environmentId={props.environmentId}
+                    threadId={props.selectedThread.id}
+                    queue={props.promptQueue}
+                    supportsPreparation={
+                      props.serverConfig?.environment.capabilities.sharedPreparation === true
+                    }
+                    hasStartedTurn={props.selectedThread.latestTurn !== null}
+                    activeTurnId={
+                      props.selectedThread.session?.status === "running"
+                        ? props.selectedThread.session.activeTurnId
+                        : null
+                    }
+                    unavailable={
+                      props.connectionStateLabel !== "connected" ||
+                      props.threadSyncStatus !== "live"
+                    }
+                  />
+                ) : null}
+                <ThreadRunOnControl
+                  environmentId={props.environmentId}
+                  thread={props.selectedThread}
                   unavailable={
                     props.connectionStateLabel !== "connected" || props.threadSyncStatus !== "live"
                   }
+                  onReconnect={props.onReconnectEnvironment}
                 />
-              ) : null}
-              <ThreadRunOnControl
-                environmentId={props.environmentId}
-                thread={props.selectedThread}
-                unavailable={
-                  props.connectionStateLabel !== "connected" || props.threadSyncStatus !== "live"
-                }
-                onReconnect={props.onReconnectEnvironment}
-              />
-              {/* Hidden (not unmounted) while a user-input request owns the
+                {/* Hidden (not unmounted) while a user-input request owns the
                 composer slot, so composer drafts and editor state survive.
                 A rejected creation has no thread to send to; the failure card
                 owns the slot instead. */}
-              <View
-                style={
-                  activeUserInputRequestId !== null ||
-                  props.creationState?.kind === "failed" ||
-                  props.creationState?.kind === "unknown"
-                    ? { display: "none" }
-                    : undefined
-                }
-              >
-                <ThreadComposer
-                  editorRef={composerEditorRef}
-                  draftMessage={props.draftMessage}
-                  draftAttachments={props.draftAttachments}
-                  placeholder="Ask the repo agent, or run a command…"
-                  contentMaxWidth={contentMaxWidth}
-                  connectionState={props.connectionStateLabel}
-                  environmentLabel={props.environmentLabel}
-                  selectedThread={props.selectedThread}
-                  hasCompactableConversation={hasCompactableConversation && !props.isCompacting}
-                  serverConfig={props.serverConfig}
-                  queueCount={props.selectedThreadQueueCount}
-                  environmentId={props.environmentId}
-                  projectCwd={props.threadCwd ?? props.projectWorkspaceRoot}
-                  // Follow-ups typed during setup wait in the draft: queueing
-                  // them against a thread id the server may still reject
-                  // would strand them in the outbox.
-                  sendBlockedReason={
-                    props.creationState?.kind === "preparing" ? "Starting the task…" : null
+                <View
+                  style={
+                    activeUserInputRequestId !== null ||
+                    props.creationState?.kind === "failed" ||
+                    props.creationState?.kind === "unknown"
+                      ? { display: "none" }
+                      : undefined
                   }
-                  bottomInset={composerBottomInset}
-                  onChangeDraftMessage={props.onChangeDraftMessage}
-                  onPickDraftMedia={props.onPickDraftMedia}
-                  onPickDraftFiles={props.onPickDraftFiles}
-                  onNativePasteImages={props.onNativePasteImages}
-                  onNativePasteText={props.onNativePasteText}
-                  onRemoveDraftImage={props.onRemoveDraftImage}
-                  onStopThread={props.onStopThread}
-                  onSendMessage={handleSendMessage}
-                  onShowUsageLimits={showUsageLimits}
-                  onUpdateModelSelection={props.onUpdateThreadModelSelection}
-                  onUpdateRuntimeMode={props.onUpdateThreadRuntimeMode}
-                  onUpdateInteractionMode={props.onUpdateThreadInteractionMode}
-                  onExpandedChange={setComposerExpanded}
-                  onEditorFocusChange={handleComposerFocusChange}
-                />
-              </View>
+                >
+                  <ThreadComposer
+                    editorRef={composerEditorRef}
+                    draftMessage={props.draftMessage}
+                    draftAttachments={props.draftAttachments}
+                    placeholder="Ask the repo agent, or run a command…"
+                    contentMaxWidth={contentMaxWidth}
+                    connectionState={props.connectionStateLabel}
+                    environmentLabel={props.environmentLabel}
+                    selectedThread={props.selectedThread}
+                    hasCompactableConversation={hasCompactableConversation && !props.isCompacting}
+                    serverConfig={props.serverConfig}
+                    queueCount={props.selectedThreadQueueCount}
+                    environmentId={props.environmentId}
+                    projectCwd={props.threadCwd ?? props.projectWorkspaceRoot}
+                    // Follow-ups typed during setup wait in the draft: queueing
+                    // them against a thread id the server may still reject
+                    // would strand them in the outbox.
+                    sendBlockedReason={
+                      props.creationState?.kind === "preparing" ? "Starting the task…" : null
+                    }
+                    bottomInset={composerBottomInset}
+                    onChangeDraftMessage={props.onChangeDraftMessage}
+                    onPickDraftMedia={props.onPickDraftMedia}
+                    onPickDraftFiles={props.onPickDraftFiles}
+                    onNativePasteImages={props.onNativePasteImages}
+                    onNativePasteText={props.onNativePasteText}
+                    onRemoveDraftImage={props.onRemoveDraftImage}
+                    onStopThread={props.onStopThread}
+                    onSendMessage={handleSendMessage}
+                    onShowUsageLimits={showUsageLimits}
+                    onUpdateModelSelection={props.onUpdateThreadModelSelection}
+                    onUpdateRuntimeMode={props.onUpdateThreadRuntimeMode}
+                    onUpdateInteractionMode={props.onUpdateThreadInteractionMode}
+                    onExpandedChange={setComposerExpanded}
+                    onEditorFocusChange={handleComposerFocusChange}
+                  />
+                </View>
+              </ThreadVmControlsProvider>
             </View>
           </Animated.View>
         </KeyboardStickyView>

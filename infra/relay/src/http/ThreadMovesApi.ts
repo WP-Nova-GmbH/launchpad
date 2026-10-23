@@ -4,6 +4,7 @@ import {
   RelayEnvironmentPrincipal,
   type RelayPortableThreadPlacement,
   type RelayThreadMove,
+  type ThreadMoveProgressReport,
 } from "@t3tools/contracts/relay";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -20,6 +21,7 @@ import { ThreadArtifactObjectStorage } from "../threads/ThreadArtifactObjects.ts
 import { makeThreadMoveArtifactStore } from "../threads/ThreadMoveArtifactStore.ts";
 import { makeThreadMoveCheckpointStore } from "../threads/ThreadMoveCheckpointStore.ts";
 import { makeThreadPlacementStore, type ThreadMove } from "../threads/ThreadPlacementStore.ts";
+import { makeThreadMoveProgressStore } from "../threads/ThreadMoveProgressStore.ts";
 import { authorizeThreadEnvironment, withEnvironmentThread } from "./ThreadEnvironmentApi.ts";
 import { withPrivateThreadOwnerAccess } from "./privateThreadAccess.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
@@ -44,6 +46,7 @@ const response = Effect.fnUntraced(function* (move: ThreadMove) {
     FROM relay_thread_move_artifacts WHERE operation_id=${move.operationId}`;
   return {
     ...move,
+    progress: yield* makeThreadMoveProgressStore(sql).read(move.operationId),
     manifestArtifactId: artifact?.manifestArtifactId ?? null,
     recoveryVerified: artifact
       ? yield* makeThreadMoveCheckpointStore(sql, objects).isRetainedComplete({
@@ -281,6 +284,17 @@ export const getPortableThreadMove = Effect.fn("relay.api.thread_moves.get")(fun
   );
 }, Effect.catchTags(failures));
 
+export const reportPortableThreadMoveProgress = Effect.fn("relay.api.thread_moves.progress")(
+  function* (input: Participant & ThreadMoveProgressReport) {
+    const sql = (yield* RelayDb).$client;
+    yield* withThreadMoveParticipant(input, "either", true, (move) =>
+      makeThreadMoveProgressStore(sql).report(move, input),
+    );
+    return { accepted: true as const };
+  },
+  Effect.catchTags(failures),
+);
+
 export const pendingPortableThreadMoves = Effect.fn("relay.api.thread_moves.pending")(
   function* (input: { environmentId: string; after: string | null; limit: number }) {
     const principal = yield* RelayEnvironmentPrincipal;
@@ -455,6 +469,9 @@ export const confirmPortableThreadMoveDestinationRemoved = Effect.fn(
 
 export const threadMovesApi = HttpApiBuilder.group(RelayApi, "threadMoves", (handlers) =>
   handlers
+    .handle("progress", ({ params, payload }) =>
+      reportPortableThreadMoveProgress({ ...params, ...payload }),
+    )
     .handle("pending", ({ params, payload }) =>
       pendingPortableThreadMoves({ ...params, ...payload }),
     )

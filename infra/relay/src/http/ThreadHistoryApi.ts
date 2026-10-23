@@ -1,3 +1,8 @@
+import type { CommandId } from "@t3tools/contracts";
+import { makeThreadMoveProgressStore } from "../threads/ThreadMoveProgressStore.ts";
+import { makeThreadCurrentQueueStore } from "../threads/ThreadCurrentQueueStore.ts";
+import { threadVmQuotaUsage } from "../threads/ThreadVmQuota.ts";
+import { makeThreadVmPolicyStore } from "../threads/ThreadVmPolicy.ts";
 import { attachmentRelativePath } from "@t3tools/shared/attachmentLayout";
 import {
   ThreadAttachmentCheckpointArchiveManifest,
@@ -15,6 +20,8 @@ import {
   RelayApi,
   RelayClientPrincipal,
   RelayPortableThreadSummary,
+  type RelayPortableThreadVmSummary,
+  type RelayPortableThreadPlacement,
 } from "@t3tools/contracts/relay";
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
@@ -42,6 +49,60 @@ export const listPortableThreads = Effect.fn("relay.api.thread_history.list")(
         AND NOT EXISTS(SELECT 1 FROM relay_thread_local_enrollments e WHERE e.thread_id=t.thread_id AND e.phase='aborted')
       ORDER BY t.thread_id LIMIT ${input.limit + 1}`;
     const scanned = candidates.slice(0, input.limit);
+    const vmRows = scanned.length
+      ? yield* sql<{
+          threadId: string;
+          generation: number;
+          environmentId: string;
+          previousLocations: NonNullable<RelayPortableThreadPlacement["previousLocations"]>;
+          vm: RelayPortableThreadVmSummary;
+        }>`SELECT t.thread_id AS "threadId",t.generation,t.environment_id AS "environmentId",
+      coalesce((SELECT jsonb_agg(jsonb_build_object('environmentId',m.source_environment_id,'generation',m.expected_generation) ORDER BY m.expected_generation) FROM relay_thread_moves m WHERE m.thread_id=t.thread_id AND m.phase='completed' AND m.expected_generation<t.generation),'[]'::jsonb) AS "previousLocations",jsonb_build_object(
+      'state', CASE WHEN move.operation_id IS NOT NULL THEN 'moving'
+        WHEN final.operation_id IS NOT NULL THEN 'saving'
+        WHEN reset.operation_id IS NOT NULL OR restore.operation_id IS NOT NULL THEN 'preparing'
+        WHEN saved.phase IN ('expired','expiring') OR (saved.phase='available' AND saved.expires_at<=clock_timestamp()) THEN 'expired'
+        WHEN saved.phase IN ('available','restoring') THEN 'saved'
+        WHEN a.state='paused' THEN 'paused'
+        WHEN a.state='running' AND ready.phase='ready' THEN 'running'
+        WHEN a.state IN ('creating','running') THEN 'preparing'
+        WHEN a.allocation_id IS NOT NULL THEN 'unavailable' ELSE 'on_machine' END,
+      'projectName', repository.name,
+      'activity',CASE WHEN activity.observed_at>=clock_timestamp()-interval '2 minutes' THEN activity.activity ELSE 'unknown' END,
+      'observedAt',to_char(activity.observed_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+      'lastWorkAt',to_char(activity.last_work_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+      'lastVerifiedBackupAt',to_char(backup.verified_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+      'savedDiskOperationId',saved.operation_id,
+      'savedDiskExpiresAt',to_char(saved.expires_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) AS vm
+      FROM relay_thread_placements t
+      JOIN relay_repositories repository ON repository.repository_id=t.repository_id AND repository.organization_id=t.organization_id
+      LEFT JOIN relay_thread_vm_policies policy ON policy.organization_id=t.organization_id
+      LEFT JOIN relay_thread_vm_allocations a ON a.thread_id=t.thread_id AND a.deleted_at IS NULL
+        AND (NOT EXISTS(SELECT 1 FROM relay_thread_vm_bindings b WHERE b.allocation_id=a.allocation_id)
+          OR EXISTS(SELECT 1 FROM relay_thread_vm_bindings b WHERE b.allocation_id=a.allocation_id AND b.environment_id=t.environment_id AND b.generation=t.generation AND b.revoked_at IS NULL))
+      LEFT JOIN relay_thread_vm_ready ready ON ready.allocation_id=a.allocation_id
+      LEFT JOIN relay_thread_vm_activity activity ON activity.allocation_id=a.allocation_id
+      LEFT JOIN relay_thread_moves move ON move.operation_id=t.operation_id AND move.phase NOT IN ('completed','aborted')
+      LEFT JOIN relay_thread_vm_final_saves final ON final.operation_id=t.operation_id AND final.phase NOT IN ('completed','aborted')
+      LEFT JOIN relay_thread_vm_resets reset ON reset.operation_id=t.operation_id AND reset.thread_id=t.thread_id
+        AND (reset.expected_generation=t.generation OR reset.expected_generation+1=t.generation) AND reset.phase NOT IN ('completed','cancelled')
+      LEFT JOIN relay_thread_vm_restores restore ON restore.operation_id=t.operation_id AND restore.thread_id=t.thread_id
+        AND (restore.generation=t.generation OR restore.generation+1=t.generation) AND restore.phase NOT IN ('completed','aborted')
+      LEFT JOIN LATERAL(SELECT operation_id,backup_operation_id,saved_at,phase,((saved_at AT TIME ZONE coalesce(policy.calendar_time_zone,'UTC') + coalesce(policy.saved_disk_retention_days,30)*interval '1 day') AT TIME ZONE coalesce(policy.calendar_time_zone,'UTC')) AS expires_at FROM relay_thread_vm_saved_disks WHERE thread_id=t.thread_id AND phase!='restored' AND (generation=t.generation OR (phase='restoring' AND restore_operation_id=t.operation_id)) ORDER BY saved_at DESC LIMIT 1) saved ON true
+      LEFT JOIN LATERAL(SELECT verified_at FROM relay_thread_vm_backups WHERE (allocation_id=a.allocation_id OR operation_id=saved.backup_operation_id) AND phase='verified' ORDER BY verified_at DESC LIMIT 1) backup ON true
+      WHERE t.thread_id=ANY(${scanned.map((row) => row.threadId)}::varchar[])`
+      : [];
+    const vmByThread = new Map(vmRows.map((row) => [row.threadId, row]));
+    const [membership] = yield* sql<{
+      organizationId: string;
+    }>`SELECT organization_id AS "organizationId" FROM relay_organization_members WHERE user_id=${userId}`;
+    const allowance = membership
+      ? {
+          used: yield* threadVmQuotaUsage(sql, userId),
+          limit: (yield* makeThreadVmPolicyStore(sql).get(membership.organizationId)).policy
+            .maxVmsPerUser,
+        }
+      : undefined;
     const entries = yield* Effect.forEach(scanned, ({ threadId }) =>
       // Recheck and hold the same access locks as individual history reads.
       withPrivateThreadAccess(threadId, "read", (placement) =>
@@ -69,7 +130,19 @@ export const listPortableThreads = Effect.fn("relay.api.thread_history.list")(
             WHERE thread_id=t.thread_id AND event_json->>'type'='thread.created' ORDER BY cursor LIMIT 1) created ON true
           LEFT JOIN LATERAL(SELECT event_json->>'occurredAt' AS value FROM relay_thread_history
             WHERE thread_id=t.thread_id ORDER BY cursor DESC LIMIT 1) updated ON true`;
-          return yield* decodeThreadSummary({ placement, ...metadata }).pipe(
+          const observed = vmByThread.get(threadId);
+          const current =
+            observed?.generation === placement.generation &&
+            observed.environmentId === placement.environmentId
+              ? observed
+              : null;
+          return yield* decodeThreadSummary({
+            placement: current
+              ? { ...placement, previousLocations: current.previousLocations }
+              : placement,
+            ...metadata,
+            ...(current ? { vm: current.vm } : {}),
+          }).pipe(
             Effect.catchTag("SchemaError", () => relayInternalErrorResponse("persistence_failed")),
           );
         }),
@@ -77,10 +150,15 @@ export const listPortableThreads = Effect.fn("relay.api.thread_history.list")(
     );
     return {
       entries: entries.filter((entry) => entry !== null),
+      ...(allowance ? { allowance } : {}),
       next: candidates.length > input.limit ? scanned.at(-1)!.threadId : null,
     };
   },
-  Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
+  Effect.catchTags({
+    SqlError: () => relayInternalErrorResponse("persistence_failed"),
+    ThreadPlacementConflict: () => relayInternalErrorResponse("persistence_failed"),
+    SchemaError: () => relayInternalErrorResponse("persistence_failed"),
+  }),
 );
 
 export const getPortableThreadPlacement = Effect.fn("relay.api.thread_history.placement")(
@@ -93,11 +171,45 @@ export const getPortableThreadPlacement = Effect.fn("relay.api.thread_history.pl
               FROM relay_thread_moves WHERE operation_id=${placement.operationId}
                 AND thread_id=${threadId} AND phase IN ('preparing','frozen','ready')`
           : [];
-        return { ...placement, moveFailureDetail: move?.failureDetail ?? null };
+        const previousLocations = yield* sql<{
+          environmentId: string;
+          generation: number;
+        }>`SELECT source_environment_id AS "environmentId",expected_generation AS generation FROM relay_thread_moves WHERE thread_id=${threadId} AND phase='completed' AND expected_generation<${placement.generation} ORDER BY expected_generation`;
+        return {
+          ...placement,
+          previousLocations,
+          moveFailureDetail: move?.failureDetail ?? null,
+          moveProgress: placement.operationId
+            ? yield* makeThreadMoveProgressStore(sql).read(placement.operationId)
+            : [],
+        };
       }),
     );
   },
 );
+export const getPortableThreadCurrentQueue = Effect.fn("relay.api.thread_history.queue")(function* (
+  threadId: string,
+  commandId?: CommandId,
+) {
+  const sql = (yield* RelayDb).$client;
+  return yield* withPrivateThreadAccess(threadId, "read", (placement) =>
+    Effect.gen(function* () {
+      const current = yield* makeThreadCurrentQueueStore(sql).read(threadId);
+      const applied = commandId
+        ? yield* sql`SELECT 1 FROM relay_thread_history
+          WHERE thread_id=${threadId} AND cursor<=${current.cursor}
+            AND event_json->>'type'='thread.prompt-queue-changed'
+            AND event_json->>'commandId'=${commandId} LIMIT 1`
+        : [];
+      return {
+        threadId,
+        generation: placement.generation,
+        ...current,
+        appliedCommandId: commandId && applied.length ? commandId : null,
+      };
+    }),
+  ).pipe(Effect.catchTag("SchemaError", () => relayInternalErrorResponse("persistence_failed")));
+});
 export const getPortableThreadHistory = Effect.fn("relay.api.thread_history.read")(
   function* (input: { threadId: string; after: number; limit: number }) {
     const sql = (yield* RelayDb).$client;
@@ -184,5 +296,8 @@ export const threadHistoryApi = HttpApiBuilder.group(RelayApi, "threadHistory", 
     .handle("getAttachment", ({ params }) => readPortableThreadAttachment(params))
     .handle("listThreads", ({ query }) => listPortableThreads(query))
     .handle("getPlacement", ({ params }) => getPortableThreadPlacement(params.threadId))
+    .handle("getCurrentQueue", ({ params, query }) =>
+      getPortableThreadCurrentQueue(params.threadId, query.commandId),
+    )
     .handle("getHistory", ({ params, query }) => getPortableThreadHistory({ ...params, ...query })),
 );

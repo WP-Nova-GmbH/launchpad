@@ -2643,3 +2643,38 @@ describe("shared VM controls", () => {
       ),
   );
 });
+
+describe("VM lifecycle reads current state before mutation", () => {
+  it.effect("rejects resume when the VM generation changed after the card loaded", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let generation = 1;
+        const methods: string[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          methods.push(request.method);
+          expect(request.method).toBe("GET");
+          return Response.json({
+            ...status,
+            generation,
+            allocation: { allocationId: "vm", ownerUserId: "owner", state: "paused" },
+            savedDisk: null,
+            setupPhase: "ready",
+          });
+        });
+        yield* AtomRegistry.mount(h.registry, h.query);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        generation = 2;
+        const result = yield* Effect.promise(() =>
+          h.controls.action.run(h.registry, {
+            environmentId,
+            threadId,
+            action: { type: "resume" },
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+        expect(methods).toEqual(["GET", "GET"]);
+      }),
+    ),
+  );
+});

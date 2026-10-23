@@ -1,4 +1,5 @@
 import { ThreadHistoryArchiveManifest } from "./threadHistory.ts";
+import { ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
 import { CodexConversationManifest } from "./codexConversation.ts";
 import { AuthSessionUser } from "./auth.ts";
 import * as DateTime from "effect/DateTime";
@@ -9,8 +10,15 @@ import {
   OrchestrationEvent,
   ClientOrchestrationCommand,
   ModelSelection,
+  ThreadPromptQueue,
 } from "./orchestration.ts";
-import { IsoDateTime, NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  CommandId,
+  IsoDateTime,
+  NonNegativeInt,
+  PositiveInt,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 
 /** Public cold-boot scope installed by the host while the destination disk is stopped. */
 export const ThreadVmRestoreBoot = Schema.Struct({
@@ -63,14 +71,68 @@ export const RelayPortableThreadPlacement = Schema.Struct({
   projectId: TrimmedNonEmptyString,
   generation: PositiveInt,
   operationId: Schema.NullOr(TrimmedNonEmptyString),
+  previousLocations: Schema.optionalKey(
+    Schema.Array(Schema.Struct({ environmentId: TrimmedNonEmptyString, generation: PositiveInt })),
+  ),
+  moveProgress: Schema.optional(Schema.Array(ThreadMoveProgressSnapshot)),
   moveFailureDetail: Schema.optional(
     Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(2000))),
   ),
 });
 export type RelayPortableThreadPlacement = typeof RelayPortableThreadPlacement.Type;
+/** Effective relay features; policy values alone do not enable a worker. */
+export const ThreadVmCapabilities = Schema.Struct({
+  configured: Schema.Boolean,
+  autoPause: Schema.Boolean,
+  autoBackup: Schema.Boolean,
+  autoDelete: Schema.Boolean,
+  replacement: Schema.Boolean,
+  restore: Schema.Boolean,
+  reset: Schema.Boolean,
+  permanentDelete: Schema.Boolean,
+  privatePreview: Schema.Boolean,
+});
+export type ThreadVmCapabilities = typeof ThreadVmCapabilities.Type;
+export const RelayPortableThreadVmSummary = Schema.Struct({
+  state: Schema.Literals([
+    "on_machine",
+    "preparing",
+    "running",
+    "paused",
+    "saving",
+    "saved",
+    "expired",
+    "moving",
+    "unavailable",
+  ]),
+  projectName: Schema.NullOr(Schema.String),
+  activity: Schema.Literals(["busy", "idle", "unknown"]),
+  observedAt: Schema.NullOr(IsoDateTime),
+  lastWorkAt: Schema.NullOr(IsoDateTime),
+  lastVerifiedBackupAt: Schema.NullOr(IsoDateTime),
+  savedDiskExpiresAt: Schema.NullOr(IsoDateTime),
+  savedDiskOperationId: Schema.optionalKey(Schema.NullOr(TrimmedNonEmptyString)),
+});
+export type RelayPortableThreadVmSummary = typeof RelayPortableThreadVmSummary.Type;
+export const RelayThreadVmAllowance = Schema.Struct({
+  used: NonNegativeInt,
+  limit: NonNegativeInt,
+});
+export type RelayThreadVmAllowance = typeof RelayThreadVmAllowance.Type;
+/** Applied queue state is independent of paginated conversation history. */
+export const RelayThreadCurrentQueue = Schema.Struct({
+  threadId: TrimmedNonEmptyString,
+  generation: PositiveInt,
+  cursor: NonNegativeInt,
+  // Present only when this exact command's queue event is included in the projection.
+  appliedCommandId: Schema.NullOr(CommandId),
+  queue: ThreadPromptQueue,
+});
+export type RelayThreadCurrentQueue = typeof RelayThreadCurrentQueue.Type;
 export const RelayPortableThreadSummary = Schema.Struct({
   placement: RelayPortableThreadPlacement,
   title: TrimmedNonEmptyString,
+  vm: Schema.optionalKey(RelayPortableThreadVmSummary),
   modelSelection: Schema.NullOr(ModelSelection),
   createdAt: Schema.NullOr(IsoDateTime),
   updatedAt: Schema.NullOr(IsoDateTime),
@@ -78,6 +140,7 @@ export const RelayPortableThreadSummary = Schema.Struct({
 export type RelayPortableThreadSummary = typeof RelayPortableThreadSummary.Type;
 export const RelayPortableThreadPage = Schema.Struct({
   entries: Schema.Array(RelayPortableThreadSummary),
+  allowance: Schema.optionalKey(RelayThreadVmAllowance),
   next: Schema.NullOr(TrimmedNonEmptyString),
 });
 export type RelayPortableThreadPage = typeof RelayPortableThreadPage.Type;

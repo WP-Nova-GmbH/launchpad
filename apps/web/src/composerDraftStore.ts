@@ -1,3 +1,4 @@
+import { blobToDataUrl } from "./lib/imageCompression";
 import { elementContextToPreviewAnnotation } from "./lib/elementContext";
 import {
   ElementContextDetails,
@@ -150,6 +151,8 @@ export interface ComposerFileAttachment extends Omit<ChatFileAttachment, "previe
   file: File | null;
   uploadedAttachmentId?: string;
   uploadEnvironmentId?: EnvironmentId;
+  /** Durable source copy while a moved attachment is waiting for its new upload. */
+  recoveryUpload?: { attachmentId: string; environmentId: EnvironmentId };
 }
 
 /**
@@ -209,6 +212,9 @@ export const PersistedComposerDraftFileAttachment = Schema.Struct({
   sizeBytes: Schema.Number,
   attachmentId: Schema.optionalKey(Schema.String),
   environmentId: Schema.optionalKey(EnvironmentId),
+  recoveryUpload: Schema.optionalKey(
+    Schema.Struct({ attachmentId: Schema.String, environmentId: EnvironmentId }),
+  ),
   source: Schema.optional(PastedTextAttachmentSource),
 });
 export type PersistedComposerDraftFileAttachment = typeof PersistedComposerDraftFileAttachment.Type;
@@ -2150,6 +2156,7 @@ export function partializeComposerDraftStoreState(
               mimeType: file.mimeType,
               sizeBytes: file.sizeBytes,
               ...(file.source ? { source: file.source } : {}),
+              ...(file.recoveryUpload ? { recoveryUpload: file.recoveryUpload } : {}),
               ...(file.uploadedAttachmentId && file.uploadEnvironmentId
                 ? {
                     attachmentId: file.uploadedAttachmentId,
@@ -2430,6 +2437,7 @@ function toHydratedThreadDraft(
       sizeBytes: file.sizeBytes,
       file: null,
       ...(file.source ? { source: file.source } : {}),
+      ...(file.recoveryUpload ? { recoveryUpload: file.recoveryUpload } : {}),
       // A marker without an attachment id hydrates as needs-reattach: no
       // bytes, no server-side upload, only the metadata to tell the user
       // what to attach again.
@@ -3508,39 +3516,54 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           });
         },
         setFileUpload: (threadRef, fileId, environmentId, attachmentId) => {
-          const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
+          const state = get();
+          const threadKey = resolveComposerDraftKey(state, threadRef) ?? "";
           if (threadKey.length === 0) {
             return;
           }
-          set((state) => {
-            const current = state.draftsByThreadKey[threadKey];
-            const file = current?.files.find((entry) => entry.id === fileId);
-            if (
-              !current ||
-              !file ||
-              (file.uploadEnvironmentId === environmentId &&
-                file.uploadedAttachmentId === attachmentId)
-            ) {
-              return state;
+          const current = state.draftsByThreadKey[threadKey];
+          const file = current?.files.find((entry) => entry.id === fileId);
+          if (
+            !current ||
+            !file ||
+            (file.uploadEnvironmentId === environmentId &&
+              file.uploadedAttachmentId === attachmentId)
+          ) {
+            return;
+          }
+          const draftsByThreadKey = {
+            ...state.draftsByThreadKey,
+            [threadKey]: {
+              ...current,
+              files: current.files.map((entry) => {
+                if (entry.id !== fileId) return entry;
+                const { recoveryUpload: _recovery, ...retained } = entry;
+                return {
+                  ...retained,
+                  uploadedAttachmentId: attachmentId,
+                  uploadEnvironmentId: environmentId,
+                };
+              }),
+            },
+          };
+          if (file.recoveryUpload) {
+            // Retry may delete the replacement upload. Keep the old recovery
+            // reference in memory AND pending storage until its replacement is durable.
+            composerDebouncedStorage.setItem(COMPOSER_DRAFT_STORAGE_KEY, {
+              state: { capturedState: { ...state, draftsByThreadKey } },
+              version: COMPOSER_DRAFT_STORAGE_VERSION,
+            });
+            try {
+              composerDebouncedStorage.flush();
+            } catch (error) {
+              composerDebouncedStorage.setItem(COMPOSER_DRAFT_STORAGE_KEY, {
+                state: { capturedState: state },
+                version: COMPOSER_DRAFT_STORAGE_VERSION,
+              });
+              throw error;
             }
-            return {
-              draftsByThreadKey: {
-                ...state.draftsByThreadKey,
-                [threadKey]: {
-                  ...current,
-                  files: current.files.map((entry) =>
-                    entry.id === fileId
-                      ? {
-                          ...entry,
-                          uploadedAttachmentId: attachmentId,
-                          uploadEnvironmentId: environmentId,
-                        }
-                      : entry,
-                  ),
-                },
-              },
-            };
-          });
+          }
+          set({ draftsByThreadKey });
         },
         markFileUploadMissing: (threadRef, fileId, environmentId, attachmentId) => {
           const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
@@ -4300,4 +4323,120 @@ export function finalizePromotedDraftThreadByRef(threadRef: ScopedThreadRef): vo
     }
   }
   clearBackgroundDraftSubmissionByRef(threadRef);
+}
+
+export interface MovedThreadDraftConflict {
+  readonly source: ComposerThreadDraftState;
+  readonly destination: ComposerThreadDraftState;
+}
+
+/** Persist at the verified destination before releasing source ownership. Upload jobs
+ * are deliberately not released: the upload queue retargets their existing IDs. */
+export async function handoffMovedThreadDraft(input: {
+  readonly source: ScopedThreadRef;
+  readonly destination: ScopedThreadRef;
+  readonly stillCurrent: () => boolean;
+  readonly recoverFile: (file: ComposerFileAttachment) => Promise<File | null>;
+  readonly choice?: {
+    readonly use: "source" | "destination";
+    readonly conflict: MovedThreadDraftConflict;
+  };
+}): Promise<{ readonly conflict?: MovedThreadDraftConflict }> {
+  if (!input.stillCurrent()) throw new Error("Your account or this thread’s location changed.");
+  const state = useComposerDraftStore.getState();
+  const source = state.getComposerDraft(input.source);
+  const destination = state.getComposerDraft(input.destination);
+  if (
+    !composerDraftHasUserContent(source) ||
+    !source ||
+    input.source.environmentId === input.destination.environmentId
+  )
+    return {};
+  if (
+    input.choice &&
+    (input.choice.conflict.source !== source || input.choice.conflict.destination !== destination)
+  ) {
+    throw new Error("A draft changed while you were choosing. Check both drafts again.");
+  }
+  if (composerDraftHasUserContent(destination) && destination && !input.choice)
+    return { conflict: { source, destination } };
+  if (input.choice?.use === "destination") return {};
+  const files = await Promise.all(
+    source.files.map(async (file) => {
+      if (file.uploadEnvironmentId === input.destination.environmentId) return file;
+      let bytes = file.file;
+      if (
+        !bytes &&
+        ((file.uploadedAttachmentId && file.uploadEnvironmentId) || file.recoveryUpload)
+      ) {
+        try {
+          bytes = await input.recoverFile(file);
+        } catch {
+          /* Retain an explicit reattach marker. */
+        }
+      }
+      const {
+        uploadedAttachmentId: _upload,
+        uploadEnvironmentId: _environment,
+        ...retained
+      } = file;
+      return {
+        ...retained,
+        file: bytes,
+        ...(_upload && _environment
+          ? { recoveryUpload: { attachmentId: _upload, environmentId: _environment } }
+          : {}),
+      };
+    }),
+  );
+  const imageSnapshots = await Promise.all(
+    source.images.map(async (image) => {
+      const existing = source.persistedAttachments.find((attachment) => attachment.id === image.id);
+      if (existing) return existing;
+      return {
+        id: image.id,
+        name: image.name,
+        mimeType: image.mimeType,
+        sizeBytes: image.sizeBytes,
+        dataUrl: await blobToDataUrl(image.file),
+        ...(image.source ? { source: image.source } : {}),
+      };
+    }),
+  );
+  if (!input.stillCurrent()) throw new Error("Your account or this thread’s location changed.");
+  const latest = useComposerDraftStore.getState();
+  if (
+    latest.getComposerDraft(input.source) !== source ||
+    latest.getComposerDraft(input.destination) !== destination
+  ) {
+    throw new Error("A draft changed during the move. Your drafts are still saved; try again.");
+  }
+  const sourceKey = resolveComposerDraftKey(latest, input.source)!;
+  const destinationKey = resolveComposerDraftKey(latest, input.destination)!;
+  const moved = {
+    ...source,
+    files,
+    persistedAttachments: imageSnapshots,
+    nonPersistedImageIds: [],
+    terminalContexts: source.terminalContexts.map((context) => ({
+      ...context,
+      terminalId: `snapshot:${context.id}`,
+      terminalLabel: `${context.terminalLabel.replace(/ \(snapshot\)$/, "")} (snapshot)`,
+    })),
+  };
+  const drafts = { ...latest.draftsByThreadKey, [destinationKey]: moved };
+  // One atomic storage value contains BOTH drafts when choosing between them.
+  // Persisting the chosen destination first would lose the other draft on a crash.
+  if (destination && composerDraftHasUserContent(destination)) drafts[sourceKey] = destination;
+  else if (!files.some((file) => file.file === null && !file.recoveryUpload))
+    delete drafts[sourceKey];
+  composerDebouncedStorage.setItem(COMPOSER_DRAFT_STORAGE_KEY, {
+    state: { capturedState: { ...latest, draftsByThreadKey: drafts } },
+    version: COMPOSER_DRAFT_STORAGE_VERSION,
+  });
+  composerDebouncedStorage.flush();
+  // The source stays visible in memory until the complete destination and
+  // conflict recovery snapshot have been durably stored.
+  useComposerDraftStore.setState({ draftsByThreadKey: drafts });
+  return {};
 }
