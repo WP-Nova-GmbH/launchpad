@@ -1,6 +1,5 @@
 import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { useServerConfigs } from "../state/entities";
-import { PortableThreadLibrary } from "./chat/PortableThreadLibrary";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { Spinner } from "~/components/ui/spinner";
@@ -3829,7 +3828,6 @@ export default function LegacySidebar() {
         attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
         projectsLength={projects.length}
       />
-      <PortableThreadLibrary />
       <SidebarChromeFooter />
     </>
   );

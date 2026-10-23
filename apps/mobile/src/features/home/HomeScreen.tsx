@@ -1,4 +1,3 @@
-import { PortableThreadLibrary } from "../threads/PortableThreadLibrary";
 import type { ThreadMoveDestination } from "../threads/threadOrder";
 import { computeThreadMoveAvailability } from "../threads/threadOrder";
 import { LegendList } from "@legendapp/list/react-native";
@@ -862,7 +861,6 @@ export function HomeScreen(props: HomeScreenProps) {
           }}
         >
           <View className="w-full max-w-[430px]">
-            <PortableThreadLibrary />
             <EmptyState
               title={emptyState.title}
               detail={emptyState.detail}
@@ -893,15 +891,6 @@ export function HomeScreen(props: HomeScreenProps) {
   }
 
   const listHeader = Platform.OS === "ios" ? null : <HomeTopContentSpacer />;
-
-  // Project scoping lives in the header filter menu (no inline chip row on
-  // mobile — the menu is the one filter surface).
-  const v2ListHeader = (
-    <>
-      <PortableThreadLibrary />
-      {listHeader}
-    </>
-  );
 
   // Use the v2 project scope for its empty state. Snoozed threads need no
   // special empty state: their shelf header is a list row even while collapsed.
@@ -939,7 +928,6 @@ export function HomeScreen(props: HomeScreenProps) {
           className="flex-1 items-center justify-center overflow-hidden rounded-t-[28px] bg-screen px-4"
           style={{ paddingBottom: insets.bottom }}
         >
-          <PortableThreadLibrary />
           {v2ListEmpty}
         </View>
       </View>
@@ -969,7 +957,7 @@ export function HomeScreen(props: HomeScreenProps) {
             drawDistance={500}
             recycleItems
             extraData={v2ExtraData}
-            ListHeaderComponent={v2ListHeader}
+            ListHeaderComponent={listHeader}
             ListFooterComponent={
               settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
                 <ThreadListV2ShowMoreRow

@@ -204,7 +204,7 @@ Recovery restores the selected workspace backup and the independently saved conv
 workspace changes made after the backup may be lost. Queued prompts remain paused.
 When the conversation or attachments are not completely saved, recovery stays unavailable
 and keeps the existing data.
-The **VM threads** overview can read saved conversations without starting a VM. Resume or restore
+Open **Settings → VM threads** to read saved conversations without starting a VM. Resume or restore
 the VM only when you want to work in it. Restoring a workspace keeps the prompt queue paused.
 
 Admins can configure the organization's VM limits and inactivity policy in

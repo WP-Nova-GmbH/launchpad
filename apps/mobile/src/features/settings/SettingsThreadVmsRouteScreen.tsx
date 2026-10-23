@@ -1,4 +1,4 @@
-import { PortableThreadLibrary } from "../threads/PortableThreadLibrary";
+import { useNavigation } from "@react-navigation/native";
 import { useAuth } from "@clerk/expo";
 import {
   ManagedRelayTenancy,
@@ -26,7 +26,7 @@ import { SettingsSection } from "./components/SettingsSection";
 export function SettingsThreadVmsRouteScreen() {
   if (!hasCloudPublicConfig())
     return (
-      <SettingsScreen title="Thread VMs">
+      <SettingsScreen title="VM policy">
         <Text className="p-5 text-base text-foreground-muted">
           Thread VMs require Launchpad Connect in this app build.
         </Text>
@@ -39,7 +39,7 @@ function ConfiguredThreadVmsSettings() {
   const { userId, isLoaded, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
   if (!isLoaded || !isSignedIn)
     return (
-      <SettingsScreen title="Thread VMs">
+      <SettingsScreen title="VM policy">
         <Text className="p-5 text-base text-foreground-muted">
           {!isLoaded
             ? "Checking your account…"
@@ -51,6 +51,7 @@ function ConfiguredThreadVmsSettings() {
 }
 
 function SignedInThreadVmsSettings() {
+  const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const { getToken, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
   const [capabilities, setCapabilities] = useState<ThreadVmCapabilities | null>(null);
@@ -145,7 +146,7 @@ function SignedInThreadVmsSettings() {
   };
 
   return (
-    <SettingsScreen title="Thread VMs">
+    <SettingsScreen title="VM policy">
       <ScreenScrollView
         contentInsetAdjustmentBehavior="automatic"
         className="flex-1"
@@ -153,7 +154,15 @@ function SignedInThreadVmsSettings() {
         contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
       >
         <>
-          <PortableThreadLibrary />
+          <MaterialButton
+            label="VM threads"
+            onPress={() =>
+              navigation.navigate("SettingsSheet", {
+                screen: "SettingsContent",
+                params: { screen: "SettingsVmThreads" },
+              })
+            }
+          />
           <Text className="text-base text-foreground-muted">
             Each VM belongs to one thread.{" "}
             {isAdmin

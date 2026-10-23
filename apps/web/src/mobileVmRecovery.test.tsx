@@ -14,6 +14,11 @@ import {
 import type { RelayThreadVmStatus } from "@t3tools/contracts/relay";
 import type { ThreadVmActionSubmission } from "@t3tools/client-runtime/relay/threadVmActionSubmission";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+type VmCapabilitiesState = {
+  data: { privatePreview: boolean };
+  isPending: boolean;
+  error: null;
+};
 interface QueuedThreadMessage {
   environmentId: EnvironmentId;
   threadId: ThreadId;
@@ -93,6 +98,7 @@ vi.mock("../../mobile/node_modules/react-native-safe-area-context", () => ({
   useSafeAreaInsets: () => ({ bottom: 0 }),
 }));
 vi.mock("../../mobile/src/components/ContextSheetSize", () => ({ ContextSheetSize: () => null }));
+vi.mock("../../mobile/src/components/AppSymbol", () => ({ SymbolView: () => null }));
 vi.mock("../../mobile/src/components/AppText", () => ({ AppText: "span", AppTextInput: "input" }));
 vi.mock("../../mobile/src/state/entities", () => ({
   useProjects: () => [],
@@ -237,11 +243,16 @@ const registryPath = "../../mobile/src/state/atom-registry";
 const { appAtomRegistry } = await vi.importActual<{ appAtomRegistry: AtomRegistry.AtomRegistry }>(
   registryPath,
 );
-const { environmentThreadShells } = await vi.importMock<{
+const { environmentThreadShells, threadVmControls } = await vi.importMock<{
   environmentThreadShells: {
     threadShellsAtom: Atom.Writable<ReadonlyArray<EnvironmentThreadShell>>;
   };
+  threadVmControls: {
+    capabilitiesAtom: Atom.Writable<VmCapabilitiesState>;
+  };
 }>("../../mobile/src/state/threads");
+const vmCapabilitiesAtom = threadVmControls.capabilitiesAtom as Atom.Writable<VmCapabilitiesState>;
+const initialVmCapabilities = appAtomRegistry.get(vmCapabilitiesAtom);
 const { serverEnvironment } = await vi.importMock<{
   serverEnvironment: {
     configValueAtom(environmentId: EnvironmentId): Atom.Writable<ServerConfig | null>;
@@ -388,6 +399,7 @@ beforeEach(() => {
   fixture.vmLifecycle.busy = false;
   fixture.vmLifecycle.error = "Storage unavailable";
   appAtomRegistry.set(vmViewAtom, initialVmView);
+  appAtomRegistry.set(vmCapabilitiesAtom, initialVmCapabilities);
   appAtomRegistry.set(
     environmentThreadShells.threadShellsAtom as Atom.Writable<
       ReadonlyArray<EnvironmentThreadShell>
@@ -519,6 +531,28 @@ describe("mobile VM recovery", () => {
     expect(anyButton("Manage VM")).toBeUndefined();
     expect(anyButton("Open preview…")).toBeDefined();
     expect(anyButton("Permanently delete thread")).toBeUndefined();
+  });
+
+  it("omits the empty actions section and shows it when an action becomes available", async () => {
+    fixture.vmLifecycle.ready = true;
+    fixture.vmLifecycle.error = null;
+    appAtomRegistry.set(vmViewAtom, {
+      ...initialVmView,
+      data: {
+        ...initialVmView.data,
+        status: { ...initialVmStatus, lastVerifiedBackupAt: null },
+      },
+    });
+    appAtomRegistry.set(vmCapabilitiesAtom, {
+      ...initialVmCapabilities,
+      data: { ...initialVmCapabilities.data, privatePreview: false },
+    });
+    await mountVm(true);
+    expect(renderer!.root.findAllByProps({ accessibilityLabel: "VM actions" })).toHaveLength(0);
+    await act(async () => {
+      appAtomRegistry.set(vmCapabilitiesAtom, initialVmCapabilities);
+    });
+    expect(anyButton("Open preview…")).toBeDefined();
   });
 
   it.each(["success", "failure"])(

@@ -35,6 +35,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { RefreshCwIcon } from "lucide-react";
 import {
   AlertDialog,
   AlertDialogPopup,
@@ -48,6 +49,7 @@ type ThreadVmUi = {
   caption: string;
   tone: "danger" | "success" | "attention" | "neutral";
   notice: ReactNode;
+  refresh: ReactNode;
   progressOnly?: boolean;
   actions: (close: () => void, standalone?: boolean) => ReactNode;
   trigger: RefObject<HTMLButtonElement | null>;
@@ -60,6 +62,10 @@ export function ThreadVmNotice({ moving = false }: { moving?: boolean }) {
 }
 export function ThreadVmMenuActions({ onAction }: { onAction: () => void }) {
   return useThreadVmUi()?.actions(onAction) ?? null;
+}
+
+export function ThreadVmRefreshButton() {
+  return useThreadVmUi()?.refresh ?? null;
 }
 
 function Panel({ children }: { children: ReactNode }) {
@@ -148,11 +154,16 @@ function StandaloneVmControls() {
   if (!ui) return null;
   return (
     <div className="grid gap-2">
-      {ui.notice ?? (
-        <p className="text-sm font-medium" role="status">
-          {ui.label}
-        </p>
-      )}
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          {ui.notice ?? (
+            <p className="text-sm font-medium" role="status">
+              {ui.label}
+            </p>
+          )}
+        </div>
+        <ThreadVmRefreshButton />
+      </div>
       {ui.actions(() => {}, true)}
     </div>
   );
@@ -613,8 +624,20 @@ function ThreadVmControlPanel({
     close();
     action();
   };
+  const refresh = (
+    <Button
+      variant="ghost-muted"
+      size="icon-xs"
+      aria-label="Refresh status"
+      title="Refresh status"
+      disabled={busy || lifecycle.busy}
+      onClick={() => threadVmControls.refresh(registry, environmentId, threadId)}
+    >
+      <RefreshCwIcon aria-hidden />
+    </Button>
+  );
   const actions = (close: () => void, standalone = false) => (
-    <div className="grid gap-1 border-t border-border pt-2" aria-label="VM actions">
+    <div className="grid gap-1 border-t border-border pt-2 empty:hidden" aria-label="VM actions">
       {presentation.primary && !deletionNote && !standalone ? (
         <MenuAction
           label={presentation.primary.label}
@@ -689,14 +712,6 @@ function ThreadVmControlPanel({
           onPress={() => openConfirmation("delete")}
         />
       ) : null}
-      <Button
-        variant="ghost-muted"
-        size="xs"
-        disabled={busy || lifecycle.busy}
-        onClick={() => threadVmControls.refresh(registry, environmentId, threadId)}
-      >
-        Refresh status
-      </Button>
     </div>
   );
   const notice =
@@ -737,6 +752,7 @@ function ThreadVmControlPanel({
               : presentation.label.replace(/^VM /, "").replace(/ VM$/, ""),
             tone: presentation.tone,
             notice,
+            refresh,
             progressOnly:
               presentation.tone === "neutral" &&
               !error &&
@@ -756,6 +772,7 @@ function ThreadVmControlPanel({
       presentation.ready,
       presentation.tone,
       notice,
+      refresh,
       error,
       lifecycle.error,
       actions,

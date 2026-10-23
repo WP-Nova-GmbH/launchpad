@@ -18,6 +18,7 @@ import {
   PanelsTopLeftIcon,
   KeyboardIcon,
   Link2Icon,
+  MonitorIcon,
   PaletteIcon,
   SearchIcon,
   Settings2Icon,
@@ -74,6 +75,7 @@ const SETTINGS_SECTION_ICONS: Readonly<
   "/settings/source-control": GitBranchIcon,
   "/settings/storage": HardDriveIcon,
   "/settings/connections": Link2Icon,
+  "/settings/vms": MonitorIcon,
   "/settings/organization": BuildingIcon,
   "/settings/archived": ArchiveIcon,
 };

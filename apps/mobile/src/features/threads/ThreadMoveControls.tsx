@@ -6,7 +6,7 @@ import {
   type MovedThreadDraftConflict,
 } from "../../state/use-composer-drafts";
 import { scopedThreadKey } from "../../lib/scopedEntities";
-import { ThreadVmMenuActions, useThreadVmUi } from "./ThreadVmControls";
+import { ThreadVmMenuActions, ThreadVmRefreshButton, useThreadVmUi } from "./ThreadVmControls";
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigation } from "@react-navigation/native";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
@@ -906,14 +906,17 @@ function ThreadMachinePicker({
                 >
                   Run on
                 </Text>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Close Run on"
-                  onPress={close}
-                  className="min-h-11 min-w-11 items-center justify-center"
-                >
-                  <SymbolView name="xmark" size={18} tintColorClassName="accent-icon-muted" />
-                </Pressable>
+                <View className="flex-row items-center">
+                  <ThreadVmRefreshButton />
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Close Run on"
+                    onPress={close}
+                    className="min-h-11 min-w-11 items-center justify-center"
+                  >
+                    <SymbolView name="xmark" size={18} tintColorClassName="accent-icon-muted" />
+                  </Pressable>
+                </View>
               </View>
               <View className="overflow-hidden rounded-2xl">
                 <MaterialListRow

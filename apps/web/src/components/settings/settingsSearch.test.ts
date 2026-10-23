@@ -321,8 +321,15 @@ describe("searchSettings", () => {
     ["automatically pull", "automatic-pull", "/settings/source-control"],
     ["actions", "project-actions", "/settings/projects"],
     ["project overview", "project-overview", "/settings/projects"],
+    ["VM threads", "vm-threads", "/settings/vms"],
   ])("routes %s to its owning category", (query, id, to) => {
     expect(searchSettings(query)[0]).toMatchObject({ id, to });
+  });
+
+  it("keeps VM threads independent of the selected environment", () => {
+    const target = getSettingsSearchTargetScope("vm-threads");
+    expect(target).toMatchObject({ scope: null });
+    expect(isSettingsSearchScopeAvailable(target!.scope, "unavailable")).toBe(true);
   });
 
   it("keeps environment settings discoverable without a primary environment", () => {

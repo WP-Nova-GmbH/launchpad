@@ -1,6 +1,3 @@
-import { useAtomSet, useAtomValue } from "@effect/atom-react";
-import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
-import { portableThreadLibrary } from "../../state/threads";
 import { useNavigation } from "@react-navigation/native";
 import type { EnvironmentThreadSearchMatch } from "@t3tools/client-runtime/state/thread-search";
 import { THREAD_JUMP_KEYBINDING_COMMANDS } from "@t3tools/contracts";
@@ -140,8 +137,6 @@ export function CommandPalette(props: {
   readonly onCommand: (command: HardwareKeyboardCommand) => void;
 }) {
   const navigation = useNavigation();
-  const vmSession = useAtomValue(managedRelaySessionAtom);
-  const setVmLibraryOpen = useAtomSet(portableThreadLibrary.openAtom);
   const { themeVariables } = useAppearancePreferences();
   const { selectThread } = useAdaptiveWorkspaceLayout();
   const runCommand = props.onCommand;
@@ -253,14 +248,17 @@ export function CommandPalette(props: {
           }),
       },
     ];
-    if (vmSession)
-      actions.push({
-        key: "threadVms",
-        kind: "action",
-        title: "VM threads",
-        searchTerms: ["VM", "sandbox", "private", "saved", "restore", "reset", "create"],
-        run: () => setVmLibraryOpen(true),
-      });
+    actions.push({
+      key: "threadVms",
+      kind: "action",
+      title: "VM threads",
+      searchTerms: ["VM", "sandbox", "private", "saved", "restore", "reset", "create"],
+      run: () =>
+        navigation.navigate("SettingsSheet", {
+          screen: "SettingsContent",
+          params: { screen: "SettingsVmThreads" },
+        }),
+    });
     const projectByKey = new Map(
       projects.map((project) => [scopedProjectKey(project.environmentId, project.id), project]),
     );
@@ -347,8 +345,6 @@ export function CommandPalette(props: {
     activeThread,
     activeThreadRef,
     navigation,
-    vmSession,
-    setVmLibraryOpen,
     projects,
     runCommand,
     savedConnectionsById,

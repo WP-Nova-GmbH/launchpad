@@ -7,6 +7,7 @@ export type SettingsSheetTarget =
   | "SettingsAppearance"
   | "SettingsOrganization"
   | "SettingsThreadVms"
+  | "SettingsVmThreads"
   | "SettingsProjectOverview"
   | "SettingsEnvironmentNewThreads"
   | "SettingsEnvironmentSourceControl"

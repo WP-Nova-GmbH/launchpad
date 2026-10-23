@@ -18,6 +18,7 @@ import {
 } from "@t3tools/client-runtime/relay/threadVmControls";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
+  Children,
   createContext,
   useCallback,
   useContext,
@@ -34,10 +35,19 @@ import * as Clipboard from "expo-clipboard";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ContextSheetSize } from "../../components/ContextSheetSize";
 import { AppText as Text, AppTextInput } from "../../components/AppText";
+import { SymbolView } from "../../components/AppSymbol";
 import { threadVmControls, threadVmActionJournal } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 function Panel({ children }: { children: ReactNode }) {
   return <View className="gap-2 px-3 py-2">{children}</View>;
+}
+function VmActionList({ children }: { children: ReactNode }) {
+  const actions = Children.toArray(children);
+  return actions.length > 0 ? (
+    <View className="gap-1 border-t border-border pt-2" accessibilityLabel="VM actions">
+      {actions}
+    </View>
+  ) : null;
 }
 function Note({ children }: { children: ReactNode }) {
   return (
@@ -102,6 +112,7 @@ type ThreadVmUi = {
   label: string;
   caption: string;
   notice: ReactNode;
+  refresh: ReactNode;
   progressOnly?: boolean;
   actions: (open: (action: () => void) => void, standalone?: boolean) => ReactNode;
 };
@@ -114,6 +125,10 @@ export function ThreadVmNotice({ moving = false }: { moving?: boolean }) {
 export function ThreadVmMenuActions({ onAction }: { onAction: (action: () => void) => void }) {
   return useThreadVmUi()?.actions(onAction) ?? null;
 }
+export function ThreadVmRefreshButton() {
+  return useThreadVmUi()?.refresh ?? null;
+}
+
 export function ThreadVmControls(props: { environmentId: EnvironmentId; threadId: ThreadId }) {
   return (
     <ThreadVmControlsProvider {...props}>
@@ -126,7 +141,12 @@ function StandaloneVmControls() {
   if (!ui) return null;
   return (
     <View className="gap-2">
-      {ui.notice ?? <Text className="text-sm font-medium text-foreground">{ui.label}</Text>}
+      <View className="flex-row items-start justify-between gap-2">
+        <View className="min-w-0 flex-1">
+          {ui.notice ?? <Text className="text-sm font-medium text-foreground">{ui.label}</Text>}
+        </View>
+        <ThreadVmRefreshButton />
+      </View>
       {ui.actions((action) => action(), true)}
     </View>
   );
@@ -574,8 +594,20 @@ function ThreadVmControlPanel({
       ) : null}
     </>
   );
+  const refresh = (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel="Refresh status"
+      disabled={busy || lifecycle.busy}
+      onPress={() => threadVmControls.refresh(registry, environmentId, threadId)}
+      className="size-11 items-center justify-center rounded-lg"
+      style={{ opacity: busy || lifecycle.busy ? 0.4 : 1 }}
+    >
+      <SymbolView name="arrow.clockwise" size={18} tintColorClassName="accent-icon-muted" />
+    </Pressable>
+  );
   const actions = (open: (action: () => void) => void, standalone = false) => (
-    <View className="gap-1 border-t border-border pt-2" accessibilityLabel="VM actions">
+    <VmActionList>
       {presentation.primary && !deletionNote && !standalone ? (
         <ActionButton
           label={presentation.primary.label}
@@ -651,12 +683,7 @@ function ThreadVmControlPanel({
           onPress={() => openConfirmation("delete")}
         />
       ) : null}
-      <ActionButton
-        label="Refresh status"
-        disabled={busy || lifecycle.busy}
-        onPress={() => threadVmControls.refresh(registry, environmentId, threadId)}
-      />
-    </View>
+    </VmActionList>
   );
   const notice =
     (status || readError || pending || deletionNote) &&
@@ -695,6 +722,7 @@ function ThreadVmControlPanel({
               ? "Ready"
               : presentation.label.replace(/^VM /, "").replace(/ VM$/, ""),
             notice,
+            refresh,
             progressOnly:
               presentation.tone === "neutral" &&
               !error &&
@@ -713,6 +741,7 @@ function ThreadVmControlPanel({
       presentation.ready,
       presentation.tone,
       notice,
+      refresh,
       error,
       lifecycle.error,
       actions,

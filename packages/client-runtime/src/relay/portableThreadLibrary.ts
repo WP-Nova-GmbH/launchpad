@@ -161,7 +161,6 @@ export interface PortableThreadDetailState {
 export function createPortableThreadLibraryAtoms<R, E>(
   runtime: Atom.AtomRuntime<ManagedRelayTenancyClient | R, E>,
 ) {
-  const openAtom = Atom.make(false).pipe(Atom.keepAlive);
   const indexStateAtom = Atom.make<PortableThreadIndexState | null>(null);
   const queueStateAtom = Atom.family((_threadId: ThreadId) =>
     Atom.make<{ session: ManagedRelaySession; current: RelayThreadCurrentQueue } | null>(null),
@@ -467,7 +466,6 @@ export function createPortableThreadLibraryAtoms<R, E>(
     }),
   });
   return {
-    openAtom,
     queueControl,
     queueReceipt,
     queueAtom,
@@ -607,28 +605,45 @@ export function createPortableThreadChatCommand<R, E>(
   });
 }
 
-/** Overview reads never inspect or wake compute. Missing summaries stay unknown. */
-export function portableThreadOverviewLabel(summary: RelayPortableThreadSummary) {
-  switch (summary.vm?.state) {
-    case "on_machine":
-      return "On machine";
-    case "preparing":
-      return "Preparing VM";
-    case "running":
-      return "Private VM · running";
-    case "paused":
-      return "Private VM · paused";
-    case "saving":
-      return "Saving workspace";
-    case "saved":
-      return "Saved workspace";
-    case "expired":
-      return "Saved workspace expired";
-    case "moving":
-      return "Moving thread";
-    default:
-      return "Status unavailable";
+const vmLocation = { kind: "vm", label: "Private VM" } as const;
+const overviewStates = {
+  on_machine: {
+    location: { kind: "machine", label: "On machine" },
+    status: null,
+    tone: "neutral",
+  },
+  preparing: { location: vmLocation, status: "Preparing", tone: "neutral" },
+  running: { location: vmLocation, status: "Running", tone: "neutral" },
+  paused: { location: vmLocation, status: "Paused", tone: "neutral" },
+  saving: { location: vmLocation, status: "Saving workspace", tone: "neutral" },
+  saved: { location: null, status: "Saved workspace", tone: "neutral" },
+  expired: { location: null, status: "Workspace expired", tone: "warning" },
+  moving: { location: null, status: "Moving thread", tone: "neutral" },
+  unavailable: { location: null, status: "Unavailable", tone: "warning" },
+  unknown: { location: null, status: "Unknown", tone: "neutral" },
+} as const;
+
+/** Uses the overview summary only; reading or expanding a row never wakes compute. */
+export function portableThreadOverviewPresentation(summary: RelayPortableThreadSummary) {
+  const vm = summary.vm;
+  const display = overviewStates[vm?.state ?? "unknown"];
+  const activity =
+    vm?.activity === "busy" ? "Working" : vm?.activity === "idle" ? "Idle" : "Unknown";
+  if (
+    summary.placement.operationId !== null &&
+    (vm?.state === "running" || vm?.state === "on_machine")
+  ) {
+    return { ...display, status: "Updating", tone: "neutral", activity } as const;
   }
+  if (vm?.state === "running" && vm.activity !== "unknown") {
+    return {
+      ...display,
+      status: vm.activity === "busy" ? "Working" : "Ready",
+      tone: vm.activity === "idle" ? "success" : "neutral",
+      activity,
+    } as const;
+  }
+  return { ...display, activity };
 }
 
 export function portableThreadOverviewAction(

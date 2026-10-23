@@ -1,6 +1,6 @@
 import type { RelayPortableThreadSummary } from "@t3tools/contracts/relay";
 import {
-  portableThreadOverviewLabel,
+  portableThreadOverviewPresentation,
   portableThreadOverviewAction,
 } from "@t3tools/client-runtime/relay/portableThreadLibrary";
 import { useNavigation } from "@react-navigation/native";
@@ -9,14 +9,16 @@ import type { ThreadQueueControlSubmission } from "@t3tools/client-runtime/relay
 import { threadMoveRelayUrl } from "../../state/thread-move-submissions";
 import * as Crypto from "expo-crypto";
 import { shareAttachmentBytes } from "../../lib/attachmentDownload";
-import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { useAtomValue } from "@effect/atom-react";
 import { CommandId, EnvironmentId, ThreadId, type ChatAttachment } from "@t3tools/contracts";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { FlatList, Modal, Pressable, ScrollView, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { FlatList, Pressable, ScrollView, View } from "react-native";
 import { AppText as Text } from "../../components/AppText";
+import { SymbolView } from "../../components/AppSymbol";
+import { StatusPill } from "../../components/StatusPill";
+import { relativeTime } from "../../lib/time";
 import {
   portableThreadLibrary,
   openPortableThreadChat,
@@ -40,7 +42,7 @@ function Action({
       accessibilityRole="button"
       disabled={disabled}
       onPress={onPress}
-      className="rounded-lg bg-card px-3 py-2"
+      className="min-h-11 justify-center rounded-lg bg-card px-3 py-2"
       style={{ opacity: disabled ? 0.4 : 1 }}
     >
       <Text className="text-sm text-foreground">{children}</Text>
@@ -74,7 +76,7 @@ function SavedVmRequests() {
       {lifecycle.entries.map((entry) => (
         <View key={entry.threadId}>
           <Text>
-            Saved {entry.action.type} request · {entry.threadId}
+            Saved {entry.action.type} request for {entry.threadId}
           </Text>
           <Action
             disabled={lifecycle.busy || !lifecycle.ready}
@@ -93,7 +95,6 @@ function LibraryBody() {
   const loadIndex = useAtomCommand(portableThreadLibrary.loadIndex, { reportFailure: false });
   const navigation = useNavigation();
   const openChat = useAtomCommand(openPortableThreadChat, { reportFailure: false });
-  const setLibraryOpen = useAtomSet(portableThreadLibrary.openAtom);
   const dispatch = useAtomCommand(threadVmControls.action, { reportFailure: false });
   const submit = useCallback(
     async (input: Parameters<typeof dispatch>[0]) => {
@@ -117,6 +118,7 @@ function LibraryBody() {
     overviewAbort.current = controller;
     return () => controller.abort();
   }, [session]);
+  const [expandedThreadId, setExpandedThreadId] = useState<ThreadId | null>(null);
   const [selected, setSelected] = useState<ThreadId | null>(null),
     [error, setError] = useState<string | null>(null),
     [busy, setBusy] = useState(false);
@@ -165,7 +167,6 @@ function LibraryBody() {
         if (abort.signal.aborted) return;
         if (result._tag === "Failure") throw squashAtomCommandFailure(result);
         navigation.navigate("Thread", result.value);
-        setLibraryOpen(false);
       } else {
         const success = await lifecycle.run({
           environmentId,
@@ -195,6 +196,14 @@ function LibraryBody() {
     }
   };
   const summary = index?.entries.find((entry) => entry.placement.threadId === selected);
+  const allowance = index?.allowance;
+  if (
+    expandedThreadId &&
+    index &&
+    !index.entries.some((entry) => entry.placement.threadId === expandedThreadId)
+  ) {
+    setExpandedThreadId(null);
+  }
   if (!session) return <Text>Sign in to Launchpad Connect to read your VM threads.</Text>;
   return (
     <View className="flex-1 gap-3">
@@ -204,24 +213,47 @@ function LibraryBody() {
         </Action>
         {selected && <Action onPress={() => setSelected(null)}>All threads</Action>}
       </View>
-      {!selected && index?.allowance && (
-        <View className="gap-1 rounded-xl border border-border bg-card p-4">
-          <Text className="font-medium">
-            Your VMs · {index.allowance.used} / {index.allowance.limit} slots
-          </Text>
-          <Text className="text-xs text-muted-foreground">
+      {!selected && allowance && (
+        <View className="gap-2 rounded-xl border border-border bg-card p-4">
+          <View className="flex-row flex-wrap items-center justify-between gap-3">
+            <Text className="text-sm font-medium">Your VMs</Text>
+            <View className="flex-row items-center gap-2.5 rounded-lg bg-subtle-strong px-2.5 py-1.5">
+              {allowance.limit > 0 && allowance.limit <= 8 && (
+                <View
+                  accessibilityElementsHidden
+                  importantForAccessibility="no-hide-descendants"
+                  className="flex-row gap-1"
+                >
+                  {Array.from({ length: allowance.limit }, (_, slot) => (
+                    <View
+                      key={slot}
+                      className={`h-1.5 w-3 rounded-full ${
+                        slot < allowance.used ? "bg-primary" : "bg-foreground/15"
+                      }`}
+                    />
+                  ))}
+                </View>
+              )}
+              <Text className="text-xs tabular-nums text-foreground-muted">
+                <Text className="font-medium text-foreground">{allowance.used}</Text>
+                {" / "}
+                {allowance.limit} used
+              </Text>
+            </View>
+          </View>
+          <Text className="text-xs text-foreground-muted">
             Paused VMs and pending replacements use a slot.
           </Text>
         </View>
       )}
       <SavedVmRequests />
       {!selected && (
-        <Text className="text-sm text-muted-foreground">
+        <Text className="text-sm text-foreground-muted">
           Open a local conversation, then choose Run on → Private VM.
         </Text>
       )}
       {(error || lifecycle.error) && (
-        <Text className="text-destructive" accessibilityLiveRegion="polite">
+        <Text className="text-danger-foreground" accessibilityLiveRegion="polite">
           {error ?? lifecycle.error}
         </Text>
       )}
@@ -233,52 +265,144 @@ function LibraryBody() {
           title={summary.title}
         />
       ) : (
-        <ScrollView contentContainerClassName="gap-2">
-          {index?.entries.map((entry) => (
-            <View
-              key={entry.placement.threadId}
-              className="gap-2 rounded-xl border border-border p-4"
-            >
-              <Text className="font-medium text-foreground">{entry.title}</Text>
-              <Text className="text-xs text-muted-foreground">
-                {entry.vm?.projectName ?? "Project"} · {portableThreadOverviewLabel(entry)}
-              </Text>
-              <Text className="text-xs text-muted-foreground">
-                {entry.vm?.lastWorkAt
-                  ? `Last work ${new Date(entry.vm.lastWorkAt).toLocaleString()}`
-                  : "Last work unavailable"}{" "}
-                ·{" "}
-                {entry.vm?.activity === "unknown"
-                  ? "activity unavailable"
-                  : (entry.vm?.activity ?? "activity unavailable")}
-              </Text>
-              <Text className="text-xs text-muted-foreground">
-                {entry.vm?.lastVerifiedBackupAt
-                  ? `Backup verified ${new Date(entry.vm.lastVerifiedBackupAt).toLocaleString()}`
-                  : "No verified backup"}
-                {entry.vm?.savedDiskExpiresAt
-                  ? ` · saved until ${new Date(entry.vm.savedDiskExpiresAt).toLocaleDateString()}`
-                  : ""}
-              </Text>
-              <View className="flex-row flex-wrap gap-2">
-                <Action
-                  disabled={
-                    busy ||
-                    (["Resume VM", "Restore VM"].includes(
-                      portableThreadOverviewAction(entry, capabilities),
-                    ) &&
-                      (lifecycle.busy || !lifecycle.ready))
-                  }
-                  onPress={() => void runPrimary(entry)}
-                >
-                  {portableThreadOverviewAction(entry, capabilities)}
-                </Action>
-                <Action onPress={() => setSelected(ThreadId.make(entry.placement.threadId))}>
-                  Read conversation
-                </Action>
-              </View>
+        <ScrollView contentContainerClassName="gap-3">
+          {index && index.entries.length > 0 && (
+            <View className="overflow-hidden rounded-xl border border-border">
+              {index.entries.map((entry, position) => {
+                const threadId = ThreadId.make(entry.placement.threadId);
+                const presentation = portableThreadOverviewPresentation(entry);
+                const action = portableThreadOverviewAction(entry, capabilities);
+                const expanded = expandedThreadId === threadId;
+                return (
+                  <View
+                    key={threadId}
+                    className={
+                      position < index.entries.length - 1 ? "border-b border-border" : undefined
+                    }
+                  >
+                    <View className="flex-row items-center gap-3 px-4 py-3">
+                      <View className="min-w-0 flex-1 gap-2">
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel={`Details for ${entry.title}`}
+                          accessibilityState={{ expanded }}
+                          onPress={() => setExpandedThreadId(expanded ? null : threadId)}
+                          className="min-h-11 flex-row items-center gap-2"
+                        >
+                          <SymbolView
+                            name={expanded ? "chevron.down" : "chevron.right"}
+                            size={14}
+                            tintColorClassName="accent-icon-muted"
+                          />
+                          <View className="min-w-0 flex-1 gap-1">
+                            <Text className="text-sm font-t3-medium text-foreground">
+                              {entry.title}
+                            </Text>
+                            {entry.vm?.projectName && (
+                              <Text className="text-xs text-foreground-muted">
+                                {entry.vm.projectName}
+                              </Text>
+                            )}
+                          </View>
+                        </Pressable>
+                        <View className="ml-5.5 flex-row flex-wrap items-center gap-2">
+                          {presentation.location && (
+                            <View className="flex-row items-center gap-1.5">
+                              <SymbolView
+                                name={
+                                  presentation.location.kind === "vm"
+                                    ? "server.rack"
+                                    : "desktopcomputer"
+                                }
+                                size={14}
+                                tintColorClassName="accent-icon-muted"
+                              />
+                              <Text className="text-xs text-foreground">
+                                {presentation.location.label}
+                              </Text>
+                            </View>
+                          )}
+                          {presentation.status && (
+                            <StatusPill
+                              size="compact"
+                              label={presentation.status}
+                              pillClassName={
+                                presentation.tone === "warning"
+                                  ? "bg-warning"
+                                  : presentation.tone === "success"
+                                    ? "bg-update"
+                                    : "bg-subtle-strong"
+                              }
+                              textClassName={
+                                presentation.tone === "warning"
+                                  ? "text-warning-foreground"
+                                  : presentation.tone === "success"
+                                    ? "text-update-foreground"
+                                    : "text-foreground-muted"
+                              }
+                            />
+                          )}
+                        </View>
+                        <Text
+                          className="ml-5.5 text-xs text-foreground-muted"
+                          accessibilityLabel={
+                            entry.vm?.lastWorkAt ? undefined : "Last work time not recorded"
+                          }
+                        >
+                          Last work{" "}
+                          {entry.vm?.lastWorkAt ? `${relativeTime(entry.vm.lastWorkAt)} ago` : "—"}
+                        </Text>
+                      </View>
+                      <Action
+                        disabled={
+                          busy ||
+                          (["Resume VM", "Restore VM"].includes(action) &&
+                            (lifecycle.busy || !lifecycle.ready))
+                        }
+                        onPress={() => void runPrimary(entry)}
+                      >
+                        {action}
+                      </Action>
+                    </View>
+                    {expanded && (
+                      <View className="gap-3 px-4 pb-4">
+                        <View className="gap-3 rounded-lg bg-subtle-strong p-3">
+                          <View className="gap-1">
+                            <Text className="text-xs text-foreground-muted">Activity</Text>
+                            <Text className="text-xs text-foreground">{presentation.activity}</Text>
+                          </View>
+                          {entry.vm &&
+                            (entry.vm.state !== "on_machine" || entry.vm.lastVerifiedBackupAt) && (
+                              <View className="gap-1">
+                                <Text className="text-xs text-foreground-muted">
+                                  Workspace backup
+                                </Text>
+                                <Text className="text-xs text-foreground">
+                                  {entry.vm.lastVerifiedBackupAt
+                                    ? `Verified ${relativeTime(entry.vm.lastVerifiedBackupAt)} ago`
+                                    : "No verified backup"}
+                                </Text>
+                              </View>
+                            )}
+                          {entry.vm?.savedDiskExpiresAt && (
+                            <View className="gap-1">
+                              <Text className="text-xs text-foreground-muted">
+                                Workspace expiry
+                              </Text>
+                              <Text className="text-xs text-foreground">
+                                {new Date(entry.vm.savedDiskExpiresAt).toLocaleString()}
+                              </Text>
+                            </View>
+                          )}
+                        </View>
+                        <Action onPress={() => setSelected(threadId)}>Read conversation</Action>
+                      </View>
+                    )}
+                  </View>
+                );
+              })}
             </View>
-          ))}
+          )}
           {index?.entries.length === 0 && <Text>No VM threads yet.</Text>}
           {!index && !error && <Text>Reading saved threads…</Text>}
           {index?.next && (
@@ -304,7 +428,6 @@ function SavedConversation({
   const currentQueue = useAtomValue(portableThreadLibrary.queueAtom(threadId));
   const loadQueue = useAtomCommand(portableThreadLibrary.loadQueue, { reportFailure: false });
   const openChat = useAtomCommand(openPortableThreadChat, { reportFailure: false });
-  const closeLibrary = useAtomSet(portableThreadLibrary.openAtom);
   const navigation = useNavigation();
   const queueControl = useAtomCommand(portableThreadLibrary.queueControl, { reportFailure: false });
   const queueReceipt = useAtomCommand(portableThreadLibrary.queueReceipt, { reportFailure: false });
@@ -335,7 +458,6 @@ function SavedConversation({
         return;
       }
       navigation.navigate("Thread", result.value);
-      if (!abort.signal.aborted) closeLibrary(false);
     } catch {
       if (!abort.signal.aborted) setError("Could not open this chat. Try again.");
     } finally {
@@ -597,11 +719,11 @@ function SavedConversation({
               ))}
             </View>
           )}
-          <Text className="text-xs text-muted-foreground">
+          <Text className="text-xs text-foreground-muted">
             Reading this conversation does not start its VM. Resume or restore it, then open chat to
             continue working.
           </Text>
-          {error && <Text className="text-destructive">{error}</Text>}
+          {error && <Text className="text-danger-foreground">{error}</Text>}
           {!detail && !error && <Text>Reading conversation…</Text>}
           {detail?.history.deleted && <Text>This thread was deleted.</Text>}
           {detail && !thread && !detail.history.deleted && (
@@ -611,7 +733,7 @@ function SavedConversation({
       }
       renderItem={({ item: message }) => (
         <View className="gap-1 rounded-lg border border-border p-3">
-          <Text className="text-xs text-muted-foreground">
+          <Text className="text-xs text-foreground-muted">
             {message.author?.displayName ?? (message.role === "user" ? "User" : "Assistant")}
           </Text>
           <Text selectable className="text-sm text-foreground">
@@ -640,32 +762,7 @@ function SavedConversation({
     />
   );
 }
-export function PortableThreadLibraryOverlay() {
-  const session = useAtomValue(managedRelaySessionAtom),
-    open = useAtomValue(portableThreadLibrary.openAtom);
-  const setOpen = useAtomSet(portableThreadLibrary.openAtom);
-  if (!session) return null;
-  return (
-    <>
-      <Modal
-        visible={open}
-        animationType="slide"
-        presentationStyle="pageSheet"
-        onRequestClose={() => setOpen(false)}
-      >
-        <SafeAreaView className="flex-1 gap-3 bg-screen p-4">
-          <View className="flex-row items-center justify-between">
-            <Text className="text-lg font-medium">VM threads</Text>
-            <Action onPress={() => setOpen(false)}>Close</Action>
-          </View>
-          {open && <LibraryBody key={session.accountId} />}
-        </SafeAreaView>
-      </Modal>
-    </>
-  );
-}
 export function PortableThreadLibrary() {
   const session = useAtomValue(managedRelaySessionAtom);
-  const setOpen = useAtomSet(portableThreadLibrary.openAtom);
-  return session ? <Action onPress={() => setOpen(true)}>VM threads</Action> : null;
+  return <LibraryBody key={`${session?.accountId}:${threadMoveRelayUrl()}`} />;
 }

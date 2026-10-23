@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import type { RelayPortableThreadVmSummary } from "@t3tools/contracts/relay";
 import {
   CommandId,
   EnvironmentId,
@@ -22,7 +23,7 @@ import type { NetworkStatus } from "../connection/model.ts";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import {
   createPortableThreadLibraryAtoms,
-  portableThreadOverviewLabel,
+  portableThreadOverviewPresentation,
   portableThreadOverviewAction,
 } from "./portableThreadLibrary.ts";
 import {
@@ -59,6 +60,16 @@ const summary = {
     generation: 1,
     operationId: null,
   },
+};
+const vmSummary: RelayPortableThreadVmSummary = {
+  state: "saved",
+  projectName: null,
+  activity: "unknown",
+  observedAt: null,
+  lastWorkAt: null,
+  lastVerifiedBackupAt: null,
+  savedDiskExpiresAt: null,
+  savedDiskOperationId: "saved",
 };
 const decode = Schema.decodeUnknownSync(OrchestrationEvent);
 const event = (type: string, payload: unknown, sequence: number) =>
@@ -148,16 +159,7 @@ const harness = Effect.fnUntraced(function* (
 
 describe("retained conversation view", () => {
   it("uses effective capabilities for overview recovery actions", () => {
-    const vm = {
-      state: "saved" as const,
-      projectName: null,
-      activity: "unknown" as const,
-      observedAt: null,
-      lastWorkAt: null,
-      lastVerifiedBackupAt: null,
-      savedDiskExpiresAt: null,
-      savedDiskOperationId: "saved",
-    };
+    const vm = vmSummary;
     const capabilities = {
       configured: true,
       autoPause: false,
@@ -185,23 +187,63 @@ describe("retained conversation view", () => {
     ).toBe("Manage VM");
   });
 
-  it("does not invent a running VM when overview state is missing or returned to a machine", () => {
-    expect(portableThreadOverviewLabel(summary)).toBe("Status unavailable");
-    expect(
-      portableThreadOverviewLabel({
-        ...summary,
-        vm: {
-          state: "on_machine",
-          projectName: null,
-          activity: "unknown",
-          observedAt: null,
-          lastWorkAt: null,
-          lastVerifiedBackupAt: null,
-          savedDiskExpiresAt: null,
-        },
-      }),
-    ).toBe("On machine");
+  it("keeps a missing summary unknown and does not assign it a location", () => {
+    expect(portableThreadOverviewPresentation(summary)).toEqual({
+      location: null,
+      status: "Unknown",
+      tone: "neutral",
+      activity: "Unknown",
+    });
   });
+
+  it.each([
+    ["on_machine", null, "machine", "neutral"],
+    ["preparing", "Preparing", "vm", "neutral"],
+    ["running", "Running", "vm", "neutral"],
+    ["paused", "Paused", "vm", "neutral"],
+    ["saving", "Saving workspace", "vm", "neutral"],
+    ["saved", "Saved workspace", null, "neutral"],
+    ["expired", "Workspace expired", null, "warning"],
+    ["moving", "Moving thread", null, "neutral"],
+    ["unavailable", "Unavailable", null, "warning"],
+  ] as const)("describes %s without inventing a live location", (state, status, location, tone) => {
+    const presentation = portableThreadOverviewPresentation({
+      ...summary,
+      vm: { ...vmSummary, state },
+    });
+    expect(presentation.status).toBe(status);
+    expect(presentation.location?.kind ?? null).toBe(location);
+    expect(presentation.tone).toBe(tone);
+  });
+
+  it.each([
+    ["idle", "Ready", "success", "Idle"],
+    ["busy", "Working", "neutral", "Working"],
+    ["unknown", "Running", "neutral", "Unknown"],
+  ] as const)("uses the reported %s activity for running VMs", (activity, status, tone, label) => {
+    expect(
+      portableThreadOverviewPresentation({
+        ...summary,
+        vm: { ...vmSummary, state: "running", activity },
+      }),
+    ).toMatchObject({ status, tone, activity: label });
+  });
+
+  it.each(["running", "on_machine"] as const)(
+    "does not show a ready %s placement during an operation",
+    (state) => {
+      const entry = {
+        ...summary,
+        placement: { ...summary.placement, operationId: "pending-operation" },
+        vm: { ...vmSummary, state, activity: "idle" as const },
+      };
+      expect(portableThreadOverviewPresentation(entry)).toMatchObject({
+        status: "Updating",
+        tone: "neutral",
+      });
+      expect(portableThreadOverviewAction(entry, null)).toBe("Manage VM");
+    },
+  );
   it.effect("reads current queue without downloading or completing conversation history", () =>
     Effect.scoped(
       Effect.gen(function* () {

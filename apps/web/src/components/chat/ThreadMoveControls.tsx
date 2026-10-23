@@ -59,7 +59,7 @@ import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
 import { environmentCatalog } from "../../connection/catalog";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ComposerControl } from "./ComposerControl";
-import { ThreadVmMenuActions, useThreadVmUi } from "./ThreadVmControls";
+import { ThreadVmMenuActions, ThreadVmRefreshButton, useThreadVmUi } from "./ThreadVmControls";
 import { useComposerMenuProps } from "./composerEventScope";
 
 function FollowThreadLocation({
@@ -872,7 +872,7 @@ function RunOnPicker({
                 <>
                   <span
                     aria-hidden="true"
-                    className={`mx-1.5 inline-block size-1.5 rounded-full ${vmUi.tone === "success" ? "bg-success" : vmUi.tone === "danger" ? "bg-destructive" : "bg-muted-foreground"}`}
+                    className={`mx-1.5 inline-block size-1.5 rounded-full align-middle ${vmUi.tone === "success" ? "bg-success" : vmUi.tone === "danger" ? "bg-destructive" : "bg-muted-foreground"}`}
                   />
                   {vmUi.caption}
                 </>
@@ -888,8 +888,9 @@ function RunOnPicker({
           padding="compact"
           {...composerFloatingLayerProps}
         >
-          <div className="px-1 pb-2 pt-1">
+          <div className="flex items-center justify-between gap-2 px-1 pb-2 pt-1">
             <PopoverTitle>Run on</PopoverTitle>
+            <ThreadVmRefreshButton />
           </div>
           <DestinationRow
             label={label}

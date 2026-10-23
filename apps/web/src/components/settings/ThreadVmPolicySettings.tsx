@@ -1,4 +1,4 @@
-import { PortableThreadLibrary } from "../chat/PortableThreadLibrary";
+import { Link } from "@tanstack/react-router";
 import { useAuth } from "@clerk/react";
 import {
   ManagedRelayTenancy,
@@ -205,7 +205,9 @@ function ThreadVmPolicyEditor({ isAdmin }: { readonly isAdmin: boolean }) {
         </p>
       ) : null}
       <div className="flex gap-2 px-3 py-3 sm:px-4">
-        <PortableThreadLibrary />
+        <Button variant="ghost" render={<Link to="/settings/vms" />}>
+          VM threads
+        </Button>
         {isAdmin ? (
           <Button disabled={busy || !draft} onClick={() => void save()}>
             Save policy

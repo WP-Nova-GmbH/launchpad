@@ -1,6 +1,6 @@
 import type { RelayPortableThreadSummary } from "@t3tools/contracts/relay";
 import {
-  portableThreadOverviewLabel,
+  portableThreadOverviewPresentation,
   portableThreadOverviewAction,
 } from "@t3tools/client-runtime/relay/portableThreadLibrary";
 import { useNavigate } from "@tanstack/react-router";
@@ -8,11 +8,19 @@ import { useThreadVmActionJournal } from "../../state/use-thread-vm-actions";
 import type { ThreadQueueControlSubmission } from "@t3tools/client-runtime/relay/threadQueueControlSubmission";
 import { threadMoveRelayUrl } from "../../state/thread-move-submissions";
 import { randomUUID } from "../../lib/utils";
-import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { useAtomValue } from "@effect/atom-react";
 import { CommandId, EnvironmentId, ThreadId, type ChatAttachment } from "@t3tools/contracts";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { ArrowLeftIcon, ChevronRightIcon, MessageSquareIcon, RefreshCwIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  CheckIcon,
+  ChevronRightIcon,
+  MessageSquareIcon,
+  MonitorIcon,
+  RefreshCwIcon,
+  ServerIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import {
@@ -24,14 +32,8 @@ import {
 } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
-import {
-  Dialog,
-  DialogPopup,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogPanel,
-} from "../ui/dialog";
+import { Badge } from "../ui/badge";
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { ThreadVmControls } from "./ThreadVmControls";
 
@@ -63,7 +65,7 @@ function SavedVmRequests() {
       {lifecycle.entries.map((entry) => (
         <div key={entry.threadId}>
           <p className="text-sm">
-            Saved {entry.action.type} request · {entry.threadId}
+            Saved {entry.action.type} request for {entry.threadId}
           </p>
           <Button
             size="sm"
@@ -84,7 +86,6 @@ function LibraryBody() {
   const loadIndex = useAtomCommand(portableThreadLibrary.loadIndex, { reportFailure: false });
   const navigate = useNavigate();
   const openChat = useAtomCommand(openPortableThreadChat, { reportFailure: false });
-  const setLibraryOpen = useAtomSet(portableThreadLibrary.openAtom);
   const dispatch = useAtomCommand(threadVmControls.action, { reportFailure: false });
   const submit = useCallback(
     async (input: Parameters<typeof dispatch>[0]) => {
@@ -108,6 +109,7 @@ function LibraryBody() {
     overviewAbort.current = controller;
     return () => controller.abort();
   }, [session]);
+  const [expandedThreadId, setExpandedThreadId] = useState<ThreadId | null>(null);
   const [selected, setSelected] = useState<ThreadId | null>(null),
     [error, setError] = useState<string | null>(null),
     [busy, setBusy] = useState(false);
@@ -156,7 +158,6 @@ function LibraryBody() {
         if (abort.signal.aborted) return;
         if (result._tag === "Failure") throw squashAtomCommandFailure(result);
         await navigate({ to: "/$environmentId/$threadId", params: result.value });
-        setLibraryOpen(false);
       } else {
         const success = await lifecycle.run({
           environmentId,
@@ -186,6 +187,14 @@ function LibraryBody() {
     }
   };
   const summary = index?.entries.find((entry) => entry.placement.threadId === selected);
+  const allowance = index?.allowance;
+  if (
+    expandedThreadId &&
+    index &&
+    !index.entries.some((entry) => entry.placement.threadId === expandedThreadId)
+  ) {
+    setExpandedThreadId(null);
+  }
   if (!session) return <p>Sign in to Launchpad Connect to read your VM threads.</p>;
   return (
     <div className="grid gap-4">
@@ -222,12 +231,31 @@ function LibraryBody() {
           </Tooltip>
         </div>
       </div>
-      {!selected && index?.allowance && (
+      {!selected && allowance && (
         <div className="rounded-xl border border-border bg-card p-4">
-          <p className="text-sm font-medium">
-            Your VMs · {index.allowance.used} / {index.allowance.limit} slots
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-sm font-medium">Your VMs</p>
+            <div className="flex items-center gap-2.5 rounded-lg bg-muted/60 px-2.5 py-1.5">
+              {allowance.limit > 0 && allowance.limit <= 8 && (
+                <span aria-hidden className="flex gap-1">
+                  {Array.from({ length: allowance.limit }, (_, slot) => (
+                    <span
+                      key={slot}
+                      className={`h-1.5 w-3 rounded-full ${
+                        slot < allowance.used ? "bg-primary" : "bg-foreground/15"
+                      }`}
+                    />
+                  ))}
+                </span>
+              )}
+              <span className="text-xs tabular-nums text-muted-foreground">
+                <span className="font-medium text-foreground">{allowance.used}</span>
+                {" / "}
+                {allowance.limit} used
+              </span>
+            </div>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
             Paused VMs and pending replacements use a slot.
           </p>
         </div>
@@ -251,80 +279,153 @@ function LibraryBody() {
       ) : (
         <>
           {index && index.entries.length > 0 && (
-            <ul
-              aria-label="VM conversations"
-              className="divide-y divide-border/60 overflow-hidden rounded-xl border border-border/70"
-            >
-              {index.entries.map((entry) => (
-                <li key={entry.placement.threadId} className="flex items-center gap-3 px-4 py-3">
-                  <button
-                    type="button"
-                    className="group flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-lg text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
-                    onClick={() => setSelected(ThreadId.make(entry.placement.threadId))}
-                  >
-                    <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                      <MessageSquareIcon aria-hidden className="size-4" />
-                    </span>
-                    <span className="grid min-w-0 flex-1 gap-1">
-                      <span className="wrap-anywhere text-sm font-medium leading-snug">
-                        {entry.title}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {entry.vm?.projectName ?? "Project"} · {portableThreadOverviewLabel(entry)}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {entry.vm?.lastWorkAt ? (
-                          <>Last work {formatRelativeTimeLabel(entry.vm.lastWorkAt)}</>
-                        ) : (
-                          "Last work unavailable"
-                        )}
-                        {entry.vm?.activity === "unknown"
-                          ? " · activity unavailable"
-                          : entry.vm?.activity === "busy"
-                            ? " · working"
-                            : " · idle"}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {entry.vm?.lastVerifiedBackupAt ? (
-                          <>
-                            Backup verified {formatRelativeTimeLabel(entry.vm.lastVerifiedBackupAt)}
-                          </>
-                        ) : (
-                          "No verified backup"
-                        )}
-                        {entry.vm?.savedDiskExpiresAt && (
-                          <>
-                            {" "}
-                            · saved until{" "}
-                            {new Date(entry.vm.savedDiskExpiresAt).toLocaleDateString()}
-                          </>
-                        )}
-                      </span>
-                      <span className="flex items-center gap-1 text-xs text-muted-foreground group-hover:text-foreground">
-                        Read conversation
-                        <ChevronRightIcon aria-hidden className="size-3" />
-                      </span>
-                    </span>
-                  </button>
-                  <div className="shrink-0">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={
-                        busy ||
-                        (["Resume VM", "Restore VM"].includes(
-                          portableThreadOverviewAction(entry, capabilities),
-                        ) &&
-                          (lifecycle.busy || !lifecycle.ready))
-                      }
-                      onClick={() => void runPrimary(entry)}
-                    >
-                      {portableThreadOverviewAction(entry, capabilities)}
-                    </Button>
-                  </div>
-                </li>
-              ))}
-            </ul>
+            <div className="@container/vm-conversations overflow-hidden rounded-xl border border-border/70">
+              <div
+                aria-hidden
+                className="hidden grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)_minmax(0,0.75fr)_8rem] gap-4 border-b border-border/60 px-4 py-3 text-xs text-muted-foreground @min-[40rem]/vm-conversations:grid"
+              >
+                <span>Conversation</span>
+                <span>Location</span>
+                <span>Last work</span>
+                <span />
+              </div>
+              <ul aria-label="VM conversations" className="divide-y divide-border/60">
+                {index.entries.map((entry) => {
+                  const threadId = ThreadId.make(entry.placement.threadId);
+                  const presentation = portableThreadOverviewPresentation(entry);
+                  const action = portableThreadOverviewAction(entry, capabilities);
+                  return (
+                    <li key={threadId}>
+                      <Collapsible
+                        open={expandedThreadId === threadId}
+                        onOpenChange={(open) => setExpandedThreadId(open ? threadId : null)}
+                      >
+                        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-2 px-4 py-3 @min-[40rem]/vm-conversations:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)_minmax(0,0.75fr)_8rem]">
+                          <CollapsibleTrigger
+                            aria-label={`Details for ${entry.title}`}
+                            className="group col-start-1 row-start-1 flex min-h-11 min-w-0 items-center gap-2 text-left"
+                          >
+                            <ChevronRightIcon
+                              aria-hidden
+                              className="size-3.5 shrink-0 text-muted-foreground group-data-panel-open:rotate-90"
+                            />
+                            <span className="grid min-w-0 gap-1">
+                              <span className="wrap-anywhere text-sm font-medium leading-snug">
+                                {entry.title}
+                              </span>
+                              {entry.vm?.projectName && (
+                                <span className="wrap-anywhere text-xs text-muted-foreground">
+                                  {entry.vm.projectName}
+                                </span>
+                              )}
+                            </span>
+                          </CollapsibleTrigger>
+                          <div className="col-start-1 row-start-2 ml-5.5 flex min-w-0 flex-wrap items-center gap-2 @min-[40rem]/vm-conversations:col-start-2 @min-[40rem]/vm-conversations:row-start-1 @min-[40rem]/vm-conversations:ml-0 @min-[40rem]/vm-conversations:flex-col @min-[40rem]/vm-conversations:items-start">
+                            {presentation.location && (
+                              <span className="flex items-center gap-1.5 text-xs">
+                                {presentation.location.kind === "vm" ? (
+                                  <ServerIcon
+                                    aria-hidden
+                                    className="size-3.5 text-muted-foreground"
+                                  />
+                                ) : (
+                                  <MonitorIcon
+                                    aria-hidden
+                                    className="size-3.5 text-muted-foreground"
+                                  />
+                                )}
+                                {presentation.location.label}
+                              </span>
+                            )}
+                            {presentation.status && (
+                              <Badge
+                                variant={
+                                  presentation.tone === "neutral" ? "secondary" : presentation.tone
+                                }
+                              >
+                                {presentation.status === "Ready" && <CheckIcon aria-hidden />}
+                                {presentation.status}
+                              </Badge>
+                            )}
+                          </div>
+                          <span className="col-start-1 row-start-3 ml-5.5 text-xs text-muted-foreground @min-[40rem]/vm-conversations:col-start-3 @min-[40rem]/vm-conversations:row-start-1 @min-[40rem]/vm-conversations:ml-0">
+                            <span className="sr-only">Last work: </span>
+                            {entry.vm?.lastWorkAt ? (
+                              <time dateTime={entry.vm.lastWorkAt}>
+                                {formatRelativeTimeLabel(entry.vm.lastWorkAt)}
+                              </time>
+                            ) : (
+                              <span aria-label="Last work time not recorded">—</span>
+                            )}
+                          </span>
+                          <div className="col-start-2 row-span-3 row-start-1 justify-self-end @min-[40rem]/vm-conversations:col-start-4 @min-[40rem]/vm-conversations:row-span-1">
+                            <Button
+                              size="xs"
+                              variant="secondary"
+                              disabled={
+                                busy ||
+                                (["Resume VM", "Restore VM"].includes(action) &&
+                                  (lifecycle.busy || !lifecycle.ready))
+                              }
+                              onClick={() => void runPrimary(entry)}
+                            >
+                              {action}
+                            </Button>
+                          </div>
+                        </div>
+                        <CollapsiblePanel>
+                          <div className="grid gap-3 px-4 pb-4">
+                            <dl className="grid gap-3 rounded-lg bg-muted/40 p-3 text-xs sm:grid-cols-2">
+                              <div className="grid gap-1">
+                                <dt className="text-muted-foreground">Activity</dt>
+                                <dd>{presentation.activity}</dd>
+                              </div>
+                              {entry.vm &&
+                                (entry.vm.state !== "on_machine" ||
+                                  entry.vm.lastVerifiedBackupAt) && (
+                                  <div className="grid gap-1">
+                                    <dt className="text-muted-foreground">Workspace backup</dt>
+                                    <dd>
+                                      {entry.vm.lastVerifiedBackupAt ? (
+                                        <time dateTime={entry.vm.lastVerifiedBackupAt}>
+                                          Verified{" "}
+                                          {formatRelativeTimeLabel(entry.vm.lastVerifiedBackupAt)}
+                                        </time>
+                                      ) : (
+                                        "No verified backup"
+                                      )}
+                                    </dd>
+                                  </div>
+                                )}
+                              {entry.vm?.savedDiskExpiresAt && (
+                                <div className="grid gap-1">
+                                  <dt className="text-muted-foreground">Workspace expiry</dt>
+                                  <dd>
+                                    <time dateTime={entry.vm.savedDiskExpiresAt}>
+                                      {new Date(entry.vm.savedDiskExpiresAt).toLocaleString()}
+                                    </time>
+                                  </dd>
+                                </div>
+                              )}
+                            </dl>
+                            <div>
+                              <Button
+                                size="xs"
+                                variant="ghost"
+                                onClick={() => setSelected(threadId)}
+                              >
+                                Read conversation
+                                <ChevronRightIcon aria-hidden />
+                              </Button>
+                            </div>
+                          </div>
+                        </CollapsiblePanel>
+                      </Collapsible>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
           )}
           {index?.entries.length === 0 && (
             <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border px-6 py-10 text-center">
@@ -374,7 +475,6 @@ function SavedConversation({
   const currentQueue = useAtomValue(portableThreadLibrary.queueAtom(threadId));
   const loadQueue = useAtomCommand(portableThreadLibrary.loadQueue, { reportFailure: false });
   const openChat = useAtomCommand(openPortableThreadChat, { reportFailure: false });
-  const closeLibrary = useAtomSet(portableThreadLibrary.openAtom);
   const navigate = useNavigate();
   const queueControl = useAtomCommand(portableThreadLibrary.queueControl, { reportFailure: false });
   const queueReceipt = useAtomCommand(portableThreadLibrary.queueReceipt, { reportFailure: false });
@@ -406,7 +506,6 @@ function SavedConversation({
         return;
       }
       await navigate({ to: "/$environmentId/$threadId", params: result.value });
-      if (!abort.signal.aborted) closeLibrary(false);
     } catch {
       if (!abort.signal.aborted) setError("Could not open this chat. Try again.");
     } finally {
@@ -741,29 +840,7 @@ function SavedConversation({
     </div>
   );
 }
-export function PortableThreadLibraryOverlay() {
-  const session = useAtomValue(managedRelaySessionAtom),
-    open = useAtomValue(portableThreadLibrary.openAtom);
-  const setOpen = useAtomSet(portableThreadLibrary.openAtom);
-  if (!session) return null;
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogPopup className="max-w-2xl" data-portable-thread-library>
-        <DialogHeader>
-          <DialogTitle>VM threads</DialogTitle>
-          <DialogDescription>Open a conversation or manage its VM.</DialogDescription>
-        </DialogHeader>
-        <DialogPanel>{open && <LibraryBody key={session.accountId} />}</DialogPanel>
-      </DialogPopup>
-    </Dialog>
-  );
-}
 export function PortableThreadLibrary() {
   const session = useAtomValue(managedRelaySessionAtom);
-  const setOpen = useAtomSet(portableThreadLibrary.openAtom);
-  return session ? (
-    <Button size="sm" variant="ghost" onClick={() => setOpen(true)}>
-      VM threads
-    </Button>
-  ) : null;
+  return <LibraryBody key={`${session?.accountId}:${threadMoveRelayUrl()}`} />;
 }

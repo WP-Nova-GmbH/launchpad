@@ -1,5 +1,4 @@
 import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
-import { PortableThreadLibrary } from "./chat/PortableThreadLibrary";
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
@@ -4977,7 +4976,6 @@ export default function Sidebar() {
           ) : null}
         </SidebarGroup>
       </SidebarContent>
-      <PortableThreadLibrary />
       <SidebarChromeFooter />
     </>
   );
