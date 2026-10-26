@@ -15,8 +15,19 @@ export const ThreadTransferNativeRuntime = Schema.Struct({
 const decodeNative = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.NullOr(ThreadTransferNativeRuntime)),
 );
-const decodeEmptyPayload = Schema.decodeUnknownEffect(
-  Schema.NullOr(Schema.fromJsonString(Schema.Null)),
+const decodeStoppedPayload = Schema.decodeUnknownEffect(
+  Schema.NullOr(
+    Schema.fromJsonString(
+      Schema.NullOr(
+        Schema.Struct({
+          activeTurnId: Schema.Null,
+          lastRuntimeEvent: Schema.Literal("provider.stopAll"),
+          lastRuntimeEventAt: Schema.DateTimeUtcFromString,
+        }),
+      ),
+    ),
+  ),
+  { onExcessProperty: "error" },
 );
 const decodeCursor = Schema.decodeUnknownEffect(Schema.fromJsonString(ThreadTransferNativeCursor));
 export class ThreadTransferRuntimeError extends Schema.TaggedError<ThreadTransferRuntimeError>()(
@@ -65,8 +76,8 @@ export const assertThreadTransferRuntime = Effect.fn("assertThreadTransferRuntim
       runtime.cursor === null
     )
       return yield* new ThreadTransferRuntimeError();
-    // The importer writes SQL NULL; the runtime repository encodes the same absence as JSON null.
-    yield* decodeEmptyPayload(runtime.payload);
+    // Imported runtimes start empty; graceful shutdown adds only idle stopAll telemetry.
+    yield* decodeStoppedPayload(runtime.payload);
     const cursor = yield* decodeCursor(runtime.cursor);
     if (cursor.threadId !== native.threadId || cursor.portableStateId !== native.portableStateId)
       return yield* new ThreadTransferRuntimeError();

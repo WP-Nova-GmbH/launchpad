@@ -972,6 +972,18 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     a.environmentId === b.environmentId &&
     a.generation === b.generation &&
     a.instanceId === b.instanceId;
+  const providerAuthBindingAtom = Atom.family((key: string) =>
+    Atom.make(
+      (get) =>
+        readManagedRelaySnapshotState(get(queryAtom(key))).data?.status?.pendingProviderAuth ??
+        null,
+    ).pipe(
+      Atom.withEquality<RelayThreadVmProviderAuthBinding | null>(
+        (a, b) => a === b || (a !== null && b !== null && sameAuthBinding(a, b)),
+      ),
+      Atom.setIdleTTL(0),
+    ),
+  );
   const validateAuthBinding = (
     binding: RelayThreadVmProviderAuthBinding,
     reply: RelayThreadVmProviderAuth | null,
@@ -989,9 +1001,9 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       .atom((get) =>
         Effect.gen(function* () {
           const session = get(managedRelaySessionAtom),
-            binding = readManagedRelaySnapshotState(get(queryAtom(key))).data?.status
-              ?.pendingProviderAuth;
-          if (!session || !binding) return null;
+            route = get(routeAtom(key)),
+            binding = get(providerAuthBindingAtom(key));
+          if (!session || !route || !binding) return null;
           const registry = yield* AtomRegistry.AtomRegistry;
           const { relay, clerkToken } = yield* authorize(registry, key);
           const [, threadId] = decodeKey(key);
@@ -1005,7 +1017,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
             return null;
           yield* validateAuthBinding(binding, reply);
           // AsyncResult retains the previous value during refresh; never show its code to a new account.
-          return reply ? { ...reply, accountId: session.accountId } : null;
+          return reply ? { ...reply, accountId: session.accountId, route } : null;
         }),
       )
       .pipe(Atom.setIdleTTL(0)),
@@ -1019,6 +1031,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         result = get(query);
       const value = readManagedRelaySnapshotState(result).data;
       if (
+        !result.waiting &&
         value &&
         value.requirement === "sign_in_required" &&
         ["starting", "waiting", "verifying"].includes(value.auth.phase)
@@ -1207,6 +1220,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           authValue &&
           binding &&
           authValue.accountId === session.accountId &&
+          authValue.route === route &&
           sameAuthBinding(binding, authValue)
             ? authValue
             : null,

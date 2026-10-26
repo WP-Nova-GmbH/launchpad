@@ -326,15 +326,16 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       yield* finish(owner, "cancelled");
       return;
     }
+    // Repair the exact saved archive even when a failed commit left a retained error.
+    if (move.manifestArtifactId !== null && move.recoveryVerified !== true) {
+      const receipt = yield* transport.publish(owner, move.manifestArtifactId);
+      if (receipt.manifestArtifactId !== move.manifestArtifactId)
+        return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
+    }
     // Failure details live in relay placement state. Appending local queue
     // events here would invalidate the immutable source sequence being moved.
     if (move.failureDetail && move.phase !== "preparing") return;
     if (move.phase === "ready") {
-      if (move.manifestArtifactId !== null && move.recoveryVerified !== true) {
-        const receipt = yield* transport.publish(owner, move.manifestArtifactId);
-        if (receipt.manifestArtifactId !== move.manifestArtifactId)
-          return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
-      }
       const committed = yield* transport.commit(owner);
       yield* assertThreadMoveIdentity(owner, committed);
       if (!["committed", "completed"].includes(committed.phase))
@@ -420,16 +421,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     )
       return yield* fail(threadId, "The frozen source changed after the move began.");
     // Publication verifies every artifact. Keep the source frozen while the destination imports it.
-    if (move.manifestArtifactId !== null) {
-      // The upload pointer can survive a failed recovery verification. Retry its
-      // acknowledgement without resending the already completed archive bytes.
-      if (move.recoveryVerified !== true) {
-        const receipt = yield* transport.publish(owner, move.manifestArtifactId);
-        if (receipt.manifestArtifactId !== move.manifestArtifactId)
-          return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
-      }
-      return;
-    }
+    if (move.manifestArtifactId !== null) return;
     yield* progress.stage("packing");
     const packed = yield* packThreadTransferArchive({
       archiveDirectory: saved.directory,
@@ -774,6 +766,8 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         manifestSha256: saved.sha256,
       });
       yield* assertThreadMoveIdentity(owner, ready);
+      // A failed commit would hide the missing save behind another retained error.
+      if (ready.recoveryVerified !== true) return;
     }
     const committed = yield* transport.commit(owner);
     yield* assertThreadMoveIdentity(owner, committed);

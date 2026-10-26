@@ -1583,6 +1583,107 @@ describe("completed thread location handoff", () => {
 });
 
 describe("owner-bound pending VM authentication", () => {
+  it.effect("keeps a delayed sign-in read running through unchanged VM status refreshes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const requests: Request[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          if (new URL(request.url).pathname.endsWith("vm-status"))
+            return Response.json(pendingVmStatus);
+          requests.push(request);
+          requested.resolve();
+          await release.promise;
+          return Response.json({ ...waitingAuth, auth: idleAuth });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => requested.promise);
+        for (let refresh = 0; refresh < 3; refresh++) {
+          h.registry.refresh(h.query);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        }
+        expect(requests).toHaveLength(1);
+        expect(requests[0]!.signal.aborted).toBe(false);
+        release.resolve();
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.auth.phase).toBe("idle");
+      }),
+    ),
+  );
+  it.effect("lets a slow active sign-in poll finish before scheduling the next poll", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const requests: Request[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          if (new URL(request.url).pathname.endsWith("vm-status"))
+            return Response.json(pendingVmStatus);
+          requests.push(request);
+          if (requests.length === 2) {
+            requested.resolve();
+            await release.promise;
+          }
+          return Response.json(waitingAuth);
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        yield* Effect.promise(() => requested.promise);
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+        expect(requests).toHaveLength(2);
+        expect(requests[1]!.signal.aborted).toBe(false);
+        release.resolve();
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.auth.interaction).toMatchObject({
+          userCode: "TEST-1234",
+        });
+      }),
+    ),
+  );
+  it.effect("hides the previous VM's code while its replacement sign-in read is pending", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let binding = authBinding;
+        const next = { ...authBinding, allocationId: "replacement-vm", operationId: "next-move" };
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          if (new URL(request.url).pathname.endsWith("vm-status"))
+            return Response.json({ ...pendingVmStatus, pendingProviderAuth: binding });
+          if (binding === next) {
+            requested.resolve();
+            await release.promise;
+          }
+          return Response.json({ ...waitingAuth, ...binding });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.allocationId).toBe(authBinding.allocationId);
+        binding = next;
+        h.registry.refresh(h.query);
+        yield* Effect.promise(() => requested.promise);
+        expect(h.registry.get(view)?.providerAuth).toBeNull();
+        release.resolve();
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.allocationId).toBe(next.allocationId);
+      }),
+    ),
+  );
   it.effect(
     "uses relay-only start and cancel for the next-generation VM while the source remains current",
     () =>

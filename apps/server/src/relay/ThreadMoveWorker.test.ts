@@ -158,6 +158,8 @@ for (const lost of [
   "published",
   "recovery-publish",
   "recovery-ready",
+  "recovery-sticky-failure",
+  "destination-awaits-recovery",
   "parallel-transfer",
   "upload",
   "commit",
@@ -182,19 +184,23 @@ for (const lost of [
   it.effect(
     lost === "published"
       ? "keeps a published move frozen without uploading the archive again after a restart"
-      : lost === "parallel-transfer"
-        ? "moves files in bounded parallel transfers and publishes only after every upload completes"
-        : lost === "commit"
-          ? "activates a verified checkout after a lost commit reply despite changed repository metadata"
-          : lost === "source-retargeted-project"
-            ? "retains the exact queued project when the relay returns another destination"
-            : lost === "destination-wrong-repository" ||
-                lost === "destination-repointed-project" ||
-                lost === "destination-nested-project" ||
-                lost === "destination-unconfirmed-repository" ||
-                lost === "destination-repointed-during-download"
-              ? `blocks ${lost} before installing a checkout or changing local files`
-              : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
+      : lost === "recovery-sticky-failure"
+        ? "retries the missing frozen recovery save despite a retained move failure"
+        : lost === "destination-awaits-recovery"
+          ? "waits after destination readiness until the frozen recovery save is verified"
+          : lost === "parallel-transfer"
+            ? "moves files in bounded parallel transfers and publishes only after every upload completes"
+            : lost === "commit"
+              ? "activates a verified checkout after a lost commit reply despite changed repository metadata"
+              : lost === "source-retargeted-project"
+                ? "retains the exact queued project when the relay returns another destination"
+                : lost === "destination-wrong-repository" ||
+                    lost === "destination-repointed-project" ||
+                    lost === "destination-nested-project" ||
+                    lost === "destination-unconfirmed-repository" ||
+                    lost === "destination-repointed-during-download"
+                  ? `blocks ${lost} before installing a checkout or changing local files`
+                  : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -272,7 +278,8 @@ for (const lost of [
           const uploads = new Map<string, Uint8Array>();
           let remote: RelayThreadMove | undefined,
             lostReply = false,
-            commits = 0;
+            commits = 0,
+            commitAttempts = 0;
           const failure = () => new ThreadMoveError({ threadId, detail: "Lost relay reply" });
           const current = Effect.suspend(() =>
             remote ? Effect.succeed(remote) : Effect.fail(failure()),
@@ -362,7 +369,12 @@ for (const lost of [
               Effect.gen(function* () {
                 expect(activeUploads).toBe(0);
                 remote = { ...remote!, manifestArtifactId: id, recoveryVerified: false };
-                if ((lost === "recovery-publish" || lost === "recovery-ready") && !lostReply) {
+                if (
+                  (lost === "recovery-publish" ||
+                    lost === "recovery-ready" ||
+                    lost === "recovery-sticky-failure") &&
+                  !lostReply
+                ) {
                   lostReply = true;
                   return yield* failure();
                 }
@@ -403,6 +415,7 @@ for (const lost of [
               Effect.sync(() => (remote = { ...remote!, phase: "ready", failureDetail: null })),
             commit: () =>
               Effect.gen(function* () {
+                commitAttempts++;
                 if (remote!.recoveryVerified !== true) return yield* failure();
                 if (remote!.phase !== "committed" && remote!.phase !== "completed") {
                   commits++;
@@ -681,11 +694,17 @@ for (const lost of [
               expect(commits).toBe(0);
               return;
             }
-            if (lost === "recovery-publish" || lost === "recovery-ready") {
+            if (
+              lost === "recovery-publish" ||
+              lost === "recovery-ready" ||
+              lost === "recovery-sticky-failure"
+            ) {
               expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
               expect(remote?.manifestArtifactId).not.toBeNull();
               const completedUploads = uploadStarts;
               if (lost === "recovery-ready") remote = { ...remote!, phase: "ready" };
+              if (lost === "recovery-sticky-failure")
+                remote = { ...remote!, failureDetail: "Frozen recovery save is not confirmed." };
               source = yield* makeThreadMoveWorker(transport, history, commands);
               yield* source.source(threadId);
               expect(uploadStarts).toBe(completedUploads);
@@ -934,6 +953,23 @@ for (const lost of [
                 expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
                 expect(commits).toBe(0);
                 destinationAuthenticated = true;
+              }
+              if (lost === "destination-awaits-recovery") {
+                remote = {
+                  ...remote!,
+                  recoveryVerified: false,
+                  failureDetail: "Frozen recovery save is not confirmed.",
+                };
+                for (let attempt = 0; attempt < 2; attempt++) {
+                  yield* destination.destination(owner);
+                  expect(remote?.phase).toBe("ready");
+                  expect(remote?.failureDetail).toBeNull();
+                  expect(commitAttempts).toBe(0);
+                  expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
+                  expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+                }
+                yield* source.source(threadId);
+                expect(remote?.recoveryVerified).toBe(true);
               }
               yield* destination.destination(owner);
               expect(remote?.phase).toBe("completed");
