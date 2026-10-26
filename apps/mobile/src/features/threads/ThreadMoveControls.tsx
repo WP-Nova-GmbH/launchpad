@@ -209,6 +209,8 @@ function FollowThreadLocation({
   )
     return null;
   const diagnostic = error ?? state.error;
+  if (!recoverUnavailable && state.movePending && !diagnostic && !draftConflict && !busy)
+    return null;
   const pending = checking || state.isPending;
   const unavailable = !busy && !pending && !state.movePending && !state.destination;
   const disabled = busy || pending || !!draftConflict || !session || !relayUrl;
@@ -362,40 +364,6 @@ function FollowThreadLocation({
   );
 }
 
-function ThreadMoveProgressCard({
-  environmentId,
-  threadId,
-}: {
-  environmentId: EnvironmentId;
-  threadId: ThreadId;
-}) {
-  const location = useAtomValue(threadVmControls.locationViewAtom(environmentId, threadId));
-  const queue = useAtomValue(
-    environmentThreadDetails.stateAtom({ environmentId, threadId }),
-    (state) => Option.getOrNull(state.data)?.promptQueue,
-  );
-  const progress = threadMoveProgressPresentation(location?.placement);
-  const moving = queue?.entries.find((entry) => entry.kind === "move" && entry.state !== "pending");
-  if (!location?.movePending || location.moveFailureDetail || !progress) return null;
-  const cancelling = moving?.state === "cancelling";
-  return (
-    <View
-      className="mx-3 my-2 grid gap-1 rounded-xl border border-border bg-muted/20 px-3 py-2 text-xs"
-      accessibilityLiveRegion="polite"
-    >
-      <Text className="font-medium">{cancelling ? "Cancelling move…" : progress.label}</Text>
-      {!cancelling && progress.detail ? (
-        <Text className="text-muted-foreground">{progress.detail}</Text>
-      ) : null}
-      <Text className="text-muted-foreground">
-        {cancelling
-          ? "Waiting for both locations to confirm cancellation."
-          : "Your conversation and files move together. Manage or cancel the move in the queue."}
-      </Text>
-    </View>
-  );
-}
-
 export function CurrentThreadLocation(props: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
@@ -404,7 +372,6 @@ export function CurrentThreadLocation(props: {
   const session = useAtomValue(managedRelaySessionAtom);
   return (
     <>
-      <ThreadMoveProgressCard environmentId={props.environmentId} threadId={props.threadId} />
       <MovedThreadDraftRecovery environmentId={props.environmentId} threadId={props.threadId} />
       <FollowThreadLocation
         key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${props.environmentId}:${props.threadId}:${props.recoverUnavailable === true}`}

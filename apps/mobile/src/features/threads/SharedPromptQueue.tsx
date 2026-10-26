@@ -1,3 +1,4 @@
+import { threadMoveQueueOwnership } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import {
   squashAtomCommandFailure,
   type AtomCommandResult,
@@ -13,13 +14,13 @@ import {
 import { useAtomValue } from "@effect/atom-react";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { portableCommandStatesAtom } from "@t3tools/client-runtime/relay/portableThreads";
+import { ThreadMoveQueueItem, useThreadMovePlacement } from "./ThreadMoveQueueItem";
 import { createThreadMoveCancellation } from "@t3tools/client-runtime/relay/threadMoveSubmission";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Crypto from "expo-crypto";
 import {
   promptAttributionLabel,
   queuedPromptEditConflict,
-  queuedMoveLabel,
   moveQueueEntryNext,
   moveQueueEntryLater,
   type QueuedPromptEdit,
@@ -84,6 +85,8 @@ function SharedPromptQueueContent({
   supportsPreparation = false,
   hasStartedTurn = false,
 }: SharedPromptQueueProps) {
+  const placement = useThreadMovePlacement(environmentId, threadId);
+  const fallbackMove = threadMoveQueueOwnership({ entries: queue.entries, placement }).fallback;
   const cancelMove = useAtomCommand(threadEnvironment.cancelMove, { reportFailure: false });
   const getCommandReceipt = useAtomCommand(threadEnvironment.getCommandReceipt, {
     reportFailure: false,
@@ -231,18 +234,19 @@ function SharedPromptQueueContent({
     queue.entries.length === 0 &&
     queue.pauseReason === null &&
     edit === null &&
-    !blockedByPreparation
+    !blockedByPreparation &&
+    !fallbackMove
   )
     return null;
   return (
     <ScrollView
-      className="mx-3 mb-2 rounded-xl border border-border bg-white p-3"
+      className="mx-3 mb-2 bg-background px-1 py-2"
       style={{ maxHeight: 260 }}
       keyboardShouldPersistTaps="handled"
     >
       <View className="mb-2 flex-row items-center justify-between gap-2">
         <Text className="font-t3-medium text-sm text-foreground">
-          Shared queue · {queue.entries.length}
+          Queued {queue.entries.length + (fallbackMove ? 1 : 0)}
         </Text>
         {queue.pauseReason === null || (blockedByPreparation && preparation.settled === false) ? (
           <QueueButton
@@ -362,74 +366,57 @@ function SharedPromptQueueContent({
           ))}
         </View>
       ) : null}
+      {fallbackMove && (
+        <ThreadMoveQueueItem
+          environmentId={environmentId}
+          threadId={threadId}
+          placement={placement}
+        />
+      )}
       {queue.entries.map((entry, index) =>
         entry.kind === "move" ? (
-          <View key={entry.messageId} className="mb-2 gap-1 rounded-lg border border-border p-2">
-            <Text className="text-sm text-foreground">
-              {index + 1}. {queuedMoveLabel(entry)}
-            </Text>
-            <Text className="text-xs text-foreground-muted">
-              {cancellation.phase(cancellationScope, entry.messageId) === "requested"
-                ? "Cancellation requested. Waiting for the environment to stop the move."
-                : (entry.detail ??
-                  (entry.state === "pending"
-                    ? "Waiting in queue"
-                    : entry.state === "cancelling"
-                      ? "Cancelling move…"
-                      : "Moving thread…"))}
-            </Text>
-            <View className="mt-1 flex-row flex-wrap gap-2">
-              <QueueButton
-                label="Move next"
-                disabled={disabled || !canReorder || index === 0}
-                onPress={() =>
-                  void run(() =>
-                    reorderQueue(
-                      request({
-                        threadId,
-                        expectedRevision: queue.revision,
-                        order: moveQueueEntryNext(queue.entries, entry.messageId),
-                      }),
-                    ),
-                  )
-                }
-              />
-              <QueueButton
-                label="Move down"
-                disabled={disabled || !canReorder || index + 1 === queue.entries.length}
-                onPress={() =>
-                  void run(() =>
-                    reorderQueue(
-                      request({
-                        threadId,
-                        expectedRevision: queue.revision,
-                        order: moveQueueEntryLater(queue.entries, entry.messageId),
-                      }),
-                    ),
-                  )
-                }
-              />
-              <QueueButton
-                label={
-                  cancellation.phase(cancellationScope, entry.messageId) === "requested"
-                    ? "Cancellation requested"
-                    : entry.state === "cancelling"
-                      ? "Cancelling move…"
-                      : cancellation.phase(cancellationScope, entry.messageId) === "unknown"
-                        ? "Retry cancellation"
-                        : "Cancel move"
-                }
-                disabled={
-                  disabled ||
-                  entry.state === "cancelling" ||
-                  ["sending", "requested"].includes(
-                    cancellation.phase(cancellationScope, entry.messageId) ?? "",
-                  )
-                }
-                onPress={() => void requestCancellation(entry)}
-              />
-            </View>
-          </View>
+          <ThreadMoveQueueItem
+            key={entry.messageId}
+            environmentId={environmentId}
+            threadId={threadId}
+            entry={entry}
+            placement={placement}
+            queuePaused={!queue.enabled || queue.pauseReason !== null}
+            cancellation={cancellation.phase(cancellationScope, entry.messageId)}
+            disabled={disabled}
+            onCancel={() => void requestCancellation(entry)}
+          >
+            <QueueButton
+              label="Move next"
+              disabled={disabled || !canReorder || index === 0}
+              onPress={() =>
+                void run(() =>
+                  reorderQueue(
+                    request({
+                      threadId,
+                      expectedRevision: queue.revision,
+                      order: moveQueueEntryNext(queue.entries, entry.messageId),
+                    }),
+                  ),
+                )
+              }
+            />
+            <QueueButton
+              label="Move down"
+              disabled={disabled || !canReorder || index + 1 === queue.entries.length}
+              onPress={() =>
+                void run(() =>
+                  reorderQueue(
+                    request({
+                      threadId,
+                      expectedRevision: queue.revision,
+                      order: moveQueueEntryLater(queue.entries, entry.messageId),
+                    }),
+                  ),
+                )
+              }
+            />
+          </ThreadMoveQueueItem>
         ) : (
           <View key={entry.messageId} className="mb-2 gap-1 rounded-lg border border-border p-2">
             <Text className="text-sm text-foreground">

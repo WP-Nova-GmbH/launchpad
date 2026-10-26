@@ -10250,13 +10250,7 @@ export default function ChatView(props: ChatViewProps) {
                         </div>
                       </div>
                     ) : null}
-                    <ThreadVmNotice
-                      moving={
-                        activeThread.promptQueue?.entries.some(
-                          (entry) => entry.kind === "move" && entry.state !== "pending",
-                        ) === true
-                      }
-                    />
+                    <ThreadVmNotice queue={activeThread.promptQueue} />
                     {routeKind === "server" ? (
                       <ThreadPresencePill threadRef={activeThreadRef} />
                     ) : null}

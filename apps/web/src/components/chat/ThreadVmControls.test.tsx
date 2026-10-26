@@ -1,7 +1,9 @@
+import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
+import type { RelayPortableThreadPlacement } from "@t3tools/contracts/relay";
 import { act, useState, type ComponentProps, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { CommandId, EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
 import { AsyncResult } from "effect/unstable/reactivity";
 import type { ThreadVmActionSubmission } from "@t3tools/client-runtime/relay/threadVmActionSubmission";
 
@@ -23,6 +25,7 @@ const fixture = vi.hoisted(() => ({
   session: { accountId: "owner" },
   checkLocation: vi.fn(),
   location: null as {
+    placement?: RelayPortableThreadPlacement;
     recoveryRequested: boolean;
     isPending: boolean;
     movePending: boolean;
@@ -230,7 +233,12 @@ vi.mock("../ui/alert-dialog", () => ({
   AlertDialogFooter: "div",
 }));
 
-import { ThreadVmControls, ThreadVmControlsProvider, ThreadVmNotice } from "./ThreadVmControls";
+import {
+  ThreadVmControls,
+  ThreadVmControlsProvider,
+  ThreadVmRecoveryControls,
+  ThreadVmNotice,
+} from "./ThreadVmControls";
 import { CurrentThreadLocation, ThreadRunOnPicker } from "./ThreadMoveControls";
 
 function deferred() {
@@ -488,11 +496,44 @@ describe("simplified VM controls", () => {
     await act(async () => renderer!.update(draftView()));
     expect(renderer!.root.findByType("input").props.value).toBe("Unsent draft");
   });
-  it("lets the move queue own ordinary preparation progress while keeping failures visible", async () => {
+  it("lets the move queue own progress and attention while a move is active", async () => {
     fixture.status = { setupPhase: "running" };
+    const placement = {
+      threadId: thread,
+      environmentId: env,
+      projectId: "project",
+      generation: 2,
+      organizationId: "org",
+      repositoryId: "repo",
+      ownerUserId: "owner",
+      operationId: "move",
+    };
+    fixture.location = {
+      placement,
+      recoveryRequested: false,
+      isPending: false,
+      movePending: true,
+      destination: null,
+      error: null,
+    };
+    const queue = {
+      ...emptyThreadPromptQueue(),
+      entries: [
+        {
+          kind: "move" as const,
+          state: "moving" as const,
+          messageId: MessageId.make("message"),
+          operationId: CommandId.make("move"),
+          revision: 1,
+          acceptedSequence: 1,
+          destination: { kind: "vm" as const },
+          createdAt: "2026-10-26T09:00:00Z",
+        },
+      ],
+    };
     const moving = () => (
       <ThreadVmControlsProvider environmentId={env} threadId={thread}>
-        <ThreadVmNotice moving />
+        <ThreadVmNotice queue={queue} />
       </ThreadVmControlsProvider>
     );
     await act(async () => {
@@ -501,7 +542,85 @@ describe("simplified VM controls", () => {
     expect(renderer!.root.findAllByProps({ "aria-label": "VM needs attention" })).toHaveLength(0);
     fixture.status = { finalSave: { errorCode: "save_failed" } };
     await act(async () => renderer!.update(moving()));
+    expect(renderer!.root.findAllByProps({ "aria-label": "VM needs attention" })).toHaveLength(0);
+    await act(async () =>
+      renderer!.update(
+        <ThreadVmControlsProvider environmentId={env} threadId={thread}>
+          <ThreadVmNotice />
+        </ThreadVmControlsProvider>,
+      ),
+    );
     expect(renderer!.root.findAllByProps({ "aria-label": "VM needs attention" })).toHaveLength(1);
+  });
+  it.each([
+    [
+      "restore",
+      "Cancel restore",
+      {
+        restore: {
+          operationId: "lifecycle",
+          phase: "preparing",
+          canCancel: true,
+          errorCode: "failed",
+        },
+      },
+    ],
+    [
+      "reset",
+      "Cancel reset",
+      { reset: { operationId: "lifecycle", phase: "creating", errorCode: null } },
+    ],
+  ])("keeps %s recovery available with an empty queue", async (_kind, label, status) => {
+    fixture.status = status;
+    fixture.location = {
+      placement: {
+        threadId: thread,
+        environmentId: env,
+        projectId: "project",
+        generation: 2,
+        organizationId: "org",
+        repositoryId: "repo",
+        ownerUserId: "owner",
+        operationId: "lifecycle",
+      },
+      recoveryRequested: false,
+      isPending: false,
+      movePending: true,
+      destination: null,
+      error: null,
+    };
+    await act(async () => {
+      renderer = create(
+        <ThreadVmControlsProvider environmentId={env} threadId={thread}>
+          <ThreadVmRecoveryControls hideRefresh queue={emptyThreadPromptQueue()} />
+        </ThreadVmControlsProvider>,
+      );
+    });
+    expect(button(label)).toBeDefined();
+    await act(async () => button(label).props.onClick());
+    expect(fixture.run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: expect.objectContaining({
+          type: _kind === "restore" ? "cancel_restore" : "cancel_reset",
+          operationId: "lifecycle",
+        }),
+      }),
+    );
+  });
+  it("keeps final-save failures visible when no VM allocation remains", async () => {
+    fixture.status = {
+      allocation: null,
+      savedDisk: null,
+      finalSave: { operationId: "save", phase: "saving", reason: "idle", errorCode: "failed" },
+    };
+    await act(async () => {
+      renderer = create(
+        <ThreadVmControlsProvider environmentId={env} threadId={thread}>
+          <ThreadVmRecoveryControls hideRefresh queue={emptyThreadPromptQueue()} />
+        </ThreadVmControlsProvider>,
+      );
+    });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Saving VM needs attention");
   });
   it("resumes a paused VM from the compact notice", async () => {
     fixture.status = { allocation: { allocationId: "allocation", state: "paused" } };

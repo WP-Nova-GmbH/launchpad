@@ -21,6 +21,57 @@ const command = (id = "cancel", revision = entry.revision) => ({
 });
 
 describe("move cancellation feedback", () => {
+  it("keeps accepted receipt state across a later failed or still-pending read", () => {
+    const cancellation = createThreadMoveCancellation();
+    const first = cancellation.prepare(scope, entry, command)!;
+    cancellation.acknowledge(scope, first, { status: "accepted", sequence: 8 });
+    cancellation.failed(scope, first);
+    cancellation.acknowledge(scope, first, { status: "unknown" });
+    expect(cancellation.pending(scope)).toEqual([first]);
+    expect(cancellation.phase(scope, entry.messageId)).toBe("requested");
+    expect(cancellation.prepare(scope, { ...entry, revision: 9 }, command)).toBeNull();
+  });
+
+  it("applies receipts before interpreting a lagging or terminal queue projection", () => {
+    const cancellation = createThreadMoveCancellation();
+    const first = cancellation.prepare(scope, entry, command)!;
+    cancellation.failed(scope, first);
+    const receipt = {
+      commandId: first.commandId,
+      position: 1,
+      receipt: { status: "accepted" as const, sequence: 8 },
+    };
+    expect(
+      cancellation.observe(scope, [entry], [{ commandId: first.commandId, receipt }]).changed,
+    ).toBe(true);
+    expect(cancellation.phase(scope, entry.messageId)).toBe("requested");
+    expect(cancellation.observe(scope, [], [{ commandId: first.commandId, receipt }]).changed).toBe(
+      true,
+    );
+    expect(cancellation.pending(scope)).toEqual([]);
+
+    const rejectedCancellation = createThreadMoveCancellation();
+    const rejected = rejectedCancellation.prepare(scope, entry, () => command("rejected"))!;
+    rejectedCancellation.failed(scope, rejected);
+    expect(
+      rejectedCancellation.observe(
+        scope,
+        [],
+        [
+          {
+            commandId: rejected.commandId,
+            receipt: {
+              commandId: rejected.commandId,
+              position: 2,
+              receipt: { status: "rejected", detail: "Too late to cancel" },
+            },
+          },
+        ],
+      ),
+    ).toEqual({ changed: true, rejection: "Too late to cancel" });
+    expect(rejectedCancellation.pending(scope)).toEqual([]);
+  });
+
   it("blocks duplicate clicks while sending and after relay staging, including progress updates", () => {
     const cancellation = createThreadMoveCancellation();
     const first = cancellation.prepare(scope, entry, command)!;

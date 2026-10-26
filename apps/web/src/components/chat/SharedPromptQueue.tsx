@@ -1,3 +1,4 @@
+import { threadMoveQueueOwnership } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import {
   squashAtomCommandFailure,
   type AtomCommandResult,
@@ -9,12 +10,12 @@ import {
   type ThreadPromptQueue,
   type TurnId,
 } from "@t3tools/contracts";
+import { ThreadMoveQueueItem, useThreadMovePlacement } from "./ThreadMoveQueueItem";
 import { createThreadMoveCancellation } from "@t3tools/client-runtime/relay/threadMoveSubmission";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import { portableCommandStatesAtom } from "@t3tools/client-runtime/relay/portableThreads";
 import {
   queuedPromptEditConflict,
-  queuedMoveLabel,
   moveQueueEntryNext,
   moveQueueEntryLater,
   type QueuedPromptEdit,
@@ -60,6 +61,8 @@ function SharedPromptQueueContent({
   supportsPreparation = false,
   canWorkLocally = false,
 }: SharedPromptQueueProps) {
+  const placement = useThreadMovePlacement(threadRef.environmentId, threadRef.threadId);
+  const fallbackMove = threadMoveQueueOwnership({ entries: queue.entries, placement }).fallback;
   const cancelMove = useAtomCommand(threadEnvironment.cancelMove, { reportFailure: false });
   const getCommandReceipt = useAtomCommand(threadEnvironment.getCommandReceipt, {
     reportFailure: false,
@@ -211,7 +214,13 @@ function SharedPromptQueueContent({
       }
     }
   };
-  if (queue.entries.length === 0 && queue.pauseReason === null && edit === null && !preparing)
+  if (
+    queue.entries.length === 0 &&
+    queue.pauseReason === null &&
+    edit === null &&
+    !preparing &&
+    !fallbackMove
+  )
     return null;
   return (
     <section
@@ -226,7 +235,7 @@ function SharedPromptQueueContent({
           <Clock3Icon aria-hidden="true" className="size-3.5" />
           {queue.pauseReason ? "Queue paused" : "Queued"}
           <span className="rounded bg-muted px-1 text-3xs tabular-nums">
-            {queue.entries.length}
+            {queue.entries.length + (fallbackMove ? 1 : 0)}
           </span>
         </span>
         {setupRunning || (preparing && preparation.settled === false) ? (
@@ -396,23 +405,28 @@ function SharedPromptQueueContent({
         </div>
       ) : null}
       <ol>
+        {fallbackMove && (
+          <li>
+            <ThreadMoveQueueItem
+              environmentId={threadRef.environmentId}
+              threadId={threadRef.threadId}
+              placement={placement}
+            />
+          </li>
+        )}
         {queue.entries.map((entry, index) =>
           entry.kind === "move" ? (
-            <li key={entry.messageId} className="border-t border-border/60 py-2 text-xs">
-              <p>
-                {index + 1}. {queuedMoveLabel(entry)}
-              </p>
-              <p role="status" className="text-muted-foreground">
-                {cancellation.phase(cancellationScope, entry.messageId) === "requested"
-                  ? "Cancellation requested. Waiting for the environment to stop the move."
-                  : (entry.detail ??
-                    (entry.state === "pending"
-                      ? "Waiting in queue"
-                      : entry.state === "cancelling"
-                        ? "Cancelling move…"
-                        : "Moving thread…"))}
-              </p>
-              <div className="mt-2 flex gap-2">
+            <li key={entry.messageId}>
+              <ThreadMoveQueueItem
+                environmentId={threadRef.environmentId}
+                threadId={threadRef.threadId}
+                entry={entry}
+                placement={placement}
+                queuePaused={!queue.enabled || queue.pauseReason !== null}
+                cancellation={cancellation.phase(cancellationScope, entry.messageId)}
+                disabled={disabled}
+                onCancel={() => void requestCancellation(entry)}
+              >
                 <Button
                   size="xs"
                   variant="ghost-muted"
@@ -449,27 +463,7 @@ function SharedPromptQueueContent({
                 >
                   Move down
                 </Button>
-                <Button
-                  size="xs"
-                  variant="ghost-muted"
-                  disabled={
-                    disabled ||
-                    entry.state === "cancelling" ||
-                    ["sending", "requested"].includes(
-                      cancellation.phase(cancellationScope, entry.messageId) ?? "",
-                    )
-                  }
-                  onClick={() => void requestCancellation(entry)}
-                >
-                  {cancellation.phase(cancellationScope, entry.messageId) === "requested"
-                    ? "Cancellation requested"
-                    : entry.state === "cancelling"
-                      ? "Cancelling move…"
-                      : cancellation.phase(cancellationScope, entry.messageId) === "unknown"
-                        ? "Retry cancellation"
-                        : "Cancel move"}
-                </Button>
-              </div>
+              </ThreadMoveQueueItem>
             </li>
           ) : (
             <SharedPromptQueueRow

@@ -329,6 +329,7 @@
       "default": "./src/relay/threadMoveSubmission.ts"
     },
     "./relay/threadMoveRecovery": "./src/relay/threadMoveRecovery.ts",
+    "./relay/threadMoveQueuePresentation": "./src/relay/threadMoveQueuePresentation.ts",
     "./relay/portableThreadHistory": {
       "types": "./src/relay/portableThreadHistory.ts",
       "default": "./src/relay/portableThreadHistory.ts"

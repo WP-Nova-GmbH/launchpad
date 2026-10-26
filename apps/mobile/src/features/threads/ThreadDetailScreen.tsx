@@ -1089,13 +1089,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                   environmentId={props.environmentId}
                   threadId={props.selectedThread.id}
                 />
-                <ThreadVmNotice
-                  moving={
-                    props.promptQueue?.entries.some(
-                      (entry) => entry.kind === "move" && entry.state !== "pending",
-                    ) === true
-                  }
-                />
+                <ThreadVmNotice queue={props.promptQueue} />
                 {props.promptQueue ? (
                   <SharedPromptQueue
                     key={`${props.environmentId}:${props.selectedThread.id}`}

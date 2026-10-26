@@ -13,6 +13,7 @@ import {
   type ThreadRelayRouting,
 } from "@t3tools/contracts";
 import type {
+  RelayPortableThreadPlacement,
   RelayPortableThreadSummary,
   RelayThreadCurrentQueue,
   RelayThreadVmAllowance,
@@ -155,6 +156,42 @@ export interface PortableThreadDetailState {
   readonly session: ManagedRelaySession;
   readonly history: PortableThreadHistory;
   readonly hasMore: boolean;
+}
+
+/** Refresh retained data independently; none of these reads may resume the VM. */
+export async function refreshSavedConversation(input: {
+  signal: AbortSignal;
+  placement: () => Promise<RelayPortableThreadPlacement | null>;
+  status: (placement: RelayPortableThreadPlacement) => Promise<unknown>;
+  queue: () => Promise<unknown>;
+  history: () => Promise<unknown>;
+}) {
+  const errors: Array<{ section: string; detail: string }> = [];
+  const read = async (section: string, action: () => Promise<unknown>) => {
+    if (input.signal.aborted) return;
+    try {
+      await action();
+    } catch (cause) {
+      if (!input.signal.aborted)
+        errors.push({
+          section,
+          detail: cause instanceof Error ? cause.message : "Could not refresh. Try again.",
+        });
+    }
+  };
+  let placement: RelayPortableThreadPlacement | null = null;
+  await read("Location", async () => {
+    placement = await input.placement();
+    if (!placement) throw new Error("Could not confirm this thread’s location.");
+  });
+  if (input.signal.aborted) return [];
+  const current = placement;
+  await Promise.all([
+    read("Queue", input.queue),
+    read("Conversation", input.history),
+    ...(current ? [read("VM status", () => input.status(current))] : []),
+  ]);
+  return errors;
 }
 
 /** A private library independent of cached environment/project discovery and VM power state. */
@@ -423,7 +460,13 @@ export function createPortableThreadLibraryAtoms<R, E>(
       mode: "serial",
       key: (input: {
         accountId: string;
-        command: import("./threadQueueControlSubmission.ts").ThreadQueueControlSubmission["command"];
+        command:
+          | import("./threadQueueControlSubmission.ts").ThreadQueueControlSubmission["command"]
+          | (import("../operations/commands.ts").CancelThreadMoveInput & {
+              type: "thread.move.cancel";
+              commandId: CommandId;
+              createdAt: string;
+            });
       }) => input.command.threadId,
     },
     execute: Effect.fnUntraced(function* (input, registry) {

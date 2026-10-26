@@ -1,7 +1,10 @@
+import { threadMoveQueueOwnership } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
+import { SavedConversationMessage } from "./SavedConversationMessage";
 import type { RelayPortableThreadSummary } from "@t3tools/contracts/relay";
 import {
   portableThreadOverviewPresentation,
   portableThreadOverviewAction,
+  refreshSavedConversation,
 } from "@t3tools/client-runtime/relay/portableThreadLibrary";
 import { useNavigation } from "@react-navigation/native";
 import { useThreadVmActionJournal } from "../../state/use-thread-vm-actions";
@@ -27,7 +30,12 @@ import {
   threadVmActionJournal,
 } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { ThreadVmControls } from "./ThreadVmControls";
+import { ThreadVmControlsProvider, ThreadVmRecoveryControls } from "./ThreadVmControls";
+import {
+  SavedThreadQueue,
+  useSavedThreadMoveCancellation,
+  useThreadMovePlacement,
+} from "./ThreadMoveQueueItem";
 function Action({
   children,
   onPress,
@@ -208,9 +216,11 @@ function LibraryBody() {
   return (
     <View className="flex-1 gap-3">
       <View className="flex-row gap-2">
-        <Action disabled={busy} onPress={() => void load()}>
-          Refresh
-        </Action>
+        {!selected && (
+          <Action disabled={busy} onPress={() => void load()}>
+            Refresh
+          </Action>
+        )}
         {selected && <Action onPress={() => setSelected(null)}>All threads</Action>}
       </View>
       {!selected && allowance && (
@@ -246,7 +256,7 @@ function LibraryBody() {
           </Text>
         </View>
       )}
-      <SavedVmRequests />
+      {!selected && <SavedVmRequests />}
       {!selected && (
         <Text className="text-sm text-foreground-muted">
           Open a local conversation, then choose Run on → Private VM.
@@ -263,6 +273,7 @@ function LibraryBody() {
           threadId={ThreadId.make(summary.placement.threadId)}
           environmentId={EnvironmentId.make(summary.placement.environmentId)}
           title={summary.title}
+          projectName={summary.vm?.projectName}
         />
       ) : (
         <ScrollView contentContainerClassName="gap-3">
@@ -419,13 +430,47 @@ function SavedConversation({
   threadId,
   environmentId,
   title,
+  projectName,
 }: {
   threadId: ThreadId;
   environmentId: EnvironmentId;
   title: string;
+  projectName?: string | null | undefined;
 }) {
+  const [expandedReasoning, setExpandedReasoning] = useState<ReadonlySet<string>>(new Set());
+  const toggleReasoning = useCallback(
+    (messageId: string) =>
+      setExpandedReasoning((previous) => {
+        const next = new Set(previous);
+        if (next.has(messageId)) next.delete(messageId);
+        else next.add(messageId);
+        return next;
+      }),
+    [],
+  );
+  const cancellation = useSavedThreadMoveCancellation(threadId);
+  const { refresh: refreshCancellation, observe: observeCancellation } = cancellation;
+  const placement = useThreadMovePlacement(environmentId, threadId);
+  const vmEnvironmentId = EnvironmentId.make(placement?.environmentId ?? environmentId);
+  const refreshPlacement = useAtomCommand(portableThreadLibrary.refreshPlacement, {
+    reportFailure: false,
+  });
+  const refreshStatus = useAtomCommand(threadVmControls.refreshStatus, { reportFailure: false });
+  const refreshInFlight = useRef(false);
+  const placementKey = JSON.stringify([
+    placement?.environmentId,
+    placement?.generation,
+    placement?.operationId,
+  ]);
+  const [refreshFeedback, setRefreshFeedback] = useState<{
+    scope: string;
+    failures: Array<{ section: string; detail: string }>;
+  } | null>(null);
+  const refreshErrors = refreshFeedback?.scope === placementKey ? refreshFeedback.failures : [];
   const detail = useAtomValue(portableThreadLibrary.detailAtom(threadId));
-  const currentQueue = useAtomValue(portableThreadLibrary.queueAtom(threadId));
+  const queueSnapshot = useAtomValue(portableThreadLibrary.queueAtom(threadId));
+  const currentQueue =
+    !placement || queueSnapshot?.generation === placement.generation ? queueSnapshot : null;
   const loadQueue = useAtomCommand(portableThreadLibrary.loadQueue, { reportFailure: false });
   const openChat = useAtomCommand(openPortableThreadChat, { reportFailure: false });
   const navigation = useNavigation();
@@ -471,6 +516,8 @@ function SavedConversation({
         if (signal.aborted) throw new Error("The queue check was cancelled.");
       };
       const scope = { accountId: session.accountId, relayUrl, threadId };
+      await refreshCancellation(signal);
+      check();
       const next = await threadQueueControlJournal
         .refresh(
           scope,
@@ -480,6 +527,9 @@ function SavedConversation({
             check();
             if (result._tag !== "Success") throw squashAtomCommandFailure(result);
             if (!result.value) throw new Error("Could not read the current queue.");
+            if (result.value.threadId !== threadId)
+              throw new Error("The queue belongs to another thread.");
+            observeCancellation(result.value.queue);
             return result.value;
           },
           async (commandId) => {
@@ -502,7 +552,15 @@ function SavedConversation({
         if (next?.rejection) setError(next.rejection);
       }
     },
-    [session, relayUrl, threadId, loadQueue, queueReceipt],
+    [
+      session,
+      relayUrl,
+      threadId,
+      loadQueue,
+      queueReceipt,
+      refreshCancellation,
+      observeCancellation,
+    ],
   );
   useEffect(() => {
     const abort = accountAbort.current;
@@ -513,13 +571,11 @@ function SavedConversation({
         if (abort.signal.aborted) return;
         setQueueDraft(draft);
         setQueueReady(true);
-        setBusy(false);
         setError(draft?.rejection ?? null);
         await refreshQueue(abort.signal);
       })
       .catch((cause) => {
         if (!abort.signal.aborted) {
-          setBusy(false);
           setError(
             cause instanceof Error ? cause.message : "Could not verify the saved queue request.",
           );
@@ -545,45 +601,77 @@ function SavedConversation({
   }, [session, threadId, loadHistory]);
   const more = async (refresh = false) => {
     const abort = accountAbort.current;
-    if (!abort || abort.signal.aborted || busy) return;
+    if (!abort || abort.signal.aborted || busy || refreshInFlight.current) return;
+    refreshInFlight.current = true;
     setBusy(true);
     setError(null);
-    try {
-      if (refresh) await refreshQueue(abort.signal);
-      if (abort.signal.aborted) return;
+    setRefreshFeedback(null);
+    let refreshScope = placementKey;
+    const readHistory = async () => {
       const result = await loadHistory({
         threadId,
         ...(refresh ? { refresh: true } : { more: true }),
       });
-      if (!abort.signal.aborted && result._tag !== "Success")
-        setError(failureMessage(result, "Could not read more history."));
-    } catch (cause) {
-      if (!abort.signal.aborted)
-        setError(cause instanceof Error ? cause.message : "Could not refresh this conversation.");
-    } finally {
-      if (!abort.signal.aborted) setBusy(false);
-    }
-  };
-  const downloadFile = async (file: ChatAttachment) => {
-    const abort = accountAbort.current;
-    if (!abort || abort.signal.aborted) return;
-    setBusy(true);
-    setError(null);
+      if (result._tag !== "Success") throw squashAtomCommandFailure(result);
+    };
     try {
-      const result = await download({ threadId, attachmentId: file.id });
-      if (result._tag !== "Success") {
-        setError(failureMessage(result, "Could not download the attachment."));
-        return;
-      }
-      if (abort.signal.aborted) return;
-      await shareAttachmentBytes({ bytes: result.value, attachment: file, signal: abort.signal });
+      if (refresh) {
+        const failures = await refreshSavedConversation({
+          signal: abort.signal,
+          placement: async () => {
+            const result = await refreshPlacement({ threadId });
+            if (result._tag !== "Success") throw squashAtomCommandFailure(result);
+            if (result.value)
+              refreshScope = JSON.stringify([
+                result.value.environmentId,
+                result.value.generation,
+                result.value.operationId,
+              ]);
+            return result.value;
+          },
+          status: async (current) => {
+            const result = await refreshStatus({
+              environmentId: EnvironmentId.make(current.environmentId),
+              threadId,
+            });
+            if (result._tag !== "Success") throw squashAtomCommandFailure(result);
+          },
+          queue: () => refreshQueue(abort.signal),
+          history: readHistory,
+        });
+        if (!abort.signal.aborted) setRefreshFeedback({ scope: refreshScope, failures });
+      } else await readHistory();
     } catch (cause) {
       if (!abort.signal.aborted)
-        setError(cause instanceof Error ? cause.message : "Could not download the attachment.");
+        setError(cause instanceof Error ? cause.message : "Could not read more history.");
     } finally {
+      refreshInFlight.current = false;
       if (!abort.signal.aborted) setBusy(false);
     }
   };
+  const downloadFile = useCallback(
+    async (file: ChatAttachment) => {
+      const abort = accountAbort.current;
+      if (!abort || abort.signal.aborted) return;
+      setBusy(true);
+      setError(null);
+      try {
+        const result = await download({ threadId, attachmentId: file.id });
+        if (result._tag !== "Success") {
+          setError(failureMessage(result, "Could not download the attachment."));
+          return;
+        }
+        if (abort.signal.aborted) return;
+        await shareAttachmentBytes({ bytes: result.value, attachment: file, signal: abort.signal });
+      } catch (cause) {
+        if (!abort.signal.aborted)
+          setError(cause instanceof Error ? cause.message : "Could not download the attachment.");
+      } finally {
+        if (!abort.signal.aborted) setBusy(false);
+      }
+    },
+    [download, threadId],
+  );
   const changeQueue = async (enabled: boolean) => {
     const abort = accountAbort.current;
     if (!abort || abort.signal.aborted) return;
@@ -655,111 +743,144 @@ function SavedConversation({
       if (!abort.signal.aborted) setBusy(false);
     }
   };
+  const fallbackMove = threadMoveQueueOwnership({
+    entries: currentQueue?.queue.entries,
+    placement,
+  }).fallback;
   const thread = detail?.history.thread;
   return (
-    <FlatList
-      data={thread?.messages ?? []}
-      keyExtractor={(message) => message.id}
-      contentContainerClassName="gap-3"
-      ListHeaderComponent={
-        <View className="gap-3">
-          <Text className="text-base font-medium text-foreground">{title}</Text>
-          <Action
-            disabled={busy || detail?.history.deleted === true}
-            onPress={() => void continueChat()}
-          >
-            Open chat
-          </Action>
-          <Action disabled={busy} onPress={() => void more(true)}>
-            Refresh conversation
-          </Action>
-          <ThreadVmControls environmentId={environmentId} threadId={threadId} />
-          {queueDraft && (
-            <View className="gap-2">
-              <Text accessibilityLiveRegion="polite">
-                {queueDraft.rejection ??
-                  (queueDraft.accepted
-                    ? "Updating queue… Refresh to check its current state."
-                    : "This queue request is saved until the environment confirms it.")}
-              </Text>
-              <Action
+    <ThreadVmControlsProvider environmentId={vmEnvironmentId} threadId={threadId}>
+      <FlatList
+        data={thread?.messages ?? []}
+        keyExtractor={(message) => message.id}
+        contentContainerClassName="gap-3"
+        ListHeaderComponent={
+          <View className="gap-3">
+            <View className="flex-row flex-wrap items-center justify-between gap-3">
+              <View className="min-w-0 flex-1 gap-1">
+                <Text className="text-base font-medium text-foreground">{title}</Text>
+                {projectName && (
+                  <Text className="text-xs text-foreground-muted">{projectName}</Text>
+                )}
+              </View>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Refresh thread"
                 disabled={busy}
-                onPress={() =>
-                  queueDraft.rejection
-                    ? void discardQueue()
-                    : queueDraft.accepted
-                      ? void more(true)
-                      : void changeQueue(queueDraft.command.type === "thread.queue.resume")
-                }
+                onPress={() => void more(true)}
+                className="min-h-11 min-w-11 items-center justify-center"
               >
-                {queueDraft.rejection
-                  ? "Dismiss rejected request"
-                  : queueDraft.accepted
-                    ? "Check current queue"
-                    : "Retry saved queue request"}
-              </Action>
-            </View>
-          )}
-          {currentQueue && (
-            <View className="gap-2">
-              <Text className="font-medium">
-                Queue {currentQueue.queue.enabled ? "enabled" : "paused"}
-              </Text>
+                <SymbolView name="arrow.clockwise" size={18} />
+              </Pressable>
               <Action
-                disabled={busy || !queueReady || queueDraft !== null}
-                onPress={() => void changeQueue(!currentQueue.queue!.enabled)}
+                disabled={busy || detail?.history.deleted === true}
+                onPress={() => void continueChat()}
               >
-                {currentQueue.queue.enabled ? "Pause queue" : "Resume queue"}
+                Open chat
               </Action>
-
-              {currentQueue.queue.entries.map((entry) => (
-                <Text key={entry.messageId}>
-                  {entry.kind === "move" ? "Move thread" : entry.text} · {entry.state}
-                </Text>
-              ))}
             </View>
-          )}
-          <Text className="text-xs text-foreground-muted">
-            Reading this conversation does not start its VM. Resume or restore it, then open chat to
-            continue working.
-          </Text>
-          {error && <Text className="text-danger-foreground">{error}</Text>}
-          {!detail && !error && <Text>Reading conversation…</Text>}
-          {detail?.history.deleted && <Text>This thread was deleted.</Text>}
-          {detail && !thread && !detail.history.deleted && (
-            <Text>The thread is being prepared. Refresh once setup finishes.</Text>
-          )}
-        </View>
-      }
-      renderItem={({ item: message }) => (
-        <View className="gap-1 rounded-lg border border-border p-3">
-          <Text className="text-xs text-foreground-muted">
-            {message.author?.displayName ?? (message.role === "user" ? "User" : "Assistant")}
-          </Text>
-          <Text selectable className="text-sm text-foreground">
-            {message.text}
-          </Text>
-          {message.attachments?.map((file) => (
-            <Action
-              key={file.id}
-              disabled={busy || (file.type !== "image" && file.type !== "file")}
-              onPress={() => void downloadFile(file)}
-            >
-              {file.name}
-            </Action>
-          ))}
-        </View>
-      )}
-      ListFooterComponent={
-        <View className="gap-2">
-          {detail?.hasMore && (
-            <Action disabled={busy} onPress={() => void more()}>
-              Read more history
-            </Action>
-          )}
-        </View>
-      }
-    />
+            {busy && (
+              <Text accessibilityLiveRegion="polite" className="text-xs text-foreground-muted">
+                Updating…
+              </Text>
+            )}
+            <ThreadVmRecoveryControls hideRefresh queue={currentQueue?.queue ?? null} />
+            {queueDraft && (
+              <View className="gap-2">
+                <Text accessibilityLiveRegion="polite">
+                  {queueDraft.rejection ??
+                    (queueDraft.accepted
+                      ? "Updating queue… Refresh to check its current state."
+                      : "This queue request is saved until the environment confirms it.")}
+                </Text>
+                {(!queueDraft.accepted || queueDraft.rejection) && (
+                  <Action
+                    disabled={busy}
+                    onPress={() =>
+                      queueDraft.rejection
+                        ? void discardQueue()
+                        : void changeQueue(queueDraft.command.type === "thread.queue.resume")
+                    }
+                  >
+                    {queueDraft.rejection
+                      ? "Dismiss rejected request"
+                      : "Retry saved queue request"}
+                  </Action>
+                )}
+              </View>
+            )}
+            {(currentQueue &&
+              (currentQueue.queue.entries.length > 0 ||
+                !currentQueue.queue.enabled ||
+                currentQueue.queue.pauseReason)) ||
+            fallbackMove ? (
+              <View className="gap-2" accessibilityLabel="Queue">
+                <View className="flex-row items-center justify-between gap-2">
+                  <Text className="text-xs text-foreground-muted">
+                    {currentQueue?.queue.enabled === false ? "Queue paused" : "Queue"}
+                  </Text>
+                  {currentQueue && (
+                    <Action
+                      disabled={busy || !queueReady || queueDraft !== null}
+                      onPress={() => void changeQueue(!currentQueue.queue.enabled)}
+                    >
+                      {currentQueue.queue.enabled ? "Pause queue" : "Resume queue"}
+                    </Action>
+                  )}
+                </View>
+                <SavedThreadQueue
+                  environmentId={vmEnvironmentId}
+                  threadId={threadId}
+                  queue={currentQueue?.queue}
+                  cancellation={cancellation}
+                  placement={placement}
+                  onChange={async () => {
+                    const abort = accountAbort.current;
+                    if (abort && !abort.signal.aborted) await refreshQueue(abort.signal);
+                  }}
+                />
+              </View>
+            ) : null}
+            <Text className="text-xs text-foreground-muted">
+              Saved conversation. Reading it does not start the VM.
+            </Text>
+            {refreshErrors.map((failure) => (
+              <Text
+                key={failure.section}
+                accessibilityLiveRegion="polite"
+                className="text-xs text-destructive"
+              >
+                {failure.section}: {failure.detail}
+              </Text>
+            ))}
+            {error && <Text className="text-danger-foreground">{error}</Text>}
+            {!detail && !error && <Text>Reading conversation…</Text>}
+            {detail?.history.deleted && <Text>This thread was deleted.</Text>}
+            {detail && !thread && !detail.history.deleted && (
+              <Text>The thread is being prepared. Refresh once setup finishes.</Text>
+            )}
+          </View>
+        }
+        renderItem={({ item: message }) => (
+          <SavedConversationMessage
+            message={message}
+            expanded={expandedReasoning.has(message.id)}
+            busy={busy}
+            onDownload={downloadFile}
+            onToggle={toggleReasoning}
+          />
+        )}
+        ListFooterComponent={
+          <View className="gap-2">
+            {detail?.hasMore && (
+              <Action disabled={busy} onPress={() => void more()}>
+                Read more history
+              </Action>
+            )}
+          </View>
+        }
+      />
+    </ThreadVmControlsProvider>
   );
 }
 export function PortableThreadLibrary() {

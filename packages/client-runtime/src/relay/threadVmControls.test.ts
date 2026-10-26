@@ -216,6 +216,39 @@ const harness = Effect.fnUntraced(function* (
 });
 
 describe("VM host availability", () => {
+  it.effect("awaits a saved-view status refresh using reads only", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        const calls: string[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init),
+            path = new URL(request.url).pathname;
+          expect(request.method).toBe("GET");
+          calls.push(path);
+          if (path === "/health") return Response.json({ ok: true, service: "relay" });
+          expect(path).toBe(`/v1/threads/${threadId}/vm-status`);
+          requested.resolve();
+          await release.promise;
+          return Response.json(status);
+        });
+        let finished = false;
+        const pending = yield* Effect.promise(() =>
+          h.controls.refreshStatus.run(h.registry, { environmentId, threadId }).then((result) => {
+            finished = true;
+            return result;
+          }),
+        ).pipe(Effect.forkChild);
+        yield* Effect.promise(() => requested.promise);
+        expect(finished).toBe(false);
+        release.resolve();
+        expect((yield* Fiber.join(pending))._tag).toBe("Success");
+        expect(calls).toEqual([`/v1/threads/${threadId}/vm-status`, "/health"]);
+      }),
+    ),
+  );
+
   it.effect(
     "uses the relay capability without signing in and treats older relays as unconfigured",
     () =>

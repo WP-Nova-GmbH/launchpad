@@ -1429,7 +1429,28 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       return reply;
     }),
   });
+  const refreshStatus = createRuntimeCommand(runtime, {
+    label: "refresh saved VM status",
+    concurrency: {
+      mode: "singleFlight",
+      key: (input: { environmentId: EnvironmentId; threadId: ThreadId }) =>
+        keyFor(input.environmentId, input.threadId),
+    },
+    execute: Effect.fnUntraced(function* (input, registry) {
+      const key = keyFor(input.environmentId, input.threadId);
+      // These queries read relay state only. Reading history must never wake compute.
+      registry.refresh(queryAtom(key));
+      registry.refresh(capabilitiesQueryAtom);
+      yield* AtomRegistry.getResult(registry, queryAtom(key), { suspendOnWaiting: true });
+      registry.refresh(providerAuthQueryAtom(key));
+      yield* AtomRegistry.getResult(registry, providerAuthQueryAtom(key), {
+        suspendOnWaiting: true,
+      });
+      yield* AtomRegistry.getResult(registry, capabilitiesQueryAtom, { suspendOnWaiting: true });
+    }),
+  });
   return {
+    refreshStatus,
     capabilitiesQueryAtom,
     capabilitiesAtom,
     hostConfigurationQueryAtom,

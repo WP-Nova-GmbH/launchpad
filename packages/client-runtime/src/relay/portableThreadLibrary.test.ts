@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import type { RelayPortableThreadVmSummary } from "@t3tools/contracts/relay";
 import {
   CommandId,
+  MessageId,
   EnvironmentId,
   ProjectId,
   ThreadId,
@@ -476,6 +477,33 @@ describe("retained conversation view", () => {
               receipt: null,
             });
           expect(calls).toEqual(["POST /v1/threads/saved-thread/commands"]);
+        }),
+      ),
+  );
+  it.effect(
+    "cancels the verified saved move through the relay without changing its command identity",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const command = {
+            type: "thread.move.cancel" as const,
+            threadId,
+            commandId: CommandId.make("cancel-original"),
+            messageId: MessageId.make("queued-move"),
+            expectedRevision: 7,
+            createdAt: at,
+          };
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            expect(request.method).toBe("POST");
+            expect(new URL(request.url).pathname).toBe(`/v1/threads/${threadId}/commands`);
+            expect(await request.json()).toEqual({ command });
+            return Response.json({ commandId: command.commandId, position: 9, receipt: null });
+          });
+          const result = yield* Effect.promise(() =>
+            h.library.queueControl.run(h.registry, { accountId: "owner", command }),
+          );
+          expect(result._tag).toBe("Success");
         }),
       ),
   );

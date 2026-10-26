@@ -7,7 +7,16 @@ import {
 } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
 import type { RelayPortableThreadSummary } from "@t3tools/contracts/relay";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 const fixture = vi.hoisted(() => ({
   session: { accountId: "owner" },
@@ -21,6 +30,8 @@ const fixture = vi.hoisted(() => ({
   commands: {
     loadIndex: vi.fn(),
     loadHistory: vi.fn(),
+    refreshPlacement: vi.fn(),
+    refreshStatus: vi.fn(),
     loadQueue: vi.fn(),
     queueReceipt: vi.fn(),
     queueControl: vi.fn(),
@@ -31,6 +42,8 @@ const fixture = vi.hoisted(() => ({
   run: vi.fn(),
   readJournal: vi.fn(),
   navigate: vi.fn(),
+  refreshCancellations: vi.fn(),
+  observeCancellations: vi.fn(),
 }));
 function readAtom(atom: unknown) {
   switch (atom) {
@@ -59,15 +72,26 @@ function threads() {
       queueAtom: () => "queue",
       loadIndex: "loadIndex",
       loadHistory: "loadHistory",
+      refreshPlacement: "refreshPlacement",
       loadQueue: "loadQueue",
       queueReceipt: "queueReceipt",
       queueControl: "queueControl",
       downloadAttachment: "downloadAttachment",
     },
     openPortableThreadChat: "openChat",
-    threadVmControls: { action: "action", capabilitiesAtom: "capabilities" },
+    threadVmControls: {
+      action: "action",
+      capabilitiesAtom: "capabilities",
+      refreshStatus: "refreshStatus",
+    },
     threadVmActionJournal: {},
-    threadQueueControlJournal: { read: fixture.readJournal },
+    threadQueueControlJournal: {
+      read: fixture.readJournal,
+      refresh: async (_scope: unknown, read: () => Promise<unknown>) => {
+        await read();
+        return null;
+      },
+    },
   };
 }
 function useJournal() {
@@ -82,7 +106,19 @@ vi.mock("../../state/use-thread-vm-actions", () => ({ useThreadVmActionJournal: 
 vi.mock("../../state/thread-move-submissions", () => ({
   threadMoveRelayUrl: () => fixture.relayUrl,
 }));
-vi.mock("./ThreadVmControls", () => ({ ThreadVmControls: () => <div>VM controls</div> }));
+vi.mock("./ThreadVmControls", () => ({
+  ThreadVmControlsProvider: ({ children }: PropsWithChildren) => children,
+  ThreadVmRecoveryControls: () => <div>VM controls</div>,
+}));
+vi.mock("./ThreadMoveQueueItem", () => ({
+  useThreadMovePlacement: (_environmentId: string, threadId: string) =>
+    fixture.index.entries.find((row) => row.placement.threadId === threadId)?.placement,
+  useSavedThreadMoveCancellation: () => ({
+    refresh: fixture.refreshCancellations,
+    observe: fixture.observeCancellations,
+  }),
+  SavedThreadQueue: () => <div>Move queue</div>,
+}));
 vi.mock("../ui/button", () => ({ Button: "button" }));
 vi.mock("../ui/badge", () => ({ Badge: "span" }));
 vi.mock("../ui/tooltip", () => ({
@@ -151,7 +187,22 @@ vi.mock("../../../../mobile/src/state/thread-move-submissions", () => ({
   threadMoveRelayUrl: () => fixture.relayUrl,
 }));
 vi.mock("../../../../mobile/src/features/threads/ThreadVmControls", () => ({
-  ThreadVmControls: () => <div>VM controls</div>,
+  ThreadVmControlsProvider: ({ children }: PropsWithChildren) => children,
+  ThreadVmRecoveryControls: () => <div>VM controls</div>,
+}));
+vi.mock("../../../../mobile/src/features/threads/ThreadMoveQueueItem", () => ({
+  useThreadMovePlacement: (_environmentId: string, threadId: string) =>
+    fixture.index.entries.find((row) => row.placement.threadId === threadId)?.placement,
+  useSavedThreadMoveCancellation: () => ({
+    refresh: fixture.refreshCancellations,
+    observe: fixture.observeCancellations,
+  }),
+  SavedThreadQueue: () => <div>Move queue</div>,
+}));
+vi.mock("../../../../mobile/src/features/threads/SavedConversationMessage", () => ({
+  SavedConversationMessage: ({ message }: { message: { text: string } }) => (
+    <div>{message.text}</div>
+  ),
 }));
 
 import { PortableThreadLibrary } from "./PortableThreadLibrary";
@@ -238,6 +289,15 @@ for (const [surface, Component] of [
       fixture.index = { entries: [entry("First"), entry("Second")], next: null };
       for (const fn of Object.values(fixture.commands))
         fn.mockResolvedValue({ _tag: "Success", value: null });
+      fixture.commands.loadQueue.mockImplementation(async ({ threadId }) => ({
+        _tag: "Success",
+        value: { threadId, generation: 2, queue: emptyThreadPromptQueue() },
+      }));
+      fixture.refreshCancellations.mockResolvedValue(undefined);
+      fixture.commands.refreshPlacement.mockResolvedValue({
+        _tag: "Success",
+        value: entry("First").placement,
+      });
       fixture.commands.openChat.mockResolvedValue({
         _tag: "Success",
         value: { environmentId: "vm", threadId: "First" },
@@ -311,6 +371,83 @@ for (const [surface, Component] of [
       expect(fixture.commands.loadHistory).toHaveBeenCalledTimes(1);
     });
 
+    it("offers one refresh in the saved view and waits for the current VM read", async () => {
+      await render();
+      await click("Details for First");
+      await click("Read conversation");
+      expect(
+        renderer!.root
+          .findAllByType("button")
+          .filter(
+            (node) =>
+              (node.props["aria-label"] ?? node.props.accessibilityLabel) === "Refresh thread",
+          ),
+      ).toHaveLength(1);
+      expect(content()).not.toContain("Refresh conversation");
+      expect(renderer!.root.findAllByProps({ "aria-label": "Refresh VM threads" })).toHaveLength(0);
+      const next = deferred<{ _tag: "Success"; value: null }>();
+      fixture.commands.refreshStatus.mockImplementation(() => next.promise);
+      await click("Refresh thread");
+      const refresh = renderer!.root
+        .findAllByType("button")
+        .find(
+          (node) =>
+            (node.props["aria-label"] ?? node.props.accessibilityLabel) === "Refresh thread",
+        )!;
+      expect(refresh.props.disabled).toBe(true);
+      await act(async () => {
+        (refresh.props.onClick ?? refresh.props.onPress)();
+      });
+      expect(fixture.commands.refreshPlacement).toHaveBeenCalledTimes(1);
+      expect(fixture.commands.refreshStatus).toHaveBeenCalledWith({
+        environmentId: "vm",
+        threadId: "First",
+      });
+      expect(fixture.commands.loadHistory).toHaveBeenCalledWith({
+        threadId: "First",
+        refresh: true,
+      });
+      await act(async () => next.resolve({ _tag: "Success", value: null }));
+      expect(refresh.props.disabled).toBe(false);
+      expect(fixture.commands.openChat).not.toHaveBeenCalled();
+      expect(fixture.run).not.toHaveBeenCalled();
+    });
+
+    it("keeps the header busy until pending cancellation receipts have been reconciled", async () => {
+      await render();
+      await click("Details for First");
+      await click("Read conversation");
+      const next = deferred<void>();
+      const previousReads = fixture.commands.loadQueue.mock.calls.length;
+      fixture.refreshCancellations.mockImplementation(() => next.promise);
+      await click("Refresh thread");
+      const refresh = renderer!.root
+        .findAllByType("button")
+        .find(
+          (node) =>
+            (node.props["aria-label"] ?? node.props.accessibilityLabel) === "Refresh thread",
+        )!;
+      expect(refresh.props.disabled).toBe(true);
+      expect(fixture.commands.loadQueue).toHaveBeenCalledTimes(previousReads);
+      await act(async () => next.resolve(undefined));
+      expect(fixture.commands.loadQueue).toHaveBeenCalledTimes(previousReads + 1);
+      expect(refresh.props.disabled).toBe(false);
+    });
+    it("refreshes retained history even when the queue read fails", async () => {
+      await render();
+      await click("Details for First");
+      await click("Read conversation");
+      fixture.commands.loadQueue.mockRejectedValue(new Error("Queue offline"));
+      await click("Refresh thread");
+      expect(fixture.commands.loadHistory).toHaveBeenCalledWith({
+        threadId: "First",
+        refresh: true,
+      });
+      expect(content()).toContain("Queue: Queue offline");
+      expect(fixture.commands.refreshStatus).toHaveBeenCalledTimes(1);
+      expect(fixture.commands.openChat).not.toHaveBeenCalled();
+    });
+
     it("opens the current placement without dispatching a VM action", async () => {
       fixture.index.entries = [entry("First")];
       await render();
@@ -366,6 +503,7 @@ for (const [surface, Component] of [
       expect(content()).toContain("Updating");
       expect(content()).not.toContain("Ready");
       await click("Manage VM");
+      expect(content()).not.toContain("Move queue");
       expect(content()).toContain("VM controls");
       expect(fixture.commands.openChat).not.toHaveBeenCalled();
       expect(fixture.run).not.toHaveBeenCalled();

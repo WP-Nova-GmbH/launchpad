@@ -19,6 +19,8 @@ export function createThreadMoveCancellation() {
     return value?.input.commandId === input.commandId ? value : undefined;
   };
   return {
+    pending: (scope: string) =>
+      scope === currentScope ? [...pending.values()].map((value) => value.input) : [],
     phase: (scope: string, messageId: string) =>
       scope === currentScope ? pending.get(messageId)?.phase : undefined,
     prepare: (scope: string, entry: ThreadMoveQueueEntry, create: () => CancellationInput) => {
@@ -44,12 +46,13 @@ export function createThreadMoveCancellation() {
           ? threadCommandAcceptance(submission, input.commandId)
           : { status: "accepted" as const };
       if (outcome.status === "rejected") pending.delete(input.messageId);
-      else value.phase = outcome.status === "accepted" ? "requested" : "unknown";
+      else if (value.phase !== "requested")
+        value.phase = outcome.status === "accepted" ? "requested" : "unknown";
       return outcome;
     },
     failed: (scope: string, input: CancellationInput) => {
       const value = current(scope, input);
-      if (value) value.phase = "unknown";
+      if (value && value.phase !== "requested") value.phase = "unknown";
     },
     observe: (
       scope: string,
@@ -67,13 +70,16 @@ export function createThreadMoveCancellation() {
         const entry = entries.find((candidate) => candidate.messageId === messageId);
         const receipt = commands.find((command) => command.commandId === value.input.commandId)
           ?.receipt?.receipt;
-        if (!entry || entry.kind !== "move" || entry.state === "cancelling") {
-          pending.delete(messageId);
-          changed = true;
-        } else if (receipt?.status === "rejected") {
+        if (receipt?.status === "rejected") {
           pending.delete(messageId);
           rejection = receipt.detail ?? "The cancellation request was rejected.";
           changed = true;
+        } else if (receipt?.status === "accepted" && value.phase !== "requested") {
+          value.phase = "requested";
+          changed = true;
+        }
+        if (!entry || entry.kind !== "move" || entry.state === "cancelling") {
+          changed = pending.delete(messageId) || changed;
         }
       }
       return { changed, rejection };

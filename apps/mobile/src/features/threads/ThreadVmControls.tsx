@@ -1,10 +1,16 @@
+import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import {
+  threadMoveQueueOwnership,
+  threadMoveQueuePresentation,
+} from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import { useThreadVmActionJournal } from "../../state/use-thread-vm-actions";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { threadMoveRelayUrl } from "../../state/thread-move-submissions";
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
-import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type { EnvironmentId, ThreadId, ThreadPromptQueue } from "@t3tools/contracts";
 import type {
   RelayThreadVmStatus,
+  RelayPortableThreadPlacement,
   RelayThreadVmReplacementCandidate,
   RelayThreadVmProviderAuth,
   RelayThreadVmProviderAuthBinding,
@@ -108,19 +114,30 @@ function Field({
   );
 }
 
+export function useThreadMovePlacement(environmentId: EnvironmentId, threadId: ThreadId) {
+  const session = useAtomValue(managedRelaySessionAtom);
+  const proofs = useAtomValue(portableThreadPlacementsAtom);
+  const location = useAtomValue(threadVmControls.locationViewAtom(environmentId, threadId));
+  return proofs?.session === session && proofs.relayUrl === threadMoveRelayUrl()
+    ? (proofs.placements.get(threadId) ?? location?.placement)
+    : location?.placement;
+}
+
 type ThreadVmUi = {
   label: string;
   caption: string;
   notice: ReactNode;
   refresh: ReactNode;
-  progressOnly?: boolean;
+  moveAction: { label: string; disabled: boolean; onPress: () => void } | null;
+  moveFeedback: ReactNode;
+  ownsMoveNotice: (queue: ThreadPromptQueue | null | undefined) => boolean;
   actions: (open: (action: () => void) => void, standalone?: boolean) => ReactNode;
 };
 const ThreadVmUiContext = createContext<ThreadVmUi | null>(null);
 export const useThreadVmUi = () => useContext(ThreadVmUiContext);
-export function ThreadVmNotice({ moving = false }: { moving?: boolean }) {
+export function ThreadVmNotice({ queue }: { queue?: ThreadPromptQueue | undefined }) {
   const ui = useThreadVmUi();
-  return moving && ui?.progressOnly ? null : (ui?.notice ?? null);
+  return queue && ui?.ownsMoveNotice(queue) ? null : (ui?.notice ?? null);
 }
 export function ThreadVmMenuActions({ onAction }: { onAction: (action: () => void) => void }) {
   return useThreadVmUi()?.actions(onAction) ?? null;
@@ -132,20 +149,26 @@ export function ThreadVmRefreshButton() {
 export function ThreadVmControls(props: { environmentId: EnvironmentId; threadId: ThreadId }) {
   return (
     <ThreadVmControlsProvider {...props}>
-      <StandaloneVmControls />
+      <ThreadVmRecoveryControls />
     </ThreadVmControlsProvider>
   );
 }
-function StandaloneVmControls() {
+export function ThreadVmRecoveryControls({
+  hideRefresh = false,
+  queue,
+}: {
+  hideRefresh?: boolean;
+  queue?: ThreadPromptQueue | null;
+}) {
   const ui = useThreadVmUi();
-  if (!ui) return null;
+  if (!ui || (queue !== undefined && ui.ownsMoveNotice(queue))) return null;
   return (
     <View className="gap-2">
       <View className="flex-row items-start justify-between gap-2">
         <View className="min-w-0 flex-1">
           {ui.notice ?? <Text className="text-sm font-medium text-foreground">{ui.label}</Text>}
         </View>
-        <ThreadVmRefreshButton />
+        {!hideRefresh && <ThreadVmRefreshButton />}
       </View>
       {ui.actions((action) => action(), true)}
     </View>
@@ -160,6 +183,7 @@ export function ThreadVmControlsProvider({
   threadId: ThreadId;
   children: ReactNode;
 }) {
+  const placement = useThreadMovePlacement(environmentId, threadId);
   const view = useAtomValue(threadVmControls.viewAtom(environmentId, threadId));
   const session = useAtomValue(managedRelaySessionAtom);
   const data = view?.data;
@@ -171,6 +195,7 @@ export function ThreadVmControlsProvider({
       status.savedDisk ||
       status.reset ||
       status.restore ||
+      status.finalSave ||
       status.replacement ||
       status.pendingProviderAuth)
       ? status
@@ -182,6 +207,7 @@ export function ThreadVmControlsProvider({
       environmentId={environmentId}
       threadId={threadId}
       status={activeStatus}
+      placement={placement}
       candidates={data?.candidates ?? []}
       readError={view?.error ?? null}
       deletionNote={
@@ -322,6 +348,7 @@ function ThreadVmControlPanel({
   environmentId,
   threadId,
   status,
+  placement,
   deletionNote,
   candidates,
   readError,
@@ -335,6 +362,7 @@ function ThreadVmControlPanel({
   environmentId: EnvironmentId;
   threadId: ThreadId;
   status: RelayThreadVmStatus | null;
+  placement: RelayPortableThreadPlacement | null | undefined;
   deletionNote: string | null;
   candidates: ReadonlyArray<RelayThreadVmReplacementCandidate>;
   readError: string | null;
@@ -723,27 +751,61 @@ function ThreadVmControlPanel({
               : presentation.label.replace(/^VM /, "").replace(/ VM$/, ""),
             notice,
             refresh,
-            progressOnly:
-              presentation.tone === "neutral" &&
-              !error &&
-              !lifecycle.error &&
-              !pending &&
-              !deletionNote,
+            moveAction:
+              presentation.primary && !deletionNote
+                ? {
+                    label: presentation.primary.label,
+                    disabled:
+                      disabled ||
+                      (presentation.primary.type !== "replace" &&
+                        presentation.disabledReason !== null),
+                    onPress: primary,
+                  }
+                : null,
+            moveFeedback: requestFeedback,
+            ownsMoveNotice: (queue: ThreadPromptQueue | null | undefined) => {
+              const ownership = threadMoveQueueOwnership({
+                entries: queue?.entries,
+                placement,
+                status,
+              });
+              if (!ownership.ownsNotice) return false;
+              const entry = queue?.entries.find(
+                (item) =>
+                  item.kind === "move" &&
+                  item.state !== "pending" &&
+                  item.operationId === placement?.operationId,
+              );
+              const move = threadMoveQueuePresentation({
+                entry: entry?.kind === "move" ? entry : undefined,
+                placement,
+                status,
+                providerAuth,
+                error: readError,
+              });
+              return (
+                !!move && (move.cancelling || !presentation.primary || move.tone !== "neutral")
+              );
+            },
             actions,
           }
         : null,
     [
       status,
+      placement,
+      providerAuth,
       readError,
       pending,
       deletionNote,
+      presentation.primary,
+      presentation.disabledReason,
+      primary,
+      disabled,
+      requestFeedback,
       presentation.label,
       presentation.ready,
-      presentation.tone,
       notice,
       refresh,
-      error,
-      lifecycle.error,
       actions,
     ],
   );
