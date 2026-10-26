@@ -502,6 +502,7 @@ import { RightPanelSheet } from "./RightPanelSheet";
 import { previewEnvironment } from "../state/preview";
 import { clampFileAttachmentUploadBytes } from "@t3tools/client-runtime/state/attachments";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { fileAttachmentCapabilityBlockReason } from "./chat/composerAttachmentFiles";
 import { assetEnvironment } from "../state/assets";
 import { readPreparedConnection } from "../state/session";
@@ -7268,6 +7269,7 @@ export default function ChatView(props: ChatViewProps) {
   );
 
   const onCompactContext = async () => {
+    const expectedAccountId = appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null;
     if (compactDisabled || !activeThread || !clientSettingsHydrated || sendInFlightRef.current) {
       return;
     }
@@ -7313,6 +7315,7 @@ export default function ChatView(props: ChatViewProps) {
               input: {
                 threadId,
                 message: { messageId, role: "user", text: "/compact", attachments: [] },
+                expectedAccountId,
                 modelSelection: context.selectedModelSelection,
                 runtimeMode,
                 interactionMode: context.interactionMode,
@@ -7374,6 +7377,7 @@ export default function ChatView(props: ChatViewProps) {
     if (overflow.length > 0 && activeThreadKey) {
       useQueuedMessageStore.getState().enqueue(activeThreadKey, {
         prompt: "",
+        ownerAccountId: appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null,
         images: overflow.filter((attachment) => attachment.type === "image"),
         files: overflow.filter((attachment) => attachment.type === "file"),
         terminalContexts: [],
@@ -7426,6 +7430,17 @@ export default function ChatView(props: ChatViewProps) {
     queuedMessage?: QueuedComposerMessage,
   ) => {
     e?.preventDefault();
+    const expectedAccountId = appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null;
+    if (queuedMessage && queuedMessage.ownerAccountId !== expectedAccountId) {
+      if (activeThreadKey)
+        useQueuedMessageStore.getState().holdAtFront(activeThreadKey, queuedMessage);
+      if (activeThread)
+        setThreadError(
+          activeThread.id,
+          "This message was queued under another account. Switch back, or restore it to the composer and send it again.",
+        );
+      return;
+    }
     // Typed out in full rather than picked from the menu. Attachments or contexts
     // mean the user is sending a prompt, so those go through as usual.
     if (
@@ -7693,6 +7708,7 @@ export default function ChatView(props: ChatViewProps) {
       clearComposerDraftContent(composerDraftTarget);
       composerRef.current?.resetCursorState();
       const followUpSent = await onSubmitPlanFollowUp({
+        expectedAccountId,
         text: followUp.text,
         context: buildMessageContext({
           terminalContexts: sendableComposerTerminalContexts,
@@ -7785,6 +7801,7 @@ export default function ChatView(props: ChatViewProps) {
       }
       useQueuedMessageStore.getState().enqueue(activeThreadKey, {
         prompt: promptForSend,
+        ownerAccountId: expectedAccountId,
         images: [...composerImages],
         files: [...composerFiles],
         terminalContexts: [...composerTerminalContexts],
@@ -8142,6 +8159,7 @@ export default function ChatView(props: ChatViewProps) {
                 environmentId,
                 input: {
                   threadId: targetThreadId,
+                  expectedAccountId,
                   message: {
                     messageId: targetMessageId,
                     role: "user",
@@ -8541,6 +8559,7 @@ export default function ChatView(props: ChatViewProps) {
         environmentId,
         input: {
           threadId: threadIdForSend,
+          expectedAccountId,
           message: {
             messageId: messageIdForSend,
             role: "user",
@@ -9121,10 +9140,12 @@ export default function ChatView(props: ChatViewProps) {
       text,
       context,
       interactionMode: nextInteractionMode,
+      expectedAccountId,
     }: {
       text: string;
       context?: ReturnType<typeof buildMessageContext>;
       interactionMode: "default" | "plan";
+      expectedAccountId: string | null;
       // A false return leaves ownership with the composer. A retained shared
       // submission owns its payload even when its acceptance is still unknown.
     }): Promise<boolean> => {
@@ -9212,6 +9233,7 @@ export default function ChatView(props: ChatViewProps) {
           environmentId,
           input: {
             threadId: threadIdForSend,
+            expectedAccountId,
             message: {
               messageId: messageIdForSend,
               role: "user",
@@ -9297,6 +9319,7 @@ export default function ChatView(props: ChatViewProps) {
   );
 
   const onImplementPlanInNewThread = useCallback(async () => {
+    const expectedAccountId = appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null;
     if (
       !activeThread ||
       !activeProject ||
@@ -9370,6 +9393,7 @@ export default function ChatView(props: ChatViewProps) {
         environmentId,
         input: {
           threadId: nextThreadId,
+          expectedAccountId,
           message: {
             messageId,
             role: "user",

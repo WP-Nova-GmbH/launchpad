@@ -18,6 +18,8 @@ import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
   AuthAccessStreamEvent,
+  AuthCurrentSessionPresentation,
+  AuthSessionStreamError,
   EnvironmentAuthorizationError,
 } from "./auth.ts";
 import {
@@ -458,6 +460,7 @@ export const WS_METHODS = {
   subscribeServerConfig: "subscribeServerConfig",
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
+  subscribeAuthSession: "subscribeAuthSession",
   subscribeBackgroundPolicy: "subscribeBackgroundPolicy",
   subscribeResourceTelemetry: "subscribeResourceTelemetry",
 } as const;
@@ -504,20 +507,20 @@ const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, 
   error: Schema.Union([EnvironmentAuthorizationError, ProviderSetupError]),
 });
 
-export const WsServerAuthenticateProviderRpc = Rpc.make(WS_METHODS.serverAuthenticateProvider, {
+const WsServerAuthenticateProviderRpc = Rpc.make(WS_METHODS.serverAuthenticateProvider, {
   payload: ServerProviderAccountAuthInput,
   success: ServerProviderAccountAuthEvent,
   error: Schema.Union([ServerProviderAccountAuthError, EnvironmentAuthorizationError]),
   stream: true,
 });
 
-export const WsServerLogoutProviderRpc = Rpc.make(WS_METHODS.serverLogoutProvider, {
+const WsServerLogoutProviderRpc = Rpc.make(WS_METHODS.serverLogoutProvider, {
   payload: ServerProviderAccountAuthInput,
   success: ServerProviderUpdatedPayload,
   error: Schema.Union([ServerProviderAccountAuthError, EnvironmentAuthorizationError]),
 });
 
-export const WsServerExportProviderAccountRpc = Rpc.make(WS_METHODS.serverExportProviderAccount, {
+const WsServerExportProviderAccountRpc = Rpc.make(WS_METHODS.serverExportProviderAccount, {
   payload: ServerProviderAccountExportInput,
   success: ServerProviderAccountExport,
   error: Schema.Union([ServerProviderAccountExportError, EnvironmentAuthorizationError]),
@@ -1277,7 +1280,7 @@ const WsDeviceTestHostRpc = Rpc.make(WS_METHODS.deviceTestHost, {
   error: Schema.Union([DeviceError, EnvironmentAuthorizationError]),
 });
 
-export const WsOrchestrationReportThreadPresenceRpc = Rpc.make(
+const WsOrchestrationReportThreadPresenceRpc = Rpc.make(
   ORCHESTRATION_WS_METHODS.reportThreadPresence,
   {
     payload: ThreadPresenceReportInput,
@@ -1285,7 +1288,7 @@ export const WsOrchestrationReportThreadPresenceRpc = Rpc.make(
   },
 );
 
-export const WsOrchestrationSubscribeThreadPresenceRpc = Rpc.make(
+const WsOrchestrationSubscribeThreadPresenceRpc = Rpc.make(
   ORCHESTRATION_WS_METHODS.subscribeThreadPresence,
   {
     payload: Schema.Struct({}),
@@ -1443,6 +1446,13 @@ const WsSubscribeServerLifecycleRpc = Rpc.make(WS_METHODS.subscribeServerLifecyc
   payload: Schema.Struct({}),
   success: ServerLifecycleStreamEvent,
   error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
+const WsSubscribeAuthSessionRpc = Rpc.make(WS_METHODS.subscribeAuthSession, {
+  payload: Schema.Struct({}),
+  success: Schema.NullOr(AuthCurrentSessionPresentation),
+  error: Schema.Union([AuthSessionStreamError, EnvironmentAuthorizationError]),
   stream: true,
 });
 
@@ -1606,6 +1616,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
+  WsSubscribeAuthSessionRpc,
   WsSubscribeBackgroundPolicyRpc,
   WsOrchestrationReportThreadPresenceRpc,
   WsOrchestrationSubscribeThreadPresenceRpc,

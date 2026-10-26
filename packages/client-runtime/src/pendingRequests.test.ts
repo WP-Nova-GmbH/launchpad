@@ -1,6 +1,12 @@
-import { EventId, TurnId, type OrchestrationThreadActivity } from "@t3tools/contracts";
+import {
+  EventId,
+  TurnId,
+  type OrchestrationThreadActivity,
+  type UserInputAttachmentAnswerPayload,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import { derivePendingRequests } from "./pendingRequests.ts";
+import { foldUserInputActivities, getQuestionAnswerPreview } from "./work-log/userInput.ts";
 
 let nextActivityId = 0;
 
@@ -27,6 +33,100 @@ function makeActivity(overrides: {
 }
 
 describe("pending approvals", () => {
+  it("keeps Launchpad's own readable Jira write approval", () => {
+    const requested = makeActivity({
+      kind: "approval.requested",
+      payload: {
+        requestId: "jira-write-approval",
+        requestType: "mcp_elicitation_approval",
+        appName: "Add Jira Comment",
+        detail: "Issue: NOCO-393\nConnection: team.atlassian.net\nComment: Done",
+      },
+    });
+    expect(derivePendingRequests([requested]).approvals[0]).toMatchObject({
+      requestId: "jira-write-approval",
+      appName: "Add Jira Comment",
+      detail: "Issue: NOCO-393\nConnection: team.atlassian.net\nComment: Done",
+    });
+  });
+
+  it("does not rename an MCP elicitation that claims a Launchpad-qualified app name", () => {
+    const requested = makeActivity({
+      kind: "approval.requested",
+      payload: {
+        requestId: "spoofed-mcp-approval",
+        requestType: "mcp_elicitation_approval",
+        appName: "mcp__t3-code__add_jira_comment",
+        detail: "Allow T3 Code · add_jira_comment on NOCO-393?",
+      },
+    });
+    expect(derivePendingRequests([requested]).approvals[0]).toMatchObject({
+      appName: "mcp__t3-code__add_jira_comment",
+      detail: "Allow T3 Code · add_jira_comment on NOCO-393?",
+    });
+  });
+
+  it("keeps unrelated approval text and choices verbatim", () => {
+    const requested = makeActivity({
+      kind: "approval.requested",
+      payload: {
+        requestId: "other-approval",
+        requestType: "mcp_elicitation_approval",
+        appName: "Another app",
+        detail: "Review code using `add_jira_comment`?",
+        options: [{ decision: "accept", label: "Inspect add_jira_comment" }],
+      },
+    });
+    expect(derivePendingRequests([requested]).approvals[0]).toMatchObject({
+      appName: "Another app",
+      detail: "Review code using `add_jira_comment`?",
+      options: [{ label: "Inspect add_jira_comment" }],
+    });
+  });
+
+  it.each(["add_jira_comment", "mcp__other_server__add_jira_comment"])(
+    "does not attribute another MCP app named %s to Launchpad",
+    (appName) => {
+      const requested = makeActivity({
+        kind: "approval.requested",
+        payload: {
+          requestId: "foreign-mcp-approval",
+          requestType: "mcp_elicitation_approval",
+          appName,
+          detail: `Allow ${appName} to inspect this issue?`,
+        },
+      });
+      expect(derivePendingRequests([requested]).approvals[0]).toMatchObject({
+        appName,
+        detail: `Allow ${appName} to inspect this issue?`,
+      });
+    },
+  );
+
+  it("names an exact Launchpad dynamic tool call without changing other command text", () => {
+    const requested = makeActivity({
+      kind: "approval.requested",
+      payload: {
+        requestId: "dynamic-jira-write",
+        requestType: "dynamic_tool_call",
+        detail: "t3-code_add_jira_comment",
+      },
+    });
+    expect(derivePendingRequests([requested]).approvals[0]?.detail).toBe("Add Jira Comment");
+  });
+
+  it("keeps an unqualified dynamic tool name exact", () => {
+    const requested = makeActivity({
+      kind: "approval.requested",
+      payload: {
+        requestId: "foreign-dynamic-tool",
+        requestType: "dynamic_tool_call",
+        detail: "add_jira_comment",
+      },
+    });
+    expect(derivePendingRequests([requested]).approvals[0]?.detail).toBe("add_jira_comment");
+  });
+
   it.each([{}, { requestType: "unknown" }])(
     "exposes legacy OpenCode approvals without a known request kind: %j",
     (legacyPayload) => {
@@ -246,6 +346,39 @@ describe("pending approvals", () => {
 });
 
 describe("pending questions", () => {
+  it("preserves exact identifiers in both a general question and its answer history", () => {
+    const requested = makeActivity({
+      kind: "user-input.requested",
+      payload: {
+        requestId: "jira-write-question",
+        questions: [
+          {
+            id: "tool_choice",
+            header: "add_jira_comment",
+            question: "Which code reference should change: add_jira_comment or edit_jira_issue?",
+            options: [{ label: "add_jira_comment", description: "Post it" }],
+            multiSelect: false,
+          },
+        ],
+      },
+    });
+    expect(derivePendingRequests([requested]).userInputs[0]?.questions[0]).toEqual({
+      id: "tool_choice",
+      header: "add_jira_comment",
+      question: "Which code reference should change: add_jira_comment or edit_jira_issue?",
+      options: [{ label: "add_jira_comment", description: "Post it" }],
+      multiSelect: false,
+    });
+    const submitted = makeActivity({
+      kind: "user-input.answer-submitted",
+      payload: { requestId: "jira-write-question", answers: { tool_choice: "add_jira_comment" } },
+    });
+    const [history] = foldUserInputActivities([requested, submitted]);
+    expect(getQuestionAnswerPreview(history!.payload as UserInputAttachmentAnswerPayload)).toBe(
+      "add_jira_comment",
+    );
+  });
+
   it("preserves native answer keys while ignoring malformed options", () => {
     const question = {
       id: "  Which path?\n",

@@ -1,18 +1,17 @@
-import { T3_PROJECT_FILE_NAME, type T3ProjectFile } from "@t3tools/contracts";
-import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
+import { type ResolvedProjectFile } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { createContext, type ReactNode, useContext, useMemo } from "react";
 
 import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
-import { getProjectFileQueryAtom, optimisticFileAtom } from "../files/projectFilesQueryState";
+import { projectEnvironment } from "../../state/projects";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
 import { resolveScopedSettingsTargets, selectScopedSettingsEnvironments } from "./scopedSettings";
 import { resolveSettingsScope, type SettingsScopeSearch } from "./settingsScope";
 
 /**
- * Each member's decoded t3.json, so file-backed settings show the file as a
+ * Each member's decoded launchpad.json, so file-backed settings show the file as a
  * layer in the inheritance chain. A member is only present once its read has
  * settled; the query atom caches per (environment, cwd).
  */
@@ -22,29 +21,16 @@ function useMemberProjectFiles(scope: ReturnType<typeof resolveSettingsScope>) {
     useMemo(
       () =>
         Atom.make((get) => {
-          const files = new Map<string, T3ProjectFile | null>();
+          const files = new Map<string, ResolvedProjectFile | null>();
           for (const member of members) {
             const result = get(
-              getProjectFileQueryAtom(
-                member.environmentId,
-                member.workspaceRoot,
-                T3_PROJECT_FILE_NAME,
-              ),
+              projectEnvironment.projectConfig({
+                environmentId: member.environmentId,
+                cwd: member.workspaceRoot,
+              }),
             );
-            if (result.waiting) continue;
-            // A pending in-app save overlays the query, like useProjectFileQuery.
-            const data =
-              get(
-                optimisticFileAtom(
-                  member.environmentId,
-                  member.workspaceRoot,
-                  T3_PROJECT_FILE_NAME,
-                ),
-              )?.data ?? Option.getOrNull(AsyncResult.value(result));
-            files.set(
-              member.physicalProjectKey,
-              data === null || data.truncated ? null : parseT3ProjectFile(data.contents),
-            );
+            if (result.waiting || result._tag === "Initial") continue;
+            files.set(member.physicalProjectKey, Option.getOrNull(AsyncResult.value(result)));
           }
           return files;
         }),

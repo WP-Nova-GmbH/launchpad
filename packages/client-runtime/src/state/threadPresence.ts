@@ -13,7 +13,6 @@ import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { managedRelaySessionAtom } from "../relay/managedRelayState.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import {
   createEnvironmentRpcCommand,
@@ -34,7 +33,13 @@ export interface ThreadPresencePerson {
   readonly displayName: string | null;
   readonly imageUrl: string | null;
   readonly typing: boolean;
+  readonly email: string | null;
+  readonly userId: string | null;
+  readonly clientDetails: string | null;
+  readonly isSelf: boolean;
 }
+
+const nonEmpty = (value: string | null | undefined) => value?.trim() || null;
 
 const EMPTY_PEOPLE: ReadonlyArray<ThreadPresencePerson> = [];
 
@@ -46,29 +51,52 @@ const EMPTY_PEOPLE: ReadonlyArray<ThreadPresencePerson> = [];
 export function collapseThreadPresence(
   participants: ReadonlyArray<ThreadPresenceParticipant>,
   threadId: ScopedThreadRef["threadId"],
-  ownUserId: string | null,
+  viewer: ThreadPresenceSnapshot["viewer"] | null,
+  includeViewer = false,
 ): ReadonlyArray<ThreadPresencePerson> {
   const people = new Map<string, ThreadPresencePerson>();
   for (const participant of participants) {
     if (participant.threadId !== threadId) continue;
-    if (participant.user !== null && participant.user.userId === ownUserId) continue;
+    const isSelf =
+      participant.user !== null
+        ? participant.user.userId === viewer?.userId
+        : participant.sessionId === viewer?.sessionId;
+    if (isSelf && !includeViewer) continue;
     const key =
       participant.user === null
-        ? `connection:${participant.connectionId}`
+        ? `session:${participant.sessionId}`
         : `user:${participant.user.userId}`;
     const existing = people.get(key);
+    const device =
+      [participant.clientOs, participant.clientBrowser].filter(Boolean).join(" · ") ||
+      (participant.clientDeviceType === "unknown" ? "Client" : participant.clientDeviceType);
     people.set(key, {
       key,
-      displayName: participant.user?.displayName ?? participant.clientLabel ?? null,
-      imageUrl: participant.user?.imageUrl ?? null,
+      displayName:
+        existing?.displayName ??
+        nonEmpty(participant.user?.displayName) ??
+        (participant.user === null ? (nonEmpty(participant.clientLabel) ?? device) : null),
+      imageUrl: existing?.imageUrl ?? nonEmpty(participant.user?.imageUrl),
+      email: existing?.email ?? nonEmpty(participant.user?.email),
+      userId: participant.user?.userId ?? null,
+      clientDetails: participant.user === null ? device : null,
+      isSelf: (existing?.isSelf ?? false) || isSelf,
       typing: (existing?.typing ?? false) || participant.typing,
     });
   }
   return people.size === 0 ? EMPTY_PEOPLE : [...people.values()];
 }
 
-function nameOf(person: ThreadPresencePerson): string {
-  return person.displayName ?? "Someone";
+export function threadPresenceName(person: ThreadPresencePerson): string {
+  return person.displayName ?? person.email ?? "Member";
+}
+
+export function threadPresenceInitials(person: ThreadPresencePerson): string {
+  if (!person.displayName) return person.email?.slice(0, 1).toUpperCase() ?? "?";
+  const parts = person.displayName.trim().split(/\s+/);
+  return (
+    (parts[0]?.[0] ?? "") + (parts.length > 1 ? (parts.at(-1)?.[0] ?? "") : "")
+  ).toUpperCase();
 }
 
 function joinNames(names: ReadonlyArray<string>): string {
@@ -82,10 +110,10 @@ export function threadPresenceLabel(people: ReadonlyArray<ThreadPresencePerson>)
   if (people.length === 0) return null;
   const typing = people.filter((person) => person.typing);
   if (typing.length > 0) {
-    const names = typing.map(nameOf);
+    const names = typing.map(threadPresenceName);
     return typing.length === 1 ? `${names[0]} is typing…` : `${joinNames(names)} are typing…`;
   }
-  const names = people.map(nameOf);
+  const names = people.map(threadPresenceName);
   return people.length === 1 ? `${names[0]} is here` : `${joinNames(names)} are here`;
 }
 
@@ -99,24 +127,27 @@ export function createThreadPresenceAtoms<R, ER>(
   });
 
   const peopleAtomFamily = Atom.family((key: string) => {
-    const ref = parseThreadKey(key);
+    const includeViewer = key.startsWith("all:");
+    const ref = parseThreadKey(includeViewer ? key.slice(4) : key);
     let previousSnapshot: ThreadPresenceSnapshot | null = null;
-    let previousOwnUserId: string | null = null;
     let previousValue = EMPTY_PEOPLE;
     return Atom.make((get): ReadonlyArray<ThreadPresencePerson> => {
       const snapshot = Option.getOrNull(
         AsyncResult.value(get(snapshotAtom({ environmentId: ref.environmentId, input: {} }))),
       );
-      const ownUserId = get(managedRelaySessionAtom)?.accountId ?? null;
-      if (snapshot === previousSnapshot && ownUserId === previousOwnUserId) {
+      if (snapshot === previousSnapshot) {
         return previousValue;
       }
       previousSnapshot = snapshot;
-      previousOwnUserId = ownUserId;
       previousValue =
         snapshot === null
           ? EMPTY_PEOPLE
-          : collapseThreadPresence(snapshot.participants, ref.threadId, ownUserId);
+          : collapseThreadPresence(
+              snapshot.participants,
+              ref.threadId,
+              snapshot.viewer ?? null,
+              includeViewer,
+            );
       return previousValue;
     }).pipe(
       Atom.setIdleTTL(PRESENCE_IDLE_TTL_MS),
@@ -127,6 +158,7 @@ export function createThreadPresenceAtoms<R, ER>(
   return {
     /** Everyone else on this thread, for the thread view to render. */
     peopleAtom: (ref: ScopedThreadRef) => peopleAtomFamily(threadKey(ref)),
+    participantsAtom: (ref: ScopedThreadRef) => peopleAtomFamily(`all:${threadKey(ref)}`),
     /** Tell the environment which thread this client is on and whether it is typing. */
     report: createEnvironmentRpcCommand(runtime, {
       label: "environment-thread-presence:report",

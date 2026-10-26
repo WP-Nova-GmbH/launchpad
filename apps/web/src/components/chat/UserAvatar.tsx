@@ -30,7 +30,7 @@ export function UserAvatar({
     <span
       aria-label={label}
       className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-full bg-muted text-[0.6em] font-semibold leading-none text-muted-foreground",
+        "inline-flex shrink-0 items-center justify-center rounded-full bg-muted text-3xs font-semibold leading-none text-muted-foreground",
         className,
       )}
     >

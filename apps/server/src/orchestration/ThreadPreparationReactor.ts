@@ -127,7 +127,7 @@ export const reconcileSharedPreparations = Effect.gen(function* () {
   }
 });
 
-export const make = Effect.gen(function* () {
+const make = Effect.gen(function* () {
   const engine = yield* OrchestrationEngineService;
   const query = yield* ProjectionSnapshotQuery;
   const git = yield* GitWorkflowService;

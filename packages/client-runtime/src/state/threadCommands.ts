@@ -1,3 +1,5 @@
+import * as Effect from "effect/Effect";
+import { IssueTrackerClientRegistry } from "../relay/issueTrackerTurn.ts";
 import * as Crypto from "effect/Crypto";
 import { Atom } from "effect/unstable/reactivity";
 import {
@@ -183,13 +185,17 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     enqueuePrompt: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread.prompt.enqueue",
-      execute: (input: EnqueueThreadPromptInput) => enqueueThreadPrompt(input),
+      execute: (input: EnqueueThreadPromptInput, registry) =>
+        enqueueThreadPrompt(input).pipe(
+          Effect.provideService(IssueTrackerClientRegistry, registry),
+        ),
       scheduler,
       concurrency,
     }),
     editPrompt: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread.prompt.edit",
-      execute: (input: EditThreadPromptInput) => editThreadPrompt(input),
+      execute: (input: EditThreadPromptInput, registry) =>
+        editThreadPrompt(input).pipe(Effect.provideService(IssueTrackerClientRegistry, registry)),
       scheduler,
       concurrency,
     }),
@@ -328,13 +334,14 @@ export function createThreadEnvironmentAtoms<R, E>(
     startTurn: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:start-turn",
       execute: (input: StartThreadTurnInput, registry, environmentId) =>
-        registry
+        (registry
           .get(snapshotAtom(environmentId))
           ?.threads.some(
             (thread) => thread.id === input.threadId && thread.promptQueueSummary !== undefined,
           )
           ? enqueueThreadPrompt(input)
-          : startThreadTurn(input),
+          : startThreadTurn(input)
+        ).pipe(Effect.provideService(IssueTrackerClientRegistry, registry)),
       scheduler,
       concurrency,
     }),
@@ -346,7 +353,10 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     respondToApproval: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:respond-to-approval",
-      execute: (input: RespondToThreadApprovalInput) => respondToThreadApproval(input),
+      execute: (input: RespondToThreadApprovalInput, registry) =>
+        respondToThreadApproval(input).pipe(
+          Effect.provideService(IssueTrackerClientRegistry, registry),
+        ),
       scheduler,
       concurrency,
     }),

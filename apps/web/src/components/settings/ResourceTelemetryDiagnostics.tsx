@@ -968,13 +968,13 @@ export function ResourceTelemetryDiagnostics({
               <TooltipTrigger
                 render={
                   <Button
-                    size="icon-micro"
+                    size="icon-xs"
                     variant="ghost"
                     disabled={telemetry.isPending}
                     onClick={telemetry.refresh}
                     aria-label="Refresh resource telemetry"
                   >
-                    <RefreshIcon size="xs" refreshing={telemetry.isPending} />
+                    <RefreshIcon refreshing={telemetry.isPending} />
                   </Button>
                 }
               />
@@ -1085,7 +1085,7 @@ export function ResourceTelemetryDiagnostics({
         headerAction={
           collectorNeedsRetry ? (
             <Button size="xs" variant="outline" disabled={isRetrying} onClick={retryCollector}>
-              <RefreshIcon size="xs" refreshing={isRetrying} />
+              <RefreshIcon refreshing={isRetrying} />
               Retry monitor
             </Button>
           ) : null
@@ -1217,13 +1217,13 @@ export function ResourceTelemetryDiagnostics({
           <div className="flex items-center gap-2">
             <HistoryWindowSelector selectedWindowMs={windowMs} onSelect={setWindowMs} />
             <Button
-              size="icon-micro"
+              size="icon-xs"
               variant="ghost"
               disabled={history.isPending}
               onClick={history.refresh}
               aria-label="Refresh resource history"
             >
-              <RefreshIcon size="xs" refreshing={history.isPending} />
+              <RefreshIcon refreshing={history.isPending} />
             </Button>
           </div>
         }

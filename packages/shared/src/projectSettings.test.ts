@@ -137,80 +137,85 @@ describe("resolveProjectSettings", () => {
   });
 });
 
-describe("resolveProjectSettings with a t3.json", () => {
-  it("walks project override, environment value, file, then built-in for file-backed keys", () => {
-    const file = { defaultThreadEnvMode: "worktree" as const };
-    const fromOverride = resolveProjectSettings(
-      {
-        ...DEFAULT_SERVER_SETTINGS,
-        projectSettingsOverrides: { [projectId]: { defaultThreadEnvMode: "local" } },
-      },
-      projectId,
-      null,
-      file,
-    );
-    expect(fromOverride.settings.defaultThreadEnvMode).toBe("local");
-    expect(fromOverride.sources.defaultThreadEnvMode).toBe("project");
+describe.each(["launchpad.json", "t3.json"] as const)(
+  "resolveProjectSettings with %s",
+  (fileName) => {
+    it("walks project override, environment value, file, then built-in for file-backed keys", () => {
+      const file = { fileName, config: { defaultThreadEnvMode: "worktree" as const } };
+      const fromOverride = resolveProjectSettings(
+        {
+          ...DEFAULT_SERVER_SETTINGS,
+          projectSettingsOverrides: { [projectId]: { defaultThreadEnvMode: "local" } },
+        },
+        projectId,
+        null,
+        file,
+      );
+      expect(fromOverride.settings.defaultThreadEnvMode).toBe("local");
+      expect(fromOverride.sources.defaultThreadEnvMode).toBe("project");
 
-    const fromEnvironment = resolveProjectSettings(
-      { ...DEFAULT_SERVER_SETTINGS, defaultThreadEnvMode: "local" },
-      projectId,
-      null,
-      file,
-    );
-    expect(fromEnvironment.settings.defaultThreadEnvMode).toBe("local");
-    expect(fromEnvironment.sources.defaultThreadEnvMode).toBe("environment");
+      const fromEnvironment = resolveProjectSettings(
+        { ...DEFAULT_SERVER_SETTINGS, defaultThreadEnvMode: "local" },
+        projectId,
+        null,
+        file,
+      );
+      expect(fromEnvironment.settings.defaultThreadEnvMode).toBe("local");
+      expect(fromEnvironment.sources.defaultThreadEnvMode).toBe("environment");
 
-    const fromFile = resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId, null, file);
-    expect(fromFile.settings.defaultThreadEnvMode).toBe("worktree");
-    expect(fromFile.sources.defaultThreadEnvMode).toBe("t3.json");
+      const fromFile = resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId, null, file);
+      expect(fromFile.settings.defaultThreadEnvMode).toBe("worktree");
+      expect(fromFile.sources.defaultThreadEnvMode).toBe(fileName);
 
-    const builtIn = resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId, null, null);
-    expect(builtIn.settings.defaultThreadEnvMode).toBe("local");
-    expect(builtIn.sources.defaultThreadEnvMode).toBe("environment");
-    // A stored null override defers like an unset one and is not reported
-    // as the project's value.
-    const nullOverride = resolveProjectSettings(
-      {
-        ...DEFAULT_SERVER_SETTINGS,
-        projectSettingsOverrides: { [projectId]: { defaultThreadEnvMode: null } as never },
-      },
-      projectId,
-      null,
-      file,
-    );
-    expect(nullOverride.settings.defaultThreadEnvMode).toBe("worktree");
-    expect(nullOverride.sources.defaultThreadEnvMode).toBe("t3.json");
-    // A file that does not mention the key leaves the source alone too.
-    expect(
-      resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId, null, {}).sources
-        .defaultThreadEnvMode,
-    ).toBe("environment");
-  });
-
-  it("resolves one key from the settings tier, then the file, then the built-in", () => {
-    expect(
-      resolveProjectFileBackedSetting("worktreeSubmodules", "none", {
-        worktreeSubmodules: "top-level",
-      }),
-    ).toEqual({ value: "none", source: "environment" });
-    expect(
-      resolveProjectFileBackedSetting("worktreeSubmodules", null, {
-        worktreeSubmodules: "top-level",
-      }),
-    ).toEqual({ value: "top-level", source: "t3.json" });
-    expect(resolveProjectFileBackedSetting("worktreeSubmodules", null, null)).toEqual({
-      value: "recursive",
-      source: "environment",
+      const builtIn = resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId, null, null);
+      expect(builtIn.settings.defaultThreadEnvMode).toBe("local");
+      expect(builtIn.sources.defaultThreadEnvMode).toBe("environment");
+      // A stored null override defers like an unset one and is not reported
+      // as the project's value.
+      const nullOverride = resolveProjectSettings(
+        {
+          ...DEFAULT_SERVER_SETTINGS,
+          projectSettingsOverrides: { [projectId]: { defaultThreadEnvMode: null } as never },
+        },
+        projectId,
+        null,
+        file,
+      );
+      expect(nullOverride.settings.defaultThreadEnvMode).toBe("worktree");
+      expect(nullOverride.sources.defaultThreadEnvMode).toBe(fileName);
+      // A file that does not mention the key leaves the source alone too.
+      expect(
+        resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId, null, { fileName, config: {} })
+          .sources.defaultThreadEnvMode,
+      ).toBe("environment");
     });
-  });
 
-  it("leaves settings untouched when no file is passed", () => {
-    expect(resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId).settings).toBe(
-      DEFAULT_SERVER_SETTINGS,
-    );
-  });
-});
+    it("resolves one key from the settings tier, then the file, then the built-in", () => {
+      expect(
+        resolveProjectFileBackedSetting("worktreeSubmodules", "none", {
+          fileName,
+          config: { worktreeSubmodules: "top-level" },
+        }),
+      ).toEqual({ value: "none", source: "environment" });
+      expect(
+        resolveProjectFileBackedSetting("worktreeSubmodules", null, {
+          fileName,
+          config: { worktreeSubmodules: "top-level" },
+        }),
+      ).toEqual({ value: "top-level", source: fileName });
+      expect(resolveProjectFileBackedSetting("worktreeSubmodules", null, null)).toEqual({
+        value: "recursive",
+        source: "environment",
+      });
+    });
+
+    it("leaves settings untouched when no file is passed", () => {
+      expect(resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId).settings).toBe(
+        DEFAULT_SERVER_SETTINGS,
+      );
+    });
+  },
+);
 
 describe("projectSettingsOverrides patches", () => {
   it("replaces a project's entry, removes it with null, and drops empty entries", () => {

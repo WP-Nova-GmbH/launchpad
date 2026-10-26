@@ -1,3 +1,4 @@
+import { issueTrackerActivityLabel } from "../../issueTrackerActivity";
 import { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
 export { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
 import * as Equal from "effect/Equal";
@@ -46,6 +47,8 @@ const TIMELINE_CONTENT_MAX_WIDTH = 768;
 const TIMELINE_MINIMAP_PERSISTENT_GUTTER = 48;
 
 function singleToolCallLabel(entry: WorkLogEntry): string {
+  const issueLabel = issueTrackerActivityLabel(entry, "completed");
+  if (issueLabel) return issueLabel;
   const toolPresentation = resolveWorkEntryToolPresentation(entry, "completed");
   if (toolPresentation) return toolPresentation.displayName;
   const command = entry.command?.trim();
@@ -55,6 +58,8 @@ function singleToolCallLabel(entry: WorkLogEntry): string {
 }
 
 export function workEntryDisplayLabel(entry: WorkLogEntry, workspaceRoot: string | undefined) {
+  const issueLabel = issueTrackerActivityLabel(entry);
+  if (issueLabel) return issueLabel;
   const toolPresentation = resolveWorkEntryToolPresentation(entry);
   if (toolPresentation) return toolPresentation.displayName;
   if (entry.command) return entry.command;
@@ -76,6 +81,8 @@ export function liveWorkEntryLabel(
   active: boolean,
 ) {
   const status = liveActivityToolStatus(entry.toolLifecycleStatus, active);
+  const issueLabel = issueTrackerActivityLabel({ ...entry, toolLifecycleStatus: status });
+  if (issueLabel) return issueLabel;
   const toolPresentation = resolveWorkEntryToolPresentation({
     ...entry,
     toolLifecycleStatus: status,

@@ -70,6 +70,11 @@ import { organizationProjectsApi, projectCatalogServerApi } from "./http/Project
 import { executorReleaseServerApi } from "./http/ExecutorReleaseApi.ts";
 import { organizationSkillsServerApi } from "./http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
+import { issueTrackersApi, issueTrackersServerApi } from "./http/IssueTrackersApi.ts";
+import { turnAuthLayer } from "./issueTrackers/TurnAuthorization.ts";
+import { issueTrackerCallbackRoute } from "./http/IssueTrackerCallbackRoute.ts";
+import * as IssueTrackerConnectionStore from "./issueTrackers/ConnectionStore.ts";
+import * as IssueTrackerWriteOperationStore from "./issueTrackers/WriteOperationStore.ts";
 import { sourceControlServerApi } from "./http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "./http/TenancyApi.ts";
 import { ManagedEndpointZone, RelayApiZone, RelayDeploymentConfig } from "./zone.ts";
@@ -177,6 +182,8 @@ const relayApiLayer = Layer.mergeAll(
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
+  issueTrackersApi,
+  issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
 );
@@ -377,6 +384,8 @@ export const ApiLive = Api.make(
             GithubApp.layer,
             GithubInstallations.layer,
             ProviderAccounts.layer,
+            IssueTrackerConnectionStore.layer,
+            IssueTrackerWriteOperationStore.layer,
             OrganizationSkills.layer,
             Machines.layer,
             OrganizationProjectCatalog.layer,
@@ -419,6 +428,7 @@ export const ApiLive = Api.make(
       Layer.provideMerge(relayClientAuthLayer),
       Layer.provideMerge(relayDpopClientAuthLayer),
       Layer.provideMerge(relayEnvironmentAuthLayer),
+      Layer.provideMerge(turnAuthLayer),
       Layer.provide(runtimeLayer),
     );
 
@@ -600,6 +610,7 @@ export const ApiLive = Api.make(
         HttpApiScalar.layer(RelayApi, { path: "/docs" }),
         relayDocsRedirectRoute,
         githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
+        issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
       ).pipe(
         Layer.provide([
           Etag.layerWeak,

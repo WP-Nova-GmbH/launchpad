@@ -27,24 +27,26 @@ export function DeviceToolVersions({
   const label = kind === "hub" ? "Device hub" : "Agent device";
   return (
     <Popover>
-      <PopoverTrigger
-        aria-label={
-          kind
-            ? `${label}: ${version ? `version ${version}` : selected ? "not installed" : "version unknown"}. Show details`
-            : undefined
-        }
-        render={<InlineButton tone="muted" />}
-      >
-        {kind
-          ? version
-            ? `v${version}`
-            : selected
-              ? "Not installed"
-              : "Version unknown"
-          : error
-            ? "Versions unavailable"
-            : "Versions"}
-      </PopoverTrigger>
+      <span className="inline-flex text-xs">
+        <PopoverTrigger
+          aria-label={
+            kind
+              ? `${label}: ${version ? `version ${version}` : selected ? "not installed" : "version unknown"}. Show details`
+              : undefined
+          }
+          render={<InlineButton tone="muted" />}
+        >
+          {kind
+            ? version
+              ? `v${version}`
+              : selected
+                ? "Not installed"
+                : "Version unknown"
+            : error
+              ? "Versions unavailable"
+              : "Versions"}
+        </PopoverTrigger>
+      </span>
       <PopoverPopup align="end" width="md">
         <PopoverTitle>{kind ? label : "Device tools"}</PopoverTitle>
         {tools ? (

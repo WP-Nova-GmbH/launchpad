@@ -1674,6 +1674,7 @@ export const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCrede
           userId: proof.sub,
           displayName: proof.name ?? null,
           imageUrl: proof.picture ?? null,
+          ...(proof.email ? { email: proof.email } : {}),
         },
       })
       .pipe(
@@ -1711,6 +1712,7 @@ export const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCrede
         userId: proof.sub,
         displayName: proof.name ?? null,
         imageUrl: proof.picture ?? null,
+        ...(proof.email ? { email: proof.email } : {}),
       },
     });
     const responsePayload = {

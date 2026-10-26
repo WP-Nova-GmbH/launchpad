@@ -49,6 +49,10 @@ From then on, executors clone, push, and open pull requests with the organizatio
 Work they do is authored by the App, and reaches exactly the repositories you installed it on.
 **Disconnect** forgets the installation; uninstalling the App on GitHub revokes access outright.
 
+## Issue trackers
+
+Jira and Linear connections belong to individual users. See [Personal issue trackers](composer.md#personal-issue-trackers) for setup and access in shared chats.
+
 ## Provider accounts
 
 Your executors need to be signed in to Codex, Claude, Cursor, or OpenCode to do anything, and

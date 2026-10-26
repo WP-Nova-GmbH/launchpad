@@ -1,5 +1,5 @@
 /**
- * T3ProjectFileLoader - Effect service that loads the checked-in `t3.json`
+ * T3ProjectFileLoader - Effect service that loads the checked-in `launchpad.json`
  * project file from a workspace root.
  *
  * Loading is best-effort: a missing file resolves to `Option.none`, and
@@ -16,7 +16,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
-import { T3_PROJECT_FILE_NAME, type T3ProjectFile } from "@t3tools/contracts";
+import { PROJECT_FILE_NAMES, type ResolvedProjectFile } from "@t3tools/contracts";
 import { T3ProjectFileFromJson } from "@t3tools/shared/t3ProjectFile";
 
 const decodeT3ProjectFileJson = Schema.decodeEffect(T3ProjectFileFromJson);
@@ -31,21 +31,21 @@ export class T3ProjectFileLoadError extends Schema.TaggedError<T3ProjectFileLoad
   },
 ) {
   override get message(): string {
-    return `Failed to ${this.operation} ${T3_PROJECT_FILE_NAME} at ${this.filePath}.`;
+    return `Failed to ${this.operation} project configuration at ${this.filePath}.`;
   }
 }
 
-/** Service tag for t3.json project file loading. */
+/** Service tag for launchpad.json project file loading. */
 export class T3ProjectFileLoader extends Context.Service<
   T3ProjectFileLoader,
   {
     /**
-     * Load and decode `t3.json` at the workspace root.
+     * Load and decode `launchpad.json` at the workspace root.
      *
      * Never fails: missing, unreadable, or invalid files resolve to
      * `Option.none` (invalid files are logged as warnings).
      */
-    readonly load: (workspaceRoot: string) => Effect.Effect<Option.Option<T3ProjectFile>>;
+    readonly load: (workspaceRoot: string) => Effect.Effect<Option.Option<ResolvedProjectFile>>;
   }
 >()("t3/project/T3ProjectFileLoader") {}
 
@@ -59,51 +59,66 @@ const logT3ProjectFileLoadError = (error: T3ProjectFileLoadError) =>
     }),
   );
 
-/** @public Service construction is part of the canonical Effect module API. */
-export const make = Effect.gen(function* () {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
+/** Reads the preferred file first, consulting the legacy name only when it is absent. */
+export const loadProjectFile = Effect.fn("T3ProjectFileLoader.load")(
+  function* (workspaceRoot: string) {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
 
-  const load: T3ProjectFileLoader["Service"]["load"] = Effect.fn("T3ProjectFileLoader.load")(
-    function* (workspaceRoot) {
-      const filePath = path.join(workspaceRoot, T3_PROJECT_FILE_NAME);
+    for (const fileName of PROJECT_FILE_NAMES) {
+      const filePath = path.join(workspaceRoot, fileName);
       const raw = yield* fileSystem.readFileString(filePath).pipe(
         Effect.asSome,
         Effect.catchTags({
           PlatformError: (error) =>
             error.reason._tag === "NotFound"
               ? Effect.succeed(Option.none<string>())
-              : logT3ProjectFileLoadError(
+              : Effect.fail(
                   new T3ProjectFileLoadError({
                     operation: "read",
                     workspaceRoot,
                     filePath,
                     cause: error,
                   }),
-                ).pipe(Effect.as(Option.none<string>())),
+                ),
         }),
       );
       if (Option.isNone(raw)) {
-        return Option.none<T3ProjectFile>();
+        continue;
       }
       return yield* decodeT3ProjectFileJson(raw.value).pipe(
-        Effect.asSome,
+        Effect.map((config) => Option.some({ fileName, config })),
         Effect.catchTags({
           SchemaError: (error) =>
-            logT3ProjectFileLoadError(
+            Effect.fail(
               new T3ProjectFileLoadError({
                 operation: "decode",
                 workspaceRoot,
                 filePath,
                 cause: error,
               }),
-            ).pipe(Effect.as(Option.none<T3ProjectFile>())),
+            ),
         }),
       );
-    },
-  );
+    }
+    return Option.none<ResolvedProjectFile>();
+  },
+  Effect.catchTag("T3ProjectFileLoadError", (error) =>
+    logT3ProjectFileLoadError(error).pipe(Effect.as(Option.none<ResolvedProjectFile>())),
+  ),
+);
 
-  return T3ProjectFileLoader.of({ load });
+/** @public Service construction is part of the canonical Effect module API. */
+export const make = Effect.gen(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  return T3ProjectFileLoader.of({
+    load: (workspaceRoot) =>
+      loadProjectFile(workspaceRoot).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+      ),
+  });
 });
 
 export const layer = Layer.effect(T3ProjectFileLoader, make);

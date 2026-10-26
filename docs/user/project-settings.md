@@ -48,10 +48,16 @@ project crumb.
 The Project category, shown while a project is selected, holds the project's name, icon, actions,
 checkouts and removal. Actions belong to a project: editing them creates the project's own list
 on each selected environment, and reset returns to the environment's shared list. A project's
-`t3.json` actions can be imported there.
+`launchpad.json` actions can be imported there.
 
-Settings a repository can also declare in `t3.json`, such as the workspace for new threads,
-resolve in one order: a project override, then the environment setting, then `t3.json`, then the
+Place `launchpad.json` at the repository root. Existing `t3.json` files remain supported when
+`launchpad.json` is absent. When both exist, only `launchpad.json` is used; their fields are not
+merged. Fix an invalid or unreadable `launchpad.json` rather than relying on the legacy file.
+Update each environment before migrating its repository to the new filename. The JSON format
+and existing `$schema` URL remain valid.
+
+Settings a repository can also declare in `launchpad.json`, such as the workspace for new threads,
+resolve in one order: a project override, then the environment setting, then `launchpad.json`, then the
 built-in default. Leave a setting on **Inherit** to let the next tier decide.
 Browser access changes apply when an agent session next starts.
 
@@ -59,7 +65,7 @@ New worktrees initialize git submodules recursively. If that step is slow becaus
 declares many nested submodules, set **Submodules** in **Settings → General** (with the project
 selected to override it there) to **Top level only** to stop at the ones the repository declares
 itself, or **Skip** to leave them for a setup script. It resolves in the same order as the
-workspace default: a `"worktreeSubmodules"` value in the `t3.json` of the branch being checked out
+workspace default: a `"worktreeSubmodules"` value in the `launchpad.json` of the branch being checked out
 applies when the project and environment are both on **Inherit**.
 
 ## Storage cleanup

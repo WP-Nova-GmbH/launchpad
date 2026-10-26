@@ -4645,6 +4645,8 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
         threadId,
       });
       assert.isTrue(Option.isNone(yield* snapshotQuery.getThreadShellById(threadId)));
+      // Stand in for the deletion reactor confirming task cleanup, which reopens the id.
+      yield* sql`DELETE FROM thread_cleanup_fences WHERE thread_id = ${threadId}`;
 
       // This projection-only fixture has no processes; acknowledge their cleanup before reusing the id.
       yield* sql`DELETE FROM thread_cleanup_fences WHERE thread_id = ${threadId}`;

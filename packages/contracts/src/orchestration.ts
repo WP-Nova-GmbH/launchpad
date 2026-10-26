@@ -6,7 +6,7 @@ import * as Struct from "effect/Struct";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import { ProviderOptionSelections } from "./model.ts";
 import { RepositoryIdentity, ThreadEnvMode, WorktreeSubmodules } from "./environment.ts";
-import { AuthSessionUser } from "./auth.ts";
+import { AuthSessionUser, AuthClientMetadataDeviceType } from "./auth.ts";
 import {
   ApprovalRequestId,
   CheckpointRef,
@@ -20,6 +20,7 @@ import {
   PositiveInt,
   ProjectId,
   ProviderItemId,
+  AuthSessionId,
   ThreadId,
   TrimmedNonEmptyString,
   TrimmedString,
@@ -550,7 +551,7 @@ export const OrchestrationProject = Schema.Struct({
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.NullOr(ModelSelection),
   // Per-project override for where new threads start. Null/absent means
-  // "no override": clients fall back to t3.json, then the global setting.
+  // "no override": clients fall back to launchpad.json, then the global setting.
   defaultThreadEnvMode: Schema.optional(Schema.NullOr(ThreadEnvMode)),
   // Opt-in because background sync performs network I/O and may move the checkout.
   // Optional on the wire so cached snapshots from older servers still decode.
@@ -600,6 +601,10 @@ export type OrchestrationMessage = typeof OrchestrationMessage.Type;
  * by device label instead.
  */
 export const ThreadPresenceParticipant = Schema.Struct({
+  sessionId: AuthSessionId,
+  clientDeviceType: AuthClientMetadataDeviceType,
+  clientOs: Schema.NullOr(Schema.String),
+  clientBrowser: Schema.NullOr(Schema.String),
   /** Opaque per-WebSocket id; two tabs of one browser are two participants. */
   connectionId: TrimmedNonEmptyString,
   threadId: ThreadId,
@@ -610,8 +615,11 @@ export const ThreadPresenceParticipant = Schema.Struct({
 });
 export type ThreadPresenceParticipant = typeof ThreadPresenceParticipant.Type;
 
-/** Everyone present on any thread of this environment except the receiving session. */
+/** Repository-visible participants, including the viewer for participant details. */
 export const ThreadPresenceSnapshot = Schema.Struct({
+  viewer: Schema.optionalKey(
+    Schema.Struct({ sessionId: AuthSessionId, userId: Schema.NullOr(Schema.String) }),
+  ),
   participants: Schema.Array(ThreadPresenceParticipant),
 });
 export type ThreadPresenceSnapshot = typeof ThreadPresenceSnapshot.Type;
@@ -916,6 +924,7 @@ export type ThreadPromptPauseReason = typeof ThreadPromptPauseReason.Type;
 
 export const ThreadPromptQueueEntry = Schema.Struct({
   kind: Schema.optional(Schema.Literal("prompt")),
+  issueTrackerAuthorizationId: Schema.optional(Schema.String),
   messageId: MessageId,
   text: Schema.String,
   attachments: Schema.Array(ChatAttachment),
@@ -1527,6 +1536,7 @@ const ThreadInteractionModeSetCommand = Schema.Struct({
 
 const PromptCommandFields = { commandId: CommandId, threadId: ThreadId, createdAt: IsoDateTime };
 const PromptMessage = Schema.Struct({
+  issueTrackerAuthorizationId: Schema.optional(Schema.String),
   text: Schema.String,
   attachments: Schema.Array(ChatAttachment),
   context: Schema.optional(OrchestrationMessageContext),
@@ -1552,6 +1562,7 @@ const ThreadPromptEnqueueCommand = Schema.Struct({
   author: Schema.optional(AuthSessionUser),
 });
 const ClientThreadPromptEnqueueCommand = Schema.Struct({
+  issueTrackerAuthorization: Schema.optional(Schema.String),
   type: Schema.Literal("thread.prompt.enqueue"),
   ...PromptEnqueueFields,
   message: Schema.Struct({ messageId: MessageId, ...ClientPromptMessage.fields }),
@@ -1561,14 +1572,17 @@ const ThreadPromptEditCommand = Schema.Struct({
   ...PromptCommandFields,
   messageId: MessageId,
   expectedRevision: NonNegativeInt,
+  expectedRuntimeMode: Schema.optional(RuntimeMode),
   message: PromptMessage,
   author: Schema.optional(AuthSessionUser),
 });
 const ClientThreadPromptEditCommand = Schema.Struct({
+  issueTrackerAuthorization: Schema.optional(Schema.String),
   type: Schema.Literal("thread.prompt.edit"),
   ...PromptCommandFields,
   messageId: MessageId,
   expectedRevision: NonNegativeInt,
+  expectedRuntimeMode: Schema.optional(RuntimeMode),
   message: ClientPromptMessage,
 });
 const ThreadPromptRemoveCommand = Schema.Struct({
@@ -1712,6 +1726,7 @@ const ThreadQueueFinalizeCommand = Schema.Struct({
 });
 
 export const ThreadTurnStartCommand = Schema.Struct({
+  issueTrackerAuthorizationId: Schema.optional(Schema.String),
   type: Schema.Literal("thread.turn.start"),
   commandId: CommandId,
   threadId: ThreadId,
@@ -1738,6 +1753,7 @@ export const ThreadTurnStartCommand = Schema.Struct({
 });
 
 const ClientThreadTurnStartCommand = Schema.Struct({
+  issueTrackerAuthorization: Schema.optional(Schema.String),
   type: Schema.Literal("thread.turn.start"),
   commandId: CommandId,
   threadId: ThreadId,
@@ -1771,6 +1787,7 @@ const ThreadApprovalRespondCommand = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   decision: ProviderApprovalDecision,
+  actorUserId: Schema.optional(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
 });
 
@@ -2414,6 +2431,7 @@ export const ThreadMessageSentPayload = Schema.Struct({
 });
 
 export const ThreadTurnStartRequestedPayload = Schema.Struct({
+  issueTrackerAuthorizationId: Schema.optional(Schema.String),
   threadId: ThreadId,
   messageId: MessageId,
   modelSelection: Schema.optional(ModelSelection),
@@ -2436,6 +2454,7 @@ export const ThreadApprovalResponseRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   decision: ProviderApprovalDecision,
+  actorUserId: Schema.optional(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
 });
 

@@ -1,3 +1,5 @@
+import { issueTrackerActivityPresentation } from "./issueTrackerActivity.ts";
+
 import {
   isToolLifecycleItemType,
   type AssetResource,
@@ -173,6 +175,7 @@ function resolveT3McpToolPresentation(
       : detail;
   return {
     displayName: `${verb} ${target}`,
+    issueUrl: undefined,
     icon:
       actionKind !== undefined
         ? ("pull-request" as const)
@@ -198,6 +201,8 @@ export function resolveWorkEntryToolPresentation(
   fallbackStatus?: "inProgress" | "completed",
 ) {
   const status = entry.toolLifecycleStatus ?? fallbackStatus;
+  const issue = issueTrackerActivityPresentation(entry, status);
+  if (issue) return issue;
   const data = entry.toolData;
   if (data !== null && typeof data === "object") {
     if (

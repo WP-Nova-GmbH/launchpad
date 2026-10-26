@@ -1,6 +1,13 @@
-import { type EnvironmentId, type ProjectReadFileResult, WS_METHODS } from "@t3tools/contracts";
+import {
+  type EnvironmentId,
+  type ProjectReadFileResult,
+  PROJECT_FILE_NAMES,
+  WS_METHODS,
+} from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
-import { Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/unstable/reactivity";
+
+import { resolveProjectConfig } from "./projectConfig.ts";
 
 import {
   createAtomCommandScheduler,
@@ -54,6 +61,30 @@ export function createProjectEnvironmentAtoms<R, E>(
     key: ({ environmentId, input }: { environmentId: string; input: { projectId: string } }) =>
       JSON.stringify([environmentId, input.projectId]),
   };
+  const readFile = createEnvironmentRpcQueryAtomFamily(runtime, {
+    label: "environment-data:projects:read-file",
+    tag: WS_METHODS.projectsReadFile,
+    staleTimeMs: 30_000,
+    idleTtlMs: 5 * 60_000,
+  });
+  const projectConfigFamily = Atom.family((key: string) => {
+    const [environmentId, cwd] = JSON.parse(key) as [EnvironmentId, string];
+    return Atom.readable(
+      (get) =>
+        resolveProjectConfig((relativePath) => {
+          const optimistic = get(
+            optimisticFileFamily(optimisticProjectFileKey({ environmentId, cwd, relativePath })),
+          );
+          const result = get(readFile({ environmentId, input: { cwd, relativePath } }));
+          return optimistic ? AsyncResult.success(optimistic.data) : result;
+        }),
+      (refresh) => {
+        for (const relativePath of PROJECT_FILE_NAMES) {
+          refresh(readFile({ environmentId, input: { cwd, relativePath } }));
+        }
+      },
+    );
+  });
   return {
     searchEntries: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:projects:search-entries",
@@ -66,12 +97,9 @@ export function createProjectEnvironmentAtoms<R, E>(
       staleTimeMs: 30_000,
       idleTtlMs: 5 * 60_000,
     }),
-    readFile: createEnvironmentRpcQueryAtomFamily(runtime, {
-      label: "environment-data:projects:read-file",
-      tag: WS_METHODS.projectsReadFile,
-      staleTimeMs: 30_000,
-      idleTtlMs: 5 * 60_000,
-    }),
+    readFile,
+    projectConfig: (target: { environmentId: EnvironmentId; cwd: string }) =>
+      projectConfigFamily(JSON.stringify([target.environmentId, target.cwd])),
     optimisticFile: (target: OptimisticProjectFileTarget) =>
       optimisticFileFamily(optimisticProjectFileKey(target)),
     create: createEnvironmentCommand(runtime, {

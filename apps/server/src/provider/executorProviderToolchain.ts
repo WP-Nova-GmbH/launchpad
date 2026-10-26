@@ -33,13 +33,13 @@ import * as ProviderRegistry from "./Services/ProviderRegistry.ts";
  * installs them. Antigravity is absent on purpose: its driver downloads its
  * own release (`AntigravityInstallation`), and Grok has no installable CLI.
  */
-export const NPM_INSTALLED_PROVIDERS: ReadonlyArray<ProviderDriverKind> = [
+const NPM_INSTALLED_PROVIDERS: ReadonlyArray<ProviderDriverKind> = [
   ProviderDriverKind.make("codex"),
   ProviderDriverKind.make("claudeAgent"),
   ProviderDriverKind.make("opencode"),
 ];
 
-export const CURSOR_PROVIDER = ProviderDriverKind.make("cursor");
+const CURSOR_PROVIDER = ProviderDriverKind.make("cursor");
 const CURSOR_INSTALL_SCRIPT_URL = "https://cursor.com/install";
 
 export class CursorInstallerFailedError extends Schema.TaggedError<CursorInstallerFailedError>()(

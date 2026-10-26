@@ -99,12 +99,14 @@ it.effect(
           "activated",
         ]);
       }).pipe(
-        Effect.provide([
-          Layer.succeed(RelayDb, { $client: sql } as unknown as RelayDb["Service"]),
-          Layer.succeed(RelayConfiguration, {
-            relayIssuer: "https://relay.example",
-          } as RelayConfiguration["Service"]),
-        ]),
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(RelayDb, { $client: sql } as unknown as RelayDb["Service"]),
+            Layer.succeed(RelayConfiguration, {
+              relayIssuer: "https://relay.example",
+            } as RelayConfiguration["Service"]),
+          ),
+        ),
       );
     }),
 );

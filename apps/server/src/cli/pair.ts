@@ -460,7 +460,9 @@ const ttlFlag = Flag.String("ttl").pipe(
 );
 
 const labelFlag = Flag.String("label").pipe(
-  Flag.withDescription("Optional label shown in the server's connections list."),
+  Flag.withDescription(
+    "Optional label for this pairing invitation. The connecting client chooses its own name.",
+  ),
   Flag.optional,
 );
 
@@ -485,7 +487,7 @@ export const pairCommand = Command.make("pair", {
   tailscaleServePort: tailscaleServePortFlag,
 }).pipe(
   Command.withDescription(
-    "Mint a pairing token for a running Launchpad server and print it as a QR code.",
+    "Mint a pairing token for a running Launchpad server and print it as a QR code. The connecting client chooses its name before completing pairing.",
   ),
   Command.withHandler((flags) =>
     Effect.gen(function* () {

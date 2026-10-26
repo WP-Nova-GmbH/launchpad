@@ -1,3 +1,4 @@
+import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -126,6 +127,12 @@ export class AuthSessionRepository extends Context.Service<
     readonly revokeAllExcept: (
       input: RevokeOtherAuthSessionsInput,
     ) => Effect.Effect<ReadonlyArray<AuthSessionId>, AuthSessionRepositoryError>;
+    readonly setLabel: (input: {
+      readonly sessionId: AuthSessionId;
+      readonly label: string;
+      readonly now: DateTime.Utc;
+      readonly connected: boolean;
+    }) => Effect.Effect<boolean, AuthSessionRepositoryError>;
     readonly setLastConnectedAt: (
       input: SetAuthSessionLastConnectedAtInput,
     ) => Effect.Effect<void, AuthSessionRepositoryError>;
@@ -508,6 +515,19 @@ export const make = Effect.gen(function* () {
       Effect.map((rows) => rows.map((row) => row.sessionId)),
     );
 
+  const setLabel: AuthSessionRepository["Service"]["setLabel"] = (input) =>
+    sql<{ sessionId: string }>`
+    UPDATE auth_sessions SET client_label = ${input.label}
+    WHERE session_id = ${input.sessionId} AND revoked_at IS NULL
+      AND (expires_at > ${DateTime.formatIso(input.now)} OR ${input.connected ? 1 : 0} = 1)
+    RETURNING session_id AS "sessionId"
+  `.pipe(
+      Effect.map((rows) => rows.length > 0),
+      Effect.mapError(
+        (cause) => new PersistenceSqlError({ operation: "AuthSessionRepository.setLabel", cause }),
+      ),
+    );
+
   const setLastConnectedAt: AuthSessionRepository["Service"]["setLastConnectedAt"] = (input) =>
     setLastConnectedAtRow(input).pipe(
       Effect.mapError(
@@ -538,6 +558,7 @@ export const make = Effect.gen(function* () {
     listActive,
     revoke,
     revokeAllExcept,
+    setLabel,
     setLastConnectedAt,
     setClientConnection,
   } satisfies AuthSessionRepository["Service"];

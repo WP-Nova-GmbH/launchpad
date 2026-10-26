@@ -320,7 +320,7 @@ function WhenVariableSelect({
 
   return (
     <Select value={value} onValueChange={(nextValue) => nextValue && onChange(nextValue)}>
-      <SelectTrigger size="compact" className="min-w-0 flex-1">
+      <SelectTrigger size="sm" className="min-w-0 flex-1">
         <SelectValue placeholder="Condition" />
         {unknownIdentifiers && unknownIdentifiers.length > 0 ? (
           <UnknownWhenVariableWarning identifiers={unknownIdentifiers} focusable={false} />
@@ -355,13 +355,13 @@ function WhenExpressionRemoveButton({
             type="button"
             variant="ghost"
             size="icon-sm"
-            className={cn("size-7", className)}
+            className={className}
             aria-label={label}
             onClick={onRemove}
           />
         }
       >
-        <MinusIcon aria-hidden className="size-3.5" />
+        <MinusIcon aria-hidden />
       </TooltipTrigger>
       <TooltipPopup side="top">{label}</TooltipPopup>
     </Tooltip>
@@ -395,7 +395,7 @@ function WhenExpressionNodeEditor({
           onPressedChange={(pressed) => onChange(setConditionNegated(node, pressed))}
           aria-label={`Negate ${condition.identifier}`}
           variant="outline"
-          size="compact"
+          size="sm"
           className="min-w-10"
         >
           Not
@@ -430,7 +430,7 @@ function WhenExpressionNodeEditor({
             onPressedChange={(pressed) => onChange(pressed ? node : node.node)}
             aria-label="Negate group"
             variant="outline"
-            size="compact"
+            size="sm"
             className="min-w-10"
           >
             Not
@@ -528,7 +528,7 @@ function WhenExpressionNodeEditor({
     >
       <div className="flex flex-wrap items-center gap-2">
         <Select value={operator} onValueChange={(value) => setOperator(value as BooleanOperator)}>
-          <SelectTrigger size="compact" className="w-24">
+          <SelectTrigger size="sm" className="w-24">
             <SelectValue />
           </SelectTrigger>
           <SelectContent alignItemWithTrigger={false} matchTriggerWidth={false}>
@@ -536,12 +536,12 @@ function WhenExpressionNodeEditor({
             <SelectItem value="or">or</SelectItem>
           </SelectContent>
         </Select>
-        <Button type="button" variant="outline" size="compact" onClick={addCondition}>
-          <PlusIcon className="size-3.5" />
+        <Button type="button" variant="outline" size="sm" onClick={addCondition}>
+          <PlusIcon />
           Condition
         </Button>
-        <Button type="button" variant="outline" size="compact" onClick={addGroup}>
-          <PlusIcon className="size-3.5" />
+        <Button type="button" variant="outline" size="sm" onClick={addGroup}>
+          <PlusIcon />
           Group
         </Button>
         {onRemove ? (
@@ -634,17 +634,17 @@ function WhenExpressionBuilder({
 
   return (
     <div className="w-[min(34rem,calc(100vw-2rem))] space-y-3">
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="text-sm font-medium text-foreground">When</div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button type="button" variant="outline" size="compact" onClick={addRootCondition}>
-            <PlusIcon className="size-3.5" />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" variant="outline" size="xs" onClick={addRootCondition}>
+            <PlusIcon />
             Condition
           </Button>
-          <Button type="button" variant="outline" size="compact" onClick={addRootGroup}>
-            <PlusIcon className="size-3.5" />
+          <Button type="button" variant="outline" size="xs" onClick={addRootGroup}>
+            <PlusIcon />
             Group
           </Button>
         </div>
@@ -658,7 +658,7 @@ function WhenExpressionBuilder({
             placeholder="Always"
             aria-invalid={Boolean(parseError)}
             aria-label="When expression"
-            size="compact"
+            size="sm"
             font="mono"
           />
           {unknownIdentifiers.length > 0 ? (
@@ -686,12 +686,12 @@ function WhenExpressionBuilder({
         ) : (
           <div className="rounded-md border border-dashed border-border/80 bg-muted/15 p-3">
             <div className="flex flex-wrap gap-2">
-              <Button type="button" size="compact" onClick={addRootCondition}>
-                <PlusIcon className="size-3.5" />
+              <Button type="button" size="sm" onClick={addRootCondition}>
+                <PlusIcon />
                 Condition
               </Button>
-              <Button type="button" variant="outline" size="compact" onClick={addRootGroup}>
-                <PlusIcon className="size-3.5" />
+              <Button type="button" variant="outline" size="sm" onClick={addRootGroup}>
+                <PlusIcon />
                 Group
               </Button>
             </div>
@@ -897,7 +897,7 @@ function WhenClauseControl({
         aria-label={`Edit when clause for ${label}`}
       >
         <span className="truncate font-mono">{expression || "Always"}</span>
-        <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+        <ChevronDownIcon className="shrink-0 opacity-60" />
       </PopoverTrigger>
       <PopoverContent align="start" sideOffset={6}>
         <WhenExpressionBuilder
@@ -939,7 +939,7 @@ function KeybindingRowMenu({
           />
         }
       >
-        <EllipsisIcon className="size-3.5" />
+        <EllipsisIcon />
       </MenuTrigger>
       <MenuPopup align="end">
         {canReset ? (
@@ -1216,7 +1216,7 @@ function NewKeybindingCancelIcon({
           />
         }
       >
-        <XIcon className="size-3.5" />
+        <XIcon />
       </TooltipTrigger>
       <TooltipPopup side="top">Cancel</TooltipPopup>
     </Tooltip>

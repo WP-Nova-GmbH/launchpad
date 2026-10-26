@@ -1,5 +1,6 @@
+import { PersonalIssueTrackers } from "../settings/PersonalIssueTrackers";
 import { UserButton, useAuth } from "@clerk/react";
-import { LogInIcon, ServerIcon, SmartphoneIcon } from "lucide-react";
+import { LinkIcon, LogInIcon, ServerIcon, SmartphoneIcon } from "lucide-react";
 
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "../ui/sidebar";
@@ -33,6 +34,13 @@ function ConfiguredT3ConnectSidebarAvatar() {
         },
       }}
     >
+      <UserButton.UserProfilePage
+        label="Connections"
+        labelIcon={<LinkIcon className="size-4" />}
+        url="connections"
+      >
+        <PersonalIssueTrackers />
+      </UserButton.UserProfilePage>
       <UserButton.UserProfilePage
         label="Mobile clients"
         labelIcon={<SmartphoneIcon className="size-4" />}

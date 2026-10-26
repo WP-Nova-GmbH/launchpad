@@ -137,3 +137,40 @@ sign-up. An enabled empty allowlist blocks all new sign-ups.
 
 Sign-up restrictions do not revoke an existing account's access. Ban the account in Clerk when
 its active sessions and future sign-ins must be disabled.
+
+## Personal issue trackers
+
+Linear uses its official MCP endpoints with OAuth dynamic client registration. No
+`LINEAR_CLIENT_ID` or `LINEAR_CLIENT_SECRET` is needed. Each user connects Linear in
+Account → Connections; operations use that user’s Linear permissions.
+
+The callback belongs to the relay, including when setup starts from a desktop or remote client:
+`<relay issuer>/v1/user/issue-trackers/linear/callback`. For a local pilot, set
+`DEV_RELAY_ISSUER` to the reachable relay origin and use an isolated `DEV_RELAY_DATABASE_URL`.
+The relay registers its callback dynamically. Initial read-only authorization uses
+`https://mcp.linear.app/mcp/readonly` and requests `read` access. Authorizing writes in
+Connections uses `https://mcp.linear.app/mcp` and requires the provider's write tools.
+
+Existing connections from the previous static OAuth application must reconnect after upgrading.
+Changing workspace requires explicit confirmation in Launchpad; the current connection stays
+available during authorization. See [Linear's MCP documentation](https://linear.app/docs/mcp).
+
+Jira also uses dynamic OAuth registration. Each user authorizes Atlassian
+in Account → Connections and chooses a site when their account has access to several sites.
+Read and search access use the permissions granted by that user’s account; authorizing
+writes adds Jira write access.
+
+Both connections keep provider credentials on the relay. The initiating user authorizes each
+prompt for its environment and thread, so interactive chats on local and managed environments
+can read and search issues. Former organization connections are retained but not used or
+reassigned; users must connect personally. Setup is available in web and desktop settings;
+chats can use the same personal connections from mobile.
+
+With write access authorized in Connections, agents can post comments and change an issue's
+title, status, or assignee. Linear descriptions can also be changed; Jira description changes
+are not supported. Each write uses the initiating user's connected account and follows the
+chat's approval mode. See [Personal issue trackers](../user/composer.md#personal-issue-trackers)
+for authorization and approval behavior.
+
+Automatic jobs, including webhook-triggered jobs, and external OpenCode servers are not
+supported by these connections.

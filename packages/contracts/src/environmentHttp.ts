@@ -18,6 +18,7 @@ import {
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
   AuthClientSession,
+  AuthRenameClientInput,
   AuthCreatePairingCredentialInput,
   AuthPairingCredentialResult,
   AuthPairingLink,
@@ -74,6 +75,9 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_scope",
   "scope_not_granted",
   "invalid_command",
+  "client_label_required",
+  "invalid_client_label",
+  "unsupported_protocol",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -123,6 +127,9 @@ export class EnvironmentRequestInvalidError extends Schema.TaggedError<Environme
   }
 
   override get message(): string {
+    if (this.reason === "client_label_required") return "Choose a client name before connecting.";
+    if (this.reason === "invalid_client_label")
+      return "Choose a client name between 1 and 80 characters.";
     return `The environment rejected the request (${this.reason}).`;
   }
 }
@@ -202,6 +209,7 @@ export class EnvironmentInternalError extends Schema.TaggedError<EnvironmentInte
 }
 
 export const EnvironmentResourceNotFoundReason = Schema.Literals([
+  "client_session_not_found",
   "thread_not_found",
   "project_not_found",
 ]);
@@ -315,6 +323,7 @@ export class EnvironmentCloudEndpointUnavailableError extends Schema.TaggedError
   }
 }
 const EnvironmentSessionCreationErrors = [
+  EnvironmentRequestInvalidError,
   EnvironmentAuthInvalidError,
   EnvironmentInternalError,
 ] as const;
@@ -502,6 +511,18 @@ class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       headers: OptionalBearerHeaders,
       success: Schema.Array(AuthClientSession),
       error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("renameClient", "/api/auth/clients/rename", {
+      headers: OptionalBearerHeaders,
+      payload: AuthRenameClientInput,
+      success: AuthClientSession,
+      error: [
+        ...EnvironmentScopedOperationErrors,
+        EnvironmentRequestInvalidError,
+        EnvironmentResourceNotFoundError,
+      ],
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(

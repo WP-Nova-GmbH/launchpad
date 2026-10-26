@@ -63,6 +63,7 @@ export function makeThreadCommandSync(
   transport: ThreadCommandTransport,
   normalize: (
     command: ClientOrchestrationCommand,
+    authenticatedUserId?: string,
   ) => Effect.Effect<OrchestrationCommand, OrchestrationDispatchCommandError>,
 ) {
   const fences = makeThreadExecutionFence(sql);
@@ -152,38 +153,51 @@ export function makeThreadCommandSync(
       // This reservation covers bounded normalization and event persistence, never
       // a tool process. After restart, a saved normalized command is safe to submit
       // again: the engine's receipt transaction deduplicates the command identity.
-      let command: OrchestrationCommand;
+      let command: OrchestrationCommand | null = null;
       if (delivery.normalizedJson === null) {
-        command = stampCommandAuthor(yield* normalize(entry.command), { user: entry.actor });
-        if (
-          !("threadId" in command) ||
-          command.threadId !== threadId ||
-          command.commandId !== delivery.commandId
-        )
-          return yield* fail(threadId, "Normalized command crossed the delivery boundary.");
-        const normalized = yield* encodeCommand(command);
-        yield* sql`UPDATE thread_relay_command_deliveries SET normalized_json = ${normalized} WHERE command_id = ${delivery.commandId}`;
+        const result = yield* normalize(entry.command, entry.actor.userId).pipe(Effect.result);
+        if (result._tag === "Failure") {
+          // A declared validation failure precedes engine dispatch. Retire it
+          // durably so an expired personal grant cannot block the whole inbox.
+          receipt = yield* saveReceipt(delivery.commandId, {
+            status: "rejected",
+            detail: result.failure.message,
+          });
+        } else {
+          command = stampCommandAuthor(result.success, { user: entry.actor });
+          if (
+            !("threadId" in command) ||
+            command.threadId !== threadId ||
+            command.commandId !== delivery.commandId
+          )
+            return yield* fail(threadId, "Normalized command crossed the delivery boundary.");
+          const normalized = yield* encodeCommand(command);
+          yield* sql`UPDATE thread_relay_command_deliveries SET normalized_json = ${normalized} WHERE command_id = ${delivery.commandId}`;
+        }
       } else command = yield* decodeCommand(delivery.normalizedJson);
       // A failure may still have persisted a rejected receipt. Never infer rejection
       // from a transient exception or an interrupted dispatch.
-      yield* engine.dispatch(command).pipe(Effect.result);
-      const persisted = yield* receipts.getByCommandId({
-        commandId: CommandId.make(delivery.commandId),
-      });
-      if (Option.isNone(persisted))
-        return yield* fail(threadId, "Command is waiting for a persisted execution receipt.");
-      if (persisted.value.aggregateKind !== "thread" || persisted.value.aggregateId !== threadId)
-        return yield* fail(threadId, "Command receipt belongs to another thread.");
-      receipt = yield* saveReceipt(
-        delivery.commandId,
-        persisted.value.status === "accepted"
-          ? { status: "accepted", sequence: persisted.value.resultSequence }
-          : {
-              status: "rejected",
-              ...(persisted.value.error === null ? {} : { detail: persisted.value.error }),
-            },
-      );
+      if (command !== null) {
+        yield* engine.dispatch(command).pipe(Effect.result);
+        const persisted = yield* receipts.getByCommandId({
+          commandId: CommandId.make(delivery.commandId),
+        });
+        if (Option.isNone(persisted))
+          return yield* fail(threadId, "Command is waiting for a persisted execution receipt.");
+        if (persisted.value.aggregateKind !== "thread" || persisted.value.aggregateId !== threadId)
+          return yield* fail(threadId, "Command receipt belongs to another thread.");
+        receipt = yield* saveReceipt(
+          delivery.commandId,
+          persisted.value.status === "accepted"
+            ? { status: "accepted", sequence: persisted.value.resultSequence }
+            : {
+                status: "rejected",
+                ...(persisted.value.error === null ? {} : { detail: persisted.value.error }),
+              },
+        );
+      }
     }
+    if (receipt === null) return yield* fail(threadId, "Command has no durable delivery receipt.");
     const persisted = yield* receipts.getByCommandId({
       commandId: CommandId.make(delivery.commandId),
     });

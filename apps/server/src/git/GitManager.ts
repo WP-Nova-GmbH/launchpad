@@ -2592,7 +2592,7 @@ export const make = Effect.gen(function* () {
           path: null,
         },
         {
-          // Best effort: a settings read failure falls back to the checkout's t3.json.
+          // Best effort: a settings read failure falls back to the checkout's launchpad.json.
           submodules: yield* projectSettingsFor(input).pipe(
             Effect.map((settings) => settings.worktreeSubmodules),
             Effect.orElseSucceed(() => null),

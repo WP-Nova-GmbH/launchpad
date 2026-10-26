@@ -5,6 +5,7 @@ import {
 } from "../threads/ThreadVmClientConnection.ts";
 import { threadVmCredentialAllows } from "./threadVmCredentialAccess.ts";
 import * as UserDirectory from "../tenancy/UserDirectory.ts";
+import { RELAY_LINEAR_CALLBACK_PATH, RELAY_JIRA_CALLBACK_PATH } from "@t3tools/contracts/relay";
 import { createClerkClient, verifyToken } from "@clerk/backend";
 import { sql as drizzleSql } from "drizzle-orm";
 import * as Crypto from "effect/Crypto";
@@ -216,6 +217,14 @@ export const RELAY_CHECKPOINT_REQUEST_DEADLINE_MS = 120_000;
 // Move verification streams a bounded archive (up to 64 GiB) in a background worker.
 export const RELAY_MOVE_REQUEST_DEADLINE_MS = 55 * 60_000;
 
+/** OAuth codes and state authenticate the callback; keep them out of traces and deadline logs. */
+const traceUrl = (url: string) => {
+  const parsed = new URL(url, "https://relay.invalid");
+  return [RELAY_LINEAR_CALLBACK_PATH, RELAY_JIRA_CALLBACK_PATH].includes(parsed.pathname)
+    ? parsed.pathname
+    : url;
+};
+
 const relayRequestDeadline = <E, R>(
   httpEffect: Effect.Effect<
     HttpServerResponse.HttpServerResponse,
@@ -253,7 +262,7 @@ const relayRequestDeadline = <E, R>(
               const request = yield* HttpServerRequest.HttpServerRequest;
               yield* Effect.logError("relay request exceeded deadline", {
                 "http.method": request.method,
-                "http.url": request.url,
+                "http.url": traceUrl(request.url),
                 "relay.request.deadline_ms": deadline,
               });
               yield* Effect.annotateCurrentSpan({
@@ -278,12 +287,23 @@ export const traceRelayHttpRequest = <E, R>(
   >,
   previewBaseUrl?: string,
 ) =>
-  // HttpMiddleware finalizes its span on the dispatcher; do not close a request-scoped exporter first.
-  HttpMiddleware.tracer(
-    appendRelayTraceContextResponseHeader.pipe(
-      Effect.andThen(relayRequestDeadline(httpEffect, previewBaseUrl)),
-    ),
-  ).pipe(Effect.ensuring(Effect.yieldNow));
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    // The handler keeps the original query while the HTTP tracer sees a redacted request view.
+    return yield* HttpMiddleware.tracer(
+      appendRelayTraceContextResponseHeader.pipe(
+        Effect.andThen(relayRequestDeadline(httpEffect, previewBaseUrl)),
+        Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+      ),
+    ).pipe(
+      Effect.provideService(
+        HttpServerRequest.HttpServerRequest,
+        request.modify({ url: traceUrl(request.url) }),
+      ),
+      // HttpMiddleware finalizes its span on the dispatcher before the exporter closes.
+      Effect.ensuring(Effect.yieldNow),
+    );
+  });
 
 export const traceRelayHttpRequestWith = <E, R, LayerError, LayerRequirements>(
   httpEffect: Effect.Effect<
@@ -966,6 +986,7 @@ export const clientApi = HttpApiBuilder.group(
             userId,
             displayName: profile?.displayName ?? null,
             imageUrl: profile?.imageUrl ?? null,
+            ...(profile?.email ? { email: profile.email } : {}),
           };
         }),
       )

@@ -1,5 +1,7 @@
 import {
   EnvironmentAuthInvalidError,
+  EnvironmentRequestInvalidError,
+  AuthSessionId,
   type AuthBrowserSessionResult,
   type AuthCreatePairingCredentialInput,
   type AuthSessionState,
@@ -670,5 +672,113 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(testApi.calls.pairingCredential).toEqual([
       { label: "Julius iPhone", scopes: ["orchestration:read"] },
     ]);
+  });
+});
+
+describe("receiver naming", () => {
+  it("holds and scrubs an ordinary URL code until an explicitly chosen valid name", async () => {
+    const browser = installTestBrowser("http://localhost/pair#token=ordinary-code");
+    let authenticated = false;
+    const fixture = await installEnvironmentHttpTest({
+      session: () =>
+        Effect.succeed(
+          authenticated
+            ? authenticatedSession(LOOPBACK_AUTH)
+            : unauthenticatedSession(LOOPBACK_AUTH),
+        ),
+      browserSession: ({ credential, client }) => {
+        expect(credential).toBe("ordinary-code");
+        if (!client?.label?.trim())
+          return Effect.fail(
+            new EnvironmentRequestInvalidError({
+              code: "invalid_request",
+              traceId: "test-trace",
+              reason:
+                client?.label === undefined ? "client_label_required" : "invalid_client_label",
+            }),
+          );
+        authenticated = true;
+        return Effect.succeed(browserSession(["orchestration:read"]));
+      },
+    });
+    const auth = await import("./environments/primary/auth");
+    auth.__resetServerAuthBootstrapForTests();
+    expect((await auth.resolveInitialServerAuthGateState()).status).toBe("needs-client-label");
+    expect(browser.location.hash).toBe("");
+    expect(auth.peekPendingPairingCredential()).toBe("ordinary-code");
+    expect((await auth.resolveInitialServerAuthGateState()).status).toBe("needs-client-label");
+    await expect(auth.submitServerAuthCredential("", "  ")).rejects.toBeDefined();
+    expect(auth.peekPendingPairingCredential()).toBe("ordinary-code");
+    await auth.submitServerAuthCredential("", "My phone");
+    expect(auth.peekPendingPairingCredential()).toBeNull();
+    expect((await auth.resolveInitialServerAuthGateState()).status).toBe("authenticated");
+    expect(fixture.calls.browserSession.at(-1)).toMatchObject({
+      credential: "ordinary-code",
+      client: { label: "My phone" },
+    });
+  });
+});
+
+describe("restored cookie naming", () => {
+  it("opens the app with the existing session and leaves naming to its environment", async () => {
+    installTestBrowser("http://localhost/");
+    const fixture = await installEnvironmentHttpTest({
+      session: () =>
+        Effect.succeed({
+          ...authenticatedSession(LOOPBACK_AUTH),
+          currentSession: {
+            sessionId: AuthSessionId.make("restored-session"),
+            client: { deviceType: "desktop" },
+            needsClientLabel: true,
+          },
+        }),
+    });
+    const auth = await import("./environments/primary/auth");
+    auth.__resetServerAuthBootstrapForTests();
+    expect(await auth.resolveInitialServerAuthGateState()).toEqual({ status: "authenticated" });
+    expect(auth.peekPendingPairingCredential()).toBeNull();
+    expect((await auth.fetchSessionState()).currentSession?.needsClientLabel).toBe(true);
+    expect(fixture.calls.browserSession).toEqual([]);
+  });
+});
+
+describe("fresh invitations during restored-session naming", () => {
+  it("redeems the new code instead of renaming the previously authorized session", async () => {
+    const browser = installTestBrowser("http://localhost/");
+    let exchanged = false;
+    const fixture = await installEnvironmentHttpTest({
+      session: () =>
+        Effect.succeed({
+          ...authenticatedSession(LOOPBACK_AUTH),
+          currentSession: {
+            sessionId: AuthSessionId.make("old-session"),
+            client: { deviceType: "desktop" },
+            needsClientLabel: !exchanged,
+          },
+        }),
+      browserSession: ({ client }) => {
+        if (!client?.label)
+          return Effect.fail(
+            new EnvironmentRequestInvalidError({
+              code: "invalid_request",
+              traceId: "test-trace",
+              reason: "client_label_required",
+            }),
+          );
+        exchanged = true;
+        return Effect.succeed(browserSession(["orchestration:read"]));
+      },
+    });
+    const auth = await import("./environments/primary/auth");
+    auth.__resetServerAuthBootstrapForTests();
+    expect((await auth.resolveInitialServerAuthGateState()).status).toBe("authenticated");
+    browser.location.hash = "token=fresh-code";
+    expect((await auth.resolveInitialServerAuthGateState()).status).toBe("needs-client-label");
+    await auth.submitServerAuthCredential("", "New client");
+    expect(fixture.calls.browserSession.at(-1)).toMatchObject({
+      credential: "fresh-code",
+      client: { label: "New client" },
+    });
+    expect((await auth.resolveInitialServerAuthGateState()).status).toBe("authenticated");
   });
 });

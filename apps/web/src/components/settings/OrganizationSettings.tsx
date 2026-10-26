@@ -105,11 +105,7 @@ function SectionNote({ children }: { children: ReactNode }) {
 }
 
 function RoleBadge({ children }: { children: string }) {
-  return (
-    <Badge variant="secondary" className="font-normal">
-      {children}
-    </Badge>
-  );
+  return <Badge variant="secondary">{children}</Badge>;
 }
 
 function OrganizationSection({ state }: { state: OrganizationAdminState }) {
@@ -139,6 +135,7 @@ function OrganizationSection({ state }: { state: OrganizationAdminState }) {
           control={
             <div className="flex w-full items-center gap-2 sm:w-auto">
               <Input
+                size="sm"
                 nativeInput
                 value={name}
                 placeholder={membership.organization.name}
@@ -167,6 +164,7 @@ function OrganizationSection({ state }: { state: OrganizationAdminState }) {
         control={
           <div className="flex w-full items-center gap-2 sm:w-auto">
             <Input
+              size="sm"
               nativeInput
               value={joinToken}
               placeholder="Invitation token"
@@ -239,7 +237,11 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
                       });
                     }}
                   >
-                    <SelectTrigger className="w-32" aria-label={`Role for ${label.primary}`}>
+                    <SelectTrigger
+                      size="sm"
+                      className="w-32"
+                      aria-label={`Role for ${label.primary}`}
+                    >
                       <SelectValue>{ORG_ROLE_LABELS[member.role]}</SelectValue>
                     </SelectTrigger>
                     <SelectPopup align="end" alignItemWithTrigger={false}>
@@ -258,7 +260,7 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
                     disabled={state.busy}
                     onClick={() => void state.removeMember(member.userId)}
                   >
-                    <TrashIcon className="size-3.5" />
+                    <TrashIcon />
                   </Button>
                 </div>
               ) : (
@@ -277,6 +279,7 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
             control={
               <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
                 <Input
+                  size="sm"
                   nativeInput
                   type="email"
                   value={email}
@@ -291,7 +294,7 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
                     if (typeof value === "string") setInviteRole(value as RelayOrgRole);
                   }}
                 >
-                  <SelectTrigger className="w-32" aria-label="Invitation role">
+                  <SelectTrigger size="sm" className="w-32" aria-label="Invitation role">
                     <SelectValue>{ORG_ROLE_LABELS[inviteRole]}</SelectValue>
                   </SelectTrigger>
                   <SelectPopup align="end" alignItemWithTrigger={false}>
@@ -340,7 +343,7 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
                         variant="outline"
                         onClick={() => copyToClipboard(issued.token, undefined)}
                       >
-                        <CopyIcon className="size-3.5" />
+                        <CopyIcon />
                         Copy token
                       </Button>
                     ) : null}
@@ -351,7 +354,7 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
                       disabled={state.busy}
                       onClick={() => void state.revokeInvitation(invitation.invitationId)}
                     >
-                      <TrashIcon className="size-3.5" />
+                      <TrashIcon />
                     </Button>
                   </div>
                 }
@@ -397,7 +400,7 @@ function RepositoryRow({
             disabled={state.busy}
             onClick={() => void state.deleteRepository(repositoryId)}
           >
-            <TrashIcon className="size-3.5" />
+            <TrashIcon />
           </Button>
         ) : null
       }
@@ -405,8 +408,8 @@ function RepositoryRow({
       <div className="space-y-2 pb-2">
         <div className="flex flex-wrap items-center gap-1.5">
           {entry.repository.canonicalKeys.map((canonicalKey) => (
-            <Badge key={canonicalKey} variant="outline" className="gap-1 font-mono text-[11px]">
-              {canonicalKey}
+            <Badge key={canonicalKey} variant="outline">
+              <code>{canonicalKey}</code>
               {canConfigure && entry.repository.canonicalKeys.length > 1 ? (
                 <button
                   type="button"
@@ -423,6 +426,7 @@ function RepositoryRow({
         {canConfigure ? (
           <div className="flex flex-wrap items-center gap-2">
             <Input
+              size="sm"
               nativeInput
               value={alias}
               placeholder="host/owner/repo"
@@ -470,7 +474,7 @@ function RepositoryRow({
                         void state.revokeAccess({ repositoryId, userId: grant.userId })
                       }
                     >
-                      <TrashIcon className="size-3.5" />
+                      <TrashIcon />
                     </Button>
                   ) : null}
                 </span>
@@ -487,6 +491,7 @@ function RepositoryRow({
               }}
             >
               <SelectTrigger
+                size="sm"
                 className="w-full sm:w-64"
                 aria-label={`Grant access to ${entry.repository.name}`}
               >
@@ -515,7 +520,7 @@ function RepositoryRow({
                 if (typeof value === "string") setGrantRole(value as RelayRepositoryRole);
               }}
             >
-              <SelectTrigger className="w-36" aria-label="Repository role">
+              <SelectTrigger size="sm" className="w-36" aria-label="Repository role">
                 <SelectValue>{REPOSITORY_ROLE_LABELS[grantRole]}</SelectValue>
               </SelectTrigger>
               <SelectPopup align="start" alignItemWithTrigger={false}>
@@ -704,7 +709,7 @@ function ProviderAccountRow({
                 disabled={state.busy}
                 onClick={() => void state.removeProviderAccount(provider)}
               >
-                <TrashIcon className="size-4" />
+                <TrashIcon />
               </Button>
             ) : null}
           </div>
@@ -726,7 +731,7 @@ function ProviderAccountRow({
                 if (typeof value === "string") setKeyName(value);
               }}
             >
-              <SelectTrigger className="w-56" aria-label={`Key kind for ${name}`}>
+              <SelectTrigger size="sm" className="w-56" aria-label={`Key kind for ${name}`}>
                 <SelectValue>{keyName}</SelectValue>
               </SelectTrigger>
               <SelectPopup align="start" alignItemWithTrigger={false}>
@@ -741,6 +746,7 @@ function ProviderAccountRow({
             <span className="font-mono text-xs text-muted-foreground">{keyName}</span>
           )}
           <Input
+            size="sm"
             nativeInput
             type="password"
             autoComplete="off"
@@ -821,7 +827,7 @@ function SkillRow({
             disabled={state.busy}
             onClick={() => void state.removeSkill(skill.name)}
           >
-            <TrashIcon className="size-4" />
+            <TrashIcon />
           </Button>
         ) : null
       }
@@ -1128,9 +1134,7 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
             <div key={repository.fullName} className="flex items-center justify-between gap-3 py-1">
               <span className="min-w-0 truncate font-mono text-xs">{repository.fullName}</span>
               {repository.registered ? (
-                <Badge variant="secondary" className="shrink-0 font-normal">
-                  Registered
-                </Badge>
+                <Badge variant="secondary">Registered</Badge>
               ) : isAdmin ? (
                 <Button
                   size="sm"
@@ -1232,6 +1236,7 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
           control={
             <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
               <Input
+                size="sm"
                 nativeInput
                 value={name}
                 placeholder="Name"
@@ -1240,6 +1245,7 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
                 className="w-full sm:w-40"
               />
               <Input
+                size="sm"
                 nativeInput
                 value={canonicalKey}
                 placeholder="github.com/acme/app"
@@ -1327,7 +1333,7 @@ function MachineRow({
       }
       control={
         <div className="flex items-center gap-2">
-          <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <ConnectionStatusDot
               dotClassName={status.dotClassName}
               pingClassName={status.pingClassName}
@@ -1340,7 +1346,7 @@ function MachineRow({
               variant="outline"
               onClick={() => copyToClipboard(machineEnrollmentCommand(enrollment), undefined)}
             >
-              <CopyIcon className="size-3.5" />
+              <CopyIcon />
               Copy setup command
             </Button>
           ) : null}
@@ -1366,7 +1372,7 @@ function MachineRow({
                 disabled={state.busy}
                 onClick={() => setConfirming(true)}
               >
-                <TrashIcon className="size-3.5" />
+                <TrashIcon />
               </Button>
             )
           ) : null}
@@ -1472,6 +1478,7 @@ function MachineCreateRow({
       control={
         <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           <Input
+            size="sm"
             nativeInput
             value={label}
             placeholder="Name"

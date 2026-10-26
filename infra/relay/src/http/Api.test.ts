@@ -137,7 +137,9 @@ describe("device listing compatibility", () => {
           lookup: ({ userIds }) => {
             expect(userIds).toEqual(["user-1"]);
             return Effect.succeed(
-              new Map([["user-1", { displayName: "Stefan", imageUrl: null, email: null }]]),
+              new Map([
+                ["user-1", { displayName: "Stefan", imageUrl: null, email: "stefan@example.com" }],
+              ]),
             );
           },
         }),
@@ -203,6 +205,7 @@ describe("device listing compatibility", () => {
         userId: "user-1",
         displayName: "Stefan",
         imageUrl: null,
+        email: "stefan@example.com",
       });
       for (const [version, devices] of [
         ["v1", [iphone]],
@@ -1604,6 +1607,38 @@ describe("relay request tracing", () => {
         expect(spans[0]?.attributes.get("http.request.header.dpop")).toBe("<redacted>");
         expect(Option.isNone(spans[0]!.parent)).toBe(true);
         expect(Option.getOrUndefined(spans[1]!.parent)?.spanId).toBe(spans[0]?.spanId);
+      }),
+  );
+
+  it.effect.each(["linear", "jira"])(
+    "keeps %s callback credentials out of HTTP traces while the handler receives them",
+    (service) =>
+      Effect.gen(function* () {
+        const spans: Array<Tracer.NativeSpan> = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            return span;
+          },
+        });
+        const callbackPath = `/v1/user/issue-trackers/${service}/callback`;
+        const request = HttpServerRequest.fromWeb(
+          new Request(`https://relay.test${callbackPath}?code=private-code&state=private-state`),
+        );
+        const endpoint = Effect.gen(function* () {
+          const original = yield* HttpServerRequest.HttpServerRequest;
+          const query = new URL(original.url, "https://relay.test").searchParams;
+          expect(query.get("code")).toBe("private-code");
+          expect(query.get("state")).toBe("private-state");
+          return HttpServerResponse.empty({ status: 200 });
+        });
+        yield* traceRelayHttpRequestWith(endpoint, Layer.succeed(Tracer.Tracer, tracer)).pipe(
+          Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+        );
+        expect(spans[0]?.attributes.get("url.path")).toBe(callbackPath);
+        expect(spans[0]?.attributes.get("url.query")).toBeUndefined();
+        expect(spans[0]?.attributes.get("url.full")).not.toContain("private-");
       }),
   );
 

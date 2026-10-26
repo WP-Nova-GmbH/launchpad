@@ -1,3 +1,4 @@
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { appAtomRegistry } from "./atom-registry";
 import { createThreadOutboxManager } from "./thread-outbox-manager";
 import type { QueuedThreadMessage } from "./thread-outbox-model";
@@ -22,7 +23,11 @@ export async function flushThreadOutbox(): Promise<void> {
 }
 
 export function enqueueThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {
-  return threadOutboxManager.enqueue({ ...message, submissionProtocol: "unattempted" });
+  return threadOutboxManager.enqueue({
+    ...message,
+    ownerAccountId: appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null,
+    submissionProtocol: "unattempted",
+  });
 }
 
 /** Waits for pending writes to settle; false if the message was rolled back. */

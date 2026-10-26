@@ -2345,6 +2345,7 @@ function OpenCommandPaletteDialog(props: {
         "grouping",
         "checkout",
         "remove",
+        "launchpad.json",
         "t3.json",
       ],
       title: "Project settings",

@@ -2,6 +2,8 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import { stripIssueTrackerAuthorization } from "@t3tools/shared/issueTrackerTurn";
+import { saveCommandAuthorization } from "../mcp/IssueTrackerTurnAuthorization.ts";
 import {
   type ClientOrchestrationCommand,
   type UserInputAttachments,
@@ -78,10 +80,21 @@ const removeClaimedAttachmentPaths = Effect.fn("Normalizer.removeClaimedAttachme
   },
 );
 
-export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
+export const normalizeDispatchCommand = (
+  command: ClientOrchestrationCommand,
+  authenticatedUserId?: string,
+) =>
   Effect.gen(function* () {
     const receivedAt = DateTime.formatIso(yield* DateTime.now);
-    const canonicalCommand = canonicalizeClientCommandTimestamps(command, receivedAt);
+    const issueTrackerAuthorizationId = yield* saveCommandAuthorization(
+      command,
+      authenticatedUserId,
+    );
+    // Transport credentials must never enter commands, events, or projections.
+    const canonicalCommand = canonicalizeClientCommandTimestamps(
+      stripIssueTrackerAuthorization(command),
+      receivedAt,
+    );
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const serverConfig = yield* ServerConfig;
@@ -122,6 +135,14 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
           canonicalCommand.createWorkspaceRootIfMissing,
         ),
         createWorkspaceRootIfMissing: canonicalCommand.createWorkspaceRootIfMissing === true,
+      } satisfies OrchestrationCommand;
+    }
+
+    if (canonicalCommand.type === "thread.approval.respond") {
+      const { actorUserId: _untrustedActor, ...trustedCommand } = canonicalCommand;
+      return {
+        ...trustedCommand,
+        ...(authenticatedUserId ? { actorUserId: authenticatedUserId } : {}),
       } satisfies OrchestrationCommand;
     }
 
@@ -348,16 +369,25 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
         return {
           ...canonicalCommand,
           message: { ...canonicalCommand.message, ...normalizedFields },
+          issueTrackerAuthorizationId,
         } satisfies OrchestrationCommand;
       case "thread.prompt.enqueue":
         return {
           ...canonicalCommand,
-          message: { ...canonicalCommand.message, ...normalizedFields },
+          message: {
+            ...canonicalCommand.message,
+            ...normalizedFields,
+            issueTrackerAuthorizationId,
+          },
         } satisfies OrchestrationCommand;
       case "thread.prompt.edit":
         return {
           ...canonicalCommand,
-          message: { ...canonicalCommand.message, ...normalizedFields },
+          message: {
+            ...canonicalCommand.message,
+            ...normalizedFields,
+            issueTrackerAuthorizationId,
+          },
         } satisfies OrchestrationCommand;
     }
   });

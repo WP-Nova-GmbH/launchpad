@@ -1,3 +1,5 @@
+import { currentSessionChanges } from "./auth/currentSession.ts";
+import { makeSessionPresenceReporter } from "./orchestration/sessionPresence.ts";
 import * as Deferred from "effect/Deferred";
 import { RepositoryAccess, stampCommandAuthor as stampActor } from "./auth/RepositoryAccess.ts";
 import {
@@ -27,6 +29,8 @@ import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   AuthOrchestrationReadScope,
+  ORCHESTRATION_PROTOCOL_VERSION,
+  ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
   type AuthEnvironmentScope,
@@ -80,6 +84,7 @@ import {
   RpcClientId,
   EnvironmentAuthorizationError,
   ThreadId,
+  type ThreadPresenceReportInput,
   TerminalProcessExitError,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -94,7 +99,12 @@ import {
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
-import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
+import {
+  HttpRouter,
+  HttpServerRequest,
+  HttpServerResponse,
+  HttpServerRespondable,
+} from "effect/unstable/http";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
@@ -523,6 +533,7 @@ const makeWsRpcLayer = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   connectionId: string,
   clientOrigin: OrchestrationClientOrigin,
+  reportSessionPresence: (input: ThreadPresenceReportInput) => Effect.Effect<void>,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
 ) =>
@@ -1205,7 +1216,7 @@ const makeWsRpcLayer = (
         });
 
       // Project setting > environment setting; null when neither is set so
-      // the driver reads the freshly created checkout's own t3.json (the
+      // the driver reads the freshly created checkout's own launchpad.json (the
       // branch being checked out may declare something the project root does
       // not). Settings that fail to load fall through the same way.
       const resolveBootstrapWorktreeSubmodules = Effect.fnUntraced(function* (input: {
@@ -2098,7 +2109,7 @@ const makeWsRpcLayer = (
               if (Option.isSome(replay)) return replay.value;
               yield* ProjectCloneTracker.rejectCommandsDuringClone(projectCloneTracker, command);
               const normalizedCommand = stampCommandAuthor(
-                yield* normalizeDispatchCommand(command),
+                yield* normalizeDispatchCommand(command, currentSession.user?.userId),
               );
               // Archive removes the thread from the client, so this transport
               // closes its session and terminals after the command lands.
@@ -3738,6 +3749,7 @@ const makeWsRpcLayer = (
                 (cause) =>
                   new ProjectReadFileError({
                     ...input,
+                    notFound: cause._tag === "WorkspaceFileSystemOperationError" && cause.notFound,
                     ...projectFileFailureContext(cause),
                     cause,
                   }),
@@ -4691,25 +4703,56 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "server" },
             _input,
           ),
+        [WS_METHODS.subscribeAuthSession]: (_input) =>
+          observeRpcStreamEffect(
+            WS_METHODS.subscribeAuthSession,
+            Effect.succeed(currentSessionChanges(currentSessionId)),
+            { "rpc.aggregate": "auth" },
+            _input,
+          ),
         [WS_METHODS.subscribeAuthAccess]: (_input) =>
           observeRpcStreamEffect(
             WS_METHODS.subscribeAuthAccess,
             Effect.gen(function* () {
+              const clientChanges = yield* sessions.subscribeChanges;
+              const linkChanges = yield* bootstrapCredentials.subscribeChanges;
               const initialSnapshot = yield* loadAuthAccessSnapshot();
               const revisionRef = yield* Ref.make(1);
               const accessChanges: Stream.Stream<
                 PairingGrantStore.BootstrapCredentialChange | SessionStore.SessionCredentialChange
-              > = Stream.merge(bootstrapCredentials.streamChanges, sessions.streamChanges);
+              > = Stream.merge(linkChanges, clientChanges);
 
-              const liveEvents: Stream.Stream<AuthAccessStreamEvent> = accessChanges.pipe(
-                Stream.mapEffect((change) =>
-                  Ref.updateAndGet(revisionRef, (revision) => revision + 1).pipe(
-                    Effect.map((revision) =>
-                      toAuthAccessStreamEvent(change, revision, currentSessionId),
-                    ),
+              const liveEvents: Stream.Stream<AuthAccessStreamEvent, AuthAccessStreamError> =
+                accessChanges.pipe(
+                  Stream.mapEffect((change) =>
+                    Effect.gen(function* () {
+                      let refreshed:
+                        | PairingGrantStore.BootstrapCredentialChange
+                        | SessionStore.SessionCredentialChange = change;
+                      if (change.type === "clientUpserted" || change.type === "clientRemoved") {
+                        const sessionId =
+                          change.type === "clientUpserted"
+                            ? change.clientSession.sessionId
+                            : change.sessionId;
+                        const active = yield* sessions
+                          .getActive(sessionId)
+                          .pipe(
+                            Effect.mapError(
+                              (error) => new AuthAccessStreamError({ message: error.message }),
+                            ),
+                          );
+                        refreshed = Option.isSome(active)
+                          ? { type: "clientUpserted", clientSession: active.value }
+                          : { type: "clientRemoved", sessionId };
+                      }
+                      return yield* Ref.updateAndGet(revisionRef, (revision) => revision + 1).pipe(
+                        Effect.map((revision) =>
+                          toAuthAccessStreamEvent(refreshed, revision, currentSessionId),
+                        ),
+                      );
+                    }),
                   ),
-                ),
-              );
+                );
 
               return Stream.concat(
                 Stream.make({
@@ -4738,13 +4781,7 @@ const makeWsRpcLayer = (
         [ORCHESTRATION_WS_METHODS.reportThreadPresence]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.reportThreadPresence,
-            threadPresence.report({
-              connectionId,
-              user: currentSession.user ?? null,
-              clientLabel: null,
-              threadId: input.threadId,
-              typing: input.typing,
-            }),
+            reportSessionPresence(input),
             { "rpc.aggregate": "thread" },
             input,
           ),
@@ -4754,14 +4791,19 @@ const makeWsRpcLayer = (
             Stream.unwrap(
               Effect.map(threadPresence.subscribe, ({ latest, changes }) =>
                 Stream.concat(Stream.make(latest), changes).pipe(
-                  // Your own connection is never "someone else"; the client
-                  // still filters its own user so a second device stays quiet.
+                  // Include the viewer for participant details; repository access still filters every entry.
                   Stream.mapEffect((snapshot) =>
                     Effect.filter(snapshot.participants, (participant) =>
-                      participant.connectionId === connectionId
-                        ? Effect.succeed(false)
-                        : canReadThread(participant.threadId),
-                    ).pipe(Effect.map((participants) => ({ participants }))),
+                      canReadThread(participant.threadId),
+                    ).pipe(
+                      Effect.map((participants) => ({
+                        participants,
+                        viewer: {
+                          sessionId: currentSessionId,
+                          userId: currentSession.user?.userId ?? null,
+                        },
+                      })),
+                    ),
                   ),
                 ),
               ),
@@ -4838,6 +4880,21 @@ export const websocketRpcRouteLayer = Layer.unwrap(
             failEnvironmentInternal("internal_error", error),
           ),
         );
+        const requestUrl = HttpServerRequest.toURL(request);
+        if (
+          Option.isNone(requestUrl) ||
+          requestUrl.value.searchParams.get(ORCHESTRATION_PROTOCOL_QUERY_PARAM) !==
+            String(ORCHESTRATION_PROTOCOL_VERSION)
+        ) {
+          return yield* HttpServerResponse.json(
+            {
+              code: "unsupported_protocol",
+              orchestrationProtocolVersion: ORCHESTRATION_PROTOCOL_VERSION,
+              message: "Update Launchpad to connect to this server.",
+            },
+            { status: 426 },
+          );
+        }
         const repositoryAccess = yield* RepositoryAccess;
         const policyClosed = yield* Deferred.make<void>();
         const policyDrained = yield* Deferred.make<void>();
@@ -4869,6 +4926,10 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         const clientAnalyticsProps = readClientAnalyticsProps(request);
         yield* sessions.recordClientConnection(session.sessionId, clientOrigin);
         yield* analytics.record("client.connected", clientAnalyticsProps);
+        const reportSessionPresence = yield* makeSessionPresenceReporter(
+          connectionId,
+          session.sessionId,
+        ).pipe(Effect.orDie);
         const rpcWebSocketHttpEffect = yield* Effect.gen(function* () {
           const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
           yield* RpcServer.make(WsRpcGroup, { disableTracing: true }).pipe(
@@ -4883,6 +4944,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               session,
               connectionId,
               clientOrigin,
+              reportSessionPresence,
               clientAnalyticsProps,
               previewAutomationBroker,
             ).pipe(

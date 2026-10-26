@@ -8,6 +8,10 @@ import {
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
+import {
+  issueTrackerActivityToolName,
+  issueTrackerToolTitle,
+} from "@t3tools/shared/issueTrackerActivity";
 
 export interface PendingApproval {
   readonly requestId: ApprovalRequestId;
@@ -86,6 +90,16 @@ function parseQuestions(value: unknown): UserInputQuestion[] {
   });
 }
 
+function qualifiedIssueTrackerToolName(value: unknown) {
+  if (
+    typeof value !== "string" ||
+    !/^(?:mcp__t3[-_ ]?code__|t3[-_ ]?code(?:[.:/_]|\s*[·°]\s*))/i.test(value.trim())
+  ) {
+    return undefined;
+  }
+  return issueTrackerActivityToolName({ label: value });
+}
+
 const requestActivityKinds = new Set([
   "approval.requested",
   "approval.resolved",
@@ -146,6 +160,10 @@ export function derivePendingRequests(activities: ReadonlyArray<OrchestrationThr
       const requestKind = isProviderRequestKind(payload.requestKind)
         ? payload.requestKind
         : requestKindFromRequestType(payload.requestType);
+      const tool =
+        payload.requestType === "dynamic_tool_call"
+          ? qualifiedIssueTrackerToolName(payload.detail)
+          : undefined;
       const options = Array.isArray(payload.options)
         ? payload.options.filter(isProviderApprovalOption)
         : [];
@@ -154,7 +172,9 @@ export function derivePendingRequests(activities: ReadonlyArray<OrchestrationThr
         // Older OpenCode approvals do not always include a recognized kind.
         requestKind: requestKind ?? "command",
         createdAt: activity.createdAt,
-        ...(typeof payload.detail === "string" && payload.detail ? { detail: payload.detail } : {}),
+        ...(typeof payload.detail === "string" && payload.detail
+          ? { detail: tool ? issueTrackerToolTitle(tool) : payload.detail }
+          : {}),
         ...(typeof payload.appName === "string" && payload.appName
           ? { appName: payload.appName }
           : {}),

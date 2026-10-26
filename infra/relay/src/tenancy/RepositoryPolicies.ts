@@ -185,10 +185,17 @@ export const deliverPending = Effect.fn("relay.repository_policy.deliver_pending
   );
 });
 
-export class RepositoryPolicyControlError extends Schema.TaggedError<RepositoryPolicyControlError>()(
-  "RepositoryPolicyControlError",
-  { message: Schema.String, cause: Schema.optional(Schema.Unknown) },
-) {}
+export class RepositoryPolicySyncError extends Schema.TaggedError<RepositoryPolicySyncError>()(
+  "RepositoryPolicySyncError",
+  {
+    detail: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
 
 export interface RepositoryPolicyControlShape {
   readonly synchronize: (input: {
@@ -196,7 +203,7 @@ export interface RepositoryPolicyControlShape {
     environmentId: string;
     publicKey: string;
     url: string;
-  }) => Effect.Effect<void, RepositoryPolicyControlError>;
+  }) => Effect.Effect<void, RepositoryPolicySyncError>;
 }
 export class RepositoryPolicyControl extends Context.Reference<RepositoryPolicyControlShape>(
   "relay/RepositoryPolicyControl",
@@ -204,8 +211,9 @@ export class RepositoryPolicyControl extends Context.Reference<RepositoryPolicyC
     defaultValue: () => ({
       synchronize: () =>
         Effect.fail(
-          new RepositoryPolicyControlError({
-            message: "Repository policy control is unavailable.",
+          new RepositoryPolicySyncError({
+            detail: "Repository policy control is unavailable.",
+            cause: null,
           }),
         ),
     }),
@@ -235,17 +243,16 @@ export const controlLayer = Layer.effect(
             );
           const accepted = yield* acknowledge({ ...input, ack });
           if (!accepted)
-            return yield* Effect.fail(
-              new RepositoryPolicyControlError({
-                message: "Policy acknowledgement did not match this environment.",
-              }),
-            );
+            return yield* new RepositoryPolicySyncError({
+              detail: "Policy acknowledgement did not match this environment.",
+              cause: null,
+            });
         }).pipe(
           Effect.provide(context),
           Effect.mapError(
             (cause) =>
-              new RepositoryPolicyControlError({
-                message: "Could not synchronize repository access.",
+              new RepositoryPolicySyncError({
+                detail: "Could not synchronize repository access.",
                 cause,
               }),
           ),

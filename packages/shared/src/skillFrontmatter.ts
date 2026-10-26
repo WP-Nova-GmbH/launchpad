@@ -9,9 +9,6 @@
  */
 import { parse as parseYamlDocument } from "yaml";
 
-/** The file every skill directory carries at its root. */
-export const SKILL_MANIFEST_FILE = "SKILL.md";
-
 const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
 
 export type SkillFrontmatter =

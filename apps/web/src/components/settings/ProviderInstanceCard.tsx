@@ -274,7 +274,7 @@ function ProviderEnvironmentSection(props: {
       description="API keys, base URLs, and other per-instance CLI settings."
       control={
         <Button type="button" size="sm" variant="outline" onClick={addVariable}>
-          <PlusIcon className="size-3" />
+          <PlusIcon />
           Add variable
         </Button>
       }
@@ -451,7 +451,7 @@ export function ProviderInstanceCard({
     : "disabled";
   const statusStyle = PROVIDER_STATUS_STYLES[statusKey];
   const summary = enabled
-    ? getProviderSummary(liveProvider)
+    ? getProviderSummary(liveProvider, { includeAuthLabel: mode !== "list" })
     : { headline: "Disabled", detail: null };
   const authEmail = liveProvider?.auth.email?.trim();
   const isAuthenticated = enabled && liveProvider?.auth.status === "authenticated";
@@ -572,7 +572,7 @@ export function ProviderInstanceCard({
       showBadge={Boolean(accentColor)}
       className="size-5"
       iconClassName="size-4 text-foreground/80"
-      badgeClassName="right-[-0.125rem] bottom-[-0.125rem] h-3 min-w-3 px-0.5 text-3xs"
+      badgeClassName="h-3 min-w-3 px-0.5 text-3xs"
     />
   ) : FallbackIconComponent ? (
     <span className="inline-flex size-5 shrink-0 items-center justify-center">
@@ -587,12 +587,8 @@ export function ProviderInstanceCard({
     </span>
   );
 
-  const titleTailNode = headerAction ? (
-    <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center">{headerAction}</span>
-  ) : null;
-
   const versionCodeNode = versionLabel ? (
-    <code className="text-xs text-muted-foreground">{versionLabel}</code>
+    <code className="min-w-0 break-all text-xs text-muted-foreground">{versionLabel}</code>
   ) : null;
 
   // Healthy and disabled rows read fine from their text; only trouble gets a dot.
@@ -635,7 +631,7 @@ export function ProviderInstanceCard({
       <div
         data-slot="settings-row"
         className={cn(
-          "group flex min-h-18 items-center gap-3 px-3 py-3 transition-colors sm:px-4",
+          "group flex min-h-18 items-start gap-3 px-3 py-4 transition-colors sm:px-4",
           selected ? "bg-muted/45" : "hover:bg-muted/25",
         )}
       >
@@ -645,27 +641,27 @@ export function ProviderInstanceCard({
             !enabled && !selected && "opacity-60 group-hover:opacity-100",
           )}
         >
-          <button
-            type="button"
-            className="pointer-events-auto absolute inset-0 cursor-pointer rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            onClick={onSelect}
-            aria-label={`Select ${displayName}`}
-            aria-pressed={selected}
-          />
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  className="pointer-events-auto absolute inset-0 cursor-pointer rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={onSelect}
+                  aria-label={`Select ${displayName}`}
+                  aria-pressed={selected}
+                />
+              }
+            />
+            <TooltipPopup side="right">
+              {displayName}
+              {String(instanceId) !== String(instance.driver) ? ` · ${instanceId}` : null}
+            </TooltipPopup>
+          </Tooltip>
           {titleIconNode}
           <span className="min-w-0 flex-1">
-            <span className="flex min-w-0 items-center gap-2">
+            <span className="flex min-h-5 min-w-0 items-center gap-2">
               <span className="truncate text-sm font-medium text-foreground">{displayName}</span>
-              {String(instanceId) !== String(instance.driver) ? (
-                <code className="min-w-0 truncate rounded bg-muted/60 px-1 py-0.5 text-3xs text-muted-foreground">
-                  {instanceId}
-                </code>
-              ) : null}
-              {versionLabel ? (
-                <code className="max-w-24 shrink-0 truncate text-xs text-muted-foreground">
-                  {versionLabel}
-                </code>
-              ) : null}
               {versionAdvisory ? (
                 hasCompatibilityWarning ? (
                   <Tooltip>
@@ -677,7 +673,7 @@ export function ProviderInstanceCard({
                           aria-label={versionAdvisory.title}
                           className="pointer-events-auto relative inline-flex shrink-0 text-warning"
                         >
-                          <VersionAdvisoryIcon className="size-3.5" />
+                          <VersionAdvisoryIcon className="size-3" />
                         </span>
                       }
                     />
@@ -697,7 +693,7 @@ export function ProviderInstanceCard({
                             copyToClipboard(updateCommand, { providerName: displayName })
                           }
                         >
-                          <ArrowUpCircleIcon className="size-3.5" />
+                          <ArrowUpCircleIcon className="size-3" />
                         </Button>
                       }
                     />
@@ -705,11 +701,16 @@ export function ProviderInstanceCard({
                   </Tooltip>
                 ) : (
                   <span role="img" aria-label="Update available" className="inline-flex shrink-0">
-                    <ArrowUpCircleIcon className="size-3.5 text-muted-foreground" />
+                    <ArrowUpCircleIcon className="size-3 text-muted-foreground" />
                   </span>
                 )
               ) : null}
             </span>
+            {String(instanceId) !== String(instance.driver) ? (
+              <code className="mt-0.5 block truncate text-3xs text-muted-foreground">
+                {instanceId}
+              </code>
+            ) : null}
             <span className="mt-0.5 flex items-start gap-1.5 text-xs leading-normal text-muted-foreground/80">
               {statusDotNode ? (
                 <span className="flex h-[1.45em] shrink-0 items-center">{statusDotNode}</span>
@@ -739,7 +740,7 @@ export function ProviderInstanceCard({
   }
 
   const editorHeaderAction = (
-    <div className="flex shrink-0 items-center gap-1.5">
+    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
       {driverOption?.badgeLabel ? (
         <Badge variant="warning" size="sm" className="shrink-0">
           {driverOption.badgeLabel}
@@ -749,7 +750,7 @@ export function ProviderInstanceCard({
       <span
         inert={readOnly}
         aria-disabled={readOnly || undefined}
-        className={cn("inline-flex items-center gap-1", readOnly && "opacity-50")}
+        className={cn("inline-flex flex-wrap items-center gap-1", readOnly && "opacity-50")}
       >
         {versionAdvisory ? (
           <Popover>
@@ -845,7 +846,7 @@ export function ProviderInstanceCard({
             </PopoverPopup>
           </Popover>
         ) : null}
-        {titleTailNode}
+        {headerAction}
         {accountAuthAction}
         {onDelete ? (
           <Button
@@ -865,7 +866,12 @@ export function ProviderInstanceCard({
 
   return (
     <>
-      <SettingsSection title={displayName} icon={titleIconNode} headerAction={editorHeaderAction}>
+      <SettingsSection
+        title={displayName}
+        icon={titleIconNode}
+        headerAction={editorHeaderAction}
+        wrapHeader
+      >
         <SettingsRow
           title="Display name"
           status={

@@ -1,4 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import * as Effect from "effect/Effect";
+import { queuedThreadMessageAccountMatches } from "./thread-outbox-model";
 import { EnvironmentNotRegisteredError } from "@t3tools/client-runtime/connection";
 import { isTransportConnectionErrorMessage } from "@t3tools/client-runtime/errors";
 import { EnvironmentRpcUnavailableError } from "@t3tools/client-runtime/rpc";
@@ -117,6 +120,51 @@ function queuedMessage(input: {
 }
 
 describe("thread outbox", () => {
+  it("captures ownership before persistence and preserves it through autosaves and reloads", async () => {
+    const { appAtomRegistry } = await import("./atom-registry");
+    const { enqueueThreadOutboxMessage, threadOutboxManager } = await import("./thread-outbox");
+    onTestFinished(() => {
+      appAtomRegistry.set(managedRelaySessionAtom, null);
+      outboxFiles.clear();
+    });
+    const message = queuedMessage({
+      messageId: "owned-message",
+      createdAt: "2026-10-02T00:00:00.000Z",
+    });
+    appAtomRegistry.set(managedRelaySessionAtom, {
+      accountId: "alice",
+      readClerkToken: () => Effect.succeed("alice"),
+    });
+    const pending = enqueueThreadOutboxMessage(message);
+    appAtomRegistry.set(managedRelaySessionAtom, {
+      accountId: "bob",
+      readClerkToken: () => Effect.succeed("bob"),
+    });
+    await pending;
+    await threadOutboxManager.update({ ...message, text: "Autosaved changes" });
+    const loaded = (await expoThreadOutboxStorage.load()).messages.find(
+      (entry) => entry.messageId === message.messageId,
+    )!;
+    expect(loaded.ownerAccountId).toBe("alice");
+    expect(loaded.text).toBe("Autosaved changes");
+    expect(queuedThreadMessageAccountMatches(loaded, "bob")).toBe(false);
+    expect(queuedThreadMessageAccountMatches(loaded, null)).toBe(false);
+    expect(queuedThreadMessageAccountMatches(loaded, "alice")).toBe(true);
+  });
+
+  it("does not let old ownerless entries acquire a signed-in user's connections", () => {
+    const original = queuedMessage({
+      messageId: "old-message",
+      createdAt: "2026-10-02T00:00:00.000Z",
+    });
+    const loaded = decodeQueuedThreadMessage(encodeQueuedThreadMessage(original));
+    expect(queuedThreadMessageAccountMatches(loaded, "bob")).toBe(false);
+    expect(queuedThreadMessageAccountMatches(loaded, null)).toBe(true);
+    const anonymous = decodeQueuedThreadMessage(
+      encodeQueuedThreadMessage({ ...original, ownerAccountId: null }),
+    );
+    expect(queuedThreadMessageAccountMatches(anonymous, "bob")).toBe(false);
+  });
   it("retains structured context through a persisted offline queue round trip", () => {
     const message: QueuedThreadMessage = {
       ...queuedMessage({ messageId: "context-message", createdAt: "2026-09-06T12:00:00.000Z" }),

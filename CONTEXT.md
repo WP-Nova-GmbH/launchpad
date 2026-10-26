@@ -2,6 +2,18 @@
 
 Language for organization-governed work and managed compute in Launchpad.
 
+## Client access
+
+**Pairing code**:
+A one-time invitation shared to authorize a client to access an environment. It grants client
+access, not a verified person's identity.
+_Avoid_: User login
+
+**Client label**:
+A human-readable, environment-specific name for a paired client, such as "Bob's iPad".
+It distinguishes clients but does not verify the person using one.
+_Avoid_: User name, verified identity
+
 ## Collaboration
 
 **Repository access**:
@@ -49,6 +61,37 @@ prompt does not change its original author.
 **Prompt editor**:
 The person who most recently changed a queued prompt's content, shown as "Edited by" alongside
 its original submitter. Both remain attributed after the prompt reaches the agent.
+
+## Issue trackers
+
+**Integration application**:
+Launchpad's registered identity with an external service, through which individual users can
+independently authorize their own connections.
+_Avoid_: Organization connection
+
+**Issue-tracker connection**:
+One Launchpad user's authorization to access a workspace or site in an external issue tracker.
+Several users may connect to the same workspace or site without sharing their authorization.
+_Avoid_: Organization connection, shared company account
+
+**Write approver**:
+The owner of the personal issue-tracker connection used for a proposed change.
+In a shared thread, another participant cannot approve a change through that connection.
+
+**Linear workspace**:
+The space in Linear that contains a company's teams and issues. It is distinct from a Launchpad
+organization and from a project's filesystem workspace.
+_Avoid_: Workspace when referring to Linear without qualification
+
+**Linear team**:
+A group within a Linear workspace that owns issues and their workflow. It is distinct from a
+Launchpad organization or repository.
+_Avoid_: Team when referring to Linear without qualification
+
+**Issue context**:
+The details, comment discussion, and embedded images from an external issue used to inform work
+in a Launchpad thread. It is distinct from a Launchpad work item.
+_Avoid_: Imported work item, synced issue
 
 ## Managed compute
 

@@ -12,6 +12,8 @@ import {
 
 const decodeSearchEntriesInput = Schema.decodeUnknownSync(ProjectSearchEntriesInput);
 const decodeSearchContentsInput = Schema.decodeUnknownSync(ProjectSearchContentsInput);
+const encodeReadError = Schema.encodeSync(ProjectReadFileError);
+const decodeReadError = Schema.decodeUnknownSync(ProjectReadFileError);
 
 describe("project search inputs", () => {
   it("allows an empty entries query for bounded frecency browsing", () => {
@@ -81,6 +83,23 @@ describe("project RPC errors", () => {
     expect(contentSearchError.message).not.toContain(cause.message);
     expect(contentSearchError).not.toHaveProperty("query");
     expect(contentSearchError.cause).toBe(cause);
+  });
+
+  it("preserves the optional missing-file signal across the wire", () => {
+    const error = new ProjectReadFileError({
+      cwd: "/workspace",
+      relativePath: "launchpad.json",
+      failure: "operation_failed",
+      notFound: true,
+    });
+    const encoded = encodeReadError(error);
+    expect(decodeReadError(encoded).notFound).toBe(true);
+    expect(
+      decodeReadError({
+        _tag: "ProjectReadFileError",
+        message: "Legacy failure",
+      }).notFound,
+    ).toBeUndefined();
   });
 
   it("decodes legacy message-only errors during rolling upgrades", () => {

@@ -1,0 +1,277 @@
+import * as Schema from "effect/Schema";
+
+import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+
+export const RELAY_LINEAR_CALLBACK_PATH = "/v1/user/issue-trackers/linear/callback";
+export const RELAY_JIRA_CALLBACK_PATH = "/v1/user/issue-trackers/jira/callback";
+
+export const RelayIssueTrackerService = Schema.Literals(["linear", "jira"]);
+export type RelayIssueTrackerService = typeof RelayIssueTrackerService.Type;
+
+export const RelayIssueTrackerAuthorization = Schema.Struct({
+  id: Schema.String,
+  phase: Schema.Literals(["pending", "exchanging", "selecting_site"]),
+  expiresAt: Schema.String,
+});
+export const RelayLinearReplacement = Schema.Struct({
+  id: Schema.String,
+  currentWorkspaceId: Schema.String,
+  workspaceId: Schema.String,
+  currentAccountLabel: Schema.String,
+  accountLabel: Schema.String,
+  expiresAt: Schema.String,
+});
+export const RelayLinearReplacementRequest = Schema.Struct({
+  proposalId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+});
+export type RelayLinearReplacementRequest = typeof RelayLinearReplacementRequest.Type;
+
+export const RelayJiraSite = Schema.Struct({
+  cloudId: TrimmedNonEmptyString.check(Schema.isMaxLength(200)),
+  siteUrl: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+  accountLabel: TrimmedNonEmptyString.check(Schema.isMaxLength(1024)),
+});
+export type RelayJiraSite = typeof RelayJiraSite.Type;
+export const RelayJiraAuthorizationRequest = Schema.Struct({
+  authorizationId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+});
+export const RelaySelectJiraSiteRequest = Schema.Struct({
+  ...RelayJiraAuthorizationRequest.fields,
+  cloudId: RelayJiraSite.fields.cloudId,
+});
+export type RelaySelectJiraSiteRequest = typeof RelaySelectJiraSiteRequest.Type;
+
+export const RelayIssueTrackerConnection = Schema.Struct({
+  service: RelayIssueTrackerService,
+  status: Schema.Literals(["connecting", "connected", "reconnect_required"]),
+  accountLabel: Schema.NullOr(Schema.String),
+  updatedAt: Schema.String,
+  searchEnabled: Schema.optionalKey(Schema.Boolean),
+  writesAvailable: Schema.optionalKey(Schema.Boolean),
+  authorization: Schema.optionalKey(RelayIssueTrackerAuthorization),
+  jiraSites: Schema.optionalKey(Schema.Array(RelayJiraSite)),
+  replacement: Schema.optionalKey(RelayLinearReplacement),
+});
+export type RelayIssueTrackerConnection = typeof RelayIssueTrackerConnection.Type;
+
+export const RelayIssueTrackerAuthorizationProfile = Schema.Struct({
+  writes: Schema.Boolean,
+});
+export type RelayIssueTrackerAuthorizationProfile =
+  typeof RelayIssueTrackerAuthorizationProfile.Type;
+
+export const RelayIssueTrackerConnections = Schema.Struct({
+  connections: Schema.Array(RelayIssueTrackerConnection),
+});
+export type RelayIssueTrackerConnections = typeof RelayIssueTrackerConnections.Type;
+
+export const RelayStartLinearResponse = Schema.Struct({
+  authorizationUrl: Schema.String,
+  authorizationId: Schema.String,
+  connection: RelayIssueTrackerConnection,
+});
+export type RelayStartLinearResponse = typeof RelayStartLinearResponse.Type;
+
+export const RelayStartJiraResponse = RelayStartLinearResponse;
+export type RelayStartJiraResponse = typeof RelayStartJiraResponse.Type;
+
+export const RelayIssueDetails = Schema.Struct({
+  identifier: Schema.String,
+  title: Schema.String,
+  description: Schema.String,
+  url: Schema.String,
+  status: Schema.NullOr(Schema.String),
+  assignee: Schema.NullOr(Schema.String),
+});
+export type RelayIssueDetails = typeof RelayIssueDetails.Type;
+
+export const RelayReadIssueRequest = Schema.Struct({
+  issue: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+});
+export const RelayPrepareIssueCommentRequest = Schema.Struct({
+  ...RelayReadIssueRequest.fields,
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(20_000)),
+  retryAfterUnknown: Schema.optionalKey(Schema.Boolean),
+  invocationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  providerSessionId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+});
+export const RelayPrepareIssueEditRequest = Schema.Struct({
+  ...RelayReadIssueRequest.fields,
+  field: Schema.Literals(["title", "description", "status", "assignee"]),
+  value: Schema.NullOr(Schema.String.check(Schema.isMaxLength(20_000))),
+  retryAfterUnknown: Schema.optionalKey(Schema.Boolean),
+  invocationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  providerSessionId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+});
+export const RelayIssueWriteOperationId = TrimmedNonEmptyString.check(Schema.isMaxLength(64));
+export const RelayIssueWriteIdRequest = Schema.Struct({ operationId: RelayIssueWriteOperationId });
+export const RelayIssueWriteOperation = Schema.Struct({
+  operationId: RelayIssueWriteOperationId,
+  state: Schema.Literals([
+    "awaiting_approval",
+    "ready",
+    "executing",
+    "succeeded",
+    "outcome_unknown",
+    "rejected",
+    "cancelled",
+    "superseded",
+  ]),
+  service: RelayIssueTrackerService,
+  action: Schema.Literals(["add_comment", "edit_issue"]),
+  field: Schema.NullOr(Schema.Literals(["title", "description", "status", "assignee"])),
+  identifier: Schema.String,
+  issueUrl: Schema.String,
+  body: Schema.String,
+  executionAccount: Schema.String,
+  resultResourceId: Schema.NullOr(Schema.String),
+  resultUrl: Schema.NullOr(Schema.String),
+  retryWarning: Schema.optionalKey(Schema.Boolean),
+});
+export const RelayExecuteIssueWriteRequest = Schema.Struct({
+  operationId: RelayIssueWriteOperationId,
+  providerSessionId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+});
+export const RelayIssueWriteResult = Schema.Struct({
+  state: Schema.Literals(["succeeded", "outcome_unknown"]),
+  resourceId: Schema.NullOr(Schema.String),
+  url: Schema.NullOr(Schema.String),
+});
+export const RelayIssueWriteDecisionRequest = Schema.Struct({
+  operationId: RelayIssueWriteOperationId,
+  decision: Schema.Literals(["approve", "reject"]),
+});
+export const RelayIssueWriteVerifiedDecision = Schema.Struct({
+  decision: Schema.NullOr(Schema.Literals(["accept", "decline"])),
+});
+export const ISSUE_TRACKER_WRITE_REQUEST_PREFIX = "issue-write:";
+const SearchFilter = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
+export const RelaySearchIssuesRequest = Schema.Struct({
+  query: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(256))),
+  project: Schema.optionalKey(SearchFilter),
+  team: Schema.optionalKey(SearchFilter),
+  status: Schema.optionalKey(SearchFilter),
+  assignee: Schema.optionalKey(SearchFilter),
+  continuation: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(16_384))),
+});
+export type RelaySearchIssuesRequest = typeof RelaySearchIssuesRequest.Type;
+export const RelaySearchIssuesResponse = Schema.Struct({
+  service: RelayIssueTrackerService,
+  accountLabel: Schema.String,
+  issues: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      identifier: Schema.String,
+      title: Schema.String,
+      url: Schema.String,
+      status: Schema.NullOr(Schema.String),
+      assignee: Schema.NullOr(Schema.String),
+      project: Schema.NullOr(Schema.String),
+      team: Schema.NullOr(Schema.String),
+    }),
+  ),
+  continuation: Schema.NullOr(Schema.String),
+  truncated: Schema.Boolean,
+});
+export type RelaySearchIssuesResponse = typeof RelaySearchIssuesResponse.Type;
+const LinearReference = TrimmedNonEmptyString.check(Schema.isMaxLength(16_384));
+export const RelayLinearImageReference = Schema.Struct({
+  reference: LinearReference,
+  url: Schema.String,
+});
+export const RelayLinearComment = Schema.Struct({
+  id: Schema.String,
+  parentId: Schema.NullOr(Schema.String),
+  body: Schema.String,
+  author: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  editedAt: Schema.NullOr(Schema.String),
+  url: Schema.String,
+  bodyTruncated: Schema.Boolean,
+  images: Schema.Array(RelayLinearImageReference),
+  imagesTruncated: Schema.Boolean,
+  imagesContinuation: Schema.NullOr(LinearReference),
+});
+export const RelayLinearDiscussion = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("available"),
+    comments: Schema.Array(RelayLinearComment),
+    continuation: Schema.NullOr(LinearReference),
+    hasMore: Schema.Boolean,
+    contentTruncated: Schema.Boolean,
+  }),
+  Schema.Struct({ status: Schema.Literal("unavailable"), reason: Schema.String }),
+]);
+export type RelayLinearDiscussion = typeof RelayLinearDiscussion.Type;
+export const RelayLinearContext = Schema.Struct({
+  source: LinearReference,
+  workspaceId: Schema.String,
+  issueId: Schema.String,
+  discussion: RelayLinearDiscussion,
+  images: Schema.Array(RelayLinearImageReference),
+  imagesTruncated: Schema.Boolean,
+  imagesContinuation: Schema.NullOr(LinearReference),
+});
+export const RelayLinearReferenceRequest = Schema.Struct({ reference: LinearReference });
+export type RelayLinearReferenceRequest = typeof RelayLinearReferenceRequest.Type;
+export const RelayLinearCommentsResponse = Schema.Struct({
+  service: Schema.Literal("linear"),
+  accountLabel: Schema.String,
+  identifier: Schema.String,
+  url: Schema.String,
+  ...RelayLinearContext.fields,
+});
+export const RelayLinearImagesResponse = Schema.Struct({
+  service: Schema.Literal("linear"),
+  accountLabel: Schema.String,
+  identifier: Schema.String,
+  url: Schema.String,
+  workspaceId: Schema.String,
+  issueId: Schema.String,
+  images: Schema.Array(RelayLinearImageReference),
+  imagesTruncated: Schema.Boolean,
+  imagesContinuation: Schema.NullOr(LinearReference),
+});
+export const RelayLinearImageResponse = Schema.Struct({
+  service: Schema.Literal("linear"),
+  accountLabel: Schema.String,
+  identifier: Schema.String,
+  url: Schema.String,
+  workspaceId: Schema.String,
+  issueId: Schema.String,
+  image: Schema.Struct({
+    mimeType: Schema.Literals(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+    data: Schema.String,
+  }),
+});
+
+export const RelayReadIssueResponse = Schema.Struct({
+  ...RelayIssueDetails.fields,
+  linear: Schema.optionalKey(RelayLinearContext),
+  service: RelayIssueTrackerService,
+  accountLabel: Schema.String,
+});
+export type RelayReadIssueResponse = typeof RelayReadIssueResponse.Type;
+
+export class RelayIssueTrackerError extends Schema.TaggedError<RelayIssueTrackerError>()(
+  "RelayIssueTrackerError",
+  {
+    code: Schema.Literals([
+      "auth_required",
+      "forbidden",
+      "not_found",
+      "invalid_input",
+      "unavailable",
+      "image_too_large",
+      "unsupported_image",
+      "conflict",
+      "write_in_progress",
+      "not_configured",
+      "rate_limited",
+    ]),
+    message: Schema.String,
+    traceId: Schema.optional(Schema.String),
+    retryAfterSeconds: Schema.optional(Schema.Number),
+  },
+  { httpApiStatus: 400 },
+) {}

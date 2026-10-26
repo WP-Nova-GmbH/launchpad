@@ -37,7 +37,7 @@ import ProjectScriptsControl, {
 import { OpenInPicker } from "./OpenInPicker";
 import { useRemoteOpenState, type RemoteOpenMode } from "../../remoteOpen";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { useT3ProjectFileScripts } from "~/hooks/useT3ProjectFileScripts";
+import { useT3ProjectFileState } from "~/hooks/useT3ProjectFileScripts";
 import { useThreadActionMenu } from "~/hooks/useThreadActionMenu";
 import { readLocalApi } from "~/localApi";
 import { threadEnvironment } from "../../state/threads";
@@ -202,7 +202,7 @@ export const ChatHeader = memo(function ChatHeader({
   );
   const activeProjectName = activeProject?.title;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
-  const fileScripts = useT3ProjectFileScripts(
+  const projectFile = useT3ProjectFileState(
     activeThreadEnvironmentId,
     activeProjectScripts ? activeProjectCwd : null,
   );
@@ -364,7 +364,8 @@ export const ChatHeader = memo(function ChatHeader({
             onRequestMenuClose={() => setActionsOpen(false)}
             presentation={actionsCollapsed ? "menu" : "toolbar"}
             scripts={activeProjectScripts}
-            fileScripts={fileScripts}
+            fileScripts={projectFile.scripts}
+            projectFileName={projectFile.fileName}
             keybindings={keybindings}
             preferredScriptId={preferredScriptId}
             onRunScript={onRunProjectScript}

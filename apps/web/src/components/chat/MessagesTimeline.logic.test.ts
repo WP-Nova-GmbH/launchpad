@@ -1094,6 +1094,7 @@ describe("resolveAssistantMessageCopyState", () => {
 describe("deriveMessagesTimelineRows", () => {
   const queuedMessage = (id: string, prompt: string) => ({
     id,
+    ownerAccountId: null,
     prompt,
     images: [],
     files: [],

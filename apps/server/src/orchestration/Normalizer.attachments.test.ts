@@ -60,6 +60,23 @@ function turnStartCommand(input: {
 }
 
 describe("normalizeDispatchCommand attachments", () => {
+  it.effect("stamps the authenticated actor on approval responses", () =>
+    Effect.gen(function* () {
+      const command = {
+        type: "thread.approval.respond" as const,
+        commandId: CommandId.make("approve-issue-change"),
+        threadId: ThreadId.make("thread-1"),
+        requestId: ApprovalRequestId.make("issue-write:operation-1"),
+        decision: "accept" as const,
+        actorUserId: "spoofed-user",
+        createdAt: "2026-08-01T00:00:00.000Z",
+      };
+      const trusted = yield* normalizeDispatchCommand(command, "authenticated-user");
+      expect(trusted).toMatchObject({ actorUserId: "authenticated-user" });
+      const anonymous = yield* normalizeDispatchCommand(command);
+      expect("actorUserId" in anonymous).toBe(false);
+    }).pipe(Effect.provide(testLayer)),
+  );
   it.effect("accepts 100 inline images and rejects 101 before writing files", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;

@@ -19,6 +19,7 @@ export const connectPairing = createRuntimeCommand(connectionAtomRuntime, {
       JSON.stringify(input),
   },
   execute: (input: {
+    readonly clientLabel?: string;
     readonly pairingUrl?: string;
     readonly host?: string;
     readonly pairingCode?: string;
@@ -35,4 +36,18 @@ export const connectSshEnvironment = createRuntimeCommand(connectionAtomRuntime,
   },
   execute: (input: { readonly target: DesktopSshEnvironmentTarget; readonly label?: string }) =>
     ConnectionOnboarding.pipe(Effect.flatMap((onboarding) => onboarding.registerSsh(input))),
+});
+
+export const renameConnectedClient = createRuntimeCommand(connectionAtomRuntime, {
+  label: "web:connection:rename-client",
+  execute: (input: {
+    readonly environmentId: import("@t3tools/contracts").EnvironmentId;
+    readonly label: string;
+    readonly sessionId?: import("@t3tools/contracts").AuthSessionId;
+  }) => ConnectionOnboarding.pipe(Effect.flatMap((service) => service.renameClient(input))),
+});
+export const readConnectedClient = createRuntimeCommand(connectionAtomRuntime, {
+  label: "web:connection:read-client",
+  execute: (environmentId: import("@t3tools/contracts").EnvironmentId) =>
+    ConnectionOnboarding.pipe(Effect.flatMap((service) => service.currentSession(environmentId))),
 });

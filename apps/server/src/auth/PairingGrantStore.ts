@@ -5,6 +5,8 @@ import {
   type AuthPairingLink,
   type ServerAuthBootstrapMethod,
   AuthSessionUser,
+  AuthClientLabel,
+  requiresClientLabel,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -16,10 +18,13 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
 import * as AuthPairingLinks from "../persistence/AuthPairingLinks.ts";
+
+const decodeClientLabel = Schema.decodeEffect(AuthClientLabel);
 
 export interface BootstrapGrant {
   readonly method: ServerAuthBootstrapMethod;
@@ -170,9 +175,15 @@ export const BootstrapCredentialInternalError = Schema.Union([
 export type BootstrapCredentialInternalError = typeof BootstrapCredentialInternalError.Type;
 export const isBootstrapCredentialInternalError = Schema.is(BootstrapCredentialInternalError);
 
+export class BootstrapClientLabelError extends Schema.TaggedError<BootstrapClientLabelError>()(
+  "BootstrapClientLabelError",
+  { reason: Schema.Literals(["client_label_required", "invalid_client_label"]) },
+) {}
+
 export const BootstrapCredentialError = Schema.Union([
   BootstrapCredentialInvalidError,
   BootstrapCredentialInternalError,
+  BootstrapClientLabelError,
 ]);
 export type BootstrapCredentialError = typeof BootstrapCredentialError.Type;
 
@@ -214,12 +225,19 @@ export class PairingGrantStore extends Context.Service<
       ReadonlyArray<AuthPairingLink>,
       BootstrapCredentialInternalError
     >;
+    readonly subscribeChanges: Effect.Effect<
+      Stream.Stream<BootstrapCredentialChange>,
+      never,
+      Scope.Scope
+    >;
     readonly streamChanges: Stream.Stream<BootstrapCredentialChange>;
     readonly revoke: (id: string) => Effect.Effect<boolean, BootstrapCredentialInternalError>;
     readonly consume: (
       credential: string,
       input?: {
         readonly proofKeyThumbprint?: string;
+        readonly requireClientLabel?: boolean;
+        readonly clientLabel?: string;
       },
     ) => Effect.Effect<BootstrapGrant, BootstrapCredentialError>;
   }
@@ -437,6 +455,24 @@ export const make = Effect.gen(function* () {
   const consume: PairingGrantStore["Service"]["consume"] = Effect.fn("PairingGrantStore.consume")(
     function* (credential, input) {
       const now = yield* DateTime.now;
+      if (input?.requireClientLabel) {
+        const seeded = (yield* Ref.get(seededGrantsRef)).get(credential);
+        const stored = seeded
+          ? null
+          : yield* pairingLinks
+              .getByCredential({ credential })
+              .pipe(Effect.mapError((cause) => new BootstrapCredentialLookupError({ cause })));
+        const grant = seeded ?? (stored && Option.isSome(stored) ? stored.value : undefined);
+        if (grant?.method === "one-time-token" && requiresClientLabel(grant)) {
+          if (input.clientLabel === undefined)
+            return yield* new BootstrapClientLabelError({ reason: "client_label_required" });
+          yield* decodeClientLabel(input.clientLabel).pipe(
+            Effect.mapError(
+              () => new BootstrapClientLabelError({ reason: "invalid_client_label" }),
+            ),
+          );
+        }
+      }
       const seededResult: ConsumeResult = yield* Ref.modify(
         seededGrantsRef,
         (current): readonly [ConsumeResult, Map<string, StoredBootstrapGrant>] => {
@@ -570,6 +606,7 @@ export const make = Effect.gen(function* () {
   );
 
   return PairingGrantStore.of({
+    subscribeChanges: PubSub.subscribe(changesPubSub).pipe(Effect.map(Stream.fromSubscription)),
     issueOneTimeToken,
     listActive,
     get streamChanges() {

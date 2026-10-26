@@ -228,12 +228,12 @@ export const make = Effect.gen(function* () {
       }
     }
 
-    // A t3.json iconPath takes precedence over the well-known locations.
+    // A launchpad.json iconPath takes precedence over the well-known locations.
     const projectFile = yield* projectFileLoader.load(projectCwd);
-    if (Option.isSome(projectFile) && projectFile.value.iconPath !== undefined) {
+    if (Option.isSome(projectFile) && projectFile.value.config?.iconPath !== undefined) {
       const existing = yield* findExistingFile(
         projectCwd,
-        [projectFile.value.iconPath],
+        [projectFile.value.config?.iconPath],
         "workspace",
       );
       if (existing) {

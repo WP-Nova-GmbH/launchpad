@@ -13,7 +13,7 @@ import { Atom } from "effect/unstable/reactivity";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { useAtomCommand } from "./use-atom-command";
 
-export const threadPresence = createThreadPresenceAtoms(connectionAtomRuntime);
+const threadPresence = createThreadPresenceAtoms(connectionAtomRuntime);
 
 const EMPTY_PEOPLE_ATOM = Atom.make<ReadonlyArray<ThreadPresencePerson>>([]).pipe(
   Atom.withLabel("web-thread-presence:empty"),
@@ -23,6 +23,10 @@ export function useThreadPresencePeople(
   ref: ScopedThreadRef | null,
 ): ReadonlyArray<ThreadPresencePerson> {
   return useAtomValue(ref === null ? EMPTY_PEOPLE_ATOM : threadPresence.peopleAtom(ref));
+}
+
+export function useThreadPresenceParticipants(ref: ScopedThreadRef | null) {
+  return useAtomValue(ref === null ? EMPTY_PEOPLE_ATOM : threadPresence.participantsAtom(ref));
 }
 
 /**
@@ -76,7 +80,6 @@ export function useThreadPresenceReporter(ref: ScopedThreadRef | null, prompt: s
       void report({ environmentId: ref.environmentId, input: { threadId: null, typing: false } });
     };
     // The prompt is captured for the reset only; edits are handled below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ref, send, report, clearIdleTimer]);
 
   useEffect(() => {

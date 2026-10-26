@@ -1,65 +1,70 @@
 import {
   T3_PROJECT_FILE_NAME,
+  LEGACY_T3_PROJECT_FILE_NAME,
+  ProjectReadFileError,
   type EnvironmentId,
+  type ProjectFileName,
+  type ResolvedProjectFile,
   type T3ProjectFile,
   type T3ProjectFileScript,
 } from "@t3tools/contracts";
-import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
+import { useAtomValue } from "@effect/atom-react";
+import * as Cause from "effect/Cause";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useMemo } from "react";
 
-import { useProjectFileQuery } from "~/components/files/projectFilesQueryState";
+import { projectEnvironment } from "~/state/projects";
 
 const NO_SCRIPTS: ReadonlyArray<T3ProjectFileScript> = [];
+const EMPTY_CONFIG = Atom.make(AsyncResult.success<ResolvedProjectFile | null>(null));
+const isReadError = Schema.is(ProjectReadFileError);
 
 export interface T3ProjectFileState {
-  /**
-   * - `valid`: t3.json exists and decoded.
-   * - `invalid`: t3.json exists but fails to decode (the server then ignores
-   *   the whole file, including `iconPath` and every script).
-   * - `missing`: no readable t3.json at the workspace root.
-   * - `loading`: the file query has not settled yet.
-   */
-  status: "loading" | "missing" | "invalid" | "valid";
-  /** The decoded file when status is `valid`, null otherwise. */
+  status: "loading" | "missing" | "invalid" | "error" | "valid";
+  fileName: ProjectFileName;
   file: T3ProjectFile | null;
+  error: string | null;
   scripts: ReadonlyArray<T3ProjectFileScript>;
 }
 
-/**
- * Decoded state of the project's checked-in `t3.json`, including whether the
- * file exists but is broken — which the runtime otherwise swallows silently.
- */
+/** Keeps the selected filename with its validation state for truthful import and error labels. */
 export function useT3ProjectFileState(
   environmentId: EnvironmentId,
   cwd: string | null,
 ): T3ProjectFileState {
-  const query = useProjectFileQuery(environmentId, cwd ?? "", T3_PROJECT_FILE_NAME, cwd !== null);
-  const contents = query.data && !query.data.truncated ? query.data.contents : null;
-  const isPending = query.isPending;
+  const result = useAtomValue(
+    cwd === null ? EMPTY_CONFIG : projectEnvironment.projectConfig({ environmentId, cwd }),
+  );
   return useMemo(() => {
-    if (contents === null) {
-      return {
-        status: isPending ? "loading" : "missing",
-        file: null,
-        scripts: NO_SCRIPTS,
-      } as const;
-    }
-    const file = parseT3ProjectFile(contents);
-    if (file === null) {
-      return { status: "invalid", file: null, scripts: NO_SCRIPTS } as const;
-    }
-    return { status: "valid", file, scripts: file.scripts ?? NO_SCRIPTS } as const;
-  }, [contents, isPending]);
-}
-
-/**
- * Scripts declared in the project's checked-in `t3.json`, offered in the
- * scripts menu for import. Missing, truncated, or invalid files resolve to
- * an empty list.
- */
-export function useT3ProjectFileScripts(
-  environmentId: EnvironmentId,
-  cwd: string | null,
-): ReadonlyArray<T3ProjectFileScript> {
-  return useT3ProjectFileState(environmentId, cwd).scripts;
+    const data = Option.getOrNull(AsyncResult.value(result));
+    const cause = result._tag === "Failure" ? Cause.squash(result.cause) : null;
+    const fileName =
+      data?.fileName ??
+      (isReadError(cause) && cause.relativePath === LEGACY_T3_PROJECT_FILE_NAME
+        ? LEGACY_T3_PROJECT_FILE_NAME
+        : T3_PROJECT_FILE_NAME);
+    return {
+      status:
+        cause !== null
+          ? "error"
+          : data !== null
+            ? data.config === null
+              ? "invalid"
+              : "valid"
+            : result.waiting || result._tag === "Initial"
+              ? "loading"
+              : "missing",
+      fileName,
+      file: cause === null ? (data?.config ?? null) : null,
+      error:
+        cause instanceof Error
+          ? cause.message
+          : cause !== null
+            ? "Could not read project configuration."
+            : null,
+      scripts: cause === null ? (data?.config?.scripts ?? NO_SCRIPTS) : NO_SCRIPTS,
+    };
+  }, [result]);
 }

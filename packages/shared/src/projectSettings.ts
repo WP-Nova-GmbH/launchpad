@@ -8,7 +8,8 @@ import {
   type ProjectSettingsOverrides,
   type ResolvedServerSettings,
   type ServerSettings,
-  type T3ProjectFile,
+  type ResolvedProjectFile,
+  type ProjectFileName,
   type ThreadEnvMode,
   type WorktreeCleanupRules,
 } from "@t3tools/contracts";
@@ -17,11 +18,11 @@ import { isModelSelectionProviderEnabled } from "./serverSettings.ts";
 /**
  * Where a project-scoped value came from. The order is the priority order:
  * a project override, then the environment value, then the repository's
- * t3.json for keys in `PROJECT_FILE_BACKED_SETTINGS`, then the built-in
+ * launchpad.json for keys in `PROJECT_FILE_BACKED_SETTINGS`, then the built-in
  * default (reported as "environment", since that is what the environment
  * value is when nothing set it).
  */
-export type ProjectSettingSource = "environment" | "project" | "t3.json";
+export type ProjectSettingSource = "environment" | "project" | ProjectFileName;
 
 export type ProjectSettingSources = Readonly<
   Record<ProjectScopedServerSettingKey, ProjectSettingSource>
@@ -78,7 +79,7 @@ export function resolveProjectSettings(
   project?: LegacyProjectSettingsFields | null,
 ): ResolvedProjectSettings;
 /**
- * With the checkout's decoded t3.json (or null for a missing or invalid
+ * With the checkout's decoded launchpad.json (or null for a missing or invalid
  * one), every file-backed key resolves to a concrete value: the file fills
  * keys whose project and environment tiers are both unset, and the built-in
  * default fills what is left.
@@ -87,13 +88,13 @@ export function resolveProjectSettings(
   settings: ServerSettings,
   projectId: ProjectId | null,
   project: LegacyProjectSettingsFields | null | undefined,
-  projectFile: T3ProjectFile | null,
+  projectFile: ResolvedProjectFile | null,
 ): ResolvedProjectSettings<ResolvedServerSettings>;
 export function resolveProjectSettings(
   settings: ServerSettings,
   projectId: ProjectId | null,
   project?: LegacyProjectSettingsFields | null,
-  projectFile?: T3ProjectFile | null,
+  projectFile?: ResolvedProjectFile | null,
 ): ResolvedProjectSettings {
   const resolved = resolveProjectOverrides(settings, projectId, project);
   return projectFile === undefined ? resolved : applyProjectFile(resolved, projectFile);
@@ -101,7 +102,7 @@ export function resolveProjectSettings(
 
 function applyProjectFile(
   resolved: ResolvedProjectSettings,
-  projectFile: T3ProjectFile | null,
+  projectFile: ResolvedProjectFile | null,
 ): ResolvedProjectSettings {
   let effective: Record<string, unknown> | null = null;
   let sources: Record<ProjectScopedServerSettingKey, ProjectSettingSource> | null = null;
@@ -123,22 +124,22 @@ function applyProjectFile(
 /**
  * The file and built-in tiers for one key, given the project-over-environment
  * value (`null` when neither is set). For callers that hold the settings tier
- * but only see the file later, such as the git driver reading the t3.json of
+ * but only see the file later, such as the git driver reading the launchpad.json of
  * the checkout it just created. Same chain as `resolveProjectSettings`.
  */
 export function resolveProjectFileBackedSetting<K extends ProjectFileBackedSettingKey>(
   key: K,
   setting: ServerSettings[K],
-  projectFile: T3ProjectFile | null,
+  projectFile: ResolvedProjectFile | null,
 ): { value: ResolvedServerSettings[K]; source: ProjectSettingSource } {
   if (setting !== null) {
     return { value: setting as ResolvedServerSettings[K], source: "environment" };
   }
   const { field, builtIn } = PROJECT_FILE_BACKED_SETTINGS[key];
-  const fromFile = projectFile?.[field] as ResolvedServerSettings[K] | undefined;
+  const fromFile = projectFile?.config?.[field] as ResolvedServerSettings[K] | undefined;
   return fromFile === undefined
     ? { value: builtIn as ResolvedServerSettings[K], source: "environment" }
-    : { value: fromFile, source: "t3.json" };
+    : { value: fromFile, source: projectFile!.fileName };
 }
 
 function resolveProjectOverrides(

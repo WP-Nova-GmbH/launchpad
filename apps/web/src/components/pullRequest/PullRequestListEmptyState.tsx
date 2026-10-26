@@ -110,7 +110,7 @@ export function PullRequestListEmptyState({
         </EmptyHeader>
         <EmptyContent>
           <Button size="sm" onClick={() => openCommandPalette({ open: "add-project" })}>
-            <PlusIcon className="size-3.5" />
+            <PlusIcon />
             Add project
           </Button>
         </EmptyContent>
@@ -144,13 +144,13 @@ export function PullRequestListEmptyState({
         </EmptyHeader>
         <div className="flex flex-wrap justify-center gap-2">
           <Button size="sm" variant="outline" onClick={onClearQuery}>
-            <SearchIcon className="size-3.5" />
+            <SearchIcon />
             Clear search
           </Button>
           {/* The hosts answered this query once; a pull request opened since then would answer
               differently, and nothing on screen says which of the two the reader is looking at. */}
           <Button size="sm" variant="outline" disabled={refreshing} onClick={onRefresh}>
-            <RefreshIcon size="sm" refreshing={refreshing} />
+            <RefreshIcon refreshing={refreshing} />
             {refreshing ? "Checking..." : "Check again"}
           </Button>
         </div>
@@ -176,7 +176,7 @@ export function PullRequestListEmptyState({
           </Button>
         ) : null}
         <Button size="sm" variant="outline" disabled={refreshing} onClick={onRefresh}>
-          <RefreshIcon size="sm" refreshing={refreshing} />
+          <RefreshIcon refreshing={refreshing} />
           {refreshing ? "Checking..." : "Check again"}
         </Button>
       </div>

@@ -3,14 +3,54 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   buildHostedChannelSelectionUrl,
   buildHostedPairingUrl,
-  hasHostedPairingRequest,
   isHostedStaticApp,
   readHostedPairingRequest,
+  resolveHostedPairingRequest,
 } from "./hostedPairing";
+import { stripPairingTokenFromUrl } from "./pairingUrl";
 
 describe("hostedPairing", () => {
   afterEach(() => {
+    resolveHostedPairingRequest(new URL("https://preview.t3.codes/"));
     vi.unstubAllEnvs();
+  });
+
+  it("keeps a pending pairing after removing its token from the address bar", () => {
+    const url = new URL(
+      "https://preview.t3.codes/pair?host=https%3A%2F%2Fbackend.example.com#token=pairing-token",
+    );
+    const request = resolveHostedPairingRequest(url);
+    const cleaned = stripPairingTokenFromUrl(url);
+    expect(cleaned.hash).toBe("");
+    expect(readHostedPairingRequest(cleaned)).toBeNull();
+    expect(resolveHostedPairingRequest(cleaned)).toEqual(request);
+    expect(request?.token).toBe("pairing-token");
+  });
+
+  it("discards a pending pairing when leaving its page", () => {
+    const url = new URL("https://preview.t3.codes/pair?host=backend.example.com#token=old-token");
+    resolveHostedPairingRequest(url);
+    expect(resolveHostedPairingRequest(new URL("https://preview.t3.codes/"))).toBeNull();
+    expect(resolveHostedPairingRequest(stripPairingTokenFromUrl(url))).toBeNull();
+  });
+
+  it.each([
+    "https://preview.t3.codes/pair?host=other.example.com",
+    "https://other.t3.codes/pair?host=backend.example.com",
+  ])("does not reuse pending credentials on a different destination: %s", (destination) => {
+    const url = new URL("https://preview.t3.codes/pair?host=backend.example.com#token=old-token");
+    resolveHostedPairingRequest(url);
+    expect(resolveHostedPairingRequest(new URL(destination))).toBeNull();
+    expect(resolveHostedPairingRequest(stripPairingTokenFromUrl(url))).toBeNull();
+  });
+
+  it("replaces a pending pairing when a fresh link is opened", () => {
+    const url = new URL("https://preview.t3.codes/pair?host=backend.example.com#token=old-token");
+    resolveHostedPairingRequest(url);
+    const fresh = new URL(url);
+    fresh.hash = "token=new-token";
+    expect(resolveHostedPairingRequest(fresh)?.token).toBe("new-token");
+    expect(resolveHostedPairingRequest(stripPairingTokenFromUrl(fresh))?.token).toBe("new-token");
   });
 
   it("reads hosted pairing host and query token parameters", () => {
@@ -21,7 +61,6 @@ describe("hostedPairing", () => {
       token: "ABCD1234",
       label: "",
     });
-    expect(hasHostedPairingRequest(url)).toBe(true);
   });
 
   it("prefers hash tokens so generated hosted links do not put credentials in search params", () => {
@@ -60,11 +99,11 @@ describe("hostedPairing", () => {
 
   it("ignores incomplete hosted pairing requests", () => {
     expect(
-      hasHostedPairingRequest(new URL("https://app.t3.codes/pair?host=backend.example.com")),
-    ).toBe(false);
-    expect(hasHostedPairingRequest(new URL("https://app.t3.codes/pair?token=ABCD1234"))).toBe(
-      false,
-    );
+      readHostedPairingRequest(new URL("https://app.t3.codes/pair?host=backend.example.com")),
+    ).toBeNull();
+    expect(
+      readHostedPairingRequest(new URL("https://app.t3.codes/pair?token=ABCD1234")),
+    ).toBeNull();
   });
 
   it("detects the hosted static app only when no backend URL is configured", () => {

@@ -55,40 +55,44 @@ describe("settingInheritanceLayers", () => {
     ]);
   });
 
-  it("shows the checkout's t3.json as a layer for file-backed keys", () => {
-    const file = { defaultThreadEnvMode: "worktree" as const };
-    const fromFile = settingInheritanceLayers(
-      {
-        environmentId,
-        label: "Laptop",
-        projectId,
-        ...resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId, null, file),
-      },
-      DEFAULT_SERVER_SETTINGS,
-      "defaultThreadEnvMode",
-    );
-    expect(fromFile.map((layer) => [layer.label, layer.value, layer.effective])).toEqual([
-      ["Project", "Inherits", false],
-      ["Laptop", "Inherits", false],
-      ["t3.json", "New worktree", true],
-      ["Default", "Current checkout", false],
-    ]);
-    const settings = { ...DEFAULT_SERVER_SETTINGS, defaultThreadEnvMode: "local" as const };
-    const fromEnvironment = settingInheritanceLayers(
-      {
-        environmentId,
-        label: "Laptop",
-        projectId,
-        ...resolveProjectSettings(settings, projectId, null, file),
-      },
-      settings,
-      "defaultThreadEnvMode",
-    );
-    expect(fromEnvironment.map((layer) => [layer.value, layer.effective])).toEqual([
-      ["Inherits", false],
-      ["Current checkout", true],
-      ["Inherits", false],
-      ["Current checkout", false],
-    ]);
-  });
+  it.each(["launchpad.json", "t3.json"] as const)(
+    "shows %s as a layer for file-backed keys",
+    (fileName) => {
+      const file = { fileName, config: { defaultThreadEnvMode: "worktree" as const } };
+      const fromFile = settingInheritanceLayers(
+        {
+          environmentId,
+          label: "Laptop",
+          projectId,
+          ...resolveProjectSettings(DEFAULT_SERVER_SETTINGS, projectId, null, file),
+        },
+        DEFAULT_SERVER_SETTINGS,
+        "defaultThreadEnvMode",
+      );
+      expect(fromFile.map((layer) => [layer.label, layer.value, layer.effective])).toEqual([
+        ["Project", "Inherits", false],
+        ["Laptop", "Inherits", false],
+        [fileName, "New worktree", true],
+        ["Default", "Current checkout", false],
+      ]);
+      const settings = { ...DEFAULT_SERVER_SETTINGS, defaultThreadEnvMode: "local" as const };
+      const fromEnvironment = settingInheritanceLayers(
+        {
+          environmentId,
+          label: "Laptop",
+          projectId,
+          projectFileName: fileName,
+          ...resolveProjectSettings(settings, projectId, null, file),
+        },
+        settings,
+        "defaultThreadEnvMode",
+      );
+      expect(fromEnvironment.map((layer) => [layer.value, layer.effective])).toEqual([
+        ["Inherits", false],
+        ["Current checkout", true],
+        ["Inherits", false],
+        ["Current checkout", false],
+      ]);
+    },
+  );
 });

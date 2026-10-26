@@ -517,7 +517,7 @@ export function ProviderModelsSection({
           {builtInModels.length > 0 ? (
             <Button
               type="button"
-              size="xs"
+              size="sm"
               variant="ghost-muted"
               onClick={() =>
                 onHiddenModelsChange(nextHiddenModelsForBulkToggle(models, hiddenModels))
@@ -537,12 +537,12 @@ export function ProviderModelsSection({
         {driverKind !== "antigravity" && !isAdding ? (
           <Button
             type="button"
-            size="xs"
+            size="sm"
             variant="ghost-muted"
             className="ml-auto"
             onClick={() => setIsAdding(true)}
           >
-            <PlusIcon className="size-3" />
+            <PlusIcon />
             Add custom model
           </Button>
         ) : null}

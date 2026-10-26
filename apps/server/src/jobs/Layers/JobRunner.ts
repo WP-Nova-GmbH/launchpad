@@ -57,7 +57,7 @@ function lastAssistantText(thread: OrchestrationThread): string | null {
   return null;
 }
 
-export const make = Effect.gen(function* () {
+const make = Effect.gen(function* () {
   const engine = yield* OrchestrationEngineService;
   const snapshotQuery = yield* ProjectionSnapshotQuery;
   const gitWorkflow = yield* GitWorkflowService;

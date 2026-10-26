@@ -1,0 +1,1 @@
+ALTER TABLE "relay_issue_tracker_write_operations" ADD COLUMN "claim_fence" varchar(64);

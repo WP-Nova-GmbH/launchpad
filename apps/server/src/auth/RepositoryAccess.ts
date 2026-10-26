@@ -2,6 +2,7 @@ import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts
 import { readInstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
 import { readThreadVmInitialState } from "../relay/ThreadVmInitialStateRecord.ts";
 import { makeThreadVmRepositoryAccess } from "./ThreadVmRepositoryAccess.ts";
+import { authSessionAuthor } from "@t3tools/contracts";
 import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
 import { markSharedThreadDatabase } from "../persistence/Migrations.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -420,7 +421,10 @@ export function stampCommandAuthor(
     command.type === "thread.move.cancel"
   ) {
     const { author: _author, ...rest } = command;
-    return { ...rest, ...(actor.user === undefined ? {} : { author: actor.user }) };
+    return {
+      ...rest,
+      ...(actor.user === undefined ? {} : { author: authSessionAuthor(actor.user) }),
+    };
   }
   return command;
 }

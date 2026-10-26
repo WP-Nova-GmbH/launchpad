@@ -1,8 +1,11 @@
 import type { OrchestrationCommandReceipt } from "@t3tools/contracts/threadTransfer";
 import { assert, describe, it } from "@effect/vitest";
 import {
+  ApprovalRequestId,
   CommandId,
+  MessageId,
   OrchestrationCommand,
+  OrchestrationDispatchCommandError,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -18,6 +21,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ServerConfig } from "../config.ts";
+import { normalizeDispatchCommand } from "../orchestration/Normalizer.ts";
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -28,6 +32,7 @@ import {
   ThreadExecutionFenceError,
 } from "../persistence/ThreadExecutionFence.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { makeThreadExecutionRelay, ThreadExecutionRelayError } from "./ThreadExecutionRelay.ts";
 import {
   makeThreadCommandSync,
@@ -40,6 +45,7 @@ const decodeCommandJson = Schema.decodeEffect(Schema.fromJsonString(Orchestratio
 const testLayer = OrchestrationLayerLive.pipe(
   Layer.provide(RepositoryIdentityResolver.layer),
   Layer.provideMerge(SqlitePersistenceMemory),
+  Layer.provideMerge(WorkspacePaths.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-inbox-test-" })),
   Layer.provideMerge(NodeServices.layer),
 );
@@ -148,6 +154,44 @@ const fixture = Effect.gen(function* () {
   };
 });
 describe("portable relay inbox delivery", () => {
+  it.effect("attributes an issue approval to its authenticated relay actor", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const normalizerContext =
+        yield* Effect.context<Effect.Services<ReturnType<typeof normalizeDispatchCommand>>>();
+      f.inbox.push({
+        ...entry("approve-issue"),
+        command: {
+          type: "thread.approval.respond",
+          commandId: CommandId.make("approve-issue"),
+          threadId,
+          requestId: ApprovalRequestId.make("issue-write:operation"),
+          decision: "accept",
+          actorUserId: "spoofed-user",
+          createdAt,
+        },
+      });
+      const sync = makeThreadCommandSync(
+        f.sql,
+        f.engine,
+        f.receipts,
+        f.execution,
+        f.transport,
+        (command, authenticatedUserId) =>
+          normalizeDispatchCommand(command, authenticatedUserId).pipe(
+            Effect.provideContext(normalizerContext),
+          ),
+      );
+      yield* sync.synchronize(threadId);
+      assert.equal(f.acknowledged.get("approve-issue")?.status, "accepted");
+      const [event] = yield* f.sql<{ actorUserId: string }>`SELECT
+        json_extract(payload_json, '$.actorUserId') AS "actorUserId"
+        FROM orchestration_events WHERE command_id = 'approve-issue'
+          AND event_type = 'thread.approval-response-requested'`;
+      assert.equal(event?.actorUserId, actor.userId);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("uploads the complete persisted receipt unchanged after a lost acknowledgement", () =>
     Effect.gen(function* () {
       const f = yield* fixture;
@@ -204,6 +248,101 @@ describe("portable relay inbox delivery", () => {
       assert.equal(archived?.status, "rejected");
       assert.equal(archived?.acceptedAt, acceptedAt);
       assert.equal(archived?.resultSequence, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("rejects an expired personal grant durably and continues the relay inbox", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const expired: RelayThreadInboxEntry = {
+        ...entry("expired-grant"),
+        acceptedAt: createdAt,
+        command: {
+          type: "thread.prompt.enqueue" as const,
+          commandId: CommandId.make("expired-grant"),
+          threadId,
+          issueTrackerAuthorization: "expired-personal-grant",
+          message: {
+            messageId: MessageId.make("expired-message"),
+            text: "Read my issue",
+            attachments: [],
+          },
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          createdAt,
+        },
+      };
+      f.inbox.push(expired, entry("after-expired", 2));
+      const archived: OrchestrationCommandReceipt[] = [];
+      let lose = true;
+      const sync = makeThreadCommandSync(
+        f.sql,
+        f.engine,
+        f.receipts,
+        f.execution,
+        {
+          ...f.transport,
+          acknowledge: (owner, id, receipt, commandReceipt) =>
+            Effect.gen(function* () {
+              if (id === expired.commandId) {
+                assert(commandReceipt);
+                archived.push(commandReceipt);
+                if (lose) {
+                  lose = false;
+                  return yield* new ThreadCommandSyncError({ threadId, detail: "reply lost" });
+                }
+              }
+              yield* f.transport.acknowledge(owner, id, receipt, commandReceipt);
+            }),
+        },
+        (command) =>
+          command.commandId === expired.commandId
+            ? Effect.fail(
+                new OrchestrationDispatchCommandError({
+                  message: "Personal connection authorization is invalid or expired.",
+                }),
+              )
+            : f.normalize(command),
+      );
+      yield* Effect.flip(sync.synchronize(threadId));
+      assert.equal(f.acknowledged.size, 0);
+      yield* sync.synchronize(threadId);
+      assert.equal(f.acknowledged.get(expired.commandId)?.status, "rejected");
+      assert.equal(f.acknowledged.get("after-expired")?.status, "accepted");
+      assert.equal(
+        Option.getOrThrow(yield* f.snapshot.getThreadDetailById(threadId)).title,
+        "after-expired",
+      );
+      assert.equal(archived.length, 2);
+      assert.deepEqual(archived[0], archived[1]);
+      assert.equal(archived[0]?.acceptedAt, createdAt);
+      assert.equal(archived[0]?.resultSequence, 0);
+      assert.isTrue(
+        Option.isNone(yield* f.receipts.getByCommandId({ commandId: expired.command.commandId })),
+      );
+      assert.isTrue([...f.work.values()].every(Boolean));
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("retains an unexpected normalization failure for a later retry", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      f.inbox.push(entry("normalizer-defect"), entry("after-defect", 2));
+      const broken = makeThreadCommandSync(
+        f.sql,
+        f.engine,
+        f.receipts,
+        f.execution,
+        f.transport,
+        () => Effect.die("Unexpected normalizer failure"),
+      );
+      const failed = yield* broken.synchronize(threadId).pipe(Effect.exit);
+      assert.equal(failed._tag, "Failure");
+      assert.equal(f.acknowledged.size, 0);
+      yield* f.make().synchronize(threadId);
+      assert.equal(f.acknowledged.get("normalizer-defect")?.status, "accepted");
+      assert.equal(f.acknowledged.get("after-defect")?.status, "accepted");
+      assert.isTrue([...f.work.values()].every(Boolean));
     }).pipe(Effect.provide(testLayer)),
   );
 

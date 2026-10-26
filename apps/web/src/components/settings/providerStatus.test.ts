@@ -18,6 +18,25 @@ const provider: ServerProvider = {
 };
 
 describe("getProviderSummary", () => {
+  it("keeps account labels in the detail view and omits them from compact summaries", () => {
+    expect(getProviderSummary(provider).headline).toBe("Authenticated · ChatGPT");
+    expect(getProviderSummary(provider, { includeAuthLabel: false }).headline).toBe(
+      "Authenticated",
+    );
+  });
+
+  it.each([
+    [{ status: "error" }, "Unavailable"],
+    [{ status: "warning" }, "Needs attention"],
+    [{ status: "disabled" }, "Disabled"],
+    [{ installed: false }, "Not found"],
+    [{ auth: { status: "unauthenticated" } }, "Not authenticated"],
+  ] as const)("preserves actionable compact status for %j", (state, headline) => {
+    expect(
+      getProviderSummary({ ...provider, ...state }, { includeAuthLabel: false }).headline,
+    ).toBe(headline);
+  });
+
   it("reports ready providers with unknown authentication as available", () => {
     expect(getProviderSummary({ ...provider, auth: { status: "unknown" } })).toEqual({
       headline: "Available",

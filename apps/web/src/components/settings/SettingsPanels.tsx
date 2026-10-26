@@ -3423,7 +3423,7 @@ export function ArchivedThreadsPanel() {
                   <Button
                     type="button"
                     variant="outline"
-                    size="xs"
+                    size="sm"
                     className="shrink-0"
                     onClick={() => {
                       void (async () => {
@@ -3448,7 +3448,7 @@ export function ArchivedThreadsPanel() {
                       })();
                     }}
                   >
-                    <ArchiveX className="size-3.5" />
+                    <ArchiveX />
                     <span>Unarchive</span>
                   </Button>
                 }

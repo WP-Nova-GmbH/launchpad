@@ -85,7 +85,7 @@ export function ProjectActionsSettings() {
     }),
   );
 
-  // A project's t3.json can declare actions to import. Read it from the
+  // A project's launchpad.json can declare actions to import. Read it from the
   // representative checkout; the imported action still fans out.
   const representativeMember = target?.projectId ? memberById.get(target.projectId) : undefined;
   const t3File = useT3ProjectFileState(
@@ -146,7 +146,7 @@ export function ProjectActionsSettings() {
                   render={
                     <Button
                       id="import-scripts"
-                      size="xs"
+                      size="sm"
                       variant="ghost"
                       disabled={saving}
                       type="button"
@@ -154,11 +154,11 @@ export function ProjectActionsSettings() {
                   }
                 >
                   Import scripts
-                  <ChevronDownIcon className="size-3.5" />
+                  <ChevronDownIcon />
                 </MenuTrigger>
                 <MenuPopup align="end">
                   <MenuGroup>
-                    <MenuGroupLabel>Import from t3.json</MenuGroupLabel>
+                    <MenuGroupLabel>Import from {t3File.fileName}</MenuGroupLabel>
                     <p className="px-2 pb-2 text-pretty text-sm text-muted-foreground">
                       Add actions declared by this checkout without editing them first.
                     </p>
@@ -182,12 +182,12 @@ export function ProjectActionsSettings() {
               </Menu>
             ) : null}
             <Button
-              size="xs"
+              size="sm"
               variant="outline"
               disabled={saving || targets.length === 0}
               onClick={() => setRequest({ scriptId: null, initial: EMPTY_PROJECT_SCRIPT_INPUT })}
             >
-              <PlusIcon className="size-3.5" />
+              <PlusIcon />
               Add action
             </Button>
           </div>
@@ -206,10 +206,16 @@ export function ProjectActionsSettings() {
           onEdit={(script) => setRequest(editorRequestForScript(script, keybindings))}
         />
       )}
+      {t3File.status === "error" ? (
+        <SettingsRow
+          title={`Cannot read ${t3File.fileName}`}
+          description={t3File.error ?? "Check access to the file."}
+        />
+      ) : null}
       {t3File.status === "invalid" ? (
         <SettingsRow
-          title="t3.json is invalid"
-          description="A t3.json exists in this checkout but fails to parse, so every action and icon it declares is ignored. Check the JSON syntax and icon values."
+          title={`${t3File.fileName} is invalid`}
+          description={`The ${t3File.fileName} in this checkout fails to parse, so every action and icon it declares is ignored. Check the JSON syntax and icon values.`}
           className="text-warning"
         />
       ) : null}

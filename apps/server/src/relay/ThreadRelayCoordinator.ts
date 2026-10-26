@@ -169,7 +169,10 @@ export const layer = Layer.effect(
       receipts,
       execution,
       authority.commands,
-      (command) => normalizeDispatchCommand(command).pipe(Effect.provideContext(normalizerContext)),
+      (command, authenticatedUserId) =>
+        normalizeDispatchCommand(command, authenticatedUserId).pipe(
+          Effect.provideContext(normalizerContext),
+        ),
     );
 
     const moves = yield* makeThreadMoveWorker(authority.moves, history, commands);

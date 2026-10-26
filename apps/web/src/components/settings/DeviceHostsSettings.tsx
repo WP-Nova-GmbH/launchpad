@@ -209,38 +209,41 @@ function DeviceHostList({
                 ? status.detail
                 : undefined;
         return (
-          <div key={host.id} className="flex items-center gap-2 border-t border-border/50 py-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 items-center gap-2">
-                <p className="truncate text-sm font-medium">{host.label}</p>
-                {platforms
-                  .filter((platform) => platform.available)
-                  .map((platform) => (
-                    <Tooltip key={platform.platform}>
-                      <TooltipTrigger
-                        render={
-                          <span
-                            tabIndex={0}
-                            role="img"
-                            aria-label={
-                              platform.platform === "ios" ? "iOS available" : "Android available"
-                            }
-                            className="shrink-0 text-muted-foreground"
-                          />
-                        }
-                      >
-                        {platform.platform === "ios" ? (
-                          <AppleIcon className="size-3.5" />
-                        ) : (
-                          <AndroidIcon className="size-3.5" />
-                        )}
-                      </TooltipTrigger>
-                      <TooltipPopup>
-                        {platform.platform === "ios" ? "iOS available" : "Android available"}
-                      </TooltipPopup>
-                    </Tooltip>
-                  ))}
-              </div>
+          <div
+            key={host.id}
+            className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 border-t border-border/50 py-2.5"
+          >
+            <div className="col-start-1 row-start-1 flex min-w-0 items-center gap-2">
+              <p className="truncate text-sm font-medium">{host.label}</p>
+              {platforms
+                .filter((platform) => platform.available)
+                .map((platform) => (
+                  <Tooltip key={platform.platform}>
+                    <TooltipTrigger
+                      render={
+                        <span
+                          tabIndex={0}
+                          role="img"
+                          aria-label={
+                            platform.platform === "ios" ? "iOS available" : "Android available"
+                          }
+                          className="shrink-0 text-muted-foreground"
+                        />
+                      }
+                    >
+                      {platform.platform === "ios" ? (
+                        <AppleIcon className="size-3.5" />
+                      ) : (
+                        <AndroidIcon className="size-3.5" />
+                      )}
+                    </TooltipTrigger>
+                    <TooltipPopup>
+                      {platform.platform === "ios" ? "iOS available" : "Android available"}
+                    </TooltipPopup>
+                  </Tooltip>
+                ))}
+            </div>
+            <div className="col-span-2 row-start-2 min-w-0">
               <p className="truncate text-xs text-muted-foreground">{host.target}</p>
               <DeviceToolVersions
                 owner={environmentLabel}
@@ -253,6 +256,15 @@ function DeviceHostList({
               {check?.status === "local" ? (
                 <p className="mt-1 text-xs text-muted-foreground">Already available locally</p>
               ) : null}
+              {progress ? (
+                <span
+                  role="status"
+                  className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+                >
+                  <Spinner size="xs" />
+                  {progress}
+                </span>
+              ) : null}
               {error ? (
                 <div className="mt-1" role="status">
                   <details className="text-xs text-destructive">
@@ -262,67 +274,60 @@ function DeviceHostList({
                 </div>
               ) : null}
             </div>
-            {progress ? (
-              <span
-                role="status"
-                className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"
-              >
-                <Spinner size="xs" />
-                {progress}
-              </span>
-            ) : null}
-            <Menu>
-              <MenuTrigger
-                render={
-                  <Button
-                    size="icon-sm"
-                    variant="ghost-muted"
-                    disabled={busy}
-                    aria-label={host.label + " options"}
-                  />
-                }
-              >
-                <MoreVertical />
-              </MenuTrigger>
-              <MenuPopup align="end">
-                <MenuItem
+            <div className="col-start-2 row-start-1 flex items-center gap-2">
+              <Menu>
+                <MenuTrigger
+                  render={
+                    <Button
+                      size="icon-sm"
+                      variant="ghost-muted"
+                      disabled={busy}
+                      aria-label={host.label + " options"}
+                    />
+                  }
+                >
+                  <MoreVertical />
+                </MenuTrigger>
+                <MenuPopup align="end">
+                  <MenuItem
+                    onClick={() => {
+                      onEdit(host);
+                    }}
+                  >
+                    Edit
+                  </MenuItem>
+                  <MenuItem variant="destructive" onClick={() => onRemove(host)}>
+                    Remove
+                  </MenuItem>
+                </MenuPopup>
+              </Menu>
+              {status?.status === "failed" &&
+              state.supportsHostRetry &&
+              state.hostStatus !== "disabled" ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy || retrying !== null}
                   onClick={() => {
-                    onEdit(host);
+                    setRetrying(host.id);
+                    void retry({ environmentId, input: { retryHostId: host.id } }).finally(() =>
+                      setRetrying(null),
+                    );
                   }}
                 >
-                  Edit
-                </MenuItem>
-                <MenuItem variant="destructive" onClick={() => onRemove(host)}>
-                  Remove
-                </MenuItem>
-              </MenuPopup>
-            </Menu>
-            {status?.status === "failed" &&
-            state.supportsHostRetry &&
-            state.hostStatus !== "disabled" ? (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={busy || retrying !== null}
-                onClick={() => {
-                  setRetrying(host.id);
-                  void retry({ environmentId, input: { retryHostId: host.id } }).finally(() =>
-                    setRetrying(null),
-                  );
-                }}
-              >
-                {retrying === host.id ? "Retrying…" : "Retry"}
-              </Button>
-            ) : (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={busy || progress !== null}
-                onClick={() => void testConnection(host)}
-              >
-                Test connection
-              </Button>
-            )}
+                  {retrying === host.id ? "Retrying…" : "Retry"}
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy || progress !== null}
+                  onClick={() => void testConnection(host)}
+                >
+                  Test connection
+                </Button>
+              )}
+            </div>
           </div>
         );
       })}

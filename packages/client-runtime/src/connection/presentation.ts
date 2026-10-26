@@ -14,6 +14,7 @@ export type EnvironmentConnectionPhase =
   | "unsupported";
 
 export interface EnvironmentConnectionPresentation {
+  readonly needsClientLabel?: boolean;
   readonly phase: EnvironmentConnectionPhase;
   readonly error: string | null;
   readonly traceId: string | null;
@@ -49,6 +50,9 @@ export function presentConnectionState(
       };
     case "blocked":
       return {
+        ...(state.lastFailure?.reason === "client-label-required"
+          ? { needsClientLabel: true }
+          : {}),
         phase: state.lastFailure?.reason === "unsupported" ? "unsupported" : "error",
         error: state.lastFailure?.message ?? null,
         traceId: state.lastFailure?.traceId ?? null,

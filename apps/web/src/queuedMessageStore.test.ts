@@ -10,6 +10,7 @@ import {
 function makeMessage(prompt: string): Omit<QueuedComposerMessage, "id"> {
   return {
     prompt,
+    ownerAccountId: "alice",
     images: [],
     files: [],
     terminalContexts: [],
@@ -24,6 +25,18 @@ function makeMessage(prompt: string): Omit<QueuedComposerMessage, "id"> {
 describe("queuedMessageStore", () => {
   beforeEach(() => {
     useQueuedMessageStore.setState({ queuesByThreadKey: {}, drainGeneration: 0 });
+  });
+
+  it("retains prompt ownership through a failed replay and holds it for user action", () => {
+    const store = useQueuedMessageStore.getState();
+    const entry = store.enqueue("thread-a", makeMessage("Alice's prompt"));
+    const taken = store.take("thread-a", entry.id, null)!;
+    store.holdAtFront("thread-a", taken);
+    const held = useQueuedMessageStore.getState().queuesByThreadKey["thread-a"]![0]!;
+    expect(held.ownerAccountId).toBe("alice");
+    expect(isQueuedMessageDue({ message: held, phase: "ready", latestToolActivityId: null })).toBe(
+      false,
+    );
   });
 
   it("keeps messages in submission order per thread", () => {

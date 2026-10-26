@@ -13,11 +13,12 @@ const onboardingScheduler = createAtomCommandScheduler();
 export const connectPairingUrl = createRuntimeCommand(connectionAtomRuntime, {
   label: "mobile:connection:connect-pairing-url",
   scheduler: onboardingScheduler,
-  concurrency: { mode: "singleFlight", key: (pairingUrl: string) => pairingUrl },
-  execute: (pairingUrl: string) =>
-    ConnectionOnboarding.pipe(
-      Effect.flatMap((onboarding) => onboarding.registerPairing({ pairingUrl })),
-    ),
+  concurrency: {
+    mode: "singleFlight",
+    key: (input: { pairingUrl: string; clientLabel?: string }) => JSON.stringify(input),
+  },
+  execute: (input: { pairingUrl: string; clientLabel?: string }) =>
+    ConnectionOnboarding.pipe(Effect.flatMap((onboarding) => onboarding.registerPairing(input))),
 });
 
 export const updateBearerConnection = createRuntimeCommand(connectionAtomRuntime, {
@@ -32,4 +33,15 @@ export const updateBearerConnection = createRuntimeCommand(connectionAtomRuntime
     readonly label: string;
     readonly httpBaseUrl: string;
   }) => ConnectionOnboarding.pipe(Effect.flatMap((onboarding) => onboarding.updateBearer(input))),
+});
+
+export const readConnectedClient = createRuntimeCommand(connectionAtomRuntime, {
+  label: "mobile:connection:read-client",
+  execute: (environmentId: EnvironmentId) =>
+    ConnectionOnboarding.pipe(Effect.flatMap((service) => service.currentSession(environmentId))),
+});
+export const renameConnectedClient = createRuntimeCommand(connectionAtomRuntime, {
+  label: "mobile:connection:rename-client",
+  execute: (input: { environmentId: EnvironmentId; label: string }) =>
+    ConnectionOnboarding.pipe(Effect.flatMap((service) => service.renameClient(input))),
 });

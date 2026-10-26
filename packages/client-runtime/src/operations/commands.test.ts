@@ -4,6 +4,7 @@ import {
   type ServerConfig,
   EnvironmentId,
   ORCHESTRATION_WS_METHODS,
+  ApprovalRequestId,
   ProjectId,
   ThreadId,
   type ClientOrchestrationCommand,
@@ -14,6 +15,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import { FetchHttpClient } from "effect/unstable/http";
+import { AtomRegistry } from "effect/unstable/reactivity";
 
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -23,16 +26,21 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
+import { IssueTrackerClientRegistry } from "../relay/issueTrackerTurn.ts";
+import { ManagedRelayClient } from "../relay/managedRelay.ts";
+import { managedRelaySessionAtom } from "../relay/managedRelayState.ts";
 import {
   archiveThread,
   startThreadTurn,
   createProject,
   revertThreadCheckpoint,
   reorderActiveThread,
+  respondToThreadApproval,
   settleThread,
   stopThreadSession,
   unsettleThread,
 } from "./commands.ts";
+import { ThreadCommandRouting } from "./commandRouting.ts";
 
 const TEST_CRYPTO_LAYER = Layer.succeed(
   Crypto.Crypto,
@@ -82,6 +90,174 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("environment commands", () => {
+  it.effect.each(["accepted", "changed_before_send", "changed_during_authorization"] as const)(
+    "authorizes an offline portable prompt before relay admission: %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const local: ClientOrchestrationCommand[] = [];
+        const routed: ClientOrchestrationCommand[] = [];
+        const supervisor = yield* makeSupervisor(local);
+        yield* SubscriptionRef.set(supervisor.session, Option.none());
+        const registry = AtomRegistry.make();
+        const session = (accountId: string) => ({
+          accountId,
+          readClerkToken: () => Effect.succeed(`${accountId}-token`),
+        });
+        registry.set(
+          managedRelaySessionAtom,
+          session(scenario === "changed_before_send" ? "bob" : "alice"),
+        );
+        const requests: Request[] = [];
+        const fetch: typeof globalThis.fetch = async (input, init) => {
+          const request = new Request(input, init);
+          requests.push(request);
+          expect(routed).toHaveLength(0);
+          expect(request.headers.get("authorization")).toBe("Bearer alice-token");
+          expect(await request.json()).toMatchObject({
+            environmentId: TARGET.environmentId,
+            threadId: "portable-thread",
+            commandId: "portable-command",
+            commandDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          });
+          if (scenario === "changed_during_authorization")
+            registry.set(managedRelaySessionAtom, session("bob"));
+          return Response.json({ authorization: "personal-grant" });
+        };
+        const outcome = yield* startThreadTurn({
+          expectedAccountId: "alice",
+          commandId: CommandId.make("portable-command"),
+          threadId: ThreadId.make("portable-thread"),
+          message: {
+            messageId: MessageId.make("portable-message"),
+            role: "user",
+            text: "Continue on the VM",
+            attachments: [],
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: "2026-10-26T12:00:00.000Z",
+        }).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.provideService(IssueTrackerClientRegistry, registry),
+          Effect.provideService(ManagedRelayClient, {
+            relayUrl: "https://relay.test",
+          } as ManagedRelayClient["Service"]),
+          Effect.provideService(FetchHttpClient.Fetch, fetch),
+          Effect.provideService(
+            Crypto.Crypto,
+            Crypto.make({
+              randomBytes: (size) => new Uint8Array(size),
+              digest: () => Effect.succeed(new Uint8Array(32)),
+            }),
+          ),
+          Effect.provideService(ThreadCommandRouting, {
+            remember: () => {},
+            isPortable: () => true,
+            receipt: () => Effect.succeed(null),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                routed.push(command);
+                return { relay: { commandId: command.commandId, position: 1, receipt: null } };
+              }),
+          }),
+          Effect.result,
+          Effect.ensuring(Effect.sync(() => registry.dispose())),
+        );
+        expect(local).toHaveLength(0);
+        expect(requests).toHaveLength(scenario === "changed_before_send" ? 0 : 1);
+        if (scenario === "accepted") {
+          expect(outcome).toMatchObject({
+            _tag: "Success",
+            success: { relay: { commandId: "portable-command", receipt: null } },
+          });
+          expect(routed).toMatchObject([
+            { type: "thread.prompt.enqueue", issueTrackerAuthorization: "personal-grant" },
+          ]);
+          expect(routed[0]).not.toHaveProperty("expectedAccountId");
+        } else {
+          expect(outcome._tag).toBe("Failure");
+          expect(routed).toHaveLength(0);
+        }
+      }),
+  );
+
+  it.effect(
+    "approves an issue write with the personal relay before notifying the environment",
+    () =>
+      Effect.gen(function* () {
+        const dispatched: ClientOrchestrationCommand[] = [];
+        const supervisor = yield* makeSupervisor(dispatched);
+        const registry = AtomRegistry.make();
+        registry.set(managedRelaySessionAtom, {
+          accountId: "alice",
+          readClerkToken: () => Effect.succeed("alice-token"),
+        });
+        const order: string[] = [];
+        const fetch: typeof globalThis.fetch = async () => {
+          order.push("relay");
+          expect(dispatched).toHaveLength(0);
+          return Response.json({
+            operationId: "operation-1",
+            state: "ready",
+            service: "jira",
+            action: "add_comment",
+            field: null,
+            identifier: "LP-42",
+            issueUrl: "https://example.atlassian.net/browse/LP-42",
+            body: "Exact comment",
+            executionAccount: "Alice",
+            resultResourceId: null,
+            resultUrl: null,
+          });
+        };
+        yield* respondToThreadApproval({
+          threadId: ThreadId.make("thread-1"),
+          requestId: ApprovalRequestId.make("issue-write:operation-1"),
+          decision: "accept",
+        }).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.provideService(IssueTrackerClientRegistry, registry),
+          Effect.provideService(ManagedRelayClient, {
+            relayUrl: "https://relay.test",
+          } as ManagedRelayClient["Service"]),
+          Effect.provideService(FetchHttpClient.Fetch, fetch),
+          Effect.ensuring(Effect.sync(() => registry.dispose())),
+        );
+        expect(order).toEqual(["relay"]);
+        expect(dispatched).toMatchObject([{ type: "thread.approval.respond", decision: "accept" }]);
+      }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
+  it.effect("does not release an issue write when personal approval fails", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched);
+      const registry = AtomRegistry.make();
+      registry.set(managedRelaySessionAtom, {
+        accountId: "alice",
+        readClerkToken: () => Effect.succeed("alice-token"),
+      });
+      const outcome = yield* respondToThreadApproval({
+        threadId: ThreadId.make("thread-1"),
+        requestId: ApprovalRequestId.make("issue-write:operation-1"),
+        decision: "accept",
+      }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(IssueTrackerClientRegistry, registry),
+        Effect.provideService(ManagedRelayClient, {
+          relayUrl: "https://relay.test",
+        } as ManagedRelayClient["Service"]),
+        Effect.provideService(FetchHttpClient.Fetch, async () =>
+          Response.json({ code: "forbidden" }, { status: 403 }),
+        ),
+        Effect.result,
+        Effect.ensuring(Effect.sync(() => registry.dispose())),
+      );
+      expect(outcome._tag).toBe("Failure");
+      expect(dispatched).toHaveLength(0);
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
   for (const shared of [false, true]) {
     it.effect(
       `uses ${shared ? "shared acceptance" : "legacy turn start"} without changing captured settings`,

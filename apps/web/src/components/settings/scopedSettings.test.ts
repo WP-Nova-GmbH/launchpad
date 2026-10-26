@@ -3,6 +3,7 @@ import {
   EnvironmentId,
   ProjectId,
   type ServerSettings,
+  type ResolvedProjectFile,
 } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
@@ -126,6 +127,28 @@ describe("scoped settings targets", () => {
     expect(selected.environment).toBe(server);
     expect(selected.environments).toEqual(environments);
     expect(selected.connectedEnvironments).toEqual([laptop, server]);
+  });
+
+  it("keeps the selected config filename per environment and reports mixed sources", () => {
+    const files = new Map<string, ResolvedProjectFile>([
+      [
+        member.physicalProjectKey,
+        { fileName: "launchpad.json", config: { defaultThreadEnvMode: "worktree" } },
+      ],
+      [
+        laptopMember.physicalProjectKey,
+        { fileName: "t3.json", config: { defaultThreadEnvMode: "worktree" } },
+      ],
+    ]);
+    const targets = resolveScopedSettingsTargets(project, [laptop, server], files);
+    expect(targets.map((target) => target.projectFileName)).toEqual(["launchpad.json", "t3.json"]);
+    expect(targets.map((target) => target.sources.defaultThreadEnvMode)).toEqual([
+      "launchpad.json",
+      "t3.json",
+    ]);
+    expect(scopedSettingsSource(targets, ["defaultThreadEnvMode"])).toBe("mixed");
+    expect(scopedSettingsSource([targets[0]!], ["defaultThreadEnvMode"])).toBe("launchpad.json");
+    expect(scopedSettingsSource([targets[1]!], ["defaultThreadEnvMode"])).toBe("t3.json");
   });
 
   it("resolves each member's effective settings and source at project scope", () => {

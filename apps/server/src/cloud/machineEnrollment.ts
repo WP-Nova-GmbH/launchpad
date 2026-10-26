@@ -27,6 +27,7 @@ import {
   CLOUD_MINT_PUBLIC_KEY,
   readInstalledMachineIdentity,
   readMachineEnrollmentConfiguration,
+  decodeRuntimeConfig,
   encodeCloudMachineIdentityJson,
   encodeEndpointRuntimeConfigJson,
   PUBLISH_AGENT_ACTIVITY_SECRET,
@@ -187,6 +188,37 @@ const scrubEnrollmentEnvFile = Effect.fn("environment.machine.scrubEnrollmentEnv
 );
 
 /**
+ * Start the connector an earlier enrollment stored. A machine is not linked to
+ * a cloud user, so the linked-environment startup path never confirms its
+ * tunnel origin and leaves the connector stopped; without this, every restart
+ * takes the machine offline for good.
+ */
+const startStoredEndpointRuntime = Effect.fn("environment.machine.startStoredEndpointRuntime")(
+  function* (
+    secrets: ServerSecretStore.ServerSecretStore["Service"],
+    endpointRuntime: ManagedEndpointRuntime.CloudManagedEndpointRuntime["Service"],
+  ) {
+    const stored = yield* secrets
+      .get(CLOUD_ENDPOINT_RUNTIME_CONFIG)
+      .pipe(
+        Effect.mapError(
+          (cause) => new MachineEnrollmentFailed({ stage: "read-configuration", cause }),
+        ),
+      );
+    const config = Option.isSome(stored)
+      ? Option.getOrNull(decodeRuntimeConfig(bytesToString(stored.value)))
+      : null;
+    if (config === null) return;
+    const status = yield* endpointRuntime.applyConfig(config);
+    if (status.status === "failed") {
+      yield* Effect.logWarning("Managed endpoint connector did not start on boot", {
+        reason: status.reason,
+      });
+    }
+  },
+);
+
+/**
  * Present the seeded credential once and become an executor: exchange the
  * seed for the durable environment credential, persist the relay
  * configuration and machine identity, and start the managed endpoint
@@ -214,6 +246,9 @@ export const reconcileMachineEnrollment = Effect.fn("environment.machine.reconci
       yield* Effect.logWarning(
         "Ignoring the machine enrollment seed: this environment is already linked to a cloud account",
       );
+    }
+    if (configuration.outcome === "already-enrolled") {
+      yield* startStoredEndpointRuntime(secrets, endpointRuntime);
     }
     if (configuration.outcome !== "pending-enrollment") return configuration;
     const relayUrl = normalizeMachineRelayUrl(configuration.relayUrl);

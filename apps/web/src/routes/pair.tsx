@@ -41,6 +41,7 @@ function PairRouteView() {
   return (
     <PairingRouteSurface
       auth={authGateState.auth}
+      labelOnly={authGateState.status === "needs-client-label"}
       onAuthenticated={() => {
         void navigate({ to: "/", replace: true });
       }}
