@@ -2,19 +2,21 @@ import {
   ThreadMoveEnqueueCommand,
   CommandId,
   EnvironmentId,
+  ProjectId,
   type ThreadId,
   type ThreadMoveDestination,
   type ThreadQueueEntry,
   type ExecutionEnvironmentDescriptor,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
-import type { RelayThreadVmStatus } from "@t3tools/contracts/relay";
+import type { RelayPortableThreadPlacement, RelayThreadVmStatus } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Schema from "effect/Schema";
 import { threadCommandAcceptance, type CommandSubmission } from "../operations/commands.ts";
 import type { EnvironmentProject } from "../state/models.ts";
 import { projectKey } from "../state/entities.ts";
 import type { ConnectionTarget } from "../connection/model.ts";
+import { threadRunOnTargetAvailability } from "./threadRunOn.ts";
 export { createThreadMoveCancellation } from "./threadMoveCancellation.ts";
 
 const ExecutionProof = Schema.Struct({
@@ -278,7 +280,24 @@ export function threadMoveRepositoryCanonicalKey(
     : undefined;
 }
 
-/** Offer the same registered repository on another known environment; admission still rechecks access. */
+/** A VM must resolve its original location before a new destination can be chosen. */
+export function threadMoveOriginalLocationBlocker(
+  isVm: boolean,
+  placement: Pick<RelayPortableThreadPlacement, "originalLocation"> | null,
+  error?: string | null,
+) {
+  return !isVm
+    ? null
+    : !placement
+      ? error
+        ? "Could not check the original project. Reopen Run on to retry."
+        : "Checking thread location…"
+      : placement.originalLocation === undefined
+        ? "Original project could not be determined."
+        : null;
+}
+
+/** Prefer the exact original project; other machines still offer the same registered repository. */
 export function threadMoveProjectTargets(
   source: EnvironmentProject,
   projects: ReadonlyArray<EnvironmentProject>,
@@ -289,11 +308,12 @@ export function threadMoveProjectTargets(
     } | null;
   }>,
   canonicalKey: string | undefined,
+  originalLocation?: RelayPortableThreadPlacement["originalLocation"],
 ) {
-  if (!canonicalKey) return [];
-  return projects
+  const targets = projects
     .filter(
       (project) =>
+        !!canonicalKey &&
         project.environmentId !== source.environmentId &&
         // VM checkout IDs are enforced by the importer. Keep cached VM projects
         // excluded even after deletion or while an older runner is disconnected.
@@ -308,10 +328,48 @@ export function threadMoveProjectTargets(
     .map((project) => ({
       key: projectKey({ environmentId: project.environmentId, projectId: project.id }),
       project,
+      original: false,
       destination: {
         kind: "environment" as const,
         environmentId: project.environmentId,
         projectId: project.id,
       },
     }));
+  if (!originalLocation || originalLocation.environmentId === source.environmentId) return targets;
+  const environmentId = EnvironmentId.make(originalLocation.environmentId);
+  const projectId = ProjectId.make(originalLocation.projectId);
+  return [
+    {
+      key: projectKey({ environmentId, projectId }),
+      project:
+        projects.find(
+          (project) => project.environmentId === environmentId && project.id === projectId,
+        ) ?? null,
+      original: true,
+      destination: { kind: "environment" as const, environmentId, projectId },
+    },
+    ...targets.filter((target) => target.destination.environmentId !== environmentId),
+  ];
+}
+
+/** A cached or missing project list cannot establish that the original project is gone. */
+export function threadMoveProjectTargetAvailability(
+  target: Pick<ReturnType<typeof threadMoveProjectTargets>[number], "original" | "project">,
+  input: Parameters<typeof threadRunOnTargetAvailability>[0] & {
+    readonly registered: boolean;
+    readonly enabled: boolean;
+    readonly projectsReady: boolean;
+  },
+) {
+  if (target.original) {
+    if (!input.registered)
+      return { action: null, detail: "Original machine is unavailable" } as const;
+    if (!input.enabled)
+      return { action: null, detail: "Enable this machine in Connections" } as const;
+  }
+  const availability = threadRunOnTargetAvailability(input);
+  if (!target.original || availability.action !== "select") return availability;
+  if (!input.projectsReady) return { action: null, detail: "Loading projects…" } as const;
+  if (!target.project) return { action: null, detail: "Original project is unavailable" } as const;
+  return availability;
 }

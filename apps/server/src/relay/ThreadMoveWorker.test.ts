@@ -172,13 +172,29 @@ for (const lost of [
   "enroll-receipts",
   "enroll-confirm",
   "enroll-cancel-prepare",
+  "source-retargeted-project",
+  "destination-wrong-repository",
+  "destination-repointed-project",
+  "destination-nested-project",
+  "destination-unconfirmed-repository",
+  "destination-repointed-during-download",
 ] as const)
   it.effect(
     lost === "published"
       ? "keeps a published move frozen without uploading the archive again after a restart"
       : lost === "parallel-transfer"
         ? "moves files in bounded parallel transfers and publishes only after every upload completes"
-        : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
+        : lost === "commit"
+          ? "activates a verified checkout after a lost commit reply despite changed repository metadata"
+          : lost === "source-retargeted-project"
+            ? "retains the exact queued project when the relay returns another destination"
+            : lost === "destination-wrong-repository" ||
+                lost === "destination-repointed-project" ||
+                lost === "destination-nested-project" ||
+                lost === "destination-unconfirmed-repository" ||
+                lost === "destination-repointed-during-download"
+              ? `blocks ${lost} before installing a checkout or changing local files`
+              : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -190,6 +206,12 @@ for (const lost of [
           );
           const src = path.join(root, "source"),
             dst = path.join(root, "destination");
+          const validationFailure =
+            lost === "destination-wrong-repository" ||
+            lost === "destination-repointed-project" ||
+            lost === "destination-nested-project" ||
+            lost === "destination-unconfirmed-repository" ||
+            lost === "destination-repointed-during-download";
           const git = (cwd: string, args: ReadonlyArray<string>) =>
             runner
               .run({
@@ -209,8 +231,7 @@ for (const lost of [
               .pipe(Effect.tap((result) => Effect.sync(() => expect(result.code).toBe(0))));
           yield* fs.makeDirectory(src);
           yield* git(src, ["init", "-b", "main"]);
-          if (lost.startsWith("enroll-"))
-            yield* git(src, ["remote", "add", "origin", "https://github.com/test/enrollment.git"]);
+          yield* git(src, ["remote", "add", "origin", "https://github.com/test/enrollment.git"]);
           yield* fs.writeFileString(path.join(src, "README"), "committed\n");
           if (lost.startsWith("cancel-"))
             yield* fs.writeFileString(
@@ -230,6 +251,12 @@ for (const lost of [
           yield* git(src, ["add", "."]);
           yield* git(src, ["commit", "-m", "base"]);
           yield* git(root, ["clone", "--no-local", src, dst]);
+          yield* git(dst, [
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/test/enrollment.git",
+          ]);
           yield* fs.writeFileString(path.join(src, "README"), "uncommitted work\n");
           if (lost === "parallel-transfer")
             for (let i = 0; i < 8; i++)
@@ -264,7 +291,16 @@ for (const lost of [
                     sourceEnvironmentId: sourceId,
                     expectedGeneration: 1,
                     destinationEnvironmentId: destinationId,
-                    destinationProjectId: projectId,
+                    destinationProjectId:
+                      lost === "source-retargeted-project" ? ProjectId.make("sibling") : projectId,
+                    ...(lost === "destination-unconfirmed-repository"
+                      ? {}
+                      : {
+                          repositoryCanonicalKeys: [
+                            "github.com/test/historical",
+                            "github.com/test/enrollment",
+                          ],
+                        }),
                     phase: "preparing",
                     sourceCursor: null,
                     manifestSha256: null,
@@ -336,6 +372,16 @@ for (const lost of [
             artifact: (_owner, id) => {
               const bytes = uploads.get(id);
               if (!bytes) return Effect.fail(failure());
+              if (
+                lost === "destination-repointed-during-download" &&
+                id === remote?.manifestArtifactId
+              )
+                return git(dst, [
+                  "remote",
+                  "set-url",
+                  "origin",
+                  "https://github.com/test/other.git",
+                ]).pipe(Effect.mapError(failure), Effect.as(Stream.succeed(bytes)));
               if (lost !== "parallel-transfer" || id === remote?.manifestArtifactId)
                 return Effect.succeed(Stream.succeed(bytes));
               return Effect.succeed(
@@ -609,6 +655,21 @@ for (const lost of [
             }
             let source = yield* makeThreadMoveWorker(transport, history, commands);
             const sourceQueue = queue.pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            if (lost === "source-retargeted-project") {
+              const error = yield* Effect.flip(source.source(threadId));
+              if (error._tag !== "ThreadMoveError") throw error;
+              expect(error.detail).toContain("different destination");
+              expect((yield* fences.get(threadId))?.phase).toBe("active");
+              const head = (yield* queue).entries[0];
+              expect(head?.kind === "move" && head.destination).toEqual({
+                kind: "environment",
+                environmentId: destinationId,
+                projectId,
+              });
+              expect(yield* fs.readFileString(path.join(src, "README"))).toBe("uncommitted work\n");
+              expect(commits).toBe(0);
+              return;
+            }
             if (lost === "source-export") {
               yield* fs.rename(src, `${src}-saved`);
               const error = yield* Effect.flip(source.source(threadId));
@@ -662,14 +723,45 @@ for (const lost of [
               const destinationEngine = yield* OrchestrationEngineService,
                 destinationSql = yield* SqlClient.SqlClient,
                 destinationFences = makeThreadExecutionFence(destinationSql);
+              const destinationRoot =
+                lost === "destination-nested-project" ? path.join(dst, "nested") : dst;
+              if (lost === "destination-nested-project") yield* fs.makeDirectory(destinationRoot);
               yield* destinationEngine.dispatch({
                 type: "project.create",
                 commandId: CommandId.make("destination-project"),
                 projectId,
                 title: "Destination",
-                workspaceRoot: dst,
+                workspaceRoot: destinationRoot,
                 createdAt: at,
               });
+              const oldHead = (yield* git(dst, ["rev-parse", "HEAD"])).stdout.trim();
+              let repointed: string | undefined;
+              if (lost === "destination-repointed-project") {
+                repointed = path.join(root, "repointed");
+                yield* git(root, ["clone", "--no-local", dst, repointed]);
+                yield* git(repointed, [
+                  "remote",
+                  "set-url",
+                  "origin",
+                  "https://github.com/test/other.git",
+                ]);
+                yield* fs.writeFileString(path.join(repointed, "README"), "repointed local work\n");
+                yield* destinationSql`UPDATE projection_projects SET workspace_root=${repointed} WHERE project_id=${projectId}`;
+              }
+              if (lost === "destination-wrong-repository") {
+                const identities = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
+                expect((yield* identities.resolve(dst))?.canonicalKey).toBe(
+                  "github.com/test/enrollment",
+                );
+                yield* git(dst, [
+                  "remote",
+                  "set-url",
+                  "origin",
+                  "https://github.com/test/other.git",
+                ]);
+              }
+              if (validationFailure)
+                yield* fs.writeFileString(path.join(dst, "README"), "destination local work\n");
               const destinationHistory = makeThreadHistorySync(destinationSql, destinationEngine, {
                 append: () => Effect.void,
                 confirmThrough: () => Effect.void,
@@ -707,6 +799,37 @@ for (const lost of [
                 generation: 2,
                 operationId: remote!.operationId,
               };
+              if (validationFailure) {
+                const worktreesRoot = (yield* ServerConfig).worktreesDir;
+                const localWorktrees = yield* fs.readDirectory(worktreesRoot);
+                const error = yield* Effect.flip(destination.destination(owner));
+                if (error._tag !== "ThreadMoveError") throw error;
+                expect(error.detail).toContain(
+                  lost === "destination-nested-project" ? "Git checkout root" : "repository",
+                );
+                expect(remote?.failureDetail).toBe(error.detail);
+                expect((yield* destinationFences.get(threadId))?.phase ?? null).toBe(
+                  lost === "destination-repointed-during-download" ? "frozen" : null,
+                );
+                expect(yield* destinationSql`SELECT 1 FROM thread_checkout_claims`).toEqual([]);
+                expect(yield* fs.readDirectory(worktreesRoot)).toEqual(localWorktrees);
+                expect((yield* git(dst, ["rev-parse", "HEAD"])).stdout.trim()).toBe(oldHead);
+                expect(yield* fs.readFileString(path.join(dst, "README"))).toBe(
+                  "destination local work\n",
+                );
+                if (repointed)
+                  expect(yield* fs.readFileString(path.join(repointed, "README"))).toBe(
+                    "repointed local work\n",
+                  );
+                expect(commits).toBe(0);
+                remote = { ...remote!, phase: "aborting" };
+                yield* destination.destination(owner);
+                expect(remote?.phase).toBe("aborted");
+                expect((yield* destinationFences.get(threadId))?.phase ?? null).toBe(
+                  lost === "destination-repointed-during-download" ? "retired" : null,
+                );
+                return;
+              }
               if (lost.startsWith("cancel-")) {
                 const error = yield* Effect.flip(destination.destination(owner));
                 expect(error._tag).toBe("ThreadTransferReadinessError");
@@ -772,6 +895,24 @@ for (const lost of [
               if (lost === "commit" || lost === "activate") {
                 yield* Effect.flip(destination.destination(owner));
                 expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
+                if (lost === "commit") {
+                  expect(remote?.phase).toBe("committed");
+                  expect(
+                    yield* destinationSql`SELECT phase FROM thread_checkout_claims
+                    WHERE operation_id=${owner.operationId}`,
+                  ).toEqual([{ phase: "installed" }]);
+                  expect(
+                    yield* destinationSql`SELECT phase FROM thread_transfer_readiness
+                    WHERE operation_id=${owner.operationId}`,
+                  ).toEqual([{ phase: "ready" }]);
+                  remote = { ...remote!, repositoryCanonicalKeys: [] };
+                  yield* git(dst, [
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/test/changed.git",
+                  ]);
+                }
                 yield* Effect.flip(
                   destinationFences.beginWork({
                     threadId,
@@ -811,6 +952,13 @@ for (const lost of [
               expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
             }).pipe(Effect.provide(environment(path.join(root, "destination-state"))));
             yield* source.source(threadId);
+            if (validationFailure) {
+              expect((yield* fences.get(threadId))?.phase).toBe("active");
+              expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
+              expect(yield* fs.readFileString(path.join(src, "README"))).toBe("uncommitted work\n");
+              expect(commits).toBe(0);
+              return;
+            }
             if (lost.startsWith("cancel-")) {
               expect((yield* fences.get(threadId))?.phase).toBe("active");
               expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);

@@ -44,8 +44,13 @@ const response = Effect.fnUntraced(function* (move: ThreadMove) {
     manifestArtifactId: string;
   }>`SELECT manifest_artifact_id AS "manifestArtifactId"
     FROM relay_thread_move_artifacts WHERE operation_id=${move.operationId}`;
+  const aliases = yield* sql<{ canonicalKey: string }>`SELECT a.canonical_key AS "canonicalKey"
+    FROM relay_repository_aliases a
+    JOIN relay_thread_placements p ON p.repository_id=a.repository_id AND p.organization_id=a.organization_id
+    WHERE p.thread_id=${move.threadId} ORDER BY a.canonical_key`;
   return {
     ...move,
+    repositoryCanonicalKeys: aliases.map((alias) => alias.canonicalKey),
     progress: yield* makeThreadMoveProgressStore(sql).read(move.operationId),
     manifestArtifactId: artifact?.manifestArtifactId ?? null,
     recoveryVerified: artifact

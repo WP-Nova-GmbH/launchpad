@@ -304,6 +304,68 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       return { owner, enrollment, move, manifest, prepare };
     }
 
+    it.effect("backfills only proven original local placements", () =>
+      Effect.gen(function* () {
+        const sql = yield* PgClient.PgClient;
+        const migration = yield* (yield* FileSystem.FileSystem).readFileString(
+          new URL(
+            "../../migrations/postgres/20261023131714_thread_original_location/migration.sql",
+            import.meta.url,
+          ).pathname,
+        );
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`CREATE TEMP TABLE relay_thread_placements (
+              thread_id text PRIMARY KEY, environment_id text, project_id text, generation integer
+            ) ON COMMIT DROP`;
+            yield* sql`CREATE TEMP TABLE relay_thread_local_enrollments (thread_id text, phase text) ON COMMIT DROP`;
+            yield* sql`CREATE TEMP TABLE relay_thread_history (thread_id text, environment_id text, event_json jsonb) ON COMMIT DROP`;
+            yield* sql`CREATE TEMP TABLE relay_thread_moves (thread_id text, source_environment_id text, expected_generation integer, phase text) ON COMMIT DROP`;
+            yield* sql`INSERT INTO relay_thread_placements VALUES
+              ('preparing','local','project',1), ('active','local','project',1),
+              ('moved','vm','vm-project',2), ('reset','replacement-vm','vm-project',5),
+              ('missing','vm','vm-project',2), ('mismatch','vm','vm-project',2),
+              ('ambiguous','vm','vm-project',2), ('aborted','local','project',1),
+              ('vm-born','vm','vm-project',1), ('vm-born-moved','local','project',2)`;
+            yield* sql`INSERT INTO relay_thread_local_enrollments VALUES
+              ('preparing','preparing'), ('active','active'), ('moved','active'),
+              ('reset','active'), ('missing','active'), ('mismatch','active'),
+              ('ambiguous','active'), ('aborted','aborted')`;
+            yield* sql`INSERT INTO relay_thread_history
+              SELECT thread_id,'original',jsonb_build_object('type','thread.created','payload',jsonb_build_object('projectId','original-project'))
+              FROM relay_thread_placements WHERE thread_id IN ('moved','reset','mismatch','ambiguous')`;
+            yield* sql`INSERT INTO relay_thread_history VALUES
+              ('ambiguous','other',jsonb_build_object('type','thread.created','payload',jsonb_build_object('projectId','other-project'))),
+              ('vm-born-moved','vm',jsonb_build_object('type','thread.created','payload',jsonb_build_object('projectId','vm-project')))`;
+            yield* sql`INSERT INTO relay_thread_moves VALUES
+              ('moved','original',1,'completed'), ('reset','original',1,'completed'),
+              ('missing','original',1,'completed'), ('mismatch','other',1,'completed'),
+              ('ambiguous','original',1,'completed'), ('vm-born-moved','vm',1,'completed')`;
+            for (const statement of migration.split("--> statement-breakpoint"))
+              yield* sql.unsafe(statement);
+            const rows = yield* sql<{
+              threadId: string;
+              environmentId: string | null;
+              projectId: string | null;
+            }>`SELECT thread_id AS "threadId", original_environment_id AS "environmentId",original_project_id AS "projectId"
+              FROM relay_thread_placements ORDER BY thread_id`;
+            expect(rows).toEqual([
+              { threadId: "aborted", environmentId: null, projectId: null },
+              { threadId: "active", environmentId: "local", projectId: "project" },
+              { threadId: "ambiguous", environmentId: null, projectId: null },
+              { threadId: "mismatch", environmentId: null, projectId: null },
+              { threadId: "missing", environmentId: null, projectId: null },
+              { threadId: "moved", environmentId: "original", projectId: "original-project" },
+              { threadId: "preparing", environmentId: "local", projectId: "project" },
+              { threadId: "reset", environmentId: "original", projectId: "original-project" },
+              { threadId: "vm-born", environmentId: null, projectId: null },
+              { threadId: "vm-born-moved", environmentId: null, projectId: null },
+            ]);
+          }),
+        );
+      }).pipe(Effect.provide(NodeFileSystem.layer)),
+    );
+
     it.effect(
       "keeps only monotonic progress from the exact move participants and ignores terminal updates",
       () =>
@@ -3674,6 +3736,9 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           // Existing setup records remain inspectable and cancellable; refusing new
           // requests must not expose another person's retained VM state.
           yield* f.setup.enqueue(f.input);
+          expect(
+            (yield* makeThreadPlacementStore(f.sql).get(f.input.threadId))?.originalLocation,
+          ).toBeNull();
           const asOwner = Effect.provideService(RelayClientPrincipal, {
             userId: f.input.ownerUserId,
             token: "test",
@@ -4374,6 +4439,11 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         yield* run((store, sql) =>
           Effect.gen(function* () {
             yield* store.enroll(enrollment);
+            expect((yield* store.get(owner.threadId))?.originalLocation).toBeNull();
+            yield* sql`INSERT INTO relay_thread_local_enrollments(thread_id,operation_id,phase)
+              VALUES(${owner.threadId},${NodeCrypto.randomUUID()},'active')`;
+            yield* sql`UPDATE relay_thread_placements SET original_environment_id=${owner.environmentId},original_project_id=${enrollment.projectId}
+              WHERE thread_id=${owner.threadId}`;
             yield* store.admit({ ...owner, workId: "turn" });
             yield* store.beginMove(move);
             expect(
@@ -4425,6 +4495,9 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
               _tag: "ThreadPlacementConflict",
             });
             yield* store.activated({ ...move, ...destination });
+            expect(
+              (yield* makeThreadPlacementStore(sql).get(owner.threadId))?.originalLocation,
+            ).toEqual({ environmentId: owner.environmentId, projectId: enrollment.projectId });
             expect(yield* store.admit({ ...destination, workId: "next" })).toMatchObject({
               newlyAdmitted: true,
             });
@@ -4433,6 +4506,8 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             ).toMatchObject({
               _tag: "ThreadPlacementConflict",
             });
+            yield* sql`UPDATE relay_thread_placements SET original_environment_id=NULL,original_project_id=NULL WHERE thread_id=${owner.threadId}`;
+            expect(yield* store.get(owner.threadId)).not.toHaveProperty("originalLocation");
           }),
         );
       }),
@@ -5657,6 +5732,8 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           };
           const cancelledPrepared =
             yield* prepareLocalThreadEnrollment(cancelledRequest).pipe(asEnvironment);
+          const originalLocation = { environmentId, projectId };
+          expect(cancelledPrepared.placement.originalLocation).toEqual(originalLocation);
           const aborted = yield* abortLocalThreadEnrollment(cancelledRequest).pipe(asEnvironment);
           expect(aborted.outcome).toBe("aborted");
           expect(yield* abortLocalThreadEnrollment(cancelledRequest).pipe(asEnvironment)).toEqual(
@@ -5695,6 +5772,9 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           expect(
             (yield* prepareLocalThreadEnrollment(reenrollment).pipe(asEnvironment)).phase,
           ).toBe("preparing");
+          expect(
+            (yield* makeThreadPlacementStore(sql).get(cancelledRequest.threadId))?.originalLocation,
+          ).toEqual(originalLocation);
           expect(yield* abortLocalThreadEnrollment(cancelledRequest).pipe(asEnvironment)).toEqual(
             aborted,
           );
@@ -5733,6 +5813,12 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           ).toBe("RelayTenancyConflictError");
           const prepared = yield* prepareLocalThreadEnrollment(request).pipe(asEnvironment);
           expect(prepared.phase).toBe("preparing");
+          expect(prepared.placement.originalLocation).toEqual(originalLocation);
+          // A pre-migration enrollment retry captures its already-verified local placement.
+          yield* sql`UPDATE relay_thread_placements SET original_environment_id=NULL,original_project_id=NULL WHERE thread_id=${threadId}`;
+          expect(yield* makeThreadPlacementStore(sql).get(threadId)).not.toHaveProperty(
+            "originalLocation",
+          );
           expect(yield* prepareLocalThreadEnrollment(request).pipe(asEnvironment)).toEqual(
             prepared,
           );
@@ -5837,6 +5923,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           const activated = yield* confirmLocalThreadEnrollment(confirm).pipe(asEnvironment);
           expect(activated.phase).toBe("active");
           expect(activated.placement.operationId).toBeNull();
+          expect(activated.placement.originalLocation).toEqual(originalLocation);
           expect(yield* confirmLocalThreadEnrollment(confirm).pipe(asEnvironment)).toEqual(
             activated,
           );

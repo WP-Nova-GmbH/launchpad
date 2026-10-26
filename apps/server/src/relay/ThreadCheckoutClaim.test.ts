@@ -128,6 +128,25 @@ const layer = Layer.mergeAll(
   ProcessRunnerLayer.pipe(Layer.provideMerge(NodeServices.layer)),
 );
 it.layer(layer)("destination checkout claims", (it) => {
+  for (const occupied of [false, true])
+    it.effect(`rejects a nested project before checkout mutation when occupied=${occupied}`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const nested = f.path.join(f.destination, "nested");
+        yield* f.sql`UPDATE projection_projects SET workspace_root=${nested} WHERE project_id='project'`;
+        if (occupied) yield* f.addThread("existing-thread", "project");
+        yield* f.fs.writeFileString(f.path.join(f.destination, "README.md"), "local work\n");
+        const error = yield* Effect.flip(f.claims.reserve(f.input));
+        expect(error.message).toContain("Git checkout root");
+        expect(yield* f.claims.get(f.input.operationId)).toBeNull();
+        expect(yield* f.fs.exists(f.input.worktreesRoot)).toBe(false);
+        expect(yield* f.git(f.destination, ["rev-parse", "HEAD"])).toBe(f.oldHead);
+        expect(yield* f.fs.readFileString(f.path.join(f.destination, "README.md"))).toBe(
+          "local work\n",
+        );
+        expect(yield* f.fs.readFileString(f.path.join(nested, "keep.txt"))).toBe("nested base\n");
+      }),
+    );
   it.effect("waits for previously admitted operations before reserving a checkout", () =>
     Effect.gen(function* () {
       const f = yield* fixture;

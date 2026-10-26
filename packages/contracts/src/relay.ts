@@ -3369,6 +3369,7 @@ export const RelayThreadMove = Schema.Struct({
   expectedGeneration: Schema.Int.check(Schema.isGreaterThan(0)),
   destinationEnvironmentId: EnvironmentId,
   destinationProjectId: ProjectId,
+  repositoryCanonicalKeys: Schema.optionalKey(Schema.Array(TrimmedNonEmptyString)),
   phase: Schema.Literals([
     "preparing",
     "frozen",

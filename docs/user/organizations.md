@@ -189,6 +189,8 @@ cloning its remote repository, so this move does not require a GitHub App. The m
 the current turn to finish, then runs before waiting prompts. It keeps those prompts with the
 conversation. To move later, reorder the move in the shared queue before it starts. A paused queue
 stays paused until you resume it. Use **Run on** again to move back to an eligible machine.
+Selecting the machine you started on automatically returns the thread to its original project.
+If that project is no longer available, Launchpad explains the problem rather than choosing another folder.
 If Launchpad cannot verify that local terminal or setup processes have stopped, the move stays
 queued with an explanation. Cancel the move to continue working locally.
 Fresh VMs need their own Codex sign-in; follow the sign-in step in the thread to let preparation continue.

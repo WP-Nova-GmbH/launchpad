@@ -24,6 +24,7 @@ import { ServerConfig } from "../config.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { inspectVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
@@ -44,6 +45,7 @@ import { ThreadExecution } from "./ThreadExecution.ts";
 import { makeThreadCheckoutClaims } from "./ThreadCheckoutClaim.ts";
 import { makeThreadCheckoutInstaller } from "./ThreadCheckoutInstall.ts";
 import { workspaceFileHash } from "./ThreadWorkspaceFiles.ts";
+import { workspaceGitText } from "./ThreadWorkspaceGit.ts";
 import { makeThreadTransferAborts } from "./ThreadTransferAbort.ts";
 import {
   ThreadMoveError,
@@ -91,6 +93,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
   const tracked = yield* VmWorkloadTracking;
   const terminals = yield* TerminalManager;
   const execution = yield* ThreadExecution;
+  const repositories = yield* RepositoryIdentityResolver;
   const archive = makeThreadTransferArchive(sql, yield* OrchestrationEventStore);
   const fences = makeThreadExecutionFence(sql),
     claims = makeThreadCheckoutClaims(sql);
@@ -283,11 +286,21 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
           destinationEnvironmentId: head.destination.environmentId,
           destinationProjectId: head.destination.projectId,
         });
-      yield* assertThreadMoveIdentity(owner, move);
-      yield* fences.beginDrain({ ...owner, previousOperationId: fence.operationId });
-      fence = (yield* fences.get(threadId))!;
     } else move = yield* transport.get(owner);
     yield* assertThreadMoveIdentity(owner, move);
+    if (
+      head.destination.kind === "environment" &&
+      (move.destinationEnvironmentId !== head.destination.environmentId ||
+        move.destinationProjectId !== head.destination.projectId)
+    )
+      return yield* fail(
+        threadId,
+        "The relay returned a different destination for the queued move.",
+      );
+    if (fence.phase === "active" && fence.operationId !== owner.operationId) {
+      yield* fences.beginDrain({ ...owner, previousOperationId: fence.operationId });
+      fence = (yield* fences.get(threadId))!;
+    }
     if (move.sourceEnvironmentId !== owner.environmentId) return;
     if (["committed", "completed"].includes(move.phase)) {
       if (fence.phase !== "retired") yield* fences.retire(owner);
@@ -639,6 +652,35 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         WHERE operation_id=${owner.operationId} AND phase='started' LIMIT 1`;
       if (started.length) return;
     }
+    const validateProject = Effect.gen(function* () {
+      // Installation retries verify the durable claim and readiness; mutable
+      // remotes or relay aliases must not strand an already installed checkout.
+      if (tracked || (yield* claims.get(owner.operationId))?.phase === "installed") return;
+      const [project] = yield* sql<{ root: string }>`SELECT workspace_root AS root
+        FROM projection_projects WHERE project_id=${move.destinationProjectId} AND deleted_at IS NULL`;
+      if (!project) return yield* fail(owner.threadId, "The destination project no longer exists.");
+      const projectRoot = yield* fs.realPath(project.root);
+      if (
+        (yield* fs.realPath(
+          yield* workspaceGitText(projectRoot, ["rev-parse", "--show-toplevel"]).pipe(
+            Effect.provideContext(context),
+          ),
+        )) !== projectRoot
+      )
+        return yield* fail(
+          owner.threadId,
+          "The destination project must point to a Git checkout root.",
+        );
+      const repository = yield* repositories.resolve(projectRoot, { refresh: true });
+      if (!move.repositoryCanonicalKeys?.length)
+        return yield* fail(owner.threadId, "The relay did not confirm the transferred repository.");
+      if (!repository || !move.repositoryCanonicalKeys.includes(repository.canonicalKey))
+        return yield* fail(
+          owner.threadId,
+          "The destination project no longer matches the transferred repository. Its local files were left untouched.",
+        );
+    });
+    yield* validateProject;
     if (!move.manifestArtifactId || !move.manifestSha256 || move.sourceCursor === null) return;
     const progress = makeThreadMoveProgress(move.progress ?? [], owner.environmentId, (report) =>
       transport.progress(owner, report),
@@ -688,6 +730,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         )
       : undefined;
     if (tracked) yield* fences.prepare({ ...owner, projectId: move.destinationProjectId });
+    yield* validateProject;
     const claim = yield* claims.get(owner.operationId);
     if (claim?.phase === "installing")
       yield* makeThreadCheckoutInstaller(sql)

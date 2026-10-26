@@ -12,6 +12,8 @@ import { useNavigation } from "@react-navigation/native";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import {
   threadMoveProjectTargets,
+  threadMoveProjectTargetAvailability,
+  threadMoveOriginalLocationBlocker,
   threadMoveRepositoryCanonicalKey,
   threadMoveProviderSupported,
   type ThreadMoveSubmission,
@@ -21,10 +23,7 @@ import {
   threadMoveObservation,
   threadMoveSnapshotReached,
 } from "@t3tools/client-runtime/relay/threadMoveRecovery";
-import {
-  threadRunOnStatus,
-  threadRunOnTargetAvailability,
-} from "@t3tools/client-runtime/relay/threadRunOn";
+import { threadRunOnStatus } from "@t3tools/client-runtime/relay/threadRunOn";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   CommandId,
@@ -54,6 +53,7 @@ import {
   threadVmControls,
 } from "../../state/threads";
 import { environmentProjects } from "../../state/projects";
+import { environmentShell } from "../../state/shell";
 import { serverEnvironment } from "../../state/server";
 import {
   useEnvironments,
@@ -87,6 +87,7 @@ function FollowThreadLocation({
     [checking, setChecking] = useState(false),
     [error, setError] = useState<string | null>(null);
   const [draftConflict, setDraftConflict] = useState<MovedThreadDraftConflict | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const draftChoice = useRef<
     { use: "source" | "destination"; conflict: MovedThreadDraftConflict } | undefined
   >(undefined);
@@ -207,88 +208,156 @@ function FollowThreadLocation({
     (!recoverUnavailable && !state.recoveryRequested && !state.destination && !state.error)
   )
     return null;
+  const diagnostic = error ?? state.error;
+  const pending = checking || state.isPending;
+  const unavailable = !busy && !pending && !state.movePending && !state.destination;
+  const disabled = busy || pending || !!draftConflict || !session || !relayUrl;
   return (
-    <View accessibilityLiveRegion="polite" className="px-3 py-2">
-      <Text className="text-xs">
-        {busy
-          ? "Opening the thread’s current location…"
-          : checking || state.isPending
-            ? "Checking this thread’s current location…"
-            : state.movePending
-              ? "This thread is still moving. Check again when the move finishes."
-              : state.destination
-                ? "Open this thread’s current location to continue."
-                : "Could not confirm this thread’s current location."}
-      </Text>
-      {error || state.error ? (
-        <Text className="text-xs text-destructive">{error ?? state.error}</Text>
-      ) : null}
-      {draftConflict ? (
-        <View className="gap-2 py-2">
-          <Text className="text-sm font-semibold">Both locations have an unsent draft</Text>
-          <Text className="text-xs">
-            Choose which draft to open. The other stays saved at the previous location.
-          </Text>
-          {(["source", "destination"] as const).map((use) => (
-            <Pressable
-              key={use}
-              accessibilityRole="button"
-              className="gap-1 rounded-lg border border-border p-3"
-              onPress={() => {
-                draftChoice.current = { use, conflict: draftConflict };
-                setDraftConflict(null);
-                setAttempt((value) => value + 1);
-              }}
-            >
-              <Text numberOfLines={3} className="text-xs">
-                {draftConflict[use].text || "Attachments and context"}
-              </Text>
-              <Text className="text-sm text-primary">
-                {use === "source" ? "Use incoming draft" : "Keep destination draft"}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-      ) : null}
-      <Pressable
-        disabled={busy || checking || state.isPending || !!draftConflict || !session || !relayUrl}
-        accessibilityRole="button"
-        onPress={async () => {
-          if (busy || checking || !session || !relayUrl) return;
-          setChecking(true);
-          setError(null);
-          try {
-            const result = await checkLocation({
-              environmentId,
-              threadId,
-              accountId: session.accountId,
-              relayUrl,
-            });
-            if (!mounted.current || appAtomRegistry.get(managedRelaySessionAtom) !== session)
-              return;
-            if (result._tag === "Failure") {
-              const failure = squashAtomCommandFailure(result);
-              setError(
-                failure instanceof Error
-                  ? failure.message
-                  : "Could not confirm this thread’s current location.",
-              );
-            } else setAttempt((value) => value + 1);
-          } catch (cause) {
-            if (mounted.current && appAtomRegistry.get(managedRelaySessionAtom) === session)
-              setError(
-                cause instanceof Error
-                  ? cause.message
-                  : "Could not confirm this thread’s current location.",
-              );
-          } finally {
-            if (mounted.current && appAtomRegistry.get(managedRelaySessionAtom) === session)
-              setChecking(false);
+    <View
+      accessibilityLiveRegion="polite"
+      className="mx-3 my-2 flex-row items-start gap-3 rounded-xl border border-border bg-muted/20 p-3"
+    >
+      <View className="h-5 justify-center">
+        <SymbolView
+          name={diagnostic || unavailable ? "exclamationmark.triangle" : "arrow.clockwise"}
+          size={18}
+          tintColorClassName={
+            diagnostic || unavailable ? "accent-warning-foreground" : "accent-icon-muted"
           }
-        }}
-      >
-        <Text className="text-sm text-primary">Open current location</Text>
-      </Pressable>
+        />
+      </View>
+      <View className="min-w-0 flex-1 gap-1">
+        <Text className="text-sm font-t3-medium">
+          {busy
+            ? "Opening thread…"
+            : pending
+              ? "Checking thread location…"
+              : state.movePending
+                ? "Thread is moving"
+                : state.destination
+                  ? diagnostic
+                    ? "Can’t open thread"
+                    : "Thread location found"
+                  : "Can’t check thread location"}
+        </Text>
+        <Text className="text-xs text-muted-foreground">
+          {busy
+            ? "Connecting to the thread’s current location."
+            : pending
+              ? "Waiting for the latest thread status."
+              : state.movePending
+                ? "Check again when the move finishes."
+                : state.destination
+                  ? "Open this thread’s current location to continue."
+                  : "We couldn’t verify where this thread is running."}
+        </Text>
+        {diagnostic ? (
+          <View>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Thread location details"
+              accessibilityState={{ expanded: detailsOpen }}
+              className="min-h-11 flex-row items-center gap-1 self-start"
+              onPress={() => setDetailsOpen((value) => !value)}
+            >
+              <Text className="text-xs text-muted-foreground">Details</Text>
+              <SymbolView
+                name={detailsOpen ? "chevron.down" : "chevron.right"}
+                size={12}
+                tintColorClassName="accent-icon-muted"
+              />
+            </Pressable>
+            {detailsOpen ? (
+              <View className="mb-2 border-l border-border pl-3">
+                <Text selectable className="text-xs text-muted-foreground">
+                  {diagnostic}
+                </Text>
+              </View>
+            ) : null}
+          </View>
+        ) : null}
+        {draftConflict ? (
+          <View className="gap-2 py-2">
+            <Text className="text-sm font-semibold">Both locations have an unsent draft</Text>
+            <Text className="text-xs">
+              Choose which draft to open. The other stays saved at the previous location.
+            </Text>
+            {(["source", "destination"] as const).map((use) => (
+              <Pressable
+                key={use}
+                accessibilityRole="button"
+                className="gap-1 rounded-lg border border-border p-3"
+                onPress={() => {
+                  draftChoice.current = { use, conflict: draftConflict };
+                  setDraftConflict(null);
+                  setAttempt((value) => value + 1);
+                }}
+              >
+                <Text numberOfLines={3} className="text-xs">
+                  {draftConflict[use].text || "Attachments and context"}
+                </Text>
+                <Text className="text-sm text-primary">
+                  {use === "source" ? "Use incoming draft" : "Keep destination draft"}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+        <Pressable
+          disabled={disabled}
+          accessibilityRole="button"
+          accessibilityState={{ disabled, busy: busy || pending }}
+          className="mt-2 min-h-11 flex-row items-center gap-2 self-start rounded-lg border border-border bg-subtle px-3 py-2"
+          style={{ opacity: disabled ? 0.5 : 1 }}
+          onPress={async () => {
+            if (busy || checking || !session || !relayUrl) return;
+            setChecking(true);
+            setError(null);
+            setDetailsOpen(false);
+            try {
+              const result = await checkLocation({
+                environmentId,
+                threadId,
+                accountId: session.accountId,
+                relayUrl,
+              });
+              if (!mounted.current || appAtomRegistry.get(managedRelaySessionAtom) !== session)
+                return;
+              if (result._tag === "Failure") {
+                const failure = squashAtomCommandFailure(result);
+                setError(
+                  failure instanceof Error
+                    ? failure.message
+                    : "Could not confirm this thread’s current location.",
+                );
+              } else setAttempt((value) => value + 1);
+            } catch (cause) {
+              if (mounted.current && appAtomRegistry.get(managedRelaySessionAtom) === session)
+                setError(
+                  cause instanceof Error
+                    ? cause.message
+                    : "Could not confirm this thread’s current location.",
+                );
+            } finally {
+              if (mounted.current && appAtomRegistry.get(managedRelaySessionAtom) === session)
+                setChecking(false);
+            }
+          }}
+        >
+          <SymbolView name="arrow.clockwise" size={14} tintColorClassName="accent-icon" />
+          <Text className="text-sm font-t3-medium">
+            {busy
+              ? "Opening…"
+              : pending
+                ? "Checking…"
+                : state.movePending
+                  ? "Check status"
+                  : state.destination && !diagnostic
+                    ? "Open thread"
+                    : "Retry"}
+          </Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -382,15 +451,28 @@ function MachineDestinationRow({
   onMove: () => void;
   onCheck: () => void;
 }) {
-  const connection = useEnvironmentConnectionState(target.project.environmentId);
-  const availability = threadRunOnTargetAvailability({
+  const connection = useEnvironmentConnectionState(target.destination.environmentId);
+  const shell = useAtomValue(environmentShell.stateValueAtom(target.destination.environmentId));
+  const availability = threadMoveProjectTargetAvailability(target, {
     phase: environment?.connection.phase,
     failureReason: connection.data?.lastFailure?.reason,
+    registered: environment !== undefined,
+    enabled: environment?.entry.enabled === true,
+    projectsReady: shell.status === "live" && Option.isSome(shell.snapshot),
   });
   return (
     <MaterialListRow
-      title={environment?.serverConfig?.environment.label ?? environment?.label ?? "Machine"}
-      subtitle={availability.detail ?? `${target.project.title} · ${target.project.workspaceRoot}`}
+      title={
+        environment?.serverConfig?.environment.label ??
+        environment?.label ??
+        (target.original ? "Original machine" : "Machine")
+      }
+      subtitle={
+        availability.detail ??
+        (target.project
+          ? `${target.project.title}\n${target.project.workspaceRoot}`
+          : "Original project")
+      }
       accessibilityRole="radio"
       accessibilityState={{ checked: false }}
       leading={
@@ -455,7 +537,13 @@ function ThreadMachinePicker({
     ? threadMoveRepositoryCanonicalKey(source, thread, config?.environment, vm?.data?.status)
     : undefined;
   const targets = source
-    ? threadMoveProjectTargets(source, projects, environments, canonicalKey)
+    ? threadMoveProjectTargets(
+        source,
+        projects,
+        environments,
+        canonicalKey,
+        placement?.originalLocation,
+      )
     : [];
   const reconnect = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
   const enqueue = useAtomCommand(threadEnvironment.enqueueMove, { reportFailure: false });
@@ -471,6 +559,7 @@ function ThreadMachinePicker({
     [error, setError] = useState<string | null>(null),
     [sheetHeight, setSheetHeight] = useState(0);
   const submitting = useRef(false);
+  const originalLocationAttempted = useRef(false);
   const signInAfterDismiss = useRef(false);
   const accountId = session?.accountId ?? null;
   const mounted = useRef(true);
@@ -661,6 +750,11 @@ function ThreadMachinePicker({
   );
   const codexSupported = threadMoveProviderSupported(selectedProvider, "environment");
   const vmSupported = threadMoveProviderSupported(selectedProvider, "vm");
+  const originalLocationBlocker = threadMoveOriginalLocationBlocker(
+    config?.environment.threadVm?.threadId === threadId,
+    placement,
+    error ?? location?.error,
+  );
   const setupBlocker = !relayUrl
     ? "Configure Launchpad Connect in the host app to move threads."
     : !session
@@ -675,9 +769,10 @@ function ThreadMachinePicker({
               ? config.environment.capabilities.threadMoves === false
                 ? "Open Launchpad on the host machine to connect this environment for thread moves."
                 : "Update this environment’s server to support queued moves."
-              : !canonicalKey
-                ? "Register this project’s Git repository in the host app first."
-                : null;
+              : (originalLocationBlocker ??
+                (!canonicalKey
+                  ? "Register this project’s Git repository in the host app first."
+                  : null));
   const pendingMove = queue?.entries.find((entry) => entry.kind === "move");
   const outstanding =
     saved !== null ||
@@ -685,6 +780,51 @@ function ThreadMachinePicker({
     location?.movePending === true ||
     location?.destination != null;
   const disabled = busy || !ready || outstanding || setupBlocker !== null;
+  const pickerVisible = openedLocation === locationKey;
+  const originalLocationEligible =
+    config?.environment.threadVm?.threadId === threadId &&
+    placement?.originalLocation === undefined &&
+    !!session &&
+    !!relayUrl &&
+    ready &&
+    !location?.isPending &&
+    !outstanding;
+  useEffect(() => {
+    if (!pickerVisible) {
+      originalLocationAttempted.current = false;
+      return;
+    }
+    if (!originalLocationEligible || originalLocationAttempted.current || !session || !relayUrl)
+      return;
+    originalLocationAttempted.current = true;
+    void Promise.resolve()
+      .then(async () => {
+        if (!isCurrent()) return;
+        setError(null);
+        const result = await checkLocation({
+          environmentId,
+          threadId,
+          accountId: session.accountId,
+          relayUrl,
+        });
+        if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      })
+      .catch((cause) => {
+        if (isCurrent())
+          setError(
+            cause instanceof Error ? cause.message : "Could not check the original project.",
+          );
+      });
+  }, [
+    pickerVisible,
+    originalLocationEligible,
+    session,
+    relayUrl,
+    environmentId,
+    threadId,
+    checkLocation,
+    isCurrent,
+  ]);
   const vmBlocker = !vmSupported
     ? "Private VMs currently require the default Codex provider."
     : host.unavailableReason;
@@ -698,11 +838,9 @@ function ThreadMachinePicker({
       (item) => item.environmentId === destination.environmentId,
     );
     const label = environment?.serverConfig?.environment.label ?? environment?.label ?? "Machine";
-    const multipleCheckouts =
-      targets.filter((item) => item.project.environmentId === destination.environmentId).length > 1;
     return target
-      ? `${label} / ${target.title}${multipleCheckouts ? ` · ${target.workspaceRoot}` : ""}`
-      : label;
+      ? `${label} / ${target.title} (${target.workspaceRoot})`
+      : `${label} / Unavailable project`;
   };
   const presentation = threadRunOnStatus({ queue, saved });
   const visibleError = error ?? location?.moveFailureDetail ?? null;
@@ -862,7 +1000,7 @@ function ThreadMachinePicker({
       ) : null}
       <Modal
         // A placement change dismisses this sheet before the route follower navigates.
-        visible={openedLocation === locationKey}
+        visible={pickerVisible}
         animationType="slide"
         presentationStyle={Platform.OS === "android" ? "overFullScreen" : "pageSheet"}
         transparent={Platform.OS === "android"}
@@ -921,7 +1059,7 @@ function ThreadMachinePicker({
               <View className="overflow-hidden rounded-2xl">
                 <MaterialListRow
                   title={currentLabel}
-                  subtitle={currentIsVm ? "Current location · VM workspace" : "Current location"}
+                  subtitle="Current location"
                   accessibilityRole="radio"
                   accessibilityState={{ checked: true }}
                   leading={currentIcon}
@@ -948,28 +1086,30 @@ function ThreadMachinePicker({
                     onPress={() => void run("send", { kind: "vm" })}
                   />
                 ) : null}
-                {targets.map((target) => {
-                  const environment = environments.find(
-                    (item) => item.environmentId === target.project.environmentId,
-                  );
-                  return (
-                    <MachineDestinationRow
-                      key={target.key}
-                      target={target}
-                      environment={environment}
-                      disabled={disabled}
-                      onMove={() => void run("send", target.destination)}
-                      onCheck={() => {
-                        void reconnect(target.project.environmentId).then((result) => {
-                          if (result._tag === "Failure")
-                            setError(
-                              "Could not connect to this machine. Check its connection settings.",
-                            );
-                        });
-                      }}
-                    />
-                  );
-                })}
+                {targets
+                  .filter((target) => target.destination.environmentId !== currentEnvironmentId)
+                  .map((target) => {
+                    const environment = environments.find(
+                      (item) => item.environmentId === target.destination.environmentId,
+                    );
+                    return (
+                      <MachineDestinationRow
+                        key={target.key}
+                        target={target}
+                        environment={environment}
+                        disabled={disabled}
+                        onMove={() => void run("send", target.destination)}
+                        onCheck={() => {
+                          void reconnect(target.destination.environmentId).then((result) => {
+                            if (result._tag === "Failure")
+                              setError(
+                                "Could not connect to this machine. Check its connection settings.",
+                              );
+                          });
+                        }}
+                      />
+                    );
+                  })}
               </View>
               <ThreadVmMenuActions
                 onAction={(action) => {

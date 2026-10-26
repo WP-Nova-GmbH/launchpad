@@ -11,6 +11,8 @@ import {
 import {
   createThreadMoveSubmissionJournal,
   threadMoveProjectTargets,
+  threadMoveProjectTargetAvailability,
+  threadMoveOriginalLocationBlocker,
   threadMoveRepositoryCanonicalKey,
   threadMoveProviderSupported,
   type ThreadMoveSubmissionStorage,
@@ -732,6 +734,175 @@ describe("durable queued move submission", () => {
         source.repositoryIdentity?.canonicalKey,
       ).map((target) => target.destination),
     ).toEqual([{ kind: "environment", environmentId: "destination", projectId: "destination" }]);
+  });
+});
+
+describe("original project move targets", () => {
+  const project = (environmentId: string, projectId: string): EnvironmentProject => ({
+    environmentId: EnvironmentId.make(environmentId),
+    id: ProjectId.make(projectId),
+    title: "Repo",
+    workspaceRoot: `/repos/${projectId}`,
+    repositoryIdentity: {
+      canonicalKey: "github:team/repo",
+      locator: {
+        source: "git-remote",
+        remoteName: "origin",
+        remoteUrl: "https://github.com/team/repo",
+      },
+    },
+    defaultModelSelection: null,
+    scripts: [],
+    createdAt: command().createdAt,
+    updatedAt: command().createdAt,
+  });
+  const source = project("vm", "vm:thread");
+  const original = project("mac", "original");
+  const sibling = project("mac", "sibling");
+  const other = project("other", "other");
+  const otherSibling = project("other", "other-sibling");
+  const projects = [source, sibling, original, other, otherSibling];
+  const environments = ["vm", "mac", "other"].map((environmentId) => ({
+    entry: {
+      target: new RelayConnectionTarget({
+        environmentId: EnvironmentId.make(environmentId),
+        label: environmentId,
+      }),
+    },
+  }));
+  const originalLocation = { environmentId: original.environmentId, projectId: original.id };
+  const targets = (availableProjects = projects, knownEnvironments = environments) =>
+    threadMoveProjectTargets(
+      source,
+      availableProjects,
+      knownEnvironments,
+      source.repositoryIdentity?.canonicalKey,
+      originalLocation,
+    );
+
+  it("offers the exact original project once and keeps other machines unchanged", () => {
+    expect(targets().map((target) => target.destination)).toEqual([
+      { kind: "environment", ...originalLocation },
+      { kind: "environment", environmentId: other.environmentId, projectId: other.id },
+      {
+        kind: "environment",
+        environmentId: otherSibling.environmentId,
+        projectId: otherSibling.id,
+      },
+    ]);
+    expect(targets()[0]?.project).toBe(original);
+  });
+
+  it("keeps the original scoped ID when its project was deleted or recreated at the same path", () => {
+    const recreated = { ...original, id: ProjectId.make("recreated") };
+    const result = targets([source, sibling, recreated, other]);
+    expect(result[0]).toMatchObject({
+      destination: { kind: "environment", ...originalLocation },
+      original: true,
+      project: null,
+    });
+    expect(result.filter((target) => target.destination.environmentId === "mac")).toHaveLength(1);
+  });
+
+  it("keeps the original row without a local machine/project cache or repository status", () => {
+    expect(threadMoveProjectTargets(source, [], [], undefined, originalLocation)).toEqual([
+      expect.objectContaining({
+        destination: { kind: "environment", ...originalLocation },
+        original: true,
+        project: null,
+      }),
+    ]);
+  });
+
+  it("uses current project metadata and lets the host validate its actual repository root", () => {
+    const updated = {
+      ...original,
+      title: "Renamed project",
+      workspaceRoot: "/repos/moved",
+      repositoryIdentity: null,
+    };
+    expect(targets([source, sibling, updated])[0]?.project).toBe(updated);
+  });
+
+  it("keeps generic choices for a VM created without an original project", () => {
+    expect(
+      threadMoveProjectTargets(source, projects, environments, "github:team/repo", null).map(
+        (target) => target.destination.projectId,
+      ),
+    ).toEqual([sibling.id, original.id, other.id, otherSibling.id]);
+  });
+
+  it("blocks VM selection until the original location is known and preserves VM-born choices", () => {
+    expect(threadMoveOriginalLocationBlocker(true, null)).toBe("Checking thread location…");
+    expect(threadMoveOriginalLocationBlocker(true, {})).toBe(
+      "Original project could not be determined.",
+    );
+    expect(threadMoveOriginalLocationBlocker(true, null, "Network failed")).toBe(
+      "Could not check the original project. Reopen Run on to retry.",
+    );
+    expect(threadMoveOriginalLocationBlocker(true, { originalLocation: null })).toBeNull();
+    expect(threadMoveOriginalLocationBlocker(true, { originalLocation })).toBeNull();
+    expect(threadMoveOriginalLocationBlocker(false, null)).toBeNull();
+  });
+
+  it("does not add the current environment as a return destination", () => {
+    expect(
+      threadMoveProjectTargets(
+        original,
+        projects,
+        environments,
+        "github:team/repo",
+        originalLocation,
+      ).filter((target) => target.destination.environmentId === original.environmentId),
+    ).toEqual([]);
+  });
+
+  const connected = {
+    phase: "connected" as const,
+    registered: true,
+    enabled: true,
+    projectsReady: true,
+  };
+  it("waits for a live project snapshot before declaring the original project unavailable", () => {
+    const missing = targets([source, sibling])[0]!;
+    expect(
+      threadMoveProjectTargetAvailability(missing, { ...connected, projectsReady: false }),
+    ).toEqual({ action: null, detail: "Loading projects…" });
+    expect(threadMoveProjectTargetAvailability(missing, connected)).toEqual({
+      action: null,
+      detail: "Original project is unavailable",
+    });
+    expect(threadMoveProjectTargetAvailability(targets()[0]!, connected)).toEqual({
+      action: "select",
+      detail: null,
+    });
+  });
+
+  it("reconnects the original machine before checking missing project metadata", () => {
+    const missing = targets([], [])[0]!;
+    expect(
+      threadMoveProjectTargetAvailability(missing, { ...connected, phase: "available" }),
+    ).toEqual({ action: "check", detail: "Not connected · Check connection" });
+    expect(
+      threadMoveProjectTargetAvailability(missing, { ...connected, phase: "offline" }),
+    ).toEqual({ action: null, detail: "Offline" });
+    expect(
+      threadMoveProjectTargetAvailability(missing, { ...connected, failureReason: "permission" }),
+    ).toEqual({ action: null, detail: "Access required" });
+    expect(
+      threadMoveProjectTargetAvailability(missing, { ...connected, registered: false }),
+    ).toEqual({ action: null, detail: "Original machine is unavailable" });
+    expect(threadMoveProjectTargetAvailability(missing, { ...connected, enabled: false })).toEqual({
+      action: null,
+      detail: "Enable this machine in Connections",
+    });
+  });
+
+  it("does not change other machines' availability while their project snapshots refresh", () => {
+    const otherTarget = targets().find((target) => target.destination.projectId === other.id)!;
+    expect(
+      threadMoveProjectTargetAvailability(otherTarget, { ...connected, projectsReady: false }),
+    ).toEqual({ action: "select", detail: null });
   });
 });
 

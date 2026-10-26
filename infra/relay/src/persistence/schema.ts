@@ -591,11 +591,17 @@ export const relayThreadPlacements = pgTable(
     ownerUserId: varchar("owner_user_id", { length: 191 }).notNull(),
     environmentId: varchar("environment_id", { length: 191 }).notNull(),
     projectId: varchar("project_id", { length: 191 }).notNull(),
+    originalEnvironmentId: varchar("original_environment_id", { length: 191 }),
+    originalProjectId: varchar("original_project_id", { length: 191 }),
     generation: integer("generation").notNull().default(1),
     operationId: varchar("operation_id", { length: 64 }),
   },
   (table) => [
     check("relay_thread_placements_generation", sql`${table.generation} > 0`),
+    check(
+      "relay_thread_placements_original_location",
+      sql`(${table.originalEnvironmentId} IS NULL) = (${table.originalProjectId} IS NULL)`,
+    ),
     index("idx_relay_thread_placements_owner").on(table.ownerUserId),
   ],
 );

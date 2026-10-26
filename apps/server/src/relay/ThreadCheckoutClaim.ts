@@ -89,11 +89,14 @@ export function makeThreadCheckoutClaims(sql: SqlClient.SqlClient) {
   }>`SELECT thread_id AS "threadId",
     project_id AS "projectId", worktree_path AS "worktreePath" FROM projection_threads
     WHERE deleted_at IS NULL OR EXISTS (SELECT 1 FROM thread_cleanup_fences c WHERE c.thread_id = projection_threads.thread_id) ORDER BY thread_id`;
+  const assertCheckoutRoot = Effect.fnUntraced(function* (root: string) {
+    const fs = yield* FileSystem.FileSystem;
+    if ((yield* fs.realPath(yield* gitText(root, ["rev-parse", "--show-toplevel"]))) !== root)
+      return yield* workspaceFailure("The project must point to a Git checkout root.");
+  });
   const inspect = Effect.fnUntraced(function* (root: string) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    if ((yield* fs.realPath(yield* gitText(root, ["rev-parse", "--show-toplevel"]))) !== root)
-      return yield* workspaceFailure("The project must point to a Git checkout root.");
     const head = yield* gitText(root, ["rev-parse", "HEAD^{commit}"]);
     const branchResult = yield* git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
       allowFailure: true,
@@ -171,6 +174,7 @@ export function makeThreadCheckoutClaims(sql: SqlClient.SqlClient) {
     const project = knownProjects.find((item) => item.projectId === input.projectId);
     if (!project) return yield* workspaceFailure("The destination project no longer exists.");
     const repositoryRoot = yield* fs.realPath(project.root);
+    yield* assertCheckoutRoot(repositoryRoot);
     const aliases: string[] = [];
     for (const candidate of knownProjects) {
       // An unreadable unrelated project must not stop a move. The selected project is required above.
@@ -350,6 +354,7 @@ export function makeThreadCheckoutClaims(sql: SqlClient.SqlClient) {
         (yield* fs.realPath(path.dirname(claim.checkoutPath))) !== path.dirname(claim.checkoutPath))
     )
       return yield* workspaceFailure("Destination paths changed after reservation.");
+    if (claim.freshCheckout !== 1) yield* assertCheckoutRoot(claim.repositoryRoot);
   });
   const verifyLocation = Effect.fn("ThreadCheckoutClaims.verifyLocation")(function* (
     operationId: string,

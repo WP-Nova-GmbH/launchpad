@@ -92,12 +92,22 @@ export function makeThreadPlacementStore(sql: PgClient) {
       );
   });
   const get = Effect.fn("relay.thread_placement.get")(function* (threadId: string) {
-    const [row] =
-      yield* sql<Placement>`SELECT thread_id AS "threadId", organization_id AS "organizationId",
+    const [row] = yield* sql<
+      Placement & { localEnrollment: boolean }
+    >`SELECT thread_id AS "threadId", organization_id AS "organizationId",
       repository_id AS "repositoryId", owner_user_id AS "ownerUserId", environment_id AS "environmentId",
-      project_id AS "projectId", generation, operation_id AS "operationId"
+      project_id AS "projectId", generation, operation_id AS "operationId",
+      CASE WHEN original_environment_id IS NULL THEN NULL ELSE
+        jsonb_build_object('environmentId',original_environment_id,'projectId',original_project_id)
+      END AS "originalLocation",
+      EXISTS(SELECT 1 FROM relay_thread_local_enrollments e
+        WHERE e.thread_id=relay_thread_placements.thread_id AND e.phase IN ('preparing','active')) AS "localEnrollment"
       FROM relay_thread_placements WHERE thread_id = ${threadId} AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=${threadId})`;
-    return row ?? null;
+    if (!row) return null;
+    const { originalLocation, localEnrollment, ...current } = row;
+    const placement: Placement = current;
+    if (originalLocation != null) return { ...placement, originalLocation };
+    return localEnrollment ? placement : { ...placement, originalLocation: null };
   });
   const lock = Effect.fnUntraced(function* (threadId: string) {
     const rows =
@@ -123,7 +133,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
       : Effect.fail(conflict("Environment no longer owns this thread generation"));
 
   const enroll = Effect.fn("relay.thread_placement.enroll")(function* (
-    input: Omit<Placement, "generation" | "operationId">,
+    input: Omit<Placement, "generation" | "operationId" | "originalLocation">,
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {

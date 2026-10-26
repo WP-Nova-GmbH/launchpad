@@ -19,6 +19,17 @@ const fixture = vi.hoisted(() => ({
   replacementEnabled: true,
   readError: null as string | null,
   authAction: vi.fn(),
+  signedIn: false,
+  session: { accountId: "owner" },
+  checkLocation: vi.fn(),
+  location: null as {
+    recoveryRequested: boolean;
+    isPending: boolean;
+    movePending: boolean;
+    destination: null;
+    error: string | null;
+  } | null,
+  readMove: vi.fn(),
   lifecycle: {
     entries: [] as ThreadVmActionSubmission[],
     ready: true,
@@ -34,9 +45,14 @@ vi.mock("@effect/atom-react", async () => {
       select ? select(value) : value,
   };
 });
-vi.mock("@t3tools/client-runtime/relay", () => ({ managedRelaySessionAtom: null }));
+vi.mock("@t3tools/client-runtime/relay", () => ({
+  get managedRelaySessionAtom() {
+    return fixture.signedIn ? fixture.session : null;
+  },
+}));
 vi.mock("../../state/thread-move-submissions", () => ({
   threadMoveRelayUrl: () => "https://relay.example.test",
+  threadMoveSubmissions: { read: fixture.readMove },
 }));
 vi.mock("../../browser/useOpenLink", () => ({ useOpenLink: () => fixture.openLink }));
 vi.mock("../../state/use-thread-vm-actions", () => ({
@@ -50,18 +66,22 @@ vi.mock("../../state/use-atom-command", () => ({
         ? fixture.preview
         : command === "auth"
           ? fixture.authAction
-          : vi.fn(),
+          : command === "location"
+            ? fixture.checkLocation
+            : vi.fn(),
 }));
 vi.mock("../../state/threads", () => ({
+  openPortableThreadChat: "open",
   threadVmActionJournal: {},
   threadEnvironment: {},
   environmentThreadDetails: {
     stateAtom: () => ({ status: "live", data: { _tag: "None" } }),
   },
   threadVmControls: {
-    locationViewAtom: () => null,
+    locationViewAtom: () => fixture.location,
     routeAtom: () => null,
     confirmedLocationAtom: () => null,
+    checkLocation: "location",
     hostConfigurationAtom: { isPending: false, unavailableReason: null },
     providerAuthAction: "auth",
     checkBackupRecovery: "backup",
@@ -114,6 +134,9 @@ vi.mock("@t3tools/client-runtime/relay/portableThreadPresentation", () => ({
 vi.mock("../../composerDraftStore", () => ({ handoffMovedThreadDraft: vi.fn() }));
 vi.mock("../../lib/movedThreadDraft", () => ({ recoverMovedDraftFile: vi.fn() }));
 vi.mock("../../state/projects", () => ({ environmentProjects: { projectsAtom: [] } }));
+vi.mock("../../state/shell", () => ({
+  environmentShell: { stateValueAtom: () => ({ status: "live", snapshot: { _tag: "None" } }) },
+}));
 vi.mock("../../state/entities", () => ({ useThreadShell: () => null }));
 vi.mock("../../state/server", () => ({
   serverEnvironment: {
@@ -208,7 +231,7 @@ vi.mock("../ui/alert-dialog", () => ({
 }));
 
 import { ThreadVmControls, ThreadVmControlsProvider, ThreadVmNotice } from "./ThreadVmControls";
-import { ThreadRunOnPicker } from "./ThreadMoveControls";
+import { CurrentThreadLocation, ThreadRunOnPicker } from "./ThreadMoveControls";
 
 function deferred() {
   let resolve!: () => void;
@@ -265,6 +288,12 @@ beforeEach(() => {
   fixture.run.mockResolvedValue(true);
   fixture.backup.mockResolvedValue(AsyncResult.success(backup));
   fixture.authAction.mockResolvedValue(AsyncResult.success({}));
+  fixture.signedIn = false;
+  fixture.checkLocation.mockReset();
+  fixture.checkLocation.mockResolvedValue(AsyncResult.success({}));
+  fixture.location = null;
+  fixture.readMove.mockReset();
+  fixture.readMove.mockResolvedValue(null);
   fixture.expired = false;
   fixture.local = false;
   fixture.status = {};
@@ -311,6 +340,116 @@ async function openConfirmation(kind: "reset" | "delete" | "backup", chat = fals
 }
 
 describe("simplified VM controls", () => {
+  it("shows a real location retry as checking, then lets the user retry a failed check", async () => {
+    fixture.signedIn = true;
+    fixture.location = {
+      recoveryRequested: true,
+      isPending: false,
+      movePending: false,
+      destination: null,
+      error: "This thread is unavailable or you no longer have access.",
+    };
+    const pending = deferred();
+    fixture.checkLocation.mockImplementationOnce(async () => {
+      await pending.promise;
+      throw new Error("The latest status is unavailable.");
+    });
+    await act(async () => {
+      renderer = create(<CurrentThreadLocation environmentId={env} threadId={thread} />);
+    });
+    const action = (label: string) =>
+      renderer!.root
+        .findAllByType("button")
+        .find((node) => node.children.some((child) => child === label))!;
+    await act(async () => {
+      void action("Retry").props.onClick();
+    });
+    expect(fixture.checkLocation).toHaveBeenCalledExactlyOnceWith({
+      environmentId: env,
+      threadId: thread,
+      accountId: "owner",
+      relayUrl: "https://relay.example.test",
+    });
+    expect(action("Checking…").props.disabled).toBe(true);
+    await act(async () => pending.resolve());
+    expect(action("Retry").props.disabled).toBe(false);
+    expect(renderer!.root.findByType("details").findByType("p").children).toEqual([
+      "The latest status is unavailable.",
+    ]);
+    await act(async () => action("Retry").props.onClick());
+    expect(fixture.checkLocation).toHaveBeenCalledTimes(2);
+  });
+
+  it("checks the original project when saved-move loading finishes with Run on still open", async () => {
+    fixture.signedIn = true;
+    const savedMove = deferred();
+    fixture.readMove.mockReturnValueOnce(savedMove.promise.then(() => null));
+    fixture.checkLocation.mockRejectedValueOnce(new Error("Origin lookup failed after startup"));
+    await mount(true);
+    await openRunOn();
+    expect(fixture.checkLocation).not.toHaveBeenCalled();
+    await act(async () => savedMove.resolve());
+    expect(
+      renderer!.root.findAllByProps({ role: "alert" }).map((node) => node.children.join("")),
+    ).toContain("Origin lookup failed after startup");
+    expect(fixture.checkLocation).toHaveBeenCalledTimes(1);
+    await act(async () => renderer!.update(view(true)));
+    expect(fixture.checkLocation).toHaveBeenCalledTimes(1);
+  });
+  it("checks the original project when VM details arrive with Run on still open", async () => {
+    fixture.signedIn = true;
+    fixture.local = true;
+    fixture.checkLocation.mockRejectedValueOnce(new Error("Origin lookup failed after VM load"));
+    await mount(true);
+    await openRunOn();
+    expect(fixture.checkLocation).not.toHaveBeenCalled();
+    fixture.local = false;
+    await act(async () => renderer!.update(view(true)));
+    expect(
+      renderer!.root.findAllByProps({ role: "alert" }).map((node) => node.children.join("")),
+    ).toContain("Origin lookup failed after VM load");
+    expect(fixture.checkLocation).toHaveBeenCalledTimes(1);
+  });
+  it("waits for Run on to reopen if saved-move loading finishes after it closes", async () => {
+    fixture.signedIn = true;
+    const savedMove = deferred();
+    fixture.readMove.mockReturnValueOnce(savedMove.promise.then(() => null));
+    fixture.checkLocation.mockRejectedValueOnce(new Error("Origin lookup failed after reopening"));
+    await mount(true);
+    await openRunOn();
+    await openRunOn();
+    await act(async () => savedMove.resolve());
+    expect(fixture.checkLocation).not.toHaveBeenCalled();
+    await openRunOn();
+    expect(
+      renderer!.root.findAllByProps({ role: "alert" }).map((node) => node.children.join("")),
+    ).toContain("Origin lookup failed after reopening");
+  });
+  it("keeps saved-move storage failures visible when Run on is opened", async () => {
+    fixture.signedIn = true;
+    fixture.readMove.mockRejectedValueOnce(new Error("Storage unavailable"));
+    await mount(true);
+    await openRunOn();
+    expect(
+      renderer!.root.findAllByProps({ role: "alert" }).map((node) => node.children.join("")),
+    ).toContain("Could not read the saved move. Resolve storage before sending another.");
+    expect(fixture.checkLocation).not.toHaveBeenCalled();
+  });
+  it("shows a failed original-project lookup and retries when Run on is reopened", async () => {
+    fixture.signedIn = true;
+    fixture.checkLocation.mockRejectedValueOnce(new Error("Original project lookup failed"));
+    await mount(true);
+    await openRunOn();
+    expect(
+      renderer!.root.findAllByProps({ role: "alert" }).map((node) => node.children.join("")),
+    ).toContain("Original project lookup failed");
+    await openRunOn();
+    await openRunOn();
+    expect(fixture.checkLocation).toHaveBeenCalledTimes(2);
+    expect(
+      renderer!.root.findAllByProps({ role: "alert" }).map((node) => node.children.join("")),
+    ).not.toContain("Original project lookup failed");
+  });
   it("keeps a ready chat quiet and exposes tools directly in Run on", async () => {
     await mount(true);
     expect(renderer!.root.findAllByProps({ "aria-label": "VM needs attention" })).toHaveLength(0);

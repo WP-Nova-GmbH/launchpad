@@ -27,7 +27,7 @@ export function makeThreadLocalEnrollmentStore(sql: PgClient) {
   const prepare = Effect.fn("relay.thread_local_enrollment.prepare")(function* (
     input: Omit<
       import("@t3tools/contracts/relay").RelayPortableThreadPlacement,
-      "generation" | "operationId"
+      "generation" | "operationId" | "originalLocation"
     > & { operationId: string },
   ) {
     return yield* sql.withTransaction(
@@ -48,6 +48,9 @@ export function makeThreadLocalEnrollmentStore(sql: PgClient) {
             prior.repositoryId !== input.repositoryId ||
             prior.organizationId !== input.organizationId ||
             prior.ownerUserId !== input.ownerUserId ||
+            (prior.originalLocation != null &&
+              (prior.originalLocation.environmentId !== input.environmentId ||
+                prior.originalLocation.projectId !== input.projectId)) ||
             (enrollment.phase === "preparing" || enrollment.phase === "aborted"
               ? prior.operationId !== enrollment.operationId
               : prior.operationId !== null)
@@ -59,17 +62,16 @@ export function makeThreadLocalEnrollmentStore(sql: PgClient) {
             yield* sql`UPDATE relay_thread_local_enrollments SET operation_id=${input.operationId},phase='preparing',source_sequence=NULL,receipt_count=NULL
               WHERE thread_id=${input.threadId}`;
             yield* sql`UPDATE relay_thread_placements SET operation_id=${input.operationId} WHERE thread_id=${input.threadId}`;
-            return {
-              placement: (yield* placements.get(input.threadId))!,
-              ...(yield* get(input.threadId))!,
-            };
           }
-          return { placement: prior, ...enrollment };
+        } else {
+          yield* placements.enroll(input);
+          yield* sql`INSERT INTO relay_thread_local_enrollments(thread_id,operation_id)
+          VALUES(${input.threadId},${input.operationId})`;
+          yield* sql`UPDATE relay_thread_placements SET operation_id=${input.operationId} WHERE thread_id=${input.threadId}`;
         }
-        yield* placements.enroll(input);
-        yield* sql`INSERT INTO relay_thread_local_enrollments(thread_id,operation_id)
-        VALUES(${input.threadId},${input.operationId})`;
-        yield* sql`UPDATE relay_thread_placements SET operation_id=${input.operationId} WHERE thread_id=${input.threadId}`;
+        // The authenticated local source owns these IDs; VM enrollment never sets an origin.
+        yield* sql`UPDATE relay_thread_placements SET original_environment_id=${input.environmentId},original_project_id=${input.projectId}
+          WHERE thread_id=${input.threadId} AND original_environment_id IS NULL`;
         return {
           placement: (yield* placements.get(input.threadId))!,
           ...(yield* get(input.threadId))!,

@@ -71,6 +71,12 @@ export const RelayPortableThreadPlacement = Schema.Struct({
   projectId: TrimmedNonEmptyString,
   generation: PositiveInt,
   operationId: Schema.NullOr(TrimmedNonEmptyString),
+  // Missing means unresolved; null identifies a VM-created thread with no original local project.
+  originalLocation: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({ environmentId: TrimmedNonEmptyString, projectId: TrimmedNonEmptyString }),
+    ),
+  ),
   previousLocations: Schema.optionalKey(
     Schema.Array(Schema.Struct({ environmentId: TrimmedNonEmptyString, generation: PositiveInt })),
   ),
