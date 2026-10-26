@@ -1,5 +1,6 @@
 import {
   AuthAccessReadScope,
+  AuthClientLabel,
   AuthAccessTokenType,
   AuthAccessWriteScope,
   AuthStandardClientScopes,
@@ -30,6 +31,7 @@ import { verifyDesktopIdentity } from "./DesktopIdentity.ts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Fiber from "effect/Fiber";
 import { identity } from "effect/Function";
 import * as Layer from "effect/Layer";
@@ -74,6 +76,8 @@ const currentEnvironmentTraceId = Effect.currentParentSpan.pipe(
   Effect.map((span) => span.traceId),
   Effect.orElseSucceed(() => "unavailable"),
 );
+
+const decodeClientLabel = Schema.decodeEffect(AuthClientLabel);
 
 export function annotateEnvironmentRequest(endpoint: string) {
   return Effect.gen(function* () {
@@ -345,7 +349,10 @@ export const authHttpApiLayer = HttpApiBuilder.group(
             const request = yield* HttpServerRequest.HttpServerRequest;
             const result = yield* serverAuth.createBrowserSession(
               args.payload.credential,
-              deriveAuthClientMetadata({ request }),
+              deriveAuthClientMetadata({
+                request,
+                ...(args.payload.client ? { presented: args.payload.client } : {}),
+              }),
             );
             const cookieName = result.cookieName ?? sessions.cookieName;
             const selectedCookie = yield* Effect.fromResult(
@@ -377,6 +384,9 @@ export const authHttpApiLayer = HttpApiBuilder.group(
               EnvironmentAuth.serverAuthCredentialReason(error),
               EnvironmentAuth.serverAuthDpopFailureReason(error),
             ),
+          ),
+          Effect.catchIf(EnvironmentAuth.isServerAuthInvalidRequestError, (error) =>
+            failEnvironmentInvalidRequest(EnvironmentAuth.serverAuthInvalidRequestReason(error)),
           ),
           Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
             failEnvironmentInternal("browser_session_issuance_failed", error),
@@ -535,6 +545,26 @@ export const authHttpApiLayer = HttpApiBuilder.group(
             failEnvironmentInternal("client_sessions_load_failed", error),
           ),
         ),
+      )
+      .handle(
+        "renameClient",
+        Effect.fn("environment.auth.renameClient")(function* (args) {
+          const caller = yield* EnvironmentAuthenticatedPrincipal;
+          const targetId = args.payload.sessionId ?? caller.sessionId;
+          if (targetId !== caller.sessionId) yield* requireEnvironmentScope(AuthAccessWriteScope);
+          const label = yield* decodeClientLabel(args.payload.label).pipe(
+            Effect.catch(() => failEnvironmentInvalidRequest("invalid_client_label")),
+          );
+          const result = yield* sessions.rename(targetId, label).pipe(
+            Effect.catchIf(SessionStore.isSessionCredentialInvalidError, () =>
+              failEnvironmentNotFound("client_session_not_found"),
+            ),
+            Effect.catchIf(SessionStore.isSessionCredentialInternalError, () =>
+              failEnvironmentInternal("internal_error"),
+            ),
+          );
+          return { ...result, current: result.sessionId === caller.sessionId };
+        }),
       )
       .handle(
         "revokeClient",

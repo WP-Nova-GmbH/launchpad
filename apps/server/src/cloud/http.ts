@@ -1597,6 +1597,7 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
           userId: proof.sub,
           displayName: proof.name ?? null,
           imageUrl: proof.picture ?? null,
+          ...(proof.email ? { email: proof.email } : {}),
         },
       })
       .pipe(
@@ -1634,6 +1635,7 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
         userId: proof.sub,
         displayName: proof.name ?? null,
         imageUrl: proof.picture ?? null,
+        ...(proof.email ? { email: proof.email } : {}),
       },
     });
     const responsePayload = {

@@ -9,9 +9,8 @@ import type {
   CodexFeedbackSubmission,
   EnvironmentThreadStatus,
 } from "@t3tools/client-runtime/state/threads";
-import { threadPresenceLabel } from "@t3tools/client-runtime/state/threadPresence";
-import { AppText as Text } from "../../components/AppText";
-import { useThreadPresencePeople, useThreadPresenceReporter } from "../../state/thread-presence";
+import { ThreadPresence } from "./ThreadPresence";
+import { useThreadPresenceReporter } from "../../state/thread-presence";
 import { SharedPromptQueue } from "./SharedPromptQueue";
 import { useKeyboardChatComposerInset, useKeyboardScrollToEnd } from "@legendapp/list/keyboard";
 import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSkills";
@@ -429,9 +428,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     );
   const selectedThreadFeed = props.selectedThreadFeed;
   useThreadPresenceReporter(props.environmentId, props.selectedThread.id, props.draftMessage);
-  const presenceLabel = threadPresenceLabel(
-    useThreadPresencePeople(props.environmentId, props.selectedThread.id),
-  );
+
   const hasCompactableConversation =
     selectedThreadFeed.some(
       (entry) =>
@@ -1071,13 +1068,10 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                 ) : null}
               </View>
 
-              {presenceLabel !== null ? (
-                <View className="items-center pb-1">
-                  <Text className="font-t3-medium text-xs text-foreground-secondary">
-                    {presenceLabel}
-                  </Text>
-                </View>
-              ) : null}
+              <ThreadPresence
+                environmentId={props.environmentId}
+                threadId={props.selectedThread.id}
+              />
               {props.promptQueue ? (
                 <SharedPromptQueue
                   key={`${props.environmentId}:${props.selectedThread.id}`}

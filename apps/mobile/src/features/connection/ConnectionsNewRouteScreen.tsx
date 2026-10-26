@@ -1,3 +1,4 @@
+import { useClientName } from "../../lib/useClientName";
 import { ScreenScrollView as ScrollView } from "../../components/ScreenScrollView";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import {
@@ -22,7 +23,6 @@ import { useRemoteConnections } from "../../state/use-remote-environment-registr
 type ConnectionsNewRouteParams = {
   readonly mode?: string;
   readonly pairingUrl?: string;
-  readonly autoConnect?: string;
 };
 
 export function ConnectionsNewRouteScreen({
@@ -40,22 +40,20 @@ export function ConnectionsNewRouteScreen({
   // Deep-link prefill exists for development automation only. A production
   // link must not arrive with attacker-chosen host and token already filled.
   const routePairingUrl = __DEV__ ? (params.pairingUrl?.trim() ?? "") : "";
-  const shouldAutoConnect =
-    __DEV__ &&
-    routePairingUrl.length > 0 &&
-    (params.autoConnect === "1" || params.autoConnect === "true");
+
   const insets = useSafeAreaInsets();
   const [hostInput, setHostInput] = useState("");
+  const [clientName, setClientName] = useClientName();
+  const submittingRef = useRef(false);
   const [codeInput, setCodeInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showScanner, setShowScanner] = useState(params.mode === "scan_qr");
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [scannerLocked, setScannerLocked] = useState(false);
-  const attemptedAutoConnectRef = useRef<string | null>(null);
 
   const headerIconColor = useUniwindTheme()["--color-icon"];
 
-  const connectDisabled = isSubmitting || hostInput.trim().length === 0;
+  const connectDisabled = isSubmitting || !clientName.trim() || hostInput.trim().length === 0;
 
   useEffect(() => {
     const { host, code } = parsePairingUrl(connectionPairingUrl);
@@ -153,38 +151,26 @@ export function ConnectionsNewRouteScreen({
     [onChangeConnectionPairingUrl, scannerLocked],
   );
 
-  const connectAndClose = useCallback(
-    async (pairingUrl: string, replaceWithHome: boolean) => {
-      setIsSubmitting(true);
-      onChangeConnectionPairingUrl(pairingUrl);
-      try {
-        const result = await onConnectPress(pairingUrl);
-        if (AsyncResult.isSuccess(result)) {
-          if (replaceWithHome || !navigation.canGoBack()) {
-            navigation.dispatch(StackActions.replace("Home"));
-          } else {
-            navigation.goBack();
-          }
-        }
-      } finally {
-        setIsSubmitting(false);
-      }
-    },
-    [navigation, onChangeConnectionPairingUrl, onConnectPress],
-  );
-
   const handleSubmit = useCallback(async () => {
-    await connectAndClose(buildPairingUrl(hostInput, codeInput), false);
-  }, [codeInput, connectAndClose, hostInput]);
-
-  useEffect(() => {
-    if (!shouldAutoConnect || attemptedAutoConnectRef.current === routePairingUrl) {
-      return;
+    if (submittingRef.current || !clientName.trim()) return;
+    const pairingUrl = buildPairingUrl(hostInput, codeInput);
+    submittingRef.current = true;
+    setIsSubmitting(true);
+    onChangeConnectionPairingUrl(pairingUrl);
+    try {
+      const result = await onConnectPress(pairingUrl, clientName);
+      if (AsyncResult.isSuccess(result)) {
+        if (!navigation.canGoBack()) {
+          navigation.dispatch(StackActions.replace("Home"));
+        } else {
+          navigation.goBack();
+        }
+      }
+    } finally {
+      submittingRef.current = false;
+      setIsSubmitting(false);
     }
-
-    attemptedAutoConnectRef.current = routePairingUrl;
-    void connectAndClose(routePairingUrl, true);
-  }, [connectAndClose, routePairingUrl, shouldAutoConnect]);
+  }, [clientName, codeInput, hostInput, navigation, onChangeConnectionPairingUrl, onConnectPress]);
 
   return (
     <SettingsScreen
@@ -262,6 +248,18 @@ export function ConnectionsNewRouteScreen({
                 onChangeText={handleCodeChange}
               />
 
+              <ConnectionFormField
+                label="Client name"
+                value={clientName}
+                onChangeText={setClientName}
+                maxLength={80}
+                placeholder="My phone"
+                editable={!isSubmitting}
+                autoCorrect={false}
+              />
+              <Text className="text-sm text-foreground-muted">
+                A name for this device on this environment.
+              </Text>
               {pairingConnectionError ? <ErrorBanner message={pairingConnectionError} /> : null}
 
               <View className="android:flex-row android:justify-end">

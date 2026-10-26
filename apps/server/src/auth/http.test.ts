@@ -204,8 +204,17 @@ it.effect("sets the selected browser session cookies through the HTTP route", ()
           );
           expect(pairingResponse.status).toBe(200);
           const pairing = (await pairingResponse.json()) as { credential: string };
-          const restrictedResponse = await environmentA.handler(
+          const unnamedResponse = await environmentA.handler(
             postJson("/api/auth/browser-session", { credential: pairing.credential }),
+            requestContext,
+          );
+          expect(unnamedResponse.status).toBe(400);
+          expect(await unnamedResponse.json()).toMatchObject({ reason: "client_label_required" });
+          const restrictedResponse = await environmentA.handler(
+            postJson("/api/auth/browser-session", {
+              credential: pairing.credential,
+              client: { label: "  Cookie test browser  " },
+            }),
             requestContext,
           );
           expect(restrictedResponse.status).toBe(200);
@@ -213,6 +222,17 @@ it.effect("sets the selected browser session cookies through the HTTP route", ()
           expect(restrictedCookies).toHaveLength(1);
           expect(restrictedCookies[0]).toMatch(/^t3_session_/);
           expect(restrictedCookies[0]).not.toContain("t3_dev_session_");
+          const restrictedSession = await environmentA.handler(
+            new Request("http://127.0.0.1/api/auth/session", {
+              headers: { cookie: restrictedCookies[0]!.split(";", 1)[0]! },
+            }),
+            requestContext,
+          );
+          expect(restrictedSession.status).toBe(200);
+          expect(await restrictedSession.json()).toMatchObject({
+            authenticated: true,
+            currentSession: { client: { label: "Cookie test browser" } },
+          });
         }),
       ([environmentA, environmentB]) =>
         Effect.promise(() => Promise.all([environmentA.dispose(), environmentB.dispose()])),

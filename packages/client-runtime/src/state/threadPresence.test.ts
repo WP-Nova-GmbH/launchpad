@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vite-plus/test";
-import { ThreadId, type ThreadPresenceParticipant } from "@t3tools/contracts";
-
-import { collapseThreadPresence, threadPresenceLabel } from "./threadPresence.ts";
-
+import { AuthSessionId, ThreadId, type ThreadPresenceParticipant } from "@t3tools/contracts";
+import {
+  collapseThreadPresence,
+  threadPresenceInitials,
+  threadPresenceLabel,
+  threadPresenceName,
+  type ThreadPresencePerson,
+} from "./threadPresence.ts";
 const threadId = ThreadId.make("thread-1");
-const otherThreadId = ThreadId.make("thread-2");
-
+const viewer = { sessionId: AuthSessionId.make("viewer-session"), userId: "alice" };
 function participant(
-  overrides: Partial<ThreadPresenceParticipant> & { readonly connectionId: string },
+  overrides: Partial<ThreadPresenceParticipant> & { connectionId: string },
 ): ThreadPresenceParticipant {
   return {
+    sessionId: AuthSessionId.make(overrides.connectionId),
+    clientDeviceType: "desktop",
+    clientOs: "macOS",
+    clientBrowser: "Chrome",
     threadId,
     user: null,
     clientLabel: null,
@@ -18,60 +25,100 @@ function participant(
     ...overrides,
   };
 }
-
-const alice = { userId: "user_alice", displayName: "Alice", imageUrl: null };
-const bob = { userId: "user_bob", displayName: "Bob", imageUrl: "https://img/bob.png" };
-
+function person(overrides: Partial<ThreadPresencePerson>): ThreadPresencePerson {
+  return {
+    key: "a",
+    displayName: "Alice",
+    imageUrl: null,
+    email: null,
+    userId: null,
+    clientDetails: null,
+    isSelf: false,
+    typing: false,
+    ...overrides,
+  };
+}
 describe("collapseThreadPresence", () => {
-  it("keeps only this thread and merges one user's connections", () => {
-    const people = collapseThreadPresence(
+  it("groups verified accounts, merges enriched profiles and typing, and uses this environment's viewer", () => {
+    const input = [
+      participant({
+        connectionId: "c1",
+        user: { userId: "alice", displayName: null, imageUrl: null },
+      }),
+      participant({
+        connectionId: "c2",
+        user: {
+          userId: "alice",
+          displayName: "Alice Smith",
+          imageUrl: "https://img/alice.png",
+          email: "alice@example.com",
+        },
+        typing: true,
+      }),
+      participant({ connectionId: "c3", threadId: ThreadId.make("other") }),
+    ];
+    expect(collapseThreadPresence(input, threadId, viewer)).toEqual([]);
+    const all = collapseThreadPresence(input, threadId, viewer, true);
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({
+      displayName: "Alice Smith",
+      email: "alice@example.com",
+      imageUrl: "https://img/alice.png",
+      isSelf: true,
+      typing: true,
+    });
+    expect(
+      collapseThreadPresence(input, threadId, { ...viewer, userId: "someone-else" }),
+    ).toHaveLength(1);
+  });
+  it("deduplicates anonymous tabs by session, keeps different clients, and marks the viewer", () => {
+    const own = participant({
+      connectionId: "own",
+      sessionId: viewer.sessionId,
+      clientLabel: "My phone",
+    });
+    const input = [
+      own,
+      { ...own, connectionId: "second-tab", typing: true },
+      participant({ connectionId: "other", clientLabel: "My phone" }),
+    ];
+    expect(collapseThreadPresence(input, threadId, { ...viewer, userId: null })).toHaveLength(1);
+    const all = collapseThreadPresence(input, threadId, { ...viewer, userId: null }, true);
+    expect(all).toHaveLength(2);
+    expect(all[0]).toMatchObject({
+      isSelf: true,
+      typing: true,
+      displayName: "My phone",
+      clientDetails: "macOS · Chrome",
+    });
+  });
+  it("never treats an editable client name as verified identity", () => {
+    const [verified, anonymous] = collapseThreadPresence(
       [
-        participant({ connectionId: "c1", user: alice }),
-        participant({ connectionId: "c2", user: alice, typing: true }),
-        participant({ connectionId: "c3", user: bob, threadId: otherThreadId }),
+        participant({
+          connectionId: "verified",
+          clientLabel: "Alice",
+          user: { userId: "user", displayName: null, imageUrl: null, email: "bob@example.com" },
+        }),
+        participant({ connectionId: "anonymous" }),
       ],
       threadId,
       null,
     );
-    expect(people).toEqual([
-      { key: "user:user_alice", displayName: "Alice", imageUrl: null, typing: true },
-    ]);
-  });
-
-  it("drops the viewer's own user but keeps sessions without a user", () => {
-    const people = collapseThreadPresence(
-      [
-        participant({ connectionId: "c1", user: alice }),
-        participant({ connectionId: "c2", clientLabel: "Launchpad Desktop" }),
-      ],
-      threadId,
-      alice.userId,
-    );
-    expect(people).toEqual([
-      { key: "connection:c2", displayName: "Launchpad Desktop", imageUrl: null, typing: false },
-    ]);
+    expect(threadPresenceName(verified!)).toBe("bob@example.com");
+    expect(threadPresenceInitials(verified!)).toBe("B");
+    expect(threadPresenceName(anonymous!)).toBe("macOS · Chrome");
+    expect(threadPresenceInitials(person({ displayName: "Alice Smith" }))).toBe("AS");
+    expect(threadPresenceName(person({ displayName: null }))).toBe("Member");
   });
 });
-
 describe("threadPresenceLabel", () => {
-  it("is silent when alone", () => {
+  it("is silent alone and preserves readable viewing/typing descriptions", () => {
     expect(threadPresenceLabel([])).toBeNull();
-  });
-
-  it("prefers typing over viewing and names everyone", () => {
-    const viewing = { key: "a", displayName: "Alice", imageUrl: null, typing: false };
-    const typing = { key: "b", displayName: "Bob", imageUrl: null, typing: true };
-    expect(threadPresenceLabel([viewing])).toBe("Alice is here");
-    expect(threadPresenceLabel([viewing, { ...typing, typing: false }])).toBe(
-      "Alice and Bob are here",
-    );
-    expect(threadPresenceLabel([viewing, typing])).toBe("Bob is typing…");
-    expect(
-      threadPresenceLabel([
-        { ...viewing, typing: true },
-        typing,
-        { key: "c", displayName: null, imageUrl: null, typing: true },
-      ]),
-    ).toBe("Alice, Bob, and Someone are typing…");
+    const alice = person({});
+    const bob = person({ key: "b", displayName: "Bob", typing: true });
+    expect(threadPresenceLabel([alice])).toBe("Alice is here");
+    expect(threadPresenceLabel([alice, bob])).toBe("Bob is typing…");
+    expect(threadPresenceLabel([alice, { ...bob, typing: false }])).toBe("Alice and Bob are here");
   });
 });

@@ -24,6 +24,22 @@ const freshWorkspace = {
 } as const;
 
 describe("resolveFirstRunDecision", () => {
+  it.each([0, 3])(
+    "keeps the app accessible with an unnamed primary and %s other projects",
+    (projectCount) => {
+      expect(
+        resolveFirstRunDecision({
+          ...freshWorkspace,
+          primaryNeedsClientLabel: true,
+          bootstrapped: false,
+          authoritative: false,
+          serverConfigAvailable: false,
+          projectCount,
+          threadCount: 0,
+        }),
+      ).toEqual({ decision: "app", persistCompletion: false });
+    },
+  );
   it("opens the wizard for an authoritative fresh workspace", () => {
     expect(resolveFirstRunDecision(freshWorkspace)).toEqual({
       decision: "wizard",

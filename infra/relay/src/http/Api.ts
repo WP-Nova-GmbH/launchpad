@@ -928,6 +928,7 @@ export const clientApi = HttpApiBuilder.group(
             userId,
             displayName: profile?.displayName ?? null,
             imageUrl: profile?.imageUrl ?? null,
+            ...(profile?.email ? { email: profile.email } : {}),
           };
         }),
       )

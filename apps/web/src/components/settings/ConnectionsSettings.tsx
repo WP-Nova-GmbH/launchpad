@@ -1,3 +1,6 @@
+import { ClientNameField, useClientName, rememberClientLabel } from "../auth/ClientNameField";
+import { ClientNameButton } from "../auth/ClientNameDialog";
+import { ThisClientSettingsRow } from "./ThisClientSettingsRow";
 import { PersonalIssueTrackers } from "./PersonalIssueTrackers";
 import {
   ChevronsLeftRightEllipsisIcon,
@@ -977,6 +980,7 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
   revokingClientSessionId,
   onRevokeSession,
 }: ConnectedClientListRowProps) {
+  const primaryEnvironment = usePrimaryEnvironment();
   const nowMs = useRelativeTimeTick(1_000);
   const isLive = clientSession.current || clientSession.connected;
   const lastConnectedAt = clientSession.lastConnectedAt;
@@ -1030,6 +1034,14 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
           </p>
         </div>
         <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
+          {primaryEnvironment ? (
+            <ClientNameButton
+              environmentId={primaryEnvironment.environmentId}
+              environmentLabel={primaryEnvironment.label}
+              sessionId={clientSession.sessionId}
+              initialLabel={clientSession.client.label ?? ""}
+            />
+          ) : null}
           {!clientSession.current ? (
             <Button
               size="xs"
@@ -1060,7 +1072,6 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
   onRevokeOtherClients,
 }: AuthorizedClientsHeaderActionProps) {
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [pairingLabel, setPairingLabel] = useState("");
   const [pairingScopes, setPairingScopes] = useState<ReadonlyArray<AuthEnvironmentScope>>([
     ...AuthStandardClientScopes,
   ]);
@@ -1070,11 +1081,9 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
     setIsCreatingPairingLink(true);
     try {
       const created = await createServerPairingCredential({
-        label: pairingLabel,
         scopes: pairingScopes,
       });
       onPairingLinkCreated(created);
-      setPairingLabel("");
       setPairingScopes([...AuthStandardClientScopes]);
       setDialogOpen(false);
     } catch (error) {
@@ -1089,7 +1098,7 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
     } finally {
       setIsCreatingPairingLink(false);
     }
-  }, [onPairingLinkCreated, pairingLabel, pairingScopes]);
+  }, [onPairingLinkCreated, pairingScopes]);
 
   const togglePairingScope = useCallback((scope: AuthEnvironmentScope, checked: boolean) => {
     setPairingScopes((current) =>
@@ -1114,7 +1123,6 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
         onOpenChange={(open) => {
           setDialogOpen(open);
           if (!open) {
-            setPairingLabel("");
             setPairingScopes([...AuthStandardClientScopes]);
           }
         }}
@@ -1136,18 +1144,6 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
             </DialogDescription>
           </DialogHeader>
           <DialogPanel>
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-medium text-foreground">
-                Client label (optional)
-              </span>
-              <Input
-                value={pairingLabel}
-                onChange={(event) => setPairingLabel(event.target.value)}
-                placeholder="e.g. Living room iPad"
-                disabled={isCreatingPairingLink}
-                autoFocus
-              />
-            </label>
             <section className="space-y-3">
               <div className="flex items-center justify-between gap-3">
                 <div>
@@ -1595,6 +1591,13 @@ function SavedBackendListRow({
         ) : null
       }
     >
+      {enabled && (isConnected || environment.connection.needsClientLabel) ? (
+        <ClientNameButton
+          environmentId={environmentId}
+          environmentLabel={environment.label}
+          required={environment.connection.needsClientLabel === true}
+        />
+      ) : null}
       {showUpdateAction ? (
         <ServerUpdateAction
           environmentId={environmentId}
@@ -1969,6 +1972,7 @@ export function ConnectionsSettings() {
   const [savedBackendMode, setSavedBackendMode] = useState<"remote" | "ssh">("remote");
   const [savedBackendHost, setSavedBackendHost] = useState("");
   const [savedBackendPairingCode, setSavedBackendPairingCode] = useState("");
+  const [clientName, setClientName] = useClientName();
   const [savedBackendSshHost, setSavedBackendSshHost] = useState("");
   const [savedBackendSshUsername, setSavedBackendSshUsername] = useState("");
   const [savedBackendSshPort, setSavedBackendSshPort] = useState("");
@@ -2351,6 +2355,8 @@ export function ConnectionsSettings() {
       return;
     }
 
+    if (!clientName.trim()) return;
+
     setIsAddingSavedBackend(true);
     setSavedBackendError(null);
     let remotePairingInput: ReturnType<typeof parseRemotePairingFields>;
@@ -2373,7 +2379,7 @@ export function ConnectionsSettings() {
       return;
     }
 
-    const result = await connectPairing(remotePairingInput);
+    const result = await connectPairing({ ...remotePairingInput, clientLabel: clientName });
     if (result._tag === "Failure") {
       if (!isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
@@ -2391,6 +2397,7 @@ export function ConnectionsSettings() {
       return;
     }
 
+    rememberClientLabel(clientName);
     setSavedBackendHost("");
     setSavedBackendPairingCode("");
     setSavedBackendSshHost("");
@@ -2405,6 +2412,7 @@ export function ConnectionsSettings() {
     setIsAddingSavedBackend(false);
   }, [
     connectPairing,
+    clientName,
     connectSavedBackendSshTarget,
     savedBackendHost,
     savedBackendMode,
@@ -2654,6 +2662,11 @@ export function ConnectionsSettings() {
 
   const renderRemoteFields = () => (
     <div className="space-y-3">
+      <ClientNameField
+        value={clientName}
+        onChange={setClientName}
+        disabled={isAddingSavedBackend}
+      />
       <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem]">
         <label className="block">
           <span className="mb-1.5 block text-xs font-medium text-foreground">Host</span>
@@ -2690,7 +2703,7 @@ export function ConnectionsSettings() {
       <Button
         variant="outline"
         className="w-full"
-        disabled={isAddingSavedBackend}
+        disabled={isAddingSavedBackend || !clientName.trim()}
         onClick={() => void handleAddSavedBackend()}
       >
         <PlusIcon />
@@ -3276,6 +3289,14 @@ export function ConnectionsSettings() {
     />
   );
 
+  const thisClientRow = primaryEnvironment ? (
+    <ThisClientSettingsRow
+      key={primaryEnvironment.environmentId}
+      environmentId={primaryEnvironment.environmentId}
+      environmentLabel={primaryEnvironment.label}
+    />
+  ) : null;
+
   const primarySettings = (
     <>
       {desktopBridge || canManageLocalBackend ? (
@@ -3321,6 +3342,7 @@ export function ConnectionsSettings() {
               ) : null
             }
           >
+            {thisClientRow}
             <LocalEnvironmentSetting />
             {canManageLocalBackend ? (
               <SettingsRow
@@ -3678,9 +3700,10 @@ export function ConnectionsSettings() {
         </>
       ) : (
         <SettingsSection {...searchableSetting("connections-environment")}>
+          {thisClientRow}
           <SettingsRow
             title="Administrative access"
-            description="Pairing links and client-session management require the access:write scope for this backend."
+            description="Managing pairing links and other clients requires administrative access to this environment."
           />
           <CloudLinkRow canManageRelay={canManageRelay} />
         </SettingsSection>
@@ -3731,23 +3754,22 @@ export function ConnectionsSettings() {
                 </DialogHeader>
                 <DialogPanel>
                   <div className="space-y-4">
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      {renderConnectionModeCard({
-                        mode: "remote",
-                        title: "Remote link",
-                        description: "Enter a backend host and pairing code.",
-                        icon: <ChevronsLeftRightEllipsisIcon aria-hidden className="size-4" />,
-                      })}
-                      {desktopBridge
-                        ? renderConnectionModeCard({
-                            mode: "ssh",
-                            title: "SSH",
-                            description:
-                              "Use local SSH config, agent, and tunnels for the backend.",
-                            icon: <TerminalIcon aria-hidden className="size-4" />,
-                          })
-                        : null}
-                    </div>
+                    {desktopBridge ? (
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {renderConnectionModeCard({
+                          mode: "remote",
+                          title: "Remote link",
+                          description: "Enter a backend host and pairing code.",
+                          icon: <ChevronsLeftRightEllipsisIcon aria-hidden className="size-4" />,
+                        })}
+                        {renderConnectionModeCard({
+                          mode: "ssh",
+                          title: "SSH",
+                          description: "Use local SSH config, agent, and tunnels for the backend.",
+                          icon: <TerminalIcon aria-hidden className="size-4" />,
+                        })}
+                      </div>
+                    ) : null}
                     <AnimatedHeight>
                       {savedBackendMode === "ssh" ? renderSshFields() : renderRemoteModeBody()}
                     </AnimatedHeight>

@@ -2,6 +2,18 @@
 
 Language for organization-governed work and managed compute in Launchpad.
 
+## Client access
+
+**Pairing code**:
+A one-time invitation shared to authorize a client to access an environment. It grants client
+access, not a verified person's identity.
+_Avoid_: User login
+
+**Client label**:
+A human-readable, environment-specific name for a paired client, such as "Bob's iPad".
+It distinguishes clients but does not verify the person using one.
+_Avoid_: User name, verified identity
+
 ## Collaboration
 
 **Repository access**:

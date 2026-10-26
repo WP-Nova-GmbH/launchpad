@@ -1,6 +1,6 @@
 import { TerminalManager } from "../terminal/Manager.ts";
 import { SetupProcessJournal } from "../terminal/SetupProcessJournal.ts";
-import { CommandId, type OrchestrationCommand } from "@t3tools/contracts";
+import { authSessionAuthor, CommandId, type OrchestrationCommand } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -139,7 +139,7 @@ export const makeDeletionDispatcher = Effect.gen(function* () {
             ),
             threadId: thread.id,
             createdAt: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
-            ...(actor.user ? { author: actor.user } : {}),
+            ...(actor.user ? { author: authSessionAuthor(actor.user) } : {}),
           };
           const receipt = yield* access.withFence(
             authorizeOrchestrationCommand(actor, stop).pipe(

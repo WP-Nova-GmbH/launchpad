@@ -1,4 +1,6 @@
+import { currentSessionPresentation } from "./currentSession.ts";
 import {
+  requiresClientLabel,
   AuthAccessTokenType,
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
@@ -398,16 +400,26 @@ export class ServerAuthScopeNotGrantedError extends Schema.TaggedError<ServerAut
   }
 }
 
+export class ServerAuthClientLabelError extends Schema.TaggedError<ServerAuthClientLabelError>()(
+  "ServerAuthClientLabelError",
+  { reason: Schema.Literals(["client_label_required", "invalid_client_label"]) },
+) {}
+
 export const ServerAuthInvalidRequestError = Schema.Union([
   ServerAuthInvalidScopeError,
   ServerAuthScopeNotGrantedError,
+  ServerAuthClientLabelError,
 ]);
 export type ServerAuthInvalidRequestError = typeof ServerAuthInvalidRequestError.Type;
 export const isServerAuthInvalidRequestError = Schema.is(ServerAuthInvalidRequestError);
 export const serverAuthInvalidRequestReason = (
   error: ServerAuthInvalidRequestError,
-): "invalid_scope" | "scope_not_granted" =>
-  error._tag === "ServerAuthInvalidScopeError" ? "invalid_scope" : "scope_not_granted";
+): "invalid_scope" | "scope_not_granted" | "client_label_required" | "invalid_client_label" =>
+  error._tag === "ServerAuthClientLabelError"
+    ? error.reason
+    : error._tag === "ServerAuthInvalidScopeError"
+      ? "invalid_scope"
+      : "scope_not_granted";
 
 export class ServerAuthForbiddenOperationError extends Schema.TaggedError<ServerAuthForbiddenOperationError>()(
   "ServerAuthForbiddenOperationError",
@@ -435,7 +447,7 @@ export class EnvironmentAuth extends Context.Service<
         readonly cookieName?: string;
         readonly expireNormalCookie?: boolean;
       },
-      ServerAuthInvalidCredentialError | ServerAuthInternalError
+      ServerAuthInvalidCredentialError | ServerAuthInvalidRequestError | ServerAuthInternalError
     >;
     readonly exchangeBootstrapCredentialForAccessToken: (
       credential: string,
@@ -534,7 +546,9 @@ const bySessionPriority = (left: AuthClientSession, right: AuthClientSession) =>
 
 export function toBootstrapExchangeError(
   cause: PairingGrantStore.BootstrapCredentialError,
-): ServerAuthInvalidCredentialError | ServerAuthInternalError {
+): ServerAuthInvalidCredentialError | ServerAuthInvalidRequestError | ServerAuthInternalError {
+  if (cause._tag === "BootstrapClientLabelError")
+    return new ServerAuthClientLabelError({ reason: cause.reason });
   if (PairingGrantStore.isBootstrapCredentialInternalError(cause)) {
     return new ServerAuthBootstrapCredentialValidationError({ cause });
   }
@@ -695,10 +709,21 @@ export const make = Effect.gen(function* () {
 
   const getSessionState: EnvironmentAuth["Service"]["getSessionState"] = (request) =>
     authenticateRequest(request).pipe(
+      Effect.flatMap((session) =>
+        sessions.getActive(session.sessionId).pipe(
+          Effect.map((current) => ({ session, current })),
+          Effect.mapError((cause) => new ServerAuthSessionsListError({ cause })),
+        ),
+      ),
       Effect.map(
-        (session) =>
+        ({ session, current }) =>
           ({
             authenticated: true,
+            ...(Option.isSome(current)
+              ? {
+                  currentSession: currentSessionPresentation(current.value),
+                }
+              : {}),
             auth: descriptor,
             scopes: session.scopes,
             sessionMethod: session.method,
@@ -742,38 +767,47 @@ export const make = Effect.gen(function* () {
         Effect.withSpan("EnvironmentAuth.createBrowserSession"),
       );
     }
-    return bootstrapCredentials.consume(credential).pipe(
-      Effect.mapError(toBootstrapExchangeError),
-      Effect.flatMap((grant) =>
-        sessions
-          .issue({
-            method: "browser-session-cookie",
-            subject: grant.subject,
-            scopes: grant.scopes,
-            client: {
-              ...requestMetadata,
-              ...(grant.label ? { label: grant.label } : {}),
-            },
-            ...(grant.user ? { user: grant.user } : {}),
-          })
-          .pipe(
-            Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
-          ),
-      ),
-      Effect.map(
-        (session) =>
-          ({
-            response: {
-              authenticated: true,
-              scopes: session.scopes,
-              sessionMethod: session.method,
-              expiresAt: DateTime.toUtc(session.expiresAt),
-            } satisfies AuthBrowserSessionResult,
-            sessionToken: session.token,
-          }) satisfies BootstrapExchangeResult,
-      ),
-      Effect.withSpan("EnvironmentAuth.createBrowserSession"),
-    );
+    return bootstrapCredentials
+      .consume(credential, {
+        requireClientLabel: true,
+        ...(requestMetadata.label !== undefined ? { clientLabel: requestMetadata.label } : {}),
+      })
+      .pipe(
+        Effect.mapError(toBootstrapExchangeError),
+        Effect.flatMap((grant) =>
+          sessions
+            .issue({
+              method: "browser-session-cookie",
+              subject: grant.subject,
+              scopes: grant.scopes,
+              client: {
+                ...requestMetadata,
+                ...(requiresClientLabel(grant) && requestMetadata.label !== undefined
+                  ? { label: requestMetadata.label.trim() }
+                  : grant.label
+                    ? { label: grant.label }
+                    : {}),
+              },
+              ...(grant.user ? { user: grant.user } : {}),
+            })
+            .pipe(
+              Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
+            ),
+        ),
+        Effect.map(
+          (session) =>
+            ({
+              response: {
+                authenticated: true,
+                scopes: session.scopes,
+                sessionMethod: session.method,
+                expiresAt: DateTime.toUtc(session.expiresAt),
+              } satisfies AuthBrowserSessionResult,
+              sessionToken: session.token,
+            }) satisfies BootstrapExchangeResult,
+        ),
+        Effect.withSpan("EnvironmentAuth.createBrowserSession"),
+      );
   };
 
   type ResolvedBootstrapGrant = Pick<
@@ -784,14 +818,14 @@ export const make = Effect.gen(function* () {
   };
   const resolveBootstrapGrant = (
     credential: string,
-    input?: { readonly proofKeyThumbprint?: string },
+    input?: { readonly proofKeyThumbprint?: string; readonly clientLabel?: string },
   ): Effect.Effect<
     ResolvedBootstrapGrant,
-    ServerAuthInvalidCredentialError | ServerAuthInternalError
+    ServerAuthInvalidCredentialError | ServerAuthInvalidRequestError | ServerAuthInternalError
   > => {
     if (!devAuth?.matches(credential)) {
       return bootstrapCredentials
-        .consume(credential, input)
+        .consume(credential, { ...input, requireClientLabel: true })
         .pipe(Effect.mapError(toBootstrapExchangeError));
     }
     return sessions.verify(credential).pipe(
@@ -809,7 +843,10 @@ export const make = Effect.gen(function* () {
 
   const exchangeBootstrapCredentialForAccessToken: EnvironmentAuth["Service"]["exchangeBootstrapCredentialForAccessToken"] =
     (credential, requestedScopes, requestMetadata, input) =>
-      resolveBootstrapGrant(credential, input).pipe(
+      resolveBootstrapGrant(credential, {
+        ...input,
+        ...(requestMetadata.label !== undefined ? { clientLabel: requestMetadata.label } : {}),
+      }).pipe(
         Effect.flatMap((grant) =>
           Effect.gen(function* () {
             const grantedScopes = requestedScopes ?? grant.scopes;
@@ -832,7 +869,11 @@ export const make = Effect.gen(function* () {
                 replaceActiveForSubjectAndMethod: grant.method === "desktop-bootstrap",
                 client: {
                   ...requestMetadata,
-                  ...(grant.label ? { label: grant.label } : {}),
+                  ...(requiresClientLabel(grant) && requestMetadata.label !== undefined
+                    ? { label: requestMetadata.label.trim() }
+                    : grant.label
+                      ? { label: grant.label }
+                      : {}),
                 },
                 ...(grant.user ? { user: grant.user } : {}),
               })

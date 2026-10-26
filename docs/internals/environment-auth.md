@@ -11,7 +11,11 @@ that grant but cannot widen it. Ordinary pairing does not grant access-managemen
 or relay-management authority. Creating another pairing link requires both
 `access:write` and every scope being delegated. The
 [auth handlers](../../apps/server/src/auth/http.ts) enforce this at issuance;
-client labels and device metadata have no authorization role.
+client labels and device metadata have no authorization role. Redeeming a one-time
+code is the authorization step; the receiving client confirms its own name before
+redemption. That editable label never supplies a verified account identity.
+Verified email is transient session/presence presentation and is omitted from
+durable command authors.
 
 The access read model contains pairing metadata, never recoverable pairing
 secrets. Only the creation response returns the raw credential. Otherwise read

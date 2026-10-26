@@ -148,11 +148,6 @@ export const ServerAuthDescriptor = Schema.Struct({
 });
 export type ServerAuthDescriptor = typeof ServerAuthDescriptor.Type;
 
-export const AuthBrowserSessionRequest = Schema.Struct({
-  credential: TrimmedNonEmptyString,
-});
-export type AuthBrowserSessionRequest = typeof AuthBrowserSessionRequest.Type;
-
 export const AuthBrowserSessionResult = Schema.Struct({
   authenticated: Schema.Literal(true),
   scopes: AuthEnvironmentScopes,
@@ -171,7 +166,7 @@ export const AuthClientMetadataDeviceType = Schema.Literals([
 export type AuthClientMetadataDeviceType = typeof AuthClientMetadataDeviceType.Type;
 
 export const AuthClientPresentationMetadata = Schema.Struct({
-  label: Schema.optionalKey(TrimmedNonEmptyString),
+  label: Schema.optionalKey(Schema.String),
   deviceType: Schema.optionalKey(AuthClientMetadataDeviceType),
   os: Schema.optionalKey(TrimmedNonEmptyString),
   osMajorVersion: Schema.optionalKey(Schema.Int),
@@ -183,13 +178,33 @@ export const AuthClientPresentationMetadata = Schema.Struct({
 });
 export type AuthClientPresentationMetadata = typeof AuthClientPresentationMetadata.Type;
 
+export const AuthClientLabel = TrimmedNonEmptyString.check(Schema.isMaxLength(80));
+export type AuthClientLabel = typeof AuthClientLabel.Type;
+
+export const AuthBrowserSessionRequest = Schema.Struct({
+  credential: TrimmedNonEmptyString,
+  client: Schema.optionalKey(AuthClientPresentationMetadata),
+});
+export type AuthBrowserSessionRequest = typeof AuthBrowserSessionRequest.Type;
+
+export const AuthRenameClientInput = Schema.Struct({
+  sessionId: Schema.optionalKey(AuthSessionId),
+  label: Schema.String,
+});
+export type AuthRenameClientInput = typeof AuthRenameClientInput.Type;
+
+/** Ordinary invitations name the receiving client, not an account. */
+export function requiresClientLabel(session: { readonly subject: string }): boolean {
+  return session.subject === "one-time-token";
+}
+
 export const AuthTokenExchangeRequest = Schema.Struct({
   grant_type: Schema.Literal(AuthTokenExchangeGrantType),
   subject_token: TrimmedNonEmptyString,
   subject_token_type: Schema.Literal(AuthEnvironmentBootstrapTokenType),
   requested_token_type: Schema.Literal(AuthAccessTokenType),
   scope: Schema.optionalKey(TrimmedNonEmptyString),
-  client_label: Schema.optionalKey(TrimmedNonEmptyString),
+  client_label: Schema.optionalKey(Schema.String),
   client_device_type: Schema.optionalKey(AuthClientMetadataDeviceType),
   client_os: Schema.optionalKey(TrimmedNonEmptyString),
 }).pipe(HttpApiSchema.asFormUrlEncoded());
@@ -248,8 +263,14 @@ export const AuthSessionUser = Schema.Struct({
   userId: TrimmedNonEmptyString,
   displayName: Schema.NullOr(TrimmedNonEmptyString),
   imageUrl: Schema.NullOr(TrimmedNonEmptyString),
+  email: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type AuthSessionUser = typeof AuthSessionUser.Type;
+
+/** Durable author attribution excludes contact information. */
+export function authSessionAuthor(user: AuthSessionUser): AuthSessionUser {
+  return { userId: user.userId, displayName: user.displayName, imageUrl: user.imageUrl };
+}
 
 export const AuthDesktopIdentityRequest = Schema.Struct({
   identity: Schema.NullOr(
@@ -374,8 +395,22 @@ export const AuthCreatePairingCredentialInput = Schema.Struct({
 });
 export type AuthCreatePairingCredentialInput = typeof AuthCreatePairingCredentialInput.Type;
 
+export const AuthCurrentSessionPresentation = Schema.Struct({
+  sessionId: AuthSessionId,
+  client: AuthClientMetadata,
+  needsClientLabel: Schema.Boolean,
+  user: Schema.optionalKey(AuthSessionUser),
+});
+export type AuthCurrentSessionPresentation = typeof AuthCurrentSessionPresentation.Type;
+
+export class AuthSessionStreamError extends Schema.TaggedError<AuthSessionStreamError>()(
+  "AuthSessionStreamError",
+  { message: Schema.String },
+) {}
+
 export const AuthSessionState = Schema.Struct({
   authenticated: Schema.Boolean,
+  currentSession: Schema.optionalKey(AuthCurrentSessionPresentation),
   auth: ServerAuthDescriptor,
   scopes: Schema.optionalKey(AuthEnvironmentScopes),
   sessionMethod: Schema.optionalKey(ServerAuthSessionMethod),

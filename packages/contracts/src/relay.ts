@@ -1212,6 +1212,7 @@ export const RelayCloudMintCredentialProofPayload = Schema.Struct({
    */
   name: Schema.optional(TrimmedNonEmptyString),
   picture: Schema.optional(TrimmedNonEmptyString),
+  email: Schema.optional(TrimmedNonEmptyString),
   nonce: TrimmedNonEmptyString,
   scope: Schema.Array(Schema.Literal("environment:connect")),
 });

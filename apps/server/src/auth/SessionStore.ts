@@ -20,6 +20,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import type * as Scope from "effect/Scope";
 import * as Option from "effect/Option";
 
 import * as ServerConfig from "../config.ts";
@@ -357,6 +358,7 @@ export const SessionCredentialInternalError = Schema.Union([
   OtherSessionsRevocationError,
 ]);
 export type SessionCredentialInternalError = typeof SessionCredentialInternalError.Type;
+export const isSessionCredentialInternalError = Schema.is(SessionCredentialInternalError);
 
 export const SessionCredentialError = Schema.Union([
   SessionCredentialInvalidError,
@@ -411,6 +413,18 @@ export class SessionStore extends Context.Service<
     readonly listActive: () => Effect.Effect<
       ReadonlyArray<AuthClientSession>,
       SessionCredentialInternalError
+    >;
+    readonly getActive: (
+      sessionId: AuthSessionId,
+    ) => Effect.Effect<Option.Option<AuthClientSession>, SessionCredentialInternalError>;
+    readonly rename: (
+      sessionId: AuthSessionId,
+      label: string,
+    ) => Effect.Effect<AuthClientSession, SessionCredentialError>;
+    readonly subscribeChanges: Effect.Effect<
+      Stream.Stream<SessionCredentialChange>,
+      never,
+      Scope.Scope
     >;
     readonly streamChanges: Stream.Stream<SessionCredentialChange>;
     readonly revoke: (
@@ -612,6 +626,27 @@ export const make = Effect.gen(function* () {
         }),
       );
     });
+
+  const getActive: SessionStore["Service"]["getActive"] = (sessionId) =>
+    loadActiveSession(sessionId).pipe(
+      Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId, cause })),
+    );
+  const rename: SessionStore["Service"]["rename"] = Effect.fn("SessionStore.rename")(
+    function* (sessionId, label) {
+      const before = yield* getActive(sessionId);
+      if (Option.isNone(before)) return yield* new UnknownSessionTokenError({ sessionId });
+      const changed = yield* authSessions
+        .setLabel({ sessionId, label, now: yield* DateTime.now, connected: before.value.connected })
+        .pipe(
+          Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId, cause })),
+        );
+      if (!changed) return yield* new UnknownSessionTokenError({ sessionId });
+      const latest = yield* getActive(sessionId);
+      if (Option.isNone(latest)) return yield* new UnknownSessionTokenError({ sessionId });
+      yield* emitUpsert(latest.value);
+      return latest.value;
+    },
+  );
 
   const markConnected: SessionStore["Service"]["markConnected"] = (sessionId) =>
     Ref.modify(connectedSessionsRef, (current) => {
@@ -1136,6 +1171,9 @@ export const make = Effect.gen(function* () {
     issue,
     replaceDesktopIdentity,
     registerConnection,
+    getActive,
+    rename,
+    subscribeChanges: PubSub.subscribe(changesPubSub).pipe(Effect.map(Stream.fromSubscription)),
     verify,
     issueWebSocketToken,
     verifyWebSocketToken,

@@ -1,3 +1,5 @@
+import { ClientNameButton } from "./ClientNameDialog";
+import { useEnvironments } from "../../state/environments";
 import { ConnectionTraceId } from "./ConnectionTraceId";
 import { SymbolView } from "../../components/AppSymbol";
 import { connectionStatusText } from "@t3tools/client-runtime/connection";
@@ -45,6 +47,11 @@ export function ConnectionEnvironmentRow(props: {
     updates: { readonly label: string; readonly displayUrl: string },
   ) => Promise<AtomCommandResult<unknown, unknown>>;
 }) {
+  const { environments } = useEnvironments();
+  const needsClientLabel =
+    environments.find(
+      (environment) => environment.environmentId === props.environment.environmentId,
+    )?.connection.needsClientLabel === true;
   const [label, setLabel] = useState(props.environment.environmentLabel);
   const [url, setUrl] = useState(props.environment.displayUrl);
   const serverConfig = useAtomValue(
@@ -154,6 +161,13 @@ export function ConnectionEnvironmentRow(props: {
           exiting={FadeOut.duration(150)}
           className="gap-3 px-4 pb-4"
         >
+          {enabled && (needsClientLabel || props.environment.connectionState === "connected") ? (
+            <ClientNameButton
+              environmentId={props.environment.environmentId}
+              environmentLabel={props.environment.environmentLabel}
+              required={needsClientLabel}
+            />
+          ) : null}
           {props.environment.isRelayManaged ? (
             <Text className="text-sm text-foreground-muted">
               Managed by Launchpad Connect. Tunnel details update automatically.

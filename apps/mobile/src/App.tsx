@@ -1,3 +1,4 @@
+import { ClientLabelGate } from "./features/connection/ClientNameDialog";
 import * as Linking from "expo-linking";
 import * as SplashScreen from "expo-splash-screen";
 import { useEffect } from "react";
@@ -90,6 +91,7 @@ function AppContent() {
                 <Navigation linking={appLinking} theme={navigationTheme} />
               </IncomingShareProvider>
               <ConfirmDialogHost />
+              <ClientLabelGate />
               <ThreadArrangementHost />
             </View>
             {/* Anchored-menu overlays render here — in-window, so the

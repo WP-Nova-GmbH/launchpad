@@ -12,6 +12,9 @@ import {
   type AuthSessionState,
   type ExecutionEnvironmentDescriptor,
   type EnvironmentAuthInvalidError,
+  type EnvironmentRequestInvalidError,
+  type AuthClientSession,
+  type AuthRenameClientInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type * as Context from "effect/Context";
@@ -26,12 +29,16 @@ import { __setPrimaryHttpRunnerForTests } from "../src/lib/runtime";
 
 type BrowserSessionHandler = (
   payload: AuthBrowserSessionRequest,
-) => Effect.Effect<AuthBrowserSessionResult, EnvironmentAuthInvalidError>;
+) => Effect.Effect<
+  AuthBrowserSessionResult,
+  EnvironmentAuthInvalidError | EnvironmentRequestInvalidError
+>;
 
 interface EnvironmentHttpTestScenario {
   readonly descriptor?: () => Effect.Effect<ExecutionEnvironmentDescriptor>;
   readonly session?: () => Effect.Effect<AuthSessionState>;
   readonly browserSession?: BrowserSessionHandler;
+  readonly renameClient?: (payload: AuthRenameClientInput) => Effect.Effect<AuthClientSession>;
   readonly pairingCredential?: (
     payload: AuthCreatePairingCredentialInput,
   ) => Effect.Effect<AuthPairingCredentialResult>;
@@ -101,6 +108,11 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
                   scenario.browserSession?.(payload) ?? unexpectedEndpoint("auth.browserSession")
                 );
               }),
+            )
+            .handle(
+              "renameClient",
+              ({ payload }) =>
+                scenario.renameClient?.(payload) ?? unexpectedEndpoint("auth.renameClient"),
             )
             .handle("token", () => unexpectedEndpoint("auth.token"))
             .handle("webSocketTicket", () => unexpectedEndpoint("auth.webSocketTicket"))

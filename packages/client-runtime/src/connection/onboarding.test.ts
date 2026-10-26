@@ -86,6 +86,7 @@ describe("connection onboarding", () => {
       const registration = yield* preparePairingRegistration({
         host: "remote.example.test",
         pairingCode: "pairing-token",
+        clientLabel: "  My phone  ",
       }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
 
       expect(registration).toMatchObject({
@@ -119,7 +120,46 @@ describe("connection onboarding", () => {
       const tokenParams = new URLSearchParams(tokenBody);
       expect(tokenParams.get("subject_token")).toBe("pairing-token");
       expect(tokenParams.get("scope")).toBe(AuthStandardClientScopes.join(" "));
-      expect(tokenParams.get("client_label")).toBe("Launchpad Test");
+      expect(tokenParams.get("client_label")).toBe("My phone");
+    }),
+  );
+
+  it.effect.each([undefined, "", "   ", "X".repeat(81)])(
+    "rejects invalid client name %j before contacting the environment",
+    (clientLabel) =>
+      Effect.gen(function* () {
+        const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+        const error = yield* preparePairingRegistration({
+          host: "remote.example.test",
+          pairingCode: "pairing-token",
+          ...(clientLabel !== undefined ? { clientLabel } : {}),
+        }).pipe(
+          Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))),
+          Effect.flip,
+        );
+        expect(error).toMatchObject({
+          reason: "configuration",
+          message: "Choose a client name between 1 and 80 characters.",
+        });
+        expect(calls).toEqual([]);
+      }),
+  );
+
+  it.effect("accepts a client name at the 80-character limit", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const clientLabel = "X".repeat(80);
+      yield* preparePairingRegistration({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+        clientLabel,
+      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
+      const tokenRequest = calls.find((call) => call.url.endsWith("/oauth/token"));
+      const tokenBody =
+        tokenRequest?.init.body instanceof Uint8Array
+          ? new TextDecoder().decode(tokenRequest.init.body)
+          : String(tokenRequest?.init.body);
+      expect(new URLSearchParams(tokenBody).get("client_label")).toBe(clientLabel);
     }),
   );
 
@@ -129,6 +169,7 @@ describe("connection onboarding", () => {
       const error = yield* preparePairingRegistration({
         host: "remote.example.test",
         pairingCode: "pairing-token",
+        clientLabel: "My phone",
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -152,6 +193,7 @@ describe("connection onboarding", () => {
       yield* preparePairingRegistration({
         host: "remote.example.test",
         pairingCode: "pairing-token",
+        clientLabel: "My phone",
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
