@@ -3,7 +3,6 @@ import type {
   OrchestrationThread,
   ThreadPromptQueueEntry,
   ThreadQueueEntry,
-  ThreadMoveQueueEntry,
 } from "@t3tools/contracts";
 
 /** One identity follows a submission from transport, through the queue, into the transcript. */
@@ -64,7 +63,4 @@ export function moveQueueEntryLater(
   if (index >= 0 && index + 1 < order.length)
     [order[index], order[index + 1]] = [order[index + 1]!, order[index]!];
   return order;
-}
-export function queuedMoveLabel(entry: ThreadMoveQueueEntry) {
-  return entry.destination.kind === "vm" ? "Move to VM" : "Move to selected environment";
 }

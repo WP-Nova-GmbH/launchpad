@@ -32,7 +32,7 @@ export const SAFE_IMAGE_FILE_EXTENSIONS = new Set([
 ]);
 
 const ATTACHMENT_ID_THREAD_SEGMENT_MAX_CHARS = 80;
-export const PENDING_ATTACHMENT_THREAD_SEGMENT = "pending";
+const PENDING_ATTACHMENT_THREAD_SEGMENT = "pending";
 /** Attachment names are display filenames, so only a final basename extension is accepted. */
 const portableExtension = (name: string) => {
   const base = name.slice(name.lastIndexOf("/") + 1),

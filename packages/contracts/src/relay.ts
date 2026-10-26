@@ -2666,7 +2666,7 @@ const RelayThreadGeneration = {
   generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
 };
 // A fresh VM authenticates with its expiring seed and a proof signed by its own key.
-export const RelayThreadVmEnrollmentGroup = HttpApiGroup.make("threadVmEnrollment").add(
+const RelayThreadVmEnrollmentGroup = HttpApiGroup.make("threadVmEnrollment").add(
   HttpApiEndpoint.post("enroll", "/v1/thread-vms/enroll", {
     payload: RelayThreadVmEnrollRequest,
     success: RelayThreadVmEnrollResponse,
@@ -2682,7 +2682,7 @@ export const RelayThreadVmPreviewPort = Schema.Int.check(
 export const RelayThreadVmPreviewResponse = Schema.Struct({ url: TrimmedNonEmptyString });
 export type RelayThreadVmPreviewResponse = typeof RelayThreadVmPreviewResponse.Type;
 
-export const RelayThreadVmsGroup = HttpApiGroup.make("threadVms")
+const RelayThreadVmsGroup = HttpApiGroup.make("threadVms")
   .add(
     HttpApiEndpoint.get("getProviderAuth", "/v1/threads/:threadId/provider-auth", {
       headers: RelayBearerRequestHeaders,
@@ -3016,7 +3016,7 @@ export const RelayThreadVmRestoreImportReceipt = Schema.Struct({
 });
 export type RelayThreadVmRestoreImportReceipt = typeof RelayThreadVmRestoreImportReceipt.Type;
 
-export const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
+const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
   .add(
     HttpApiEndpoint.post(
       "getRestoreRecovery",
@@ -3332,7 +3332,7 @@ export const RelayThreadArtifactReceipt = Schema.Struct({
 export type RelayThreadArtifactReceipt = typeof RelayThreadArtifactReceipt.Type;
 
 /** Upload bytes with an environment credential; clients never receive private storage URLs. */
-export const RelayThreadArtifactsGroup = HttpApiGroup.make("threadArtifacts")
+const RelayThreadArtifactsGroup = HttpApiGroup.make("threadArtifacts")
   .add(
     HttpApiEndpoint.put(
       "upload",
@@ -3420,7 +3420,7 @@ const RelayThreadMoveParams = Schema.Struct({
   ...RelayThreadOwnerParams.fields,
   operationId: RelayThreadArtifactId,
 });
-export const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
+const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
   .add(
     HttpApiEndpoint.post(
       "progress",
@@ -3601,7 +3601,7 @@ export const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
   )
   .middleware(RelayEnvironmentAuth);
 
-export const RelayThreadCommandsGroup = HttpApiGroup.make("threadCommands")
+const RelayThreadCommandsGroup = HttpApiGroup.make("threadCommands")
   .add(
     HttpApiEndpoint.post("stage", "/v1/threads/:threadId/commands", {
       params: Schema.Struct({ threadId: ThreadId }),
@@ -3632,7 +3632,7 @@ export const RelayThreadCommandsGroup = HttpApiGroup.make("threadCommands")
   )
   .middleware(RelayClientAuth);
 
-export const RelayThreadHistoryGroup = HttpApiGroup.make("threadHistory")
+const RelayThreadHistoryGroup = HttpApiGroup.make("threadHistory")
   .add(
     HttpApiEndpoint.get("listThreads", "/v1/threads/portable", {
       headers: RelayBearerRequestHeaders,
@@ -3687,7 +3687,7 @@ export const RelayThreadHistoryGroup = HttpApiGroup.make("threadHistory")
   )
   .middleware(RelayClientAuth);
 
-export const RelayThreadVmPolicyGroup = HttpApiGroup.make("threadVmPolicy")
+const RelayThreadVmPolicyGroup = HttpApiGroup.make("threadVmPolicy")
   .add(
     HttpApiEndpoint.get("getThreadVmPolicy", "/v1/organization/thread-vm-policy", {
       headers: RelayBearerRequestHeaders,

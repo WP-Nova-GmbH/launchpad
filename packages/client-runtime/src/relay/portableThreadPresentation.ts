@@ -218,9 +218,7 @@ export function canCreateThreadInEnvironment(
 }
 
 /** Only routing and queue changes invalidate placement; streamed text and titles do not. */
-export function portableThreadRoutingFingerprint(
-  shells: ReadonlyArray<EnvironmentThreadShell>,
-): string {
+function portableThreadRoutingFingerprint(shells: ReadonlyArray<EnvironmentThreadShell>): string {
   return JSON.stringify(
     shells
       .map((shell) => [
