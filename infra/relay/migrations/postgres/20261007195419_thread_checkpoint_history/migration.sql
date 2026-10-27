@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_native_checkpoints" ADD COLUMN "recovery_history_json" jsonb;

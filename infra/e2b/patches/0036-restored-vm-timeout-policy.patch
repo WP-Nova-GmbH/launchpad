@@ -1,0 +1,53 @@
+--- a/packages/api/internal/orchestrator/restore.go
++++ b/packages/api/internal/orchestrator/restore.go
+@@ -56,6 +56,7 @@
+ 			BuildId: op.PreparedBuildID.String(), TemplateId: op.SandboxID, BaseTemplateId: op.SourceTemplateID,
+ 			SandboxId: op.SandboxID, ExecutionId: op.ExecutionID.String(), TeamId: op.TeamID.String(),
+ 			Snapshot: true, Metadata: metadata, KernelVersion: build.KernelVersion,
++			AutoPause: true, AutoPauseFilesystemOnly: true,
+ 			FirecrackerVersion: build.FirecrackerVersion, EnvdVersion: *build.EnvdVersion,
+ 			// Use the same memory backing as ordinary E2B startup.
+ 			HugePages: version.HasHugePages(),
+@@ -154,7 +155,8 @@
+ 		SandboxID: op.SandboxID, TemplateID: op.SandboxID, BaseTemplateID: op.SourceTemplateID,
+ 		ClientID: response.GetClientId(), ExecutionID: op.ExecutionID.String(), TeamID: op.TeamID, BuildID: op.PreparedBuildID,
+ 		RenewableLifetime: config.GetRenewableLifetime(),
+-		Metadata:          config.GetMetadata(), MaxInstanceLength: time.Duration(config.GetMaxSandboxLength()) * time.Hour,
++		AutoPause:         config.GetAutoPause(), AutoPauseFilesystemOnly: config.GetAutoPauseFilesystemOnly(),
++		Metadata: config.GetMetadata(), MaxInstanceLength: time.Duration(config.GetMaxSandboxLength()) * time.Hour,
+ 		StartTime: request.GetStartTime().AsTime(), EndTime: request.GetEndTime().AsTime(),
+ 		VCpu: config.GetVcpu(), RamMB: config.GetRamMb(), TotalDiskSizeMB: config.GetTotalDiskSizeMb(),
+ 		KernelVersion: config.GetKernelVersion(), FirecrackerVersion: response.GetResolvedFirecrackerVersion(), FirecrackerVersionResolved: true,
+--- a/packages/api/internal/orchestrator/restore_test.go
++++ b/packages/api/internal/orchestrator/restore_test.go
+@@ -25,6 +25,8 @@
+ 	require.NoError(t, err)
+ 	require.True(t, req.GetFilesystemBoot())
+ 	require.True(t, req.GetSandbox().GetSnapshot())
++	require.True(t, req.GetSandbox().GetAutoPause())
++	require.True(t, req.GetSandbox().GetAutoPauseFilesystemOnly())
+ 	require.Equal(t, op.PreparedBuildID.String(), req.GetSandbox().GetBuildId())
+ 	require.Equal(t, op.OperationID.String(), req.GetSandbox().GetMetadata()["launchpad.operation_id"])
+ 	require.Equal(t, now.Add(10*time.Minute), req.GetEndTime().AsTime())
+@@ -89,3 +91,21 @@
+ 		})
+ 	}
+ }
++
++func TestPreparedRestoreTimeoutPolicySurvivesDurableRequest(t *testing.T) {
++	t.Parallel()
++	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
++	build := queries.EnvBuild{FirecrackerVersion: "v1.14-0.2.0", EnvdVersion: new("envd"), TotalDiskSizeMb: new(int64(64)), RamMb: 1024, Vcpu: 1}
++	team := &teamtypes.Team{Limits: &teamtypes.TeamLimits{MaxLengthHours: 1}}
++	request, err := BuildRestoreRequest(queries.SandboxRestoreOperation{}, build, team, api.LaunchpadRestoreRequest{LeaseSeconds: new(600)}, now)
++	require.NoError(t, err)
++	raw, err := protojson.Marshal(request)
++	require.NoError(t, err)
++	restored := &rpc.SandboxCreateRequest{}
++	require.NoError(t, protojson.Unmarshal(raw, restored))
++	require.True(t, restored.GetSandbox().GetAutoPause(), "a finite restore lease must preserve the disk on timeout")
++	require.True(t, restored.GetSandbox().GetAutoPauseFilesystemOnly(), "timeout must enter the certified filesystem pause path")
++	require.Nil(t, restored.GetSandbox().GetAutoResume(), "inbound traffic must not wake the restored VM")
++	require.True(t, restored.GetFilesystemBoot(), "policy persistence must not restore process memory")
++	require.Equal(t, now.Add(10*time.Minute), restored.GetEndTime().AsTime())
++}

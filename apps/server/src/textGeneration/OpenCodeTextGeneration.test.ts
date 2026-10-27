@@ -14,6 +14,7 @@ import * as OpenCodeRuntime from "../provider/opencodeRuntime.ts";
 import * as OpenCodeServerOwner from "../provider/OpenCodeServerOwner.ts";
 import * as OpenCodeTextGeneration from "./OpenCodeTextGeneration.ts";
 import * as TextGeneration from "./TextGeneration.ts";
+const encodePrompt = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const runtimeMock = {
   state: {
@@ -235,6 +236,27 @@ const advanceIdleClock = Effect.gen(function* () {
 });
 
 it.layer(OpenCodeTextGenerationTestLayer)("OpenCodeTextGeneration", (it) => {
+  it.effect("forwards workflow approval context into the actual model prompt", () =>
+    withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
+      Effect.gen(function* () {
+        runtimeMock.state.promptResult = {
+          data: { parts: [{ type: "text", text: '{"verdict":"approve","reasoning":"In scope"}' }] },
+        };
+        yield* textGeneration.generateApprovalVerdict({
+          cwd: process.cwd(),
+          toolKind: "command",
+          requestType: "command_execution_approval",
+          stepInstruction: "s".repeat(5_000),
+          jobContext: "JOB_CONTEXT",
+          reviewConstraint: "REVIEW_REQUIRED",
+          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        });
+        const prompt = yield* encodePrompt(runtimeMock.state.promptParts[0]);
+        expect(prompt).toContain("JOB_CONTEXT");
+        expect(prompt).toContain("REVIEW_REQUIRED");
+      }),
+    ),
+  );
   it.effect("excludes generic files from thread title generation", () =>
     withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
       Effect.gen(function* () {

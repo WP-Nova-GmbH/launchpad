@@ -1,0 +1,348 @@
+diff --git a/packages/shared/pkg/storage/header/references.go b/packages/shared/pkg/storage/header/references.go
+new file mode 100644
+index 0000000..e575f66
+--- /dev/null
++++ b/packages/shared/pkg/storage/header/references.go
+@@ -0,0 +1,42 @@
++package header
++
++import (
++	"fmt"
++
++	"github.com/google/uuid"
++)
++
++// ReferencedBuildIDs reports every build whose objects a saved build may read.
++// Both disk and memory mappings are required for RAM snapshots: a child can replace all
++// rootfs blocks while still referring to an ancestor's memory blocks. The
++// snapshot's own build is retained for its snapfile and metadata even if no
++// mapped block happens to use it. An unreadable or mismatched header must stop
++// collection rather than make a build appear unreferenced.
++// filesystemOnly must come from the stored build metadata; a missing memory
++// header alone does not establish that the build is a cold-boot disk.
++func ReferencedBuildIDs(buildID uuid.UUID, rootfs, memfile *Header, filesystemOnly bool) (map[uuid.UUID]struct{}, error) {
++	if buildID == uuid.Nil || rootfs == nil || (!filesystemOnly && memfile == nil) {
++		return nil, fmt.Errorf("missing headers for build %s", buildID)
++	}
++
++	references := map[uuid.UUID]struct{}{buildID: {}}
++	headers := []*Header{rootfs}
++	if memfile != nil {
++		headers = append(headers, memfile)
++	}
++	for _, h := range headers {
++		if h.Metadata == nil || h.Metadata.BuildId != buildID {
++			return nil, fmt.Errorf("mismatched header for build %s", buildID)
++		}
++		if h.Mapping.Len() == 0 {
++			return nil, fmt.Errorf("empty mapping in header for build %s", buildID)
++		}
++		for _, id := range h.Mapping.Builds() {
++			if id == uuid.Nil {
++				return nil, fmt.Errorf("empty mapped build in header for build %s", buildID)
++			}
++			references[id] = struct{}{}
++		}
++	}
++	return references, nil
++}
+diff --git a/packages/shared/pkg/storage/header/references_test.go b/packages/shared/pkg/storage/header/references_test.go
+new file mode 100644
+index 0000000..86dd50a
+--- /dev/null
++++ b/packages/shared/pkg/storage/header/references_test.go
+@@ -0,0 +1,55 @@
++package header
++
++import (
++	"testing"
++
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestReferencedBuildIDsIncludesIndependentDiskAndMemoryAncestors(t *testing.T) {
++	t.Parallel()
++	self, diskParent, memoryParent := uuid.New(), uuid.New(), uuid.New()
++	makeHeader := func(parent uuid.UUID) *Header {
++		h, err := NewHeader(&Metadata{Version: MetadataVersionV4, BuildId: self,
++			BlockSize: 4096, Size: 8192}, []BuildMap{
++			{Offset: 0, Length: 4096, BuildId: self},
++			{Offset: 4096, Length: 4096, BuildId: parent},
++		})
++		require.NoError(t, err)
++		return h
++	}
++
++	refs, err := ReferencedBuildIDs(self, makeHeader(diskParent), makeHeader(memoryParent), false)
++	require.NoError(t, err)
++	require.Equal(t, map[uuid.UUID]struct{}{
++		self: {}, diskParent: {}, memoryParent: {},
++	}, refs)
++}
++
++func TestReferencedBuildIDsFailsClosed(t *testing.T) {
++	t.Parallel()
++	self := uuid.New()
++	h, err := NewHeader(&Metadata{Version: 3, BuildId: self,
++		BlockSize: 4096, Size: 4096}, nil)
++	require.NoError(t, err)
++	_, err = ReferencedBuildIDs(self, h, nil, false)
++	require.Error(t, err)
++
++	wrong, err := NewHeader(&Metadata{Version: 3, BuildId: uuid.New(),
++		BlockSize: 4096, Size: 4096}, nil)
++	require.NoError(t, err)
++	_, err = ReferencedBuildIDs(self, h, wrong, false)
++	require.Error(t, err)
++}
++
++func TestReferencedBuildIDsAcceptsAnExplicitFilesystemOnlyBuild(t *testing.T) {
++	t.Parallel()
++	self := uuid.New()
++	h, err := NewHeader(&Metadata{Version: 3, BuildId: self,
++		BlockSize: 4096, Size: 4096}, nil)
++	require.NoError(t, err)
++	refs, err := ReferencedBuildIDs(self, h, nil, true)
++	require.NoError(t, err)
++	require.Equal(t, map[uuid.UUID]struct{}{self: {}}, refs)
++}
+diff --git a/packages/orchestrator/pkg/template/template/references.go b/packages/orchestrator/pkg/template/template/references.go
+new file mode 100644
+index 0000000..9bcf88a
+--- /dev/null
++++ b/packages/orchestrator/pkg/template/template/references.go
+@@ -0,0 +1,60 @@
++package template
++
++import (
++	"context"
++	"fmt"
++
++	"github.com/google/uuid"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++)
++
++// RetainedBuilds marks the object prefixes needed by retained template, live
++// sandbox and restore roots. The caller must hold admission against new roots
++// for the entire mark/delete transaction. No deletion is safe when this scan
++// fails: a missing header is not evidence that its ancestor layers are unused.
++func RetainedBuilds(ctx context.Context, store storage.StorageProvider, roots []uuid.UUID) (map[uuid.UUID]struct{}, error) {
++	retained := make(map[uuid.UUID]struct{})
++	scanned := make(map[uuid.UUID]struct{})
++	for _, buildID := range roots {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		if buildID == uuid.Nil {
++			return nil, fmt.Errorf("empty retained build identity")
++		}
++		if _, done := scanned[buildID]; done {
++			continue
++		}
++		meta, err := metadata.FromBuildID(ctx, store, buildID.String())
++		if err != nil {
++			return nil, fmt.Errorf("read retained metadata %s: %w", buildID, err)
++		}
++		if meta.Template.BuildID != "" && meta.Template.BuildID != buildID.String() {
++			return nil, fmt.Errorf("mismatched retained metadata for build %s", buildID)
++		}
++		paths := storage.Paths{BuildID: buildID.String()}
++		rootfs, _, err := header.LoadStoredHeader(ctx, store, paths.RootfsHeader())
++		if err != nil {
++			return nil, fmt.Errorf("read retained rootfs %s: %w", buildID, err)
++		}
++		var memfile *header.Header
++		if !meta.IsFilesystemOnly() {
++			memfile, _, err = header.LoadStoredHeader(ctx, store, paths.MemfileHeader())
++			if err != nil {
++				return nil, fmt.Errorf("read retained memory %s: %w", buildID, err)
++			}
++		}
++		references, err := header.ReferencedBuildIDs(buildID, rootfs, memfile, meta.IsFilesystemOnly())
++		if err != nil {
++			return nil, err
++		}
++		for id := range references {
++			retained[id] = struct{}{}
++		}
++		scanned[buildID] = struct{}{}
++	}
++	return retained, nil
++}
+diff --git a/packages/orchestrator/pkg/template/template/references_test.go b/packages/orchestrator/pkg/template/template/references_test.go
+new file mode 100644
+index 0000000..49f79e6
+--- /dev/null
++++ b/packages/orchestrator/pkg/template/template/references_test.go
+@@ -0,0 +1,61 @@
++package template
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++)
++
++func TestRetainedBuildsUsesStoredFilesystemOnlyMetadata(t *testing.T) {
++	t.Parallel()
++	for _, filesystemOnly := range []bool{true, false} {
++		t.Run(map[bool]string{true: "cold disk", false: "RAM snapshot"}[filesystemOnly], func(t *testing.T) {
++			t.Parallel()
++			store, err := storage.NewProvider(t.Context(), storage.Spec{
++				Provider: storage.LocalStorageProvider, BasePath: t.TempDir(),
++			})
++			require.NoError(t, err)
++			self, diskAncestor, memoryAncestor := uuid.New(), uuid.New(), uuid.New()
++			paths := storage.Paths{BuildID: self.String()}
++			meta := metadata.Template{Version: metadata.CurrentVersion,
++				Template:       metadata.TemplateMetadata{BuildID: self.String()},
++				FilesystemOnly: filesystemOnly}
++			bytes, err := json.Marshal(meta)
++			require.NoError(t, err)
++			blob, err := store.OpenBlob(t.Context(), paths.Metadata())
++			require.NoError(t, err)
++			require.NoError(t, blob.Put(t.Context(), bytes))
++			writeHeader := func(path string, ancestor uuid.UUID) {
++				h, err := header.NewHeader(&header.Metadata{Version: 3, BuildId: self,
++					BlockSize: 4096, Size: 4096}, []header.BuildMap{{Length: 4096, BuildId: ancestor}})
++				require.NoError(t, err)
++				_, _, _, err = header.StoreHeader(t.Context(), store, path, h)
++				require.NoError(t, err)
++			}
++			writeHeader(paths.RootfsHeader(), diskAncestor)
++			if !filesystemOnly {
++				_, err := RetainedBuilds(t.Context(), store, []uuid.UUID{self})
++				require.ErrorContains(t, err, "read retained memory")
++				writeHeader(paths.MemfileHeader(), memoryAncestor)
++			}
++			refs, err := RetainedBuilds(t.Context(), store, []uuid.UUID{self, self})
++			require.NoError(t, err)
++			want := map[uuid.UUID]struct{}{self: {}, diskAncestor: {}}
++			if !filesystemOnly {
++				want[memoryAncestor] = struct{}{}
++			}
++			require.Equal(t, want, refs)
++			rootfs, err := store.OpenBlob(t.Context(), paths.RootfsHeader())
++			require.NoError(t, err)
++			require.NoError(t, rootfs.Put(t.Context(), []byte("truncated")))
++			_, err = RetainedBuilds(t.Context(), store, []uuid.UUID{self})
++			require.ErrorContains(t, err, "read retained rootfs")
++		})
++	}
++}
+diff --git a/packages/shared/pkg/storage/storage_fs.go b/packages/shared/pkg/storage/storage_fs.go
+index 7d3292f49..15eb85382 100644
+--- a/packages/shared/pkg/storage/storage_fs.go
++++ b/packages/shared/pkg/storage/storage_fs.go
+@@ -105,7 +105,7 @@ func (o *fsObject) WriteTo(ctx context.Context, dst io.Writer) (n int64, err err
+ 	start := time.Now()
+ 	defer func() { RecordReadBlob(ctx, time.Since(start), n, o.path, SourceFS, err) }()
+ 
+-	handle, err := o.getHandle(true)
++	handle, err := o.getHandle()
+ 	if err != nil {
+ 		return 0, err
+ 	}
+@@ -204,7 +204,7 @@ func (o *fsObject) storeFileCompressed(ctx context.Context, localPath string, cf
+ }
+ 
+ func (o *fsObject) openRangeReader(_ context.Context, off, length int64) (RangeReader, error) {
+-	f, err := o.getHandle(true)
++	f, err := o.getHandle()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -225,7 +225,7 @@ func (o *fsObject) Size(ctx context.Context) (_ int64, err error) {
+ 	start := time.Now()
+ 	defer func() { RecordReadSize(ctx, time.Since(start), o.objType, SourceFS, err) }()
+ 
+-	handle, err := o.getHandle(true)
++	handle, err := o.getHandle()
+ 	if err != nil {
+ 		return 0, err
+ 	}
+@@ -272,26 +272,23 @@ func ValidateUploadToken(key []byte, path string, expires int64, token string) b
+ 	return hmac.Equal([]byte(expected), []byte(token))
+ }
+ 
+-func (o *fsObject) getHandle(checkExistence bool) (*os.File, error) {
+-	if checkExistence {
+-		info, err := os.Stat(o.path)
+-		if err != nil {
+-			if os.IsNotExist(err) {
+-				return nil, ErrObjectNotExist
+-			}
+-
+-			return nil, err
+-		}
+-
+-		if info.IsDir() {
+-			return nil, fmt.Errorf("path %s is a directory", o.path)
++func (o *fsObject) getHandle() (*os.File, error) {
++	handle, err := os.Open(o.path)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil, ErrObjectNotExist
+ 		}
++		return nil, err
+ 	}
+-
+-	handle, err := os.OpenFile(o.path, os.O_RDWR|os.O_CREATE, 0o644)
++	info, err := handle.Stat()
+ 	if err != nil {
++		handle.Close()
+ 		return nil, err
+ 	}
++	if info.IsDir() {
++		handle.Close()
++		return nil, fmt.Errorf("path %s is a directory", o.path)
++	}
+ 
+ 	return handle, nil
+ }
+diff --git a/packages/shared/pkg/storage/storage_fs_test.go b/packages/shared/pkg/storage/storage_fs_test.go
+index 78b3da324..36b20dc0e 100644
+--- a/packages/shared/pkg/storage/storage_fs_test.go
++++ b/packages/shared/pkg/storage/storage_fs_test.go
+@@ -45,6 +45,31 @@ func TestOpenObject_Write_Exists_WriteTo(t *testing.T) {
+ 	require.Equal(t, contents, data)
+ }
+ 
++func TestFSReadHandleCannotWriteOrCreateObjects(t *testing.T) {
++	t.Parallel()
++	p := newTempProvider(t)
++	ctx := t.Context()
++	obj, err := p.OpenBlob(ctx, "retained-header")
++	require.NoError(t, err)
++	require.NoError(t, obj.Put(ctx, []byte("retained")))
++	file, err := obj.(*fsObject).getHandle()
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, file.Close()) })
++	_, err = file.Write([]byte("changed"))
++	require.Error(t, err)
++	data, err := GetBlob(ctx, obj)
++	require.NoError(t, err)
++	require.Equal(t, "retained", string(data))
++
++	missing, err := p.OpenBlob(ctx, "missing-header")
++	require.NoError(t, err)
++	_, err = GetBlob(ctx, missing)
++	require.ErrorIs(t, err, ErrObjectNotExist)
++	exists, err := missing.Exists(ctx)
++	require.NoError(t, err)
++	require.False(t, exists)
++}
++
+ func TestFSPut(t *testing.T) {
+ 	t.Parallel()
+ 	p := newTempProvider(t)

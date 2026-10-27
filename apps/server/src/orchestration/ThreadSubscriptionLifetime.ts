@@ -45,7 +45,11 @@ export const makeThreadSubscriptionLifetime = Effect.fn("makeThreadSubscriptionL
     const consume = (event: OrchestrationEvent, anchor: ThreadSubscriptionAnchor) =>
       Effect.gen(function* () {
         if (invalid || event.sequence <= anchor.snapshotSequence) return;
-        if (event.type === "thread.deleted" || event.type === "thread.created") {
+        if (
+          event.type === "thread.deleted" ||
+          event.type === "thread.created" ||
+          event.type === "thread.placement-imported"
+        ) {
           yield* invalidate;
           return;
         }
@@ -60,7 +64,12 @@ export const makeThreadSubscriptionLifetime = Effect.fn("makeThreadSubscriptionL
             if (captured) return yield* consume(event, captured);
             // Keep consuming while the database read waits; never accumulate an unbounded
             // PubSub backlog. Setup/terminal observers only need lifecycle boundaries.
-            if (input.onEvent || event.type === "thread.deleted" || event.type === "thread.created")
+            if (
+              input.onEvent ||
+              event.type === "thread.deleted" ||
+              event.type === "thread.created" ||
+              event.type === "thread.placement-imported"
+            )
               pending.push(yield* pendingBudget.retain(event));
           }),
         ),

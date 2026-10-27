@@ -1,0 +1,349 @@
+--- a/packages/orchestrator/pkg/sandbox/cgroup/manager.go
++++ b/packages/orchestrator/pkg/sandbox/cgroup/manager.go
+@@ -389,6 +389,12 @@
+ }
+ 
+ func (m *managerImpl) Create(ctx context.Context, cgroupName string) (*CgroupHandle, error) {
++	release, err := reserveNormalCapacity(RootCgroupPath, "/etc/launchpad-e2b-host-capacity.json", "/run/launchpad-quarantine-probes.lock", cgroupName)
++	if err != nil {
++		return nil, fmt.Errorf("host VM capacity admission: %w", err)
++	}
++	defer release()
++
+ 	cgroupPath := m.cgroupPath(cgroupName)
+ 
+ 	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+--- a/packages/orchestrator/pkg/sandbox/execution_fence.go
++++ b/packages/orchestrator/pkg/sandbox/execution_fence.go
+@@ -26,7 +26,7 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return execution.New(filepath.Join(config.OrchestratorBaseDir, "executions"), strings.TrimSpace(string(bootID)), cgroup.KillExisting)
++	return execution.New(filepath.Join(config.OrchestratorBaseDir, "executions"), strings.TrimSpace(string(bootID)), cgroup.StopAndReleaseCapacity)
+ }
+ 
+ func (f *Factory) reserveExecution(runtime sandboxtypes.RuntimeMetadata, group string) (*execution.Reservation, error) {
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/cgroup/host_capacity_linux.go
+@@ -0,0 +1,144 @@
++//go:build linux
++
++package cgroup
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++
++	"golang.org/x/sys/unix"
++)
++
++type hostCapacityBudget struct {
++	Format               string `json:"format"`
++	MaxRunningVMs        int    `json:"maxRunningVms"`
++	ReserveMemoryMiB     int    `json:"reserveMemoryMiB"`
++	ReserveCPUCount      int    `json:"reserveCpuCount"`
++	NormalMemoryMaxBytes int64  `json:"normalMemoryMaxBytes"`
++	NormalCPUCount       int    `json:"normalCpuCount"`
++	ProbeMemoryMaxBytes  int64  `json:"probeMemoryMaxBytes"`
++	ProbeCPUCount        int    `json:"probeCpuCount"`
++}
++
++// A cgroup directory reserves a normal slot before clone. It is kept until the
++// existing execution journal confirms physical stop and removes it. The host
++// lock also excludes cold probes and operator budget changes during admission.
++func reserveNormalCapacity(root, budgetPath, lockPath, name string) (func(), error) {
++	noop := func() {}
++	if _, err := os.Lstat(budgetPath); os.IsNotExist(err) {
++		// Upstream deployments without the Launchpad recovery budget retain
++		// their ordinary behavior. Cold verification refuses an absent budget.
++		return noop, nil
++	} else if err != nil {
++		return noop, err
++	}
++	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
++	if err != nil {
++		return noop, err
++	}
++	release := func() { _ = unix.Flock(int(lock.Fd()), unix.LOCK_UN); _ = lock.Close() }
++	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
++		_ = lock.Close()
++		return noop, fmt.Errorf("host capacity is being reserved: %w", err)
++	}
++	admitted := false
++	defer func() {
++		if !admitted {
++			release()
++		}
++	}()
++	info, err := os.Lstat(budgetPath)
++	if err != nil {
++		return noop, err
++	}
++	owner, ok := info.Sys().(*syscall.Stat_t)
++	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !ok || owner.Uid != uint32(os.Geteuid()) || info.Size() > 4096 {
++		return noop, errors.New("unowned host capacity budget")
++	}
++	file, err := os.Open(budgetPath)
++	if err != nil {
++		return noop, err
++	}
++	defer file.Close()
++	decoder := json.NewDecoder(io.LimitReader(file, 4097))
++	decoder.DisallowUnknownFields()
++	var budget hostCapacityBudget
++	if err := decoder.Decode(&budget); err != nil {
++		return noop, err
++	}
++	var extra any
++	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
++		return noop, errors.New("invalid trailing host budget")
++	}
++	if budget.Format != "launchpad-host-capacity-v1" || budget.MaxRunningVMs < 1 || budget.MaxRunningVMs > 4096 ||
++		budget.ReserveMemoryMiB < 2048 || budget.ReserveCPUCount < 1 ||
++		budget.NormalMemoryMaxBytes != int64(budget.MaxRunningVMs)*5*1024*1024*1024 ||
++		budget.NormalCPUCount != budget.MaxRunningVMs*2 || budget.ProbeMemoryMaxBytes != 5*1024*1024*1024 || budget.ProbeCPUCount != 2 {
++		return noop, errors.New("unsupported host capacity budget")
++	}
++	limits := map[string]string{"memory.max": strconv.FormatInt(budget.NormalMemoryMaxBytes, 10),
++		"memory.swap.max": "0"}
++	for key, expected := range limits {
++		actual, err := os.ReadFile(filepath.Join(root, key))
++		if err != nil || strings.Join(strings.Fields(string(actual)), " ") != expected {
++			return noop, errors.New("ordinary VM limits differ from the protected host budget")
++		}
++	}
++	cpuLimit, err := os.ReadFile(filepath.Join(root, "cpu.max"))
++	if err != nil || !cpuLimitMatches(string(cpuLimit), budget.NormalCPUCount) {
++		return noop, errors.New("ordinary VM limits differ from the protected host budget")
++	}
++	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
++		return noop, errors.New("invalid VM cgroup identity")
++	}
++	entries, err := os.ReadDir(root)
++	if err != nil {
++		return noop, err
++	}
++	count := 0
++	for _, entry := range entries {
++		if entry.IsDir() {
++			count++
++			if entry.Name() == name {
++				return noop, errors.New("VM cgroup is already reserved")
++			}
++		}
++	}
++	if count >= budget.MaxRunningVMs {
++		return noop, errors.New("waiting for normal VM host capacity")
++	}
++	admitted = true
++	return release, nil
++}
++
++// E2B initializes a different scheduling period after restart. Equivalent
++// quota/period pairs enforce the same CPU count; unlimited or weaker limits fail.
++func cpuLimitMatches(value string, cpus int) bool {
++	fields := strings.Fields(value)
++	if len(fields) != 2 {
++		return false
++	}
++	quota, quotaErr := strconv.ParseInt(fields[0], 10, 64)
++	period, periodErr := strconv.ParseInt(fields[1], 10, 64)
++	return quotaErr == nil && periodErr == nil && period >= 1000 && period <= 1000000 && quota == int64(cpus)*period
++}
++
++// The execution journal has already fenced future clones of this exact group.
++// Release its capacity directory only after descendants are physically absent.
++func StopAndReleaseCapacity(ctx context.Context, name string) error {
++	if err := KillExisting(ctx, name); err != nil {
++		return err
++	}
++	if err := os.Remove(filepath.Join(RootCgroupPath, name)); err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return nil
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/cgroup/host_capacity_linux_test.go
+@@ -0,0 +1,173 @@
++//go:build linux
++
++package cgroup
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sync"
++	"syscall"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func budgetFixture(t *testing.T) (string, string, string) {
++	t.Helper()
++	root := t.TempDir()
++	budget := hostCapacityBudget{Format: "launchpad-host-capacity-v1", MaxRunningVMs: 1,
++		ReserveMemoryMiB: 3072, ReserveCPUCount: 1, NormalMemoryMaxBytes: 5 * 1024 * 1024 * 1024,
++		NormalCPUCount: 2, ProbeMemoryMaxBytes: 5 * 1024 * 1024 * 1024, ProbeCPUCount: 2}
++	bytes, err := json.Marshal(budget)
++	require.NoError(t, err)
++	file := filepath.Join(root, "budget.json")
++	require.NoError(t, os.WriteFile(file, bytes, 0o600))
++	for key, value := range map[string]string{"memory.max": "5368709120", "memory.swap.max": "0", "cpu.max": "200000 100000"} {
++		require.NoError(t, os.WriteFile(filepath.Join(root, key), []byte(value), 0o600))
++	}
++	return root, file, filepath.Join(root, "host.lock")
++}
++
++func TestHostBudgetCountsEmptyReservations(t *testing.T) {
++	t.Parallel()
++	root, file, lock := budgetFixture(t)
++	release, err := reserveNormalCapacity(root, file, lock, "sbx-first")
++	require.NoError(t, err)
++	require.NoError(t, os.Mkdir(filepath.Join(root, "sbx-first"), 0o700))
++	release()
++	_, err = reserveNormalCapacity(root, file, lock, "sbx-second")
++	require.ErrorContains(t, err, "waiting")
++	_, err = reserveNormalCapacity(root, file, lock, "sbx-first")
++	require.ErrorContains(t, err, "already reserved")
++	require.NoError(t, os.Remove(filepath.Join(root, "sbx-first")))
++	release, err = reserveNormalCapacity(root, file, lock, "sbx-second")
++	require.NoError(t, err)
++	release()
++}
++
++func TestHostBudgetConcurrentAdmissionsHaveOneWinner(t *testing.T) {
++	t.Parallel()
++	root, file, lock := budgetFixture(t)
++	var wg sync.WaitGroup
++	outcomes := make(chan bool, 2)
++	for _, name := range []string{"sbx-first", "sbx-second"} {
++		wg.Go(func() {
++			release, err := reserveNormalCapacity(root, file, lock, name)
++			if err != nil {
++				outcomes <- false
++				return
++			}
++			defer release()
++			err = os.Mkdir(filepath.Join(root, name), 0o700)
++			outcomes <- err == nil
++		})
++	}
++	wg.Wait()
++	close(outcomes)
++	winners := 0
++	for won := range outcomes {
++		if won {
++			winners++
++		}
++	}
++	require.Equal(t, 1, winners)
++}
++
++func TestHostBudgetMismatchNeverAdmits(t *testing.T) {
++	t.Parallel()
++	for _, key := range []string{"memory.max", "memory.swap.max", "cpu.max"} {
++		t.Run(key, func(t *testing.T) {
++			root, file, lock := budgetFixture(t)
++			require.NoError(t, os.WriteFile(filepath.Join(root, key), []byte("max"), 0o600))
++			_, err := reserveNormalCapacity(root, file, lock, "sbx-first")
++			require.Error(t, err)
++			_, err = os.Stat(filepath.Join(root, "sbx-first"))
++			require.True(t, os.IsNotExist(err))
++		})
++	}
++}
++
++func TestHostBudgetEquivalentCPUPeriodSurvivesRestart(t *testing.T) {
++	t.Parallel()
++	for _, value := range []string{"200000 100000", "400000 200000", "2000 1000"} {
++		t.Run(value, func(t *testing.T) {
++			root, file, lock := budgetFixture(t)
++			require.NoError(t, os.WriteFile(filepath.Join(root, "cpu.max"), []byte(value), 0o600))
++			release, err := reserveNormalCapacity(root, file, lock, "sbx-first")
++			require.NoError(t, err)
++			release()
++		})
++	}
++	for _, value := range []string{"400001 200000", "199999 100000", "max 100000", "-200000 -100000", "2000 1000 extra", "0 0", "20000000 10000000"} {
++		t.Run(value, func(t *testing.T) {
++			root, file, lock := budgetFixture(t)
++			require.NoError(t, os.WriteFile(filepath.Join(root, "cpu.max"), []byte(value), 0o600))
++			_, err := reserveNormalCapacity(root, file, lock, "sbx-first")
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestHostBudgetPublicOrInvalidReceiptNeverAdmits(t *testing.T) {
++	t.Parallel()
++	root, file, lock := budgetFixture(t)
++	require.NoError(t, os.Chmod(file, 0o644))
++	_, err := reserveNormalCapacity(root, file, lock, "sbx-first")
++	require.ErrorContains(t, err, "unowned")
++	require.NoError(t, os.Chmod(file, 0o600))
++	require.NoError(t, os.WriteFile(file, []byte(`{"format":"launchpad-host-capacity-v1","maxRunningVms":1}`), 0o600))
++	_, err = reserveNormalCapacity(root, file, lock, "sbx-first")
++	require.Error(t, err)
++}
++
++func TestHostBudgetUnconfiguredKeepsUpstreamBehavior(t *testing.T) {
++	t.Parallel()
++	root := t.TempDir()
++	release, err := reserveNormalCapacity(root, filepath.Join(root, "absent.json"), filepath.Join(root, "host.lock"), "sbx-first")
++	require.NoError(t, err)
++	release()
++	_, err = os.Stat(filepath.Join(root, "host.lock"))
++	require.True(t, os.IsNotExist(err))
++}
++
++// This test is dispatched only on an empty, dedicated host with an operator
++// budget. The child is placed atomically in this test's exact reserved cgroup.
++func TestHostBudgetRealAdmission(t *testing.T) {
++	if os.Getenv("LAUNCHPAD_E2B_CAPACITY_PROOF") != "1" {
++		t.Skip("dedicated host proof only")
++	}
++	require.Equal(t, 0, os.Geteuid())
++	entries, err := os.ReadDir(RootCgroupPath)
++	require.NoError(t, err)
++	for _, entry := range entries {
++		require.False(t, entry.IsDir(), "existing capacity reservation")
++	}
++	manager, err := NewManager()
++	require.NoError(t, err)
++	name := fmt.Sprintf("sbx-budget-proof-%d", os.Getpid())
++	handle, err := manager.Create(t.Context(), name)
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, handle.Remove(t.Context())) })
++	child := exec.Command("/bin/sleep", "120")
++	child.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: handle.GetFD()}
++	require.NoError(t, child.Start())
++	require.NoError(t, handle.ReleaseCgroupFD())
++	t.Cleanup(func() { require.NoError(t, handle.Kill(t.Context())); _ = child.Wait() })
++	_, err = manager.Create(t.Context(), name+"-second")
++	require.ErrorContains(t, err, "waiting")
++	processes, err := os.ReadFile(filepath.Join(RootCgroupPath, name, "cgroup.procs"))
++	require.NoError(t, err)
++	require.Contains(t, string(processes), fmt.Sprint(child.Process.Pid))
++	require.NoError(t, StopAndReleaseCapacity(t.Context(), name))
++	_ = child.Wait()
++	_, err = os.Stat(filepath.Join(RootCgroupPath, name))
++	require.True(t, os.IsNotExist(err))
++	require.NoError(t, handle.Remove(t.Context()))
++	second, err := manager.Create(t.Context(), name+"-second")
++	require.NoError(t, err)
++	require.NoError(t, second.ReleaseCgroupFD())
++	require.NoError(t, second.Remove(t.Context()))
++}

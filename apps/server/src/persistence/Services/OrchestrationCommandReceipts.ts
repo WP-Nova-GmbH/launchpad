@@ -6,15 +6,7 @@
  *
  * @module OrchestrationCommandReceiptRepository
  */
-import {
-  CommandId,
-  IsoDateTime,
-  NonNegativeInt,
-  OrchestrationAggregateKind,
-  OrchestrationCommandReceiptStatus,
-  ProjectId,
-  ThreadId,
-} from "@t3tools/contracts";
+import { CommandId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Context from "effect/Context";
@@ -22,18 +14,8 @@ import type * as Effect from "effect/Effect";
 
 import type { OrchestrationCommandReceiptRepositoryError } from "../Errors.ts";
 
-export const OrchestrationCommandReceipt = Schema.Struct({
-  commandId: CommandId,
-  aggregateKind: OrchestrationAggregateKind,
-  aggregateId: Schema.Union([ProjectId, ThreadId]),
-  // Null on legacy receipts; rejected bootstrap commands may never have a thread row.
-  projectId: Schema.optional(Schema.NullOr(ProjectId)),
-  acceptedAt: IsoDateTime,
-  resultSequence: NonNegativeInt,
-  status: OrchestrationCommandReceiptStatus,
-  error: Schema.NullOr(Schema.String),
-});
-export type OrchestrationCommandReceipt = typeof OrchestrationCommandReceipt.Type;
+import { OrchestrationCommandReceipt } from "@t3tools/contracts/threadTransfer";
+export { OrchestrationCommandReceipt } from "@t3tools/contracts/threadTransfer";
 
 export const GetByCommandIdInput = Schema.Struct({
   commandId: CommandId,

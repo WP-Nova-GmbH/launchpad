@@ -248,6 +248,17 @@ export function CommandPalette(props: {
           }),
       },
     ];
+    actions.push({
+      key: "threadVms",
+      kind: "action",
+      title: "VM threads",
+      searchTerms: ["VM", "sandbox", "private", "saved", "restore", "reset", "create"],
+      run: () =>
+        navigation.navigate("SettingsSheet", {
+          screen: "SettingsContent",
+          params: { screen: "SettingsVmThreads" },
+        }),
+    });
     const projectByKey = new Map(
       projects.map((project) => [scopedProjectKey(project.environmentId, project.id), project]),
     );

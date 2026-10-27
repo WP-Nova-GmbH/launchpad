@@ -3837,6 +3837,13 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           "git@github.com:octocat/codething-mvp.git",
         ]);
 
+        // Keep fetch/push local while the configured URL supplies fork identity.
+        const fs = yield* FileSystem.FileSystem;
+        const ssh = yield* fs.makeTempFileScoped({ prefix: "t3-test-ssh-" });
+        yield* fs.writeFileString(ssh, `exec git-upload-pack '${forkDir}'\n`);
+        yield* runGit(repoDir, ["config", "core.sshCommand", `sh '${ssh}'`]);
+        yield* runGit(repoDir, ["config", "remote.fork-seed.pushurl", forkDir]);
+
         const { manager, ghCalls } = yield* makeManager({
           ghScenario: {
             prListSequenceByHeadSelector: {

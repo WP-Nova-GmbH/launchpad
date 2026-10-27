@@ -1,0 +1,130 @@
+--- a/packages/orchestrator/pkg/proxy/proxy.go
++++ b/packages/orchestrator/pkg/proxy/proxy.go
+@@ -112,6 +112,8 @@
+ 				return nil, reverseproxy.NewErrInvalidTrafficAccessToken(sandboxId, trafficAccessTokenHeader)
+ 			}
+ 		}
++
++		stripApplicationIngressCredentials(r, isNonEnvdTraffic)
+ 
+ 		// Handle request host masking only for non-envd traffic.
+ 		var maskRequestHost *string = nil
+@@ -269,3 +271,13 @@
+ func (p *SandboxProxy) OnNetworkRelease(_ context.Context, sbx *sandbox.Sandbox) {
+ 	p.limiter.Remove(sbx.LifecycleID)
+ }
++
++// Routing credentials authorize the edge, never an application running in the guest.
++func stripApplicationIngressCredentials(r *http.Request, applicationTraffic bool) {
++	if !applicationTraffic {
++		return
++	}
++	for _, name := range []string{trafficAccessTokenHeader, "E2b-Sandbox-Id", "E2b-Sandbox-Port"} {
++		r.Header.Del(name)
++	}
++}
+--- /dev/null
++++ b/packages/orchestrator/pkg/proxy/launchpad_ingress_credentials_test.go
+@@ -0,0 +1,35 @@
++//go:build linux
++
++package proxy
++
++import (
++	"net/http"
++	"testing"
++)
++
++func TestApplicationIngressStripsEdgeCredentials(t *testing.T) {
++	for _, app := range []bool{true, false} {
++		r, err := http.NewRequest(http.MethodGet, "http://guest.test/", nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		for _, name := range []string{trafficAccessTokenHeader, "E2b-Sandbox-Id", "E2b-Sandbox-Port"} {
++			r.Header.Set(name, "edge-secret")
++		}
++		r.Header.Set("Authorization", "app-auth")
++		r.Header.Set("Cookie", "app_session=app-cookie")
++		stripApplicationIngressCredentials(r, app)
++		for _, name := range []string{trafficAccessTokenHeader, "E2b-Sandbox-Id", "E2b-Sandbox-Port"} {
++			want := "edge-secret"
++			if app {
++				want = ""
++			}
++			if got := r.Header.Get(name); got != want {
++				t.Fatalf("edge header %s survived application boundary", name)
++			}
++		}
++		if r.Header.Get("Authorization") != "app-auth" || r.Header.Get("Cookie") != "app_session=app-cookie" {
++			t.Fatal("application credentials were changed")
++		}
++	}
++}
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -675,14 +675,15 @@
+ 
+ // LaunchpadRuntimeCapabilities defines model for LaunchpadRuntimeCapabilities.
+ type LaunchpadRuntimeCapabilities struct {
+-	PausedSnapshots          bool `json:"pausedSnapshots"`
+-	BuildCollectionAdmission bool `json:"buildCollectionAdmission"`
+-	DiskRestore              bool `json:"diskRestore"`
+-	ExecutionBuildRoots      bool `json:"executionBuildRoots"`
+-	LiveBuildCollection      bool `json:"liveBuildCollection"`
+-	QuiescedSnapshots        bool `json:"quiescedSnapshots"`
+-	RenewableLifetime        bool `json:"renewableLifetime"`
+-	Version                  int  `json:"version"`
++	PrivatePreviewHeaderBoundary bool `json:"privatePreviewHeaderBoundary"`
++	PausedSnapshots              bool `json:"pausedSnapshots"`
++	BuildCollectionAdmission     bool `json:"buildCollectionAdmission"`
++	DiskRestore                  bool `json:"diskRestore"`
++	ExecutionBuildRoots          bool `json:"executionBuildRoots"`
++	LiveBuildCollection          bool `json:"liveBuildCollection"`
++	QuiescedSnapshots            bool `json:"quiescedSnapshots"`
++	RenewableLifetime            bool `json:"renewableLifetime"`
++	Version                      int  `json:"version"`
+ }
+ 
+ // ListedSandbox defines model for ListedSandbox.
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -33,7 +33,7 @@
+ 		a.sendAPIStoreError(c, http.StatusForbidden, "Launchpad restore is not enabled for this team")
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
++	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{PrivatePreviewHeaderBoundary: true, Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
+ }
+ 
+ func canonicalRestoreRequest(body api.LaunchpadRestoreRequest) ([]byte, error) {
+--- a/packages/api/internal/handlers/launchpad_capabilities_test.go
++++ b/packages/api/internal/handlers/launchpad_capabilities_test.go
+@@ -48,6 +48,7 @@
+ 			require.True(t, capabilities.DiskRestore)
+ 			require.True(t, capabilities.QuiescedSnapshots)
+ 			require.True(t, capabilities.PausedSnapshots)
++			require.True(t, capabilities.PrivatePreviewHeaderBoundary)
+ 			require.True(t, capabilities.ExecutionBuildRoots)
+ 			require.False(t, capabilities.LiveBuildCollection, "unknown host cannot claim guarded live storage")
+ 		})
+--- a/spec/openapi.yml
++++ b/spec/openapi.yml
+@@ -318,7 +318,7 @@
+           $ref: '#/components/schemas/Sandbox'
+     LaunchpadRuntimeCapabilities:
+       type: object
+-      required: [version, diskRestore, renewableLifetime, quiescedSnapshots, pausedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection]
++      required: [version, privatePreviewHeaderBoundary, diskRestore, renewableLifetime, quiescedSnapshots, pausedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection]
+       properties:
+         version:
+           type: integer
+@@ -329,6 +329,8 @@
+         quiescedSnapshots:
+           type: boolean
+         pausedSnapshots:
++          type: boolean
++        privatePreviewHeaderBoundary:
+           type: boolean
+         buildCollectionAdmission:
+           type: boolean

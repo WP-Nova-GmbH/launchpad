@@ -1,0 +1,1 @@
+CREATE INDEX "idx_relay_thread_history_queue_event" ON "relay_thread_history" ("thread_id",("event_json"->>'eventId')) WHERE "event_json"->>'type'='thread.prompt-queue-changed';

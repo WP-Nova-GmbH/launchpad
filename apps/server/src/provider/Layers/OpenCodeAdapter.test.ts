@@ -576,6 +576,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
 
 const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
   upsert: () => Effect.void,
+  confirmShutdown: () => Effect.succeed(false),
   recordImportedTranscript: () => Effect.die("unused"),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
@@ -668,6 +669,22 @@ const questionRequest = (id: string, sessionID: string): QuestionRequest => ({
 });
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
+  it.effect("rejects missing local approval and user-input callbacks before native dispatch", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("opencode-missing-callback");
+      yield* adapter.startSession({ threadId, runtimeMode: "approval-required" });
+      for (const response of [
+        adapter.respondToRequest(threadId, ApprovalRequestId.make("missing"), "accept"),
+        adapter.respondToUserInput(threadId, ApprovalRequestId.make("missing"), {}),
+      ])
+        NodeAssert.equal((yield* Effect.flip(response))._tag, "ProviderAdapterValidationError");
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, []);
+      NodeAssert.deepEqual(runtimeMock.state.questionReplyCalls, []);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect.each(["prompt", "command", "compact"] as const)(
     "validates at native %s dispatch before sending anything",
     (operation) =>
@@ -3931,11 +3948,14 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       yield* Fiber.join(openedFiber);
       const replyFiber = yield* adapter
         .respondToRequest(threadId, ApprovalRequestId.make(request.id), "accept")
-        .pipe(Effect.exit, Effect.forkChild);
+        .pipe(Effect.result, Effect.forkChild);
       yield* Effect.promise(() => replyStarted.promise);
       yield* Effect.yieldNow;
       yield* advanceTestClock(10_000);
-      NodeAssert.equal(Exit.isFailure(yield* Fiber.join(replyFiber)), true);
+      const reply = yield* Fiber.join(replyFiber);
+      NodeAssert.equal(reply._tag, "Failure");
+      if (reply._tag === "Failure")
+        NodeAssert.equal(reply.failure._tag, "ProviderAdapterRequestError");
       NodeAssert.equal(runtimeMock.state.permissionReplySignals[0]?.aborted, true);
       runtimeMock.state.permissionReplyImplementation = null;
       const resolvedFiber = yield* adapter.streamEvents.pipe(
@@ -3971,8 +3991,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         .respondToRequest(threadId, ApprovalRequestId.make(request.id), "accept")
         .pipe(Effect.result);
       NodeAssert.equal(reply._tag, "Failure");
-      if (reply._tag === "Failure" && reply.failure._tag === "ProviderAdapterRequestError") {
-        NodeAssert.match(reply.failure.detail, /still loading/);
+      if (reply._tag === "Failure") {
+        NodeAssert.equal(reply.failure._tag, "ProviderAdapterValidationError");
+        if (reply.failure._tag === "ProviderAdapterValidationError")
+          NodeAssert.match(reply.failure.issue, /still loading/);
       }
       const openedFiber = yield* adapter.streamEvents.pipe(
         Stream.filter((event) => event.threadId === threadId && event.type === "request.opened"),

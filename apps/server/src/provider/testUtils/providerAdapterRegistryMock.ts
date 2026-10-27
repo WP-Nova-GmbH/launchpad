@@ -16,6 +16,18 @@ import { ProviderUnsupportedError, type ProviderAdapterError } from "../Errors.t
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import type { ProviderAdapterRegistryShape } from "../Services/ProviderAdapterRegistry.ts";
 
+export const withResolvedInstance = (
+  registry: Omit<ProviderAdapterRegistryShape, "resolveInstance">,
+): ProviderAdapterRegistryShape => ({
+  ...registry,
+  resolveInstance: (id) =>
+    Effect.gen(function* () {
+      const info = yield* registry.getInstanceInfo(id);
+      const adapter = yield* registry.getByInstance(id);
+      return { ...info, adapter };
+    }),
+});
+
 export type KindAdapterMap = Partial<
   Record<ProviderDriverKind, ProviderAdapterShape<ProviderAdapterError>>
 >;
@@ -44,7 +56,7 @@ export const makeAdapterRegistryMock = (adapters: KindAdapterMap): ProviderAdapt
         );
   };
 
-  return {
+  return withResolvedInstance({
     getByInstance,
     getInstanceInfo: (instanceId) => {
       const adapter = byInstanceId.get(instanceId);
@@ -70,5 +82,5 @@ export const makeAdapterRegistryMock = (adapters: KindAdapterMap): ProviderAdapt
     subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), (pubsub) =>
       PubSub.subscribe(pubsub),
     ),
-  };
+  });
 };

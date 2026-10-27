@@ -263,3 +263,92 @@ describe("GithubApp.mintInstallationToken", () => {
     }),
   );
 });
+
+const scopedTokenResponse = {
+  token: "ghs_repository_only",
+  expires_at: "2099-01-01T00:00:00Z",
+  repositories: [{ full_name: "acme/project" }],
+};
+const decodeRepositoryTokenRequest = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.Struct({ repositories: Schema.Array(Schema.String) })),
+);
+
+describe("GithubApp.mintRepositoryToken", () => {
+  it.effect("requests one repository and returns only a matching unexpired token", () =>
+    Effect.gen(function* () {
+      const { app, requests } = makeApp(() => Response.json(scopedTokenResponse, { status: 201 }));
+      const github = yield* app;
+      expect(
+        yield* github.mintRepositoryToken({
+          installationId: "42",
+          canonicalKey: "github.com/acme/project",
+        }),
+      ).toEqual({
+        token: scopedTokenResponse.token,
+        expiresAt: scopedTokenResponse.expires_at,
+      });
+      expect(requests).toHaveLength(1);
+      const request = requests[0]!;
+      expect(request.url).toBe("https://api.github.com/app/installations/42/access_tokens");
+      expect(request.method).toBe("POST");
+      expect(request.body._tag).toBe("Uint8Array");
+      if (request.body._tag !== "Uint8Array") throw new Error("Expected JSON request body");
+      expect(decodeRepositoryTokenRequest(new TextDecoder().decode(request.body.body))).toEqual({
+        repositories: ["project"],
+      });
+    }),
+  );
+
+  it.effect("never falls back to installation access for an empty or malformed scope", () =>
+    Effect.gen(function* () {
+      const { app, requests } = makeApp(() => Response.json(scopedTokenResponse));
+      const github = yield* app;
+      for (const canonicalKey of [
+        "",
+        "github.com/acme",
+        "github.com/acme/",
+        "github.com/acme/..",
+        "github.com/acme/project/extra",
+        "gitlab.com/acme/project",
+      ]) {
+        expect(
+          yield* Effect.flip(github.mintRepositoryToken({ installationId: "42", canonicalKey })),
+        ).toMatchObject({ _tag: "GithubRequestFailed" });
+      }
+      expect(requests).toHaveLength(0);
+    }),
+  );
+
+  it.effect(
+    "rejects broad, wrong-owner, missing, expired and malformed scopes without leaking a token",
+    () =>
+      Effect.gen(function* () {
+        for (const response of [
+          { ...scopedTokenResponse, repositories: [] },
+          {
+            ...scopedTokenResponse,
+            repositories: [...scopedTokenResponse.repositories, { full_name: "acme/other" }],
+          },
+          { ...scopedTokenResponse, repositories: [{ full_name: "another-owner/project" }] },
+          { ...scopedTokenResponse, repositories: undefined },
+          { ...scopedTokenResponse, expires_at: "1970-01-01T00:00:00Z" },
+          { ...scopedTokenResponse, expires_at: "invalid" },
+          { ...scopedTokenResponse, token: 42 },
+        ]) {
+          const { app, requests } = makeApp(() => Response.json(response));
+          const github = yield* app;
+          const error = yield* Effect.flip(
+            github.mintRepositoryToken({
+              installationId: "42",
+              canonicalKey: "github.com/acme/project",
+            }),
+          );
+          expect(error._tag).toBe("GithubRequestFailed");
+          expect(String(error)).not.toContain("ghs_repository_only");
+          if (error._tag === "GithubRequestFailed")
+            expect(String(error.cause)).not.toContain("ghs_repository_only");
+          expect(requests).toHaveLength(1);
+        }
+      }),
+  );
+});

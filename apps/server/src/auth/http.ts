@@ -145,7 +145,10 @@ export function failEnvironmentScopeRequired(requiredScope: AuthEnvironmentScope
 }
 
 function failEnvironmentOperationForbidden(
-  reason: "current_session_revoke_not_allowed" | "desktop_session_required",
+  reason:
+    | "current_session_revoke_not_allowed"
+    | "desktop_session_required"
+    | "personal_browser_session_required",
 ) {
   return currentEnvironmentTraceId.pipe(
     Effect.flatMap((traceId) =>
@@ -262,6 +265,48 @@ export const authHttpApiLayer = HttpApiBuilder.group(
     const httpClient = yield* HttpClient.HttpClient;
 
     return handlers
+      .handle(
+        "browserIdentity",
+        Effect.fn("environment.auth.browserIdentity")(function* ({ payload, endpoint }) {
+          yield* annotateEnvironmentRequest(endpoint.name);
+          yield* appendCredentialResponseHeaders;
+          const session = yield* EnvironmentAuthenticatedPrincipal;
+          const access = yield* RepositoryAccess;
+          if (
+            session.method !== "browser-session-cookie" ||
+            session.subject === "reusable-dev-token" ||
+            session.subject === "cloud-connect" ||
+            (yield* access.status).enabled
+          )
+            return yield* failEnvironmentOperationForbidden("personal_browser_session_required");
+          const user =
+            payload.identity === null
+              ? null
+              : yield* verifyDesktopIdentity(payload.identity).pipe(
+                  Effect.provideService(HttpClient.HttpClient, httpClient),
+                  Effect.catch(() => failEnvironmentInternal("identity_verification_failed")),
+                );
+          const issued = yield* access.withFence(
+            Effect.gen(function* () {
+              if ((yield* access.status).enabled)
+                return yield* failEnvironmentOperationForbidden(
+                  "personal_browser_session_required",
+                );
+              return yield* sessions.replaceBrowserIdentity(session.sessionId, user).pipe(
+                Effect.catch(
+                  Effect.fnUntraced(function* (error) {
+                    if (SessionStore.isSessionCredentialInvalidError(error))
+                      return yield* failEnvironmentAuthInvalid("invalid_credential");
+                    return yield* failEnvironmentInternal("browser_session_issuance_failed");
+                  }),
+                ),
+              );
+            }),
+          );
+          yield* appendSessionCookie(sessions.cookieName, issued.token, issued.expiresAt);
+          return { user };
+        }),
+      )
       .handle(
         "desktopIdentity",
         Effect.fn("environment.auth.desktopIdentity")(function* ({ payload, endpoint }) {

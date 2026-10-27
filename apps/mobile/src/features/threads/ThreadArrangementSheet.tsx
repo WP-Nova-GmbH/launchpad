@@ -13,7 +13,7 @@ import { AppText as Text } from "../../components/AppText";
 import { SymbolView } from "../../components/AppSymbol";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { environmentServerConfigsAtom } from "../../state/server";
-import { environmentThreadShells } from "../../state/threads";
+import { navigationThreadShellsAtom } from "../../state/threads";
 import {
   pendingThreadOrderAtom,
   threadDropBusyAtom,
@@ -148,7 +148,7 @@ function DragHandle(props: {
 
 export function ThreadArrangementSheet(props: { onClose: () => void }) {
   const insets = useSafeAreaInsets();
-  const threads = useAtomValue(environmentThreadShells.threadShellsAtom);
+  const threads = useAtomValue(navigationThreadShellsAtom);
   const configs = useAtomValue(environmentServerConfigsAtom);
   const queuedThreadKeys = useAtomValue(queuedThreadKeysAtom);
   const pendingOrder = useAtomValue(pendingThreadOrderAtom);

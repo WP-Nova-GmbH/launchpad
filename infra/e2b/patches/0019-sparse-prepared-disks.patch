@@ -1,0 +1,101 @@
+diff --git a/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux.go b/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux.go
+index f2cf7e8bf..9a9df792e 100644
+--- a/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux.go
+@@ -3,6 +3,7 @@
+ package rootfs
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+@@ -193,8 +194,15 @@ func copyPreparedDisk(ctx context.Context, path string, source block.ReadonlyDev
+ 		return "", err
+ 	}
+ 	defer func() { err = errors.Join(err, out.Close()) }()
++	// The verified disk's logical geometry includes free zeroed blocks. Preserve
++	// them as holes instead of allocating every byte of the VM's free disk space.
++	// Reads and checksums still cover all bytes; this is not a live-source copy.
++	if err := out.Truncate(size); err != nil {
++		return "", err
++	}
+ 	hash := sha256.New()
+ 	buf := make([]byte, 1<<20)
++	zero := make([]byte, len(buf))
+ 	for offset := int64(0); offset < size; {
+ 		if err := ctx.Err(); err != nil {
+ 			return "", err
+@@ -207,8 +215,10 @@ func copyPreparedDisk(ctx context.Context, path string, source block.ReadonlyDev
+ 		if n != len(chunk) {
+ 			return "", io.ErrUnexpectedEOF
+ 		}
+-		if _, err := out.Write(chunk); err != nil {
+-			return "", err
++		if !bytes.Equal(chunk, zero[:len(chunk)]) {
++			if _, err := out.WriteAt(chunk, offset); err != nil {
++				return "", err
++			}
+ 		}
+ 		_, _ = hash.Write(chunk)
+ 		offset += int64(n)
+diff --git a/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux_test.go b/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux_test.go
+index d35fccdbf..f0d7c28ec 100644
+--- a/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux_test.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/prepared_disk_linux_test.go
+@@ -5,8 +5,11 @@ package rootfs
+ import (
+ 	"bytes"
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"errors"
+ 	"fmt"
++	"golang.org/x/sys/unix"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+@@ -222,3 +225,41 @@ func TestPreparedDiskRejectsUnflushedMemorySnapshots(t *testing.T) {
+ 		require.ErrorIs(t, err, os.ErrNotExist, "rejected source must not publish any destination")
+ 	}
+ }
++
++func TestPreparedDiskSparseCopyPreservesAllBytesAndTrailingGeometry(t *testing.T) {
++	t.Parallel()
++	for _, nonzero := range []bool{false, true} {
++		t.Run(fmt.Sprint(nonzero), func(t *testing.T) {
++			dir := t.TempDir()
++			size := int64(5<<20) + header.RootfsBlockSize
++			original := make([]byte, size)
++			if nonzero {
++				copy(original[2<<20:], bytes.Repeat([]byte{0x6a}, int(header.RootfsBlockSize)))
++			}
++			sourcePath := filepath.Join(dir, "source")
++			file, err := os.OpenFile(sourcePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
++			require.NoError(t, err)
++			require.NoError(t, file.Truncate(size))
++			if nonzero {
++				_, err = file.WriteAt(original[2<<20:2<<20+header.RootfsBlockSize], 2<<20)
++				require.NoError(t, err)
++			}
++			require.NoError(t, file.Close())
++			source, err := block.NewLocal(sourcePath, header.RootfsBlockSize, uuid.New())
++			require.NoError(t, err)
++			defer source.Close()
++			destination := filepath.Join(dir, "disk")
++			sum, err := copyPreparedDisk(t.Context(), destination, source, size)
++			require.NoError(t, err)
++			actual, err := os.ReadFile(destination)
++			require.NoError(t, err)
++			require.Equal(t, original, actual)
++			digest := sha256.Sum256(original)
++			require.Equal(t, hex.EncodeToString(digest[:]), sum)
++			var stat unix.Stat_t
++			require.NoError(t, unix.Stat(destination, &stat))
++			require.Equal(t, size, stat.Size, "trailing zero blocks define the filesystem geometry")
++			require.Less(t, stat.Blocks*512, size/2, "free disk blocks must not allocate a second whole VM disk")
++		})
++	}
++}
+
+

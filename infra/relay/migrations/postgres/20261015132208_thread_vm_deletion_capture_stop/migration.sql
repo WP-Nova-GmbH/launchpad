@@ -1,0 +1,2 @@
+ALTER TABLE "relay_thread_deletions" ADD COLUMN "allow_uncertain_capture_cleanup" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_allocations" ADD COLUMN "deletion_stop_receipt" jsonb;

@@ -11,6 +11,28 @@ export const emptyThreadPromptQueue = (): ThreadPromptQueue => ({
   finalizedTurnId: null,
 });
 
+/** Queued work prevents lifecycle idleness; archive/pause suppresses only waiting entries. */
+export function threadPromptQueueHasWork(
+  queue: {
+    readonly enabled: boolean;
+    readonly handoff: unknown | null;
+    readonly awaitingTurnId: unknown | null;
+    readonly preparation?: { readonly state: string; readonly settled: boolean } | undefined;
+    readonly entries: ReadonlyArray<{ readonly state: string }>;
+  },
+  archived: boolean,
+): boolean {
+  return (
+    queue.handoff !== null ||
+    queue.awaitingTurnId !== null ||
+    (queue.preparation !== undefined && !queue.preparation.settled) ||
+    queue.entries.some((entry) =>
+      ["delivering", "unknown", "moving", "cancelling"].includes(entry.state),
+    ) ||
+    (!archived && queue.enabled && queue.entries.length > 0)
+  );
+}
+
 /** Apply one persisted delta; FIFO uses the enqueue event's server sequence. */
 export function applyThreadPromptQueueChange(
   previous: ThreadPromptQueue | undefined,
@@ -26,8 +48,18 @@ export function applyThreadPromptQueueChange(
       ...change.entry,
       acceptedSequence: change.entry.acceptedSequence || sequence,
     };
-    entries = [...entries.filter((item) => item.messageId !== entry.messageId), entry].sort(
-      (left, right) => left.acceptedSequence - right.acceptedSequence,
+    const index = entries.findIndex((item) => item.messageId === entry.messageId);
+    entries =
+      index < 0
+        ? [...entries, entry]
+        : entries.map((item, position) => (position === index ? entry : item));
+  }
+  if (change.order) {
+    const positions = new Map(change.order.map((id, index) => [id, index]));
+    entries = [...entries].sort(
+      (left, right) =>
+        (positions.get(left.messageId) ?? Number.MAX_SAFE_INTEGER) -
+        (positions.get(right.messageId) ?? Number.MAX_SAFE_INTEGER),
     );
   }
   return {

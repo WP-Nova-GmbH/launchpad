@@ -67,7 +67,20 @@ export type RecordImportedTranscriptInput = typeof RecordImportedTranscriptInput
 
 export interface ProviderSessionRuntimeUpsertOptions {
   readonly onConflict?: "update" | "ignore";
+  readonly preserveContinuation?: boolean;
+  readonly expectedRuntimeEpisode?: string;
 }
+
+export const ConfirmShutdownInput = Schema.Struct({
+  threadId: ThreadId,
+  provider: Schema.String,
+  providerInstanceId: ProviderInstanceId,
+  workflowJobId: Schema.NullOr(Schema.String),
+  continuationKey: Schema.String,
+  runtimeEpisode: Schema.NullOr(Schema.String),
+  preserveRestartIntent: Schema.optional(Schema.Boolean),
+});
+export type ConfirmShutdownInput = typeof ConfirmShutdownInput.Type;
 
 /**
  * ProviderSessionRuntimeRepository - Service tag for provider runtime persistence.
@@ -85,6 +98,10 @@ export class ProviderSessionRuntimeRepository extends Context.Service<
       runtime: ProviderSessionRuntime,
       options?: ProviderSessionRuntimeUpsertOptions,
     ) => Effect.Effect<void, ProviderSessionRuntimeRepositoryError>;
+
+    readonly confirmShutdown: (
+      input: ConfirmShutdownInput,
+    ) => Effect.Effect<boolean, ProviderSessionRuntimeRepositoryError>;
 
     /** Record one source file without replacing the current session state. */
     readonly recordImportedTranscript: (
@@ -172,8 +189,14 @@ export const make = Effect.gen(function* () {
 
   // Runtime writes can carry stale payloads. Only recordImportedTranscript may
   // change source records, so restore that field from the row being updated.
+  // Guarded live writes neither insert missing rows nor undo persisted shutdown of the same episode.
   const upsertRuntimeRow = SqlSchema.void({
-    Request: ProviderSessionRuntimeDbRowSchema,
+    Request: ProviderSessionRuntimeDbRowSchema.mapFields(
+      Struct.assign({
+        preserveContinuation: Schema.Boolean,
+        expectedRuntimeEpisode: Schema.NullOr(Schema.String),
+      }),
+    ),
     execute: (runtime) =>
       sql`
         INSERT INTO provider_session_runtime (
@@ -187,7 +210,7 @@ export const make = Effect.gen(function* () {
           resume_cursor_json,
           runtime_payload_json
         )
-        VALUES (
+        SELECT
           ${runtime.threadId},
           ${runtime.providerName},
           ${runtime.providerInstanceId},
@@ -201,6 +224,17 @@ export const make = Effect.gen(function* () {
             THEN json_remove(${runtime.runtimePayload}, '$.importedTranscripts')
             ELSE ${runtime.runtimePayload}
           END
+        WHERE ${runtime.expectedRuntimeEpisode} IS NULL OR EXISTS (
+          SELECT 1 FROM provider_session_runtime
+          WHERE thread_id = ${runtime.threadId}
+            AND json_extract(
+              CASE WHEN json_valid(runtime_payload_json) THEN runtime_payload_json ELSE '{}' END,
+              '$.providerContinuation.runtimeEpisode'
+            ) IS ${runtime.expectedRuntimeEpisode}
+            AND json_type(
+              CASE WHEN json_valid(runtime_payload_json) THEN runtime_payload_json ELSE '{}' END,
+              '$.providerContinuation.shutdownConfirmed'
+            ) = 'false'
         )
         ON CONFLICT (thread_id)
         DO UPDATE SET
@@ -211,7 +245,7 @@ export const make = Effect.gen(function* () {
           status = excluded.status,
           last_seen_at = excluded.last_seen_at,
           resume_cursor_json = excluded.resume_cursor_json,
-          runtime_payload_json = CASE
+          runtime_payload_json = json_patch(CASE
             WHEN json_type(
               CASE
                 WHEN json_valid(provider_session_runtime.runtime_payload_json)
@@ -230,7 +264,17 @@ export const make = Effect.gen(function* () {
               json_extract(provider_session_runtime.runtime_payload_json, '$.importedTranscripts')
             )
             ELSE excluded.runtime_payload_json
-          END
+          END, CASE WHEN ${runtime.preserveContinuation}
+            THEN json_object('providerContinuation', json_extract(
+              CASE WHEN json_valid(provider_session_runtime.runtime_payload_json)
+                THEN provider_session_runtime.runtime_payload_json ELSE '{}' END,
+              '$.providerContinuation'
+            )) ELSE '{}' END)
+        WHERE ${runtime.expectedRuntimeEpisode} IS NULL OR json_extract(
+          CASE WHEN json_valid(provider_session_runtime.runtime_payload_json)
+            THEN provider_session_runtime.runtime_payload_json ELSE '{}' END,
+          '$.providerContinuation.runtimeEpisode'
+        ) IS ${runtime.expectedRuntimeEpisode}
       `,
   });
 
@@ -365,7 +409,14 @@ export const make = Effect.gen(function* () {
   });
 
   const upsert: ProviderSessionRuntimeRepository["Service"]["upsert"] = (runtime, options) =>
-    (options?.onConflict === "ignore" ? insertRuntimeRow(runtime) : upsertRuntimeRow(runtime)).pipe(
+    (options?.onConflict === "ignore"
+      ? insertRuntimeRow(runtime)
+      : upsertRuntimeRow({
+          ...runtime,
+          preserveContinuation: options?.preserveContinuation ?? false,
+          expectedRuntimeEpisode: options?.expectedRuntimeEpisode ?? null,
+        })
+    ).pipe(
       Effect.mapError(
         toPersistenceSqlOrDecodeError(
           "ProviderSessionRuntimeRepository.upsert:query",
@@ -374,6 +425,45 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
+
+  // Proof and its runtime identity are compared in the same SQL operation.
+  const confirmShutdown: ProviderSessionRuntimeRepository["Service"]["confirmShutdown"] = Effect.fn(
+    "ProviderSessionRuntimeRepository.confirmShutdown",
+  )(function* (input) {
+    const rows = yield* sql<{ threadId: string }>`
+        UPDATE provider_session_runtime
+        SET status = 'stopped', runtime_payload_json = json_set(
+          CASE WHEN ${input.preserveRestartIntent ?? false} THEN runtime_payload_json
+          ELSE json_set(runtime_payload_json,
+            '$.continueAfterServerUpdate', NULL,
+            '$.continueAfterServerUpdatePrepared', NULL) END,
+          '$.providerContinuation.shutdownConfirmed', json('true'),
+          '$.providerContinuation.shutdownEvidenceVersion', 2,
+          '$.activeTurnId', NULL
+        )
+        WHERE thread_id = ${input.threadId}
+          AND provider_name = ${input.provider}
+          AND provider_instance_id = ${input.providerInstanceId}
+          AND json_valid(runtime_payload_json)
+          AND json_extract(runtime_payload_json, '$.providerContinuation.workflowJobId')
+            IS ${input.workflowJobId}
+          AND json_extract(runtime_payload_json, '$.providerContinuation.continuationKey')
+            IS ${input.continuationKey}
+          AND json_extract(runtime_payload_json, '$.providerContinuation.runtimeEpisode')
+            IS ${input.runtimeEpisode}
+        RETURNING thread_id AS "threadId"
+      `.pipe(
+      Effect.mapError(
+        (cause) =>
+          new PersistenceSqlError({
+            operation: "ProviderSessionRuntimeRepository.confirmShutdown:query",
+            correlation: { threadId: input.threadId },
+            cause,
+          }),
+      ),
+    );
+    return rows.length === 1;
+  });
 
   const recordImportedTranscript: ProviderSessionRuntimeRepository["Service"]["recordImportedTranscript"] =
     (input) =>
@@ -465,6 +555,7 @@ export const make = Effect.gen(function* () {
 
   return {
     upsert,
+    confirmShutdown,
     recordImportedTranscript,
     getByThreadId,
     list,

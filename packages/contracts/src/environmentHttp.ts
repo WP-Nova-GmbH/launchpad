@@ -13,6 +13,7 @@ import {
   AuthAccessTokenResult,
   AuthDesktopIdentityRequest,
   AuthDesktopIdentityResult,
+  AuthBrowserIdentityResult,
   AuthSessionUser,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
@@ -89,6 +90,7 @@ export type EnvironmentAuthInvalidReason = typeof EnvironmentAuthInvalidReason.T
 export const EnvironmentOperationForbiddenReason = Schema.Literals([
   "current_session_revoke_not_allowed",
   "desktop_session_required",
+  "personal_browser_session_required",
 ]);
 export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationForbiddenReason.Type;
 
@@ -437,6 +439,14 @@ class EnvironmentMetadataHttpApi extends HttpApiGroup.make("metadata").add(
 
 class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
   .add(
+    HttpApiEndpoint.post("browserIdentity", "/api/auth/browser-identity", {
+      headers: OptionalBearerHeaders,
+      payload: AuthDesktopIdentityRequest,
+      success: AuthBrowserIdentityResult,
+      error: [EnvironmentInternalError, EnvironmentOperationForbiddenError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
     HttpApiEndpoint.post("desktopIdentity", "/api/auth/desktop-identity", {
       headers: OptionalBearerHeaders,
       payload: AuthDesktopIdentityRequest,
@@ -667,6 +677,11 @@ class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")
     // Proof-authenticated and bearer-free, exactly like mint-credential: a
     // dispatch arrives from the relay, not from a signed-in human.
     HttpApiEndpoint.post("t3DispatchJob", "/api/t3-connect/dispatch-job", {
+      payload: RelayCloudDispatchJobRequest,
+      success: RelayEnvironmentDispatchJobResponse,
+      error: EnvironmentHttpCloudErrors,
+    }),
+    HttpApiEndpoint.post("t3WorkflowJob", "/api/t3-connect/workflow-job", {
       payload: RelayCloudDispatchJobRequest,
       success: RelayEnvironmentDispatchJobResponse,
       error: EnvironmentHttpCloudErrors,

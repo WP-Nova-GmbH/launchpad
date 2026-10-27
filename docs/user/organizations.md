@@ -127,25 +127,112 @@ checkout — a repository the organization has not registered is simply not gove
 What the organization does govern is work it runs for you: starting a job against a repository that
 _is_ registered requires a role on that repository.
 
+## Workflow sources
+
+When Linear workflow connections are available on your relay, open **Settings → Connections →
+Workflow sources** to connect your workspace. This is separate from your personal issue-tracker
+connection in the composer. Only the connection owner can allow new repository use, and only for
+repositories they maintain or administer. Other repository maintainers can inspect granted sources
+and withdraw their repository's use. **Workflow sources** in the repository workflow view opens
+that repository's access management, including when it has no saved workflows.
+
+Reconnect uses the same Linear workspace and preserves existing repository consent. Connect a
+separate source for a different workspace. Withdrawing access requires fresh owner consent before
+it can be used again. Disconnect removes Launchpad's stored authorization; it does not cancel
+Starting or running work. Use the run's Cancel action to stop that work.
+
+Automatic Linear triggers require relay support and verified event delivery for the selected team. Rollout of automatic execution depends on the relay’s available integration. Mobile shows source health; configure sources and triggers in the web or desktop app. If the service configuration needs attention,
+retry after the relay operator repairs it rather than reconnecting your account.
+
+## Repository workflows
+
+Maintainers and admins can create workflows from **Workflows** in the sidebar or command palette.
+Choose a repository; **Settings → Organization → Repositories → Manage workflows** opens the same view. Choose an enrolled organization machine and a project for that repository,
+then add and order Agent, Review, Input, Push branch, and Open PR steps. Human zones show where work waits for a
+response. Each checkpoint can require a repository maintainer or allow anyone with repository
+access; Review defaults to maintainers and Input defaults to all repository members. Agent steps
+can choose a Codex or Claude model on that machine or use the project's default. All Agent steps
+in a job must use compatible providers of the same kind so they can share the conversation.
+Model changes are available when that provider supports them. If its configuration becomes
+incompatible during a job, cancel the job and run it again after correcting the workflow.
+
+Start with **Agent → Review** or **Reviewed implementation → PR** from **Use template**, or build your own sequence. **Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy; choose a destination checkout if more than one is available. Copies start with automatic triggering Off and no trigger.
+
+**Push branch** commits the saved result, including normal commit hooks, and pushes the job's branch. **Open PR** opens a PR against the base selected when the job was accepted; it requires a Push after the latest Agent step. Add Review before publishing when human approval is wanted. Workflows without publishing steps keep changes local. Publishing requires an updated Linux or macOS executor; PR publishing currently supports GitHub. Other forges are rejected before the run starts.
+
+Anyone with repository access can run a workflow with a description of the task and inspect the
+shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own
+worktree and one shared agent conversation. Inspect the saved result and diff before approving a
+Review. Answer an Input checkpoint to supply context for later steps. Responses are retained as
+history, and response drafts remain available while waiting for the machine to acknowledge them. Leaving an editor with unsaved changes asks whether to keep editing or discard and leave. Discard removes local edits; a Save already submitted may still complete. Save errors retain edits; Retry checks the saved version before submitting again. Reloading or restarting the app does not restore unsaved drafts.
+
+When automatic triggering is available on your relay, open **Trigger settings** in the editor. Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected status. Optional labels must all match. You can connect Linear and allow repository use from the editor without leaving your draft. Enabling requires verified event delivery for that exact team and a validated execution target. Save applies the rule and its On/Off setting; changed rules apply only to events after Save. The catalog shows the saved state and any source or target problem. Turning On without a trigger opens setup; turning Off stops new event admissions and preserves existing jobs and manual Run. Archive disables automation, and restore leaves it Off. Automatic execution depends on your relay’s available integration and rollout; configuring a trigger alone does not confirm that a job has started.
+
+Before an automatic job is handed to its environment, Launchpad reads the issue’s current title,
+description, status and labels. Comments and images are excluded. The run keeps those details even
+if the issue changes later; open **Issue details** on the run to inspect what it used. Later team,
+status or label changes do not cancel a job already created by an event. Offline or busy environments
+leave jobs queued. If issue context exceeds 32,000 characters including its metadata, shorten the
+description and refresh the run; Launchpad does not start with truncated requirements. Source or
+issue access problems keep the job queued with recovery guidance. Disconnecting a source prevents
+new handoffs; work already marked Starting may continue. Use Cancel run to stop existing work.
+
+**Runs** opens with active jobs, oldest first, including jobs from archived workflows. Use
+**Needs attention** to find human checkpoints, pauses and blocked jobs, or **History** for completed
+runs, newest first. Load more runs to reach older history or further active jobs. Refresh starts from
+the first page and picks up status changes. If starting a run loses its reply, check active runs
+before explicitly starting another; it may create an additional job.
+
+Runs marked **Started by workflow** and their automatic prompts identify the workflow that
+started them. Human checkpoint responses still identify the person who responded.
+
+Request changes sends feedback to the Review's chosen earlier Agent step in the same worktree.
+Earlier inputs and results remain valid; later steps run again and need fresh human responses.
+Rework retains the files already prepared rather than restoring an older copy. Setup and background
+previews remain available through intermediate checkpoints and rework, without running setup again.
+At completion, the job stops setup and checks the final saved result before releasing the worktree.
+If cleanup or completion fails, use **Retry approval** or **Retry completion** when offered. Confirmed
+cleanup is reused. Rework keeps using the same published branch and PR. A closed or merged PR needs attention; the job will not open a replacement.
+
+If publishing loses a reply, use **Retry publishing action** when offered. The job checks the saved commit, remote branch, and PR before attempting more work. An uncertain PR creation may remain paused if its identity cannot be confirmed. Cancellation cannot undo an existing push or PR.
+
+Archive workflows to prevent new runs without deleting their history. Already accepted runs continue with their saved definition; queued jobs wait for restore or cancellation. Restore requires a valid execution target.
+
+Maintainers can pause an accepted job from its job view. The current automatic step, including Agent
+preparation or publishing, finishes before the pause takes effect; later steps wait. Setup and previews stay
+running. Resume before answering checkpoints or retrying work. Resume preserves unanswered
+checkpoints and any failure requiring recovery. Requests saved while a machine is offline remain
+pending until it acknowledges them. Queued jobs and jobs on older machines do not offer Pause.
+
+Maintainers can cancel jobs or explicitly retry failed preparation. Cancellation stays pending
+until the machine confirms that work stopped; prepared files and history are retained. Review
+protects the saved result from ordinary chat and git changes until approval or cancellation.
+If stopping fails or is interrupted by a restart, use **Retry cancellation** to finish stopping
+the job. Uncertain prompt delivery pauses the job; cancel it before starting again. Cancellation
+also dismisses that uncertain delivery. If setup ownership has been lost, the job keeps its workspace.
+When the recovery message asks for a host restart, restart the executor machine and retry cleanup;
+restarting Launchpad alone is insufficient. Automatic host-restart recovery is unavailable on Windows.
+
+Automatic cleanup covers ordinary setup programs and background previews. Projects must arrange
+cleanup for Docker containers, system services, and other independently managed services.
+
+On mobile, open **Settings → Workflow jobs** to inspect a job, answer checkpoints, approve results,
+request changes, open the PR, retry publishing, pause, resume, or cancel. Workflow creation
+and manual Run are available on web and desktop.
+
 ## Machines
 
-Machines are computers the organization buys through Launchpad Connect. An **agent executor** runs work
-for the organization; a **review host** is reserved for running review builds of your application
-in a later release. Only admins provision and remove them; every member can see the list.
+Machines are existing computers an admin connects to the organization. Every member can see
+the list. In **Settings → Organization**, choose **Connect existing machine**, then run the
+returned setup command on that computer. The invitation expires after one day; if it expires,
+disconnect the unused entry and create another.
 
-Provisioning takes a name and a role. The machine sets itself up and reports in on its own —
-nobody signs in on it, and it can never be linked as somebody's personal environment. Until it
-does, it shows as **Setting up** and the list refreshes itself; if it never manages to report in
-within a day, it shows as **Enrollment expired** and the only fix is to destroy it and provision a
-fresh one.
+Once enrolled, the machine appears alongside your environments on every signed-in client.
+An admin can disconnect it from Organization settings. Disconnecting removes organization
+access and its managed connection; it keeps the computer's files and running server.
 
-Once a machine is **Ready**, it appears to every member of the organization alongside their own
-environments, so you can open projects and threads on it from any client, exactly as you would on
-a machine of your own. Nobody presses Connect for it: each device you sign in on picks the
-organization's machines up on its own, including a device you sign in on for the first time, and
-drops a machine once an admin destroys it. In **Settings → Connections** such a machine is
-labelled **Organization machine** and has no Disconnect or Remove; it comes and goes with the
-organization, not with your device.
+Managed Docker and Hetzner machine creation has been retired in favor of thread VMs. Existing
+managed compute needs cleanup by its host operator.
 
 Its projects remain listed on Start when the machine is offline. They are labelled **Offline** and
 cannot be opened until that machine reconnects. This retained catalog contains only project and
@@ -188,6 +275,43 @@ themselves within half an hour, with no one logging in. Signing in to a
 provider on a machine directly (**Settings → Providers**, with the machine selected) still works
 and stays on that machine until the organization shares a new account for that provider.
 
-Destroying a machine destroys everything on it, including any projects and thread history it
-holds — which is why the trash can asks for a second, labelled click. The organization has a limit
-on how many machines it can hold at once; ask us to raise it when you hit it.
+The organization has a limit on how many connected machines it can hold at once;
+ask us to raise it when you hit it.
+
+## Thread VM policy
+
+Start a thread with the default Codex provider on your machine, then use **Run on → Private VM**
+to transfer its workspace and conversation to a dedicated VM. The first version uploads your local checkout rather than
+cloning its remote repository, so this move does not require a GitHub App. The move waits for
+the current turn to finish, then runs before waiting prompts. It keeps those prompts with the
+conversation. To move later, reorder the move in the shared queue before it starts. A paused queue
+stays paused until you resume it. Use **Run on** again to move back to an eligible machine.
+Selecting the machine you started on automatically returns the thread to its original project.
+If that project is no longer available, Launchpad explains the problem rather than choosing another folder.
+The move also waits for active threads, checkpoints, setup tasks and open terminals sharing the
+same checkout. Other worktrees can keep working. Pending prompts wait until the snapshot is ready;
+manually paused queues stay paused. The snapshot includes the whole checkout, including environment
+files and changes from other threads.
+Close local terminals when their work is finished. Programs detached from those terminals are outside
+this guard; stop any that could change the checkout during the move. If Launchpad cannot confirm
+that managed work has stopped, the move stays queued with an explanation. Cancel it to continue locally.
+Fresh VMs need their own Codex sign-in; follow the sign-in step in the thread to let preparation continue.
+Unsent drafts follow the thread on the device making the move. If both locations have a draft,
+choose which one to continue; Launchpad keeps the other copy. Reattach any files whose original
+machine is no longer reachable before sending them.
+After a saved workspace expires, **Reset VM** preserves the conversation and recreates the workspace
+at the Git commit uploaded during the move. Changes made inside the VM are discarded, and queued
+prompts stay paused until you resume them.
+
+If a VM becomes unavailable, open its controls and choose **Recover from backup…**.
+Recovery restores the selected workspace backup and the independently saved conversation;
+workspace changes made after the backup may be lost. Queued prompts remain paused.
+When the conversation or attachments are not completely saved, recovery stays unavailable
+and keeps the existing data.
+Open **Settings → VM threads** to read saved conversations without starting a VM. Resume or restore
+the VM only when you want to work in it. Restoring a workspace keeps the prompt queue paused.
+
+Admins can configure the organization's VM limits and inactivity policy in
+**Settings → Organization → Thread VMs**. The timezone controls which days count toward
+idle deletion; Saturdays and Sundays are excluded. Saved workspace retention uses calendar days.
+Settings show which automatic actions the relay has enabled. Other members can view the current policy.

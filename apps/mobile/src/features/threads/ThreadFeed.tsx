@@ -1553,7 +1553,7 @@ function renderFeedEntry(
       );
       return (
         <View className="mb-5 items-end">
-          {message.author ? (
+          {message.author || message.workflowOrigin ? (
             <Text className="mb-1 pr-0.5 font-t3-medium text-xs text-foreground-secondary">
               {promptAttributionLabel(message)}
             </Text>

@@ -9,7 +9,7 @@ import {
 import { getThreadListV2OrderedSection } from "../features/threads/threadListV2";
 import { appAtomRegistry } from "./atom-registry";
 import { environmentServerConfigsAtom } from "./server";
-import { environmentThreadShells } from "./threads";
+import { navigationThreadShellsAtom } from "./threads";
 import { queuedThreadKeysAtom } from "./use-thread-outbox";
 
 // Covers lifecycle commands before a cross-section move can acquire an order hold.
@@ -53,7 +53,7 @@ export function beginPendingThreadOrder(pending: PendingThreadOrder) {
     if (current === null) return;
     const configs = appAtomRegistry.get(environmentServerConfigsAtom);
     const ordered = getThreadListV2OrderedSection({
-      threads: appAtomRegistry.get(environmentThreadShells.threadShellsAtom),
+      threads: appAtomRegistry.get(navigationThreadShellsAtom),
       section: current.section,
       now: new Date().toISOString(),
       queuedThreadKeys: appAtomRegistry.get(queuedThreadKeysAtom),
@@ -75,7 +75,7 @@ export function beginPendingThreadOrder(pending: PendingThreadOrder) {
   refreshPendingOrder = refresh;
   appAtomRegistry.set(pendingThreadOrderAtom, pending);
   unsubscribers.push(
-    appAtomRegistry.subscribe(environmentThreadShells.threadShellsAtom, refresh),
+    appAtomRegistry.subscribe(navigationThreadShellsAtom, refresh),
     appAtomRegistry.subscribe(environmentServerConfigsAtom, refresh),
     appAtomRegistry.subscribe(queuedThreadKeysAtom, refresh),
   );

@@ -1,3 +1,4 @@
+import type { WorkflowAttribution } from "@t3tools/contracts";
 import {
   CurrentIssueTrackerAuthorization,
   readTurnAuthorization,
@@ -9,12 +10,16 @@ import {
   resolveIssueWrite,
 } from "../../mcp/IssueTrackerApprovalBroker.ts";
 import { withWorkspaceLease } from "../../workspace/workspaceLease.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
+import { checkoutCaptureReleases } from "../../workspace/CheckoutCaptureSignals.ts";
+import { resolveCheckoutPath } from "../../workspace/CheckoutAccess.ts";
 import {
   type ChatAttachment,
   type AuthSessionUser,
   CommandId,
   EventId,
-  type ModelSelection,
+  MessageId,
+  ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
   type ProjectId,
@@ -42,16 +47,26 @@ import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
+import { WorkflowRunStore } from "../../jobs/WorkflowRunStore.ts";
+import {
+  activeWorkflowStep,
+  workflowPromptId,
+  workflowAllowsPrompt,
+} from "../../jobs/workflowSequence.ts";
+import type { WorkflowProviderContinuation } from "../../provider/Services/ProviderService.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterValidationError,
+  ProviderAdapterSessionNotFoundError,
   ProviderValidationError,
   ProviderWorkspaceMissingError,
+  ProviderExecutionError,
 } from "../../provider/Errors.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
@@ -81,9 +96,12 @@ import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 const isProviderAdapterProcessError = Schema.is(ProviderAdapterProcessError);
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationError);
+const isProviderAdapterSessionNotFoundError = Schema.is(ProviderAdapterSessionNotFoundError);
 const isProviderValidationError = Schema.is(ProviderValidationError);
+const isProviderExecutionError = Schema.is(ProviderExecutionError);
 const isProviderWorkspaceMissingError = Schema.is(ProviderWorkspaceMissingError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
+const modelSelectionsEqual = Schema.toEquivalence(ModelSelection);
 
 type ProviderIntentEvent = Extract<
   OrchestrationEvent,
@@ -111,19 +129,26 @@ function toNonEmptyProviderInput(value: string | undefined): string | undefined 
 function attributedPrompt(
   text: string,
   identities: {
+    workflowOrigin?: WorkflowAttribution | undefined;
     author?: AuthSessionUser | undefined;
     editedBy?: AuthSessionUser | undefined;
     steeredBy?: AuthSessionUser | undefined;
   },
   shared = false,
 ) {
-  if ((!shared && !identities.author) || text.trimStart().startsWith("/")) return text;
+  if (
+    (!shared && !identities.author && !identities.workflowOrigin) ||
+    text.trimStart().startsWith("/")
+  )
+    return text;
   const label = (actor: AuthSessionUser) =>
     `${actor.displayName ?? actor.userId} (${actor.userId})`.replace(/[\r\n[\]]/g, " ");
   const labels = [
-    identities.author
-      ? `Submitted by ${label(identities.author)}`
-      : "Submitted by an unidentified teammate",
+    identities.workflowOrigin
+      ? `Started by workflow ${identities.workflowOrigin.workflowName.replace(/[\r\n[\]]/g, " ")}`
+      : identities.author
+        ? `Submitted by ${label(identities.author)}`
+        : "Submitted by an unidentified teammate",
     identities.editedBy ? `edited by ${label(identities.editedBy)}` : undefined,
     identities.steeredBy ? `steered by ${label(identities.steeredBy)}` : undefined,
   ]
@@ -256,12 +281,15 @@ const make = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerAuthService = yield* ProviderAuthService;
   const providerService = yield* ProviderService;
+  const workflows = yield* WorkflowRunStore;
   const providerRegistry = yield* ProviderRegistry;
   const gitWorkflow = yield* GitWorkflowService;
   const reactorScope = yield* Effect.scope;
   const promptNow = Effect.map(DateTime.now, DateTime.formatIso);
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const sql = yield* SqlClient.SqlClient;
+  const captures = makeCheckoutCapture(sql);
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const textGeneration = yield* TextGeneration;
   const serverSettingsService = yield* ServerSettingsService;
@@ -294,6 +322,7 @@ const make = Effect.gen(function* () {
   const threadModelSelections = new Map<string, ModelSelection>();
   const compactingThreadIds = new Set<ThreadId>();
   type QueuedTurnStart = Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>;
+  const turnsAfterCheckoutCapture = new Map<string, QueuedTurnStart>();
   // Turn starts received while a thread compacts, replayed in order once its session is restored.
   const turnsAfterCompaction = new Map<ThreadId, Array<QueuedTurnStart>>();
   // Replay command id → the queued turn start it re-requests. `sent` settles once the replay's
@@ -321,6 +350,7 @@ const make = Effect.gen(function* () {
     readonly turnId: TurnId | null;
     readonly createdAt: string;
     readonly requestId?: string;
+    readonly stopCommandId?: string | undefined;
   }) =>
     Effect.all({
       commandId: serverCommandId("provider-failure-activity"),
@@ -339,6 +369,7 @@ const make = Effect.gen(function* () {
             payload: {
               detail: input.detail,
               ...(input.requestId ? { requestId: input.requestId } : {}),
+              ...(input.stopCommandId ? { stopCommandId: input.stopCommandId } : {}),
             },
             turnId: input.turnId,
             createdAt: input.createdAt,
@@ -355,6 +386,12 @@ const make = Effect.gen(function* () {
     const queued = turnsAfterCompaction.get(threadId) ?? [];
     turnsAfterCompaction.delete(threadId);
     for (const event of queued) {
+      const admission = yield* captures.lookupAdmission(
+        threadId,
+        `request:${event.commandId ?? event.eventId}`,
+        "provider",
+      );
+      if (admission) yield* captures.completeUnboundRequest(admission.admissionId);
       yield* appendProviderFailureActivity({
         threadId,
         kind: "provider.turn.start.failed",
@@ -380,25 +417,41 @@ const make = Effect.gen(function* () {
       if (turnsAfterCompaction.get(threadId) !== queued) return;
       // In flight from here on: a cancellation reports it when the replay runs, not from the queue.
       queued.shift();
-      if (Option.isNone(turnStart)) continue;
+      if (Option.isNone(turnStart)) {
+        const admission = yield* captures.lookupAdmission(
+          threadId,
+          `request:${event.commandId ?? event.eventId}`,
+          "provider",
+        );
+        if (admission) yield* captures.completeUnboundRequest(admission.admissionId);
+        continue;
+      }
       // Reissue the durable request after restoration clears compaction's
       // pending slot. Reusing the message id preserves a single user bubble.
       const commandId = yield* serverCommandId("after-compaction");
       const sent = yield* Deferred.make<void>();
+      const accepted = yield* captures.lookupAdmission(
+        threadId,
+        `request:${event.commandId ?? event.eventId}`,
+        "provider",
+      );
       resumedTurnStarts.set(commandId, { event, queued, sent });
       const { messageId, ...request } = event.payload;
       yield* orchestrationEngine
-        .dispatch({
-          type: "thread.turn.start",
-          commandId,
-          ...request,
-          message: {
-            messageId,
-            role: "user",
-            text: turnStart.value.message.text,
-            attachments: turnStart.value.message.attachments ?? [],
+        .dispatch(
+          {
+            type: "thread.turn.start",
+            commandId,
+            ...request,
+            message: {
+              messageId,
+              role: "user",
+              text: turnStart.value.message.text,
+              attachments: turnStart.value.message.attachments ?? [],
+            },
           },
-        })
+          accepted ? { parentCheckoutAdmissionId: accepted.admissionId } : undefined,
+        )
         .pipe(
           Effect.onError(() =>
             Effect.sync(() => {
@@ -424,6 +477,7 @@ const make = Effect.gen(function* () {
     if (isProviderAdapterValidationError(failReason?.error)) {
       return failReason.error.issue;
     }
+    if (isProviderExecutionError(failReason?.error)) return failReason.error.message;
     if (isProviderWorkspaceMissingError(failReason?.error)) {
       return failReason.error.message;
     }
@@ -590,6 +644,20 @@ const make = Effect.gen(function* () {
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
+  const threadCheckoutScope = Effect.fnUntraced(function* (thread: {
+    readonly projectId: ProjectId;
+    readonly worktreePath: string | null;
+  }) {
+    const project = yield* resolveProject(thread.projectId);
+    if (!project) return;
+    const checkoutRoot = yield* resolveCheckoutPath(
+      thread.worktreePath ?? project.workspaceRoot,
+      fileSystem,
+      path,
+    );
+    return { checkoutRoot, gitCommonRoot: checkoutRoot };
+  });
+
   const resolveThreadDetail = Effect.fnUntraced(function* (threadId: ThreadId) {
     return yield* projectionSnapshotQuery
       .getThreadDetailById(threadId, { activityKinds: [] })
@@ -628,6 +696,78 @@ const make = Effect.gen(function* () {
     });
   });
 
+  const workflowAttempt = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    messageId: MessageId,
+    capturedJobId?: string,
+  ) {
+    const run = capturedJobId
+      ? yield* workflows.get(capturedJobId)
+      : yield* workflows.getByThread(threadId);
+    if (!run && !capturedJobId) return undefined;
+    if (
+      !run ||
+      run.progress.threadId !== threadId ||
+      !run.executionReserved ||
+      !workflowAllowsPrompt(run, messageId) ||
+      !["preparing", "running"].includes(run.progress.status) ||
+      activeWorkflowStep(run)?.kind !== "agent" ||
+      workflowPromptId(run) !== messageId ||
+      !run.providerContinuation
+    )
+      return yield* new ProviderAdapterValidationError({
+        provider: "unknown",
+        operation: "sendTurn",
+        issue:
+          "The workflow prompt no longer owns the current Agent step, or its original provider identity is unavailable.",
+      });
+    const info = yield* providerService.getInstanceInfo(run.modelSelection.instanceId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterValidationError({
+            provider: run.providerContinuation!.driver,
+            operation: "sendTurn",
+            issue: cause.message,
+          }),
+      ),
+    );
+    if (
+      !info.enabled ||
+      info.driverKind !== run.providerContinuation.driver ||
+      info.continuationIdentity.continuationKey !== run.providerContinuation.continuationKey
+    )
+      return yield* new ProviderAdapterValidationError({
+        provider: run.providerContinuation.driver,
+        operation: "sendTurn",
+        issue:
+          "The Agent provider's continuation identity changed or is unavailable. Cancel this job before starting again.",
+      });
+    const thread = yield* projectionSnapshotQuery
+      .getThreadDetailById(threadId)
+      .pipe(Effect.map(Option.getOrUndefined), Effect.orDie);
+    const queued = thread?.promptQueue?.entries.find((prompt) => prompt.messageId === messageId);
+    const selection = queued?.kind === "prompt" ? queued.modelSelection : undefined;
+    if (!selection || !modelSelectionsEqual(selection, run.modelSelection))
+      return yield* new ProviderAdapterValidationError({
+        provider: run.providerContinuation.driver,
+        operation: "sendTurn",
+        issue: "The queued prompt no longer matches the workflow's frozen Agent model selection.",
+      });
+    const firstSession =
+      thread?.session === null &&
+      thread.latestTurn === null &&
+      !thread.messages.some((message) => message.role === "user") &&
+      (thread.promptQueue?.admissions.length ?? 0) === 0 &&
+      thread.promptQueue?.pauseReason?.code !== "delivery-unknown" &&
+      !run.sequence?.completed.some((step) => step.checkpoint !== null);
+    return {
+      jobId: run.jobId,
+      ...run.providerContinuation,
+      firstSession,
+      messageId,
+    } satisfies WorkflowProviderContinuation;
+  });
+
   const ensureSessionForThread = Effect.fn("ensureSessionForThread")(function* (
     threadId: ThreadId,
     createdAt: string,
@@ -635,6 +775,7 @@ const make = Effect.gen(function* () {
       readonly modelSelection?: ModelSelection;
       readonly pendingTurnStart?: boolean;
       readonly personalTurn?: boolean;
+      readonly workflowContinuation?: WorkflowProviderContinuation;
     },
   ) {
     yield* deletion.drainThrough(yield* orchestrationEngine.latestSequence, threadId);
@@ -643,6 +784,12 @@ const make = Effect.gen(function* () {
       return yield* Effect.die(new Error(`Thread '${threadId}' was not found in read model.`));
     }
 
+    const ownedWorkflow = yield* workflows.getByThread(threadId);
+    const workflowContinuation =
+      options?.workflowContinuation ??
+      (ownedWorkflow?.providerContinuation
+        ? { jobId: ownedWorkflow.jobId, ...ownedWorkflow.providerContinuation }
+        : undefined);
     const desiredRuntimeMode = thread.runtimeMode;
     const requestedModelSelection = options?.modelSelection;
     const resolveActiveSession = (threadId: ThreadId) =>
@@ -693,20 +840,6 @@ const make = Effect.gen(function* () {
         : thread.modelSelection.instanceId;
     const desiredModelSelection = requestedModelSelection ?? thread.modelSelection;
     const desiredInstanceId = desiredModelSelection.instanceId;
-    const currentInfo = yield* providerService.getInstanceInfo(currentInstanceId).pipe(
-      Effect.mapError(
-        () =>
-          new ProviderAdapterRequestError({
-            provider: providerErrorLabelFromInstanceHint({
-              instanceId: String(currentInstanceId),
-              modelSelectionInstanceId: String(thread.modelSelection.instanceId),
-              sessionProvider: thread.session?.providerName ?? undefined,
-            }),
-            method: "thread.turn.start",
-            detail: `Thread '${threadId}' references unknown provider instance '${currentInstanceId}'. The instance is not configured in this build.`,
-          }),
-      ),
-    );
     const desiredInfo = yield* providerService.getInstanceInfo(desiredInstanceId).pipe(
       Effect.mapError(
         () =>
@@ -719,6 +852,30 @@ const make = Effect.gen(function* () {
           }),
       ),
     );
+    const currentInfo =
+      workflowContinuation && !activeSession
+        ? {
+            ...desiredInfo,
+            driverKind: workflowContinuation.driver,
+            continuationIdentity: {
+              driverKind: workflowContinuation.driver,
+              continuationKey: workflowContinuation.continuationKey,
+            },
+          }
+        : yield* providerService.getInstanceInfo(currentInstanceId).pipe(
+            Effect.mapError(
+              () =>
+                new ProviderAdapterRequestError({
+                  provider: providerErrorLabelFromInstanceHint({
+                    instanceId: String(currentInstanceId),
+                    modelSelectionInstanceId: String(thread.modelSelection.instanceId),
+                    sessionProvider: thread.session?.providerName ?? undefined,
+                  }),
+                  method: "thread.turn.start",
+                  detail: `Thread '${threadId}' references unknown provider instance '${currentInstanceId}'. The instance is not configured in this build.`,
+                }),
+            ),
+          );
     const desiredDriverKind = desiredInfo.driverKind;
     if (!isProviderDriverKind(desiredDriverKind)) {
       return yield* new ProviderAdapterRequestError({
@@ -797,16 +954,20 @@ const make = Effect.gen(function* () {
       readonly provider?: ProviderDriverKind;
     }) =>
       providerService
-        .startSession(threadId, {
+        .startSession(
           threadId,
-          ...(preferredProvider ? { provider: preferredProvider } : {}),
-          providerInstanceId: desiredInstanceId,
-          ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
-          ...(thread.title ? { title: thread.title } : {}),
-          modelSelection: desiredModelSelection,
-          ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
-          runtimeMode: desiredRuntimeMode,
-        })
+          {
+            threadId,
+            ...(preferredProvider ? { provider: preferredProvider } : {}),
+            providerInstanceId: desiredInstanceId,
+            ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+            ...(thread.title ? { title: thread.title } : {}),
+            modelSelection: desiredModelSelection,
+            ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+            runtimeMode: desiredRuntimeMode,
+          },
+          workflowContinuation ? { workflowContinuation } : undefined,
+        )
         .pipe(Effect.tap(() => refreshWorkspaceSnapshot));
 
     const bindSessionToThread = (session: ProviderSession) =>
@@ -913,6 +1074,7 @@ const make = Effect.gen(function* () {
   });
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
+    readonly workflowContinuation?: WorkflowProviderContinuation;
     readonly issueTrackerAuthorizationId?: string | undefined;
     readonly requirePersonalAuthorization?: boolean;
     readonly allowPersonalSteer?: boolean;
@@ -983,6 +1145,7 @@ const make = Effect.gen(function* () {
     }
     yield* ensureSessionForThread(input.threadId, input.createdAt, {
       ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+      ...(input.workflowContinuation ? { workflowContinuation: input.workflowContinuation } : {}),
       pendingTurnStart: true,
       personalTurn: true,
     }).pipe(
@@ -1349,6 +1512,17 @@ const make = Effect.gen(function* () {
       receivedEvent.commandId !== null ? resumedTurnStarts.get(receivedEvent.commandId) : undefined;
     const event = resumed ? { ...receivedEvent, payload: resumed.event.payload } : receivedEvent;
     const key = turnStartKeyForEvent(event);
+    const parentAdmissionId = yield* CheckoutAdmission;
+    const completeAcceptedStart = Effect.gen(function* () {
+      let id = parentAdmissionId;
+      while (id) {
+        const admitted = yield* captures.getAdmission(id);
+        if (!admitted) break;
+        yield* captures.completeUnboundRequest(id);
+        id = admitted.parentAdmissionId ?? undefined;
+      }
+    });
+    let crossedProviderBoundary = false;
     if (yield* hasHandledTurnStartRecently(key)) {
       return;
     }
@@ -1362,6 +1536,7 @@ const make = Effect.gen(function* () {
       messageId: event.payload.messageId,
     });
     if (Option.isNone(turnStart) || turnStart.value.message.role !== "user") {
+      yield* completeAcceptedStart;
       yield* appendProviderFailureActivity({
         threadId: event.payload.threadId,
         kind: "provider.turn.start.failed",
@@ -1375,15 +1550,19 @@ const make = Effect.gen(function* () {
     }
     const { message, hasOtherUserMessages } = turnStart.value;
     const appendTurnStartFailure = (summary: string, detail: string) =>
-      appendProviderFailureActivity({
-        threadId: event.payload.threadId,
-        kind: "provider.turn.start.failed",
-        summary,
-        detail,
-        turnId: null,
-        createdAt: event.payload.createdAt,
-        requestId: event.payload.messageId,
-      });
+      (!crossedProviderBoundary && parentAdmissionId ? completeAcceptedStart : Effect.void).pipe(
+        Effect.andThen(
+          appendProviderFailureActivity({
+            threadId: event.payload.threadId,
+            kind: "provider.turn.start.failed",
+            summary,
+            detail,
+            turnId: null,
+            createdAt: event.payload.createdAt,
+            requestId: event.payload.messageId,
+          }),
+        ),
+      );
     if (resumed && turnsAfterCompaction.get(event.payload.threadId) !== resumed.queued) {
       return yield* appendTurnStartFailure(
         "Queued message was not sent",
@@ -1391,14 +1570,34 @@ const make = Effect.gen(function* () {
       );
     }
 
-    const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
+    const handleTurnStartFailure = Effect.fnUntraced(function* (cause: Cause.Cause<unknown>) {
       if (Cause.hasInterruptsOnly(cause)) {
-        return Effect.void;
+        return;
       }
+      const failure = Cause.findErrorOption(cause);
+      const executionFailure =
+        Option.isSome(failure) && isProviderExecutionError(failure.value)
+          ? failure.value
+          : undefined;
+      if (executionFailure?.waitingForCheckout && !executionFailure.uncertain) {
+        turnsAfterCheckoutCapture.set(key, event);
+        yield* Cache.invalidate(handledTurnStartKeys, key);
+        return;
+      }
+      if (
+        parentAdmissionId &&
+        (!crossedProviderBoundary ||
+          executionFailure?.uncertain === false ||
+          (Option.isSome(failure) &&
+            (isProviderAdapterValidationError(failure.value) ||
+              isProviderAdapterSessionNotFoundError(failure.value) ||
+              isProviderValidationError(failure.value))))
+      )
+        yield* completeAcceptedStart;
       const detail = formatFailureDetail(cause);
       // Preserve the turn this follow-up targeted, even if it finished while
       // the steer was being rejected. A failed new turn still needs an error state.
-      return (
+      yield* (
         thread.session?.status === "running" || thread.session?.activeTurnId != null
           ? Effect.void
           : setThreadSessionErrorOnTurnStartFailure({
@@ -1410,7 +1609,7 @@ const make = Effect.gen(function* () {
         Effect.flatMap(() => appendTurnStartFailure("Provider turn start failed", detail)),
         Effect.asVoid,
       );
-    };
+    });
 
     const recoverTurnStartFailure = (cause: Cause.Cause<unknown>) =>
       handleTurnStartFailure(cause).pipe(
@@ -1472,6 +1671,7 @@ const make = Effect.gen(function* () {
       return true;
     }).pipe(Effect.catchCause((cause) => recoverTurnStartFailure(cause).pipe(Effect.as(true))));
     if (authCommandHandled) {
+      if (parentAdmissionId) yield* captures.complete(parentAdmissionId);
       return;
     }
 
@@ -1513,6 +1713,7 @@ const make = Effect.gen(function* () {
     }
 
     let compactionSessionEnsured = false;
+    let nativeCompactionCompleted = false;
     const handleCompactionFailure = (cause: Cause.Cause<unknown>) => {
       if (Cause.hasInterruptsOnly(cause)) {
         return Effect.void;
@@ -1542,8 +1743,24 @@ const make = Effect.gen(function* () {
         Effect.asVoid,
       );
     };
-    const recoverCompactionFailure = (cause: Cause.Cause<unknown>) =>
-      handleCompactionFailure(cause).pipe(
+    const recoverCompactionFailure = (cause: Cause.Cause<unknown>) => {
+      const failure = Cause.findErrorOption(cause);
+      const rejected =
+        parentAdmissionId &&
+        Option.isSome(failure) &&
+        (isProviderAdapterValidationError(failure.value) ||
+          isProviderAdapterSessionNotFoundError(failure.value) ||
+          isProviderValidationError(failure.value))
+          ? captures
+              .getAdmission(parentAdmissionId)
+              .pipe(
+                Effect.flatMap((admission) =>
+                  admission?.turnId === null ? captures.complete(parentAdmissionId) : Effect.void,
+                ),
+              )
+          : Effect.void;
+      return rejected.pipe(
+        Effect.andThen(handleCompactionFailure(cause)),
         Effect.catchCause((recoveryCause) =>
           Effect.logWarning("provider command reactor failed to recover compaction failure", {
             eventType: event.type,
@@ -1553,6 +1770,7 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
+    };
     if (isCompactCommand) {
       if (!hasOtherUserMessages) {
         return yield* appendTurnStartFailure(
@@ -1589,11 +1807,13 @@ const make = Effect.gen(function* () {
         if (event.payload.modelSelection !== undefined) {
           threadModelSelections.set(event.payload.threadId, event.payload.modelSelection);
         }
+        crossedProviderBoundary = true;
         const result = yield* providerService.compactThread(
           event.payload.threadId,
           event.payload.modelSelection,
           event.payload.messageId,
         );
+        nativeCompactionCompleted = result.type === "native";
         if (result.type === "turn" && result.outcome !== "completed") {
           return yield* new ProviderAdapterRequestError({
             provider: "unknown",
@@ -1603,6 +1823,13 @@ const make = Effect.gen(function* () {
         }
       }).pipe(
         Effect.andThen(restoreCompaction(event.payload.threadId, true)),
+        Effect.andThen(
+          Effect.suspend(() =>
+            nativeCompactionCompleted && parentAdmissionId
+              ? captures.complete(parentAdmissionId)
+              : Effect.void,
+          ),
+        ),
         Effect.andThen(clearCompacting),
         Effect.andThen(resumeTurnsAfterCompaction(event.payload.threadId)),
         Effect.catchCause((cause) =>
@@ -1657,6 +1884,7 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    crossedProviderBoundary = true;
     const send = providerService
       .sendTurn(sendTurnRequest.value)
       .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure));
@@ -1668,6 +1896,36 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const startTurnWithCheckoutAdmission = Effect.fnUntraced(function* (event: QueuedTurnStart) {
+    const thread = yield* resolveThreadShell(event.payload.threadId);
+    if (!thread) return;
+    const workId = `request:${event.commandId ?? event.eventId}`;
+    const prior = yield* captures.lookupAdmission(thread.id, workId, "provider");
+    let admissionId = prior?.admissionId;
+    if (!admissionId) {
+      const scope = yield* threadCheckoutScope(thread);
+      if (!scope) return;
+      const admitted = yield* captures
+        .admit({ ...scope, threadId: thread.id, workId, kind: "provider" })
+        .pipe(
+          Effect.catchTag("CheckoutCaptureError", (error) => {
+            if (!error.waitingForCheckout) return Effect.fail(error);
+            turnsAfterCheckoutCapture.set(turnStartKeyForEvent(event), event);
+            return Effect.void;
+          }),
+        );
+      if (!admitted) return;
+      admissionId = admitted.admissionId;
+    }
+    turnsAfterCheckoutCapture.delete(turnStartKeyForEvent(event));
+    const start = processTurnStartRequested(event).pipe(
+      Effect.provideService(CheckoutAdmission, admissionId),
+    );
+    yield* thread.worktreePath
+      ? withWorkspaceLease(path.resolve(thread.worktreePath), start)
+      : start;
+  });
+
   // This set owns only live fibers. The engine owns every durable queue transition.
   const executingPromptAttempts = new Set<CommandId>();
   const readPromptThread = (threadId: ThreadId) =>
@@ -1676,6 +1934,7 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     attemptId: CommandId,
   ) {
+    const parent = yield* captures.lookupAdmission(threadId, `request:${attemptId}`, "provider");
     let crossedProviderBoundary = false;
     let observedCompactionTerminal = false;
     let admittedTurnId: TurnId | undefined;
@@ -1699,7 +1958,15 @@ const make = Effect.gen(function* () {
       const queue = thread?.promptQueue;
       const handoff = queue?.handoff;
       const prompt = queue?.entries.find((entry) => entry.messageId === handoff?.messageId);
-      if (!thread || !queue || !handoff || handoff.attemptId !== attemptId || !prompt) return;
+      if (
+        !thread ||
+        !queue ||
+        !handoff ||
+        handoff.attemptId !== attemptId ||
+        !prompt ||
+        prompt.kind === "move"
+      )
+        return;
       const release = (detail: string, pause = false) =>
         Effect.flatMap(promptNow, (createdAt) =>
           orchestrationEngine.dispatch({
@@ -1847,6 +2114,7 @@ const make = Effect.gen(function* () {
               payload: { providerInstanceId: instanceId },
             },
           });
+          crossedProviderBoundary = false;
           return;
         }
       }
@@ -1880,6 +2148,7 @@ const make = Effect.gen(function* () {
           }
         }
       }
+      const continuation = yield* workflowAttempt(threadId, prompt.messageId);
       const request =
         handoff.mode === "steer"
           ? {
@@ -1890,6 +2159,7 @@ const make = Effect.gen(function* () {
               interactionMode: prompt.interactionMode,
             }
           : yield* buildSendTurnRequestForThread({
+              ...(continuation ? { workflowContinuation: continuation } : {}),
               issueTrackerAuthorizationId: prompt.issueTrackerAuthorizationId,
               requirePersonalAuthorization: Boolean(prompt.issueTrackerAuthorizationId),
               threadId,
@@ -1961,6 +2231,7 @@ const make = Effect.gen(function* () {
               "The prompt was stopped or its target changed before dispatch. It remains queued.",
           });
         }
+        yield* workflowAttempt(threadId, prompt.messageId, continuation?.jobId);
       });
       crossedProviderBoundary = true;
       if (isCompact) {
@@ -2009,6 +2280,7 @@ const make = Effect.gen(function* () {
             createdAt: yield* promptNow,
           });
         yield* restoreCompaction(threadId, true, admittedTurnId);
+        if (compaction.type === "native" && parent) yield* captures.complete(parent.admissionId);
       } else {
         yield* providerService.sendTurn(
           {
@@ -2024,6 +2296,7 @@ const make = Effect.gen(function* () {
       }
     });
     yield* run.pipe(
+      Effect.provideService(CheckoutAdmission, parent?.admissionId),
       Effect.catchCause((cause) =>
         Effect.gen(function* () {
           const detail = formatFailureDetail(cause);
@@ -2050,11 +2323,21 @@ const make = Effect.gen(function* () {
             return;
           }
           const failure = Cause.findErrorOption(cause);
+          const executionFailure =
+            Option.isSome(failure) && isProviderExecutionError(failure.value)
+              ? failure.value
+              : undefined;
           const provenRejected =
-            !crossedProviderBoundary ||
-            (Option.isSome(failure) &&
-              (isProviderAdapterValidationError(failure.value) ||
-                isProviderValidationError(failure.value)));
+            executionFailure !== undefined
+              ? !executionFailure.uncertain
+              : !crossedProviderBoundary ||
+                (Option.isSome(failure) &&
+                  (isProviderAdapterValidationError(failure.value) ||
+                    isProviderAdapterSessionNotFoundError(failure.value) ||
+                    isProviderValidationError(failure.value)));
+          const waitingForCheckout =
+            executionFailure?.waitingForCheckout === true && !executionFailure.uncertain;
+          if (provenRejected && parent) yield* captures.complete(parent.admissionId);
           const current = yield* readPromptThread(threadId);
           if (provenRejected && current?.promptQueue?.handoff?.attemptId === attemptId) {
             yield* orchestrationEngine.dispatch({
@@ -2064,7 +2347,9 @@ const make = Effect.gen(function* () {
               attemptId,
               detail,
               pause:
-                current.promptQueue.enabled && current.promptQueue.handoff.mode === "next-turn",
+                !waitingForCheckout &&
+                current.promptQueue.enabled &&
+                current.promptQueue.handoff.mode === "next-turn",
               createdAt: yield* promptNow,
             });
           } else {
@@ -2077,6 +2362,7 @@ const make = Effect.gen(function* () {
               createdAt: yield* promptNow,
             });
           }
+          if (waitingForCheckout) return;
           yield* appendProviderFailureActivity({
             threadId,
             kind: "provider.turn.start.failed",
@@ -2086,6 +2372,13 @@ const make = Effect.gen(function* () {
             createdAt: yield* promptNow,
           });
         }),
+      ),
+      Effect.ensuring(
+        Effect.suspend(() =>
+          !crossedProviderBoundary && parent
+            ? captures.complete(parent.admissionId).pipe(Effect.orDie)
+            : Effect.void,
+        ),
       ),
       Effect.ensuring(Effect.sync(() => void executingPromptAttempts.delete(attemptId))),
     );
@@ -2117,6 +2410,7 @@ const make = Effect.gen(function* () {
     const head = queue.entries[0];
     if (
       !head ||
+      head.kind === "move" ||
       !queue.enabled ||
       (queue.preparation !== undefined && queue.preparation.state !== "ready") ||
       head.state !== "pending" ||
@@ -2126,6 +2420,16 @@ const make = Effect.gen(function* () {
       compactingThreadIds.has(threadId)
     )
       return;
+    const scope = yield* threadCheckoutScope(thread);
+    if (scope) {
+      const accepting = yield* captures.assertAccepting(scope).pipe(
+        Effect.as(true),
+        Effect.catchTag("CheckoutCaptureError", (error) =>
+          error.waitingForCheckout ? Effect.succeed(false) : Effect.fail(error),
+        ),
+      );
+      if (!accepting) return;
+    }
     yield* orchestrationEngine
       .dispatch({
         type: "thread.prompt.claim",
@@ -2136,7 +2440,12 @@ const make = Effect.gen(function* () {
         expectedControlRevision: queue.revision,
         createdAt: yield* promptNow,
       })
-      .pipe(Effect.catchTag("OrchestrationCommandInvariantError", () => Effect.void));
+      .pipe(
+        Effect.catchTag(
+          ["OrchestrationCommandInvariantError", "ThreadExecutionFenceError"],
+          () => Effect.void,
+        ),
+      );
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -2152,14 +2461,35 @@ const make = Effect.gen(function* () {
     }
     const session = thread.session;
     if (!session || session.status === "stopped") {
-      return yield* appendProviderFailureActivity({
-        threadId: event.payload.threadId,
-        kind: "provider.turn.interrupt.failed",
-        summary: "Provider turn interrupt failed",
-        detail: "No active provider session is bound to this thread.",
-        turnId: event.payload.turnId ?? null,
-        createdAt: event.payload.createdAt,
-      });
+      // Queue pause also requests an interrupt when the provider is already stopped.
+      return;
+    }
+    if (
+      session.status === "ready" &&
+      session.activeTurnId === null &&
+      event.payload.turnId === undefined &&
+      !thread.hasPendingApprovals &&
+      !thread.hasPendingUserInput &&
+      !thread.backgroundLiveness &&
+      !compactingThreadIds.has(thread.id)
+    ) {
+      const current = yield* resolveThreadDetail(thread.id);
+      const queue = current?.promptQueue;
+      if (
+        current?.session?.status === "ready" &&
+        current.session.activeTurnId === null &&
+        (!current.latestTurn ||
+          (current.latestTurn.state !== "running" && current.latestTurn.completedAt !== null)) &&
+        !compactingThreadIds.has(thread.id) &&
+        !queue?.handoff &&
+        !queue?.awaitingTurnId &&
+        !queue?.admissions.length &&
+        (!queue?.preparation || queue.preparation.settled) &&
+        (!queue || queue.entries.every((entry) => entry.state === "pending"))
+      ) {
+        // Interrupting a missing idle runtime would recover it just to stop no turn.
+        return;
+      }
     }
 
     const recoverInterruptFailure = (cause: Cause.Cause<unknown>) => {
@@ -2368,7 +2698,8 @@ const make = Effect.gen(function* () {
       "The session was stopped during context compaction. Send this message again to continue.",
     ).pipe(
       Effect.andThen(
-        thread.session && thread.session.status !== "stopped"
+        (thread.session && thread.session.status !== "stopped") ||
+          (yield* workflows.getByThread(thread.id))
           ? providerService.stopSession({ threadId: thread.id })
           : Effect.void,
       ),
@@ -2391,6 +2722,7 @@ const make = Effect.gen(function* () {
                 kind: "provider.session.stop.failed",
                 summary: "Provider session stop failed",
                 detail,
+                stopCommandId: event.commandId ?? undefined,
                 turnId: null,
                 createdAt: now,
               }),
@@ -2468,10 +2800,7 @@ const make = Effect.gen(function* () {
       }
       case "thread.turn-start-requested": {
         if (event.metadata.queueAdmission === true) return;
-        const thread = yield* resolveThreadShell(event.payload.threadId);
-        yield* thread?.worktreePath
-          ? withWorkspaceLease(path.resolve(thread.worktreePath), processTurnStartRequested(event))
-          : processTurnStartRequested(event);
+        yield* startTurnWithCheckoutAdmission(event);
         return;
       }
       case "thread.turn-interrupt-requested":
@@ -2530,7 +2859,45 @@ const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
+  const resumeAfterCheckoutCapture = Effect.fnUntraced(function* (checkoutRoot: string) {
+    const threads = yield* sql<{ threadId: ThreadId; checkoutRoot: string }>`
+      SELECT t.thread_id AS "threadId", COALESCE(t.worktree_path, p.workspace_root) AS "checkoutRoot"
+      FROM projection_threads t JOIN projection_projects p ON p.project_id=t.project_id
+      WHERE t.deleted_at IS NULL AND p.deleted_at IS NULL
+    `;
+    for (const thread of threads) {
+      const root = yield* resolveCheckoutPath(thread.checkoutRoot, fileSystem, path).pipe(
+        Effect.catchTag("PlatformError", (cause) =>
+          Effect.logWarning("provider command reactor could not resolve a checkout after capture", {
+            threadId: thread.threadId,
+            checkoutRoot: thread.checkoutRoot,
+            cause: cause.message,
+          }).pipe(Effect.as(undefined)),
+        ),
+      );
+      if (root === undefined) continue;
+      const contains = (parent: string, child: string) => {
+        const relative = path.relative(parent, child);
+        return (
+          relative === "" ||
+          (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+        );
+      };
+      if (!contains(root, checkoutRoot) && !contains(checkoutRoot, root)) continue;
+      for (const event of turnsAfterCheckoutCapture.values())
+        if (event.payload.threadId === thread.threadId) yield* worker.enqueue(event);
+      yield* worker.drain;
+      yield* advancePromptQueue(thread.threadId);
+    }
+  });
+
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
+    yield* checkoutCaptureReleases(sql).pipe(
+      Stream.runForEach((root) =>
+        forkParked(resumeAfterCheckoutCapture(root).pipe(Effect.ignoreCause({ log: true }))),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
     const pendingTitles = yield* findPendingThreadTitles().pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -2566,24 +2933,28 @@ const make = Effect.gen(function* () {
     // Subscribe before returning, even while event handling waits for server activation.
     const recoverPromptQueues = Effect.gen(function* () {
       const snapshot = yield* projectionSnapshotQuery.getCommandReadModel();
-      for (const thread of snapshot.threads) {
-        const queue = thread.promptQueue;
-        if (!queue) continue;
-        const attempts = queue.handoff
-          ? [queue.handoff.attemptId]
-          : queue.admissions.map((admission) => admission.attemptId);
-        for (const attemptId of attempts)
-          yield* orchestrationEngine.dispatch({
-            type: "thread.prompt.unknown",
-            commandId: yield* serverCommandId("prompt-recovery"),
-            threadId: thread.id,
-            attemptId,
-            detail:
-              "The server restarted during provider work. Review provider history, then explicitly resolve delivery before resuming.",
-            createdAt: yield* promptNow,
-          });
-        if (attempts.length === 0) yield* advancePromptQueue(thread.id);
-      }
+      for (const thread of snapshot.threads)
+        yield* Effect.gen(function* () {
+          const queue = thread.promptQueue;
+          if (!queue) return;
+          const attempts = queue.handoff
+            ? [queue.handoff.attemptId]
+            : queue.admissions.map((admission) => admission.attemptId);
+          for (const attemptId of attempts)
+            yield* orchestrationEngine.dispatch({
+              type: "thread.prompt.unknown",
+              commandId: yield* serverCommandId("prompt-recovery"),
+              threadId: thread.id,
+              attemptId,
+              detail:
+                "The server restarted during provider work. Review provider history, then explicitly resolve delivery before resuming.",
+              createdAt: yield* promptNow,
+            });
+          if (attempts.length === 0) yield* advancePromptQueue(thread.id);
+        }).pipe(
+          // A held/moved thread must not prevent recovery of other threads or stop the live consumer.
+          Effect.catchTag("ThreadExecutionFenceError", () => Effect.void),
+        );
     });
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
     yield* forkParked(

@@ -40,6 +40,7 @@ import {
   stopThreadSession,
   unsettleThread,
 } from "./commands.ts";
+import { ThreadCommandRouting } from "./commandRouting.ts";
 
 const TEST_CRYPTO_LAYER = Layer.succeed(
   Crypto.Crypto,
@@ -89,6 +90,97 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("environment commands", () => {
+  it.effect.each(["accepted", "changed_before_send", "changed_during_authorization"] as const)(
+    "authorizes an offline portable prompt before relay admission: %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const local: ClientOrchestrationCommand[] = [];
+        const routed: ClientOrchestrationCommand[] = [];
+        const supervisor = yield* makeSupervisor(local);
+        yield* SubscriptionRef.set(supervisor.session, Option.none());
+        const registry = AtomRegistry.make();
+        const session = (accountId: string) => ({
+          accountId,
+          readClerkToken: () => Effect.succeed(`${accountId}-token`),
+        });
+        registry.set(
+          managedRelaySessionAtom,
+          session(scenario === "changed_before_send" ? "bob" : "alice"),
+        );
+        const requests: Request[] = [];
+        const fetch: typeof globalThis.fetch = async (input, init) => {
+          const request = new Request(input, init);
+          requests.push(request);
+          expect(routed).toHaveLength(0);
+          expect(request.headers.get("authorization")).toBe("Bearer alice-token");
+          expect(await request.json()).toMatchObject({
+            environmentId: TARGET.environmentId,
+            threadId: "portable-thread",
+            commandId: "portable-command",
+            commandDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          });
+          if (scenario === "changed_during_authorization")
+            registry.set(managedRelaySessionAtom, session("bob"));
+          return Response.json({ authorization: "personal-grant" });
+        };
+        const outcome = yield* startThreadTurn({
+          expectedAccountId: "alice",
+          commandId: CommandId.make("portable-command"),
+          threadId: ThreadId.make("portable-thread"),
+          message: {
+            messageId: MessageId.make("portable-message"),
+            role: "user",
+            text: "Continue on the VM",
+            attachments: [],
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: "2026-10-26T12:00:00.000Z",
+        }).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.provideService(IssueTrackerClientRegistry, registry),
+          Effect.provideService(ManagedRelayClient, {
+            relayUrl: "https://relay.test",
+          } as ManagedRelayClient["Service"]),
+          Effect.provideService(FetchHttpClient.Fetch, fetch),
+          Effect.provideService(
+            Crypto.Crypto,
+            Crypto.make({
+              randomBytes: (size) => new Uint8Array(size),
+              digest: () => Effect.succeed(new Uint8Array(32)),
+            }),
+          ),
+          Effect.provideService(ThreadCommandRouting, {
+            remember: () => {},
+            isPortable: () => true,
+            receipt: () => Effect.succeed(null),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                routed.push(command);
+                return { relay: { commandId: command.commandId, position: 1, receipt: null } };
+              }),
+          }),
+          Effect.result,
+          Effect.ensuring(Effect.sync(() => registry.dispose())),
+        );
+        expect(local).toHaveLength(0);
+        expect(requests).toHaveLength(scenario === "changed_before_send" ? 0 : 1);
+        if (scenario === "accepted") {
+          expect(outcome).toMatchObject({
+            _tag: "Success",
+            success: { relay: { commandId: "portable-command", receipt: null } },
+          });
+          expect(routed).toMatchObject([
+            { type: "thread.prompt.enqueue", issueTrackerAuthorization: "personal-grant" },
+          ]);
+          expect(routed[0]).not.toHaveProperty("expectedAccountId");
+        } else {
+          expect(outcome._tag).toBe("Failure");
+          expect(routed).toHaveLength(0);
+        }
+      }),
+  );
+
   it.effect(
     "approves an issue write with the personal relay before notifying the environment",
     () =>

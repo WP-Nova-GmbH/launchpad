@@ -85,8 +85,31 @@
       "entry": ["src/*NativeComponent.ts!"],
     },
     "infra/relay": {
-      // GitHub App setup runs by hand from the repository root.
-      "entry": ["alchemy.run.ts!", "src/persistence/schema.ts!", "scripts/create-github-app.ts"],
+      // Setup, preflight, and smoke/proof scripts run directly; portability
+      // scripts are also bundled and launched by filename.
+      "entry": [
+        "alchemy.run.ts!",
+        "src/persistence/schema.ts!",
+        "scripts/create-github-app.ts",
+        "scripts/build-codex-portability-proof.mjs",
+        "scripts/codex-portability-proof.mjs",
+        "scripts/dev-vm-preflight.ts",
+        // TypeScript uses this declaration for the template builder's .mjs module.
+        "scripts/e2b-build-template.d.mts",
+        "scripts/e2b-codex-portability-smoke.mjs",
+        "scripts/e2b-disk-retention-smoke.mjs",
+        "scripts/e2b-enrollment-smoke.mjs",
+        "scripts/e2b-lifetime-smoke.ts",
+        "scripts/e2b-prepared-restore-smoke.mjs",
+        "scripts/e2b-private-ingress-proof.mjs",
+        "scripts/e2b-restore-smoke.ts",
+        "scripts/e2b-runner-smoke.mjs",
+        "scripts/e2b-stop-smoke.mjs",
+        "scripts/e2b-workspace-portability-smoke.mjs",
+        "scripts/preview-cloudflare-smoke.mjs",
+        "scripts/run-codex-portability-proof.mjs",
+        "scripts/workspace-portability-proof.mjs",
+      ],
     },
     "packages/*": {
       // These workspace packages are private to this monorepo.

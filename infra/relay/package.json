@@ -23,7 +23,9 @@
     "@t3tools/shared": "workspace:*",
     "alchemy": "2.0.0-beta.79",
     "drizzle-orm": "1.0.0-rc.5-ab785fc",
-    "effect": "catalog:"
+    "e2b": "2.46.1",
+    "effect": "catalog:",
+    "tldts": "7.4.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260601.1",

@@ -288,6 +288,7 @@ export class GitHubCli extends Context.Service<
     }) => Effect.Effect<VcsProcess.VcsProcessOutput, GitHubCliError>;
 
     readonly listOpenPullRequests: (input: {
+      readonly repository?: string;
       readonly cwd: string;
       readonly headSelector: string;
       readonly limit?: number;
@@ -295,6 +296,7 @@ export class GitHubCli extends Context.Service<
     }) => Effect.Effect<ReadonlyArray<GitHubPullRequestSummary>, GitHubCliError>;
 
     readonly getPullRequest: (input: {
+      readonly repository?: string;
       readonly cwd: string;
       readonly reference: string;
       readonly rateLimitHost?: string;
@@ -312,12 +314,13 @@ export class GitHubCli extends Context.Service<
     }) => Effect.Effect<GitHubRepositoryCloneUrls, GitHubCliError>;
 
     readonly createPullRequest: (input: {
+      readonly repository?: string;
       readonly cwd: string;
       readonly baseBranch: string;
       readonly headSelector: string;
       readonly title: string;
       readonly bodyFile: string;
-    }) => Effect.Effect<void, GitHubCliError>;
+    }) => Effect.Effect<void | { readonly url: string | null }, GitHubCliError>;
 
     readonly getDefaultBranch: (input: {
       readonly cwd: string;
@@ -524,6 +527,7 @@ export const make = Effect.gen(function* () {
         args: [
           "pr",
           "list",
+          ...(input.repository ? ["--repo", input.repository] : []),
           "--head",
           input.headSelector,
           "--state",
@@ -563,6 +567,7 @@ export const make = Effect.gen(function* () {
         args: [
           "pr",
           "view",
+          ...(input.repository ? ["--repo", input.repository] : []),
           input.reference,
           "--json",
           "number,title,url,baseRefName,headRefName,state,isDraft,mergedAt,closedAt,updatedAt,isCrossRepository,headRepository,headRepositoryOwner",
@@ -622,6 +627,7 @@ export const make = Effect.gen(function* () {
         args: [
           "pr",
           "create",
+          ...(input.repository ? ["--repo", input.repository] : []),
           "--base",
           input.baseBranch,
           "--head",
@@ -631,7 +637,15 @@ export const make = Effect.gen(function* () {
           "--body-file",
           input.bodyFile,
         ],
-      }).pipe(Effect.asVoid),
+      }).pipe(
+        Effect.map((result) => ({
+          url:
+            result.stdout
+              .trim()
+              .split(/\s/)
+              .find((value) => value.startsWith("https://")) ?? null,
+        })),
+      ),
     getDefaultBranch: (input) =>
       execute({
         cwd: input.cwd,

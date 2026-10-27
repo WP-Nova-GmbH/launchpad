@@ -1748,7 +1748,7 @@ function WorktreeSetupTimelineRow({
     <WorktreeSetupCard
       snapshot={row.snapshot}
       embedded={row.embedded}
-      onCancel={row.embedded ? null : ctx.onCancelWorktreeSetup}
+      onCancel={ctx.onCancelWorktreeSetup}
       onWorkLocally={
         !row.embedded && row.snapshot.phase === "running" ? ctx.onWorktreeSetupWorkLocally : null
       }
@@ -2107,7 +2107,9 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
     <div className="group flex flex-col items-end gap-1">
       <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
         <MessageAuthorHeading>
-          {author?.displayName ?? (author ? "Teammate" : "You")}
+          {row.message.workflowOrigin
+            ? `Workflow · ${row.message.workflowOrigin.workflowName}`
+            : (author?.displayName ?? (author ? "Teammate" : "You"))}
         </MessageAuthorHeading>
         {(regularImages.length > 0 || userVideos.length > 0) && (
           <div className="mb-2 grid max-w-[210px] grid-cols-2 gap-2">

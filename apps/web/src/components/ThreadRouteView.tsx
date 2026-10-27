@@ -1,4 +1,7 @@
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
+import { connectionStatusText } from "@t3tools/client-runtime/connection";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { useAtomValue } from "@effect/atom-react";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
@@ -7,6 +10,11 @@ import ChatView from "./ChatView";
 import { resolveDraftPromotionNavigationTarget, threadHasStarted } from "./ChatView.logic";
 import { waitForDraftHeroTransition } from "./chat/draftHeroTransition";
 import { SidebarInset } from "./ui/sidebar";
+import { WorkflowResultReturn } from "./workflows/WorkflowNavigation";
+import { Button } from "./ui/button";
+import { environmentCatalog } from "../connection/catalog";
+import { useAtomCommand } from "../state/use-atom-command";
+import { CurrentThreadLocation } from "./chat/ThreadMoveControls";
 import {
   finalizePromotedDraftThreadByRef,
   markPromotedDraftThreadByRef,
@@ -23,6 +31,7 @@ import {
   useThreadStatus,
 } from "../state/entities";
 import { useEnvironmentQuery } from "../state/query";
+import { useEnvironments } from "../state/environments";
 import { environmentShell } from "../state/shell";
 import {
   buildThreadRouteParams,
@@ -46,6 +55,9 @@ import { resolveThreadSyncPhase } from "../threadSync";
  */
 export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const navigate = useNavigate();
+  const environments = useEnvironments();
+  const reconnect = useAtomCommand(environmentCatalog.retryNow);
+  const relaySession = useAtomValue(managedRelaySessionAtom);
   const draftId = target.kind === "draft" ? target.draftId : null;
   const draftSession = useComposerDraftStore((store) =>
     draftId === null ? null : store.getDraftSession(draftId),
@@ -83,6 +95,9 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const serverThreadStatus = useThreadStatus(serverThreadRef);
   const environmentThreadRefs = useEnvironmentThreadRefs(serverThreadRef?.environmentId ?? null);
   const bootstrapComplete = shell.data?.snapshot._tag === "Some";
+  const connection = serverThreadRef
+    ? environments.presentationById.get(serverThreadRef.environmentId)?.connection
+    : undefined;
   const draftThread = useComposerDraftStore((store) =>
     serverThreadRef ? store.getDraftThreadByRef(serverThreadRef) : null,
   );
@@ -122,6 +137,13 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   });
   const serverThreadStarted = threadHasStarted(serverThreadDetail);
   const environmentHasAnyThreads = environmentThreadRefs.length > 0 || environmentHasDraftThreads;
+  const recoverUnavailable =
+    target.kind === "server" &&
+    relaySession !== null &&
+    serverThreadShell === null &&
+    ((environments.isReady && !environments.presentationById.has(target.threadRef.environmentId)) ||
+      shell.error !== null ||
+      renderState === "missing");
 
   useEffect(() => {
     if (!inferredThreadRef || draftSession?.promotedTo) {
@@ -167,11 +189,18 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
     if (renderState === "missing") {
       const { clearPendingFileDropsForThread } = useSidebarPendingFileDropStore.getState();
       clearPendingFileDropsForThread(target.threadRef);
-      if (environmentHasAnyThreads) {
+      if (environmentHasAnyThreads && !recoverUnavailable) {
         void navigate({ to: "/", replace: true });
       }
     }
-  }, [bootstrapComplete, environmentHasAnyThreads, navigate, renderState, target]);
+  }, [
+    bootstrapComplete,
+    environmentHasAnyThreads,
+    navigate,
+    recoverUnavailable,
+    renderState,
+    target,
+  ]);
 
   useEffect(() => {
     if (target.kind !== "server" || !serverThreadStarted || !draftThread) {
@@ -204,11 +233,45 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         threadSyncPhase={threadSyncPhase}
       />
     );
+  } else {
+    const error = connection?.error ?? shell.error;
+    view = (
+      <div className="flex flex-1 items-center justify-center px-6">
+        <div role="status" className="max-w-md space-y-3 text-center">
+          <h2 className="text-sm font-medium">
+            {error ? "Could not connect to this thread" : "Loading thread…"}
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            {error ??
+              (connection ? connectionStatusText(connection) : "Connecting to its environment…")}
+          </p>
+          {connection &&
+          (error || connection.phase === "offline" || connection.phase === "available") ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => void reconnect(target.threadRef.environmentId)}
+            >
+              Reconnect
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    );
   }
 
   return (
     <SidebarInset className="h-svh min-h-0 overflow-hidden overscroll-y-none md:h-dvh">
-      {view}
+      <WorkflowResultReturn />
+      {target.kind === "server" ? (
+        <CurrentThreadLocation
+          key={scopedThreadKey(target.threadRef)}
+          environmentId={target.threadRef.environmentId}
+          threadId={target.threadRef.threadId}
+          recoverUnavailable={recoverUnavailable}
+        />
+      ) : null}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{view}</div>
     </SidebarInset>
   );
 }

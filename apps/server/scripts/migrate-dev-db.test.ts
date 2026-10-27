@@ -5,7 +5,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { runMigrations } from "../src/persistence/Migrations.ts";
+import { legacyWorkflowDatabase } from "../src/persistence/Migrations.test-fixture.ts";
+import { runMigrations, combinedReaderMarker } from "../src/persistence/Migrations.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runMigrateDevDb } from "./migrate-dev-db.ts";
 
@@ -193,3 +194,52 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
     }),
   );
 });
+
+it.effect("normalizes an isolated snapshot of legacy workflow data before pruning", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-legacy-workflow-" });
+    const source = path.join(root, "source.sqlite");
+    const before = yield* withDatabase(
+      source,
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* legacyWorkflowDatabase();
+        yield* sql`INSERT INTO repository_workflow_jobs VALUES ('historical','retained-thread','done',0,'{"origin":{"kind":"manual","userId":"alice"},"retained":true}')`;
+        return yield* sql`SELECT migration_id,name FROM effect_sql_migrations ORDER BY migration_id`;
+      }),
+    );
+    const result = yield* runMigrateDevDb(
+      { baseDir: path.join(root, "destination"), source, projects: 1, threadsPerProject: 1 },
+      { sharedHome: path.join(root, "unused-shared") },
+    );
+    yield* withDatabase(
+      result.databasePath,
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        assert.deepEqual(yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id=1`, [
+          { name: combinedReaderMarker },
+        ]);
+        assert.deepEqual(yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id=60`, [
+          { name: "ThreadExecutionFences" },
+        ]);
+        assert.deepEqual(yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id=76`, [
+          { name: "RepositoryWorkflowJobs" },
+        ]);
+        assert.deepEqual(yield* sql`SELECT job_id FROM repository_workflow_jobs`, [
+          { job_id: "historical" },
+        ]);
+      }),
+    );
+    assert.deepEqual(
+      yield* withDatabase(
+        source,
+        Effect.gen(function* () {
+          return yield* (yield* SqlClient.SqlClient)`SELECT migration_id,name FROM effect_sql_migrations ORDER BY migration_id`;
+        }),
+      ),
+      before,
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);

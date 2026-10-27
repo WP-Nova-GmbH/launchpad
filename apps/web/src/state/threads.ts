@@ -1,3 +1,19 @@
+import {
+  createPortableThreadPresentationAtom,
+  createPortableThreadNavigationRefreshAtom,
+} from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { createThreadVmActionJournal } from "@t3tools/client-runtime/relay/threadVmActionSubmission";
+import { createThreadQueueControlJournal } from "@t3tools/client-runtime/relay/threadQueueControlSubmission";
+import { portableThreadIntentStorage, threadMoveRelayUrl } from "./thread-move-submissions";
+import {
+  createPortableThreadLibraryAtoms,
+  createPortableThreadChatCommand,
+} from "@t3tools/client-runtime/relay/portableThreadLibrary";
+import {
+  createThreadVmControlAtoms,
+  withPortableThreadDeletion,
+} from "@t3tools/client-runtime/relay/threadVmControls";
+import { createPortableThreadCommandAtoms } from "@t3tools/client-runtime/relay/portableThreads";
 import { useAtomValue } from "@effect/atom-react";
 import { enabledEnvironmentIds } from "@t3tools/client-runtime/state/connections";
 import { arrayElementsEqual } from "@t3tools/client-runtime/state/entities";
@@ -16,6 +32,7 @@ import * as Cause from "effect/Cause";
 import { serverEnvironment } from "./server";
 import {
   retainSharedPromptSubmission,
+  sharedPromptSubmissionAccount,
   forgetSharedPromptSubmission,
   rejectSharedPromptSubmission,
 } from "../sharedPromptSubmissionStore";
@@ -29,6 +46,18 @@ import {
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { environmentSnapshotAtom } from "./shell";
+import { randomUUID } from "../lib/utils";
+import { orchestrationEnvironment } from "./orchestration";
+
+export const portableThreadLibrary = createPortableThreadLibraryAtoms(connectionAtomRuntime);
+export const threadVmActionJournal = createThreadVmActionJournal(portableThreadIntentStorage);
+export const threadVmControls = createThreadVmControlAtoms(
+  connectionAtomRuntime,
+  environmentSnapshotAtom,
+  portableThreadLibrary.routeAtom,
+  (environmentId) => orchestrationEnvironment.archivedShellSnapshot({ environmentId, input: {} }),
+  (environmentId, threadId) => environmentThreadDetails.detailAtom({ environmentId, threadId }),
+);
 
 const baseThreadEnvironment = createThreadEnvironmentAtoms(
   connectionAtomRuntime,
@@ -36,18 +65,32 @@ const baseThreadEnvironment = createThreadEnvironmentAtoms(
 );
 // The journal owns a shared prompt until the server acknowledges durable acceptance.
 // Retry uses the captured command and message IDs, including after a renderer restart.
-export const threadEnvironment: typeof baseThreadEnvironment = {
+export const threadEnvironment = {
   ...baseThreadEnvironment,
+  delete: withPortableThreadDeletion(
+    baseThreadEnvironment.delete,
+    threadVmControls.action,
+    threadVmActionJournal,
+    threadVmControls.routeAtom,
+    randomUUID,
+  ),
   startTurn: {
     ...baseThreadEnvironment.startTurn,
     run: (async (registry, value) => {
       if (
         registry.get(serverEnvironment.configValueAtom(value.environmentId))?.environment
-          .capabilities.sharedPromptQueue !== true
+          .capabilities.sharedPromptQueue !== true &&
+        !registry
+          .get(environmentSnapshotAtom(value.environmentId))
+          ?.threads.some(
+            (thread) =>
+              thread.id === value.input.threadId && thread.promptQueueSummary !== undefined,
+          )
       ) {
         return baseThreadEnvironment.startTurn.run(registry, value);
       }
       try {
+        const account = sharedPromptSubmissionAccount();
         const supportsPreparation =
           registry.get(serverEnvironment.configValueAtom(value.environmentId))?.environment
             .capabilities.sharedPreparation === true;
@@ -61,6 +104,7 @@ export const threadEnvironment: typeof baseThreadEnvironment = {
           ...value,
           input: { ...pending.command, expectedAccountId: value.input.expectedAccountId },
         });
+        if (sharedPromptSubmissionAccount() !== account) return result;
         if (result._tag === "Success") {
           try {
             forgetSharedPromptSubmission(pending.command.commandId);
@@ -78,8 +122,25 @@ export const threadEnvironment: typeof baseThreadEnvironment = {
                 : {}),
             },
           });
+          if (sharedPromptSubmissionAccount() !== account) return result;
+          if (receipt._tag === "Success" && "relay" in receipt.value) {
+            if (receipt.value.relay.receipt?.status !== "rejected") {
+              try {
+                forgetSharedPromptSubmission(pending.command.commandId);
+              } catch {
+                /* Retry retains the same ID. */
+              }
+              return AsyncResult.success(receipt.value);
+            }
+            rejectSharedPromptSubmission(
+              pending.command.commandId,
+              receipt.value.relay.receipt.detail ?? "The environment rejected this prompt.",
+            );
+            return result;
+          }
           if (
             receipt._tag === "Success" &&
+            "status" in receipt.value &&
             receipt.value.status === "accepted" &&
             receipt.value.sequence !== undefined
           ) {
@@ -91,7 +152,11 @@ export const threadEnvironment: typeof baseThreadEnvironment = {
             return AsyncResult.success({ sequence: receipt.value.sequence });
           }
           const error = squashAtomCommandFailure(result);
-          if (receipt._tag === "Success" && receipt.value.status === "rejected")
+          if (
+            receipt._tag === "Success" &&
+            "status" in receipt.value &&
+            receipt.value.status === "rejected"
+          )
             rejectSharedPromptSubmission(
               pending.command.commandId,
               receipt.value.detail ?? "The server rejected this prompt.",
@@ -118,6 +183,23 @@ export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(
 export const environmentThreadShells = createEnvironmentThreadShellAtoms({
   catalogValueAtom: environmentCatalog.catalogValueAtom,
   snapshotAtom: threadEnvironment.snapshotAtom,
+});
+
+const navigationPlacementIndexAtom = createPortableThreadNavigationRefreshAtom(
+  connectionAtomRuntime,
+  portableThreadLibrary,
+  {
+    shellsAtom: environmentThreadShells.threadShellsAtom,
+    catalogAtom: environmentCatalog.catalogValueAtom,
+    connectionStateAtom: environmentCatalog.stateAtom,
+    relayUrl: threadMoveRelayUrl,
+  },
+);
+
+export const navigationThreadShellsAtom = createPortableThreadPresentationAtom({
+  shellsAtom: environmentThreadShells.threadShellsAtom,
+  relayUrl: threadMoveRelayUrl,
+  indexLoadedAtom: navigationPlacementIndexAtom,
 });
 
 const EMPTY_THREAD_STATE_ATOM = Atom.make(AsyncResult.success(EMPTY_ENVIRONMENT_THREAD_STATE)).pipe(
@@ -219,3 +301,14 @@ export const runningThreadKeepAliveAtom = createRunningThreadKeepAliveAtom({
   threadsAtom: environmentThreadShells.environmentThreadsAtom,
   stateAtom: environmentThreads.stateAtom,
 });
+
+export const portableThreadCommands = createPortableThreadCommandAtoms(
+  connectionAtomRuntime,
+  environmentSnapshotAtom,
+);
+
+export const openPortableThreadChat = createPortableThreadChatCommand(connectionAtomRuntime);
+
+export const threadQueueControlJournal = createThreadQueueControlJournal(
+  portableThreadIntentStorage,
+);

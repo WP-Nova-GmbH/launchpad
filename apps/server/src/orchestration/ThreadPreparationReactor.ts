@@ -1,3 +1,4 @@
+import { TerminalManager } from "../terminal/Manager.ts";
 import {
   CommandId,
   EventId,
@@ -15,21 +16,28 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
+import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import { ServerConfig } from "../config.ts";
 import { ProjectSetupScriptRunner } from "../project/ProjectSetupScriptRunner.ts";
 import { WorktreeSetupTracker } from "../project/WorktreeSetupTracker.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import { forkParked } from "../serverActivation.ts";
-import { TerminalManager } from "../terminal/Manager.ts";
+import { SetupProcessJournal } from "../terminal/SetupProcessJournal.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import { resolveCheckoutPath } from "../workspace/CheckoutAccess.ts";
+import { checkoutCaptureReleases } from "../workspace/CheckoutCaptureSignals.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./Services/ThreadDeletionReactor.ts";
@@ -62,14 +70,23 @@ const decodeSetup = Schema.decodeUnknownOption(WorktreeSetupSnapshot);
 export const reconcileSharedPreparations = Effect.gen(function* () {
   const engine = yield* OrchestrationEngineService;
   const query = yield* ProjectionSnapshotQuery;
+  const journal = yield* SetupProcessJournal;
+  const terminal = yield* TerminalManager;
   const snapshot = yield* query.getShellSnapshot();
   const activities = yield* query.listActivitiesByKind(WORKTREE_SETUP_ACTIVITY_KIND);
+  const runningLegacyScripts = new Set<ThreadId>();
   const interruptedLegacyThreads = new Set(
     activities.flatMap((activity) => {
       const setup = decodeSetup(activity.payload);
-      return Option.isSome(setup) &&
-        activity.id === worktreeSetupActivityId(setup.value.threadId) &&
-        setup.value.phase !== "done" &&
+      if (Option.isNone(setup) || activity.id !== worktreeSetupActivityId(setup.value.threadId))
+        return [];
+      if (
+        setup.value.stages.some(
+          (stage) => stage.id === "setup-script" && stage.status === "running",
+        )
+      )
+        runningLegacyScripts.add(setup.value.threadId);
+      return setup.value.phase !== "done" &&
         !setup.value.stages.some((stage) => stage.id === "agent" && stage.status === "done")
         ? [setup.value.threadId]
         : [];
@@ -77,19 +94,39 @@ export const reconcileSharedPreparations = Effect.gen(function* () {
   );
   const createdAt = yield* now;
   for (const shell of snapshot.threads) {
-    const summary = shell.promptQueueSummary;
-    if (!summary) continue;
     if (
-      summary.preparation
-        ? summary.preparation.state !== "running" && summary.preparation.settled
-        : !interruptedLegacyThreads.has(shell.id)
+      !shell.promptQueueSummary?.preparation &&
+      !interruptedLegacyThreads.has(shell.id) &&
+      !runningLegacyScripts.has(shell.id)
     )
       continue;
     const detailed = yield* query.getThreadDetailById(shell.id);
     if (Option.isNone(detailed)) continue;
     const previous = detailed.value.promptQueue?.preparation;
-    if (previous && previous.state !== "running" && previous.settled) continue;
-    if (!previous && !interruptedLegacyThreads.has(shell.id)) continue;
+    if (previous?.state === "pending") continue; // No work started; the saved recipe can still run.
+    const legacy = interruptedLegacyThreads.has(shell.id) || runningLegacyScripts.has(shell.id);
+    if (!previous && !legacy) continue;
+    if (previous && previous.state !== "running" && previous.settled && !previous.script && !legacy)
+      continue;
+    const ownsScript = previous?.script || runningLegacyScripts.has(shell.id);
+    const cleanup = ownsScript
+      ? yield* journal
+          .recover({ threadId: shell.id, attemptId: previous?.attemptId ?? `legacy:${shell.id}` })
+          .pipe(
+            Effect.flatMap((receipt) =>
+              terminal.closeOwned({
+                threadId: receipt.threadId,
+                terminalId: receipt.terminalId,
+                receipt,
+              }),
+            ),
+            Effect.result,
+          )
+      : undefined;
+    const failure = cleanup?._tag === "Failure" ? cleanup.failure.message : undefined;
+    // A completed command can leave its shell alive. Reconciliation closes that
+    // captured owner too, without turning a saved ready workspace into a new attempt.
+    const ready = previous?.state === "ready" && failure === undefined;
     const commandId = CommandId.make(
       `preparation-restart:${shell.id}:${snapshot.snapshotSequence}`,
     );
@@ -102,12 +139,16 @@ export const reconcileSharedPreparations = Effect.gen(function* () {
       preparation: previous
         ? {
             ...previous,
-            state: "failed",
-            settled: true,
+            state: ready ? "ready" : "failed",
+            settled: failure === undefined,
             revision: previous.revision + 1,
             failure: {
-              reason: "interrupted",
-              detail: "The server restarted during setup. Retry setup and resume when ready.",
+              reason: failure ? "failed" : "interrupted",
+              detail:
+                failure ??
+                (ready
+                  ? "The server restarted and stopped the setup preview. The prepared result is retained."
+                  : "The server restarted during setup. Retry setup and resume when ready."),
             },
           }
         : {
@@ -115,11 +156,12 @@ export const reconcileSharedPreparations = Effect.gen(function* () {
             attemptId: commandId,
             revision: 0,
             state: "failed",
-            settled: true,
+            settled: failure === undefined,
             recipe: null,
             failure: {
               reason: "legacy-needs-review",
               detail:
+                failure ??
                 "An earlier setup did not finish and its recipe was not saved. Review the workspace or choose Work locally.",
             },
           },
@@ -133,13 +175,24 @@ const make = Effect.gen(function* () {
   const git = yield* GitWorkflowService;
   const runner = yield* ProjectSetupScriptRunner;
   const tracker = yield* WorktreeSetupTracker;
+  const journal = yield* SetupProcessJournal;
   const terminal = yield* TerminalManager;
   const settingsService = yield* ServerSettingsService;
   const deletion = yield* ThreadDeletionReactor;
   const config = yield* ServerConfig;
   const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  const sql = yield* SqlClient.SqlClient;
+  const captures = makeCheckoutCapture(sql);
+  const fences = makeThreadExecutionFence(sql);
   const scope = yield* Scope.Scope;
-  const workers = new Map<ThreadId, { fiber: Fiber.Fiber<void>; attemptId: CommandId }>();
+  const workers = new Map<
+    ThreadId,
+    { fiber: Fiber.Fiber<void>; attemptId: CommandId; stopCommandId?: CommandId }
+  >();
+  const waitingForCapture = new Map<ThreadId, number>();
+  let captureReleaseVersion = 0;
+  const scheduleLock = yield* Semaphore.make(1);
   const seenSequence = yield* SubscriptionRef.make(0);
   const noteSeen = (sequence: number) =>
     SubscriptionRef.update(seenSequence, (seen) => Math.max(seen, sequence));
@@ -196,18 +249,32 @@ const make = Effect.gen(function* () {
     reason: "cancelled" | "failed",
     finishTracked: boolean,
     preserveFailure = true,
+    stopCommandId?: CommandId,
   ) {
     const closed = terminalId
-      ? yield* terminal
-          .close({ threadId, terminalId, waitForProcessExit: true })
-          .pipe(Effect.result)
+      ? yield* journal
+          .cleanup({
+            threadId,
+            attemptId: accepted.attemptId,
+            commandId: stopCommandId ?? `${accepted.attemptId}:cleanup`,
+          })
+          .pipe(
+            Effect.flatMap((receipt) =>
+              terminal.closeOwned({
+                threadId: receipt.threadId,
+                terminalId: receipt.terminalId,
+                receipt,
+              }),
+            ),
+            Effect.result,
+          )
       : undefined;
     const closeFailure =
       closed?._tag === "Failure"
         ? `Setup could not be stopped. Choose Stop setup again before retrying. ${closed.failure.message}`
         : undefined;
     const current = (yield* read(threadId))?.promptQueue?.preparation;
-    if (!current || current.attemptId !== accepted.attemptId || current.state === "ready") return;
+    if (!current || current.attemptId !== accepted.attemptId) return;
     if (finishTracked)
       yield* finish(
         threadId,
@@ -219,11 +286,11 @@ const make = Effect.gen(function* () {
     // after the captured process exited, not merely after sending its signal.
     while (true) {
       const latest = (yield* read(threadId))?.promptQueue?.preparation;
-      if (!latest || latest.attemptId !== accepted.attemptId || latest.state === "ready") return;
+      if (!latest || latest.attemptId !== accepted.attemptId) return;
       const saved = yield* update(threadId, latest, {
         ...latest,
         revision: latest.revision + 1,
-        state: "failed",
+        state: latest.state === "ready" && !closeFailure ? "ready" : "failed",
         settled: closeFailure === undefined,
         failure: closeFailure
           ? { reason: "failed", detail: closeFailure }
@@ -243,6 +310,8 @@ const make = Effect.gen(function* () {
     let terminalId: string | undefined;
     let didBeginTracking = false;
     let backgroundCompletion: Effect.Effect<void> | undefined;
+    const admissions: string[] = [];
+    let admissionReleaseVersion = captureReleaseVersion;
     const program = Effect.gen(function* () {
       // Every deletion before this accepted incarnation must finish before it owns resources.
       yield* deletion.drainThrough(yield* engine.latestSequence, threadId);
@@ -257,24 +326,6 @@ const make = Effect.gen(function* () {
         preparation.state !== "pending"
       )
         return;
-      // Register cancellation only after cleanup for the previous incarnation drained.
-      yield* tracker
-        .begin({
-          threadId,
-          creationSequence: anchor.value.creationSequence,
-          branch: preparation.recipe?.prepareWorktree?.branch ?? null,
-          baseRef: preparation.recipe?.prepareWorktree?.baseBranch ?? null,
-          stages: ["fetch", "checkout", "submodules", "setup-script", "agent"],
-          fiber: workers.get(threadId)?.fiber ?? null,
-        })
-        .pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              didBeginTracking = true;
-            }),
-          ),
-          Effect.uninterruptible,
-        );
       const project = yield* query.getProjectShellById(thread.projectId);
       if (Option.isNone(project) || !preparation.recipe)
         return yield* new PreparationError({
@@ -313,6 +364,63 @@ const make = Effect.gen(function* () {
             async: selected.async !== false,
           }
         : null;
+      const sourceRoot = yield* resolveCheckoutPath(
+        requested ? recipe.projectCwd : (target.worktreePath ?? recipe.projectCwd),
+        fs,
+        path,
+      );
+      const targetRoot = yield* resolveCheckoutPath(
+        target.worktreePath ?? recipe.projectCwd,
+        fs,
+        path,
+      );
+      admissionReleaseVersion = captureReleaseVersion;
+      const committedAdmissions = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const reserved: string[] = [];
+          const fence = yield* fences.get(threadId);
+          if (fence && fence.phase !== "active")
+            return yield* new PreparationError({
+              detail: "This thread is moving and cannot start setup.",
+            });
+          for (const checkoutRoot of new Set([sourceRoot, targetRoot])) {
+            const admitted = yield* captures.admit({
+              threadId,
+              workId: `preparation:${accepted.attemptId}:${checkoutRoot}`,
+              kind: "setup",
+              checkoutRoot,
+            });
+            if (admitted.decision !== "start")
+              return yield* new PreparationError({
+                detail: "This setup attempt needs reconciliation before it can run again.",
+              });
+            reserved.push(admitted.admissionId);
+          }
+          return reserved;
+        }),
+      );
+      admissions.push(...committedAdmissions);
+      waitingForCapture.delete(threadId);
+      const sourceAdmission = admissions[0]!;
+      const targetAdmission = admissions[sourceRoot === targetRoot ? 0 : 1]!;
+      // Register cancellation only after cleanup for the previous incarnation drained.
+      yield* tracker
+        .begin({
+          threadId,
+          creationSequence: anchor.value.creationSequence,
+          branch: preparation.recipe?.prepareWorktree?.branch ?? null,
+          baseRef: preparation.recipe?.prepareWorktree?.baseBranch ?? null,
+          stages: ["fetch", "checkout", "submodules", "setup-script", "agent"],
+          fiber: workers.get(threadId)?.fiber ?? null,
+        })
+        .pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              didBeginTracking = true;
+            }),
+          ),
+          Effect.uninterruptible,
+        );
       let running: ThreadPreparation = {
         ...preparation,
         target,
@@ -321,6 +429,10 @@ const make = Effect.gen(function* () {
         settled: false,
         revision: preparation.revision + 1,
       };
+      if (script && target.worktreePath) {
+        terminalId = `setup-${running.attemptId}`;
+        yield* journal.begin({ threadId, attemptId: running.attemptId, terminalId });
+      }
       yield* update(threadId, preparation, running);
       const initialProgress = yield* tracker.get(threadId);
       if (initialProgress) yield* record(initialProgress, accepted.attemptId);
@@ -423,8 +535,9 @@ const make = Effect.gen(function* () {
               yield* tracker.stageStatus(threadId, "checkout", "done");
             }
           }),
-        );
+        ).pipe(Effect.provideService(CheckoutAdmission, sourceAdmission));
       }
+      if (sourceRoot !== targetRoot) yield* captures.complete(sourceAdmission);
       // TerminalManager.open takes the workspace lease itself. Never hold it across this call.
       yield* assertCurrent;
       if (script && target.worktreePath) {
@@ -438,18 +551,20 @@ const make = Effect.gen(function* () {
             worktreePath: target.worktreePath,
             resolvedScript: script,
             preferredTerminalId: terminalId,
+            preparationAttemptId: running.attemptId,
             observeCompletion: {
               onOutputLine: (line) => tracker.appendTail(threadId, "setup-script", line),
             },
           })
-          .pipe(Effect.result);
+          .pipe(Effect.provideService(CheckoutAdmission, targetAdmission), Effect.result);
         if (launched._tag === "Failure") {
           yield* tracker.stageStatus(threadId, "setup-script", "failed", launched.failure.message);
-          if (!script.async) return yield* launched.failure;
+          return yield* launched.failure;
         } else if (launched.success.status === "started" && launched.success.completion) {
           const completion = launched.success.completion.pipe(
             Effect.flatMap((result) =>
               Effect.gen(function* () {
+                yield* journal.complete({ threadId, attemptId: accepted.attemptId });
                 const detail =
                   result.exitCode === null
                     ? "The setup terminal closed before successful completion."
@@ -468,7 +583,7 @@ const make = Effect.gen(function* () {
           if (script.async)
             backgroundCompletion = completion.pipe(Effect.ignoreCause({ log: true }));
           else yield* completion;
-        } else if (!script.async)
+        } else
           return yield* new PreparationError({
             detail:
               "Setup did not report a completion handle. Required setup cannot be considered successful.",
@@ -480,21 +595,48 @@ const make = Effect.gen(function* () {
         target,
         revision: running.revision + 1,
         state: "ready",
-        settled: true,
+        settled: backgroundCompletion === undefined,
       });
       yield* tracker.stageStatus(threadId, "agent", "done");
       if (backgroundCompletion) {
         const progress = yield* tracker.get(threadId);
         if (progress) yield* record(progress, accepted.attemptId);
         yield* backgroundCompletion;
+        // Queue admission can advance revisions. Stop owns settlement once it lands.
+        while (true) {
+          const current = (yield* read(threadId))?.promptQueue?.preparation;
+          if (
+            current?.attemptId !== accepted.attemptId ||
+            current.state !== "ready" ||
+            current.settled
+          )
+            break;
+          const saved = yield* update(threadId, current, {
+            ...current,
+            settled: true,
+            revision: current.revision + 1,
+          }).pipe(
+            Effect.as(true),
+            Effect.catchTag("OrchestrationCommandInvariantError", () => Effect.succeed(false)),
+          );
+          if (saved) break;
+        }
       }
       // Background progress is still owned here, while ready already permits delivery.
       yield* finish(threadId, accepted.attemptId, "done");
     });
     yield* program.pipe(
+      Effect.catchTag("CheckoutCaptureError", (error) => {
+        if (!error.waitingForCheckout) return Effect.fail(error);
+        waitingForCapture.set(threadId, admissionReleaseVersion);
+        return Effect.void;
+      }),
       Effect.onExit((exit) =>
         Effect.gen(function* () {
-          if (exit._tag === "Success") return;
+          if (exit._tag === "Success") {
+            yield* Effect.forEach(admissions, captures.complete, { discard: true });
+            return;
+          }
           const detail = Cause.hasInterrupts(exit.cause)
             ? "Setup was interrupted. Retry setup and resume when ready."
             : String(Cause.squash(exit.cause));
@@ -505,63 +647,151 @@ const make = Effect.gen(function* () {
             detail,
             Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed",
             didBeginTracking,
+            true,
+            workers.get(threadId)?.stopCommandId,
           );
+          const current = (yield* read(threadId))?.promptQueue?.preparation;
+          if (current?.attemptId === accepted.attemptId && current.settled)
+            yield* Effect.forEach(admissions, captures.complete, { discard: true });
         }).pipe(Effect.ignoreCause({ log: true })),
       ),
       Effect.ignoreCause({ log: true }),
     );
   });
 
+  const recordStop = Effect.fn("ThreadPreparationReactor.recordStop")(function* (
+    threadId: ThreadId,
+    stopCommandId: CommandId,
+  ) {
+    const preparation = (yield* read(threadId))?.promptQueue?.preparation;
+    if (!preparation) return;
+    const failed = !preparation.settled;
+    const createdAt = yield* now;
+    const kind = failed ? "preparation.stop.failed" : "preparation.stop.completed";
+    yield* engine.dispatch({
+      type: "thread.activity.append",
+      commandId: CommandId.make(`${stopCommandId}:${kind}`),
+      threadId,
+      createdAt,
+      activity: {
+        id: EventId.make(`${stopCommandId}:${kind}`),
+        kind,
+        tone: failed ? "error" : "info",
+        summary: failed ? "Setup stop failed" : "Setup stopped",
+        payload: {
+          stopCommandId,
+          detail: failed
+            ? (preparation.failure?.detail ?? "Setup could not be stopped.")
+            : "Setup cleanup confirmed.",
+        },
+        turnId: null,
+        createdAt,
+      },
+    });
+  });
   const schedule = Effect.fn("ThreadPreparationReactor.schedule")(function* (
     threadId: ThreadId,
-    retryCancellation = false,
+    stopCommandId?: CommandId,
   ) {
     const thread = yield* read(threadId);
     const preparation = thread?.promptQueue?.preparation;
-    const active = workers.get(threadId);
+    let active = workers.get(threadId);
+    if (active && waitingForCapture.has(threadId)) {
+      yield* Fiber.await(active.fiber);
+      active = workers.get(threadId);
+    }
     if (active) {
+      // The queue and session events share a Stop identity. The second event must
+      // neither interrupt its cleanup worker before it starts nor retry a failure.
+      if (stopCommandId && active.stopCommandId === stopCommandId) return;
+      const previousStop = active.stopCommandId;
+      if (stopCommandId) active.stopCommandId = stopCommandId;
       if (
         !preparation ||
         preparation.state === "failed" ||
-        preparation.attemptId !== active.attemptId
-      )
-        yield* Fiber.interrupt(active.fiber);
-      if (!preparation || preparation.attemptId === active.attemptId) return;
+        preparation.attemptId !== active.attemptId ||
+        stopCommandId
+      ) {
+        if (previousStop) yield* Fiber.await(active.fiber);
+        else yield* Fiber.interrupt(active.fiber);
+      }
+      if (!preparation || (preparation.attemptId === active.attemptId && !previousStop)) {
+        if (stopCommandId) yield* recordStop(threadId, stopCommandId);
+        return;
+      }
     }
-    if (!preparation) return;
-    const retryStop = retryCancellation && preparation.state === "failed" && !preparation.settled;
+    if (!preparation) {
+      waitingForCapture.delete(threadId);
+      return;
+    }
+    const stop = stopCommandId !== undefined;
     if (
-      !retryStop &&
+      !stop &&
       (thread?.archivedAt !== null ||
         preparation.state !== "pending" ||
         !thread?.promptQueue?.enabled)
-    )
+    ) {
+      waitingForCapture.delete(threadId);
       return;
+    }
+    waitingForCapture.delete(threadId);
     const gate = yield* Deferred.make<void>();
     const fiber = yield* Deferred.await(gate).pipe(
       Effect.andThen(
-        retryStop
+        stop
           ? settleAttempt(
               threadId,
               preparation,
-              `setup-${preparation.attemptId}`,
+              preparation.script ? `setup-${preparation.attemptId}` : undefined,
               "Setup stopped. Retry setup and resume when ready.",
               "cancelled",
               false,
               false,
-            ).pipe(Effect.uninterruptible, Effect.ignoreCause({ log: true }))
+              stopCommandId,
+            ).pipe(
+              Effect.andThen(recordStop(threadId, stopCommandId!)),
+              Effect.uninterruptible,
+              Effect.ignoreCause({ log: true }),
+            )
           : run(threadId, preparation),
       ),
-      Effect.ensuring(Effect.sync(() => workers.delete(threadId))),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          workers.delete(threadId);
+          const deniedAt = waitingForCapture.get(threadId);
+          if (deniedAt !== undefined && deniedAt < captureReleaseVersion)
+            yield* scheduleSafely(threadId).pipe(Effect.forkIn(scope));
+        }),
+      ),
       Effect.forkIn(scope),
     );
-    workers.set(threadId, { fiber, attemptId: preparation.attemptId });
+    workers.set(threadId, {
+      fiber,
+      attemptId: preparation.attemptId,
+      ...(stopCommandId ? { stopCommandId } : {}),
+    });
     yield* Deferred.succeed(gate, undefined);
-  });
+  }, scheduleLock.withPermit);
+  const scheduleSafely = (threadId: ThreadId): Effect.Effect<void> =>
+    schedule(threadId).pipe(Effect.ignoreCause({ log: true }));
 
   return ThreadPreparationReactor.of({
     start: () =>
       Effect.gen(function* () {
+        yield* checkoutCaptureReleases(sql).pipe(
+          Stream.runForEach(() =>
+            Effect.sync(() => {
+              captureReleaseVersion++;
+            }).pipe(
+              Effect.andThen(
+                forkParked(
+                  Effect.forEach([...waitingForCapture.keys()], scheduleSafely, { discard: true }),
+                ),
+              ),
+            ),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        );
         const events = yield* engine.subscribeDomainEvents;
         yield* forkParked(
           Effect.gen(function* () {
@@ -571,11 +801,16 @@ const make = Effect.gen(function* () {
                 yield* schedule(thread.id);
             yield* noteSeen(snapshot.snapshotSequence);
             yield* Stream.runForEach(events, (event) =>
-              (event.type === "thread.prompt-queue-changed" || event.type === "thread.deleted"
+              (event.type === "thread.prompt-queue-changed" ||
+              event.type === "thread.deleted" ||
+              event.type === "thread.session-stop-requested"
                 ? schedule(
                     event.payload.threadId,
-                    event.type === "thread.prompt-queue-changed" &&
-                      event.payload.control?.pauseReason?.code === "stopped",
+                    event.type === "thread.prompt-queue-changed"
+                      ? event.payload.stopCommandId
+                      : event.type === "thread.session-stop-requested"
+                        ? (event.commandId ?? undefined)
+                        : undefined,
                   ).pipe(Effect.ignoreCause({ log: true }))
                 : Effect.void
               ).pipe(Effect.andThen(noteSeen(event.sequence))),

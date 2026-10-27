@@ -1,0 +1,1223 @@
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -650,6 +650,12 @@
+   persists a boot intent before its only start attempt, returns durable success
+   receipts on retries and inspects the exact execution after a lost reply.
+   Ordinary create routes cannot boot prepared resources before activation.
++  If the immutable startup lease expires before boot intent, the host durably
++  fences that destination as expired, deletes its private and published disk
++  copies, and returns an identity-bound terminal result. Only that result allows
++  the API to mark the operation failed and release pins/capacity. A lost cleanup
++  reply is retried against the same receipt. Expiry after boot intent is never
++  treated as proof of absence or permission to start another guest.
+   Unknown boot outcomes retain their disk reservation and require reconciliation;
+   registry absence is not a stop receipt. Source revocation and one-use enrollment
+   authorization remain the calling coordinator's responsibility. Failed-start
+diff --git a/packages/api/internal/api/api.gen.go b/packages/api/internal/api/api.gen.go
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -71,28 +71,31 @@
+ 
+ // Defines values for LaunchpadRestoreStatusState.
+ const (
+-	Activating LaunchpadRestoreStatusState = "activating"
+-	Active     LaunchpadRestoreStatusState = "active"
+-	Cancelled  LaunchpadRestoreStatusState = "cancelled"
+-	Cancelling LaunchpadRestoreStatusState = "cancelling"
+-	Prepared   LaunchpadRestoreStatusState = "prepared"
+-	Preparing  LaunchpadRestoreStatusState = "preparing"
++	LaunchpadRestoreStatusStateActivating LaunchpadRestoreStatusState = "activating"
++	LaunchpadRestoreStatusStateActive     LaunchpadRestoreStatusState = "active"
++	LaunchpadRestoreStatusStateCancelled  LaunchpadRestoreStatusState = "cancelled"
++	LaunchpadRestoreStatusStateCancelling LaunchpadRestoreStatusState = "cancelling"
++	LaunchpadRestoreStatusStateFailed     LaunchpadRestoreStatusState = "failed"
++	LaunchpadRestoreStatusStatePrepared   LaunchpadRestoreStatusState = "prepared"
++	LaunchpadRestoreStatusStatePreparing  LaunchpadRestoreStatusState = "preparing"
+ )
+ 
+ // Valid indicates whether the value is a known member of the LaunchpadRestoreStatusState enum.
+ func (e LaunchpadRestoreStatusState) Valid() bool {
+ 	switch e {
+-	case Activating:
++	case LaunchpadRestoreStatusStateActivating:
+ 		return true
+-	case Active:
++	case LaunchpadRestoreStatusStateActive:
+ 		return true
+-	case Cancelled:
++	case LaunchpadRestoreStatusStateCancelled:
++		return true
++	case LaunchpadRestoreStatusStateCancelling:
+ 		return true
+-	case Cancelling:
++	case LaunchpadRestoreStatusStateFailed:
+ 		return true
+-	case Prepared:
++	case LaunchpadRestoreStatusStatePrepared:
+ 		return true
+-	case Preparing:
++	case LaunchpadRestoreStatusStatePreparing:
+ 		return true
+ 	default:
+ 		return false
+@@ -26067,272 +26070,272 @@
+ 	"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",
+ }
+ 
+ // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,
+diff --git a/packages/api/internal/handlers/launchpad_restore_worker.go b/packages/api/internal/handlers/launchpad_restore_worker.go
+--- a/packages/api/internal/handlers/launchpad_restore_worker.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker.go
+@@ -17,6 +17,7 @@
+ 	restorestore "github.com/e2b-dev/infra/packages/db/pkg/restores"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++	"github.com/e2b-dev/infra/packages/shared/pkg/restoreresult"
+ )
+ 
+ type restoreRuntime interface {
+@@ -178,6 +179,9 @@
+ 		}
+ 		digest := sha256.Sum256(op.Manifest)
+ 		if err := a.restoreRuntime().ActivatePreparedRestore(ctx, op, request, hex.EncodeToString(digest[:])); err != nil {
++			if restoreresult.IsExpired(err, op.PreparedBuildID.String()) {
++				return store.Complete(ctx, op.TeamID, op.OperationID, *op.ClaimID, "failed")
++			}
+ 			return err
+ 		}
+ 		if _, err := client.ReleaseRestoreDisk(child, &rpc.RestoreDiskRequest{PreparedBuildId: op.PreparedBuildID.String()}); err != nil {
+diff --git a/packages/api/internal/handlers/launchpad_restore_worker_test.go b/packages/api/internal/handlers/launchpad_restore_worker_test.go
+--- a/packages/api/internal/handlers/launchpad_restore_worker_test.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker_test.go
+@@ -6,12 +6,16 @@
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"testing"
+ 	"time"
+ 
++	"github.com/e2b-dev/infra/packages/shared/pkg/restoreresult"
+ 	"github.com/google/uuid"
+ 	"github.com/stretchr/testify/require"
+ 	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ 	"google.golang.org/protobuf/types/known/emptypb"
+ 
+ 	restorestore "github.com/e2b-dev/infra/packages/db/pkg/restores"
+@@ -22,10 +26,11 @@
+ 
+ type restoreWorkerRuntime struct {
+ 	rpc.SandboxServiceClient
+-	lostReply bool
+-	boots     int
+-	released  bool
+-	cancelled bool
++	activationError error
++	lostReply       bool
++	boots           int
++	released        bool
++	cancelled       bool
+ }
+ 
+ func (r *restoreWorkerRuntime) RestoreClient(ctx context.Context, _ uuid.UUID, _ string) (rpc.SandboxServiceClient, context.Context, error) {
+@@ -45,6 +50,9 @@
+ 	return &emptypb.Empty{}, nil
+ }
+ func (r *restoreWorkerRuntime) ActivatePreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string) error {
++	if r.activationError != nil {
++		return r.activationError
++	}
+ 	if r.boots == 0 {
+ 		r.boots++
+ 	}
+@@ -124,3 +132,58 @@
+ 	require.Equal(t, "cancelled", finished.State)
+ 	require.Zero(t, finished.ReservedBytes)
+ }
++
++func TestLaunchpadRestoreWorkerReleasesOnlyConfirmedExpiredDestination(t *testing.T) {
++	t.Parallel()
++	for _, confirmed := range []bool{false, true} {
++		t.Run(fmt.Sprint(confirmed), func(t *testing.T) {
++			db := testutils.SetupDatabase(t)
++			p := restorePinFixture(t, db)
++			p.ClusterID = uuid.Nil
++			store := restorestore.Store{DB: db.SqlcClient}
++			_, err := store.Create(t.Context(), p, p.ReservedBytes)
++			require.NoError(t, err)
++			runtime := &restoreWorkerRuntime{}
++			server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime}
++			require.NoError(t, server.processRestoreOperation(t.Context(), claimRestoreWork(t, db)))
++			_, err = store.Activate(t.Context(), p.TeamID, p.OperationID)
++			require.NoError(t, err)
++			claimed := claimRestoreWork(t, db)
++			_, err = store.SaveActivationRequest(t.Context(), claimed, []byte(`{"sandbox":{}}`))
++			require.NoError(t, err)
++			runtime.activationError = status.Error(codes.FailedPrecondition, "restore boot outcome requires reconciliation")
++			if confirmed {
++				runtime.activationError = restoreresult.Expired(p.PreparedBuildID.String())
++			}
++			err = server.processRestoreOperation(t.Context(), claimed)
++			if confirmed {
++				require.NoError(t, err)
++			} else {
++				require.Error(t, err)
++			}
++			finished, err := db.SqlcClient.GetRestoreOperation(t.Context(), queries.GetRestoreOperationParams{TeamID: p.TeamID, OperationID: p.OperationID})
++			require.NoError(t, err)
++			pinned, err := db.SqlcClient.HasRestoreBuildPins(t.Context(), p.SourceBuildID)
++			require.NoError(t, err)
++			require.Zero(t, runtime.boots)
++			if !confirmed {
++				require.Equal(t, "activating", finished.State)
++				require.Positive(t, finished.ReservedBytes)
++				require.True(t, pinned)
++				return
++			}
++			require.Equal(t, "failed", finished.State)
++			require.Zero(t, finished.ReservedBytes)
++			require.False(t, pinned)
++			require.NotNil(t, finished.LastError)
++			require.Contains(t, *finished.LastError, "expired before guest start")
++			_, err = store.Activate(t.Context(), p.TeamID, p.OperationID)
++			require.ErrorIs(t, err, restorestore.ErrConflict)
++			// New admission is possible after cleanup; the original operation remains a
++			// terminal idempotency record and cannot be resurrected by a retry.
++			retried, err := store.Create(t.Context(), p, p.ReservedBytes)
++			require.NoError(t, err)
++			require.Equal(t, "failed", retried.State)
++		})
++	}
++}
+diff --git a/packages/db/migrations/20261002054149_restore_activation_failure.sql b/packages/db/migrations/20261002054149_restore_activation_failure.sql
+new file mode 100644
+--- /dev/null
++++ b/packages/db/migrations/20261002054149_restore_activation_failure.sql
+@@ -0,0 +1,12 @@
++-- +goose Up
++ALTER TABLE public.sandbox_restore_operations DROP CONSTRAINT sandbox_restore_operations_state_check;
++ALTER TABLE public.sandbox_restore_operations ADD CONSTRAINT sandbox_restore_operations_state_check
++    CHECK (state IN ('preparing','prepared','activating','active','cancelling','cancelled','failed'));
++
++-- +goose Down
++-- A failed operation has a durable never-started host fence; retain that
++-- tombstone as cancelled if rolling back this status extension.
++UPDATE public.sandbox_restore_operations SET state='cancelled' WHERE state='failed';
++ALTER TABLE public.sandbox_restore_operations DROP CONSTRAINT sandbox_restore_operations_state_check;
++ALTER TABLE public.sandbox_restore_operations ADD CONSTRAINT sandbox_restore_operations_state_check
++    CHECK (state IN ('preparing','prepared','activating','active','cancelling','cancelled'));
+diff --git a/packages/db/pkg/restores/store.go b/packages/db/pkg/restores/store.go
+--- a/packages/db/pkg/restores/store.go
++++ b/packages/db/pkg/restores/store.go
+@@ -153,6 +153,11 @@
+ 	if n != 1 {
+ 		return fmt.Errorf("restore completion lost its worker claim or state: %w", ErrConflict)
+ 	}
++	if state == "failed" {
++		if err := txDB.RetireFailedRestoreTemplate(ctx, queries.RetireFailedRestoreTemplateParams{TeamID: team, OperationID: operation}); err != nil {
++			return err
++		}
++	}
+ 	if err = txDB.ReleaseRestorePins(ctx, queries.ReleaseRestorePinsParams{TeamID: team, OperationID: operation}); err != nil {
+ 		return err
+ 	}
+diff --git a/packages/db/queries/operations.sql.go b/packages/db/queries/operations.sql.go
+--- a/packages/db/queries/operations.sql.go
++++ b/packages/db/queries/operations.sql.go
+@@ -153,11 +153,12 @@
+ const finishRestoreOperation = `-- name: FinishRestoreOperation :execrows
+ UPDATE public.sandbox_restore_operations
+ SET state = $1::text, reserved_bytes = 0, claim_id = NULL,
+-    claim_until = NULL, last_error = NULL, updated_at = now()
++    claim_until = NULL, last_error = CASE WHEN $1::text = 'failed'
++    THEN 'activation lease expired before guest start; destination cleaned' ELSE NULL END, updated_at = now()
+ WHERE team_id = $2 AND operation_id = $3 AND claim_id = $4
+ AND claim_until > now()
+ AND ((state = 'cancelling' AND $1::text = 'cancelled')
+-  OR (state = 'activating' AND $1::text = 'active'))
++  OR (state = 'activating' AND $1::text IN ('active','failed')))
+ `
+ 
+ type FinishRestoreOperationParams struct {
+@@ -443,7 +444,7 @@
+ DELETE FROM public.sandbox_restore_pins p
+ WHERE p.team_id = $1 AND p.operation_id = $2
+ AND EXISTS (SELECT 1 FROM public.sandbox_restore_operations o
+-    WHERE o.team_id = $1 AND o.operation_id = $2 AND o.state IN ('active','cancelled'))
++    WHERE o.team_id = $1 AND o.operation_id = $2 AND o.state IN ('active','cancelled','failed'))
+ `
+ 
+ type ReleaseRestorePinsParams struct {
+@@ -540,6 +541,24 @@
+ 	return column_1, err
+ }
+ 
++const retireFailedRestoreTemplate = `-- name: RetireFailedRestoreTemplate :exec
++UPDATE public.envs e SET deleted_at = now()
++FROM public.sandbox_restore_operations o
++WHERE o.team_id = $1 AND o.operation_id = $2 AND o.state = 'failed'
++AND e.id = o.sandbox_id AND e.team_id = o.team_id AND e.deleted_at IS NULL
++`
++
++type RetireFailedRestoreTemplateParams struct {
++	TeamID      uuid.UUID
++	OperationID uuid.UUID
++}
++
++// The host has proved that this destination never booted and removed its data.
++func (q *Queries) RetireFailedRestoreTemplate(ctx context.Context, arg RetireFailedRestoreTemplateParams) error {
++	_, err := q.db.Exec(ctx, retireFailedRestoreTemplate, arg.TeamID, arg.OperationID)
++	return err
++}
++
+ const retryRestoreOperation = `-- name: RetryRestoreOperation :execrows
+ UPDATE public.sandbox_restore_operations
+ SET claim_id = NULL, claim_until = NULL, next_attempt_at = $1::timestamptz,
+diff --git a/packages/db/queries/restores/operations.sql b/packages/db/queries/restores/operations.sql
+--- a/packages/db/queries/restores/operations.sql
++++ b/packages/db/queries/restores/operations.sql
+@@ -98,17 +98,18 @@
+ -- confirmed deletion or transferred the disk into live sandbox storage.
+ UPDATE public.sandbox_restore_operations
+ SET state = sqlc.arg(terminal_state)::text, reserved_bytes = 0, claim_id = NULL,
+-    claim_until = NULL, last_error = NULL, updated_at = now()
++    claim_until = NULL, last_error = CASE WHEN sqlc.arg(terminal_state)::text = 'failed'
++    THEN 'activation lease expired before guest start; destination cleaned' ELSE NULL END, updated_at = now()
+ WHERE team_id = @team_id AND operation_id = @operation_id AND claim_id = @claim_id
+ AND claim_until > now()
+ AND ((state = 'cancelling' AND sqlc.arg(terminal_state)::text = 'cancelled')
+-  OR (state = 'activating' AND sqlc.arg(terminal_state)::text = 'active'));
++  OR (state = 'activating' AND sqlc.arg(terminal_state)::text IN ('active','failed')));
+ 
+ -- name: ReleaseRestorePins :exec
+ DELETE FROM public.sandbox_restore_pins p
+ WHERE p.team_id = @team_id AND p.operation_id = @operation_id
+ AND EXISTS (SELECT 1 FROM public.sandbox_restore_operations o
+-    WHERE o.team_id = @team_id AND o.operation_id = @operation_id AND o.state IN ('active','cancelled'));
++    WHERE o.team_id = @team_id AND o.operation_id = @operation_id AND o.state IN ('active','cancelled','failed'));
+ 
+ -- name: RestoreReservedBytes :one
+ SELECT COALESCE(sum(reserved_bytes),0)::bigint FROM public.sandbox_restore_operations
+@@ -143,3 +144,10 @@
+ FROM public.sandbox_restore_operations o JOIN public.env_builds b ON b.id = o.source_build_id
+ WHERE o.team_id = @team_id AND o.operation_id = @operation_id AND o.state = 'activating'
+ ON CONFLICT (id) DO NOTHING;
++
++-- name: RetireFailedRestoreTemplate :exec
++-- The host has proved that this destination never booted and removed its data.
++UPDATE public.envs e SET deleted_at = now()
++FROM public.sandbox_restore_operations o
++WHERE o.team_id = @team_id AND o.operation_id = @operation_id AND o.state = 'failed'
++AND e.id = o.sandbox_id AND e.team_id = o.team_id AND e.deleted_at IS NULL;
+diff --git a/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux.go b/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux.go
+--- a/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux.go
+@@ -10,12 +10,16 @@
+ 	"errors"
+ 	"os"
+ 	"path/filepath"
++	"time"
+ 
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++
+ 	"github.com/google/uuid"
+ 	"golang.org/x/sys/unix"
+ )
+ 
+ var ErrRestoreActivationStarted = errors.New("restore activation has started")
++var ErrRestoreActivationExpired = errors.New("restore activation expired before guest start")
+ 
+ // RestoreActivation survives lost replies and process restarts independently of
+ // the temporary disk. Booting is an irreversible intent: absence from the live
+@@ -55,7 +59,7 @@
+ 		return result, ErrPreparedDiskCorrupt
+ 	}
+ 	switch result.State {
+-	case "accepted", "booting":
++	case "accepted", "booting", "expired":
+ 		if len(result.Response) != 0 {
+ 			return result, ErrPreparedDiskCorrupt
+ 		}
+@@ -257,3 +261,42 @@
+ 	}
+ 	return syncPreparedDirectory(directory)
+ }
++
++// CheckDeadline may reject only an attempt whose durable boot intent has never
++// landed. A retry of booting/active must reconcile even after its original lease
++// ends; expiry alone does not prove that the earlier guest stopped.
++func (h *RestoreActivationLock) CheckDeadline(endAt, now time.Time) error {
++	if h.lock == nil {
++		return ErrPreparedDiskBusy
++	}
++	if h.record.State == "expired" {
++		return ErrRestoreActivationExpired
++	}
++	if h.record.State != "accepted" || endAt.After(now) {
++		return nil
++	}
++	h.record.State = "expired"
++	if err := h.persist(); err != nil {
++		return err
++	}
++	return ErrRestoreActivationExpired
++}
++
++// DiscardExpired removes only this never-started destination. The small receipt
++// remains as a permanent fence against delayed activation and ordinary Create.
++// Cleanup failures are retryable and must retain the control-plane reservation.
++func (h *RestoreActivationLock) DiscardExpired(ctx context.Context, store storage.StorageProvider) error {
++	if h.lock == nil || h.record.State != "expired" {
++		return ErrRestoreActivationStarted
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if err := store.DeleteObjectsWithPrefix(ctx, h.buildID.String()+"/"); err != nil {
++		return err
++	}
++	if err := os.RemoveAll(filepath.Join(h.directory, h.buildID.String())); err != nil {
++		return err
++	}
++	return syncPreparedDirectory(h.directory)
++}
+diff --git a/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux_test.go b/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux_test.go
+--- a/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux_test.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux_test.go
+@@ -5,7 +5,11 @@
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+ 	"os"
++	"path/filepath"
++	"time"
+ 
+ 	"testing"
+ 
+@@ -97,3 +101,80 @@
+ 	require.NoError(t, CancelPreparedDisk(t.Context(), directory, id))
+ 	require.ErrorIs(t, RequireActivatedBuild(directory, id), ErrPreparedDiskCancelled)
+ }
++
++func TestRestoreExpiryFencesDelayedBootAndRetriesCleanup(t *testing.T) {
++	t.Parallel()
++	directory, id, digest := activationFixture(t, []byte(`{"version":1}`))
++	store, err := storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: t.TempDir()})
++	require.NoError(t, err)
++	// Preserve an unrelated recovery build while removing all published objects
++	// of this failed destination, including a partially completed publication.
++	sourcePath := storage.Paths{BuildID: uuid.NewString()}.Rootfs()
++	source, err := store.OpenBlob(t.Context(), sourcePath)
++	require.NoError(t, err)
++	require.NoError(t, source.Put(t.Context(), []byte("recovery disk")))
++	destination, err := store.OpenBlob(t.Context(), storage.Paths{BuildID: id.String()}.Rootfs())
++	require.NoError(t, err)
++	require.NoError(t, destination.Put(t.Context(), []byte("partial destination")))
++	lock, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("fixed request"))
++	require.NoError(t, err)
++	now := time.Now()
++	require.NoError(t, lock.CheckDeadline(now.Add(time.Second), now))
++	require.Equal(t, "accepted", lock.Record().State)
++	require.ErrorIs(t, lock.DiscardExpired(t.Context(), store), ErrRestoreActivationStarted)
++	require.ErrorIs(t, lock.CheckDeadline(now, now), ErrRestoreActivationExpired)
++	require.ErrorIs(t, lock.BeginBoot(), ErrRestoreActivationStarted)
++	require.ErrorIs(t, lock.Complete(json.RawMessage(`{"ready":true}`)), ErrPreparedDiskConflict)
++	require.NoError(t, lock.Close())
++	// Losing the reply, restarting the process, or moving the wall clock back
++	// cannot turn a persisted expiry into permission to boot.
++	retry, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("fixed request"))
++	require.NoError(t, err)
++	require.ErrorIs(t, retry.CheckDeadline(now.Add(time.Hour), now), ErrRestoreActivationExpired)
++	broken := &expiryDeleteFailure{StorageProvider: store}
++	require.Error(t, retry.DiscardExpired(t.Context(), broken))
++	_, err = os.Stat(filepath.Join(directory, id.String()))
++	require.NoError(t, err)
++	for range 2 {
++		require.NoError(t, retry.DiscardExpired(t.Context(), store))
++	}
++	require.NoError(t, retry.Close())
++	_, err = os.Stat(filepath.Join(directory, id.String()))
++	require.ErrorIs(t, err, os.ErrNotExist)
++	exists, err := destination.Exists(t.Context())
++	require.NoError(t, err)
++	require.False(t, exists)
++	exists, err = source.Exists(t.Context())
++	require.NoError(t, err)
++	require.True(t, exists)
++	require.ErrorIs(t, RequireActivatedBuild(directory, id), ErrRestoreActivationStarted)
++	require.ErrorIs(t, ReleaseActivatedDisk(t.Context(), directory, id), ErrRestoreActivationStarted)
++	final, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("fixed request"))
++	require.NoError(t, err)
++	defer final.Close()
++	require.Equal(t, "expired", final.Record().State)
++	require.ErrorIs(t, final.BeginBoot(), ErrRestoreActivationStarted)
++}
++
++type expiryDeleteFailure struct{ storage.StorageProvider }
++
++func (*expiryDeleteFailure) DeleteObjectsWithPrefix(context.Context, string) error {
++	return errors.New("storage unavailable")
++}
++
++func TestRestoreLeaseExpiryDoesNotRetireAnUncertainOrActiveGuest(t *testing.T) {
++	t.Parallel()
++	for _, active := range []bool{false, true} {
++		directory, id, digest := activationFixture(t, []byte(`{"version":1}`))
++		lock, err := LockRestoreActivation(t.Context(), directory, id, digest, []byte("fixed request"))
++		require.NoError(t, err)
++		require.NoError(t, lock.BeginBoot())
++		if active {
++			require.NoError(t, lock.Complete(json.RawMessage(`{"ready":true}`)))
++		}
++		require.NoError(t, lock.CheckDeadline(time.Now().Add(-time.Hour), time.Now()))
++		require.ErrorIs(t, lock.DiscardExpired(t.Context(), nil), ErrRestoreActivationStarted)
++		require.ErrorIs(t, lock.BeginBoot(), ErrRestoreActivationStarted)
++		require.NoError(t, lock.Close())
++	}
++}
+diff --git a/packages/orchestrator/pkg/server/restore_disk.go b/packages/orchestrator/pkg/server/restore_disk.go
+--- a/packages/orchestrator/pkg/server/restore_disk.go
++++ b/packages/orchestrator/pkg/server/restore_disk.go
+@@ -21,6 +21,7 @@
+ 
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++	"github.com/e2b-dev/infra/packages/shared/pkg/restoreresult"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+ )
+ 
+@@ -186,6 +187,11 @@
+ 		return nil, restoreDiskError(err)
+ 	}
+ 	defer activation.Close()
++	// Inspect an existing receipt before applying wall-clock expiry. A completed
++	// activation may have been renewed since the immutable request was recorded.
++	if err := activation.CheckDeadline(req.GetCreate().GetEndTime().AsTime(), time.Now()); err != nil {
++		return nil, s.restoreActivationFailure(ctx, activation, id, err)
++	}
+ 	record := activation.Record()
+ 	if record.State == "active" {
+ 		result := &orchestrator.SandboxCreateResponse{}
+@@ -216,9 +222,16 @@
+ 		if err != nil {
+ 			return nil, restoreDiskError(err)
+ 		}
+-		response, err = s.createSandbox(ctx, req.GetCreate(), activation.BeginBoot)
++		response, err = s.createSandbox(ctx, req.GetCreate(), func() error {
++			// Disk publication, admission, and template loading may have consumed the
++			// lease. Recheck at the last safe point, before persisting boot intent.
++			if err := activation.CheckDeadline(req.GetCreate().GetEndTime().AsTime(), time.Now()); err != nil {
++				return err
++			}
++			return activation.BeginBoot()
++		})
+ 		if err != nil {
+-			return nil, err
++			return nil, s.restoreActivationFailure(ctx, activation, id, err)
+ 		}
+ 	}
+ 	raw, err := protojson.Marshal(response)
+@@ -245,3 +258,13 @@
+ 	}
+ 	return &emptypb.Empty{}, nil
+ }
++
++func (s *Server) restoreActivationFailure(ctx context.Context, activation *rootfs.RestoreActivationLock, id uuid.UUID, err error) error {
++	if !errors.Is(err, rootfs.ErrRestoreActivationExpired) {
++		return err
++	}
++	if err := activation.DiscardExpired(ctx, s.persistence); err != nil {
++		return err
++	}
++	return restoreresult.Expired(id.String())
++}
+diff --git a/packages/orchestrator/pkg/server/restore_disk_test.go b/packages/orchestrator/pkg/server/restore_disk_test.go
+--- a/packages/orchestrator/pkg/server/restore_disk_test.go
++++ b/packages/orchestrator/pkg/server/restore_disk_test.go
+@@ -3,8 +3,17 @@
+ package server
+ 
+ import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
++	"github.com/e2b-dev/infra/packages/shared/pkg/restoreresult"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+ 	"github.com/google/uuid"
++	"google.golang.org/protobuf/proto"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
++	"os"
++	"path/filepath"
+ 	"testing"
+ 	"time"
+ 
+@@ -63,3 +72,48 @@
+ 	_, err = validateRestoreActivation(&orchestrator.RestoreDiskActivateRequest{})
+ 	require.Equal(t, codes.InvalidArgument, status.Code(err))
+ }
++
++func TestRestoreExpiredRequestCleansAndReturnsDurableFailureWithoutGuestFactory(t *testing.T) {
++	t.Parallel()
++	server := &Server{}
++	server.config.RestorePreparationEnabled = true
++	server.config.OrchestratorBaseDir = t.TempDir()
++	var err error
++	server.persistence, err = storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: t.TempDir()})
++	require.NoError(t, err)
++	id := uuid.New()
++	token := "test-access-token"
++	req := &orchestrator.RestoreDiskActivateRequest{
++		ManifestSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
++		Create: &orchestrator.SandboxCreateRequest{
++			Sandbox:        &orchestrator.SandboxConfig{BuildId: id.String(), TeamId: uuid.NewString(), SandboxId: "destination", ExecutionId: uuid.NewString(), TemplateId: "restore", Snapshot: true, EnvdAccessToken: &token},
++			FilesystemBoot: new(true), StartTime: timestamppb.New(time.Now().Add(-time.Hour)), EndTime: timestamppb.New(time.Now().Add(-time.Minute)),
++		},
++	}
++	raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(req.GetCreate())
++	require.NoError(t, err)
++	digest := sha256.New()
++	digest.Write([]byte(req.GetManifestSha256()))
++	digest.Write(raw)
++	receipt, err := json.Marshal(rootfs.RestoreActivation{Version: 1, RequestSHA256: hex.EncodeToString(digest.Sum(nil)), State: "accepted"})
++	require.NoError(t, err)
++	directory, err := server.restoreDiskDirectory()
++	require.NoError(t, err)
++	require.NoError(t, os.MkdirAll(filepath.Join(directory, id.String()), 0o700))
++	require.NoError(t, os.WriteFile(filepath.Join(directory, id.String()+".activation.json"), receipt, 0o600))
++	// A previous attempt published part of this destination, then failed preflight.
++	blob, err := server.persistence.OpenBlob(t.Context(), storage.Paths{BuildID: id.String()}.Rootfs())
++	require.NoError(t, err)
++	require.NoError(t, blob.Put(t.Context(), []byte("partial publication")))
++	for range 2 {
++		response, err := server.ActivateRestoreDisk(t.Context(), req)
++		require.Nil(t, response)
++		require.True(t, restoreresult.IsExpired(err, id.String()), "unexpected error: %v", err)
++	}
++	exists, err := blob.Exists(t.Context())
++	require.NoError(t, err)
++	require.False(t, exists)
++	_, err = os.Stat(filepath.Join(directory, id.String()))
++	require.ErrorIs(t, err, os.ErrNotExist)
++	require.Error(t, server.requireRestoreActivated(req.GetCreate()), "ordinary create cannot bypass the receipt")
++}
+diff --git a/packages/shared/pkg/restoreresult/expired.go b/packages/shared/pkg/restoreresult/expired.go
+new file mode 100644
+--- /dev/null
++++ b/packages/shared/pkg/restoreresult/expired.go
+@@ -0,0 +1,37 @@
++// Package restoreresult carries authoritative restore outcomes across gRPC.
++package restoreresult
++
++import (
++	"google.golang.org/genproto/googleapis/rpc/errdetails"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++const domain = "launchpad.e2b.restore"
++const expired = "ACTIVATION_EXPIRED_BEFORE_START"
++
++// Expired is emitted only after the host has persisted a never-started fence
++// and removed that destination's temporary and published disk objects.
++func Expired(buildID string) error {
++	s, err := status.New(codes.FailedPrecondition, "restore activation expired before guest start; destination cleaned").WithDetails(
++		&errdetails.ErrorInfo{Domain: domain, Reason: expired, Metadata: map[string]string{"prepared_build_id": buildID}},
++	)
++	if err != nil {
++		return err
++	}
++	return s.Err()
++}
++
++func IsExpired(err error, buildID string) bool {
++	s, ok := status.FromError(err)
++	if !ok || s.Code() != codes.FailedPrecondition {
++		return false
++	}
++	for _, detail := range s.Details() {
++		info, ok := detail.(*errdetails.ErrorInfo)
++		if ok && info.Domain == domain && info.Reason == expired && info.Metadata["prepared_build_id"] == buildID {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/packages/shared/pkg/restoreresult/expired_test.go b/packages/shared/pkg/restoreresult/expired_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/shared/pkg/restoreresult/expired_test.go
+@@ -0,0 +1,22 @@
++package restoreresult
++
++import (
++	"fmt"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"testing"
++)
++
++func TestExpiredResultRequiresStructuredMatchingIdentity(t *testing.T) {
++	t.Parallel()
++	original := Expired("assigned-build")
++	// Exercise the protobuf transport representation, not error string matching.
++	transported := status.ErrorProto(status.Convert(original).Proto())
++	require.True(t, IsExpired(transported, "assigned-build"))
++	require.True(t, IsExpired(fmt.Errorf("activate: %w", transported), "assigned-build"))
++	require.False(t, IsExpired(transported, "other-build"))
++	require.False(t, IsExpired(status.Error(codes.FailedPrecondition, status.Convert(original).Message()), "assigned-build"))
++	require.False(t, IsExpired(status.Error(codes.DeadlineExceeded, "reply lost"), "assigned-build"))
++	require.False(t, IsExpired(nil, "assigned-build"))
++}
+diff --git a/spec/openapi.yml b/spec/openapi.yml
+--- a/spec/openapi.yml
++++ b/spec/openapi.yml
+@@ -274,7 +274,7 @@
+           format: uuid
+         state:
+           type: string
+-          enum: [preparing, prepared, activating, active, cancelling, cancelled]
++          enum: [preparing, prepared, activating, active, cancelling, cancelled, failed]
+         generation:
+           type: string
+         sandboxID:

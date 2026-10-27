@@ -1,3 +1,4 @@
+import { ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   RepositoryPolicyControl,
   RepositoryPolicySyncError,
@@ -213,7 +214,6 @@ function connectorTestLayer(
     readonly allocations?: ManagedEndpointAllocations.ManagedEndpointAllocations["Service"];
     readonly machine?: Machines.MachineRecord | null;
     readonly membershipOrganizationId?: string | null;
-    readonly allowLocalMachineEndpoints?: boolean;
     readonly identities?: ReadonlyMap<string, RelayUserIdentity>;
   },
 ) {
@@ -289,14 +289,7 @@ function connectorTestLayer(
         }),
       ),
     ),
-    Layer.provide(
-      RelayConfiguration.layer({
-        ...settings,
-        ...(options?.allowLocalMachineEndpoints === undefined
-          ? {}
-          : { allowLocalMachineEndpoints: options.allowLocalMachineEndpoints }),
-      }),
-    ),
+    Layer.provide(RelayConfiguration.layer(settings)),
     Layer.provide(Layer.succeed(HttpClient.HttpClient, HttpClient.make(execute))),
   );
 }
@@ -493,16 +486,12 @@ describe("EnvironmentConnector", () => {
     );
   });
 
-  it.effect("checks a relay-provisioned Docker machine through its local endpoint in dev", () => {
+  it.effect("rejects a retired Docker machine loopback endpoint before sending a request", () => {
     const seenUrls: Array<string> = [];
     const execute = (request: HttpClientRequest.HttpClientRequest) =>
       Effect.sync(() => {
-        const healthRequest = decodeHealthRequestBody(requestBodyText(request));
         seenUrls.push(request.url);
-        return HttpClientResponse.fromWeb(
-          request,
-          Response.json(signHealthResponse(healthRequest), { status: 200 }),
-        );
+        throw new Error("unexpected request");
       });
     const machine: Machines.MachineRecord = {
       machineId: "machine-local",
@@ -525,21 +514,20 @@ describe("EnvironmentConnector", () => {
 
     return Effect.gen(function* () {
       const connector = yield* EnvironmentConnector.EnvironmentConnector;
-      const result = yield* connector.status({
-        userId: "user_member",
-        environmentId: "env-connector-test",
-      });
-
-      expect(seenUrls).toEqual(["http://127.0.0.1:23000/api/t3-connect/health"]);
-      expect(result).toMatchObject({
-        environmentId: "env-connector-test",
-        endpoint: {
-          httpBaseUrl: "http://127.0.0.1:23000",
-          wsBaseUrl: "ws://127.0.0.1:23000",
-          providerKind: "manual",
-        },
-        status: "online",
-      });
+      const result = yield* Effect.result(
+        connector.status({
+          userId: "user_member",
+          environmentId: "env-connector-test",
+        }),
+      );
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toMatchObject({
+          operation: "status",
+          reason: "endpoint_provider_not_managed",
+        });
+      }
+      expect(seenUrls).toEqual([]);
     }).pipe(
       Effect.provide(
         connectorTestLayer(execute, {
@@ -550,7 +538,6 @@ describe("EnvironmentConnector", () => {
           allocations: makeAllocations(null),
           machine,
           membershipOrganizationId: "organization-1",
-          allowLocalMachineEndpoints: true,
         }),
       ),
     );
@@ -609,7 +596,6 @@ describe("EnvironmentConnector", () => {
           allocations: makeAllocations(null),
           machine,
           membershipOrganizationId: "organization-1",
-          allowLocalMachineEndpoints: true,
         }),
       ),
     );
@@ -1354,6 +1340,169 @@ describe("EnvironmentConnector.resolveAccess", () => {
     deprovisionedAt: null,
     createdAt: "2026-08-19T00:00:00.000Z",
   };
+
+  it.effect("signs automation with a job subject and keeps the human reviewer separate", () => {
+    const origin = {
+      kind: "automation",
+      organizationId: "organization-1",
+      repositoryId: "repo-1",
+      workflowId: "flow",
+      source: {
+        provider: "linear",
+        applicationId: "app",
+        workspaceId: "ws",
+        connectionId: "connection",
+        grantId: "grant",
+      },
+      occurrenceId: "event",
+    } as const;
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const envelope = decodeDispatchJobRequestBody(requestBodyText(request));
+        const proof = decodeRequestProof<RelayCloudDispatchJobProofPayload>(envelope.proof);
+        expect(proof).toMatchObject({
+          sub: "workflow:workflow-job",
+          workflowOrigin: origin,
+          requestedBy: "bob",
+        });
+        expect(request.url).toContain("/workflow-job");
+        const workflowResult = {
+          protocol: 8 as const,
+          outcome: "missing" as const,
+          detail: null,
+          progress: null,
+        };
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json(
+            signDispatchJobResponse(
+              envelope,
+              { workflowResult, requestId: proof.jti },
+              { workflowResult },
+            ),
+          ),
+        );
+      });
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const input = {
+        environmentId: "env-connector-test",
+        jobId: RelayJobId.make("workflow-job"),
+        repositoryCanonicalKey: "github.com/acme/app",
+        baseBranch: "HEAD",
+        instruction: "Inspect",
+        workflowOrigin: origin,
+        requestedBy: "bob",
+        workflowControl: {
+          operation: "status" as const,
+          organizationId: "organization-1",
+          repositoryId: "repo-1",
+          projectId: ProjectId.make("project-1"),
+        },
+      };
+      expect((yield* connector.dispatchJob(input)).workflowResult?.protocol).toBe(8);
+      const { workflowControl: _control, ...personal } = input;
+      expect((yield* Effect.exit(connector.dispatchJob(personal)))._tag).toBe("Failure");
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(execute, {
+          machine: {
+            ...enrolledMachine,
+            endpointHttpBaseUrl: "https://env.example.test/",
+            endpointWsBaseUrl: "wss://env.example.test/ws",
+          },
+          links: noLinks(),
+          allocations: makeAllocations(),
+        }),
+      ),
+    );
+  });
+
+  it.effect(
+    "uses the workflow endpoint and rejects a replayed nonce or unsigned progress change",
+    () =>
+      Effect.gen(function* () {
+        for (const variant of ["valid", "wrong_nonce", "changed_body"] as const) {
+          const seenUrls: string[] = [];
+          const execute = (request: HttpClientRequest.HttpClientRequest) =>
+            Effect.sync(() => {
+              seenUrls.push(request.url);
+              const envelope = decodeDispatchJobRequestBody(requestBodyText(request));
+              const requestProof = decodeRequestProof<RelayCloudDispatchJobProofPayload>(
+                envelope.proof,
+              );
+              const progress = {
+                protocol: 3 as const,
+                outcome: "accepted" as const,
+                detail: null,
+                progress: {
+                  revision: 4,
+                  status: "awaiting_review" as const,
+                  threadId: ThreadId.make("workflow-thread"),
+                  detail: null,
+                  checkpoint: null,
+                  approvalPending: true,
+                  retryableApproval: false,
+                },
+              };
+              return HttpClientResponse.fromWeb(
+                request,
+                Response.json(
+                  signDispatchJobResponse(
+                    envelope,
+                    {
+                      accepted: false,
+                      workflowResult: progress,
+                      requestId: variant === "wrong_nonce" ? "old-request" : requestProof.jti,
+                    },
+                    {
+                      workflowResult:
+                        variant === "changed_body" ? { ...progress, outcome: "busy" } : progress,
+                    },
+                  ),
+                ),
+              );
+            });
+          const call = EnvironmentConnector.EnvironmentConnector.pipe(
+            Effect.flatMap((connector) =>
+              connector.dispatchJob({
+                userId: "removed-submitter",
+                environmentId: "env-connector-test",
+                jobId: RelayJobId.make("workflow-job"),
+                repositoryCanonicalKey: "github.com/acme/app",
+                baseBranch: "HEAD",
+                instruction: "Inspect",
+                workflowControl: {
+                  operation: "status",
+                  organizationId: "organization-1",
+                  repositoryId: "repo-1",
+                  projectId: ProjectId.make("project-1"),
+                },
+              }),
+            ),
+            Effect.provide(
+              connectorTestLayer(execute, {
+                machine: {
+                  ...enrolledMachine,
+                  endpointHttpBaseUrl: "https://env.example.test/",
+                  endpointWsBaseUrl: "wss://env.example.test/ws",
+                },
+                links: noLinks(),
+                allocations: makeAllocations(),
+              }),
+            ),
+          );
+          if (variant === "valid")
+            expect((yield* call).workflowResult).toMatchObject({
+              protocol: 3,
+              outcome: "accepted",
+              progress: { approvalPending: true, retryableApproval: false },
+            });
+          else expect((yield* Effect.flip(call))._tag).toBe("EnvironmentMintResponseInvalid");
+          expect(seenUrls).toEqual(["https://env.example.test/api/t3-connect/workflow-job"]);
+        }
+      }),
+  );
 
   it.effect("resolves an enrolled machine for a member of its organization", () =>
     Effect.gen(function* () {

@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeNet from "node:net";
+import * as NodeProcess from "node:process";
 import * as NodeReadline from "node:readline";
 import type * as NodeStream from "node:stream";
 
@@ -96,18 +97,34 @@ export const readBootstrapEnvelope = Effect.fn("readBootstrapEnvelope")(function
 
     const cleanup = () => {
       stream.removeListener("error", handleError);
+      input.removeListener("error", handleError);
       input.removeListener("line", handleLine);
       input.removeListener("close", handleClose);
       input.close();
-      stream.destroy();
+      if (fd === 0) {
+        NodeProcess.stdin.pause();
+        NodeProcess.stdin.unref?.();
+      } else {
+        stream.destroy();
+      }
+    };
+
+    const finish = (
+      result: Effect.Effect<
+        Option.Option<A>,
+        BootstrapEnvelopeReadError | BootstrapEnvelopeDecodeError
+      >,
+    ) => {
+      cleanup();
+      resume(result);
     };
 
     const handleError = (error: Error) => {
       if (isUnavailableBootstrapFdError(error)) {
-        resume(Effect.succeedNone);
+        finish(Effect.succeedNone);
         return;
       }
-      resume(
+      finish(
         Effect.fail(
           new BootstrapEnvelopeReadError({
             fd,
@@ -120,9 +137,9 @@ export const readBootstrapEnvelope = Effect.fn("readBootstrapEnvelope")(function
     const handleLine = (line: string) => {
       const parsed = decodeJsonResult(schema)(line);
       if (Result.isSuccess(parsed)) {
-        resume(Effect.succeedSome(parsed.success));
+        finish(Effect.succeedSome(parsed.success));
       } else {
-        resume(
+        finish(
           Effect.fail(
             new BootstrapEnvelopeDecodeError({
               fd,
@@ -134,10 +151,11 @@ export const readBootstrapEnvelope = Effect.fn("readBootstrapEnvelope")(function
     };
 
     const handleClose = () => {
-      resume(Effect.succeedNone);
+      finish(Effect.succeedNone);
     };
 
     stream.once("error", handleError);
+    input.once("error", handleError);
     input.once("line", handleLine);
     input.once("close", handleClose);
 
@@ -168,6 +186,9 @@ const isFdReady = (fd: number) =>
 
 const makeBootstrapInputStream = (fd: number) =>
   Effect.gen(function* () {
+    // envd supplies non-blocking stdin. Node's stdin stream waits for pipe
+    // readiness; fs.createReadStream instead fails with EAGAIN between writes.
+    if (fd === 0) return NodeProcess.stdin;
     const platform = yield* HostProcessPlatform;
     const fdPath = resolveFdPath(fd, platform);
     return yield* Effect.try<NodeStream.Readable, BootstrapInputStreamOpenError>({

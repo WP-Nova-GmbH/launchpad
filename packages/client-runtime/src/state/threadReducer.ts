@@ -1,3 +1,5 @@
+import { ThreadWorkflowJob } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { pipe } from "effect/Function";
 import * as Arr from "effect/Array";
 import * as O from "effect/Order";
@@ -46,6 +48,8 @@ function withPullRequests(
   };
 }
 
+const isWorkflowProgress = Schema.is(ThreadWorkflowJob);
+
 const proposedPlanOrder = O.combine<OrchestrationThread["proposedPlans"][number]>(
   O.mapInput(O.String, (p) => p.createdAt),
   O.mapInput(O.String, (p) => p.id),
@@ -90,6 +94,41 @@ function isResolvableContextWindowActivity(activity: OrchestrationThreadActivity
   return typeof usedTokens === "number" && Number.isFinite(usedTokens) && usedTokens >= 0;
 }
 
+/** Initialize the same detail model for a retained relay history and a live stream. */
+export function threadFromCreatedEvent(
+  event: Extract<OrchestrationEvent, { readonly type: "thread.created" }>,
+): OrchestrationThread {
+  return {
+    id: event.payload.threadId,
+    projectId: event.payload.projectId,
+    title: event.payload.title,
+    modelSelection: event.payload.modelSelection,
+    runtimeMode: event.payload.runtimeMode,
+    interactionMode: event.payload.interactionMode,
+    branch: event.payload.branch,
+    worktreePath: event.payload.worktreePath,
+    branchPullRequest: null,
+    latestTurn: null,
+    createdAt: event.payload.createdAt,
+    updatedAt: event.payload.updatedAt,
+    archivedAt: null,
+    settledOverride: null,
+    settledAt: null,
+    unsettledAt: null,
+    activeOrderKey: null,
+    autoSettleDisabledAt: null,
+    snoozedUntil: null,
+    snoozedAt: null,
+    deletedAt: null,
+    pullRequests: [],
+    messages: [],
+    proposedPlans: [],
+    activities: [],
+    checkpoints: [],
+    session: null,
+  };
+}
+
 /**
  * Apply a single orchestration event to an `OrchestrationThread`, returning
  * the updated thread, a deletion signal, or an "unchanged" marker when the
@@ -111,38 +150,14 @@ export function applyThreadDetailEvent(
       return { kind: "unchanged" };
 
     // ── Thread lifecycle ────────────────────────────────────────────
+    case "thread.placement-imported":
+      // The stream replaces history with a fresh snapshot at this boundary.
+      return { kind: "unchanged" };
+
     case "thread.created":
       return {
         kind: "updated",
-        thread: {
-          id: event.payload.threadId,
-          projectId: event.payload.projectId,
-          title: event.payload.title,
-          modelSelection: event.payload.modelSelection,
-          runtimeMode: event.payload.runtimeMode,
-          interactionMode: event.payload.interactionMode,
-          branch: event.payload.branch,
-          worktreePath: event.payload.worktreePath,
-          branchPullRequest: null,
-          latestTurn: null,
-          createdAt: event.payload.createdAt,
-          updatedAt: event.payload.updatedAt,
-          archivedAt: null,
-          settledOverride: null,
-          settledAt: null,
-          unsettledAt: null,
-          activeOrderKey: null,
-          autoSettleDisabledAt: null,
-          snoozedUntil: null,
-          snoozedAt: null,
-          deletedAt: null,
-          pullRequests: [],
-          messages: [],
-          proposedPlans: [],
-          activities: [],
-          checkpoints: [],
-          session: null,
-        },
+        thread: threadFromCreatedEvent(event),
       };
 
     case "thread.deleted":
@@ -411,6 +426,9 @@ export function applyThreadDetailEvent(
           : {}),
         ...(event.payload.context !== undefined ? { context: event.payload.context } : {}),
         ...(event.payload.author !== undefined ? { author: event.payload.author } : {}),
+        ...(event.payload.workflowOrigin !== undefined
+          ? { workflowOrigin: event.payload.workflowOrigin }
+          : {}),
         ...(event.payload.editedBy !== undefined ? { editedBy: event.payload.editedBy } : {}),
         ...(event.payload.steeredBy !== undefined ? { steeredBy: event.payload.steeredBy } : {}),
         turnId: event.payload.turnId,
@@ -436,6 +454,9 @@ export function applyThreadDetailEvent(
           ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
           ...(message.context !== undefined ? { context: message.context } : {}),
           ...(message.author !== undefined ? { author: message.author } : {}),
+          ...(message.workflowOrigin !== undefined
+            ? { workflowOrigin: message.workflowOrigin }
+            : {}),
           ...(message.editedBy !== undefined ? { editedBy: message.editedBy } : {}),
           ...(message.steeredBy !== undefined ? { steeredBy: message.steeredBy } : {}),
         };
@@ -700,6 +721,14 @@ export function applyThreadDetailEvent(
     // ── Activities ──────────────────────────────────────────────────
     case "thread.activity-appended": {
       const activity = event.payload.activity;
+      const workflowOwnership =
+        activity.kind === "workflow.progress" && isWorkflowProgress(activity.payload)
+          ? {
+              workflowJob: ["done", "cancelled", "failed"].includes(activity.payload.status)
+                ? null
+                : activity.payload,
+            }
+          : {};
       // A resolvable context-window update supersedes earlier resolvable ones
       // for the same turn: consumers only read the latest value (walking the
       // array backwards), and providers stream these updates continuously, so
@@ -729,6 +758,7 @@ export function applyThreadDetailEvent(
           kind: "updated",
           thread: {
             ...thread,
+            ...workflowOwnership,
             activities,
             updatedAt: event.occurredAt,
           },
@@ -752,7 +782,7 @@ export function applyThreadDetailEvent(
 
       return {
         kind: "updated",
-        thread: { ...thread, activities, updatedAt: event.occurredAt },
+        thread: { ...thread, ...workflowOwnership, activities, updatedAt: event.occurredAt },
       };
     }
 

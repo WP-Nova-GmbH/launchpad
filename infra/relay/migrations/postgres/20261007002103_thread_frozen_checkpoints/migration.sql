@@ -1,0 +1,5 @@
+ALTER TABLE "relay_thread_native_checkpoints" ADD COLUMN "capture_operation_id" varchar(64);--> statement-breakpoint
+DROP INDEX "idx_relay_thread_native_checkpoints_turn";--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_relay_thread_native_checkpoints_turn" ON "relay_thread_native_checkpoints" ("thread_id","generation","turn_id") WHERE "capture_operation_id" IS NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_relay_thread_native_checkpoints_capture" ON "relay_thread_native_checkpoints" ("thread_id","generation","capture_operation_id") WHERE "capture_operation_id" IS NOT NULL;--> statement-breakpoint
+ALTER TABLE "relay_thread_native_checkpoints" ADD CONSTRAINT "relay_thread_native_checkpoints_capture" CHECK ("capture_operation_id" IS NULL OR "capture_operation_id" ~ '^[0-9a-f-]{36}$');

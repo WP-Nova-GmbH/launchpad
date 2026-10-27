@@ -30,8 +30,32 @@ describe.sequential("primary environment HTTP layer", () => {
       yield* HttpClient.get("http://127.0.0.1:3773/api/auth/session");
 
       const request = new Request(fetchMock.mock.calls[0]?.[0], fetchMock.mock.calls[0]?.[1]);
-      expect(request.credentials).toBe("include");
+      expect(request.credentials).toBe("same-origin");
       expect(request.headers.get("authorization")).toBeNull();
+    }).pipe(Effect.provide(makePrimaryEnvironmentHttpLayer()));
+  });
+
+  it.effect("does not opt relay requests into cross-origin cookies", () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: {
+          href: "http://127.0.0.1:3773/settings",
+          origin: "http://127.0.0.1:3773",
+        },
+      },
+    });
+
+    return Effect.gen(function* () {
+      yield* HttpClient.post("https://relay.example/v1/client/environment-link-challenges", {
+        headers: { authorization: "Bearer cloud-session" },
+      });
+      const request = new Request(fetchMock.mock.calls[0]?.[0], fetchMock.mock.calls[0]?.[1]);
+      expect(request.credentials).toBe("same-origin");
+      expect(new URL(request.url).origin).not.toBe("http://127.0.0.1:3773");
+      expect(request.headers.get("authorization")).toBe("Bearer cloud-session");
     }).pipe(Effect.provide(makePrimaryEnvironmentHttpLayer()));
   });
 

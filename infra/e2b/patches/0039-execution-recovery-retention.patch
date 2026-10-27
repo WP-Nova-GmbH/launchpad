@@ -1,0 +1,3219 @@
+diff --git a/packages/api/internal/api/api.gen.go b/packages/api/internal/api/api.gen.go
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -101,13 +101,13 @@
+ 
+ // Defines values for LaunchpadColdProbeReceiptVersion.
+ const (
+-	N1 LaunchpadColdProbeReceiptVersion = 1
++	LaunchpadColdProbeReceiptVersionN1 LaunchpadColdProbeReceiptVersion = 1
+ )
+ 
+ // Valid indicates whether the value is a known member of the LaunchpadColdProbeReceiptVersion enum.
+ func (e LaunchpadColdProbeReceiptVersion) Valid() bool {
+ 	switch e {
+-	case N1:
++	case LaunchpadColdProbeReceiptVersionN1:
+ 		return true
+ 	default:
+ 		return false
+@@ -162,6 +162,72 @@
+ 	}
+ }
+ 
++// Defines values for LaunchpadRetentionCandidateDisposition.
++const (
++	LaunchpadRetentionCandidateDispositionNoCurrentTip LaunchpadRetentionCandidateDisposition = "no_current_tip"
++	LaunchpadRetentionCandidateDispositionReadyTip     LaunchpadRetentionCandidateDisposition = "ready_tip"
++)
++
++// Valid indicates whether the value is a known member of the LaunchpadRetentionCandidateDisposition enum.
++func (e LaunchpadRetentionCandidateDisposition) Valid() bool {
++	switch e {
++	case LaunchpadRetentionCandidateDispositionNoCurrentTip:
++		return true
++	case LaunchpadRetentionCandidateDispositionReadyTip:
++		return true
++	default:
++		return false
++	}
++}
++
++// Defines values for LaunchpadRetentionReceiptDisposition.
++const (
++	LaunchpadRetentionReceiptDispositionNoCurrentTip LaunchpadRetentionReceiptDisposition = "no_current_tip"
++	LaunchpadRetentionReceiptDispositionReadyTip     LaunchpadRetentionReceiptDisposition = "ready_tip"
++)
++
++// Valid indicates whether the value is a known member of the LaunchpadRetentionReceiptDisposition enum.
++func (e LaunchpadRetentionReceiptDisposition) Valid() bool {
++	switch e {
++	case LaunchpadRetentionReceiptDispositionNoCurrentTip:
++		return true
++	case LaunchpadRetentionReceiptDispositionReadyTip:
++		return true
++	default:
++		return false
++	}
++}
++
++// Defines values for LaunchpadRetentionReceiptKind.
++const (
++	RetainedForStop LaunchpadRetentionReceiptKind = "retained_for_stop"
++)
++
++// Valid indicates whether the value is a known member of the LaunchpadRetentionReceiptKind enum.
++func (e LaunchpadRetentionReceiptKind) Valid() bool {
++	switch e {
++	case RetainedForStop:
++		return true
++	default:
++		return false
++	}
++}
++
++// Defines values for LaunchpadRetentionReceiptVersion.
++const (
++	LaunchpadRetentionReceiptVersionN1 LaunchpadRetentionReceiptVersion = 1
++)
++
++// Valid indicates whether the value is a known member of the LaunchpadRetentionReceiptVersion enum.
++func (e LaunchpadRetentionReceiptVersion) Valid() bool {
++	switch e {
++	case LaunchpadRetentionReceiptVersionN1:
++		return true
++	default:
++		return false
++	}
++}
++
+ // Defines values for LogLevel.
+ const (
+ 	LogLevelDebug LogLevel = "debug"
+@@ -708,13 +774,57 @@
+ // LaunchpadRestoreStatusState defines model for LaunchpadRestoreStatus.State.
+ type LaunchpadRestoreStatusState string
+ 
++// LaunchpadRetentionCandidate defines model for LaunchpadRetentionCandidate.
++type LaunchpadRetentionCandidate struct {
++	BuildID     *openapi_types.UUID                    `json:"buildID"`
++	Disposition LaunchpadRetentionCandidateDisposition `json:"disposition"`
++	ExecutionID openapi_types.UUID                     `json:"executionID"`
++	Metadata    map[string]string                      `json:"metadata"`
++	SandboxID   string                                 `json:"sandboxID"`
++}
++
++// LaunchpadRetentionCandidateDisposition defines model for LaunchpadRetentionCandidate.Disposition.
++type LaunchpadRetentionCandidateDisposition string
++
++// LaunchpadRetentionReceipt defines model for LaunchpadRetentionReceipt.
++type LaunchpadRetentionReceipt struct {
++	BuildID             *openapi_types.UUID                  `json:"buildID"`
++	Disposition         LaunchpadRetentionReceiptDisposition `json:"disposition"`
++	ExecutionID         openapi_types.UUID                   `json:"executionID"`
++	Kind                LaunchpadRetentionReceiptKind        `json:"kind"`
++	Metadata            map[string]string                    `json:"metadata"`
++	RecoveryOperationID openapi_types.UUID                   `json:"recoveryOperationID"`
++	RequestSHA256       string                               `json:"requestSHA256"`
++	RetainedBuildIDs    []openapi_types.UUID                 `json:"retainedBuildIDs"`
++	RetainedTemplateID  *string                              `json:"retainedTemplateID"`
++	SandboxID           string                               `json:"sandboxID"`
++	Version             LaunchpadRetentionReceiptVersion     `json:"version"`
++}
++
++// LaunchpadRetentionReceiptDisposition defines model for LaunchpadRetentionReceipt.Disposition.
++type LaunchpadRetentionReceiptDisposition string
++
++// LaunchpadRetentionReceiptKind defines model for LaunchpadRetentionReceipt.Kind.
++type LaunchpadRetentionReceiptKind string
++
++// LaunchpadRetentionReceiptVersion defines model for LaunchpadRetentionReceipt.Version.
++type LaunchpadRetentionReceiptVersion int
++
++// LaunchpadRetentionRequest defines model for LaunchpadRetentionRequest.
++type LaunchpadRetentionRequest struct {
++	BuildID     *openapi_types.UUID `json:"buildID"`
++	ExecutionID openapi_types.UUID  `json:"executionID"`
++	Metadata    map[string]string   `json:"metadata"`
++}
++
+ // LaunchpadRuntimeCapabilities defines model for LaunchpadRuntimeCapabilities.
+ type LaunchpadRuntimeCapabilities struct {
++	BuildCollectionAdmission     bool `json:"buildCollectionAdmission"`
+ 	CertifiedPauses              bool `json:"certifiedPauses"`
+-	BuildCollectionAdmission     bool `json:"buildCollectionAdmission"`
+ 	DiskRestore                  bool `json:"diskRestore"`
+ 	DurableCreationIdentity      bool `json:"durableCreationIdentity"`
+ 	ExecutionBuildRoots          bool `json:"executionBuildRoots"`
++	ExecutionRetention           bool `json:"executionRetention"`
+ 	LiveBuildCollection          bool `json:"liveBuildCollection"`
+ 	PausedSnapshots              bool `json:"pausedSnapshots"`
+ 	PrivatePreviewHeaderBoundary bool `json:"privatePreviewHeaderBoundary"`
+@@ -2366,6 +2476,9 @@
+ 
+ // PatchEventsWebhooksWebhookIDJSONRequestBody defines body for PatchEventsWebhooksWebhookID for application/json ContentType.
+ type PatchEventsWebhooksWebhookIDJSONRequestBody = WebhookConfiguration
++
++// PutLaunchpadExecutionRetentionJSONRequestBody defines body for PutLaunchpadExecutionRetention for application/json ContentType.
++type PutLaunchpadExecutionRetentionJSONRequestBody = LaunchpadRetentionRequest
+ 
+ // PutLaunchpadRestoreJSONRequestBody defines body for PutLaunchpadRestore for application/json ContentType.
+ type PutLaunchpadRestoreJSONRequestBody = LaunchpadRestoreRequest
+@@ -2866,6 +2979,17 @@
+ 	// StopLaunchpadExecution performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
+ 	StopLaunchpadExecution(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*http.Response, error)
+ 
++	// GetLaunchpadRetentionCandidate performs a GET /extensions/launchpad/v1/executions/{sandboxID}/retention-candidate (the `GetLaunchpadRetentionCandidate` operationId) request.
++	GetLaunchpadRetentionCandidate(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*http.Response, error)
++
++	// PutLaunchpadExecutionRetentionWithBody performs a PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID} (the `PutLaunchpadExecutionRetention` operationId) request,
++	// with any type of body and a specified content type.
++	PutLaunchpadExecutionRetentionWithBody(ctx context.Context, sandboxID string, recoveryOperationID openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
++
++	// PutLaunchpadExecutionRetention performs a PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID} (the `PutLaunchpadExecutionRetention` operationId) request.
++	// Takes a body of the `application/json` content type.
++	PutLaunchpadExecutionRetention(ctx context.Context, sandboxID string, recoveryOperationID openapi_types.UUID, body PutLaunchpadExecutionRetentionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
++
+ 	// DeleteLaunchpadRestore performs a DELETE /extensions/launchpad/v1/restores/{operationID} (the `DeleteLaunchpadRestore` operationId) request.
+ 	DeleteLaunchpadRestore(ctx context.Context, operationID openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
+ 
+@@ -4022,6 +4146,47 @@
+ // StopLaunchpadExecution performs a DELETE /extensions/launchpad/v1/executions/{sandboxID} (the `StopLaunchpadExecution` operationId) request.
+ func (c *Client) StopLaunchpadExecution(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+ 	req, err := NewStopLaunchpadExecutionRequest(c.Server, sandboxID)
++	if err != nil {
++		return nil, err
++	}
++	req = req.WithContext(ctx)
++	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
++		return nil, err
++	}
++	return c.Client.Do(req)
++}
++
++// GetLaunchpadRetentionCandidate performs a GET /extensions/launchpad/v1/executions/{sandboxID}/retention-candidate (the `GetLaunchpadRetentionCandidate` operationId) request.
++func (c *Client) GetLaunchpadRetentionCandidate(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*http.Response, error) {
++	req, err := NewGetLaunchpadRetentionCandidateRequest(c.Server, sandboxID)
++	if err != nil {
++		return nil, err
++	}
++	req = req.WithContext(ctx)
++	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
++		return nil, err
++	}
++	return c.Client.Do(req)
++}
++
++// PutLaunchpadExecutionRetentionWithBody performs a PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID} (the `PutLaunchpadExecutionRetention` operationId) request,
++// with any type of body and a specified content type.
++func (c *Client) PutLaunchpadExecutionRetentionWithBody(ctx context.Context, sandboxID string, recoveryOperationID openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
++	req, err := NewPutLaunchpadExecutionRetentionRequestWithBody(c.Server, sandboxID, recoveryOperationID, contentType, body)
++	if err != nil {
++		return nil, err
++	}
++	req = req.WithContext(ctx)
++	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
++		return nil, err
++	}
++	return c.Client.Do(req)
++}
++
++// PutLaunchpadExecutionRetention performs a PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID} (the `PutLaunchpadExecutionRetention` operationId) request.
++// Takes a body of the `application/json` content type.
++func (c *Client) PutLaunchpadExecutionRetention(ctx context.Context, sandboxID string, recoveryOperationID openapi_types.UUID, body PutLaunchpadExecutionRetentionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
++	req, err := NewPutLaunchpadExecutionRetentionRequest(c.Server, sandboxID, recoveryOperationID, body)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -6708,6 +6873,94 @@
+ 	return req, nil
+ }
+ 
++// NewGetLaunchpadRetentionCandidateRequest constructs an http.Request for the GetLaunchpadRetentionCandidate method
++func NewGetLaunchpadRetentionCandidateRequest(server string, sandboxID string) (*http.Request, error) {
++	var err error
++
++	var pathParam0 string
++
++	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "sandboxID", sandboxID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
++	if err != nil {
++		return nil, err
++	}
++
++	serverURL, err := url.Parse(server)
++	if err != nil {
++		return nil, err
++	}
++
++	operationPath := fmt.Sprintf("/extensions/launchpad/v1/executions/%s/retention-candidate", pathParam0)
++	if operationPath[0] == '/' {
++		operationPath = "." + operationPath
++	}
++
++	queryURL, err := serverURL.Parse(operationPath)
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
++	if err != nil {
++		return nil, err
++	}
++
++	return req, nil
++}
++
++// NewPutLaunchpadExecutionRetentionRequest calls the generic PutLaunchpadExecutionRetention builder with application/json body
++func NewPutLaunchpadExecutionRetentionRequest(server string, sandboxID string, recoveryOperationID openapi_types.UUID, body PutLaunchpadExecutionRetentionJSONRequestBody) (*http.Request, error) {
++	var bodyReader io.Reader
++	buf, err := json.Marshal(body)
++	if err != nil {
++		return nil, err
++	}
++	bodyReader = bytes.NewReader(buf)
++	return NewPutLaunchpadExecutionRetentionRequestWithBody(server, sandboxID, recoveryOperationID, "application/json", bodyReader)
++}
++
++// NewPutLaunchpadExecutionRetentionRequestWithBody constructs an http.Request for the PutLaunchpadExecutionRetention method, with any body, and a specified content type
++func NewPutLaunchpadExecutionRetentionRequestWithBody(server string, sandboxID string, recoveryOperationID openapi_types.UUID, contentType string, body io.Reader) (*http.Request, error) {
++	var err error
++
++	var pathParam0 string
++
++	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "sandboxID", sandboxID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
++	if err != nil {
++		return nil, err
++	}
++
++	var pathParam1 string
++
++	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "recoveryOperationID", recoveryOperationID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
++	if err != nil {
++		return nil, err
++	}
++
++	serverURL, err := url.Parse(server)
++	if err != nil {
++		return nil, err
++	}
++
++	operationPath := fmt.Sprintf("/extensions/launchpad/v1/executions/%s/retentions/%s", pathParam0, pathParam1)
++	if operationPath[0] == '/' {
++		operationPath = "." + operationPath
++	}
++
++	queryURL, err := serverURL.Parse(operationPath)
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := http.NewRequest(http.MethodPut, queryURL.String(), body)
++	if err != nil {
++		return nil, err
++	}
++
++	req.Header.Add("Content-Type", contentType)
++
++	return req, nil
++}
++
+ // NewDeleteLaunchpadRestoreRequest constructs an http.Request for the DeleteLaunchpadRestore method
+ func NewDeleteLaunchpadRestoreRequest(server string, operationID openapi_types.UUID) (*http.Request, error) {
+ 	var err error
+@@ -9860,6 +10113,21 @@
+ 	//
+ 	// Returns a wrapper object for the known response body format(s).
+ 	StopLaunchpadExecutionWithResponse(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*StopLaunchpadExecutionResponse, error)
++
++	// GetLaunchpadRetentionCandidateWithResponse performs a GET /extensions/launchpad/v1/executions/{sandboxID}/retention-candidate (the `GetLaunchpadRetentionCandidate` operationId) request.
++	//
++	// Returns a wrapper object for the known response body format(s).
++	GetLaunchpadRetentionCandidateWithResponse(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*GetLaunchpadRetentionCandidateResponse, error)
++
++	// PutLaunchpadExecutionRetentionWithBodyWithResponse performs a PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID} (the `PutLaunchpadExecutionRetention` operationId) request,
++	// with any type of body and a specified content type.
++	//
++	// Returns a wrapper object for the known response body format(s).
++	PutLaunchpadExecutionRetentionWithBodyWithResponse(ctx context.Context, sandboxID string, recoveryOperationID openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutLaunchpadExecutionRetentionResponse, error)
++
++	// PutLaunchpadExecutionRetentionWithResponse performs a PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID} (the `PutLaunchpadExecutionRetention` operationId) request.
++	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
++	PutLaunchpadExecutionRetentionWithResponse(ctx context.Context, sandboxID string, recoveryOperationID openapi_types.UUID, body PutLaunchpadExecutionRetentionJSONRequestBody, reqEditors ...RequestEditorFn) (*PutLaunchpadExecutionRetentionResponse, error)
+ 
+ 	// DeleteLaunchpadRestoreWithResponse performs a DELETE /extensions/launchpad/v1/restores/{operationID} (the `DeleteLaunchpadRestore` operationId) request.
+ 	//
+@@ -12407,6 +12675,88 @@
+ 
+ // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+ func (r StopLaunchpadExecutionResponse) ContentType() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Header.Get("Content-Type")
++	}
++	return ""
++}
++
++type GetLaunchpadRetentionCandidateResponse struct {
++	Body         []byte
++	HTTPResponse *http.Response
++	// JSON200 the response for an HTTP 200 `application/json` response
++	JSON200 *LaunchpadRetentionCandidate
++}
++
++// GetJSON200 returns the response for an HTTP 200 `application/json` response
++func (r GetLaunchpadRetentionCandidateResponse) GetJSON200() *LaunchpadRetentionCandidate {
++	return r.JSON200
++}
++
++// GetBody returns the raw response body bytes
++func (r GetLaunchpadRetentionCandidateResponse) GetBody() []byte {
++	return r.Body
++}
++
++// Status returns HTTPResponse.Status
++func (r GetLaunchpadRetentionCandidateResponse) Status() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Status
++	}
++	return http.StatusText(0)
++}
++
++// StatusCode returns HTTPResponse.StatusCode
++func (r GetLaunchpadRetentionCandidateResponse) StatusCode() int {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.StatusCode
++	}
++	return 0
++}
++
++// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
++func (r GetLaunchpadRetentionCandidateResponse) ContentType() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Header.Get("Content-Type")
++	}
++	return ""
++}
++
++type PutLaunchpadExecutionRetentionResponse struct {
++	Body         []byte
++	HTTPResponse *http.Response
++	// JSON200 the response for an HTTP 200 `application/json` response
++	JSON200 *LaunchpadRetentionReceipt
++}
++
++// GetJSON200 returns the response for an HTTP 200 `application/json` response
++func (r PutLaunchpadExecutionRetentionResponse) GetJSON200() *LaunchpadRetentionReceipt {
++	return r.JSON200
++}
++
++// GetBody returns the raw response body bytes
++func (r PutLaunchpadExecutionRetentionResponse) GetBody() []byte {
++	return r.Body
++}
++
++// Status returns HTTPResponse.Status
++func (r PutLaunchpadExecutionRetentionResponse) Status() string {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.Status
++	}
++	return http.StatusText(0)
++}
++
++// StatusCode returns HTTPResponse.StatusCode
++func (r PutLaunchpadExecutionRetentionResponse) StatusCode() int {
++	if r.HTTPResponse != nil {
++		return r.HTTPResponse.StatusCode
++	}
++	return 0
++}
++
++// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
++func (r PutLaunchpadExecutionRetentionResponse) ContentType() string {
+ 	if r.HTTPResponse != nil {
+ 		return r.HTTPResponse.Header.Get("Content-Type")
+ 	}
+@@ -17213,6 +17563,39 @@
+ 	return ParseStopLaunchpadExecutionResponse(rsp)
+ }
+ 
++// GetLaunchpadRetentionCandidateWithResponse performs a GET /extensions/launchpad/v1/executions/{sandboxID}/retention-candidate (the `GetLaunchpadRetentionCandidate` operationId) request.
++//
++// Returns a wrapper object for the known response body format(s).
++func (c *ClientWithResponses) GetLaunchpadRetentionCandidateWithResponse(ctx context.Context, sandboxID string, reqEditors ...RequestEditorFn) (*GetLaunchpadRetentionCandidateResponse, error) {
++	rsp, err := c.GetLaunchpadRetentionCandidate(ctx, sandboxID, reqEditors...)
++	if err != nil {
++		return nil, err
++	}
++	return ParseGetLaunchpadRetentionCandidateResponse(rsp)
++}
++
++// PutLaunchpadExecutionRetentionWithBodyWithResponse performs a PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID} (the `PutLaunchpadExecutionRetention` operationId) request,
++// with any type of body and a specified content type.
++//
++// Returns a wrapper object for the known response body format(s).
++func (c *ClientWithResponses) PutLaunchpadExecutionRetentionWithBodyWithResponse(ctx context.Context, sandboxID string, recoveryOperationID openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutLaunchpadExecutionRetentionResponse, error) {
++	rsp, err := c.PutLaunchpadExecutionRetentionWithBody(ctx, sandboxID, recoveryOperationID, contentType, body, reqEditors...)
++	if err != nil {
++		return nil, err
++	}
++	return ParsePutLaunchpadExecutionRetentionResponse(rsp)
++}
++
++// PutLaunchpadExecutionRetentionWithResponse performs a PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID} (the `PutLaunchpadExecutionRetention` operationId) request.
++// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
++func (c *ClientWithResponses) PutLaunchpadExecutionRetentionWithResponse(ctx context.Context, sandboxID string, recoveryOperationID openapi_types.UUID, body PutLaunchpadExecutionRetentionJSONRequestBody, reqEditors ...RequestEditorFn) (*PutLaunchpadExecutionRetentionResponse, error) {
++	rsp, err := c.PutLaunchpadExecutionRetention(ctx, sandboxID, recoveryOperationID, body, reqEditors...)
++	if err != nil {
++		return nil, err
++	}
++	return ParsePutLaunchpadExecutionRetentionResponse(rsp)
++}
++
+ // DeleteLaunchpadRestoreWithResponse performs a DELETE /extensions/launchpad/v1/restores/{operationID} (the `DeleteLaunchpadRestore` operationId) request.
+ //
+ // Returns a wrapper object for the known response body format(s).
+@@ -19906,6 +20289,58 @@
+ 			PhysicallyStopped bool   `json:"physicallyStopped"`
+ 			SandboxID         string `json:"sandboxID"`
+ 		}
++		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
++			return nil, err
++		}
++		response.JSON200 = &dest
++
++	}
++
++	return response, nil
++}
++
++// ParseGetLaunchpadRetentionCandidateResponse parses an HTTP response from a GetLaunchpadRetentionCandidateWithResponse call
++func ParseGetLaunchpadRetentionCandidateResponse(rsp *http.Response) (*GetLaunchpadRetentionCandidateResponse, error) {
++	bodyBytes, err := io.ReadAll(rsp.Body)
++	defer func() { _ = rsp.Body.Close() }()
++	if err != nil {
++		return nil, err
++	}
++
++	response := &GetLaunchpadRetentionCandidateResponse{
++		Body:         bodyBytes,
++		HTTPResponse: rsp,
++	}
++
++	switch {
++	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
++		var dest LaunchpadRetentionCandidate
++		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
++			return nil, err
++		}
++		response.JSON200 = &dest
++
++	}
++
++	return response, nil
++}
++
++// ParsePutLaunchpadExecutionRetentionResponse parses an HTTP response from a PutLaunchpadExecutionRetentionWithResponse call
++func ParsePutLaunchpadExecutionRetentionResponse(rsp *http.Response) (*PutLaunchpadExecutionRetentionResponse, error) {
++	bodyBytes, err := io.ReadAll(rsp.Body)
++	defer func() { _ = rsp.Body.Close() }()
++	if err != nil {
++		return nil, err
++	}
++
++	response := &PutLaunchpadExecutionRetentionResponse{
++		Body:         bodyBytes,
++		HTTPResponse: rsp,
++	}
++
++	switch {
++	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
++		var dest LaunchpadRetentionReceipt
+ 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+ 			return nil, err
+ 		}
+@@ -23882,6 +24317,12 @@
+ 
+ 	// (DELETE /extensions/launchpad/v1/executions/{sandboxID})
+ 	StopLaunchpadExecution(c *gin.Context, sandboxID string)
++
++	// (GET /extensions/launchpad/v1/executions/{sandboxID}/retention-candidate)
++	GetLaunchpadRetentionCandidate(c *gin.Context, sandboxID string)
++
++	// (PUT /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID})
++	PutLaunchpadExecutionRetention(c *gin.Context, sandboxID string, recoveryOperationID openapi_types.UUID)
+ 
+ 	// (DELETE /extensions/launchpad/v1/restores/{operationID})
+ 	DeleteLaunchpadRestore(c *gin.Context, operationID openapi_types.UUID)
+@@ -24881,6 +25322,65 @@
+ 	siw.Handler.StopLaunchpadExecution(c, sandboxID)
+ }
+ 
++// GetLaunchpadRetentionCandidate operation middleware
++func (siw *ServerInterfaceWrapper) GetLaunchpadRetentionCandidate(c *gin.Context) {
++
++	var err error
++	_ = err
++
++	// ------------- Path parameter "sandboxID" -------------
++	var sandboxID string
++
++	err = runtime.BindStyledParameterWithOptions("simple", "sandboxID", c.Param("sandboxID"), &sandboxID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
++	if err != nil {
++		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter sandboxID: %w", err), http.StatusBadRequest)
++		return
++	}
++
++	for _, middleware := range siw.HandlerMiddlewares {
++		middleware(c)
++		if c.IsAborted() {
++			return
++		}
++	}
++
++	siw.Handler.GetLaunchpadRetentionCandidate(c, sandboxID)
++}
++
++// PutLaunchpadExecutionRetention operation middleware
++func (siw *ServerInterfaceWrapper) PutLaunchpadExecutionRetention(c *gin.Context) {
++
++	var err error
++	_ = err
++
++	// ------------- Path parameter "sandboxID" -------------
++	var sandboxID string
++
++	err = runtime.BindStyledParameterWithOptions("simple", "sandboxID", c.Param("sandboxID"), &sandboxID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
++	if err != nil {
++		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter sandboxID: %w", err), http.StatusBadRequest)
++		return
++	}
++
++	// ------------- Path parameter "recoveryOperationID" -------------
++	var recoveryOperationID openapi_types.UUID
++
++	err = runtime.BindStyledParameterWithOptions("simple", "recoveryOperationID", c.Param("recoveryOperationID"), &recoveryOperationID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
++	if err != nil {
++		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter recoveryOperationID: %w", err), http.StatusBadRequest)
++		return
++	}
++
++	for _, middleware := range siw.HandlerMiddlewares {
++		middleware(c)
++		if c.IsAborted() {
++			return
++		}
++	}
++
++	siw.Handler.PutLaunchpadExecutionRetention(c, sandboxID, recoveryOperationID)
++}
++
+ // DeleteLaunchpadRestore operation middleware
+ func (siw *ServerInterfaceWrapper) DeleteLaunchpadRestore(c *gin.Context) {
+ 
+@@ -26540,6 +27040,8 @@
+ 
+ 	router.DELETE(options.BaseURL+"/extensions/launchpad/v1/creations/:operationID", wrapper.CancelLaunchpadCreation)
+ 	router.GET(options.BaseURL+"/extensions/launchpad/v1/creations/:operationID", wrapper.GetLaunchpadCreation)
++	router.GET(options.BaseURL+"/extensions/launchpad/v1/executions/:sandboxID/retention-candidate", wrapper.GetLaunchpadRetentionCandidate)
++	router.PUT(options.BaseURL+"/extensions/launchpad/v1/executions/:sandboxID/retentions/:recoveryOperationID", wrapper.PutLaunchpadExecutionRetention)
+ 	router.DELETE(options.BaseURL+"/extensions/launchpad/v1/executions/:sandboxID", wrapper.StopLaunchpadExecution)
+ 	router.GET(options.BaseURL+"/extensions/launchpad/v1/capabilities", wrapper.GetLaunchpadCapabilities)
+ 	router.DELETE(options.BaseURL+"/extensions/launchpad/v1/restores/:operationID", wrapper.DeleteLaunchpadRestore)
+@@ -26627,333 +27129,341 @@
+ // const string: with thousands of chunks the chained `+` fold is several
+ // times slower for the Go compiler than parsing a slice literal.
+ var swaggerSpec = []string{
+-	"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",
++	"c7JovGMTI/zfteJYj+3ann7++n8CAAD//w==",
+ }
+ 
+ // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,
+diff --git a/packages/api/internal/handlers/launchpad_restore.go b/packages/api/internal/handlers/launchpad_restore.go
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -33,7 +33,7 @@
+ 		a.sendAPIStoreError(c, http.StatusForbidden, "Launchpad restore is not enabled for this team")
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{CertifiedPauses: true, DurableCreationIdentity: true, PrivatePreviewHeaderBoundary: true, Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
++	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{ExecutionRetention: true, CertifiedPauses: true, DurableCreationIdentity: true, PrivatePreviewHeaderBoundary: true, Version: 1, DiskRestore: true, PausedSnapshots: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
+ }
+ 
+ func canonicalRestoreRequest(body api.LaunchpadRestoreRequest) ([]byte, error) {
+diff --git a/packages/api/internal/handlers/launchpad_retention.go b/packages/api/internal/handlers/launchpad_retention.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_retention.go
+@@ -0,0 +1,92 @@
++package handlers
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"time"
++
++	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
++)
++
++func (a *APIStore) retentionError(c *gin.Context, err error) {
++	switch {
++	case errors.Is(err, executions.ErrRetentionCandidateChanged):
++		c.JSON(http.StatusConflict, gin.H{"code": "retention_candidate_changed", "message": "No retention was committed for this operation; inspect the current candidate"})
++	case errors.Is(err, pgx.ErrNoRows):
++		a.sendAPIStoreError(c, 404, "Managed execution was not found")
++	case errors.Is(err, executions.ErrRetention):
++		a.sendAPIStoreError(c, 409, "Execution ownership or retained snapshot changed; keep the sandbox")
++	default:
++		a.sendAPIStoreError(c, 503, "Execution retention is incomplete; keep the sandbox")
++	}
++}
++
++func (a *APIStore) GetLaunchpadRetentionCandidate(c *gin.Context, sandboxID string) {
++	team := auth.MustGetTeamID(c)
++	if !a.restoreAdmissionEnabled(team) {
++		a.sendAPIStoreError(c, 403, "Execution retention is not enabled for this team")
++		return
++	}
++	candidate, err := (executions.Store{DB: a.sqlcDB}).RetentionCandidate(c.Request.Context(), team, sandboxID)
++	if err != nil {
++		a.retentionError(c, err)
++		return
++	}
++	c.JSON(http.StatusOK, candidate)
++}
++
++func (a *APIStore) PutLaunchpadExecutionRetention(c *gin.Context, sandboxID string, recoveryOperationID uuid.UUID) {
++	team := auth.MustGetTeamID(c)
++	if !a.restoreAdmissionEnabled(team) {
++		a.sendAPIStoreError(c, 403, "Execution retention is not enabled for this team")
++		return
++	}
++	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 8*1024)
++	decoder := json.NewDecoder(c.Request.Body)
++	decoder.DisallowUnknownFields()
++	var body executions.RetentionRequest
++	var extra any
++	if decoder.Decode(&body) != nil || !errors.Is(decoder.Decode(&extra), io.EOF) {
++		a.sendAPIStoreError(c, 400, "Invalid execution retention request")
++		return
++	}
++	validate := func(ctx context.Context, roots []uuid.UUID) ([]uuid.UUID, error) {
++		bounded, cancel := context.WithTimeout(ctx, 15*time.Second)
++		defer cancel()
++		client, child, err := a.restoreRuntime().RestoreClient(bounded, uuid.Nil, a.config.LaunchpadRestoreNodeID)
++		if err != nil {
++			return nil, err
++		}
++		raw := make([]string, 0, len(roots))
++		for _, id := range roots {
++			raw = append(raw, id.String())
++		}
++		result, err := client.ValidateRetainedBuildRoots(child, &orchestrator.RetainedBuildRootsRequest{BuildIds: raw})
++		if err != nil {
++			return nil, err
++		}
++		refs := make([]uuid.UUID, 0, len(result.GetBuildIds()))
++		for _, value := range result.GetBuildIds() {
++			id, err := uuid.Parse(value)
++			if err != nil || id == uuid.Nil {
++				return nil, executions.ErrRetention
++			}
++			refs = append(refs, id)
++		}
++		return refs, nil
++	}
++	receipt, err := (executions.Store{DB: a.sqlcDB}).RetainForStop(c.Request.Context(), team, sandboxID, recoveryOperationID, body, validate)
++	if err != nil {
++		a.retentionError(c, err)
++		return
++	}
++	c.JSON(http.StatusOK, receipt)
++}
+diff --git a/packages/api/internal/handlers/launchpad_retention_test.go b/packages/api/internal/handlers/launchpad_retention_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_retention_test.go
+@@ -0,0 +1,109 @@
++package handlers
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/db/pkg/buildretention"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/template"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestRetentionRootsAndAncestorsSurviveStoppedSnapshotCleanupAndCollection(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	base := testutils.CreateTestTemplate(t, db, team)
++	sbx := "recover-" + uuid.NewString()
++	store := executions.Store{DB: db.SqlcClient}
++	owner := map[string]string{"launchpad.managed": "thread-vm-v1", "launchpad.allocation_id": "allocation-from-import", "launchpad.operation_id": uuid.NewString(), "launchpad.thread_id": uuid.NewString(), "launchpad.generation": "2"}
++	require.NoError(t, store.CaptureCreation(t.Context(), team, sbx, owner))
++	attempt := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sbx, ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "offline-host"}
++	require.NoError(t, store.Register(t.Context(), attempt, uuid.New(), true))
++	snapshot := testutils.UpsertTestSnapshot(t, t.Context(), db, "damaged-"+uuid.NewString(), sbx, team, base)
++	raw, err := json.Marshal(owner)
++	require.NoError(t, err)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE snapshots SET metadata=$2 WHERE sandbox_id=$1`, sbx, string(raw)))
++	files, err := storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: t.TempDir()})
++	require.NoError(t, err)
++	self, disk, memory, garbage := snapshot.BuildID, uuid.New(), uuid.New(), uuid.New()
++	paths := storage.Paths{BuildID: self.String()}
++	put := func(path string, value []byte) {
++		b, err := files.OpenBlob(t.Context(), path)
++		require.NoError(t, err)
++		require.NoError(t, b.Put(t.Context(), value))
++	}
++	raw, err = json.Marshal(metadata.Template{Version: metadata.CurrentVersion, Template: metadata.TemplateMetadata{BuildID: self.String()}})
++	require.NoError(t, err)
++	put(paths.Metadata(), raw)
++	writeHeader := func(path string, ancestor uuid.UUID) {
++		h, err := header.NewHeader(&header.Metadata{Version: 3, BuildId: self, BlockSize: 4096, Size: 4096}, []header.BuildMap{{Length: 4096, BuildId: ancestor}})
++		require.NoError(t, err)
++		_, _, _, err = header.StoreHeader(t.Context(), files, path, h)
++		require.NoError(t, err)
++	}
++	writeHeader(paths.RootfsHeader(), disk)
++	writeHeader(paths.MemfileHeader(), memory)
++	for _, id := range []uuid.UUID{self, disk, memory, garbage} {
++		put((storage.Paths{BuildID: id.String()}).Snapfile(), []byte(id.String()))
++	}
++	candidate, err := store.RetentionCandidate(t.Context(), team, sbx)
++	require.NoError(t, err)
++	receipt, err := store.RetainForStop(t.Context(), team, sbx, uuid.New(), candidate.RetentionRequest, func(ctx context.Context, roots []uuid.UUID) ([]uuid.UUID, error) {
++		refs, err := template.RetainedBuilds(ctx, files, roots)
++		out := []uuid.UUID{}
++		for id := range refs {
++			out = append(out, id)
++		}
++		return out, err
++	})
++	require.NoError(t, err)
++	require.ElementsMatch(t, []uuid.UUID{self, disk, memory}, receipt.RetainedBuildIDs)
++	// Simulate the existing host certificate admission; then exercise actual
++	// API stopped replay, whose source-snapshot cleanup used to drop this root.
++	count, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: sbx})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, count)
++	api := &APIStore{sqlcDB: db.SqlcClient}
++	ctx, response := restoreHTTPContext(t, team, nil)
++	api.StopLaunchpadExecution(ctx, sbx)
++	require.Equal(t, 200, response.Code, response.Body.String())
++	// Only our independent retained template remains live. The ordinary stopped
++	// snapshot environment is soft-deleted by the normal stop cleanup path.
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE envs SET deleted_at=now() WHERE id=$1`, snapshot.TemplateID))
++	require.NoError(t, buildretention.WithIdleCatalog(t.Context(), db.SqlcClient, func(c buildretention.Catalog) error {
++		require.Contains(t, c.Roots, self)
++		_, err := template.CollectBuildObjects(t.Context(), files, []uuid.UUID{self}, []uuid.UUID{self, disk, memory, garbage})
++		return err
++	}))
++	for _, id := range []uuid.UUID{self, disk, memory, garbage} {
++		blob, err := files.OpenBlob(t.Context(), (storage.Paths{BuildID: id.String()}).Snapfile())
++		if id == garbage {
++			require.ErrorIs(t, err, storage.ErrBuildRetired)
++			continue
++		}
++		require.NoError(t, err)
++		exists, err := blob.Exists(t.Context())
++		require.NoError(t, err)
++		require.Equal(t, id != garbage, exists)
++	}
++}
++
++func TestRetentionCandidateChangedErrorIsExplicitAndNotGeneric(t *testing.T) {
++	api := &APIStore{}
++	ctx, response := restoreHTTPContext(t, uuid.New(), nil)
++	api.retentionError(ctx, executions.ErrRetentionCandidateChanged)
++	require.Equal(t, 409, response.Code)
++	require.Contains(t, response.Body.String(), `"code":"retention_candidate_changed"`)
++	ctx, response = restoreHTTPContext(t, uuid.New(), nil)
++	api.retentionError(ctx, executions.ErrRetention)
++	require.Equal(t, 409, response.Code)
++	require.NotContains(t, response.Body.String(), "retention_candidate_changed")
++}
+diff --git a/packages/api/internal/handlers/launchpad_snapshot_alias_test.go b/packages/api/internal/handlers/launchpad_snapshot_alias_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_snapshot_alias_test.go
+@@ -0,0 +1,65 @@
++package handlers
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
++	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
++	authtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
++	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	redisutils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
++	"github.com/gin-gonic/gin"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestLaunchpadSnapshotAliasReadDoesNotTrustCachedAbsence(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	slug := testutils.GetTeamSlug(t, t.Context(), db, team)
++	redis := redisutils.SetupInstance(t)
++	cache := templatecache.NewTemplateCache(db.SqlcClient, redis)
++	t.Cleanup(func() { _ = cache.Close(t.Context()) })
++	a := &APIStore{sqlcDB: db.SqlcClient, templateCache: cache}
++	a.config.LaunchpadRestoreNodeID = "dedicated-host"
++	a.config.LaunchpadRestoreCapacityBytes = 1
++	a.config.LaunchpadRestoreTeams = []string{team.String()}
++	request := func(identifier string) *httptest.ResponseRecorder {
++		response := httptest.NewRecorder()
++		c, _ := gin.CreateTestContext(response)
++		c.Request = httptest.NewRequest("GET", "/templates/aliases/"+identifier, nil)
++		auth.SetTeamInfoForTest(t, c, &authtypes.Team{Team: &authqueries.Team{ID: team, Slug: slug}})
++		a.GetTemplatesAliasesAlias(c, identifier)
++		return response
++	}
++	for _, prefix := range []string{"launchpad-backup-", "launchpad-final-", "ordinary-", "launchpad-backup-not-a-uuid-"} {
++		alias := prefix + uuid.NewString()
++		_, err := cache.ResolveAlias(t.Context(), alias, slug)
++		require.ErrorIs(t, err, templatecache.ErrTemplateNotFound)
++		template := testutils.CreateTestTemplate(t, db, team)
++		testutils.CreateTestTemplateAliasWithName(t, db, template, alias, &slug)
++		_, err = cache.ResolveAlias(t.Context(), alias, slug)
++		require.ErrorIs(t, err, templatecache.ErrTemplateNotFound, "the real Redis negative entry remains stale after publication")
++		response := request(alias)
++		if launchpadPausedSnapshotAlias(alias) {
++			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
++			require.Contains(t, response.Body.String(), template)
++			require.Equal(t, http.StatusBadRequest, request("another-team/"+alias).Code)
++			require.Equal(t, http.StatusNotFound, request(alias+":missing-tag").Code)
++			a.config.LaunchpadRestoreNodeID = ""
++			require.Equal(t, http.StatusNotFound, request(alias).Code, "ordinary hosts retain their cache behavior")
++			a.config.LaunchpadRestoreNodeID = "dedicated-host"
++		} else {
++			require.Equal(t, http.StatusNotFound, response.Code, "ordinary and malformed aliases retain caching")
++		}
++	}
++	missing := "launchpad-backup-" + uuid.NewString()
++	require.Equal(t, http.StatusNotFound, request(missing).Code)
++	foreign := testutils.CreateTestTeam(t, db)
++	foreignTemplate := testutils.CreateTestTemplate(t, db, foreign)
++	testutils.CreateTestTemplateAliasWithName(t, db, foreignTemplate, missing, &slug)
++	require.Equal(t, http.StatusForbidden, request(missing).Code, "uncached reads preserve exact team ownership")
++}
+diff --git a/packages/api/internal/handlers/snapshot_template_create.go b/packages/api/internal/handlers/snapshot_template_create.go
+--- a/packages/api/internal/handlers/snapshot_template_create.go
++++ b/packages/api/internal/handlers/snapshot_template_create.go
+@@ -5,7 +5,6 @@
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
+-	"strings"
+ 
+ 	"github.com/gin-gonic/gin"
+ 	"go.opentelemetry.io/otel/trace"
+@@ -22,20 +21,7 @@
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+ 	sharedUtils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
+-	"github.com/google/uuid"
+ )
+-
+-// Both periodic backups and final saves retain the same immutable paused disk.
+-// Only operation-scoped names may use this non-waking path.
+-func launchpadPausedSnapshotAlias(alias string) bool {
+-	for _, prefix := range []string{"launchpad-backup-", "launchpad-final-"} {
+-		if suffix, ok := strings.CutPrefix(alias, prefix); ok {
+-			parsed, err := uuid.Parse(suffix)
+-			return err == nil && parsed.String() == suffix
+-		}
+-	}
+-	return false
+-}
+ 
+ func (a *APIStore) PostSandboxesSandboxIDSnapshots(c *gin.Context, sandboxID api.SandboxID) {
+ 	ctx := c.Request.Context()
+diff --git a/packages/api/internal/handlers/template_alias.go b/packages/api/internal/handlers/template_alias.go
+--- a/packages/api/internal/handlers/template_alias.go
++++ b/packages/api/internal/handlers/template_alias.go
+@@ -13,7 +13,20 @@
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
++	"github.com/google/uuid"
+ )
++
++// Operation-scoped disk aliases also need authoritative reads after an uncertain
++// capture. A failed create may leave its earlier negative cache entry intact.
++func launchpadPausedSnapshotAlias(alias string) bool {
++	for _, prefix := range []string{"launchpad-backup-", "launchpad-final-"} {
++		if suffix, ok := strings.CutPrefix(alias, prefix); ok {
++			parsed, err := uuid.Parse(suffix)
++			return err == nil && parsed.String() == suffix
++		}
++	}
++	return false
++}
+ 
+ func (a *APIStore) GetTemplatesAliasesAlias(c *gin.Context, alias string) {
+ 	ctx := c.Request.Context()
+@@ -41,7 +54,23 @@
+ 		return
+ 	}
+ 
+-	aliasInfo, metadata, err := a.templateCache.ResolveAliasWithMetadata(ctx, identifier, team.Slug)
++	var aliasInfo *templatecache.AliasInfo
++	var metadata *templatecache.TemplateMetadata
++	if a.restoreAdmissionEnabled(team.ID) && launchpadPausedSnapshotAlias(id.ExtractAlias(identifier)) {
++		row, lookupErr := a.sqlcDB.GetTemplateByAlias(ctx, queries.GetTemplateByAliasParams{Alias: id.ExtractAlias(identifier), Namespace: &team.Slug})
++		if lookupErr != nil {
++			if dberrors.IsNotFoundError(lookupErr) {
++				a.sendAPIStoreError(c, http.StatusNotFound, "Snapshot alias not found")
++			} else {
++				a.sendAPIStoreError(c, http.StatusInternalServerError, "Error resolving snapshot alias")
++			}
++			return
++		}
++		aliasInfo = &templatecache.AliasInfo{TemplateID: row.ID, TeamID: row.TeamID}
++		metadata = &templatecache.TemplateMetadata{TemplateID: row.ID, TeamID: row.TeamID, Public: row.Public}
++	} else {
++		aliasInfo, metadata, err = a.templateCache.ResolveAliasWithMetadata(ctx, identifier, team.Slug)
++	}
+ 	if err != nil {
+ 		apiErr := templatecache.ErrorToAPIError(err, identifier)
+ 		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
+diff --git a/packages/api/internal/orchestrator/checkpoint_instance.go b/packages/api/internal/orchestrator/checkpoint_instance.go
+--- a/packages/api/internal/orchestrator/checkpoint_instance.go
++++ b/packages/api/internal/orchestrator/checkpoint_instance.go
+@@ -70,7 +70,7 @@
+ 			return err
+ 		}
+ 	}
+-	upsertResult, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, false))
++	upsertResult, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, false), sbx.ExecutionID)
+ 	if err != nil {
+ 		return fmt.Errorf("error upserting snapshot: %w", err)
+ 	}
+diff --git a/packages/api/internal/orchestrator/pause_instance.go b/packages/api/internal/orchestrator/pause_instance.go
+--- a/packages/api/internal/orchestrator/pause_instance.go
++++ b/packages/api/internal/orchestrator/pause_instance.go
+@@ -31,7 +31,7 @@
+ 	ctx, span := tracer.Start(ctx, "pause-sandbox")
+ 	defer span.End()
+ 
+-	result, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, filesystemOnly))
++	result, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, filesystemOnly), sbx.ExecutionID)
+ 	if err != nil {
+ 		telemetry.ReportCriticalError(ctx, "error inserting snapshot for env", err)
+ 
+@@ -209,11 +209,18 @@
+ }
+ 
+ // throttledUpsertSnapshot runs UpsertSnapshot gated by the snapshot upsert semaphore.
+-func (o *Orchestrator) throttledUpsertSnapshot(ctx context.Context, params queries.UpsertSnapshotParams) (queries.UpsertSnapshotRow, error) {
++func (o *Orchestrator) throttledUpsertSnapshot(ctx context.Context, params queries.UpsertSnapshotParams, executionID string) (queries.UpsertSnapshotRow, error) {
+ 	if err := o.snapshotUpsertSem.Acquire(ctx, 1); err != nil {
+ 		return queries.UpsertSnapshotRow{}, err
+ 	}
+ 	defer o.snapshotUpsertSem.Release(1)
+ 
++	if o.buildRetentionAdmission && params.Metadata["launchpad.managed"] == "thread-vm-v1" {
++		expected, err := uuid.Parse(executionID)
++		if err != nil {
++			return queries.UpsertSnapshotRow{}, executions.ErrFenced
++		}
++		return (executions.Store{DB: o.sqlcDB}).UpsertSnapshotForExecution(ctx, expected, params)
++	}
+ 	return o.sqlcDB.UpsertSnapshot(ctx, params)
+ }
+diff --git a/packages/api/internal/orchestrator/snapshot_template.go b/packages/api/internal/orchestrator/snapshot_template.go
+--- a/packages/api/internal/orchestrator/snapshot_template.go
++++ b/packages/api/internal/orchestrator/snapshot_template.go
+@@ -11,6 +11,7 @@
+ 	"google.golang.org/grpc/codes"
+ 
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
++	"github.com/e2b-dev/infra/packages/db/client"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+@@ -82,12 +83,24 @@
+ 			return SnapshotTemplateResult{}, err
+ 		}
+ 	}
+-	upsertResult, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, filesystemOnly))
++	upsertResult, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, filesystemOnly), sbx.ExecutionID)
+ 	if err != nil {
+ 		return SnapshotTemplateResult{}, fmt.Errorf("error upserting snapshot: %w", err)
+ 	}
+ 
+-	snapshotTemplateEnvID, err := o.resolveOrCreateSnapshotTemplate(ctx, sandboxID, teamID, upsertResult.BuildID, sbx.NodeID, sbx.ClusterID, opts)
++	publish := func(db *client.Client) (string, error) {
++		return o.resolveOrCreateSnapshotTemplate(ctx, db, sandboxID, teamID, upsertResult.BuildID, sbx.NodeID, sbx.ClusterID, opts)
++	}
++	var snapshotTemplateEnvID string
++	if o.buildRetentionAdmission && filesystemOnly {
++		execution, parseErr := uuid.Parse(sbx.ExecutionID)
++		if parseErr != nil {
++			return SnapshotTemplateResult{}, executions.ErrFenced
++		}
++		snapshotTemplateEnvID, err = (executions.Store{DB: o.sqlcDB}).PublishSnapshotTemplateForExecution(ctx, teamID, sandboxID, execution, publish)
++	} else {
++		snapshotTemplateEnvID, err = publish(o.sqlcDB)
++	}
+ 	if err != nil {
+ 		o.failSnapshotBuild(ctx, upsertResult.BuildID, err)
+ 
+@@ -216,6 +229,7 @@
+ 
+ func (o *Orchestrator) resolveOrCreateSnapshotTemplate(
+ 	ctx context.Context,
++	db *client.Client,
+ 	sandboxID string,
+ 	teamID uuid.UUID,
+ 	buildID uuid.UUID,
+@@ -225,7 +239,7 @@
+ ) (string, error) {
+ 	// Existing template — just assign the build
+ 	if opts.ExistingTemplateID != nil {
+-		rows, err := o.sqlcDB.CreateTemplateBuildAssignment(ctx, queries.CreateTemplateBuildAssignmentParams{
++		rows, err := db.CreateTemplateBuildAssignment(ctx, queries.CreateTemplateBuildAssignmentParams{
+ 			TemplateID: *opts.ExistingTemplateID,
+ 			BuildID:    buildID,
+ 			Tag:        opts.Tag,
+@@ -246,7 +260,7 @@
+ 	}
+ 
+ 	// Create new snapshot template env
+-	envID, err := o.sqlcDB.CreateSnapshotTemplateEnv(ctx, queries.CreateSnapshotTemplateEnvParams{
++	envID, err := db.CreateSnapshotTemplateEnv(ctx, queries.CreateSnapshotTemplateEnvParams{
+ 		SnapshotID:   id.Generate(),
+ 		TeamID:       teamID,
+ 		ClusterID:    clusterIDPtr,
+@@ -261,7 +275,7 @@
+ 
+ 	// Create alias if a name was provided
+ 	if opts.Alias != nil && opts.Namespace != nil {
+-		err = o.sqlcDB.CreateTemplateAlias(ctx, queries.CreateTemplateAliasParams{
++		err = db.CreateTemplateAlias(ctx, queries.CreateTemplateAliasParams{
+ 			Alias:      *opts.Alias,
+ 			TemplateID: envID,
+ 			Namespace:  opts.Namespace,
+diff --git a/packages/db/migrations/20261015120000_execution_retention_receipts.sql b/packages/db/migrations/20261015120000_execution_retention_receipts.sql
+new file mode 100644
+--- /dev/null
++++ b/packages/db/migrations/20261015120000_execution_retention_receipts.sql
+@@ -0,0 +1,15 @@
++-- +goose Up
++CREATE TABLE public.sandbox_execution_retentions (
++    team_id uuid NOT NULL REFERENCES public.teams(id),
++    operation_id uuid NOT NULL,
++    sandbox_id text NOT NULL,
++    execution_id uuid NOT NULL,
++    request_payload bytea NOT NULL,
++    receipt jsonb NOT NULL,
++    created_at timestamptz NOT NULL DEFAULT now(),
++    PRIMARY KEY (team_id, operation_id),
++    UNIQUE (team_id, sandbox_id)
++);
++
++-- +goose Down
++DROP TABLE public.sandbox_execution_retentions;
+diff --git a/packages/db/pkg/executions/retention.go b/packages/db/pkg/executions/retention.go
+new file mode 100644
+--- /dev/null
++++ b/packages/db/pkg/executions/retention.go
+@@ -0,0 +1,396 @@
++package executions
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"maps"
++	"slices"
++	"strconv"
++	"strings"
++
++	"github.com/e2b-dev/infra/packages/db/client"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
++)
++
++var ErrRetention = errors.New("execution retention identity or roots changed")
++var ErrRetentionCandidateChanged = errors.New("retention candidate changed without a saved receipt")
++
++type RetentionRequest struct {
++	ExecutionID uuid.UUID         `json:"executionID"`
++	BuildID     *uuid.UUID        `json:"buildID"`
++	Metadata    map[string]string `json:"metadata"`
++}
++
++type RetentionCandidate struct {
++	RetentionRequest
++	SandboxID   string `json:"sandboxID"`
++	Disposition string `json:"disposition"`
++}
++
++type RetentionReceipt struct {
++	RetentionCandidate
++	Version             int         `json:"version"`
++	Kind                string      `json:"kind"`
++	RecoveryOperationID uuid.UUID   `json:"recoveryOperationID"`
++	RetainedTemplateID  *string     `json:"retainedTemplateID"`
++	RetainedBuildIDs    []uuid.UUID `json:"retainedBuildIDs"`
++	RequestSHA256       string      `json:"requestSHA256"`
++}
++
++func validRetentionRequest(in RetentionRequest) bool {
++	if in.ExecutionID == uuid.Nil || (in.BuildID != nil && *in.BuildID == uuid.Nil) || in.Metadata["launchpad.managed"] != "thread-vm-v1" {
++		return false
++	}
++	for _, key := range []string{"launchpad.operation_id"} {
++		id, err := uuid.Parse(in.Metadata[key])
++		if err != nil || id == uuid.Nil || id.String() != in.Metadata[key] {
++			return false
++		}
++	}
++	allocation := in.Metadata["launchpad.allocation_id"]
++	if allocation == "" || strings.TrimSpace(allocation) != allocation || len(allocation) > 64 {
++		return false
++	}
++	thread := in.Metadata["launchpad.thread_id"]
++	if thread == "" || strings.TrimSpace(thread) != thread || len(thread) > 191 {
++		return false
++	}
++	generation, err := strconv.ParseUint(in.Metadata["launchpad.generation"], 10, 64)
++	if err != nil || generation == 0 || strconv.FormatUint(generation, 10) != in.Metadata["launchpad.generation"] {
++		return false
++	}
++	if in.Metadata["launchpad.restore"] == "" {
++		return len(in.Metadata) == 5
++	}
++	if in.Metadata["launchpad.restore"] != "v1" {
++		return false
++	}
++	parent, attempt := in.Metadata["launchpad.restore_parent_operation_id"], in.Metadata["launchpad.restore_boot_attempt"]
++	if parent == "" && attempt == "" {
++		return len(in.Metadata) == 6
++	}
++	id, err := uuid.Parse(parent)
++	if err != nil || id == uuid.Nil || id.String() != parent {
++		return false
++	}
++	number, err := strconv.ParseUint(attempt, 10, 32)
++	return len(in.Metadata) == 8 && err == nil && number > 0 && len(attempt) <= 9 && strconv.FormatUint(number, 10) == attempt
++}
++
++// Candidate reads only durable ownership and catalog state. It never consults a
++// routing cache, renews a lease, contacts a guest, or interprets missing files as absence.
++func (s Store) RetentionCandidate(ctx context.Context, team uuid.UUID, sandbox string) (RetentionCandidate, error) {
++	_, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return RetentionCandidate{}, err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	return retentionCandidate(ctx, tx, team, sandbox)
++}
++
++func retentionCandidate(ctx context.Context, tx pgx.Tx, team uuid.UUID, sandbox string) (RetentionCandidate, error) {
++	result := RetentionCandidate{SandboxID: sandbox, Disposition: "no_current_tip"}
++	var state string
++	err := tx.QueryRow(ctx, `SELECT state,current_execution_id FROM public.sandbox_execution_fences WHERE team_id=$1 AND sandbox_id=$2`, team, sandbox).Scan(&state, &result.ExecutionID)
++	if err != nil {
++		return result, err
++	}
++	if state != "active" && state != "paused" && state != "stopped" {
++		return result, ErrRetention
++	}
++	var registered bool
++	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.sandbox_execution_attempts WHERE team_id=$1 AND sandbox_id=$2 AND execution_id=$3)`, team, sandbox, result.ExecutionID).Scan(&registered); err != nil {
++		return result, err
++	}
++	if !registered {
++		return result, ErrRetention
++	}
++	rows, err := tx.Query(ctx, `SELECT metadata FROM public.sandbox_creation_operations WHERE team_id=$1 AND sandbox_id=$2 AND NOT cancelled
++        UNION ALL SELECT convert_from(request_payload,'UTF8')::jsonb->'metadata' FROM public.sandbox_restore_operations
++        WHERE team_id=$1 AND sandbox_id=$2 AND execution_id=$3 AND state='active'`, team, sandbox, result.ExecutionID)
++	if err != nil {
++		return result, err
++	}
++	count := 0
++	for rows.Next() {
++		var raw []byte
++		if err = rows.Scan(&raw); err != nil {
++			break
++		}
++		count++
++		var owner map[string]string
++		if err = json.Unmarshal(raw, &owner); err != nil {
++			break
++		}
++		result.Metadata = make(map[string]string, 5)
++		for _, key := range []string{"launchpad.managed", "launchpad.allocation_id", "launchpad.operation_id", "launchpad.thread_id", "launchpad.generation", "launchpad.restore", "launchpad.restore_parent_operation_id", "launchpad.restore_boot_attempt"} {
++			if value, ok := owner[key]; ok {
++				result.Metadata[key] = value
++			}
++		}
++	}
++	rows.Close()
++	if err != nil {
++		return result, err
++	}
++	if err = rows.Err(); err != nil {
++		return result, err
++	}
++	if count != 1 || !validRetentionRequest(result.RetentionRequest) {
++		return result, ErrRetention
++	}
++	// Freeze publication in RetainForStop before this same query is repeated.
++	// A failed build is not a ready tip; an unfinished writer is not proven absent.
++	var busy bool
++	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.snapshots s
++        JOIN public.env_build_assignments a ON a.env_id=s.env_id
++        JOIN public.env_builds b ON b.id=a.build_id
++        WHERE s.team_id=$1 AND s.sandbox_id=$2 AND b.status_group IN ('pending','in_progress'))`, team, sandbox).Scan(&busy)
++	if err != nil {
++		return result, err
++	}
++	if busy {
++		return result, ErrRetention
++	}
++	rows, err = tx.Query(ctx, `SELECT s.metadata,b.id FROM public.snapshots s
++        JOIN public.envs e ON e.id=s.env_id AND e.team_id=s.team_id
++        LEFT JOIN LATERAL (SELECT a.build_id,a.created_at FROM public.env_build_assignments a
++            JOIN public.env_builds ready ON ready.id=a.build_id AND ready.status_group='ready'
++            WHERE a.env_id=s.env_id AND a.tag='default') tip ON true
++        LEFT JOIN public.env_builds b ON b.id=tip.build_id
++        WHERE s.team_id=$1 AND s.sandbox_id=$2 AND (tip.build_id IS NULL OR tip.created_at=(
++            SELECT max(a.created_at) FROM public.env_build_assignments a JOIN public.env_builds ready ON ready.id=a.build_id AND ready.status_group='ready'
++            WHERE a.env_id=s.env_id AND a.tag='default'))`, team, sandbox)
++	if err != nil {
++		return result, err
++	}
++	count = 0
++	for rows.Next() {
++		var raw []byte
++		if err = rows.Scan(&raw, &result.BuildID); err != nil {
++			break
++		}
++		count++
++		var owner map[string]string
++		if err = json.Unmarshal(raw, &owner); err != nil {
++			break
++		}
++		for key, value := range result.Metadata {
++			if owner[key] != value {
++				err = ErrRetention
++				break
++			}
++		}
++		if err != nil {
++			break
++		}
++	}
++	rows.Close()
++	if err != nil {
++		return result, err
++	}
++	if err = rows.Err(); err != nil {
++		return result, err
++	}
++	if count > 1 {
++		return result, ErrRetention
++	}
++	if result.BuildID != nil {
++		result.Disposition = "ready_tip"
++	}
++	return result, nil
++}
++
++// RetainForStop publishes independent snapshot-template roots and seals the
++// existing execution fence in one transaction. Validation only reads immutable
++// object headers on the host; it must never acquire database locks or boot a VM.
++// ponytail: rare owner recovery holds global catalog writes for this bounded RPC.
++func (s Store) RetainForStop(ctx context.Context, team uuid.UUID, sandbox string, operation uuid.UUID, in RetentionRequest, validate func(context.Context, []uuid.UUID) ([]uuid.UUID, error)) (RetentionReceipt, error) {
++	var empty RetentionReceipt
++	if team == uuid.Nil || sandbox == "" || operation == uuid.Nil || !validRetentionRequest(in) || validate == nil {
++		return empty, ErrRetention
++	}
++	raw, err := json.Marshal(in)
++	if err != nil {
++		return empty, err
++	}
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return empty, err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	// Same admission lock/order as physical collection. The shared table locks
++	// also exclude internal snapshot workers until the roots and fence commit.
++	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(0x4c5041444743)); err != nil {
++		return empty, err
++	}
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandbox})
++	if err != nil {
++		return empty, err
++	}
++	if _, err = tx.Exec(ctx, `LOCK TABLE public.envs,public.env_builds,public.env_build_assignments,public.snapshots,public.snapshot_templates IN SHARE ROW EXCLUSIVE MODE`); err != nil {
++		return empty, err
++	}
++	var storedRequest, storedReceipt []byte
++	var storedSandbox string
++	var storedExecution uuid.UUID
++	err = tx.QueryRow(ctx, `SELECT sandbox_id,execution_id,request_payload,receipt FROM public.sandbox_execution_retentions WHERE team_id=$1 AND operation_id=$2`, team, operation).Scan(&storedSandbox, &storedExecution, &storedRequest, &storedReceipt)
++	if err == nil {
++		if storedSandbox != sandbox || storedExecution != in.ExecutionID || !bytes.Equal(raw, storedRequest) || (state != "stopping" && state != "stopped") {
++			return empty, ErrRetention
++		}
++		var out RetentionReceipt
++		if err = json.Unmarshal(storedReceipt, &out); err != nil {
++			return empty, err
++		}
++		return out, tx.Commit(ctx)
++	}
++	if !errors.Is(err, pgx.ErrNoRows) {
++		return empty, err
++	}
++	candidate, err := retentionCandidate(ctx, tx, team, sandbox)
++	if err != nil {
++		if errors.Is(err, ErrRetention) {
++			return empty, ErrRetentionCandidateChanged
++		}
++		return empty, err
++	}
++	if candidate.ExecutionID != in.ExecutionID || !maps.Equal(candidate.Metadata, in.Metadata) || (candidate.BuildID == nil) != (in.BuildID == nil) || (in.BuildID != nil && *candidate.BuildID != *in.BuildID) {
++		return empty, ErrRetentionCandidateChanged
++	}
++	digest := sha256.Sum256(raw)
++	out := RetentionReceipt{RetentionCandidate: candidate, Version: 1, Kind: "retained_for_stop", RecoveryOperationID: operation, RetainedBuildIDs: []uuid.UUID{}, RequestSHA256: hex.EncodeToString(digest[:])}
++	if in.BuildID != nil {
++		refs, err := validate(ctx, []uuid.UUID{*in.BuildID})
++		if err != nil {
++			return empty, err
++		}
++		if !slices.Contains(refs, *in.BuildID) {
++			return empty, ErrRetention
++		}
++		slices.SortFunc(refs, func(a, b uuid.UUID) int { return bytes.Compare(a[:], b[:]) })
++		refs = slices.Compact(refs)
++		for _, id := range refs {
++			if id == uuid.Nil {
++				return empty, ErrRetention
++			}
++		}
++		out.RetainedBuildIDs = refs
++		identity := sha256.Sum256(append(append([]byte{}, team[:]...), operation[:]...))
++		template := "lr" + hex.EncodeToString(identity[:])[:18]
++		var node string
++		var cluster *uuid.UUID
++		err = tx.QueryRow(ctx, `SELECT a.node_id,a.cluster_id FROM public.sandbox_execution_attempts a WHERE team_id=$1 AND sandbox_id=$2 AND execution_id=$3 ORDER BY node_id LIMIT 1`, team, sandbox, in.ExecutionID).Scan(&node, &cluster)
++		if err != nil {
++			return empty, err
++		}
++		if cluster != nil && *cluster == uuid.Nil {
++			cluster = nil
++		}
++		created, err := db.CreateSnapshotTemplateEnv(ctx, queries.CreateSnapshotTemplateEnvParams{SnapshotID: template, TeamID: team, ClusterID: cluster, SandboxID: sandbox, OriginNodeID: &node, BuildID: in.BuildID, Tag: "default"})
++		if err != nil {
++			return empty, err
++		}
++		var same bool
++		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.snapshot_templates s JOIN public.active_envs e ON e.id=s.env_id AND e.team_id=$2 WHERE s.env_id=$1 AND s.sandbox_id=$3 AND s.build_id=$4)`, created, team, sandbox, *in.BuildID).Scan(&same)
++		if err != nil {
++			return empty, err
++		}
++		if !same {
++			return empty, ErrRetention
++		}
++		out.RetainedTemplateID = &created
++	}
++	// A pre-existing stopped receipt is already permanent admission proof.
++	// Never revive it merely to record retention of any remaining ready tip.
++	if state != "stopped" {
++		if err = db.FenceSandboxExecution(ctx, queries.FenceSandboxExecutionParams{TeamID: team, SandboxID: sandbox}); err != nil {
++			return empty, err
++		}
++	}
++	encoded, err := json.Marshal(out)
++	if err != nil {
++		return empty, err
++	}
++	_, err = tx.Exec(ctx, `INSERT INTO public.sandbox_execution_retentions(team_id,operation_id,sandbox_id,execution_id,request_payload,receipt) VALUES($1,$2,$3,$4,$5,$6)`, team, operation, sandbox, in.ExecutionID, raw, string(encoded))
++	if err != nil {
++		return empty, err
++	}
++	return out, tx.Commit(ctx)
++}
++
++// UpsertSnapshotForExecution publishes durable capture work while holding the
++// same fence used by recovery. A request delayed before its upsert cannot create
++// a late snapshot after retention has sealed admission, even if it read Redis first.
++func (s Store) UpsertSnapshotForExecution(ctx context.Context, execution uuid.UUID, in queries.UpsertSnapshotParams) (queries.UpsertSnapshotRow, error) {
++	var empty queries.UpsertSnapshotRow
++	if execution == uuid.Nil {
++		return empty, ErrFenced
++	}
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return empty, err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(0x4c5041444743)); err != nil {
++		return empty, err
++	}
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: in.TeamID, SandboxID: in.SandboxID})
++	if err != nil {
++		return empty, err
++	}
++	if state != "active" {
++		return empty, ErrFenced
++	}
++	var current uuid.UUID
++	if err = tx.QueryRow(ctx, `SELECT current_execution_id FROM sandbox_execution_fences WHERE team_id=$1 AND sandbox_id=$2`, in.TeamID, in.SandboxID).Scan(&current); err != nil {
++		return empty, err
++	}
++	if current != execution {
++		return empty, ErrFenced
++	}
++	result, err := db.UpsertSnapshot(ctx, in)
++	if err != nil {
++		return empty, err
++	}
++	return result, tx.Commit(ctx)
++}
++
++// PublishSnapshotTemplateForExecution keeps the named root and its alias in the
++// same fence transaction. A capture admitted before Stop may be delayed before
++// publication; once Stop seals the fence, it cannot make a missing alias appear.
++func (s Store) PublishSnapshotTemplateForExecution(ctx context.Context, team uuid.UUID, sandbox string, execution uuid.UUID, publish func(*client.Client) (string, error)) (string, error) {
++	if execution == uuid.Nil {
++		return "", ErrFenced
++	}
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return "", err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(0x4c5041444743)); err != nil {
++		return "", err
++	}
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandbox})
++	if err != nil {
++		return "", err
++	}
++	var current uuid.UUID
++	if err = tx.QueryRow(ctx, `SELECT current_execution_id FROM sandbox_execution_fences WHERE team_id=$1 AND sandbox_id=$2`, team, sandbox).Scan(&current); err != nil {
++		return "", err
++	}
++	if state != "active" || current != execution {
++		return "", ErrFenced
++	}
++	result, err := publish(db)
++	if err != nil {
++		return "", err
++	}
++	return result, tx.Commit(ctx)
++}
+diff --git a/packages/db/pkg/executions/retention_test.go b/packages/db/pkg/executions/retention_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/db/pkg/executions/retention_test.go
+@@ -0,0 +1,371 @@
++package executions_test
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/e2b-dev/infra/packages/db/client"
++	"github.com/e2b-dev/infra/packages/db/pkg/buildretention"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
++	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/pkg/types"
++	"github.com/e2b-dev/infra/packages/db/queries"
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5/pgtype"
++	"github.com/stretchr/testify/require"
++)
++
++func retentionFixture(t *testing.T) (*testutils.Database, executions.Store, uuid.UUID, string, executions.RetentionCandidate) {
++	t.Helper()
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	base := testutils.CreateTestTemplate(t, db, team)
++	sandbox := "retention-" + uuid.NewString()
++	store := executions.Store{DB: db.SqlcClient}
++	metadata := map[string]string{"launchpad.managed": "thread-vm-v1", "launchpad.allocation_id": "allocation-from-import", "launchpad.operation_id": uuid.NewString(), "launchpad.thread_id": "imported-thread-non-uuid", "launchpad.generation": "3"}
++	require.NoError(t, store.CaptureCreation(t.Context(), team, sandbox, metadata))
++	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sandbox, ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}
++	require.NoError(t, store.Register(t.Context(), p, uuid.New(), true))
++	snap := testutils.UpsertTestSnapshot(t, t.Context(), db, "snapshot-"+uuid.NewString(), sandbox, team, base)
++	raw, err := json.Marshal(metadata)
++	require.NoError(t, err)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE snapshots SET metadata=$2,config='{}' WHERE sandbox_id=$1`, sandbox, string(raw)))
++	got, err := store.RetentionCandidate(t.Context(), team, sandbox)
++	require.NoError(t, err)
++	require.Equal(t, snap.BuildID, *got.BuildID)
++	return db, store, team, sandbox, got
++}
++
++func TestExecutionRetentionRejectsNamedPublicationDelayedAfterCaptureAdmission(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	base := testutils.CreateTestTemplate(t, db, team)
++	in := queries.UpsertSnapshotParams{TemplateID: "admitted-" + uuid.NewString(), TeamID: team, SandboxID: sandbox, BaseTemplateID: base, Metadata: types.JSONBStringMap(candidate.Metadata), Vcpu: 2, RamMb: 2048, KernelVersion: "6.1.0", FirecrackerVersion: "1.4.0", OriginNodeID: "host", StartedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, Status: types.BuildStatusSnapshotting, SourceBuildID: *candidate.BuildID}
++	admitted, err := store.UpsertSnapshotForExecution(t.Context(), candidate.ExecutionID, in)
++	require.NoError(t, err)
++	alias := "late-" + uuid.NewString()
++	ready, release := make(chan struct{}), make(chan struct{})
++	result := make(chan error, 1)
++	go func() {
++		close(ready)
++		<-release
++		_, e := store.PublishSnapshotTemplateForExecution(t.Context(), team, sandbox, candidate.ExecutionID, func(tx *client.Client) (string, error) {
++			return publishRetentionTestAlias(t.Context(), tx, team, sandbox, admitted.BuildID, alias)
++		})
++		result <- e
++	}()
++	<-ready
++	_, err = store.BeginStop(t.Context(), team, sandbox)
++	require.NoError(t, err)
++	close(release)
++	require.ErrorIs(t, <-result, executions.ErrFenced)
++	require.Zero(t, retentionAliasCount(t, db, alias), "a stopped capture cannot publish its previously missing alias")
++}
++
++func TestExecutionRetentionNamedPublicationCommitsBeforeStopAndRollsBackOnFailure(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	alias := "published-" + uuid.NewString()
++	entered, release := make(chan struct{}), make(chan struct{})
++	published := make(chan error, 1)
++	go func() {
++		_, err := store.PublishSnapshotTemplateForExecution(t.Context(), team, sandbox, candidate.ExecutionID, func(tx *client.Client) (string, error) {
++			id, err := publishRetentionTestAlias(t.Context(), tx, team, sandbox, *candidate.BuildID, alias)
++			close(entered)
++			<-release
++			return id, err
++		})
++		published <- err
++	}()
++	<-entered
++	require.Zero(t, retentionAliasCount(t, db, alias), "publication stays uncommitted while the fence is held")
++	stopStarted, stopped := make(chan struct{}), make(chan error, 1)
++	go func() { close(stopStarted); _, err := store.BeginStop(t.Context(), team, sandbox); stopped <- err }()
++	<-stopStarted
++	close(release)
++	require.NoError(t, <-published)
++	require.NoError(t, <-stopped)
++	require.Equal(t, 1, retentionAliasCount(t, db, alias), "Stop observes a completely committed named root")
++	_, err := store.PublishSnapshotTemplateForExecution(t.Context(), team, sandbox, uuid.New(), func(*client.Client) (string, error) { t.Error("wrong execution reached publication"); return "", nil })
++	require.ErrorIs(t, err, executions.ErrFenced)
++
++	db2, store2, team2, sandbox2, candidate2 := retentionFixture(t)
++	_, err = store2.PublishSnapshotTemplateForExecution(t.Context(), team2, sandbox2, uuid.New(), func(*client.Client) (string, error) {
++		t.Error("wrong active execution reached publication")
++		return "", nil
++	})
++	require.ErrorIs(t, err, executions.ErrFenced)
++	failed := errors.New("alias callback failed")
++	_, err = store2.PublishSnapshotTemplateForExecution(t.Context(), team2, sandbox2, candidate2.ExecutionID, func(tx *client.Client) (string, error) {
++		id, e := publishRetentionTestAlias(t.Context(), tx, team2, sandbox2, *candidate2.BuildID, alias)
++		if e != nil {
++			return "", e
++		}
++		return id, failed
++	})
++	require.ErrorIs(t, err, failed)
++	require.Zero(t, retentionAliasCount(t, db2, alias), "a failed publication cannot leave its alias")
++}
++
++func publishRetentionTestAlias(ctx context.Context, db *client.Client, team uuid.UUID, sandbox string, build uuid.UUID, alias string) (string, error) {
++	node, namespace := "host", "retention-tests"
++	env, err := db.CreateSnapshotTemplateEnv(ctx, queries.CreateSnapshotTemplateEnvParams{SnapshotID: "named-" + uuid.NewString(), TeamID: team, SandboxID: sandbox, OriginNodeID: &node, BuildID: &build, Tag: "default"})
++	if err != nil {
++		return "", err
++	}
++	return env, db.CreateTemplateAlias(ctx, queries.CreateTemplateAliasParams{Alias: alias, TemplateID: env, Namespace: &namespace})
++}
++
++func retentionAliasCount(t *testing.T, db *testutils.Database, alias string) int {
++	t.Helper()
++	_, tx, err := db.SqlcClient.WithTx(t.Context())
++	require.NoError(t, err)
++	defer tx.Rollback(t.Context())
++	var count int
++	require.NoError(t, tx.QueryRow(t.Context(), `SELECT count(*) FROM env_aliases WHERE alias=$1`, alias).Scan(&count))
++	return count
++}
++
++func TestExecutionRetentionSealsOnlyAfterValidationAndSurvivesOrdinaryStop(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	op := uuid.New()
++	ancestor := uuid.New()
++	missing := errors.New("missing immutable memory header")
++	_, err := store.RetainForStop(t.Context(), team, sandbox, op, candidate.RetentionRequest, func(context.Context, []uuid.UUID) ([]uuid.UUID, error) { return nil, missing })
++	require.ErrorIs(t, err, missing)
++	require.Equal(t, "active", retentionFence(t, db, team, sandbox))
++	called := 0
++	validate := func(_ context.Context, roots []uuid.UUID) ([]uuid.UUID, error) {
++		called++
++		require.Equal(t, []uuid.UUID{*candidate.BuildID}, roots)
++		return []uuid.UUID{ancestor, *candidate.BuildID}, nil
++	}
++	receipt, err := store.RetainForStop(t.Context(), team, sandbox, op, candidate.RetentionRequest, validate)
++	require.NoError(t, err)
++	require.Equal(t, "retained_for_stop", receipt.Kind)
++	require.Equal(t, "ready_tip", receipt.Disposition)
++	require.NotNil(t, receipt.RetainedTemplateID)
++	require.ElementsMatch(t, []uuid.UUID{ancestor, *candidate.BuildID}, receipt.RetainedBuildIDs)
++	require.Equal(t, "stopping", retentionFence(t, db, team, sandbox))
++	require.ErrorIs(t, store.ValidatePausedDisk(t.Context(), team, sandbox, *candidate.BuildID), executions.ErrPausedDisk, "retention is not a pause certificate")
++	require.ErrorIs(t, store.Register(t.Context(), queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sandbox, ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}, uuid.New(), true), executions.ErrFenced)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE envs SET deleted_at=now() WHERE id=(SELECT env_id FROM snapshots WHERE sandbox_id=$1)`, sandbox))
++	_, err = store.BeginStop(t.Context(), team, sandbox)
++	require.NoError(t, err)
++	count, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: sandbox})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, count)
++	require.NoError(t, store.CleanupStoppedSnapshot(t.Context(), team, sandbox))
++	replay, err := store.RetainForStop(t.Context(), team, sandbox, op, candidate.RetentionRequest, validate)
++	require.NoError(t, err)
++	require.Equal(t, receipt, replay)
++	require.Equal(t, 1, called)
++	require.NoError(t, buildretention.WithIdleCatalog(t.Context(), db.SqlcClient, func(c buildretention.Catalog) error { require.Contains(t, c.Roots, *candidate.BuildID); return nil }))
++	changed := candidate.RetentionRequest
++	changed.ExecutionID = uuid.New()
++	_, err = store.RetainForStop(t.Context(), team, sandbox, op, changed, validate)
++	require.Error(t, err)
++	changed = candidate.RetentionRequest
++	changed.BuildID = nil
++	_, err = store.RetainForStop(t.Context(), team, sandbox, op, changed, validate)
++	require.Error(t, err)
++	_, err = store.RetainForStop(t.Context(), team, sandbox, uuid.New(), candidate.RetentionRequest, validate)
++	require.Error(t, err)
++}
++
++func retentionFence(t *testing.T, db *testutils.Database, team uuid.UUID, sandbox string) string {
++	t.Helper()
++	state, err := db.SqlcClient.LockExecutionFence(t.Context(), queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandbox})
++	require.NoError(t, err)
++	return state
++}
++
++func TestExecutionRetentionRejectsForeignChangedAndAmbiguousIdentity(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	validate := func(_ context.Context, roots []uuid.UUID) ([]uuid.UUID, error) {
++		t.Fatal("invalid candidate reached storage")
++		return nil, nil
++	}
++	_, err := store.RetentionCandidate(t.Context(), uuid.New(), sandbox)
++	require.Error(t, err)
++	changes := []executions.RetentionRequest{candidate.RetentionRequest, candidate.RetentionRequest, candidate.RetentionRequest}
++	changes[0].ExecutionID = uuid.New()
++	changes[1].BuildID = nil
++	changes[2].Metadata = map[string]string{}
++	for key, value := range candidate.Metadata {
++		changes[2].Metadata[key] = value
++	}
++	changes[2].Metadata["launchpad.generation"] = "4"
++	for _, changed := range changes {
++		_, err = store.RetainForStop(t.Context(), team, sandbox, uuid.New(), changed, validate)
++		require.ErrorIs(t, err, executions.ErrRetentionCandidateChanged)
++		require.Equal(t, "active", retentionFence(t, db, team, sandbox))
++	}
++	// Two equally recent ready assignments cannot pick an arbitrary damaged tip.
++	var env string
++	_, tx, err := db.SqlcClient.WithTx(t.Context())
++	require.NoError(t, err)
++	require.NoError(t, tx.QueryRow(t.Context(), `SELECT env_id FROM snapshots WHERE sandbox_id=$1`, sandbox).Scan(&env))
++	require.NoError(t, tx.Rollback(t.Context()))
++	base := testutils.CreateTestTemplate(t, db, team)
++	other := testutils.CreateTestBuild(t, t.Context(), db, base, "uploaded")
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `INSERT INTO env_build_assignments(env_id,build_id,tag,created_at) SELECT env_id,$2,tag,created_at FROM env_build_assignments WHERE env_id=$1 AND tag='default'`, env, other))
++	_, err = store.RetentionCandidate(t.Context(), team, sandbox)
++	require.ErrorIs(t, err, executions.ErrRetention)
++	_, err = store.RetainForStop(t.Context(), team, sandbox, uuid.New(), candidate.RetentionRequest, validate)
++	require.ErrorIs(t, err, executions.ErrRetentionCandidateChanged)
++	require.Equal(t, "active", retentionFence(t, db, team, sandbox))
++}
++
++func TestExecutionRetentionCertifiesNoTipOnlyFromOwnedSettledCatalog(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_builds SET status='failed' WHERE id=$1`, *candidate.BuildID))
++	empty, err := store.RetentionCandidate(t.Context(), team, sandbox)
++	require.NoError(t, err)
++	require.Nil(t, empty.BuildID)
++	require.Equal(t, "no_current_tip", empty.Disposition)
++	receipt, err := store.RetainForStop(t.Context(), team, sandbox, uuid.New(), empty.RetentionRequest, func(context.Context, []uuid.UUID) ([]uuid.UUID, error) {
++		t.Fatal("no tip must not probe storage or guest")
++		return nil, nil
++	})
++	require.NoError(t, err)
++	require.Nil(t, receipt.RetainedTemplateID)
++	require.Empty(t, receipt.RetainedBuildIDs)
++	require.Equal(t, "stopping", retentionFence(t, db, team, sandbox))
++	// A concurrent capture is neither a missing tip nor permission to stop it.
++	db2, store2, team2, sandbox2, current := retentionFixture(t)
++	require.NoError(t, db2.SqlcClient.TestsRawSQL(t.Context(), `UPDATE env_builds SET status='building' WHERE id=$1`, *current.BuildID))
++	_, err = store2.RetentionCandidate(t.Context(), team2, sandbox2)
++	require.ErrorIs(t, err, executions.ErrRetention)
++	require.Equal(t, "active", retentionFence(t, db2, team2, sandbox2))
++}
++
++func TestExecutionRetentionReadsRestoredOwnerWithoutCreationIntent(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	candidate.Metadata["launchpad.restore"] = "v1"
++	candidate.Metadata["launchpad.restore_parent_operation_id"] = uuid.NewString()
++	candidate.Metadata["launchpad.restore_boot_attempt"] = "2"
++	rawOwner, err := json.Marshal(candidate.Metadata)
++	require.NoError(t, err)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE snapshots SET metadata=$2 WHERE sandbox_id=$1`, sandbox, string(rawOwner)))
++	raw, err := json.Marshal(map[string]any{"metadata": candidate.Metadata})
++	require.NoError(t, err)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `DELETE FROM sandbox_creation_operations WHERE team_id=$1 AND sandbox_id=$2`, team, sandbox))
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `INSERT INTO sandbox_restore_operations(team_id,operation_id,request_sha256,request_payload,source_template_id,source_build_id,prepared_build_id,sandbox_id,execution_id,cluster_id,node_id,generation,state,reserved_bytes,manifest)
++        VALUES($1,$2,repeat('a',64),$3,'source',$4,$5,$6,$7,$8,'host','3','active',0,'{}')`, team, uuid.New(), raw, *candidate.BuildID, uuid.New(), sandbox, candidate.ExecutionID, uuid.Nil))
++	got, err := store.RetentionCandidate(t.Context(), team, sandbox)
++	require.NoError(t, err)
++	require.Equal(t, candidate, got)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE sandbox_restore_operations SET state='activating',next_attempt_at=$2 WHERE sandbox_id=$1`, sandbox, time.Now()))
++	_, err = store.RetentionCandidate(t.Context(), team, sandbox)
++	require.ErrorIs(t, err, executions.ErrRetention)
++}
++
++func TestExecutionRetentionSharesFenceFirstOrderWithPausedAlias(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), `UPDATE snapshots SET config='{"filesystemOnly":true}' WHERE sandbox_id=$1`, sandbox))
++	require.NoError(t, store.MarkPaused(t.Context(), team, sandbox, candidate.ExecutionID, *candidate.BuildID, func([]queries.SandboxExecutionAttempt) error { return nil }))
++	namespace := testutils.GetTeamSlug(t, t.Context(), db, team)
++	ready := make(chan struct{})
++	var wg sync.WaitGroup
++	failures := make(chan error, 17)
++	// Alias creation takes this same fence before catalog writes. Neither path
++	// may hold the catalog while waiting for the other path's fence.
++	for range 16 {
++		wg.Go(func() {
++			<-ready
++			_, err := store.RetainPausedDisk(t.Context(), team, sandbox, namespace, "launchpad-backup-"+uuid.NewString())
++			if err != nil && !errors.Is(err, executions.ErrPausedDisk) {
++				failures <- err
++			}
++		})
++	}
++	wg.Go(func() {
++		<-ready
++		_, err := store.RetainForStop(t.Context(), team, sandbox, uuid.New(), candidate.RetentionRequest, func(_ context.Context, roots []uuid.UUID) ([]uuid.UUID, error) { return roots, nil })
++		if err != nil {
++			failures <- err
++		}
++	})
++	close(ready)
++	wg.Wait()
++	close(failures)
++	for err := range failures {
++		require.NoError(t, err)
++	}
++	require.Equal(t, "stopping", retentionFence(t, db, team, sandbox))
++}
++
++func TestExecutionRetentionRejectsCaptureDelayedBeforeItsDurableAdmission(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	base := testutils.CreateTestTemplate(t, db, team)
++	in := queries.UpsertSnapshotParams{TemplateID: "late-" + uuid.NewString(), TeamID: team, SandboxID: sandbox, BaseTemplateID: base, Metadata: types.JSONBStringMap(candidate.Metadata), Vcpu: 2, RamMb: 2048, KernelVersion: "6.1.0", FirecrackerVersion: "1.4.0", OriginNodeID: "host", StartedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, Status: types.BuildStatusSnapshotting, SourceBuildID: *candidate.BuildID}
++	started := make(chan struct{})
++	finished := make(chan error, 1)
++	receipt, err := store.RetainForStop(t.Context(), team, sandbox, uuid.New(), candidate.RetentionRequest, func(_ context.Context, roots []uuid.UUID) ([]uuid.UUID, error) {
++		go func() {
++			close(started)
++			_, err := store.UpsertSnapshotForExecution(t.Context(), candidate.ExecutionID, in)
++			finished <- err
++		}()
++		<-started
++		return roots, nil
++	})
++	require.NoError(t, err)
++	require.NotNil(t, receipt.RetainedTemplateID)
++	require.ErrorIs(t, <-finished, executions.ErrFenced, "a capture already read from routing before retention must not publish later")
++	require.Equal(t, "stopping", retentionFence(t, db, team, sandbox))
++	_, tx, err := db.SqlcClient.WithTx(t.Context())
++	require.NoError(t, err)
++	defer tx.Rollback(t.Context())
++	var count int
++	require.NoError(t, tx.QueryRow(t.Context(), `SELECT count(*) FROM env_build_assignments a JOIN snapshots s ON s.env_id=a.env_id WHERE s.sandbox_id=$1`, sandbox).Scan(&count))
++	require.Equal(t, 1, count, "no late pending capture was inserted after sealing")
++}
++
++func TestExecutionRetentionDefersToCaptureWhoseAdmissionAlreadyCommitted(t *testing.T) {
++	db, store, team, sandbox, candidate := retentionFixture(t)
++	base := testutils.CreateTestTemplate(t, db, team)
++	in := queries.UpsertSnapshotParams{TemplateID: "early-" + uuid.NewString(), TeamID: team, SandboxID: sandbox, BaseTemplateID: base, Metadata: types.JSONBStringMap(candidate.Metadata), Vcpu: 2, RamMb: 2048, KernelVersion: "6.1.0", FirecrackerVersion: "1.4.0", OriginNodeID: "host", StartedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, Status: types.BuildStatusSnapshotting, SourceBuildID: *candidate.BuildID}
++	_, err := store.UpsertSnapshotForExecution(t.Context(), candidate.ExecutionID, in)
++	require.NoError(t, err)
++	_, err = store.RetainForStop(t.Context(), team, sandbox, uuid.New(), candidate.RetentionRequest, func(context.Context, []uuid.UUID) ([]uuid.UUID, error) {
++		t.Fatal("pending capture must block before header validation or stop")
++		return nil, nil
++	})
++	require.ErrorIs(t, err, executions.ErrRetentionCandidateChanged)
++	require.Equal(t, "active", retentionFence(t, db, team, sandbox))
++}
++
++func TestExecutionRetentionUsesExistingStoppedCertificateWithoutRevivingIt(t *testing.T) {
++	for _, cleanup := range []bool{false, true} {
++		t.Run(map[bool]string{false: "remaining ready tip", true: "no current tip"}[cleanup], func(t *testing.T) {
++			db, store, team, sandbox, before := retentionFixture(t)
++			_, err := store.BeginStop(t.Context(), team, sandbox)
++			require.NoError(t, err)
++			count, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: sandbox})
++			require.NoError(t, err)
++			require.EqualValues(t, 1, count)
++			if cleanup {
++				require.NoError(t, store.CleanupStoppedSnapshot(t.Context(), team, sandbox))
++			}
++			candidate, err := store.RetentionCandidate(t.Context(), team, sandbox)
++			require.NoError(t, err)
++			require.Equal(t, before.ExecutionID, candidate.ExecutionID)
++			require.Equal(t, cleanup, candidate.BuildID == nil)
++			receipt, err := store.RetainForStop(t.Context(), team, sandbox, uuid.New(), candidate.RetentionRequest, func(_ context.Context, roots []uuid.UUID) ([]uuid.UUID, error) { return roots, nil })
++			require.NoError(t, err)
++			require.Equal(t, "stopped", retentionFence(t, db, team, sandbox))
++			require.Equal(t, cleanup, receipt.RetainedTemplateID == nil)
++			require.ErrorIs(t, store.Register(t.Context(), queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sandbox, ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}, uuid.New(), true), executions.ErrFenced)
++			replay, err := store.RetainForStop(t.Context(), team, sandbox, receipt.RecoveryOperationID, candidate.RetentionRequest, func(context.Context, []uuid.UUID) ([]uuid.UUID, error) {
++				t.Fatal("saved immutable receipt must replay")
++				return nil, nil
++			})
++			require.NoError(t, err)
++			require.Equal(t, receipt, replay)
++		})
++	}
++}
+diff --git a/packages/orchestrator/orchestrator.proto b/packages/orchestrator/orchestrator.proto
+--- a/packages/orchestrator/orchestrator.proto
++++ b/packages/orchestrator/orchestrator.proto
+@@ -315,7 +315,17 @@
+   bool physically_stopped = 4;
+ }
+ 
++message RetainedBuildRootsRequest {
++  repeated string build_ids = 1;
++}
++
++message RetainedBuildRootsResponse {
++  repeated string build_ids = 1;
++}
++
+ service SandboxService {
++  // Immutable storage inspection only: never starts, probes or resumes a guest.
++  rpc ValidateRetainedBuildRoots(RetainedBuildRootsRequest) returns (RetainedBuildRootsResponse);
+   rpc StopExecution(StopExecutionRequest) returns (StopExecutionResponse);
+   rpc DiscardStoppedRestoreDisk(RestoreDiskActivateRequest) returns (google.protobuf.Empty);
+   rpc ReleaseRestoreDisk(RestoreDiskRequest) returns (google.protobuf.Empty);
+diff --git a/packages/orchestrator/pkg/server/retained_build_roots.go b/packages/orchestrator/pkg/server/retained_build_roots.go
+new file mode 100644
+--- /dev/null
++++ b/packages/orchestrator/pkg/server/retained_build_roots.go
+@@ -0,0 +1,42 @@
++//go:build linux
++
++package server
++
++import (
++	"context"
++	"slices"
++	"time"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/template"
++	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++	"github.com/google/uuid"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++// ValidateRetainedBuildRoots reads persisted metadata and both disk and memory
++// mappings without touching execution, a guest, a lease or any database lock.
++func (s *Server) ValidateRetainedBuildRoots(ctx context.Context, in *orchestrator.RetainedBuildRootsRequest) (*orchestrator.RetainedBuildRootsResponse, error) {
++	if !s.config.LaunchpadRequireExecutionFence {
++		return nil, status.Error(codes.Unimplemented, "execution retention is disabled")
++	}
++	if len(in.GetBuildIds()) != 1 {
++		return nil, status.Error(codes.InvalidArgument, "one exact retained root is required")
++	}
++	root, err := uuid.Parse(in.GetBuildIds()[0])
++	if err != nil || root == uuid.Nil {
++		return nil, status.Error(codes.InvalidArgument, "invalid retained root")
++	}
++	child, cancel := context.WithTimeout(ctx, 15*time.Second)
++	defer cancel()
++	refs, err := template.RetainedBuilds(child, s.persistence, []uuid.UUID{root})
++	if err != nil {
++		return nil, status.Error(codes.FailedPrecondition, "retained immutable build headers are unavailable")
++	}
++	out := &orchestrator.RetainedBuildRootsResponse{BuildIds: make([]string, 0, len(refs))}
++	for id := range refs {
++		out.BuildIds = append(out.BuildIds, id.String())
++	}
++	slices.Sort(out.BuildIds)
++	return out, nil
++}
+diff --git a/packages/orchestrator/pkg/server/retained_build_roots_test.go b/packages/orchestrator/pkg/server/retained_build_roots_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/orchestrator/pkg/server/retained_build_roots_test.go
+@@ -0,0 +1,57 @@
++//go:build linux
++
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
++	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++func TestRetentionValidationReadsStoredDiskAndIndependentMemoryAncestors(t *testing.T) {
++	server := &Server{}
++	server.config.LaunchpadRequireExecutionFence = true
++	var err error
++	server.persistence, err = storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: t.TempDir()})
++	require.NoError(t, err)
++	self, disk, memory := uuid.New(), uuid.New(), uuid.New()
++	paths := storage.Paths{BuildID: self.String()}
++	request := &orchestrator.RetainedBuildRootsRequest{BuildIds: []string{self.String()}}
++	_, err = server.ValidateRetainedBuildRoots(t.Context(), request)
++	require.Equal(t, codes.FailedPrecondition, status.Code(err))
++	raw, err := json.Marshal(metadata.Template{Version: metadata.CurrentVersion, Template: metadata.TemplateMetadata{BuildID: self.String()}})
++	require.NoError(t, err)
++	blob, err := server.persistence.OpenBlob(t.Context(), paths.Metadata())
++	require.NoError(t, err)
++	require.NoError(t, blob.Put(t.Context(), raw))
++	write := func(path string, ancestor uuid.UUID) {
++		h, err := header.NewHeader(&header.Metadata{Version: 3, BuildId: self, BlockSize: 4096, Size: 4096}, []header.BuildMap{{Length: 4096, BuildId: ancestor}})
++		require.NoError(t, err)
++		_, _, _, err = header.StoreHeader(t.Context(), server.persistence, path, h)
++		require.NoError(t, err)
++	}
++	write(paths.RootfsHeader(), disk)
++	_, err = server.ValidateRetainedBuildRoots(t.Context(), request)
++	require.Equal(t, codes.FailedPrecondition, status.Code(err), "missing memory header must not become a filesystem-only snapshot")
++	write(paths.MemfileHeader(), memory)
++	result, err := server.ValidateRetainedBuildRoots(t.Context(), request)
++	require.NoError(t, err)
++	require.ElementsMatch(t, []string{self.String(), disk.String(), memory.String()}, result.BuildIds)
++	cancelled, cancel := context.WithCancel(t.Context())
++	cancel()
++	_, err = server.ValidateRetainedBuildRoots(cancelled, request)
++	require.Error(t, err)
++	// No sandboxFactory, SQL client or guest connection exists in this fixture.
++	server.config.LaunchpadRequireExecutionFence = false
++	_, err = server.ValidateRetainedBuildRoots(t.Context(), request)
++	require.Equal(t, codes.Unimplemented, status.Code(err))
++}
+diff --git a/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go b/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
+--- a/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
++++ b/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
+@@ -2076,6 +2076,94 @@
+ 		return x.PhysicallyStopped
+ 	}
+ 	return false
++}
++
++type RetainedBuildRootsRequest struct {
++	state         protoimpl.MessageState `protogen:"open.v1"`
++	BuildIds      []string               `protobuf:"bytes,1,rep,name=build_ids,json=buildIds,proto3" json:"build_ids,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
++}
++
++func (x *RetainedBuildRootsRequest) Reset() {
++	*x = RetainedBuildRootsRequest{}
++	mi := &file_orchestrator_proto_msgTypes[29]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *RetainedBuildRootsRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RetainedBuildRootsRequest) ProtoMessage() {}
++
++func (x *RetainedBuildRootsRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_orchestrator_proto_msgTypes[29]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RetainedBuildRootsRequest.ProtoReflect.Descriptor instead.
++func (*RetainedBuildRootsRequest) Descriptor() ([]byte, []int) {
++	return file_orchestrator_proto_rawDescGZIP(), []int{29}
++}
++
++func (x *RetainedBuildRootsRequest) GetBuildIds() []string {
++	if x != nil {
++		return x.BuildIds
++	}
++	return nil
++}
++
++type RetainedBuildRootsResponse struct {
++	state         protoimpl.MessageState `protogen:"open.v1"`
++	BuildIds      []string               `protobuf:"bytes,1,rep,name=build_ids,json=buildIds,proto3" json:"build_ids,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
++}
++
++func (x *RetainedBuildRootsResponse) Reset() {
++	*x = RetainedBuildRootsResponse{}
++	mi := &file_orchestrator_proto_msgTypes[30]
++	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++	ms.StoreMessageInfo(mi)
++}
++
++func (x *RetainedBuildRootsResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RetainedBuildRootsResponse) ProtoMessage() {}
++
++func (x *RetainedBuildRootsResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_orchestrator_proto_msgTypes[30]
++	if x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RetainedBuildRootsResponse.ProtoReflect.Descriptor instead.
++func (*RetainedBuildRootsResponse) Descriptor() ([]byte, []int) {
++	return file_orchestrator_proto_rawDescGZIP(), []int{30}
++}
++
++func (x *RetainedBuildRootsResponse) GetBuildIds() []string {
++	if x != nil {
++		return x.BuildIds
++	}
++	return nil
+ }
+ 
+ var File_orchestrator_proto protoreflect.FileDescriptor
+@@ -2287,8 +2375,13 @@
+ 	"\n" +
+ 	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12!\n" +
+ 	"\fexecution_id\x18\x03 \x01(\tR\vexecutionId\x12-\n" +
+-	"\x12physically_stopped\x18\x04 \x01(\bR\x11physicallyStopped2\xd8\x06\n" +
+-	"\x0eSandboxService\x12>\n" +
++	"\x12physically_stopped\x18\x04 \x01(\bR\x11physicallyStopped\"8\n" +
++	"\x19RetainedBuildRootsRequest\x12\x1b\n" +
++	"\tbuild_ids\x18\x01 \x03(\tR\bbuildIds\"9\n" +
++	"\x1aRetainedBuildRootsResponse\x12\x1b\n" +
++	"\tbuild_ids\x18\x01 \x03(\tR\bbuildIds2\xaf\a\n" +
++	"\x0eSandboxService\x12U\n" +
++	"\x1aValidateRetainedBuildRoots\x12\x1a.RetainedBuildRootsRequest\x1a\x1b.RetainedBuildRootsResponse\x12>\n" +
+ 	"\rStopExecution\x12\x15.StopExecutionRequest\x1a\x16.StopExecutionResponse\x12P\n" +
+ 	"\x19DiscardStoppedRestoreDisk\x12\x1b.RestoreDiskActivateRequest\x1a\x16.google.protobuf.Empty\x12A\n" +
+ 	"\x12ReleaseRestoreDisk\x12\x13.RestoreDiskRequest\x1a\x16.google.protobuf.Empty\x12J\n" +
+@@ -2316,7 +2409,7 @@
+ 	return file_orchestrator_proto_rawDescData
+ }
+ 
+-var file_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
++var file_orchestrator_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+ var file_orchestrator_proto_goTypes = []any{
+ 	(*SandboxConfig)(nil),                // 0: SandboxConfig
+ 	(*SandboxIam)(nil),                   // 1: SandboxIam
+@@ -2347,74 +2440,78 @@
+ 	(*RestoreDiskActivateRequest)(nil),   // 26: RestoreDiskActivateRequest
+ 	(*StopExecutionRequest)(nil),         // 27: StopExecutionRequest
+ 	(*StopExecutionResponse)(nil),        // 28: StopExecutionResponse
+-	nil,                                  // 29: SandboxConfig.EnvVarsEntry
+-	nil,                                  // 30: SandboxConfig.MetadataEntry
+-	nil,                                  // 31: SandboxIam.TokensEntry
+-	nil,                                  // 32: SandboxNetworkTransform.HeadersEntry
+-	nil,                                  // 33: SandboxNetworkEgressConfig.RulesEntry
+-	nil,                                  // 34: SandboxCheckpointRequest.MetadataEntry
+-	(*timestamppb.Timestamp)(nil),        // 35: google.protobuf.Timestamp
+-	(*emptypb.Empty)(nil),                // 36: google.protobuf.Empty
++	(*RetainedBuildRootsRequest)(nil),    // 29: RetainedBuildRootsRequest
++	(*RetainedBuildRootsResponse)(nil),   // 30: RetainedBuildRootsResponse
++	nil,                                  // 31: SandboxConfig.EnvVarsEntry
++	nil,                                  // 32: SandboxConfig.MetadataEntry
++	nil,                                  // 33: SandboxIam.TokensEntry
++	nil,                                  // 34: SandboxNetworkTransform.HeadersEntry
++	nil,                                  // 35: SandboxNetworkEgressConfig.RulesEntry
++	nil,                                  // 36: SandboxCheckpointRequest.MetadataEntry
++	(*timestamppb.Timestamp)(nil),        // 37: google.protobuf.Timestamp
++	(*emptypb.Empty)(nil),                // 38: google.protobuf.Empty
+ }
+ var file_orchestrator_proto_depIdxs = []int32{
+-	29, // 0: SandboxConfig.env_vars:type_name -> SandboxConfig.EnvVarsEntry
+-	30, // 1: SandboxConfig.metadata:type_name -> SandboxConfig.MetadataEntry
++	31, // 0: SandboxConfig.env_vars:type_name -> SandboxConfig.EnvVarsEntry
++	32, // 1: SandboxConfig.metadata:type_name -> SandboxConfig.MetadataEntry
+ 	5,  // 2: SandboxConfig.network:type_name -> SandboxNetworkConfig
+ 	4,  // 3: SandboxConfig.volumeMounts:type_name -> SandboxVolumeMount
+ 	3,  // 4: SandboxConfig.auto_resume:type_name -> SandboxAutoResumeConfig
+ 	1,  // 5: SandboxConfig.iam:type_name -> SandboxIam
+-	31, // 6: SandboxIam.tokens:type_name -> SandboxIam.TokensEntry
++	33, // 6: SandboxIam.tokens:type_name -> SandboxIam.TokensEntry
+ 	9,  // 7: SandboxNetworkConfig.egress:type_name -> SandboxNetworkEgressConfig
+ 	11, // 8: SandboxNetworkConfig.ingress:type_name -> SandboxNetworkIngressConfig
+-	32, // 9: SandboxNetworkTransform.headers:type_name -> SandboxNetworkTransform.HeadersEntry
++	34, // 9: SandboxNetworkTransform.headers:type_name -> SandboxNetworkTransform.HeadersEntry
+ 	6,  // 10: SandboxNetworkRule.transform:type_name -> SandboxNetworkTransform
+ 	7,  // 11: SandboxNetworkDomainRules.rules:type_name -> SandboxNetworkRule
+-	33, // 12: SandboxNetworkEgressConfig.rules:type_name -> SandboxNetworkEgressConfig.RulesEntry
++	35, // 12: SandboxNetworkEgressConfig.rules:type_name -> SandboxNetworkEgressConfig.RulesEntry
+ 	10, // 13: SandboxNetworkEgressConfig.egress_proxy_tls:type_name -> SandboxNetworkEgressProxyTLS
+ 	0,  // 14: SandboxCreateRequest.sandbox:type_name -> SandboxConfig
+-	35, // 15: SandboxCreateRequest.start_time:type_name -> google.protobuf.Timestamp
+-	35, // 16: SandboxCreateRequest.end_time:type_name -> google.protobuf.Timestamp
++	37, // 15: SandboxCreateRequest.start_time:type_name -> google.protobuf.Timestamp
++	37, // 16: SandboxCreateRequest.end_time:type_name -> google.protobuf.Timestamp
+ 	17, // 17: SandboxCreateResponse.scheduling_metadata:type_name -> SchedulingMetadata
+-	35, // 18: SandboxUpdateRequest.end_time:type_name -> google.protobuf.Timestamp
++	37, // 18: SandboxUpdateRequest.end_time:type_name -> google.protobuf.Timestamp
+ 	9,  // 19: SandboxUpdateRequest.egress:type_name -> SandboxNetworkEgressConfig
+ 	17, // 20: SandboxPauseResponse.scheduling_metadata:type_name -> SchedulingMetadata
+-	34, // 21: SandboxCheckpointRequest.metadata:type_name -> SandboxCheckpointRequest.MetadataEntry
++	36, // 21: SandboxCheckpointRequest.metadata:type_name -> SandboxCheckpointRequest.MetadataEntry
+ 	17, // 22: SandboxCheckpointResponse.scheduling_metadata:type_name -> SchedulingMetadata
+ 	0,  // 23: RunningSandbox.config:type_name -> SandboxConfig
+-	35, // 24: RunningSandbox.start_time:type_name -> google.protobuf.Timestamp
+-	35, // 25: RunningSandbox.end_time:type_name -> google.protobuf.Timestamp
++	37, // 24: RunningSandbox.start_time:type_name -> google.protobuf.Timestamp
++	37, // 25: RunningSandbox.end_time:type_name -> google.protobuf.Timestamp
+ 	21, // 26: SandboxListResponse.sandboxes:type_name -> RunningSandbox
+ 	12, // 27: RestoreDiskActivateRequest.create:type_name -> SandboxCreateRequest
+ 	2,  // 28: SandboxIam.TokensEntry.value:type_name -> SandboxIamToken
+ 	8,  // 29: SandboxNetworkEgressConfig.RulesEntry.value:type_name -> SandboxNetworkDomainRules
+-	27, // 30: SandboxService.StopExecution:input_type -> StopExecutionRequest
+-	26, // 31: SandboxService.DiscardStoppedRestoreDisk:input_type -> RestoreDiskActivateRequest
+-	24, // 32: SandboxService.ReleaseRestoreDisk:input_type -> RestoreDiskRequest
+-	26, // 33: SandboxService.ActivateRestoreDisk:input_type -> RestoreDiskActivateRequest
+-	23, // 34: SandboxService.PrepareRestoreDisk:input_type -> RestoreDiskPrepareRequest
+-	24, // 35: SandboxService.InspectRestoreDisk:input_type -> RestoreDiskRequest
+-	24, // 36: SandboxService.CancelRestoreDisk:input_type -> RestoreDiskRequest
+-	12, // 37: SandboxService.Create:input_type -> SandboxCreateRequest
+-	14, // 38: SandboxService.Update:input_type -> SandboxUpdateRequest
+-	36, // 39: SandboxService.List:input_type -> google.protobuf.Empty
+-	15, // 40: SandboxService.Delete:input_type -> SandboxDeleteRequest
+-	16, // 41: SandboxService.Pause:input_type -> SandboxPauseRequest
+-	19, // 42: SandboxService.Checkpoint:input_type -> SandboxCheckpointRequest
+-	28, // 43: SandboxService.StopExecution:output_type -> StopExecutionResponse
+-	36, // 44: SandboxService.DiscardStoppedRestoreDisk:output_type -> google.protobuf.Empty
+-	36, // 45: SandboxService.ReleaseRestoreDisk:output_type -> google.protobuf.Empty
+-	13, // 46: SandboxService.ActivateRestoreDisk:output_type -> SandboxCreateResponse
+-	25, // 47: SandboxService.PrepareRestoreDisk:output_type -> RestoreDiskResponse
+-	25, // 48: SandboxService.InspectRestoreDisk:output_type -> RestoreDiskResponse
+-	36, // 49: SandboxService.CancelRestoreDisk:output_type -> google.protobuf.Empty
+-	13, // 50: SandboxService.Create:output_type -> SandboxCreateResponse
+-	36, // 51: SandboxService.Update:output_type -> google.protobuf.Empty
+-	22, // 52: SandboxService.List:output_type -> SandboxListResponse
+-	36, // 53: SandboxService.Delete:output_type -> google.protobuf.Empty
+-	18, // 54: SandboxService.Pause:output_type -> SandboxPauseResponse
+-	20, // 55: SandboxService.Checkpoint:output_type -> SandboxCheckpointResponse
+-	43, // [43:56] is the sub-list for method output_type
+-	30, // [30:43] is the sub-list for method input_type
++	29, // 30: SandboxService.ValidateRetainedBuildRoots:input_type -> RetainedBuildRootsRequest
++	27, // 31: SandboxService.StopExecution:input_type -> StopExecutionRequest
++	26, // 32: SandboxService.DiscardStoppedRestoreDisk:input_type -> RestoreDiskActivateRequest
++	24, // 33: SandboxService.ReleaseRestoreDisk:input_type -> RestoreDiskRequest
++	26, // 34: SandboxService.ActivateRestoreDisk:input_type -> RestoreDiskActivateRequest
++	23, // 35: SandboxService.PrepareRestoreDisk:input_type -> RestoreDiskPrepareRequest
++	24, // 36: SandboxService.InspectRestoreDisk:input_type -> RestoreDiskRequest
++	24, // 37: SandboxService.CancelRestoreDisk:input_type -> RestoreDiskRequest
++	12, // 38: SandboxService.Create:input_type -> SandboxCreateRequest
++	14, // 39: SandboxService.Update:input_type -> SandboxUpdateRequest
++	38, // 40: SandboxService.List:input_type -> google.protobuf.Empty
++	15, // 41: SandboxService.Delete:input_type -> SandboxDeleteRequest
++	16, // 42: SandboxService.Pause:input_type -> SandboxPauseRequest
++	19, // 43: SandboxService.Checkpoint:input_type -> SandboxCheckpointRequest
++	30, // 44: SandboxService.ValidateRetainedBuildRoots:output_type -> RetainedBuildRootsResponse
++	28, // 45: SandboxService.StopExecution:output_type -> StopExecutionResponse
++	38, // 46: SandboxService.DiscardStoppedRestoreDisk:output_type -> google.protobuf.Empty
++	38, // 47: SandboxService.ReleaseRestoreDisk:output_type -> google.protobuf.Empty
++	13, // 48: SandboxService.ActivateRestoreDisk:output_type -> SandboxCreateResponse
++	25, // 49: SandboxService.PrepareRestoreDisk:output_type -> RestoreDiskResponse
++	25, // 50: SandboxService.InspectRestoreDisk:output_type -> RestoreDiskResponse
++	38, // 51: SandboxService.CancelRestoreDisk:output_type -> google.protobuf.Empty
++	13, // 52: SandboxService.Create:output_type -> SandboxCreateResponse
++	38, // 53: SandboxService.Update:output_type -> google.protobuf.Empty
++	22, // 54: SandboxService.List:output_type -> SandboxListResponse
++	38, // 55: SandboxService.Delete:output_type -> google.protobuf.Empty
++	18, // 56: SandboxService.Pause:output_type -> SandboxPauseResponse
++	20, // 57: SandboxService.Checkpoint:output_type -> SandboxCheckpointResponse
++	44, // [44:58] is the sub-list for method output_type
++	30, // [30:44] is the sub-list for method input_type
+ 	30, // [30:30] is the sub-list for extension type_name
+ 	30, // [30:30] is the sub-list for extension extendee
+ 	0,  // [0:30] is the sub-list for field type_name
+@@ -2439,7 +2536,7 @@
+ 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+ 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_orchestrator_proto_rawDesc), len(file_orchestrator_proto_rawDesc)),
+ 			NumEnums:      0,
+-			NumMessages:   35,
++			NumMessages:   37,
+ 			NumExtensions: 0,
+ 			NumServices:   1,
+ 		},
+diff --git a/packages/shared/pkg/grpc/orchestrator/orchestrator_grpc.pb.go b/packages/shared/pkg/grpc/orchestrator/orchestrator_grpc.pb.go
+--- a/packages/shared/pkg/grpc/orchestrator/orchestrator_grpc.pb.go
++++ b/packages/shared/pkg/grpc/orchestrator/orchestrator_grpc.pb.go
+@@ -20,25 +20,28 @@
+ const _ = grpc.SupportPackageIsVersion9
+ 
+ const (
+-	SandboxService_StopExecution_FullMethodName             = "/SandboxService/StopExecution"
+-	SandboxService_DiscardStoppedRestoreDisk_FullMethodName = "/SandboxService/DiscardStoppedRestoreDisk"
+-	SandboxService_ReleaseRestoreDisk_FullMethodName        = "/SandboxService/ReleaseRestoreDisk"
+-	SandboxService_ActivateRestoreDisk_FullMethodName       = "/SandboxService/ActivateRestoreDisk"
+-	SandboxService_PrepareRestoreDisk_FullMethodName        = "/SandboxService/PrepareRestoreDisk"
+-	SandboxService_InspectRestoreDisk_FullMethodName        = "/SandboxService/InspectRestoreDisk"
+-	SandboxService_CancelRestoreDisk_FullMethodName         = "/SandboxService/CancelRestoreDisk"
+-	SandboxService_Create_FullMethodName                    = "/SandboxService/Create"
+-	SandboxService_Update_FullMethodName                    = "/SandboxService/Update"
+-	SandboxService_List_FullMethodName                      = "/SandboxService/List"
+-	SandboxService_Delete_FullMethodName                    = "/SandboxService/Delete"
+-	SandboxService_Pause_FullMethodName                     = "/SandboxService/Pause"
+-	SandboxService_Checkpoint_FullMethodName                = "/SandboxService/Checkpoint"
++	SandboxService_ValidateRetainedBuildRoots_FullMethodName = "/SandboxService/ValidateRetainedBuildRoots"
++	SandboxService_StopExecution_FullMethodName              = "/SandboxService/StopExecution"
++	SandboxService_DiscardStoppedRestoreDisk_FullMethodName  = "/SandboxService/DiscardStoppedRestoreDisk"
++	SandboxService_ReleaseRestoreDisk_FullMethodName         = "/SandboxService/ReleaseRestoreDisk"
++	SandboxService_ActivateRestoreDisk_FullMethodName        = "/SandboxService/ActivateRestoreDisk"
++	SandboxService_PrepareRestoreDisk_FullMethodName         = "/SandboxService/PrepareRestoreDisk"
++	SandboxService_InspectRestoreDisk_FullMethodName         = "/SandboxService/InspectRestoreDisk"
++	SandboxService_CancelRestoreDisk_FullMethodName          = "/SandboxService/CancelRestoreDisk"
++	SandboxService_Create_FullMethodName                     = "/SandboxService/Create"
++	SandboxService_Update_FullMethodName                     = "/SandboxService/Update"
++	SandboxService_List_FullMethodName                       = "/SandboxService/List"
++	SandboxService_Delete_FullMethodName                     = "/SandboxService/Delete"
++	SandboxService_Pause_FullMethodName                      = "/SandboxService/Pause"
++	SandboxService_Checkpoint_FullMethodName                 = "/SandboxService/Checkpoint"
+ )
+ 
+ // SandboxServiceClient is the client API for SandboxService service.
+ //
+ // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+ type SandboxServiceClient interface {
++	// Immutable storage inspection only: never starts, probes or resumes a guest.
++	ValidateRetainedBuildRoots(ctx context.Context, in *RetainedBuildRootsRequest, opts ...grpc.CallOption) (*RetainedBuildRootsResponse, error)
+ 	StopExecution(ctx context.Context, in *StopExecutionRequest, opts ...grpc.CallOption) (*StopExecutionResponse, error)
+ 	DiscardStoppedRestoreDisk(ctx context.Context, in *RestoreDiskActivateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+ 	ReleaseRestoreDisk(ctx context.Context, in *RestoreDiskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+@@ -64,6 +67,16 @@
+ 	return &sandboxServiceClient{cc}
+ }
+ 
++func (c *sandboxServiceClient) ValidateRetainedBuildRoots(ctx context.Context, in *RetainedBuildRootsRequest, opts ...grpc.CallOption) (*RetainedBuildRootsResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(RetainedBuildRootsResponse)
++	err := c.cc.Invoke(ctx, SandboxService_ValidateRetainedBuildRoots_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ func (c *sandboxServiceClient) StopExecution(ctx context.Context, in *StopExecutionRequest, opts ...grpc.CallOption) (*StopExecutionResponse, error) {
+ 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+ 	out := new(StopExecutionResponse)
+@@ -198,6 +211,8 @@
+ // All implementations must embed UnimplementedSandboxServiceServer
+ // for forward compatibility.
+ type SandboxServiceServer interface {
++	// Immutable storage inspection only: never starts, probes or resumes a guest.
++	ValidateRetainedBuildRoots(context.Context, *RetainedBuildRootsRequest) (*RetainedBuildRootsResponse, error)
+ 	StopExecution(context.Context, *StopExecutionRequest) (*StopExecutionResponse, error)
+ 	DiscardStoppedRestoreDisk(context.Context, *RestoreDiskActivateRequest) (*emptypb.Empty, error)
+ 	ReleaseRestoreDisk(context.Context, *RestoreDiskRequest) (*emptypb.Empty, error)
+@@ -223,6 +238,9 @@
+ // pointer dereference when methods are called.
+ type UnimplementedSandboxServiceServer struct{}
+ 
++func (UnimplementedSandboxServiceServer) ValidateRetainedBuildRoots(context.Context, *RetainedBuildRootsRequest) (*RetainedBuildRootsResponse, error) {
++	return nil, status.Error(codes.Unimplemented, "method ValidateRetainedBuildRoots not implemented")
++}
+ func (UnimplementedSandboxServiceServer) StopExecution(context.Context, *StopExecutionRequest) (*StopExecutionResponse, error) {
+ 	return nil, status.Error(codes.Unimplemented, "method StopExecution not implemented")
+ }
+@@ -283,6 +301,24 @@
+ 	s.RegisterService(&SandboxService_ServiceDesc, srv)
+ }
+ 
++func _SandboxService_ValidateRetainedBuildRoots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RetainedBuildRootsRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServiceServer).ValidateRetainedBuildRoots(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: SandboxService_ValidateRetainedBuildRoots_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServiceServer).ValidateRetainedBuildRoots(ctx, req.(*RetainedBuildRootsRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
+ func _SandboxService_StopExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+ 	in := new(StopExecutionRequest)
+ 	if err := dec(in); err != nil {
+@@ -525,6 +561,10 @@
+ 	HandlerType: (*SandboxServiceServer)(nil),
+ 	Methods: []grpc.MethodDesc{
+ 		{
++			MethodName: "ValidateRetainedBuildRoots",
++			Handler:    _SandboxService_ValidateRetainedBuildRoots_Handler,
++		},
++		{
+ 			MethodName: "StopExecution",
+ 			Handler:    _SandboxService_StopExecution_Handler,
+ 		},
+diff --git a/spec/openapi.yml b/spec/openapi.yml
+--- a/spec/openapi.yml
++++ b/spec/openapi.yml
+@@ -235,6 +235,59 @@
+             $ref: "#/components/schemas/Error"
+ 
+   schemas:
++    LaunchpadRetentionRequest:
++      type: object
++      additionalProperties: false
++      required: [executionID, buildID, metadata]
++      properties:
++        executionID:
++          type: string
++          format: uuid
++        buildID:
++          type: string
++          format: uuid
++          nullable: true
++        metadata:
++          type: object
++          additionalProperties:
++            type: string
++    LaunchpadRetentionCandidate:
++      allOf:
++        - $ref: '#/components/schemas/LaunchpadRetentionRequest'
++        - type: object
++          required: [sandboxID, disposition]
++          properties:
++            sandboxID:
++              type: string
++            disposition:
++              type: string
++              enum: [ready_tip, no_current_tip]
++    LaunchpadRetentionReceipt:
++      allOf:
++        - $ref: '#/components/schemas/LaunchpadRetentionCandidate'
++        - type: object
++          required: [version, kind, recoveryOperationID, retainedTemplateID, retainedBuildIDs, requestSHA256]
++          properties:
++            version:
++              type: integer
++              enum: [1]
++            kind:
++              type: string
++              enum: [retained_for_stop]
++            recoveryOperationID:
++              type: string
++              format: uuid
++            retainedTemplateID:
++              type: string
++              nullable: true
++            retainedBuildIDs:
++              type: array
++              items:
++                type: string
++                format: uuid
++            requestSHA256:
++              type: string
++              pattern: '^[0-9a-f]{64}$'
+     LaunchpadRestoreRequest:
+       type: object
+       additionalProperties: false
+@@ -343,8 +396,12 @@
+               enum: [true]
+     LaunchpadRuntimeCapabilities:
+       type: object
+-      required: [version, privatePreviewHeaderBoundary, diskRestore, renewableLifetime, quiescedSnapshots, pausedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection, durableCreationIdentity]
+-      properties:
++      required: [executionRetention, certifiedPauses, version, privatePreviewHeaderBoundary, diskRestore, renewableLifetime, quiescedSnapshots, pausedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection, durableCreationIdentity]
++      properties:
++        certifiedPauses:
++          type: boolean
++        executionRetention:
++          type: boolean
+         version:
+           type: integer
+         diskRestore:
+@@ -2855,6 +2912,58 @@
+                 $ref: '#/components/schemas/LaunchpadCreationStopReceipt'
+         default:
+           description: Unauthorized request, unavailable registry, or physical stop not confirmed
++  /extensions/launchpad/v1/executions/{sandboxID}/retention-candidate:
++    get:
++      operationId: getLaunchpadRetentionCandidate
++      security:
++        - ApiKeyAuth: []
++      parameters:
++        - name: sandboxID
++          in: path
++          required: true
++          schema:
++            type: string
++      responses:
++        '200':
++          description: Non-waking exact managed ownership and ready snapshot tip, or authoritative no-current-tip
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/LaunchpadRetentionCandidate'
++        default:
++          description: Unknown, unauthorized, changing or ambiguous execution
++  /extensions/launchpad/v1/executions/{sandboxID}/retentions/{recoveryOperationID}:
++    put:
++      operationId: putLaunchpadExecutionRetention
++      security:
++        - ApiKeyAuth: []
++      parameters:
++        - name: sandboxID
++          in: path
++          required: true
++          schema:
++            type: string
++        - name: recoveryOperationID
++          in: path
++          required: true
++          schema:
++            type: string
++            format: uuid
++      requestBody:
++        required: true
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/LaunchpadRetentionRequest'
++      responses:
++        '200':
++          description: Immutable roots retained and execution admission permanently sealed; not a physical-stop or pause receipt
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/LaunchpadRetentionReceipt'
++        default:
++          description: Invalid, unauthorized, changed, incomplete or unavailable retention; keep the sandbox
+   /extensions/launchpad/v1/executions/{sandboxID}:
+     delete:
+       operationId: stopLaunchpadExecution

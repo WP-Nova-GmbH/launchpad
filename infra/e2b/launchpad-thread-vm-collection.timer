@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically collect released Launchpad VM disk layers
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+Unit=launchpad-thread-vm-collection.service
+
+[Install]
+WantedBy=timers.target

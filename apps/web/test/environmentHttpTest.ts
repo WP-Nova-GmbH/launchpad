@@ -90,6 +90,7 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
         ),
         HttpApiBuilder.group(EnvironmentHttpApi, "auth", (handlers) =>
           handlers
+            .handle("browserIdentity", () => unexpectedEndpoint("auth.browserIdentity"))
             .handle("desktopIdentity", () =>
               Effect.die("Desktop identity is not used by this fixture"),
             )

@@ -1,14 +1,47 @@
+import {
+  localVmClientConnectionsEnabled,
+  makeDevThreadVmClientProxy,
+} from "./dev-thread-vm-client-proxy.ts";
+import { DevThreadVmClientEndpoint } from "../src/threads/ThreadVmClientConnection.ts";
+import { authorizeThreadVmConnection } from "../src/threads/ThreadVmConnectionAccess.ts";
+import { threadVmPreviewRoutes } from "../src/http/ThreadVmPreviewProxy.ts";
+import { threadVmPreviewNode } from "../src/http/ThreadVmPreviewNode.ts";
+import { threadMovesApi } from "../src/http/ThreadMovesApi.ts";
+import { threadArtifactsApi } from "../src/http/ThreadArtifactsApi.ts";
+import { threadVmsApi } from "../src/http/ThreadVmsApi.ts";
+import {
+  ThreadVmRuntimeConfiguration,
+  reconcileThreadVmProvisioning,
+  reconcileThreadVmActivity,
+  reconcileThreadVmPauses,
+  reconcileThreadVmResumes,
+  reconcileThreadVmLeases,
+  reconcileThreadVmBackups,
+  reconcileThreadArtifacts,
+} from "../src/threads/ThreadVmRuntime.ts";
+import { ThreadArtifactObjectStorage } from "../src/threads/ThreadArtifactObjects.ts";
+import { makeLocalThreadArtifactObjects } from "../src/threads/ThreadArtifactLocalObjects.ts";
+import * as Cause from "effect/Cause";
+import { threadVmEnrollmentApi } from "../src/http/ThreadVmEnrollmentApi.ts";
+import { threadEnvironmentApi } from "../src/http/ThreadEnvironmentApi.ts";
+import { threadCommandsApi } from "../src/http/ThreadCommandsApi.ts";
+import { threadHistoryApi } from "../src/http/ThreadHistoryApi.ts";
+import { threadVmPolicyApi } from "../src/http/ThreadVmPolicyApi.ts";
+
+import * as AutomaticOffers from "../src/workflowEvents/AutomaticOffer.ts";
+import * as WorkflowWake from "../src/jobs/WorkflowWake.ts";
+import { workflowEventsRoute } from "../src/http/WorkflowEventsRoute.ts";
 import { repositoryAccessServerApi } from "../src/http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "../src/tenancy/RepositoryPolicies.ts";
 /**
  * Runs the relay locally, on Node, against a plain Postgres.
  *
  * This is not a mock. The HTTP surface, the schemas, the authorization, the
- * services and the SQL are the deployed ones — only the three Cloudflare
- * bindings are replaced, because Tunnel, DNS, and Queues have no local
+ * services and the SQL are the deployed ones. Tunnel and DNS use real
+ * Cloudflare credentials when configured; delivery queues have no local
  * equivalent:
  *
- *   - managed endpoints  → Docker machines use validated host-loopback endpoints
+ *   - managed endpoints → unavailable until Cloudflare is configured
  *   - APNs/FCM delivery queues → drop, so publishing activity does not need a queue
  *
  * Clerk verification is real, using CLERK_SECRET_KEY from infra/relay/.env, so
@@ -29,6 +62,7 @@ import * as NodeURL from "node:url";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schedule from "effect/Schedule";
@@ -43,6 +77,7 @@ import * as PgClient from "@effect/sql-pg/PgClient";
 import { RelayApi } from "@t3tools/contracts/relay";
 
 import { loadOrCreateDevCloudMintKeyPair } from "./dev-cloud-mint-key-pair.ts";
+import { loadDevThreadVmRuntimeSettings } from "./dev-thread-vm-template.ts";
 
 import {
   RELAY_HTTP_ROUTER_CONFIG,
@@ -53,7 +88,7 @@ import {
   metadataApi,
   mobileApi,
   relayClientAuthLayer,
-  relayCors,
+  makeRelayCors,
   relayDocsRedirectRoute,
   relayDpopClientAuthLayer,
   relayEnvironmentAuthLayer,
@@ -68,11 +103,15 @@ import { organizationSkillsServerApi } from "../src/http/OrganizationSkillsApi.t
 import { providerAccountsServerApi } from "../src/http/ProviderAccountsApi.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "../src/http/IssueTrackersApi.ts";
 import { turnAuthLayer } from "../src/issueTrackers/TurnAuthorization.ts";
+import { workflowSourcesApi, workflowSourceCallbackRoute } from "../src/http/WorkflowSourcesApi.ts";
 import { issueTrackerCallbackRoute } from "../src/http/IssueTrackerCallbackRoute.ts";
 import * as IssueTrackerConnectionStore from "../src/issueTrackers/ConnectionStore.ts";
 import * as IssueTrackerWriteOperationStore from "../src/issueTrackers/WriteOperationStore.ts";
 import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
+import * as Workflows from "../src/jobs/Workflows.ts";
+import { workflowsApi } from "../src/http/WorkflowsApi.ts";
+import { deliverPendingWorkflowJobs } from "../src/jobs/WorkflowDispatcher.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
 import * as AgentActivityRows from "../src/agentActivity/AgentActivityRows.ts";
 import * as ApnsClient from "../src/agentActivity/ApnsClient.ts";
@@ -100,7 +139,6 @@ import * as CloudflareApiEndpointClients from "../src/environments/CloudflareApi
 import * as ManagedEndpointProvider from "../src/environments/ManagedEndpointProvider.ts";
 import * as ManagedEndpointReaper from "../src/environments/ManagedEndpointReaper.ts";
 import * as ManagedTunnelLimits from "../src/environments/ManagedTunnelLimits.ts";
-import * as DockerComputeProvider from "../src/machines/DockerComputeProvider.ts";
 import * as MachineEnroller from "../src/machines/MachineEnroller.ts";
 import * as MachineLimits from "../src/machines/MachineLimits.ts";
 import * as Machines from "../src/machines/Machines.ts";
@@ -180,6 +218,8 @@ function required(name: string): string {
  * none of them set the relay refuses to provision, which is how a local dev
  * relay runs.
  */
+const localVmConnections = localVmClientConnectionsEnabled(process.env);
+
 const cloudflareEndpointEnv = (() => {
   const apiToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
   const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
@@ -203,6 +243,9 @@ const managedEndpointCleanupMode = Schema.decodeUnknownSync(
 )(process.env.RELAY_TUNNEL_CLEANUP_MODE?.trim() || "off");
 
 const port = Number(process.env.DEV_RELAY_PORT ?? DEFAULT_PORT);
+if (localVmConnections && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+  throw new Error("Local VM connections require a fixed valid DEV_RELAY_PORT.");
+}
 const databaseUrl = process.env.DEV_RELAY_DATABASE_URL?.trim() || DEFAULT_DATABASE_URL;
 const relayIssuer = process.env.DEV_RELAY_ISSUER?.trim() || `http://127.0.0.1:${port}`;
 const cloudMintKeyPair = loadOrCreateDevCloudMintKeyPair(
@@ -238,6 +281,22 @@ const relayConfigurationLayer = Layer.succeed(
     clerkJwtAudience: process.env.CLERK_JWT_AUDIENCE?.trim() || "t3-code-relay",
     cloudMintPrivateKey: Redacted.make(cloudMintKeyPair.privateKey),
     cloudMintPublicKey: cloudMintKeyPair.publicKey,
+    linearWorkflowWebhook: RelayConfiguration.workflowWebhookConfiguration(
+      process.env.LINEAR_WORKFLOW_CLIENT_ID,
+      process.env.LINEAR_WORKFLOW_WEBHOOK_SECRET?.trim()
+        ? Redacted.make(process.env.LINEAR_WORKFLOW_WEBHOOK_SECRET)
+        : undefined,
+      process.env.LINEAR_WORKFLOW_WEBHOOK_GENERATION,
+      process.env.LINEAR_WORKFLOW_ADMISSION_ENABLED === "true",
+    ),
+    linearWorkflow: process.env.LINEAR_WORKFLOW_CLIENT_ID?.trim()
+      ? {
+          clientId: process.env.LINEAR_WORKFLOW_CLIENT_ID.trim(),
+          ...(process.env.LINEAR_WORKFLOW_CLIENT_SECRET?.trim()
+            ? { clientSecret: Redacted.make(process.env.LINEAR_WORKFLOW_CLIENT_SECRET.trim()) }
+            : {}),
+        }
+      : undefined,
     github:
       process.env.GITHUB_APP_ID && process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_PRIVATE_KEY
         ? {
@@ -255,10 +314,6 @@ const relayConfigurationLayer = Layer.succeed(
     managedEndpointNamespace: cloudflareEndpointEnv
       ? process.env.MANAGED_ENDPOINT_NAMESPACE?.trim() || "prod"
       : undefined,
-    // Loopback machine endpoints are only reachable from the relay's own host,
-    // so they are a local-development affordance. A relay that can provision
-    // real tunnels hands out reachable hostnames instead.
-    allowLocalMachineEndpoints: cloudflareEndpointEnv === undefined,
     // What enrolled executors keep themselves current with: the same
     // repository and branch a push deploys this relay from.
     executorSource: {
@@ -303,28 +358,15 @@ const managedEndpointClientsLayer =
         }),
       ).pipe(Layer.provide(FetchHttpClient.layer));
 
-const runtimeLayer = Layer.empty
+const runtimeLayerBase = WorkflowWake.layer
+  .pipe(Layer.provideMerge(AutomaticOffers.layer), Layer.provideMerge(MobileRegistrations.layer))
   .pipe(
-    Layer.provideMerge(MobileRegistrations.layer),
     Layer.provideMerge(AgentActivityPublisher.layer),
     Layer.provideMerge(
       EnvironmentConnector.layer.pipe(Layer.provideMerge(RepositoryPolicies.controlLayer)),
     ),
     Layer.provideMerge(EnvironmentLinker.layer),
     Layer.provideMerge(MachineEnroller.layer),
-    // Dev-mode machines are Docker containers on this host, running the
-    // executor image built from infra/executor-image/Dockerfile.
-    Layer.provideMerge(
-      DockerComputeProvider.layerDocker({
-        image:
-          process.env.DEV_MACHINE_DOCKER_IMAGE?.trim() ||
-          DockerComputeProvider.DEFAULT_DEV_MACHINE_DOCKER_IMAGE,
-        containerServerPort: Number(
-          process.env.DEV_MACHINE_DOCKER_SERVER_PORT ??
-            DockerComputeProvider.DEFAULT_DEV_MACHINE_SERVER_PORT,
-        ),
-      }),
-    ),
     Layer.provideMerge(MachineLimits.layer),
     Layer.provideMerge(
       Layer.merge(EnvironmentPublishSignatures.layer, ManagedEndpointReaper.layer),
@@ -370,6 +412,7 @@ const runtimeLayer = Layer.empty
       Layer.mergeAll(
         AgentActivityRows.layer,
         Jobs.layer,
+        Workflows.layer,
         Organizations.layer,
         Invitations.layer,
         Repositories.layer,
@@ -396,6 +439,18 @@ const runtimeLayer = Layer.empty
   )
   .pipe(
     // Split only because `pipe` takes at most twenty arguments.
+    Layer.provideMerge(
+      Layer.effect(
+        ThreadArtifactObjectStorage,
+        Effect.map(FileSystem.FileSystem, (fs) =>
+          makeLocalThreadArtifactObjects(
+            fs,
+            process.env.DEV_RELAY_ARTIFACT_ROOT?.trim() ||
+              NodeURL.fileURLToPath(new URL("../../../.t3/relay-artifacts", import.meta.url)),
+          ),
+        ),
+      ),
+    ),
     Layer.provideMerge(LiveActivities.layer),
     Layer.provideMerge(DeliveryAttempts.layer),
     Layer.provideMerge(RelayTokens.layer),
@@ -407,12 +462,40 @@ const runtimeLayer = Layer.empty
     Layer.provideMerge(FetchHttpClient.layer),
   );
 
+const runtimeLayer = localVmConnections
+  ? Layer.mergeAll(
+      Layer.succeed(RelayConfiguration.RelayTokenResourceAliases, [`http://127.0.0.1:${port}`]),
+      Layer.effect(
+        DevThreadVmClientEndpoint,
+        Effect.gen(function* () {
+          const { settings } = yield* ThreadVmRuntimeConfiguration;
+          if (!settings)
+            return yield* Effect.die(
+              "Local VM connections require private E2B runtime configuration.",
+            );
+          return yield* makeDevThreadVmClientProxy({
+            compute: settings.compute,
+            authorize: authorizeThreadVmConnection,
+          });
+        }),
+      ),
+    ).pipe(Layer.provideMerge(runtimeLayerBase))
+  : runtimeLayerBase;
+
 const relayApiLayer = Layer.mergeAll(
   healthApi,
   metadataApi,
   mobileApi,
   clientApi,
   organizationApi,
+  threadVmPolicyApi,
+  threadHistoryApi,
+  threadCommandsApi,
+  threadArtifactsApi,
+  threadMovesApi,
+  threadEnvironmentApi,
+  threadVmEnrollmentApi,
+  threadVmsApi,
   repositoriesApi,
   organizationProjectsApi,
   machinesApi,
@@ -420,12 +503,14 @@ const relayApiLayer = Layer.mergeAll(
   tokenApi,
   dpopClientApi,
   jobsApi,
+  workflowsApi,
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
   issueTrackersApi,
+  workflowSourcesApi,
   issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
@@ -439,16 +524,22 @@ const appLayer = relayApiLayer.pipe(
   Layer.provide(runtimeLayer),
 );
 
-const routerLayer = Layer.merge(
+const makeRouterLayer = (previewBaseUrl?: string) =>
   Layer.mergeAll(
-    HttpApiBuilder.layer(RelayApi, { openapiPath: "/openapi.json" }).pipe(Layer.provide(appLayer)),
-    HttpApiScalar.layer(RelayApi, { path: "/docs" }),
-    relayDocsRedirectRoute,
-    githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
-    issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
-  ).pipe(Layer.provide([Etag.layerWeak, relayCors])),
-  relayNotFoundRoute,
-);
+    Layer.mergeAll(
+      HttpApiBuilder.layer(RelayApi, { openapiPath: "/openapi.json" }).pipe(
+        Layer.provide(appLayer),
+      ),
+      HttpApiScalar.layer(RelayApi, { path: "/docs" }),
+      relayDocsRedirectRoute,
+      githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
+      issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+      workflowSourceCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+      workflowEventsRoute.pipe(Layer.provide(runtimeLayer)),
+    ).pipe(Layer.provide([Etag.layerWeak, makeRelayCors(previewBaseUrl)])),
+    relayNotFoundRoute,
+    threadVmPreviewRoutes.pipe(Layer.provide(Layer.merge(runtimeLayer, threadVmPreviewNode))),
+  );
 
 /**
  * The Worker sweeps inactive tunnels from a cron; here a fiber does the same
@@ -476,13 +567,119 @@ const managedEndpointSweepLayer =
 
 const main = Effect.gen(function* () {
   const nodeHttp = yield* Effect.promise(() => import("node:http"));
+  const threadVmSettings = yield* loadDevThreadVmRuntimeSettings;
   yield* Effect.logInfo("Development relay listening", { port, issuer: relayIssuer, databaseUrl });
   // Handler requirements are deferred to the serve step rather than discharged
   // by the group layers, so this is where the runtime has to be supplied.
   return yield* Layer.launch(
     Layer.mergeAll(
-      HttpRouter.serve(routerLayer),
+      HttpRouter.serve(makeRouterLayer(threadVmSettings?.previewBaseUrl)),
       managedEndpointSweepLayer,
+      threadVmSettings
+        ? Layer.effectDiscard(
+            reconcileThreadVmProvisioning(threadVmSettings).pipe(
+              Effect.timeout("90 seconds"),
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning(
+                      "Thread VM provisioning is pending; durable claims will be retried.",
+                    ),
+              ),
+              Effect.repeat(Schedule.spaced("2 seconds")),
+              Effect.forkScoped,
+            ),
+          )
+        : Layer.empty,
+      threadVmSettings
+        ? Layer.effectDiscard(
+            reconcileThreadVmActivity(threadVmSettings).pipe(
+              Effect.timeout("45 seconds"),
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning("Thread VM activity inspection will retry."),
+              ),
+              Effect.repeat(Schedule.spaced("1 minute")),
+              Effect.forkScoped,
+            ),
+          )
+        : Layer.empty,
+      threadVmSettings
+        ? Layer.effectDiscard(
+            reconcileThreadVmPauses(threadVmSettings).pipe(
+              Effect.timeout("45 seconds"),
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning("Thread VM pause reconciliation will retry."),
+              ),
+              Effect.repeat(Schedule.spaced("1 minute")),
+              Effect.forkScoped,
+            ),
+          )
+        : Layer.empty,
+      threadVmSettings
+        ? Layer.effectDiscard(
+            reconcileThreadVmResumes(threadVmSettings).pipe(
+              Effect.timeout("45 seconds"),
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning("Thread VM resume reconciliation will retry."),
+              ),
+              Effect.repeat(Schedule.spaced("1 minute")),
+              Effect.forkScoped,
+            ),
+          )
+        : Layer.empty,
+      threadVmSettings
+        ? Layer.effectDiscard(
+            reconcileThreadVmLeases(threadVmSettings).pipe(
+              Effect.timeout("45 seconds"),
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning("Thread VM lease renewal will retry."),
+              ),
+              Effect.repeat(Schedule.spaced("1 minute")),
+              Effect.forkScoped,
+            ),
+          )
+        : Layer.empty,
+      threadVmSettings
+        ? Layer.effectDiscard(
+            reconcileThreadVmBackups(threadVmSettings).pipe(
+              Effect.timeout("2 minutes"),
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning("Thread VM backup reconciliation will retry."),
+              ),
+              Effect.repeat(Schedule.spaced("1 minute")),
+              Effect.forkScoped,
+            ),
+          )
+        : Layer.empty,
+      Layer.effectDiscard(
+        reconcileThreadArtifacts().pipe(
+          Effect.timeout("2 minutes"),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("Thread artifact cleanup will retry."),
+          ),
+          Effect.repeat(Schedule.spaced("5 minutes")),
+          Effect.forkScoped,
+        ),
+      ),
+      Layer.effectDiscard(
+        deliverPendingWorkflowJobs().pipe(
+          Effect.ignoreCause({ log: true }),
+          Effect.repeat(Schedule.spaced("10 seconds")),
+          Effect.forkScoped,
+        ),
+      ),
       Layer.effectDiscard(
         RepositoryPolicies.deliverPending().pipe(
           Effect.catchCause((cause) =>
@@ -497,9 +694,9 @@ const main = Effect.gen(function* () {
       // Delegated thread ids exceed the router's default path parameter limit.
       Layer.provide(Layer.succeed(HttpRouter.RouterConfig, RELAY_HTTP_ROUTER_CONFIG)),
       Layer.provide(runtimeLayer),
-      Layer.provide(NodeServices.layer),
+      Layer.provide(Layer.succeed(ThreadVmRuntimeConfiguration, { settings: threadVmSettings })),
     ),
   );
 });
 
-NodeRuntime.runMain(main);
+NodeRuntime.runMain(main.pipe(Effect.provide(NodeServices.layer)));

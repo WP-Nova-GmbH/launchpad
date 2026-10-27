@@ -144,3 +144,41 @@ describe("thread subscription lifetime", () => {
     ),
   );
 });
+
+it.effect("invalidates the old project authorization before delivering an imported placement", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const events = yield* PubSub.unbounded<OrchestrationEvent>();
+      const authorizing = yield* Deferred.make<void>();
+      const delivered: OrchestrationEvent[] = [];
+      const pending = yield* makeThreadSubscriptionLifetime({
+        threadId,
+        events: Stream.fromPubSub(events),
+        readAnchor: Effect.succeedSome(anchor),
+        authorize: () =>
+          Deferred.succeed(authorizing, undefined).pipe(Effect.andThen(Effect.never)),
+        onEvent: (event) =>
+          Effect.sync(() => {
+            delivered.push(event);
+          }),
+      }).pipe(Effect.exit, Effect.forkScoped);
+      yield* Deferred.await(authorizing);
+      yield* PubSub.publishAll(events, [
+        {
+          ...base(6),
+          type: "thread.placement-imported" as const,
+          payload: {
+            threadId,
+            projectId: ProjectId.make("different-access-boundary"),
+            branch: null,
+            worktreePath: null,
+            updatedAt: base(6).occurredAt,
+          },
+        },
+        message(7),
+      ]);
+      expect(Exit.isFailure(yield* Fiber.join(pending))).toBe(true);
+      expect(delivered).toEqual([]);
+    }),
+  ),
+);

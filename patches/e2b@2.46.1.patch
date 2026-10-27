@@ -1,0 +1,80 @@
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -6439,13 +6439,14 @@
+ }
+ //#endregion
+ //#region src/template/buildApi.ts
+-async function requestBuild(client, { name, tags, cpuCount, memoryMB }, signal) {
++async function requestBuild(client, { name, tags, cpuCount, memoryMB, minFreeDiskMb }, signal) {
+ 	const requestBuildRes = await client.api.POST("/v3/templates", {
+ 		body: {
+ 			name,
+ 			tags,
+ 			cpuCount,
+-			memoryMB
++			memoryMB,
++			minFreeDiskMb
+ 		},
+ 		signal
+ 	});
+@@ -7444,7 +7445,8 @@
+ 			name,
+ 			tags: options.tags,
+ 			cpuCount: (_options$cpuCount = options.cpuCount) !== null && _options$cpuCount !== void 0 ? _options$cpuCount : 2,
+-			memoryMB: (_options$memoryMB = options.memoryMB) !== null && _options$memoryMB !== void 0 ? _options$memoryMB : 1024
++			memoryMB: (_options$memoryMB = options.memoryMB) !== null && _options$memoryMB !== void 0 ? _options$memoryMB : 1024,
++			minFreeDiskMb: options.minFreeDiskMb
+ 		}, config.getSignal(void 0, options.signal));
+ 		(_options$onBuildLogs2 = options.onBuildLogs) === null || _options$onBuildLogs2 === void 0 || _options$onBuildLogs2.call(options, new LogEntry(/* @__PURE__ */ new Date(), "info", `Template created with ID: ${templateID}, Build ID: ${buildID}`));
+ 		const instructionsWithHashes = await _this10.instructionsWithHashes();
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -6392,13 +6392,14 @@
+ }
+ //#endregion
+ //#region src/template/buildApi.ts
+-async function requestBuild(client, { name, tags, cpuCount, memoryMB }, signal) {
++async function requestBuild(client, { name, tags, cpuCount, memoryMB, minFreeDiskMb }, signal) {
+ 	const requestBuildRes = await client.api.POST("/v3/templates", {
+ 		body: {
+ 			name,
+ 			tags,
+ 			cpuCount,
+-			memoryMB
++			memoryMB,
++			minFreeDiskMb
+ 		},
+ 		signal
+ 	});
+@@ -7397,7 +7398,8 @@
+ 			name,
+ 			tags: options.tags,
+ 			cpuCount: (_options$cpuCount = options.cpuCount) !== null && _options$cpuCount !== void 0 ? _options$cpuCount : 2,
+-			memoryMB: (_options$memoryMB = options.memoryMB) !== null && _options$memoryMB !== void 0 ? _options$memoryMB : 1024
++			memoryMB: (_options$memoryMB = options.memoryMB) !== null && _options$memoryMB !== void 0 ? _options$memoryMB : 1024,
++			minFreeDiskMb: options.minFreeDiskMb
+ 		}, config.getSignal(void 0, options.signal));
+ 		(_options$onBuildLogs2 = options.onBuildLogs) === null || _options$onBuildLogs2 === void 0 || _options$onBuildLogs2.call(options, new LogEntry(/* @__PURE__ */ new Date(), "info", `Template created with ID: ${templateID}, Build ID: ${buildID}`));
+ 		const instructionsWithHashes = await _this10.instructionsWithHashes();
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -11222,6 +11222,8 @@
+    * @default 1024
+    */
+   memoryMB?: number;
++  /** Minimum free disk space in MiB after building the template. */
++  minFreeDiskMb?: number;
+   /**
+    * If true, skips cache and forces a complete rebuild.
+    * @default false
+--- a/dist/index.d.mts
++++ b/dist/index.d.mts
+@@ -11222,6 +11222,8 @@
+    * @default 1024
+    */
+   memoryMB?: number;
++  /** Minimum free disk space in MiB after building the template. */
++  minFreeDiskMb?: number;
+   /**
+    * If true, skips cache and forces a complete rebuild.
+    * @default false

@@ -166,6 +166,33 @@ const cursorAdapterTestLayer = it.layer(
 );
 
 cursorAdapterTestLayer("CursorAdapterLive", (it) => {
+  it.effect("rejects missing local approval and user-input callbacks before native dispatch", () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-missing-callback-")),
+      );
+      const logPath = NodePath.join(directory, "requests.jsonl");
+      const wrapper = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_REQUEST_LOG_PATH: logPath }),
+      );
+      const adapter = yield* makeCursorAdapter(decodeCursorSettings({ binaryPath: wrapper }));
+      const threadId = ThreadId.make("cursor-missing-callback");
+      yield* adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      const requests = yield* Effect.promise(() => readJsonLines(logPath));
+      for (const response of [
+        adapter.respondToRequest(threadId, ApprovalRequestId.make("missing"), "accept"),
+        adapter.respondToUserInput(threadId, ApprovalRequestId.make("missing"), {}),
+      ])
+        assert.equal((yield* Effect.flip(response))._tag, "ProviderAdapterValidationError");
+      assert.deepEqual(yield* Effect.promise(() => readJsonLines(logPath)), requests);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("validates at ACP dispatch and can retry a rejected prompt", () =>
     Effect.gen(function* () {
       const directory = yield* Effect.promise(() =>
@@ -402,7 +429,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       const originalTurns = [...(yield* adapter.readThread(threadId)).turns];
       assert.isFalse(adapter.capabilities.supportsConversationRollback);
       const error = yield* adapter.rollbackThread(threadId, 1).pipe(Effect.flip);
-      assert.equal(error._tag, "ProviderAdapterRequestError");
+      assert.equal(error._tag, "ProviderAdapterValidationError");
       assert.deepStrictEqual((yield* adapter.readThread(threadId)).turns, originalTurns);
       yield* adapter.stopSession(threadId);
     }),

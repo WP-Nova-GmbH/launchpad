@@ -1,0 +1,44 @@
+diff --git a/packages/orchestrator/pkg/sandbox/fc/kernel_args.go b/packages/orchestrator/pkg/sandbox/fc/kernel_args.go
+--- a/packages/orchestrator/pkg/sandbox/fc/kernel_args.go
++++ b/packages/orchestrator/pkg/sandbox/fc/kernel_args.go
+@@ -126,6 +126,12 @@
+ 	// keeps the architected timer as its clocksource. The serial console is ttyS0 on both:
+ 	// Firecracker exposes a 16550-compatible UART on arm64 too, and the arm64 guest kernel
+ 	// is built with the 8250 driver.
++	// Bind the ARM UART even with quiet logging. The pinned ARM image can stall
++	// during systemd cold boot without a console; verbosity stays unchanged.
++	if arch == "arm64" {
++		args["console"] = "ttyS0"
++	}
++
+ 	if arch == "amd64" {
+ 		args["i8042.nokbd"] = ""
+ 		args["i8042.noaux"] = ""
+diff --git a/packages/orchestrator/pkg/sandbox/fc/kernel_args_test.go b/packages/orchestrator/pkg/sandbox/fc/kernel_args_test.go
+--- a/packages/orchestrator/pkg/sandbox/fc/kernel_args_test.go
++++ b/packages/orchestrator/pkg/sandbox/fc/kernel_args_test.go
+@@ -67,6 +67,7 @@
+ 
+ // An arm64 guest gets the same command line minus the two x86-only devices: no i8042
+ // controller to silence and no kvm-clock to select (the architected timer is the default).
++// Its UART stays bound for quiet cold boots too.
+ // Pinned literally for the same reason as the amd64 defaults above.
+ func TestBuildKernelArgs_Arm64DropsX86OnlyParams(t *testing.T) {
+ 	t.Parallel()
+@@ -79,14 +80,14 @@
+ 		{
+ 			name:    "production defaults",
+ 			options: ProcessOptions{InitScriptPath: "/sbin/init"},
+-			want: "init=/sbin/init ip=" + testIPv4 +
++			want: "console=ttyS0 init=/sbin/init ip=" + testIPv4 +
+ 				" ipv6.autoconf=1 ipv6.disable=0 loglevel=1 panic=1 pci=off quiet" +
+ 				" random.trust_cpu=on reboot=k rootflags=discard selinux=0",
+ 		},
+ 		{
+ 			name:    "kvm clock requested is not applied",
+ 			options: ProcessOptions{InitScriptPath: "/sbin/init", KvmClock: true},
+-			want: "init=/sbin/init ip=" + testIPv4 +
++			want: "console=ttyS0 init=/sbin/init ip=" + testIPv4 +
+ 				" ipv6.autoconf=1 ipv6.disable=0 loglevel=1 panic=1 pci=off quiet" +
+ 				" random.trust_cpu=on reboot=k rootflags=discard selinux=0",
+ 		},

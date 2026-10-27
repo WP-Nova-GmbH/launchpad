@@ -30,6 +30,13 @@ export interface ProviderInstanceRoutingInfo {
  * ProviderAdapterRegistryShape - Service API for adapter lookup.
  */
 export interface ProviderAdapterRegistryShape {
+  /** Capture routing and its guarded adapter from one live instance lookup. */
+  readonly resolveInstance: (
+    instanceId: ProviderInstanceId,
+  ) => Effect.Effect<
+    ProviderInstanceRoutingInfo & { readonly adapter: ProviderAdapterShape<ProviderAdapterError> },
+    ProviderUnsupportedError
+  >;
   /**
    * Resolve the adapter for a specific instance id. Returns
    * `ProviderUnsupportedError` if no such instance is currently registered

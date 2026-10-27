@@ -611,6 +611,20 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       "applyThreadsProjection",
     )(function* (event, attachmentSideEffects) {
       switch (event.type) {
+        case "thread.placement-imported": {
+          const row = yield* projectionThreadRepository.getById({
+            threadId: event.payload.threadId,
+          });
+          if (Option.isSome(row))
+            yield* projectionThreadRepository.upsert({
+              ...row.value,
+              projectId: event.payload.projectId,
+              branch: event.payload.branch,
+              worktreePath: event.payload.worktreePath,
+              updatedAt: event.payload.updatedAt,
+            });
+          return;
+        }
         case "thread.created":
           // A draft retry can re-create this id; links belong to the old incarnation.
           yield* projectionThreadPullRequestRepository.deleteByThreadId({
@@ -1198,6 +1212,9 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               : {}),
             isStreaming: false,
             ...(event.payload.author !== undefined ? { author: event.payload.author } : {}),
+            ...(event.payload.workflowOrigin !== undefined
+              ? { workflowOrigin: event.payload.workflowOrigin }
+              : {}),
             ...(event.payload.editedBy !== undefined ? { editedBy: event.payload.editedBy } : {}),
             ...(event.payload.steeredBy !== undefined
               ? { steeredBy: event.payload.steeredBy }
@@ -1971,14 +1988,16 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         // after the transaction before deleting a file.
         const removedPaths = new Set<string>();
         const retainedPaths = new Set(
-          queue.entries.flatMap((entry) =>
-            entry.attachments.flatMap((attachment) => {
-              const path = attachmentRelativePath(attachment);
-              return path === null ? [] : [path];
-            }),
-          ),
+          queue.entries
+            .filter((entry) => entry.kind !== "move")
+            .flatMap((entry) =>
+              entry.attachments.flatMap((attachment) => {
+                const path = attachmentRelativePath(attachment);
+                return path === null ? [] : [path];
+              }),
+            ),
         );
-        for (const prompt of previous?.entries ?? [])
+        for (const prompt of (previous?.entries ?? []).filter((entry) => entry.kind !== "move"))
           for (const attachment of prompt.attachments) {
             const path = attachmentRelativePath(attachment);
             if (path !== null && !retainedPaths.has(path)) removedPaths.add(path);
@@ -2050,6 +2069,11 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
         }
 
+        // A baseline owns its inherited files. Replaying its old reverts during startup
+        // must not delete attachments that were deliberately restored with the archive.
+        const inherited = yield* sql`SELECT 1 FROM thread_transfer_baselines
+          WHERE thread_id = ${event.aggregateId} AND destination_sequence >= ${event.sequence} LIMIT 1`;
+        if (inherited.length) return;
         const deletedThreadIds = new Set<string>();
         for (const threadId of sideEffects.deletedThreadIds) {
           const recreatedLater = yield* eventStore.hasEventAfter({
@@ -2072,7 +2096,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           const retainedPaths = collectThreadAttachmentRelativePaths(threadId, messages);
           const queue = yield* getPromptQueue(sql, ThreadId.make(threadId));
           for (const prompt of queue?.entries ?? []) {
-            for (const attachment of prompt.attachments) {
+            for (const attachment of prompt.kind === "move" ? [] : prompt.attachments) {
               const relativePath = attachmentRelativePath(attachment);
               if (relativePath !== null) retainedPaths.add(relativePath);
             }

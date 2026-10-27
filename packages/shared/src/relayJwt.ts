@@ -13,6 +13,7 @@ export const RELAY_ACTIVITY_PUBLISH_TYP = "t3-env-activity+jwt";
 export const RELAY_PROJECT_CATALOG_PUBLISH_TYP = "t3-env-project-catalog+jwt";
 export const RELAY_DISPATCH_JOB_REQUEST_TYP = "t3-cloud-dispatch-job+jwt";
 export const RELAY_DISPATCH_JOB_RESPONSE_TYP = "t3-env-dispatch-job+jwt";
+export const RELAY_THREAD_VM_ENROLL_PROOF_TYP = "launchpad-thread-vm-enroll+jwt";
 export const RELAY_MACHINE_ENROLL_PROOF_TYP = "t3-machine-enroll+jwt";
 export const RELAY_MANAGED_TUNNEL_RECOVERY_TYP = "t3-env-managed-tunnel-recovery+jwt";
 

@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_backups" ADD COLUMN "probe_receipt" jsonb;

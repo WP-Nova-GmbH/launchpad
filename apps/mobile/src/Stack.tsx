@@ -85,7 +85,10 @@ import {
   SettingsOpenSourceLicenseRouteScreen,
   SettingsOpenSourceLicensesRouteScreen,
 } from "./features/settings/SettingsOpenSourceLicensesRouteScreen";
+import { WorkflowJobsScreen } from "./features/settings/WorkflowJobsScreen";
 import { SettingsProjectGroupingRouteScreen } from "./features/settings/SettingsProjectGroupingRouteScreen";
+import { SettingsThreadVmsRouteScreen } from "./features/settings/SettingsThreadVmsRouteScreen";
+import { SettingsVmThreadsRouteScreen } from "./features/settings/SettingsVmThreadsRouteScreen";
 import { SettingsProjectOverviewRouteScreen } from "./features/settings/SettingsProjectOverviewRouteScreen";
 import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
@@ -268,6 +271,26 @@ const SettingsContentStack = createNativeStackNavigator({
       options: {
         title: "Organization",
       },
+    }),
+    SettingsVmThreads: createNativeStackScreen({
+      screen: SettingsVmThreadsRouteScreen,
+      linking: "vms",
+      options: {
+        ...SHEET_SOLID_HEADER_OPTIONS,
+        headerStyle: undefined,
+        scrollEdgeEffects: undefined,
+        title: "VM threads",
+      },
+    }),
+    SettingsThreadVms: createNativeStackScreen({
+      screen: SettingsThreadVmsRouteScreen,
+      linking: "thread-vms",
+      options: { title: "VM policy" },
+    }),
+    SettingsWorkflowJobs: createNativeStackScreen({
+      screen: WorkflowJobsScreen,
+      linking: "workflow-jobs",
+      options: { title: "Workflow jobs" },
     }),
     SettingsProjectOverview: createNativeStackScreen({
       screen: SettingsProjectOverviewRouteScreen,

@@ -1,0 +1,287 @@
+--- /dev/null
++++ b/packages/shared/pkg/restoreresult/stopped.go
+@@ -0,0 +1,35 @@
++package restoreresult
++
++import (
++	"google.golang.org/genproto/googleapis/rpc/errdetails"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++const stopped = "ACTIVATION_EXECUTION_PHYSICALLY_STOPPED"
++
++// Stopped is emitted only after the exact host execution has a permanent stop
++// fence and the immutable activation receipt has retained that outcome.
++func Stopped(buildID string) error {
++	s, err := status.New(codes.FailedPrecondition, "restore execution physically stopped; destination cleaned").WithDetails(
++		&errdetails.ErrorInfo{Domain: domain, Reason: stopped, Metadata: map[string]string{"prepared_build_id": buildID}},
++	)
++	if err != nil {
++		return err
++	}
++	return s.Err()
++}
++
++func IsStopped(err error, buildID string) bool {
++	s, ok := status.FromError(err)
++	if !ok || s.Code() != codes.FailedPrecondition {
++		return false
++	}
++	for _, detail := range s.Details() {
++		info, ok := detail.(*errdetails.ErrorInfo)
++		if ok && info.Domain == domain && info.Reason == stopped && info.Metadata["prepared_build_id"] == buildID {
++			return true
++		}
++	}
++	return false
++}
+--- /dev/null
++++ b/packages/shared/pkg/restoreresult/stopped_test.go
+@@ -0,0 +1,22 @@
++package restoreresult
++
++import (
++	"fmt"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"testing"
++)
++
++func TestStoppedResultRequiresStructuredMatchingIdentity(t *testing.T) {
++	t.Parallel()
++	original := Stopped("assigned-build")
++	transported := status.ErrorProto(status.Convert(original).Proto())
++	require.True(t, IsStopped(transported, "assigned-build"))
++	require.True(t, IsStopped(fmt.Errorf("activate: %w", transported), "assigned-build"))
++	require.False(t, IsStopped(transported, "other-build"))
++	require.False(t, IsStopped(status.Error(codes.FailedPrecondition, status.Convert(original).Message()), "assigned-build"))
++	require.False(t, IsStopped(status.Error(codes.DeadlineExceeded, "reply lost"), "assigned-build"))
++	require.False(t, IsStopped(Expired("assigned-build"), "assigned-build"))
++	require.False(t, IsStopped(nil, "assigned-build"))
++}
+--- a/packages/orchestrator/pkg/server/restore_disk.go
++++ b/packages/orchestrator/pkg/server/restore_disk.go
+@@ -219,7 +219,10 @@
+ 	if record.State == "booting" {
+ 		live, found := s.sandboxFactory.Sandboxes.Get(config.GetSandboxId())
+ 		if !found {
+-			return nil, status.Error(codes.FailedPrecondition, "restore boot outcome requires reconciliation")
++			// This exclusive activation lock is held through the original create.
++			// Another create cannot still be booting here. Missing registration still
++			// requires physical fencing: a crashed host may have orphaned processes.
++			return nil, s.retireUnregisteredRestore(ctx, activation, id, config)
+ 		}
+ 		if live.Runtime.ExecutionID != config.GetExecutionId() || live.Runtime.BuildID != id.String() || live.Runtime.TeamID != config.GetTeamId() {
+ 			return nil, status.Error(codes.AlreadyExists, "restore execution identity conflicts")
+@@ -273,7 +276,29 @@
+ 	return &emptypb.Empty{}, nil
+ }
+ 
++func (s *Server) retireUnregisteredRestore(ctx context.Context, activation *rootfs.RestoreActivationLock, id uuid.UUID, config *orchestrator.SandboxConfig) error {
++	if activation.Record().State != "booting" {
++		return rootfs.ErrRestoreActivationStarted
++	}
++	receipt, err := s.StopExecution(ctx, &orchestrator.StopExecutionRequest{
++		TeamId: config.GetTeamId(), SandboxId: config.GetSandboxId(), ExecutionId: config.GetExecutionId(), RegisteredBeforeStart: true,
++	})
++	if err != nil {
++		return err
++	}
++	if !receipt.GetPhysicallyStopped() || receipt.GetTeamId() != config.GetTeamId() || receipt.GetSandboxId() != config.GetSandboxId() || receipt.GetExecutionId() != config.GetExecutionId() {
++		return status.Error(codes.FailedPrecondition, "restore execution stop is unconfirmed")
++	}
++	if err := activation.DiscardStopped(ctx); err != nil {
++		return restoreDiskError(err)
++	}
++	return restoreresult.Stopped(id.String())
++}
++
+ func (s *Server) restoreActivationFailure(ctx context.Context, activation *rootfs.RestoreActivationLock, id uuid.UUID, err error) error {
++	if errors.Is(err, rootfs.ErrRestoreActivationStopped) {
++		return restoreresult.Stopped(id.String())
++	}
+ 	if !errors.Is(err, rootfs.ErrRestoreActivationExpired) {
+ 		return err
+ 	}
+--- a/packages/orchestrator/pkg/server/restore_disk_test.go
++++ b/packages/orchestrator/pkg/server/restore_disk_test.go
+@@ -191,6 +191,80 @@
+ 	_, err = os.Stat(diskDir)
+ 	require.ErrorIs(t, err, os.ErrNotExist)
+ 	_, err = server.ActivateRestoreDisk(t.Context(), req)
+-	require.ErrorIs(t, err, rootfs.ErrRestoreActivationStopped)
++	require.True(t, restoreresult.IsStopped(err, id.String()))
+ 	require.Error(t, server.requireRestoreActivated(req.GetCreate()))
+ }
++
++func TestRestoreUnregisteredBootRetiresExactExecutionAndKeepsSource(t *testing.T) {
++	server := &Server{info: &service.ServiceInfo{}}
++	server.config.RestorePreparationEnabled = true
++	server.config.LaunchpadRequireExecutionFence = true
++	server.config.OrchestratorBaseDir = t.TempDir()
++	id := uuid.New()
++	config := &orchestrator.SandboxConfig{BuildId: id.String(), TeamId: uuid.NewString(), SandboxId: "failed-start", ExecutionId: uuid.NewString()}
++	directory, err := server.restoreDiskDirectory()
++	require.NoError(t, err)
++	require.NoError(t, os.MkdirAll(directory, 0o700))
++	source := filepath.Join(directory, "saved-source")
++	require.NoError(t, os.WriteFile(source, []byte("keep this saved disk"), 0o600))
++	disk := filepath.Join(directory, id.String())
++	require.NoError(t, os.Mkdir(disk, 0o700))
++	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
++	request := []byte("bound immutable request")
++	sum := sha256.Sum256(append([]byte(digest), request...))
++	raw, err := json.Marshal(rootfs.RestoreActivation{Version: 1, RequestSHA256: hex.EncodeToString(sum[:]), State: "booting"})
++	require.NoError(t, err)
++	require.NoError(t, os.WriteFile(filepath.Join(directory, id.String()+".activation.json"), raw, 0o600))
++	activation, err := rootfs.LockRestoreActivation(t.Context(), directory, id, digest, request)
++	require.NoError(t, err)
++	server.config.LaunchpadRequireExecutionFence = false
++	err = server.retireUnregisteredRestore(t.Context(), activation, id, config)
++	require.False(t, restoreresult.IsStopped(err, id.String()))
++	require.Equal(t, "booting", activation.Record().State)
++	_, statErr := os.Stat(disk)
++	require.NoError(t, statErr)
++	server.config.LaunchpadRequireExecutionFence = true
++	err = server.retireUnregisteredRestore(t.Context(), activation, id, config)
++	require.True(t, restoreresult.IsStopped(err, id.String()))
++	require.Equal(t, "stopped", activation.Record().State)
++	require.NoError(t, activation.Close())
++	_, err = os.Stat(disk)
++	require.ErrorIs(t, err, os.ErrNotExist)
++	retained, err := os.ReadFile(source)
++	require.NoError(t, err)
++	require.Equal(t, "keep this saved disk", string(retained))
++	activation, err = rootfs.LockRestoreActivation(t.Context(), directory, id, digest, request)
++	require.NoError(t, err)
++	defer activation.Close()
++	require.ErrorIs(t, activation.BeginBoot(), rootfs.ErrRestoreActivationStarted)
++	require.True(t, restoreresult.IsStopped(server.restoreActivationFailure(t.Context(), activation, id, activation.CheckDeadline(time.Now(), time.Now())), id.String()))
++}
++
++func TestRestoreUnregisteredRecoveryCannotRetireActiveOrAcceptedReceipt(t *testing.T) {
++	for _, state := range []string{"accepted", "active"} {
++		t.Run(state, func(t *testing.T) {
++			server := &Server{info: &service.ServiceInfo{}}
++			server.config.RestorePreparationEnabled = true
++			server.config.OrchestratorBaseDir = t.TempDir()
++			directory, err := server.restoreDiskDirectory()
++			require.NoError(t, err)
++			require.NoError(t, os.MkdirAll(directory, 0o700))
++			id := uuid.New()
++			digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
++			request := []byte("bound request")
++			sum := sha256.Sum256(append([]byte(digest), request...))
++			record := rootfs.RestoreActivation{Version: 1, RequestSHA256: hex.EncodeToString(sum[:]), State: state}
++			if state == "active" {
++				record.Response = json.RawMessage(`{}`)
++			}
++			raw, err := json.Marshal(record)
++			require.NoError(t, err)
++			require.NoError(t, os.WriteFile(filepath.Join(directory, id.String()+".activation.json"), raw, 0o600))
++			activation, err := rootfs.LockRestoreActivation(t.Context(), directory, id, digest, request)
++			require.NoError(t, err)
++			defer activation.Close()
++			require.ErrorIs(t, server.retireUnregisteredRestore(t.Context(), activation, id, &orchestrator.SandboxConfig{}), rootfs.ErrRestoreActivationStarted)
++			require.Equal(t, state, activation.Record().State)
++		})
++	}
++}
+--- a/packages/api/internal/handlers/launchpad_restore_worker.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker.go
+@@ -203,6 +203,17 @@
+ 		digest := sha256.Sum256(op.Manifest)
+ 
+ 		if err := a.restoreRuntime().ActivatePreparedRestore(ctx, op, request, hex.EncodeToString(digest[:]), int(team.Limits.SandboxConcurrency)); err != nil {
++			if restoreresult.IsStopped(err, op.PreparedBuildID.String()) {
++				// Save the ordinary API execution fence using the same exact host receipts
++				// and routing cleanup as an explicit stop, then release the restore pin.
++				if code, message := a.stopLaunchpadExecution(ctx, op.TeamID, op.SandboxID); code != 0 {
++					return errors.New(message)
++				}
++				if err := a.restoreRuntime().DiscardStoppedPreparedRestore(ctx, op, request, hex.EncodeToString(digest[:])); err != nil {
++					return err
++				}
++				return store.Complete(ctx, op.TeamID, op.OperationID, *op.ClaimID, "failed")
++			}
+ 			if restoreresult.IsExpired(err, op.PreparedBuildID.String()) {
+ 				return store.Complete(ctx, op.TeamID, op.OperationID, *op.ClaimID, "failed")
+ 			}
+--- a/packages/api/internal/handlers/launchpad_restore_worker_test.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker_test.go
+@@ -28,6 +28,7 @@
+ type restoreWorkerRuntime struct {
+ 	rpc.SandboxServiceClient
+ 	activationError     error
++	activationOutcome   func(context.Context, queries.SandboxRestoreOperation) error
+ 	lostReply           bool
+ 	boots               int
+ 	released            bool
+@@ -52,7 +53,10 @@
+ 	r.released = true
+ 	return &emptypb.Empty{}, nil
+ }
+-func (r *restoreWorkerRuntime) ActivatePreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string, int) error {
++func (r *restoreWorkerRuntime) ActivatePreparedRestore(ctx context.Context, op queries.SandboxRestoreOperation, _ *rpc.SandboxCreateRequest, _ string, _ int) error {
++	if r.activationOutcome != nil {
++		return r.activationOutcome(ctx, op)
++	}
+ 	if r.activationError != nil {
+ 		return r.activationError
+ 	}
+@@ -241,3 +245,53 @@
+ 	require.NoError(t, err)
+ 	require.False(t, pinned)
+ }
++
++func TestLaunchpadRestoreWorkerAcceptsOnlyBoundStoppedOutcome(t *testing.T) {
++	for _, kind := range []string{"matching", "foreign-build", "unstructured", "lost-reply"} {
++		t.Run(kind, func(t *testing.T) {
++			t.Parallel()
++			db := testutils.SetupDatabase(t)
++			p := restorePinFixture(t, db)
++			p.ClusterID = uuid.Nil
++			store := restorestore.Store{DB: db.SqlcClient}
++			_, err := store.Create(t.Context(), p, p.ReservedBytes)
++			require.NoError(t, err)
++			runtime := &restoreWorkerRuntime{}
++			runtime.activationOutcome = func(ctx context.Context, op queries.SandboxRestoreOperation) error {
++				switch kind {
++				case "matching":
++					// This mock host outcome represents an already saved exact stop receipt.
++					require.NoError(t, db.SqlcClient.TestsRawSQL(ctx, "INSERT INTO sandbox_execution_fences(team_id,sandbox_id,state) VALUES($1,$2,'stopped')", op.TeamID, op.SandboxID))
++					return restoreresult.Stopped(op.PreparedBuildID.String())
++				case "foreign-build":
++					return restoreresult.Stopped(uuid.NewString())
++				case "unstructured":
++					return status.Error(codes.FailedPrecondition, "restore execution physically stopped; destination cleaned")
++				default:
++					return status.Error(codes.DeadlineExceeded, "activation response lost")
++				}
++			}
++			server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime, authService: fakeAPIKeyAuthService{team: &authtypes.Team{Limits: &authtypes.TeamLimits{SandboxConcurrency: 3}}}}
++			require.NoError(t, server.processRestoreOperation(t.Context(), claimRestoreWork(t, db)))
++			_, err = store.Activate(t.Context(), p.TeamID, p.OperationID)
++			require.NoError(t, err)
++			activation := claimRestoreWork(t, db)
++			_, err = store.SaveActivationRequest(t.Context(), activation, []byte(`{"sandbox":{}}`))
++			require.NoError(t, err)
++			err = server.processRestoreOperation(t.Context(), activation)
++			row, getErr := db.SqlcClient.GetRestoreOperation(t.Context(), queries.GetRestoreOperationParams{TeamID: p.TeamID, OperationID: p.OperationID})
++			require.NoError(t, getErr)
++			if kind == "matching" {
++				require.NoError(t, err)
++				require.Equal(t, "failed", row.State)
++				require.Zero(t, row.ReservedBytes)
++				require.True(t, runtime.discardedStopped)
++			} else {
++				require.Error(t, err)
++				require.Equal(t, "activating", row.State)
++				require.Positive(t, row.ReservedBytes)
++				require.False(t, runtime.discardedStopped)
++			}
++		})
++	}
++}

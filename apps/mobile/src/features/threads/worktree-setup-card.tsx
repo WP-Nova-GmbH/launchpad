@@ -18,7 +18,7 @@ export interface WorktreeSetupCardProps {
   turnStarted: boolean;
   turnStartedAt: string | null;
   working: boolean;
-  onCancel: () => void;
+  onCancel: (() => void) | null;
   onWorkLocally: (() => void) | null;
 }
 
@@ -200,7 +200,6 @@ function useSetupClock(active: boolean) {
 
 function SetupDetailsSheet({
   snapshot,
-  turnStarted,
   onCancel,
   onWorkLocally,
   onClose,
@@ -208,7 +207,7 @@ function SetupDetailsSheet({
 }: WorktreeSetupCardProps & { onClose: () => void; now: number }) {
   const insets = useSafeAreaInsets();
   const [bodyHeight, setBodyHeight] = useState(0);
-  const canCancel = snapshot.phase === "running" && !turnStarted;
+  const canCancel = snapshot.phase === "running" && onCancel !== null;
   return (
     <WorktreeSetupSheet height={bodyHeight} onClose={onClose}>
       <ScrollView
@@ -244,7 +243,7 @@ function SetupDetailsSheet({
               accessibilityLabel="Cancel worktree setup"
               onPress={() => {
                 onClose();
-                onCancel();
+                onCancel?.();
               }}
               className="min-h-11 justify-center px-2"
             >

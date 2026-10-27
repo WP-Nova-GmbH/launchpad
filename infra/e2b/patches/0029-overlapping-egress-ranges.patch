@@ -1,0 +1,110 @@
+--- a/packages/orchestrator/pkg/sandbox/network/firewall.go
++++ b/packages/orchestrator/pkg/sandbox/network/firewall.go
+@@ -468,8 +468,9 @@
+ 
+ // splitEgressCIDRs separates toolkit-encodable CIDRs from max-ending ranges (the
+ // toolkit's end.Next() overflows there). Those collapse to one [boundaryStart,
+-// maxIPv4] interval; ordinary CIDRs it subsumes are dropped, since the non-merge
+-// set silently corrupts overlapping elements in a single flush.
++// maxIPv4] interval. Collapse nested/duplicate IPv4 ranges before insertion:
++// host addresses commonly overlap the private CIDRs, and nft's non-merge set
++// rejects or silently truncates overlapping interval elements.
+ func splitEgressCIDRs(cidrs []string) (toolkit []string, boundaryStart netip.Addr) {
+ 	toolkit = make([]string, 0, len(cidrs))
+ 	for _, cidr := range cidrs {
+@@ -485,13 +486,24 @@
+ 		toolkit = append(toolkit, cidr)
+ 	}
+ 
+-	if !boundaryStart.IsValid() {
+-		return toolkit, boundaryStart
+-	}
+-
+-	kept := toolkit[:0]
+-	for _, cidr := range toolkit {
+-		if start, _, ok := ipv4Range(cidr); ok && !start.Less(boundaryStart) {
++	kept := make([]string, 0, len(toolkit))
++	for i, cidr := range toolkit {
++		start, end, ok := ipv4Range(cidr)
++		if ok && boundaryStart.IsValid() && !start.Less(boundaryStart) {
++			continue
++		}
++		covered := false
++		if ok {
++			for j, other := range toolkit {
++				otherStart, otherEnd, valid := ipv4Range(other)
++				if i != j && valid && !start.Less(otherStart) && !otherEnd.Less(end) &&
++					(start != otherStart || end != otherEnd || j < i) {
++					covered = true
++					break
++				}
++			}
++		}
++		if covered {
+ 			continue
+ 		}
+ 		kept = append(kept, cidr)
+--- /dev/null
++++ b/packages/orchestrator/pkg/sandbox/network/firewall_overlap_test.go
+@@ -0,0 +1,61 @@
++//go:build linux
++
++package network
++
++import (
++	"net/netip"
++	"os"
++	"runtime"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"github.com/vishvananda/netns"
++)
++
++func TestApplyRules_OverlappingHostAddresses(t *testing.T) {
++	if os.Geteuid() != 0 {
++		t.Skip("requires root for isolated netns and nftables")
++	}
++	runtime.LockOSThread()
++	defer runtime.UnlockOSThread()
++	original, err := netns.Get()
++	require.NoError(t, err)
++	defer original.Close()
++	isolated, err := netns.New()
++	require.NoError(t, err)
++	defer func() { require.NoError(t, netns.Set(original)); require.NoError(t, isolated.Close()) }()
++	fw, err := NewFirewall("tap0", "172.20.0.1", nil)
++	require.NoError(t, err)
++	defer func() { require.NoError(t, fw.Close()) }()
++	base := []string{"10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"}
++	require.NoError(t, fw.ApplyRules(t.Context(), false, nil, base))
++	ranges := append(base, "192.168.5.15", "172.18.0.1", "172.17.0.1", "192.168.0.0/16", "10.1.0.0/16", "203.0.113.4/32", "203.0.113.4", "fe80::5055:55ff:fec5:15ec")
++	reversed := append([]string(nil), ranges...)
++	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
++		reversed[left], reversed[right] = reversed[right], reversed[left]
++	}
++	for _, entries := range [][]string{ranges, reversed} {
++		for _, allow := range []bool{false, true} {
++			if allow {
++				require.NoError(t, fw.ApplyRules(t.Context(), false, entries, nil))
++			} else {
++				require.NoError(t, fw.ApplyRules(t.Context(), false, nil, entries))
++			}
++			target := fw.userDenySet.Set()
++			if allow {
++				target = fw.userAllowSet.Set()
++			}
++			elements, err := fw.conn.GetSetElements(target)
++			require.NoError(t, err)
++			for _, p := range []ipv4SetProbe{
++				{netip.MustParseAddr("10.2.0.1"), true}, {netip.MustParseAddr("172.31.255.255"), true},
++				{netip.MustParseAddr("192.168.255.255"), true}, {netip.MustParseAddr("192.169.0.1"), false},
++				{netip.MustParseAddr("203.0.113.4"), true}, {netip.MustParseAddr("203.0.113.5"), false},
++				{maxIPv4, true}, {netip.MustParseAddr("8.8.8.8"), false},
++			} {
++				require.Equal(t, p.want, intervalSetContainsIPv4(t, elements, p.address), "membership %s", p.address)
++			}
++		}
++	}
++	require.NoError(t, fw.ApplyRules(t.Context(), false, nil, base))
++}

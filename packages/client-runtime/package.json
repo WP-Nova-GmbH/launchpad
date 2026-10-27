@@ -111,6 +111,10 @@
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"
     },
+    "./relay/workflow-responses": {
+      "types": "./src/relay/workflowResponses.ts",
+      "default": "./src/relay/workflowResponses.ts"
+    },
     "./state/auth": {
       "types": "./src/state/auth.ts",
       "default": "./src/state/auth.ts"
@@ -318,7 +322,43 @@
     "./device/duo-control": {
       "types": "./src/device/duoControl.ts",
       "default": "./src/device/duoControl.ts"
-    }
+    },
+    "./relay/workflow-session": {
+      "types": "./src/relay/workflowSession.ts",
+      "default": "./src/relay/workflowSession.ts"
+    },
+    "./relay/portableThreads": {
+      "types": "./src/relay/portableThreads.ts",
+      "default": "./src/relay/portableThreads.ts"
+    },
+    "./relay/portableThreadPresentation": "./src/relay/portableThreadPresentation.ts",
+    "./relay/threadVmControls": {
+      "types": "./src/relay/threadVmControls.ts",
+      "default": "./src/relay/threadVmControls.ts"
+    },
+    "./relay/threadRunOn": {
+      "types": "./src/relay/threadRunOn.ts",
+      "default": "./src/relay/threadRunOn.ts"
+    },
+    "./relay/threadMoveSubmission": {
+      "types": "./src/relay/threadMoveSubmission.ts",
+      "default": "./src/relay/threadMoveSubmission.ts"
+    },
+    "./relay/threadMoveRecovery": "./src/relay/threadMoveRecovery.ts",
+    "./relay/threadMoveQueuePresentation": "./src/relay/threadMoveQueuePresentation.ts",
+    "./relay/portableThreadHistory": {
+      "types": "./src/relay/portableThreadHistory.ts",
+      "default": "./src/relay/portableThreadHistory.ts"
+    },
+    "./relay/portableThreadLibrary": {
+      "types": "./src/relay/portableThreadLibrary.ts",
+      "default": "./src/relay/portableThreadLibrary.ts"
+    },
+    "./relay/threadVmCreation": "./src/relay/threadVmCreation.ts",
+    "./relay/threadQueueControlSubmission": "./src/relay/threadQueueControlSubmission.ts",
+    "./relay/threadVmActionSubmission": "./src/relay/threadVmActionSubmission.ts",
+    "./relay/threadVmActionController": "./src/relay/threadVmActionController.ts",
+    "./relay/workflow-result": "./src/relay/workflowResult.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

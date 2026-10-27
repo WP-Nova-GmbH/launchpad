@@ -1,3 +1,4 @@
+import { readInstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
 import { applyRepositoryPolicyProof } from "./repositoryPolicy.ts";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import * as NodeCrypto from "node:crypto";
@@ -80,6 +81,7 @@ import { requireEnvironmentScope } from "../auth/http.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { JobRunner } from "../jobs/Services/JobRunner.ts";
+import { RepositoryWorkflowRunner } from "../jobs/RepositoryWorkflowRunner.ts";
 import { m0Workflow } from "../jobs/workflow.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
@@ -93,6 +95,8 @@ import {
 import {
   CLOUD_ENDPOINT_RUNTIME_CONFIG,
   CLOUD_ENDPOINT_CONFIRMED_ORIGIN,
+  managedTunnelsDisabled,
+  requireManagedTunnels,
   decodeConfirmedOrigin,
   CLOUD_LINKED_USER_ID,
   CLOUD_MINT_PUBLIC_KEY,
@@ -299,7 +303,7 @@ function readInstalledCloudUserId(
 
 type InstalledCloudPrincipal =
   | { readonly kind: "user"; readonly userId: string }
-  | { readonly kind: "machine" };
+  | { readonly kind: "machine"; readonly organizationId: string };
 
 /**
  * Who the relay's signed proofs must be bound to. A personal environment
@@ -319,7 +323,7 @@ function readInstalledCloudPrincipal(
     Effect.flatMap(
       (machine): Effect.Effect<InstalledCloudPrincipal, EnvironmentAuth.ServerAuthInternalError> =>
         machine !== null
-          ? Effect.succeed({ kind: "machine" })
+          ? Effect.succeed({ kind: "machine", organizationId: machine.organizationId })
           : readInstalledCloudUserId(secrets).pipe(
               Effect.map((userId) => ({ kind: "user", userId })),
             ),
@@ -524,6 +528,11 @@ const makeCloudLinkProof = Effect.fn("environment.cloud.makeLinkProof")(function
   request: RelayLinkProofRequest,
   requestUrl: string,
 ) {
+  if (request.endpoint.providerKind === "cloudflare_tunnel" && (yield* managedTunnelsDisabled)) {
+    return yield* new EnvironmentHttpBadRequestError({
+      message: "Managed tunnels are disabled by T3CODE_DISABLE_MANAGED_TUNNELS.",
+    });
+  }
   const keyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(dependencies.secrets);
   if (
     !isSupportedLinkProviderKind(request) ||
@@ -620,6 +629,7 @@ const activateManagedTunnel = Effect.fn("environment.cloud.activateManagedTunnel
     readonly origin: RelayManagedEndpointOrigin;
   },
 ) {
+  yield* requireManagedTunnels;
   return yield* dependencies.endpointRuntime.withLinkStateLock(
     Effect.gen(function* () {
       const currentConfig = yield* dependencies.secrets.get(CLOUD_ENDPOINT_RUNTIME_CONFIG);
@@ -675,6 +685,7 @@ const activateManagedTunnelWithRetry = (
 export const startManagedCloudTunnelIfOriginConfirmed = Effect.fn(
   "environment.cloud.startManagedCloudTunnelIfOriginConfirmed",
 )(function* (localOrigin: string, options?: { readonly requireConfirmedOrigin?: boolean }) {
+  if (yield* managedTunnelsDisabled) return false;
   const dependencies = yield* cloudHttpDependencies;
   const requireConfirmedOrigin = options?.requireConfirmedOrigin ?? true;
   const parsedOrigin = yield* Effect.try({
@@ -730,6 +741,7 @@ const applyCloudRelayConfig = Effect.fn("environment.cloud.applyRelayConfig")(fu
   },
 ) {
   const apply = Effect.gen(function* () {
+    if (payload.endpointRuntime?.providerKind === "cloudflare_tunnel") yield* requireManagedTunnels;
     yield* validateRelayConfigPayload(payload);
     yield* validateLinkedCloudUser({
       secrets: dependencies.secrets,
@@ -909,6 +921,7 @@ const reconcileDesiredCloudLinkWith = Effect.fn("environment.cloud.reconcileDesi
       ),
     );
     const mode = yield* readCliDesiredLinkMode;
+    if (mode !== "publish_only") yield* requireManagedTunnels;
     const managedTunnelsEnabled = mode !== "publish_only";
     const relayUrl = yield* requireRelayUrl;
     const challenge = yield* relayClientRequest(dependencies, {
@@ -1062,6 +1075,7 @@ const makeManagedTunnelRecoveryProof = Effect.fn(
 export const registerManagedCloudTunnelRecovery = Effect.fn(
   "environment.cloud.registerManagedCloudTunnelRecovery",
 )(function* (localOrigin: string, options?: { readonly retryRuntimeFailures?: boolean }) {
+  yield* requireManagedTunnels;
   const dependencies = yield* cloudHttpDependencies;
   const [runtimeConfig, relayUrl, cloudUserId, environmentCredential] = yield* Effect.all([
     dependencies.secrets.get(CLOUD_ENDPOINT_RUNTIME_CONFIG),
@@ -1139,6 +1153,7 @@ export const recoverManagedCloudTunnel = Effect.fn("environment.cloud.recoverMan
     expectedConfig?: RelayManagedEndpointRuntimeConfig,
     options?: { readonly retryRuntimeFailures?: boolean },
   ) {
+    yield* requireManagedTunnels;
     const dependencies = yield* cloudHttpDependencies;
     const [runtimeConfig, relayUrl, cloudUserId, environmentCredential] = yield* Effect.all([
       dependencies.secrets.get(CLOUD_ENDPOINT_RUNTIME_CONFIG),
@@ -1301,6 +1316,7 @@ const desktopUpdateRestartPending = Effect.gen(function* () {
 export const releaseManagedTunnelOnShutdown = Effect.fn(
   "environment.cloud.releaseManagedTunnelOnShutdown",
 )(function* () {
+  if (yield* managedTunnelsDisabled) return false;
   const dependencies = yield* cloudHttpDependencies;
   // Only a managed link stores a runtime config; publish-only links have no
   // tunnel to release.
@@ -1467,12 +1483,37 @@ const cloudPreferencesHandler = Effect.fn("environment.cloud.preferences")(
   ),
 );
 
-const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
-  function* (dependencies: CloudHttpDependencies, request: RelayCloudEnvironmentHealthRequest) {
-    const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
-    const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
+export interface CloudHealthDependencies {
+  readonly secrets: CloudHttpDependencies["secrets"];
+  readonly environment: Pick<
+    CloudHttpDependencies["environment"],
+    "getEnvironmentId" | "getDescriptor"
+  >;
+}
+
+export const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
+  function* (dependencies: CloudHealthDependencies, request: RelayCloudEnvironmentHealthRequest) {
+    const vm = yield* readInstalledThreadVm().pipe(
+      Effect.provideService(ServerSecretStore.ServerSecretStore, dependencies.secrets),
+      Effect.mapError(
+        () =>
+          new EnvironmentHttpUnauthorizedError({ message: "Private VM identity is unavailable." }),
+      ),
+    );
+    const cloudMintPublicKey = vm
+      ? vm.cloudMintPublicKey
+      : yield* readCloudMintPublicKey(dependencies.secrets);
+    const relayIssuer = vm ? vm.relayIssuer : yield* readCloudRelayIssuer(dependencies.secrets);
     const environmentId = yield* dependencies.environment.getEnvironmentId;
-    const principal = yield* readInstalledCloudPrincipal(dependencies.secrets);
+    const principal = vm ? null : yield* readInstalledCloudPrincipal(dependencies.secrets);
+    const repositoryAccess = yield* RepositoryAccess;
+    if (
+      vm &&
+      (vm.environmentId !== environmentId || repositoryAccess.threadId !== vm.scope.threadId)
+    )
+      return yield* new EnvironmentHttpUnauthorizedError({
+        message: "Private VM authorization is unavailable.",
+      });
     const now = yield* DateTime.now;
     const nowSeconds = Math.floor(now.epochMilliseconds / 1_000);
     const proofOption = yield* verifyRelayJwt({
@@ -1486,7 +1527,7 @@ const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
     if (
       Option.isNone(proofOption) ||
       proofOption.value.environmentId !== environmentId ||
-      (principal.kind === "user" && proofOption.value.sub !== principal.userId) ||
+      (principal?.kind === "user" && proofOption.value.sub !== principal.userId) ||
       !hasBoundedCloudProofLifetime({ ...proofOption.value, nowSeconds }) ||
       !hasExactScope({ scopes: proofOption.value.scope, expected: "environment:status" })
     ) {
@@ -1495,6 +1536,20 @@ const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
       });
     }
     const proof = proofOption.value;
+    if (vm)
+      yield* repositoryAccess
+        .requireMember({
+          user: { userId: proof.sub, displayName: null, imageUrl: null },
+        })
+        .pipe(
+          Effect.mapError(
+            () =>
+              new EnvironmentHttpUnauthorizedError({
+                message: "Repository policy is unavailable or access was removed.",
+              }),
+          ),
+        );
+
     const jtiSecretName = `${CLOUD_HEALTH_JTI_PREFIX}${proof.jti}`;
     const nonceSecretName = `${CLOUD_HEALTH_NONCE_PREFIX}${proof.nonce}`;
     const consumedReplayGuards = yield* consumeCloudReplayGuards({
@@ -1560,12 +1615,37 @@ const cloudEnvironmentHealthHandler = Effect.fn("environment.cloud.health")(
   ),
 );
 
-const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")(
-  function* (dependencies: CloudHttpDependencies, request: RelayCloudMintCredentialRequest) {
-    const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
-    const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
+export interface CloudMintDependencies {
+  readonly secrets: CloudHttpDependencies["secrets"];
+  readonly environment: Pick<CloudHttpDependencies["environment"], "getEnvironmentId">;
+  readonly environmentAuth: Pick<CloudHttpDependencies["environmentAuth"], "createPairingLink">;
+}
+
+export const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")(
+  function* (dependencies: CloudMintDependencies, request: RelayCloudMintCredentialRequest) {
+    const vm = yield* readInstalledThreadVm().pipe(
+      Effect.provideService(ServerSecretStore.ServerSecretStore, dependencies.secrets),
+      Effect.mapError(
+        () =>
+          new EnvironmentHttpUnauthorizedError({ message: "Private VM identity is unavailable." }),
+      ),
+    );
+    // The private enrollment is atomic and authoritative. Never fall back to a
+    // linked personal account or shared-machine key when that identity exists.
+    const cloudMintPublicKey = vm
+      ? vm.cloudMintPublicKey
+      : yield* readCloudMintPublicKey(dependencies.secrets);
+    const relayIssuer = vm ? vm.relayIssuer : yield* readCloudRelayIssuer(dependencies.secrets);
     const environmentId = yield* dependencies.environment.getEnvironmentId;
-    const principal = yield* readInstalledCloudPrincipal(dependencies.secrets);
+    const principal = vm ? null : yield* readInstalledCloudPrincipal(dependencies.secrets);
+    const repositoryAccess = yield* RepositoryAccess;
+    if (
+      vm &&
+      (vm.environmentId !== environmentId || repositoryAccess.threadId !== vm.scope.threadId)
+    )
+      return yield* new EnvironmentHttpUnauthorizedError({
+        message: "Private VM authorization is unavailable.",
+      });
     const now = yield* DateTime.now;
     const nowSeconds = Math.floor(now.epochMilliseconds / 1_000);
     const proofOption = yield* verifyRelayJwt({
@@ -1579,7 +1659,7 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
     if (
       Option.isNone(proofOption) ||
       proofOption.value.environmentId !== environmentId ||
-      (principal.kind === "user" && proofOption.value.sub !== principal.userId) ||
+      (principal?.kind === "user" && proofOption.value.sub !== principal.userId) ||
       proofOption.value.cnf.jkt !== proofOption.value.clientProofKeyThumbprint ||
       !hasBoundedCloudProofLifetime({ ...proofOption.value, nowSeconds }) ||
       !hasExactScope({ scopes: proofOption.value.scope, expected: "environment:connect" })
@@ -1589,7 +1669,6 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
       });
     }
     const proof = proofOption.value;
-    const repositoryAccess = yield* RepositoryAccess;
     yield* repositoryAccess
       .requireMember({
         user: {
@@ -1694,6 +1773,7 @@ export interface CloudDispatchJobDependencies {
   readonly jobRunner: JobRunner["Service"];
   readonly snapshotQuery: ProjectionSnapshotQuery["Service"];
   readonly repositoryIdentity: RepositoryIdentityResolver["Service"];
+  readonly workflowRunner?: import("../jobs/RepositoryWorkflowRunner.ts").RepositoryWorkflowRunnerShape;
 }
 
 const cloudDispatchJobDependencies = Effect.gen(function* () {
@@ -1703,6 +1783,7 @@ const cloudDispatchJobDependencies = Effect.gen(function* () {
     jobRunner: yield* JobRunner,
     snapshotQuery: yield* ProjectionSnapshotQuery,
     repositoryIdentity: yield* RepositoryIdentityResolver,
+    workflowRunner: yield* RepositoryWorkflowRunner,
   } satisfies CloudDispatchJobDependencies;
 });
 
@@ -1740,7 +1821,11 @@ const resolveDispatchJobProject = Effect.fn("environment.cloud.resolveDispatchJo
  * scope and the response goes back the moment the job is under way.
  */
 export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob")(
-  function* (dependencies: CloudDispatchJobDependencies, request: RelayCloudDispatchJobRequest) {
+  function* (
+    dependencies: CloudDispatchJobDependencies,
+    request: RelayCloudDispatchJobRequest,
+    workflowOnly = false,
+  ) {
     const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
     const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
     const environmentId = yield* dependencies.environment.getEnvironmentId;
@@ -1772,6 +1857,37 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
       });
     }
     const proof = proofOption.value;
+    const origin = proof.workflowOrigin;
+    if (
+      (origin === undefined && proof.sub.startsWith("workflow:")) ||
+      (origin !== undefined && !proof.workflowControl) ||
+      (origin?.kind === "automation" &&
+        (principal.kind !== "machine" ||
+          proof.sub !== `workflow:${proof.jobId}` ||
+          origin.organizationId !== proof.workflowControl?.organizationId ||
+          origin.repositoryId !== proof.workflowControl?.repositoryId ||
+          (proof.workflowControl.operation === "start" &&
+            origin.workflowId !== proof.workflowControl.workflow.workflowId))) ||
+      (origin?.kind === "manual" && proof.sub !== (proof.requestedBy ?? origin.userId)) ||
+      (origin?.kind !== "automation" &&
+        proof.requestedBy !== undefined &&
+        proof.requestedBy !== proof.sub)
+    )
+      return yield* new EnvironmentHttpUnauthorizedError({
+        message: "Invalid workflow origin or requester.",
+      });
+    if (
+      workflowOnly !== (proof.workflowControl !== undefined) ||
+      (proof.workflowControl !== undefined &&
+        (principal.kind !== "machine" ||
+          principal.organizationId !== proof.workflowControl.organizationId ||
+          (proof.workflowControl.operation === "start" &&
+            proof.workflowControl.workflow.definition.environmentId !== environmentId)))
+    ) {
+      return yield* new EnvironmentHttpUnauthorizedError({
+        message: "This workflow request is not bound to the enrolled organization.",
+      });
+    }
 
     const consumedReplayGuards = yield* consumeCloudReplayGuards({
       secrets: dependencies.secrets,
@@ -1782,6 +1898,58 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
       return yield* new EnvironmentHttpConflictError({
         message: "Cloud job dispatch request was already consumed.",
       });
+    }
+
+    if (proof.workflowControl !== undefined) {
+      const workflowResult =
+        dependencies.workflowRunner === undefined
+          ? {
+              protocol: 6 as const,
+              outcome: "unavailable" as const,
+              detail: "Workflow execution is unavailable.",
+              progress: null,
+            }
+          : yield* dependencies.workflowRunner
+              .handle({
+                jobId: proof.jobId,
+                ...(origin?.kind === "automation" ? {} : { userId: proof.sub }),
+                ...(origin === undefined ? {} : { origin }),
+                ...(proof.requestedBy === undefined ? {} : { requestedBy: proof.requestedBy }),
+                repositoryCanonicalKey: proof.repositoryCanonicalKey,
+                instruction: proof.instruction,
+                control: proof.workflowControl,
+              })
+              .pipe(
+                Effect.catch(
+                  failEnvironmentCloudInternalError("Could not handle the workflow job."),
+                ),
+              );
+      const accepted = workflowResult.progress !== null;
+      const keyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(dependencies.secrets);
+      const responsePayload = {
+        iss: `t3-env:${environmentId}`,
+        aud: normalizeRelayIssuer(relayIssuer),
+        sub: environmentId,
+        jti: yield* Crypto.Crypto.pipe(Effect.flatMap((crypto) => crypto.randomUUIDv4)),
+        iat: nowSeconds,
+        exp: nowSeconds + 300,
+        environmentId,
+        jobId: proof.jobId,
+        accepted,
+        workflowResult,
+        requestId: proof.jti,
+      } satisfies RelayEnvironmentDispatchJobResponseProofPayload;
+      const responseProof = yield* signRelayJwt({
+        privateKey: keyPair.privateKey,
+        typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+        payload: responsePayload,
+      });
+      yield* appendCloudCredentialResponseHeaders;
+      return {
+        accepted,
+        workflowResult,
+        proof: responseProof,
+      } satisfies RelayEnvironmentDispatchJobResponseShape;
     }
 
     // ADR-0006: an executor works only on repositories it already has. A job
@@ -1883,6 +2051,9 @@ export const connectHttpApiLayer = HttpApiBuilder.group(
       .handle("mintCredential", ({ payload }) => cloudMintCredentialHandler(dependencies, payload))
       .handle("t3MintCredential", ({ payload }) =>
         traceRelayRequest(cloudMintCredentialHandler(dependencies, payload)),
+      )
+      .handle("t3WorkflowJob", ({ payload }) =>
+        traceRelayRequest(cloudDispatchJobHandler(dispatchJobDependencies, payload, true)),
       )
       .handle("t3DispatchJob", ({ payload }) =>
         traceRelayRequest(

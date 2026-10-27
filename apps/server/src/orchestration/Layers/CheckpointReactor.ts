@@ -18,8 +18,9 @@ import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
-import type * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { CheckoutAdmission, makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 
@@ -36,7 +37,6 @@ import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBus } from "../Services/RuntimeReceiptBus.ts";
 import type { CheckpointStoreError } from "../../checkpointing/Errors.ts";
-import type { OrchestrationDispatchError } from "../Errors.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
@@ -406,6 +406,13 @@ const make = Effect.gen(function* () {
       if (thread.session?.activeTurnId && !sameId(thread.session.activeTurnId, turnId)) {
         return "skipped" as const;
       }
+
+      // Portable native capture must finish before queue finalization. A duplicate
+      // Git checkpoint does not prove that independently retained native state exists.
+      yield* (
+        providerService.checkpointConversation?.({ threadId: event.threadId, turnId }) ??
+          Effect.void
+      );
 
       // Only skip if a real (non-placeholder) checkpoint already exists for this turn.
       // ProviderRuntimeIngestion may insert placeholder entries with status "missing"
@@ -1026,7 +1033,8 @@ const make = Effect.gen(function* () {
           ),
         ),
       );
-      if (turnId !== null) {
+      if (turnId !== null) yield* captureAdmissions.completeTurn(event.threadId, turnId);
+      if (turnId !== null && thread?.promptQueue?.awaitingTurnId === turnId) {
         const state = event.type === "turn.aborted" ? "interrupted" : event.payload.state;
         yield* orchestrationEngine.dispatch({
           type: "thread.queue.finalize",
@@ -1050,14 +1058,43 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const processInput = (
-    input: ReactorInput,
-  ): Effect.Effect<
-    void,
-    CheckpointStoreError | OrchestrationDispatchError | PlatformError.PlatformError,
-    never
-  > =>
-    input.source === "domain" ? processDomainEvent(input.event) : processRuntimeEvent(input.event);
+  const captureSql = yield* SqlClient.SqlClient;
+  const captureAdmissions = makeCheckoutCapture(captureSql);
+  const processInput = Effect.fnUntraced(function* (input: ReactorInput) {
+    const threadId =
+      input.source === "runtime"
+        ? input.event.threadId
+        : "threadId" in input.event.payload
+          ? input.event.payload.threadId
+          : undefined;
+    const turnId = input.source === "runtime" ? input.event.turnId : undefined;
+    let parent =
+      threadId && turnId ? yield* captureAdmissions.activeAdmission(threadId, turnId) : undefined;
+    if (
+      input.source === "domain" &&
+      (input.event.type === "thread.turn-start-requested" ||
+        input.event.type === "thread.message-sent")
+    ) {
+      const event = input.event;
+      const admission = event.commandId
+        ? yield* captureAdmissions.lookupAdmission(
+            event.payload.threadId,
+            `request:${event.commandId}`,
+            "provider",
+          )
+        : null;
+      if (admission && !admission.completed) parent = admission.admissionId;
+      else if (event.metadata.queueAdmission === true) {
+        const [message] = yield* captureSql<{ turnId: string | null }>`SELECT turn_id AS "turnId"
+          FROM projection_messages WHERE thread_id=${event.payload.threadId} AND message_id=${event.payload.messageId}`;
+        if (message?.turnId)
+          parent = yield* captureAdmissions.activeAdmission(event.payload.threadId, message.turnId);
+      }
+    }
+    yield* (
+      input.source === "domain" ? processDomainEvent(input.event) : processRuntimeEvent(input.event)
+    ).pipe(Effect.provideService(CheckoutAdmission, parent));
+  });
 
   const processInputSafely = (input: ReactorInput) =>
     processInput(input).pipe(

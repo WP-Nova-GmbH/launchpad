@@ -42,7 +42,7 @@ const previewSessionSyncAtom = Atom.family((threadKey: string) => {
     let eventsVersion = 0;
 
     const reconcileSessions = (result: Atom.Type<typeof sessionsAtom>) => {
-      if (!AsyncResult.isSuccess(result)) return;
+      if (!AsyncResult.isSuccess(result) || result.waiting) return;
       reconcilePreviewServerSessions(threadRef, result.value);
     };
 
@@ -60,6 +60,9 @@ const previewSessionSyncAtom = Atom.family((threadKey: string) => {
       disposed = true;
     });
     const initialEvent = get.once(eventsAtom);
+    // Initialize the SWR wrapper before refreshing its underlying query. A
+    // subscription alone does not read it or connect it to query updates.
+    get.once(sessionsAtom);
     get.subscribe(sessionsAtom, (result) => {
       reconcileSessions(result);
     });

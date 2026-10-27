@@ -1,0 +1,1279 @@
+diff --git a/packages/api/cmd/launchpad-build-collector/main.go b/packages/api/cmd/launchpad-build-collector/main.go
+--- a/packages/api/cmd/launchpad-build-collector/main.go
++++ b/packages/api/cmd/launchpad-build-collector/main.go
+@@ -34,7 +34,7 @@
+ 	DeletedBuilds      []uuid.UUID `json:"deletedBuilds"`
+ }
+ 
+-func verifyAdmission(ctx context.Context, input settings) error {
++func verifyAdmission(ctx context.Context, input settings, live bool) error {
+ 	origin, err := url.Parse(input.APIURL)
+ 	if err != nil || origin.Scheme != "http" || origin.Hostname() != "127.0.0.1" || origin.User != nil ||
+ 		origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" || input.APIKey == "" {
+@@ -55,16 +55,18 @@
+ 	var capabilities struct {
+ 		Version                  int  `json:"version"`
+ 		BuildCollectionAdmission bool `json:"buildCollectionAdmission"`
++		ExecutionBuildRoots      bool `json:"executionBuildRoots"`
++		LiveBuildCollection      bool `json:"liveBuildCollection"`
+ 	}
+ 	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&capabilities) != nil ||
+-		capabilities.Version != 1 || !capabilities.BuildCollectionAdmission {
++		capabilities.Version != 1 || !capabilities.BuildCollectionAdmission || (live && (!capabilities.ExecutionBuildRoots || !capabilities.LiveBuildCollection)) {
+ 		return fmt.Errorf("the running API does not admit safe build collection")
+ 	}
+ 	return nil
+ }
+-func collect(ctx context.Context, input settings, apply bool) (result, error) {
++func collect(ctx context.Context, input settings, apply, live bool) (result, error) {
+ 	out := result{DryRun: !apply, UnreferencedBuilds: []uuid.UUID{}, DeletedBuilds: []uuid.UUID{}}
+-	if err := verifyAdmission(ctx, input); err != nil {
++	if err := verifyAdmission(ctx, input, live); err != nil {
+ 		return out, err
+ 	}
+ 	if input.StoragePath == "" || input.StoragePath[0] != '/' || input.DatabaseURL == "" {
+@@ -79,7 +81,11 @@
+ 	if err != nil {
+ 		return out, fmt.Errorf("collection storage is unavailable")
+ 	}
+-	err = buildretention.WithIdleCatalog(ctx, db, func(catalog buildretention.Catalog) error {
++	withCatalog := buildretention.WithIdleCatalog
++	if live {
++		withCatalog = buildretention.WithPinnedCatalog
++	}
++	err = withCatalog(ctx, db, func(catalog buildretention.Catalog) error {
+ 		retained, err := template.RetainedBuilds(ctx, store, catalog.Roots)
+ 		if err != nil {
+ 			return err
+@@ -103,6 +109,7 @@
+ }
+ func run() int {
+ 	apply := flag.Bool("apply", false, "Delete unreferenced build objects; default only reports them")
++	live := flag.Bool("live", false, "Permit durably pinned live executions; legacy unknown boots still block")
+ 	flag.Parse()
+ 	decoder := json.NewDecoder(io.LimitReader(os.Stdin, 64*1024))
+ 	decoder.DisallowUnknownFields()
+@@ -116,7 +123,7 @@
+ 	}
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+ 	defer cancel()
+-	out, err := collect(ctx, input, *apply)
++	out, err := collect(ctx, input, *apply, *live)
+ 	// Database/transport errors can contain credentials; print only bounded
+ 	// identities and a generic refusal, never the settings or raw failure.
+ 	if json.NewEncoder(os.Stdout).Encode(out) != nil {
+diff --git a/packages/api/cmd/launchpad-build-collector/main_test.go b/packages/api/cmd/launchpad-build-collector/main_test.go
+--- a/packages/api/cmd/launchpad-build-collector/main_test.go
++++ b/packages/api/cmd/launchpad-build-collector/main_test.go
+@@ -6,7 +6,9 @@
+ 	"net/http/httptest"
+ 	"testing"
+ 
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
++	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
+@@ -53,7 +55,7 @@
+ 		require.NoError(t, blob.Put(t.Context(), []byte("payload")))
+ 	}
+ 	input := settings{DatabaseURL: db.ConnStr(), StoragePath: source, APIURL: capabilityServer(t, true).URL, APIKey: "proof-key"}
+-	out, err := collect(t.Context(), input, false)
++	out, err := collect(t.Context(), input, false, false)
+ 	require.NoError(t, err)
+ 	require.True(t, out.DryRun)
+ 	require.Equal(t, 2, out.RetainedBuilds)
+@@ -64,7 +66,7 @@
+ 	exists, err := blob.Exists(t.Context())
+ 	require.NoError(t, err)
+ 	require.True(t, exists)
+-	out, err = collect(t.Context(), input, true)
++	out, err = collect(t.Context(), input, true, false)
+ 	require.NoError(t, err)
+ 	require.False(t, out.DryRun)
+ 	require.Equal(t, []uuid.UUID{dead}, out.DeletedBuilds)
+@@ -80,9 +82,64 @@
+ func TestCollectorRequiresVerifiedLocalAPIAdmission(t *testing.T) {
+ 	// No valid database or storage is needed: admission must fail first.
+ 	input := settings{APIURL: capabilityServer(t, false).URL, APIKey: "proof-key"}
+-	_, err := collect(t.Context(), input, true)
++	_, err := collect(t.Context(), input, true, false)
+ 	require.ErrorContains(t, err, "does not admit")
+ 	input.APIURL = "https://example.invalid"
+-	err = verifyAdmission(t.Context(), input)
++	err = verifyAdmission(t.Context(), input, false)
+ 	require.ErrorContains(t, err, "loopback API")
+ }
++
++func TestLiveCollectorRequiresPositiveBootRootCapability(t *testing.T) {
++	input := settings{APIURL: capabilityServer(t, true).URL, APIKey: "proof-key"}
++	require.NoError(t, verifyAdmission(t.Context(), input, false))
++	require.ErrorContains(t, verifyAdmission(t.Context(), input, true), "does not admit")
++}
++func TestLiveCollectorDeletesOnlyUnreferencedDiskWithActiveExecution(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	env := testutils.CreateTestTemplate(t, db, team)
++	boot := testutils.CreateTestBuild(t, t.Context(), db, env, "uploaded")
++	ancestor := testutils.CreateTestBuild(t, t.Context(), db, env, "uploaded")
++	dead := testutils.CreateTestBuild(t, t.Context(), db, env, "uploaded")
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.envs SET deleted_at=now() WHERE id=$1", env))
++	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "live-host"}
++	require.NoError(t, (executions.Store{DB: db.SqlcClient}).Register(t.Context(), p, boot, true))
++	source := t.TempDir()
++	store, err := storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: source})
++	require.NoError(t, err)
++	paths := storage.Paths{BuildID: boot.String()}
++	data, err := json.Marshal(metadata.Template{Version: metadata.CurrentVersion, Template: metadata.TemplateMetadata{BuildID: boot.String()}, FilesystemOnly: true})
++	require.NoError(t, err)
++	blob, err := store.OpenBlob(t.Context(), paths.Metadata())
++	require.NoError(t, err)
++	require.NoError(t, blob.Put(t.Context(), data))
++	h, err := header.NewHeader(&header.Metadata{Version: 3, BuildId: boot, BlockSize: 4096, Size: 4096}, []header.BuildMap{{Length: 4096, BuildId: ancestor}})
++	require.NoError(t, err)
++	_, _, _, err = header.StoreHeader(t.Context(), store, paths.RootfsHeader(), h)
++	require.NoError(t, err)
++	for _, id := range []uuid.UUID{ancestor, dead} {
++		b, err := store.OpenBlob(t.Context(), id.String()+"/rootfs")
++		require.NoError(t, err)
++		require.NoError(t, b.Put(t.Context(), []byte("retained bytes")))
++	}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		require.Equal(t, "proof-key", r.Header.Get("X-API-Key"))
++		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"version": 1, "buildCollectionAdmission": true, "executionBuildRoots": true, "liveBuildCollection": true}))
++	}))
++	t.Cleanup(server.Close)
++	input := settings{DatabaseURL: db.ConnStr(), StoragePath: source, APIURL: server.URL, APIKey: "proof-key"}
++	_, err = collect(t.Context(), input, true, false)
++	require.Error(t, err)
++	out, err := collect(t.Context(), input, true, true)
++	require.NoError(t, err)
++	require.Equal(t, []uuid.UUID{dead}, out.DeletedBuilds)
++	blob, err = store.OpenBlob(t.Context(), ancestor.String()+"/rootfs")
++	require.NoError(t, err)
++	bytes, err := storage.GetBlob(t.Context(), blob)
++	require.NoError(t, err)
++	require.Equal(t, "retained bytes", string(bytes))
++	// Corrupting the boot root stops the entire mark before any other candidate is removed.
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.sandbox_execution_build_roots SET build_id=$1", uuid.New()))
++	_, err = collect(t.Context(), input, true, true)
++	require.Error(t, err)
++}
+diff --git a/packages/api/internal/api/api.gen.go b/packages/api/internal/api/api.gen.go
+--- a/packages/api/internal/api/api.gen.go
++++ b/packages/api/internal/api/api.gen.go
+@@ -610,6 +610,8 @@
+ type LaunchpadRuntimeCapabilities struct {
+ 	BuildCollectionAdmission bool `json:"buildCollectionAdmission"`
+ 	DiskRestore              bool `json:"diskRestore"`
++	ExecutionBuildRoots      bool `json:"executionBuildRoots"`
++	LiveBuildCollection      bool `json:"liveBuildCollection"`
+ 	QuiescedSnapshots        bool `json:"quiescedSnapshots"`
+ 	RenewableLifetime        bool `json:"renewableLifetime"`
+ 	Version                  int  `json:"version"`
+diff --git a/packages/api/internal/cfg/model.go b/packages/api/internal/cfg/model.go
+--- a/packages/api/internal/cfg/model.go
++++ b/packages/api/internal/cfg/model.go
+@@ -32,6 +32,9 @@
+ )
+ 
+ type Config struct {
++	// Set from the compiled API build, never from an operator-provided version.
++	LaunchpadRuntimeBuildVersion string `env:"-"`
++
+ 	// Only operators can grant renewable continuous lifetime to a dedicated team.
+ 	// Already admitted allocations retain their recorded policy until retired.
+ 	LaunchpadRenewableLifetimeTeams []string `env:"LAUNCHPAD_RENEWABLE_LIFETIME_TEAMS" envSeparator:","`
+diff --git a/packages/api/internal/handlers/launchpad_capabilities_test.go b/packages/api/internal/handlers/launchpad_capabilities_test.go
+--- a/packages/api/internal/handlers/launchpad_capabilities_test.go
++++ b/packages/api/internal/handlers/launchpad_capabilities_test.go
+@@ -47,6 +47,8 @@
+ 			require.Equal(t, tc.renewable, capabilities.RenewableLifetime)
+ 			require.True(t, capabilities.DiskRestore)
+ 			require.True(t, capabilities.QuiescedSnapshots)
++			require.True(t, capabilities.ExecutionBuildRoots)
++			require.False(t, capabilities.LiveBuildCollection, "unknown host cannot claim guarded live storage")
+ 		})
+ 	}
+ }
+diff --git a/packages/api/internal/handlers/launchpad_execution_test.go b/packages/api/internal/handlers/launchpad_execution_test.go
+--- a/packages/api/internal/handlers/launchpad_execution_test.go
++++ b/packages/api/internal/handlers/launchpad_execution_test.go
+@@ -76,8 +76,9 @@
+ 	team := testutils.CreateTestTeam(t, db)
+ 	other := testutils.CreateTestTeam(t, db)
+ 	store := executions.Store{DB: db.SqlcClient}
++	buildID := uuid.New()
+ 	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "offline-host"}
+-	require.NoError(t, store.Register(t.Context(), p))
++	require.NoError(t, store.Register(t.Context(), p, buildID, true))
+ 	_, err := store.BeginStop(t.Context(), team, p.SandboxID)
+ 	require.NoError(t, err)
+ 	n, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: p.SandboxID})
+diff --git a/packages/api/internal/handlers/launchpad_restore.go b/packages/api/internal/handlers/launchpad_restore.go
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -33,7 +33,7 @@
+ 		a.sendAPIStoreError(c, http.StatusForbidden, "Launchpad restore is not enabled for this team")
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{Version: 1, DiskRestore: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true})
++	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{Version: 1, DiskRestore: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true, BuildCollectionAdmission: true, ExecutionBuildRoots: true, LiveBuildCollection: a.orchestrator.CanCollectLiveBuilds()})
+ }
+ 
+ func canonicalRestoreRequest(body api.LaunchpadRestoreRequest) ([]byte, error) {
+diff --git a/packages/api/internal/orchestrator/build_retention.go b/packages/api/internal/orchestrator/build_retention.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/orchestrator/build_retention.go
+@@ -0,0 +1,19 @@
++package orchestrator
++
++import (
++	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
++	"github.com/google/uuid"
++	"strings"
++)
++
++// Live reclamation requires the same reproducible patch-set build on the API
++// and host. An older/unknown host may ignore retirement tombstones, even if the
++// upgraded API has already registered its boot roots. Such roots stay held but
++// cannot authorize live collection.
++func (o *Orchestrator) canCollectLiveOnNode(node *nodemanager.Node) bool {
++	return node != nil && strings.HasPrefix(o.buildRetentionRuntimeVersion, "launchpad-patched-") &&
++		node.Metadata().Version == o.buildRetentionRuntimeVersion
++}
++func (o *Orchestrator) CanCollectLiveBuilds() bool {
++	return o != nil && o.buildRetentionNodeID != "" && o.canCollectLiveOnNode(o.GetNode(uuid.Nil, o.buildRetentionNodeID))
++}
+diff --git a/packages/api/internal/orchestrator/build_retention_test.go b/packages/api/internal/orchestrator/build_retention_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/api/internal/orchestrator/build_retention_test.go
+@@ -0,0 +1,24 @@
++package orchestrator
++
++import (
++	"github.com/e2b-dev/infra/packages/api/internal/api"
++	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
++	"github.com/stretchr/testify/require"
++	"testing"
++)
++
++func TestLiveCollectionRefusesUnknownOrMixedRuntimeBuild(t *testing.T) {
++	version := "launchpad-patched-proof-1599d6e79e30"
++	o := &Orchestrator{buildRetentionRuntimeVersion: version}
++	require.False(t, o.canCollectLiveOnNode(nil))
++	for _, old := range []string{"", "0.14.1", "launchpad-patched-old-1599d6e79e30"} {
++		node := nodemanager.NewTestNode("host", api.NodeStatusReady, 0, 8, nodemanager.WithOrchestratorVersion(old))
++		require.False(t, o.canCollectLiveOnNode(node))
++	}
++	node := nodemanager.NewTestNode("host", api.NodeStatusReady, 0, 8, nodemanager.WithOrchestratorVersion(version))
++	require.True(t, o.canCollectLiveOnNode(node))
++	o.buildRetentionRuntimeVersion = ""
++	require.False(t, o.canCollectLiveOnNode(node))
++	var unknown *Orchestrator
++	require.False(t, unknown.CanCollectLiveBuilds())
++}
+diff --git a/packages/api/internal/orchestrator/checkpoint_instance.go b/packages/api/internal/orchestrator/checkpoint_instance.go
+--- a/packages/api/internal/orchestrator/checkpoint_instance.go
++++ b/packages/api/internal/orchestrator/checkpoint_instance.go
+@@ -11,6 +11,7 @@
+ 	"google.golang.org/grpc/codes"
+ 
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+@@ -62,6 +63,13 @@
+ 		return fmt.Errorf("node '%s' not found", sbx.NodeID)
+ 	}
+ 
++	// A full-memory checkpoint may take the resume-fresh host path. Its actual
++	// base after an uncertain reply cannot be inferred from the API's old row.
++	if o.buildRetentionAdmission || sbx.Metadata["launchpad.managed"] == "thread-vm-v1" {
++		if err := (executions.Store{DB: o.sqlcDB}).DisableLiveCollection(ctx, teamID, sandboxID); err != nil {
++			return err
++		}
++	}
+ 	upsertResult, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, false))
+ 	if err != nil {
+ 		return fmt.Errorf("error upserting snapshot: %w", err)
+diff --git a/packages/api/internal/orchestrator/create_instance.go b/packages/api/internal/orchestrator/create_instance.go
+--- a/packages/api/internal/orchestrator/create_instance.go
++++ b/packages/api/internal/orchestrator/create_instance.go
+@@ -427,7 +427,7 @@
+ 			if err != nil {
+ 				return err
+ 			}
+-			return (executions.Store{DB: o.sqlcDB}).Register(ctx, queries.InsertExecutionAttemptParams{TeamID: team.Team.ID, SandboxID: sandboxID, ExecutionID: id, ClusterID: target.ClusterID, NodeID: target.ID})
++			return (executions.Store{DB: o.sqlcDB}).Register(ctx, queries.InsertExecutionAttemptParams{TeamID: team.Team.ID, SandboxID: sandboxID, ExecutionID: id, ClusterID: target.ClusterID, NodeID: target.ID}, sbxData.Build.ID, sbxData.Metadata["launchpad.managed"] == "thread-vm-v1" && o.canCollectLiveOnNode(target))
+ 		})
+ 	}
+ 	placed, err := placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels, executionAdmission...)
+diff --git a/packages/api/internal/orchestrator/orchestrator.go b/packages/api/internal/orchestrator/orchestrator.go
+--- a/packages/api/internal/orchestrator/orchestrator.go
++++ b/packages/api/internal/orchestrator/orchestrator.go
+@@ -58,6 +58,8 @@
+ 
+ type Orchestrator struct {
+ 	buildRetentionAdmission       bool
++	buildRetentionRuntimeVersion  string
++	buildRetentionNodeID          string
+ 	renewableLifetimeTeams        []string
+ 	httpClient                    *http.Client
+ 	nodeDiscovery                 servicediscovery.Discoverer
+@@ -186,23 +188,25 @@
+ 	skipNomadSync := localRegistryOwnsOrchestrators
+ 
+ 	o := Orchestrator{
+-		renewableLifetimeTeams:  slices.Clone(config.LaunchpadRenewableLifetimeTeams),
+-		buildRetentionAdmission: config.LaunchpadRestoreNodeID != "",
+-		httpClient:              httpClient,
+-		analytics:               analyticsInstance,
+-		posthogClient:           posthogClient,
+-		nodeDiscovery:           nodeDiscovery,
+-		nodes:                   smap.New[*nodemanager.Node](),
+-		placementAlgorithm:      bestOfKAlgorithm,
+-		scoreHugepages:          config.BestOfKHugepageMemory,
+-		featureFlagsClient:      featureFlags,
+-		accessTokenGenerator:    accessTokenGenerator,
+-		routingCatalog:          routingCatalog,
+-		sqlcDB:                  sqlcDB,
+-		snapshotCache:           snapshotCache,
+-		tel:                     tel,
+-		clusters:                clusters,
+-		redisStorage:            redisStorage,
++		renewableLifetimeTeams:       slices.Clone(config.LaunchpadRenewableLifetimeTeams),
++		buildRetentionAdmission:      config.LaunchpadRestoreNodeID != "",
++		buildRetentionRuntimeVersion: config.LaunchpadRuntimeBuildVersion,
++		buildRetentionNodeID:         config.LaunchpadRestoreNodeID,
++		httpClient:                   httpClient,
++		analytics:                    analyticsInstance,
++		posthogClient:                posthogClient,
++		nodeDiscovery:                nodeDiscovery,
++		nodes:                        smap.New[*nodemanager.Node](),
++		placementAlgorithm:           bestOfKAlgorithm,
++		scoreHugepages:               config.BestOfKHugepageMemory,
++		featureFlagsClient:           featureFlags,
++		accessTokenGenerator:         accessTokenGenerator,
++		routingCatalog:               routingCatalog,
++		sqlcDB:                       sqlcDB,
++		snapshotCache:                snapshotCache,
++		tel:                          tel,
++		clusters:                     clusters,
++		redisStorage:                 redisStorage,
+ 
+ 		createdCounter: createdCounter,
+ 
+diff --git a/packages/api/internal/orchestrator/restore.go b/packages/api/internal/orchestrator/restore.go
+--- a/packages/api/internal/orchestrator/restore.go
++++ b/packages/api/internal/orchestrator/restore.go
+@@ -114,7 +114,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	if err := (executions.Store{DB: o.sqlcDB}).Register(ctx, queries.InsertExecutionAttemptParams{TeamID: op.TeamID, SandboxID: op.SandboxID, ExecutionID: op.ExecutionID, ClusterID: op.ClusterID, NodeID: op.NodeID}); err != nil {
++	if err := (executions.Store{DB: o.sqlcDB}).Register(ctx, queries.InsertExecutionAttemptParams{TeamID: op.TeamID, SandboxID: op.SandboxID, ExecutionID: op.ExecutionID, ClusterID: op.ClusterID, NodeID: op.NodeID}, op.PreparedBuildID, o.canCollectLiveOnNode(o.GetNode(op.ClusterID, op.NodeID))); err != nil {
+ 		return err
+ 	}
+ 	response, err := client.ActivateRestoreDisk(child, &rpc.RestoreDiskActivateRequest{Create: request, ManifestSha256: digest, ReconcileOnly: reconcileOnly})
+diff --git a/packages/api/internal/orchestrator/snapshot_template.go b/packages/api/internal/orchestrator/snapshot_template.go
+--- a/packages/api/internal/orchestrator/snapshot_template.go
++++ b/packages/api/internal/orchestrator/snapshot_template.go
+@@ -11,6 +11,7 @@
+ 	"google.golang.org/grpc/codes"
+ 
+ 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+@@ -76,6 +77,11 @@
+ 	// freeze the filesystem. The host takes this checkpoint in place; the
+ 	// running source keeps its process memory and connections.
+ 	filesystemOnly := sbx.Metadata["launchpad.managed"] == "thread-vm-v1"
++	if o.buildRetentionAdmission && !filesystemOnly {
++		if err := (executions.Store{DB: o.sqlcDB}).DisableLiveCollection(ctx, teamID, sandboxID); err != nil {
++			return SnapshotTemplateResult{}, err
++		}
++	}
+ 	upsertResult, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, filesystemOnly))
+ 	if err != nil {
+ 		return SnapshotTemplateResult{}, fmt.Errorf("error upserting snapshot: %w", err)
+diff --git a/packages/api/main.go b/packages/api/main.go
+--- a/packages/api/main.go
++++ b/packages/api/main.go
+@@ -443,6 +443,7 @@
+ 	// Create an instance of our handler which satisfies the generated interface
+ 	//  (use the outer context rather than the signal handling
+ 	//   context so it doesn't exit first.)
++	config.LaunchpadRuntimeBuildVersion = serviceVersion
+ 	apiStore := handlers.NewAPIStore(ctx, tel, redisClient, featureFlags, config)
+ 	cleanupFns = append(cleanupFns, apiStore.Close)
+ 
+diff --git a/packages/db/migrations/20261006190000_execution_build_roots.sql b/packages/db/migrations/20261006190000_execution_build_roots.sql
+new file mode 100644
+--- /dev/null
++++ b/packages/db/migrations/20261006190000_execution_build_roots.sql
+@@ -0,0 +1,17 @@
++-- +goose Up
++-- A root is registered in the same transaction as its physical boot identity.
++-- Existing attempts intentionally remain unknown; never infer their base from routing.
++CREATE TABLE public.sandbox_execution_build_roots (
++    team_id uuid NOT NULL,
++    sandbox_id text NOT NULL,
++    execution_id uuid NOT NULL,
++    cluster_id uuid NOT NULL,
++    node_id text NOT NULL,
++    build_id uuid NOT NULL CHECK (build_id <> '00000000-0000-0000-0000-000000000000'),
++    collect_while_live boolean NOT NULL DEFAULT false,
++    PRIMARY KEY (team_id,sandbox_id,execution_id,cluster_id,node_id),
++    FOREIGN KEY (team_id,sandbox_id,execution_id,cluster_id,node_id)
++        REFERENCES public.sandbox_execution_attempts(team_id,sandbox_id,execution_id,cluster_id,node_id)
++);
++-- +goose Down
++DROP TABLE public.sandbox_execution_build_roots;
+diff --git a/packages/db/pkg/buildretention/store.go b/packages/db/pkg/buildretention/store.go
+--- a/packages/db/pkg/buildretention/store.go
++++ b/packages/db/pkg/buildretention/store.go
+@@ -49,6 +49,17 @@
+ // first collector is for idle hosts; a Redis miss is never an absence proof.
+ // It retains all usable build assignments, paused disks and durable restore pins.
+ func WithIdleCatalog(ctx context.Context, db *client.Client, collect func(Catalog) error) error {
++	return withCatalog(ctx, db, false, collect)
++}
++
++// WithPinnedCatalog permits live/paused executions only when every possible boot
++// attempt has a durable base root recorded before its RPC. Unknown legacy boots,
++// in-flight disk writers and changing restore operations still refuse collection.
++func WithPinnedCatalog(ctx context.Context, db *client.Client, collect func(Catalog) error) error {
++	return withCatalog(ctx, db, true, collect)
++}
++
++func withCatalog(ctx context.Context, db *client.Client, live bool, collect func(Catalog) error) error {
+ 	_, tx, err := db.WithTx(ctx)
+ 	if err != nil {
+ 		return err
+@@ -62,19 +73,25 @@
+ 	if _, err = tx.Exec(ctx, `LOCK TABLE public.envs, public.env_builds, public.env_build_assignments,
+         public.active_template_builds, public.snapshots, public.snapshot_templates,
+         public.sandbox_restore_operations, public.sandbox_restore_pins,
+-        public.sandbox_execution_fences, public.sandbox_execution_attempts IN SHARE MODE`); err != nil {
++        public.sandbox_execution_fences, public.sandbox_execution_attempts,
++        public.sandbox_execution_build_roots IN SHARE MODE`); err != nil {
+ 		return err
+ 	}
+ 	var busy bool
+ 	if err = tx.QueryRow(ctx, `SELECT
+-        EXISTS(SELECT 1 FROM public.sandbox_execution_fences WHERE state <> 'stopped') OR
++        EXISTS(SELECT 1 FROM public.sandbox_execution_fences f WHERE state <> 'stopped' AND
++            (NOT $1 OR NOT EXISTS(SELECT 1 FROM public.sandbox_execution_attempts a
++                WHERE a.team_id=f.team_id AND a.sandbox_id=f.sandbox_id) OR
++             EXISTS(SELECT 1 FROM public.sandbox_execution_attempts a
++                LEFT JOIN public.sandbox_execution_build_roots r USING (team_id,sandbox_id,execution_id,cluster_id,node_id)
++                WHERE a.team_id=f.team_id AND a.sandbox_id=f.sandbox_id AND (r.build_id IS NULL OR NOT r.collect_while_live)))) OR
+         EXISTS(SELECT 1 FROM public.active_template_builds) OR
+         EXISTS(SELECT 1 FROM public.env_builds WHERE status_group IN ('pending','in_progress')) OR
+         EXISTS(SELECT 1 FROM public.sandbox_restore_operations
+             WHERE state IN ('preparing','activating','cancelling')) OR
+         EXISTS(SELECT 1 FROM public.sandbox_restore_operations o
+             LEFT JOIN public.sandbox_execution_fences f USING (team_id,sandbox_id)
+-            WHERE o.state='active' AND (f.state IS NULL OR f.state <> 'stopped'))`).Scan(&busy); err != nil {
++            WHERE o.state='active' AND (f.state IS NULL OR (NOT $1 AND f.state <> 'stopped')))`, live).Scan(&busy); err != nil {
+ 		return err
+ 	}
+ 	if busy {
+@@ -95,6 +112,9 @@
+         UNION SELECT p.build_id FROM public.sandbox_restore_pins p
+         UNION SELECT o.prepared_build_id FROM public.sandbox_restore_operations o
+             WHERE o.state='prepared'
++        UNION SELECT r.build_id FROM public.sandbox_execution_build_roots r
++            JOIN public.sandbox_execution_fences f USING (team_id,sandbox_id)
++            WHERE f.state <> 'stopped'
+     ) retained`)
+ 	if err != nil {
+ 		return err
+diff --git a/packages/db/pkg/buildretention/store_test.go b/packages/db/pkg/buildretention/store_test.go
+--- a/packages/db/pkg/buildretention/store_test.go
++++ b/packages/db/pkg/buildretention/store_test.go
+@@ -5,6 +5,7 @@
+ 	"errors"
+ 	"testing"
+ 
++	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/google/uuid"
+@@ -99,3 +100,81 @@
+ 	release()
+ 	require.NoError(t, WithIdleCatalog(t.Context(), db.SqlcClient, func(Catalog) error { return nil }))
+ }
++
++func TestPinnedCatalogProtectsEveryPossibleLiveBootUntilPhysicalStop(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	env := testutils.CreateTestTemplate(t, db, team)
++	first := testutils.CreateTestBuild(t, t.Context(), db, env, "uploaded")
++	second := testutils.CreateTestBuild(t, t.Context(), db, env, "uploaded")
++	dead := testutils.CreateTestBuild(t, t.Context(), db, env, "uploaded")
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.envs SET deleted_at=now() WHERE id=$1", env))
++	registry := executions.Store{DB: db.SqlcClient}
++	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "first-node"}
++	require.NoError(t, registry.Register(t.Context(), p, first, true))
++	// A lost placement response may leave both possible hosts alive. Both roots stay protected.
++	next := p
++	next.NodeID = "second-node"
++	next.ExecutionID = uuid.New()
++	require.NoError(t, registry.Register(t.Context(), next, second, true))
++	collect := func(c Catalog) error {
++		require.ElementsMatch(t, []uuid.UUID{first, second}, c.Roots)
++		require.ElementsMatch(t, []uuid.UUID{first, second, dead}, c.Candidates)
++		return nil
++	}
++	require.ErrorIs(t, WithIdleCatalog(t.Context(), db.SqlcClient, collect), ErrBusy)
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, collect))
++	_, err := registry.BeginStop(t.Context(), team, p.SandboxID)
++	require.NoError(t, err)
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, collect), "a stop intent is not permission to release roots")
++	n, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: p.SandboxID})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, n)
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(c Catalog) error { require.Empty(t, c.Roots); return nil }))
++}
++func TestPinnedCatalogRejectsAnyUnrecordedBootOrDiskWriter(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	registry := executions.Store{DB: db.SqlcClient}
++	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}
++	require.NoError(t, registry.Register(t.Context(), p, uuid.New(), true))
++	called := false
++	collect := func(Catalog) error { called = true; return nil }
++	legacy := p
++	legacy.NodeID = "unknown-host"
++	require.NoError(t, db.SqlcClient.InsertExecutionAttempt(t.Context(), legacy))
++	require.ErrorIs(t, WithPinnedCatalog(t.Context(), db.SqlcClient, collect), ErrBusy)
++	require.False(t, called)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "DELETE FROM public.sandbox_execution_attempts WHERE node_id=$1", legacy.NodeID))
++	env := testutils.CreateTestTemplate(t, db, team)
++	testutils.CreateTestBuild(t, t.Context(), db, env, "building")
++	require.ErrorIs(t, WithPinnedCatalog(t.Context(), db.SqlcClient, collect), ErrBusy)
++	require.False(t, called)
++}
++func TestPinnedCatalogHoldsBootRootPublicationUntilCollectionCompletes(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(Catalog) error {
++		_, tx, err := db.SqlcClient.WithTx(t.Context())
++		require.NoError(t, err)
++		defer rollback(t.Context(), tx)
++		_, err = tx.Exec(t.Context(), "LOCK TABLE public.sandbox_execution_build_roots IN ROW EXCLUSIVE MODE NOWAIT")
++		var pgErr *pgconn.PgError
++		require.ErrorAs(t, err, &pgErr)
++		require.Equal(t, "55P03", pgErr.Code)
++		return nil
++	}))
++}
++
++func TestPinnedCatalogRefusesRebasedExecutionsEvenAfterCreateRetry(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	registry := executions.Store{DB: db.SqlcClient}
++	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}
++	root := uuid.New()
++	require.NoError(t, registry.Register(t.Context(), p, root, true))
++	require.NoError(t, registry.DisableLiveCollection(t.Context(), team, p.SandboxID))
++	require.NoError(t, registry.Register(t.Context(), p, root, true))
++	called := false
++	require.ErrorIs(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(Catalog) error { called = true; return nil }), ErrBusy)
++	require.False(t, called)
++}
+diff --git a/packages/db/pkg/executions/store.go b/packages/db/pkg/executions/store.go
+--- a/packages/db/pkg/executions/store.go
++++ b/packages/db/pkg/executions/store.go
+@@ -8,14 +8,20 @@
+ 	"github.com/e2b-dev/infra/packages/db/client"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
+ )
+ 
+ var ErrFenced = errors.New("sandbox execution is permanently fenced")
++var ErrBuildConflict = errors.New("execution boot build is unknown or conflicts with its durable identity")
+ 
+ type Store struct{ DB *client.Client }
+ 
+-func (s Store) Register(ctx context.Context, p queries.InsertExecutionAttemptParams) error {
+-	if p.TeamID == uuid.Nil || p.ExecutionID == uuid.Nil || p.SandboxID == "" || p.NodeID == "" {
++// Register pins the original disk and memory base before any create RPC. The
++// pinned runtime's in-place checkpoints keep using that original template and
++// cumulative local COW overlays; they never rebase a running sandbox onto a backup.
++// A resume has a new execution identity and pins its newly selected snapshot.
++func (s Store) Register(ctx context.Context, p queries.InsertExecutionAttemptParams, buildID uuid.UUID, collectWhileLive bool) error {
++	if p.TeamID == uuid.Nil || p.ExecutionID == uuid.Nil || p.SandboxID == "" || p.NodeID == "" || buildID == uuid.Nil {
+ 		return errors.New("invalid execution identity")
+ 	}
+ 	db, tx, err := s.DB.WithTx(ctx)
+@@ -33,8 +39,34 @@
+ 	if state != "active" {
+ 		return ErrFenced
+ 	}
+-	if err := db.InsertExecutionAttempt(ctx, p); err != nil {
++	// The fence row serializes concurrent registrations for this sandbox. Never
++	// backfill a legacy attempt: it may already be running a different disk.
++	var existing bool
++	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.sandbox_execution_attempts
++        WHERE team_id=$1 AND sandbox_id=$2 AND execution_id=$3 AND cluster_id=$4 AND node_id=$5)`,
++		p.TeamID, p.SandboxID, p.ExecutionID, p.ClusterID, p.NodeID).Scan(&existing); err != nil {
+ 		return err
++	}
++	if existing {
++		var recorded uuid.UUID
++		err := tx.QueryRow(ctx, `SELECT build_id FROM public.sandbox_execution_build_roots
++            WHERE team_id=$1 AND sandbox_id=$2 AND execution_id=$3 AND cluster_id=$4 AND node_id=$5`,
++			p.TeamID, p.SandboxID, p.ExecutionID, p.ClusterID, p.NodeID).Scan(&recorded)
++		if errors.Is(err, pgx.ErrNoRows) || (err == nil && recorded != buildID) {
++			return ErrBuildConflict
++		}
++		if err != nil {
++			return err
++		}
++	} else {
++		if err := db.InsertExecutionAttempt(ctx, p); err != nil {
++			return err
++		}
++		if _, err := tx.Exec(ctx, `INSERT INTO public.sandbox_execution_build_roots
++            (team_id,sandbox_id,execution_id,cluster_id,node_id,build_id,collect_while_live) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
++			p.TeamID, p.SandboxID, p.ExecutionID, p.ClusterID, p.NodeID, buildID, collectWhileLive); err != nil {
++			return err
++		}
+ 	}
+ 	return tx.Commit(ctx)
+ }
+@@ -86,3 +118,21 @@
+ 	}
+ 	return tx.Commit(ctx)
+ }
++
++// DisableLiveCollection runs before any checkpoint that may resume a new disk
++// base under the same execution identity. That flow is outside Launchpad's
++// filesystem-only in-place protocol. Refuse online reclamation thereafter rather
++// than invent a base from a possibly lost RPC reply. Physical stop still releases
++// the roots. A create retry deliberately cannot re-enable this permission.
++func (s Store) DisableLiveCollection(ctx context.Context, team uuid.UUID, sandboxID string) error {
++	_, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	if _, err := tx.Exec(ctx, `UPDATE public.sandbox_execution_build_roots SET collect_while_live=false
++     WHERE team_id=$1 AND sandbox_id=$2`, team, sandboxID); err != nil {
++		return err
++	}
++	return tx.Commit(ctx)
++}
+diff --git a/packages/db/pkg/executions/store_test.go b/packages/db/pkg/executions/store_test.go
+--- a/packages/db/pkg/executions/store_test.go
++++ b/packages/db/pkg/executions/store_test.go
+@@ -20,12 +20,13 @@
+ 	team := testutils.CreateTestTeam(t, db)
+ 	other := testutils.CreateTestTeam(t, db)
+ 	store := executions.Store{DB: db.SqlcClient}
++	buildID := uuid.New()
+ 	first := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "node-a"}
+-	require.NoError(t, store.Register(t.Context(), first))
+-	require.NoError(t, store.Register(t.Context(), first))
++	require.NoError(t, store.Register(t.Context(), first, buildID, true))
++	require.NoError(t, store.Register(t.Context(), first, buildID, true))
+ 	second := first
+ 	second.NodeID = "node-b"
+-	require.NoError(t, store.Register(t.Context(), second))
++	require.NoError(t, store.Register(t.Context(), second, buildID, true))
+ 	_, err := store.BeginStop(t.Context(), other, first.SandboxID)
+ 	require.ErrorIs(t, err, pgx.ErrNoRows)
+ 	_, err = store.BeginStop(t.Context(), team, "unknown")
+@@ -34,7 +35,7 @@
+ 	require.NoError(t, err)
+ 	require.Len(t, attempts, 2)
+ 	reopened := executions.Store{DB: db.SqlcClient}
+-	require.ErrorIs(t, reopened.Register(t.Context(), first), executions.ErrFenced)
++	require.ErrorIs(t, reopened.Register(t.Context(), first, buildID, true), executions.ErrFenced)
+ 	published := false
+ 	require.ErrorIs(t, reopened.Publish(t.Context(), team, first.SandboxID, func() error { published = true; return nil }), executions.ErrFenced)
+ 	require.False(t, published, "a late create reply must not republish a stopped VM")
+@@ -46,21 +47,21 @@
+ 	require.NoError(t, err)
+ 	require.Equal(t, attempts, replay)
+ 	second.ExecutionID = uuid.New()
+-	require.ErrorIs(t, reopened.Register(t.Context(), second), executions.ErrFenced)
++	require.ErrorIs(t, reopened.Register(t.Context(), second, buildID, true), executions.ErrFenced)
+ 
+ 	// Stop races admission. Every registration that wins must be in the stop
+ 	// host list; a registration that loses must fail before the create RPC.
+ 	raced := first
+ 	raced.SandboxID = uuid.NewString()
+ 	raced.ExecutionID = uuid.New()
+-	require.NoError(t, store.Register(t.Context(), raced))
++	require.NoError(t, store.Register(t.Context(), raced, buildID, true))
+ 	next := raced
+ 	next.NodeID = "node-race"
+ 	ready := make(chan struct{})
+ 	var group sync.WaitGroup
+ 	var registerErr, stopErr error
+ 	var captured []queries.SandboxExecutionAttempt
+-	group.Go(func() { <-ready; registerErr = store.Register(context.Background(), next) })
++	group.Go(func() { <-ready; registerErr = store.Register(context.Background(), next, buildID, true) })
+ 	group.Go(func() { <-ready; captured, stopErr = store.BeginStop(context.Background(), team, raced.SandboxID) })
+ 	close(ready)
+ 	group.Wait()
+@@ -75,7 +76,7 @@
+ 	publication := first
+ 	publication.SandboxID = uuid.NewString()
+ 	publication.ExecutionID = uuid.New()
+-	require.NoError(t, store.Register(t.Context(), publication))
++	require.NoError(t, store.Register(t.Context(), publication, buildID, true))
+ 	entered := make(chan struct{})
+ 	release := make(chan struct{})
+ 	done := make(chan error, 1)
+@@ -91,3 +92,25 @@
+ 	require.ErrorIs(t, store.Publish(t.Context(), team, publication.SandboxID, func() error { t.Fatal("fenced publication executed"); return nil }), executions.ErrFenced)
+ 
+ }
++
++func TestExecutionBuildPinsAreImmutableAndLegacyAttemptsStayUnknown(t *testing.T) {
++	db := testutils.SetupDatabase(t)
++	team := testutils.CreateTestTeam(t, db)
++	store := executions.Store{DB: db.SqlcClient}
++	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "host"}
++	build := uuid.New()
++	require.Error(t, store.Register(t.Context(), p, uuid.Nil, true))
++	require.NoError(t, store.Register(t.Context(), p, build, true))
++	require.NoError(t, store.Register(t.Context(), p, build, true))
++	require.ErrorIs(t, store.Register(t.Context(), p, uuid.New(), true), executions.ErrBuildConflict)
++	// A restart must preserve the same exact build, not infer it from Redis or a new caller.
++	reopened := executions.Store{DB: db.SqlcClient}
++	require.NoError(t, reopened.Register(t.Context(), p, build, true))
++	legacy := p
++	legacy.ExecutionID = uuid.New()
++	require.NoError(t, db.SqlcClient.InsertExecutionAttempt(t.Context(), legacy))
++	require.ErrorIs(t, reopened.Register(t.Context(), legacy, build, true), executions.ErrBuildConflict)
++	attempts, err := store.BeginStop(t.Context(), team, p.SandboxID)
++	require.NoError(t, err)
++	require.Len(t, attempts, 2, "unknown legacy attempts must still be physically stopped")
++}
+diff --git a/packages/orchestrator/pkg/localupload/build_retirement_linux_test.go b/packages/orchestrator/pkg/localupload/build_retirement_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/orchestrator/pkg/localupload/build_retirement_linux_test.go
+@@ -0,0 +1,29 @@
++//go:build linux
++
++package localupload
++
++import (
++	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestSignedUploadCannotRecreateRetiredBuild(t *testing.T) {
++	handler, base, key := newTestHandler(t)
++	id := uuid.New()
++	path := id.String() + "/rootfs"
++	store, err := storage.NewProvider(t.Context(), storage.Spec{Provider: storage.LocalStorageProvider, BasePath: base})
++	require.NoError(t, err)
++	require.NoError(t, storage.RetireBuildObjects(t.Context(), store, id))
++	request := httptest.NewRequest(http.MethodPut, signedURL(t, key, path, time.Minute), strings.NewReader("late upload"))
++	response := httptest.NewRecorder()
++	handler.ServeHTTP(response, request)
++	require.Equal(t, http.StatusConflict, response.Code)
++	_, err = store.OpenBlob(t.Context(), path)
++	require.ErrorIs(t, err, storage.ErrBuildRetired)
++}
+diff --git a/packages/orchestrator/pkg/localupload/handler.go b/packages/orchestrator/pkg/localupload/handler.go
+--- a/packages/orchestrator/pkg/localupload/handler.go
++++ b/packages/orchestrator/pkg/localupload/handler.go
+@@ -66,6 +66,12 @@
+ 		return
+ 	}
+ 
++	release, err := storage.AcquireLocalBuildWrite(r.Context(), h.basePath, path)
++	if err != nil {
++		http.Error(w, "immutable build upload refused", http.StatusConflict)
++		return
++	}
++	defer release()
+ 	fullPath := filepath.Join(h.basePath, path)
+ 
+ 	// Create parent directories
+diff --git a/packages/orchestrator/pkg/template/template/collection.go b/packages/orchestrator/pkg/template/template/collection.go
+--- a/packages/orchestrator/pkg/template/template/collection.go
++++ b/packages/orchestrator/pkg/template/template/collection.go
+@@ -41,7 +41,7 @@
+ 			return deleted, err
+ 		}
+ 		// The trailing separator excludes another key sharing the UUID prefix.
+-		if err := store.DeleteObjectsWithPrefix(ctx, id.String()+"/"); err != nil {
++		if err := storage.RetireBuildObjects(ctx, store, id); err != nil {
+ 			return deleted, fmt.Errorf("delete build %s: %w", id, err)
+ 		}
+ 		deleted = append(deleted, id)
+diff --git a/packages/orchestrator/pkg/template/template/collection_test.go b/packages/orchestrator/pkg/template/template/collection_test.go
+--- a/packages/orchestrator/pkg/template/template/collection_test.go
++++ b/packages/orchestrator/pkg/template/template/collection_test.go
+@@ -20,11 +20,12 @@
+ 	cancel  context.CancelFunc
+ }
+ 
+-func (s *collectionStorage) DeleteObjectsWithPrefix(ctx context.Context, prefix string) error {
++func (s *collectionStorage) RetireBuild(ctx context.Context, id uuid.UUID) error {
++	prefix := id.String() + "/"
+ 	if prefix == s.fail {
+ 		return errors.New("lost deletion reply")
+ 	}
+-	if err := s.StorageProvider.DeleteObjectsWithPrefix(ctx, prefix); err != nil {
++	if err := storage.RetireBuildObjects(ctx, s.StorageProvider, id); err != nil {
+ 		return err
+ 	}
+ 	s.deleted = append(s.deleted, prefix)
+diff --git a/packages/shared/pkg/storage/build_retirement.go b/packages/shared/pkg/storage/build_retirement.go
+new file mode 100644
+--- /dev/null
++++ b/packages/shared/pkg/storage/build_retirement.go
+@@ -0,0 +1,23 @@
++package storage
++
++import (
++	"context"
++	"errors"
++	"github.com/google/uuid"
++)
++
++var ErrBuildRetired = errors.New("immutable build has been physically retired")
++var ErrBuildRetirementUnsupported = errors.New("storage does not provide immutable build retirement")
++
++// RetireBuildObjects permanently rejects late writes before removing the exact
++// immutable UUID prefix. Only guarded local storage supports this protocol; a
++// plain prefix delete cannot stop an abandoned upload from recreating the data.
++func RetireBuildObjects(ctx context.Context, store StorageProvider, id uuid.UUID) error {
++	guarded, ok := store.(interface {
++		RetireBuild(context.Context, uuid.UUID) error
++	})
++	if !ok {
++		return ErrBuildRetirementUnsupported
++	}
++	return guarded.RetireBuild(ctx, id)
++}
+diff --git a/packages/shared/pkg/storage/build_retirement_linux.go b/packages/shared/pkg/storage/build_retirement_linux.go
+new file mode 100644
+--- /dev/null
++++ b/packages/shared/pkg/storage/build_retirement_linux.go
+@@ -0,0 +1,153 @@
++//go:build linux
++
++package storage
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/google/uuid"
++	"golang.org/x/sys/unix"
++)
++
++const buildGuardDirectory = ".launchpad-build-retirement"
++
++// AcquireLocalBuildWrite spans the entire object write, including atomic rename
++// and size sidecars. The returned release is required even on a failed upload.
++// It also guards directory creation by readers and signed local upload handlers.
++func AcquireLocalBuildWrite(ctx context.Context, basePath, key string) (func(), error) {
++	if !filepath.IsLocal(key) || filepath.Clean(key) != strings.TrimSuffix(key, "/") {
++		return nil, fmt.Errorf("invalid local object key")
++	}
++	first, _, _ := strings.Cut(key, "/")
++	id, err := uuid.Parse(first)
++	if err != nil || id.String() != first {
++		return func() {}, nil
++	}
++	lock, err := acquireBuildGuard(ctx, basePath, id, unix.LOCK_SH)
++	if err != nil {
++		return nil, err
++	}
++	marker := filepath.Join(basePath, buildGuardDirectory, id.String()+".retired")
++	info, err := os.Lstat(marker)
++	if err == nil {
++		lock.Close()
++		if !info.Mode().IsRegular() {
++			return nil, fmt.Errorf("invalid retirement record")
++		}
++		return nil, ErrBuildRetired
++	}
++	if !errors.Is(err, os.ErrNotExist) {
++		lock.Close()
++		return nil, err
++	}
++	return func() { lock.Close() }, nil
++}
++
++func acquireBuildGuard(ctx context.Context, basePath string, id uuid.UUID, mode int) (*os.File, error) {
++	dir := filepath.Join(basePath, buildGuardDirectory)
++	if err := os.MkdirAll(dir, 0700); err != nil {
++		return nil, err
++	}
++	info, err := os.Lstat(dir)
++	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
++		return nil, fmt.Errorf("invalid retirement directory")
++	}
++	descriptor, err := unix.Open(filepath.Join(dir, id.String()+".lock"), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
++	if err != nil {
++		return nil, err
++	}
++	lock := os.NewFile(uintptr(descriptor), "build guard")
++	info, err = lock.Stat()
++	if err != nil || !info.Mode().IsRegular() {
++		lock.Close()
++		return nil, fmt.Errorf("invalid build guard")
++	}
++	for {
++		if err := ctx.Err(); err != nil {
++			lock.Close()
++			return nil, err
++		}
++		err := unix.Flock(descriptor, mode|unix.LOCK_NB)
++		if err == nil {
++			return lock, nil
++		}
++		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
++			lock.Close()
++			return nil, err
++		}
++		timer := time.NewTimer(10 * time.Millisecond)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			lock.Close()
++			return nil, ctx.Err()
++		case <-timer.C:
++		}
++	}
++}
++
++func (s *fsStorage) RetireBuild(ctx context.Context, id uuid.UUID) error {
++	if id == uuid.Nil {
++		return fmt.Errorf("empty immutable build identity")
++	}
++	lock, err := acquireBuildGuard(ctx, s.basePath, id, unix.LOCK_EX)
++	if err != nil {
++		return err
++	}
++	defer lock.Close()
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	dir := filepath.Join(s.basePath, buildGuardDirectory)
++	marker := filepath.Join(dir, id.String()+".retired")
++	descriptor, err := unix.Open(marker, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
++	if err == nil {
++		f := os.NewFile(uintptr(descriptor), "build retirement")
++		syncErr := f.Sync()
++		closeErr := f.Close()
++		if syncErr != nil || closeErr != nil {
++			return errors.Join(syncErr, closeErr)
++		}
++	} else if !errors.Is(err, unix.EEXIST) {
++		return err
++	}
++	info, err := os.Lstat(marker)
++	if err != nil || !info.Mode().IsRegular() {
++		return fmt.Errorf("invalid retirement record")
++	}
++	// Retry must sync again after an earlier uncertain fsync. A durable tombstone
++	// precedes deletion, so a crash can leak bytes but cannot resurrect a build.
++	f, err := os.Open(marker)
++	if err != nil {
++		return err
++	}
++	err = f.Sync()
++	closeErr := f.Close()
++	if err != nil || closeErr != nil {
++		return errors.Join(err, closeErr)
++	}
++	parent, err := os.Open(dir)
++	if err != nil {
++		return err
++	}
++	err = parent.Sync()
++	closeErr = parent.Close()
++	if err != nil || closeErr != nil {
++		return errors.Join(err, closeErr)
++	}
++	if err := os.RemoveAll(s.getPath(id.String() + "/")); err != nil {
++		return err
++	}
++	parent, err = os.Open(s.basePath)
++	if err != nil {
++		return err
++	}
++	defer parent.Close()
++	return parent.Sync()
++}
+diff --git a/packages/shared/pkg/storage/build_retirement_linux_test.go b/packages/shared/pkg/storage/build_retirement_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/packages/shared/pkg/storage/build_retirement_linux_test.go
+@@ -0,0 +1,101 @@
++//go:build linux
++
++package storage
++
++import (
++	"context"
++	"errors"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++	"golang.org/x/sys/unix"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestRetiredBuildRejectsCachedBlobSeekableAndLateWrites(t *testing.T) {
++	base := t.TempDir()
++	id := uuid.New()
++	key := id.String() + "/rootfs"
++	store := newFileSystemStorage(base, "", nil)
++	blob, err := store.OpenBlob(t.Context(), key)
++	require.NoError(t, err)
++	require.NoError(t, blob.Put(t.Context(), []byte("disk")))
++	seekable, err := store.OpenSeekable(t.Context(), key)
++	require.NoError(t, err)
++	source := filepath.Join(t.TempDir(), "source")
++	require.NoError(t, os.WriteFile(source, []byte("late upload"), 0600))
++	require.NoError(t, RetireBuildObjects(t.Context(), store, id))
++	require.ErrorIs(t, blob.Put(t.Context(), []byte("late metadata")), ErrBuildRetired)
++	_, _, err = seekable.StoreFile(t.Context(), source)
++	require.ErrorIs(t, err, ErrBuildRetired)
++	_, err = store.OpenBlob(t.Context(), key)
++	require.ErrorIs(t, err, ErrBuildRetired)
++	_, err = store.OpenSeekable(t.Context(), key)
++	require.ErrorIs(t, err, ErrBuildRetired)
++	// A process restart or lost deletion reply never removes the permanent fence.
++	reopened := newFileSystemStorage(base, "", nil)
++	require.NoError(t, RetireBuildObjects(t.Context(), reopened, id))
++	_, err = reopened.OpenBlob(t.Context(), key)
++	require.ErrorIs(t, err, ErrBuildRetired)
++	_, err = os.Stat(filepath.Join(base, id.String()))
++	require.ErrorIs(t, err, os.ErrNotExist)
++}
++func TestRetirementWaitsForWholeWriteAndCancellationCannotDelete(t *testing.T) {
++	base := t.TempDir()
++	id := uuid.New()
++	key := id.String() + "/rootfs"
++	store := newFileSystemStorage(base, "", nil)
++	blob, err := store.OpenBlob(t.Context(), key)
++	require.NoError(t, err)
++	require.NoError(t, blob.Put(t.Context(), []byte("original")))
++	release, err := AcquireLocalBuildWrite(t.Context(), base, key)
++	require.NoError(t, err)
++	// A second process/provider opens the same kernel lock, not a process-local mutex.
++	descriptor, err := unix.Open(filepath.Join(base, buildGuardDirectory, id.String()+".lock"), unix.O_RDWR, 0)
++	require.NoError(t, err)
++	defer unix.Close(descriptor)
++	require.ErrorIs(t, unix.Flock(descriptor, unix.LOCK_EX|unix.LOCK_NB), unix.EWOULDBLOCK)
++	ctx, cancel := context.WithCancel(t.Context())
++	cancel()
++	require.ErrorIs(t, RetireBuildObjects(ctx, store, id), context.Canceled)
++	bytes, err := GetBlob(t.Context(), blob)
++	require.NoError(t, err)
++	require.Equal(t, "original", string(bytes))
++	release()
++	require.NoError(t, RetireBuildObjects(t.Context(), store, id))
++}
++func TestRetirementRecordsRejectSymlinksAndInvalidBuilds(t *testing.T) {
++	base := t.TempDir()
++	id := uuid.New()
++	key := id.String() + "/rootfs"
++	store := newFileSystemStorage(base, "", nil)
++	require.Error(t, RetireBuildObjects(t.Context(), store, uuid.Nil))
++	dir := filepath.Join(base, buildGuardDirectory)
++	require.NoError(t, os.Mkdir(dir, 0700))
++	target := filepath.Join(t.TempDir(), "untouched")
++	require.NoError(t, os.WriteFile(target, []byte("host file"), 0600))
++	require.NoError(t, os.Symlink(target, filepath.Join(dir, id.String()+".lock")))
++	_, err := store.OpenBlob(t.Context(), key)
++	require.Error(t, err)
++	require.Error(t, RetireBuildObjects(t.Context(), store, id))
++	bytes, err := os.ReadFile(target)
++	require.NoError(t, err)
++	require.Equal(t, "host file", string(bytes))
++}
++func TestRetirementMarkerPersistsAcrossFailedPrefixRemoval(t *testing.T) {
++	base := t.TempDir()
++	id := uuid.New()
++	store := newFileSystemStorage(base, "", nil)
++	// A persisted marker from an interrupted deletion is sufficient to reject a
++	// retrying uploader, even while the old prefix is still present.
++	dir := filepath.Join(base, buildGuardDirectory)
++	require.NoError(t, os.Mkdir(dir, 0700))
++	require.NoError(t, os.WriteFile(filepath.Join(dir, id.String()+".retired"), nil, 0600))
++	require.NoError(t, os.Mkdir(filepath.Join(base, id.String()), 0700))
++	_, err := AcquireLocalBuildWrite(t.Context(), base, id.String()+"/rootfs")
++	require.ErrorIs(t, err, ErrBuildRetired)
++	require.NoError(t, RetireBuildObjects(t.Context(), store, id))
++	_, err = os.Stat(filepath.Join(base, id.String()))
++	require.True(t, errors.Is(err, os.ErrNotExist))
++}
+diff --git a/packages/shared/pkg/storage/build_retirement_unsupported.go b/packages/shared/pkg/storage/build_retirement_unsupported.go
+new file mode 100644
+--- /dev/null
++++ b/packages/shared/pkg/storage/build_retirement_unsupported.go
+@@ -0,0 +1,20 @@
++//go:build !linux
++
++package storage
++
++import (
++	"context"
++	"github.com/google/uuid"
++)
++
++// Physical retirement is supported only on the pinned Linux E2B host. Ordinary
++// storage behavior on other platforms remains unchanged; collection refuses.
++func AcquireLocalBuildWrite(ctx context.Context, _, _ string) (func(), error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	return func() {}, nil
++}
++func (s *fsStorage) RetireBuild(context.Context, uuid.UUID) error {
++	return ErrBuildRetirementUnsupported
++}
+diff --git a/packages/shared/pkg/storage/compress_upload_test.go b/packages/shared/pkg/storage/compress_upload_test.go
+--- a/packages/shared/pkg/storage/compress_upload_test.go
++++ b/packages/shared/pkg/storage/compress_upload_test.go
+@@ -432,7 +432,7 @@
+ 				for range b.N {
+ 					outDir := b.TempDir()
+ 					outPath := filepath.Join(outDir, "output.dat")
+-					obj := &fsObject{path: outPath}
++					obj := &fsObject{path: outPath, basePath: filepath.Dir(outPath), key: filepath.Base(outPath)}
+ 
+ 					fullFT, _, err := obj.StoreFile(b.Context(), inputPath, WithCompressConfig(compCfg))
+ 					if err != nil {
+diff --git a/packages/shared/pkg/storage/storage_fs.go b/packages/shared/pkg/storage/storage_fs.go
+--- a/packages/shared/pkg/storage/storage_fs.go
++++ b/packages/shared/pkg/storage/storage_fs.go
+@@ -30,8 +30,10 @@
+ var _ StorageProvider = (*fsStorage)(nil)
+ 
+ type fsObject struct {
+-	path    string
+-	objType SeekableObjectType
++	basePath string
++	key      string
++	path     string
++	objType  SeekableObjectType
+ }
+ 
+ var (
+@@ -72,7 +74,12 @@
+ 	return UploadURL{URL: u}, nil
+ }
+ 
+-func (s *fsStorage) OpenSeekable(_ context.Context, path string) (Seekable, error) {
++func (s *fsStorage) OpenSeekable(ctx context.Context, path string) (Seekable, error) {
++	release, err := AcquireLocalBuildWrite(ctx, s.basePath, path)
++	if err != nil {
++		return nil, err
++	}
++	defer release()
+ 	dir := filepath.Dir(s.getPath(path))
+ 	if err := os.MkdirAll(dir, 0o755); err != nil {
+ 		return nil, err
+@@ -81,18 +88,25 @@
+ 	objType, _ := seekableObjectType(path)
+ 
+ 	return &fsObject{
++		basePath: s.basePath, key: path,
+ 		path:    s.getPath(path),
+ 		objType: objType,
+ 	}, nil
+ }
+ 
+-func (s *fsStorage) OpenBlob(_ context.Context, path string) (Blob, error) {
++func (s *fsStorage) OpenBlob(ctx context.Context, path string) (Blob, error) {
++	release, err := AcquireLocalBuildWrite(ctx, s.basePath, path)
++	if err != nil {
++		return nil, err
++	}
++	defer release()
+ 	dir := filepath.Dir(s.getPath(path))
+ 	if err := os.MkdirAll(dir, 0o755); err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	return &fsObject{
++		basePath: s.basePath, key: path,
+ 		path: s.getPath(path),
+ 	}, nil
+ }
+@@ -117,13 +131,23 @@
+ 	return n, err
+ }
+ 
+-func (o *fsObject) Put(_ context.Context, data []byte, _ ...PutOption) error {
+-	_, err := o.replaceFrom(bytes.NewReader(data))
++func (o *fsObject) Put(ctx context.Context, data []byte, _ ...PutOption) error {
++	release, err := AcquireLocalBuildWrite(ctx, o.basePath, o.key)
++	if err != nil {
++		return err
++	}
++	defer release()
++	_, err = o.replaceFrom(bytes.NewReader(data))
+ 
+ 	return err
+ }
+ 
+ func (o *fsObject) StoreFile(ctx context.Context, path string, opts ...PutOption) (*FullFrameTable, [32]byte, error) {
++	release, err := AcquireLocalBuildWrite(ctx, o.basePath, o.key)
++	if err != nil {
++		return nil, [32]byte{}, err
++	}
++	defer release()
+ 	putOpts := ApplyPutOptions(opts)
+ 	cfg := CompressConfigFromOpts(putOpts)
+ 	if cfg.IsCompressionEnabled() {
+diff --git a/spec/openapi.yml b/spec/openapi.yml
+--- a/spec/openapi.yml
++++ b/spec/openapi.yml
+@@ -293,7 +293,7 @@
+           $ref: '#/components/schemas/Sandbox'
+     LaunchpadRuntimeCapabilities:
+       type: object
+-      required: [version, diskRestore, renewableLifetime, quiescedSnapshots, buildCollectionAdmission]
++      required: [version, diskRestore, renewableLifetime, quiescedSnapshots, buildCollectionAdmission, executionBuildRoots, liveBuildCollection]
+       properties:
+         version:
+           type: integer
+@@ -304,6 +304,10 @@
+         quiescedSnapshots:
+           type: boolean
+         buildCollectionAdmission:
++          type: boolean
++        executionBuildRoots:
++          type: boolean
++        liveBuildCollection:
+           type: boolean
+     Rig:
+       description: An orchestrator node pool backed by one cloud scaling group

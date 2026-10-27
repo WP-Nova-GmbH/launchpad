@@ -1,0 +1,141 @@
+diff --git a/packages/db/pkg/executions/store.go b/packages/db/pkg/executions/store.go
+--- a/packages/db/pkg/executions/store.go
++++ b/packages/db/pkg/executions/store.go
+@@ -149,3 +149,24 @@
+ 	}
+ 	return tx.Commit(ctx)
+ }
++
++// CleanupStoppedSnapshot removes the resume record only after the permanent
++// physical-stop receipt. Replays repair cleanup missed before an API restart.
++func (s Store) CleanupStoppedSnapshot(ctx context.Context, team uuid.UUID, sandboxID string) error {
++	db, tx, err := s.DB.WithTx(ctx)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback(context.WithoutCancel(ctx))
++	state, err := db.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
++	if err != nil {
++		return err
++	}
++	if state != "stopped" {
++		return ErrFenced
++	}
++	if _, err := tx.Exec(ctx, "DELETE FROM public.snapshots WHERE team_id=$1 AND sandbox_id=$2", team, sandboxID); err != nil {
++		return err
++	}
++	return tx.Commit(ctx)
++}
+diff --git a/packages/api/internal/handlers/launchpad_execution.go b/packages/api/internal/handlers/launchpad_execution.go
+--- a/packages/api/internal/handlers/launchpad_execution.go
++++ b/packages/api/internal/handlers/launchpad_execution.go
+@@ -28,6 +28,10 @@
+ 	// registry tombstone already prevents all later managed starts/resumes.
+ 	state, err := a.sqlcDB.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: team, SandboxID: sandboxID})
+ 	if err == nil && state == "stopped" {
++		if err := (executions.Store{DB: a.sqlcDB}).CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
++			a.sendAPIStoreError(c, 503, "Stopped snapshot cleanup is incomplete")
++			return
++		}
+ 		c.JSON(http.StatusOK, gin.H{"sandboxID": sandboxID, "physicallyStopped": true})
+ 		return
+ 	}
+@@ -62,6 +66,10 @@
+ 		a.sendAPIStoreError(c, 503, "Physical stop receipt could not be saved")
+ 		return
+ 	}
++	if err := (executions.Store{DB: a.sqlcDB}).CleanupStoppedSnapshot(ctx, team, sandboxID); err != nil {
++		a.sendAPIStoreError(c, 503, "Stopped snapshot cleanup is incomplete")
++		return
++	}
+ 	c.JSON(http.StatusOK, gin.H{"sandboxID": sandboxID, "physicallyStopped": true})
+ }
+ 
+diff --git a/packages/db/pkg/buildretention/store_test.go b/packages/db/pkg/buildretention/store_test.go
+--- a/packages/db/pkg/buildretention/store_test.go
++++ b/packages/db/pkg/buildretention/store_test.go
+@@ -253,8 +253,20 @@
+ 		require.Contains(t, c.Candidates, failed.BuildID)
+ 		return nil
+ 	}))
+-	// Positive stop cleanup deletes the snapshot record; soft deletion alone did not.
+-	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "DELETE FROM public.snapshots WHERE sandbox_id=$1", sandbox))
++	// Only a positive permanent stop permits removing the resume record.
++	registry := executions.Store{DB: db.SqlcClient}
++	require.Error(t, registry.CleanupStoppedSnapshot(t.Context(), team, sandbox))
++	require.NoError(t, registry.Register(t.Context(), queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: sandbox, ExecutionID: uuid.New(), NodeID: "test-node"}, boot, true))
++	require.ErrorIs(t, registry.CleanupStoppedSnapshot(t.Context(), team, sandbox), executions.ErrFenced)
++	_, err = registry.BeginStop(t.Context(), team, sandbox)
++	require.NoError(t, err)
++	require.ErrorIs(t, registry.CleanupStoppedSnapshot(t.Context(), team, sandbox), executions.ErrFenced)
++	n, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: sandbox})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, n)
++	require.Error(t, registry.CleanupStoppedSnapshot(t.Context(), uuid.New(), sandbox))
++	require.NoError(t, registry.CleanupStoppedSnapshot(t.Context(), team, sandbox))
++	require.NoError(t, registry.CleanupStoppedSnapshot(t.Context(), team, sandbox))
+ 	require.NoError(t, WithPinnedCatalog(t.Context(), db.SqlcClient, func(c Catalog) error {
+ 		require.ElementsMatch(t, []uuid.UUID{boot}, c.Roots)
+ 		return nil
+diff --git a/packages/api/internal/handlers/launchpad_execution_test.go b/packages/api/internal/handlers/launchpad_execution_test.go
+--- a/packages/api/internal/handlers/launchpad_execution_test.go
++++ b/packages/api/internal/handlers/launchpad_execution_test.go
+@@ -4,12 +4,14 @@
+ 	"context"
+ 	"errors"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/e2b-dev/infra/packages/db/pkg/executions"
+ 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
+ 	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
+ 	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5/pgtype"
+ 	"github.com/stretchr/testify/require"
+ 	"google.golang.org/grpc"
+ )
+@@ -76,10 +78,29 @@
+ 	team := testutils.CreateTestTeam(t, db)
+ 	other := testutils.CreateTestTeam(t, db)
+ 	store := executions.Store{DB: db.SqlcClient}
+-	buildID := uuid.New()
++	base := testutils.CreateTestTemplate(t, db, team)
++	buildID := testutils.CreateTestBuild(t, t.Context(), db, base, "uploaded")
+ 	p := queries.InsertExecutionAttemptParams{TeamID: team, SandboxID: uuid.NewString(), ExecutionID: uuid.New(), ClusterID: uuid.Nil, NodeID: "offline-host"}
+ 	require.NoError(t, store.Register(t.Context(), p, buildID, true))
+-	_, err := store.BeginStop(t.Context(), team, p.SandboxID)
++	snapshot, err := db.SqlcClient.UpsertSnapshot(t.Context(), queries.UpsertSnapshotParams{
++		TemplateID: "paused-" + uuid.NewString(), TeamID: team, SandboxID: p.SandboxID,
++		BaseTemplateID: base, StartedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
++		OriginNodeID: "offline-host", Vcpu: 2, RamMb: 2048, FreeDiskSizeMb: 512,
++		KernelVersion: "6.1.0", FirecrackerVersion: "1.4.0", Status: "building", SourceBuildID: buildID,
++	})
++	require.NoError(t, err)
++	require.NoError(t, db.SqlcClient.UpdateEnvBuildStatus(t.Context(), queries.UpdateEnvBuildStatusParams{BuildID: snapshot.BuildID, Status: "uploaded"}))
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(), "UPDATE public.envs SET deleted_at=now() WHERE id=$1", snapshot.TemplateID))
++	checkSnapshots := func(expected int) {
++		_, tx, err := db.SqlcClient.WithTx(t.Context())
++		require.NoError(t, err)
++		defer tx.Rollback(context.WithoutCancel(t.Context()))
++		var count int
++		require.NoError(t, tx.QueryRow(t.Context(), "SELECT count(*) FROM public.snapshots WHERE team_id=$1 AND sandbox_id=$2", team, p.SandboxID).Scan(&count))
++		require.Equal(t, expected, count)
++	}
++	checkSnapshots(1)
++	_, err = store.BeginStop(t.Context(), team, p.SandboxID)
+ 	require.NoError(t, err)
+ 	n, err := db.SqlcClient.ConfirmExecutionStopped(t.Context(), queries.ConfirmExecutionStoppedParams{TeamID: team, SandboxID: p.SandboxID})
+ 	require.NoError(t, err)
+@@ -91,6 +112,11 @@
+ 	server.StopLaunchpadExecution(ctx, p.SandboxID)
+ 	require.Equal(t, 200, response.Code)
+ 	require.JSONEq(t, `{"sandboxID":"`+p.SandboxID+`","physicallyStopped":true}`, response.Body.String())
++	checkSnapshots(0)
++	ctx, response = restoreHTTPContext(t, team, nil)
++	server.StopLaunchpadExecution(ctx, p.SandboxID)
++	require.Equal(t, 200, response.Code)
++
+ 	ctx, response = restoreHTTPContext(t, other, nil)
+ 	server.StopLaunchpadExecution(ctx, p.SandboxID)
+ 	require.Equal(t, 404, response.Code)

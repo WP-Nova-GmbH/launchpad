@@ -133,6 +133,10 @@ export function useManagedRelayDevices() {
   };
 }
 
+export function refreshManagedRelayOrganizationCatalog(accountId: string): void {
+  managedRelayOrganizationCatalogQueryManager.refresh(appAtomRegistry, accountId);
+}
+
 export function useManagedRelayOrganizationCatalog() {
   const session = useAtomValue(managedRelaySessionAtom);
   const accountId = session?.accountId ?? null;
@@ -151,7 +155,7 @@ export function useManagedRelayOrganizationCatalog() {
   }, [snapshot.error, snapshot.errorTraceId]);
   const refresh = useCallback(() => {
     if (accountId) {
-      managedRelayOrganizationCatalogQueryManager.refresh(appAtomRegistry, accountId);
+      refreshManagedRelayOrganizationCatalog(accountId);
     }
   }, [accountId]);
 

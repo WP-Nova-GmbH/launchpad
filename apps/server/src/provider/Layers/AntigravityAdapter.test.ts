@@ -320,6 +320,25 @@ const layer = ServerConfig.layerTest(process.cwd(), {
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
 it.layer(layer)("AntigravityAdapter", (it) => {
+  it.effect("rejects missing local approval and user-input callbacks before native dispatch", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      const calls = h.calls.slice();
+      for (const response of [
+        h.adapter.respondToRequest(threadId, ApprovalRequestId.make("missing"), "accept"),
+        h.adapter.respondToUserInput(threadId, ApprovalRequestId.make("missing"), {}),
+      ])
+        expect((yield* Effect.flip(response))._tag).toBe("ProviderAdapterValidationError");
+      expect(h.calls).toEqual(calls);
+      yield* h.adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect(
     "runs native auth, resume, models, commands, and streaming through the ACP transport",
     () =>

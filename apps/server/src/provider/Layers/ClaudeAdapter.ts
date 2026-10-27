@@ -10,6 +10,8 @@
 
 import { validateTurnDelivery } from "../turnDelivery.ts";
 import * as NodeUtil from "node:util";
+import * as NodeCrypto from "node:crypto";
+import { makeClaudeNativeProcess, type ClaudeNativeProcess } from "./ClaudeNativeProcess.ts";
 import {
   type CanUseTool,
   query,
@@ -77,6 +79,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Semaphore from "effect/Semaphore";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
@@ -411,6 +414,7 @@ function rememberPendingTaskModel(
 interface ClaudeSessionContext {
   session: ProviderSession;
   startInput: Parameters<ClaudeAdapterShape["startSession"]>[0];
+  startOptions: Parameters<ClaudeAdapterShape["startSession"]>[1];
   readonly turnStartMessageIds: Array<string | null>;
   readonly promptQueue: Queue.Queue<PromptQueueItem>;
   readonly query: ClaudeQueryRuntime;
@@ -456,6 +460,9 @@ interface ClaudeSessionContext {
   /** Limits already announced for the running turn, keyed `window:resetsAt`. */
   announcedUsageLimits: { turnId: string; keys: Set<string> } | undefined;
   stopped: boolean;
+  readonly stopLock: Semaphore.Semaphore;
+  readonly runtimeEpisode: string;
+  readonly nativeProcess: ClaudeNativeProcess;
 }
 
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
@@ -463,11 +470,13 @@ interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
   readonly setPermissionMode: (mode: PermissionMode) => Promise<void>;
   readonly setMaxThinkingTokens: (maxThinkingTokens: number | null) => Promise<void>;
   readonly close: () => void;
+  readonly return?: () => Promise<IteratorResult<SDKMessage, void>>;
 }
 
 export interface ClaudeAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly createNativeProcess?: (threadId: ThreadId) => Effect.Effect<ClaudeNativeProcess>;
   readonly createQuery?: (input: {
     readonly prompt: AsyncIterable<SDKUserMessage>;
     readonly options: ClaudeQueryOptions;
@@ -2108,6 +2117,54 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }) as ClaudeQueryRuntime);
 
   const sessions = new Map<ThreadId, ClaudeSessionContext>();
+  const confirmedStops = new Map<string, ThreadId>();
+  const contextsByEpisode = new Map<string, ClaudeSessionContext>();
+  const pendingStarts = new Map<string, ThreadId>();
+  const acquiredProcesses = new Map<
+    string,
+    {
+      threadId: ThreadId;
+      process: ClaudeNativeProcess;
+      query?: ClaudeQueryRuntime;
+      promptQueue: Queue.Queue<PromptQueueItem>;
+    }
+  >();
+  const stopAcquiredProcess = Effect.fnUntraced(function* (episode: string) {
+    const acquired = acquiredProcesses.get(episode);
+    if (!acquired) return;
+    yield* acquired.process.stop;
+    if (acquired.query) {
+      yield* Effect.try({
+        try: () => acquired.query!.close(),
+        catch: (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: acquired.threadId,
+            detail: "Failed to dispose the original partially started Claude query.",
+            cause,
+          }),
+      });
+      yield* Queue.shutdown(acquired.promptQueue);
+      if (!acquired.query.return)
+        return yield* new ProviderAdapterProcessError({
+          provider: PROVIDER,
+          threadId: acquired.threadId,
+          detail: "Original query disposal receipt is unavailable.",
+        });
+      yield* Effect.tryPromise({
+        try: () => acquired.query!.return!(),
+        catch: (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: acquired.threadId,
+            detail: "The partially started query could not be disposed.",
+            cause,
+          }),
+      });
+    }
+    confirmedStops.set(episode, acquired.threadId);
+    acquiredProcesses.delete(episode);
+  });
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -2460,6 +2517,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return;
     }
     const nextThreadId = message.session_id;
+    if (
+      context.startOptions?.requireResume &&
+      context.resumeSessionId &&
+      context.resumeSessionId !== nextThreadId
+    )
+      return yield* new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "thread/resume",
+        detail: "Claude returned a different conversation than the required workflow history.",
+      });
     context.resumeSessionId = message.session_id;
     yield* updateResumeCursor(context);
 
@@ -4212,7 +4279,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           cause,
         }),
     ).pipe(
-      Stream.takeWhile(() => !context.stopped),
+      // Iterator disposal closes SDK stdin; keep draining until native stop owns that ordering.
+      Stream.filter(() => !context.stopped),
       Stream.runForEach((message) =>
         handleSdkMessage(context, message).pipe(
           Effect.mapError(
@@ -4265,109 +4333,138 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     context: ClaudeSessionContext,
     options?: { readonly emitExitEvent?: boolean },
   ) {
-    if (context.stopped) return;
+    return yield* context.stopLock.withPermit(
+      Effect.gen(function* () {
+        if (confirmedStops.get(context.runtimeEpisode) === context.session.threadId) return;
 
-    // Schedule process termination before any cleanup that can wait on the
-    // provider. The SDK closes stdin, then escalates from SIGTERM to SIGKILL.
-    yield* Effect.try({
-      try: () => context.query.close(),
-      catch: (cause) =>
-        new ProviderAdapterProcessError({
-          provider: PROVIDER,
-          threadId: context.session.threadId,
-          detail: "Failed to close Claude runtime query.",
-          cause,
-        }),
-    });
+        context.stopped = true;
+        // SDK cleanup can close the leader before Windows tree termination; native proof comes first.
+        yield* context.nativeProcess.stop;
+        yield* Effect.try({
+          try: () => context.query.close(),
+          catch: (cause) =>
+            new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: context.session.threadId,
+              detail: "Failed to close Claude runtime query.",
+              cause,
+            }),
+        });
 
-    context.stopped = true;
+        context.stopped = true;
 
-    for (const taskId of Array.from(context.liveTaskIds)) {
-      if (!context.liveTaskIds.delete(taskId)) {
-        continue;
-      }
-      const stamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        type: "task.completed",
-        eventId: stamp.eventId,
-        provider: PROVIDER,
-        createdAt: stamp.createdAt,
-        threadId: context.session.threadId,
-        ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
-        payload: {
-          taskId: RuntimeTaskId.make(taskId),
-          status: "stopped",
-          ...taskLinkageFor(context.taskAgents, taskId),
-        },
-        providerRefs: nativeProviderRefs(context),
-      });
-    }
+        for (const taskId of Array.from(context.liveTaskIds)) {
+          if (!context.liveTaskIds.delete(taskId)) {
+            continue;
+          }
+          const stamp = yield* makeEventStamp();
+          yield* offerRuntimeEvent({
+            type: "task.completed",
+            eventId: stamp.eventId,
+            provider: PROVIDER,
+            createdAt: stamp.createdAt,
+            threadId: context.session.threadId,
+            ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
+            payload: {
+              taskId: RuntimeTaskId.make(taskId),
+              status: "stopped",
+              ...taskLinkageFor(context.taskAgents, taskId),
+            },
+            providerRefs: nativeProviderRefs(context),
+          });
+        }
 
-    for (const [requestId, pending] of context.pendingApprovals) {
-      yield* Deferred.succeed(pending.decision, "cancel");
-      const stamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        type: "request.resolved",
-        eventId: stamp.eventId,
-        provider: PROVIDER,
-        createdAt: stamp.createdAt,
-        threadId: context.session.threadId,
-        ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
-        requestId: asRuntimeRequestId(requestId),
-        payload: {
-          requestType: pending.requestType,
-          decision: "cancel",
-        },
-        providerRefs: nativeProviderRefs(context),
-      });
-    }
-    context.pendingApprovals.clear();
+        for (const [requestId, pending] of context.pendingApprovals) {
+          yield* Deferred.succeed(pending.decision, "cancel");
+          const stamp = yield* makeEventStamp();
+          yield* offerRuntimeEvent({
+            type: "request.resolved",
+            eventId: stamp.eventId,
+            provider: PROVIDER,
+            createdAt: stamp.createdAt,
+            threadId: context.session.threadId,
+            ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
+            requestId: asRuntimeRequestId(requestId),
+            payload: {
+              requestType: pending.requestType,
+              decision: "cancel",
+            },
+            providerRefs: nativeProviderRefs(context),
+          });
+        }
+        context.pendingApprovals.clear();
 
-    // Same reason as the approvals above: a request nobody can answer any more
-    // must not stay open, or the thread can never be settled.
-    for (const pending of context.pendingUserInputs.values()) {
-      yield* pending.cancel;
-    }
+        // Same reason as the approvals above: a request nobody can answer any more
+        // must not stay open, or the thread can never be settled.
+        for (const pending of context.pendingUserInputs.values()) {
+          yield* pending.cancel;
+        }
 
-    if (context.turnState) {
-      yield* completeTurn(context, "interrupted", "Session stopped.");
-    }
+        if (context.turnState) {
+          yield* completeTurn(context, "interrupted", "Session stopped.");
+        }
 
-    yield* Queue.shutdown(context.promptQueue);
+        yield* Queue.shutdown(context.promptQueue);
 
-    const streamFiber = context.streamFiber;
-    context.streamFiber = undefined;
-    if (streamFiber && streamFiber.pollUnsafe() === undefined) {
-      yield* Fiber.interrupt(streamFiber);
-    }
+        const streamFiber = context.streamFiber;
+        context.streamFiber = undefined;
+        if (streamFiber && streamFiber.pollUnsafe() === undefined) {
+          yield* Fiber.interrupt(streamFiber);
+        }
 
-    const updatedAt = yield* nowIso;
-    context.session = {
-      ...context.session,
-      status: "closed",
-      activeTurnId: undefined,
-      updatedAt,
-    };
+        if (!context.query.return)
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: context.session.threadId,
+            detail: "The original Claude query cleanup receipt is unavailable.",
+          });
+        {
+          yield* Effect.tryPromise({
+            try: () => context.query.return!(),
+            catch: (cause) =>
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: context.session.threadId,
+                detail: "The original Claude query shutdown could not be confirmed.",
+                cause,
+              }),
+          });
+          confirmedStops.set(context.runtimeEpisode, context.session.threadId);
+          contextsByEpisode.delete(context.runtimeEpisode);
+          acquiredProcesses.delete(context.runtimeEpisode);
+        }
+        const updatedAt = yield* nowIso;
+        context.session = {
+          ...context.session,
+          status: "closed",
+          activeTurnId: undefined,
+          updatedAt,
+        };
 
-    if (options?.emitExitEvent !== false && sessions.get(context.session.threadId) === context) {
-      const stamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        type: "session.exited",
-        eventId: stamp.eventId,
-        provider: PROVIDER,
-        createdAt: stamp.createdAt,
-        threadId: context.session.threadId,
-        payload: {
-          reason: "Session stopped",
-          exitKind: "graceful",
-        },
-        providerRefs: {},
-      });
-    }
+        if (
+          options?.emitExitEvent !== false &&
+          sessions.get(context.session.threadId) === context
+        ) {
+          const stamp = yield* makeEventStamp();
+          yield* offerRuntimeEvent({
+            type: "session.exited",
+            eventId: stamp.eventId,
+            provider: PROVIDER,
+            createdAt: stamp.createdAt,
+            threadId: context.session.threadId,
+            payload: {
+              reason: "Session stopped",
+              exitKind: "graceful",
+            },
+            providerRefs: {},
+          });
+        }
 
-    if (sessions.get(context.session.threadId) === context) {
-      sessions.delete(context.session.threadId);
-    }
+        if (sessions.get(context.session.threadId) === context) {
+          sessions.delete(context.session.threadId);
+        }
+      }),
+    );
   });
 
   const requireSession = (
@@ -4393,8 +4490,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     return Effect.succeed(context);
   };
 
-  const startSession: ClaudeAdapterShape["startSession"] = Effect.fn("startSession")(
-    function* (input) {
+  const startSessionInternal = Effect.fn("startSession")(
+    function* (
+      input: Parameters<ClaudeAdapterShape["startSession"]>[0],
+      sessionOptions: Parameters<ClaudeAdapterShape["startSession"]>[1],
+      runtimeEpisode: string,
+    ) {
       const modelCatalog = yield* modelCatalogEffect;
       if (input.provider !== undefined && input.provider !== PROVIDER) {
         return yield* new ProviderAdapterValidationError({
@@ -4404,6 +4505,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         });
       }
 
+      const resumeState = readClaudeResumeState(input.resumeCursor);
+      if (sessionOptions?.requireResume && !resumeState?.resume)
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "startSession",
+          issue: "The required Claude conversation cursor is missing or malformed.",
+        });
+      pendingStarts.set(runtimeEpisode, input.threadId);
+      yield* sessionOptions?.beforeStart?.(runtimeEpisode) ?? Effect.void;
       const existingContext = sessions.get(input.threadId);
       if (existingContext) {
         yield* Effect.logWarning("claude.session.replacing", {
@@ -4417,7 +4527,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }
 
       const startedAt = yield* nowIso;
-      const resumeState = readClaudeResumeState(input.resumeCursor);
+
       const threadId = input.threadId;
       const existingResumeSessionId = resumeState?.resume;
       const newSessionId = existingResumeSessionId === undefined ? yield* randomUUIDv4 : undefined;
@@ -4913,10 +5023,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(input.cwd ? [input.cwd] : []),
         serverConfig.attachmentsDir,
       ];
+      const nativeProcess = yield* (
+        options?.createNativeProcess?.(threadId) ?? makeClaudeNativeProcess(threadId)
+      );
+      acquiredProcesses.set(runtimeEpisode, { threadId, process: nativeProcess, promptQueue });
       const queryOptions: ClaudeQueryOptions = {
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(apiModelId ? { model: apiModelId } : {}),
         pathToClaudeCodeExecutable: claudeBinaryPath,
+        spawnClaudeCodeProcess: (spawnOptions) => nativeProcess.spawn(spawnOptions),
         systemPrompt: {
           type: "preset",
           preset: "claude_code",
@@ -5008,6 +5123,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           }),
       });
 
+      const acquired = acquiredProcesses.get(runtimeEpisode)!;
+      acquired.query = queryRuntime;
       const session: ProviderSession = {
         threadId,
         provider: PROVIDER,
@@ -5033,6 +5150,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const context: ClaudeSessionContext = {
         session,
         startInput: input,
+        startOptions: sessionOptions,
         turnStartMessageIds: resumeState?.turnStartMessageIds
           ? [...resumeState.turnStartMessageIds]
           : Array.from({ length: resumeState?.turnCount ?? 0 }, () => null),
@@ -5061,9 +5179,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastThreadStartedId: undefined,
         announcedUsageLimits: undefined,
         stopped: false,
+        stopLock: yield* Semaphore.make(1),
+        runtimeEpisode,
+        nativeProcess,
       };
       yield* Ref.set(contextRef, context);
       sessions.set(threadId, context);
+      contextsByEpisode.set(runtimeEpisode, context);
+      pendingStarts.delete(runtimeEpisode);
 
       const sessionStartedStamp = yield* makeEventStamp();
       yield* offerRuntimeEvent({
@@ -5137,10 +5260,32 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...session,
       };
     },
+    (effect, input, _options, runtimeEpisode) =>
+      effect.pipe(
+        Effect.onError(() =>
+          Effect.gen(function* () {
+            if (pendingStarts.get(runtimeEpisode) !== input.threadId) return;
+            const context = contextsByEpisode.get(runtimeEpisode);
+            if (context) yield* stopSessionInternal(context).pipe(Effect.result);
+            else if (acquiredProcesses.has(runtimeEpisode))
+              yield* stopAcquiredProcess(runtimeEpisode).pipe(Effect.result);
+            else confirmedStops.set(runtimeEpisode, input.threadId);
+            pendingStarts.delete(runtimeEpisode);
+          }),
+        ),
+      ),
   );
+  const startSession: ClaudeAdapterShape["startSession"] = (input, sessionOptions) =>
+    Effect.suspend(() => startSessionInternal(input, sessionOptions, NodeCrypto.randomUUID()));
 
   const sendTurn: ClaudeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input, hooks) {
     const context = yield* requireSession(input.threadId);
+    // The startup hook owns every internal restart; policy refreshes only change resume strictness.
+    if (hooks?.sessionOptions?.requireResume !== undefined)
+      context.startOptions = {
+        ...context.startOptions,
+        requireResume: hooks.sessionOptions.requireResume,
+      };
     yield* validateTurnDelivery(
       PROVIDER,
       input,
@@ -5395,11 +5540,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         numTurns >= context.turnStartMessageIds.length
       ) {
         yield* stopSessionInternal(context, { emitExitEvent: false });
-        yield* startSession({
-          ...context.startInput,
-          runtimeMode: context.session.runtimeMode,
-          resumeCursor: undefined,
-        });
+        yield* startSession(
+          {
+            ...context.startInput,
+            runtimeMode: context.session.runtimeMode,
+            resumeCursor: undefined,
+          },
+          context.startOptions,
+        );
         return yield* snapshotThread(yield* requireSession(threadId));
       }
       const sessionId = context.resumeSessionId;
@@ -5545,17 +5693,20 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         retainedBoundaries.splice(0, retainedBoundaries.length, ...remappedBoundaries);
       }
       yield* stopSessionInternal(context, { emitExitEvent: false });
-      yield* startSession({
-        ...context.startInput,
-        runtimeMode: context.session.runtimeMode,
-        resumeCursor: fork
-          ? {
-              resume: fork.sessionId,
-              turnCount: retainedCount,
-              turnStartMessageIds: retainedBoundaries,
-            }
-          : undefined,
-      });
+      yield* startSession(
+        {
+          ...context.startInput,
+          runtimeMode: context.session.runtimeMode,
+          resumeCursor: fork
+            ? {
+                resume: fork.sessionId,
+                turnCount: retainedCount,
+                turnStartMessageIds: retainedBoundaries,
+              }
+            : undefined,
+        },
+        context.startOptions,
+      );
       const restarted = yield* requireSession(threadId);
       restarted.turns.push(...retainedTurns);
       return yield* snapshotThread(restarted);
@@ -5567,10 +5718,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const context = yield* requireSession(threadId);
       const pending = context.pendingApprovals.get(requestId);
       if (!pending) {
-        return yield* new ProviderAdapterRequestError({
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          method: "item/requestApproval/decision",
-          detail: `Unknown pending approval request: ${requestId}`,
+          operation: "respondToRequest",
+          issue: `Unknown pending approval request: ${requestId}`,
         });
       }
 
@@ -5585,10 +5736,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     const context = yield* requireSession(threadId);
     const pending = context.pendingUserInputs.get(requestId);
     if (!pending) {
-      return yield* new ProviderAdapterRequestError({
+      return yield* new ProviderAdapterValidationError({
         provider: PROVIDER,
-        method: "item/tool/respondToUserInput",
-        detail: `Unknown pending user-input request: ${requestId}`,
+        operation: "respondToUserInput",
+        issue: `Unknown pending user-input request: ${requestId}`,
       });
     }
 
@@ -5596,17 +5747,41 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     yield* Deferred.succeed(pending.answers, answers);
   });
 
-  const stopSession: ClaudeAdapterShape["stopSession"] = Effect.fn("stopSession")(
-    function* (threadId) {
-      const context = yield* requireSession(threadId);
-      yield* stopSessionInternal(context, {
-        emitExitEvent: true,
+  const stopSession: ClaudeAdapterShape["stopSession"] = (threadId, runtimeEpisode) =>
+    Effect.gen(function* () {
+      const context = runtimeEpisode
+        ? contextsByEpisode.get(runtimeEpisode)
+        : sessions.get(threadId);
+      if (context && context.session.threadId === threadId) {
+        yield* stopSessionInternal(context);
+        return;
+      }
+      if (!runtimeEpisode) return;
+      if (pendingStarts.get(runtimeEpisode) === threadId)
+        return yield* new ProviderAdapterProcessError({
+          provider: PROVIDER,
+          threadId,
+          detail: "The original native acquisition is still in progress.",
+        });
+      if (confirmedStops.get(runtimeEpisode) === threadId) return;
+      const acquired = acquiredProcesses.get(runtimeEpisode);
+      if (acquired?.threadId === threadId) {
+        yield* stopAcquiredProcess(runtimeEpisode);
+        return;
+      }
+      return yield* new ProviderAdapterProcessError({
+        provider: PROVIDER,
+        threadId,
+        detail: "The requested runtime episode is not available for cleanup.",
       });
-    },
-  );
+    });
 
   const listSessions: ClaudeAdapterShape["listSessions"] = () =>
-    Effect.sync(() => Array.from(sessions.values(), ({ session }) => ({ ...session })));
+    Effect.sync(() =>
+      Array.from(sessions.values())
+        .filter((context) => !context.stopped)
+        .map(({ session }) => ({ ...session })),
+    );
 
   const hasSession: ClaudeAdapterShape["hasSession"] = (threadId) =>
     Effect.sync(() => {
@@ -5629,11 +5804,22 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
   });
 
-  const stopAll: ClaudeAdapterShape["stopAll"] = () =>
-    stopSessions(Array.from(sessions.values()), true);
+  const stopAllInternal = Effect.fn("stopAllInternal")(function* (emitExitEvent: boolean) {
+    const results = [
+      yield* stopSessions(Array.from(contextsByEpisode.values()), emitExitEvent).pipe(
+        Effect.result,
+      ),
+    ];
+    for (const [episode] of acquiredProcesses) {
+      if (!contextsByEpisode.has(episode))
+        results.push(yield* stopAcquiredProcess(episode).pipe(Effect.result));
+    }
+    for (const result of results) if (result._tag === "Failure") return yield* result.failure;
+  });
+  const stopAll: ClaudeAdapterShape["stopAll"] = () => stopAllInternal(true);
 
   yield* Effect.addFinalizer(() =>
-    stopSessions(Array.from(sessions.values()), false).pipe(
+    stopAllInternal(false).pipe(
       Effect.catch((cause) =>
         Effect.logError("Failed to emit Claude session shutdown event.", { cause }),
       ),
@@ -5659,6 +5845,33 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     listSessions,
     hasSession,
     stopAll,
+    isSessionStopConfirmed: (threadId, episode) =>
+      Effect.sync(() =>
+        episode
+          ? !pendingStarts.has(episode) && confirmedStops.get(episode) === threadId
+          : !Array.from(pendingStarts.values()).includes(threadId) &&
+            !sessions.has(threadId) &&
+            Array.from(confirmedStops.values()).includes(threadId),
+      ),
+    getSessionRuntimeEpisode: (threadId) =>
+      Effect.sync(() => sessions.get(threadId)?.runtimeEpisode),
+    releaseSessionStopConfirmation: (threadId, episode) =>
+      Effect.sync(() => {
+        if (confirmedStops.get(episode) === threadId) confirmedStops.delete(episode);
+      }),
+    updateSessionOptions: (threadId, policy) =>
+      requireSession(threadId).pipe(
+        Effect.tap((context) =>
+          Effect.sync(() => {
+            if (policy.requireResume !== undefined)
+              context.startOptions = {
+                ...context.startOptions,
+                requireResume: policy.requireResume,
+              };
+          }),
+        ),
+        Effect.asVoid,
+      ),
     get streamEvents() {
       return Stream.fromQueue(runtimeEventQueue);
     },

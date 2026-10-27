@@ -90,6 +90,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   /** Environment owns durable shared prompt queues; ordinary sends must enqueue. */
   sharedPromptQueue: Schema.optionalKey(Schema.Boolean),
   sharedPreparation: Schema.optionalKey(Schema.Boolean),
+  /** Queued moves, including atomic insertion after already claimed work. */
+  threadMoves: Schema.optionalKey(Schema.Boolean),
   /** Organization repository grants are enforced on existing connections. */
   organizationRepositoryAccess: Schema.optionalKey(Schema.Boolean),
   /** Initial repository policy synchronization has completed. Relay outages do not reset it. */
@@ -169,6 +171,7 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   /** Server can stream self-update progress before acknowledging the
       restart. Clients fall back to server.updateServer when absent. */
   serverSelfUpdateProgress: Schema.optionalKey(Schema.Boolean),
+  agentSessionImportProgress: Schema.optionalKey(Schema.Boolean),
   /** Server can durably mark running provider turns before a self-update and
       continue them after the replacement process starts. */
   serverUpdateThreadContinuation: Schema.optionalKey(Schema.Boolean),
@@ -197,6 +200,8 @@ export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabi
 
 export const ExecutionEnvironmentDescriptor = Schema.Struct({
   environmentId: EnvironmentId,
+  /** This environment belongs exclusively to one VM thread and cannot receive other thread moves. */
+  threadVm: Schema.optionalKey(Schema.Struct({ threadId: ThreadId })),
   label: TrimmedNonEmptyString,
   platform: ExecutionEnvironmentPlatform,
   serverVersion: TrimmedNonEmptyString,

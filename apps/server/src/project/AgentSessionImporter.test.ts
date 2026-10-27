@@ -1,3 +1,4 @@
+import { threadExecutionTestLayerForDatabase } from "../provider/testUtils/threadExecutionTestLayer.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it, vi } from "@effect/vitest";
 import {
@@ -8,6 +9,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  type AgentSessionImportProgress,
   type OrchestrationCommand,
   type OrchestrationProjectShell,
   type OrchestrationThread,
@@ -30,6 +32,7 @@ import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import { OrchestrationEngineLive } from "../orchestration/Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "../orchestration/Layers/ProjectionPipeline.ts";
@@ -185,13 +188,17 @@ const runImport = (input: {
   readonly directory: ProviderSessionDirectory.ProviderSessionDirectory["Service"];
   readonly snapshots: ReturnType<typeof makeSnapshotsLayer>;
   readonly expectedWorkspaceRoot?: string;
+  readonly onProgress?: (progress: AgentSessionImportProgress) => Effect.Effect<void>;
 }) =>
-  importRecentAgentThreads({
-    projectId: PROJECT_ID,
-    ...(input.expectedWorkspaceRoot === undefined
-      ? {}
-      : { expectedWorkspaceRoot: input.expectedWorkspaceRoot }),
-  }).pipe(
+  importRecentAgentThreads(
+    {
+      projectId: PROJECT_ID,
+      ...(input.expectedWorkspaceRoot === undefined
+        ? {}
+        : { expectedWorkspaceRoot: input.expectedWorkspaceRoot }),
+    },
+    input.onProgress,
+  ).pipe(
     Effect.provideService(AgentSessionScanner.AgentSessionScanner, input.scanner),
     Effect.provideService(OrchestrationEngine.OrchestrationEngineService, input.engine),
     Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, input.directory),
@@ -203,6 +210,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
     it.effect("uses the project root and stores provider-specific resume cursors", () =>
       Effect.gen(function* () {
         const commands: Array<OrchestrationCommand> = [];
+        const progress: Array<AgentSessionImportProgress> = [];
         const bindings: Array<ProviderSessionDirectory.ProviderRuntimeBinding> = [];
         let scannedRoot: string | undefined;
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
@@ -214,6 +222,11 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
               Stream.fromEffect(
                 Effect.sync(() => {
                   expect(bindings).toHaveLength(1);
+                  expect(progress.at(-1)).toEqual({
+                    importedCount: 1,
+                    skippedCount: 0,
+                    reading: null,
+                  });
                   return makeThreadOutcome(makeThread("claudeAgent"));
                 }),
               ),
@@ -232,6 +245,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
           upsert: (binding) => Effect.sync(() => void bindings.push(binding)),
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.void,
           getBinding: () => Effect.succeedNone,
           listThreadIds: () => Effect.die("unused"),
@@ -244,9 +258,22 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
           directory,
           snapshots: makeSnapshotsLayer({ project: makeProject() }),
           expectedWorkspaceRoot: `${WORKSPACE_ROOT}/`,
+          onProgress: (event) =>
+            Effect.sync(() => {
+              // A visible imported count must mean its history and source identity have landed.
+              expect(
+                commands.filter((command) => command.type === "thread.history.import"),
+              ).toHaveLength(event.importedCount);
+              progress.push(event);
+            }),
         });
 
         expect(result).toEqual({ importedCount: 2, skippedCount: 0 });
+        expect(progress).toEqual([
+          { importedCount: 0, skippedCount: 0, reading: null },
+          { importedCount: 1, skippedCount: 0, reading: null },
+          { importedCount: 2, skippedCount: 0, reading: null },
+        ]);
         expect(scannedRoot).toBe(WORKSPACE_ROOT);
         expect(commands.map((command) => command.type)).toEqual([
           "thread.create",
@@ -337,6 +364,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
           upsert: () => Effect.die("must not bind a scanner skip"),
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.die("unused"),
           getBinding: () => Effect.die("must not read a scanner skip binding"),
           listThreadIds: () => Effect.die("unused"),
@@ -414,6 +442,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
             return Effect.void;
           },
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.void,
           getBinding: () =>
             Effect.succeed(bindings[0] === undefined ? Option.none() : Option.some(bindings[0])),
@@ -456,6 +485,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
           upsert: () => Effect.die("must not replace an active binding"),
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.void,
           getBinding: () => Effect.succeedSome(runningBinding),
           listThreadIds: () => Effect.die("unused"),
@@ -511,6 +541,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
           upsert: () => Effect.die("must not bind malformed or wrong-project sessions"),
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.die("unused"),
           getBinding: () => Effect.succeedNone,
           listThreadIds: () => Effect.die("unused"),
@@ -576,7 +607,7 @@ const integrationLayer = Layer.mergeAll(
   Layer.provide(OrchestrationEventStoreLive),
   Layer.provide(OrchestrationCommandReceiptRepositoryLive),
   Layer.provide(RepositoryIdentityResolver.layer),
-  Layer.provide(SqlitePersistenceMemory),
+  Layer.provideMerge(SqlitePersistenceMemory),
   Layer.provideMerge(integrationServerConfig),
   Layer.provideMerge(NodeServices.layer),
 );
@@ -866,6 +897,7 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
         const engine = yield* OrchestrationEngine.OrchestrationEngineService;
         const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
         const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const sql = yield* SqlClient.SqlClient;
         const fileSystem = yield* FileSystem.FileSystem;
         const workspaceRoot = yield* fileSystem.makeTempDirectoryScoped();
         const projectId = ProjectId.make(`project-import-resume-${source}`);
@@ -891,6 +923,8 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
             .pipe(Effect.tap(() => Deferred.succeed(turnSent, undefined))),
         );
         const providerLayer = makeProviderServiceLive().pipe(
+          Layer.provide(threadExecutionTestLayerForDatabase),
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
           Layer.provide(
             Layer.succeed(
               ProviderAdapterRegistry,

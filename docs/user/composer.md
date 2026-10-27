@@ -72,10 +72,14 @@ paused. Anyone with access can choose **Retry setup and resume**. To use the pro
 instead, stop setup, wait for it to finish stopping, then choose **Work locally**. Both actions
 keep the same thread and queued prompts. Reconnecting does not rerun an interrupted script.
 
-Deleting a thread waits for required setup to stop. If stopping fails, the thread stays visible
-and paused: choose **Stop setup** again, then **Delete** once it has stopped. A failed deletion
-will not finish automatically later. Deleting a project keeps all its threads if any setup
-cannot stop; threads already stopped remain paused.
+Deleting or archiving a thread waits for its setup programs to stop, including background
+previews left running after setup finished. If stopping fails, the thread stays visible and
+paused: choose **Stop setup** again, then retry Delete or Archive. A failed request will not
+finish automatically later. Deleting a project keeps all its threads if any setup cannot stop;
+threads already stopped remain paused.
+
+Restarting a setup terminal stops its setup programs and opens a fresh shell. It does not
+rerun setup; use **Retry setup and resume** when you want to run setup again.
 
 Setup scripts run in the background by default. A script configured to wait before the agent
 starts must exit successfully; a failed background script does not pause the queue.

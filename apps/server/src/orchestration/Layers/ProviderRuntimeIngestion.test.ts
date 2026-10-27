@@ -37,8 +37,16 @@ import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { it as effectIt } from "@effect/vitest";
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import {
+  ProviderEventBarrier,
+  type ProviderIngestionEvent,
+} from "../../provider/ProviderEventBarrier.ts";
+import { ProviderValidationError } from "../../provider/Errors.ts";
+import { OrchestrationCommandInvariantError } from "../Errors.ts";
+import { ThreadExecutionFenceError } from "../../persistence/ThreadExecutionFence.ts";
 
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
@@ -116,7 +124,7 @@ function isLegacyTurnCompletedEvent(
 function createProviderServiceHarness() {
   const runtimeEventPubSub = Effect.runSync(
     PubSub.unbounded<{
-      readonly events: ReadonlyArray<ProviderRuntimeEvent>;
+      readonly events: ReadonlyArray<ProviderIngestionEvent>;
       readonly enqueued?: Deferred.Deferred<void>;
     }>(),
   );
@@ -130,6 +138,7 @@ function createProviderServiceHarness() {
     interruptTurn: () => unsupported(),
     respondToRequest: () => unsupported(),
     respondToUserInput: () => unsupported(),
+    isWorkflowSessionStopConfirmed: () => Effect.succeed(false),
     stopSession: () => unsupported(),
     listSessions: () => Effect.succeed([...runtimeSessions]),
     getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
@@ -149,7 +158,22 @@ function createProviderServiceHarness() {
     },
     rollbackConversation: () => unsupported(),
     uploadFeedback: () => unsupported(),
+    flushRuntimeEvents: (threadId) =>
+      Effect.gen(function* () {
+        const done = yield* Deferred.make<void, ProviderValidationError>();
+        yield* PubSub.publish(runtimeEventPubSub, {
+          events: [new ProviderEventBarrier(threadId, done)],
+        });
+        yield* Deferred.await(done);
+      }),
     get streamEvents() {
+      return service.streamIngestionEvents!.pipe(
+        Stream.filter(
+          (event): event is ProviderRuntimeEvent => !(event instanceof ProviderEventBarrier),
+        ),
+      );
+    },
+    get streamIngestionEvents() {
       return Stream.fromPubSub(runtimeEventPubSub).pipe(
         Stream.flatMap(({ events, enqueued }) =>
           Stream.concat(
@@ -417,6 +441,28 @@ describe("ProviderRuntimeIngestion", () => {
 
     return {
       engine,
+      setOutputOwnership: (
+        generation: number,
+        phase: "active" | "draining" | "frozen" | "retired" = "active",
+      ) =>
+        testRuntime.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`INSERT INTO thread_execution_fences(thread_id,relay_url,environment_id,project_id,generation,operation_id,phase)
+            VALUES('thread-1','https://relay.example','test-environment','project-1',${generation},'checkout-test',${phase})
+            ON CONFLICT(thread_id) DO UPDATE SET generation=excluded.generation,phase=excluded.phase`;
+          }),
+        ),
+      setCheckoutReserved: (reserved: boolean) =>
+        testRuntime.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`INSERT INTO thread_checkout_claims(operation_id,thread_id,generation,project_id,repository_root,checkout_path,mode,manifest_sha256,workspace_sha256,inspection_json,phase)
+            VALUES('checkout-test','thread-1',2,'project-1',${workspaceRoot},${workspaceRoot},'main',${"a".repeat(64)},${"b".repeat(64)},'{}',${reserved ? "reserved" : "released"})
+            ON CONFLICT(operation_id) DO UPDATE SET phase=excluded.phase,release_reason=${reserved ? null : "activated"}`;
+            yield* sql`INSERT OR IGNORE INTO thread_checkout_claim_projects(operation_id,project_id) VALUES('checkout-test','project-1')`;
+          }),
+        ),
       dispatch,
       readModel: () => testRuntime.runPromise(snapshotQuery.getSnapshot()),
       readTurn: (turnId: TurnId) =>
@@ -432,6 +478,8 @@ describe("ProviderRuntimeIngestion", () => {
             .pipe(Effect.map(Option.getOrThrow)),
         ),
       emit: provider.emit,
+      flush: (threadId = asThreadId("thread-1")) =>
+        testRuntime.runPromise(provider.service.flushRuntimeEvents!(threadId)),
       advanceClock: (ms: number) => {
         clockOffsetMs += ms;
       },
@@ -441,6 +489,349 @@ describe("ProviderRuntimeIngestion", () => {
       drain,
     };
   }
+
+  it("confirms stopped output only after buffered text has been persisted", async () => {
+    const harness = await createHarness({ serverSettings: { responseStreamingMode: "paragraph" } });
+    const threadId = asThreadId("thread-1"),
+      turnId = asTurnId("receipt-turn");
+    const base = {
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      turnId,
+      createdAt: "2026-01-01T00:00:01Z",
+    };
+    harness.emit({ ...base, type: "turn.started", eventId: asEventId("receipt-start") });
+    harness.emit({
+      ...base,
+      type: "content.delta",
+      eventId: asEventId("receipt-text"),
+      itemId: asItemId("receipt-item"),
+      payload: { streamKind: "assistant_text", delta: "Saved before the move." },
+    });
+    harness.emit({
+      ...base,
+      type: "turn.aborted",
+      eventId: asEventId("receipt-stop"),
+      payload: { reason: "Moving" },
+    });
+    await harness.flush();
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.messages).toEqual([
+      expect.objectContaining({ text: "Saved before the move.", streaming: false, turnId }),
+    ]);
+    expect(thread?.session?.activeTurnId).toBeNull();
+  });
+
+  it("retains ordered stopped output through checkout rejection and ingests it before confirming the barrier", async () => {
+    const harness = await createHarness({ serverSettings: { responseStreamingMode: "turn" } });
+    await harness.setOutputOwnership(2);
+    await harness.setCheckoutReserved(true);
+    const threadId = asThreadId("thread-1"),
+      turnId = asTurnId("checkout-held-turn");
+    const base = {
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      turnId,
+      createdAt: "2026-01-01T00:00:01Z",
+    };
+    harness.emit({ ...base, type: "session.started", eventId: asEventId("checkout-held-session") });
+    harness.emit({ ...base, type: "turn.started", eventId: asEventId("checkout-held-start") });
+    harness.emit({
+      ...base,
+      type: "content.delta",
+      eventId: asEventId("checkout-held-text"),
+      itemId: asItemId("checkout-held-item"),
+      payload: { streamKind: "assistant_text", delta: "Durable stopped output." },
+    });
+    harness.emit({
+      ...base,
+      type: "turn.aborted",
+      eventId: asEventId("checkout-held-stop"),
+      payload: { reason: "Moving" },
+    });
+    harness.emit({
+      ...base,
+      type: "session.exited",
+      eventId: asEventId("checkout-held-exit"),
+      payload: { reason: "Stopped" },
+    });
+    await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+    await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+    expect((await harness.readModel()).threads.find((t) => t.id === threadId)?.messages).toEqual(
+      [],
+    );
+    await harness.setCheckoutReserved(false);
+    await harness.setOutputOwnership(2, "draining");
+    await harness.flush();
+    const thread = (await harness.readModel()).threads.find((t) => t.id === threadId);
+    expect(thread?.messages).toEqual([
+      expect.objectContaining({ text: "Durable stopped output.", streaming: false, turnId }),
+    ]);
+    expect(thread?.session).toMatchObject({ status: "stopped", activeTurnId: null });
+  });
+
+  it("retries captured commands after partial ingestion without replaying buffering or earlier effects", async () => {
+    const harness = await createHarness({ serverSettings: { responseStreamingMode: "turn" } });
+    const dispatch = harness.engine.dispatch;
+    const rejected = new Set<string>();
+    const spy = vi.spyOn(harness.engine, "dispatch").mockImplementation((command, options) => {
+      if (
+        (command.type === "thread.message.assistant.delta" ||
+          command.type === "thread.message.assistant.complete") &&
+        !rejected.has(command.type)
+      ) {
+        rejected.add(command.type);
+        return Effect.fail(
+          new ThreadExecutionFenceError({
+            threadId: "thread-1",
+            detail: "Checkout reserved before persistence",
+            ownership: null,
+          }),
+        );
+      }
+      return dispatch(command, options);
+    });
+    try {
+      const threadId = asThreadId("thread-1"),
+        turnId = asTurnId("partial-output-turn");
+      const base = {
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId,
+        createdAt: "2026-01-01T00:00:01Z",
+      };
+      harness.emit({ ...base, type: "turn.started", eventId: asEventId("partial-output-start") });
+      harness.emit({
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("partial-output-text"),
+        itemId: asItemId("partial-output-item"),
+        payload: { streamKind: "assistant_text", delta: "Exactly once." },
+      });
+      harness.emit({
+        ...base,
+        type: "turn.aborted",
+        eventId: asEventId("partial-output-stop"),
+        payload: { reason: "Moving" },
+      });
+      await harness.flush();
+      const thread = (await harness.readModel()).threads.find((t) => t.id === threadId);
+      expect(thread?.messages).toEqual([
+        expect.objectContaining({ text: "Exactly once.", streaming: false }),
+      ]);
+      for (const type of rejected) {
+        const commands = spy.mock.calls
+          .map(([command]) => command)
+          .filter((command) => command.type === type);
+        expect(commands).toHaveLength(2);
+        expect(commands[0]?.commandId).toBe(commands[1]?.commandId);
+        expect(commands[0]).toEqual(commands[1]);
+      }
+      const starts = spy.mock.calls
+        .map(([command]) => command)
+        .filter(
+          (command) =>
+            command.type === "thread.session.set" && command.session.status === "running",
+        );
+      expect(starts).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("resumes checkout-held output on the next provider event without needing a recovery flush", async () => {
+    const harness = await createHarness();
+    await harness.setOutputOwnership(2);
+    await harness.setCheckoutReserved(true);
+    const base = {
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("checkout-resumed-turn"),
+      createdAt: "2026-01-01T00:00:01Z",
+    };
+    harness.emit({
+      ...base,
+      type: "session.started",
+      eventId: asEventId("checkout-resumed-session"),
+    });
+    await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+    await harness.setCheckoutReserved(false);
+    await harness.emitAndDrain([
+      { ...base, type: "turn.started", eventId: asEventId("checkout-resumed-start") },
+      {
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("checkout-resumed-text"),
+        itemId: asItemId("checkout-resumed-item"),
+        payload: { streamKind: "assistant_text", delta: "First turn works." },
+      },
+      {
+        ...base,
+        type: "turn.aborted",
+        eventId: asEventId("checkout-resumed-stop"),
+        payload: { reason: "Moving" },
+      },
+    ]);
+    expect((await harness.readModel()).threads.find((t) => t.id === "thread-1")?.messages).toEqual([
+      expect.objectContaining({ text: "First turn works.", streaming: false }),
+    ]);
+  });
+
+  const verifyUnrelatedThreadStillIngests = async (
+    harness: Awaited<ReturnType<typeof createHarness>>,
+  ) => {
+    const createdAt = "2026-01-01T00:00:02Z";
+    await harness.dispatch({
+      type: "project.create",
+      commandId: CommandId.make("unrelated-project"),
+      projectId: asProjectId("project-2"),
+      title: "Unrelated Project",
+      workspaceRoot: makeTempDir("provider-unrelated-"),
+      defaultModelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+      createdAt,
+    });
+    await harness.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("unrelated-thread"),
+      threadId: asThreadId("thread-2"),
+      projectId: asProjectId("project-2"),
+      title: "Unrelated Thread",
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required",
+      branch: null,
+      worktreePath: null,
+      createdAt,
+    });
+    await harness.emitAndDrain([
+      {
+        type: "turn.started",
+        eventId: asEventId("unrelated-turn-start"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-2"),
+        turnId: asTurnId("unrelated-turn"),
+        createdAt,
+      },
+    ]);
+    await harness.flush(asThreadId("thread-2"));
+    expect(
+      (await harness.readModel()).threads.find((t) => t.id === "thread-2")?.session?.activeTurnId,
+    ).toBe("unrelated-turn");
+  };
+
+  for (const phase of ["frozen", "retired"] as const) {
+    it(`never holds initially ${phase} provider output even with a reserved checkout`, async () => {
+      const harness = await createHarness();
+      await harness.setOutputOwnership(2, phase);
+      await harness.setCheckoutReserved(true);
+      harness.emit({
+        type: "turn.started",
+        eventId: asEventId(`initial-${phase}`),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId(`initial-${phase}-turn`),
+        createdAt: "2026-01-01T00:00:01Z",
+      });
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+      await harness.setCheckoutReserved(false);
+      await harness.setOutputOwnership(2, "active");
+      await verifyUnrelatedThreadStillIngests(harness);
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+      expect(
+        (await harness.readModel()).threads.find((t) => t.id === "thread-1")?.session?.activeTurnId,
+      ).toBeNull();
+    });
+  }
+
+  for (const changed of ["generation", "frozen", "retired"] as const) {
+    it(`refuses held provider output after ownership becomes ${changed}`, async () => {
+      const harness = await createHarness();
+      await harness.setOutputOwnership(2);
+      await harness.setCheckoutReserved(true);
+      harness.emit({
+        type: "turn.started",
+        eventId: asEventId(`held-${changed}`),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId(`held-${changed}-turn`),
+        createdAt: "2026-01-01T00:00:01Z",
+      });
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+      await harness.setCheckoutReserved(false);
+      await harness.setOutputOwnership(
+        changed === "generation" ? 3 : 2,
+        changed === "generation" ? "active" : changed,
+      );
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+      expect(
+        (await harness.readModel()).threads.find((t) => t.id === "thread-1")?.session?.activeTurnId,
+      ).toBeNull();
+      await verifyUnrelatedThreadStillIngests(harness);
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+    });
+  }
+
+  it("refuses an output receipt when a previous provider event could not be persisted", async () => {
+    const harness = await createHarness();
+    const spy = vi.spyOn(harness.engine, "dispatch").mockImplementationOnce(() =>
+      Effect.fail(
+        new OrchestrationCommandInvariantError({
+          commandType: "thread.session.set",
+          detail: "Interrupted persistence",
+        }),
+      ),
+    );
+    try {
+      harness.emit({
+        type: "turn.started",
+        eventId: asEventId("failed-output"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("failed-output-turn"),
+        createdAt: "2026-01-01T00:00:01Z",
+      });
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+      spy.mockRestore();
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("clears an output failure only after that exact event is successfully replayed", async () => {
+    const harness = await createHarness();
+    const event = {
+      type: "turn.started" as const,
+      eventId: asEventId("replayed-output"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("replayed-output-turn"),
+      createdAt: "2026-01-01T00:00:01Z",
+    };
+    const spy = vi.spyOn(harness.engine, "dispatch").mockImplementationOnce(() =>
+      Effect.fail(
+        new OrchestrationCommandInvariantError({
+          commandType: "thread.session.set",
+          detail: "Interrupted persistence",
+        }),
+      ),
+    );
+    try {
+      harness.emit(event);
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+      spy.mockRestore();
+      await harness.emitAndDrain([{ ...event, eventId: asEventId("unrelated-output") }]);
+      await expect(harness.flush()).rejects.toMatchObject({ _tag: "ProviderValidationError" });
+      await harness.emitAndDrain([event]);
+      await harness.flush();
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === event.threadId,
+      );
+      expect(thread?.session?.activeTurnId).toBe(event.turnId);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 
   it("maps turn started/completed events into thread session updates", async () => {
     const harness = await createHarness();

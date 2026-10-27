@@ -1,0 +1,681 @@
+--- a/packages/orchestrator/orchestrator.proto
++++ b/packages/orchestrator/orchestrator.proto
+@@ -317,6 +317,7 @@
+ 
+ service SandboxService {
+   rpc StopExecution(StopExecutionRequest) returns (StopExecutionResponse);
++  rpc DiscardStoppedRestoreDisk(RestoreDiskActivateRequest) returns (google.protobuf.Empty);
+   rpc ReleaseRestoreDisk(RestoreDiskRequest) returns (google.protobuf.Empty);
+   rpc ActivateRestoreDisk(RestoreDiskActivateRequest) returns (SandboxCreateResponse);
+   rpc PrepareRestoreDisk(RestoreDiskPrepareRequest) returns (RestoreDiskResponse);
+--- a/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
++++ b/packages/shared/pkg/grpc/orchestrator/orchestrator.pb.go
+@@ -2287,9 +2287,10 @@
+ 	"\n" +
+ 	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12!\n" +
+ 	"\fexecution_id\x18\x03 \x01(\tR\vexecutionId\x12-\n" +
+-	"\x12physically_stopped\x18\x04 \x01(\bR\x11physicallyStopped2\x86\x06\n" +
++	"\x12physically_stopped\x18\x04 \x01(\bR\x11physicallyStopped2\xd8\x06\n" +
+ 	"\x0eSandboxService\x12>\n" +
+-	"\rStopExecution\x12\x15.StopExecutionRequest\x1a\x16.StopExecutionResponse\x12A\n" +
++	"\rStopExecution\x12\x15.StopExecutionRequest\x1a\x16.StopExecutionResponse\x12P\n" +
++	"\x19DiscardStoppedRestoreDisk\x12\x1b.RestoreDiskActivateRequest\x1a\x16.google.protobuf.Empty\x12A\n" +
+ 	"\x12ReleaseRestoreDisk\x12\x13.RestoreDiskRequest\x1a\x16.google.protobuf.Empty\x12J\n" +
+ 	"\x13ActivateRestoreDisk\x12\x1b.RestoreDiskActivateRequest\x1a\x16.SandboxCreateResponse\x12F\n" +
+ 	"\x12PrepareRestoreDisk\x12\x1a.RestoreDiskPrepareRequest\x1a\x14.RestoreDiskResponse\x12?\n" +
+@@ -2387,31 +2388,33 @@
+ 	2,  // 28: SandboxIam.TokensEntry.value:type_name -> SandboxIamToken
+ 	8,  // 29: SandboxNetworkEgressConfig.RulesEntry.value:type_name -> SandboxNetworkDomainRules
+ 	27, // 30: SandboxService.StopExecution:input_type -> StopExecutionRequest
+-	24, // 31: SandboxService.ReleaseRestoreDisk:input_type -> RestoreDiskRequest
+-	26, // 32: SandboxService.ActivateRestoreDisk:input_type -> RestoreDiskActivateRequest
+-	23, // 33: SandboxService.PrepareRestoreDisk:input_type -> RestoreDiskPrepareRequest
+-	24, // 34: SandboxService.InspectRestoreDisk:input_type -> RestoreDiskRequest
+-	24, // 35: SandboxService.CancelRestoreDisk:input_type -> RestoreDiskRequest
+-	12, // 36: SandboxService.Create:input_type -> SandboxCreateRequest
+-	14, // 37: SandboxService.Update:input_type -> SandboxUpdateRequest
+-	36, // 38: SandboxService.List:input_type -> google.protobuf.Empty
+-	15, // 39: SandboxService.Delete:input_type -> SandboxDeleteRequest
+-	16, // 40: SandboxService.Pause:input_type -> SandboxPauseRequest
+-	19, // 41: SandboxService.Checkpoint:input_type -> SandboxCheckpointRequest
+-	28, // 42: SandboxService.StopExecution:output_type -> StopExecutionResponse
+-	36, // 43: SandboxService.ReleaseRestoreDisk:output_type -> google.protobuf.Empty
+-	13, // 44: SandboxService.ActivateRestoreDisk:output_type -> SandboxCreateResponse
+-	25, // 45: SandboxService.PrepareRestoreDisk:output_type -> RestoreDiskResponse
+-	25, // 46: SandboxService.InspectRestoreDisk:output_type -> RestoreDiskResponse
+-	36, // 47: SandboxService.CancelRestoreDisk:output_type -> google.protobuf.Empty
+-	13, // 48: SandboxService.Create:output_type -> SandboxCreateResponse
+-	36, // 49: SandboxService.Update:output_type -> google.protobuf.Empty
+-	22, // 50: SandboxService.List:output_type -> SandboxListResponse
+-	36, // 51: SandboxService.Delete:output_type -> google.protobuf.Empty
+-	18, // 52: SandboxService.Pause:output_type -> SandboxPauseResponse
+-	20, // 53: SandboxService.Checkpoint:output_type -> SandboxCheckpointResponse
+-	42, // [42:54] is the sub-list for method output_type
+-	30, // [30:42] is the sub-list for method input_type
++	26, // 31: SandboxService.DiscardStoppedRestoreDisk:input_type -> RestoreDiskActivateRequest
++	24, // 32: SandboxService.ReleaseRestoreDisk:input_type -> RestoreDiskRequest
++	26, // 33: SandboxService.ActivateRestoreDisk:input_type -> RestoreDiskActivateRequest
++	23, // 34: SandboxService.PrepareRestoreDisk:input_type -> RestoreDiskPrepareRequest
++	24, // 35: SandboxService.InspectRestoreDisk:input_type -> RestoreDiskRequest
++	24, // 36: SandboxService.CancelRestoreDisk:input_type -> RestoreDiskRequest
++	12, // 37: SandboxService.Create:input_type -> SandboxCreateRequest
++	14, // 38: SandboxService.Update:input_type -> SandboxUpdateRequest
++	36, // 39: SandboxService.List:input_type -> google.protobuf.Empty
++	15, // 40: SandboxService.Delete:input_type -> SandboxDeleteRequest
++	16, // 41: SandboxService.Pause:input_type -> SandboxPauseRequest
++	19, // 42: SandboxService.Checkpoint:input_type -> SandboxCheckpointRequest
++	28, // 43: SandboxService.StopExecution:output_type -> StopExecutionResponse
++	36, // 44: SandboxService.DiscardStoppedRestoreDisk:output_type -> google.protobuf.Empty
++	36, // 45: SandboxService.ReleaseRestoreDisk:output_type -> google.protobuf.Empty
++	13, // 46: SandboxService.ActivateRestoreDisk:output_type -> SandboxCreateResponse
++	25, // 47: SandboxService.PrepareRestoreDisk:output_type -> RestoreDiskResponse
++	25, // 48: SandboxService.InspectRestoreDisk:output_type -> RestoreDiskResponse
++	36, // 49: SandboxService.CancelRestoreDisk:output_type -> google.protobuf.Empty
++	13, // 50: SandboxService.Create:output_type -> SandboxCreateResponse
++	36, // 51: SandboxService.Update:output_type -> google.protobuf.Empty
++	22, // 52: SandboxService.List:output_type -> SandboxListResponse
++	36, // 53: SandboxService.Delete:output_type -> google.protobuf.Empty
++	18, // 54: SandboxService.Pause:output_type -> SandboxPauseResponse
++	20, // 55: SandboxService.Checkpoint:output_type -> SandboxCheckpointResponse
++	43, // [43:56] is the sub-list for method output_type
++	30, // [30:43] is the sub-list for method input_type
+ 	30, // [30:30] is the sub-list for extension type_name
+ 	30, // [30:30] is the sub-list for extension extendee
+ 	0,  // [0:30] is the sub-list for field type_name
+--- a/packages/shared/pkg/grpc/orchestrator/orchestrator_grpc.pb.go
++++ b/packages/shared/pkg/grpc/orchestrator/orchestrator_grpc.pb.go
+@@ -20,18 +20,19 @@
+ const _ = grpc.SupportPackageIsVersion9
+ 
+ const (
+-	SandboxService_StopExecution_FullMethodName       = "/SandboxService/StopExecution"
+-	SandboxService_ReleaseRestoreDisk_FullMethodName  = "/SandboxService/ReleaseRestoreDisk"
+-	SandboxService_ActivateRestoreDisk_FullMethodName = "/SandboxService/ActivateRestoreDisk"
+-	SandboxService_PrepareRestoreDisk_FullMethodName  = "/SandboxService/PrepareRestoreDisk"
+-	SandboxService_InspectRestoreDisk_FullMethodName  = "/SandboxService/InspectRestoreDisk"
+-	SandboxService_CancelRestoreDisk_FullMethodName   = "/SandboxService/CancelRestoreDisk"
+-	SandboxService_Create_FullMethodName              = "/SandboxService/Create"
+-	SandboxService_Update_FullMethodName              = "/SandboxService/Update"
+-	SandboxService_List_FullMethodName                = "/SandboxService/List"
+-	SandboxService_Delete_FullMethodName              = "/SandboxService/Delete"
+-	SandboxService_Pause_FullMethodName               = "/SandboxService/Pause"
+-	SandboxService_Checkpoint_FullMethodName          = "/SandboxService/Checkpoint"
++	SandboxService_StopExecution_FullMethodName             = "/SandboxService/StopExecution"
++	SandboxService_DiscardStoppedRestoreDisk_FullMethodName = "/SandboxService/DiscardStoppedRestoreDisk"
++	SandboxService_ReleaseRestoreDisk_FullMethodName        = "/SandboxService/ReleaseRestoreDisk"
++	SandboxService_ActivateRestoreDisk_FullMethodName       = "/SandboxService/ActivateRestoreDisk"
++	SandboxService_PrepareRestoreDisk_FullMethodName        = "/SandboxService/PrepareRestoreDisk"
++	SandboxService_InspectRestoreDisk_FullMethodName        = "/SandboxService/InspectRestoreDisk"
++	SandboxService_CancelRestoreDisk_FullMethodName         = "/SandboxService/CancelRestoreDisk"
++	SandboxService_Create_FullMethodName                    = "/SandboxService/Create"
++	SandboxService_Update_FullMethodName                    = "/SandboxService/Update"
++	SandboxService_List_FullMethodName                      = "/SandboxService/List"
++	SandboxService_Delete_FullMethodName                    = "/SandboxService/Delete"
++	SandboxService_Pause_FullMethodName                     = "/SandboxService/Pause"
++	SandboxService_Checkpoint_FullMethodName                = "/SandboxService/Checkpoint"
+ )
+ 
+ // SandboxServiceClient is the client API for SandboxService service.
+@@ -39,6 +40,7 @@
+ // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+ type SandboxServiceClient interface {
+ 	StopExecution(ctx context.Context, in *StopExecutionRequest, opts ...grpc.CallOption) (*StopExecutionResponse, error)
++	DiscardStoppedRestoreDisk(ctx context.Context, in *RestoreDiskActivateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+ 	ReleaseRestoreDisk(ctx context.Context, in *RestoreDiskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+ 	ActivateRestoreDisk(ctx context.Context, in *RestoreDiskActivateRequest, opts ...grpc.CallOption) (*SandboxCreateResponse, error)
+ 	PrepareRestoreDisk(ctx context.Context, in *RestoreDiskPrepareRequest, opts ...grpc.CallOption) (*RestoreDiskResponse, error)
+@@ -72,6 +74,16 @@
+ 	return out, nil
+ }
+ 
++func (c *sandboxServiceClient) DiscardStoppedRestoreDisk(ctx context.Context, in *RestoreDiskActivateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(emptypb.Empty)
++	err := c.cc.Invoke(ctx, SandboxService_DiscardStoppedRestoreDisk_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ func (c *sandboxServiceClient) ReleaseRestoreDisk(ctx context.Context, in *RestoreDiskRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+ 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+ 	out := new(emptypb.Empty)
+@@ -187,6 +199,7 @@
+ // for forward compatibility.
+ type SandboxServiceServer interface {
+ 	StopExecution(context.Context, *StopExecutionRequest) (*StopExecutionResponse, error)
++	DiscardStoppedRestoreDisk(context.Context, *RestoreDiskActivateRequest) (*emptypb.Empty, error)
+ 	ReleaseRestoreDisk(context.Context, *RestoreDiskRequest) (*emptypb.Empty, error)
+ 	ActivateRestoreDisk(context.Context, *RestoreDiskActivateRequest) (*SandboxCreateResponse, error)
+ 	PrepareRestoreDisk(context.Context, *RestoreDiskPrepareRequest) (*RestoreDiskResponse, error)
+@@ -213,6 +226,9 @@
+ func (UnimplementedSandboxServiceServer) StopExecution(context.Context, *StopExecutionRequest) (*StopExecutionResponse, error) {
+ 	return nil, status.Error(codes.Unimplemented, "method StopExecution not implemented")
+ }
++func (UnimplementedSandboxServiceServer) DiscardStoppedRestoreDisk(context.Context, *RestoreDiskActivateRequest) (*emptypb.Empty, error) {
++	return nil, status.Error(codes.Unimplemented, "method DiscardStoppedRestoreDisk not implemented")
++}
+ func (UnimplementedSandboxServiceServer) ReleaseRestoreDisk(context.Context, *RestoreDiskRequest) (*emptypb.Empty, error) {
+ 	return nil, status.Error(codes.Unimplemented, "method ReleaseRestoreDisk not implemented")
+ }
+@@ -285,6 +301,24 @@
+ 	return interceptor(ctx, in, info, handler)
+ }
+ 
++func _SandboxService_DiscardStoppedRestoreDisk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RestoreDiskActivateRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(SandboxServiceServer).DiscardStoppedRestoreDisk(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: SandboxService_DiscardStoppedRestoreDisk_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(SandboxServiceServer).DiscardStoppedRestoreDisk(ctx, req.(*RestoreDiskActivateRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
+ func _SandboxService_ReleaseRestoreDisk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+ 	in := new(RestoreDiskRequest)
+ 	if err := dec(in); err != nil {
+@@ -495,6 +529,10 @@
+ 			Handler:    _SandboxService_StopExecution_Handler,
+ 		},
+ 		{
++			MethodName: "DiscardStoppedRestoreDisk",
++			Handler:    _SandboxService_DiscardStoppedRestoreDisk_Handler,
++		},
++		{
+ 			MethodName: "ReleaseRestoreDisk",
+ 			Handler:    _SandboxService_ReleaseRestoreDisk_Handler,
+ 		},
+--- a/packages/orchestrator/pkg/server/restore_disk.go
++++ b/packages/orchestrator/pkg/server/restore_disk.go
+@@ -52,6 +52,8 @@
+ 	switch {
+ 	case errors.Is(err, os.ErrNotExist):
+ 		return status.Error(codes.NotFound, "prepared restore disk does not exist")
++	case errors.Is(err, rootfs.ErrRestoreActivationStopped):
++		return status.Error(codes.FailedPrecondition, "restore execution was permanently stopped")
+ 	case errors.Is(err, rootfs.ErrRestoreActivationStarted):
+ 		return status.Error(codes.FailedPrecondition, "restore activation requires reconciliation")
+ 	case errors.Is(err, rootfs.ErrPreparedDiskCancelled):
+@@ -271,3 +273,35 @@
+ 	}
+ 	return restoreresult.Expired(id.String())
+ }
++
++// DiscardStoppedRestoreDisk reconciles a failed boot only after positive host
++// fencing. Neither API absence nor a timeout is accepted as shutdown evidence.
++func (s *Server) DiscardStoppedRestoreDisk(ctx context.Context, req *orchestrator.RestoreDiskActivateRequest) (*emptypb.Empty, error) {
++	directory, err := s.restoreDiskDirectory()
++	if err != nil {
++		return nil, err
++	}
++	id, err := validateRestoreActivation(req)
++	if err != nil {
++		return nil, err
++	}
++	request, err := (proto.MarshalOptions{Deterministic: true}).Marshal(req.GetCreate())
++	if err != nil {
++		return nil, err
++	}
++	activation, err := rootfs.LockRestoreActivation(ctx, directory, id, req.GetManifestSha256(), request)
++	if err != nil {
++		return nil, restoreDiskError(err)
++	}
++	defer activation.Close()
++	create := req.GetCreate().GetSandbox()
++	if _, err := s.StopExecution(ctx, &orchestrator.StopExecutionRequest{
++		TeamId: create.GetTeamId(), SandboxId: create.GetSandboxId(), ExecutionId: create.GetExecutionId(),
++	}); err != nil {
++		return nil, err
++	}
++	if err := activation.DiscardStopped(ctx); err != nil {
++		return nil, restoreDiskError(err)
++	}
++	return &emptypb.Empty{}, nil
++}
+--- a/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux.go
+@@ -19,6 +19,7 @@
+ )
+ 
+ var ErrRestoreActivationStarted = errors.New("restore activation has started")
++var ErrRestoreActivationStopped = errors.New("restore execution was permanently stopped")
+ var ErrRestoreActivationExpired = errors.New("restore activation expired before guest start")
+ 
+ // RestoreActivation survives lost replies and process restarts independently of
+@@ -59,7 +60,7 @@
+ 		return result, ErrPreparedDiskCorrupt
+ 	}
+ 	switch result.State {
+-	case "accepted", "booting", "expired":
++	case "accepted", "booting", "expired", "stopped":
+ 		if len(result.Response) != 0 {
+ 			return result, ErrPreparedDiskCorrupt
+ 		}
+@@ -269,6 +270,9 @@
+ 	if h.lock == nil {
+ 		return ErrPreparedDiskBusy
+ 	}
++	if h.record.State == "stopped" {
++		return ErrRestoreActivationStopped
++	}
+ 	if h.record.State == "expired" {
+ 		return ErrRestoreActivationExpired
+ 	}
+@@ -300,3 +304,24 @@
+ 	}
+ 	return syncPreparedDirectory(h.directory)
+ }
++
++// DiscardStopped is used only after the host has confirmed permanent execution
++// fencing for the exact immutable activation request. Keep the published build
++// for lineage-aware GC; deleting a prepared copy cannot invalidate descendants.
++func (h *RestoreActivationLock) DiscardStopped(ctx context.Context) error {
++	if h.lock == nil {
++		return ErrPreparedDiskBusy
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	h.record.State = "stopped"
++	h.record.Response = nil
++	if err := h.persist(); err != nil {
++		return err
++	}
++	if err := os.RemoveAll(filepath.Join(h.directory, h.buildID.String())); err != nil {
++		return err
++	}
++	return syncPreparedDirectory(h.directory)
++}
+--- a/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux_test.go
++++ b/packages/orchestrator/pkg/sandbox/rootfs/restore_activation_linux_test.go
+@@ -178,3 +178,34 @@
+ 		require.NoError(t, lock.Close())
+ 	}
+ }
++
++func TestRestoreConfirmedStopPersistsAcrossCleanupAndRestart(t *testing.T) {
++	for _, state := range []string{"accepted", "booting", "active"} {
++		t.Run(state, func(t *testing.T) {
++			directory, id, digest := activationFixture(t, []byte(`{"version":1}`))
++			request := []byte("exact activation identity")
++			first, err := LockRestoreActivation(t.Context(), directory, id, digest, request)
++			require.NoError(t, err)
++			if state != "accepted" {
++				require.NoError(t, first.BeginBoot())
++			}
++			if state == "active" {
++				require.NoError(t, first.Complete(json.RawMessage(`{"ready":true}`)))
++			}
++			require.NoError(t, first.DiscardStopped(t.Context()))
++			require.NoError(t, first.Close())
++			_, err = os.Stat(filepath.Join(directory, id.String()))
++			require.ErrorIs(t, err, os.ErrNotExist)
++			retry, err := LockRestoreActivation(t.Context(), directory, id, digest, request)
++			require.NoError(t, err)
++			require.Equal(t, "stopped", retry.Record().State)
++			require.NoError(t, retry.DiscardStopped(t.Context()))
++			require.ErrorIs(t, retry.CheckDeadline(time.Now().Add(time.Hour), time.Now()), ErrRestoreActivationStopped)
++			require.Error(t, retry.BeginBoot())
++			require.NoError(t, retry.Close())
++			require.Error(t, RequireActivatedBuild(directory, id))
++			_, err = LockRestoreActivation(t.Context(), directory, id, digest, []byte("different execution"))
++			require.ErrorIs(t, err, ErrPreparedDiskConflict)
++		})
++	}
++}
+--- a/packages/api/internal/handlers/launchpad_restore_worker.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker.go
+@@ -10,6 +10,7 @@
+ 	"time"
+ 
+ 	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5"
+ 	"google.golang.org/protobuf/encoding/protojson"
+ 
+ 	"github.com/e2b-dev/infra/packages/api/internal/api"
+@@ -21,6 +22,7 @@
+ )
+ 
+ type restoreRuntime interface {
++	DiscardStoppedPreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string) error
+ 	RestoreClient(context.Context, uuid.UUID, string) (rpc.SandboxServiceClient, context.Context, error)
+ 	ActivatePreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string, int) error
+ }
+@@ -146,6 +148,24 @@
+ 		}
+ 		return nil
+ 	case "activating":
++		fence, err := a.sqlcDB.LockExecutionFence(ctx, queries.LockExecutionFenceParams{TeamID: op.TeamID, SandboxID: op.SandboxID})
++		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
++			return err
++		}
++		if fence == "stopped" {
++			if len(op.ActivationRequest) == 0 {
++				return errors.New("stopped restore is missing its immutable activation request")
++			}
++			request := &rpc.SandboxCreateRequest{}
++			if err := protojson.Unmarshal(op.ActivationRequest, request); err != nil {
++				return err
++			}
++			digest := sha256.Sum256(op.Manifest)
++			if err := a.restoreRuntime().DiscardStoppedPreparedRestore(ctx, op, request, hex.EncodeToString(digest[:])); err != nil {
++				return err
++			}
++			return store.Complete(ctx, op.TeamID, op.OperationID, *op.ClaimID, "failed")
++		}
+ 		team, err := a.authService.GetTeamByID(ctx, op.TeamID)
+ 		if err != nil {
+ 			return err
+@@ -181,6 +201,7 @@
+ 			return err
+ 		}
+ 		digest := sha256.Sum256(op.Manifest)
++
+ 		if err := a.restoreRuntime().ActivatePreparedRestore(ctx, op, request, hex.EncodeToString(digest[:]), int(team.Limits.SandboxConcurrency)); err != nil {
+ 			if restoreresult.IsExpired(err, op.PreparedBuildID.String()) {
+ 				return store.Complete(ctx, op.TeamID, op.OperationID, *op.ClaimID, "failed")
+--- a/packages/api/internal/handlers/launchpad_restore_worker_test.go
++++ b/packages/api/internal/handlers/launchpad_restore_worker_test.go
+@@ -27,11 +27,13 @@
+ 
+ type restoreWorkerRuntime struct {
+ 	rpc.SandboxServiceClient
+-	activationError error
+-	lostReply       bool
+-	boots           int
+-	released        bool
+-	cancelled       bool
++	activationError     error
++	lostReply           bool
++	boots               int
++	released            bool
++	cancelled           bool
++	stoppedDiscardError error
++	discardedStopped    bool
+ }
+ 
+ func (r *restoreWorkerRuntime) RestoreClient(ctx context.Context, _ uuid.UUID, _ string) (rpc.SandboxServiceClient, context.Context, error) {
+@@ -177,7 +179,7 @@
+ 			require.Zero(t, finished.ReservedBytes)
+ 			require.False(t, pinned)
+ 			require.NotNil(t, finished.LastError)
+-			require.Contains(t, *finished.LastError, "expired before guest start")
++			require.Equal(t, "restore activation did not complete; destination cleaned", *finished.LastError)
+ 			_, err = store.Activate(t.Context(), p.TeamID, p.OperationID)
+ 			require.ErrorIs(t, err, restorestore.ErrConflict)
+ 			// New admission is possible after cleanup; the original operation remains a
+@@ -188,3 +190,54 @@
+ 		})
+ 	}
+ }
++
++func (r *restoreWorkerRuntime) DiscardStoppedPreparedRestore(context.Context, queries.SandboxRestoreOperation, *rpc.SandboxCreateRequest, string) error {
++	if r.stoppedDiscardError != nil {
++		return r.stoppedDiscardError
++	}
++	r.discardedStopped = true
++	return nil
++}
++
++func TestLaunchpadRestoreWorkerReleasesStoppedActivationOnlyAfterHostCleanup(t *testing.T) {
++	t.Parallel()
++	db := testutils.SetupDatabase(t)
++	p := restorePinFixture(t, db)
++	p.ClusterID = uuid.Nil
++	store := restorestore.Store{DB: db.SqlcClient}
++	_, err := store.Create(t.Context(), p, p.ReservedBytes)
++	require.NoError(t, err)
++	runtime := &restoreWorkerRuntime{stoppedDiscardError: errors.New("host unavailable")}
++	// Revoked team policy cannot prevent cleanup of an already stopped allocation.
++	server := &APIStore{sqlcDB: db.SqlcClient, restoreRuntimeOverride: runtime}
++	require.NoError(t, server.processRestoreOperation(t.Context(), claimRestoreWork(t, db)))
++	_, err = store.Activate(t.Context(), p.TeamID, p.OperationID)
++	require.NoError(t, err)
++	activation := claimRestoreWork(t, db)
++	_, err = store.SaveActivationRequest(t.Context(), activation, []byte(`{"sandbox":{}}`))
++	require.NoError(t, err)
++	require.NoError(t, db.SqlcClient.TestsRawSQL(t.Context(),
++		"INSERT INTO sandbox_execution_fences(team_id,sandbox_id,state) VALUES($1,$2,'stopped')", p.TeamID, p.SandboxID))
++	require.Error(t, server.processRestoreOperation(t.Context(), activation))
++	retained, err := db.SqlcClient.GetRestoreOperation(t.Context(), queries.GetRestoreOperationParams{TeamID: p.TeamID, OperationID: p.OperationID})
++	require.NoError(t, err)
++	require.Positive(t, retained.ReservedBytes)
++	require.Equal(t, "activating", retained.State)
++	pinned, err := db.SqlcClient.HasRestoreBuildPins(t.Context(), p.SourceBuildID)
++	require.NoError(t, err)
++	require.True(t, pinned)
++	require.Zero(t, runtime.boots)
++	runtime.stoppedDiscardError = nil
++	require.NoError(t, server.processRestoreOperation(t.Context(), activation))
++	require.True(t, runtime.discardedStopped)
++	require.Zero(t, runtime.boots)
++	require.False(t, runtime.released)
++	finished, err := db.SqlcClient.GetRestoreOperation(t.Context(), queries.GetRestoreOperationParams{TeamID: p.TeamID, OperationID: p.OperationID})
++	require.NoError(t, err)
++	require.Equal(t, "failed", finished.State)
++	require.Equal(t, "restore activation did not complete; destination cleaned", *finished.LastError)
++	require.Zero(t, finished.ReservedBytes)
++	pinned, err = db.SqlcClient.HasRestoreBuildPins(t.Context(), p.SourceBuildID)
++	require.NoError(t, err)
++	require.False(t, pinned)
++}
+--- a/packages/orchestrator/pkg/server/restore_disk_test.go
++++ b/packages/orchestrator/pkg/server/restore_disk_test.go
+@@ -7,7 +7,10 @@
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"fmt"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/execution"
+ 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
++	"github.com/e2b-dev/infra/packages/orchestrator/pkg/service"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/restoreresult"
+ 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+ 	"github.com/google/uuid"
+@@ -35,6 +38,8 @@
+ 	_, err = server.CancelRestoreDisk(t.Context(), &orchestrator.RestoreDiskRequest{})
+ 	require.Equal(t, codes.Unimplemented, status.Code(err))
+ 	_, err = server.ActivateRestoreDisk(t.Context(), &orchestrator.RestoreDiskActivateRequest{})
++	require.Equal(t, codes.Unimplemented, status.Code(err))
++	_, err = server.DiscardStoppedRestoreDisk(t.Context(), &orchestrator.RestoreDiskActivateRequest{})
+ 	require.Equal(t, codes.Unimplemented, status.Code(err))
+ 	_, err = server.ReleaseRestoreDisk(t.Context(), &orchestrator.RestoreDiskRequest{})
+ 	require.Equal(t, codes.Unimplemented, status.Code(err))
+@@ -137,3 +142,55 @@
+ 		})
+ 	}
+ }
++
++func TestRestoreDiscardRequiresBoundPhysicalStopAndRejectsLateBoot(t *testing.T) {
++	server := &Server{info: &service.ServiceInfo{}}
++	server.config.RestorePreparationEnabled = true
++	server.config.LaunchpadRequireExecutionFence = true
++	server.config.OrchestratorBaseDir = t.TempDir()
++	id := uuid.New()
++	token := "test-access-token"
++	req := &orchestrator.RestoreDiskActivateRequest{
++		ManifestSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
++		Create: &orchestrator.SandboxCreateRequest{
++			Sandbox:        &orchestrator.SandboxConfig{BuildId: id.String(), TeamId: uuid.NewString(), SandboxId: "stopped-proof", ExecutionId: uuid.NewString(), TemplateId: "restore", Snapshot: true, EnvdAccessToken: &token},
++			FilesystemBoot: new(true), StartTime: timestamppb.Now(), EndTime: timestamppb.New(time.Now().Add(time.Minute)),
++		},
++	}
++	raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(req.GetCreate())
++	require.NoError(t, err)
++	digest := sha256.New()
++	digest.Write([]byte(req.ManifestSha256))
++	digest.Write(raw)
++	receipt, err := json.Marshal(rootfs.RestoreActivation{Version: 1, RequestSHA256: hex.EncodeToString(digest.Sum(nil)), State: "booting"})
++	require.NoError(t, err)
++	directory, err := server.restoreDiskDirectory()
++	require.NoError(t, err)
++	diskDir := filepath.Join(directory, id.String())
++	require.NoError(t, os.MkdirAll(diskDir, 0o700))
++	require.NoError(t, os.WriteFile(filepath.Join(directory, id.String()+".activation.json"), receipt, 0o600))
++	_, err = server.DiscardStoppedRestoreDisk(t.Context(), req)
++	require.Equal(t, codes.FailedPrecondition, status.Code(err), "API absence cannot authorize cleanup")
++	_, err = os.Stat(diskDir)
++	require.NoError(t, err)
++	journal, err := sandbox.ExecutionStore(server.config.BuilderConfig)
++	require.NoError(t, err)
++	config := req.GetCreate().GetSandbox()
++	_, err = journal.StopRegistered(t.Context(), execution.Identity{TeamID: config.TeamId, SandboxID: config.SandboxId, ExecutionID: config.ExecutionId})
++	require.NoError(t, err)
++	changed := proto.Clone(req).(*orchestrator.RestoreDiskActivateRequest)
++	changed.Create.Sandbox.ExecutionId = uuid.NewString()
++	_, err = server.DiscardStoppedRestoreDisk(t.Context(), changed)
++	require.Equal(t, codes.AlreadyExists, status.Code(err), "must bind the original request before stopping anything")
++	_, err = os.Stat(diskDir)
++	require.NoError(t, err)
++	for range 2 {
++		_, err = server.DiscardStoppedRestoreDisk(t.Context(), req)
++		require.NoError(t, err)
++	}
++	_, err = os.Stat(diskDir)
++	require.ErrorIs(t, err, os.ErrNotExist)
++	_, err = server.ActivateRestoreDisk(t.Context(), req)
++	require.ErrorIs(t, err, rootfs.ErrRestoreActivationStopped)
++	require.Error(t, server.requireRestoreActivated(req.GetCreate()))
++}
+--- a/packages/api/internal/orchestrator/restore.go
++++ b/packages/api/internal/orchestrator/restore.go
+@@ -60,6 +60,39 @@
+ 	}, nil
+ }
+ 
++// The durable request excludes secrets. Both activation and stopped cleanup
++// must reconstruct exactly the same host-bound request from the stable seed.
++func (o *Orchestrator) authenticatedRestoreRequest(request *rpc.SandboxCreateRequest) (*rpc.SandboxCreateRequest, error) {
++	request = proto.CloneOf(request)
++	config := request.GetSandbox()
++	token, err := o.accessTokenGenerator.GenerateEnvdAccessToken(config.GetSandboxId())
++	if err != nil {
++		return nil, err
++	}
++	traffic, err := o.accessTokenGenerator.GenerateTrafficAccessToken(config.GetSandboxId())
++	if err != nil {
++		return nil, err
++	}
++	config.EnvdAccessToken = &token
++	config.Network = &rpc.SandboxNetworkConfig{Ingress: &rpc.SandboxNetworkIngressConfig{TrafficAccessToken: &traffic}}
++	return request, nil
++}
++
++func (o *Orchestrator) DiscardStoppedPreparedRestore(ctx context.Context, op queries.SandboxRestoreOperation, request *rpc.SandboxCreateRequest, digest string) error {
++	request, err := o.authenticatedRestoreRequest(request)
++	if err != nil {
++		return err
++	}
++	client, child, err := o.RestoreClient(ctx, op.ClusterID, op.NodeID)
++	if err != nil {
++		return err
++	}
++	if _, err := client.DiscardStoppedRestoreDisk(child, &rpc.RestoreDiskActivateRequest{Create: request, ManifestSha256: digest}); err != nil {
++		return err
++	}
++	return o.sandboxStore.ReleaseRestore(ctx, op.TeamID, op.SandboxID, op.OperationID)
++}
++
+ func (o *Orchestrator) ActivatePreparedRestore(ctx context.Context, op queries.SandboxRestoreOperation, request *rpc.SandboxCreateRequest, digest string, concurrency int) error {
+ 	// An already-expired request is reconciliation-only: the host's durable
+ 	// receipt either returns the previous result or rejects a never-started VM.
+@@ -70,18 +103,13 @@
+ 			return err
+ 		}
+ 	}
+-	request = proto.CloneOf(request)
+-	config := request.GetSandbox()
+-	token, err := o.accessTokenGenerator.GenerateEnvdAccessToken(op.SandboxID)
++	request, err := o.authenticatedRestoreRequest(request)
+ 	if err != nil {
+ 		return err
+ 	}
+-	traffic, err := o.accessTokenGenerator.GenerateTrafficAccessToken(op.SandboxID)
+-	if err != nil {
+-		return err
+-	}
+-	config.EnvdAccessToken = &token
+-	config.Network = &rpc.SandboxNetworkConfig{Ingress: &rpc.SandboxNetworkIngressConfig{TrafficAccessToken: &traffic}}
++	config := request.GetSandbox()
++	token := config.GetEnvdAccessToken()
++	traffic := config.GetNetwork().GetIngress().GetTrafficAccessToken()
+ 	client, child, err := o.RestoreClient(ctx, op.ClusterID, op.NodeID)
+ 	if err != nil {
+ 		return err
+--- a/packages/api/internal/orchestrator/restore_test.go
++++ b/packages/api/internal/orchestrator/restore_test.go
+@@ -2,10 +2,14 @@
+ 
+ import (
+ 	"github.com/e2b-dev/infra/packages/api/internal/api"
++	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+ 	teamtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
+ 	"github.com/e2b-dev/infra/packages/db/queries"
++	rpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
+ 	"github.com/google/uuid"
+ 	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/encoding/protojson"
++	"google.golang.org/protobuf/proto"
+ 	"testing"
+ 	"time"
+ )
+@@ -31,3 +35,27 @@
+ 	_, err = BuildRestoreRequest(op, build, team, input, now)
+ 	require.Error(t, err)
+ }
++
++func TestPreparedRestoreCredentialsReconstructedAfterPersistence(t *testing.T) {
++	t.Parallel()
++	generator, err := sandbox.NewAccessTokenGenerator("test-stable-seed")
++	require.NoError(t, err)
++	o := &Orchestrator{accessTokenGenerator: generator}
++	saved := &rpc.SandboxCreateRequest{Sandbox: &rpc.SandboxConfig{SandboxId: "destination"}}
++	activation, err := o.authenticatedRestoreRequest(saved)
++	require.NoError(t, err)
++	require.NotEmpty(t, activation.GetSandbox().GetEnvdAccessToken())
++	require.NotEmpty(t, activation.GetSandbox().GetNetwork().GetIngress().GetTrafficAccessToken())
++	require.Empty(t, saved.GetSandbox().GetEnvdAccessToken())
++	raw, err := protojson.Marshal(saved)
++	require.NoError(t, err)
++	restored := &rpc.SandboxCreateRequest{}
++	require.NoError(t, protojson.Unmarshal(raw, restored))
++	cleanup, err := o.authenticatedRestoreRequest(restored)
++	require.NoError(t, err)
++	activationBytes, err := (proto.MarshalOptions{Deterministic: true}).Marshal(activation)
++	require.NoError(t, err)
++	cleanupBytes, err := (proto.MarshalOptions{Deterministic: true}).Marshal(cleanup)
++	require.NoError(t, err)
++	require.Equal(t, activationBytes, cleanupBytes, "the host receipt binds the full request, including reconstructed credentials")
++}
+--- a/packages/db/queries/restores/operations.sql
++++ b/packages/db/queries/restores/operations.sql
+@@ -99,7 +99,7 @@
+ UPDATE public.sandbox_restore_operations
+ SET state = sqlc.arg(terminal_state)::text, reserved_bytes = 0, claim_id = NULL,
+     claim_until = NULL, last_error = CASE WHEN sqlc.arg(terminal_state)::text = 'failed'
+-    THEN 'activation lease expired before guest start; destination cleaned' ELSE NULL END, updated_at = now()
++    THEN 'restore activation did not complete; destination cleaned' ELSE NULL END, updated_at = now()
+ WHERE team_id = @team_id AND operation_id = @operation_id AND claim_id = @claim_id
+ AND claim_until > now()
+ AND ((state = 'cancelling' AND sqlc.arg(terminal_state)::text = 'cancelled')
+--- a/packages/db/queries/operations.sql.go
++++ b/packages/db/queries/operations.sql.go
+@@ -154,7 +154,7 @@
+ UPDATE public.sandbox_restore_operations
+ SET state = $1::text, reserved_bytes = 0, claim_id = NULL,
+     claim_until = NULL, last_error = CASE WHEN $1::text = 'failed'
+-    THEN 'activation lease expired before guest start; destination cleaned' ELSE NULL END, updated_at = now()
++    THEN 'restore activation did not complete; destination cleaned' ELSE NULL END, updated_at = now()
+ WHERE team_id = $2 AND operation_id = $3 AND claim_id = $4
+ AND claim_until > now()
+ AND ((state = 'cancelling' AND $1::text = 'cancelled')

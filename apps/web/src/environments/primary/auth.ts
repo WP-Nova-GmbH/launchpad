@@ -1,5 +1,6 @@
 import type {
   AuthBrowserSessionResult,
+  AuthDesktopIdentityRequest,
   AuthClientMetadata,
   AuthEnvironmentScope,
   AuthPairingCredentialResult,
@@ -205,6 +206,24 @@ export async function fetchSessionState(): Promise<AuthSessionState> {
       });
     }
   });
+}
+
+/** The server verifies this token; the replacement credential stays in its HttpOnly cookie. */
+export async function replaceBrowserIdentity(
+  identity: AuthDesktopIdentityRequest["identity"],
+): Promise<void> {
+  try {
+    await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.auth.browserIdentity({ headers: {}, payload: { identity } }),
+        ),
+      ),
+    );
+  } catch {
+    // Keep the token-bearing HTTP request out of error objects and diagnostics.
+    throw new Error("Launchpad Connect could not verify this browser's account.");
+  }
 }
 
 function readHttpApiStatus(error: unknown): number | null {

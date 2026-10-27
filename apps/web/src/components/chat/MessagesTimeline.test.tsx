@@ -192,6 +192,42 @@ beforeAll(async () => {
 // still touch `window` through the tooltip's focus handling.
 beforeEach(stubDomGlobals);
 
+it("labels automatic prompts as the frozen workflow instead of You", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("requestAnimationFrame", () => 0);
+  vi.stubGlobal("cancelAnimationFrame", () => {});
+  const entry = buildUserTimelineEntry("Automatic task");
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(() => {
+      renderer = create(
+        <MessagesTimeline
+          {...buildProps()}
+          timelineEntries={[
+            {
+              ...entry,
+              message: {
+                ...entry.message,
+                workflowOrigin: {
+                  kind: "automation",
+                  jobId: "job",
+                  workflowId: "flow",
+                  workflowName: "Frozen workflow",
+                },
+              },
+            },
+          ]}
+        />,
+      );
+    });
+    const output = JSON.stringify(renderer!.toJSON());
+    expect(output).toContain("Workflow · Frozen workflow");
+    expect(output).not.toContain('"You"');
+  } finally {
+    await act(() => renderer?.unmount());
+  }
+});
+
 const ACTIVE_THREAD_ENVIRONMENT_ID = EnvironmentId.make("environment-local");
 const MESSAGE_CREATED_AT = "2026-03-17T19:12:28.000Z";
 

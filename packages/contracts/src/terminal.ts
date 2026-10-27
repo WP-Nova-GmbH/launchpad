@@ -383,7 +383,17 @@ export class TerminalProcessExitError extends Schema.TaggedError<TerminalProcess
   }
 }
 
+export class TerminalExecutionError extends Schema.TaggedError<TerminalExecutionError>()(
+  "TerminalExecutionError",
+  { threadId: Schema.String, terminalId: Schema.String, detail: Schema.String },
+) {
+  override get message() {
+    return this.detail;
+  }
+}
+
 export const TerminalError = Schema.Union([
+  TerminalExecutionError,
   TerminalCwdError,
   TerminalHistoryError,
   TerminalSessionLookupError,

@@ -25,6 +25,8 @@ export function SharedPromptQueueRow({
   onEdit,
   onSteer,
   onRemove,
+  onMoveNext,
+  onMoveDown,
 }: {
   entry: ThreadPromptQueueEntry;
   index: number;
@@ -36,6 +38,8 @@ export function SharedPromptQueueRow({
   onEdit: () => void;
   onSteer: () => void;
   onRemove: () => void;
+  onMoveNext?: (() => void) | undefined;
+  onMoveDown?: (() => void) | undefined;
 }) {
   const focusEditor = useRef(false);
   const attribution = promptAttributionLabel(entry);
@@ -148,6 +152,16 @@ export function SharedPromptQueueRow({
                     <PencilIcon />
                     Edit
                   </MenuItem>
+                  {onMoveNext ? (
+                    <MenuItem disabled={disabled} onClick={onMoveNext}>
+                      Move next
+                    </MenuItem>
+                  ) : null}
+                  {onMoveDown ? (
+                    <MenuItem disabled={disabled} onClick={onMoveDown}>
+                      Move down
+                    </MenuItem>
+                  ) : null}
                   <MenuItem disabled={disabled} onClick={onRemove} variant="destructive">
                     <Trash2Icon />
                     Remove

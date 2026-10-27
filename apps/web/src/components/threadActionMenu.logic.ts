@@ -32,6 +32,7 @@ export type ThreadActionMenuId =
 
 export interface ThreadActionMenuState {
   readonly branch: string | null;
+  readonly canCreateThread?: boolean;
   /**
    * Project scoping for the thread list. Null on surfaces with no scoped
    * list behind the menu (the chat header), where the item must not show.
@@ -70,7 +71,7 @@ export function buildThreadActionMenuItems(
   state: ThreadActionMenuState,
 ): ReadonlyArray<ContextMenuItem<ThreadActionMenuId>> {
   return [
-    ...(state.branch
+    ...(state.branch && state.canCreateThread !== false
       ? [
           {
             id: "new-thread-on-branch" as const,

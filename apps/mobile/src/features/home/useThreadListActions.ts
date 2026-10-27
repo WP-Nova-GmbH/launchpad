@@ -1,6 +1,7 @@
 import type { ThreadMoveDestination } from "../threads/threadOrder";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import { canSnooze, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
+import { THREAD_DELETE_WARNING } from "@t3tools/client-runtime/relay/threadVmControls";
 import * as Cause from "effect/Cause";
 import * as Haptics from "expo-haptics";
 import { useCallback, useRef } from "react";
@@ -209,7 +210,7 @@ function useConfirmDeleteThread(
   return useCallback(
     (thread: EnvironmentThreadShell) => {
       const title = "Delete thread?";
-      const message = `“${thread.title}” will be permanently deleted, including its terminal history.`;
+      const message = `“${thread.title}” will be permanently deleted, including its terminal history.\n\n${THREAD_DELETE_WARNING}`;
       if (process.env.EXPO_OS === "ios") {
         Alert.alert(title, message, [
           { text: "Cancel", style: "cancel" },

@@ -16,13 +16,17 @@ import * as Schema from "effect/Schema";
 import packageJson from "../../package.json" with { type: "json" };
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
-import { readAgentActivityPublishingActive } from "../cloud/config.ts";
+import {
+  readAgentActivityPublishingActive,
+  readRelayConnectionConfigured,
+} from "../cloud/config.ts";
 import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import { resolveServerEnvironmentLabel } from "./ServerEnvironmentLabel.ts";
 import { detectServerEnvironmentMachineKind } from "./ServerEnvironmentMachine.ts";
+import { readInstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
 
 export class ServerEnvironmentIdPersistenceError extends Schema.TaggedError<ServerEnvironmentIdPersistenceError>()(
   "ServerEnvironmentIdPersistenceError",
@@ -189,6 +193,7 @@ export const make = Effect.gen(function* () {
   const hostPlatform = yield* HostProcessPlatform;
   const hostArchitecture = yield* HostProcessArchitecture;
   const environmentId = yield* identity.getEnvironmentId;
+  const threadVm = yield* readInstalledThreadVm();
   const cwdBaseName = path.basename(serverConfig.cwd).trim();
   const label = yield* resolveServerEnvironmentLabel({ cwdBaseName });
   const machine = yield* detectServerEnvironmentMachineKind();
@@ -206,6 +211,7 @@ export const make = Effect.gen(function* () {
 
   const descriptor: ExecutionEnvironmentDescriptor = {
     environmentId,
+    ...(threadVm ? { threadVm: { threadId: threadVm.scope.threadId } } : {}),
     label,
     platform: {
       os: platformOs(hostPlatform),
@@ -243,6 +249,7 @@ export const make = Effect.gen(function* () {
       threadPullRequestLinking: true,
       environmentIcon: true,
       projectCloneTracking: true,
+      agentSessionImportProgress: true,
       ...(serverSelfUpdate === null ? {} : { serverSelfUpdate }),
       ...(serverSelfUpdate === "boot-service" || desktopAppUpdate
         ? {
@@ -263,6 +270,7 @@ export const make = Effect.gen(function* () {
       const agentActivityPublishing = yield* readAgentActivityPublishingActive(secrets);
       const repositoryAccess = yield* RepositoryAccess;
       const policy = yield* repositoryAccess.status;
+      const relayLinked = yield* readRelayConnectionConfigured(secrets);
       return {
         ...descriptor,
         capabilities: {
@@ -270,6 +278,7 @@ export const make = Effect.gen(function* () {
           agentActivityPublishing,
           sharedPromptQueue: policy.enabled,
           sharedPreparation: policy.enabled,
+          threadMoves: policy.enabled || relayLinked,
           organizationRepositoryAccess: policy.enabled,
           repositoryPolicyReady: policy.ready,
         },

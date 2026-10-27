@@ -100,6 +100,7 @@ export function HardwareKeyboardCommandProvider({
     const commands = new Set<HardwareKeyboardCommand>(getRegisteredHardwareKeyboardCommands());
     commands.add("newTask");
     commands.add("commandPalette");
+    commands.add("threadVms");
     if (pathname !== "/" && !pathname.startsWith("/threads/")) {
       for (const command of commands) {
         if (command.startsWith("thread.jump.")) commands.delete(command);
@@ -117,6 +118,14 @@ export function HardwareKeyboardCommandProvider({
 
   const onCommand = useCallback(
     (command: HardwareKeyboardCommand) => {
+      if (command === "threadVms") {
+        setPaletteOpen(false);
+        navigation.navigate("SettingsSheet", {
+          screen: "SettingsContent",
+          params: { screen: "SettingsVmThreads" },
+        });
+        return;
+      }
       if (command === "commandPalette") {
         setPaletteOpen(true);
         return;

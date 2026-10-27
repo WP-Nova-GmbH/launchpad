@@ -12,6 +12,13 @@ export interface EnvironmentProject extends OrchestrationProjectShell {
 
 export interface EnvironmentThreadShell extends OrchestrationThreadShell {
   readonly environmentId: EnvironmentId;
+  /** Navigation-only recovery metadata; the source ref stays intact for history and commands. */
+  readonly portableLocation?: {
+    readonly environmentId: EnvironmentId;
+    readonly generation: number;
+    readonly label: string;
+    readonly machine: "cloud" | "server";
+  };
 }
 
 export type EnvironmentMessage = OrchestrationMessage;

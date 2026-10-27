@@ -390,6 +390,10 @@ export class SessionStore extends Context.Service<
       sessionId: AuthSessionId,
       user: AuthSessionUser | null,
     ) => Effect.Effect<IssuedSession, SessionCredentialError>;
+    readonly replaceBrowserIdentity: (
+      sessionId: AuthSessionId,
+      user: AuthSessionUser | null,
+    ) => Effect.Effect<IssuedSession, SessionCredentialError>;
     readonly registerConnection: (
       sessionId: AuthSessionId,
       close: Effect.Effect<void>,
@@ -1072,9 +1076,11 @@ export const make = Effect.gen(function* () {
     Effect.mapError((cause) => new ActiveSessionsListError({ cause })),
   );
 
-  const replaceDesktopIdentity: SessionStore["Service"]["replaceDesktopIdentity"] = Effect.fn(
-    "SessionStore.replaceDesktopIdentity",
-  )(function* (sessionId, user) {
+  const replaceIdentity = Effect.fn("SessionStore.replaceIdentity")(function* (
+    sessionId: AuthSessionId,
+    user: AuthSessionUser | null,
+    source: "desktop" | "browser",
+  ) {
     const row = yield* authSessions
       .getById({ sessionId })
       .pipe(
@@ -1082,8 +1088,11 @@ export const make = Effect.gen(function* () {
       );
     if (
       Option.isNone(row) ||
-      row.value.subject !== "desktop-bootstrap" ||
-      row.value.method !== "bearer-access-token"
+      (source === "desktop"
+        ? row.value.subject !== "desktop-bootstrap" || row.value.method !== "bearer-access-token"
+        : row.value.method !== "browser-session-cookie" ||
+          row.value.subject === "reusable-dev-token" ||
+          row.value.subject === "cloud-connect")
     ) {
       return yield* new UnknownSessionTokenError({ sessionId });
     }
@@ -1109,6 +1118,15 @@ export const make = Effect.gen(function* () {
       ...(user === null ? {} : { user }),
     });
   });
+
+  const replaceDesktopIdentity: SessionStore["Service"]["replaceDesktopIdentity"] = (
+    sessionId,
+    user,
+  ) => replaceIdentity(sessionId, user, "desktop");
+  const replaceBrowserIdentity: SessionStore["Service"]["replaceBrowserIdentity"] = (
+    sessionId,
+    user,
+  ) => replaceIdentity(sessionId, user, "browser");
 
   const revoke: SessionStore["Service"]["revoke"] = Effect.fn("SessionStore.revoke")(
     function* (sessionId) {
@@ -1170,6 +1188,7 @@ export const make = Effect.gen(function* () {
     legacyCookieName,
     issue,
     replaceDesktopIdentity,
+    replaceBrowserIdentity,
     registerConnection,
     getActive,
     rename,

@@ -1,3 +1,5 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { useServerConfigs } from "../state/entities";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { Spinner } from "~/components/ui/spinner";
@@ -116,7 +118,8 @@ import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
 
-import { useThreadActions } from "../hooks/useThreadActions";
+import { requiresThreadDeleteConfirmation, useThreadActions } from "../hooks/useThreadActions";
+import { THREAD_DELETE_WARNING } from "@t3tools/client-runtime/relay/threadVmControls";
 import { projectEnvironment } from "../state/projects";
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { useEnvironment, useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
@@ -421,9 +424,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   // No primary (the hosted app) means every thread is remote, and the machine
   // glyph is what tells the environments apart.
-  const isRemoteThread = thread.environmentId !== primaryEnvironmentId;
-  const remoteEnvLabel = environment?.label ?? null;
-  const remoteMachine = resolveEnvironmentMachineKind(environment?.serverConfig ?? null);
+  const isRemoteThread = !!thread.portableLocation || thread.environmentId !== primaryEnvironmentId;
+  const remoteEnvLabel = thread.portableLocation?.label ?? environment?.label ?? null;
+  const remoteMachine =
+    thread.portableLocation?.machine ??
+    resolveEnvironmentMachineKind(environment?.serverConfig ?? null);
   // A desktop-local secondary backend (e.g. the WSL backend) shows up as a
   // bearer environment whose connection id is prefixed "local:". It runs on the
   // user's own machine, so the cloud icon is misleading, label it "Local" and
@@ -1152,6 +1157,10 @@ interface SidebarProjectItemProps {
 }
 
 const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjectItemProps) {
+  const creationConfigs = useServerConfigs();
+  const canCreateInProject = props.project.memberProjects.some((member) =>
+    canCreateThreadInEnvironment(creationConfigs.get(member.environmentId)),
+  );
   const {
     project,
     isThreadListExpanded,
@@ -1960,12 +1969,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
       if (clicked !== "delete") return;
 
-      if (appSettingsConfirmThreadDelete) {
+      if (
+        selectedThreadEntries.some(({ threadRef }) =>
+          requiresThreadDeleteConfirmation(threadRef, appSettingsConfirmThreadDelete),
+        )
+      ) {
         const confirmed = await api.dialogs.confirm(
-          [
-            `Delete ${count} thread${count === 1 ? "" : "s"}?`,
-            "This permanently clears conversation history for these threads.",
-          ].join("\n"),
+          [`Delete ${count} thread${count === 1 ? "" : "s"}?`, THREAD_DELETE_WARNING].join("\n"),
           { variant: "destructive" },
         );
         if (!confirmed) return;
@@ -2006,6 +2016,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
   const createThreadForProjectMember = useCallback(
     (member: SidebarProjectGroupMember) => {
+      if (!canCreateThreadInEnvironment(creationConfigs.get(member.environmentId))) return;
       if (isMobile) {
         setOpenMobile(false);
       }
@@ -2027,7 +2038,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         }
       })();
     },
-    [handleNewThread, isMobile, setOpenMobile],
+    [handleNewThread, isMobile, setOpenMobile, creationConfigs],
   );
 
   const handleCreateThreadClick = useCallback(
@@ -2047,10 +2058,14 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         }
         const clickedResult = await settlePromise(() =>
           api.contextMenu.show(
-            project.memberProjects.map((member) => ({
-              id: member.physicalProjectKey,
-              label: formatProjectMemberActionLabel(member, project.groupedProjectCount),
-            })),
+            project.memberProjects
+              .filter((member) =>
+                canCreateThreadInEnvironment(creationConfigs.get(member.environmentId)),
+              )
+              .map((member) => ({
+                id: member.physicalProjectKey,
+                label: formatProjectMemberActionLabel(member, project.groupedProjectCount),
+              })),
             {
               x: event.clientX,
               y: event.clientY,
@@ -2081,7 +2096,12 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         createThreadForProjectMember(targetMember);
       })();
     },
-    [createThreadForProjectMember, project.groupedProjectCount, project.memberProjects],
+    [
+      creationConfigs,
+      createThreadForProjectMember,
+      project.groupedProjectCount,
+      project.memberProjects,
+    ],
   );
 
   const attemptArchiveThread = useCallback(
@@ -2248,7 +2268,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         thread.worktreePath ?? threadProject?.workspaceRoot ?? project.workspaceRoot ?? null;
       const clicked = await api.contextMenu.show(
         [
-          ...(thread.branch
+          ...(thread.branch &&
+          canCreateThreadInEnvironment(creationConfigs.get(thread.environmentId))
             ? [{ id: "new-thread-on-branch", label: `New thread on ${thread.branch}` }]
             : []),
           { id: "rename", label: "Rename thread" },
@@ -2322,12 +2343,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
       if (clicked !== "delete") return;
-      if (appSettingsConfirmThreadDelete) {
+      if (requiresThreadDeleteConfirmation(threadRef, appSettingsConfirmThreadDelete)) {
         const confirmed = await api.dialogs.confirm(
-          [
-            `Delete thread "${thread.title}"?`,
-            "This permanently clears conversation history for this thread.",
-          ].join("\n"),
+          [`Delete thread "${thread.title}"?`, THREAD_DELETE_WARNING].join("\n"),
           { variant: "destructive" },
         );
         if (!confirmed) {
@@ -2347,6 +2365,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
     },
     [
+      creationConfigs,
       appSettingsConfirmThreadDelete,
       copyPathToClipboard,
       copyThreadIdToClipboard,
@@ -2450,7 +2469,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         <Tooltip>
           <TooltipTrigger
             render={
-              <div className="pointer-events-none absolute top-[calc(50%+1px)] right-0.5 -translate-y-1/2 opacity-0 transition-opacity duration-150 max-sm:pointer-events-auto max-sm:opacity-100 group-hover/project-header:pointer-events-auto group-hover/project-header:opacity-100 group-focus-within/project-header:pointer-events-auto group-focus-within/project-header:opacity-100">
+              <div
+                hidden={!canCreateInProject}
+                className="pointer-events-none absolute top-[calc(50%+1px)] right-0.5 -translate-y-1/2 opacity-0 transition-opacity duration-150 max-sm:pointer-events-auto max-sm:opacity-100 group-hover/project-header:pointer-events-auto group-hover/project-header:opacity-100 group-focus-within/project-header:pointer-events-auto group-focus-within/project-header:opacity-100"
+              >
                 <button
                   type="button"
                   aria-label={`Create new thread in ${project.displayName}`}

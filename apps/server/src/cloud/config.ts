@@ -1,3 +1,4 @@
+import { EnvironmentCloudEndpointUnavailableError } from "@t3tools/contracts";
 import {
   RelayManagedEndpointOrigin,
   RelayManagedEndpointRuntimeConfig,
@@ -8,6 +9,21 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import type * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+
+/** Operator policy also applies to cached connectors and direct setup calls. */
+export const managedTunnelsDisabled = Config.Boolean("T3CODE_DISABLE_MANAGED_TUNNELS").pipe(
+  Config.withDefault(false),
+  Effect.orDie,
+);
+
+export const requireManagedTunnels = Effect.gen(function* () {
+  if (yield* managedTunnelsDisabled) {
+    return yield* new EnvironmentCloudEndpointUnavailableError({
+      message: "Managed tunnels are disabled by T3CODE_DISABLE_MANAGED_TUNNELS.",
+      endpointRuntimeStatus: { status: "disabled" },
+    });
+  }
+});
 
 export const CLOUD_MINT_PUBLIC_KEY = "cloud-mint-ed25519-public-key";
 export const CLOUD_ENDPOINT_RUNTIME_CONFIG = "cloud-endpoint-runtime-config";
@@ -101,6 +117,20 @@ export const decodeConfirmedOrigin = Schema.decodeUnknownOption(
 export function isAgentActivityPublishingEnabledValue(value: string | null): boolean {
   return value === "true";
 }
+
+/** A personal environment can transfer threads through its existing relay link. */
+export const readRelayConnectionConfigured = (
+  secrets: ServerSecretStore.ServerSecretStore["Service"],
+): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    const [url, credential] = yield* Effect.all([
+      secrets.get(RELAY_URL_SECRET),
+      secrets.get(RELAY_ENVIRONMENT_CREDENTIAL_SECRET),
+    ]);
+    const configured = (value: Option.Option<Uint8Array>) =>
+      Option.isSome(value) && new TextDecoder().decode(value.value).trim().length > 0;
+    return configured(url) && configured(credential);
+  }).pipe(Effect.orElseSucceed(() => false));
 
 /** Whether agent-activity publishes currently leave this environment: the
     publish opt-in secret is enabled and the relay link credentials exist.

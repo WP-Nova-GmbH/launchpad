@@ -1,3 +1,4 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
@@ -119,7 +120,8 @@ import {
   getThreadKeysToDeselectAfterDelete,
   useThreadSelectionStore,
 } from "../threadSelectionStore";
-import { useThreadActions } from "../hooks/useThreadActions";
+import { requiresThreadDeleteConfirmation, useThreadActions } from "../hooks/useThreadActions";
+import { THREAD_DELETE_WARNING } from "@t3tools/client-runtime/relay/threadVmControls";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
@@ -3949,13 +3951,15 @@ export default function Sidebar() {
         return;
       }
       if (clicked.value !== "delete") return;
-      if (confirmThreadDelete) {
+      if (
+        threadKeys.some((key) => {
+          const ref = parseScopedThreadKey(key);
+          return ref && requiresThreadDeleteConfirmation(ref, confirmThreadDelete);
+        })
+      ) {
         const confirmed = await settlePromise(() =>
           api.dialogs.confirm(
-            [
-              `Delete ${count} thread${count === 1 ? "" : "s"}?`,
-              "This permanently clears conversation history for these threads.",
-            ].join("\n"),
+            [`Delete ${count} thread${count === 1 ? "" : "s"}?`, THREAD_DELETE_WARNING].join("\n"),
             { variant: "destructive" },
           ),
         );
@@ -4053,6 +4057,9 @@ export default function Sidebar() {
         const clicked = await settlePromise(() =>
           api.contextMenu.show(
             buildThreadActionMenuItems({
+              canCreateThread: canCreateThreadInEnvironment(
+                serverConfigs.get(thread.environmentId),
+              ),
               branch: thread.branch ?? null,
               projectFilter: threadProjectGroup
                 ? {
@@ -4234,13 +4241,10 @@ export default function Sidebar() {
             return;
           }
           case "delete": {
-            if (confirmThreadDelete) {
+            if (requiresThreadDeleteConfirmation(threadRef, confirmThreadDelete)) {
               const confirmed = await settlePromise(() =>
                 api.dialogs.confirm(
-                  [
-                    `Delete thread "${thread.title}"?`,
-                    "This permanently clears conversation history for this thread.",
-                  ].join("\n"),
+                  [`Delete thread "${thread.title}"?`, THREAD_DELETE_WARNING].join("\n"),
                   { variant: "destructive" },
                 ),
               );
@@ -4385,6 +4389,7 @@ export default function Sidebar() {
           activeThread: newThreadContext.activeThread ?? undefined,
           defaultProjectRef: newThreadContext.defaultProjectRef,
           handleNewThread: newThreadContext.handleNewThread,
+          canCreateThreadInProject: newThreadContext.canCreateThreadInProject,
         });
         return;
       }
@@ -4602,9 +4607,15 @@ export default function Sidebar() {
                             `${thread.environmentId}:${thread.projectId}`,
                           ) ?? null
                         }
-                        environmentLabel={environmentLabelById.get(thread.environmentId) ?? null}
+                        environmentLabel={
+                          thread.portableLocation?.label ??
+                          environmentLabelById.get(thread.environmentId) ??
+                          null
+                        }
                         environmentMachine={
-                          environmentMachineById.get(thread.environmentId) ?? "server"
+                          thread.portableLocation?.machine ??
+                          environmentMachineById.get(thread.environmentId) ??
+                          "server"
                         }
                         providerEntryByInstanceId={
                           providerEntriesByEnvironment.get(thread.environmentId) ??
@@ -4739,10 +4750,14 @@ export default function Sidebar() {
                             }
                             currentEnvironmentId={primaryEnvironmentId}
                             environmentLabel={
-                              environmentLabelById.get(thread.environmentId) ?? null
+                              thread.portableLocation?.label ??
+                              environmentLabelById.get(thread.environmentId) ??
+                              null
                             }
                             environmentMachine={
-                              environmentMachineById.get(thread.environmentId) ?? "server"
+                              thread.portableLocation?.machine ??
+                              environmentMachineById.get(thread.environmentId) ??
+                              "server"
                             }
                             project={
                               projectByKey.get(`${thread.environmentId}:${thread.projectId}`) ??

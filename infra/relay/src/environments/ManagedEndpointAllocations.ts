@@ -456,6 +456,13 @@ export const make = Effect.gen(function* () {
                 recoveryEnvironmentPublicKey:
                   relayManagedEndpointAllocations.recoveryEnvironmentPublicKey,
                 linkedEnvironmentPublicKey: relayEnvironmentLinks.environmentPublicKey,
+                // Every thread VM supports narrow tunnel recovery. Keep revoked/deleted bindings
+                // eligible too, so their disconnected tunnels can be collected after the grace period.
+                threadVmAllocation: sql<boolean>`exists (
+                  select 1 from relay_thread_vm_bindings b
+                  where b.environment_id = ${relayManagedEndpointAllocations.environmentId}
+                    and ${relayManagedEndpointAllocations.userId} = 'thread-vm:' || b.allocation_id
+                )`,
               })
               .from(relayManagedEndpointAllocations)
               .leftJoin(
@@ -477,13 +484,15 @@ export const make = Effect.gen(function* () {
                       recoveryEnabledAt,
                       recoveryEnvironmentPublicKey,
                       linkedEnvironmentPublicKey,
+                      threadVmAllocation,
                       ...allocation
                     }) => ({
                       ...allocation,
                       recoveryEnabled:
-                        recoveryEnabledAt !== null &&
-                        recoveryEnvironmentPublicKey !== null &&
-                        recoveryEnvironmentPublicKey === linkedEnvironmentPublicKey,
+                        threadVmAllocation ||
+                        (recoveryEnabledAt !== null &&
+                          recoveryEnvironmentPublicKey !== null &&
+                          recoveryEnvironmentPublicKey === linkedEnvironmentPublicKey),
                     }),
                   ),
                 ),

@@ -97,6 +97,8 @@ export interface ApprovalVerdictGenerationInput {
   requestDetail?: string | undefined;
   /** The instruction the step was given, so the verdict can judge relevance. */
   stepInstruction: string;
+  jobContext?: string | undefined;
+  reviewConstraint?: string | undefined;
   policy?: TextGenerationPolicy | undefined;
   /** What model and provider to use for generation. */
   modelSelection: ModelSelection;

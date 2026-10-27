@@ -1,0 +1,22 @@
+[Unit]
+Description=Collect released Launchpad VM disk layers
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/etc/launchpad-e2b/build-collector.json
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/launchpad-e2b/launchpad-build-collector --live --apply
+StandardInput=file:/etc/launchpad-e2b/build-collector.json
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=6min
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes

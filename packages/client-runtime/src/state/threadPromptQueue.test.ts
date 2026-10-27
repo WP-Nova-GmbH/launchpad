@@ -32,6 +32,19 @@ describe("shared prompt presentation", () => {
     expect(queuedPromptEditConflict(draft, undefined)).toContain("draft is preserved");
     expect(draft.text).toBe("My unsaved edit");
   });
+  it("labels automatic prompts and keeps human editing attribution", () => {
+    expect(
+      promptAttributionLabel({
+        workflowOrigin: {
+          kind: "automation",
+          jobId: "job",
+          workflowId: "flow",
+          workflowName: "Frozen name",
+        },
+        editedBy: { userId: "bob", displayName: "Bob", imageUrl: null },
+      }),
+    ).toBe("Started by workflow · Frozen name · Edited by Bob");
+  });
   it("keeps submitter, editor and steerer distinct", () => {
     expect(
       promptAttributionLabel({

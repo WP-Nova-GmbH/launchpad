@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_saved_disks" ALTER COLUMN "host_id" SET DATA TYPE varchar(191) USING "host_id"::varchar(191);

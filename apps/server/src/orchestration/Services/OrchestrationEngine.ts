@@ -40,12 +40,24 @@ export interface DeletionPreconditions {
   readonly threads: ReadonlyArray<{
     readonly threadId: ThreadId;
     readonly preparationAttemptId: CommandId | null;
+    readonly worktreePath?: string | null;
+    readonly cleanupAttemptIds?: ReadonlyArray<string>;
   }>;
 }
 
 export interface OrchestrationDispatchOptions {
   readonly origin?: OrchestrationClientOrigin;
+  /** Preserve an accepted start's lineage when compaction reissues its pending projection. */
+  readonly parentCheckoutAdmissionId?: string;
+  /** Rechecked in the event transaction; enrolled threads accept only relay inbox delivery. */
+  readonly directClientCommand?: true;
+  /** Bind a held provider-output command to its original pre-persistence ownership. */
+  readonly expectedThreadOwnership?: {
+    readonly environmentId: string;
+    readonly generation: number;
+  } | null;
   readonly deletionPreconditions?: DeletionPreconditions;
+  readonly requireSetupCleanup?: true;
   /** Serialize a preflight rejection with duplicate commands and their receipts. */
   readonly rejection?: { readonly detail: string; readonly projectId: ProjectId };
 }

@@ -171,7 +171,6 @@ describe("saved submission ownership", () => {
       await act(() => switchAccount("bob"));
       await act(async () => {
         preparing.release();
-        await finished.entered;
       });
       expect(transport.requests).toHaveLength(0);
       expect(transport.dispatched).toHaveLength(0);

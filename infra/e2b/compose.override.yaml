@@ -1,0 +1,42 @@
+# Copy beside the compose.yaml/.env from the pinned E2B Embed revision.
+# Apply host-firewall.nft before bringing up this dedicated compute host.
+x-launchpad-logging: &launchpad-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+services:
+  api:
+    logging: *launchpad-logging
+  client-proxy:
+    logging: *launchpad-logging
+  postgres:
+    logging: *launchpad-logging
+  redis:
+    logging: *launchpad-logging
+  clickhouse:
+    logging: *launchpad-logging
+  vector:
+    logging: *launchpad-logging
+  orchestrator:
+    logging: *launchpad-logging
+    environment:
+      LAUNCHPAD_REQUIRE_HOST_FIREWALL: "true"
+      LAUNCHPAD_REQUIRE_EXECUTION_FENCE: "true"
+      RESTORE_COLD_PROBE_ENABLED: ${RESTORE_COLD_PROBE_ENABLED:-false}
+      LAUNCHPAD_COLD_BOOT_TIMEOUT: ${LAUNCHPAD_COLD_BOOT_TIMEOUT:-60s}
+      BUILD_ENSURE_FREE_DISK_SPACE: "true"
+  launchpad-keepalive:
+    logging: *launchpad-logging
+    image: ${E2B_NODE_E2B_IMAGE:?Use the pinned upstream E2B .env}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      E2B_API_URL: http://127.0.0.1:3000
+    volumes:
+      - seed-state:/run/e2b:ro
+      - ./e2b-keepalive.ts:/app/launchpad-keepalive.ts:ro
+    entrypoint: [node, /app/launchpad-keepalive.ts]
+    depends_on:
+      api:
+        condition: service_healthy

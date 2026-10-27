@@ -1,3 +1,4 @@
+import { TerminalManager } from "./terminal/Manager.ts";
 // @effect-diagnostics nodeBuiltinImport:off - CLI integration exercises Node HTTP and filesystem boundaries.
 import * as NodeHttp from "node:http";
 import * as NodeFS from "node:fs";
@@ -29,6 +30,15 @@ import * as CliError from "effect/unstable/cli/CliError";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
+import {
+  threadVmEnrollmentCommand,
+  threadVmRestoreIdentityCommand,
+  threadVmRestoreCleanupCommand,
+  threadVmRestoreImportCommand,
+  threadVmSetupCommand,
+  threadVmServeCommand,
+  threadVmGitCredentialCommand,
+} from "./cli/threadVm.ts";
 import { cli, makeCli } from "./bin.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import {
@@ -372,6 +382,7 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
     const routesLayer = HttpApiBuilder.layer(ProjectCliHttpApi).pipe(
       Layer.provide(
         orchestrationHttpApiLayer.pipe(
+          Layer.provide(Layer.mock(TerminalManager, { closeOwned: () => Effect.succeed(false) })),
           Layer.provide(Layer.mock(ThreadDeletionReactor)({ drainThrough: () => Effect.void })),
           Layer.provide(
             Layer.mock(ThreadPreparationReactor)({ drainAttemptThrough: () => Effect.void }),
@@ -880,4 +891,25 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       assert.equal(optionError.option, "--dev-url");
     }),
   );
+});
+
+it("private VM commands resolve their own server configuration", () => {
+  const commands = [
+    threadVmEnrollmentCommand,
+    threadVmRestoreIdentityCommand,
+    threadVmRestoreCleanupCommand,
+    threadVmRestoreImportCommand,
+    threadVmSetupCommand,
+    threadVmServeCommand,
+    threadVmGitCredentialCommand,
+  ] as const;
+  // The CLI resolves configuration from its selected base directory, rather
+  // than requiring an unrelated caller's running-server configuration.
+  const selfConfigured: Extract<
+    Command.Services<(typeof commands)[number]>,
+    ServerConfig.ServerConfig
+  > extends never
+    ? true
+    : never = true;
+  assert.isTrue(selfConfigured);
 });

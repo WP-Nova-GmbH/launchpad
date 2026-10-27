@@ -1,4 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCrypto from "node:crypto";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import { installPortableCodexHome } from "../Drivers/PortableCodexHome.ts";
 import * as NodeAssert from "node:assert/strict";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -22,7 +26,10 @@ import { createModelSelection } from "@t3tools/shared/model";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
 
+import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -37,16 +44,19 @@ import * as CodexErrors from "effect-codex-app-server/errors";
 
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import { ProviderAdapterValidationError } from "../Errors.ts";
+import { ProviderAdapterValidationError, type ProviderAdapterProcessError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
+  CodexSessionRuntimePendingApprovalNotFoundError,
+  CodexSessionRuntimePendingUserInputNotFoundError,
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeSendTurnInput,
   type CodexSessionRuntimeShape,
   type CodexThreadSnapshot,
 } from "./CodexSessionRuntime.ts";
 import { makeCodexAdapter } from "./CodexAdapter.ts";
+const encodeUnknownJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 // Test-local service tag so the rest of the file can keep using `yield* CodexAdapter`.
@@ -60,7 +70,7 @@ const asEventId = (value: string): EventId => EventId.make(value);
 const asItemId = (value: string): ProviderItemId => ProviderItemId.make(value);
 
 class FakeCodexRuntime implements CodexSessionRuntimeShape {
-  private readonly eventQueue = Effect.runSync(Queue.unbounded<ProviderEvent>());
+  private readonly eventQueue = Effect.runSync(Queue.unbounded<ProviderEvent, Cause.Done<void>>());
   private readonly now = "2026-01-01T00:00:00.000Z";
 
   public readonly startImpl = vi.fn(() =>
@@ -141,6 +151,9 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
   }
 
   readThread = Effect.promise(() => this.readThreadImpl());
+  readConversationSource: CodexSessionRuntimeShape["readConversationSource"] = Effect.die(
+    "No native checkpoint source configured for this fixture",
+  );
 
   rollbackThread(numTurns: number) {
     return Effect.promise(() => this.rollbackThreadImpl(numTurns));
@@ -162,7 +175,10 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     return Stream.fromQueue(this.eventQueue);
   }
 
-  close = Effect.promise(() => this.closeImpl());
+  closeNativeWriter?: NonNullable<CodexSessionRuntimeShape["closeNativeWriter"]>;
+  endEvents = Queue.end(this.eventQueue);
+  closeEffect: Effect.Effect<void, ProviderAdapterProcessError> | undefined;
+  close = Effect.suspend(() => this.closeEffect ?? Effect.promise(() => this.closeImpl()));
 
   emit(event: ProviderEvent) {
     return Queue.offer(this.eventQueue, event).pipe(Effect.asVoid);
@@ -222,6 +238,7 @@ function makeScopedRuntimeFactory(options?: { readonly failConstruction?: boolea
 
 const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
   upsert: () => Effect.void,
+  confirmShutdown: () => Effect.succeed(false),
   recordImportedTranscript: () => Effect.die("unused"),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
@@ -249,6 +266,252 @@ const validationLayer = it.layer(
 );
 
 validationLayer("CodexAdapterLive validation", (it) => {
+  it.effect("isolates precommit native resume notifications and closes the probe runtime", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const bootObserved = yield* Deferred.make<void>();
+        const runtimes: FakeCodexRuntime[] = [];
+        const threadId = asThreadId("probe-thread");
+        const nativeId = "00000000-0000-4000-8000-000000000001";
+        const event = (id: string, method: string): ProviderEvent => ({
+          id: asEventId(id),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          createdAt: "2026-01-01T00:00:00Z",
+          method,
+        });
+        const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
+          nativeEventLogger: {
+            filePath: "test-probe-native",
+            write: (value) =>
+              value && typeof value === "object" && "id" in value && value.id === "probe-bootstrap"
+                ? Deferred.succeed(bootObserved, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+            close: () => Effect.void,
+          },
+          makeRuntime: (options) => {
+            const runtime = new FakeCodexRuntime(options);
+            if (runtimes.length === 0)
+              runtime.start = () =>
+                Effect.gen(function* () {
+                  yield* runtime.emit(event("probe-bootstrap", "session/connecting"));
+                  yield* Deferred.await(bootObserved);
+                  return {
+                    ...(yield* Effect.promise(() => runtime.startImpl())),
+                    ...(options.resumeCursor ? { resumeCursor: options.resumeCursor } : {}),
+                  };
+                });
+            runtimes.push(runtime);
+            return Effect.succeed(runtime);
+          },
+        });
+        const cursor = { threadId: nativeId, resumePolicy: "require-existing" as const };
+        const result = yield* adapter.probeSession({
+          threadId,
+          runtimeMode: "full-access",
+          resumeCursor: cursor,
+        });
+        NodeAssert.deepStrictEqual(result.resumeCursor, cursor);
+        NodeAssert.equal(runtimes[0]?.closeImpl.mock.calls.length, 1);
+        NodeAssert.deepStrictEqual(yield* adapter.listSessions(), []);
+        NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+        // The normal adapter's first event must be this marker. Probe bootstrap
+        // was observed by its native logger but cannot be queued in this stream.
+        yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+        const observed = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+        const normalRuntime = runtimes[1];
+        NodeAssert.ok(normalRuntime);
+        yield* normalRuntime.emit(event("normal-after-probe", "session/ready"));
+        NodeAssert.equal(
+          Option.getOrThrow(yield* Fiber.join(observed)).eventId,
+          "normal-after-probe",
+        );
+        const rejected = yield* Effect.flip(
+          adapter.probeSession({ threadId, runtimeMode: "full-access" }),
+        );
+        NodeAssert.equal(rejected._tag, "ProviderAdapterValidationError");
+        NodeAssert.equal(runtimes[1]?.closeImpl.mock.calls.length, 0);
+        NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      }),
+    ),
+  );
+  it.effect(
+    "probes transferred history with the configured Codex across versions and rejects failed resume",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* fs.realPath(
+            yield* fs.makeTempDirectoryScoped({ prefix: "portable-adapter-" }),
+          );
+          const account = path.join(root, "configured-account");
+          yield* fs.makeDirectory(account);
+          yield* fs.writeFileString(
+            path.join(account, "auth.json"),
+            "destination-only-token-fixture",
+          );
+          const nativeId = "01900000-0000-7000-8000-000000000001";
+          const rolloutPath = path.join(root, "rollout.jsonl");
+          const rollout =
+            (yield* encodeUnknownJson({
+              type: "session_meta",
+              payload: {
+                id: nativeId,
+                cli_version: "0.163.0-alpha.10.2",
+                history_mode: "paginated",
+              },
+            })) + "\n";
+          yield* fs.writeFileString(rolloutPath, rollout);
+          const installed = yield* installPortableCodexHome({
+            stateDir: path.join(root, "state"),
+            threadId: "portable-test",
+            operationId: "move-1",
+            providerInstanceId: "codex",
+            transferSha256: "a".repeat(64),
+            rolloutPath,
+            codexVersion: "0.159.3",
+            manifest: {
+              format: "codex-rollout-v1",
+              threadId: nativeId,
+              codexVersion: "0.163.0-alpha.10.2",
+              historyMode: "paginated",
+              rolloutName: `rollout-2026-10-01T12-00-00-${nativeId}.jsonl`,
+              sha256: NodeCrypto.createHash("sha256").update(rollout).digest("hex"),
+            },
+          });
+          const binaryPath = path.join(root, "codex-fixture");
+          const writeVersion = (version: string) =>
+            fs.writeFileString(binaryPath, `#!/bin/sh\nprintf 'codex-cli ${version}\\n'\n`, {
+              mode: 0o700,
+            });
+          yield* writeVersion("0.159.3");
+          const factory = makeRuntimeFactory();
+          const config = yield* ServerConfig;
+          const adapter = yield* makeCodexAdapter(
+            decodeCodexSettings({ binaryPath, homePath: account }),
+            { makeRuntime: factory.factory },
+          ).pipe(
+            Effect.provideService(ServerConfig, { ...config, stateDir: path.join(root, "state") }),
+          );
+          const input = {
+            threadId: asThreadId("portable-test"),
+            runtimeMode: "full-access" as const,
+            cwd: root,
+            resumeCursor: installed.resumeCursor,
+          };
+          yield* adapter.startSession(input);
+          NodeAssert.equal(factory.lastRuntime?.options.binaryPath, binaryPath);
+          NodeAssert.equal(factory.lastRuntime?.options.homePath, installed.homePath);
+          NodeAssert.deepStrictEqual(
+            factory.lastRuntime?.options.resumeCursor,
+            installed.resumeCursor,
+          );
+          NodeAssert.equal(
+            yield* fs.readFileString(path.join(installed.homePath, "auth.json")),
+            "destination-only-token-fixture",
+          );
+          yield* adapter.stopSession(input.threadId);
+          yield* writeVersion("0.160.0");
+          yield* adapter.probeSession(input);
+          NodeAssert.equal(factory.lastRuntime?.options.binaryPath, binaryPath);
+          NodeAssert.deepStrictEqual(
+            factory.lastRuntime?.options.resumeCursor,
+            installed.resumeCursor,
+          );
+          NodeAssert.equal(factory.lastRuntime?.sendTurnImpl.mock.calls.length, 0);
+          NodeAssert.equal(factory.lastRuntime?.closeImpl.mock.calls.length, 1);
+          NodeAssert.equal(yield* adapter.hasSession(input.threadId), false);
+          const count = factory.factory.mock.calls.length;
+          const requestLog = path.join(root, "requests");
+          yield* fs.writeFileString(
+            binaryPath,
+            `#!/usr/bin/env node
+const fs = require("node:fs");
+if (process.argv.includes("--version")) { process.stdout.write("codex-cli 0.160.0\\n"); }
+else {
+  require("node:readline").createInterface({input: process.stdin}).on("line", line => {
+    const message = JSON.parse(line);
+    fs.appendFileSync(process.env.MOCK_REQUESTS, message.method + "\\n");
+    if (message.method === "initialize") process.stdout.write(JSON.stringify({id: message.id, result: {
+      userAgent: "test", codexHome: process.env.MOCK_WRONG_HOME ? process.cwd() : process.env.CODEX_HOME,
+      platformFamily: "unix", platformOs: "macos"
+    }}) + "\\n");
+    if (message.method === "thread/resume") process.stdout.write(JSON.stringify({id: message.id,
+      ...(process.env.MOCK_RESUME_ERROR
+        ? { error: { code: -32603, message: "thread not found: incompatible native history" } }
+        : { result: { cwd: process.cwd(), model: "gpt-5.3-codex", thread: { id: message.params.threadId } } })
+    }) + "\\n");
+  });
+}
+`,
+            { mode: 0o700 },
+          );
+          const realAdapter = (environment: Record<string, string> = {}) =>
+            makeCodexAdapter(decodeCodexSettings({ binaryPath, homePath: account }), {
+              environment: { ...process.env, MOCK_REQUESTS: requestLog, ...environment },
+            }).pipe(
+              Effect.provideService(ServerConfig, {
+                ...config,
+                stateDir: path.join(root, "state"),
+              }),
+            );
+          const wrongHomeAdapter = yield* realAdapter({ MOCK_WRONG_HOME: "1" });
+          const wrongHome = yield* Effect.flip(wrongHomeAdapter.probeSession(input));
+          NodeAssert.equal(wrongHome._tag, "ProviderAdapterValidationError", wrongHome.message);
+          NodeAssert.equal(yield* fs.readFileString(requestLog), "initialize\n");
+          yield* fs.writeFileString(requestLog, "");
+          const compatible = yield* realAdapter();
+          const probed = yield* compatible.probeSession(input);
+          NodeAssert.deepStrictEqual(probed.resumeCursor, installed.resumeCursor);
+          NodeAssert.equal(yield* compatible.hasSession(input.threadId), false);
+          NodeAssert.equal(
+            yield* fs.readFileString(requestLog),
+            "initialize\ninitialized\nthread/resume\n",
+          );
+          yield* fs.writeFileString(requestLog, "");
+          const incompatible = yield* realAdapter({ MOCK_RESUME_ERROR: "1" });
+          const failed = yield* Effect.flip(incompatible.probeSession(input));
+          NodeAssert.equal(failed._tag, "ProviderAdapterProcessError");
+          NodeAssert.match(failed.message, /incompatible native history/);
+          NodeAssert.equal(yield* incompatible.hasSession(input.threadId), false);
+          NodeAssert.equal(
+            yield* fs.readFileString(requestLog),
+            "initialize\ninitialized\nthread/resume\n",
+          );
+          yield* fs.remove(path.join(installed.homePath, "sessions"), { recursive: true });
+          yield* Effect.flip(adapter.startSession(input));
+          NodeAssert.equal(factory.factory.mock.calls.length, count);
+        }),
+      ),
+  );
+
+  it.effect("never discards a damaged required cursor and starts a fresh conversation", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      validationRuntimeFactory.factory.mockClear();
+      for (const cursor of [
+        { resumePolicy: "require-existing" },
+        { resumePolicy: "require-existing", threadId: null },
+        { resumePolicy: "require-existing", threadId: " " },
+        { threadId: "native", portableStateId: "../other" },
+        { threadId: null, portableStateId: "a".repeat(64) },
+        { threadId: "native", portableStateId: "a".repeat(64) },
+      ]) {
+        const error = yield* Effect.flip(
+          adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId: asThreadId("damaged-transfer"),
+            runtimeMode: "full-access",
+            resumeCursor: cursor,
+          }),
+        );
+        NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      }
+      NodeAssert.equal(validationRuntimeFactory.factory.mock.calls.length, 0);
+    }),
+  );
   it.effect("returns validation error for non-codex provider on startSession", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;
@@ -319,6 +582,27 @@ const sessionErrorLayer = it.layer(
 );
 
 sessionErrorLayer("CodexAdapterLive session errors", (it) => {
+  it.effect("rejects missing local approval and user-input callbacks before native dispatch", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("codex-missing-callback");
+      yield* adapter.startSession({ threadId, runtimeMode: "approval-required" });
+      const runtime: CodexSessionRuntimeShape = sessionRuntimeFactory.lastRuntime!;
+      vi.spyOn(runtime, "respondToRequest").mockImplementation((requestId) =>
+        Effect.fail(new CodexSessionRuntimePendingApprovalNotFoundError({ requestId })),
+      );
+      vi.spyOn(runtime, "respondToUserInput").mockImplementation((requestId) =>
+        Effect.fail(new CodexSessionRuntimePendingUserInputNotFoundError({ requestId })),
+      );
+      for (const response of [
+        adapter.respondToRequest(threadId, ApprovalRequestId.make("missing"), "accept"),
+        adapter.respondToUserInput(threadId, ApprovalRequestId.make("missing"), {}),
+      ])
+        NodeAssert.equal((yield* Effect.flip(response))._tag, "ProviderAdapterValidationError");
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("targets native steering and rejects a finished target before dispatch", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;
@@ -475,12 +759,16 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
         }),
       );
 
-      NodeAssert.deepStrictEqual(runtime.sendTurnImpl.mock.calls[0]?.[0], {
-        input: "hello",
-        model: "gpt-5.3-codex",
-        effort: "high",
-        serviceTier: "priority",
-      });
+      NodeAssert.deepStrictEqual(
+        { ...runtime.sendTurnImpl.mock.calls[0]?.[0], beforeDispatch: undefined },
+        {
+          beforeDispatch: undefined,
+          input: "hello",
+          model: "gpt-5.3-codex",
+          effort: "high",
+          serviceTier: "priority",
+        },
+      );
     }),
   );
 
@@ -641,12 +929,16 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
         }),
       );
 
-      NodeAssert.deepStrictEqual(runtime.sendTurnImpl.mock.calls[0]?.[0], {
-        input: "hello",
-        model: "gpt-5.3-codex",
-        effort: "high",
-        serviceTier: "flex",
-      });
+      NodeAssert.deepStrictEqual(
+        { ...runtime.sendTurnImpl.mock.calls[0]?.[0], beforeDispatch: undefined },
+        {
+          beforeDispatch: undefined,
+          input: "hello",
+          model: "gpt-5.3-codex",
+          effort: "high",
+          serviceTier: "flex",
+        },
+      );
     }).pipe(Effect.provide(customLayer));
   });
 });
@@ -1797,7 +2089,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
     }),
   );
 
-  it.effect("maps session/closed lifecycle events to canonical session.exited runtime events", () =>
+  it.effect("maps unexpected native session exit to canonical runtime events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();
       const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
@@ -1808,7 +2100,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         provider: ProviderDriverKind.make("codex"),
         threadId: asThreadId("thread-1"),
         createdAt: "2026-01-01T00:00:00.000Z",
-        method: "session/closed",
+        method: "session/exited",
         message: "Session stopped",
       };
 
@@ -3117,6 +3409,460 @@ usageLimitLayer("CodexAdapterLive usage limits", (it) => {
       if (first._tag !== "Some" || first.value.type !== "runtime.error") return;
       NodeAssert.equal(first.value.payload.message, "Codex is temporarily unavailable.");
       NodeAssert.equal(first.value.payload.class, "provider_error");
+    }),
+  );
+});
+
+validationLayer("native conversation checkpoint capture", (it) => {
+  const encodeString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
+  const decodeRequest = Schema.decodeUnknownSync(
+    Schema.fromJsonString(
+      Schema.Struct({ method: Schema.String, params: Schema.optionalKey(Schema.Unknown) }),
+    ),
+  );
+  const fixture = Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem,
+      path = yield* Path.Path;
+    const root = yield* fs.realPath(
+      yield* fs.makeTempDirectoryScoped({ prefix: "codex-checkpoint-" }),
+    );
+    const home = path.join(root, "provider");
+    yield* fs.makeDirectory(path.join(home, "sessions"), { recursive: true });
+    const nativeId = "01900000-0000-7000-8000-000000000001";
+    const rolloutPath = path.join(
+      home,
+      "sessions",
+      `rollout-2026-10-01T12-00-00-${nativeId}.jsonl`,
+    );
+    yield* fs.writeFileString(
+      rolloutPath,
+      '{"type":"session_meta","payload":{"id":"' +
+        nativeId +
+        '","cli_version":"0.159.3","history_mode":"paginated"}}\n',
+    );
+    yield* fs.writeFileString(path.join(home, "auth.json"), "must stay at source");
+    yield* fs.writeFileString(
+      path.join(home, "sessions", "unrelated.jsonl"),
+      "other private thread",
+    );
+    const closeObserved = yield* Deferred.make<void>();
+    const isClosed = Schema.is(Schema.Struct({ method: Schema.Literal("session/closed") }));
+    const factory = makeRuntimeFactory();
+    const adapter = yield* makeCodexAdapter(decodeCodexSettings({ homePath: home }), {
+      makeRuntime: factory.factory,
+      nativeEventLogger: {
+        filePath: "memory://native-checkpoint",
+        write: (event) =>
+          isClosed(event)
+            ? Deferred.succeed(closeObserved, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        close: () => Effect.void,
+      },
+    });
+    const threadId = asThreadId("native-checkpoint-test");
+    yield* adapter.startSession({ threadId, cwd: root, runtimeMode: "full-access" });
+    const runtime = factory.lastRuntime!;
+    runtime.readConversationSource = Effect.succeed({ threadId: nativeId, rolloutPath });
+    const input = { threadId, artifactRoot: path.join(root, "checkpoint"), referencedFiles: [] };
+    return {
+      adapter,
+      factory,
+      runtime,
+      fs,
+      path,
+      root,
+      nativeId,
+      rolloutPath,
+      input,
+      closeObserved,
+    };
+  });
+
+  it.effect(
+    "retains a stopped source using only native metadata reads, with no writer or credentials",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          yield* f.adapter.stopSession(f.input.threadId);
+          const binary = f.path.join(f.root, "read-only-codex");
+          const methods = f.path.join(f.root, "requests.jsonl");
+          const program = [
+            "#!/usr/bin/env node",
+            "const fs = require('node:fs'), readline = require('node:readline');",
+            "readline.createInterface({input:process.stdin}).on('line', line => {",
+            "const request=JSON.parse(line);fs.appendFileSync(" +
+              encodeString(methods) +
+              ",JSON.stringify(request)+'\\n');",
+            "if(request.id===undefined)return;",
+            "const result=request.method==='initialize'?{codexHome:process.env.CODEX_HOME,userAgent:'codex/0.159.3',platformFamily:'unix',platformOs:'macos'}:{thread:{id:" +
+              encodeString(f.nativeId) +
+              ",path:" +
+              encodeString(f.rolloutPath) +
+              ",historyMode:'paginated'}};",
+            "process.stdout.write(JSON.stringify({id:request.id,result})+'\\n');",
+            "});",
+          ].join("\n");
+          yield* f.fs.writeFileString(binary, program, { mode: 0o700 });
+          const runtimes = makeRuntimeFactory();
+          const adapter = yield* makeCodexAdapter(
+            decodeCodexSettings({
+              binaryPath: binary,
+              homePath: f.path.join(f.root, "provider"),
+            }),
+            { makeRuntime: runtimes.factory },
+          );
+          const point = yield* adapter.checkpointConversation!({
+            ...f.input,
+            stoppedSource: { nativeThreadId: f.nativeId, cwd: f.root },
+          });
+          const requests = (yield* f.fs.readFileString(methods))
+            .trim()
+            .split("\n")
+            .map((line) => decodeRequest(line));
+          NodeAssert.deepEqual(
+            requests.map((request) => request.method),
+            ["initialize", "initialized", "thread/read"],
+          );
+          NodeAssert.deepEqual(requests[2]!.params, { threadId: f.nativeId, includeTurns: false });
+          NodeAssert.equal(runtimes.factory.mock.calls.length, 0);
+          NodeAssert.equal(yield* adapter.hasSession(f.input.threadId), false);
+          NodeAssert.equal(point.nativeThreadId, f.nativeId);
+          NodeAssert.deepEqual((yield* f.fs.readDirectory(point.directory)).sort(), [
+            "manifest.json",
+            "rollout.jsonl",
+          ]);
+        }),
+      ),
+  );
+  it.effect("a stopped-source export cannot bypass a live session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const error = yield* Effect.flip(
+          f.adapter.checkpointConversation!({
+            ...f.input,
+            stoppedSource: { nativeThreadId: f.nativeId, cwd: f.root },
+          }),
+        );
+        NodeAssert.ok(error.message.includes("must stop"));
+        NodeAssert.equal(f.runtime.closeImpl.mock.calls.length, 0);
+        NodeAssert.equal(yield* f.adapter.hasSession(f.input.threadId), true);
+        NodeAssert.equal(yield* f.fs.exists(f.input.artifactRoot), false);
+      }),
+    ),
+  );
+  it.effect("closes the native writer before exporting only the same conversation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        f.runtime.closeImpl.mockImplementation(async () => {
+          NodeFS.appendFileSync(
+            f.rolloutPath,
+            '{"type":"event_msg","payload":{"type":"user_message","message":"flushed fact"}}\n',
+          );
+        });
+        const point = yield* f.adapter.checkpointConversation!(f.input);
+        NodeAssert.equal(point.nativeThreadId, f.nativeId);
+        NodeAssert.ok(
+          (yield* f.fs.readFileString(f.path.join(point.directory, "rollout.jsonl"))).includes(
+            "flushed fact",
+          ),
+        );
+        NodeAssert.deepEqual((yield* f.fs.readDirectory(point.directory)).sort(), [
+          "manifest.json",
+          "rollout.jsonl",
+        ]);
+        NodeAssert.equal(yield* f.adapter.hasSession(f.input.threadId), false);
+      }),
+    ),
+  );
+  it.effect("retains a VM checkpoint without claiming its background workloads stopped", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture.pipe(Effect.provideService(VmWorkloadTracking, true));
+        const episode = yield* f.adapter.getSessionRuntimeEpisode!(f.input.threadId);
+        let nativeCloses = 0;
+        f.runtime.closeNativeWriter = Effect.gen(function* () {
+          nativeCloses++;
+          NodeFS.appendFileSync(
+            f.rolloutPath,
+            '{"type":"event_msg","payload":{"type":"user_message","message":"VM writer flushed"}}\n',
+          );
+          yield* f.runtime.emit({
+            id: asEventId("vm-final-stderr"),
+            kind: "notification",
+            provider: ProviderDriverKind.make("codex"),
+            threadId: f.input.threadId,
+            createdAt: "2026-10-27T10:00:00.000Z",
+            method: "process/stderr",
+            message: "last native output",
+          });
+          yield* f.runtime.endEvents;
+        });
+        const point = yield* f.adapter.checkpointConversation!(f.input);
+        yield* f.adapter.stopSession(f.input.threadId, episode);
+        NodeAssert.equal(nativeCloses, 1);
+        NodeAssert.equal(f.runtime.closeImpl.mock.calls.length, 0);
+        NodeAssert.equal(yield* f.adapter.hasSession(f.input.threadId), false);
+        NodeAssert.equal(
+          yield* f.adapter.isSessionStopConfirmed!(f.input.threadId, episode),
+          false,
+        );
+        NodeAssert.ok(
+          (yield* f.fs.readFileString(f.path.join(point.directory, "rollout.jsonl"))).includes(
+            "VM writer flushed",
+          ),
+        );
+        const final = yield* f.adapter.streamEvents.pipe(
+          Stream.filter((event) => event.type === "runtime.warning"),
+          Stream.runHead,
+        );
+        NodeAssert.equal(Option.getOrThrow(final).payload.message, "last native output");
+      }),
+    ),
+  );
+  it.effect("rejected unsettled native state leaves the session running and no archive", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        f.runtime.readConversationSource = Effect.fail(
+          new ProviderAdapterValidationError({
+            provider: "codex",
+            operation: "checkpointConversation",
+            issue: "child still running",
+          }),
+        );
+        const error = yield* Effect.flip(f.adapter.checkpointConversation!(f.input));
+        NodeAssert.ok(error.message.includes("child still running"));
+        NodeAssert.equal(f.runtime.closeImpl.mock.calls.length, 0);
+        NodeAssert.equal(yield* f.adapter.hasSession(f.input.threadId), true);
+        NodeAssert.equal(yield* f.fs.exists(f.input.artifactRoot), false);
+      }),
+    ),
+  );
+  it.effect("a new turn cannot dispatch while a native checkpoint is capturing", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const entered = yield* Deferred.make<void>(),
+          release = yield* Deferred.make<void>();
+        f.runtime.readConversationSource = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.as({ threadId: f.nativeId, rolloutPath: f.rolloutPath }),
+        );
+        const capturing = yield* f.adapter.checkpointConversation!(f.input).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        const error = yield* Effect.flip(
+          f.adapter.sendTurn({ threadId: f.input.threadId, input: "next", attachments: [] }),
+        );
+        NodeAssert.ok(error.message.includes("being checkpointed"));
+        NodeAssert.equal(f.runtime.sendTurnImpl.mock.calls.length, 0);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(capturing);
+      }),
+    ),
+  );
+  it.effect("a checkpoint close cannot surface as a crash in the next resumed turn", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        f.runtime.close = f.runtime
+          .emit({
+            id: asEventId("checkpoint-close"),
+            kind: "session",
+            provider: ProviderDriverKind.make("codex"),
+            threadId: f.input.threadId,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            method: "session/closed",
+            message: "Session stopped",
+          })
+          .pipe(Effect.andThen(Deferred.await(f.closeObserved)), Effect.as(undefined));
+        const events = yield* f.adapter.streamEvents.pipe(Stream.toPull);
+        yield* f.adapter.checkpointConversation!(f.input);
+        yield* f.adapter.startSession({
+          threadId: f.input.threadId,
+          cwd: f.root,
+          runtimeMode: "full-access",
+        });
+        const runtimes = yield* f.adapter.listSessions();
+        NodeAssert.equal(runtimes.length, 1);
+        // The first remaining event must be the explicitly emitted next turn,
+        // rather than a delayed graceful exit from the previous runtime.
+        const resumed = f.factory.lastRuntime!;
+        yield* resumed.emit({
+          ...codexTurnEvent("turn/started", "next-turn"),
+          threadId: f.input.threadId,
+        });
+        const [event] = yield* events;
+        NodeAssert.equal(event!.type, "turn.started");
+        NodeAssert.equal(event!.turnId, asTurnId("next-turn"));
+      }),
+    ),
+  );
+});
+
+const shutdownFailureFactory = makeScopedRuntimeFactory();
+const shutdownFailureLayer = it.layer(
+  Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      return yield* makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: shutdownFailureFactory.factory,
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+);
+shutdownFailureLayer("Codex verified shutdown", (it) => {
+  it.effect("retains failed startup cleanup for an explicit retry", () =>
+    Effect.gen(function* () {
+      let failedRuntime: FakeCodexRuntime | undefined;
+      shutdownFailureFactory.factory.mockImplementationOnce((options) => {
+        const runtime = new FakeCodexRuntime(options);
+        failedRuntime = runtime;
+        runtime.startImpl.mockRejectedValueOnce(new Error("startup failed"));
+        runtime.closeImpl.mockRejectedValueOnce(new Error("cleanup failed"));
+        return Effect.succeed(runtime);
+      });
+      const adapter = yield* CodexAdapter;
+      const id = asThreadId("failed-start-cleanup");
+      const failure = yield* adapter
+        .startSession({ threadId: id, runtimeMode: "approval-required" })
+        .pipe(Effect.exit);
+      NodeAssert.equal(Exit.isFailure(failure), true);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(id), false);
+      NodeAssert.equal(yield* adapter.hasSession(id), false);
+      yield* adapter.stopSession(id);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(id), true);
+      NodeAssert.equal(failedRuntime!.closeImpl.mock.calls.length, 2);
+    }),
+  );
+  it.effect("waits for owned scope disposal and shares concurrent stop confirmation", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      let runtime: FakeCodexRuntime | undefined;
+      shutdownFailureFactory.factory.mockImplementationOnce((options) =>
+        Effect.gen(function* () {
+          yield* Effect.addFinalizer(() =>
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(released))),
+          );
+          runtime = new FakeCodexRuntime(options);
+          return runtime;
+        }),
+      );
+      const adapter = yield* CodexAdapter;
+      const id = asThreadId("scope-close-confirmation");
+      yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+      const first = yield* adapter.stopSession(id).pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      const second = yield* adapter.stopSession(id).pipe(Effect.forkScoped);
+      const proof = yield* adapter.isSessionStopConfirmed!(id);
+      yield* Deferred.succeed(released, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+      NodeAssert.equal(proof, false);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(id), true);
+      NodeAssert.equal(runtime!.closeImpl.mock.calls.length, 1);
+    }),
+  );
+  it.effect("does not publish graceful exit until native cleanup settles", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const id = asThreadId("held-native-close");
+      yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+      const runtime = shutdownFailureFactory.lastRuntime!;
+      const held = yield* Deferred.make<void>();
+      const boundary = yield* Deferred.make<void>();
+      const exited = yield* Deferred.make<void>();
+      let exits = 0;
+      yield* adapter.streamEvents.pipe(
+        Stream.runForEach((event) =>
+          Effect.gen(function* () {
+            if (event.threadId !== id) return;
+            if (event.type === "session.exited") {
+              exits++;
+              yield* Deferred.succeed(exited, undefined);
+            }
+            if (event.type === "session.state.changed" && event.payload.state === "ready")
+              yield* Deferred.succeed(boundary, undefined);
+          }),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      runtime.closeEffect = Effect.gen(function* () {
+        yield* runtime.emit({
+          id: asEventId("early-close"),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId: id,
+          createdAt: "2026-10-12T12:00:00.000Z",
+          method: "session/closed",
+          message: "Session stopped",
+        });
+        yield* runtime.emit({
+          id: asEventId("close-boundary"),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId: id,
+          createdAt: "2026-10-12T12:00:00.000Z",
+          method: "session/ready",
+        });
+        yield* Deferred.await(held);
+      });
+      const stopping = yield* adapter.stopSession(id).pipe(Effect.forkScoped);
+      yield* Deferred.await(boundary);
+      const before = { exits, confirmed: yield* adapter.isSessionStopConfirmed!(id) };
+      yield* Deferred.succeed(held, undefined);
+      yield* Fiber.join(stopping);
+      yield* Deferred.await(exited);
+      NodeAssert.deepEqual(before, { exits: 0, confirmed: false });
+      NodeAssert.equal(exits, 1);
+    }),
+  );
+});
+
+shutdownFailureLayer("Codex runtime episode receipts", (it) => {
+  it.effect("an old stop receipt cannot authorize stopping the replacement", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("codex-episode-replacement");
+      const input = { threadId, runtimeMode: "approval-required" as const };
+      yield* adapter.startSession(input);
+      const oldEpisode = yield* adapter.getSessionRuntimeEpisode!(threadId);
+      yield* adapter.stopSession(threadId, oldEpisode);
+      const entered = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      let nextEpisode: string | undefined;
+      const starting = yield* adapter
+        .startSession(input, {
+          beforeStart: (episode) => {
+            nextEpisode = episode;
+            return Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(released)),
+            );
+          },
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      NodeAssert.notEqual(oldEpisode, nextEpisode);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(threadId, nextEpisode), false);
+      NodeAssert.equal(
+        (yield* adapter.stopSession(threadId, nextEpisode).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* Deferred.succeed(released, undefined);
+      yield* Fiber.join(starting);
+      yield* adapter.stopSession(threadId, oldEpisode);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(threadId, nextEpisode), false);
+      yield* adapter.stopSession(threadId, nextEpisode);
+      NodeAssert.equal(yield* adapter.isSessionStopConfirmed!(threadId, nextEpisode), true);
     }),
   );
 });

@@ -1,7 +1,9 @@
 import type {
   AuthSessionUser,
+  WorkflowAttribution,
   OrchestrationThread,
   ThreadPromptQueueEntry,
+  ThreadQueueEntry,
 } from "@t3tools/contracts";
 
 /** One identity follows a submission from transport, through the queue, into the transcript. */
@@ -15,12 +17,16 @@ export function acceptedThreadMessageIds(
 }
 
 export function promptAttributionLabel(prompt: {
+  readonly workflowOrigin?: WorkflowAttribution | undefined;
   readonly author?: AuthSessionUser | undefined;
   readonly editedBy?: AuthSessionUser | undefined;
   readonly steeredBy?: AuthSessionUser | undefined;
 }): string | null {
   const name = (actor: AuthSessionUser) => actor.displayName ?? "Teammate";
   const parts = [
+    ...(prompt.workflowOrigin
+      ? [`Started by workflow · ${prompt.workflowOrigin.workflowName}`]
+      : []),
     ...(prompt.author ? [`Submitted by ${name(prompt.author)}`] : []),
     ...(prompt.editedBy ? [`Edited by ${name(prompt.editedBy)}`] : []),
     ...(prompt.steeredBy ? [`Steered by ${name(prompt.steeredBy)}`] : []),
@@ -45,4 +51,21 @@ export function queuedPromptEditConflict(
     return "A teammate changed this prompt. Review the current version before replacing it.";
   }
   return null;
+}
+
+export function moveQueueEntryNext(
+  entries: ReadonlyArray<ThreadQueueEntry>,
+  id: ThreadQueueEntry["messageId"],
+) {
+  return [id, ...entries.filter((entry) => entry.messageId !== id).map((entry) => entry.messageId)];
+}
+export function moveQueueEntryLater(
+  entries: ReadonlyArray<ThreadQueueEntry>,
+  id: ThreadQueueEntry["messageId"],
+) {
+  const order = entries.map((entry) => entry.messageId);
+  const index = order.indexOf(id);
+  if (index >= 0 && index + 1 < order.length)
+    [order[index], order[index + 1]] = [order[index + 1]!, order[index]!];
+  return order;
 }

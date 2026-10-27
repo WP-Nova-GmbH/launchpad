@@ -32,6 +32,7 @@ import { useCallback, useEffect, useState } from "react";
 import { runtime } from "../lib/runtime";
 import { decodedRelayClientError } from "./linkEnvironment";
 import { resolveRelayClerkTokenOptions } from "./publicConfig";
+import { refreshManagedRelayOrganizationCatalog } from "./managedRelayState";
 
 const isAccessRemovalStatus = Schema.is(RepositoryAccessRemovalStatus);
 
@@ -125,10 +126,6 @@ export interface OrganizationAdminState {
   /** Installations of the App as GitHub reports them, for picking one that was installed directly. */
   readonly listGithubInstallations: () => Promise<ReadonlyArray<RelayGithubInstallationCandidate> | null>;
   readonly disconnectGithub: () => Promise<boolean>;
-  readonly provisionMachine: (input: {
-    readonly label: string;
-    readonly role: RelayMachineRole;
-  }) => Promise<boolean>;
   readonly connectMachine: (input: {
     readonly label: string;
     readonly role: RelayMachineRole;
@@ -162,7 +159,7 @@ function failureMessage(cause: unknown): string {
  * something else when it does not.
  */
 export function useOrganizationAdmin(): OrganizationAdminState {
-  const { getToken, isSignedIn } = useAuth();
+  const { getToken, isSignedIn, userId } = useAuth();
   const [snapshot, setSnapshot] = useState<OrganizationAdminSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -322,6 +319,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       setError(null);
       try {
         const result = await run();
+        if (userId) refreshManagedRelayOrganizationCatalog(userId);
         if (
           typeof result === "object" &&
           result !== null &&
@@ -339,7 +337,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         setBusy(false);
       }
     },
-    [load],
+    [load, userId],
   );
 
   return {
@@ -502,12 +500,6 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       mutate("Could not revoke access", () =>
         call("Could not revoke access", (client, clerkToken) =>
           client.revokeAccess({ clerkToken, ...input }),
-        ),
-      ),
-    provisionMachine: (input) =>
-      mutate("Could not provision the machine", () =>
-        call("Could not provision the machine", (client, clerkToken) =>
-          client.provisionMachine({ clerkToken, payload: input }),
         ),
       ),
     connectMachine: (input) =>

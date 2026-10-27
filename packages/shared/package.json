@@ -366,6 +366,26 @@
     "./gitPatchPath": {
       "types": "./src/gitPatchPath.ts",
       "import": "./src/gitPatchPath.ts"
+    },
+    "./nativeCheckpointFiles": {
+      "types": "./src/nativeCheckpointFiles.ts",
+      "import": "./src/nativeCheckpointFiles.ts"
+    },
+    "./attachmentLayout": {
+      "types": "./src/attachmentLayout.ts",
+      "import": "./src/attachmentLayout.ts"
+    },
+    "./attachmentCheckpointFiles": {
+      "types": "./src/attachmentCheckpointFiles.ts",
+      "import": "./src/attachmentCheckpointFiles.ts"
+    },
+    "./threadAttachmentReferences": {
+      "types": "./src/threadAttachmentReferences.ts",
+      "import": "./src/threadAttachmentReferences.ts"
+    },
+    "./threadVmServerStart": {
+      "types": "./src/threadVmServerStart.ts",
+      "import": "./src/threadVmServerStart.ts"
     }
   },
   "scripts": {

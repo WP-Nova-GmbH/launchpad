@@ -9,13 +9,16 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as WorkflowsRouteImport } from './routes/workflows'
 import { Route as WelcomeRouteImport } from './routes/welcome'
 import { Route as UsageRouteImport } from './routes/usage'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as PairRouteImport } from './routes/pair'
 import { Route as ConnectRouteImport } from './routes/connect'
 import { Route as ChatRouteImport } from './routes/_chat'
+import { Route as WorkflowsIndexRouteImport } from './routes/workflows.index'
 import { Route as ChatIndexRouteImport } from './routes/_chat.index'
+import { Route as SettingsVmsRouteImport } from './routes/settings.vms'
 import { Route as SettingsStorageRouteImport } from './routes/settings.storage'
 import { Route as SettingsSourceControlRouteImport } from './routes/settings.source-control'
 import { Route as SettingsSnapShotRouteImport } from './routes/settings.snap-shot'
@@ -32,9 +35,19 @@ import { Route as SettingsArchivedRouteImport } from './routes/settings.archived
 import { Route as SettingsAppearanceRouteImport } from './routes/settings.appearance'
 import { Route as ProjectsProjectKeyRouteImport } from './routes/projects.$projectKey'
 import { Route as ChatPullRequestsRouteImport } from './routes/_chat.pull-requests'
+import { Route as WorkflowsRepositoryIdIndexRouteImport } from './routes/workflows.$repositoryId.index'
+import { Route as WorkflowsRepositoryIdNewRouteImport } from './routes/workflows.$repositoryId.new'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
 import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$environmentId.$threadId'
+import { Route as WorkflowsRepositoryIdJobsJobIdRouteImport } from './routes/workflows.$repositoryId.jobs.$jobId'
+import { Route as WorkflowsRepositoryIdWorkflowIdRunRouteImport } from './routes/workflows.$repositoryId.$workflowId.run'
+import { Route as WorkflowsRepositoryIdWorkflowIdEditRouteImport } from './routes/workflows.$repositoryId.$workflowId.edit'
 
+const WorkflowsRoute = WorkflowsRouteImport.update({
+  id: '/workflows',
+  path: '/workflows',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const WelcomeRoute = WelcomeRouteImport.update({
   id: '/welcome',
   path: '/welcome',
@@ -64,10 +77,20 @@ const ChatRoute = ChatRouteImport.update({
   id: '/_chat',
   getParentRoute: () => rootRouteImport,
 } as any)
+const WorkflowsIndexRoute = WorkflowsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => WorkflowsRoute,
+} as any)
 const ChatIndexRoute = ChatIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => ChatRoute,
+} as any)
+const SettingsVmsRoute = SettingsVmsRouteImport.update({
+  id: '/vms',
+  path: '/vms',
+  getParentRoute: () => SettingsRoute,
 } as any)
 const SettingsStorageRoute = SettingsStorageRouteImport.update({
   id: '/storage',
@@ -150,6 +173,18 @@ const ChatPullRequestsRoute = ChatPullRequestsRouteImport.update({
   path: '/pull-requests',
   getParentRoute: () => ChatRoute,
 } as any)
+const WorkflowsRepositoryIdIndexRoute =
+  WorkflowsRepositoryIdIndexRouteImport.update({
+    id: '/$repositoryId/',
+    path: '/$repositoryId/',
+    getParentRoute: () => WorkflowsRoute,
+  } as any)
+const WorkflowsRepositoryIdNewRoute =
+  WorkflowsRepositoryIdNewRouteImport.update({
+    id: '/$repositoryId/new',
+    path: '/$repositoryId/new',
+    getParentRoute: () => WorkflowsRoute,
+  } as any)
 const ChatDraftDraftIdRoute = ChatDraftDraftIdRouteImport.update({
   id: '/draft/$draftId',
   path: '/draft/$draftId',
@@ -161,6 +196,24 @@ const ChatEnvironmentIdThreadIdRoute =
     path: '/$environmentId/$threadId',
     getParentRoute: () => ChatRoute,
   } as any)
+const WorkflowsRepositoryIdJobsJobIdRoute =
+  WorkflowsRepositoryIdJobsJobIdRouteImport.update({
+    id: '/$repositoryId/jobs/$jobId',
+    path: '/$repositoryId/jobs/$jobId',
+    getParentRoute: () => WorkflowsRoute,
+  } as any)
+const WorkflowsRepositoryIdWorkflowIdRunRoute =
+  WorkflowsRepositoryIdWorkflowIdRunRouteImport.update({
+    id: '/$repositoryId/$workflowId/run',
+    path: '/$repositoryId/$workflowId/run',
+    getParentRoute: () => WorkflowsRoute,
+  } as any)
+const WorkflowsRepositoryIdWorkflowIdEditRoute =
+  WorkflowsRepositoryIdWorkflowIdEditRouteImport.update({
+    id: '/$repositoryId/$workflowId/edit',
+    path: '/$repositoryId/$workflowId/edit',
+    getParentRoute: () => WorkflowsRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
@@ -169,6 +222,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof SettingsRouteWithChildren
   '/usage': typeof UsageRoute
   '/welcome': typeof WelcomeRoute
+  '/workflows': typeof WorkflowsRouteWithChildren
   '/pull-requests': typeof ChatPullRequestsRoute
   '/projects/$projectKey': typeof ProjectsProjectKeyRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
@@ -185,8 +239,15 @@ export interface FileRoutesByFullPath {
   '/settings/snap-shot': typeof SettingsSnapShotRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/settings/storage': typeof SettingsStorageRoute
+  '/settings/vms': typeof SettingsVmsRoute
+  '/workflows/': typeof WorkflowsIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/workflows/$repositoryId/new': typeof WorkflowsRepositoryIdNewRoute
+  '/workflows/$repositoryId/': typeof WorkflowsRepositoryIdIndexRoute
+  '/workflows/$repositoryId/$workflowId/edit': typeof WorkflowsRepositoryIdWorkflowIdEditRoute
+  '/workflows/$repositoryId/$workflowId/run': typeof WorkflowsRepositoryIdWorkflowIdRunRoute
+  '/workflows/$repositoryId/jobs/$jobId': typeof WorkflowsRepositoryIdJobsJobIdRoute
 }
 export interface FileRoutesByTo {
   '/connect': typeof ConnectRoute
@@ -210,9 +271,16 @@ export interface FileRoutesByTo {
   '/settings/snap-shot': typeof SettingsSnapShotRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/settings/storage': typeof SettingsStorageRoute
+  '/settings/vms': typeof SettingsVmsRoute
   '/': typeof ChatIndexRoute
+  '/workflows': typeof WorkflowsIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/workflows/$repositoryId/new': typeof WorkflowsRepositoryIdNewRoute
+  '/workflows/$repositoryId': typeof WorkflowsRepositoryIdIndexRoute
+  '/workflows/$repositoryId/$workflowId/edit': typeof WorkflowsRepositoryIdWorkflowIdEditRoute
+  '/workflows/$repositoryId/$workflowId/run': typeof WorkflowsRepositoryIdWorkflowIdRunRoute
+  '/workflows/$repositoryId/jobs/$jobId': typeof WorkflowsRepositoryIdJobsJobIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -222,6 +290,7 @@ export interface FileRoutesById {
   '/settings': typeof SettingsRouteWithChildren
   '/usage': typeof UsageRoute
   '/welcome': typeof WelcomeRoute
+  '/workflows': typeof WorkflowsRouteWithChildren
   '/_chat/pull-requests': typeof ChatPullRequestsRoute
   '/projects/$projectKey': typeof ProjectsProjectKeyRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
@@ -238,9 +307,16 @@ export interface FileRoutesById {
   '/settings/snap-shot': typeof SettingsSnapShotRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/settings/storage': typeof SettingsStorageRoute
+  '/settings/vms': typeof SettingsVmsRoute
   '/_chat/': typeof ChatIndexRoute
+  '/workflows/': typeof WorkflowsIndexRoute
   '/_chat/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/workflows/$repositoryId/new': typeof WorkflowsRepositoryIdNewRoute
+  '/workflows/$repositoryId/': typeof WorkflowsRepositoryIdIndexRoute
+  '/workflows/$repositoryId/$workflowId/edit': typeof WorkflowsRepositoryIdWorkflowIdEditRoute
+  '/workflows/$repositoryId/$workflowId/run': typeof WorkflowsRepositoryIdWorkflowIdRunRoute
+  '/workflows/$repositoryId/jobs/$jobId': typeof WorkflowsRepositoryIdJobsJobIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -251,6 +327,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/usage'
     | '/welcome'
+    | '/workflows'
     | '/pull-requests'
     | '/projects/$projectKey'
     | '/settings/appearance'
@@ -267,8 +344,15 @@ export interface FileRouteTypes {
     | '/settings/snap-shot'
     | '/settings/source-control'
     | '/settings/storage'
+    | '/settings/vms'
+    | '/workflows/'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/workflows/$repositoryId/new'
+    | '/workflows/$repositoryId/'
+    | '/workflows/$repositoryId/$workflowId/edit'
+    | '/workflows/$repositoryId/$workflowId/run'
+    | '/workflows/$repositoryId/jobs/$jobId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/connect'
@@ -292,9 +376,16 @@ export interface FileRouteTypes {
     | '/settings/snap-shot'
     | '/settings/source-control'
     | '/settings/storage'
+    | '/settings/vms'
     | '/'
+    | '/workflows'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/workflows/$repositoryId/new'
+    | '/workflows/$repositoryId'
+    | '/workflows/$repositoryId/$workflowId/edit'
+    | '/workflows/$repositoryId/$workflowId/run'
+    | '/workflows/$repositoryId/jobs/$jobId'
   id:
     | '__root__'
     | '/_chat'
@@ -303,6 +394,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/usage'
     | '/welcome'
+    | '/workflows'
     | '/_chat/pull-requests'
     | '/projects/$projectKey'
     | '/settings/appearance'
@@ -319,9 +411,16 @@ export interface FileRouteTypes {
     | '/settings/snap-shot'
     | '/settings/source-control'
     | '/settings/storage'
+    | '/settings/vms'
     | '/_chat/'
+    | '/workflows/'
     | '/_chat/$environmentId/$threadId'
     | '/_chat/draft/$draftId'
+    | '/workflows/$repositoryId/new'
+    | '/workflows/$repositoryId/'
+    | '/workflows/$repositoryId/$workflowId/edit'
+    | '/workflows/$repositoryId/$workflowId/run'
+    | '/workflows/$repositoryId/jobs/$jobId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -331,11 +430,19 @@ export interface RootRouteChildren {
   SettingsRoute: typeof SettingsRouteWithChildren
   UsageRoute: typeof UsageRoute
   WelcomeRoute: typeof WelcomeRoute
+  WorkflowsRoute: typeof WorkflowsRouteWithChildren
   ProjectsProjectKeyRoute: typeof ProjectsProjectKeyRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/workflows': {
+      id: '/workflows'
+      path: '/workflows'
+      fullPath: '/workflows'
+      preLoaderRoute: typeof WorkflowsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/welcome': {
       id: '/welcome'
       path: '/welcome'
@@ -378,12 +485,26 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/workflows/': {
+      id: '/workflows/'
+      path: '/'
+      fullPath: '/workflows/'
+      preLoaderRoute: typeof WorkflowsIndexRouteImport
+      parentRoute: typeof WorkflowsRoute
+    }
     '/_chat/': {
       id: '/_chat/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof ChatIndexRouteImport
       parentRoute: typeof ChatRoute
+    }
+    '/settings/vms': {
+      id: '/settings/vms'
+      path: '/vms'
+      fullPath: '/settings/vms'
+      preLoaderRoute: typeof SettingsVmsRouteImport
+      parentRoute: typeof SettingsRoute
     }
     '/settings/storage': {
       id: '/settings/storage'
@@ -497,6 +618,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatPullRequestsRouteImport
       parentRoute: typeof ChatRoute
     }
+    '/workflows/$repositoryId/': {
+      id: '/workflows/$repositoryId/'
+      path: '/$repositoryId'
+      fullPath: '/workflows/$repositoryId/'
+      preLoaderRoute: typeof WorkflowsRepositoryIdIndexRouteImport
+      parentRoute: typeof WorkflowsRoute
+    }
+    '/workflows/$repositoryId/new': {
+      id: '/workflows/$repositoryId/new'
+      path: '/$repositoryId/new'
+      fullPath: '/workflows/$repositoryId/new'
+      preLoaderRoute: typeof WorkflowsRepositoryIdNewRouteImport
+      parentRoute: typeof WorkflowsRoute
+    }
     '/_chat/draft/$draftId': {
       id: '/_chat/draft/$draftId'
       path: '/draft/$draftId'
@@ -510,6 +645,27 @@ declare module '@tanstack/react-router' {
       fullPath: '/$environmentId/$threadId'
       preLoaderRoute: typeof ChatEnvironmentIdThreadIdRouteImport
       parentRoute: typeof ChatRoute
+    }
+    '/workflows/$repositoryId/jobs/$jobId': {
+      id: '/workflows/$repositoryId/jobs/$jobId'
+      path: '/$repositoryId/jobs/$jobId'
+      fullPath: '/workflows/$repositoryId/jobs/$jobId'
+      preLoaderRoute: typeof WorkflowsRepositoryIdJobsJobIdRouteImport
+      parentRoute: typeof WorkflowsRoute
+    }
+    '/workflows/$repositoryId/$workflowId/run': {
+      id: '/workflows/$repositoryId/$workflowId/run'
+      path: '/$repositoryId/$workflowId/run'
+      fullPath: '/workflows/$repositoryId/$workflowId/run'
+      preLoaderRoute: typeof WorkflowsRepositoryIdWorkflowIdRunRouteImport
+      parentRoute: typeof WorkflowsRoute
+    }
+    '/workflows/$repositoryId/$workflowId/edit': {
+      id: '/workflows/$repositoryId/$workflowId/edit'
+      path: '/$repositoryId/$workflowId/edit'
+      fullPath: '/workflows/$repositoryId/$workflowId/edit'
+      preLoaderRoute: typeof WorkflowsRepositoryIdWorkflowIdEditRouteImport
+      parentRoute: typeof WorkflowsRoute
     }
   }
 }
@@ -545,6 +701,7 @@ interface SettingsRouteChildren {
   SettingsSnapShotRoute: typeof SettingsSnapShotRoute
   SettingsSourceControlRoute: typeof SettingsSourceControlRoute
   SettingsStorageRoute: typeof SettingsStorageRoute
+  SettingsVmsRoute: typeof SettingsVmsRoute
 }
 
 const SettingsRouteChildren: SettingsRouteChildren = {
@@ -562,10 +719,35 @@ const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsSnapShotRoute: SettingsSnapShotRoute,
   SettingsSourceControlRoute: SettingsSourceControlRoute,
   SettingsStorageRoute: SettingsStorageRoute,
+  SettingsVmsRoute: SettingsVmsRoute,
 }
 
 const SettingsRouteWithChildren = SettingsRoute._addFileChildren(
   SettingsRouteChildren,
+)
+
+interface WorkflowsRouteChildren {
+  WorkflowsIndexRoute: typeof WorkflowsIndexRoute
+  WorkflowsRepositoryIdNewRoute: typeof WorkflowsRepositoryIdNewRoute
+  WorkflowsRepositoryIdIndexRoute: typeof WorkflowsRepositoryIdIndexRoute
+  WorkflowsRepositoryIdWorkflowIdEditRoute: typeof WorkflowsRepositoryIdWorkflowIdEditRoute
+  WorkflowsRepositoryIdWorkflowIdRunRoute: typeof WorkflowsRepositoryIdWorkflowIdRunRoute
+  WorkflowsRepositoryIdJobsJobIdRoute: typeof WorkflowsRepositoryIdJobsJobIdRoute
+}
+
+const WorkflowsRouteChildren: WorkflowsRouteChildren = {
+  WorkflowsIndexRoute: WorkflowsIndexRoute,
+  WorkflowsRepositoryIdNewRoute: WorkflowsRepositoryIdNewRoute,
+  WorkflowsRepositoryIdIndexRoute: WorkflowsRepositoryIdIndexRoute,
+  WorkflowsRepositoryIdWorkflowIdEditRoute:
+    WorkflowsRepositoryIdWorkflowIdEditRoute,
+  WorkflowsRepositoryIdWorkflowIdRunRoute:
+    WorkflowsRepositoryIdWorkflowIdRunRoute,
+  WorkflowsRepositoryIdJobsJobIdRoute: WorkflowsRepositoryIdJobsJobIdRoute,
+}
+
+const WorkflowsRouteWithChildren = WorkflowsRoute._addFileChildren(
+  WorkflowsRouteChildren,
 )
 
 const rootRouteChildren: RootRouteChildren = {
@@ -575,6 +757,7 @@ const rootRouteChildren: RootRouteChildren = {
   SettingsRoute: SettingsRouteWithChildren,
   UsageRoute: UsageRoute,
   WelcomeRoute: WelcomeRoute,
+  WorkflowsRoute: WorkflowsRouteWithChildren,
   ProjectsProjectKeyRoute: ProjectsProjectKeyRoute,
 }
 export const routeTree = rootRouteImport

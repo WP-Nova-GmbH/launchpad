@@ -1,0 +1,47 @@
+# Load before starting E2B on its dedicated host. The pinned runtime creates
+# veth-<slot> host interfaces; Docker's own interfaces do not have the hyphen.
+# Never flush the host ruleset: E2B and Docker own their separate tables.
+table inet launchpad_thread_vm
+delete table inet launchpad_thread_vm
+table inet launchpad_thread_vm {
+  set private_v4 {
+    type ipv4_addr
+    flags interval
+    elements = {
+      0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+      169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24,
+      192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24,
+      224.0.0.0/4, 240.0.0.0/4
+    }
+  }
+
+  chain prerouting {
+    type filter hook prerouting priority -190; policy accept;
+    iifname "veth-*" ct state established,related accept
+    iifname "veth-*" meta nfproto ipv6 counter drop
+    # Check the original destination before E2B redirects TCP into its host
+    # egress proxies. This also blocks E2B's 192.0.2.1 host-service alias.
+    iifname "veth-*" ip daddr @private_v4 counter drop
+    iifname "veth-*" fib daddr type local counter drop
+  }
+
+  chain input {
+    type filter hook input priority -190; policy accept;
+    # Allow replies to host-initiated envd/preview connections, not new guest
+    # connections to any host service (including its public addresses).
+    iifname "veth-*" ct state established,related accept
+    # Only redirected Internet traffic may enter E2B's pinned TCP proxies.
+    iifname "veth-*" ct status dnat tcp dport { 5016, 5017, 5018 } accept
+    iifname "veth-*" counter drop
+  }
+
+  chain forward {
+    type filter hook forward priority -190; policy accept;
+    # Guests have IPv4 Internet access. Drop forwarded IPv6 outside the guest
+    # so guest root cannot enable a route around the IPv4 policy.
+    iifname "veth-*" meta nfproto ipv6 counter drop
+    iifname "veth-*" ip daddr @private_v4 counter drop
+    # Also reject packets routed toward another E2B guest namespace.
+    iifname "veth-*" oifname "veth-*" counter drop
+  }
+}

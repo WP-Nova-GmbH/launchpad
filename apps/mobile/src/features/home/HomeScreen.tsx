@@ -892,10 +892,6 @@ export function HomeScreen(props: HomeScreenProps) {
 
   const listHeader = Platform.OS === "ios" ? null : <HomeTopContentSpacer />;
 
-  // Project scoping lives in the header filter menu (no inline chip row on
-  // mobile — the menu is the one filter surface).
-  const v2ListHeader = listHeader;
-
   // Use the v2 project scope for its empty state. Snoozed threads need no
   // special empty state: their shelf header is a list row even while collapsed.
   const v2ListEmpty =
@@ -961,7 +957,7 @@ export function HomeScreen(props: HomeScreenProps) {
             drawDistance={500}
             recycleItems
             extraData={v2ExtraData}
-            ListHeaderComponent={v2ListHeader}
+            ListHeaderComponent={listHeader}
             ListFooterComponent={
               settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
                 <ThreadListV2ShowMoreRow

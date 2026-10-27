@@ -1,3 +1,4 @@
+import { WorkflowResultReturn, type WorkflowResultOrigin } from "../settings/WorkflowResultReturn";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { enqueueThreadOutboxMessage } from "../../state/thread-outbox";
 import {
@@ -53,6 +54,7 @@ import { LoadingScreen } from "../../components/LoadingScreen";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { connectionTone } from "../connection/connectionTone";
+import { EnvironmentConnectionNotice } from "../connection/EnvironmentConnectionNotice";
 import {
   useRemoteConnections,
   useRemoteConnectionStatus,
@@ -73,6 +75,7 @@ import {
 } from "../terminal/terminalLaunchContext";
 import { terminalDebugLog } from "../terminal/terminalDebugLog";
 import { ThreadDetailScreen, type ThreadDetailScreenProps } from "./ThreadDetailScreen";
+import { CurrentThreadLocation } from "./ThreadMoveControls";
 import { GitOverviewSheet } from "./git/GitOverviewSheet";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useSelectedThreadGitActions } from "../../state/use-selected-thread-git-actions";
@@ -216,6 +219,7 @@ function OpeningThreadLoadingScreen() {
 }
 
 type ThreadRouteScreenRouteProps = StaticScreenProps<{
+  readonly workflowOrigin?: WorkflowResultOrigin;
   readonly environmentId: string;
   readonly threadId: string;
 }>;
@@ -251,7 +255,7 @@ function ThreadUnavailableScreen(props: {
   );
 }
 
-export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
   const { state: workspaceState } = useWorkspaceState();
   const { connectionState } = useRemoteConnectionStatus();
   const { selectedThread } = useThreadSelection();
@@ -261,7 +265,7 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
   const environmentId = environmentIdRaw ? EnvironmentId.make(environmentIdRaw) : null;
   const routeEnvironmentRuntime = useRemoteEnvironmentRuntime(environmentId);
   const routeEnvironmentShellState = useEnvironmentShellState(environmentId);
-  const { onReconnectEnvironment } = useRemoteConnections();
+  const { connectedEnvironments, onReconnectEnvironment } = useRemoteConnections();
   const navigation = useNavigation();
   const routeConnectionState =
     routeEnvironmentRuntime?.connectionState ?? (environmentId ? "available" : connectionState);
@@ -284,10 +288,6 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
   // loading placeholder while messages fetch, the floating pill above the
   // composer reports loading/syncing, and the composer's connection pill
   // reports connecting/reconnecting status.
-  if (selectedThread !== null && selectedThreadKey === routeThreadKey) {
-    return <ThreadRouteContent {...props} selectedThreadDetailState={selectedThreadDetailState} />;
-  }
-
   const stillHydrating = threadRouteIsHydrating({
     isLoadingConnections: workspaceState.isLoadingConnections,
     connectionState: routeConnectionState,
@@ -297,26 +297,58 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
     detailHasError: Option.isSome(selectedThreadDetailState.error),
   });
 
-  if (stillHydrating) {
-    return <OpeningThreadLoadingScreen />;
-  }
-
   return (
-    <ThreadUnavailableScreen
-      actionLabel={
-        routeEnvironmentRuntime === null ? "Manage environments" : "Reconnect environment"
-      }
-      onAction={() => {
-        if (routeEnvironmentRuntime !== null) {
-          onReconnectEnvironment(environmentId);
-          return;
+    <>
+      <CurrentThreadLocation
+        key={routeThreadKey}
+        environmentId={environmentId}
+        threadId={ThreadId.make(threadIdRaw)}
+        recoverUnavailable={
+          selectedThreadKey !== routeThreadKey &&
+          !workspaceState.isLoadingConnections &&
+          (routeEnvironmentRuntime === null || !stillHydrating)
         }
-        navigation.navigate("SettingsSheet", {
-          screen: "SettingsContent",
-          params: { screen: "SettingsEnvironments" },
-        });
-      }}
-    />
+      />
+      {selectedThread !== null && selectedThreadKey === routeThreadKey ? (
+        <ThreadRouteContent {...props} selectedThreadDetailState={selectedThreadDetailState} />
+      ) : routeEnvironmentRuntime !== null &&
+        routeConnectionState !== "connected" &&
+        selectedThreadDetailState.status !== "deleted" ? (
+        <View className="flex-1 bg-screen">
+          <EnvironmentConnectionNotice
+            environmentLabel={
+              connectedEnvironments.find((entry) => entry.environmentId === environmentId)
+                ?.environmentLabel ?? "Environment"
+            }
+            connection={{
+              phase: routeConnectionState,
+              error: routeEnvironmentRuntime.connectionError,
+              traceId: routeEnvironmentRuntime.connectionErrorTraceId,
+            }}
+            resourceName="thread"
+            onRetry={() => void onReconnectEnvironment(environmentId)}
+          />
+        </View>
+      ) : stillHydrating ? (
+        <OpeningThreadLoadingScreen />
+      ) : (
+        <ThreadUnavailableScreen
+          actionLabel={
+            routeEnvironmentRuntime === null ? "Manage environments" : "Reconnect environment"
+          }
+          onAction={() => {
+            if (routeEnvironmentRuntime !== null) {
+              onReconnectEnvironment(environmentId);
+              return;
+            }
+            navigation.navigate("SettingsSheet", {
+              screen: "SettingsContent",
+              params: { screen: "SettingsEnvironments" },
+            });
+          }}
+        />
+      )}
+    </>
   );
 }
 
@@ -1027,7 +1059,7 @@ function ThreadRouteContent(
                   turnStartedAt: selectedThreadDetail?.latestTurn?.startedAt ?? null,
                   working: composer.activeWorkStartedAt !== null,
                   turnStarted: selectedThreadDetail?.latestTurn?.startedAt != null,
-                  onCancel: handleCancelWorktreeSetup,
+                  onCancel: selectedThreadDetail?.workflowJob ? null : handleCancelWorktreeSetup,
                   onWorkLocally:
                     !selectedThreadDetail?.promptQueue?.preparation &&
                     selectedThreadCreation?.outcome == null &&
@@ -1101,5 +1133,17 @@ function ThreadRouteContent(
 
       {renderThreadRouteBody()}
     </>
+  );
+}
+
+export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+  return (
+    <View className="flex-1">
+      <WorkflowResultReturn
+        origin={props.route.params.workflowOrigin}
+        threadId={props.route.params.threadId}
+      />
+      <ThreadRouteScreenContent {...props} />
+    </View>
   );
 }

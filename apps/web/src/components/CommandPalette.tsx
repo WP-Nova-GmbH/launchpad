@@ -1,5 +1,8 @@
 "use client";
 
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { hasCloudPublicConfig } from "../cloud/publicConfig";
+
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 
@@ -592,6 +595,14 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         });
         return;
       }
+      if (command === "threadVms.open") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.repeat) return;
+        setOpen(false);
+        void navigate({ to: "/settings/vms" });
+        return;
+      }
       if (command === "usage.open") {
         event.preventDefault();
         event.stopPropagation();
@@ -695,7 +706,8 @@ function CommandPaletteDialog(props: {
       data-palette-mode={props.mode}
       data-testid="command-palette"
       finalFocus={() => {
-        composerHandleRef?.current?.focusAtEnd();
+        if (!document.querySelector("[data-portable-thread-library]"))
+          composerHandleRef?.current?.focusAtEnd();
         return false;
       }}
       onBackdropPointerDown={() => {
@@ -756,8 +768,13 @@ function OpenCommandPaletteDialog(props: {
   const desktopLocalBootstraps = useDesktopLocalBootstraps();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const availableSettingsSearchItems = useAvailableSettingsSearchItems();
-  const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread } =
-    useHandleNewThread();
+  const {
+    activeDraftThread,
+    activeThread,
+    defaultProjectRef,
+    handleNewThread,
+    canCreateThreadInProject,
+  } = useHandleNewThread();
   const projects = useProjects();
   const referenceThreadRef =
     pathname === "/pull-requests"
@@ -770,7 +787,8 @@ function OpenCommandPaletteDialog(props: {
         ? scopeThreadRef(activeThread.environmentId, activeThread.id)
         : null;
   const openPanelPullRequestUrl = useOpenPanelPullRequestUrl(referenceThreadRef);
-  const activeThreadServerConfig = useServerConfigs().get(
+  const serverConfigs = useServerConfigs();
+  const activeThreadServerConfig = serverConfigs.get(
     activeThread?.environmentId ?? ("" as EnvironmentId),
   );
   const activeThreadReferenceCopyTarget =
@@ -1301,7 +1319,9 @@ function OpenCommandPaletteDialog(props: {
     () =>
       enumerateCommandPaletteItems(
         buildProjectActionItems({
-          projects: pickerProjects,
+          projects: pickerProjects.filter((project) =>
+            canCreateThreadInEnvironment(serverConfigs.get(project.environmentId)),
+          ),
           valuePrefix: "new-thread-in",
           searchTerms: (project) => {
             const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
@@ -1357,6 +1377,7 @@ function OpenCommandPaletteDialog(props: {
       contextualProjectRef,
       handleNewThread,
       pickerProjects,
+      serverConfigs,
       projectEnvironmentLocationById,
       projectGroupByTargetKey,
     ],
@@ -1982,13 +2003,24 @@ function OpenCommandPaletteDialog(props: {
   ]);
 
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
+  actionItems.push({
+    kind: "action",
+    value: "action:vm-threads",
+    title: "VM threads",
+    searchTerms: ["sandbox", "VM", "saved", "restore", "reset", "create", "private"],
+    icon: <MonitorIcon className={ITEM_ICON_CLASS} />,
+    shortcutCommand: "threadVms.open",
+    run: async () => {
+      await navigate({ to: "/settings/vms" });
+    },
+  });
 
   if (projects.length > 0) {
     const activeProjectTitle =
       projectPickerEntries.find((entry) => entry.isPreferred)?.group.displayName ??
       (currentProjectId ? (projectTitleById.get(currentProjectId) ?? null) : null);
 
-    if (activeProjectTitle) {
+    if (activeProjectTitle && canCreateThreadInEnvironment(activeThreadServerConfig)) {
       actionItems.push({
         kind: "action",
         value: "action:new-thread",
@@ -2006,6 +2038,7 @@ function OpenCommandPaletteDialog(props: {
             activeThread: activeThread ?? undefined,
             defaultProjectRef,
             handleNewThread,
+            canCreateThreadInProject,
           });
         },
       });
@@ -2265,6 +2298,18 @@ function OpenCommandPaletteDialog(props: {
       },
     });
   }
+
+  if (hasCloudPublicConfig())
+    actionItems.push({
+      kind: "action",
+      value: "action:workflows",
+      title: "Open workflows",
+      searchTerms: ["workflow", "automation", "jobs", "human review"],
+      icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        await navigate({ to: "/workflows" });
+      },
+    });
 
   actionItems.push({
     kind: "action",

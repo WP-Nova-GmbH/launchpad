@@ -569,10 +569,12 @@ export function ThreadRowTrailingStatus({ thread }: { thread: SidebarThreadSumma
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   // No primary (the hosted app) means every thread is remote, and the machine
   // glyph is what tells the environments apart.
-  const isRemoteThread = thread.environmentId !== primaryEnvironmentId;
-  const remoteEnvLabel = environment?.label ?? null;
+  const isRemoteThread = !!thread.portableLocation || thread.environmentId !== primaryEnvironmentId;
+  const remoteEnvLabel = thread.portableLocation?.label ?? environment?.label ?? null;
   const threadEnvironmentLabel = isRemoteThread ? (remoteEnvLabel ?? "Remote") : null;
-  const remoteMachine = resolveEnvironmentMachineKind(environment?.serverConfig ?? null);
+  const remoteMachine =
+    thread.portableLocation?.machine ??
+    resolveEnvironmentMachineKind(environment?.serverConfig ?? null);
   const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
 
   if (!terminalStatus && !isRemoteThread) {
@@ -581,6 +583,9 @@ export function ThreadRowTrailingStatus({ thread }: { thread: SidebarThreadSumma
 
   return (
     <span className="inline-flex shrink-0 items-center gap-1.5">
+      {thread.portableLocation ? (
+        <span className="text-xs text-muted-foreground">{thread.portableLocation.label}</span>
+      ) : null}
       {terminalStatus ? (
         <Tooltip>
           <TooltipTrigger

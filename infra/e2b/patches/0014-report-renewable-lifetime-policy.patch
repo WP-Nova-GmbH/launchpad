@@ -1,0 +1,77 @@
+--- a/packages/api/internal/handlers/launchpad_restore.go
++++ b/packages/api/internal/handlers/launchpad_restore.go
+@@ -33,7 +33,7 @@
+ 		a.sendAPIStoreError(c, http.StatusForbidden, "Launchpad restore is not enabled for this team")
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{Version: 1, DiskRestore: true, RenewableLifetime: false, QuiescedSnapshots: true})
++	c.JSON(http.StatusOK, api.LaunchpadRuntimeCapabilities{Version: 1, DiskRestore: true, RenewableLifetime: a.config.AllowsRenewableLifetime(auth.MustGetTeamInfo(c).Team.ID), QuiescedSnapshots: true})
+ }
+ 
+ func canonicalRestoreRequest(body api.LaunchpadRestoreRequest) ([]byte, error) {
+--- /dev/null
++++ b/packages/api/internal/handlers/launchpad_capabilities_test.go
+@@ -0,0 +1,52 @@
++package handlers
++
++import (
++	"encoding/json"
++	"net/http"
++	"testing"
++
++	"github.com/e2b-dev/infra/packages/api/internal/api"
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/require"
++)
++
++func TestLaunchpadCapabilitiesFollowAuthenticatedTeamPolicy(t *testing.T) {
++	team, other := uuid.New(), uuid.New()
++	for _, tc := range []struct {
++		name           string
++		restoreTeams   []string
++		renewableTeams []string
++		node           string
++		capacity       int64
++		status         int
++		renewable      bool
++	}{
++		{"enabled", []string{team.String()}, []string{team.String()}, "node", 1024, http.StatusOK, true},
++		{"lifetime disabled", []string{team.String()}, nil, "node", 1024, http.StatusOK, false},
++		{"another team's lifetime", []string{team.String()}, []string{other.String()}, "node", 1024, http.StatusOK, false},
++		{"another team's restore", []string{other.String()}, []string{team.String()}, "node", 1024, http.StatusForbidden, false},
++		{"no restore node", []string{team.String()}, []string{team.String()}, "", 1024, http.StatusForbidden, false},
++		{"no restore capacity", []string{team.String()}, []string{team.String()}, "node", 0, http.StatusForbidden, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			// No compute or persistence services: reporting capabilities must not start or wake a VM.
++			server := &APIStore{}
++			server.config.LaunchpadRestoreTeams = tc.restoreTeams
++			server.config.LaunchpadRenewableLifetimeTeams = tc.renewableTeams
++			server.config.LaunchpadRestoreNodeID = tc.node
++			server.config.LaunchpadRestoreCapacityBytes = tc.capacity
++			c, response := restoreHTTPContext(t, team, nil)
++			c.Request.Method = http.MethodGet
++			server.GetLaunchpadCapabilities(c)
++			require.Equal(t, tc.status, response.Code)
++			if tc.status != http.StatusOK {
++				return
++			}
++			var capabilities api.LaunchpadRuntimeCapabilities
++			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &capabilities))
++			require.Equal(t, tc.renewable, capabilities.RenewableLifetime)
++			require.True(t, capabilities.DiskRestore)
++			require.True(t, capabilities.QuiescedSnapshots)
++		})
++	}
++}
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -149,6 +149,8 @@
+   traffic and automatic resume disabled. The team-authenticated response is not
+   cacheable. Paused and ordinary sandboxes omit the token; inspection never wakes
+   a sandbox. The Launchpad relay retains this token and authorizes its own clients.
++  The capability endpoint reports renewable lifetime from the authenticated team’s
++  operator-configured allowlist; restore admission alone does not enable it.
+ - **State**: writes sandbox records to Redis (source of truth for *running* sandboxes) and a
+   legacy sandbox→node **routing catalog** (`sandbox:catalog:{id}`) in Redis. client-proxy no
+   longer reads it; it reads the orchestrator-written `sandbox:routing:{id}` (see "Sandbox routing

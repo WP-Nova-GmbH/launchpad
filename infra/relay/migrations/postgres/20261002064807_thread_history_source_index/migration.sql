@@ -1,0 +1,1 @@
+CREATE INDEX "idx_relay_thread_history_thread_source" ON "relay_thread_history" ("thread_id","environment_id","source_sequence");

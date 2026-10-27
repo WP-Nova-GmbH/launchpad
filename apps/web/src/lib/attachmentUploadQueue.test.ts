@@ -1,11 +1,14 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { Atom, AsyncResult } from "effect/unstable/reactivity";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 
 import {
+  COMPOSER_DRAFT_STORAGE_KEY,
   composerFileNeedsReattach,
   DraftId,
+  handoffMovedThreadDraft,
   useComposerDraftStore,
   type ComposerFileAttachment,
   type ComposerImageAttachment,
@@ -19,7 +22,30 @@ const mocks = vi.hoisted(() => ({
   removeUpload: Symbol("remove-upload"),
   runAtomCommand: vi.fn(),
   readPreparedConnection: vi.fn(),
+  writeDraft: vi.fn(),
+  readDraft: vi.fn<(key: string) => string | null>(),
 }));
+
+vi.mock("./storage", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./storage")>();
+  return {
+    ...actual,
+    createMemoryStorage: () => {
+      const storage = actual.createMemoryStorage();
+      mocks.readDraft.mockImplementation((key) => {
+        const value = storage.getItem(key);
+        return typeof value === "string" ? value : null;
+      });
+      return {
+        ...storage,
+        setItem: (key: string, value: string) => {
+          mocks.writeDraft(key, value);
+          storage.setItem(key, value);
+        },
+      };
+    },
+  };
+});
 
 vi.mock("@t3tools/client-runtime/state/runtime", () => ({
   executeAtomQuery: mocks.executeAtomQuery,
@@ -571,6 +597,143 @@ describe("attachmentUploadQueue", () => {
       status: "ready",
       attachmentId: "pending-environment-1-recoverable.pdf",
     });
+  });
+
+  it("keeps moved-file recovery through a failed save, explicit retry, and reload", async () => {
+    vi.useFakeTimers();
+    const source = scopeThreadRef(firstEnvironment, ThreadId.make("moved-save-source"));
+    const destination = scopeThreadRef(secondEnvironment, ThreadId.make("moved-save-target"));
+    const file: ComposerFileAttachment = {
+      ...makeFile("moved-save"),
+      file: null,
+      uploadedAttachmentId: "source-upload",
+      uploadEnvironmentId: firstEnvironment,
+    };
+    const recoveryUpload = { attachmentId: "source-upload", environmentId: firstEnvironment };
+    const currentFile = () =>
+      useComposerDraftStore.getState().getComposerDraft(destination)!.files[0]!;
+    const savedFile = () =>
+      JSON.parse(mocks.readDraft(COMPOSER_DRAFT_STORAGE_KEY)!).state.draftsByThreadKey[
+        scopedThreadKey(destination)
+      ].files[0];
+    const nextRequest = () =>
+      new Promise<TestXmlHttpRequest>((resolve) => {
+        vi.spyOn(TestXmlHttpRequest.prototype, "send").mockImplementationOnce(function (
+          this: TestXmlHttpRequest,
+        ) {
+          resolve(this);
+        });
+      });
+    let uploadCount = 0;
+    mocks.runAtomCommand.mockImplementation(async (_registry: unknown, command: unknown) =>
+      command === mocks.createUploadUrl
+        ? {
+            _tag: "Success",
+            value: {
+              attachmentId: `destination-upload-${++uploadCount}`,
+              relativeUrl: "/upload",
+              expiresAt: 1,
+            },
+          }
+        : { _tag: "Success", value: undefined },
+    );
+    mocks.executeAtomQuery.mockResolvedValue({
+      _tag: "Success",
+      value: { relativeUrl: "/source-upload" },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(new Uint8Array([1, 2, 3]))),
+    );
+    useComposerDraftStore.getState().addFiles(source, [file]);
+
+    try {
+      await handoffMovedThreadDraft({
+        source,
+        destination,
+        stillCurrent: () => true,
+        recoverFile: async () => null,
+      });
+      expect(currentFile()).toMatchObject({ file: null, recoveryUpload });
+
+      const firstStarted = nextRequest();
+      startAttachmentUpload({
+        environmentId: secondEnvironment,
+        image: currentFile(),
+        draftTarget: destination,
+      });
+      const firstRequest = await firstStarted;
+      mocks.writeDraft.mockImplementationOnce(() => {
+        throw new Error("Storage quota exceeded");
+      });
+      const firstSettled = awaitAttachmentUploads([file.id]);
+      firstRequest.complete();
+      await firstSettled;
+
+      expect(readAttachmentUpload(file.id)?.status).toBe("failed");
+      expect(currentFile()).toMatchObject({ file: null, recoveryUpload });
+      expect(currentFile().uploadedAttachmentId).toBeUndefined();
+      // A later deferred write must also keep the usable source, rather than
+      // committing the replacement that Retry is about to delete.
+      await vi.runOnlyPendingTimersAsync();
+      expect(savedFile()).toMatchObject({ recoveryUpload });
+      expect(savedFile().attachmentId).toBeUndefined();
+
+      const retryStarted = nextRequest();
+      retryAttachmentUpload({
+        environmentId: secondEnvironment,
+        image: currentFile(),
+        draftTarget: destination,
+      });
+      const retryRequest = await retryStarted;
+      expect(mocks.runAtomCommand).toHaveBeenCalledWith(
+        expect.anything(),
+        mocks.removeUpload,
+        {
+          environmentId: secondEnvironment,
+          input: { attachmentId: "destination-upload-1" },
+        },
+        expect.anything(),
+      );
+      const retrySettled = awaitAttachmentUploads([file.id]);
+      retryRequest.complete();
+      await retrySettled;
+      expect(currentFile()).toMatchObject({
+        uploadedAttachmentId: "destination-upload-2",
+        uploadEnvironmentId: secondEnvironment,
+      });
+      expect(currentFile().recoveryUpload).toBeUndefined();
+      expect(savedFile()).toMatchObject({
+        attachmentId: "destination-upload-2",
+        environmentId: secondEnvironment,
+      });
+      expect(savedFile().recoveryUpload).toBeUndefined();
+
+      useAttachmentUploadStore.setState({ uploadsByImageId: {} });
+      useComposerDraftStore.setState(useComposerDraftStore.getInitialState(), true);
+      await useComposerDraftStore.persist.rehydrate();
+      const restored = currentFile();
+      expect(restored).toMatchObject({
+        file: null,
+        uploadedAttachmentId: "destination-upload-2",
+        uploadEnvironmentId: secondEnvironment,
+      });
+      startAttachmentUpload({
+        environmentId: secondEnvironment,
+        image: restored,
+        draftTarget: destination,
+      });
+      await awaitAttachmentUploads([file.id]);
+      expect(readAttachmentUpload(file.id)).toMatchObject({
+        status: "ready",
+        attachmentId: "destination-upload-2",
+      });
+      expect(TestXmlHttpRequest.requests).toHaveLength(2);
+    } finally {
+      useComposerDraftStore.getState().clearComposerContent(source);
+      useComposerDraftStore.getState().clearComposerContent(destination);
+      vi.useRealTimers();
+    }
   });
 
   it("removes a persisted upload when its draft is discarded during verification", async () => {

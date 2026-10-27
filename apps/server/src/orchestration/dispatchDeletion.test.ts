@@ -1,3 +1,7 @@
+import { TerminalManager } from "../terminal/Manager.ts";
+import * as Journal from "../terminal/SetupProcessJournal.ts";
+import { SetupProcessAdapter, SetupProcessError } from "../terminal/SetupProcessAdapter.ts";
+import * as Context from "effect/Context";
 import { describe, expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -26,6 +30,7 @@ import { PersistenceSqlError } from "../persistence/Errors.ts";
 import { ServerConfig } from "../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
+import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { ProjectionThreadRepositoryLive } from "../persistence/Layers/ProjectionThreads.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
@@ -44,6 +49,41 @@ import { ThreadPreparationReactor } from "./ThreadPreparationReactor.ts";
 const createdAt = "2026-09-28T00:00:00.000Z";
 const projectId = ProjectId.make("delete-project");
 const actor = { user: { userId: "teammate", displayName: null, imageUrl: null } };
+const CleanupControls = Context.Service<{ fail: boolean; stops: number }>("test/LifecycleCleanup");
+const cleanupLayer = Layer.effect(
+  CleanupControls,
+  Effect.sync(() => ({ fail: false, stops: 0 })),
+);
+const journalLayer = Journal.layer.pipe(
+  Layer.provide(
+    Layer.effect(
+      SetupProcessAdapter,
+      Effect.gen(function* () {
+        const controls = yield* CleanupControls;
+        return SetupProcessAdapter.of({
+          launcher: Effect.succeed("/helper"),
+          host: Effect.succeed({ host: "fixture", session: "boot" }),
+          arm: () => Effect.succeed("/bin/sh"),
+          inspect: (pid) =>
+            Effect.succeed({
+              protocol: 4,
+              identity: `birth-${pid}`,
+              owned: true,
+              fullStop: false,
+              boot: { host: "fixture", session: "boot" },
+            }),
+          stop: () =>
+            Effect.suspend(() => {
+              controls.stops++;
+              return controls.fail
+                ? Effect.fail(new SetupProcessError({ message: "Unit stop denied" }))
+                : Effect.void;
+            }),
+        });
+      }),
+    ),
+  ),
+);
 function makeTestLayer(failRejectedCommandId?: CommandId) {
   const receiptLayer =
     failRejectedCommandId === undefined
@@ -81,6 +121,9 @@ function makeTestLayer(failRejectedCommandId?: CommandId) {
     Layer.provide(
       Layer.succeed(RepositoryIdentityResolver, { resolve: () => Effect.succeed(null) }),
     ),
+    Layer.provideMerge(Layer.mock(TerminalManager, { closeOwned: () => Effect.succeed(false) })),
+    Layer.provideMerge(journalLayer),
+    Layer.provideMerge(cleanupLayer),
     Layer.provideMerge(SqlitePersistenceMemory),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-delete-dispatch-" })),
     Layer.provideMerge(NodeServices.layer),
@@ -97,6 +140,7 @@ const makeHarness = Effect.gen(function* () {
   const fence = yield* Semaphore.make(1);
   const allowed = yield* Ref.make(true);
   const authorizations: string[] = [];
+  const managedThreads = new Set<ThreadId>();
   const requireAccess = Ref.get(allowed).pipe(
     Effect.flatMap((value) =>
       value
@@ -115,9 +159,16 @@ const makeHarness = Effect.gen(function* () {
     withFence: fence.withPermit,
     requirePersistedProject: () => requireAccess,
     requireCommand: (_actor, command) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         authorizations.push(command.type);
-      }).pipe(Effect.andThen(requireAccess)),
+        yield* requireAccess;
+        if ("threadId" in command && managedThreads.has(command.threadId))
+          return yield* new EnvironmentAuthorizationError({
+            message: "Send this thread's commands through the relay inbox.",
+            requiredScope: AuthOrchestrationReadScope,
+            reason: "portable-thread",
+          });
+      }),
   };
   const drains = yield* Queue.unbounded<{
     threadId: ThreadId;
@@ -281,6 +332,7 @@ const makeHarness = Effect.gen(function* () {
     access,
     allowed,
     authorizations,
+    managedThreads,
     drains,
     drainHandler,
     create,
@@ -384,6 +436,99 @@ describe("creation dispatch cleanup fence", () => {
 });
 
 describe("deletion dispatch preflight", () => {
+  it.effect("marks project deletes as client commands when a transport supplies no options", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      const threadId = ThreadId.make("project-delete-transport-default");
+      yield* h.engine.dispatch(createThread(threadId, "create-transport-default"));
+      const fence = makeThreadExecutionFence(yield* SqlClient.SqlClient);
+      const owner = {
+        threadId,
+        projectId,
+        relayUrl: "https://relay.example",
+        environmentId: "here",
+        generation: 1,
+        operationId: "enrollment",
+      };
+      yield* fence.prepare(owner);
+      yield* fence.activate(owner);
+      const before = yield* h.query.getCommandReadModel();
+      const command = {
+        type: "project.delete" as const,
+        projectId,
+        force: true,
+        commandId: CommandId.make("transport-project-delete"),
+      };
+      const error = yield* h.dispatch(actor, command).pipe(Effect.flip);
+      expect(error._tag).toBe("ThreadExecutionFenceError");
+      expect(error.message).toContain("managed threads through Launchpad Connect");
+      expect((yield* h.query.getCommandReadModel()).snapshotSequence).toBe(before.snapshotSequence);
+      expect((yield* h.read(threadId)).deletedAt).toBeNull();
+      expect((yield* fence.get(threadId))?.phase).toBe("active");
+      expect(yield* Queue.size(h.drains)).toBe(0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a project cascade before stopping any managed or local thread", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      const local = yield* h.seed("local-project-delete");
+      const managed = yield* h.seed("managed-project-delete", true);
+      yield* h.settle(managed, true);
+      h.managedThreads.add(managed);
+      const before = yield* h.query.getCommandReadModel();
+      const command = {
+        type: "project.delete" as const,
+        projectId,
+        force: true,
+        commandId: CommandId.make("refuse-portable-project-delete"),
+      };
+      const error = yield* h.dispatch(actor, command).pipe(Effect.flip);
+      expect(error.message).toContain("managed threads through Launchpad Connect");
+      expect(yield* Queue.size(h.drains)).toBe(0);
+      expect((yield* h.query.getCommandReadModel()).snapshotSequence).toBe(before.snapshotSequence);
+      for (const id of [local, managed])
+        expect(yield* h.read(id)).toEqual(before.threads.find((t) => t.id === id));
+      expect(
+        Option.isNone(yield* h.receipts.getByCommandId({ commandId: command.commandId })),
+      ).toBe(true);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("rechecks captured thread ownership when enrollment occurs during setup shutdown", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      const threadId = yield* h.seed("enrolled-during-project-delete");
+      const stopped = yield* Deferred.make<void>();
+      yield* Ref.set(h.drainHandler, (id) =>
+        Deferred.await(stopped).pipe(Effect.andThen(h.settle(id, true)), Effect.orDie),
+      );
+      const command = {
+        type: "project.delete" as const,
+        projectId,
+        force: true,
+        commandId: CommandId.make("project-delete-enrollment-race"),
+      };
+      const deletion = yield* h.dispatch(actor, command).pipe(Effect.result, Effect.forkChild);
+      yield* Queue.take(h.drains);
+      yield* h.access.withFence(Effect.sync(() => h.managedThreads.add(threadId)));
+      yield* Deferred.succeed(stopped, undefined);
+      const result = yield* Fiber.join(deletion);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure")
+        expect(result.failure.message).toContain("managed threads through Launchpad Connect");
+      expect((yield* h.read(threadId)).deletedAt).toBeNull();
+      expect(
+        (yield* h.query.getCommandReadModel()).projects.find((project) => project.id === projectId)
+          ?.deletedAt,
+      ).toBeNull();
+      expect(
+        Option.getOrThrow(yield* h.receipts.getByCommandId({ commandId: command.commandId }))
+          .status,
+      ).toBe("rejected");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("deduplicates overlapping Delete requests after the same scoped shutdown", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness;
@@ -569,3 +714,84 @@ describe("deletion dispatch preflight", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 });
+
+for (const kind of ["thread.delete", "thread.archive"] as const) {
+  it.effect(`${kind} confirms ready setup previews and failed requests cannot revive`, () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness;
+      const journal = yield* Journal.SetupProcessJournal;
+      const controls = yield* CleanupControls;
+      const threadId = yield* h.seed(`ready-preview-${kind}`);
+      const before = (yield* h.read(threadId)).promptQueue!.preparation!;
+      yield* h.engine.dispatch({
+        type: "thread.preparation.update",
+        threadId,
+        commandId: CommandId.make(`ready-${kind}`),
+        createdAt,
+        expectedRevision: before.revision,
+        preparation: { ...before, revision: before.revision + 1, state: "ready", settled: true },
+      });
+      for (const entry of (yield* h.read(threadId)).promptQueue!.entries) {
+        yield* h.engine.dispatch({
+          type: "thread.prompt.remove",
+          commandId: CommandId.make(`remove-${kind}`),
+          threadId,
+          messageId: entry.messageId,
+          expectedRevision: entry.revision,
+          createdAt,
+        });
+      }
+      const attempt = { threadId, attemptId: before.attemptId };
+      yield* journal.begin({ ...attempt, terminalId: "setup-" + before.attemptId });
+      yield* journal.capture({ ...attempt, pid: 123 });
+      yield* journal.complete(attempt);
+      controls.fail = true;
+      const request = { type: kind, threadId, commandId: CommandId.make(`reject-preview-${kind}`) };
+      expect((yield* h.dispatch(actor, request).pipe(Effect.result))._tag).toBe("Failure");
+      expect((yield* h.read(threadId)).deletedAt).toBeNull();
+      expect((yield* h.read(threadId)).archivedAt).toBeNull();
+      expect((yield* h.read(threadId)).promptQueue!.enabled).toBe(false);
+      controls.fail = false;
+      yield* journal.cleanup({ ...attempt, commandId: "explicit-recovery" });
+      const stops = controls.stops;
+      expect((yield* h.dispatch(actor, request).pipe(Effect.result))._tag).toBe("Failure");
+      expect(controls.stops).toBe(stops);
+      expect((yield* h.read(threadId)).deletedAt).toBeNull();
+      expect((yield* h.read(threadId)).archivedAt).toBeNull();
+      yield* h.dispatch(actor, { ...request, commandId: CommandId.make(`retry-preview-${kind}`) });
+      const hidden = yield* h.read(threadId);
+      expect(kind === "thread.archive" ? hidden.archivedAt : hidden.deletedAt).not.toBeNull();
+      expect(controls.stops).toBe(stops);
+    }).pipe(Effect.provide(testLayer)),
+  );
+}
+
+it.effect("Archive after confirmed Stop retains failed preparation and its cause", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness;
+    const journal = yield* Journal.SetupProcessJournal;
+    const threadId = yield* h.seed("archive-failed-settled");
+    yield* h.settle(threadId, true);
+    const preparation = (yield* h.read(threadId)).promptQueue!.preparation!;
+    for (const entry of (yield* h.read(threadId)).promptQueue!.entries)
+      yield* h.engine.dispatch({
+        type: "thread.prompt.remove",
+        commandId: CommandId.make("dismiss-before-archive"),
+        threadId,
+        messageId: entry.messageId,
+        expectedRevision: entry.revision,
+        createdAt,
+      });
+    yield* journal.begin({ threadId, attemptId: preparation.attemptId, terminalId: "setup" });
+    yield* journal.capture({ threadId, attemptId: preparation.attemptId, pid: 123 });
+    yield* h.dispatch(actor, {
+      type: "thread.archive",
+      threadId,
+      commandId: CommandId.make("archive-after-stop"),
+    });
+    const current = yield* h.read(threadId);
+    expect(current.archivedAt).not.toBeNull();
+    expect(current.promptQueue!.preparation!.state).toBe("failed");
+    expect(current.promptQueue!.preparation!.failure).toEqual(preparation.failure);
+  }).pipe(Effect.provide(testLayer)),
+);
