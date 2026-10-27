@@ -1,3 +1,4 @@
+import { WorkflowResultReturn, type WorkflowResultOrigin } from "../settings/WorkflowResultReturn";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { enqueueThreadOutboxMessage } from "../../state/thread-outbox";
 import {
@@ -218,6 +219,7 @@ function OpeningThreadLoadingScreen() {
 }
 
 type ThreadRouteScreenRouteProps = StaticScreenProps<{
+  readonly workflowOrigin?: WorkflowResultOrigin;
   readonly environmentId: string;
   readonly threadId: string;
 }>;
@@ -253,7 +255,7 @@ function ThreadUnavailableScreen(props: {
   );
 }
 
-export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
   const { state: workspaceState } = useWorkspaceState();
   const { connectionState } = useRemoteConnectionStatus();
   const { selectedThread } = useThreadSelection();
@@ -1057,7 +1059,7 @@ function ThreadRouteContent(
                   turnStartedAt: selectedThreadDetail?.latestTurn?.startedAt ?? null,
                   working: composer.activeWorkStartedAt !== null,
                   turnStarted: selectedThreadDetail?.latestTurn?.startedAt != null,
-                  onCancel: handleCancelWorktreeSetup,
+                  onCancel: selectedThreadDetail?.workflowJob ? null : handleCancelWorktreeSetup,
                   onWorkLocally:
                     !selectedThreadDetail?.promptQueue?.preparation &&
                     selectedThreadCreation?.outcome == null &&
@@ -1131,5 +1133,17 @@ function ThreadRouteContent(
 
       {renderThreadRouteBody()}
     </>
+  );
+}
+
+export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+  return (
+    <View className="flex-1">
+      <WorkflowResultReturn
+        origin={props.route.params.workflowOrigin}
+        threadId={props.route.params.threadId}
+      />
+      <ThreadRouteScreenContent {...props} />
+    </View>
   );
 }

@@ -15,6 +15,7 @@ import {
   threadMoveOriginalLocationBlocker,
   threadMoveRepositoryCanonicalKey,
   threadMoveProviderSupported,
+  threadWorkflowMoveBlocker,
   type ThreadMoveSubmissionStorage,
 } from "./threadMoveSubmission.ts";
 import type { EnvironmentProject } from "../state/models.ts";
@@ -1036,4 +1037,14 @@ describe("move provider eligibility", () => {
       expect(threadMoveProviderSupported(provider, "environment")).toBe(false);
     }
   });
+});
+
+it("blocks moves until workflow ownership is released, including terminal state awaiting cleanup", () => {
+  for (const status of ["running", "awaiting_review", "paused", "cancelling", "done"]) {
+    expect(
+      threadWorkflowMoveBlocker({ workflowJob: { jobId: "job", repositoryId: "repo", status } }),
+    ).not.toBeNull();
+  }
+  expect(threadWorkflowMoveBlocker({ workflowJob: null })).toBeNull();
+  expect(threadWorkflowMoveBlocker({})).toBeNull();
 });

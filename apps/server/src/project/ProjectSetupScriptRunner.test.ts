@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from "@effect/vitest";
-import { type OrchestrationProject, ProjectId, type TerminalEvent } from "@t3tools/contracts";
+import {
+  type OrchestrationProject,
+  ProjectId,
+  TerminalProcessExitError,
+  type TerminalEvent,
+} from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -9,6 +16,7 @@ import * as Schema from "effect/Schema";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
+import { SetupProcessJournal, SetupProcessError } from "../terminal/SetupProcessJournal.ts";
 import * as ProjectSetupScriptRunner from "./ProjectSetupScriptRunner.ts";
 
 const isProjectSetupScriptOperationError = Schema.is(
@@ -59,16 +67,18 @@ const makeProjectionSnapshotQueryLayer = (project: OrchestrationProject) =>
   });
 
 type TerminalOverrides = Pick<TerminalManager.TerminalManager["Service"], "open" | "write"> &
-  Partial<Pick<TerminalManager.TerminalManager["Service"], "subscribe">>;
+  Partial<Pick<TerminalManager.TerminalManager["Service"], "subscribe" | "writeSetup">>;
 
 const makeTerminalManagerLayer = (overrides: TerminalOverrides) =>
   Layer.succeed(TerminalManager.TerminalManager, {
     captureCleanup: () => Effect.die("unused"),
+    writeSetup: () => Effect.die("unexpected setup write"),
     deleteHistory: () => Effect.void,
     attachStream: () => Effect.die(new Error("unused")),
     resize: () => Effect.void,
     clear: () => Effect.void,
     restart: () => Effect.die(new Error("unused")),
+    closeOwned: () => Effect.succeed(false),
     close: () => Effect.void,
     subscribe: () => Effect.succeed(() => undefined),
     subscribeMetadata: () => Effect.succeed(() => undefined),
@@ -531,3 +541,353 @@ describe("ProjectSetupScriptRunner", () => {
     );
   });
 });
+
+it.effect("a managed setup never writes its command if birth identity persistence fails", () => {
+  const write = vi.fn(() => Effect.void);
+  const open = () =>
+    Effect.succeed({
+      threadId: "thread-1",
+      terminalId: "setup-attempt",
+      cwd: "/repo/worktrees/a",
+      worktreePath: "/repo/worktrees/a",
+      status: "running" as const,
+      pid: 123,
+      history: "",
+      exitCode: null,
+      exitSignal: null,
+      label: "Setup",
+      updatedAt: "2026-10-09T00:00:00Z",
+    });
+  const project = makeProject([
+    {
+      id: "setup",
+      name: "Setup",
+      command: "preview",
+      icon: "configure",
+      runOnWorktreeCreate: true,
+    },
+  ]);
+  return Effect.gen(function* () {
+    const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+    const error = yield* Effect.flip(
+      runner.runForThread({
+        threadId: "thread-1",
+        projectId: "project-1",
+        worktreePath: "/repo/worktrees/a",
+        preferredTerminalId: "setup-attempt",
+        preparationAttemptId: "attempt",
+      }),
+    );
+    expect(error).toMatchObject({ operation: "recordProcess" });
+    expect(write).not.toHaveBeenCalled();
+  }).pipe(
+    Effect.provide(
+      testLayer(project, { open, write }).pipe(
+        Layer.provide(
+          Layer.succeed(SetupProcessJournal, {
+            owners: () => Effect.succeed([]),
+            launcher: Effect.succeed("/native/helper"),
+            confirmed: () => Effect.succeed(false),
+            begin: () => Effect.void,
+            capture: () =>
+              Effect.fail(new SetupProcessError({ message: "Identity could not be saved" })),
+            complete: () => Effect.void,
+            cleanup: () => Effect.fail(new SetupProcessError({ message: "Not used" })),
+            recover: () => Effect.fail(new SetupProcessError({ message: "Not used" })),
+          }),
+        ),
+      ),
+    ),
+  );
+});
+
+for (const selected of [
+  "/usr/bin/fish",
+  "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  "cmd.exe",
+  "exited-before-arm-ack",
+] as const) {
+  it.effect(`uses the acknowledged setup shell and rejects unsafe delivery: ${selected}`, () =>
+    Effect.gen(function* () {
+      const project = makeProject([
+        {
+          id: "setup",
+          name: "Setup",
+          command: "bun install",
+          icon: "configure",
+          runOnWorktreeCreate: true,
+        },
+      ]);
+      const writes: string[] = [];
+      let listener: ((event: TerminalEvent) => Effect.Effect<void>) | undefined;
+      const terminalId = "setup-attempt";
+      const layer = testLayer(project, {
+        open: () =>
+          Effect.succeed({
+            threadId: "thread-1",
+            terminalId,
+            cwd: "/repo/worktrees/a",
+            worktreePath: "/repo/worktrees/a",
+            status: "running",
+            pid: 123,
+            history: "",
+            exitCode: null,
+            exitSignal: null,
+            label: terminalId,
+            updatedAt: "now",
+          }),
+        write: () => Effect.die("unexpected ordinary write"),
+        writeSetup: ({ data }) =>
+          Effect.sync(() => {
+            writes.push(data);
+          }),
+        subscribe: (callback) =>
+          Effect.sync(() => {
+            listener = callback;
+            return () => {
+              listener = undefined;
+            };
+          }),
+      }).pipe(
+        Layer.provide(
+          Layer.succeed(SetupProcessJournal, {
+            ...SetupProcessJournal.defaultValue(),
+            launcher: Effect.succeed("/helper"),
+            capture: () =>
+              Effect.gen(function* () {
+                expect(listener).toBeDefined();
+                if (selected === "exited-before-arm-ack") {
+                  yield* listener!({
+                    type: "exited",
+                    threadId: "thread-1",
+                    terminalId,
+                    sequence: 1,
+                    exitCode: 7,
+                    exitSignal: null,
+                  });
+                  return "/bin/sh";
+                }
+                return selected;
+              }),
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+        const result = yield* runner
+          .runForThread({
+            threadId: "thread-1",
+            projectId: "project-1",
+            worktreePath: "/repo/worktrees/a",
+            preparationAttemptId: "attempt",
+            preferredTerminalId: terminalId,
+            observeCompletion: {},
+          })
+          .pipe(Effect.result);
+        if (selected === "cmd.exe" || selected === "exited-before-arm-ack") {
+          expect(result._tag).toBe("Failure");
+          expect(writes).toEqual([]);
+        } else {
+          expect(result._tag).toBe("Success");
+          expect(writes[0]).toContain(
+            selected === "/usr/bin/fish" ? "begin\rbun install\rend" : "$global:LASTEXITCODE",
+          );
+        }
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+}
+
+it.effect(
+  "restarting the setup terminal ends the old setup wait without replaying the script",
+  () =>
+    Effect.gen(function* () {
+      const project = makeProject([
+        {
+          id: "setup",
+          name: "Setup",
+          command: "bun install",
+          icon: "configure",
+          runOnWorktreeCreate: true,
+        },
+      ]);
+      const writes: string[] = [];
+      let listener: ((event: TerminalEvent) => Effect.Effect<void>) | undefined;
+      const terminalId = "setup";
+      const layer = testLayer(project, {
+        open: () =>
+          Effect.succeed({
+            threadId: "thread-1",
+            terminalId,
+            cwd: "/repo/worktrees/a",
+            worktreePath: "/repo/worktrees/a",
+            status: "running",
+            pid: 123,
+            history: "",
+            exitCode: null,
+            exitSignal: null,
+            label: terminalId,
+            updatedAt: "now",
+          }),
+        write: ({ data }) =>
+          Effect.sync(() => {
+            writes.push(data);
+          }),
+        subscribe: (callback) =>
+          Effect.sync(() => {
+            listener = callback;
+            return () => {
+              listener = undefined;
+            };
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+        const result = yield* runner.runForThread({
+          threadId: "thread-1",
+          projectId: "project-1",
+          worktreePath: "/repo/worktrees/a",
+          preferredTerminalId: terminalId,
+          observeCompletion: {},
+        });
+        expect(result.status).toBe("started");
+        if (result.status !== "started") return;
+        yield* listener!({
+          type: "restarted",
+          threadId: "thread-1",
+          terminalId,
+          sequence: 1,
+          snapshot: {
+            threadId: "thread-1",
+            terminalId,
+            cwd: "/repo/worktrees/a",
+            worktreePath: "/repo/worktrees/a",
+            status: "running",
+            pid: 456,
+            history: "",
+            exitCode: null,
+            exitSignal: null,
+            label: terminalId,
+            updatedAt: "now",
+          },
+        });
+        expect((yield* result.completion!).exitCode).toBeNull();
+        expect(writes).toHaveLength(1);
+        expect(listener).toBeUndefined();
+      }).pipe(Effect.provide(layer));
+    }),
+);
+
+const managedSnapshot = {
+  threadId: "thread-1",
+  terminalId: "setup-attempt",
+  cwd: "/repo/worktrees/a",
+  worktreePath: "/repo/worktrees/a",
+  status: "running" as const,
+  pid: 123,
+  history: "",
+  exitCode: null,
+  exitSignal: null,
+  label: "setup-attempt",
+  updatedAt: "now",
+};
+const armedJournal = {
+  ...SetupProcessJournal.defaultValue(),
+  launcher: Effect.succeed("/helper"),
+  capture: () => Effect.succeed("/bin/sh"),
+};
+
+it.effect.each([
+  [false, true],
+  [false, false],
+  [true, true],
+  [true, false],
+] as const)(
+  "guarded delivery failure retains its policy and releases observation (async=%s observe=%s)",
+  ([async, observe]) =>
+    Effect.gen(function* () {
+      const project = makeProject([]);
+      const listeners = new Set<(event: TerminalEvent) => Effect.Effect<void>>();
+      const write = vi.fn(() => Effect.void);
+      const layer = testLayer(project, {
+        open: () => Effect.succeed(managedSnapshot),
+        write,
+        writeSetup: () =>
+          Effect.fail(
+            new TerminalProcessExitError({
+              threadId: "thread-1",
+              terminalId: "setup-attempt",
+              terminalPid: 123,
+              detail: "Setup owner was replaced",
+            }),
+          ),
+        subscribe: (listener) =>
+          Effect.sync(() => {
+            listeners.add(listener);
+            return () => {
+              listeners.delete(listener);
+            };
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+        const failure = yield* runner
+          .runForThread({
+            threadId: "thread-1",
+            projectId: "project-1",
+            worktreePath: "/repo/worktrees/a",
+            preparationAttemptId: "attempt",
+            preferredTerminalId: "setup-attempt",
+            ...(observe ? { observeCompletion: {} } : {}),
+            resolvedScript: { id: "setup", name: "Setup", command: "echo SIDE_EFFECT", async },
+          })
+          .pipe(Effect.flip);
+        expect(failure).toMatchObject({
+          operation: "writeCommand",
+          waitForCompletion: !async,
+          cause: { _tag: "TerminalProcessExitError" },
+        });
+        expect(write).not.toHaveBeenCalled();
+        expect(listeners.size).toBe(0);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provideService(SetupProcessJournal, armedJournal)),
+);
+
+it.effect("interrupted guarded delivery releases its completion observer without fallback", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const listeners = new Set<(event: TerminalEvent) => Effect.Effect<void>>();
+    const write = vi.fn(() => Effect.void);
+    const layer = testLayer(makeProject([]), {
+      open: () => Effect.succeed(managedSnapshot),
+      write,
+      writeSetup: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      subscribe: (listener) =>
+        Effect.sync(() => {
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+          };
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+      const pending = yield* runner
+        .runForThread({
+          threadId: "thread-1",
+          projectId: "project-1",
+          worktreePath: "/repo/worktrees/a",
+          preparationAttemptId: "attempt",
+          preferredTerminalId: "setup-attempt",
+          observeCompletion: {},
+          resolvedScript: { id: "setup", name: "Setup", command: "echo SIDE_EFFECT", async: false },
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      expect(listeners.size).toBe(1);
+      yield* Fiber.interrupt(pending);
+      expect(listeners.size).toBe(0);
+      expect(write).not.toHaveBeenCalled();
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provideService(SetupProcessJournal, armedJournal)),
+);

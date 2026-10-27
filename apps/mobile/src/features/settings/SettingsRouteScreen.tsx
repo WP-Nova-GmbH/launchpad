@@ -92,6 +92,15 @@ function ConfiguredSettingsRouteScreen() {
         </SettingsSection>
 
         <SettingsIndexSections />
+        {isSignedIn ? (
+          <SettingsSection title="Workflows">
+            <SettingsRow
+              icon="arrow.triangle.branch"
+              label="Workflow jobs"
+              target="SettingsWorkflowJobs"
+            />
+          </SettingsSection>
+        ) : null}
       </ScrollView>
     </View>
   );

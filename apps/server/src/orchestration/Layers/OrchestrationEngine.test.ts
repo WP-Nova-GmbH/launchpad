@@ -15,9 +15,9 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import {
+  EnvironmentId,
   ApprovalRequestId,
   EventId,
-  EnvironmentId,
   CheckpointRef,
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -72,6 +72,16 @@ import {
 } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
+import * as WorkflowRunStore from "../../jobs/WorkflowRunStore.ts";
+import * as WorkflowRunner from "../../jobs/RepositoryWorkflowRunner.ts";
+import * as SetupProcessJournal from "../../terminal/SetupProcessJournal.ts";
+import { SetupProcessAdapter } from "../../terminal/SetupProcessAdapter.ts";
+import { TerminalManager } from "../../terminal/Manager.ts";
+import { GitVcsDriver } from "../../vcs/GitVcsDriver.ts";
+import { CheckpointStore } from "../../checkpointing/CheckpointStore.ts";
+import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -3199,7 +3209,7 @@ describe("atomic shared preparation acceptance", () => {
         },
       ])
         await expect(system.run(system.engine.dispatch(command, options))).rejects.toThrow(
-          "changed during deletion",
+          "changed during cleanup",
         );
       expect(
         Option.getOrThrow(await system.readThread(threadId)).promptQueue!.preparation!.state,
@@ -3279,7 +3289,7 @@ describe("atomic shared preparation acceptance", () => {
           commandId: CommandId.make("stale-delete"),
         };
         await expect(system.run(system.engine.dispatch(stale, options))).rejects.toThrow(
-          "changed during deletion",
+          "changed during cleanup",
         );
         expect(Option.getOrThrow(await system.receipt(stale.commandId)).projectId).toBe(projectId);
         expect(Option.isSome(await system.readThread(threadId))).toBe(true);
@@ -4648,3 +4658,253 @@ describe("queued move provider admission", () => {
     },
   );
 });
+effectIt.effect(
+  "recovered workflow approval uses durable cleanup, settles the failed preparation, and permits deletion",
+  () =>
+    Effect.gen(function* () {
+      const engine = yield* OrchestrationEngineService;
+      const query = yield* ProjectionSnapshotQuery;
+      const store = yield* WorkflowRunStore.WorkflowRunStore;
+      const projectId = ProjectId.make("recovered-project");
+      const threadId = ThreadId.make("workflow:recovered:agent");
+      const attemptId = CommandId.make("recovered-setup");
+      const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-test" };
+      yield* engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("recover-project"),
+        projectId,
+        title: "Recovery",
+        workspaceRoot: "/tmp/recovered-repo",
+        createdAt: now(),
+      });
+      yield* engine.dispatch({
+        type: "thread.prompt.enqueue",
+        commandId: attemptId,
+        threadId,
+        message: { messageId: MessageId.make("recovered-prompt"), text: "Work", attachments: [] },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        createdAt: now(),
+        bootstrap: {
+          createThread: {
+            projectId,
+            title: "Recovery",
+            modelSelection,
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            branch: "t3-job/recovered",
+            worktreePath: "/tmp/recovered-job",
+            createdAt: now(),
+          },
+          prepareWorktree: {
+            projectCwd: "/tmp/recovered-repo",
+            baseBranch: "main",
+            branch: "t3-job/recovered",
+          },
+          runSetupScript: true,
+        },
+      });
+      const original = Option.getOrThrow(yield* query.getThreadDetailById(threadId)).promptQueue!
+        .preparation!;
+      const running = {
+        ...original,
+        revision: original.revision + 1,
+        state: "running" as const,
+        settled: false,
+        target: { branch: "t3-job/recovered", worktreePath: "/tmp/recovered-job" },
+        script: { id: "preview", name: "Preview", command: "preview", async: true },
+      };
+      yield* engine.dispatch({
+        type: "thread.preparation.update",
+        threadId,
+        commandId: CommandId.make("recover-running"),
+        expectedRevision: original.revision,
+        preparation: running,
+        createdAt: now(),
+      });
+      yield* engine.dispatch({
+        type: "thread.preparation.update",
+        threadId,
+        commandId: CommandId.make("recover-failed"),
+        expectedRevision: running.revision,
+        preparation: {
+          ...running,
+          revision: running.revision + 1,
+          state: "failed",
+          failure: { reason: "interrupted", detail: "Preparation interrupted before cleanup" },
+        },
+        createdAt: now(),
+      });
+      let stops = 0;
+      const journal = yield* Effect.service(SetupProcessJournal.SetupProcessJournal).pipe(
+        Effect.provide(
+          SetupProcessJournal.layer.pipe(
+            Layer.provide(
+              Layer.mock(TerminalManager, {
+                close: () => Effect.void,
+                closeOwned: () => Effect.succeed(false),
+              }),
+            ),
+            Layer.provide(
+              Layer.mock(SetupProcessAdapter, {
+                launcher: Effect.succeed("/native/helper"),
+                arm: () => Effect.succeed("/bin/sh"),
+                host: Effect.succeed({ host: "host", session: "boot" }),
+                inspect: () =>
+                  Effect.succeed({
+                    protocol: 4,
+                    identity: "owned-birth",
+                    owned: true,
+                    fullStop: false,
+                    boot: { host: "host", session: "boot" },
+                  }),
+                stop: () =>
+                  Effect.sync(() => {
+                    stops++;
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+      yield* journal.begin({ threadId, attemptId, terminalId: "setup-recovered" });
+      yield* journal.capture({ threadId, attemptId, pid: 42 });
+      yield* journal.cleanup({ threadId, attemptId, commandId: "recovered-approve" });
+      expect(yield* journal.confirmed({ threadId, attemptId })).toBe(true);
+      const checkpoint = {
+        checkpointId: "saved-result",
+        turnId: "saved-turn",
+        checkpointRef: "refs/t3/saved",
+        checkpointTurnCount: 1,
+      };
+      yield* store.save({
+        jobId: "recovered",
+        userId: "first-maintainer",
+        repositoryCanonicalKey: "github.com/acme/repo",
+        instruction: "Work",
+        workflow: {
+          workflowId: "workflow",
+          organizationId: "org",
+          repositoryId: "repo",
+          revision: 1,
+          archived: false,
+          createdAt: now(),
+          updatedAt: now(),
+          definition: {
+            name: "Workflow",
+            environmentId: EnvironmentId.make("env"),
+            projectId,
+            steps: [
+              {
+                id: "agent",
+                kind: "agent",
+                title: "Work",
+                instruction: "Work",
+                modelSelection: null,
+              },
+              { id: "review", kind: "review", title: "Review", role: "maintainer" },
+            ],
+          },
+        },
+        progress: {
+          revision: 3,
+          status: "awaiting_review",
+          threadId,
+          detail: null,
+          checkpoint,
+          approvalPending: true,
+        },
+        modelSelection,
+        baseBranch: "main",
+        baseSha: "saved-head",
+        createdAt: now(),
+        promptDispatched: true,
+        executionReserved: false,
+        worktreePath: "/tmp/recovered-job",
+        preparedHead: "saved-head",
+        approvedBy: null,
+        approvalAttempt: {
+          approvedBy: "first-maintainer",
+          checkpointId: checkpoint.checkpointId,
+          preparedHead: "saved-head",
+          acceptedRevision: 2,
+          commandId: "recovered-approve",
+          createdAt: now(),
+          setupCleanup: { attemptId, state: "done", detail: null },
+        },
+      });
+      const runner = yield* WorkflowRunner.make.pipe(
+        Effect.provideService(SetupProcessJournal.SetupProcessJournal, journal),
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.mock(GitVcsDriver, {
+              resolveCommit: () => Effect.succeed({ commitSha: "saved-head" }),
+              statusDetailsLocal: () =>
+                Effect.succeed({
+                  isRepo: true,
+                  hasOriginRemote: true,
+                  isDefaultBranch: false,
+                  branch: "t3-job/recovered",
+                  upstreamRef: null,
+                  hasWorkingTreeChanges: false,
+                  workingTree: { files: [], insertions: 0, deletions: 0 },
+                  hasUpstream: false,
+                  aheadCount: 0,
+                  behindCount: 0,
+                  aheadOfDefaultCount: 0,
+                }),
+            }),
+            Layer.mock(CheckpointStore, {
+              captureCheckpoint: () => Effect.void,
+              diffCheckpoints: () => Effect.succeed(""),
+              deleteCheckpointRefs: () => Effect.void,
+            }),
+            Layer.mock(ProviderRegistry, {}),
+            Layer.mock(ProviderService, {}),
+            Layer.mock(TextGeneration, {}),
+            Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver, {
+              resolve: () => Effect.succeed(null),
+            }),
+          ),
+        ),
+      );
+      const response = yield* runner.handle({
+        jobId: "recovered",
+        userId: "first-maintainer",
+        instruction: "Work",
+        repositoryCanonicalKey: "github.com/acme/repo",
+        control: { operation: "status", organizationId: "org", repositoryId: "repo", projectId },
+      });
+      expect(response.progress?.status).toBe("done");
+      const settled = Option.getOrThrow(yield* query.getThreadDetailById(threadId)).promptQueue!
+        .preparation!;
+      expect(settled.state).toBe("failed");
+      expect(settled.settled).toBe(true);
+      expect(settled.revision).toBe(running.revision + 2);
+      expect(stops).toBe(1);
+      yield* runner.handle({
+        jobId: "recovered",
+        userId: "first-maintainer",
+        instruction: "Work",
+        repositoryCanonicalKey: "github.com/acme/repo",
+        control: { operation: "status", organizationId: "org", repositoryId: "repo", projectId },
+      });
+      expect(
+        Option.getOrThrow(yield* query.getThreadDetailById(threadId)).promptQueue!.preparation!
+          .revision,
+      ).toBe(settled.revision);
+      yield* engine.dispatch({
+        type: "thread.delete",
+        threadId,
+        commandId: CommandId.make("delete-recovered"),
+      });
+      expect(Option.isNone(yield* query.getThreadDetailById(threadId))).toBe(true);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.mock(TerminalManager, { closeOwned: () => Effect.succeed(false) }),
+          WorkflowRunStore.layer.pipe(Layer.provideMerge(makeOrchestrationLayer())),
+        ),
+      ),
+    ),
+);

@@ -62,6 +62,64 @@ prompt does not change its original author.
 The person who most recently changed a queued prompt's content, shown as "Edited by" alongside
 its original submitter. Both remain attributed after the prompt reaches the agent.
 
+## Workflows
+
+**Workflow**:
+A repository-owned, named, ordered set of steps describing how work is carried out and
+reviewed.
+
+**Workflow copy**:
+An independent workflow created from another workflow. Later edits to the source workflow
+do not change its copies.
+
+**Job**:
+A single execution of a repository workflow under the definition used at its start.
+
+**Job handoff**:
+An offer of a job to its selected execution environment, awaiting confirmation of acceptance.
+An uncertain handoff may still have started work.
+
+**Job completion**:
+A job's successful end, after its configured steps have finished and its setup work has stopped.
+
+**Setup work**:
+A workspace preparation's programs and background previews, retained as part of that preparation
+after the initial setup command finishes. Docker-managed containers and system services have
+a separate lifecycle.
+
+**Event trigger**:
+A repository workflow's rule selecting external events using issue details at the time of the
+event. Later issue changes do not change which occurrences created existing jobs.
+
+**Trigger occurrence**:
+A distinct external event that matches a workflow's event trigger. Several occurrences may
+refer to the same issue.
+
+**Workflow execution environment**:
+The environment selected to run a repository workflow's jobs.
+
+**Workflow zone**:
+A visual grouping derived from a workflow's steps that distinguishes automatic work from
+each checkpoint requiring human intervention. Steps determine what happens; zones show it.
+
+**Human checkpoint**:
+A workflow step that pauses the work until a person responds, either by reviewing a result
+or supplying required input.
+
+**Checkpoint responder**:
+A person eligible to answer a human checkpoint under that checkpoint's repository role
+requirement.
+
+**Review checkpoint**:
+A human checkpoint for approving prepared work or requesting changes to it.
+
+**Input checkpoint**:
+A human checkpoint for supplying information required by later steps.
+
+**Rework**:
+A revision of prepared work in response to review feedback, carried out by its designated
+earlier agent step. The revised work requires a fresh review.
+
 ## Issue trackers
 
 **Integration application**:
@@ -73,6 +131,10 @@ _Avoid_: Organization connection
 One Launchpad user's authorization to access a workspace or site in an external issue tracker.
 Several users may connect to the same workspace or site without sharing their authorization.
 _Avoid_: Organization connection, shared company account
+
+**Automation connection**:
+An authorization to use an external workspace or site as an event source for repository workflows.
+It can be reused by repositories explicitly allowed by the connection's owner.
 
 **Write approver**:
 The owner of the personal issue-tracker connection used for a proposed change.
@@ -92,6 +154,10 @@ _Avoid_: Team when referring to Linear without qualification
 The details, comment discussion, and embedded images from an external issue used to inform work
 in a Launchpad thread. It is distinct from a Launchpad work item.
 _Avoid_: Imported work item, synced issue
+
+**Issue snapshot**:
+The issue details preserved for a particular job at handoff. Later changes to the external
+issue do not change that job’s instructions.
 
 ## Managed compute
 

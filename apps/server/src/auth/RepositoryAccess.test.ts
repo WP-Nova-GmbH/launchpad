@@ -35,7 +35,7 @@ import {
   encodeCloudMachineIdentityJson,
 } from "../cloud/config.ts";
 import { SecretStorePersistError, ServerSecretStore } from "./ServerSecretStore.ts";
-import { make } from "./RepositoryAccess.ts";
+import { make, stampCommandAuthor } from "./RepositoryAccess.ts";
 
 const user = { user: { userId: "vali", displayName: "Vali", imageUrl: null } };
 const admin = { user: { userId: "admin", displayName: null, imageUrl: null } };
@@ -655,4 +655,81 @@ it.layer(testLayer)("repository authorization", (it) => {
       ).toBe(true);
     }),
   );
+});
+
+it.effect(
+  "workflow execution requires a current exact organization repository binding without a human account",
+  () =>
+    Effect.gen(function* () {
+      const { construct, projects } = yield* fixture;
+      const access = yield* construct;
+      const binding = {
+        organizationId: "org",
+        repositoryId: "repo-a",
+        projectId: projectA,
+        repositoryCanonicalKey: "github.com/a/a",
+      };
+      assert.equal((yield* Effect.exit(access.requireWorkflowProject(binding)))._tag, "Failure");
+      yield* access.apply(policy, true);
+      yield* access.requireWorkflowProject(binding);
+      assert.equal(
+        (yield* Effect.exit(access.requireWorkflowProject({ ...binding, repositoryId: "repo-b" })))
+          ._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.exit(access.requireWorkflowProject({ ...binding, organizationId: "other" })))
+          ._tag,
+        "Failure",
+      );
+      projects[0] = {
+        ...projects[0]!,
+        repositoryIdentity: {
+          ...projects[0]!.repositoryIdentity!,
+          canonicalKey: "github.com/other/other",
+        },
+      };
+      assert.equal((yield* Effect.exit(access.requireWorkflowProject(binding)))._tag, "Failure");
+      projects[0] = {
+        ...projects[0]!,
+        repositoryIdentity: {
+          ...projects[0]!.repositoryIdentity!,
+          canonicalKey: binding.repositoryCanonicalKey,
+        },
+      };
+      yield* access.apply(
+        {
+          ...policy,
+          revision: 2,
+          members: [],
+          repositories: policy.repositories.map((repo) => ({ ...repo, userIds: [] })),
+        },
+        true,
+      );
+      yield* access.requireWorkflowProject(binding);
+      yield* access.apply({ ...policy, revision: 3, members: [], repositories: [] }, true);
+      assert.equal((yield* Effect.exit(access.requireWorkflowProject(binding)))._tag, "Failure");
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+);
+
+it("strips internal workflow attribution while stamping the actual wire requester", () => {
+  const command = {
+    type: "thread.prompt.enqueue" as const,
+    commandId: CommandId.make("client-prompt"),
+    threadId: threadA,
+    message: { messageId: MessageId.make("client-message"), text: "hello", attachments: [] },
+    runtimeMode: "approval-required" as const,
+    interactionMode: "default" as const,
+    createdAt: "2026-10-15T00:00:00.000Z",
+    author: { userId: "fake", displayName: null, imageUrl: null },
+    workflowOrigin: {
+      kind: "automation" as const,
+      jobId: "job",
+      workflowId: "flow",
+      workflowName: "Trusted",
+    },
+  };
+  expect(stampCommandAuthor(command, user)).not.toHaveProperty("workflowOrigin");
+  expect(stampCommandAuthor(command, user)).toMatchObject({ author: user.user });
+  expect(stampCommandAuthor(command, {})).not.toHaveProperty("author");
 });

@@ -30,7 +30,16 @@ export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 
 export type ProviderAdmissionEvidence = "provider-ack" | "harness-dispatch";
 
+export interface ProviderSessionStartOptions {
+  readonly requireResume?: boolean;
+  readonly beforeStart?: (
+    runtimeEpisode: string,
+  ) => Effect.Effect<void, ProviderAdapterValidationError>;
+}
+
 export interface ProviderSendTurnCallbacks {
+  /** Effective policy for this operation, including released workflow threads. */
+  readonly sessionOptions?: ProviderSessionStartOptions;
   /** Revalidate after preparation, immediately before the native dispatch. A
    * failure proves this prompt was never handed to the provider. */
   readonly beforeDispatch?: Effect.Effect<void, ProviderAdapterValidationError>;
@@ -114,6 +123,7 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly startSession: (
     input: ProviderSessionStartInput,
+    options?: ProviderSessionStartOptions,
   ) => Effect.Effect<ProviderSession, TError>;
 
   /**
@@ -150,10 +160,28 @@ export interface ProviderAdapterShape<TError> {
     answers: ProviderUserInputAnswers,
   ) => Effect.Effect<void, TError>;
 
-  /**
-   * Stop one provider session.
-   */
-  readonly stopSession: (threadId: ThreadId) => Effect.Effect<void, TError>;
+  /** Update server-owned continuity policy without restarting a live session. */
+  readonly updateSessionOptions?: (
+    threadId: ThreadId,
+    options: ProviderSessionStartOptions,
+  ) => Effect.Effect<void, TError>;
+
+  /** Proof retained by the exact adapter that completed native shutdown. */
+  readonly isSessionStopConfirmed?: (
+    threadId: ThreadId,
+    runtimeEpisode?: string,
+  ) => Effect.Effect<boolean>;
+  readonly getSessionRuntimeEpisode?: (threadId: ThreadId) => Effect.Effect<string | undefined>;
+  readonly releaseSessionStopConfirmation?: (
+    threadId: ThreadId,
+    runtimeEpisode: string,
+  ) => Effect.Effect<void>;
+
+  /** Stop one provider session. */
+  readonly stopSession: (
+    threadId: ThreadId,
+    runtimeEpisode?: string,
+  ) => Effect.Effect<void, TError>;
 
   /**
    * List currently active provider sessions for this adapter.

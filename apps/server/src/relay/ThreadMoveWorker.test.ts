@@ -1759,6 +1759,16 @@ it.effect("enrolls a settled native turn despite its last-admitted runtime marke
             updatedAt: at,
           },
         ];
+        yield* sql`INSERT INTO repository_workflow_jobs VALUES ('held',${threadId},'awaiting_review',0,'{}')`;
+        const queued = yield* queue;
+        const held = yield* Effect.flip(worker.synchronize(threadId, owner));
+        expect(held._tag === "ThreadMoveError" ? held.detail : "").toContain("workflow");
+        expect(prepareCalls).toBe(0);
+        expect(yield* queue).toEqual(queued);
+        expect(
+          yield* sql`SELECT 1 FROM thread_local_enrollments WHERE thread_id=${threadId}`,
+        ).toEqual([]);
+        yield* sql`DELETE FROM repository_workflow_jobs`;
         const result = yield* Effect.result(worker.synchronize(threadId, owner));
         expect(prepareCalls).toBe(1);
         expect(result._tag).toBe("Failure");
@@ -1847,6 +1857,13 @@ for (const kind of ["terminal", "setup"] as const)
             makeThreadHistorySync(sql, engine, { append: unused, confirmThrough: unused }),
             { synchronize: unused },
           ).pipe(Effect.provide(Layer.mock(TerminalManager)({ close: unused })));
+          yield* sql`INSERT INTO repository_workflow_jobs VALUES ('held',${threadId},'awaiting_review',0,'{}')`;
+          const queued = yield* queue;
+          const held = yield* Effect.flip(worker.source(threadId));
+          expect(held._tag === "ThreadMoveError" ? held.detail : "").toContain("workflow");
+          expect(yield* queue).toEqual(queued);
+          expect((yield* fences.get(threadId))?.phase).toBe("active");
+          yield* sql`DELETE FROM repository_workflow_jobs`;
           yield* worker.source(threadId);
           const before = yield* queue;
           expect(before.entries[0]).toMatchObject({

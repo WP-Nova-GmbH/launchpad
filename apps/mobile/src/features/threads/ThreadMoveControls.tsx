@@ -1,3 +1,4 @@
+import { workflowResultOrigin } from "@t3tools/client-runtime/relay/workflow-result";
 import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { MovedThreadDraftRecovery } from "./MovedThreadDraftRecovery";
 import { threadMoveProgressPresentation } from "@t3tools/client-runtime/relay/threadVmControls";
@@ -8,7 +9,7 @@ import {
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { ThreadVmMenuActions, ThreadVmRefreshButton, useThreadVmUi } from "./ThreadVmControls";
 import { useAtomValue } from "@effect/atom-react";
-import { useNavigation } from "@react-navigation/native";
+import { useNavigation, useRoute } from "@react-navigation/native";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import {
   threadMoveProjectTargets,
@@ -16,6 +17,7 @@ import {
   threadMoveOriginalLocationBlocker,
   threadMoveRepositoryCanonicalKey,
   threadMoveProviderSupported,
+  threadWorkflowMoveBlocker,
   type ThreadMoveSubmission,
 } from "@t3tools/client-runtime/relay/threadMoveSubmission";
 import {
@@ -82,6 +84,7 @@ function FollowThreadLocation({
   const checkLocation = useAtomCommand(threadVmControls.checkLocation, { reportFailure: false });
   const open = useAtomCommand(openPortableThreadChat, { reportFailure: false });
   const navigation = useNavigation();
+  const route = useRoute();
   const [attempt, setAttempt] = useState(0),
     [busy, setBusy] = useState(false),
     [checking, setChecking] = useState(false),
@@ -171,7 +174,11 @@ function FollowThreadLocation({
           }
           setDraftConflict(null);
           draftChoice.current = undefined;
-          navigation.navigate("Thread", result.value);
+          navigation.navigate("Thread", {
+            ...result.value,
+            workflowOrigin:
+              workflowResultOrigin(route.params, session.accountId, threadId) ?? undefined,
+          });
         }
       })
       .catch((cause) => {
@@ -192,6 +199,7 @@ function FollowThreadLocation({
       cancelled = true;
     };
   }, [
+    route.params,
     destinationId,
     generation,
     session,
@@ -722,24 +730,27 @@ function ThreadMachinePicker({
     placement,
     error ?? location?.error,
   );
+  const workflowBlocker = threadWorkflowMoveBlocker(thread);
   const setupBlocker = !relayUrl
     ? "Configure Launchpad Connect in the host app to move threads."
     : !session
       ? "Sign in to Launchpad Connect to move this thread."
-      : thread.archivedAt
-        ? "Unarchive this thread before moving it."
-        : unavailable || !config || !detailReady
-          ? "Reconnect this environment to choose another machine."
-          : !codexSupported
-            ? "Thread moves currently require Codex."
-            : config.environment.capabilities.threadMoves !== true
-              ? config.environment.capabilities.threadMoves === false
-                ? "Open Launchpad on the host machine to connect this environment for thread moves."
-                : "Update this environment’s server to support queued moves."
-              : (originalLocationBlocker ??
-                (!canonicalKey
-                  ? "Register this project’s Git repository in the host app first."
-                  : null));
+      : workflowBlocker
+        ? workflowBlocker
+        : thread.archivedAt
+          ? "Unarchive this thread before moving it."
+          : unavailable || !config || !detailReady
+            ? "Reconnect this environment to choose another machine."
+            : !codexSupported
+              ? "Thread moves currently require Codex."
+              : config.environment.capabilities.threadMoves !== true
+                ? config.environment.capabilities.threadMoves === false
+                  ? "Open Launchpad on the host machine to connect this environment for thread moves."
+                  : "Update this environment’s server to support queued moves."
+                : (originalLocationBlocker ??
+                  (!canonicalKey
+                    ? "Register this project’s Git repository in the host app first."
+                    : null));
   const pendingMove = queue?.entries.find((entry) => entry.kind === "move");
   const outstanding =
     saved !== null ||

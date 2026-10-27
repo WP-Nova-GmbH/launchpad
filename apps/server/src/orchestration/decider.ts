@@ -213,10 +213,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   command,
   readModel,
   userInputActivity,
+  allowFailedPreparationArchive = false,
 }: {
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
   readonly userInputActivity?: OrchestrationThreadActivity;
+  readonly allowFailedPreparationArchive?: boolean;
 }): Effect.fn.Return<
   DecideOrchestrationCommandResult,
   OrchestrationCommandRejection | PlatformError.PlatformError,
@@ -321,7 +323,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         thread.promptQueue.handoff !== null ||
         thread.promptQueue.awaitingTurnId !== null ||
         (thread.promptQueue.preparation !== undefined &&
-          (thread.promptQueue.preparation.state !== "ready" ||
+          ((thread.promptQueue.preparation.state !== "ready" &&
+            !(
+              command.type === "thread.archive" &&
+              allowFailedPreparationArchive &&
+              thread.promptQueue.preparation.state === "failed"
+            )) ||
             !thread.promptQueue.preparation.settled)))
     ) {
       return yield* new OrchestrationCommandInvariantError({
@@ -1647,6 +1654,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
               turnId: null,
               streaming: false,
               ...(command.author !== undefined ? { author: command.author } : {}),
+              ...(command.workflowOrigin !== undefined
+                ? { workflowOrigin: command.workflowOrigin }
+                : {}),
               createdAt: command.createdAt,
               updatedAt: command.createdAt,
             },
@@ -1751,6 +1761,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           messageId: command.message.messageId,
           role: "user",
           ...(command.author ? { author: command.author } : {}),
+          ...(command.workflowOrigin ? { workflowOrigin: command.workflowOrigin } : {}),
           text: command.message.text,
           attachments: command.message.attachments,
           ...(command.message.context !== undefined ? { context: command.message.context } : {}),

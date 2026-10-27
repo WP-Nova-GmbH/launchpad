@@ -6,6 +6,7 @@ export type SettingsSheetTarget =
   | "SettingsArchive"
   | "SettingsAppearance"
   | "SettingsOrganization"
+  | "SettingsWorkflowJobs"
   | "SettingsThreadVms"
   | "SettingsVmThreads"
   | "SettingsProjectOverview"

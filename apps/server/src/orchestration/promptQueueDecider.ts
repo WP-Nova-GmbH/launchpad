@@ -381,6 +381,7 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
               ? { sourceProposedPlan: command.sourceProposedPlan }
               : {}),
             ...(command.author ? { author: command.author } : {}),
+            ...(command.workflowOrigin ? { workflowOrigin: command.workflowOrigin } : {}),
             runtimeMode: command.runtimeMode,
             interactionMode: command.interactionMode,
             revision: 1,
@@ -497,6 +498,7 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
             attachments: prompt.attachments,
             ...(prompt.context ? { context: prompt.context } : {}),
             ...(prompt.author ? { author: prompt.author } : {}),
+            ...(prompt.workflowOrigin ? { workflowOrigin: prompt.workflowOrigin } : {}),
             ...(prompt.editedBy ? { editedBy: prompt.editedBy } : {}),
             ...(handoff.steeredBy ? { steeredBy: handoff.steeredBy } : {}),
             turnId: command.evidence === "local-command" ? null : command.turnId,
@@ -549,7 +551,15 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
       return [
         change({
           handoff: null,
-          ...(command.pause ? { control: pause({ code: "failed", detail: command.detail }) } : {}),
+          ...(command.pause
+            ? {
+                control: pause({
+                  code: "failed",
+                  detail: command.detail,
+                  ...(prompt ? { messageId: prompt.messageId } : {}),
+                }),
+              }
+            : {}),
           ...(prompt ? { entry: { ...prompt, state: "pending" } } : {}),
         }),
       ];
@@ -578,7 +588,11 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
     case "thread.queue.pause":
       return [
         change({
-          ...(preparation && (preparation.state === "pending" || preparation.state === "running")
+          stopCommandId: command.commandId,
+          ...(preparation &&
+          (preparation.state === "pending" ||
+            preparation.state === "running" ||
+            (preparation.state === "ready" && !preparation.settled))
             ? {
                 preparation: {
                   ...preparation,

@@ -11,6 +11,12 @@
 import * as Migrator from "effect/unstable/sql/Migrator";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import {
+  checkMigrationHistory,
+  combinedReaderMarker,
+  legacyWorkflowOffset,
+} from "./MigrationCompatibility.ts";
+export { combinedReaderMarker } from "./MigrationCompatibility.ts";
 
 // Import all migrations statically
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -89,6 +95,15 @@ import Migration0073 from "./Migrations/073_ThreadLocalEnrollment.ts";
 import Migration0072 from "./Migrations/072_ThreadVmMoveCheckout.ts";
 import Migration0075 from "./Migrations/075_CheckoutCapture.ts";
 
+import Migration0076 from "./Migrations/076_RepositoryWorkflowJobs.ts";
+import Migration0077 from "./Migrations/077_WorkflowCancellationFences.ts";
+import Migration0078 from "./Migrations/078_SetupProcessOwnership.ts";
+import Migration0079 from "./Migrations/079_SetupCleanupEvidence.ts";
+import Migration0080 from "./Migrations/080_SetupLifecycleCleanup.ts";
+import Migration0081 from "./Migrations/081_WorkflowSteps.ts";
+import Migration0082 from "./Migrations/082_WorkflowManualPause.ts";
+import Migration0083 from "./Migrations/083_WorkflowOrigin.ts";
+import Migration0084 from "./Migrations/084_WorkflowPortableReader.ts";
 /**
  * Migration loader with all migrations defined inline.
  *
@@ -175,6 +190,15 @@ const migrationEntries = [
   [73, "ThreadLocalEnrollment", Migration0073],
   [74, "ThreadLocalEnrollmentAbort", Migration0074],
   [75, "CheckoutCapture", Migration0075],
+  [76, "RepositoryWorkflowJobs", Migration0076],
+  [77, "WorkflowCancellationFences", Migration0077],
+  [78, "SetupProcessOwnership", Migration0078],
+  [79, "SetupCleanupEvidence", Migration0079],
+  [80, "SetupLifecycleCleanup", Migration0080],
+  [81, "WorkflowSteps", Migration0081],
+  [82, "WorkflowManualPause", Migration0082],
+  [83, "WorkflowOrigin", Migration0083],
+  [84, "WorkflowPortableReader", Migration0084],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -238,118 +262,8 @@ const forgetRenumberedMigrations = Effect.gen(function* () {
   }
 });
 
-/**
- * A migration id that a database already recorded under a different name means
- * the id was reused for a different change. The migrator compares ids only, so
- * it would silently skip the new migration on that database and the schema it
- * creates never appears — surfacing later as per-request failures. Refuse to
- * run migrations instead, naming both sides of the mismatch. Recorded ids this
- * build does not define are tolerated: they are what running older code
- * against a newer database looks like.
- */
-const verifyMigrationHistory = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  const tableExists = yield* sql.onDialectOrElse({
-    pg: () =>
-      sql`SELECT 1 AS "one" FROM information_schema.tables WHERE table_name = 'effect_sql_migrations'`,
-    orElse: () =>
-      sql`SELECT 1 AS "one" FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'`,
-  });
-  if (tableExists.length === 0) {
-    return;
-  }
-  yield* forgetRenumberedMigrations;
-  const recorded = yield* sql<{ migration_id: number; name: string }>`
-    SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
-  `.withoutTransform;
-  const namesById = new Map<number, string>(
-    migrationEntries.map(([id, name]) => [id, name] as const),
-  );
-  const mismatches: Array<string> = [];
-  for (const { migration_id, name } of recorded) {
-    if (
-      migration_id === 1 &&
-      name === "OrchestrationEvents_CheckoutCaptureReaderV1" &&
-      recorded.some(
-        (migration) => migration.migration_id === 75 && migration.name === "CheckoutCapture",
-      )
-    )
-      continue;
-    if (
-      migration_id === 1 &&
-      name === "OrchestrationEvents_TransferAbortReaderV1" &&
-      recorded.some(
-        (migration) => migration.migration_id === 70 && migration.name === "ThreadTransferAborts",
-      )
-    )
-      continue;
-    if (
-      migration_id === 1 &&
-      name === "OrchestrationEvents_FrozenCheckpointReaderV1" &&
-      [
-        [60, "ThreadExecutionFences"],
-        [66, "ThreadMoveQueue"],
-        [69, "FrozenThreadCheckpoints"],
-      ].every(([id, label]) =>
-        recorded.some((migration) => migration.migration_id === id && migration.name === label),
-      )
-    )
-      continue;
-    if (
-      migration_id === 1 &&
-      name === "OrchestrationEvents_ThreadMoveQueueReaderV1" &&
-      recorded.some(
-        (migration) => migration.migration_id === 66 && migration.name === "ThreadMoveQueue",
-      )
-    )
-      continue;
-    if (
-      migration_id === 1 &&
-      name === "OrchestrationEvents_PortableThreadReaderV1" &&
-      recorded.some(
-        (migration) => migration.migration_id === 60 && migration.name === "ThreadExecutionFences",
-      )
-    )
-      continue;
-    if (
-      migration_id === 1 &&
-      name === "OrchestrationEvents_ThreadCleanupReaderV1" &&
-      recorded.some(
-        (migration) => migration.migration_id === 59 && migration.name === "ThreadCleanupFences",
-      )
-    )
-      continue;
-    if (
-      migration_id === 1 &&
-      (name === "OrchestrationEvents_SharedThreadReaderV1" ||
-        (name === sharedThreadReaderMarker &&
-          recorded.some(
-            (migration) =>
-              migration.migration_id === 58 && migration.name === "CommandReceiptProjectScope",
-          ))) &&
-      recorded.some(
-        (migration) => migration.migration_id === 57 && migration.name === "SharedPromptQueue",
-      )
-    )
-      continue;
-    const expected = namesById.get(migration_id);
-    if (expected !== undefined && expected !== name) {
-      mismatches.push(
-        `migration ${migration_id}: database recorded "${name}", this build defines "${expected}"`,
-      );
-    }
-  }
-  if (mismatches.length > 0) {
-    return yield* new Migrator.MigrationError({
-      kind: "BadState",
-      message: [
-        "Recorded migrations do not match this build:",
-        ...mismatches.map((mismatch) => `  - ${mismatch}`),
-        "Refusing to run migrations. A migration id was reused for a different change, so a database that recorded the old id silently skips the new one and never receives its schema changes. Reconcile the database history with this build (or run the matching code) before starting.",
-      ].join("\n"),
-    });
-  }
-});
+/** Read-only validation is shared by the dev snapshot tool. */
+export const verifyMigrationHistory = checkMigrationHistory(migrationManifest);
 
 /**
  * Run all pending migrations.
@@ -364,8 +278,74 @@ const verifyMigrationHistory = Effect.gen(function* () {
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
 }: RunMigrationsOptions = {}) {
-  yield* verifyMigrationHistory;
-  const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
+  const sql = yield* SqlClient.SqlClient;
+  const executedMigrations = yield* sql.withTransaction(
+    Effect.gen(function* () {
+      const table =
+        yield* sql`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'`;
+      if (table.length) yield* forgetRenumberedMigrations;
+      const history = yield* verifyMigrationHistory;
+      const executed: Array<readonly [number, string]> = [];
+      if (history.kind === "legacy-workflow") {
+        if (toMigrationInclusive !== undefined && toMigrationInclusive < 84)
+          return yield* new Migrator.MigrationError({
+            kind: "BadState",
+            message: "Legacy workflow history requires the complete combined migration.",
+          });
+        // Do not move these rows above the VM watermark until every VM schema exists.
+        // The outer transaction also rolls back nested migrator receipts and DDL.
+        const original = yield* sql<{
+          migration_id: number;
+          name: string;
+          created_at: string;
+        }>`SELECT migration_id, name, created_at FROM effect_sql_migrations WHERE migration_id >= 60 ORDER BY migration_id`
+          .withoutTransform;
+        yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id >= 60`;
+        executed.push(...(yield* run({ loader: makeMigrationLoader(75) })));
+        const installed = yield* sql<{
+          migration_id: number;
+          name: string;
+        }>`SELECT migration_id, name FROM effect_sql_migrations WHERE migration_id BETWEEN 60 AND 75`
+          .withoutTransform;
+        if (
+          !migrationManifest
+            .filter(([id]) => id >= 60 && id <= 75)
+            .every(([id, name]) =>
+              installed.some((row) => row.migration_id === id && row.name === name),
+            )
+        )
+          return yield* new Migrator.MigrationError({
+            kind: "BadState",
+            message: "VM migration history did not complete before workflow remapping.",
+          });
+        for (const row of original)
+          yield* sql`INSERT INTO effect_sql_migrations (migration_id, name, created_at) VALUES (${row.migration_id + legacyWorkflowOffset}, ${row.name}, ${row.created_at})`;
+      }
+      const target = toMigrationInclusive ?? 84;
+      if (target >= 76 && history.through < 84)
+        yield* sql`DROP TRIGGER IF EXISTS checkout_capture_preserve_reader_barrier`;
+      executed.push(...(yield* run({ loader: makeMigrationLoader(toMigrationInclusive) })));
+      if (target >= 84 && history.readerActivated)
+        yield* sql`UPDATE effect_sql_migrations SET name = ${combinedReaderMarker} WHERE migration_id = 1`;
+      yield* verifyMigrationHistory;
+      const final = yield* sql<{
+        migration_id: number;
+        name: string;
+      }>`SELECT migration_id, name FROM effect_sql_migrations`.withoutTransform;
+      if (
+        !migrationManifest
+          .filter(([id]) => id <= target)
+          .every(([id, name]) =>
+            final.some((row) => row.migration_id === id && (row.name === name || id === 1)),
+          )
+      )
+        return yield* new Migrator.MigrationError({
+          kind: "BadState",
+          message: "Required migration prefix is incomplete.",
+        });
+      return executed;
+    }),
+  );
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
   yield* migrations.length === 0
     ? Effect.logDebug("Database schema is current")

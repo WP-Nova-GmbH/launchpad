@@ -1,3 +1,4 @@
+import { WorkflowConflictError, WorkflowInvalidError } from "@t3tools/contracts/workflows";
 import {
   RelayAccessTokenType,
   RelayApi,
@@ -84,6 +85,14 @@ export const ManagedRelayDpopSignerError = Schema.Union([
 export type ManagedRelayDpopSignerError = typeof ManagedRelayDpopSignerError.Type;
 
 export const ManagedRelayRequestAction = Schema.Literals([
+  "workflow sources",
+  "listWorkflows",
+  "saveWorkflow",
+  "listWorkflowJobs",
+  "pageWorkflowJobs",
+  "runWorkflow",
+  "getWorkflowJob",
+  "respondToWorkflowJob",
   "exchange relay DPoP access token",
   "list relay-managed environments",
   "list relay client devices",
@@ -181,6 +190,14 @@ export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
 export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay health read",
+  "workflow sources",
+  "listWorkflows",
+  "saveWorkflow",
+  "listWorkflowJobs",
+  "pageWorkflowJobs",
+  "runWorkflow",
+  "getWorkflowJob",
+  "respondToWorkflowJob",
   "Relay DPoP access token exchange",
   "Relay environment listing",
   "Relay client device listing",
@@ -299,6 +316,9 @@ export class ManagedRelayUrlInvalidError extends Schema.TaggedError<ManagedRelay
   }
 }
 
+const isWorkflowConflictError = Schema.is(WorkflowConflictError);
+const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
+
 export class ManagedRelayRequestFailedError extends Schema.TaggedError<ManagedRelayRequestFailedError>()(
   "ManagedRelayRequestFailedError",
   {
@@ -310,6 +330,8 @@ export class ManagedRelayRequestFailedError extends Schema.TaggedError<ManagedRe
   },
 ) {
   override get message(): string {
+    if (isWorkflowConflictError(this.cause) || isWorkflowInvalidError(this.cause))
+      return this.cause.message;
     const message = `Could not ${this.action}.`;
     return this.transportFailed ? `${message} ${NETWORK_BLOCKING_HINT}` : message;
   }
@@ -365,6 +387,8 @@ export const ManagedRelayClientError = Schema.Union([
 export type ManagedRelayClientError = typeof ManagedRelayClientError.Type;
 
 export type RelayHttpRequestError =
+  | import("@t3tools/contracts/workflows").WorkflowConflictError
+  | import("@t3tools/contracts/workflows").WorkflowInvalidError
   | RelayProtectedErrorType
   | HttpClientError.HttpClientError
   | Schema.SchemaError;

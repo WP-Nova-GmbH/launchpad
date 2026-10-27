@@ -4,6 +4,8 @@ import { CommandId, ThreadId, PortableThreadCommand } from "@t3tools/contracts";
 import { RelayThreadVmCreateRequest, DEFAULT_THREAD_VM_POLICY } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import { RelayRepositoryId } from "@t3tools/contracts/relay";
+
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import { layer, ManagedRelayTenancyClient } from "./managedRelayTenancy.ts";
 import * as ManagedRelayTenancy from "./managedRelayTenancy.ts";
@@ -689,6 +691,88 @@ function testLayer(fetchFn: typeof globalThis.fetch) {
   );
 }
 
+it.effect(
+  "preserves the observed workflow revision when sending preparation and cancellation retries",
+  () => {
+    const bodies: unknown[] = [];
+    const fetchFn = (async (input, init) => {
+      const request = new Request(input, init);
+      bodies.push(await request.json());
+      expect(request.headers.get("authorization")).toBe("Bearer maintainer-token");
+      return Response.json({
+        jobId: "job-1",
+        repositoryId: "repo-1",
+        workflowId: "workflow-1",
+        environmentId: "env-1",
+        instruction: "Fix issue",
+        status: "paused",
+        detail: "Setup failed",
+        workflow: null,
+        progress: {
+          revision: 5,
+          status: "paused",
+          threadId: "workflow:job-1:agent",
+          detail: "Setup failed",
+          checkpoint: null,
+          retryablePreparation: true,
+        },
+        createdAt: "2026-10-08T12:00:00Z",
+        updatedAt: "2026-10-08T12:00:00Z",
+      });
+    }) satisfies typeof globalThis.fetch;
+    return Effect.gen(function* () {
+      const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+      yield* client.respondToWorkflowJob({
+        clerkToken: "maintainer-token",
+        repositoryId: RelayRepositoryId.make("repo-1"),
+        jobId: "job-1",
+        payload: { operation: "retry_cancellation", expectedRevision: 8 },
+      });
+      yield* client.respondToWorkflowJob({
+        clerkToken: "maintainer-token",
+        repositoryId: RelayRepositoryId.make("repo-1"),
+        jobId: "job-1",
+        payload: { operation: "retry_preparation", expectedRevision: 5 },
+      });
+      yield* client.respondToWorkflowJob({
+        clerkToken: "maintainer-token",
+        repositoryId: RelayRepositoryId.make("repo-1"),
+        jobId: "job-1",
+        payload: { operation: "cancel" },
+      });
+      for (const operation of ["input", "request_changes"] as const)
+        yield* client.respondToWorkflowJob({
+          clerkToken: "maintainer-token",
+          repositoryId: RelayRepositoryId.make("repo-1"),
+          jobId: "job-1",
+          payload: {
+            operation,
+            checkpointId: "checkpoint-7",
+            expectedRevision: 7,
+            text: "Preserve this answer",
+          },
+        });
+      expect(bodies).toEqual([
+        { operation: "retry_cancellation", expectedRevision: 8 },
+        { operation: "retry_preparation", expectedRevision: 5 },
+        { operation: "cancel" },
+        {
+          operation: "input",
+          checkpointId: "checkpoint-7",
+          expectedRevision: 7,
+          text: "Preserve this answer",
+        },
+        {
+          operation: "request_changes",
+          checkpointId: "checkpoint-7",
+          expectedRevision: 7,
+          text: "Preserve this answer",
+        },
+      ]);
+    }).pipe(Effect.provide(testLayer(fetchFn)));
+  },
+);
+
 describe("organization issue tracker client", () => {
   it.effect("uses the current organization's bearer for listing and changing connections", () => {
     const requests: { url: string; method: string; bearer: string | null; body: unknown }[] = [];
@@ -852,4 +936,36 @@ it.effect.each(["select", "cancel"] as const)(
       );
     }).pipe(Effect.provide(testLayer(fetchFn)));
   },
+);
+
+it.effect("requests bounded workflow pages without losing the scoped cursor", () => {
+  const seen: URL[] = [];
+  const fetchFn = (async (input, init) => {
+    const request = new Request(input, init);
+    seen.push(new URL(request.url));
+    expect(request.headers.get("authorization")).toBe("Bearer page-token");
+    return Response.json({ jobs: [], nextCursor: null });
+  }) satisfies typeof globalThis.fetch;
+  return Effect.gen(function* () {
+    const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+    expect(
+      yield* client.pageWorkflowJobs({
+        clerkToken: "page-token",
+        repositoryId: RelayRepositoryId.make("repo"),
+        query: { view: "active", limit: 25, cursor: "scope:opaque/cursor" },
+      }),
+    ).toEqual({ jobs: [], nextCursor: null });
+    expect(seen[0]!.pathname).toBe("/v1/repositories/repo/workflow-jobs/page");
+    expect(seen[0]!.searchParams.get("limit")).toBe("25");
+    expect(seen[0]!.searchParams.get("cursor")).toBe("scope:opaque/cursor");
+  }).pipe(Effect.provide(testLayer(fetchFn)));
+});
+
+it.effect("keeps legacy catalog capability unknown and retains the legacy array helper", () =>
+  Effect.gen(function* () {
+    const client = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+    const input = { clerkToken: "token", repositoryId: RelayRepositoryId.make("repo") };
+    expect(yield* client.readWorkflowCatalog(input)).toEqual({ workflows: [] });
+    expect(yield* client.listWorkflows(input)).toEqual([]);
+  }).pipe(Effect.provide(testLayer(async () => Response.json({ workflows: [] })))),
 );

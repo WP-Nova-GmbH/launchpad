@@ -136,6 +136,14 @@ describe("private VM client access", () => {
         assert.deepEqual([...(yield* access.projectIds(owner))!], [receipt.projectId]);
         yield* access.requirePersistedProject(owner, receipt.projectId);
         yield* access
+          .requireWorkflowProject({
+            organizationId: "org",
+            repositoryId: vm.scope.repositoryId,
+            projectId: receipt.projectId,
+            repositoryCanonicalKey: "github.com/acme/repository",
+          })
+          .pipe(Effect.flip);
+        yield* access
           .requireMember({ user: { ...owner.user, userId: "other-admin" } })
           .pipe(Effect.flip);
         yield* access

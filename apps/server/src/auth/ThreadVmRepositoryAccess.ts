@@ -131,6 +131,8 @@ export const makeThreadVmRepositoryAccess = Effect.fn("ThreadVmRepositoryAccess.
       })),
     ),
     requireMember,
+    // Workflow automation is organization-machine work, outside a private VM credential.
+    requireWorkflowProject: () => Effect.fail(denied()),
     requireProject,
     requirePersistedProject: requireProject,
     requireThread,

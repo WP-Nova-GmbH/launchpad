@@ -202,6 +202,17 @@ const fixture = Effect.fnUntraced(function* (options?: {
 it.layer(
   Layer.mergeAll(SqlitePersistenceMemory, RunnerLayer.pipe(Layer.provideMerge(NodeServices.layer))),
 )("destination transfer readiness", (it) => {
+  it.effect("rejects workflow ownership before destination setup or native validation", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.sql`INSERT INTO repository_workflow_jobs VALUES ('held',${f.input.threadId},'awaiting_review',0,'{}')`;
+      expect((yield* Effect.flip(f.prepare)).message).toContain("workflow");
+      expect(yield* f.fs.exists(f.path.join(f.root, "setup-count"))).toBe(false);
+      expect(f.calls).toEqual([]);
+      expect(yield* f.phase).toEqual([]);
+    }),
+  );
+
   it.effect(
     "runs setup once, resumes only the native conversation, closes it and stays fenced until activation",
     () =>

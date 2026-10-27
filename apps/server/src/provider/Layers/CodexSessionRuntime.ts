@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import {
   VmControlSpawner,
   VmWorkloadTracking,
@@ -24,6 +26,7 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { normalizeModelSlug } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
 import type * as Cause from "effect/Cause";
@@ -44,6 +47,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexClient from "effect-codex-app-server/client";
@@ -52,7 +56,7 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
-import { ProviderAdapterValidationError } from "../Errors.ts";
+import { ProviderAdapterValidationError, ProviderAdapterProcessError } from "../Errors.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -200,6 +204,7 @@ export interface CodexSessionRuntimeOptions {
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
+  readonly requireResume?: boolean | undefined;
   readonly appServerArgs?: ReadonlyArray<string>;
   /** The provider's model list; supplies the display name for runtime info. */
   readonly models?: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
@@ -262,7 +267,9 @@ export interface CodexSessionRuntimeShape {
     answers: ProviderUserInputAnswers,
   ) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly events: Stream.Stream<ProviderEvent, never>;
-  readonly close: Effect.Effect<void>;
+  readonly close: Effect.Effect<void, ProviderAdapterProcessError>;
+  /** VM native-writer receipt only; detached workload ownership stays with the supervisor. */
+  readonly closeNativeWriter?: Effect.Effect<void, ProviderAdapterProcessError>;
   readonly closeIdleVmHarness?: (
     operationId: string,
     admit: VmHarnessStopAdmission,
@@ -774,8 +781,10 @@ export const openCodexThread = (input: {
   readonly serviceTier: CodexServiceTier | undefined;
   readonly resumeThreadId: string | undefined;
   readonly resumePolicy?: CodexResumeCursor["resumePolicy"];
+  readonly requireResume?: boolean | undefined;
 }): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> => {
   const resumeThreadId = input.resumeThreadId;
+  const requireResume = input.requireResume === true || input.resumePolicy === "require-existing";
   const startParams = buildThreadStartParams({
     cwd: input.cwd,
     runtimeMode: input.runtimeMode,
@@ -784,7 +793,7 @@ export const openCodexThread = (input: {
   });
 
   if (resumeThreadId === undefined) {
-    if (input.resumePolicy === "require-existing") {
+    if (requireResume) {
       return Effect.fail(
         CodexErrors.CodexAppServerRequestError.invalidRequest(
           "A required Codex conversation cannot be resumed without its native thread ID.",
@@ -816,16 +825,14 @@ export const openCodexThread = (input: {
         ),
       ),
       Effect.filterOrFail(
-        (response) =>
-          input.resumePolicy !== "require-existing" || response.thread.id === resumeThreadId,
+        (response) => !requireResume || response.thread.id === resumeThreadId,
         () =>
           CodexErrors.CodexAppServerRequestError.invalidRequest(
             "Codex resumed a different conversation than the required native thread ID.",
           ),
       ),
       Effect.catchIf(
-        (error) =>
-          input.resumePolicy !== "require-existing" && isRecoverableThreadResumeError(error),
+        (error) => !requireResume && isRecoverableThreadResumeError(error),
         (error) =>
           Effect.logWarning("codex app-server thread resume fell back to fresh start", {
             threadId: input.threadId,
@@ -1375,6 +1382,56 @@ export const rollbackCodexThread = Effect.fn("rollbackCodexThread")(function* (
   return { threadId, turns: snapshot.turns.slice(0, retainedCount) };
 });
 
+const isMissingProcess = Schema.is(Schema.Struct({ code: Schema.Literal("ESRCH") }));
+
+/** Stop only the captured child; a lost leader with surviving children is unconfirmed ownership. */
+export const stopCodexProcess = Effect.fn("CodexSessionRuntime.stopProcess")(function* (
+  threadId: ThreadId,
+  child: Pick<ChildProcessSpawner.ChildProcessHandle, "pid" | "isRunning" | "kill" | "exitCode">,
+) {
+  const failure = (cause: unknown) =>
+    new ProviderAdapterProcessError({
+      provider: PROVIDER,
+      threadId,
+      detail: "The original Codex process tree could not be confirmed stopped.",
+      cause,
+    });
+  const platform = yield* HostProcessPlatform;
+  const running = yield* child.isRunning.pipe(Effect.mapError(failure));
+  if (platform === "win32") {
+    if (!running) return yield* failure("The original native tree ownership was lost.");
+    // The spawner falls back to leader-only killing when taskkill fails. That is not tree proof.
+    yield* Effect.callback<void, ProviderAdapterProcessError>((resume) => {
+      NodeChildProcess.execFile(
+        "taskkill",
+        ["/pid", String(child.pid), "/t", "/f"],
+        { windowsHide: true, timeout: 3_000 },
+        (error) => resume(error ? Effect.fail(failure(error)) : Effect.void),
+      );
+    });
+    yield* child.exitCode.pipe(Effect.ignore);
+  } else if (running)
+    yield* child
+      .kill({ forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER })
+      .pipe(Effect.mapError(failure));
+  if (yield* child.isRunning.pipe(Effect.mapError(failure)))
+    return yield* failure("The native child is still running.");
+  if (platform === "win32") return;
+  const absent = yield* Effect.try({
+    try: () => {
+      try {
+        process.kill(-Number(child.pid), 0);
+        return false;
+      } catch (cause) {
+        if (isMissingProcess(cause)) return true;
+        throw cause;
+      }
+    },
+    catch: failure,
+  });
+  if (!absent) return yield* failure("The owned process group is still present.");
+});
+
 export const makeCodexSessionRuntime = (
   options: CodexSessionRuntimeOptions,
 ): Effect.Effect<
@@ -1402,6 +1459,9 @@ export const makeCodexSessionRuntime = (
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
     const suppressMemoryConsolidationNotification = makeMemoryConsolidationNotificationFilter();
     const closedRef = yield* Ref.make(false);
+    const closeLock = yield* Semaphore.make(1);
+    let shutdownConfirmed = false;
+    let nativeStopped = false;
     let interruptEpoch = 0;
     /** The `additionalContext` of the latest `turn/start`, restored after compaction. */
     const lastAdditionalContextRef =
@@ -2630,6 +2690,7 @@ export const makeCodexSessionRuntime = (
         ...(options.resumeCursor?.resumePolicy
           ? { resumePolicy: options.resumeCursor.resumePolicy }
           : {}),
+        requireResume: options.requireResume,
       });
 
       const providerThreadId = opened.thread.id;
@@ -2663,26 +2724,87 @@ export const makeCodexSessionRuntime = (
       return providerThreadId;
     });
 
-    const close = Effect.gen(function* () {
-      const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
-      if (alreadyClosed) {
-        return;
+    const close = closeLock.withPermit(
+      Effect.gen(function* () {
+        if (shutdownConfirmed) return;
+        yield* Ref.set(closedRef, true);
+        // Explicit kill reports errors; scoped release alone ignores termination failures.
+        if (!nativeStopped) {
+          yield* stopCodexProcess(options.threadId, child);
+          nativeStopped = true;
+        }
+        yield* settlePendingApprovals("cancel").pipe(Effect.ignore);
+        yield* settlePendingUserInputs({}).pipe(Effect.ignore);
+        yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
+        yield* Scope.close(runtimeScope, Exit.void).pipe(
+          Effect.catchCause((cause) =>
+            Effect.fail(
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: options.threadId,
+                detail: "Codex runtime cleanup failed.",
+                cause,
+              }),
+            ),
+          ),
+        );
+        yield* Queue.shutdown(serverNotifications);
+        yield* Queue.shutdown(events);
+        shutdownConfirmed = true;
+      }),
+    );
+
+    const drainVmNativeWriter = Effect.gen(function* () {
+      if (vmShutdownComplete) return;
+      if (!vmInputDrained) {
+        yield* child.exitCode.pipe(Effect.exit);
+        yield* client.raw.awaitInputDrained!;
+        const barrier = yield* Deferred.make<void>();
+        yield* Queue.offer(serverNotifications, { barrier });
+        yield* Deferred.await(barrier);
+        vmInputDrained = true;
       }
-      yield* settlePendingApprovals("cancel");
-      yield* settlePendingUserInputs({});
-      yield* updateSession(sessionRef, {
-        status: "closed",
-        activeTurnId: undefined,
-      });
-      yield* emitSessionEvent("session/closed", "Session stopped").pipe(
-        Effect.catch((cause) =>
-          Effect.logError("Failed to emit Codex session closed event.", { cause }),
-        ),
-      );
+      if (!(yield* Ref.get(closedRef))) {
+        yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
+        yield* emitSessionEvent("session/closed", "Session stopped");
+        yield* Ref.set(closedRef, true);
+      }
       yield* Scope.close(runtimeScope, Exit.void);
       yield* Queue.shutdown(serverNotifications);
-      yield* Queue.shutdown(events);
+      yield* Queue.end(events);
+      vmShutdownComplete = true;
     });
+
+    const closeNativeWriter = closeLock.withPermit(
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (vmShutdownComplete) return;
+          const failure = (cause: unknown) =>
+            new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: options.threadId,
+              detail: "The VM Codex native writer could not be confirmed stopped.",
+              cause,
+            });
+          if (!trackWorkloads || !client.raw.awaitInputDrained)
+            return yield* failure("Native-writer shutdown requires VM output-drain receipts.");
+          yield* Ref.set(closedRef, true);
+          yield* settlePendingApprovals("cancel").pipe(Effect.ignore);
+          yield* settlePendingUserInputs({}).pipe(Effect.ignore);
+          // ProcessOnlyCleanup preserves tool workloads in the VM's supervised cgroup.
+          if (yield* child.isRunning.pipe(Effect.mapError(failure)))
+            yield* child
+              .kill({ forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER })
+              .pipe(Effect.mapError(failure));
+          if (yield* child.isRunning.pipe(Effect.mapError(failure)))
+            return yield* failure("The native writer is still running.");
+          yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
+          yield* drainVmNativeWriter.pipe(
+            Effect.catchCause((cause) => Effect.fail(failure(cause))),
+          );
+        }),
+      ),
+    );
 
     const closeIdleVmHarness = Effect.fn("CodexSessionRuntime.close_idle_vm")(function* (
       operationId: string,
@@ -2738,30 +2860,15 @@ export const makeCodexSessionRuntime = (
             }
             vmStopping = true;
           }
-          if (!vmInputDrained) {
-            yield* child.exitCode.pipe(Effect.exit);
-            yield* client.raw.awaitInputDrained!;
-            const barrier = yield* Deferred.make<void>();
-            yield* Queue.offer(serverNotifications, { barrier });
-            yield* Deferred.await(barrier);
-            vmInputDrained = true;
-          }
-          if (!(yield* Ref.get(closedRef))) {
-            yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
-            yield* emitSessionEvent("session/closed", "Session stopped");
-            yield* Ref.set(closedRef, true);
-          }
-          yield* Scope.close(runtimeScope, Exit.void);
-          yield* Queue.shutdown(serverNotifications);
-          yield* Queue.end(events);
-          vmShutdownComplete = true;
+          yield* drainVmNativeWriter;
           return true;
         }),
       );
-    });
+    }, closeLock.withPermit);
 
     return {
       start,
+      ...(trackWorkloads ? { closeNativeWriter } : {}),
       closeIdleVmHarness,
       getSession: Ref.get(sessionRef),
       compactThread: (beforeDispatch) =>

@@ -10,6 +10,7 @@ import ChatView from "./ChatView";
 import { resolveDraftPromotionNavigationTarget, threadHasStarted } from "./ChatView.logic";
 import { waitForDraftHeroTransition } from "./chat/draftHeroTransition";
 import { SidebarInset } from "./ui/sidebar";
+import { WorkflowResultReturn } from "./workflows/WorkflowNavigation";
 import { Button } from "./ui/button";
 import { environmentCatalog } from "../connection/catalog";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -261,6 +262,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
 
   return (
     <SidebarInset className="h-svh min-h-0 overflow-hidden overscroll-y-none md:h-dvh">
+      <WorkflowResultReturn />
       {target.kind === "server" ? (
         <CurrentThreadLocation
           key={scopedThreadKey(target.threadRef)}
@@ -269,7 +271,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
           recoverUnavailable={recoverUnavailable}
         />
       ) : null}
-      {view}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{view}</div>
     </SidebarInset>
   );
 }

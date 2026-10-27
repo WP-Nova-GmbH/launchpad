@@ -1,3 +1,4 @@
+import { TerminalManager } from "./terminal/Manager.ts";
 // @effect-diagnostics nodeBuiltinImport:off - CLI integration exercises Node HTTP and filesystem boundaries.
 import * as NodeHttp from "node:http";
 import * as NodeFS from "node:fs";
@@ -381,6 +382,7 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
     const routesLayer = HttpApiBuilder.layer(ProjectCliHttpApi).pipe(
       Layer.provide(
         orchestrationHttpApiLayer.pipe(
+          Layer.provide(Layer.mock(TerminalManager, { closeOwned: () => Effect.succeed(false) })),
           Layer.provide(Layer.mock(ThreadDeletionReactor)({ drainThrough: () => Effect.void })),
           Layer.provide(
             Layer.mock(ThreadPreparationReactor)({ drainAttemptThrough: () => Effect.void }),

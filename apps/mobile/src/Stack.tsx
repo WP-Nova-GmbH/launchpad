@@ -85,6 +85,7 @@ import {
   SettingsOpenSourceLicenseRouteScreen,
   SettingsOpenSourceLicensesRouteScreen,
 } from "./features/settings/SettingsOpenSourceLicensesRouteScreen";
+import { WorkflowJobsScreen } from "./features/settings/WorkflowJobsScreen";
 import { SettingsProjectGroupingRouteScreen } from "./features/settings/SettingsProjectGroupingRouteScreen";
 import { SettingsThreadVmsRouteScreen } from "./features/settings/SettingsThreadVmsRouteScreen";
 import { SettingsVmThreadsRouteScreen } from "./features/settings/SettingsVmThreadsRouteScreen";
@@ -285,6 +286,11 @@ const SettingsContentStack = createNativeStackNavigator({
       screen: SettingsThreadVmsRouteScreen,
       linking: "thread-vms",
       options: { title: "VM policy" },
+    }),
+    SettingsWorkflowJobs: createNativeStackScreen({
+      screen: WorkflowJobsScreen,
+      linking: "workflow-jobs",
+      options: { title: "Workflow jobs" },
     }),
     SettingsProjectOverview: createNativeStackScreen({
       screen: SettingsProjectOverviewRouteScreen,

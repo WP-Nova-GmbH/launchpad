@@ -38,6 +38,7 @@ type SharedPromptQueueProps = {
   queue: ThreadPromptQueue;
   activeTurnId: TurnId | null;
   unavailable?: boolean;
+  workflowControlled?: boolean;
   supportsPreparation?: boolean;
   canWorkLocally?: boolean;
 };
@@ -58,6 +59,7 @@ function SharedPromptQueueContent({
   queue,
   activeTurnId,
   unavailable = false,
+  workflowControlled = false,
   supportsPreparation = false,
   canWorkLocally = false,
 }: SharedPromptQueueProps) {
@@ -135,10 +137,11 @@ function SharedPromptQueueContent({
   const canReorder =
     queue.handoff === null && queue.entries.every((entry) => entry.state === "pending");
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
-  const disabled = busy || unavailable;
+  const disabled = busy || unavailable || workflowControlled;
   const preparation = queue.preparation;
   const preparing = preparation !== undefined && preparation.state !== "ready";
   const setupRunning = preparation?.state === "pending" || preparation?.state === "running";
+  const setupActive = setupRunning || preparation?.settled === false;
   const run = async (
     action: () => Promise<AtomCommandResult<unknown, unknown>>,
     onSuccess?: () => void,
@@ -219,7 +222,8 @@ function SharedPromptQueueContent({
     queue.pauseReason === null &&
     edit === null &&
     !preparing &&
-    !fallbackMove
+    !fallbackMove &&
+    !setupActive
   )
     return null;
   return (
@@ -238,7 +242,7 @@ function SharedPromptQueueContent({
             {queue.entries.length + (fallbackMove ? 1 : 0)}
           </span>
         </span>
-        {setupRunning || (preparing && preparation.settled === false) ? (
+        {setupActive ? (
           <Button
             size="xs"
             variant="secondary"
@@ -287,6 +291,16 @@ function SharedPromptQueueContent({
           </Tooltip>
         ) : null}
       </div>
+      {workflowControlled ? (
+        <p role="status" className="mt-1 text-xs text-muted-foreground">
+          Use this workflow job’s review or Cancel controls in Organization settings.
+        </p>
+      ) : null}
+      {setupActive && !preparing ? (
+        <p role="status" className="mt-1 text-xs text-muted-foreground">
+          Setup is running in the background.
+        </p>
+      ) : null}
       {preparing ? (
         <div className="mt-2 space-y-2 wrap-anywhere">
           <p role="status" className="text-xs text-muted-foreground">

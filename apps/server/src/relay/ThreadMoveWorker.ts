@@ -1,3 +1,4 @@
+import { assertWorkflowThreadReleased } from "../persistence/WorkflowThreadOwnership.ts";
 import { configureThreadVmMoveRepository } from "./ThreadVmRepositoryBinding.ts";
 import { makeThreadMoveProgress } from "./ThreadMoveProgress.ts";
 import { prepareThreadVmMoveWorkspace } from "./ThreadVmMoveWorkspace.ts";
@@ -471,6 +472,9 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     if (!state || !fence || fence.phase === "retired") return;
     let head = state.queue.entries[0];
     if (!head || head.kind !== "move") return;
+    yield* assertWorkflowThreadReleased(sql, threadId).pipe(
+      Effect.mapError((error) => fail(threadId, error.message)),
+    );
     if (head.state === "pending") {
       if (
         !state.queue.enabled ||

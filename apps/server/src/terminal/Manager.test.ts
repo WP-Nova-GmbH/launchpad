@@ -7,6 +7,12 @@ import {
   makeThreadExecutionRelay,
   ThreadExecutionRelayError,
 } from "../relay/ThreadExecutionRelay.ts";
+import {
+  SetupProcessJournal,
+  SetupProcessError,
+  type SetupProcessOwner,
+  type SetupProcessJournalShape,
+} from "./SetupProcessJournal.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -16,6 +22,7 @@ import {
   type TerminalMetadataStreamEvent,
   type TerminalOpenInput,
   type TerminalRestartInput,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ServerSettingsError,
@@ -43,6 +50,9 @@ import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vite-plus/test";
 
+import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -63,6 +73,8 @@ class FakePtyProcess implements PtyAdapter.PtyProcess {
   resizeFailure: unknown | undefined;
   private readonly dataListeners = new Set<(data: string) => void>();
   private readonly exitListeners = new Set<(event: PtyAdapter.PtyExitEvent) => void>();
+  private readonly shellExitListeners = new Set<(event: PtyAdapter.PtyExitEvent) => void>();
+  private shellExit: PtyAdapter.PtyExitEvent | undefined;
   killed = false;
 
   constructor(pid: number) {
@@ -102,6 +114,19 @@ class FakePtyProcess implements PtyAdapter.PtyProcess {
     };
   }
 
+  onShellExit(callback: (event: PtyAdapter.PtyExitEvent) => void): () => void {
+    this.shellExitListeners.add(callback);
+    if (this.shellExit) callback(this.shellExit);
+    return () => {
+      this.shellExitListeners.delete(callback);
+    };
+  }
+
+  emitShellExit(event: PtyAdapter.PtyExitEvent): void {
+    this.shellExit = event;
+    for (const listener of this.shellExitListeners) listener(event);
+  }
+
   emitData(data: string): void {
     for (const listener of this.dataListeners) {
       listener(data);
@@ -119,6 +144,7 @@ class FakePtyAdapter {
   readonly spawnInputs: PtyAdapter.PtySpawnInput[] = [];
   readonly processes: FakePtyProcess[] = [];
   readonly spawnFailures: Error[] = [];
+  readonly pids: number[] = [];
   private readonly mode: "sync" | "async";
   private nextPid = 9000;
 
@@ -140,7 +166,7 @@ class FakePtyAdapter {
         }),
       );
     }
-    const process = new FakePtyProcess(this.nextPid++);
+    const process = new FakePtyProcess(this.pids.shift() ?? this.nextPid++);
     this.processes.push(process);
     if (this.mode === "async") {
       return Effect.tryPromise({
@@ -316,6 +342,74 @@ const createManager = (
     }),
   );
 
+const setupJournalFixture = () => {
+  const records = new Map<string, SetupProcessOwner>();
+  const cleanup: SetupProcessJournalShape["cleanup"] = (input) =>
+    Effect.suspend(() => {
+      const owner = records.get(input.attemptId);
+      if (!owner) return Effect.fail(new SetupProcessError({ message: "Missing setup owner" }));
+      const source = owner.pid === null ? ("not-delivered" as const) : ("native" as const);
+      records.set(input.attemptId, { ...owner, exited: true, evidence: { protocol: 4, source } });
+      return Effect.succeed({ ...owner, source });
+    });
+  const journal: SetupProcessJournalShape = {
+    ...SetupProcessJournal.defaultValue(),
+    launcher: Effect.succeed("/helper"),
+    owners: (threadId, terminalId) =>
+      Effect.sync(() =>
+        [...records.values()].filter(
+          (owner) =>
+            owner.threadId === threadId &&
+            (terminalId === undefined || owner.terminalId === terminalId),
+        ),
+      ),
+    begin: (input) =>
+      Effect.sync(() => {
+        records.set(input.attemptId, {
+          ...input,
+          createdAt: "now",
+          pid: null,
+          identity: null,
+          completed: false,
+          exited: false,
+          legacy: false,
+        });
+      }),
+    capture: (input) =>
+      Effect.suspend(() => {
+        const owner = records.get(input.attemptId);
+        if (!owner || owner.exited || owner.pid !== null)
+          return Effect.fail(new SetupProcessError({ message: "Setup cannot be captured again" }));
+        records.set(input.attemptId, {
+          ...owner,
+          pid: input.pid,
+          identity: "birth",
+          ownershipVersion: 4,
+        });
+        return Effect.succeed("/bin/bash");
+      }),
+    confirmed: (input) => Effect.sync(() => !!records.get(input.attemptId)?.evidence),
+    cleanup,
+    recover: (input) => cleanup({ ...input, commandId: "recover" }),
+  };
+  return { journal, records };
+};
+
+const openOwnedSetup = Effect.fnUntraced(function* (
+  manager: TerminalManager.TerminalManager["Service"],
+  journal: SetupProcessJournalShape,
+) {
+  const attempt = { threadId: "thread-1", attemptId: "attempt", terminalId: DEFAULT_TERMINAL_ID };
+  yield* journal.begin(attempt);
+  const opened = yield* manager.open({
+    ...openInput(),
+    setupProcessOwner: yield* journal.launcher,
+    setupAttemptId: attempt.attemptId,
+  });
+  yield* journal.capture({ ...attempt, pid: opened.pid! });
+  return { ...attempt, expectedPid: opened.pid!, data: "echo SETUP\r" };
+});
+
 const withHostPlatform = (platform: NodeJS.Platform) =>
   Layer.succeed(HostProcessPlatform, platform);
 
@@ -465,6 +559,327 @@ it.layer(
         Effect.provide(CheckoutAccess.layer.pipe(Layer.provideMerge(SqlitePersistenceMemory))),
       ),
   );
+
+  for (const action of [
+    "Restart",
+    "Close/reopen",
+    "changed context",
+    "PID reuse",
+    "new setup attempt",
+  ] as const) {
+    it.effect(
+      `rejects setup delivery delayed across ${action} instead of writing to its replacement`,
+      () => {
+        const { journal } = setupJournalFixture();
+        return Effect.gen(function* () {
+          yield* journal.begin({
+            threadId: "thread-1",
+            attemptId: "attempt",
+            terminalId: DEFAULT_TERMINAL_ID,
+          });
+          const adapter = new FakePtyAdapter();
+          if (action === "PID reuse" || action === "new setup attempt")
+            adapter.pids.push(9000, 9000);
+          const { manager, ptyAdapter } = yield* createManager(5, {
+            ptyAdapter: adapter,
+            processTable: Effect.succeed([]),
+          });
+          const writeEntered = yield* Deferred.make<void>();
+          const releaseWrite = yield* Deferred.make<void>();
+          const project = {
+            id: ProjectId.make("project"),
+            title: "Project",
+            workspaceRoot: process.cwd(),
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: "now",
+            updatedAt: "now",
+            deletedAt: null,
+          };
+          const runnerLayer = ProjectSetupScriptRunner.layer.pipe(
+            Layer.provide(
+              Layer.succeed(TerminalManager.TerminalManager, {
+                ...manager,
+                writeSetup: (input) =>
+                  Deferred.succeed(writeEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseWrite)),
+                    Effect.andThen(manager.writeSetup(input)),
+                  ),
+              }),
+            ),
+            Layer.provide(
+              Layer.mock(ProjectionSnapshotQuery, {
+                getActiveProjectByWorkspaceRoot: () => Effect.succeedSome(project),
+              }),
+            ),
+            Layer.provide(ServerSettings.ServerSettingsService.layerTest()),
+          );
+          yield* Effect.gen(function* () {
+            const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+            const pending = yield* runner
+              .runForThread({
+                threadId: "thread-1",
+                worktreePath: process.cwd(),
+                projectCwd: process.cwd(),
+                preferredTerminalId: DEFAULT_TERMINAL_ID,
+                preparationAttemptId: "attempt",
+                observeCompletion: {},
+                resolvedScript: {
+                  id: "setup",
+                  name: "Setup",
+                  command: "echo SIDE_EFFECT",
+                  async: false,
+                },
+              })
+              .pipe(Effect.result, Effect.forkChild);
+            yield* Deferred.await(writeEntered);
+            if (action === "Close/reopen") {
+              yield* manager.close({ threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID });
+              yield* manager.open(openInput());
+            } else if (action === "changed context") {
+              yield* manager.open(openInput({ env: { NEW_CONTEXT: "1" } }));
+            } else if (action === "new setup attempt") {
+              yield* journal.begin({
+                threadId: "thread-1",
+                terminalId: DEFAULT_TERMINAL_ID,
+                attemptId: "replacement",
+              });
+              const fresh = yield* manager.open({
+                ...openInput({ env: { NEW_CONTEXT: "1" } }),
+                setupProcessOwner: "/helper",
+                setupAttemptId: "replacement",
+              });
+              yield* journal.capture({
+                threadId: "thread-1",
+                attemptId: "replacement",
+                pid: fresh.pid!,
+              });
+            } else {
+              yield* manager.restart(restartInput());
+            }
+            yield* Deferred.succeed(releaseWrite, undefined);
+            const result = yield* Fiber.join(pending);
+            const replacement = ptyAdapter.processes[1]!;
+            expect(ptyAdapter.spawnInputs[1]?.ownerExecutable).toBe(
+              action === "new setup attempt" ? "/helper" : undefined,
+            );
+            if (action === "PID reuse" || action === "new setup attempt")
+              expect(replacement.pid).toBe(ptyAdapter.processes[0]!.pid);
+            expect(replacement.writes).toEqual([]);
+            expect(result).toMatchObject({
+              _tag: "Failure",
+              failure: { operation: "writeCommand" },
+            });
+          }).pipe(Effect.provide(runnerLayer));
+        }).pipe(Effect.provideService(SetupProcessJournal, journal));
+      },
+    );
+  }
+
+  it.effect(
+    "writes setup to its captured owner and releases the lock after a PTY write error",
+    () => {
+      const { journal, records } = setupJournalFixture();
+      return Effect.gen(function* () {
+        const { manager, ptyAdapter } = yield* createManager();
+        const input = yield* openOwnedSetup(manager, journal);
+        const owner = ptyAdapter.processes[0]!;
+        records.set("attempt", { ...records.get("attempt")!, completed: true });
+        owner.writeFailure = new Error("PTY write denied");
+        expect(yield* manager.writeSetup(input).pipe(Effect.result)).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "TerminalWriteError" },
+        });
+        expect(owner.writes).toEqual([]);
+        owner.writeFailure = undefined;
+        yield* manager.writeSetup(input);
+        expect(owner.writes).toEqual([input.data]);
+        yield* manager.restart(restartInput());
+        expect(ptyAdapter.processes[1]!.writes).toEqual([]);
+      }).pipe(Effect.provideService(SetupProcessJournal, journal));
+    },
+  );
+
+  it.effect.each([
+    "missing",
+    "uncaptured",
+    "wrong pid",
+    "wrong terminal",
+    "wrong attempt",
+    "exited",
+    "proof",
+  ] as const)("rejects setup without matching live captured ownership: %s", (change) => {
+    const { journal, records } = setupJournalFixture();
+    return Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const input = yield* openOwnedSetup(manager, journal);
+      const record = records.get("attempt")!;
+      if (change === "missing") records.clear();
+      else if (change === "uncaptured")
+        records.set("attempt", { ...record, pid: null, identity: null });
+      else if (change === "wrong pid")
+        records.set("attempt", { ...record, pid: input.expectedPid + 1 });
+      else if (change === "wrong terminal")
+        records.set("attempt", { ...record, terminalId: "other" });
+      else if (change === "wrong attempt") {
+        records.set("other", { ...record, attemptId: "other" });
+        input.attemptId = "other";
+      } else if (change === "exited") records.set("attempt", { ...record, exited: true });
+      else records.set("attempt", { ...record, evidence: { protocol: 4, source: "native" } });
+      expect(yield* manager.writeSetup(input).pipe(Effect.result)).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "TerminalProcessExitError" },
+      });
+      expect(ptyAdapter.processes[0]!.writes).toEqual([]);
+    }).pipe(Effect.provideService(SetupProcessJournal, journal));
+  });
+
+  it.effect.each(["PTY", "shell"] as const)(
+    "rejects setup after %s exit and retains cleanup ownership",
+    (kind) => {
+      const { journal } = setupJournalFixture();
+      return Effect.gen(function* () {
+        const { manager, ptyAdapter } = yield* createManager();
+        const input = yield* openOwnedSetup(manager, journal);
+        const owner = ptyAdapter.processes[0]!;
+        if (kind === "PTY") owner.emitExit({ exitCode: 7, signal: null });
+        else owner.emitShellExit({ exitCode: 7, signal: null });
+        expect(yield* manager.writeSetup(input).pipe(Effect.isFailure)).toBe(true);
+        expect(owner.writes).toEqual([]);
+        expect(yield* journal.confirmed(input)).toBe(false);
+        yield* manager.close({ threadId: input.threadId, terminalId: input.terminalId });
+        expect(yield* journal.confirmed(input)).toBe(true);
+      }).pipe(Effect.provideService(SetupProcessJournal, journal));
+    },
+  );
+
+  it.effect("rejects an already-exited shell before its terminal event can enter the drain", () => {
+    const { journal } = setupJournalFixture();
+    return Effect.gen(function* () {
+      const adapter = new FakePtyAdapter();
+      const spawn = adapter.spawn.bind(adapter);
+      adapter.spawn = (input) =>
+        spawn(input).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              adapter.processes.at(-1)!.emitShellExit({ exitCode: 7, signal: null });
+            }),
+          ),
+        );
+      const { manager, ptyAdapter } = yield* createManager(5, { ptyAdapter: adapter });
+      const input = yield* openOwnedSetup(manager, journal);
+      // Exit replay happens before startSession installs the process in the session.
+      expect((yield* manager.open(openInput())).status).toBe("running");
+      expect(yield* manager.writeSetup(input).pipe(Effect.isFailure)).toBe(true);
+      expect(ptyAdapter.processes[0]!.writes).toEqual([]);
+      expect(yield* journal.confirmed(input)).toBe(false);
+      yield* manager.close({ threadId: input.threadId });
+      expect(yield* journal.confirmed(input)).toBe(true);
+    }).pipe(Effect.provideService(SetupProcessJournal, journal));
+  });
+
+  it.effect("blocks setup delivery when captured cleanup fails before physical stop", () => {
+    const fixture = setupJournalFixture();
+    const journal = {
+      ...fixture.journal,
+      cleanup: () => Effect.fail(new SetupProcessError({ message: "Stop denied" })),
+    };
+    return Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const input = yield* openOwnedSetup(manager, journal);
+      const captured = yield* manager.captureCleanup(input.threadId);
+      expect(yield* manager.writeSetup(input).pipe(Effect.isFailure)).toBe(true);
+      expect(yield* captured.stop.pipe(Effect.isFailure)).toBe(true);
+      expect(yield* manager.writeSetup(input).pipe(Effect.isFailure)).toBe(true);
+      expect(ptyAdapter.processes[0]!.writes).toEqual([]);
+      expect(yield* journal.confirmed(input)).toBe(false);
+    }).pipe(Effect.provideService(SetupProcessJournal, journal));
+  });
+
+  it.effect("serializes delivery that wins the lock before Restart", () => {
+    const fixture = setupJournalFixture();
+    const entered = Deferred.makeUnsafe<void>();
+    const release = Deferred.makeUnsafe<void>();
+    let holdRead = false;
+    const journal = {
+      ...fixture.journal,
+      owners: (threadId: string, terminalId?: string) =>
+        (holdRead
+          ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          : Effect.void
+        ).pipe(Effect.andThen(fixture.journal.owners(threadId, terminalId))),
+    };
+    return Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const input = yield* openOwnedSetup(manager, journal);
+      holdRead = true;
+      const writing = yield* manager.writeSetup(input).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const restarting = yield* manager
+        .restart(restartInput())
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      expect(restarting.pollUnsafe()).toBeUndefined();
+      expect(ptyAdapter.processes).toHaveLength(1);
+      holdRead = false;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(writing);
+      yield* Fiber.join(restarting);
+      expect(ptyAdapter.processes[0]!.writes).toEqual([input.data]);
+      expect(ptyAdapter.processes[1]!.writes).toEqual([]);
+    }).pipe(Effect.provideService(SetupProcessJournal, journal));
+  });
+
+  it.effect("interrupted setup delivery releases the lifecycle permit without writing", () => {
+    const fixture = setupJournalFixture();
+    const entered = Deferred.makeUnsafe<void>();
+    let holdRead = false;
+    const journal = {
+      ...fixture.journal,
+      owners: (threadId: string, terminalId?: string) =>
+        (holdRead
+          ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+          : Effect.void
+        ).pipe(Effect.andThen(fixture.journal.owners(threadId, terminalId))),
+    };
+    return Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const input = yield* openOwnedSetup(manager, journal);
+      holdRead = true;
+      const writing = yield* manager.writeSetup(input).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* Fiber.interrupt(writing);
+      expect(ptyAdapter.processes[0]!.writes).toEqual([]);
+      holdRead = false;
+      yield* manager.restart(restartInput());
+      yield* manager.write({ ...input, data: "pwd\r" });
+      expect(ptyAdapter.processes[1]!.writes).toEqual(["pwd\r"]);
+    }).pipe(Effect.provideService(SetupProcessJournal, journal));
+  });
+
+  it.effect("does not relaunch a captured setup attempt after its PTY exits", () => {
+    const { journal } = setupJournalFixture();
+    return Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      yield* openOwnedSetup(manager, journal);
+      const exited = Deferred.makeUnsafe<void>();
+      const off = yield* manager.subscribe((event) =>
+        event.type === "exited" ? Deferred.succeed(exited, undefined) : Effect.void,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(off));
+      ptyAdapter.processes[0]!.emitExit({ exitCode: 0, signal: null });
+      yield* Deferred.await(exited);
+      expect(
+        yield* manager
+          .open({
+            ...openInput(),
+            setupProcessOwner: "/helper",
+            setupAttemptId: "attempt",
+          })
+          .pipe(Effect.isFailure),
+      ).toBe(true);
+      expect(ptyAdapter.processes).toHaveLength(1);
+    }).pipe(Effect.provideService(SetupProcessJournal, journal));
+  });
 
   it.effect("spawns lazily and reuses running terminal per thread", () =>
     Effect.gen(function* () {
@@ -1892,7 +2307,7 @@ it.layer(
     }),
   );
 
-  it.effect.each(["explicit", "marked"] as const)(
+  it.effect.each(["explicit", "marked", "owned", "legacy-owned"] as const)(
     "%s strict close waits for the captured process exit before reporting closure",
     (mode) =>
       Effect.gen(function* () {
@@ -1910,18 +2325,59 @@ it.layer(
           kill(signal);
           Deferred.doneUnsafe(signaled, Effect.void);
         };
-        const closing = yield* manager
-          .close({
-            threadId: "thread-1",
-            ...(mode === "explicit" ? { waitForProcessExit: true } : {}),
-          })
-          .pipe(Effect.forkScoped);
+        if (mode === "owned") {
+          expect(
+            yield* manager.closeOwned({
+              threadId: "thread-1",
+              terminalId: DEFAULT_TERMINAL_ID,
+              expectedPid: process.pid + 1,
+            }),
+          ).toBe(false);
+          expect(process.killSignals).toEqual([]);
+        }
+        const closing = yield* (
+          mode === "owned" || mode === "legacy-owned"
+            ? manager
+                .closeOwned({
+                  threadId: "thread-1",
+                  terminalId: DEFAULT_TERMINAL_ID,
+                  ...(mode === "owned" ? { expectedPid: process.pid } : {}),
+                })
+                .pipe(Effect.asVoid)
+            : manager.close({
+                threadId: "thread-1",
+                ...(mode === "explicit" ? { waitForProcessExit: true } : {}),
+              })
+        ).pipe(Effect.forkScoped);
         yield* Deferred.await(signaled);
         expect(closing.pollUnsafe()).toBeUndefined();
         expect((yield* getEvents).some((event) => event.type === "closed")).toBe(false);
         process.emitExit({ exitCode: 0, signal: null });
         yield* Fiber.join(closing);
         expect(process.killSignals).toEqual(["SIGTERM"]);
+        expect((yield* getEvents).filter((event) => event.type === "closed")).toHaveLength(1);
+      }),
+  );
+
+  it.effect(
+    "OS-confirmed exit closes a stale captured PTY without signalling its recycled PID",
+    () =>
+      Effect.gen(function* () {
+        const { manager, ptyAdapter, getEvents } = yield* createManager();
+        yield* manager.open(openInput());
+        const process = ptyAdapter.processes[0]!;
+        process.kill = () => {
+          throw new Error("A stale PID must never be signalled");
+        };
+        expect(
+          yield* manager.closeOwned({
+            threadId: "thread-1",
+            terminalId: DEFAULT_TERMINAL_ID,
+            expectedPid: process.pid,
+            exitConfirmed: true,
+          }),
+        ).toBe(true);
+        expect(process.killSignals).toEqual([]);
         expect((yield* getEvents).filter((event) => event.type === "closed")).toHaveLength(1);
       }),
   );
@@ -2938,6 +3394,83 @@ it.layer(
     }),
   );
 
+  it.effect("uncaptured setup cleanup never signals a handle after its PTY exit", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      yield* manager.open({
+        ...openInput(),
+        setupProcessOwner: "/native/owner",
+        setupAttemptId: "unarmed",
+      });
+      const process = ptyAdapter.processes[0]!;
+      process.emitExit({ exitCode: 0, signal: null });
+      process.kill = () => {
+        throw new Error("Recycled PID must never be signalled");
+      };
+      yield* manager.close({ threadId: "thread-1" });
+      expect(process.killSignals).toEqual([]);
+    }).pipe(
+      Effect.provideService(SetupProcessJournal, {
+        ...SetupProcessJournal.defaultValue(),
+        owners: () =>
+          Effect.succeed([
+            {
+              threadId: "thread-1",
+              attemptId: "unarmed",
+              terminalId: DEFAULT_TERMINAL_ID,
+              createdAt: "now",
+              pid: null,
+              identity: null,
+              completed: false,
+              exited: false,
+              legacy: false,
+            },
+          ]),
+        cleanup: () =>
+          Effect.succeed({
+            threadId: "thread-1",
+            attemptId: "unarmed",
+            terminalId: DEFAULT_TERMINAL_ID,
+            pid: null,
+            identity: null,
+            source: "not-delivered",
+          }),
+      }),
+    ),
+  );
+  it.effect("server shutdown retains durable setup anchors for journal recovery", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const { manager, ptyAdapter } = yield* createManager(5).pipe(
+        Effect.provideService(Scope.Scope, scope),
+      );
+      yield* manager.open({
+        ...openInput(),
+        setupProcessOwner: "/native/owner",
+        setupAttemptId: "setup-shutdown",
+      });
+      yield* Scope.close(scope, Exit.void);
+      expect(ptyAdapter.processes[0]?.killSignals).toEqual([]);
+    }).pipe(
+      Effect.provideService(SetupProcessJournal, {
+        ...SetupProcessJournal.defaultValue(),
+        owners: () =>
+          Effect.succeed([
+            {
+              threadId: "thread-1",
+              attemptId: "setup-shutdown",
+              terminalId: DEFAULT_TERMINAL_ID,
+              createdAt: "now",
+              pid: null,
+              identity: null,
+              completed: false,
+              exited: false,
+              legacy: false,
+            },
+          ]),
+      }),
+    ),
+  );
   it.effect("scoped runtime shutdown stops active terminals cleanly", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make("sequential");
@@ -3085,6 +3618,25 @@ it.layer(
       expect(ptyAdapter.processes).toEqual([]);
     }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
+
+  it.effect("a captured setup command cannot bypass a draining VM execution fence", () => {
+    const { journal } = setupJournalFixture();
+    return Effect.gen(function* () {
+      const { fence, execution, move } = yield* portableTerminalFixture;
+      const { manager, ptyAdapter } = yield* createManager(5, { execution });
+      const input = yield* openOwnedSetup(manager, journal);
+      yield* manager.writeSetup(input);
+      expect(ptyAdapter.processes[0]!.writes).toEqual([input.data]);
+      yield* fence.beginDrain(move);
+      expect(
+        (yield* Effect.result(manager.writeSetup({ ...input, data: "echo BLOCKED\r" })))._tag,
+      ).toBe("Failure");
+      expect(ptyAdapter.processes[0]!.writes).toEqual([input.data]);
+    }).pipe(
+      Effect.provideService(SetupProcessJournal, journal),
+      Effect.provide(SqlitePersistenceMemory),
+    );
+  });
 
   it.effect("portable terminals block input and new shells when a move drains execution", () =>
     Effect.gen(function* () {

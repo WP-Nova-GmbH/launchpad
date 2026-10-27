@@ -72,6 +72,10 @@ function approvalRequestedEvent(input: {
 }
 
 interface SupervisorHarnessOptions {
+  readonly supervisor?: Pick<
+    Parameters<typeof attachApprovalSupervisor>[0],
+    "resolveCwd" | "jobContext" | "reviewConstraint" | "stepInstruction"
+  >;
   readonly verdict?: (
     input: ApprovalVerdictGenerationInput,
   ) => ApprovalVerdictGenerationResult | "fail";
@@ -174,6 +178,7 @@ function withSupervisor<A>(
         stepInstruction: "Add a health endpoint",
         cwd: "/tmp/worktree",
         modelSelection: MODEL_SELECTION,
+        ...options.supervisor,
       });
       return yield* use(harness);
     }),
@@ -260,6 +265,39 @@ it.effect("consults the model for an ordinary command and accepts its approval",
     assert.equal(response?.type === "thread.approval.respond" ? response.decision : null, "accept");
   }),
 );
+
+for (const reason of ["workspace", "step", "context"] as const) {
+  it.effect(`escalates workflow approval with invalid ${reason} without a model call`, () =>
+    withSupervisor(
+      {
+        supervisor: {
+          stepInstruction: reason === "step" ? "s".repeat(32_001) : "Add a health endpoint",
+          jobContext: reason === "context" ? "j".repeat(32_001) : "Fix the requested issue",
+          reviewConstraint: "Require human review",
+          resolveCwd: Effect.succeed(reason === "workspace" ? null : "/jobs/worktree"),
+        },
+      },
+      (h) =>
+        Effect.gen(function* () {
+          yield* h.emit(
+            approvalRequestedEvent({
+              requestId: `invalid-${reason}`,
+              requestType: "command_execution_approval",
+              detail: "pnpm test",
+            }),
+          );
+          const verdict = yield* h.awaitDispatch(isVerdictActivity);
+          assert.equal((yield* Ref.get(h.modelCalls)).length, 0);
+          assert.equal((yield* Ref.get(h.dispatched)).filter(isApprovalResponse).length, 0);
+          assert.equal(
+            verdict.type === "thread.activity.append" &&
+              (verdict.activity.payload as { verdict: string }).verdict,
+            "escalate",
+          );
+        }),
+    ),
+  );
+}
 
 it.effect("declines when the model denies, and does not end the step", () =>
   Effect.gen(function* () {
@@ -502,4 +540,33 @@ it.effect("ignores approvals on other threads", () =>
       ["req-after"],
     );
   }),
+);
+
+it.effect("recovers a persisted verdict without another model decision or response identity", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness();
+    yield* attachApprovalSupervisor({
+      engine: harness.engine,
+      textGeneration: harness.textGeneration,
+      crypto: yield* Crypto.Crypto,
+      threadId: THREAD_ID,
+      stepInstruction: "Implement",
+      cwd: "/tmp/worktree",
+      modelSelection: MODEL_SELECTION,
+      replayEvents: Stream.fromIterable([
+        approvalRequestedEvent({ requestId: "resolved" }),
+        approvalRequestedEvent({ requestId: "pending" }),
+      ]),
+      resolvedRequestIds: new Set(["resolved"]),
+      recordedVerdicts: new Map([["pending", "deny"]]),
+    });
+    const response = yield* harness.awaitDispatch(isApprovalResponse);
+    assert.strictEqual(
+      response.type === "thread.approval.respond" ? response.decision : null,
+      "decline",
+    );
+    assert.strictEqual(response.commandId, `server:supervisor:${THREAD_ID}:pending:respond`);
+    assert.strictEqual((yield* Ref.get(harness.modelCalls)).length, 0);
+    assert.strictEqual((yield* Ref.get(harness.dispatched)).length, 1);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

@@ -3,6 +3,7 @@ import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSpawner from "@effect/platform-node/NodeChildProcessSpawner";
 import { ThreadId } from "@t3tools/contracts";
+import { vi } from "vite-plus/test";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -38,6 +39,7 @@ const fixture = Effect.gen(function* () {
   const methods: string[] = [];
   let admitted = true,
     controlStops = 0,
+    nativeStops = 0,
     processOnly = false,
     groupId = "";
   const end = Queue.end(output).pipe(
@@ -47,8 +49,11 @@ const fixture = Effect.gen(function* () {
   const handle = ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(42),
     exitCode: Deferred.await(exited),
-    isRunning: Effect.succeed(true),
-    kill: () => end,
+    isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
+    kill: () =>
+      Effect.sync(() => {
+        nativeStops++;
+      }).pipe(Effect.andThen(end)),
     unref: Effect.succeed(Effect.void),
     stdin: Sink.forEach((bytes: Uint8Array) =>
       Effect.gen(function* () {
@@ -145,6 +150,9 @@ const fixture = Effect.gen(function* () {
     get stops() {
       return controlStops;
     },
+    get nativeStops() {
+      return nativeStops;
+    },
     reject: () => {
       admitted = false;
     },
@@ -168,6 +176,7 @@ it.layer(NodeServices.layer)("owned idle Codex shutdown", (it) => {
           );
           yield* Queue.take(f.stopRequested);
           NodeAssert.equal(f.stops, 1);
+          const ordinaryCleanup = yield* f.runtime.closeNativeWriter!.pipe(Effect.forkScoped);
           const previous = f.methods.length;
           NodeAssert.equal((yield* Effect.result(f.runtime.compactThread()))._tag, "Failure");
           NodeAssert.equal(f.methods.length, previous);
@@ -182,6 +191,7 @@ it.layer(NodeServices.layer)("owned idle Codex shutdown", (it) => {
           });
           yield* f.end;
           NodeAssert.equal(yield* Fiber.join(stopping), true);
+          yield* Fiber.join(ordinaryCleanup);
           const drained = yield* Fiber.join(events);
           NodeAssert.ok(drained.some((event) => event.method === "item/agentMessage/delta"));
           NodeAssert.equal(drained.at(-1)?.method, "session/closed");
@@ -190,8 +200,45 @@ it.layer(NodeServices.layer)("owned idle Codex shutdown", (it) => {
             true,
           );
           NodeAssert.equal(f.stops, 1);
+          // Ordinary provider cleanup follows idle shutdown and consumes the same writer receipt.
+          yield* f.runtime.closeNativeWriter!;
+          yield* f.runtime.closeNativeWriter!;
+          NodeAssert.equal(f.nativeStops, 0);
         }),
       ),
+  );
+  it.effect("closes and drains a VM writer while a supervised background tool remains", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const events = yield* f.runtime.events.pipe(Stream.runCollect, Effect.forkScoped);
+        // The writer exits, but a detached tool still occupies its original process group.
+        const groupProbe = vi.spyOn(process, "kill").mockReturnValue(true);
+        try {
+          yield* f.send({
+            method: "item/agentMessage/delta",
+            params: {
+              threadId: nativeId,
+              turnId: "last-turn",
+              itemId: "last-item",
+              delta: "output flushed before native EOF",
+            },
+          });
+          yield* f.runtime.closeNativeWriter!;
+          yield* f.runtime.closeNativeWriter!;
+          NodeAssert.equal(f.nativeStops, 1);
+          NodeAssert.equal(groupProbe.mock.calls.length, 0);
+          NodeAssert.ok(
+            (yield* Fiber.join(events)).some((event) => event.method === "item/agentMessage/delta"),
+          );
+          // A native-writer receipt must never satisfy the workflow's stronger tree stop.
+          NodeAssert.equal((yield* Effect.result(f.runtime.close))._tag, "Failure");
+          NodeAssert.deepEqual(groupProbe.mock.calls[0], [-42, 0]);
+        } finally {
+          groupProbe.mockRestore();
+        }
+      }),
+    ),
   );
   it.effect("keeps a live native turn and its process untouched", () =>
     Effect.scoped(

@@ -825,6 +825,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/organization",
   },
   {
+    id: "workflow-sources",
+    title: "Workflow sources",
+    to: "/settings/connections",
+    cloudOnly: true,
+    searchTerms: ["Linear workflow source repository consent connect reconnect disconnect"],
+  },
+  {
     id: "personal-issue-trackers",
     title: "Issue trackers",
     to: "/settings/connections",
@@ -845,6 +852,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     id: "organization-repositories",
     title: "Repositories and access",
     to: "/settings/organization",
+    searchTerms: ["workflow workflows job jobs human review automation agent manual run cancel"],
   },
   {
     id: "vm-threads",

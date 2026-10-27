@@ -1212,6 +1212,9 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               : {}),
             isStreaming: false,
             ...(event.payload.author !== undefined ? { author: event.payload.author } : {}),
+            ...(event.payload.workflowOrigin !== undefined
+              ? { workflowOrigin: event.payload.workflowOrigin }
+              : {}),
             ...(event.payload.editedBy !== undefined ? { editedBy: event.payload.editedBy } : {}),
             ...(event.payload.steeredBy !== undefined
               ? { steeredBy: event.payload.steeredBy }

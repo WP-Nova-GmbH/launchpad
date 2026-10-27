@@ -27,6 +27,10 @@ import { threadEnvironmentApi } from "../src/http/ThreadEnvironmentApi.ts";
 import { threadCommandsApi } from "../src/http/ThreadCommandsApi.ts";
 import { threadHistoryApi } from "../src/http/ThreadHistoryApi.ts";
 import { threadVmPolicyApi } from "../src/http/ThreadVmPolicyApi.ts";
+
+import * as AutomaticOffers from "../src/workflowEvents/AutomaticOffer.ts";
+import * as WorkflowWake from "../src/jobs/WorkflowWake.ts";
+import { workflowEventsRoute } from "../src/http/WorkflowEventsRoute.ts";
 import { repositoryAccessServerApi } from "../src/http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "../src/tenancy/RepositoryPolicies.ts";
 /**
@@ -99,11 +103,15 @@ import { organizationSkillsServerApi } from "../src/http/OrganizationSkillsApi.t
 import { providerAccountsServerApi } from "../src/http/ProviderAccountsApi.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "../src/http/IssueTrackersApi.ts";
 import { turnAuthLayer } from "../src/issueTrackers/TurnAuthorization.ts";
+import { workflowSourcesApi, workflowSourceCallbackRoute } from "../src/http/WorkflowSourcesApi.ts";
 import { issueTrackerCallbackRoute } from "../src/http/IssueTrackerCallbackRoute.ts";
 import * as IssueTrackerConnectionStore from "../src/issueTrackers/ConnectionStore.ts";
 import * as IssueTrackerWriteOperationStore from "../src/issueTrackers/WriteOperationStore.ts";
 import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
+import * as Workflows from "../src/jobs/Workflows.ts";
+import { workflowsApi } from "../src/http/WorkflowsApi.ts";
+import { deliverPendingWorkflowJobs } from "../src/jobs/WorkflowDispatcher.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
 import * as AgentActivityRows from "../src/agentActivity/AgentActivityRows.ts";
 import * as ApnsClient from "../src/agentActivity/ApnsClient.ts";
@@ -273,6 +281,22 @@ const relayConfigurationLayer = Layer.succeed(
     clerkJwtAudience: process.env.CLERK_JWT_AUDIENCE?.trim() || "t3-code-relay",
     cloudMintPrivateKey: Redacted.make(cloudMintKeyPair.privateKey),
     cloudMintPublicKey: cloudMintKeyPair.publicKey,
+    linearWorkflowWebhook: RelayConfiguration.workflowWebhookConfiguration(
+      process.env.LINEAR_WORKFLOW_CLIENT_ID,
+      process.env.LINEAR_WORKFLOW_WEBHOOK_SECRET?.trim()
+        ? Redacted.make(process.env.LINEAR_WORKFLOW_WEBHOOK_SECRET)
+        : undefined,
+      process.env.LINEAR_WORKFLOW_WEBHOOK_GENERATION,
+      process.env.LINEAR_WORKFLOW_ADMISSION_ENABLED === "true",
+    ),
+    linearWorkflow: process.env.LINEAR_WORKFLOW_CLIENT_ID?.trim()
+      ? {
+          clientId: process.env.LINEAR_WORKFLOW_CLIENT_ID.trim(),
+          ...(process.env.LINEAR_WORKFLOW_CLIENT_SECRET?.trim()
+            ? { clientSecret: Redacted.make(process.env.LINEAR_WORKFLOW_CLIENT_SECRET.trim()) }
+            : {}),
+        }
+      : undefined,
     github:
       process.env.GITHUB_APP_ID && process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_PRIVATE_KEY
         ? {
@@ -334,7 +358,8 @@ const managedEndpointClientsLayer =
         }),
       ).pipe(Layer.provide(FetchHttpClient.layer));
 
-const runtimeLayerBase = MobileRegistrations.layer
+const runtimeLayerBase = WorkflowWake.layer
+  .pipe(Layer.provideMerge(AutomaticOffers.layer), Layer.provideMerge(MobileRegistrations.layer))
   .pipe(
     Layer.provideMerge(AgentActivityPublisher.layer),
     Layer.provideMerge(
@@ -387,6 +412,7 @@ const runtimeLayerBase = MobileRegistrations.layer
       Layer.mergeAll(
         AgentActivityRows.layer,
         Jobs.layer,
+        Workflows.layer,
         Organizations.layer,
         Invitations.layer,
         Repositories.layer,
@@ -477,12 +503,14 @@ const relayApiLayer = Layer.mergeAll(
   tokenApi,
   dpopClientApi,
   jobsApi,
+  workflowsApi,
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
   issueTrackersApi,
+  workflowSourcesApi,
   issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
@@ -506,6 +534,8 @@ const makeRouterLayer = (previewBaseUrl?: string) =>
       relayDocsRedirectRoute,
       githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
       issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+      workflowSourceCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+      workflowEventsRoute.pipe(Layer.provide(runtimeLayer)),
     ).pipe(Layer.provide([Etag.layerWeak, makeRelayCors(previewBaseUrl)])),
     relayNotFoundRoute,
     threadVmPreviewRoutes.pipe(Layer.provide(Layer.merge(runtimeLayer, threadVmPreviewNode))),
@@ -640,6 +670,13 @@ const main = Effect.gen(function* () {
               : Effect.logWarning("Thread artifact cleanup will retry."),
           ),
           Effect.repeat(Schedule.spaced("5 minutes")),
+          Effect.forkScoped,
+        ),
+      ),
+      Layer.effectDiscard(
+        deliverPendingWorkflowJobs().pipe(
+          Effect.ignoreCause({ log: true }),
+          Effect.repeat(Schedule.spaced("10 seconds")),
           Effect.forkScoped,
         ),
       ),

@@ -62,6 +62,19 @@ export class RelayConfiguration extends Context.Service<
     readonly cloudMintPublicKey: string;
     /** Absent until a deployment configures a GitHub App; the surface hides itself. */
     readonly github?: GithubAppCredentials | undefined;
+    /** Configure only after native owner/credential isolation has been proven. */
+    readonly linearWorkflow?:
+      | { readonly clientId: string; readonly clientSecret?: Redacted.Redacted<string> }
+      | undefined;
+    /** Intake may observe delivery while admission stays disabled until release verification. */
+    readonly linearWorkflowWebhook?:
+      | {
+          readonly applicationId: string;
+          readonly signingSecret: Redacted.Redacted<string>;
+          readonly generation: string;
+          readonly admissionEnabled: boolean;
+        }
+      | undefined;
     readonly managedEndpointBaseDomain: string | undefined;
     readonly managedEndpointNamespace: string | undefined;
     /**
@@ -84,3 +97,22 @@ export const make = (configuration: RelayConfiguration["Service"]) =>
 
 export const layer = (configuration: RelayConfiguration["Service"]) =>
   Layer.succeed(RelayConfiguration, make(configuration));
+
+export function workflowWebhookConfiguration(
+  applicationId: string | undefined,
+  signingSecret: Redacted.Redacted<string> | undefined,
+  generation: string | undefined,
+  admissionEnabled = false,
+) {
+  return applicationId?.trim() &&
+    signingSecret &&
+    Redacted.value(signingSecret).trim() &&
+    generation?.trim()
+    ? {
+        applicationId: applicationId.trim(),
+        signingSecret,
+        generation: generation.trim(),
+        admissionEnabled,
+      }
+    : undefined;
+}

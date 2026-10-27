@@ -373,3 +373,12 @@ export function threadMoveProjectTargetAvailability(
   if (!target.project) return { action: null, detail: "Original project is unavailable" } as const;
   return availability;
 }
+
+/** Ownership is released durably; a terminal-looking status alone is not cleanup proof. */
+export function threadWorkflowMoveBlocker(
+  thread: Pick<OrchestrationThreadShell, "workflowJob"> | null | undefined,
+) {
+  return thread?.workflowJob
+    ? "This thread belongs to a workflow. Finish or cancel the workflow before moving it."
+    : null;
+}

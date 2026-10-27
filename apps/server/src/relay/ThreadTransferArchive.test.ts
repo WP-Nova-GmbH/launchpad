@@ -212,6 +212,15 @@ const layer = Layer.mergeAll(OrchestrationEventStoreLive, SessionLayer).pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 it.layer(layer)("whole thread transfer archive", (it) => {
+  it.effect("refuses direct frozen export while a workflow still owns the thread", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`INSERT INTO repository_workflow_jobs VALUES ('held',${f.owner.threadId},'awaiting_review',0,'{}')`;
+      expect((yield* Effect.flip(f.archive.exportFrozen(f.input))).message).toContain("workflow");
+      expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("frozen");
+    }),
+  );
+
   it.effect(
     "a coordinated move reuses exact frozen native files even when their workspace originals have changed",
     () =>

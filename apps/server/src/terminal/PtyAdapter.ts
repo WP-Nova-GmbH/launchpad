@@ -40,10 +40,16 @@ export interface PtyProcess {
   resize(cols: number, rows: number): void;
   kill(signal?: string): void;
   onData(callback: (data: string) => void): () => void;
+  onShellExit?: (callback: (event: PtyExitEvent) => void) => () => void;
   onExit(callback: (event: PtyExitEvent) => void): () => void;
 }
 
 export interface PtySpawnInput {
+  ownerExecutable?: string;
+  ownerShellCandidates?: ReadonlyArray<{
+    readonly shell: string;
+    readonly args?: ReadonlyArray<string>;
+  }>;
   shell: string;
   args?: string[];
   cwd: string;

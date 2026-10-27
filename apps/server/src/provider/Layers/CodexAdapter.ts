@@ -41,6 +41,9 @@ import {
 } from "../ProviderEventBarrier.ts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
+import * as Semaphore from "effect/Semaphore";
 import * as NodeCrypto from "node:crypto";
 import * as NodeOS from "node:os";
 import * as FileSystem from "effect/FileSystem";
@@ -56,7 +59,6 @@ import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
-import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexErrors from "effect-codex-app-server/errors";
@@ -138,6 +140,8 @@ interface CodexAdapterSessionContext {
   readonly eventFiber: Fiber.Fiber<void, never>;
   readonly turnTokenUsage: CodexTurnTokenUsageState;
   stopped: boolean;
+  readonly stopLock: Semaphore.Semaphore;
+  readonly runtimeEpisode: string;
 }
 
 type CodexCumulativeTokenUsage = {
@@ -2295,8 +2299,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderIngestionEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  const confirmedStops = new Map<string, ThreadId>();
+  const closedVmWriters = new Map<string, ThreadId>();
+  const contextsByEpisode = new Map<string, CodexAdapterSessionContext>();
+  const pendingStarts = new Map<string, ThreadId>();
 
-  const startSession: CodexAdapterShape["startSession"] = (input) =>
+  const startSession: CodexAdapterShape["startSession"] = (input, sessionOptions) =>
     Effect.scoped(
       Effect.gen(function* () {
         if (input.provider !== undefined && input.provider !== PROVIDER) {
@@ -2366,9 +2374,25 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             )
           : undefined;
 
+        if (sessionOptions?.requireResume && !isCodexResumeCursorSchema(input.resumeCursor))
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "The required Codex conversation cursor is missing or malformed.",
+          });
+        const runtimeEpisode = NodeCrypto.randomUUID();
+        let nativeAttempted = false;
+        pendingStarts.set(runtimeEpisode, input.threadId);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            pendingStarts.delete(runtimeEpisode);
+            if (!nativeAttempted) confirmedStops.set(runtimeEpisode, input.threadId);
+          }),
+        );
+        yield* sessionOptions?.beforeStart?.(runtimeEpisode) ?? Effect.void;
         const existing = sessions.get(input.threadId);
-        if (existing && !existing.stopped) {
-          yield* Effect.suspend(() => stopSessionInternal(existing));
+        if (existing) {
+          yield* Effect.suspend(() => stopSessionInternal(existing, { emitExitEvent: false }));
         }
 
         const serviceTier =
@@ -2376,7 +2400,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+
         const runtimeInput: CodexSessionRuntimeOptions = {
+          ...(sessionOptions?.requireResume !== undefined
+            ? { requireResume: sessionOptions.requireResume }
+            : {}),
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
           cwd: input.cwd ?? process.cwd(),
@@ -2428,6 +2456,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
         );
         const createRuntime = options?.makeRuntime ?? makeCodexSessionRuntime;
+        nativeAttempted = true;
         const runtime = yield* createRuntime(runtimeInput).pipe(
           Effect.provideService(VmWorkloadTracking, trackWorkloads),
           Effect.provideService(VmControlSpawner, controlSpawner),
@@ -2528,6 +2557,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               }
             }
 
+            if (event.method === "session/closed") return;
             const mappedEvents = mapToRuntimeEvents(event, event.threadId).map((runtimeEvent) => {
               if (runtimeEvent.type === "turn.completed" && runtimeEvent.turnId) {
                 return {
@@ -2574,30 +2604,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           }),
         ).pipe(Effect.forkIn(sessionScope));
 
-        const started = yield* runtime.start().pipe(
-          Effect.mapError((cause) =>
-            cause._tag === "ProviderAdapterValidationError"
-              ? cause
-              : new ProviderAdapterProcessError({
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                  detail: cause.message,
-                  cause,
-                }),
-          ),
-          Effect.onError(() =>
-            runtime.close.pipe(
-              Effect.andThen(Effect.ignore(Scope.close(sessionScope, Exit.void))),
-              Effect.andThen(Fiber.interrupt(eventFiber)),
-              Effect.ignore,
-            ),
-          ),
-        );
-
-        sessions.set(input.threadId, {
+        const context: CodexAdapterSessionContext = {
           threadId: input.threadId,
           scope: sessionScope,
           runtime,
+          eventFiber,
+          turnTokenUsage,
           codexHome: path.resolve(
             expandHomePath(
               runtimeInput.homePath ||
@@ -2610,12 +2622,40 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           checkpointing: false,
           checkpointClose,
           mutations: yield* Semaphore.make(1),
-          eventFiber,
-          turnTokenUsage,
-          stopped: false,
-        });
+          stopped: true,
+          stopLock: yield* Semaphore.make(1),
+          runtimeEpisode,
+        };
+        // Startup can fail after spawning. Retain the exact runtime until cleanup is proven.
+        sessions.set(input.threadId, context);
+        contextsByEpisode.set(runtimeEpisode, context);
         sessionScopeTransferred = true;
-
+        const outcome = yield* runtime.start().pipe(
+          Effect.mapError((cause) =>
+            cause._tag === "ProviderAdapterValidationError"
+              ? cause
+              : new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  detail: cause.message,
+                  cause,
+                }),
+          ),
+          Effect.exit,
+        );
+        if (Exit.isFailure(outcome)) {
+          const cleanup = yield* stopSessionInternal(context).pipe(Effect.exit);
+          if (Exit.isFailure(cleanup))
+            return yield* new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+              detail: `Codex startup failed: ${Cause.pretty(outcome.cause)} Cleanup remains unconfirmed: ${Cause.pretty(cleanup.cause)}`,
+              cause: { startup: outcome.cause, cleanup: cleanup.cause },
+            });
+          return yield* Effect.failCause(outcome.cause);
+        }
+        context.stopped = false;
+        const started = outcome.value;
         return started;
       }),
     );
@@ -2848,15 +2888,59 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
     session: CodexAdapterSessionContext,
+    options?: { readonly emitExitEvent?: boolean },
   ) {
-    if (session.stopped) {
-      return;
-    }
-    session.stopped = true;
-    sessions.delete(session.threadId);
-    yield* session.runtime.close.pipe(Effect.ignore);
-    yield* Effect.ignore(Scope.close(session.scope, Exit.void));
-    yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
+    return yield* session.stopLock.withPermit(
+      Effect.gen(function* () {
+        if (
+          confirmedStops.get(session.runtimeEpisode) === session.threadId ||
+          closedVmWriters.get(session.runtimeEpisode) === session.threadId
+        )
+          return;
+        session.stopped = true;
+        if (trackWorkloads && !session.runtime.closeNativeWriter)
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: session.threadId,
+            detail: "VM native-writer shutdown is unavailable.",
+          });
+        yield* (trackWorkloads ? session.runtime.closeNativeWriter! : session.runtime.close).pipe(
+          Effect.catchCause((cause) =>
+            Effect.fail(
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: session.threadId,
+                detail: "The original Codex runtime could not be confirmed stopped.",
+                cause,
+              }),
+            ),
+          ),
+        );
+        // VM writer shutdown ends the stream only after native EOF; retain every final event.
+        if (trackWorkloads) yield* Fiber.join(session.eventFiber);
+        yield* Scope.close(session.scope, Exit.void);
+        yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
+        const current = sessions.get(session.threadId) === session;
+        if (current) sessions.delete(session.threadId);
+        contextsByEpisode.delete(session.runtimeEpisode);
+        // A writer receipt cannot prove that the VM's detached workloads stopped.
+        (trackWorkloads ? closedVmWriters : confirmedStops).set(
+          session.runtimeEpisode,
+          session.threadId,
+        );
+        if (current && options?.emitExitEvent !== false && !session.checkpointClose.value)
+          yield* Queue.offer(runtimeEventQueue, {
+            type: "session.exited",
+            eventId: EventId.make(NodeCrypto.randomUUID()),
+            provider: PROVIDER,
+            providerInstanceId: boundInstanceId,
+            threadId: session.threadId,
+            createdAt: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
+            payload: { reason: "Session stopped", exitKind: "graceful" },
+            providerRefs: {},
+          });
+      }),
+    );
   });
 
   const checkpointConversation: NonNullable<CodexAdapterShape["checkpointConversation"]> =
@@ -2924,7 +3008,6 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // Closing the native writer flushes its rollout before the stable export.
         // It is not proof that detached tools stopped; the workload supervisor owns that evidence.
         session.checkpointClose.value = true;
-        yield* session.runtime.close;
         yield* stopSessionInternal(session);
         const archive = yield* exportCodexConversation({
           codexHome: session.codexHome,
@@ -2991,10 +3074,25 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
   });
 
-  const stopSession: CodexAdapterShape["stopSession"] = (threadId) =>
+  const stopSession: CodexAdapterShape["stopSession"] = (threadId, runtimeEpisode) =>
     Effect.gen(function* () {
-      const session = sessions.get(threadId);
-      if (!session) {
+      const session = runtimeEpisode
+        ? contextsByEpisode.get(runtimeEpisode)
+        : sessions.get(threadId);
+      if (!session || session.threadId !== threadId) {
+        if (
+          runtimeEpisode &&
+          confirmedStops.get(runtimeEpisode) !== threadId &&
+          closedVmWriters.get(runtimeEpisode) !== threadId
+        )
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail:
+              pendingStarts.get(runtimeEpisode) === threadId
+                ? "The original runtime acquisition is still in progress."
+                : "The requested runtime episode is not available for cleanup.",
+          });
         return;
       }
       yield* stopSessionInternal(session);
@@ -3040,7 +3138,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     Effect.succeed(Boolean(sessions.get(threadId) && !sessions.get(threadId)?.stopped));
 
   const stopAll: CodexAdapterShape["stopAll"] = () =>
-    Effect.forEach(Array.from(sessions.values()), stopSessionInternal, {
+    Effect.forEach(Array.from(sessions.values()), (session) => stopSessionInternal(session), {
       concurrency: 1,
       discard: true,
     }).pipe(Effect.asVoid);
@@ -3091,6 +3189,21 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             }),
         ),
       ),
+    isSessionStopConfirmed: (threadId, episode) =>
+      Effect.sync(() =>
+        episode
+          ? !pendingStarts.has(episode) && confirmedStops.get(episode) === threadId
+          : !Array.from(pendingStarts.values()).includes(threadId) &&
+            !sessions.has(threadId) &&
+            Array.from(confirmedStops.values()).includes(threadId),
+      ),
+    getSessionRuntimeEpisode: (threadId) =>
+      Effect.sync(() => sessions.get(threadId)?.runtimeEpisode),
+    releaseSessionStopConfirmation: (threadId, episode) =>
+      Effect.sync(() => {
+        if (confirmedStops.get(episode) === threadId) confirmedStops.delete(episode);
+        if (closedVmWriters.get(episode) === threadId) closedVmWriters.delete(episode);
+      }),
     get streamEvents() {
       return consumeProviderEventBarriers(Stream.fromQueue(runtimeEventQueue));
     },

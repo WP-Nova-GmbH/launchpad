@@ -1,0 +1,367 @@
+import {
+  RepositoryWorkflow,
+  RepositoryWorkflowJob,
+  isTerminalWorkflowJob,
+  WorkflowConflictError,
+  WorkflowInvalidError,
+  type WorkflowJobPageQuery,
+  type WorkflowJobPage,
+  type SaveRepositoryWorkflow,
+} from "@t3tools/contracts/workflows";
+import { WorkflowOrigin, sameWorkflowOrigin } from "@t3tools/contracts";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+import * as Routing from "../workflowEvents/Routing.ts";
+import { RelayDb } from "../db.ts";
+import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
+
+export type WorkflowDispatchScope = {
+  occurrenceId?: string;
+  connectionId?: string;
+  environmentId?: string;
+};
+export type WorkflowJobRecord = Omit<typeof relayWorkflowJobs.$inferSelect, "summary">;
+const isInvalid = Schema.is(WorkflowInvalidError);
+const isConflict = Schema.is(WorkflowConflictError);
+const decodeOrigin = Schema.decodeUnknownSync(WorkflowOrigin);
+
+const JobPageCursor = Schema.Struct({
+  version: Schema.Literal(1),
+  repositoryId: Schema.String,
+  view: Schema.Literals(["active", "attention", "history"]),
+  createdAt: Schema.String.check(Schema.isMaxLength(64)),
+  jobId: Schema.String.check(Schema.isMaxLength(64)),
+});
+const decodeCursor = Schema.decodeEffect(Schema.fromJsonString(JobPageCursor));
+const encodeCursor = Schema.encodeSync(Schema.fromJsonString(JobPageCursor));
+export class WorkflowPersistenceError extends Schema.TaggedError<WorkflowPersistenceError>()(
+  "WorkflowPersistenceError",
+  { cause: Schema.Defect() },
+) {}
+const persist = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(Effect.mapError((cause) => new WorkflowPersistenceError({ cause })));
+
+function validateOrigin(row: WorkflowJobRecord, record = row.record) {
+  const origin = decodeOrigin(
+    record.origin ??
+      (row.submitterUserId ? { kind: "manual", userId: row.submitterUserId } : undefined),
+  );
+  if (
+    origin.kind === "manual"
+      ? origin.userId !== row.submitterUserId
+      : row.submitterUserId !== null ||
+        origin.organizationId !== row.organizationId ||
+        origin.repositoryId !== row.repositoryId ||
+        origin.workflowId !== record.workflowId ||
+        (record.requiredProtocol ?? 0) < 8
+  )
+    throw new Error("Invalid workflow origin binding.");
+  return { ...record, origin };
+}
+
+export const make = Effect.gen(function* () {
+  const db = yield* RelayDb;
+  const now = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+  const get = (workflowId: string) =>
+    persist(
+      db
+        .select({ record: relayRepositoryWorkflows.record })
+        .from(relayRepositoryWorkflows)
+        .where(eq(relayRepositoryWorkflows.workflowId, workflowId))
+        .limit(1),
+    ).pipe(Effect.map((rows) => rows[0]?.record ?? null));
+  const getJob = (jobId: string) =>
+    persist(
+      db.select().from(relayWorkflowJobs).where(eq(relayWorkflowJobs.jobId, jobId)).limit(1),
+    ).pipe(Effect.map((rows): WorkflowJobRecord | null => rows[0] ?? null));
+  return {
+    get,
+    getJob,
+    list: (repositoryId: string) =>
+      persist(
+        db
+          .select({ record: relayRepositoryWorkflows.record })
+          .from(relayRepositoryWorkflows)
+          .where(eq(relayRepositoryWorkflows.repositoryId, repositoryId)),
+      ).pipe(Effect.map((rows) => rows.map((row) => row.record))),
+    save: Effect.fn("Workflows.save")(function* (
+      organizationId: string,
+      repositoryId: string,
+      input: typeof SaveRepositoryWorkflow.Type,
+      context?: Routing.SaveContext,
+    ) {
+      const timestamp = yield* now;
+      const previous = yield* get(input.workflowId);
+      if (
+        (previous && previous.repositoryId !== repositoryId) ||
+        (previous?.revision ?? 0) !== input.expectedRevision
+      ) {
+        return yield* new WorkflowConflictError({
+          message: "This workflow changed. Reload it before saving; your draft has been retained.",
+        });
+      }
+      const record = {
+        workflowId: input.workflowId,
+        organizationId,
+        repositoryId,
+        revision: input.expectedRevision + 1,
+        definition: input.definition,
+        archived: input.archived,
+        automation: Routing.automation(previous?.automation),
+        createdAt: previous?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      } satisfies RepositoryWorkflow;
+      if (input.automation !== undefined || previous?.automation?.trigger) {
+        return yield* Routing.save(
+          {
+            ...record,
+            automation: Routing.automation(
+              input.automation === undefined ? previous?.automation : input.automation,
+            ),
+          },
+          input,
+          previous,
+          context,
+        ).pipe(
+          Effect.provideService(RelayDb, db),
+          Effect.mapError((cause) =>
+            isInvalid(cause) || isConflict(cause) ? cause : new WorkflowPersistenceError({ cause }),
+          ),
+        );
+      }
+      const rows = previous
+        ? yield* persist(
+            db
+              .update(relayRepositoryWorkflows)
+              .set({ revision: record.revision, record })
+              .where(
+                and(
+                  eq(relayRepositoryWorkflows.workflowId, input.workflowId),
+                  eq(relayRepositoryWorkflows.revision, input.expectedRevision),
+                ),
+              )
+              .returning(),
+          )
+        : yield* persist(
+            db
+              .insert(relayRepositoryWorkflows)
+              .values({
+                workflowId: input.workflowId,
+                repositoryId,
+                revision: record.revision,
+                record,
+              })
+              .onConflictDoNothing()
+              .returning(),
+          );
+      if (rows.length === 0)
+        return yield* new WorkflowConflictError({
+          message: "This workflow was saved elsewhere. Reload before saving your draft.",
+        });
+      return record;
+    }),
+    createJob: (row: WorkflowJobRecord) =>
+      persist(
+        Effect.try(() => validateOrigin(row)).pipe(
+          Effect.flatMap((record) => db.insert(relayWorkflowJobs).values({ ...row, record })),
+        ),
+      ).pipe(Effect.as(row)),
+    listJobs: (repositoryId: string) =>
+      persist(
+        db
+          .select()
+          .from(relayWorkflowJobs)
+          .where(eq(relayWorkflowJobs.repositoryId, repositoryId))
+          .orderBy(desc(relayWorkflowJobs.createdAt))
+          .limit(100),
+      ),
+    pageJobs: Effect.fn("Workflows.pageJobs")(function* (
+      repositoryId: string,
+      query: WorkflowJobPageQuery,
+    ): Effect.fn.Return<WorkflowJobPage, WorkflowPersistenceError | WorkflowInvalidError> {
+      const cursor =
+        query.cursor === undefined
+          ? null
+          : yield* decodeCursor(query.cursor).pipe(
+              Effect.mapError(
+                () =>
+                  new WorkflowInvalidError({
+                    message: "Invalid run-list cursor. Refresh the list.",
+                  }),
+              ),
+            );
+      if (cursor && (cursor.repositoryId !== repositoryId || cursor.view !== query.view))
+        return yield* new WorkflowInvalidError({
+          message: "This cursor belongs to a different run list. Refresh the list.",
+        });
+      const jobs = relayWorkflowJobs;
+      const history = query.view === "history";
+      const limit = query.limit ?? 50;
+      const rows = yield* persist(
+        db
+          .select({ summary: jobs.summary })
+          .from(jobs)
+          .where(
+            and(
+              eq(jobs.repositoryId, repositoryId),
+              history
+                ? sql`${jobs.status} IN ('done','cancelled','failed')`
+                : sql`${jobs.status} NOT IN ('done','cancelled','failed')`,
+              query.view === "attention"
+                ? sql`${jobs.summary}->>'needsAttention' = 'true'`
+                : undefined,
+              cursor
+                ? history
+                  ? sql`(${jobs.createdAt}, ${jobs.jobId}) < (${cursor.createdAt}, ${cursor.jobId})`
+                  : sql`(${jobs.createdAt}, ${jobs.jobId}) > (${cursor.createdAt}, ${cursor.jobId})`
+                : undefined,
+            ),
+          )
+          .orderBy(
+            history ? desc(jobs.createdAt) : asc(jobs.createdAt),
+            history ? desc(jobs.jobId) : asc(jobs.jobId),
+          )
+          .limit(limit + 1),
+      );
+      const page = rows.slice(0, limit).map((row) => row.summary);
+      const last = page.at(-1);
+      return {
+        jobs: page,
+        nextCursor:
+          rows.length > limit && last
+            ? encodeCursor({
+                version: 1,
+                repositoryId,
+                view: query.view,
+                createdAt: last.createdAt,
+                jobId: last.jobId,
+              })
+            : null,
+      };
+    }),
+    pendingJobs: (scope: WorkflowDispatchScope = {}) =>
+      persist(
+        db
+          .select()
+          .from(relayWorkflowJobs)
+          .where(
+            and(
+              scope.occurrenceId
+                ? sql`${relayWorkflowJobs.jobId} IN (SELECT job_id FROM relay_workflow_admissions WHERE occurrence_id=${scope.occurrenceId})`
+                : undefined,
+              scope.connectionId
+                ? sql`${relayWorkflowJobs.jobId} IN (SELECT job_id FROM relay_workflow_admissions WHERE connection_id=${scope.connectionId})`
+                : undefined,
+              scope.environmentId
+                ? sql`(${relayWorkflowJobs.record}->>'environmentId'=${scope.environmentId} OR (${relayWorkflowJobs.record}->'workflow'='null'::jsonb AND ${relayWorkflowJobs.record}->>'workflowId' IN (SELECT workflow_id FROM relay_repository_workflows WHERE record#>>'{definition,environmentId}'=${scope.environmentId})))`
+                : undefined,
+              sql`(${relayWorkflowJobs.pendingControl} IS NOT NULL OR ${relayWorkflowJobs.record}->'workflow'<>'null'::jsonb OR COALESCE((${relayWorkflowJobs.record}#>>'{queueReason,retryAt}')::double precision,0)<=extract(epoch FROM clock_timestamp())*1000)`,
+              inArray(relayWorkflowJobs.status, [
+                "queued",
+                "dispatching",
+                "preparing",
+                "running",
+                "awaiting_review",
+                "awaiting_input",
+                "waiting_capacity",
+                "finishing",
+                "paused",
+                "cancelling",
+              ]),
+            ),
+          )
+          .orderBy(asc(relayWorkflowJobs.checkedAt), asc(relayWorkflowJobs.createdAt))
+          .limit(100),
+      ),
+    /** A cross-instance lease pins an offered snapshot until acceptance is reconciled. */
+    claim: Effect.fn("Workflows.claim")(function* (jobId: string) {
+      // Database time also governs lease-fenced writes; relay clocks may differ.
+      const rows = yield* persist(
+        db
+          .update(relayWorkflowJobs)
+          .set({
+            leaseUntil: sql`to_char((clock_timestamp() + interval '30 seconds') AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`,
+            checkedAt: sql`to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`,
+          })
+          .where(
+            and(
+              eq(relayWorkflowJobs.jobId, jobId),
+              or(
+                isNull(relayWorkflowJobs.leaseUntil),
+                sql`${relayWorkflowJobs.leaseUntil}::timestamptz <= clock_timestamp()`,
+              ),
+            ),
+          )
+          .returning(),
+      );
+      const row: WorkflowJobRecord | null = rows[0] ?? null;
+      return row;
+    }),
+    updateJob: Effect.fn("Workflows.updateJob")(function* (
+      previous: WorkflowJobRecord,
+      record: RepositoryWorkflowJob,
+      pendingControl = previous.pendingControl,
+      releaseLease = true,
+      expectedLease?: string,
+    ) {
+      if (isTerminalWorkflowJob(previous.record.status)) return previous;
+      record = yield* persist(
+        Effect.try(() => {
+          const saved = validateOrigin(previous);
+          const next = validateOrigin(previous, record);
+          if (!sameWorkflowOrigin(saved.origin, next.origin))
+            throw new Error("Workflow origin is immutable.");
+          return next;
+        }),
+      );
+      const rows = yield* persist(
+        db
+          .update(relayWorkflowJobs)
+          .set({
+            record,
+            status: record.status,
+            repositoryCanonicalKey: previous.repositoryCanonicalKey,
+            pendingControl,
+            revision: previous.revision + 1,
+            ...(releaseLease ? { leaseUntil: null } : {}),
+          })
+          .where(
+            and(
+              eq(relayWorkflowJobs.jobId, previous.jobId),
+              eq(relayWorkflowJobs.revision, previous.revision),
+              ...(expectedLease === undefined
+                ? []
+                : [
+                    eq(relayWorkflowJobs.leaseUntil, expectedLease),
+                    sql`${relayWorkflowJobs.leaseUntil}::timestamptz > clock_timestamp()`,
+                  ]),
+            ),
+          )
+          .returning(),
+      );
+      if (rows.length === 0)
+        return yield* new WorkflowConflictError({
+          message: "The job changed. Refresh its current state.",
+        });
+      const row: WorkflowJobRecord = rows[0]!;
+      return row;
+    }),
+    release: (jobId: string, leaseUntil: string) =>
+      persist(
+        db
+          .update(relayWorkflowJobs)
+          .set({ leaseUntil: null })
+          .where(
+            and(eq(relayWorkflowJobs.jobId, jobId), eq(relayWorkflowJobs.leaseUntil, leaseUntil)),
+          ),
+      ).pipe(Effect.asVoid),
+  };
+});
+export class Workflows extends Context.Service<Workflows, Effect.Success<typeof make>>()(
+  "launchpad-relay/jobs/Workflows",
+) {}
+export const layer = Layer.effect(Workflows, make);

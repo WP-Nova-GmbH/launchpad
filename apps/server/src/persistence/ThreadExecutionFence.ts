@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodePath from "node:path";
 import type { OrchestrationCommand } from "@t3tools/contracts";
+import { assertWorkflowThreadReleased } from "./WorkflowThreadOwnership.ts";
 import { assertThreadTransferRuntime } from "./ThreadTransferRuntime.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -92,6 +93,9 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
   const prepare = Effect.fn("ThreadExecutionFence.prepare")(function* (input: Enrollment) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
+        yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+          Effect.mapError((error) => fail(input.threadId, error.message)),
+        );
         const prior = yield* get(input.threadId);
         if (prior) {
           if (prior.relayUrl !== input.relayUrl || prior.environmentId !== input.environmentId)
@@ -141,6 +145,9 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
   const activate = Effect.fn("ThreadExecutionFence.activate")(function* (input: Operation) {
     yield* sql.withTransaction(
       Effect.gen(function* () {
+        yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+          Effect.mapError((error) => fail(input.threadId, error.message)),
+        );
         const row = yield* operation(input);
         if (row.phase === "active") return;
         if (row.phase !== "frozen" && row.phase !== "draining")
@@ -184,6 +191,9 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
   ) {
     yield* sql.withTransaction(
       Effect.gen(function* () {
+        yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+          Effect.mapError((error) => fail(input.threadId, error.message)),
+        );
         const row = yield* current(input);
         if (row.phase !== "active") {
           if (
@@ -206,6 +216,9 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
   const freeze = Effect.fn("ThreadExecutionFence.freeze")(function* (input: Operation) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
+        yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+          Effect.mapError((error) => fail(input.threadId, error.message)),
+        );
         const row = yield* operation(input);
         if (row.phase === "frozen" && row.frozenSequence !== null) return row.frozenSequence;
         if (row.phase !== "draining")

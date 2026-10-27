@@ -41,6 +41,12 @@ const harness = Effect.fnUntraced(function* (
   fetchFn: typeof fetch,
   initial: ReadonlyArray<ConnectionCatalogEntry> = [],
   expectedPlacement?: { environmentId: EnvironmentId; generation: number },
+  workflowResult?: {
+    accountId: string;
+    organizationId: string;
+    repositoryId: string;
+    originalEnvironmentId: EnvironmentId;
+  },
 ) {
   const registry = AtomRegistry.make();
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
@@ -65,7 +71,12 @@ const harness = Effect.fnUntraced(function* (
       }),
   };
   const open = openPortableThreadChat(
-    { threadId, title: "Private work", ...(expectedPlacement ? { expectedPlacement } : {}) },
+    {
+      threadId,
+      title: "Private work",
+      ...(expectedPlacement ? { expectedPlacement } : {}),
+      ...(workflowResult ? { workflowResult } : {}),
+    },
     registry,
     connections,
   ).pipe(
@@ -237,3 +248,74 @@ describe("explicit saved-thread chat connection", () => {
     ),
   );
 });
+
+const workflowResult = {
+  accountId: "owner",
+  organizationId: "org",
+  repositoryId: "repo",
+  originalEnvironmentId: EnvironmentId.make("original-machine"),
+};
+it.effect("opens a moved workflow result at its verified current environment", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const h = yield* harness(respond, [], undefined, workflowResult);
+      expect(yield* h.open).toEqual({ environmentId, threadId });
+    }),
+  ),
+);
+it.effect(
+  "keeps an unmoved workflow result on its original machine only after a definite missing placement",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(
+          async () =>
+            Response.json(
+              {
+                _tag: "RelayTenancyNotFoundError",
+                code: "tenancy_not_found",
+                reason: "thread_not_found",
+                traceId: "trace",
+              },
+              { status: 404 },
+            ),
+          [],
+          undefined,
+          workflowResult,
+        );
+        expect(yield* h.open).toEqual({
+          environmentId: workflowResult.originalEnvironmentId,
+          threadId,
+        });
+        expect(h.registered).toEqual([]);
+      }),
+    ),
+);
+it.effect(
+  "does not fall back on connection failures or follow a workflow result into another repository",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const fetchFn of [
+          async () => {
+            throw new Error("Offline");
+          },
+          async () => Response.json({ ...placement, repositoryId: "other-repo" }),
+          async () =>
+            Response.json(
+              {
+                _tag: "RelayTenancyForbiddenError",
+                code: "tenancy_forbidden",
+                reason: "no_repository_access",
+                traceId: "trace",
+              },
+              { status: 403 },
+            ),
+        ] satisfies Array<typeof fetch>) {
+          const h = yield* harness(fetchFn, [], undefined, workflowResult);
+          expect((yield* Effect.result(h.open))._tag).toBe("Failure");
+          expect(h.registered).toEqual([]);
+        }
+      }),
+    ),
+);

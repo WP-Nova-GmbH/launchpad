@@ -25,9 +25,11 @@ import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { RunRepositoryWorkflow, WorkflowAgentStep } from "@t3tools/contracts/workflows";
 
 import type { OrchestrationEngineShape } from "../orchestration/Services/OrchestrationEngine.ts";
 import type { TextGeneration } from "../textGeneration/TextGeneration.ts";
@@ -42,6 +44,13 @@ export const SUPERVISOR_VERDICT_ACTIVITY_KIND = "job.supervisor.verdict";
 export type SupervisorVerdict = "approve" | "deny" | "escalate";
 
 const decodeApprovalPayload = Schema.decodeUnknownEffect(ApprovalRequestedActivityPayload);
+const decodeWorkflowTask = Schema.decodeUnknownOption(
+  Schema.Struct({
+    stepInstruction: WorkflowAgentStep.fields.instruction,
+    jobContext: RunRepositoryWorkflow.fields.instruction,
+    reviewConstraint: Schema.String.check(Schema.isMaxLength(1_000)),
+  }),
+);
 
 function isApprovalRequested(
   event: OrchestrationEvent,
@@ -71,14 +80,21 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
   readonly threadId: ThreadId;
   readonly stepInstruction: string;
   readonly cwd: string;
+  readonly resolveCwd?: Effect.Effect<string | null>;
+  readonly jobContext?: string | undefined;
+  readonly reviewConstraint?: string | undefined;
   readonly modelSelection: ModelSelection;
+  readonly replayEvents?: Stream.Stream<OrchestrationEvent>;
+  readonly liveEvents?: Stream.Stream<OrchestrationEvent>;
+  readonly resolvedRequestIds?: ReadonlySet<string>;
+  readonly recordedVerdicts?: ReadonlyMap<string, SupervisorVerdict>;
 }) {
   const { engine, textGeneration, crypto, threadId, stepInstruction, cwd, modelSelection } = input;
 
   // The engine republishes persisted events after a dispatch failure, so the
   // same request can arrive twice. Answering twice would mean a second model
   // call and a second response to a request already settled.
-  const answered = new Set<string>();
+  const answered = new Set(input.resolvedRequestIds);
 
   const commandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(
@@ -128,7 +144,10 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
     // marks the pending-approval projection resolved.
     yield* engine.dispatch({
       type: "thread.approval.respond",
-      commandId: yield* commandId("respond"),
+      commandId:
+        input.replayEvents === undefined
+          ? yield* commandId("respond")
+          : CommandId.make(`server:supervisor:${threadId}:${requestId}:respond`),
       threadId,
       requestId,
       decision,
@@ -158,6 +177,12 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
     }
     answered.add(requestId);
 
+    const recorded = input.recordedVerdicts?.get(requestId);
+    if (recorded !== undefined) {
+      if (recorded !== "escalate")
+        yield* respond(requestId, recorded === "approve" ? "accept" : "decline");
+      return;
+    }
     const disposition = classifyApprovalRequest({ requestType, detail });
 
     // The verdict is always recorded before it is acted on, so "why did the
@@ -186,13 +211,30 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
       return;
     }
 
+    const actualCwd = input.resolveCwd ? yield* input.resolveCwd : cwd;
+    const validTask = input.jobContext === undefined || Option.isSome(decodeWorkflowTask(input));
+    if (!actualCwd || !validTask) {
+      yield* recordVerdict({
+        requestId,
+        requestType,
+        verdict: "escalate",
+        reasoning: !actualCwd
+          ? "The job's prepared workspace is unavailable."
+          : "The saved workflow task is invalid or exceeds its supported length.",
+        consultedModel: false,
+      });
+      return;
+    }
     const generated = yield* textGeneration
       .generateApprovalVerdict({
-        cwd,
+        cwd: actualCwd,
         toolKind: disposition.toolKind,
         requestType: requestType ?? "unknown",
         ...(detail === undefined ? {} : { requestDetail: detail }),
         stepInstruction,
+        ...(input.jobContext === undefined
+          ? {}
+          : { jobContext: input.jobContext, reviewConstraint: input.reviewConstraint }),
         modelSelection,
       })
       .pipe(Effect.option);
@@ -230,8 +272,15 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
     yield* respond(requestId, verdict === "approve" ? "accept" : "decline");
   });
 
+  const events =
+    input.replayEvents === undefined
+      ? engine.streamDomainEvents
+      : Stream.concat(
+          input.replayEvents,
+          input.liveEvents ?? (yield* engine.subscribeDomainEvents),
+        );
   yield* Effect.forkScoped(
-    Stream.runForEach(engine.streamDomainEvents, (event) =>
+    Stream.runForEach(events, (event) =>
       isApprovalRequested(event, threadId)
         ? handle(event).pipe(
             Effect.catchCause((cause) =>
@@ -253,4 +302,8 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
   readonly stepInstruction: string;
   readonly cwd: string;
   readonly modelSelection: ModelSelection;
+  readonly replayEvents?: Stream.Stream<OrchestrationEvent>;
+  readonly liveEvents?: Stream.Stream<OrchestrationEvent>;
+  readonly resolvedRequestIds?: ReadonlySet<string>;
+  readonly recordedVerdicts?: ReadonlyMap<string, SupervisorVerdict>;
 }) => Effect.Effect<void, never, Scope.Scope>;

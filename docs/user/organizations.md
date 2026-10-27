@@ -127,6 +127,99 @@ checkout — a repository the organization has not registered is simply not gove
 What the organization does govern is work it runs for you: starting a job against a repository that
 _is_ registered requires a role on that repository.
 
+## Workflow sources
+
+When Linear workflow connections are available on your relay, open **Settings → Connections →
+Workflow sources** to connect your workspace. This is separate from your personal issue-tracker
+connection in the composer. Only the connection owner can allow new repository use, and only for
+repositories they maintain or administer. Other repository maintainers can inspect granted sources
+and withdraw their repository's use. **Workflow sources** in the repository workflow view opens
+that repository's access management, including when it has no saved workflows.
+
+Reconnect uses the same Linear workspace and preserves existing repository consent. Connect a
+separate source for a different workspace. Withdrawing access requires fresh owner consent before
+it can be used again. Disconnect removes Launchpad's stored authorization; it does not cancel
+Starting or running work. Use the run's Cancel action to stop that work.
+
+Automatic Linear triggers require relay support and verified event delivery for the selected team. Rollout of automatic execution depends on the relay’s available integration. Mobile shows source health; configure sources and triggers in the web or desktop app. If the service configuration needs attention,
+retry after the relay operator repairs it rather than reconnecting your account.
+
+## Repository workflows
+
+Maintainers and admins can create workflows from **Workflows** in the sidebar or command palette.
+Choose a repository; **Settings → Organization → Repositories → Manage workflows** opens the same view. Choose an enrolled organization machine and a project for that repository,
+then add and order Agent, Review, Input, Push branch, and Open PR steps. Human zones show where work waits for a
+response. Each checkpoint can require a repository maintainer or allow anyone with repository
+access; Review defaults to maintainers and Input defaults to all repository members. Agent steps
+can choose a Codex or Claude model on that machine or use the project's default. All Agent steps
+in a job must use compatible providers of the same kind so they can share the conversation.
+Model changes are available when that provider supports them. If its configuration becomes
+incompatible during a job, cancel the job and run it again after correcting the workflow.
+
+Start with **Agent → Review** or **Reviewed implementation → PR** from **Use template**, or build your own sequence. **Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy; choose a destination checkout if more than one is available. Copies start with automatic triggering Off and no trigger.
+
+**Push branch** commits the saved result, including normal commit hooks, and pushes the job's branch. **Open PR** opens a PR against the base selected when the job was accepted; it requires a Push after the latest Agent step. Add Review before publishing when human approval is wanted. Workflows without publishing steps keep changes local. Publishing requires an updated Linux or macOS executor; PR publishing currently supports GitHub. Other forges are rejected before the run starts.
+
+Anyone with repository access can run a workflow with a description of the task and inspect the
+shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own
+worktree and one shared agent conversation. Inspect the saved result and diff before approving a
+Review. Answer an Input checkpoint to supply context for later steps. Responses are retained as
+history, and response drafts remain available while waiting for the machine to acknowledge them. Leaving an editor with unsaved changes asks whether to keep editing or discard and leave. Discard removes local edits; a Save already submitted may still complete. Save errors retain edits; Retry checks the saved version before submitting again. Reloading or restarting the app does not restore unsaved drafts.
+
+When automatic triggering is available on your relay, open **Trigger settings** in the editor. Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected status. Optional labels must all match. You can connect Linear and allow repository use from the editor without leaving your draft. Enabling requires verified event delivery for that exact team and a validated execution target. Save applies the rule and its On/Off setting; changed rules apply only to events after Save. The catalog shows the saved state and any source or target problem. Turning On without a trigger opens setup; turning Off stops new event admissions and preserves existing jobs and manual Run. Archive disables automation, and restore leaves it Off. Automatic execution depends on your relay’s available integration and rollout; configuring a trigger alone does not confirm that a job has started.
+
+Before an automatic job is handed to its environment, Launchpad reads the issue’s current title,
+description, status and labels. Comments and images are excluded. The run keeps those details even
+if the issue changes later; open **Issue details** on the run to inspect what it used. Later team,
+status or label changes do not cancel a job already created by an event. Offline or busy environments
+leave jobs queued. If issue context exceeds 32,000 characters including its metadata, shorten the
+description and refresh the run; Launchpad does not start with truncated requirements. Source or
+issue access problems keep the job queued with recovery guidance. Disconnecting a source prevents
+new handoffs; work already marked Starting may continue. Use Cancel run to stop existing work.
+
+**Runs** opens with active jobs, oldest first, including jobs from archived workflows. Use
+**Needs attention** to find human checkpoints, pauses and blocked jobs, or **History** for completed
+runs, newest first. Load more runs to reach older history or further active jobs. Refresh starts from
+the first page and picks up status changes. If starting a run loses its reply, check active runs
+before explicitly starting another; it may create an additional job.
+
+Runs marked **Started by workflow** and their automatic prompts identify the workflow that
+started them. Human checkpoint responses still identify the person who responded.
+
+Request changes sends feedback to the Review's chosen earlier Agent step in the same worktree.
+Earlier inputs and results remain valid; later steps run again and need fresh human responses.
+Rework retains the files already prepared rather than restoring an older copy. Setup and background
+previews remain available through intermediate checkpoints and rework, without running setup again.
+At completion, the job stops setup and checks the final saved result before releasing the worktree.
+If cleanup or completion fails, use **Retry approval** or **Retry completion** when offered. Confirmed
+cleanup is reused. Rework keeps using the same published branch and PR. A closed or merged PR needs attention; the job will not open a replacement.
+
+If publishing loses a reply, use **Retry publishing action** when offered. The job checks the saved commit, remote branch, and PR before attempting more work. An uncertain PR creation may remain paused if its identity cannot be confirmed. Cancellation cannot undo an existing push or PR.
+
+Archive workflows to prevent new runs without deleting their history. Already accepted runs continue with their saved definition; queued jobs wait for restore or cancellation. Restore requires a valid execution target.
+
+Maintainers can pause an accepted job from its job view. The current automatic step, including Agent
+preparation or publishing, finishes before the pause takes effect; later steps wait. Setup and previews stay
+running. Resume before answering checkpoints or retrying work. Resume preserves unanswered
+checkpoints and any failure requiring recovery. Requests saved while a machine is offline remain
+pending until it acknowledges them. Queued jobs and jobs on older machines do not offer Pause.
+
+Maintainers can cancel jobs or explicitly retry failed preparation. Cancellation stays pending
+until the machine confirms that work stopped; prepared files and history are retained. Review
+protects the saved result from ordinary chat and git changes until approval or cancellation.
+If stopping fails or is interrupted by a restart, use **Retry cancellation** to finish stopping
+the job. Uncertain prompt delivery pauses the job; cancel it before starting again. Cancellation
+also dismisses that uncertain delivery. If setup ownership has been lost, the job keeps its workspace.
+When the recovery message asks for a host restart, restart the executor machine and retry cleanup;
+restarting Launchpad alone is insufficient. Automatic host-restart recovery is unavailable on Windows.
+
+Automatic cleanup covers ordinary setup programs and background previews. Projects must arrange
+cleanup for Docker containers, system services, and other independently managed services.
+
+On mobile, open **Settings → Workflow jobs** to inspect a job, answer checkpoints, approve results,
+request changes, open the PR, retry publishing, pause, resume, or cancel. Workflow creation
+and manual Run are available on web and desktop.
+
 ## Machines
 
 Machines are existing computers an admin connects to the organization. Every member can see

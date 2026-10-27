@@ -1,3 +1,4 @@
+import { assertWorkflowThreadReleased } from "../persistence/WorkflowThreadOwnership.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   CommandId,
@@ -128,6 +129,9 @@ export const makeThreadLocalEnrollmentWorker = Effect.fn("ThreadLocalEnrollmentW
             threadId,
             "Register this repository with your relay before moving its thread.",
           );
+        yield* assertWorkflowThreadReleased(sql, threadId).pipe(
+          Effect.mapError((error) => fail(threadId, error.message)),
+        );
         if (head.state === "pending")
           yield* engine.dispatch({
             type: "thread.move.claim",
@@ -140,6 +144,9 @@ export const makeThreadLocalEnrollmentWorker = Effect.fn("ThreadLocalEnrollmentW
           });
         yield* sql.withTransaction(
           Effect.gen(function* () {
+            yield* assertWorkflowThreadReleased(sql, threadId).pipe(
+              Effect.mapError((error) => fail(threadId, error.message)),
+            );
             if (!(yield* idle(threadId)))
               return yield* fail(
                 threadId,
@@ -248,6 +255,9 @@ export const makeThreadLocalEnrollmentWorker = Effect.fn("ThreadLocalEnrollmentW
           return false;
         }
       }
+      yield* assertWorkflowThreadReleased(sql, threadId).pipe(
+        Effect.mapError((error) => fail(threadId, error.message)),
+      );
       const prepared = yield* transport.prepare(owner, request);
       if (
         prepared.operationId !== intent.operationId ||

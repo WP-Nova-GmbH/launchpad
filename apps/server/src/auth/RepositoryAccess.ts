@@ -47,9 +47,19 @@ const StoredPolicy = Schema.Struct({
 const decodeStored = Schema.decodeUnknownSync(Schema.fromJsonString(StoredPolicy));
 const encodeStored = Schema.encodeSync(Schema.fromJsonString(StoredPolicy));
 
+export interface WorkflowProjectBinding {
+  readonly organizationId: string;
+  readonly repositoryId: string;
+  readonly projectId: ProjectId;
+  readonly repositoryCanonicalKey: string;
+}
 export interface RepositoryAccessShape {
   /** When present, even another thread in the same project is outside the audience. */
   readonly threadId?: ThreadId;
+  /** Internal execution only. Callers supply a verified dispatch or a durable accepted run. */
+  readonly requireWorkflowProject: (
+    binding: WorkflowProjectBinding,
+  ) => Effect.Effect<void, EnvironmentAuthorizationError>;
   readonly status: Effect.Effect<{
     readonly enabled: boolean;
     readonly ready: boolean;
@@ -98,6 +108,7 @@ export class RepositoryAccess extends Context.Reference<RepositoryAccessShape>(
   {
     defaultValue: (): RepositoryAccessShape => ({
       status: Effect.succeed({ enabled: false, ready: true, revision: 0 }),
+      requireWorkflowProject: () => Effect.fail(denied()),
       requireMember: () => Effect.void,
       projectIds: () => Effect.undefined,
       requireProject: () => Effect.void,
@@ -260,6 +271,33 @@ export const make = Effect.gen(function* () {
         revision: stored.policy?.revision ?? 0,
       })),
     ),
+    requireWorkflowProject: Effect.fn("RepositoryAccess.requireWorkflowProject")(
+      function* (binding) {
+        const org = yield* organizationId;
+        if (!ready || org !== binding.organizationId || stored.policy?.organizationId !== org)
+          return yield* denied();
+        const project = yield* query.getProjectShellById(binding.projectId).pipe(Effect.orDie);
+        const repository = stored.policy.repositories.find(
+          (entry) => entry.repositoryId === binding.repositoryId,
+        );
+        if (
+          Option.isNone(project) ||
+          !repository ||
+          project.value.repositoryIdentity?.canonicalKey !== binding.repositoryCanonicalKey ||
+          !repository.canonicalKeys.includes(binding.repositoryCanonicalKey) ||
+          (stored.bindings[binding.projectId] !== undefined &&
+            stored.bindings[binding.projectId] !== binding.repositoryId)
+        )
+          return yield* denied();
+        if (stored.bindings[binding.projectId] === undefined) {
+          stored = {
+            ...stored,
+            bindings: { ...stored.bindings, [binding.projectId]: binding.repositoryId },
+          };
+          yield* persist();
+        }
+      },
+    ),
     requireMember: (actor) => member(actor).pipe(Effect.asVoid),
     projectIds,
     requireProject,
@@ -404,6 +442,10 @@ export function stampCommandAuthor(
   command: OrchestrationCommand,
   actor: RepositoryActor,
 ): OrchestrationCommand {
+  if ("workflowOrigin" in command) {
+    const { workflowOrigin: _workflowOrigin, ...rest } = command;
+    command = rest;
+  }
   if (
     command.type === "thread.turn.start" ||
     command.type === "thread.message.user.append" ||

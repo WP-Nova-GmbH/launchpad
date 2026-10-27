@@ -1,3 +1,4 @@
+import { assertWorkflowThreadReleased } from "../persistence/WorkflowThreadOwnership.ts";
 import {
   assertThreadTransferRuntime,
   ThreadTransferNativeRuntime as NativeRuntime,
@@ -56,6 +57,9 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
     readonly manifestSha256: string;
   }) {
     const sql = yield* SqlClient.SqlClient;
+    yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+      Effect.mapError((error) => fail(error.message)),
+    );
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const claims = makeThreadCheckoutClaims(sql);

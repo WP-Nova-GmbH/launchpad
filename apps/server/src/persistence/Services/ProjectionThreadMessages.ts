@@ -8,6 +8,7 @@
  */
 import {
   AuthSessionUser,
+  WorkflowAttribution,
   ChatAttachment,
   MessageId,
   OrchestrationMessageContext,
@@ -34,6 +35,7 @@ export const ProjectionThreadMessage = Schema.Struct({
   context: Schema.optional(OrchestrationMessageContext),
   isStreaming: Schema.Boolean,
   author: Schema.optional(AuthSessionUser),
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   editedBy: Schema.optional(AuthSessionUser),
   steeredBy: Schema.optional(AuthSessionUser),
   createdAt: IsoDateTime,

@@ -23,6 +23,10 @@ import { threadEnvironmentApi } from "./http/ThreadEnvironmentApi.ts";
 import { threadCommandsApi } from "./http/ThreadCommandsApi.ts";
 import { threadHistoryApi } from "./http/ThreadHistoryApi.ts";
 import { threadVmPolicyApi } from "./http/ThreadVmPolicyApi.ts";
+
+import * as AutomaticOffers from "./workflowEvents/AutomaticOffer.ts";
+import * as WorkflowWake from "./jobs/WorkflowWake.ts";
+import { workflowEventsRoute } from "./http/WorkflowEventsRoute.ts";
 import { repositoryAccessServerApi } from "./http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "./tenancy/RepositoryPolicies.ts";
 import * as Alchemy from "alchemy";
@@ -72,6 +76,7 @@ import { organizationSkillsServerApi } from "./http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "./http/IssueTrackersApi.ts";
 import { turnAuthLayer } from "./issueTrackers/TurnAuthorization.ts";
+import { workflowSourcesApi, workflowSourceCallbackRoute } from "./http/WorkflowSourcesApi.ts";
 import { issueTrackerCallbackRoute } from "./http/IssueTrackerCallbackRoute.ts";
 import * as IssueTrackerConnectionStore from "./issueTrackers/ConnectionStore.ts";
 import * as IssueTrackerWriteOperationStore from "./issueTrackers/WriteOperationStore.ts";
@@ -87,6 +92,9 @@ import * as RelayTokens from "./auth/RelayTokens.ts";
 import * as EnvironmentCredentials from "./environments/EnvironmentCredentials.ts";
 import * as EnvironmentLinks from "./environments/EnvironmentLinks.ts";
 import * as Jobs from "./jobs/Jobs.ts";
+import * as Workflows from "./jobs/Workflows.ts";
+import { workflowsApi } from "./http/WorkflowsApi.ts";
+import { deliverPendingWorkflowJobs } from "./jobs/WorkflowDispatcher.ts";
 import * as ManagedEndpointAllocations from "./environments/ManagedEndpointAllocations.ts";
 import * as LiveActivities from "./agentActivity/LiveActivities.ts";
 import * as RelayDb from "./db.ts";
@@ -177,12 +185,14 @@ const relayApiLayer = Layer.mergeAll(
   tokenApi,
   dpopClientApi,
   jobsApi,
+  workflowsApi,
   serverApi,
   projectCatalogServerApi,
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
   issueTrackersApi,
+  workflowSourcesApi,
   issueTrackersServerApi,
   organizationSkillsServerApi,
   executorReleaseServerApi,
@@ -253,6 +263,19 @@ export const ApiLive = Api.make(
     const axiomTracesEndpoint = yield* observability.traces.otelTracesEndpoint;
 
     // Optional: a deployment without a GitHub App simply hides the surface.
+    const linearClientId = yield* Config.String("LINEAR_WORKFLOW_CLIENT_ID").pipe(Config.option);
+    const linearWebhookSecret = yield* Config.Redacted("LINEAR_WORKFLOW_WEBHOOK_SECRET").pipe(
+      Config.option,
+    );
+    const linearWebhookGeneration = yield* Config.String("LINEAR_WORKFLOW_WEBHOOK_GENERATION").pipe(
+      Config.option,
+    );
+    const linearAdmissionEnabled = yield* Config.Boolean("LINEAR_WORKFLOW_ADMISSION_ENABLED").pipe(
+      Config.withDefault(false),
+    );
+    const linearClientSecret = yield* Config.Redacted("LINEAR_WORKFLOW_CLIENT_SECRET").pipe(
+      Config.option,
+    );
     const githubAppId = yield* Config.String("GITHUB_APP_ID").pipe(Config.option);
     const githubAppSlug = yield* Config.String("GITHUB_APP_SLUG").pipe(Config.option);
     const githubAppPrivateKey = yield* Config.Redacted("GITHUB_APP_PRIVATE_KEY").pipe(
@@ -301,6 +324,22 @@ export const ApiLive = Api.make(
         clerkJwtAudience,
         cloudMintPrivateKey: yield* cloudMintPrivateKey,
         cloudMintPublicKey: yield* cloudMintPublicKey,
+        linearWorkflowWebhook: RelayConfiguration.workflowWebhookConfiguration(
+          Option.getOrUndefined(linearClientId),
+          Option.getOrUndefined(linearWebhookSecret),
+          Option.getOrUndefined(linearWebhookGeneration),
+          linearAdmissionEnabled,
+        ),
+        linearWorkflow:
+          Option.isSome(linearClientId) && linearClientId.value.trim()
+            ? {
+                clientId: linearClientId.value.trim(),
+                ...(Option.isSome(linearClientSecret) &&
+                Redacted.value(linearClientSecret.value).trim()
+                  ? { clientSecret: linearClientSecret.value }
+                  : {}),
+              }
+            : undefined,
         github:
           Option.isSome(githubAppId) &&
           Option.isSome(githubAppSlug) &&
@@ -326,7 +365,11 @@ export const ApiLive = Api.make(
       }).pipe(Effect.map(makeRelayTraceLayer)),
     );
 
-    const runtimeLayer = Layer.succeed(ThreadVmRuntimeConfiguration, { settings: threadVmSettings })
+    const runtimeLayer = Layer.merge(
+      WorkflowWake.layer,
+      Layer.succeed(ThreadVmRuntimeConfiguration, { settings: threadVmSettings }),
+    )
+      .pipe(Layer.provideMerge(AutomaticOffers.layer))
       .pipe(
         Layer.provideMerge(MobileRegistrations.layer),
         Layer.provideMerge(AgentActivityPublisher.layer),
@@ -377,6 +420,7 @@ export const ApiLive = Api.make(
           Layer.mergeAll(
             AgentActivityRows.layer,
             Jobs.layer,
+            Workflows.layer,
             Organizations.layer,
             Invitations.layer,
             Repositories.layer,
@@ -554,6 +598,12 @@ export const ApiLive = Api.make(
       ),
     );
 
+    yield* Cloudflare.Workers.cron("* * * * *", () =>
+      deliverPendingWorkflowJobs().pipe(
+        Effect.ignoreCause({ log: true }),
+        Effect.provide(runtimeLayer),
+      ),
+    );
     yield* Cloudflare.Workers.cron("*/5 * * * *", () =>
       Effect.all(
         [
@@ -611,6 +661,8 @@ export const ApiLive = Api.make(
         relayDocsRedirectRoute,
         githubAppSetupRoutes.pipe(Layer.provide(runtimeLayer)),
         issueTrackerCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+        workflowSourceCallbackRoute.pipe(Layer.provide(runtimeLayer)),
+        workflowEventsRoute.pipe(Layer.provide(runtimeLayer)),
       ).pipe(
         Layer.provide([
           Etag.layerWeak,

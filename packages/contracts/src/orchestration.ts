@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { WorkflowAttribution } from "./workflowOrigin.ts";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Struct from "effect/Struct";
@@ -578,6 +579,7 @@ export const OrchestrationMessageRole = Schema.Literals([
 export type OrchestrationMessageRole = typeof OrchestrationMessageRole.Type;
 
 export const OrchestrationMessage = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   id: MessageId,
   role: OrchestrationMessageRole,
   text: Schema.String,
@@ -869,7 +871,9 @@ export const ThreadPreparation = Schema.Struct({
   originalCommandId: CommandId,
   attemptId: CommandId,
   revision: NonNegativeInt,
+  /** Ready allows delivery while an asynchronous setup command is still running. */
   state: Schema.Literals(["pending", "running", "ready", "failed"]),
+  /** Command completion/stop acknowledgement; an idle setup shell can still need closing. */
   settled: Schema.Boolean,
   recipe: Schema.NullOr(
     Schema.Struct({
@@ -911,6 +915,7 @@ export const ThreadPreparationSummary = Schema.Struct({
 });
 
 export const ThreadPromptPauseReason = Schema.Struct({
+  messageId: Schema.optional(MessageId),
   code: Schema.Literals([
     "stopped",
     "failed",
@@ -924,6 +929,7 @@ export type ThreadPromptPauseReason = typeof ThreadPromptPauseReason.Type;
 
 export const ThreadPromptQueueEntry = Schema.Struct({
   kind: Schema.optional(Schema.Literal("prompt")),
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   issueTrackerAuthorizationId: Schema.optional(Schema.String),
   messageId: MessageId,
   text: Schema.String,
@@ -1010,6 +1016,7 @@ export const ThreadPromptQueueSummary = Schema.Struct({
   pauseReason: Schema.NullOr(ThreadPromptPauseReason),
 });
 export const ThreadPromptQueueChangedPayload = Schema.Struct({
+  stopCommandId: Schema.optional(CommandId),
   preparation: Schema.optional(ThreadPreparation),
   threadId: ThreadId,
   entry: Schema.optional(ThreadQueueEntry),
@@ -1024,7 +1031,13 @@ export const ThreadPromptQueueChangedPayload = Schema.Struct({
 });
 export type ThreadPromptQueueChangedPayload = typeof ThreadPromptQueueChangedPayload.Type;
 
+export const ThreadWorkflowJob = Schema.Struct({
+  jobId: Schema.String,
+  repositoryId: Schema.String,
+  status: Schema.String,
+});
 export const OrchestrationThread = Schema.Struct({
+  workflowJob: Schema.optional(Schema.NullOr(ThreadWorkflowJob)),
   promptQueue: Schema.optional(ThreadPromptQueue),
   id: ThreadId,
   projectId: ProjectId,
@@ -1125,6 +1138,7 @@ export type ThreadRelayRouting = typeof ThreadRelayRouting.Type;
 
 export const OrchestrationThreadShell = Schema.Struct({
   relayRouting: Schema.optional(ThreadRelayRouting),
+  workflowJob: Schema.optional(Schema.NullOr(ThreadWorkflowJob)),
   promptQueueSummary: Schema.optional(ThreadPromptQueueSummary),
   id: ThreadId,
   projectId: ProjectId,
@@ -1557,6 +1571,7 @@ const PromptEnqueueFields = {
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
 };
 const ThreadPromptEnqueueCommand = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   type: Schema.Literal("thread.prompt.enqueue"),
   ...PromptEnqueueFields,
   message: Schema.Struct({ messageId: MessageId, ...PromptMessage.fields }),
@@ -1728,6 +1743,7 @@ const ThreadQueueFinalizeCommand = Schema.Struct({
 });
 
 export const ThreadTurnStartCommand = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   issueTrackerAuthorizationId: Schema.optional(Schema.String),
   type: Schema.Literal("thread.turn.start"),
   commandId: CommandId,
@@ -2042,6 +2058,7 @@ const ThreadHistoryImportCommand = Schema.Struct({
  * turn that follows references the same message id.
  */
 const ThreadMessageUserAppendCommand = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   author: Schema.optional(AuthSessionUser),
   type: Schema.Literal("thread.message.user.append"),
   commandId: CommandId,
@@ -2416,6 +2433,7 @@ export const ThreadInteractionModeSetPayload = Schema.Struct({
 });
 
 export const ThreadMessageSentPayload = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowAttribution),
   threadId: ThreadId,
   messageId: MessageId,
   role: OrchestrationMessageRole,

@@ -1,3 +1,4 @@
+import { RepositorySourcesButton } from "../workflows/WorkflowSources";
 import {
   BuildingIcon,
   CopyIcon,
@@ -27,6 +28,7 @@ import type {
 } from "@t3tools/contracts/relay";
 
 import { GitHubIcon } from "../Icons";
+import { Link } from "@tanstack/react-router";
 import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useProjects } from "../../state/entities";
@@ -548,6 +550,21 @@ function RepositoryRow({
             </Button>
           </div>
         ) : null}
+        <div className="flex flex-wrap gap-2 border-t pt-3">
+          {canConfigure ? <RepositorySourcesButton repositoryId={repositoryId} /> : null}
+          <Button
+            variant="outline"
+            render={
+              <Link
+                to="/workflows/$repositoryId"
+                params={{ repositoryId: entry.repository.repositoryId }}
+                search={{ tab: "workflows" }}
+              />
+            }
+          >
+            Manage workflows
+          </Button>
+        </div>
       </div>
     </SettingsRow>
   );

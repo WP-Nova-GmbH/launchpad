@@ -9,6 +9,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import { WorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
 import * as Option from "effect/Option";
 
 import {
@@ -130,6 +131,7 @@ export const authorizeOrchestrationCommand = Effect.fn("CommandReceiptAccess.aut
         requiredScope: AuthOrchestrationOperateScope,
       });
     }
+    yield* (yield* WorkflowRunStore).requireCommand(command);
     const access = yield* RepositoryAccess;
     if (!(yield* access.status).enabled) return yield* access.requireCommand(actor, command);
     yield* access.requireMember(actor);

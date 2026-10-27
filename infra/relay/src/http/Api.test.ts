@@ -1,6 +1,7 @@
 import * as UserDirectory from "../tenancy/UserDirectory.ts";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import {
+  WORKFLOW_LINEAR_CALLBACK_PATH,
   RelayClientAuth,
   RelayClientPrincipal,
   type RelayClientDeviceRecord,
@@ -1610,7 +1611,7 @@ describe("relay request tracing", () => {
       }),
   );
 
-  it.effect.each(["linear", "jira"])(
+  it.effect.each(["linear", "jira", "workflow-linear"])(
     "keeps %s callback credentials out of HTTP traces while the handler receives them",
     (service) =>
       Effect.gen(function* () {
@@ -1622,7 +1623,10 @@ describe("relay request tracing", () => {
             return span;
           },
         });
-        const callbackPath = `/v1/user/issue-trackers/${service}/callback`;
+        const callbackPath =
+          service === "workflow-linear"
+            ? WORKFLOW_LINEAR_CALLBACK_PATH
+            : `/v1/user/issue-trackers/${service}/callback`;
         const request = HttpServerRequest.fromWeb(
           new Request(`https://relay.test${callbackPath}?code=private-code&state=private-state`),
         );

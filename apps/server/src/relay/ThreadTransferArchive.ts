@@ -1,3 +1,4 @@
+import { assertWorkflowThreadReleased } from "../persistence/WorkflowThreadOwnership.ts";
 import { makeThreadTransferSource } from "./ThreadTransferSource.ts";
 import type { ProviderServiceShape } from "../provider/Services/ProviderService.ts";
 import { copyFrozenNativeCheckpoint } from "./ThreadFrozenNativeArchive.ts";
@@ -71,6 +72,9 @@ export function makeThreadTransferArchive(
     readonly native: { readonly codexHome: string; readonly rolloutPath: string } | null;
     readonly nativeCheckpointTurnId?: string;
   }) {
+    yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+      Effect.mapError((error) => fail(error.message)),
+    );
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const sessions = yield* ProviderSessionRuntimeRepository;

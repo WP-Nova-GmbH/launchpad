@@ -12,6 +12,8 @@ import {
   OrchestrationDispatchCommandError,
   type ThreadRelayRouting,
 } from "@t3tools/contracts";
+import { RelayTenancyNotFoundError } from "@t3tools/contracts/relay";
+import { ManagedRelayRequestFailedError } from "./managedRelay.ts";
 import type {
   RelayPortableThreadPlacement,
   RelayPortableThreadSummary,
@@ -532,7 +534,15 @@ type PortableThreadChatInput = {
   threadId: ThreadId;
   title: string;
   expectedPlacement?: { environmentId: EnvironmentId; generation: number };
+  workflowResult?: {
+    accountId: string;
+    organizationId: string;
+    repositoryId: string;
+    originalEnvironmentId: EnvironmentId;
+  };
 };
+const isRequestFailed = Schema.is(ManagedRelayRequestFailedError);
+const isNotFound = Schema.is(RelayTenancyNotFoundError);
 /** Explicit connection only: saved reads never call this or resume compute. */
 export const openPortableThreadChat = Effect.fnUntraced(function* (
   input: PortableThreadChatInput,
@@ -545,8 +555,29 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
     new OrchestrationDispatchCommandError({
       message: "Your account or this thread’s location changed. Refresh before opening chat.",
     });
+  if (input.workflowResult && input.workflowResult.accountId !== session.accountId)
+    return yield* changed();
   const auth = { clerkToken, threadId: input.threadId };
-  const placement = yield* relay.getPortableThreadPlacement(auth);
+  const placement = yield* relay.getPortableThreadPlacement(auth).pipe(
+    Effect.catchIf(
+      (error) =>
+        Boolean(input.workflowResult) &&
+        isRequestFailed(error) &&
+        isNotFound(error.cause) &&
+        error.cause.reason === "thread_not_found",
+      () => Effect.succeed(null),
+    ),
+  );
+  if (!currentAccount()) return yield* changed();
+  // An enrolled-machine workflow has no portable placement until its first move.
+  // Only an explicit missing record permits the immutable original location.
+  if (placement === null)
+    return { environmentId: input.workflowResult!.originalEnvironmentId, threadId: input.threadId };
+  const matchesRepository = (value: RelayPortableThreadPlacement) =>
+    !input.workflowResult ||
+    (value.organizationId === input.workflowResult.organizationId &&
+      value.repositoryId === input.workflowResult.repositoryId);
+  if (!matchesRepository(placement)) return yield* changed();
   if (
     !currentAccount() ||
     !isPortableThreadPlacementReadCurrent(
@@ -601,6 +632,7 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
       input.threadId,
       request,
     ) ||
+    !matchesRepository(latest) ||
     latest.threadId !== input.threadId ||
     latest.environmentId !== placement.environmentId ||
     latest.generation !== placement.generation ||

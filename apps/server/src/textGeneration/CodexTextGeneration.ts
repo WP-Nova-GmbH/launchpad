@@ -429,6 +429,8 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         requestType: input.requestType,
         requestDetail: input.requestDetail,
         stepInstruction: input.stepInstruction,
+        jobContext: input.jobContext,
+        reviewConstraint: input.reviewConstraint,
         policy: input.policy,
       });
 

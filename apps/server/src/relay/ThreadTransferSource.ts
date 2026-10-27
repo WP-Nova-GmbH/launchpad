@@ -1,3 +1,4 @@
+import { assertWorkflowThreadReleased } from "../persistence/WorkflowThreadOwnership.ts";
 import { ThreadId, TurnId, ThreadPromptQueue } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -41,6 +42,9 @@ export function makeThreadTransferSource(
   }) {
     const fail = (detail: string) =>
       new ThreadExecutionFenceError({ threadId: input.threadId, detail });
+    yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+      Effect.mapError((error) => fail(error.message)),
+    );
     const fence = yield* fences.get(input.threadId);
     if (
       !fence ||

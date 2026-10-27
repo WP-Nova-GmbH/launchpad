@@ -98,6 +98,42 @@ const claim = {
 };
 
 it.layer(NodeServices.layer)("shared prompt queue", (it) => {
+  it.effect(
+    "keeps workflow attribution from enqueue through admission without inventing an author",
+    () =>
+      Effect.gen(function* () {
+        const workflowOrigin = {
+          kind: "automation" as const,
+          jobId: "job",
+          workflowId: "flow",
+          workflowName: "Frozen name",
+        };
+        const original = enqueue("first");
+        let state = yield* apply(yield* readModelWithThread, {
+          ...original,
+          author: undefined,
+          workflowOrigin,
+        });
+        expect(
+          queue(state).entries[0]?.kind === "move"
+            ? undefined
+            : queue(state).entries.find((entry) => entry.kind !== "move")?.workflowOrigin,
+        ).toEqual(workflowOrigin);
+        state = yield* apply(state, claim);
+        state = yield* apply(state, {
+          type: "thread.prompt.admit",
+          commandId: CommandId.make("admit-auto"),
+          threadId,
+          attemptId: claim.commandId,
+          turnId: TurnId.make("auto-turn"),
+          evidence: "provider-ack",
+          createdAt,
+        });
+        expect(state.threads[0]?.messages[0]?.workflowOrigin).toEqual(workflowOrigin);
+        expect(state.threads[0]?.messages[0]?.author).toBeUndefined();
+      }),
+  );
+
   it.effect("rejects an edit authorized for a different queued runtime mode", () =>
     Effect.gen(function* () {
       const original = enqueue("personal");

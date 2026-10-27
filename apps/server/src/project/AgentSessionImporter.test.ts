@@ -245,6 +245,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
           upsert: (binding) => Effect.sync(() => void bindings.push(binding)),
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.void,
           getBinding: () => Effect.succeedNone,
           listThreadIds: () => Effect.die("unused"),
@@ -363,6 +364,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
           upsert: () => Effect.die("must not bind a scanner skip"),
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.die("unused"),
           getBinding: () => Effect.die("must not read a scanner skip binding"),
           listThreadIds: () => Effect.die("unused"),
@@ -440,6 +442,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
             return Effect.void;
           },
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.void,
           getBinding: () =>
             Effect.succeed(bindings[0] === undefined ? Option.none() : Option.some(bindings[0])),
@@ -482,6 +485,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
           upsert: () => Effect.die("must not replace an active binding"),
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.void,
           getBinding: () => Effect.succeedSome(runningBinding),
           listThreadIds: () => Effect.die("unused"),
@@ -537,6 +541,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
           upsert: () => Effect.die("must not bind malformed or wrong-project sessions"),
           getProvider: () => Effect.die("unused"),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.die("unused"),
           getBinding: () => Effect.succeedNone,
           listThreadIds: () => Effect.die("unused"),

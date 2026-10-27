@@ -1090,6 +1090,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                     environmentId={props.environmentId}
                     threadId={props.selectedThread.id}
                     queue={props.promptQueue}
+                    workflowControlled={props.selectedThread.workflowJob != null}
                     supportsPreparation={
                       props.serverConfig?.environment.capabilities.sharedPreparation === true
                     }
@@ -1144,7 +1145,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                     // them against a thread id the server may still reject
                     // would strand them in the outbox.
                     sendBlockedReason={
-                      props.creationState?.kind === "preparing" ? "Starting the task…" : null
+                      props.selectedThread?.workflowJob && !activeUserInputRequestId
+                        ? "This thread belongs to a workflow. Use Workflow jobs in Settings."
+                        : props.creationState?.kind === "preparing"
+                          ? "Starting the task…"
+                          : null
                     }
                     bottomInset={composerBottomInset}
                     onChangeDraftMessage={props.onChangeDraftMessage}

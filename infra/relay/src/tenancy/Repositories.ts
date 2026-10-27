@@ -381,6 +381,25 @@ export const make = Effect.gen(function* () {
           repositoryId: input.repositoryId,
           cause,
         });
+      const sql = db.$client;
+      const [hint] = yield* sql<{
+        organization_id: string;
+      }>`SELECT organization_id FROM relay_repositories WHERE repository_id=${input.repositoryId}`.pipe(
+        Effect.mapError(failure),
+      );
+      if (!hint) return false;
+      // Fence membership before access: removal's trigger holds the policy revision until access is cleared.
+      yield* sql`SELECT user_id FROM relay_organization_members WHERE organization_id=${hint.organization_id} ORDER BY user_id FOR SHARE`.pipe(
+        Effect.mapError(failure),
+      );
+      yield* sql`SELECT user_id FROM relay_repository_access WHERE repository_id=${input.repositoryId} ORDER BY user_id FOR UPDATE`.pipe(
+        Effect.mapError(failure),
+      );
+      const [current] =
+        yield* sql`SELECT repository_id FROM relay_repositories WHERE repository_id=${input.repositoryId} AND organization_id=${hint.organization_id} FOR UPDATE`.pipe(
+          Effect.mapError(failure),
+        );
+      if (!current) return false;
       yield* db
         .delete(relayRepositoryAliases)
         .where(eq(relayRepositoryAliases.repositoryId, input.repositoryId))

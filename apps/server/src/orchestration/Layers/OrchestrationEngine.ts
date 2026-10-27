@@ -6,6 +6,7 @@ import { applyThreadPromptQueueChange } from "@t3tools/shared/threadPromptQueue"
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
 import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
 import { changesQueueProviders, validateThreadQueueProviders } from "../ThreadQueueProviders.ts";
+import { SetupProcessJournal } from "../../terminal/SetupProcessJournal.ts";
 import type {
   OrchestrationClientOrigin,
   OrchestrationEvent,
@@ -130,6 +131,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   // The event engine also serves offline tools without provider runtimes. Those
   // tools may edit ordinary queues, but cannot approve a VM provider selection.
   const providers = yield* Effect.serviceOption(ProviderInstanceRegistry);
+  const setupJournal = yield* SetupProcessJournal;
   const eventStore = yield* OrchestrationEventStore;
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
@@ -355,7 +357,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             new OrchestrationCommandInvariantError({
               commandType: envelope.command.type,
               detail:
-                "The task or its setup changed during deletion. Review it and choose Delete again.",
+                "The task or its setup changed during cleanup. Review it and retry the action.",
             });
           if (
             yield* eventStore.hasEventAfter({
@@ -372,6 +374,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               !thread ||
               thread.deletedAt !== null ||
               thread.projectId !== deletion.projectId ||
+              (captured.worktreePath !== undefined &&
+                thread.worktreePath !== captured.worktreePath) ||
               (thread.promptQueue?.preparation?.attemptId ?? null) !==
                 captured.preparationAttemptId ||
               (yield* eventStore.hasEventAfter({
@@ -382,6 +386,22 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               }))
             )
               return yield* changed();
+            if (envelope.options?.requireSetupCleanup) {
+              const owners = yield* setupJournal
+                .owners(captured.threadId)
+                .pipe(Effect.mapError(() => changed()));
+              const attempts = new Set([
+                ...(captured.cleanupAttemptIds ?? []),
+                ...owners.map((owner) => owner.attemptId),
+              ]);
+              for (const attemptId of attempts)
+                if (
+                  !(yield* setupJournal
+                    .confirmed({ threadId: captured.threadId, attemptId })
+                    .pipe(Effect.mapError(() => changed())))
+                )
+                  return yield* changed();
+            }
           }
           if (
             envelope.command.type === "project.delete" &&
@@ -487,6 +507,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,
+          ...(envelope.command.type === "thread.archive" &&
+          deletion &&
+          envelope.options?.requireSetupCleanup
+            ? { allowFailedPreparationArchive: true }
+            : {}),
           ...(Option.isSome(userInputActivity)
             ? { userInputActivity: userInputActivity.value }
             : {}),

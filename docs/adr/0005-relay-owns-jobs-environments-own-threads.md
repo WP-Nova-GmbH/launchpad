@@ -16,11 +16,34 @@ thread**. The relay never models a turn.
 | ----------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | `queued → dispatched → running → awaiting_review → paused → done / failed`                                                    | turns, messages, tool calls, approvals, diffs, checkpoints |
 | which [executor](../internals/glossary.md#executor), which [repository](../internals/glossary.md#repository), which thread id | what an approval is actually asking                        |
-| which workflow the organization defined for this trigger                                                                      | which agents run within a step, and in what order          |
+| which repository workflow matched this trigger                                                                                | which agents run within a step, and in what order          |
 | user intent: start, pause, continue, cancel, modify                                                                           | the effect of that intent on thread state                  |
 
 A pipeline step compiles down to: _create thread T in project P on executor E, with these
 instructions, this provider instance, this runtime mode — report when it settles._
+
+A repository workflow selects its execution environment explicitly. V1 targets enrolled
+organization environments, including self-hosted machines, so jobs and human checkpoints use
+repository-shared access. Owner-only personal environments would require a separate sharing
+policy before they can host repository workflows. Event-triggered jobs stay
+queued at the relay while that environment is offline, rather than being routed to another
+machine. This keeps the chosen checkout and execution context predictable, and lets the relay
+accept external events independently of environment availability. Queued jobs use the workflow's
+current definition when dispatched. Once execution starts, that definition stays fixed through
+human checkpoints and rework; later workflow edits apply to queued and future jobs.
+
+Withdrawing an automation connection or its repository authorization stops new event admission
+and queued jobs that have not entered a job handoff. A job already being offered may finish
+starting and continue with its frozen instructions; use Cancel run to stop it. A missing reply
+cannot prove whether work started, so withdrawal does not interrupt reconciliation of that same
+handoff. If the environment confirms that it did not start the job, its return to the queue
+requires current source authorization before a later handoff.
+
+A signed provider occurrence and all its matching queued jobs commit in one relay transaction.
+Retain its semantic identity even when it matches no workflow: retries cannot reinterpret old events
+after an edit or a later enable. A trigger Save and admission serialize on the same logical source;
+new criteria apply strictly after the database-clock Save boundary. Queued-job admission is separate
+from execution handoff and cannot depend on environment availability or provider refresh HTTP.
 
 ## Why the seam is coarse
 
@@ -47,6 +70,29 @@ Background setup remains the default and its failure does not pause the queue or
 When a script is configured to wait before the agent starts, it must finish successfully; failure
 to launch or a failed exit pauses the queue before delivery. This preserves the explicit choice
 to run background work while making a required setup failure visible before dependent work starts.
+
+Workspace preparation retains ownership of its setup work, including background programs that
+outlive the command that started them. Intermediate Review approvals advance the workflow while
+retaining the job's workspace and setup ownership. They do not stop setup programs or previews:
+later Agent steps and rework can keep using them without rerunning setup. Each Review still checks
+its saved result; unexpected changes block approval. Final job completion confirms setup stopped
+and verifies the final result before releasing the workspace; cancellation also requires confirmed
+cleanup before release. Current process ancestry alone cannot establish that all of the job's setup
+work has stopped.
+A manual workflow pause is a separate durable hold on automatic step advancement. The reserved
+Agent step, including preparation, finishes at its finalized checkpoint before acknowledging the
+hold. Keep the underlying human wait or failure state: Resume removes only that hold. Setup and
+previews retain their existing ownership while paused. Accepted holds survive executor restart;
+the compatible-reader barrier prevents older servers from silently ignoring them.
+
+Automatic cleanup covers ordinary job-owned background programs. Docker-managed containers
+and system services have separately managed lifecycles; projects using them arrange their
+cleanup. Their automatic cleanup is outside this workflow slice.
+
+When the planned VM support is introduced, revisit how the VM boundary owns setup work and
+confirms cleanup, including VM lifetime, restart recovery, services started inside the VM,
+and the effect on other jobs sharing compute. This is an explicit follow-up before VM support ships; the current setup ownership
+decision does not decide whether a VM belongs to one job or a long-lived environment.
 
 Required preparation interrupted by a server restart stays paused until an authorized teammate
 explicitly retries preparation and resumes the queue. Reconnecting alone must not rerun setup
@@ -89,11 +135,16 @@ Stopping a shared thread interrupts its running turn and pauses automatic delive
 shared queue. Pending prompts remain visible and retained until someone explicitly resumes the
 queue; stopping work must not immediately start the next person's queued prompt.
 
-Deleting a shared thread waits for confirmation that its required setup has stopped. If shutdown
-cannot be confirmed, the thread stays visible with its queue paused, an explanation, and a way to
-retry Stop. Hiding it first would remove the team's recovery path while setup may still be running.
-Once deletion reports failure, that request ends. A later setup exit does not delete the thread;
-someone must explicitly request deletion again after recovery.
+Deleting or archiving a shared thread confirms that its setup work has stopped before hiding
+the thread, including previews left running after the setup command finished. If shutdown cannot
+be confirmed, the thread stays visible with its queue paused, an explanation, and a way to retry
+Stop. Hiding it first would remove the team's recovery path while setup may still be running.
+Once deletion or archiving reports failure, that request ends. A later setup exit does not hide
+the thread; someone must explicitly request deletion or archiving again after recovery.
+
+Restarting a setup terminal confirms that its setup work stopped before opening a fresh shell.
+It does not repeat the setup recipe; rerunning preparation remains an explicit action because
+it can repeat side effects.
 
 Failed turns and provider usage limits also pause automatic delivery, retain all pending prompts,
 and show why the queue paused. A teammate must explicitly resume it after addressing the problem;

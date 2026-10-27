@@ -1,3 +1,4 @@
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import {
   RelayApi,
@@ -117,6 +118,7 @@ export const projectCatalogServerApi = HttpApiBuilder.group(
             revision: payload.revision,
             projects: payload.projects,
           });
+          yield* wakeWorkflows({ environmentId: params.environmentId });
           return { ok: true, acceptedRevision };
         },
         mapErrorTags({

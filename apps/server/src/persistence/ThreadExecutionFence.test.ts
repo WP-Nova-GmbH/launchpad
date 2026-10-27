@@ -2,7 +2,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { SqlitePersistenceMemory } from "./Layers/Sqlite.ts";
-import { runMigrations } from "./Migrations.ts";
+import { runMigrations, combinedReaderMarker } from "./Migrations.ts";
 import { makeThreadExecutionFence, ThreadExecutionFenceError } from "./ThreadExecutionFence.ts";
 import { makeCheckoutCapture } from "./CheckoutCapture.ts";
 
@@ -128,7 +128,7 @@ describe("durable thread execution ownership", () => {
         VALUES ('delete-ordinary', 'thread', 'ordinary', 1, 'thread.deleted', '2026-10-02T00:00:00Z', 'system', '{}', '{}')`;
         assert.deepStrictEqual(
           yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
-          [{ name: "OrchestrationEvents_PortableThreadReaderV1" }],
+          [{ name: combinedReaderMarker }],
         );
         assert.deepStrictEqual(yield* runMigrations(), []);
         yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 60`;

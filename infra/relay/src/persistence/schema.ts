@@ -1,5 +1,11 @@
 import type { RuntimeMode } from "@t3tools/contracts";
 import type {
+  RepositoryWorkflow,
+  RepositoryWorkflowJob,
+  RepositoryWorkflowJobSummary,
+  RespondToWorkflowJob,
+} from "@t3tools/contracts/workflows";
+import type {
   RelayAgentActivityAggregateState,
   RelayAgentActivityState,
   RelayAgentAwarenessPreferences,
@@ -636,6 +642,117 @@ export const relayJobs = pgTable(
   (table) => [
     index("idx_relay_jobs_owner").on(table.ownerUserId, table.createdAt),
     index("idx_relay_jobs_environment").on(table.environmentId, table.createdAt),
+  ],
+);
+
+export const relayRepositoryWorkflows = pgTable(
+  "relay_repository_workflows",
+  {
+    workflowId: varchar("workflow_id", { length: 64 }).primaryKey(),
+    repositoryId: varchar("repository_id", { length: 64 }).notNull(),
+    revision: integer("revision").notNull(),
+    record: jsonb("record").notNull().$type<RepositoryWorkflow>(),
+    automationEnabled: boolean("automation_enabled").notNull().default(false),
+    sourceApplicationId: text("source_application_id"),
+    sourceWorkspaceId: text("source_workspace_id"),
+    triggerTeamId: text("trigger_team_id"),
+    triggerEvent: text("trigger_event"),
+    triggerGrantId: text("trigger_grant_id"),
+    routingGeneration: integer("routing_generation").notNull().default(0),
+    effectiveAfter: text("effective_after"),
+    targetCapability: jsonb("target_capability"),
+  },
+  (table) => [
+    check(
+      "workflow_routing_consistent",
+      sql`automation_enabled = COALESCE((record#>>'{automation,enabled}')::boolean,false)
+    AND (NOT automation_enabled OR COALESCE((record->>'archived' = 'false' AND source_application_id IS NOT NULL
+    AND source_workspace_id IS NOT NULL AND effective_after IS NOT NULL AND target_capability IS NOT NULL
+    AND routing_generation > 0 AND trigger_team_id IS NOT NULL AND trigger_grant_id IS NOT NULL
+    AND trigger_event IN ('issue_created','entered_status') AND trigger_team_id = record#>>'{automation,trigger,teamId}'
+    AND trigger_grant_id = record#>>'{automation,trigger,grantId}' AND trigger_event = record#>>'{automation,trigger,event}'),false))`,
+    ),
+    index("idx_repository_workflows_repository").on(table.repositoryId),
+    index("idx_workflow_event_rules")
+      .on(
+        table.sourceApplicationId,
+        table.sourceWorkspaceId,
+        table.triggerTeamId,
+        table.triggerEvent,
+      )
+      .where(sql`automation_enabled`),
+  ],
+);
+
+export const relayWorkflowJobs = pgTable(
+  "relay_workflow_jobs",
+  {
+    jobId: varchar("job_id", { length: 64 }).primaryKey(),
+    repositoryId: varchar("repository_id", { length: 64 }).notNull(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    submitterUserId: varchar("submitter_user_id", { length: 191 }),
+    repositoryCanonicalKey: text("repository_canonical_key"),
+    status: varchar("status", { length: 32 }).notNull().$type<RepositoryWorkflowJob["status"]>(),
+    record: jsonb("record").notNull().$type<RepositoryWorkflowJob>(),
+    // A stored projection backfills legacy jobs and stays consistent across every writer.
+    // jsonb_object is immutable, as PostgreSQL requires for generated columns.
+    summary: jsonb("summary")
+      .notNull()
+      .$type<RepositoryWorkflowJobSummary>()
+      .generatedAlwaysAs(
+        sql`jsonb_object(
+        ARRAY['jobId','repositoryId','workflowId','environmentId','instruction','status','detail','createdAt','updatedAt'],
+        ARRAY["job_id"::text,"repository_id"::text,"record"->>'workflowId',"record"->>'environmentId',left(CASE WHEN "record"->'event' IS NOT NULL THEN COALESCE("record"#>>'{issueSnapshot,identifier}',"record"#>>'{event,identifier}') || ': ' || COALESCE("record"#>>'{issueSnapshot,title}',"record"#>>'{event,title}') ELSE "record"->>'instruction' END,500),"status"::text,left("record"->>'detail',500),"created_at"::text,"record"->>'updatedAt']
+      ) || CASE WHEN "status" IN ('awaiting_review','awaiting_input','paused')
+        OR ("status" = 'queued' AND CASE WHEN "record" ? 'queueReason' THEN COALESCE("record"#>>'{queueReason,code}' NOT IN ('environment_offline','environment_busy','source_unavailable','source_rate_limited','workflow_changed'),false) ELSE "record"->>'detail' IS NOT NULL END)
+        OR ("status" = 'cancelling' AND "record"#>>'{progress,retryableCancellation}' = 'true')
+        THEN '{"needsAttention":true}'::jsonb ELSE '{"needsAttention":false}'::jsonb END
+      || ('{"originSummary":' || (
+        jsonb_object(ARRAY['kind'], ARRAY["record"#>>'{origin,kind}'])
+        || CASE WHEN "record"#>>'{workflow,definition,name}' IS NOT NULL
+          THEN jsonb_object(ARRAY['workflowName'], ARRAY[left("record"#>>'{workflow,definition,name}',120)])
+          ELSE '{}'::jsonb END)::text || '}')::jsonb
+      || CASE WHEN "record" ? 'queueReason' THEN ('{"queueReason":' || ("record"->'queueReason')::text || '}')::jsonb ELSE '{}'::jsonb END`,
+      ),
+    pendingControl: jsonb("pending_control").$type<{
+      userId: string;
+      response: typeof RespondToWorkflowJob.Type;
+    }>(),
+    revision: integer("revision").notNull(),
+    leaseUntil: varchar("lease_until", { length: 64 }),
+    createdAt: varchar("created_at", { length: 64 }).notNull(),
+    checkedAt: varchar("checked_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    index("idx_workflow_jobs_dispatch_pending")
+      .on(table.checkedAt, table.createdAt)
+      .where(sql`"status" NOT IN ('done','cancelled','failed')`),
+    check(
+      "workflow_job_origin",
+      sql`(
+      ("record"#>>'{origin,kind}' = 'manual' AND "submitter_user_id" IS NOT NULL
+        AND "record"#>>'{origin,userId}' = "submitter_user_id")
+      OR ("record"#>>'{origin,kind}' = 'automation' AND "submitter_user_id" IS NULL
+        AND "record"#>>'{origin,organizationId}' = "organization_id"
+        AND "record"#>>'{origin,repositoryId}' = "repository_id"
+        AND "record"#>>'{origin,workflowId}' = "record"->>'workflowId'
+        AND "record"#>>'{origin,source,provider}' = 'linear'
+        AND length(trim("record"#>>'{origin,source,applicationId}')) > 0
+        AND length(trim("record"#>>'{origin,source,workspaceId}')) > 0
+        AND length(trim("record"#>>'{origin,source,connectionId}')) > 0
+        AND length(trim("record"#>>'{origin,source,grantId}')) > 0
+        AND length(trim("record"#>>'{origin,occurrenceId}')) > 0
+        AND "record"->'requiredProtocol' = '8'::jsonb)
+    ) IS TRUE`,
+    ),
+    index("idx_workflow_jobs_repository").on(table.repositoryId, table.createdAt),
+    index("idx_workflow_jobs_status").on(table.status, table.checkedAt),
+    index("idx_workflow_jobs_active_page")
+      .on(table.repositoryId, table.createdAt, table.jobId)
+      .where(sql`"status" NOT IN ('done','cancelled','failed')`),
+    index("idx_workflow_jobs_history_page")
+      .on(table.repositoryId, table.createdAt, table.jobId)
+      .where(sql`"status" IN ('done','cancelled','failed')`),
   ],
 );
 
@@ -1778,6 +1895,12 @@ export const relayThreadVmRestores = pgTable(
     servingRequested: boolean("serving_requested").notNull().default(false),
     probeRemovedAt: timestamp("probe_removed_at", { withTimezone: true }),
     bootPrepareStartedAt: timestamp("boot_prepare_started_at", { withTimezone: true }),
+    bootRecoveryStartedAt: timestamp("boot_recovery_started_at", { withTimezone: true }),
+    bootAttempt: integer("boot_attempt").notNull().default(0),
+    retiredBootReceipts: jsonb("retired_boot_receipts")
+      .notNull()
+      .default(sql`'[]'::jsonb`)
+      .$type<ReadonlyArray<unknown>>(),
     bootReceipt:
       jsonb("boot_receipt").$type<import("../machines/E2BRestoreClient.ts").E2BRestoreStatus>(),
     identityCleanedAt: timestamp("identity_cleaned_at", { withTimezone: true }),
@@ -1802,6 +1925,11 @@ export const relayThreadVmRestores = pgTable(
       sql`(${table.savedDiskOperationId} IS NOT NULL) <> (${table.backupRecoveryOperationId} IS NOT NULL)`,
     ),
     check("relay_thread_vm_restores_probe_attempt", sql`${table.probeAttempt}>=0`),
+    check("relay_thread_vm_restores_boot_attempt_check", sql`${table.bootAttempt} >= 0`),
+    check(
+      "relay_thread_vm_restores_retired_boot_receipts_check",
+      sql`jsonb_typeof(${table.retiredBootReceipts}) = 'array'`,
+    ),
     check("relay_thread_vm_restores_generation", sql`${table.generation} > 0`),
     check(
       "relay_thread_vm_restores_phase",
@@ -1821,7 +1949,7 @@ export const relayThreadVmRestores = pgTable(
     ),
     check(
       "relay_thread_vm_restores_boot_prepared",
-      sql`${table.phase} NOT IN ('boot_prepared','committed','booted','importing','completed') OR (${table.bootPrepareStartedAt} IS NOT NULL AND ${table.bootReceipt} IS NOT NULL)`,
+      sql`${table.phase} NOT IN ('boot_prepared','committed','booted','importing','completed') OR (${table.bootPrepareStartedAt} IS NOT NULL AND ${table.bootReceipt} IS NOT NULL) OR (${table.phase} = 'committed' AND ${table.bootReceipt} IS NULL AND ${table.bootAttempt} > 0 AND jsonb_array_length(${table.retiredBootReceipts}) = ${table.bootAttempt} AND ${table.retiredBootReceipts}->-1->>'physicallyStopped' = 'true')`,
     ),
     check(
       "relay_thread_vm_restores_committed",
@@ -2065,3 +2193,122 @@ export const relayThreadVmPreviews = pgTable(
 );
 
 export { relayThreadCurrentQueues } from "./threadQueueSchema.ts";
+
+/** Native workflow sources deliberately do not share personal MCP credentials. */
+export const relayWorkflowConnections = pgTable(
+  "relay_workflow_connections",
+  {
+    connectionId: text("connection_id").primaryKey(),
+    ownerUserId: text("owner_user_id").notNull(),
+    applicationId: text("application_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    workspaceName: text("workspace_name").notNull(),
+    viewerName: text("viewer_name").notNull(),
+    status: text("status").notNull(),
+    authorizationEpoch: integer("authorization_epoch").notNull().default(1),
+    activatedAt: text("activated_at").notNull(),
+    authorizationStartedAt: text("authorization_started_at"),
+    deliveryEvidence: jsonb("delivery_evidence"),
+    credentialVersion: integer("credential_version").notNull().default(1),
+    payloadSealed: text("payload_sealed"),
+    health: jsonb("health").notNull(),
+    leaseId: text("lease_id"),
+    leaseUntil: text("lease_until"),
+    refreshStartedAt: text("refresh_started_at"),
+  },
+  (t) => [
+    uniqueIndex("workflow_connection_owner_workspace").on(
+      t.ownerUserId,
+      t.applicationId,
+      t.workspaceId,
+    ),
+  ],
+);
+export const relayWorkflowAuthorizations = pgTable(
+  "relay_workflow_authorizations",
+  {
+    ownerUserId: text("owner_user_id").notNull(),
+    applicationId: text("application_id").notNull(),
+    version: integer("version").notNull().default(0),
+    attemptId: text("attempt_id"),
+    startedAt: text("started_at"),
+    connectionId: text("connection_id"),
+    expectedEpoch: integer("expected_epoch"),
+    stateHash: text("state_hash"),
+    pendingSealed: text("pending_sealed"),
+    expiresAt: text("expires_at"),
+    status: text("status"),
+    error: text("error"),
+  },
+  (t) => [
+    primaryKey({ columns: [t.ownerUserId, t.applicationId] }),
+    uniqueIndex("workflow_authorization_state").on(t.stateHash),
+  ],
+);
+export const relayWorkflowRepositoryGrants = pgTable(
+  "relay_workflow_repository_grants",
+  {
+    grantId: text("grant_id").primaryKey(),
+    connectionId: text("connection_id").notNull(),
+    organizationId: text("organization_id").notNull(),
+    repositoryId: text("repository_id").notNull(),
+    ownerUserId: text("owner_user_id").notNull(),
+    generation: integer("generation").notNull(),
+    revoked: boolean("revoked").notNull().default(false),
+    createdAt: text("created_at").notNull(),
+    revokedAt: text("revoked_at"),
+    revokedReason: text("revoked_reason"),
+  },
+  (t) => [
+    uniqueIndex("workflow_active_repository_source")
+      .on(t.repositoryId, t.connectionId)
+      .where(sql`NOT ${t.revoked}`),
+    uniqueIndex("workflow_grant_generation").on(t.repositoryId, t.connectionId, t.generation),
+    index("workflow_grant_owner_org").on(t.ownerUserId, t.organizationId),
+  ],
+);
+
+export const relayWorkflowOccurrences = pgTable(
+  "relay_workflow_occurrences",
+  {
+    occurrenceId: text("occurrence_id").primaryKey(),
+    applicationId: text("application_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    eventKey: text("event_key").notNull(),
+    eventType: text("event_type").notNull(),
+    occurredAt: text("occurred_at").notNull(),
+    receivedAt: text("received_at").notNull(),
+    facts: jsonb("facts").notNull(),
+    jobCount: integer("job_count").notNull().default(0),
+  },
+  (t) => [
+    uniqueIndex("workflow_occurrence_identity").on(t.applicationId, t.workspaceId, t.eventKey),
+    index("workflow_revocation_cutoff").on(
+      t.applicationId,
+      t.workspaceId,
+      t.eventType,
+      t.occurredAt,
+    ),
+  ],
+);
+export const relayWorkflowAdmissions = pgTable(
+  "relay_workflow_admissions",
+  {
+    occurrenceId: text("occurrence_id").notNull(),
+    workflowId: text("workflow_id").notNull(),
+    jobId: text("job_id").notNull(),
+    organizationId: text("organization_id").notNull(),
+    repositoryId: text("repository_id").notNull(),
+    connectionId: text("connection_id").notNull(),
+    grantId: text("grant_id").notNull(),
+    grantGeneration: integer("grant_generation").notNull(),
+    authorizationEpoch: integer("authorization_epoch").notNull(),
+    workflowRevision: integer("workflow_revision").notNull(),
+    routingGeneration: integer("routing_generation").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.occurrenceId, t.workflowId] }),
+    uniqueIndex("workflow_admission_job").on(t.jobId),
+    index("idx_workflow_admissions_connection").on(t.connectionId),
+  ],
+);

@@ -181,3 +181,15 @@ it.effect("never freezes an active owner without its coordinator drain", () =>
     }),
   ),
 );
+
+it.effect("refuses source transfer before capturing an active workflow's conversation", () =>
+  runAttachmentCheckpointTest(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`INSERT INTO repository_workflow_jobs VALUES ('held',${f.owner.threadId},'awaiting_review',0,'{}')`;
+      expect((yield* Effect.flip(f.source.freeze(f.input))).message).toContain("workflow");
+      expect(f.captures()).toBe(0);
+      expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("draining");
+    }),
+  ),
+);

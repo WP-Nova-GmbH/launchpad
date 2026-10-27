@@ -130,7 +130,10 @@ vi.mock("../../state/threads", () => ({
     }),
   },
 }));
-vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
+vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => vi.fn(),
+  useLocation: () => ({ state: null }),
+}));
 vi.mock("@t3tools/client-runtime/relay/portableThreadPresentation", () => ({
   portableThreadPlacementsAtom: [],
 }));

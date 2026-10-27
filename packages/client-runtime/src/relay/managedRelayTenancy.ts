@@ -84,6 +84,16 @@ import {
 } from "@t3tools/contracts/relay";
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
+import type {
+  RepositoryWorkflow,
+  RepositoryWorkflowJob,
+  RepositoryWorkflowJobSummary,
+  WorkflowJobPage,
+  WorkflowJobPageQuery,
+  SaveRepositoryWorkflow,
+  RunRepositoryWorkflow,
+  RespondToWorkflowJob,
+} from "@t3tools/contracts/workflows";
 import * as Context from "effect/Context";
 import * as Stream from "effect/Stream";
 import * as Effect from "effect/Effect";
@@ -108,6 +118,47 @@ export class ManagedRelayTenancyClient extends Context.Service<
   {
     readonly relayUrl: string;
     readonly getHealth: () => Effect.Effect<RelayHealthResponse, ManagedRelayClientError>;
+    readonly readWorkflowCatalog: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<
+      import("@t3tools/contracts/workflows").WorkflowCatalog,
+      ManagedRelayClientError
+    >;
+    readonly listWorkflows: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<ReadonlyArray<RepositoryWorkflow>, ManagedRelayClientError>;
+    readonly saveWorkflow: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly payload: typeof SaveRepositoryWorkflow.Type;
+    }) => Effect.Effect<RepositoryWorkflow, ManagedRelayClientError>;
+    readonly listWorkflowJobs: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<ReadonlyArray<RepositoryWorkflowJobSummary>, ManagedRelayClientError>;
+    readonly pageWorkflowJobs: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly query: WorkflowJobPageQuery;
+    }) => Effect.Effect<WorkflowJobPage, ManagedRelayClientError>;
+    readonly runWorkflow: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly payload: typeof RunRepositoryWorkflow.Type;
+    }) => Effect.Effect<RepositoryWorkflowJob, ManagedRelayClientError>;
+    readonly getWorkflowJob: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly jobId: string;
+    }) => Effect.Effect<RepositoryWorkflowJob, ManagedRelayClientError>;
+    readonly respondToWorkflowJob: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly jobId: string;
+      readonly payload: typeof RespondToWorkflowJob.Type;
+    }) => Effect.Effect<RepositoryWorkflowJob, ManagedRelayClientError>;
     /** Also what creates the caller's organization the first time they ask. */
     readonly getOrganization: (input: {
       readonly clerkToken: string;
@@ -448,6 +499,14 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     relayUrl,
     getHealth: unavailable("clientRuntime.managedRelayTenancy.getHealth"),
     getOrganization: unavailable("clientRuntime.managedRelayTenancy.getOrganization"),
+    readWorkflowCatalog: unavailable("clientRuntime.managedRelayTenancy.readWorkflowCatalog"),
+    listWorkflows: unavailable("clientRuntime.managedRelayTenancy.listWorkflows"),
+    saveWorkflow: unavailable("clientRuntime.managedRelayTenancy.saveWorkflow"),
+    listWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.listWorkflowJobs"),
+    pageWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.pageWorkflowJobs"),
+    runWorkflow: unavailable("clientRuntime.managedRelayTenancy.runWorkflow"),
+    getWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJob"),
+    respondToWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.respondToWorkflowJob"),
     renameOrganization: unavailable("clientRuntime.managedRelayTenancy.renameOrganization"),
     listMembers: unavailable("clientRuntime.managedRelayTenancy.listMembers"),
     updateMemberRole: unavailable("clientRuntime.managedRelayTenancy.updateMemberRole"),
@@ -594,6 +653,131 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.getHealth"),
       withRelayClientTracing,
+    ),
+    readWorkflowCatalog: Effect.fn("clientRuntime.managedRelayTenancy.readWorkflowCatalog")(
+      function* (input) {
+        return yield* client.workflows
+          .list({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("listWorkflows")),
+            timeoutRelayRequest("listWorkflows"),
+          );
+      },
+    ),
+    listWorkflows: Effect.fn("clientRuntime.managedRelayTenancy.listWorkflows")(function* (input) {
+      return yield* client.workflows
+        .list({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+        })
+        .pipe(
+          Effect.map((response) => response.workflows),
+          Effect.mapError(relayRequestError("listWorkflows")),
+          timeoutRelayRequest("listWorkflows"),
+        );
+    }),
+    saveWorkflow: Effect.fn("clientRuntime.managedRelayTenancy.saveWorkflow")(function* (input) {
+      return yield* client.workflows
+        .save({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+          payload: input.payload,
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("saveWorkflow")),
+          timeoutRelayRequest("saveWorkflow"),
+        );
+    }),
+    listWorkflowJobs: Effect.fn("clientRuntime.managedRelayTenancy.listWorkflowJobs")(
+      function* (input) {
+        return yield* client.workflows
+          .listJobs({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId },
+          })
+          .pipe(
+            Effect.map((response) => response.jobs),
+            Effect.mapError(relayRequestError("listWorkflowJobs")),
+            timeoutRelayRequest("listWorkflowJobs"),
+          );
+      },
+    ),
+    pageWorkflowJobs: Effect.fn("clientRuntime.managedRelayTenancy.pageWorkflowJobs")(
+      function* (input) {
+        return yield* client.workflows
+          .pageJobs({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId },
+            query: input.query,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("pageWorkflowJobs")),
+            timeoutRelayRequest("pageWorkflowJobs"),
+          );
+      },
+    ),
+    runWorkflow: Effect.fn("clientRuntime.managedRelayTenancy.runWorkflow")(function* (input) {
+      return yield* client.workflows
+        .run({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+          payload: input.payload,
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("runWorkflow")),
+          timeoutRelayRequest("runWorkflow"),
+        );
+    }),
+    getWorkflowJob: Effect.fn("clientRuntime.managedRelayTenancy.getWorkflowJob")(
+      function* (input) {
+        return yield* client.workflows
+          .getJob({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId, jobId: input.jobId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("getWorkflowJob")),
+            timeoutRelayRequest("getWorkflowJob"),
+          );
+      },
+    ),
+    respondToWorkflowJob: Effect.fn("clientRuntime.managedRelayTenancy.respondToWorkflowJob")(
+      function* (input) {
+        const request = {
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId, jobId: input.jobId },
+        };
+        const payload = input.payload;
+        const response = (() => {
+          switch (payload.operation) {
+            case "pause":
+              return client.workflows.respond({ ...request, payload });
+            case "resume":
+              return client.workflows.respond({ ...request, payload });
+            case "approve":
+              return client.workflows.respond({ ...request, payload });
+            case "input":
+              return client.workflows.respond({ ...request, payload });
+            case "request_changes":
+              return client.workflows.respond({ ...request, payload });
+            case "retry_action":
+              return client.workflows.respond({ ...request, payload });
+            case "retry_preparation":
+              return client.workflows.respond({ ...request, payload });
+            case "retry_cancellation":
+              return client.workflows.respond({ ...request, payload });
+            case "cancel":
+              return client.workflows.respond({ ...request, payload });
+          }
+        })();
+        return yield* response.pipe(
+          Effect.mapError(relayRequestError("respondToWorkflowJob")),
+          timeoutRelayRequest("respondToWorkflowJob"),
+        );
+      },
     ),
     getOrganization: Effect.fnUntraced(
       function* (input) {

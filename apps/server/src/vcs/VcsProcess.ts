@@ -181,8 +181,15 @@ export const make = Effect.gen(function* () {
     const args =
       privateVm && input.command === "git" ? privateThreadVmGitArgs(input.args) : input.args;
 
+    const beginOwner = yield* ProcessRunner.CurrentWorkflowCommand;
+    const owner = beginOwner
+      ? yield* beginOwner.pipe(
+          Effect.mapError((cause) => new VcsProcessSpawnError({ ...baseError, cause })),
+        )
+      : null;
     const result = yield* processRunner
       .run({
+        ...(owner ? { owner } : {}),
         command: input.command,
         args,
         cwd: input.cwd,

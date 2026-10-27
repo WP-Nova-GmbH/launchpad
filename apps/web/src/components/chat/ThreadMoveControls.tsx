@@ -1,10 +1,11 @@
+import { workflowResultOrigin } from "@t3tools/client-runtime/relay/workflow-result";
 import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { MovedThreadDraftRecovery } from "./MovedThreadDraftRecovery";
 import { threadMoveProgressPresentation } from "@t3tools/client-runtime/relay/threadVmControls";
 import { handoffMovedThreadDraft, type MovedThreadDraftConflict } from "../../composerDraftStore";
 import { recoverMovedDraftFile } from "../../lib/movedThreadDraft";
 import { useAtomValue } from "@effect/atom-react";
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useLocation } from "@tanstack/react-router";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import {
   threadMoveProjectTargets,
@@ -12,6 +13,7 @@ import {
   threadMoveOriginalLocationBlocker,
   threadMoveRepositoryCanonicalKey,
   threadMoveProviderSupported,
+  threadWorkflowMoveBlocker,
   type ThreadMoveSubmission,
   type ThreadMoveSubmissionScope,
 } from "@t3tools/client-runtime/relay/threadMoveSubmission";
@@ -85,6 +87,7 @@ function FollowThreadLocation({
   const checkLocation = useAtomCommand(threadVmControls.checkLocation, { reportFailure: false });
   const open = useAtomCommand(openPortableThreadChat, { reportFailure: false });
   const navigate = useNavigate();
+  const location = useLocation();
   const [attempt, setAttempt] = useState(0),
     [busy, setBusy] = useState(false),
     [checking, setChecking] = useState(false),
@@ -162,7 +165,16 @@ function FollowThreadLocation({
           }
           setDraftConflict(null);
           draftChoice.current = undefined;
-          await navigate({ to: "/$environmentId/$threadId", params: result.value, replace: true });
+          await navigate({
+            to: "/$environmentId/$threadId",
+            params: result.value,
+            replace: true,
+            state: (previous) => ({
+              ...previous,
+              workflowOrigin:
+                workflowResultOrigin(location.state, session.accountId, threadId) ?? undefined,
+            }),
+          });
         }
       })
       .catch((cause) => {
@@ -183,6 +195,7 @@ function FollowThreadLocation({
       cancelled = true;
     };
   }, [
+    location.state,
     destinationId,
     generation,
     session,
@@ -766,6 +779,7 @@ function RunOnPicker({
     placement,
     error ?? location?.error,
   );
+  const workflowBlocker = threadWorkflowMoveBlocker(thread);
   const blocker =
     !relayUrl || !hasCloudPublicConfig()
       ? "Launchpad Connect is not configured on this host."
@@ -773,24 +787,26 @@ function RunOnPicker({
         ? "Sign in to Launchpad Connect to move this thread."
         : !thread || !config
           ? "Checking this thread’s host…"
-          : thread.archivedAt
-            ? "Restore this archived thread before moving it."
-            : unavailable
-              ? "Reconnect to this thread’s host before moving it."
-              : !codexSupported
-                ? "Thread moves currently require Codex."
-                : config.environment.capabilities.threadMoves === false
-                  ? "Connect this host to move its threads."
-                  : config.environment.capabilities.threadMoves !== true
-                    ? "Update this host’s server to support queued moves."
-                    : !detailReady
-                      ? "Syncing this thread’s queue…"
-                      : (originalLocationBlocker ??
-                        (!canonicalKey
-                          ? isVm
-                            ? "The VM’s repository is not available yet. Reconnect to its host and try again."
-                            : "Register this Git repository in Organization settings first."
-                          : null));
+          : workflowBlocker
+            ? workflowBlocker
+            : thread.archivedAt
+              ? "Restore this archived thread before moving it."
+              : unavailable
+                ? "Reconnect to this thread’s host before moving it."
+                : !codexSupported
+                  ? "Thread moves currently require Codex."
+                  : config.environment.capabilities.threadMoves === false
+                    ? "Connect this host to move its threads."
+                    : config.environment.capabilities.threadMoves !== true
+                      ? "Update this host’s server to support queued moves."
+                      : !detailReady
+                        ? "Syncing this thread’s queue…"
+                        : (originalLocationBlocker ??
+                          (!canonicalKey
+                            ? isVm
+                              ? "The VM’s repository is not available yet. Reconnect to its host and try again."
+                              : "Register this Git repository in Organization settings first."
+                            : null));
   const disabled =
     busy || !ready || blocker !== null || status !== null || movePending || movedAway;
   const originalLocationAttempted = useRef(false);

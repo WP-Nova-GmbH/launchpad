@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Context from "effect/Context";
+import * as Scope from "effect/Scope";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -39,6 +40,8 @@ import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
+import * as SetupProcessJournal from "../terminal/SetupProcessJournal.ts";
+import { SetupProcessAdapter, SetupProcessError } from "../terminal/SetupProcessAdapter.ts";
 import { PtySpawnError, type PtyProcess, type PtyExitEvent } from "../terminal/PtyAdapter.ts";
 import { isOrchestrationCommandRejection } from "./Errors.ts";
 import { decideOrchestrationCommand } from "./decider.ts";
@@ -58,6 +61,7 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
   readonly beforeWorkspace?: Effect.Effect<void>;
   readonly beforeDeletionDrain?: Effect.Effect<void>;
   readonly afterAdmissionRollback?: Effect.Effect<void>;
+  readonly beforeSetupDelivery?: Effect.Effect<void>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -136,6 +140,42 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
       };
     },
   };
+  const nativeJournal = SetupProcessJournal.layer.pipe(
+    Layer.provide(SqlitePersistenceMemory),
+    Layer.provide(
+      Layer.mock(SetupProcessAdapter, {
+        launcher: Effect.succeed("/native/helper"),
+        arm: () => Effect.succeed("/bin/sh"),
+        host: Effect.succeed({ host: "test-host", session: "boot-1" }),
+        inspect: () =>
+          Effect.succeed({
+            protocol: 4,
+            identity: "captured-test-process",
+            owned: true,
+            fullStop: false,
+            boot: { host: "test-host", session: "boot-1" },
+          }),
+        stop: () =>
+          Effect.callback<void, SetupProcessError>((resume) => {
+            const off = process.onExit(() => {
+              off();
+              resume(Effect.void);
+            });
+            try {
+              process.kill("SIGTERM");
+            } catch (cause) {
+              off();
+              resume(Effect.fail(new SetupProcessError({ message: String(cause) })));
+            }
+          }),
+      }),
+    ),
+  );
+  const journalService = Context.get(
+    yield* Layer.buildWithScope(nativeJournal, yield* Scope.Scope),
+    SetupProcessJournal.SetupProcessJournal,
+  );
+  const journal = Layer.succeed(SetupProcessJournal.SetupProcessJournal, journalService);
   // The real manager acquires the same workspace lease as preparation. Only the PTY is fake.
   const terminal = yield* TerminalManager.makeWithOptions({
     checkoutAccess: { assertAvailable: () => Effect.void },
@@ -167,7 +207,10 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
     env: { SHELL: "/bin/sh", PATH: "/usr/bin:/bin" },
     processTable: Effect.succeed([]),
     processKillGraceMs: 1,
-  }).pipe(Effect.provide(ProcessRunner.layer));
+  }).pipe(
+    Effect.provide(ProcessRunner.layer),
+    Effect.provideService(SetupProcessJournal.SetupProcessJournal, journalService),
+  );
   const dispatch: OrchestrationEngineService["Service"]["dispatch"] = (command) =>
     dispatchLock.withPermit(
       Effect.gen(function* () {
@@ -253,9 +296,15 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
       ),
   });
   const settings = ServerSettingsService.layerTest();
-  const terminalLayer = Layer.succeed(TerminalManager.TerminalManager, terminal);
+  const terminalLayer = Layer.succeed(TerminalManager.TerminalManager, {
+    ...terminal,
+    writeSetup: (input) =>
+      (options?.beforeSetupDelivery ?? Effect.void).pipe(
+        Effect.andThen(terminal.writeSetup(input)),
+      ),
+  });
   const runner = ProjectSetupScriptRunner.layer.pipe(
-    Layer.provide(Layer.mergeAll(query, settings, terminalLayer)),
+    Layer.provide(Layer.mergeAll(query, settings, terminalLayer, journal)),
   );
   const services = Layer.mergeAll(
     Layer.succeed(SqlClient.SqlClient, admissionSql),
@@ -263,6 +312,7 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
     query,
     settings,
     terminalLayer,
+    journal,
     runner,
     WorktreeSetupTracker.layer,
     Layer.mock(ThreadDeletionReactor, {
@@ -391,6 +441,7 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
       return closeCount;
     },
     nextScript: Queue.take(writes),
+    pendingScripts: Queue.size(writes),
     nextSignal: Queue.take(signals),
     closeFromUI: terminal.close({ threadId }),
     stopTerminal: terminal.close({ threadId, waitForProcessExit: true }),
@@ -644,6 +695,51 @@ it.layer(testLayer, { excludeTestServices: true })("ThreadPreparationReactor", (
       }),
   );
 
+  it.effect(
+    "closing the owner before delayed setup delivery retains required prompts and blocks claiming",
+    () =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const h = yield* makeHarness({
+          async: false,
+          beforeSetupDelivery: Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+          ),
+        });
+        yield* h.enqueue("alice", true);
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadPreparationReactor.ThreadPreparationReactor;
+          yield* reactor.start();
+          yield* Deferred.await(entered);
+          yield* h.closeFromUI;
+          yield* Deferred.succeed(release, undefined);
+          yield* h.awaitPreparation(
+            (preparation) => preparation.state === "failed" && preparation.settled,
+          );
+          yield* reactor.drain;
+          const queue = h.state().threads[0]!.promptQueue!;
+          expect(queue.enabled).toBe(false);
+          expect(queue.entries.map((entry) => entry.messageId)).toEqual(["alice"]);
+          expect(yield* h.pendingScripts).toBe(0);
+          expect(h.state().threads[0]!.messages).toEqual([]);
+          const claim = yield* h
+            .dispatch({
+              type: "thread.prompt.claim",
+              commandId: CommandId.make("claim-after-rejected-delivery"),
+              threadId,
+              messageId: MessageId.make("alice"),
+              expectedRevision: queue.entries[0]!.revision,
+              expectedControlRevision: queue.revision,
+              createdAt,
+            })
+            .pipe(Effect.result);
+          expect(claim._tag).toBe("Failure");
+          expect(h.state().threads[0]!.messages).toEqual([]);
+        }).pipe(Effect.provide(h.layer));
+      }),
+  );
+
   it.effect.each(["exit", "launch", "closed"] as const)(
     "wait-script %s failure retains prompts and retries the same workspace",
     (failure) =>
@@ -668,26 +764,32 @@ it.layer(testLayer, { excludeTestServices: true })("ThreadPreparationReactor", (
             h.state().threads[0]?.promptQueue?.entries.map((entry) => entry.messageId),
           ).toEqual(["alice", "bob"]);
           h.controls.launchFailure = false;
-          yield* h.dispatch({
+          const retry: OrchestrationCommand = {
             type: "thread.preparation.retry",
             commandId: CommandId.make("retry-setup"),
             threadId,
             expectedRevision: failed.revision,
             expectedControlRevision: h.state().threads[0]!.promptQueue!.revision,
             createdAt,
-          });
+          };
+          const receipt = yield* h.dispatch(retry);
           yield* h.complete(yield* h.nextScript, 0);
           yield* h.awaitPreparation((preparation) => preparation.state === "ready");
           yield* reactor.drain;
+          const sequence = h.state().snapshotSequence;
+          expect(yield* h.dispatch(retry)).toEqual(receipt);
+          yield* reactor.drain;
+          expect(h.state().snapshotSequence).toBe(sequence);
+          expect(yield* h.pendingScripts).toBe(0);
           expect(h.worktreeCreates).toBe(1);
           expect(h.state().threads[0]?.promptQueue?.enabled).toBe(true);
         }).pipe(Effect.provide(h.layer));
       }),
   );
 
-  it.effect(
-    "background setup is ready before script completion and a failed exit does not pause the queue",
-    () =>
+  it.effect.each([0, 9])(
+    "background setup allows delivery before completion and settles exit %s without pausing",
+    (exitCode) =>
       Effect.gen(function* () {
         const h = yield* makeHarness();
         yield* h.enqueue("alice", true);
@@ -695,11 +797,26 @@ it.layer(testLayer, { excludeTestServices: true })("ThreadPreparationReactor", (
           const reactor = yield* ThreadPreparationReactor.ThreadPreparationReactor;
           yield* reactor.start();
           const command = yield* h.nextScript;
-          yield* h.awaitPreparation((preparation) => preparation.state === "ready");
-          yield* h.complete(command, 9);
+          const ready = yield* h.awaitPreparation((preparation) => preparation.state === "ready");
+          expect(ready.settled).toBe(false);
+          const queue = h.state().threads[0]!.promptQueue!;
+          yield* h.dispatch({
+            type: "thread.prompt.claim",
+            threadId,
+            commandId: CommandId.make("claim-while-preview"),
+            messageId: MessageId.make("alice"),
+            expectedRevision: queue.entries[0]!.revision,
+            expectedControlRevision: queue.revision,
+            createdAt,
+          });
+          expect(h.state().threads[0]!.promptQueue!.handoff?.messageId).toBe("alice");
+          yield* h.complete(command, exitCode);
           yield* reactor.drain;
           expect(h.state().threads[0]?.promptQueue?.enabled).toBe(true);
-          expect(h.state().threads[0]?.promptQueue?.preparation?.state).toBe("ready");
+          expect(h.state().threads[0]?.promptQueue?.preparation).toMatchObject({
+            state: "ready",
+            settled: true,
+          });
         }).pipe(Effect.provide(h.layer));
       }),
   );
@@ -799,10 +916,11 @@ it.layer(testLayer, { excludeTestServices: true })("ThreadPreparationReactor", (
           });
         yield* ThreadPreparationReactor.reconcileSharedPreparations.pipe(Effect.provide(h.layer));
         const queue = h.state().threads[0]!.promptQueue!;
-        expect(queue.preparation?.state).toBe(state === "running" ? "failed" : state);
-        expect(queue.preparation?.settled).toBe(true);
-        expect(queue.enabled).toBe(state !== "running");
-        if (state === "running") expect(queue.preparation?.failure?.reason).toBe("interrupted");
+        expect(queue.preparation?.state).toBe(state === "pending" ? "pending" : "failed");
+        expect(queue.preparation?.settled).toBe(state === "pending");
+        expect(queue.enabled).toBe(state === "pending");
+        if (state !== "pending")
+          expect(queue.preparation?.failure?.detail).toContain("Restart the executor host");
         expect(queue.entries[0]?.messageId).toBe("alice");
         expect(h.worktreeCreates).toBe(0);
       }),
@@ -879,6 +997,13 @@ it.layer(testLayer, { excludeTestServices: true })("ThreadPreparationReactor", (
                 preparation.failure?.detail.includes("could not be stopped") === true,
             );
             yield* reactor.drain;
+            expect(
+              h
+                .state()
+                .threads[0]!.activities.find(
+                  (activity) => activity.kind === "preparation.stop.failed",
+                ),
+            ).toMatchObject({ payload: { stopCommandId: "stop-script" } });
           }
           const stopped = h.state().threads[0]!.promptQueue!;
           expect(stopped.preparation?.settled).toBe(false);
@@ -896,7 +1021,7 @@ it.layer(testLayer, { excludeTestServices: true })("ThreadPreparationReactor", (
           if (signalFailure) {
             h.controls.signalFailure = false;
             yield* h.dispatch({
-              type: "thread.queue.pause",
+              type: "thread.session.stop",
               commandId: CommandId.make("stop-script-again"),
               threadId,
               createdAt,
@@ -1086,6 +1211,71 @@ it.layer(testLayer, { excludeTestServices: true })("ThreadPreparationReactor", (
           expect(
             h.commands.filter((command) => command.type === "thread.prompt.enqueue"),
           ).toHaveLength(2);
+        }).pipe(Effect.provide(h.layer));
+      }),
+  );
+  it.effect.each([false, true])(
+    "Stop waits for ready background setup even with unknown delivery: %s",
+    (unknown) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* h.enqueue("alice", true);
+        h.controls.exitOnSignal = false;
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadPreparationReactor.ThreadPreparationReactor;
+          yield* reactor.start();
+          const command = yield* h.nextScript;
+          yield* h.awaitPreparation((prep) => prep.state === "ready");
+          if (unknown) {
+            const queue = h.state().threads[0]!.promptQueue!;
+            yield* h.dispatch({
+              type: "thread.prompt.claim",
+              threadId,
+              commandId: CommandId.make("claim-unknown"),
+              messageId: MessageId.make("alice"),
+              expectedRevision: queue.entries[0]!.revision,
+              expectedControlRevision: queue.revision,
+              createdAt,
+            });
+            yield* h.dispatch({
+              type: "thread.prompt.unknown",
+              threadId,
+              commandId: CommandId.make("unknown"),
+              attemptId: CommandId.make("claim-unknown"),
+              detail: "Delivery unknown",
+              createdAt,
+            });
+          }
+          yield* h.dispatch({
+            type: "thread.session.stop",
+            threadId,
+            commandId: CommandId.make("stop-preview"),
+            createdAt,
+          });
+          yield* h.nextSignal;
+          expect(h.state().threads[0]!.promptQueue!.preparation).toMatchObject({
+            state: "failed",
+            settled: false,
+          });
+          yield* h.complete(command, 0); // A command sentinel is not a process-exit acknowledgement.
+          expect(h.state().threads[0]!.promptQueue!.preparation?.settled).toBe(false);
+          yield* h.closeTerminal;
+          yield* h.awaitPreparation((prep) => prep.state === "failed" && prep.settled);
+          yield* reactor.drain;
+          expect(h.closeCount).toBe(1);
+          expect(h.state().threads[0]!.promptQueue!.pauseReason?.code).toBe(
+            unknown ? "delivery-unknown" : "stopped",
+          );
+          expect(h.state().threads[0]!.activities).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                kind: "preparation.stop.completed",
+                payload: expect.objectContaining({
+                  stopCommandId: "stop-preview",
+                }),
+              }),
+            ]),
+          );
         }).pipe(Effect.provide(h.layer));
       }),
   );

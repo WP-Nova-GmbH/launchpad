@@ -160,6 +160,25 @@ function withFakeCodexEnv<A, E, R>(
 }
 
 it.layer(CodexTextGenerationTestLayer)("CodexTextGeneration", (it) => {
+  it.effect("forwards workflow approval context into the actual model prompt", () =>
+    withFakeCodexEnv(
+      {
+        output: JSON.stringify({ verdict: "approve", reasoning: "In scope" }),
+        stdinMustContain:
+          "Job context:\nFix JOB_CONTEXT\n\nRequired review constraint:\nREVIEW_REQUIRED",
+      },
+      (textGeneration) =>
+        textGeneration.generateApprovalVerdict({
+          cwd: process.cwd(),
+          toolKind: "command",
+          requestType: "command_execution_approval",
+          stepInstruction: "s".repeat(5_000),
+          jobContext: "Fix JOB_CONTEXT",
+          reviewConstraint: "REVIEW_REQUIRED",
+          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        }),
+    ),
+  );
   for (const selectedModel of ["gpt-5.6-luna", "openai.gpt-5.6-luna"]) {
     it.effect(`dispatches the qualified live model for ${selectedModel}`, () =>
       withFakeCodexEnv(

@@ -1,3 +1,4 @@
+import { WorkflowAttribution } from "@t3tools/contracts";
 import {
   getPromptQueue,
   listPromptQueues,
@@ -123,6 +124,7 @@ const ProjectionThreadMessageDbRowSchema = ProjectionThreadMessage.mapFields(
     attachments: Schema.NullOr(Schema.fromJsonString(Schema.Array(ChatAttachment))),
     context: Schema.NullOr(Schema.fromJsonString(OrchestrationMessageContext)),
     author: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
+    workflowOrigin: Schema.NullOr(Schema.fromJsonString(WorkflowAttribution)),
     editedBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
     steeredBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
   }),
@@ -744,6 +746,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
@@ -1355,6 +1358,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         attachments_json AS "attachments",
         context_json AS "context",
         author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
         is_streaming AS "isStreaming",
@@ -1391,6 +1395,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
@@ -1807,6 +1812,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
@@ -2220,6 +2226,7 @@ pending_approval_requests AS (
                   ...(row.attachments !== null ? { attachments: row.attachments } : {}),
                   ...(row.context !== null ? { context: row.context } : {}),
                   ...(row.author !== null ? { author: row.author } : {}),
+                  ...(row.workflowOrigin !== null ? { workflowOrigin: row.workflowOrigin } : {}),
                   ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
                   ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
                   turnId: row.turnId,
@@ -3435,6 +3442,7 @@ pending_approval_requests AS (
         ...(row.attachments !== null ? { attachments: row.attachments } : {}),
         ...(row.context !== null ? { context: row.context } : {}),
         ...(row.author !== null ? { author: row.author } : {}),
+        ...(row.workflowOrigin !== null ? { workflowOrigin: row.workflowOrigin } : {}),
         ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
         ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
       },
@@ -3657,8 +3665,18 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThread>();
       }
 
+      const workflowRows = threadId.startsWith("workflow:")
+        ? yield* sql<{
+            jobId: string;
+            repositoryId: string;
+            status: string;
+          }>`SELECT job_id AS "jobId", json_extract(record_json, '$.workflow.repositoryId') AS "repositoryId", status FROM repository_workflow_jobs WHERE thread_id = ${threadId} AND status NOT IN ('done', 'cancelled', 'failed')`.pipe(
+            Effect.orDie,
+          )
+        : [];
       const promptQueue = yield* getPromptQueue(sql, threadId);
       const thread = {
+        workflowJob: workflowRows[0] ?? null,
         ...(promptQueue ? { promptQueue } : {}),
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,
@@ -3701,6 +3719,7 @@ pending_approval_requests AS (
             turnId: row.turnId,
             streaming: row.isStreaming === 1,
             ...(row.author !== null ? { author: row.author } : {}),
+            ...(row.workflowOrigin !== null ? { workflowOrigin: row.workflowOrigin } : {}),
             ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
             ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
             createdAt: row.createdAt,

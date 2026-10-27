@@ -5,7 +5,11 @@ import {
 } from "../threads/ThreadVmClientConnection.ts";
 import { threadVmCredentialAllows } from "./threadVmCredentialAccess.ts";
 import * as UserDirectory from "../tenancy/UserDirectory.ts";
-import { RELAY_LINEAR_CALLBACK_PATH, RELAY_JIRA_CALLBACK_PATH } from "@t3tools/contracts/relay";
+import {
+  RELAY_LINEAR_CALLBACK_PATH,
+  RELAY_JIRA_CALLBACK_PATH,
+  WORKFLOW_LINEAR_CALLBACK_PATH,
+} from "@t3tools/contracts/relay";
 import { createClerkClient, verifyToken } from "@clerk/backend";
 import { sql as drizzleSql } from "drizzle-orm";
 import * as Crypto from "effect/Crypto";
@@ -82,6 +86,8 @@ import * as EnvironmentLinks from "../environments/EnvironmentLinks.ts";
 import * as GithubInstallations from "../tenancy/GithubInstallations.ts";
 import * as Invitations from "../tenancy/Invitations.ts";
 import * as Jobs from "../jobs/Jobs.ts";
+import * as Workflows from "../jobs/Workflows.ts";
+import * as WorkflowProjectCatalog from "../projects/OrganizationProjectCatalog.ts";
 import * as LiveActivities from "../agentActivity/LiveActivities.ts";
 import * as Organizations from "../tenancy/Organizations.ts";
 import * as Repositories from "../tenancy/Repositories.ts";
@@ -220,7 +226,11 @@ export const RELAY_MOVE_REQUEST_DEADLINE_MS = 55 * 60_000;
 /** OAuth codes and state authenticate the callback; keep them out of traces and deadline logs. */
 const traceUrl = (url: string) => {
   const parsed = new URL(url, "https://relay.invalid");
-  return [RELAY_LINEAR_CALLBACK_PATH, RELAY_JIRA_CALLBACK_PATH].includes(parsed.pathname)
+  return [
+    RELAY_LINEAR_CALLBACK_PATH,
+    RELAY_JIRA_CALLBACK_PATH,
+    WORKFLOW_LINEAR_CALLBACK_PATH,
+  ].includes(parsed.pathname)
     ? parsed.pathname
     : url;
 };
@@ -1700,6 +1710,8 @@ const RelayCommonPersistenceError = Schema.Union([
   EnvironmentCredentials.EnvironmentCredentialAuthenticatePersistenceError,
   EnvironmentCredentials.EnvironmentCredentialRevokePersistenceError,
   Jobs.JobPersistenceError,
+  Workflows.WorkflowPersistenceError,
+  WorkflowProjectCatalog.OrganizationProjectCatalogPersistenceError,
   DpopProofs.DpopProofReplayPersistenceError,
   LiveActivities.LiveActivityTargetListPersistenceError,
   AgentActivityRows.AgentActivityRowUpsertPersistenceError,

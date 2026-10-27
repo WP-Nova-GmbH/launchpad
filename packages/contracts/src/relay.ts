@@ -17,6 +17,21 @@ import {
   ThreadVmPolicyRecord,
 } from "./threadVm.ts";
 import {
+  RepositoryWorkflow,
+  WorkflowCatalog,
+  RepositoryWorkflowJob,
+  RepositoryWorkflowJobSummary,
+  WorkflowJobPageQuery,
+  WorkflowJobPage,
+  SaveRepositoryWorkflow,
+  RunRepositoryWorkflow,
+  RespondToWorkflowJob,
+  WorkflowControl,
+  WorkflowControlResult,
+  WorkflowConflictError,
+  WorkflowInvalidError,
+} from "./workflows.ts";
+import {
   RepositoryPolicyProof,
   RepositoryPolicyAcknowledgement,
   RepositoryAccessRemovalStatus,
@@ -52,8 +67,24 @@ import {
   RelayIssueTrackerError,
 } from "./issueTrackers.ts";
 export * from "./issueTrackers.ts";
+export * from "./workflowSources.ts";
+import {
+  WorkflowSourceError,
+  WorkflowSourceOwner,
+  WorkflowRepositorySources,
+  WorkflowSourceHealthList,
+  BeginWorkflowSource,
+  WorkflowSourceAuthorization,
+  DisconnectWorkflowSource,
+  AllowWorkflowSource,
+  WorkflowSourceMetadataQuery,
+  WorkflowSourceMetadataPage,
+  WorkflowSourceSelectionQuery,
+  WorkflowSourceSelection,
+} from "./workflowSources.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
+import { WorkflowOrigin } from "./workflowOrigin.ts";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiEndpoint from "effect/unstable/httpapi/HttpApiEndpoint";
 import * as HttpApiGroup from "effect/unstable/httpapi/HttpApiGroup";
@@ -2356,12 +2387,15 @@ export type RelayJob = typeof RelayJob.Type;
  * relay issuer, and the response is signed back.
  */
 export const RelayCloudDispatchJobProofPayload = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowOrigin),
+  requestedBy: Schema.optional(TrimmedNonEmptyString),
   ...RelaySignedJwtRegisteredClaims,
   environmentId: EnvironmentId,
   jobId: RelayJobId,
   repositoryCanonicalKey: TrimmedNonEmptyString,
   baseBranch: TrimmedNonEmptyString,
   instruction: TrimmedNonEmptyString,
+  workflowControl: Schema.optional(WorkflowControl),
 });
 export type RelayCloudDispatchJobProofPayload = typeof RelayCloudDispatchJobProofPayload.Type;
 
@@ -2375,6 +2409,8 @@ export const RelayEnvironmentDispatchJobResponseProofPayload = Schema.Struct({
   environmentId: EnvironmentId,
   jobId: RelayJobId,
   accepted: Schema.Boolean,
+  workflowResult: Schema.optional(WorkflowControlResult),
+  requestId: Schema.optional(TrimmedNonEmptyString),
 });
 export type RelayEnvironmentDispatchJobResponseProofPayload =
   typeof RelayEnvironmentDispatchJobResponseProofPayload.Type;
@@ -2386,6 +2422,7 @@ export type RelayEnvironmentDispatchJobResponseProofPayload =
 export const RelayEnvironmentDispatchJobResponse = Schema.Struct({
   accepted: Schema.Boolean,
   proof: TrimmedNonEmptyString,
+  workflowResult: Schema.optional(WorkflowControlResult),
 });
 export type RelayEnvironmentDispatchJobResponse = typeof RelayEnvironmentDispatchJobResponse.Type;
 
@@ -3711,6 +3748,153 @@ const RelayRepositoryParams = Schema.Struct({
   repositoryId: RelayRepositoryId,
 });
 
+const RelayWorkflowSourcesGroup = HttpApiGroup.make("workflowSources")
+  .add(
+    HttpApiEndpoint.get("health", "/v1/repositories/:repositoryId/workflow-sources/health", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: WorkflowSourceHealthList,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.get("owner", "/v1/workflow-sources", {
+      headers: RelayBearerRequestHeaders,
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("begin", "/v1/workflow-sources/linear/begin", {
+      headers: RelayBearerRequestHeaders,
+      payload: BeginWorkflowSource,
+      success: WorkflowSourceAuthorization,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("cancel", "/v1/workflow-sources/linear/cancel", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ attemptId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("disconnect", "/v1/workflow-sources/disconnect", {
+      headers: RelayBearerRequestHeaders,
+      payload: DisconnectWorkflowSource,
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("refreshOwner", "/v1/workflow-sources/refresh", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ connectionId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.get("repository", "/v1/repositories/:repositoryId/workflow-sources", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("allow", "/v1/repositories/:repositoryId/workflow-sources/allow", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: AllowWorkflowSource,
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("withdraw", "/v1/repositories/:repositoryId/workflow-sources/withdraw", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("withdrawOwner", "/v1/workflow-sources/withdraw", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post(
+      "refreshRepository",
+      "/v1/repositories/:repositoryId/workflow-sources/refresh",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: RelayRepositoryParams,
+        payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+        success: WorkflowRepositorySources,
+        error: [...RelayTenancyErrors, WorkflowSourceError],
+      },
+    ),
+    HttpApiEndpoint.post("selection", "/v1/repositories/:repositoryId/workflow-sources/selection", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: WorkflowSourceSelectionQuery,
+      success: WorkflowSourceSelection,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("metadata", "/v1/repositories/:repositoryId/workflow-sources/metadata", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: WorkflowSourceMetadataQuery,
+      success: WorkflowSourceMetadataPage,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+  )
+  .middleware(RelayClientAuth);
+
+const WorkflowErrors = [
+  ...RelayTenancyErrors,
+  WorkflowConflictError,
+  WorkflowInvalidError,
+] as const;
+const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
+  .add(
+    HttpApiEndpoint.get("list", "/v1/repositories/:repositoryId/workflows", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: WorkflowCatalog,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.post("save", "/v1/repositories/:repositoryId/workflows", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: SaveRepositoryWorkflow,
+      success: RepositoryWorkflow,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get("listJobs", "/v1/repositories/:repositoryId/workflow-jobs", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: Schema.Struct({ jobs: Schema.Array(RepositoryWorkflowJobSummary) }),
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get("pageJobs", "/v1/repositories/:repositoryId/workflow-jobs/page", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      query: WorkflowJobPageQuery,
+      success: WorkflowJobPage,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.post("run", "/v1/repositories/:repositoryId/workflow-jobs", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: RunRepositoryWorkflow,
+      success: RepositoryWorkflowJob,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get("getJob", "/v1/repositories/:repositoryId/workflow-jobs/:jobId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+      success: RepositoryWorkflowJob,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.post("respond", "/v1/repositories/:repositoryId/workflow-jobs/:jobId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+      payload: RespondToWorkflowJob,
+      success: RepositoryWorkflowJob,
+      error: WorkflowErrors,
+    }),
+  )
+  .middleware(RelayClientAuth);
+
 /**
  * Organizations, membership, and invitations. Everything here is relay-owned:
  * Clerk says who the caller is and this group decides what that means.
@@ -4544,6 +4728,8 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayTokenGroup,
     RelayDpopClientGroup,
     RelayJobsGroup,
+    RelayWorkflowsGroup,
+    RelayWorkflowSourcesGroup,
     RelayServerGroup,
     RelayProjectCatalogServerGroup,
     RelaySourceControlServerGroup,
