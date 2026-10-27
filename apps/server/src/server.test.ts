@@ -1,4 +1,7 @@
 import * as CheckoutAccess from "./workspace/CheckoutAccess.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "./persistence/CheckoutCapture.ts";
+import * as Context from "effect/Context";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as GitHubCliAvailability from "./sourceControl/GitHubCliAvailability.ts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
@@ -531,6 +534,7 @@ const makeBrowserOtlpPayload = (spanName: string) =>
   });
 
 const buildAppUnderTest = (options?: {
+  onDatabase?: (sql: SqlClient.SqlClient) => Effect.Effect<void>;
   onPairingChangesSubscribed?: Effect.Effect<void>;
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
   layers?: {
@@ -784,7 +788,18 @@ const buildAppUnderTest = (options?: {
       // Viewed-file marks for a host that keeps none of its own are rows, so the routes want a
       // database. Its own, in memory: nothing here shares a table with the auth store.
       makeRoutesLayer.pipe(
-        Layer.provide(Layer.mergeAll(serviceLauncherClientLayer, SqlitePersistenceMemory)),
+        Layer.provide(
+          Layer.mergeAll(
+            serviceLauncherClientLayer,
+            options?.onDatabase
+              ? SqlitePersistenceMemory.pipe(
+                  Layer.tap((context) =>
+                    options.onDatabase!(Context.get(context, SqlClient.SqlClient)),
+                  ),
+                )
+              : SqlitePersistenceMemory,
+          ),
+        ),
       ),
       {
         disableListenLog: true,
@@ -12072,12 +12087,110 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("rejects legacy bootstrap before Git when a capture already holds its source", () =>
+    Effect.gen(function* () {
+      let captures: ReturnType<typeof makeCheckoutCapture> | undefined;
+      let gitCalls = 0;
+      const dispatched: OrchestrationCommand[] = [];
+      yield* buildAppUnderTest({
+        onDatabase: (sql) =>
+          Effect.sync(() => {
+            captures = makeCheckoutCapture(sql);
+          }),
+        layers: {
+          vcsDriver: {
+            isInsideWorkTree: () =>
+              Effect.sync(() => {
+                gitCalls++;
+                return true;
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: dispatched.length };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+      if (!captures) throw new Error("Missing route database");
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const checkoutRoot = yield* CheckoutAccess.resolveCheckoutPath("/tmp/project", fs, path);
+      yield* captures.acquireDrain({
+        operationId: "capture-before-bootstrap",
+        threadId: "moving",
+        environmentId: "source",
+        generation: 1,
+        checkoutRoot,
+        gitCommonRoot: checkoutRoot,
+      });
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const result = yield* Effect.scoped(
+        withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("held-bootstrap"),
+            threadId: ThreadId.make("held-bootstrap"),
+            message: {
+              messageId: MessageId.make("held-bootstrap-message"),
+              role: "user",
+              text: "hello",
+              attachments: [],
+            },
+            modelSelection: defaultModelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            bootstrap: {
+              createThread: {
+                projectId: defaultProjectId,
+                title: "Held",
+                modelSelection: defaultModelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: null,
+                createdAt,
+              },
+              prepareWorktree: {
+                projectCwd: "/tmp/project",
+                baseBranch: "main",
+                branch: "held-bootstrap",
+              },
+              runSetupScript: true,
+            },
+            createdAt,
+          }),
+        ),
+      ).pipe(Effect.result);
+      assertTrue(result._tag === "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "OrchestrationDispatchCommandError");
+        assert.include(result.failure.message, "Waiting for this checkout");
+      }
+      assert.equal(gitCalls, 0);
+      assert.deepEqual(dispatched, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect(
     "bootstraps first-send worktree turns on the server before dispatching turn start",
     () =>
       Effect.gen(function* () {
         const dispatchedCommands: Array<OrchestrationCommand> = [];
         const bootstrapGitOperations: string[] = [];
+        let captures: ReturnType<typeof makeCheckoutCapture> | undefined;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sourceRoot = yield* CheckoutAccess.resolveCheckoutPath("/tmp/project", fs, path);
+        const targetRoot = yield* CheckoutAccess.resolveCheckoutPath(
+          "/tmp/bootstrap-worktree",
+          fs,
+          path,
+        );
+        let terminalAdmission: string | undefined;
         const refreshStatus = vi.fn((_: string) =>
           Effect.succeed({
             isRepo: true,
@@ -12105,9 +12218,22 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         );
         const fetchRemote = vi.fn(
           (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["fetchRemote"]>[0]) =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
               bootstrapGitOperations.push("fetch");
-            }),
+              if (!captures) throw new Error("Missing route database");
+              const scope = { checkoutRoot: sourceRoot, gitCommonRoot: sourceRoot };
+              assert.lengthOf(yield* captures.blockers(scope), 1);
+              yield* captures.acquireDrain({
+                ...scope,
+                operationId: "capture-during-legacy-setup",
+                threadId: "moving",
+                environmentId: "source",
+                generation: 1,
+              });
+              const parentAdmissionId = yield* CheckoutAdmission;
+              assert.isDefined(parentAdmissionId);
+              yield* captures.assertAccepting(scope, { parentAdmissionId: parentAdmissionId! });
+            }).pipe(Effect.orDie),
         );
         const remoteBranchExists = vi.fn(
           (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["remoteBranchExists"]>[0]) =>
@@ -12145,18 +12271,38 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]["runForThread"]
             >[0],
           ) =>
-            Effect.succeed({
-              status: "started" as const,
-              scriptId: "setup",
-              scriptName: "Setup",
-              scriptCommand: "npm install",
-              terminalId: "setup-setup",
-              cwd: "/tmp/bootstrap-worktree",
-              async: true,
-            }),
+            Effect.gen(function* () {
+              if (!captures) throw new Error("Missing route database");
+              const parentAdmissionId = yield* CheckoutAdmission;
+              assert.isDefined(parentAdmissionId);
+              assert.equal(
+                (yield* captures.getAdmission(parentAdmissionId!))?.checkoutRoot,
+                targetRoot,
+              );
+              terminalAdmission = (yield* captures.admit({
+                threadId: "thread-bootstrap",
+                workId: "async-setup-terminal",
+                kind: "terminal",
+                checkoutRoot: targetRoot,
+                parentAdmissionId: parentAdmissionId!,
+              })).admissionId;
+              return {
+                status: "started" as const,
+                scriptId: "setup",
+                scriptName: "Setup",
+                scriptCommand: "npm install",
+                terminalId: "setup-setup",
+                cwd: "/tmp/bootstrap-worktree",
+                async: true,
+              };
+            }).pipe(Effect.orDie),
         );
 
         yield* buildAppUnderTest({
+          onDatabase: (sql) =>
+            Effect.sync(() => {
+              captures = makeCheckoutCapture(sql);
+            }),
           layers: {
             vcsDriver: {
               isInsideWorkTree: () => Effect.succeed(true),
@@ -12228,6 +12374,17 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         );
 
         assert.equal(response.sequence, 8);
+        if (!captures) throw new Error("Missing route database");
+        assert.lengthOf(
+          yield* captures.blockers({ checkoutRoot: sourceRoot, gitCommonRoot: sourceRoot }),
+          0,
+        );
+        assert.deepEqual(
+          (yield* captures.blockers({ checkoutRoot: targetRoot, gitCommonRoot: targetRoot })).map(
+            (row) => row.admissionId,
+          ),
+          [terminalAdmission],
+        );
         assert.deepEqual(
           dispatchedCommands.map((command) => command.type),
           [
@@ -13015,6 +13172,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
   ])("$caseName", ({ async, cancel, exitCode }) =>
     Effect.gen(function* () {
       const dispatchedCommands: Array<OrchestrationCommand> = [];
+      let captures: ReturnType<typeof makeCheckoutCapture> | undefined;
+      let checkoutAccess: Effect.Success<typeof CheckoutAccess.make> | undefined;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const pathService = yield* Path.Path;
+      let worktreeRemoved = false;
       const scriptExit = yield* Deferred.make<void>();
       const runForThread = vi.fn(
         (
@@ -13035,12 +13197,31 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       yield* buildAppUnderTest({
+        onDatabase: (sql) =>
+          Effect.gen(function* () {
+            captures = makeCheckoutCapture(sql);
+            checkoutAccess = yield* CheckoutAccess.make.pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, pathService),
+            );
+          }),
         layers: {
           vcsDriver: {
             isInsideWorkTree: () => Effect.succeed(true),
           },
           gitVcsDriver: {
             execute: () => Effect.succeed(SUCCESSFUL_GIT_EXECUTION),
+            removeWorktree: () =>
+              Effect.gen(function* () {
+                if (!checkoutAccess) throw new Error("Missing checkout guard");
+                const operation = yield* checkoutAccess.begin({
+                  kind: "vcs",
+                  paths: ["/tmp/project", "/tmp/bootstrap-worktree"],
+                });
+                worktreeRemoved = true;
+                yield* checkoutAccess.complete(operation);
+              }).pipe(Effect.orDie),
             createWorktree: () =>
               Effect.succeed({
                 worktree: {
@@ -13147,10 +13328,25 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.isFalse(turnStarted());
 
       if (cancel) {
+        if (!captures) throw new Error("Missing route database");
+        const checkoutRoot = yield* CheckoutAccess.resolveCheckoutPath(
+          "/tmp/bootstrap-worktree",
+          fileSystem,
+          pathService,
+        );
+        yield* captures.acquireDrain({
+          operationId: "target-move-during-setup-cancel",
+          threadId: "target-sibling",
+          environmentId: "source",
+          generation: 1,
+          checkoutRoot,
+          gitCommonRoot: checkoutRoot,
+        });
         const cancelled = yield* Effect.scoped(
           withWsRpcClient(wsUrl, (client) => client[WS_METHODS.worktreeSetupCancel]({ threadId })),
         );
         assert.isTrue(cancelled.cancelled);
+        assert.isTrue(worktreeRemoved);
         assertTrue(dispatchedCommands.some((command) => command.type === "thread.delete"));
         const outcome = dispatchedCommands.findLast(
           (command) =>
@@ -13181,6 +13377,33 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       // finish and start the turn regardless.
       yield* Fiber.interrupt(dispatchFiber);
       assert.isFalse(turnStarted());
+      if (!captures) throw new Error("Missing route database");
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      for (const [requested, expected] of [
+        ["/tmp/project", 0],
+        ["/tmp/bootstrap-worktree", 1],
+      ] as const) {
+        const checkoutRoot = yield* CheckoutAccess.resolveCheckoutPath(requested, fs, path);
+        assert.lengthOf(
+          yield* captures.blockers({ checkoutRoot, gitCommonRoot: checkoutRoot }),
+          expected,
+        );
+      }
+      const sourceRoot = yield* CheckoutAccess.resolveCheckoutPath("/tmp/project", fs, path);
+      const captureOwner = {
+        operationId: "source-move-during-target-setup",
+        threadId: "moving-sibling",
+        environmentId: "source",
+        generation: 1,
+      };
+      yield* captures.acquireDrain({
+        ...captureOwner,
+        checkoutRoot: sourceRoot,
+        gitCommonRoot: sourceRoot,
+      });
+      yield* captures.enterCapturing(captureOwner);
+      yield* captures.release(captureOwner, { outcome: "sealed", manifestSha256: "a".repeat(64) });
 
       yield* Deferred.succeed(scriptExit, undefined);
       yield* snapshotWhere((snapshot) => stageStatus(snapshot, "agent") === "done");

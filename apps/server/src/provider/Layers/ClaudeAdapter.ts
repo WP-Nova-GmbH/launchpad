@@ -5567,10 +5567,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const context = yield* requireSession(threadId);
       const pending = context.pendingApprovals.get(requestId);
       if (!pending) {
-        return yield* new ProviderAdapterRequestError({
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          method: "item/requestApproval/decision",
-          detail: `Unknown pending approval request: ${requestId}`,
+          operation: "respondToRequest",
+          issue: `Unknown pending approval request: ${requestId}`,
         });
       }
 
@@ -5585,10 +5585,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     const context = yield* requireSession(threadId);
     const pending = context.pendingUserInputs.get(requestId);
     if (!pending) {
-      return yield* new ProviderAdapterRequestError({
+      return yield* new ProviderAdapterValidationError({
         provider: PROVIDER,
-        method: "item/tool/respondToUserInput",
-        detail: `Unknown pending user-input request: ${requestId}`,
+        operation: "respondToUserInput",
+        issue: `Unknown pending user-input request: ${requestId}`,
       });
     }
 

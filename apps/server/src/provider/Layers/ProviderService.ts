@@ -25,6 +25,7 @@ import { OrchestrationEventStore } from "../../persistence/Services/Orchestratio
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
 import { ThreadExecution } from "../../relay/ThreadExecution.ts";
+import { CheckoutAdmission } from "../../persistence/CheckoutCapture.ts";
 import { makeProviderExecution } from "../ProviderExecution.ts";
 import * as NodeUtil from "node:util";
 import {
@@ -93,6 +94,7 @@ import {
 import {
   ProviderAdapterRequestError,
   ProviderAdapterProcessError,
+  ProviderExecutionError,
   type ProviderAdapterError,
   type ProviderServiceError,
   ProviderValidationError,
@@ -499,7 +501,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 ) {
   const vmWorkloads = yield* VmWorkloadTracking;
   const analytics = yield* Effect.service(AnalyticsService.AnalyticsService);
-  const admitExecution = makeProviderExecution(yield* ThreadExecution);
+  const execution = yield* ThreadExecution;
+  const admitExecution = makeProviderExecution(execution);
+  type ProviderInvocation = Effect.Success<ReturnType<typeof admitExecution>>;
+  const rejectOnPreflightFailure = <A, E, R>(
+    invocation: ProviderInvocation,
+    effect: Effect.Effect<A, E, R>,
+  ) =>
+    effect.pipe(
+      Effect.catchCause((cause) => invocation.reject.pipe(Effect.andThen(Effect.failCause(cause)))),
+    );
+  const settleSessionInvocation = (invocation: ProviderInvocation, session: ProviderSession) =>
+    session.status === "running" && session.activeTurnId
+      ? invocation.bindTurn(String(session.activeTurnId))
+      : session.status === "ready"
+        ? invocation.complete
+        : Effect.void;
   const serverConfig = yield* ServerConfig.ServerConfig;
   const checkpointSql = yield* SqlClient.SqlClient;
   const nativeCheckpoints = makeThreadNativeCheckpoint(checkpointSql);
@@ -513,6 +530,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+  const isActiveTurnPayload = Schema.is(Schema.Struct({ activeTurnId: Schema.String }));
+  const withActiveTurnAdmission = Effect.fn("ProviderService.withActiveTurnAdmission")(function* <
+    A,
+    E,
+    R,
+  >(threadId: ThreadId, effect: Effect.Effect<A, E, R>) {
+    if (yield* CheckoutAdmission) return yield* effect;
+    const binding = yield* directory.getBinding(threadId);
+    const payload = Option.isSome(binding) ? binding.value.runtimePayload : undefined;
+    const admission = isActiveTurnPayload(payload)
+      ? yield* execution.activeAdmission(threadId, payload.activeTurnId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderExecutionError({
+                threadId,
+                operation: "read-active-admission",
+                uncertain: true,
+                cause,
+              }),
+          ),
+        )
+      : undefined;
+    return yield* effect.pipe(Effect.provideService(CheckoutAdmission, admission));
+  });
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const projectionQuery = yield* Effect.serviceOption(
     ProjectionSnapshotQuery.ProjectionSnapshotQuery,
@@ -1008,7 +1049,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const pendingDeliveries = new Map<
     ThreadId,
-    { events: ProviderRuntimeEvent[]; buffer: boolean }
+    { events: ProviderRuntimeEvent[]; buffer: boolean; directSends?: number }
   >();
   const publishAdmittedRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Effect.succeed(event).pipe(
@@ -1035,8 +1076,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.asVoid,
     );
 
-  // Adapters may emit turn.started before their send call acknowledges. Keep
-  // those events behind the durable queue-to-message promotion.
+  // Adapters may emit turn events before acknowledging a send. Queued delivery
+  // waits for durable binding; overlapping direct calls share a buffer until all settle.
   const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Effect.suspend(() => {
       const pending = pendingDeliveries.get(event.threadId);
@@ -1355,8 +1396,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
-      yield* admitExecution(input.binding.threadId, "recover-session");
-      yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
+      const invocation = yield* admitExecution(input.binding.threadId, "recover-session");
+      yield* rejectOnPreflightFailure(
+        invocation,
+        prepareMcpSession(input.binding.threadId, bindingInstanceId),
+      ).pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
       const resumed = yield* adapter
         .startSession({
           threadId: input.binding.threadId,
@@ -1367,7 +1411,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
           runtimeMode: input.binding.runtimeMode ?? "full-access",
         })
-        .pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
+        .pipe(
+          Effect.catchTag(
+            ["ProviderAdapterValidationError", "ProviderAdapterSessionNotFoundError"],
+            (error) => invocation.reject.pipe(Effect.andThen(Effect.fail(error))),
+          ),
+          Effect.onError(() => clearMcpSession(input.binding.threadId)),
+        );
       if (resumed.provider !== adapter.provider) {
         yield* clearMcpSession(input.binding.threadId);
         return yield* toValidationError(
@@ -1380,6 +1430,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         { ...resumed, providerInstanceId: bindingInstanceId },
         input.binding.threadId,
       );
+      yield* settleSessionInvocation(invocation, resumed);
       yield* analytics.record("provider.session.recovered", {
         provider: resumed.provider,
         strategy: "resume-thread",
@@ -1606,8 +1657,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           }
         }
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
-        yield* admitExecution(threadId, "start-session");
-        yield* prepareMcpSession(threadId, resolvedInstanceId);
+        const invocation = yield* admitExecution(threadId, "start-session");
+        yield* rejectOnPreflightFailure(
+          invocation,
+          prepareMcpSession(threadId, resolvedInstanceId),
+        ).pipe(Effect.onError(() => clearMcpSession(threadId)));
         const session = yield* adapter
           .startSession({
             ...input,
@@ -1615,7 +1669,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
           })
-          .pipe(Effect.onError(() => clearMcpSession(threadId)));
+          .pipe(
+            Effect.catchTag(
+              ["ProviderAdapterValidationError", "ProviderAdapterSessionNotFoundError"],
+              (error) => invocation.reject.pipe(Effect.andThen(Effect.fail(error))),
+            ),
+            Effect.onError(() => clearMcpSession(threadId)),
+          );
 
         if (session.provider !== adapter.provider) {
           yield* clearMcpSession(threadId);
@@ -1636,6 +1696,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         yield* upsertSessionBinding(sessionWithInstance, threadId, {
           modelSelection: input.modelSelection,
         });
+        yield* settleSessionInvocation(invocation, sessionWithInstance);
         yield* analytics.record("provider.session.started", {
           provider: sessionWithInstance.provider,
           runtimeMode: input.runtimeMode,
@@ -1857,7 +1918,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           );
         }
       }
-      if (deliveryHooks && pendingDeliveries.has(input.threadId)) {
+      const pendingDelivery = pendingDeliveries.get(input.threadId);
+      if (pendingDelivery && (deliveryHooks || pendingDelivery.directSends === undefined)) {
         return yield* toValidationError(
           "ProviderService.sendTurn",
           "Another prompt is still being admitted for this thread.",
@@ -1905,11 +1967,54 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 metadata: turnMetadata,
               });
             if (!deliveryHooks) {
-              yield* admitExecution(input.threadId, "send-turn", input.delivery?.attemptId);
-              const turn = yield* routed.adapter.sendTurn(input);
-              yield* associate(turn);
-              yield* persistAdmission(turn);
-              return turn;
+              const existing = pendingDeliveries.get(input.threadId);
+              if (existing && existing.directSends === undefined)
+                return yield* toValidationError(
+                  "ProviderService.sendTurn",
+                  "Another prompt is still being admitted for this thread.",
+                );
+              const pending = existing ?? {
+                events: [] as ProviderRuntimeEvent[],
+                buffer: true,
+                directSends: 0,
+              };
+              pending.directSends = (pending.directSends ?? 0) + 1;
+              pendingDeliveries.set(input.threadId, pending);
+              return yield* Effect.gen(function* () {
+                const invocation = yield* admitExecution(
+                  input.threadId,
+                  "send-turn",
+                  input.delivery?.attemptId,
+                );
+                const turn = yield* routed.adapter
+                  .sendTurn(input)
+                  .pipe(
+                    Effect.catchTag(
+                      ["ProviderAdapterValidationError", "ProviderAdapterSessionNotFoundError"],
+                      (error) => invocation.reject.pipe(Effect.andThen(Effect.fail(error))),
+                    ),
+                  );
+                yield* invocation.bindTurn(String(turn.turnId));
+                yield* associate(turn);
+                yield* persistAdmission(turn);
+                return turn;
+              }).pipe(
+                Effect.onExit(() =>
+                  Effect.gen(function* () {
+                    pending.directSends = (pending.directSends ?? 1) - 1;
+                    if (pending.directSends > 0) return;
+                    while (pending.directSends === 0 && pending.events.length > 0)
+                      yield* Effect.forEach(pending.events.splice(0), publishAdmittedRuntimeEvent, {
+                        discard: true,
+                      });
+                    if (
+                      pending.directSends === 0 &&
+                      pendingDeliveries.get(input.threadId) === pending
+                    )
+                      pendingDeliveries.delete(input.threadId);
+                  }),
+                ),
+              );
             }
             const pending = {
               events: [] as ProviderRuntimeEvent[],
@@ -1917,6 +2022,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             };
             pendingDeliveries.set(input.threadId, pending);
             let admitted = false;
+            let invocation: ProviderInvocation | undefined;
             const admissionCallbacks: ProviderSendTurnCallbacks = {
               ...(deliveryHooks.beforeDispatch
                 ? { beforeDispatch: deliveryHooks.beforeDispatch }
@@ -1924,6 +2030,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               onAdmitted: (turn, evidence) =>
                 Effect.gen(function* () {
                   if (admitted) return;
+                  if (!invocation) return yield* Effect.die("Provider admission was not reserved.");
+                  yield* invocation.bindTurn(String(turn.turnId)).pipe(Effect.orDie);
                   yield* persistAdmission(turn).pipe(Effect.orDie);
                   yield* associate(turn);
                   yield* deliveryHooks.onAdmitted(turn, evidence);
@@ -1939,7 +2047,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             };
             return yield* (deliveryHooks.beforeDispatch ?? Effect.void).pipe(
               Effect.andThen(
-                admitExecution(input.threadId, "send-turn", input.delivery?.attemptId),
+                admitExecution(input.threadId, "send-turn", input.delivery?.attemptId).pipe(
+                  Effect.tap((reserved) =>
+                    Effect.sync(() => {
+                      invocation = reserved;
+                    }),
+                  ),
+                ),
               ),
               Effect.andThen(() => routed.adapter.sendTurn(input, admissionCallbacks)),
               Effect.tap(() =>
@@ -1949,6 +2063,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                       "ProviderService.sendTurn",
                       "The provider did not admit this prompt. It remains queued.",
                     ),
+              ),
+              Effect.catchTag(
+                ["ProviderAdapterValidationError", "ProviderAdapterSessionNotFoundError"],
+                (error) =>
+                  (invocation?.reject ?? Effect.void).pipe(Effect.andThen(Effect.fail(error))),
               ),
               Effect.ensuring(
                 Effect.sync(() => {
@@ -2096,6 +2215,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             }),
         ),
       );
+      let compactInvocation: ProviderInvocation | undefined;
       const completionWork: Effect.Effect<
         { terminal: string; result: ProviderService.ProviderCompactionResult },
         ProviderServiceError
@@ -2103,6 +2223,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         compaction.type === "native"
           ? awaitNativeCompaction(
               admitExecution(threadId, "compact", requestId).pipe(
+                Effect.tap((invocation) =>
+                  Effect.sync(() => {
+                    compactInvocation = invocation;
+                  }),
+                ),
                 Effect.andThen(() =>
                   compaction.start(routed.threadId, modelSelection, hooks?.beforeDispatch),
                 ),
@@ -2174,7 +2299,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 },
               };
             });
-      const { terminal, result } = yield* completionWork.pipe(Effect.ensuring(clearPending));
+      const { terminal, result } = yield* completionWork.pipe(
+        Effect.catchTag(
+          ["ProviderAdapterValidationError", "ProviderAdapterSessionNotFoundError"],
+          (error) =>
+            (compactInvocation?.reject ?? Effect.void).pipe(Effect.andThen(Effect.fail(error))),
+        ),
+        Effect.ensuring(clearPending),
+      );
+      if (terminal === "completed" && compactInvocation) yield* compactInvocation.complete;
       if (result.type === "native" && terminal !== "completed") {
         return yield* new ProviderAdapterRequestError({
           provider: routed.adapter.provider,
@@ -2237,26 +2370,40 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         payload: rawInput,
       });
       let metricProvider = "unknown";
-      return yield* Effect.gen(function* () {
-        yield* admitExecution(input.threadId, "approval", input.requestId);
-        const routed = yield* resolveRoutableSession({
-          threadId: input.threadId,
-          operation: "ProviderService.respondToRequest",
-          allowRecovery: true,
-        });
-        metricProvider = routed.adapter.provider;
-        yield* Effect.annotateCurrentSpan({
-          "provider.operation": "respond-to-request",
-          "provider.kind": routed.adapter.provider,
-          "provider.thread_id": input.threadId,
-          "provider.request_id": input.requestId,
-        });
-        yield* routed.adapter.respondToRequest(routed.threadId, input.requestId, input.decision);
-        yield* analytics.record("provider.request.responded", {
-          provider: routed.adapter.provider,
-          decision: input.decision,
-        });
-      }).pipe(
+      return yield* withActiveTurnAdmission(
+        input.threadId,
+        Effect.gen(function* () {
+          const invocation = yield* admitExecution(input.threadId, "approval", input.requestId);
+          const routed = yield* rejectOnPreflightFailure(
+            invocation,
+            resolveRoutableSession({
+              threadId: input.threadId,
+              operation: "ProviderService.respondToRequest",
+              allowRecovery: true,
+            }),
+          );
+          metricProvider = routed.adapter.provider;
+          yield* Effect.annotateCurrentSpan({
+            "provider.operation": "respond-to-request",
+            "provider.kind": routed.adapter.provider,
+            "provider.thread_id": input.threadId,
+            "provider.request_id": input.requestId,
+          });
+          yield* routed.adapter
+            .respondToRequest(routed.threadId, input.requestId, input.decision)
+            .pipe(
+              Effect.catchTag(
+                ["ProviderAdapterValidationError", "ProviderAdapterSessionNotFoundError"],
+                (error) => invocation.reject.pipe(Effect.andThen(Effect.fail(error))),
+              ),
+            );
+          yield* invocation.complete;
+          yield* analytics.record("provider.request.responded", {
+            provider: routed.adapter.provider,
+            decision: input.decision,
+          });
+        }),
+      ).pipe(
         withMetrics({
           counter: providerTurnsTotal,
           outcomeAttributes: () =>
@@ -2277,26 +2424,43 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       payload: rawInput,
     });
     let metricProvider = "unknown";
-    return yield* Effect.gen(function* () {
-      yield* admitExecution(input.threadId, "user-input", input.requestId);
-      const routed = yield* resolveRoutableSession({
-        threadId: input.threadId,
-        operation: "ProviderService.respondToUserInput",
-        allowRecovery: true,
-      });
-      metricProvider = routed.adapter.provider;
-      yield* Effect.annotateCurrentSpan({
-        "provider.operation": "respond-to-user-input",
-        "provider.kind": routed.adapter.provider,
-        "provider.thread_id": input.threadId,
-        "provider.request_id": input.requestId,
-      });
-      const answers = yield* appendUserInputAttachmentPaths({
-        ...input,
-        attachmentsDir: serverConfig.attachmentsDir,
-      }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
-      yield* routed.adapter.respondToUserInput(routed.threadId, input.requestId, answers);
-    }).pipe(
+    return yield* withActiveTurnAdmission(
+      input.threadId,
+      Effect.gen(function* () {
+        const invocation = yield* admitExecution(input.threadId, "user-input", input.requestId);
+        const routed = yield* rejectOnPreflightFailure(
+          invocation,
+          resolveRoutableSession({
+            threadId: input.threadId,
+            operation: "ProviderService.respondToUserInput",
+            allowRecovery: true,
+          }),
+        );
+        metricProvider = routed.adapter.provider;
+        yield* Effect.annotateCurrentSpan({
+          "provider.operation": "respond-to-user-input",
+          "provider.kind": routed.adapter.provider,
+          "provider.thread_id": input.threadId,
+          "provider.request_id": input.requestId,
+        });
+        const answers = yield* rejectOnPreflightFailure(
+          invocation,
+          appendUserInputAttachmentPaths({
+            ...input,
+            attachmentsDir: serverConfig.attachmentsDir,
+          }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem)),
+        );
+        yield* routed.adapter
+          .respondToUserInput(routed.threadId, input.requestId, answers)
+          .pipe(
+            Effect.catchTag(
+              ["ProviderAdapterValidationError", "ProviderAdapterSessionNotFoundError"],
+              (error) => invocation.reject.pipe(Effect.andThen(Effect.fail(error))),
+            ),
+          );
+        yield* invocation.complete;
+      }),
+    ).pipe(
       withMetrics({
         counter: providerTurnsTotal,
         outcomeAttributes: () =>
@@ -2548,12 +2712,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     let metricProvider = "unknown";
     return yield* Effect.gen(function* () {
       yield* assertConversationRollbackSupported(input.threadId);
-      yield* admitExecution(input.threadId, "rollback");
-      const routed = yield* resolveRoutableSession({
-        threadId: input.threadId,
-        operation: "ProviderService.rollbackConversation",
-        allowRecovery: true,
-      });
+      const invocation = yield* admitExecution(input.threadId, "rollback");
+      const routed = yield* rejectOnPreflightFailure(
+        invocation,
+        resolveRoutableSession({
+          threadId: input.threadId,
+          operation: "ProviderService.rollbackConversation",
+          allowRecovery: true,
+        }),
+      );
       metricProvider = routed.adapter.provider;
       yield* Effect.annotateCurrentSpan({
         "provider.operation": "rollback-conversation",
@@ -2561,7 +2728,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.thread_id": input.threadId,
         "provider.rollback_turns": input.numTurns,
       });
-      yield* routed.adapter.rollbackThread(routed.threadId, input.numTurns);
+      yield* routed.adapter
+        .rollbackThread(routed.threadId, input.numTurns)
+        .pipe(
+          Effect.catchTag(
+            ["ProviderAdapterValidationError", "ProviderAdapterSessionNotFoundError"],
+            (error) => invocation.reject.pipe(Effect.andThen(Effect.fail(error))),
+          ),
+        );
+      yield* invocation.complete;
       const session = (yield* routed.adapter.listSessions()).find(
         (session) => session.threadId === routed.threadId,
       );

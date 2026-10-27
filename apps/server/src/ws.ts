@@ -126,6 +126,8 @@ import {
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { makeThreadExecutionFence } from "./persistence/ThreadExecutionFence.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "./persistence/CheckoutCapture.ts";
+import { resolveCheckoutPath } from "./workspace/CheckoutAccess.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import {
   makeCreationDispatcher,
@@ -614,6 +616,9 @@ const makeWsRpcLayer = (
         );
       const crypto = yield* Crypto.Crypto;
       const sql = yield* SqlClient.SqlClient;
+      const checkoutCaptures = makeCheckoutCapture(sql);
+      const bootstrapFileSystem = yield* FileSystem.FileSystem;
+      const bootstrapPath = yield* Path.Path;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       /** A reference's host-level link key; the project's own host where the ref names none. */
       const resolvePullRequestSyncKey = (reference: PullRequestRef) =>
@@ -1257,6 +1262,66 @@ const makeWsRpcLayer = (
           let targetProjectId = bootstrap?.createThread?.projectId;
           let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
           let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
+          const existingThread = bootstrap?.createThread
+            ? undefined
+            : yield* projectionSnapshotQuery.getThreadShellById(command.threadId).pipe(
+                Effect.map(Option.getOrUndefined),
+                Effect.mapError((cause) =>
+                  toDispatchCommandError(cause, "The setup thread could not be read."),
+                ),
+              );
+          const projectId = targetProjectId ?? existingThread?.projectId;
+          const project = projectId
+            ? yield* projectionSnapshotQuery.getProjectShellById(projectId).pipe(
+                Effect.map(Option.getOrUndefined),
+                Effect.mapError((cause) =>
+                  toDispatchCommandError(cause, "The setup project could not be read."),
+                ),
+              )
+            : undefined;
+          const sourceRoot =
+            bootstrap?.prepareWorktree?.projectCwd ??
+            targetWorktreePath ??
+            existingThread?.worktreePath ??
+            project?.workspaceRoot;
+          if (!sourceRoot)
+            return yield* new OrchestrationDispatchCommandError({
+              message: "The setup checkout is unavailable.",
+            });
+          const setupAdmissions = new Map<string, string>();
+          const admitSetupScope = Effect.fnUntraced(function* (root: string) {
+            const checkoutRoot = yield* resolveCheckoutPath(
+              root,
+              bootstrapFileSystem,
+              bootstrapPath,
+            ).pipe(
+              Effect.mapError((cause) =>
+                toDispatchCommandError(cause, "The setup checkout could not be resolved."),
+              ),
+            );
+            const prior = setupAdmissions.get(checkoutRoot);
+            if (prior) return prior;
+            const admitted = yield* checkoutCaptures
+              .admit({
+                threadId: command.threadId,
+                kind: "setup",
+                workId: `bootstrap:${command.commandId}:${checkoutRoot}`,
+                checkoutRoot,
+              })
+              .pipe(
+                Effect.mapError((cause) =>
+                  toDispatchCommandError(cause, "The setup checkout is unavailable."),
+                ),
+              );
+            if (admitted.decision !== "start")
+              return yield* new OrchestrationDispatchCommandError({
+                message: "This setup attempt needs reconciliation before it can run again.",
+              });
+            setupAdmissions.set(checkoutRoot, admitted.admissionId);
+            return admitted.admissionId;
+          });
+          const sourceAdmission = yield* admitSetupScope(sourceRoot);
+          let targetAdmission = sourceAdmission;
           // The setup script's terminal, once started. Cancel closes only this
           // one so terminals the user opened meanwhile survive.
           let setupTerminalId: string | null = null;
@@ -1505,7 +1570,7 @@ const makeWsRpcLayer = (
                 return null;
               }
               return completionFiber;
-            });
+            }).pipe(Effect.provideService(CheckoutAdmission, targetAdmission));
 
           const bootstrapProgram = Effect.gen(function* () {
             const prepareWorktree = bootstrap?.prepareWorktree;
@@ -1695,10 +1760,11 @@ const makeWsRpcLayer = (
                   progress: {
                     // Git has registered the directory at this point, so a
                     // cancel during the submodule step can still remove it.
-                    onWorktreeClaimed: (path) =>
-                      Effect.sync(() => {
-                        targetWorktreePath = path;
-                      }),
+                    onWorktreeClaimed: (claimedPath) =>
+                      Effect.gen(function* () {
+                        targetWorktreePath = claimedPath;
+                        targetAdmission = yield* admitSetupScope(claimedPath);
+                      }).pipe(Effect.orDie),
                     onCheckoutProgress: ({ percent, completed, total }) => {
                       checkoutTotal = total;
                       return worktreeSetupTracker.stage(threadId, "checkout", {
@@ -1770,6 +1836,7 @@ const makeWsRpcLayer = (
                 }),
               }));
               targetWorktreePath = worktree.worktree.path;
+              targetAdmission = yield* admitSetupScope(targetWorktreePath);
               yield* dispatchFromClient({
                 type: "thread.meta.update",
                 commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
@@ -1777,9 +1844,13 @@ const makeWsRpcLayer = (
                 branch: worktree.worktree.refName,
                 worktreePath: targetWorktreePath,
               });
-              yield* refreshGitStatus(targetWorktreePath);
+              yield* refreshGitStatus(targetWorktreePath).pipe(
+                Effect.provideService(CheckoutAdmission, targetAdmission),
+              );
             }
 
+            if (sourceAdmission !== targetAdmission)
+              yield* checkoutCaptures.complete(sourceAdmission);
             const pendingSetupScript = yield* runSetupProgram();
 
             yield* track(worktreeSetupTracker.stageStatus(threadId, "agent", "running"));
@@ -1910,6 +1981,9 @@ const makeWsRpcLayer = (
                               force: true,
                             })
                             .pipe(
+                              // Keep the target's drain permission; source Git work
+                              // must enter normally after releasing its admission.
+                              Effect.provideService(CheckoutAdmission, targetAdmission),
                               Effect.retry({ times: 4, schedule: Schedule.spaced("500 millis") }),
                             ),
                         ),
@@ -1949,6 +2023,13 @@ const makeWsRpcLayer = (
                   ),
               ).pipe(Effect.andThen(cleanupAndFail(cause, dispatchError)));
             }),
+            Effect.ensuring(
+              Effect.suspend(() =>
+                Effect.forEach(setupAdmissions.values(), checkoutCaptures.complete, {
+                  discard: true,
+                }).pipe(Effect.orDie),
+              ),
+            ),
             // Cancellation must finish recording and rollback after the bootstrap is interrupted.
             Effect.uninterruptible,
           );
@@ -1980,7 +2061,9 @@ const makeWsRpcLayer = (
               })
             : settledBootstrapProgram;
 
-          return yield* runBootstrap;
+          return yield* runBootstrap.pipe(
+            Effect.provideService(CheckoutAdmission, sourceAdmission),
+          );
         });
 
       const dispatchNormalizedCommand = (

@@ -14,6 +14,7 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ProviderSessionRuntimeRepository } from "../persistence/ProviderSessionRuntime.ts";
 import type { OrchestrationEventStoreShape } from "../persistence/Services/OrchestrationEventStore.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import {
   CodexConversationManifest,
   exportCodexConversation,
@@ -33,6 +34,7 @@ import {
 } from "./ThreadHistoryArchive.ts";
 import { exportThreadWorkspace, importThreadWorkspace } from "./ThreadWorkspaceTransfer.ts";
 import { workspaceFileHash } from "./ThreadWorkspaceFiles.ts";
+import { workspaceGitText } from "./ThreadWorkspaceGit.ts";
 import { attachmentRelativePath } from "../attachmentStore.ts";
 
 import { ThreadTransferArchiveManifest } from "@t3tools/contracts/threadTransfer";
@@ -88,7 +90,29 @@ export function makeThreadTransferArchive(
       FROM projection_threads t JOIN projection_projects p ON p.project_id = t.project_id
       WHERE t.thread_id = ${input.threadId} AND t.project_id = ${fence.projectId} AND t.deleted_at IS NULL AND p.deleted_at IS NULL`;
     if (!project) return yield* fail("The thread has no current source checkout.");
-    const workspaceRoot = yield* fs.realPath(project.workspaceRoot);
+    const resolvedWorkspaceRoot = yield* fs.realPath(project.workspaceRoot);
+    const capture = yield* makeCheckoutCapture(sql).get(input.operationId);
+    if (capture) {
+      const gitCommonRoot = yield* fs.realPath(
+        yield* workspaceGitText(resolvedWorkspaceRoot, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ]),
+      );
+      if (
+        capture.phase !== "capturing" ||
+        capture.threadId !== input.threadId ||
+        capture.environmentId !== input.environmentId ||
+        capture.generation !== input.generation ||
+        capture.checkoutRoot !== resolvedWorkspaceRoot ||
+        capture.gitCommonRoot !== gitCommonRoot
+      )
+        return yield* fail("The source checkout changed after its snapshot admission.");
+    }
+    // Ownership is frozen before resolving this binding. Keep the export on the
+    // admitted canonical path even if its registered alias changes afterward.
+    const workspaceRoot = capture?.checkoutRoot ?? resolvedWorkspaceRoot;
     const runtime = yield* sessions.getByThreadId({ threadId: ThreadId.make(input.threadId) });
     let nativeThreadId: string | null = null;
     if (Option.isSome(runtime)) {

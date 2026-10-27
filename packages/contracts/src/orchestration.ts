@@ -965,6 +965,7 @@ export const ThreadMoveQueueEntry = Schema.Struct({
   state: Schema.Literals(["pending", "moving", "blocked", "cancelling"]),
   operationId: Schema.optional(CommandId),
   detail: Schema.optional(Schema.String),
+  waitingForCheckout: Schema.optionalKey(Schema.Boolean),
 });
 export type ThreadMoveQueueEntry = typeof ThreadMoveQueueEntry.Type;
 export const ThreadQueueEntry = Schema.Union([ThreadMoveQueueEntry, ThreadPromptQueueEntry]);
@@ -1641,6 +1642,7 @@ const ThreadMoveProgressCommand = Schema.Struct({
   expectedRevision: NonNegativeInt,
   detail: Schema.String,
   blocked: Schema.Boolean,
+  waitingForCheckout: Schema.optionalKey(Schema.Boolean),
 });
 const ThreadMoveFinishCommand = Schema.Struct({
   type: Schema.Literal("thread.move.finish"),

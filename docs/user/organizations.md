@@ -195,8 +195,13 @@ conversation. To move later, reorder the move in the shared queue before it star
 stays paused until you resume it. Use **Run on** again to move back to an eligible machine.
 Selecting the machine you started on automatically returns the thread to its original project.
 If that project is no longer available, Launchpad explains the problem rather than choosing another folder.
-If Launchpad cannot verify that local terminal or setup processes have stopped, the move stays
-queued with an explanation. Cancel the move to continue working locally.
+The move also waits for active threads, checkpoints, setup tasks and open terminals sharing the
+same checkout. Other worktrees can keep working. Pending prompts wait until the snapshot is ready;
+manually paused queues stay paused. The snapshot includes the whole checkout, including environment
+files and changes from other threads.
+Close local terminals when their work is finished. Programs detached from those terminals are outside
+this guard; stop any that could change the checkout during the move. If Launchpad cannot confirm
+that managed work has stopped, the move stays queued with an explanation. Cancel it to continue locally.
 Fresh VMs need their own Codex sign-in; follow the sign-in step in the thread to let preparation continue.
 Unsent drafts follow the thread on the device making the move. If both locations have a draft,
 choose which one to continue; Launchpad keeps the other copy. Reattach any files whose original

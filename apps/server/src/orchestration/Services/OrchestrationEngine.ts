@@ -45,6 +45,8 @@ export interface DeletionPreconditions {
 
 export interface OrchestrationDispatchOptions {
   readonly origin?: OrchestrationClientOrigin;
+  /** Preserve an accepted start's lineage when compaction reissues its pending projection. */
+  readonly parentCheckoutAdmissionId?: string;
   /** Rechecked in the event transaction; enrolled threads accept only relay inbox delivery. */
   readonly directClientCommand?: true;
   /** Bind a held provider-output command to its original pre-persistence ownership. */

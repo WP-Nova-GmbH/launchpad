@@ -15,13 +15,18 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
+import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import { ServerConfig } from "../config.ts";
 import { ProjectSetupScriptRunner } from "../project/ProjectSetupScriptRunner.ts";
@@ -30,6 +35,8 @@ import { ServerSettingsService } from "../serverSettings.ts";
 import { forkParked } from "../serverActivation.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import { resolveCheckoutPath } from "../workspace/CheckoutAccess.ts";
+import { checkoutCaptureReleases } from "../workspace/CheckoutCaptureSignals.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./Services/ThreadDeletionReactor.ts";
@@ -138,8 +145,15 @@ const make = Effect.gen(function* () {
   const deletion = yield* ThreadDeletionReactor;
   const config = yield* ServerConfig;
   const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  const sql = yield* SqlClient.SqlClient;
+  const captures = makeCheckoutCapture(sql);
+  const fences = makeThreadExecutionFence(sql);
   const scope = yield* Scope.Scope;
   const workers = new Map<ThreadId, { fiber: Fiber.Fiber<void>; attemptId: CommandId }>();
+  const waitingForCapture = new Map<ThreadId, number>();
+  let captureReleaseVersion = 0;
+  const scheduleLock = yield* Semaphore.make(1);
   const seenSequence = yield* SubscriptionRef.make(0);
   const noteSeen = (sequence: number) =>
     SubscriptionRef.update(seenSequence, (seen) => Math.max(seen, sequence));
@@ -243,6 +257,8 @@ const make = Effect.gen(function* () {
     let terminalId: string | undefined;
     let didBeginTracking = false;
     let backgroundCompletion: Effect.Effect<void> | undefined;
+    const admissions: string[] = [];
+    let admissionReleaseVersion = captureReleaseVersion;
     const program = Effect.gen(function* () {
       // Every deletion before this accepted incarnation must finish before it owns resources.
       yield* deletion.drainThrough(yield* engine.latestSequence, threadId);
@@ -257,24 +273,6 @@ const make = Effect.gen(function* () {
         preparation.state !== "pending"
       )
         return;
-      // Register cancellation only after cleanup for the previous incarnation drained.
-      yield* tracker
-        .begin({
-          threadId,
-          creationSequence: anchor.value.creationSequence,
-          branch: preparation.recipe?.prepareWorktree?.branch ?? null,
-          baseRef: preparation.recipe?.prepareWorktree?.baseBranch ?? null,
-          stages: ["fetch", "checkout", "submodules", "setup-script", "agent"],
-          fiber: workers.get(threadId)?.fiber ?? null,
-        })
-        .pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              didBeginTracking = true;
-            }),
-          ),
-          Effect.uninterruptible,
-        );
       const project = yield* query.getProjectShellById(thread.projectId);
       if (Option.isNone(project) || !preparation.recipe)
         return yield* new PreparationError({
@@ -313,6 +311,63 @@ const make = Effect.gen(function* () {
             async: selected.async !== false,
           }
         : null;
+      const sourceRoot = yield* resolveCheckoutPath(
+        requested ? recipe.projectCwd : (target.worktreePath ?? recipe.projectCwd),
+        fs,
+        path,
+      );
+      const targetRoot = yield* resolveCheckoutPath(
+        target.worktreePath ?? recipe.projectCwd,
+        fs,
+        path,
+      );
+      admissionReleaseVersion = captureReleaseVersion;
+      const committedAdmissions = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const reserved: string[] = [];
+          const fence = yield* fences.get(threadId);
+          if (fence && fence.phase !== "active")
+            return yield* new PreparationError({
+              detail: "This thread is moving and cannot start setup.",
+            });
+          for (const checkoutRoot of new Set([sourceRoot, targetRoot])) {
+            const admitted = yield* captures.admit({
+              threadId,
+              workId: `preparation:${accepted.attemptId}:${checkoutRoot}`,
+              kind: "setup",
+              checkoutRoot,
+            });
+            if (admitted.decision !== "start")
+              return yield* new PreparationError({
+                detail: "This setup attempt needs reconciliation before it can run again.",
+              });
+            reserved.push(admitted.admissionId);
+          }
+          return reserved;
+        }),
+      );
+      admissions.push(...committedAdmissions);
+      waitingForCapture.delete(threadId);
+      const sourceAdmission = admissions[0]!;
+      const targetAdmission = admissions[sourceRoot === targetRoot ? 0 : 1]!;
+      // Register cancellation only after cleanup for the previous incarnation drained.
+      yield* tracker
+        .begin({
+          threadId,
+          creationSequence: anchor.value.creationSequence,
+          branch: preparation.recipe?.prepareWorktree?.branch ?? null,
+          baseRef: preparation.recipe?.prepareWorktree?.baseBranch ?? null,
+          stages: ["fetch", "checkout", "submodules", "setup-script", "agent"],
+          fiber: workers.get(threadId)?.fiber ?? null,
+        })
+        .pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              didBeginTracking = true;
+            }),
+          ),
+          Effect.uninterruptible,
+        );
       let running: ThreadPreparation = {
         ...preparation,
         target,
@@ -423,8 +478,9 @@ const make = Effect.gen(function* () {
               yield* tracker.stageStatus(threadId, "checkout", "done");
             }
           }),
-        );
+        ).pipe(Effect.provideService(CheckoutAdmission, sourceAdmission));
       }
+      if (sourceRoot !== targetRoot) yield* captures.complete(sourceAdmission);
       // TerminalManager.open takes the workspace lease itself. Never hold it across this call.
       yield* assertCurrent;
       if (script && target.worktreePath) {
@@ -442,7 +498,7 @@ const make = Effect.gen(function* () {
               onOutputLine: (line) => tracker.appendTail(threadId, "setup-script", line),
             },
           })
-          .pipe(Effect.result);
+          .pipe(Effect.provideService(CheckoutAdmission, targetAdmission), Effect.result);
         if (launched._tag === "Failure") {
           yield* tracker.stageStatus(threadId, "setup-script", "failed", launched.failure.message);
           if (!script.async) return yield* launched.failure;
@@ -492,9 +548,17 @@ const make = Effect.gen(function* () {
       yield* finish(threadId, accepted.attemptId, "done");
     });
     yield* program.pipe(
+      Effect.catchTag("CheckoutCaptureError", (error) => {
+        if (!error.waitingForCheckout) return Effect.fail(error);
+        waitingForCapture.set(threadId, admissionReleaseVersion);
+        return Effect.void;
+      }),
       Effect.onExit((exit) =>
         Effect.gen(function* () {
-          if (exit._tag === "Success") return;
+          if (exit._tag === "Success") {
+            yield* Effect.forEach(admissions, captures.complete, { discard: true });
+            return;
+          }
           const detail = Cause.hasInterrupts(exit.cause)
             ? "Setup was interrupted. Retry setup and resume when ready."
             : String(Cause.squash(exit.cause));
@@ -506,6 +570,9 @@ const make = Effect.gen(function* () {
             Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed",
             didBeginTracking,
           );
+          const current = (yield* read(threadId))?.promptQueue?.preparation;
+          if (current?.attemptId === accepted.attemptId && current.settled)
+            yield* Effect.forEach(admissions, captures.complete, { discard: true });
         }).pipe(Effect.ignoreCause({ log: true })),
       ),
       Effect.ignoreCause({ log: true }),
@@ -518,7 +585,11 @@ const make = Effect.gen(function* () {
   ) {
     const thread = yield* read(threadId);
     const preparation = thread?.promptQueue?.preparation;
-    const active = workers.get(threadId);
+    let active = workers.get(threadId);
+    if (active && waitingForCapture.has(threadId)) {
+      yield* Fiber.await(active.fiber);
+      active = workers.get(threadId);
+    }
     if (active) {
       if (
         !preparation ||
@@ -528,15 +599,21 @@ const make = Effect.gen(function* () {
         yield* Fiber.interrupt(active.fiber);
       if (!preparation || preparation.attemptId === active.attemptId) return;
     }
-    if (!preparation) return;
+    if (!preparation) {
+      waitingForCapture.delete(threadId);
+      return;
+    }
     const retryStop = retryCancellation && preparation.state === "failed" && !preparation.settled;
     if (
       !retryStop &&
       (thread?.archivedAt !== null ||
         preparation.state !== "pending" ||
         !thread?.promptQueue?.enabled)
-    )
+    ) {
+      waitingForCapture.delete(threadId);
       return;
+    }
+    waitingForCapture.delete(threadId);
     const gate = yield* Deferred.make<void>();
     const fiber = yield* Deferred.await(gate).pipe(
       Effect.andThen(
@@ -552,16 +629,39 @@ const make = Effect.gen(function* () {
             ).pipe(Effect.uninterruptible, Effect.ignoreCause({ log: true }))
           : run(threadId, preparation),
       ),
-      Effect.ensuring(Effect.sync(() => workers.delete(threadId))),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          workers.delete(threadId);
+          const deniedAt = waitingForCapture.get(threadId);
+          if (deniedAt !== undefined && deniedAt < captureReleaseVersion)
+            yield* scheduleSafely(threadId).pipe(Effect.forkIn(scope));
+        }),
+      ),
       Effect.forkIn(scope),
     );
     workers.set(threadId, { fiber, attemptId: preparation.attemptId });
     yield* Deferred.succeed(gate, undefined);
-  });
+  }, scheduleLock.withPermit);
+  const scheduleSafely = (threadId: ThreadId): Effect.Effect<void> =>
+    schedule(threadId).pipe(Effect.ignoreCause({ log: true }));
 
   return ThreadPreparationReactor.of({
     start: () =>
       Effect.gen(function* () {
+        yield* checkoutCaptureReleases(sql).pipe(
+          Stream.runForEach(() =>
+            Effect.sync(() => {
+              captureReleaseVersion++;
+            }).pipe(
+              Effect.andThen(
+                forkParked(
+                  Effect.forEach([...waitingForCapture.keys()], scheduleSafely, { discard: true }),
+                ),
+              ),
+            ),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        );
         const events = yield* engine.subscribeDomainEvents;
         yield* forkParked(
           Effect.gen(function* () {

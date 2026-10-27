@@ -131,7 +131,12 @@ export function threadMoveQueuePresentation(input: {
     label = cancellation === "sending" ? "Requesting cancellation…" : "Cancelling move…";
     detail = "Waiting for both locations to confirm cancellation.";
   } else if (waiting) {
-    label = input.queuePaused ? "Waiting for the queue to resume" : "Waiting in queue";
+    label = input.queuePaused
+      ? "Waiting for the queue to resume"
+      : entry?.waitingForCheckout
+        ? "Waiting for shared checkout"
+        : "Waiting in queue";
+    detail = entry?.detail ?? null;
   } else if (entry?.state === "blocked" || matching?.moveFailureDetail) {
     label = "Move needs attention";
     detail = matching?.moveFailureDetail ?? entry?.detail ?? null;
@@ -145,6 +150,9 @@ export function threadMoveQueuePresentation(input: {
     detail = vm.detail;
     tone = vm.tone;
     step = 1;
+  } else if (entry?.waitingForCheckout) {
+    label = "Waiting for shared checkout";
+    detail = entry.detail ?? null;
   } else if (progress) {
     label = progress.label;
     detail = progress.detail;

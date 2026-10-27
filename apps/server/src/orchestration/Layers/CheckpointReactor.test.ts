@@ -54,6 +54,8 @@ import * as RuntimeReceiptBus from "../Services/RuntimeReceiptBus.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
@@ -271,6 +273,7 @@ describe("CheckpointReactor", () => {
     | CheckpointReactor
     | CheckpointStore.CheckpointStore
     | ProjectionSnapshotQuery
+    | SqlClient.SqlClient
     | RuntimeReceiptBus.RuntimeReceiptBus,
     unknown
   > | null = null;
@@ -410,6 +413,7 @@ describe("CheckpointReactor", () => {
       Layer.provideMerge(WorkspacePaths.layer),
       Layer.provideMerge(VcsProcess.layerLocal),
       Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+      Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provide(OrganizationSourceControlCredentials.layerNone),
       Layer.provideMerge(ServerConfigLayer),
       Layer.provideMerge(NodeServices.layer),
@@ -531,6 +535,92 @@ describe("CheckpointReactor", () => {
       pullRequestRefreshes,
     };
   }
+
+  effectIt.effect("finishes an admitted turn checkpoint while its checkout is draining", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({ seedFilesystemCheckpoints: false }),
+      );
+      const sql = yield* Effect.promise(() => runtime!.runPromise(SqlClient.SqlClient));
+      const captures = makeCheckoutCapture(sql);
+      const threadId = ThreadId.make("thread-1");
+      const turnId = asTurnId("draining-turn");
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("draining-start"),
+        threadId,
+        message: {
+          messageId: MessageId.make("draining-message"),
+          role: "user",
+          text: "work",
+          attachments: [],
+        },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        createdAt,
+      });
+      const parent = yield* captures.lookupAdmission(
+        threadId,
+        "request:draining-start",
+        "provider",
+      );
+      yield* captures.bindTurn(parent!.admissionId, turnId);
+      const owner = {
+        operationId: "sibling-move",
+        threadId: "moving",
+        environmentId: "local",
+        generation: 1,
+      };
+      yield* captures.acquireDrain({
+        ...owner,
+        checkoutRoot: harness.cwd,
+        gitCommonRoot: NodePath.join(harness.cwd, ".git"),
+      });
+      harness.provider.emit({
+        type: "turn.started",
+        eventId: EventId.make("draining-started"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId,
+        createdAt,
+        payload: {},
+      });
+      expect(yield* harness.nextReceipt).toMatchObject({ type: "checkpoint.baseline.captured" });
+      harness.provider.emit({
+        type: "turn.completed",
+        eventId: EventId.make("draining-completed"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId,
+        createdAt,
+        payload: { state: "completed" },
+      });
+      expect(yield* harness.nextReceipt).toMatchObject({
+        type: "checkpoint.diff.finalized",
+        turnId,
+      });
+      expect(yield* harness.nextReceipt).toMatchObject({
+        type: "turn.processing.quiesced",
+        turnId,
+      });
+      yield* Effect.promise(() => harness.drain());
+      expect((yield* captures.getAdmission(parent!.admissionId))?.completed).toBe(1);
+      expect(
+        yield* captures.blockers({
+          checkoutRoot: harness.cwd,
+          gitCommonRoot: NodePath.join(harness.cwd, ".git"),
+        }),
+      ).toHaveLength(0);
+      const thread = (yield* Effect.promise(() => harness.readModel())).threads[0]!;
+      expect(
+        thread.checkpoints.some(
+          (checkpoint) => checkpoint.turnId === turnId && checkpoint.status === "ready",
+        ),
+      ).toBe(true);
+      yield* captures.enterCapturing(owner);
+    }),
+  );
 
   effectIt.effect.each(["completed", "failed"] as const)(
     "finalizes a shared queue in a non-git project after %s",

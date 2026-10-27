@@ -1,4 +1,7 @@
-import { make as makeCheckoutAccess } from "../../workspace/CheckoutAccess.ts";
+import { make as makeCheckoutAccess, resolveCheckoutPath } from "../../workspace/CheckoutAccess.ts";
+import { makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import { applyThreadPromptQueueChange } from "@t3tools/shared/threadPromptQueue";
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
 import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
@@ -119,6 +122,9 @@ function commandProjectScope(command: OrchestrationCommand, readModel: Orchestra
 const makeOrchestrationEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const executionFence = makeThreadExecutionFence(sql);
+  const captures = makeCheckoutCapture(sql);
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const checkoutAccess = yield* makeCheckoutAccess;
   const vmMode = yield* VmWorkloadTracking;
   // The event engine also serves offline tools without provider runtimes. Those
@@ -214,24 +220,28 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           : executionFence.assertProjectMutable(aggregateRef.aggregateId, workspaceRoot)
       ).pipe(
         Effect.andThen(
-          envelope.command.type === "project.delete" &&
-            envelope.command.force &&
-            envelope.options?.directClientCommand
+          envelope.command.type === "project.delete" && envelope.command.force
             ? Effect.forEach(
                 commandReadModel.threads.filter(
                   (thread) =>
                     thread.deletedAt === null && thread.projectId === aggregateRef.aggregateId,
                 ),
                 (thread) =>
-                  executionFence.assertDirectClientAllowed(thread.id).pipe(
-                    Effect.mapError((error) =>
-                      error._tag === "ThreadExecutionFenceError"
-                        ? new ThreadExecutionFenceError({
-                            threadId: thread.id,
-                            detail:
-                              "Delete this project's managed threads through Launchpad Connect before deleting the project.",
-                          })
-                        : error,
+                  executionFence.assertMutable(thread.id).pipe(
+                    Effect.andThen(
+                      envelope.options?.directClientCommand
+                        ? executionFence.assertDirectClientAllowed(thread.id).pipe(
+                            Effect.mapError((error) =>
+                              error._tag === "ThreadExecutionFenceError"
+                                ? new ThreadExecutionFenceError({
+                                    threadId: thread.id,
+                                    detail:
+                                      "Delete this project's managed threads through Launchpad Connect before deleting the project.",
+                                  })
+                                : error,
+                            ),
+                          )
+                        : Effect.void,
                     ),
                   ),
                 { discard: true },
@@ -543,12 +553,80 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 ...planned,
                 metadata: { ...planned.metadata, origin: envelope.origin },
               }));
+        const startsWork =
+          envelope.command.type === "thread.turn.start" ||
+          envelope.command.type === "thread.prompt.claim" ||
+          envelope.command.type === "thread.prompt.steer";
+        const startingThread = startsWork
+          ? commandReadModel.threads.find((thread) => thread.id === aggregateRef.aggregateId)
+          : undefined;
+        const startingProject = startingThread
+          ? commandReadModel.projects.find((project) => project.id === startingThread.projectId)
+          : undefined;
+        const checkoutRoot =
+          startingThread && startingProject
+            ? yield* resolveCheckoutPath(
+                startingThread.worktreePath ?? startingProject.workspaceRoot,
+                fs,
+                path,
+              ).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ThreadExecutionFenceError({
+                      threadId: startingThread.id,
+                      detail: `The checkout could not be prepared: ${cause.message}`,
+                    }),
+                ),
+              )
+            : undefined;
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
               // Recheck in the write transaction so a concurrent freeze cannot
               // acknowledge a watermark and then receive another mutation.
               yield* checkExecutionFence;
+              // Reserve accepted starts before publishing their events. A capture
+              // can then drain an accepted-but-not-yet-spawned turn safely.
+              if (checkoutRoot && startingThread) {
+                const [current] = yield* sql<{
+                  projectId: string;
+                  workspaceRoot: string;
+                  worktreePath: string | null;
+                }>`SELECT t.project_id AS "projectId", p.workspace_root AS "workspaceRoot",
+                  t.worktree_path AS "worktreePath"
+                  FROM projection_threads t JOIN projection_projects p ON p.project_id=t.project_id
+                  WHERE t.thread_id=${startingThread.id} AND t.deleted_at IS NULL`;
+                if (
+                  !current ||
+                  current.projectId !== startingThread.projectId ||
+                  current.workspaceRoot !== startingProject?.workspaceRoot ||
+                  current.worktreePath !== startingThread.worktreePath
+                )
+                  return yield* new ThreadExecutionFenceError({
+                    threadId: startingThread.id,
+                    detail: "The thread checkout changed while preparing this request. Retry it.",
+                  });
+                yield* captures
+                  .admit({
+                    threadId: startingThread.id,
+                    kind: "provider",
+                    workId: `request:${envelope.command.commandId}`,
+                    checkoutRoot,
+                    ...(envelope.options?.parentCheckoutAdmissionId
+                      ? { parentAdmissionId: envelope.options.parentCheckoutAdmissionId }
+                      : {}),
+                  })
+                  .pipe(
+                    Effect.catchTag("CheckoutCaptureError", (error) =>
+                      Effect.fail(
+                        new ThreadExecutionFenceError({
+                          threadId: startingThread.id,
+                          detail: error.message,
+                        }),
+                      ),
+                    ),
+                  );
+              }
               const committedEvents: OrchestrationEvent[] = [];
               const attachmentCleanups: Effect.Effect<void>[] = [];
               let nextCommandReadModel = commandReadModel;

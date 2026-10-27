@@ -5,6 +5,8 @@ import * as Fiber from "effect/Fiber";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
+import { makeProviderExecution } from "../provider/ProviderExecution.ts";
 import {
   makeThreadExecutionRelay,
   ThreadExecutionRelayError,
@@ -28,9 +30,18 @@ const move = {
 };
 const unavailable = (operation: "admit" | "complete") =>
   new ThreadExecutionRelayError({ threadId: "thread", operation, detail: "Relay unavailable" });
+const bindThread = Effect.fnUntraced(function* (threadId: string) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT OR IGNORE INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at)
+    VALUES('project','Project','/workspace/project','[]','2026-10-05T10:00:00.000Z','2026-10-05T10:00:00.000Z')`;
+  yield* sql`INSERT OR IGNORE INTO projection_threads(thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at)
+    VALUES(${threadId},'project','Thread','{"instanceId":"codex","model":"gpt-5"}','full-access','default','2026-10-05T10:00:00.000Z','2026-10-05T10:00:00.000Z')`;
+});
 const fixture = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const fence = makeThreadExecutionFence(sql);
+  yield* bindThread("thread");
+  yield* bindThread("ordinary");
   yield* fence.prepare(enrollment);
   yield* fence.activate(enrollment);
   const remote = new Map<string, boolean>();
@@ -50,6 +61,129 @@ const fixture = Effect.gen(function* () {
   return { sql, fence, remote, authority };
 });
 describe("portable execution handshake", () => {
+  it.effect.each(["thread", "ordinary"] as const)(
+    "keeps a held rejected reply retryable until %s admits another invocation",
+    (threadId) =>
+      Effect.gen(function* () {
+        const { sql, authority } = yield* fixture;
+        const relay = makeThreadExecutionRelay(sql, authority);
+        const admit = makeProviderExecution(relay);
+        const invocation = yield* admit(threadId, "approval", "held-retry");
+        yield* invocation.reject;
+        const capture = makeCheckoutCapture(sql);
+        const owner = { ...enrollment, operationId: "held-rejected-reply" };
+        yield* capture.acquireDrain({
+          ...owner,
+          checkoutRoot: "/workspace/project",
+          gitCommonRoot: "/workspace/project",
+        });
+        const held = yield* Effect.flip(admit(threadId, "approval", "held-retry"));
+        assert.isTrue(held.waitingForCheckout);
+        assert.isFalse(held.uncertain);
+        yield* capture.release(owner, { outcome: "cancelled" });
+        yield* admit(threadId, "approval", "held-retry");
+        const pending = yield* Effect.flip(admit(threadId, "approval", "held-retry"));
+        assert.isTrue(pending.uncertain);
+        assert.isTrue(
+          yield* relay.wasStarted({ threadId, kind: "provider", workId: "approval:held-retry" }),
+        );
+      }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+  it.effect.each(["thread", "ordinary"] as const)(
+    "retries only a rejected provider invocation for %s",
+    (threadId) =>
+      Effect.gen(function* () {
+        const { sql, authority } = yield* fixture;
+        const relay = makeThreadExecutionRelay(sql, authority);
+        const input = { threadId, kind: "provider" as const, workId: "approval:retry" };
+        assert.equal(yield* relay.begin(input), threadId === "ordinary" ? "ordinary" : "start");
+        yield* relay.rejectInvocation(input);
+        const restarted = makeThreadExecutionRelay(sql, authority);
+        assert.equal(yield* restarted.begin(input), threadId === "ordinary" ? "ordinary" : "start");
+        yield* restarted.rejectInvocation(input);
+        const capture = makeCheckoutCapture(sql);
+        const owner = { ...enrollment, operationId: "reject-retry-capture" };
+        yield* capture.acquireDrain({
+          ...owner,
+          checkoutRoot: "/workspace/project",
+          gitCommonRoot: "/workspace/project",
+        });
+        assert.propertyVal(yield* Effect.flip(restarted.begin(input)), "waitingForCheckout", true);
+        yield* capture.release(owner, { outcome: "cancelled" });
+        yield* restarted.begin(input);
+        yield* restarted.completeInvocation(input);
+        assert.equal(
+          yield* restarted.begin(input),
+          threadId === "ordinary" ? "completed" : "reconcile",
+        );
+        assert.equal(
+          (yield* restarted.lookupAdmission(threadId, input.workId, input.kind))?.rejected,
+          0,
+        );
+      }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+  it.effect.each(["uncertain", "completed"] as const)(
+    "never replays an ordinary %s operation after portable enrollment",
+    (state) =>
+      Effect.gen(function* () {
+        const { sql, fence, authority, remote } = yield* fixture;
+        const relay = makeThreadExecutionRelay(sql, authority);
+        const ordinary = {
+          threadId: "ordinary",
+          kind: "terminal" as const,
+          workId: "ordinary-spawn",
+        };
+        assert.equal(yield* relay.begin(ordinary), "ordinary");
+        if (state === "completed") yield* relay.confirmOrdinaryStopped(ordinary);
+        const owner = { ...enrollment, threadId: "ordinary", operationId: "ordinary-enrollment" };
+        yield* fence.prepare(owner);
+        yield* fence.activate(owner);
+        assert.equal(
+          yield* relay.begin(ordinary),
+          state === "completed" ? "completed" : "reconcile",
+        );
+        assert.equal(remote.size, 0);
+        assert.deepEqual(
+          yield* sql`SELECT 1 FROM thread_execution_work WHERE thread_id='ordinary'`,
+          [],
+        );
+        assert.propertyVal(
+          (yield* relay.lookupAdmission("ordinary", ordinary.workId, "terminal"))!,
+          "completed",
+          state === "completed" ? 1 : 0,
+        );
+      }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+  it.effect("settles an ordinary PTY after enrollment without completing portable work", () =>
+    Effect.gen(function* () {
+      const { sql, fence, authority } = yield* fixture;
+      const relay = makeThreadExecutionRelay(sql, authority);
+      const ordinary = {
+        threadId: "ordinary",
+        kind: "terminal" as const,
+        workId: "ordinary-terminal",
+      };
+      yield* relay.begin(ordinary);
+      yield* fence.prepare({ ...enrollment, threadId: "ordinary", operationId: "new-enrollment" });
+      yield* relay.confirmOrdinaryStopped(ordinary);
+      assert.propertyVal(
+        (yield* relay.lookupAdmission("ordinary", ordinary.workId, "terminal"))!,
+        "completed",
+        1,
+      );
+      const portable = { ...work, kind: "terminal" as const };
+      yield* relay.begin(portable);
+      assert.equal(
+        (yield* Effect.flip(relay.confirmOrdinaryStopped(portable)))._tag,
+        "ThreadExecutionFenceError",
+      );
+      assert.propertyVal(
+        (yield* relay.lookupAdmission("thread", portable.workId, "terminal"))!,
+        "completed",
+        0,
+      );
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
   it.effect("settles stopped provider admissions only after drain and retries lost receipts", () =>
     Effect.gen(function* () {
       const { sql, fence, remote, authority } = yield* fixture;
@@ -227,6 +361,8 @@ describe("portable execution handshake", () => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const fence = makeThreadExecutionFence(sql);
+      yield* bindThread("thread");
+      yield* bindThread("other");
       let admissions = 0;
       const authority: ThreadExecutionAuthority = {
         admit: () =>
@@ -260,5 +396,128 @@ describe("portable execution handshake", () => {
       assert.equal((yield* Effect.flip(stale.begin(work)))._tag, "ThreadExecutionFenceError");
       assert.equal(admissions, 1);
     }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+  it.effect("durably drains ordinary siblings and lets inherited turns finish", () =>
+    Effect.gen(function* () {
+      const { sql, authority } = yield* fixture;
+      const relay = makeThreadExecutionRelay(sql, authority);
+      const capture = makeCheckoutCapture(sql);
+      const ordinary = { ...work, threadId: "ordinary", workId: "request" };
+      assert.equal(yield* relay.begin(ordinary), "ordinary");
+      assert.equal(yield* makeThreadExecutionRelay(sql, authority).begin(ordinary), "reconcile");
+      const parent = yield* relay.lookupAdmission(
+        ordinary.threadId,
+        ordinary.workId,
+        ordinary.kind,
+      );
+      assert.isNotNull(parent);
+      const captureOwner = { ...enrollment, operationId: "capture" };
+      const scope = { checkoutRoot: "/workspace/project", gitCommonRoot: "/workspace/project" };
+      yield* capture.acquireDrain({ ...captureOwner, ...scope });
+      assert.equal(
+        (yield* Effect.flip(relay.begin({ ...ordinary, workId: "new" })))._tag,
+        "CheckoutCaptureError",
+      );
+      const child = { ...ordinary, workId: "send" };
+      assert.equal(
+        yield* relay
+          .begin(child)
+          .pipe(Effect.provideService(CheckoutAdmission, parent!.admissionId)),
+        "ordinary",
+      );
+      yield* relay.bindTurn(child, "turn");
+      yield* relay.completeInvocation(child);
+      assert.lengthOf(yield* capture.blockers(scope), 2);
+      yield* relay.completeTurn("ordinary", "turn");
+      assert.lengthOf(yield* capture.blockers(scope), 0);
+      yield* capture.enterCapturing(captureOwner);
+      assert.equal(
+        (yield* Effect.flip(relay.assertAccepting("ordinary")))._tag,
+        "CheckoutCaptureError",
+      );
+      yield* capture.release(captureOwner, { outcome: "sealed", manifestSha256: "a".repeat(64) });
+      assert.equal(yield* relay.begin({ ...ordinary, workId: "next" }), "ordinary");
+      assert.equal(
+        (yield* Effect.flip(relay.begin({ ...ordinary, threadId: "unknown" })))._tag,
+        "ThreadExecutionFenceError",
+      );
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+  it.effect("lets admitted ordinary and portable terminals finish during checkout drain", () =>
+    Effect.gen(function* () {
+      const { sql, authority } = yield* fixture;
+      const relay = makeThreadExecutionRelay(sql, authority);
+      const capture = makeCheckoutCapture(sql);
+      const scope = { checkoutRoot: "/workspace/project", gitCommonRoot: "/workspace/project" };
+      const owner = { ...enrollment, operationId: "capture" };
+      const portable = { ...work, kind: "terminal" as const, workId: "portable-shell" };
+      const ordinary = { ...portable, threadId: "ordinary", workId: "ordinary-shell" };
+      yield* relay.begin(portable);
+      yield* relay.begin(ordinary);
+      yield* capture.acquireDrain({ ...owner, ...scope });
+      assert.lengthOf(yield* capture.blockers(scope), 2);
+      assert.equal(
+        yield* relay.withActiveWork(portable, Effect.succeed("portable input")),
+        "portable input",
+      );
+      assert.equal(
+        yield* relay.withActiveWork(ordinary, Effect.succeed("ordinary input")),
+        "ordinary input",
+      );
+      assert.equal(
+        (yield* Effect.flip(relay.begin({ ...portable, workId: "late-shell" })))._tag,
+        "CheckoutCaptureError",
+      );
+      yield* relay.confirmStopped(portable);
+      yield* relay.confirmStopped(ordinary);
+      yield* capture.enterCapturing(owner);
+      for (const terminal of [portable, ordinary]) {
+        assert.equal(
+          (yield* Effect.flip(relay.withActiveWork(terminal, Effect.succeed("unexpected input"))))
+            ._tag,
+          "ThreadExecutionFenceError",
+        );
+      }
+      assert.equal(
+        (yield* Effect.flip(relay.assertAccepting("thread")))._tag,
+        "CheckoutCaptureError",
+      );
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+  it.effect(
+    "settles idle portable provider invocations without completing their ownership lease",
+    () =>
+      Effect.gen(function* () {
+        const { sql, fence, authority } = yield* fixture;
+        const relay = makeThreadExecutionRelay(sql, authority);
+        const capture = makeCheckoutCapture(sql);
+        const idle = { ...work, workId: "start-session" };
+        yield* relay.begin(idle);
+        yield* relay.completeInvocation(idle);
+        assert.equal(
+          (yield* relay.lookupAdmission(idle.threadId, idle.workId, idle.kind))?.completed,
+          1,
+        );
+        assert.equal(
+          (yield* fence.getWork({ ...idle, workId: "provider:start-session", generation: 1 }))
+            ?.completed,
+          0,
+        );
+        yield* relay.begin(work);
+        yield* relay.bindTurn(work, "turn");
+        yield* relay.completeInvocation(work);
+        assert.equal(
+          (yield* relay.lookupAdmission(work.threadId, work.workId, work.kind))?.completed,
+          0,
+        );
+        yield* relay.completeTurn(work.threadId, "turn");
+        assert.lengthOf(
+          yield* capture.blockers({
+            checkoutRoot: "/workspace/project",
+            gitCommonRoot: "/workspace/project",
+          }),
+          0,
+        );
+      }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
 });

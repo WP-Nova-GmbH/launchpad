@@ -173,6 +173,87 @@ describe("move queue presentation", () => {
       threadMoveQueuePresentation({ placement: { ...placement, operationId: null } }),
     ).toBeNull();
   });
+  it.each([false, true])("shows pending checkout blockers when paused=%s", (queuePaused) => {
+    const detail = "Waiting for other work in this checkout: Build API and Fix login.";
+    expect(
+      threadMoveQueuePresentation({
+        entry: { ...entry, state: "pending", waitingForCheckout: true, detail },
+        placement,
+        status,
+        queuePaused,
+      }),
+    ).toMatchObject({
+      label: queuePaused ? "Waiting for the queue to resume" : "Waiting for shared checkout",
+      detail,
+      tone: "neutral",
+      waiting: true,
+      step: null,
+      completedSteps: [],
+    });
+  });
+  it("preserves ordinary pending notices without marking them as checkout waits", () => {
+    const detail = "Local terminal shutdown is unverified. Cancel to continue here.";
+    expect(
+      threadMoveQueuePresentation({ entry: { ...entry, state: "pending", detail } }),
+    ).toMatchObject({ label: "Waiting in queue", detail, tone: "neutral" });
+  });
+  it("shows a claimed checkout wait instead of VM preparation or transfer progress", () => {
+    const detail = "Waiting for other work in this checkout: Build API.";
+    expect(
+      threadMoveQueuePresentation({
+        entry: { ...entry, waitingForCheckout: true, detail },
+        placement,
+        status,
+      }),
+    ).toMatchObject({
+      label: "Waiting for shared checkout",
+      detail,
+      tone: "neutral",
+      waiting: false,
+      step: null,
+      completedSteps: [],
+    });
+  });
+  it("returns to verified progress when capture starts after a checkout wait", () => {
+    const capturing = {
+      ...placement,
+      moveProgress: placement.moveProgress!.map((snapshot) => ({
+        ...snapshot,
+        stage: "capturing" as const,
+        totalBytes: null,
+      })),
+    };
+    expect(threadMoveQueuePresentation({ entry, placement: capturing, status })).toMatchObject({
+      label: "Saving conversation",
+      detail: null,
+      tone: "neutral",
+      step: 0,
+    });
+  });
+  it("keeps cancellation and failures ahead of a claimed checkout wait", () => {
+    const waiting = { ...entry, waitingForCheckout: true, detail: "Waiting for Build API." };
+    for (const [cancellation, label] of [
+      ["sending", "Requesting cancellation…"],
+      ["requested", "Cancelling move…"],
+      ["unknown", "Could not confirm cancellation"],
+    ] as const)
+      expect(
+        threadMoveQueuePresentation({ entry: waiting, placement, cancellation }),
+      ).toMatchObject({ label, step: null, completedSteps: [] });
+    expect(
+      threadMoveQueuePresentation({
+        entry: { ...waiting, state: "blocked", detail: "Capture failed" },
+        placement,
+      }),
+    ).toMatchObject({ label: "Move needs attention", detail: "Capture failed", tone: "danger" });
+    expect(
+      threadMoveQueuePresentation({ entry: waiting, placement, error: "Connection unavailable" }),
+    ).toMatchObject({
+      label: "Could not check move status",
+      detail: "Connection unavailable",
+      tone: "attention",
+    });
+  });
   it("never borrows progress from another operation, generation, or a pending move", () => {
     for (const changed of [
       { ...placement, operationId: "older" },
@@ -221,7 +302,7 @@ describe("move queue presentation", () => {
     };
     expect(
       threadMoveQueuePresentation({
-        entry,
+        entry: { ...entry, waitingForCheckout: true },
         placement,
         status: { ...status, pendingProviderAuth: binding },
       }),
@@ -237,7 +318,12 @@ describe("move queue presentation", () => {
   it.each([false, true])(
     "prioritizes cancellation for a pending move when paused=%s",
     (queuePaused) => {
-      const pending = { ...entry, state: "pending" as const };
+      const pending = {
+        ...entry,
+        state: "pending" as const,
+        waitingForCheckout: true,
+        detail: "Waiting for other work in this checkout: Build API.",
+      };
       for (const [cancellation, label] of [
         ["sending", "Requesting cancellation…"],
         ["requested", "Cancelling move…"],

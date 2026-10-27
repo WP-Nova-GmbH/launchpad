@@ -1,4 +1,4 @@
-import { threadExecutionTestLayer } from "../provider/testUtils/threadExecutionTestLayer.ts";
+import { threadExecutionTestLayerForDatabase } from "../provider/testUtils/threadExecutionTestLayer.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it, vi } from "@effect/vitest";
 import {
@@ -32,6 +32,7 @@ import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import { OrchestrationEngineLive } from "../orchestration/Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "../orchestration/Layers/ProjectionPipeline.ts";
@@ -601,7 +602,7 @@ const integrationLayer = Layer.mergeAll(
   Layer.provide(OrchestrationEventStoreLive),
   Layer.provide(OrchestrationCommandReceiptRepositoryLive),
   Layer.provide(RepositoryIdentityResolver.layer),
-  Layer.provide(SqlitePersistenceMemory),
+  Layer.provideMerge(SqlitePersistenceMemory),
   Layer.provideMerge(integrationServerConfig),
   Layer.provideMerge(NodeServices.layer),
 );
@@ -891,6 +892,7 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
         const engine = yield* OrchestrationEngine.OrchestrationEngineService;
         const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
         const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const sql = yield* SqlClient.SqlClient;
         const fileSystem = yield* FileSystem.FileSystem;
         const workspaceRoot = yield* fileSystem.makeTempDirectoryScoped();
         const projectId = ProjectId.make(`project-import-resume-${source}`);
@@ -916,8 +918,8 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
             .pipe(Effect.tap(() => Deferred.succeed(turnSent, undefined))),
         );
         const providerLayer = makeProviderServiceLive().pipe(
-          Layer.provide(threadExecutionTestLayer),
-          Layer.provide(SqlitePersistenceMemory),
+          Layer.provide(threadExecutionTestLayerForDatabase),
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
           Layer.provide(
             Layer.succeed(
               ProviderAdapterRegistry,

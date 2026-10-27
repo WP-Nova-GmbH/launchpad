@@ -2,6 +2,7 @@ import * as CheckoutAccess from "../workspace/CheckoutAccess.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import {
   makeThreadExecutionRelay,
   ThreadExecutionRelayError,
@@ -273,6 +274,7 @@ const createManager = (
           begin: () => Effect.succeed("ordinary" as const),
           assertAccepting: () => Effect.succeed(undefined),
           withActiveWork: (_work, effect) => effect,
+          confirmOrdinaryStopped: () => Effect.void,
         },
         logsDir,
         historyLineLimit,
@@ -1581,7 +1583,7 @@ it.layer(
       expect(events.filter((event) => event.type === "output").map((event) => event.data)).toEqual(
         writes,
       );
-      const snapshot = events.filter((event) => event.type === "snapshot").at(-1)?.snapshot;
+      const snapshot = events.findLast((event) => event.type === "snapshot")?.snapshot;
       expect(snapshot?.history).toBe("aa😀\rEND");
       expect(snapshot?.sequence).toBe(reopened.sequence);
     }),
@@ -2960,6 +2962,11 @@ it.layer(
 
 const portableTerminalFixture = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at)
+    VALUES('project','Project',${process.cwd()},'[]','2026-10-27','2026-10-27')`;
+  for (const threadId of ["thread-1", "ordinary"])
+    yield* sql`INSERT INTO projection_threads(thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at)
+      VALUES(${threadId},'project','Thread','{"instanceId":"codex","model":"gpt-5"}','full-access','default','2026-10-27','2026-10-27')`;
   const fence = makeThreadExecutionFence(sql);
   const owner = {
     threadId: "thread-1",
@@ -2984,6 +2991,101 @@ it.layer(
   Layer.mergeAll(NodeServices.layer, ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer))),
   { excludeTestServices: true },
 )("Portable terminals", (it) => {
+  it.effect("ordinary terminal exit retires its admission and unblocks checkout capture", () =>
+    Effect.gen(function* () {
+      const { sql, execution } = yield* portableTerminalFixture;
+      const retired = yield* Deferred.make<void>();
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        execution: {
+          ...execution,
+          confirmOrdinaryStopped: (work) =>
+            execution
+              .confirmOrdinaryStopped(work)
+              .pipe(Effect.tap(() => Deferred.succeed(retired, undefined))),
+        },
+      });
+      yield* manager.open({ ...openInput(), threadId: "ordinary" });
+      const capture = makeCheckoutCapture(sql);
+      const scope = { checkoutRoot: process.cwd(), gitCommonRoot: process.cwd() };
+      const owner = {
+        operationId: "ordinary-capture",
+        threadId: "moving",
+        environmentId: "environment",
+        generation: 1,
+      };
+      yield* capture.acquireDrain({ ...owner, ...scope });
+      expect(yield* capture.blockers(scope)).toHaveLength(1);
+      ptyAdapter.processes[0]!.emitExit({ exitCode: 0, signal: null });
+      yield* Deferred.await(retired);
+      expect(yield* capture.blockers(scope)).toEqual([]);
+      yield* capture.enterCapturing(owner);
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
+  it.effect("ordinary failed stop stays admitted until a positive exit is persisted", () =>
+    Effect.gen(function* () {
+      const { sql, execution } = yield* portableTerminalFixture;
+      const persisting = yield* Deferred.make<void>();
+      const persist = yield* Deferred.make<void>();
+      yield* Effect.addFinalizer(() => Deferred.succeed(persist, undefined));
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        execution: {
+          ...execution,
+          confirmOrdinaryStopped: (work) =>
+            Deferred.succeed(persisting, undefined).pipe(
+              Effect.andThen(Deferred.await(persist)),
+              Effect.andThen(execution.confirmOrdinaryStopped(work)),
+            ),
+        },
+      });
+      yield* manager.open({ ...openInput(), threadId: "ordinary" });
+      const process = ptyAdapter.processes[0]!;
+      process.kill = () => {
+        throw new Error("Signal denied");
+      };
+      expect(
+        (yield* Effect.result(manager.close({ threadId: "ordinary", waitForProcessExit: true })))
+          ._tag,
+      ).toBe("Failure");
+      expect(
+        yield* sql`SELECT 1 FROM checkout_work_admissions WHERE thread_id='ordinary' AND completed=0`,
+      ).toHaveLength(1);
+      process.kill = () => process.emitExit({ exitCode: 0, signal: null });
+      const closing = yield* manager
+        .close({ threadId: "ordinary", waitForProcessExit: true })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(persisting);
+      expect(closing.pollUnsafe()).toBeUndefined();
+      expect(
+        yield* sql`SELECT 1 FROM checkout_work_admissions WHERE thread_id='ordinary' AND completed=0`,
+      ).toHaveLength(1);
+      yield* Deferred.succeed(persist, undefined);
+      yield* Fiber.join(closing);
+      expect(
+        yield* sql`SELECT 1 FROM checkout_work_admissions WHERE thread_id='ordinary' AND completed=0`,
+      ).toEqual([]);
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
+  it.effect("an unknown ordinary spawn failure retains its reservation", () =>
+    Effect.gen(function* () {
+      const { sql, execution } = yield* portableTerminalFixture;
+      const ptyAdapter = new FakePtyAdapter();
+      ptyAdapter.spawnFailures.push(new Error("Native spawn result lost"));
+      const { manager } = yield* createManager(5, { execution, ptyAdapter });
+      const snapshot = yield* manager.open({ ...openInput(), threadId: "ordinary" });
+      expect(snapshot.status).toBe("error");
+      expect(ptyAdapter.processes).toEqual([]);
+      expect(
+        yield* sql`SELECT 1 FROM checkout_work_admissions WHERE thread_id='ordinary' AND completed=0`,
+      ).toHaveLength(1);
+      expect(
+        (yield* Effect.result(manager.open({ ...openInput(), threadId: "ordinary" })))._tag,
+      ).toBe("Failure");
+      expect(ptyAdapter.processes).toEqual([]);
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
   it.effect("portable terminals block input and new shells when a move drains execution", () =>
     Effect.gen(function* () {
       const { sql, fence, execution, move } = yield* portableTerminalFixture;

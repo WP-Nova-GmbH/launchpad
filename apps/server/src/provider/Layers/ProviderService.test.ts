@@ -9,6 +9,7 @@ import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
 import { ThreadExecution } from "../../relay/ThreadExecution.ts";
 import { makeThreadExecutionRelay } from "../../relay/ThreadExecutionRelay.ts";
 import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
 import {
   threadExecutionTestLayer,
   threadExecutionTestLayerForDatabase,
@@ -88,7 +89,7 @@ import type {
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import { makeProviderServiceLive, type ProviderServiceLiveOptions } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -175,27 +176,28 @@ function makeFakeCodexAdapter(
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   const subscribed = Deferred.makeUnsafe<void>();
 
-  const startSession = vi.fn((input: ProviderSessionStartInput) =>
-    Effect.sync(() => {
-      const now = "2026-01-01T00:00:00.000Z";
-      const session: ProviderSession = {
-        provider,
-        ...(input.providerInstanceId !== undefined
-          ? { providerInstanceId: input.providerInstanceId }
-          : {}),
-        status: "ready",
-        runtimeMode: input.runtimeMode,
-        threadId: input.threadId,
-        resumeCursor: input.resumeCursor ?? {
-          opaque: `resume-${String(input.threadId)}`,
-        },
-        cwd: input.cwd ?? process.cwd(),
-        createdAt: now,
-        updatedAt: now,
-      };
-      sessions.set(session.threadId, session);
-      return session;
-    }),
+  const startSession = vi.fn(
+    (input: ProviderSessionStartInput): Effect.Effect<ProviderSession, ProviderAdapterError> =>
+      Effect.sync(() => {
+        const now = "2026-01-01T00:00:00.000Z";
+        const session: ProviderSession = {
+          provider,
+          ...(input.providerInstanceId !== undefined
+            ? { providerInstanceId: input.providerInstanceId }
+            : {}),
+          status: "ready",
+          runtimeMode: input.runtimeMode,
+          threadId: input.threadId,
+          resumeCursor: input.resumeCursor ?? {
+            opaque: `resume-${String(input.threadId)}`,
+          },
+          cwd: input.cwd ?? process.cwd(),
+          createdAt: now,
+          updatedAt: now,
+        };
+        sessions.set(session.threadId, session);
+        return session;
+      }),
   );
 
   const sendTurn = vi.fn(
@@ -463,6 +465,7 @@ function makeProviderServiceLayer(
     readonly supportsConversationRollback?: boolean;
     readonly analyticsLayer?: Layer.Layer<AnalyticsService.AnalyticsService>;
     readonly registry?: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"];
+    readonly issueMcpCredential?: ProviderServiceLiveOptions["issueMcpCredential"];
   } = {},
 ) {
   const codex = makeFakeCodexAdapter(CODEX_DRIVER, input.supportsConversationRollback);
@@ -494,7 +497,9 @@ function makeProviderServiceLayer(
     : Layer.empty;
   const layer = it.layer(
     Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+      makeProviderServiceLive(
+        input.issueMcpCredential ? { issueMcpCredential: input.issueMcpCredential } : undefined,
+      ).pipe(
         Layer.provide(input.executionLayer ?? SqlitePersistenceMemory),
         Layer.provide(historyLayer),
         Layer.provide(Layer.succeed(VmWorkloadTracking, input.vmWorkloads ?? false)),
@@ -539,6 +544,28 @@ import {
 } from "../../mcp/IssueTrackerApprovalBroker.ts";
 
 const sharedDelivery = makeProviderServiceLayer();
+const drainRawProviderEvents = Effect.fnUntraced(function* (
+  provider: ProviderService.ProviderService["Service"],
+  adapter: ReturnType<typeof makeFakeCodexAdapter>,
+  threadId: ThreadId,
+) {
+  const eventId = asEventId(NodeCrypto.randomUUID());
+  const processed = yield* provider.streamEvents.pipe(
+    Stream.filter((event) => event.eventId === eventId),
+    Stream.take(1),
+    Stream.runDrain,
+    Effect.forkChild({ startImmediately: true }),
+  );
+  adapter.emit({
+    type: "runtime.warning",
+    eventId,
+    provider: adapter.adapter.provider,
+    threadId,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    payload: { message: "Earlier native events processed." },
+  });
+  yield* Fiber.join(processed);
+});
 sharedDelivery.layer("ProviderService shared delivery", (it) => {
   it.effect.each([
     { terminal: "turn.completed", matches: false },
@@ -1152,11 +1179,6 @@ it.effect("ProviderServiceLive flushes deferred completions during shutdown", ()
       .pipe(Effect.forkChild);
     yield* Deferred.await(secondStarted);
 
-    const runtimeEvents = yield* Stream.take(provider.streamEvents, 2).pipe(
-      Stream.runDrain,
-      Effect.forkChild,
-    );
-    yield* Effect.yieldNow;
     codex.emit({
       type: "turn.started",
       eventId: asEventId("evt-turn-analytics-stop-all-deferred-start"),
@@ -1184,7 +1206,7 @@ it.effect("ProviderServiceLive flushes deferred completions during shutdown", ()
         },
       },
     });
-    yield* Fiber.join(runtimeEvents);
+    yield* drainRawProviderEvents(provider, codex, threadId);
     assert.equal(recordedAnalytics.eventsByName("provider.turn.completed").length, 0);
 
     const closeExit = yield* Scope.close(scope, Exit.void).pipe(Effect.exit);
@@ -2559,11 +2581,15 @@ routing.layer("ProviderServiceLive routing", (it) => {
         runtimeMode: "full-access",
       });
       routing.codex.compactThread.mockClear();
-      routing.codex.compactThread.mockImplementationOnce(() => Effect.never);
+      const nativeStarted = yield* Deferred.make<void>();
+      routing.codex.compactThread.mockImplementationOnce(() =>
+        Deferred.succeed(nativeStarted, undefined).pipe(Effect.andThen(Effect.never)),
+      );
 
       const resultFiber = yield* provider
         .compactThread(threadId)
         .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(nativeStarted);
       yield* advanceTestClock(50);
       const concurrent = yield* provider.compactThread(threadId).pipe(Effect.result);
       assert.equal(concurrent._tag, "Failure");
@@ -2635,9 +2661,28 @@ routing.layer("ProviderServiceLive routing", (it) => {
         runtimeMode: "full-access",
       });
 
+      const firstAdmitted = yield* Deferred.make<void>();
+      const retryAdmitted = yield* Deferred.make<void>();
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const upsert = directory.upsert;
+      let admissions = 0;
+      const admissionSpy = vi
+        .spyOn(directory, "upsert")
+        .mockImplementation((input) =>
+          upsert(input).pipe(
+            Effect.tap(() =>
+              input.threadId === threadId && input.status === "running"
+                ? Deferred.succeed(++admissions === 1 ? firstAdmitted : retryAdmitted, undefined)
+                : Effect.void,
+            ),
+          ),
+        );
+      yield* Effect.addFinalizer(() => Effect.sync(() => admissionSpy.mockRestore()));
+
       const resultFiber = yield* provider
         .compactThread(threadId)
         .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(firstAdmitted);
       yield* advanceTestClock(600_001);
       const result = yield* Fiber.join(resultFiber);
       assert.equal(result._tag, "Failure");
@@ -2649,7 +2694,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         }),
       );
       const retryFiber = yield* provider.compactThread(threadId).pipe(Effect.forkChild);
-      yield* advanceTestClock(50);
+      yield* Deferred.await(retryAdmitted);
       routing.cursor.emit({
         type: "turn.completed",
         eventId: asEventId("evt-compact-fallback-retry-completed"),
@@ -4443,8 +4488,6 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
       const secondStarted = yield* Deferred.make<void>();
       const firstRelease = yield* Deferred.make<void>();
       const secondRelease = yield* Deferred.make<void>();
-      const initialStartsObserved = yield* Deferred.make<void>();
-      let initialStartCount = 0;
       const firstTurnId = asTurnId("turn-analytics-overlap-first");
       const secondTurnId = asTurnId("turn-analytics-overlap-second");
       primaryAnalyticsCodex.sendTurn
@@ -4463,14 +4506,9 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
           }),
         );
 
-      const runtimeEvents = yield* Stream.take(provider.streamEvents, 5).pipe(
-        Stream.tap((event) => {
-          if (event.type !== "turn.started" || initialStartCount >= 2) return Effect.void;
-          initialStartCount += 1;
-          return initialStartCount === 2
-            ? Deferred.succeed(initialStartsObserved, undefined).pipe(Effect.asVoid)
-            : Effect.void;
-        }),
+      const runtimeEvents = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.turnId !== undefined),
+        Stream.take(5),
         Stream.runDrain,
         Effect.forkChild,
       );
@@ -4509,7 +4547,7 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
           payload: { model: `native-${suffix}`, effort: `native-effort-${suffix}` },
         });
       }
-      yield* Deferred.await(initialStartsObserved);
+      yield* drainRawProviderEvents(provider, primaryAnalyticsCodex, threadId);
       yield* Deferred.succeed(secondRelease, undefined);
       yield* Fiber.join(secondSend);
       primaryAnalyticsCodex.emit({
@@ -4561,6 +4599,7 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
       const threadId = asThreadId("thread-turn-analytics-fast-completion");
       const turnId = asTurnId("turn-analytics-fast-completion");
       const returnRelease = yield* Deferred.make<void>();
+      const nativeProcessed = yield* Deferred.make<void>();
       yield* provider.startSession(threadId, {
         provider: CODEX_DRIVER,
         providerInstanceId: codexInstanceId,
@@ -4588,6 +4627,8 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
             turnId,
             payload: { state: "completed" },
           });
+          yield* drainRawProviderEvents(provider, primaryAnalyticsCodex, threadId);
+          yield* Deferred.succeed(nativeProcessed, undefined);
           yield* Deferred.await(returnRelease);
           return { threadId: input.threadId, turnId };
         }),
@@ -4608,13 +4649,14 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
           modelSelection: createModelSelection(codexInstanceId, "requested-fast"),
         })
         .pipe(Effect.forkChild);
-      const terminal = yield* Fiber.join(terminalReceipt);
-      assert.equal(terminal._tag, "Some");
+      yield* Deferred.await(nativeProcessed);
+      assert.equal(terminalReceipt.pollUnsafe(), undefined);
       assert.equal(sendFiber.pollUnsafe(), undefined);
       assert.equal(recordedTurnAnalytics.eventsByName("provider.turn.completed").length, 0);
 
       yield* Deferred.succeed(returnRelease, undefined);
       yield* Fiber.join(sendFiber);
+      assert.equal((yield* Fiber.join(terminalReceipt))._tag, "Some");
       const completed = recordedTurnAnalytics.eventsByName("provider.turn.completed");
       assert.equal(completed.length, 1);
       assert.deepInclude(completed[0]?.properties ?? {}, {
@@ -4743,10 +4785,6 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
           }),
         );
 
-      const runtimeEvents = yield* Stream.take(provider.streamEvents, 4).pipe(
-        Stream.runDrain,
-        Effect.forkChild,
-      );
       const firstSend = yield* provider
         .sendTurn({
           threadId,
@@ -4793,7 +4831,7 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
           payload: { state: "completed" },
         });
       }
-      yield* Fiber.join(runtimeEvents);
+      yield* drainRawProviderEvents(provider, primaryAnalyticsCodex, threadId);
       assert.equal(recordedTurnAnalytics.eventsByName("provider.turn.completed").length, 0);
       yield* advanceTestClock(40);
 
@@ -4829,6 +4867,7 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
       const canceledStarted = yield* Deferred.make<void>();
       const canceledRelease = yield* Deferred.make<void>();
       const nextReturnRelease = yield* Deferred.make<void>();
+      const nativeProcessed = yield* Deferred.make<void>();
       const nextTurnId = asTurnId("turn-analytics-after-canceled-send");
       yield* provider.startSession(threadId, {
         provider: CODEX_DRIVER,
@@ -4864,6 +4903,8 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
               turnId: nextTurnId,
               payload: { state: "completed" },
             });
+            yield* drainRawProviderEvents(provider, primaryAnalyticsCodex, threadId);
+            yield* Deferred.succeed(nativeProcessed, undefined);
             yield* Deferred.await(nextReturnRelease);
             return { threadId, turnId: nextTurnId };
           }),
@@ -4894,14 +4935,15 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
           interactionMode: "plan",
         })
         .pipe(Effect.forkChild);
-      const terminal = yield* Fiber.join(terminalReceipt);
-      assert.equal(terminal._tag, "Some");
+      yield* Deferred.await(nativeProcessed);
+      assert.equal(terminalReceipt.pollUnsafe(), undefined);
       assert.equal(nextSend.pollUnsafe(), undefined);
       // The canceled request must not hold the completion. The live request
       // still does, until its adapter response links it to the turn.
       assert.equal(recordedTurnAnalytics.eventsByName("provider.turn.completed").length, 0);
       yield* Deferred.succeed(nextReturnRelease, undefined);
       const nextTurn = yield* Fiber.join(nextSend);
+      assert.equal((yield* Fiber.join(terminalReceipt))._tag, "Some");
       assert.equal(nextTurn.turnId, nextTurnId);
 
       const completed = recordedTurnAnalytics.eventsByName("provider.turn.completed");
@@ -4944,11 +4986,6 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
         );
       }
 
-      const runtimeEvents = yield* Stream.take(provider.streamEvents, turnIds.length * 2).pipe(
-        Stream.runDrain,
-        Effect.forkChild,
-      );
-      yield* Effect.yieldNow;
       const sends = [];
       for (let index = 0; index < turnIds.length; index += 1) {
         sends.push(
@@ -4984,7 +5021,7 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
           payload: { state: "completed" },
         });
       }
-      yield* Fiber.join(runtimeEvents);
+      yield* drainRawProviderEvents(provider, primaryAnalyticsCodex, threadId);
       assert.equal(recordedTurnAnalytics.eventsByName("provider.turn.completed").length, 1);
 
       for (const send of sends) {
@@ -5034,11 +5071,6 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
         .pipe(Effect.forkChild);
       yield* Deferred.await(secondStarted);
 
-      const runtimeEvents = yield* Stream.take(provider.streamEvents, 2).pipe(
-        Stream.runDrain,
-        Effect.forkChild,
-      );
-      yield* Effect.yieldNow;
       primaryAnalyticsCodex.emit({
         type: "turn.started",
         eventId: asEventId("evt-turn-analytics-stop-deferred-start"),
@@ -5057,7 +5089,7 @@ turnAnalytics.layer("ProviderServiceLive turn analytics", (it) => {
         turnId,
         payload: { state: "completed" },
       });
-      yield* Fiber.join(runtimeEvents);
+      yield* drainRawProviderEvents(provider, primaryAnalyticsCodex, threadId);
       assert.equal(recordedTurnAnalytics.eventsByName("provider.turn.completed").length, 0);
 
       yield* provider.stopSession({ threadId });
@@ -5814,13 +5846,679 @@ const portableProviderLayer = Layer.effect(
   }),
 ).pipe(Layer.provideMerge(SqlitePersistenceMemory), Layer.orDie);
 const portableProviders = makeProviderServiceLayer({ executionLayer: portableProviderLayer });
+const mcpPreflightFailures = new Set<string>();
+const ordinaryAdmissions = makeProviderServiceLayer({
+  executionLayer: portableProviderLayer,
+  issueMcpCredential: (request) =>
+    mcpPreflightFailures.has(request.threadId)
+      ? Effect.die(new Error("MCP preparation failed before native dispatch."))
+      : Effect.succeed(undefined),
+});
+ordinaryAdmissions.layer("Ordinary provider checkout admissions", (it) => {
+  const prepare = Effect.fnUntraced(function* (id: string) {
+    const threadId = asThreadId(`ordinary-${id}`);
+    const sql = yield* SqlClient.SqlClient;
+    const root = NodePath.join(process.cwd(), threadId);
+    yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+      VALUES (${threadId},'Project',${root},'[]','2026-10-27','2026-10-27')`;
+    yield* sql`INSERT INTO projection_threads (thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at)
+      VALUES (${threadId},${threadId},'Thread','{"instanceId":"codex","model":"gpt-5"}','full-access','default','2026-10-27','2026-10-27')`;
+    const provider = yield* ProviderService.ProviderService;
+    const captures = makeCheckoutCapture(sql);
+    yield* ordinaryAdmissions.codex.whenSubscribed;
+    yield* provider.startSession(threadId, {
+      threadId,
+      providerInstanceId: codexInstanceId,
+      runtimeMode: "full-access",
+    });
+    return { threadId, sql, root, provider, captures };
+  });
+
+  it.effect("binds early native completion before publishing it and keeps the turn admitted", () =>
+    Effect.gen(function* () {
+      const { threadId, provider, captures, sql } = yield* prepare("early-completion");
+      const [idle] = yield* sql<{
+        completed: number;
+      }>`SELECT completed FROM checkout_work_admissions WHERE thread_id=${threadId}`;
+      assert.equal(idle?.completed, 1);
+      const turnId = asTurnId("early-completion-turn");
+      const terminal = {
+        type: "turn.completed" as const,
+        threadId,
+        turnId,
+        provider: CODEX_DRIVER,
+        eventId: asEventId("early-native-completion"),
+        createdAt: "2026-10-27T10:00:00.000Z",
+        payload: { state: "completed" as const },
+      };
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === terminal.eventId),
+        Stream.mapEffect((event) =>
+          Effect.gen(function* () {
+            const admission = yield* captures.lookupAdmission(
+              threadId,
+              "send-turn:early",
+              "provider",
+            );
+            assert.equal(admission?.turnId, turnId);
+            assert.equal(admission?.completed, 0);
+            return event;
+          }),
+        ),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      ordinaryAdmissions.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          const barrierId = asEventId("early-native-barrier");
+          const barrier = yield* provider.streamEvents.pipe(
+            Stream.filter((event) => event.eventId === barrierId),
+            Stream.runHead,
+            Effect.forkChild({ startImmediately: true }),
+          );
+          ordinaryAdmissions.codex.emit(terminal);
+          ordinaryAdmissions.codex.emit({
+            type: "runtime.warning",
+            threadId,
+            provider: CODEX_DRIVER,
+            eventId: barrierId,
+            createdAt: terminal.createdAt,
+            payload: { message: "Earlier native events processed" },
+          });
+          yield* Fiber.join(barrier);
+          return { threadId, turnId };
+        }),
+      );
+      yield* provider.sendTurn({
+        threadId,
+        input: "Finish immediately",
+        delivery: { attemptId: "early", mode: "next-turn" },
+      });
+      const event = Option.getOrThrow(yield* Fiber.join(completed));
+      assert.deepEqual(event, { ...terminal, providerInstanceId: codexInstanceId });
+      assert.isDefined(yield* captures.activeAdmission(threadId, turnId));
+      yield* captures.completeTurn(threadId, turnId);
+      assert.isUndefined(yield* captures.activeAdmission(threadId, turnId));
+    }),
+  );
+
+  it.effect("allows active-turn answers while draining but denies mutations during capture", () =>
+    Effect.gen(function* () {
+      const { threadId, root, provider, captures } = yield* prepare("controls");
+      const turn = yield* provider.sendTurn({ threadId, input: "Ask for approval" });
+      const owner = {
+        threadId,
+        operationId: "controls-move",
+        environmentId: "destination",
+        generation: 1,
+      };
+      yield* captures.acquireDrain({ ...owner, checkoutRoot: root, gitCommonRoot: root });
+      let expectedPhase: "draining" | "capturing" = "draining";
+      yield* Effect.addFinalizer(() =>
+        captures.release(owner, { outcome: "cancelled", expectedPhase }).pipe(Effect.orDie),
+      );
+      yield* provider.respondToRequest({
+        threadId,
+        requestId: ApprovalRequestId.make("approval"),
+        decision: "accept",
+      });
+      yield* provider.respondToUserInput({
+        threadId,
+        requestId: ApprovalRequestId.make("answer"),
+        answers: { choice: "yes" },
+      });
+      const fresh = yield* Effect.flip(provider.sendTurn({ threadId, input: "New work" }));
+      assert.equal(fresh._tag, "ProviderExecutionError");
+      if (fresh._tag === "ProviderExecutionError") assert.isTrue(fresh.waitingForCheckout);
+      yield* captures.completeTurn(threadId, String(turn.turnId));
+      yield* captures.enterCapturing(owner);
+      expectedPhase = "capturing";
+      const approvals = ordinaryAdmissions.codex.respondToRequest.mock.calls.length;
+      const captured = yield* Effect.flip(
+        provider.respondToRequest({
+          threadId,
+          requestId: ApprovalRequestId.make("captured"),
+          decision: "accept",
+        }),
+      );
+      assert.equal(captured._tag, "ProviderExecutionError");
+      if (captured._tag === "ProviderExecutionError") assert.isTrue(captured.waitingForCheckout);
+      assert.equal(ordinaryAdmissions.codex.respondToRequest.mock.calls.length, approvals);
+      yield* provider.interruptTurn({ threadId });
+      yield* provider.stopSession({ threadId });
+      assert.isFalse(yield* ordinaryAdmissions.codex.adapter.hasSession(threadId));
+    }),
+  );
+
+  it.effect(
+    "flushes concurrent direct output when the last call settles with native uncertainty",
+    () =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures } = yield* prepare("concurrent-direct");
+        const firstStarted = yield* Deferred.make<void>();
+        const secondStarted = yield* Deferred.make<void>();
+        const firstRelease = yield* Deferred.make<void>();
+        const secondRelease = yield* Deferred.make<void>();
+        const turnId = asTurnId("concurrent-first");
+        ordinaryAdmissions.codex.sendTurn
+          .mockImplementationOnce(() =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(firstStarted, undefined);
+              yield* Deferred.await(firstRelease);
+              return { threadId, turnId };
+            }),
+          )
+          .mockImplementationOnce(() =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(secondStarted, undefined);
+              yield* Deferred.await(secondRelease);
+              return yield* new ProviderAdapterRequestError({
+                provider: CODEX_DRIVER,
+                method: "sendTurn",
+                detail: "Connection lost after dispatch.",
+              });
+            }),
+          );
+        const eventId = asEventId("concurrent-first-started");
+        const published = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === eventId),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const first = yield* provider
+          .sendTurn({
+            threadId,
+            input: "first",
+            delivery: { attemptId: "first", mode: "next-turn" },
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(firstStarted);
+        const second = yield* provider
+          .sendTurn({
+            threadId,
+            input: "second",
+            delivery: { attemptId: "second", mode: "next-turn" },
+          })
+          .pipe(Effect.exit, Effect.forkChild);
+        yield* Deferred.await(secondStarted);
+        ordinaryAdmissions.codex.emit({
+          type: "turn.started",
+          eventId,
+          threadId,
+          turnId,
+          provider: CODEX_DRIVER,
+          createdAt: "2026-10-27T10:00:00.000Z",
+          payload: {},
+        });
+        yield* drainRawProviderEvents(provider, ordinaryAdmissions.codex, threadId);
+        assert.isUndefined(published.pollUnsafe());
+        yield* Deferred.succeed(firstRelease, undefined);
+        yield* Fiber.join(first);
+        assert.isUndefined(published.pollUnsafe());
+        yield* Deferred.succeed(secondRelease, undefined);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(second)));
+        assert.equal(Option.getOrThrow(yield* Fiber.join(published)).eventId, eventId);
+        const uncertain = yield* captures.lookupAdmission(threadId, "send-turn:second", "provider");
+        assert.equal(uncertain?.completed, 0);
+        assert.isNull(uncertain?.turnId);
+        assert.equal(
+          (yield* captures.lookupAdmission(threadId, "send-turn:first", "provider"))?.turnId,
+          turnId,
+        );
+      }),
+  );
+
+  it.effect("keeps failed native sends reserved and never dispatches their retry", () =>
+    Effect.gen(function* () {
+      const { threadId, provider, captures } = yield* prepare("uncertain");
+      ordinaryAdmissions.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: CODEX_DRIVER,
+            method: "sendTurn",
+            detail: "Connection lost after dispatch",
+          }),
+        ),
+      );
+      const input = {
+        threadId,
+        input: "May already be running",
+        delivery: { attemptId: "uncertain", mode: "next-turn" as const },
+      };
+      yield* Effect.flip(provider.sendTurn(input));
+      const admission = yield* captures.lookupAdmission(
+        threadId,
+        "send-turn:uncertain",
+        "provider",
+      );
+      assert.equal(admission?.completed, 0);
+      assert.isNull(admission?.turnId);
+      const sends = ordinaryAdmissions.codex.sendTurn.mock.calls.length;
+      const retry = yield* Effect.flip(provider.sendTurn(input));
+      assert.equal(retry._tag, "ProviderExecutionError");
+      if (retry._tag === "ProviderExecutionError") assert.isTrue(retry.uncertain);
+      assert.equal(ordinaryAdmissions.codex.sendTurn.mock.calls.length, sends);
+    }),
+  );
+
+  it.effect.each(["approval", "user-input"] as const)(
+    "retries the same %s request only after a definite rejection",
+    (operation) =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures } = yield* prepare(`reply-retry-${operation}`);
+        const method =
+          operation === "approval"
+            ? ordinaryAdmissions.codex.respondToRequest
+            : ordinaryAdmissions.codex.respondToUserInput;
+        method.mockImplementationOnce(() =>
+          Effect.fail(
+            new ProviderAdapterValidationError({
+              provider: CODEX_DRIVER,
+              operation,
+              issue: "The provider is still loading this request. Try again.",
+            }),
+          ),
+        );
+        const respond =
+          operation === "approval"
+            ? provider.respondToRequest({
+                threadId,
+                requestId: asRequestId("retry"),
+                decision: "accept",
+              })
+            : provider.respondToUserInput({
+                threadId,
+                requestId: asRequestId("retry"),
+                answers: {},
+              });
+        const calls = method.mock.calls.length;
+        assert.equal((yield* Effect.flip(respond))._tag, "ProviderAdapterValidationError");
+        assert.equal(
+          (yield* captures.lookupAdmission(threadId, `${operation}:retry`, "provider"))?.rejected,
+          1,
+        );
+        yield* respond;
+        const duplicate = yield* Effect.flip(respond);
+        assert.equal(duplicate._tag, "ProviderExecutionError");
+        assert.equal(method.mock.calls.length, calls + 2);
+        const acknowledged = yield* captures.lookupAdmission(
+          threadId,
+          `${operation}:retry`,
+          "provider",
+        );
+        assert.equal(acknowledged?.completed, 1);
+        assert.equal(acknowledged?.rejected, 0);
+      }),
+  );
+
+  it.effect.each(["approval", "user-input"] as const)(
+    "never replays an uncertain %s response",
+    (operation) =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures } = yield* prepare(`reply-uncertain-${operation}`);
+        const method =
+          operation === "approval"
+            ? ordinaryAdmissions.codex.respondToRequest
+            : ordinaryAdmissions.codex.respondToUserInput;
+        method.mockImplementationOnce(() =>
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: CODEX_DRIVER,
+              method: operation,
+              detail: "The reply was lost after dispatch.",
+            }),
+          ),
+        );
+        const respond =
+          operation === "approval"
+            ? provider.respondToRequest({
+                threadId,
+                requestId: asRequestId("unknown"),
+                decision: "accept",
+              })
+            : provider.respondToUserInput({
+                threadId,
+                requestId: asRequestId("unknown"),
+                answers: {},
+              });
+        const calls = method.mock.calls.length;
+        assert.equal((yield* Effect.flip(respond))._tag, "ProviderAdapterRequestError");
+        assert.equal((yield* Effect.flip(respond))._tag, "ProviderExecutionError");
+        assert.equal(method.mock.calls.length, calls + 1);
+        const uncertain = yield* captures.lookupAdmission(
+          threadId,
+          `${operation}:unknown`,
+          "provider",
+        );
+        assert.equal(uncertain?.completed, 0);
+        assert.equal(uncertain?.rejected, 0);
+      }),
+  );
+
+  it.effect.each([false, true])(
+    "retires an admitted send when its session stops before dispatch, callbacks=%s",
+    (callbacks) =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures, root } = yield* prepare(
+          `stopped-before-send-${callbacks}`,
+        );
+        const send = ordinaryAdmissions.codex.sendTurn.getMockImplementation()!;
+        ordinaryAdmissions.codex.sendTurn.mockImplementationOnce((input, hooks) =>
+          ordinaryAdmissions.codex
+            .stopSession(input.threadId)
+            .pipe(Effect.andThen(Effect.suspend(() => send(input, hooks)))),
+        );
+        const stopped = yield* Effect.flip(
+          provider.sendTurn(
+            {
+              threadId,
+              input: "The session stops after admission",
+              delivery: { attemptId: "stopped", mode: "next-turn" },
+            },
+            callbacks ? { onAdmitted: () => Effect.void } : undefined,
+          ),
+        );
+        assert.equal(stopped._tag, "ProviderAdapterSessionNotFoundError");
+        const rejected = yield* captures.lookupAdmission(threadId, "send-turn:stopped", "provider");
+        assert.equal(rejected?.completed, 1);
+        assert.equal(rejected?.rejected, 1);
+        assert.deepEqual(yield* captures.blockers({ checkoutRoot: root, gitCommonRoot: root }), []);
+      }),
+  );
+
+  it.effect.each([false, true])(
+    "retires a rejected native send with admission callbacks=%s",
+    (callbacks) =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures, root } = yield* prepare(
+          `send-validation-${callbacks}`,
+        );
+        ordinaryAdmissions.codex.sendTurn.mockImplementationOnce(() =>
+          Effect.fail(
+            new ProviderAdapterValidationError({
+              provider: CODEX_DRIVER,
+              operation: "sendTurn",
+              issue: "Rejected before native dispatch.",
+            }),
+          ),
+        );
+        const rejected = yield* Effect.flip(
+          provider.sendTurn(
+            {
+              threadId,
+              input: "Do not dispatch",
+              delivery: { attemptId: "rejected", mode: "next-turn" },
+            },
+            callbacks ? { onAdmitted: () => Effect.void } : undefined,
+          ),
+        );
+        assert.equal(rejected._tag, "ProviderAdapterValidationError");
+        assert.equal(
+          (yield* captures.lookupAdmission(threadId, "send-turn:rejected", "provider"))?.completed,
+          1,
+        );
+        assert.deepEqual(yield* captures.blockers({ checkoutRoot: root, gitCommonRoot: root }), []);
+      }),
+  );
+
+  it.effect.each(["start", "recover"] as const)(
+    "retires a rejected native session %s",
+    (operation) =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures, sql, root } = yield* prepare(
+          `session-validation-${operation}`,
+        );
+        if (operation === "recover") yield* ordinaryAdmissions.codex.stopAll();
+        ordinaryAdmissions.codex.startSession.mockImplementationOnce(() =>
+          Effect.fail(
+            new ProviderAdapterValidationError({
+              provider: CODEX_DRIVER,
+              operation: "startSession",
+              issue: "Rejected before starting a process.",
+            }),
+          ),
+        );
+        const attempt =
+          operation === "recover"
+            ? provider.sendTurn({ threadId, input: "Recover" }).pipe(Effect.asVoid)
+            : provider
+                .startSession(threadId, {
+                  threadId,
+                  providerInstanceId: codexInstanceId,
+                  runtimeMode: "full-access",
+                })
+                .pipe(Effect.asVoid);
+        const rejected = yield* Effect.flip(attempt);
+        assert.equal(rejected._tag, "ProviderAdapterValidationError");
+        const rows = yield* sql<{
+          completed: number;
+        }>`SELECT completed FROM checkout_work_admissions WHERE thread_id=${threadId} AND work_id LIKE ${operation === "recover" ? "recover-session:%" : "start-session:%"} ORDER BY sequence DESC`;
+        assert.equal(rows[0]?.completed, 1);
+        assert.deepEqual(yield* captures.blockers({ checkoutRoot: root, gitCommonRoot: root }), []);
+      }),
+  );
+
+  it.effect.each(["approval", "user-input", "rollback"] as const)(
+    "retires only the outer %s when route recovery is uncertain",
+    (operation) =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures, sql, root } = yield* prepare(
+          `route-failure-${operation}`,
+        );
+        yield* ordinaryAdmissions.codex.stopAll();
+        ordinaryAdmissions.codex.startSession.mockImplementationOnce(() =>
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: CODEX_DRIVER,
+              method: "startSession",
+              detail: "Connection lost after recovery dispatch.",
+            }),
+          ),
+        );
+        const calls = [
+          ordinaryAdmissions.codex.respondToRequest.mock.calls.length,
+          ordinaryAdmissions.codex.respondToUserInput.mock.calls.length,
+          ordinaryAdmissions.codex.rollbackThread.mock.calls.length,
+        ];
+        const attempt =
+          operation === "approval"
+            ? provider.respondToRequest({
+                threadId,
+                requestId: asRequestId("route"),
+                decision: "accept",
+              })
+            : operation === "user-input"
+              ? provider.respondToUserInput({
+                  threadId,
+                  requestId: asRequestId("route"),
+                  answers: {},
+                })
+              : provider.rollbackConversation({ threadId, numTurns: 1 });
+        assert.equal((yield* Effect.flip(attempt))._tag, "ProviderAdapterRequestError");
+        assert.deepEqual(
+          [
+            ordinaryAdmissions.codex.respondToRequest.mock.calls.length,
+            ordinaryAdmissions.codex.respondToUserInput.mock.calls.length,
+            ordinaryAdmissions.codex.rollbackThread.mock.calls.length,
+          ],
+          calls,
+        );
+        const rows = yield* sql<{
+          completed: number;
+        }>`SELECT completed FROM checkout_work_admissions WHERE thread_id=${threadId} AND work_id LIKE ${`${operation}:%`}`;
+        assert.equal(rows[0]?.completed, 1);
+        const blockers = yield* captures.blockers({ checkoutRoot: root, gitCommonRoot: root });
+        assert.equal(blockers.length, 1);
+        assert.isTrue(blockers[0]!.workId.startsWith("recover-session:"));
+        assert.equal(blockers[0]!.completed, 0);
+        assert.isNull(blockers[0]!.turnId);
+      }),
+  );
+
+  it.effect("retires a native compaction rejected before dispatch", () =>
+    Effect.gen(function* () {
+      const { threadId, provider, captures, root } = yield* prepare("compact-validation");
+      ordinaryAdmissions.codex.compactThread.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterValidationError({
+            provider: CODEX_DRIVER,
+            operation: "compactThread",
+            issue: "Rejected before native dispatch.",
+          }),
+        ),
+      );
+      const rejected = yield* Effect.flip(
+        provider.compactThread(threadId, undefined, MessageId.make("rejected")),
+      );
+      assert.equal(rejected._tag, "ProviderAdapterValidationError");
+      assert.equal(
+        (yield* captures.lookupAdmission(threadId, "compact:rejected", "provider"))?.completed,
+        1,
+      );
+      assert.deepEqual(yield* captures.blockers({ checkoutRoot: root, gitCommonRoot: root }), []);
+    }),
+  );
+
+  it.effect("keeps a bound turn admitted if validation arrives after its acknowledgement", () =>
+    Effect.gen(function* () {
+      const { threadId, provider, captures } = yield* prepare("acknowledged-validation");
+      const turnId = TurnId.make("acknowledged-before-validation");
+      ordinaryAdmissions.codex.sendTurn.mockImplementationOnce((input, callbacks) =>
+        Effect.gen(function* () {
+          yield* (
+            callbacks?.onAdmitted({ threadId: input.threadId, turnId }, "provider-ack") ??
+              Effect.void
+          );
+          return yield* new ProviderAdapterValidationError({
+            provider: CODEX_DRIVER,
+            operation: "sendTurn",
+            issue: "Already acknowledged.",
+          });
+        }),
+      );
+      yield* Effect.flip(
+        provider.sendTurn(
+          {
+            threadId,
+            input: "Acknowledged",
+            delivery: { attemptId: "acknowledged", mode: "next-turn" },
+          },
+          { onAdmitted: () => Effect.void },
+        ),
+      );
+      const admission = yield* captures.lookupAdmission(
+        threadId,
+        "send-turn:acknowledged",
+        "provider",
+      );
+      assert.equal(admission?.turnId, turnId);
+      assert.equal(admission?.completed, 0);
+    }),
+  );
+
+  it.effect("completes acknowledged idle recovery before holding the resumed turn", () =>
+    Effect.gen(function* () {
+      const { threadId, provider, sql } = yield* prepare("recovery");
+      yield* ordinaryAdmissions.codex.stopAll();
+      yield* provider.sendTurn({ threadId, input: "Resume" });
+      const rows = yield* sql<{
+        workId: string;
+        completed: number;
+        turnId: string | null;
+      }>`SELECT work_id AS "workId",completed,turn_id AS "turnId" FROM checkout_work_admissions WHERE thread_id=${threadId}`;
+      assert.equal(rows.find((row) => row.workId.startsWith("recover-session:"))?.completed, 1);
+      const turn = rows.find((row) => row.workId.startsWith("send-turn:"));
+      assert.equal(turn?.completed, 0);
+      assert.equal(turn?.turnId, `turn-${threadId}`);
+    }),
+  );
+
+  it.effect.each(["start", "recover"] as const)(
+    "retires local MCP preparation failure during %s",
+    (operation) =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures, sql, root } = yield* prepare(
+          `mcp-preflight-${operation}`,
+        );
+        if (operation === "recover") yield* ordinaryAdmissions.codex.stopAll();
+        mcpPreflightFailures.add(threadId);
+        yield* Effect.addFinalizer(() => Effect.sync(() => mcpPreflightFailures.delete(threadId)));
+        const starts = ordinaryAdmissions.codex.startSession.mock.calls.length;
+        const attempt =
+          operation === "recover"
+            ? provider.sendTurn({ threadId, input: "Recover" }).pipe(Effect.asVoid)
+            : provider
+                .startSession(threadId, {
+                  threadId,
+                  providerInstanceId: codexInstanceId,
+                  runtimeMode: "full-access",
+                })
+                .pipe(Effect.asVoid);
+        const failure = yield* Effect.exit(attempt);
+        assert.isTrue(Exit.isFailure(failure));
+        assert.equal(ordinaryAdmissions.codex.startSession.mock.calls.length, starts);
+        const rows = yield* sql<{
+          completed: number;
+        }>`SELECT completed FROM checkout_work_admissions WHERE thread_id=${threadId} AND work_id LIKE ${operation === "recover" ? "recover-session:%" : "start-session:%"} ORDER BY sequence DESC`;
+        assert.equal(rows[0]?.completed, 1);
+        assert.deepEqual(yield* captures.blockers({ checkoutRoot: root, gitCommonRoot: root }), []);
+      }),
+  );
+
+  it.effect.each(["ready", "running"] as const)(
+    "settles a %s resume acknowledgement with an old turn ID",
+    (status) =>
+      Effect.gen(function* () {
+        const { threadId, provider, captures, root } = yield* prepare(
+          `resume-stale-turn-${status}`,
+        );
+        yield* ordinaryAdmissions.codex.stopAll();
+        const start = ordinaryAdmissions.codex.startSession.getMockImplementation()!;
+        ordinaryAdmissions.codex.startSession.mockImplementationOnce((input) =>
+          start(input).pipe(
+            Effect.map((session) => ({
+              ...session,
+              status,
+              activeTurnId: TurnId.make("old-settled-turn"),
+            })),
+          ),
+        );
+        if (status === "running")
+          ordinaryAdmissions.codex.sendTurn.mockImplementationOnce(() =>
+            Effect.succeed({ threadId, turnId: TurnId.make("old-settled-turn") }),
+          );
+        const parent = yield* captures.admit({
+          threadId,
+          workId: "request:resume",
+          kind: "provider",
+          checkoutRoot: root,
+        });
+        const result = yield* provider
+          .sendTurn({ threadId, input: "New turn after idle resume" })
+          .pipe(Effect.provideService(CheckoutAdmission, parent.admissionId));
+        const admitted = yield* captures.getAdmission(parent.admissionId);
+        assert.equal(admitted?.turnId, result.turnId);
+        assert.equal(admitted?.completed, 0);
+        const children = yield* captures.blockers({ checkoutRoot: root, gitCommonRoot: root });
+        assert.equal(
+          children.some((row) => row.workId.startsWith("recover-session:")),
+          status === "running",
+        );
+      }),
+  );
+});
 portableProviders.layer("Portable provider execution", (it) => {
   const enroll = Effect.fnUntraced(function* (threadId: ThreadId) {
     const sql = yield* SqlClient.SqlClient;
+    const root = NodePath.join(process.cwd(), threadId);
+    yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+      VALUES (${threadId},'Project',${root},'[]','2026-10-27','2026-10-27')`;
+    yield* sql`INSERT INTO projection_threads (thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at)
+      VALUES (${threadId},${threadId},'Thread','{"instanceId":"codex","model":"gpt-5"}','full-access','default','2026-10-27','2026-10-27')`;
     const fence = makeThreadExecutionFence(sql);
     const owner = {
       threadId,
-      projectId: "project",
+      projectId: threadId,
       environmentId: "environment",
       relayUrl: "https://relay.test",
       generation: 1,

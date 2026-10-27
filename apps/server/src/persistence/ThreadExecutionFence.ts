@@ -211,9 +211,24 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
         if (row.phase !== "draining")
           return yield* fail(input.threadId, "Drain the thread before freezing it.");
         yield* requireIdle(input.threadId);
-        const pending = yield* sql`SELECT 1 FROM checkout_operation_projects
-          WHERE project_id = ${row.projectId} LIMIT 1`;
-        if (pending.length)
+        const [capture] = yield* sql<{ checkoutRoot: string; gitCommonRoot: string }>`
+          SELECT checkout_root AS "checkoutRoot",git_common_root AS "gitCommonRoot" FROM checkout_capture_holds
+          WHERE operation_id=${input.operationId} AND thread_id=${input.threadId}
+            AND generation=${input.generation} AND phase!='released'`;
+        const pending = capture
+          ? (yield* sql<{
+              path: string | null;
+              kind: string;
+            }>`SELECT p.path,o.kind FROM checkout_operations o
+              LEFT JOIN checkout_operation_paths p USING(operation_id)`).some(
+              ({ path, kind }) =>
+                path === null ||
+                overlaps(path, capture.checkoutRoot) ||
+                (kind === "vcs" && overlaps(path, capture.gitCommonRoot)),
+            )
+          : (yield* sql`SELECT 1 FROM checkout_operation_projects
+              WHERE project_id = ${row.projectId} LIMIT 1`).length > 0;
+        if (pending)
           return yield* fail(
             input.threadId,
             "Checkout operations have not been confirmed stopped.",
@@ -451,8 +466,11 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
         unresolved.threadId,
         "Finish the checkout installation before adding another project.",
       );
-    const [held] = yield* sql<{ threadId: string }>`SELECT thread_id AS "threadId"
-      FROM thread_execution_fences WHERE project_id = ${projectId} AND phase IN ('frozen', 'retired') LIMIT 1`;
+    const [held] = yield* sql<{ threadId: string }>`SELECT f.thread_id AS "threadId"
+      FROM thread_execution_fences f WHERE f.project_id = ${projectId} AND f.phase IN ('frozen', 'retired')
+        AND NOT EXISTS (SELECT 1 FROM checkout_capture_holds h
+          WHERE h.operation_id=f.operation_id AND h.thread_id=f.thread_id
+            AND h.generation=f.generation AND h.phase='released') LIMIT 1`;
     if (held) return yield* fail(held.threadId, "This project contains a frozen or moved thread.");
   });
   return {

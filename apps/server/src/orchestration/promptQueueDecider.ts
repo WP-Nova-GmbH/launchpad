@@ -145,7 +145,7 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         return yield* fail(
           "The move is not ready to start. Wait for the preceding work to settle.",
         );
-      const { detail: _pendingDetail, ...claimed } = candidate;
+      const { detail: _pendingDetail, waitingForCheckout: _pendingWait, ...claimed } = candidate;
       return [
         change({
           entry: {
@@ -168,9 +168,15 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
           candidate.revision !== command.expectedRevision
         )
           return yield* fail("The pending move notice belongs to an older head or revision.");
+        const { waitingForCheckout: _previousWait, ...pending } = candidate;
         return [
           change({
-            entry: { ...candidate, detail: command.detail, revision: candidate.revision + 1 },
+            entry: {
+              ...pending,
+              ...(command.waitingForCheckout ? { waitingForCheckout: true } : {}),
+              detail: command.detail,
+              revision: candidate.revision + 1,
+            },
           }),
         ];
       }
@@ -189,10 +195,12 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         // The worker checks that transaction before reporting completed here.
         return [change({ removedMessageId: candidate.messageId })];
       }
+      const { waitingForCheckout: _previousWait, ...moving } = candidate;
       return [
         change({
           entry: {
-            ...candidate,
+            ...moving,
+            ...(command.waitingForCheckout ? { waitingForCheckout: true } : {}),
             state:
               candidate.state === "cancelling"
                 ? "cancelling"

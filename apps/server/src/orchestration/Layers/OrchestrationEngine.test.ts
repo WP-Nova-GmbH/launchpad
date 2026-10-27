@@ -44,6 +44,7 @@ import { TestClock } from "effect/testing";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
+import { makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import * as OrchestrationCommandReceipts from "../../persistence/Services/OrchestrationCommandReceipts.ts";
@@ -215,6 +216,116 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("reserves accepted starts and holds new work only in the captured physical checkout", async () => {
+    const root = await NodeFSP.realpath(
+      await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "engine-capture-")),
+    );
+    const checkout = NodePath.join(root, "checkout");
+    const alias = NodePath.join(root, "alias");
+    const worktree = NodePath.join(root, "worktree");
+    await NodeFSP.mkdir(checkout);
+    await NodeFSP.mkdir(worktree);
+    await NodeFSP.symlink(checkout, alias);
+    const system = await createOrchestrationSystem();
+    const projectId = ProjectId.make("capture-project");
+    const accepted = ThreadId.make("accepted");
+    const waiting = ThreadId.make("waiting");
+    const independent = ThreadId.make("independent");
+    const capture = makeCheckoutCapture(system.sql);
+    const owner = {
+      operationId: "capture",
+      threadId: "moving",
+      environmentId: "local",
+      generation: 1,
+    };
+    const start = (threadId: ThreadId, commandId: string) =>
+      system.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make(commandId),
+        threadId,
+        message: {
+          messageId: MessageId.make(commandId),
+          role: "user",
+          text: "hello",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      });
+    try {
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("capture-project"),
+          projectId,
+          title: "Capture",
+          workspaceRoot: checkout,
+          createdAt: now(),
+        }),
+      );
+      for (const [threadId, worktreePath] of [
+        [accepted, null],
+        [waiting, alias],
+        [independent, worktree],
+      ] as const)
+        await system.run(
+          system.engine.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`create-${threadId}`),
+            threadId,
+            projectId,
+            title: threadId,
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath,
+            createdAt: now(),
+          }),
+        );
+      await system.run(start(accepted, "accepted-before-capture"));
+      const admitted = await system.run(
+        capture.lookupAdmission(accepted, "request:accepted-before-capture", "provider"),
+      );
+      expect(admitted).toMatchObject({ checkoutRoot: checkout, completed: 0 });
+      await system.run(
+        capture.acquireDrain({
+          ...owner,
+          checkoutRoot: checkout,
+          gitCommonRoot: NodePath.join(checkout, ".git"),
+        }),
+      );
+      await expect(system.run(capture.enterCapturing(owner))).rejects.toThrow(
+        "admitted checkout work",
+      );
+      await expect(system.run(start(waiting, "rejected-by-capture"))).rejects.toThrow(
+        "Waiting for this checkout",
+      );
+      expect(
+        await system.run(
+          capture.lookupAdmission(waiting, "request:rejected-by-capture", "provider"),
+        ),
+      ).toBeNull();
+      expect(
+        (await system.readModel()).threads.find((thread) => thread.id === waiting)?.messages,
+      ).toHaveLength(0);
+      await system.run(start(independent, "worktree-start"));
+      await system.run(capture.complete(admitted!.admissionId));
+      await system.run(capture.enterCapturing(owner));
+      await system.run(
+        capture.release(owner, { outcome: "sealed", manifestSha256: "a".repeat(64) }),
+      );
+      await system.run(start(waiting, "after-capture"));
+      expect(
+        await system.run(capture.lookupAdmission(waiting, "request:after-capture", "provider")),
+      ).toMatchObject({ checkoutRoot: checkout, completed: 0 });
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("registers unrelated canonical roots while retaining uncertain checkout operations", async () => {
     const root = await NodeFSP.realpath(
       await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "project-registration-")),
@@ -2401,39 +2512,18 @@ describe("OrchestrationEngine", () => {
 
   it("rolls back all events for a multi-event command when projection fails mid-dispatch", async () => {
     let shouldFailRequestedProjection = true;
-    const flakyProjectionPipeline: OrchestrationProjectionPipelineShape = {
-      bootstrap: Effect.void,
-      projectEvent: () => Effect.void,
-      projectEventDeferred: (event) => {
+    const runtime = ManagedRuntime.make(
+      makeOrchestrationLayer(undefined, undefined, (event) => {
         if (
           shouldFailRequestedProjection &&
           event.commandId === CommandId.make("cmd-turn-start-atomic") &&
           event.type === "thread.turn-start-requested"
         ) {
           shouldFailRequestedProjection = false;
-          return Effect.fail(
-            new PersistenceSqlError({
-              operation: "test.projection",
-              detail: "projection failed",
-            }),
-          );
+          return true;
         }
-        return Effect.succeed(Effect.void);
-      },
-    };
-
-    const runtime = ManagedRuntime.make(
-      OrchestrationEngineLive.pipe(
-        Layer.provide(OrchestrationProjectionSnapshotQueryLive),
-        Layer.provide(ThreadBackgroundLiveness.layer),
-        Layer.provide(ThreadPlanProgress.layer),
-        Layer.provide(Layer.succeed(OrchestrationProjectionPipeline, flakyProjectionPipeline)),
-        Layer.provide(OrchestrationEventStoreLive),
-        Layer.provide(OrchestrationCommandReceiptRepositoryLive),
-        Layer.provide(RepositoryIdentityResolver.layer),
-        Layer.provide(SqlitePersistenceMemory),
-        Layer.provide(NodeServices.layer),
-      ),
+        return false;
+      }),
     );
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const createdAt = now();
@@ -2487,7 +2577,7 @@ describe("OrchestrationEngine", () => {
     };
 
     await expect(runtime.runPromise(engine.dispatch(turnStartCommand))).rejects.toThrow(
-      "projection failed",
+      "projection failure",
     );
 
     const eventsAfterFailure = await runtime.runPromise(
@@ -3291,6 +3381,89 @@ describe("atomic shared preparation acceptance", () => {
 });
 
 describe("portable thread command fences", () => {
+  it("keeps the moving thread protected from offline force deletion after releasing its checkout", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = ProjectId.make("released-capture-project");
+    const threadId = ThreadId.make("released-capture-thread");
+    const root = "/tmp/released-capture-project";
+    const owner = {
+      projectId,
+      threadId,
+      operationId: "sealed-capture",
+      environmentId: "local",
+      generation: 1,
+      relayUrl: "https://relay.example",
+    };
+    try {
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("released-project"),
+          projectId,
+          title: "Project",
+          workspaceRoot: root,
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("released-thread"),
+          threadId,
+          projectId,
+          title: "Moving",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      const enrollment = { ...owner, operationId: "initial-enrollment" };
+      await system.run(system.fence.prepare(enrollment));
+      await system.run(system.fence.activate(enrollment));
+      await system.run(
+        system.fence.beginDrain({ ...owner, previousOperationId: enrollment.operationId }),
+      );
+      await system.run(system.fence.freeze(owner));
+      const captures = makeCheckoutCapture(system.sql);
+      await system.run(
+        captures.acquireDrain({ ...owner, checkoutRoot: root, gitCommonRoot: `${root}/.git` }),
+      );
+      await system.run(captures.enterCapturing(owner));
+      await system.run(
+        captures.release(owner, { outcome: "sealed", manifestSha256: "c".repeat(64) }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "project.meta.update",
+          commandId: CommandId.make("rename-released-project"),
+          projectId,
+          title: "Renamed",
+        }),
+      );
+      for (const phase of ["frozen", "retired"] as const) {
+        if (phase === "retired") await system.run(system.fence.retire(owner));
+        const before = await system.run(system.engine.latestSequence);
+        await expect(
+          system.run(
+            system.engine.dispatch({
+              type: "project.delete",
+              commandId: CommandId.make(`offline-delete-${phase}`),
+              projectId,
+              force: true,
+            }),
+          ),
+        ).rejects.toMatchObject({ _tag: "ThreadExecutionFenceError" });
+        expect(await system.run(system.engine.latestSequence)).toBe(before);
+        expect(Option.getOrThrow(await system.readThread(threadId)).deletedAt).toBeNull();
+      }
+    } finally {
+      await system.dispose();
+    }
+  });
+
   it("prevents a direct turn from bypassing a newly queued local move", async () => {
     const system = await createOrchestrationSystem(undefined, undefined, undefined, {
       getInstance: () =>

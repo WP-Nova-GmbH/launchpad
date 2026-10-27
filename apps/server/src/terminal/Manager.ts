@@ -1336,7 +1336,10 @@ function normalizedRuntimeEnv(
 
 interface TerminalManagerOptions {
   checkoutAccess: Pick<CheckoutAccess["Service"], "assertAvailable">;
-  execution: Pick<ThreadExecution["Service"], "begin" | "assertAccepting" | "withActiveWork">;
+  execution: Pick<
+    ThreadExecution["Service"],
+    "begin" | "assertAccepting" | "withActiveWork" | "confirmOrdinaryStopped"
+  >;
   logsDir: string;
   historyLineLimit?: number;
   historyByteLimit?: number;
@@ -1642,25 +1645,57 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     terminalId: string;
     exited: Deferred.Deferred<void>;
     done: boolean;
+    reconcile: Effect.Effect<void, TerminalExecutionError>;
     unsubscribe: () => void;
   };
   const ownedProcesses = new Map<PtyAdapter.PtyProcess, OwnedProcess>();
-  const trackProcess = (process: PtyAdapter.PtyProcess, session: TerminalSessionState) => {
+  const trackProcess = (
+    process: PtyAdapter.PtyProcess,
+    session: TerminalSessionState,
+    work: ThreadWorkIdentity,
+    ordinary: boolean,
+  ) => {
+    const lock = Semaphore.makeUnsafe(1);
+    let reconciled = false;
     const owned: OwnedProcess = {
       process,
       threadId: session.threadId,
       terminalId: session.terminalId,
       exited: Deferred.makeUnsafe<void>(),
       done: false,
+      reconcile: lock.withPermit(
+        Effect.gen(function* () {
+          if (!owned.done || reconciled) return;
+          // Local capture waits for Launchpad-owned open terminals. A positive
+          // PTY exit closes that work; detached programs are outside this guard.
+          // Portable execution still needs the VM's independent workload proof.
+          if (ordinary)
+            yield* options.execution
+              .confirmOrdinaryStopped(work)
+              .pipe(Effect.mapError(executionError(session)));
+          reconciled = true;
+          ownedProcesses.delete(process);
+        }),
+      ),
       unsubscribe: () => {},
     };
     ownedProcesses.set(process, owned);
     owned.unsubscribe = process.onExit(() => {
       owned.done = true;
       Deferred.doneUnsafe(owned.exited, Effect.void);
-      ownedProcesses.delete(process);
       owned.unsubscribe();
       runFork(clearKillFiber(process));
+      runFork(
+        owned.reconcile.pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("terminal exit admission reconciliation failed", {
+              threadId: owned.threadId,
+              terminalId: owned.terminalId,
+              cause,
+            }),
+          ),
+        ),
+      );
     });
     if (owned.done) owned.unsubscribe();
   };
@@ -2228,7 +2263,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   ) {
     const { process, threadId, terminalId } = owned;
     yield* clearKillFiber(process);
-    if (owned.done) return;
+    if (owned.done) return yield* owned.reconcile;
     const failure = (detail: string, cause?: unknown) =>
       new TerminalProcessExitError({
         threadId,
@@ -2246,7 +2281,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     const stopped = yield* Deferred.await(owned.exited).pipe(
       Effect.timeoutOption(processKillGraceMs),
     );
-    if (Option.isSome(stopped)) return;
+    if (Option.isSome(stopped)) return yield* owned.reconcile;
     yield* signal("SIGKILL");
     yield* Deferred.await(owned.exited).pipe(
       Effect.timeoutOrElse({
@@ -2254,6 +2289,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         orElse: () => Effect.fail(failure("No process exit was reported after termination.")),
       }),
     );
+    yield* owned.reconcile;
   });
 
   const stopProcess = Effect.fn("terminal.stopProcess")(function* (
@@ -2363,9 +2399,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       .pipe(Effect.mapError(executionError(session)));
     if (permission !== "start" && permission !== "ordinary")
       return yield* executionError(session)();
-    // A shell exit does not prove that detached children stopped. Its durable
-    // reservation stays pending until workload reconciliation can prove those
-    // children stopped; onExit alone cannot release it.
+    // Ordinary terminals settle on their PTY exit. Portable terminals retain
+    // their independent VM workload reservation until reconciliation.
     yield* stopProcess(session);
     yield* Effect.annotateCurrentSpan({
       "terminal.thread_id": session.threadId,
@@ -2405,7 +2440,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             ptyProcess = spawnResult.process;
             processWork.set(ptyProcess, work);
             delete session.pendingExecution;
-            trackProcess(ptyProcess, session);
+            trackProcess(ptyProcess, session, work, permission === "ordinary");
             startedShell = spawnResult.shellLabel;
 
             const processPid = ptyProcess.pid;

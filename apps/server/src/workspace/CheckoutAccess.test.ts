@@ -16,6 +16,7 @@ import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./WorkspaceFileSystem.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import { CheckoutAccess, layer, make } from "./CheckoutAccess.ts";
 
 let serial = 0;
@@ -42,9 +43,244 @@ const fixture = Effect.gen(function* () {
   const access = yield* CheckoutAccess;
   return { root, main, held, sibling, id, fs, path, sql, access };
 });
+const pausedAdmission = Effect.fnUntraced(function* () {
+  const f = yield* fixture;
+  yield* f.sql`UPDATE thread_checkout_claims SET phase = 'released' WHERE operation_id = ${f.id}`;
+  const preparing = yield* Deferred.make<void>();
+  const resume = yield* Deferred.make<void>();
+  let paused = false;
+  const access = yield* make.pipe(
+    Effect.provideService(FileSystem.FileSystem, {
+      ...f.fs,
+      realPath: (requested) =>
+        Effect.gen(function* () {
+          if (requested === f.main && !paused) {
+            paused = true;
+            yield* Deferred.succeed(preparing, undefined);
+            yield* Deferred.await(resume);
+          }
+          return yield* f.fs.realPath(requested);
+        }),
+    }),
+  );
+  return { ...f, access, preparing, resume };
+});
 it.layer(
   layer.pipe(Layer.provideMerge(SqlitePersistenceMemory), Layer.provideMerge(NodeServices.layer)),
 )("checkout reservation boundaries", (it) => {
+  it.effect("records linked worktree Git metadata and blocks it during sibling capture", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      const common = f.path.join(f.main, ".git");
+      const linked = f.path.join(common, "worktrees", "sibling");
+      yield* f.fs.makeDirectory(linked, { recursive: true });
+      yield* f.fs.writeFileString(f.path.join(linked, "commondir"), "../..\n");
+      yield* f.fs.writeFileString(f.path.join(f.sibling, ".git"), `gitdir: ${linked}\n`);
+      const git = yield* f.access.begin({ paths: [f.sibling], kind: "vcs" });
+      expect(
+        yield* f.sql`SELECT path FROM checkout_operation_paths WHERE operation_id=${git} ORDER BY path`,
+      ).toEqual([common, f.sibling].sort().map((path) => ({ path })));
+      const capture = makeCheckoutCapture(f.sql);
+      const owner = {
+        threadId: f.id,
+        operationId: f.id,
+        generation: 2,
+        environmentId: "destination",
+      };
+      yield* capture.acquireDrain({ ...owner, checkoutRoot: f.main, gitCommonRoot: common });
+      yield* Effect.flip(capture.enterCapturing(owner));
+      yield* f.access.complete(git);
+      yield* capture.enterCapturing(owner);
+      const write = yield* f.access.begin({ paths: [f.sibling], kind: "write-file" });
+      yield* f.access.complete(write);
+      expect(
+        (yield* Effect.flip(f.access.begin({ paths: [f.sibling], kind: "vcs" }))).retryable,
+      ).toBe(true);
+      yield* capture.release(owner, { outcome: "sealed", manifestSha256: "c".repeat(64) });
+      const resumed = yield* f.access.begin({ paths: [f.sibling], kind: "vcs" });
+      yield* f.access.complete(resumed);
+    }),
+  );
+
+  it.effect("releases sibling access while keeping the moving thread and destination fenced", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.fs.makeDirectory(f.path.join(f.main, ".git"));
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      yield* f.sql`INSERT INTO projection_threads(thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at)
+        VALUES(${f.id},${f.id},'Moving','{"instanceId":"codex","model":"gpt-5"}','full-access','default','2026-10-27','2026-10-27')`;
+      yield* f.sql`UPDATE projection_threads SET worktree_path=NULL WHERE thread_id=${`${f.id}-other`}`;
+      const capture = makeCheckoutCapture(f.sql);
+      const owner = {
+        operationId: f.id,
+        threadId: f.id,
+        generation: 2,
+        environmentId: "destination",
+      };
+      yield* capture.acquireDrain({
+        ...owner,
+        checkoutRoot: f.main,
+        gitCommonRoot: f.path.join(f.main, ".git"),
+      });
+      yield* capture.enterCapturing(owner);
+      yield* capture.release(owner, { outcome: "sealed", manifestSha256: "a".repeat(64) });
+      const fence = makeThreadExecutionFence(f.sql);
+      yield* f.access.assertAvailable({ path: f.main });
+      const operation = yield* f.access.begin({ paths: [f.main], kind: "vcs" });
+      yield* f.access.complete(operation);
+      yield* f.access.projectRegistrationPath(f.main);
+      yield* fence.assertProjectMutable(f.id);
+      yield* fence.assertMutable(`${f.id}-other`);
+      yield* Effect.flip(fence.assertMutable(f.id));
+      yield* f.sql`UPDATE thread_execution_fences SET phase='retired' WHERE thread_id=${f.id}`;
+      yield* fence.assertProjectMutable(f.id);
+      yield* Effect.flip(fence.assertMutable(f.id));
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='reserved' WHERE operation_id=${f.id}`;
+      yield* f.sql`INSERT INTO thread_checkout_claim_projects(operation_id,project_id) VALUES(${f.id},${f.id})`;
+      yield* Effect.flip(f.access.assertAvailable({ path: f.held }));
+      yield* Effect.flip(fence.assertProjectMutable(f.id));
+    }),
+  );
+
+  it.effect("requires matching released capture operation, thread and generation", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      yield* f.sql`INSERT INTO projection_threads(thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at)
+        VALUES(${f.id},${f.id},'Moving','{"instanceId":"codex","model":"gpt-5"}','full-access','default','2026-10-27','2026-10-27')`;
+      yield* f.sql`INSERT INTO checkout_capture_holds(operation_id,thread_id,generation,environment_id,checkout_root,git_common_root,admission_sequence,phase,release_outcome,manifest_sha256)
+        VALUES(${f.id},${f.id},2,'destination',${f.main},${f.main},0,'released','sealed',${"b".repeat(64)})`;
+      const fence = makeThreadExecutionFence(f.sql);
+      for (const mismatch of ["operation", "thread", "generation"] as const) {
+        yield* f.sql`UPDATE checkout_capture_holds SET operation_id=${mismatch === "operation" ? `${f.id}-old` : f.id},thread_id=${mismatch === "thread" ? "other" : f.id},generation=${mismatch === "generation" ? 1 : 2} WHERE checkout_root=${f.main}`;
+        yield* Effect.flip(f.access.assertAvailable({ path: f.main }));
+        yield* Effect.flip(f.access.begin({ paths: [f.main], kind: "write-file" }));
+        yield* Effect.flip(fence.assertProjectMutable(f.id));
+      }
+    }),
+  );
+
+  it.effect("permits admitted file subpaths during drain without granting ancestor paths", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      const capture = makeCheckoutCapture(f.sql);
+      const parent = yield* capture.admit({
+        threadId: `${f.id}-other`,
+        workId: "turn",
+        kind: "provider",
+        checkoutRoot: f.main,
+      });
+      const owner = {
+        threadId: f.id,
+        operationId: f.id,
+        generation: 2,
+        environmentId: "destination",
+      };
+      yield* capture.acquireDrain({ ...owner, checkoutRoot: f.main, gitCommonRoot: f.main });
+      const file = f.path.join(f.main, "new", "file");
+      const operation = yield* f.access
+        .begin({ paths: [file], kind: "write-file" })
+        .pipe(Effect.provideService(CheckoutAdmission, parent.admissionId));
+      yield* f.access.complete(operation);
+      yield* Effect.flip(
+        f.access
+          .begin({ paths: [f.root], kind: "write-file" })
+          .pipe(Effect.provideService(CheckoutAdmission, parent.admissionId)),
+      );
+      const unrelated = yield* f.access
+        .begin({ paths: [f.sibling], kind: "write-file" })
+        .pipe(Effect.provideService(CheckoutAdmission, parent.admissionId));
+      yield* f.access.complete(unrelated);
+      yield* capture.complete(parent.admissionId);
+      yield* Effect.flip(
+        f.access
+          .begin({ paths: [file], kind: "write-file" })
+          .pipe(Effect.provideService(CheckoutAdmission, parent.admissionId)),
+      );
+      yield* capture.enterCapturing(owner);
+      yield* Effect.flip(f.access.begin({ paths: [file], kind: "write-file" }));
+    }),
+  );
+  it.effect("keeps SQL available while filesystem admission is paused", () =>
+    Effect.gen(function* () {
+      const f = yield* pausedAdmission();
+      const pending = yield* f.access
+        .begin({ paths: [f.main], kind: "vcs" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(f.preparing);
+      yield* f.sql`UPDATE projection_projects SET title = 'Unrelated change' WHERE project_id = ${f.id}`;
+      yield* Deferred.succeed(f.resume, undefined);
+      const operationId = yield* Fiber.join(pending);
+      yield* f.access.complete(operationId);
+    }),
+  );
+  it.effect("rechecks a reservation created during filesystem preparation", () =>
+    Effect.gen(function* () {
+      const f = yield* pausedAdmission();
+      const pending = yield* f.access
+        .begin({ paths: [f.main], kind: "write-file" })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(f.preparing);
+      yield* f.sql`UPDATE thread_checkout_claims SET phase = 'reserved', checkout_path = ${f.main}
+        WHERE operation_id = ${f.id}`;
+      yield* Deferred.succeed(f.resume, undefined);
+      const result = yield* Fiber.join(pending);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") expect(result.failure.message).toContain("reserved");
+      expect(yield* f.sql`SELECT * FROM checkout_operations`).toEqual([]);
+    }),
+  );
+  it.effect("includes a project alias registered during filesystem preparation", () =>
+    Effect.gen(function* () {
+      const f = yield* pausedAdmission();
+      const alias = f.path.join(f.root, "alias");
+      yield* f.fs.symlink(f.main, alias);
+      const pending = yield* f.access
+        .begin({ paths: [f.main], kind: "write-file" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(f.preparing);
+      const aliasId = `${f.id}-alias`;
+      yield* f.sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES (${aliasId},'Alias',${alias},'[]','2026-10-05T10:00:00.000Z','2026-10-05T10:00:00.000Z')`;
+      yield* Deferred.succeed(f.resume, undefined);
+      const operationId = yield* Fiber.join(pending);
+      expect(
+        yield* f.sql`SELECT project_id AS id FROM checkout_operation_projects
+          WHERE operation_id = ${operationId} ORDER BY project_id`,
+      ).toEqual([{ id: f.id }, { id: aliasId }]);
+      yield* f.access.complete(operationId);
+    }),
+  );
+  it.effect("bounds preparation retries when project paths keep changing", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase = 'released' WHERE operation_id = ${f.id}`;
+      const requested = f.path.join(f.root, "operation");
+      yield* f.fs.makeDirectory(requested);
+      let preparations = 0;
+      const access = yield* make.pipe(
+        Effect.provideService(FileSystem.FileSystem, {
+          ...f.fs,
+          realPath: (input) =>
+            Effect.gen(function* () {
+              if (input === requested) {
+                preparations++;
+                yield* f.sql`UPDATE projection_projects
+                  SET workspace_root = ${preparations % 2 === 1 ? f.sibling : f.main}
+                  WHERE project_id = ${f.id}`;
+              }
+              return yield* f.fs.realPath(input);
+            }),
+        }),
+      );
+      const error = yield* Effect.flip(access.begin({ paths: [requested], kind: "write-file" }));
+      expect(error.retryable).toBe(true);
+      expect(preparations).toBe(3);
+      expect(yield* f.sql`SELECT * FROM checkout_operations`).toEqual([]);
+    }),
+  );
   it.effect("blocks aliases and new files but permits unrelated workspace edits", () =>
     Effect.gen(function* () {
       const f = yield* fixture;

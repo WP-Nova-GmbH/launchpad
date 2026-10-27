@@ -14,6 +14,7 @@ import {
   type ThreadPreparation,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -25,6 +26,11 @@ import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
+import { notifyCheckoutCaptureReleased } from "../workspace/CheckoutCaptureSignals.ts";
+import { resolveCheckoutPath } from "../workspace/CheckoutAccess.ts";
 
 import { ServerConfig } from "../config.ts";
 import { GitWorkflowService } from "../git/GitWorkflowService.ts";
@@ -51,12 +57,41 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
   readonly launchFailure?: boolean;
   readonly beforeWorkspace?: Effect.Effect<void>;
   readonly beforeDeletionDrain?: Effect.Effect<void>;
+  readonly afterAdmissionRollback?: Effect.Effect<void>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const config = yield* ServerConfig;
   const crypto = yield* Crypto.Crypto;
-  const projectCwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-preparation-project-" });
+  const projectCwd = yield* fs.realPath(
+    yield* fs.makeTempDirectoryScoped({ prefix: "t3-preparation-project-" }),
+  );
+  const targetRoot = yield* resolveCheckoutPath(
+    path.join(config.worktreesDir, path.basename(projectCwd), "t3code-preparation"),
+    fs,
+    path,
+  );
+  const sql = Context.get(yield* Layer.build(SqlitePersistenceMemory), SqlClient.SqlClient);
+  const captures = makeCheckoutCapture(sql);
+  let firstTransaction = true;
+  const admissionSql = options?.afterAdmissionRollback
+    ? new Proxy(sql, {
+        get(target, property, receiver) {
+          if (property !== "withTransaction") return Reflect.get(target, property, receiver);
+          return <A, E, R>(effect: Effect.Effect<A, E, R>) => {
+            const outer = firstTransaction;
+            firstTransaction = false;
+            return target
+              .withTransaction(effect)
+              .pipe(
+                Effect.onExit((exit) =>
+                  outer && exit._tag === "Failure" ? options.afterAdmissionRollback! : Effect.void,
+                ),
+              );
+          };
+        },
+      })
+    : sql;
   const events = yield* PubSub.unbounded<OrchestrationEvent>();
   const updates = yield* Queue.unbounded<ThreadPreparation>();
   const writes = yield* Queue.unbounded<string>();
@@ -105,9 +140,19 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
   const terminal = yield* TerminalManager.makeWithOptions({
     checkoutAccess: { assertAvailable: () => Effect.void },
     execution: {
-      begin: () => Effect.succeed("ordinary" as const),
+      begin: (work) =>
+        Effect.gen(function* () {
+          const parentAdmissionId = yield* CheckoutAdmission;
+          const admitted = yield* captures.admit({
+            ...work,
+            checkoutRoot: targetRoot,
+            ...(parentAdmissionId ? { parentAdmissionId } : {}),
+          });
+          return admitted.decision === "start" ? ("ordinary" as const) : admitted.decision;
+        }),
       assertAccepting: () => Effect.succeed(undefined),
       withActiveWork: (_work, effect) => effect,
+      confirmOrdinaryStopped: (work) => captures.complete(captures.admissionId(work)),
     },
     logsDir: path.join(config.baseDir, "preparation-terminal-logs"),
     ptyAdapter: {
@@ -213,6 +258,7 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
     Layer.provide(Layer.mergeAll(query, settings, terminalLayer)),
   );
   const services = Layer.mergeAll(
+    Layer.succeed(SqlClient.SqlClient, admissionSql),
     engine,
     query,
     settings,
@@ -245,6 +291,13 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
       createWorktree: (input) =>
         Effect.gen(function* () {
           yield* options?.beforeWorkspace ?? Effect.void;
+          const parentAdmissionId = yield* CheckoutAdmission;
+          yield* captures
+            .assertAccepting(
+              { checkoutRoot: projectCwd, gitCommonRoot: projectCwd },
+              parentAdmissionId ? { parentAdmissionId } : {},
+            )
+            .pipe(Effect.orDie);
           worktreeCreates++;
           claimedPath = input.path!;
           yield* fs.makeDirectory(claimedPath, { recursive: true }).pipe(Effect.orDie);
@@ -322,6 +375,10 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
     enqueue,
     awaitPreparation,
     commands,
+    captures,
+    projectCwd,
+    targetRoot,
+    notifyCaptureRelease: notifyCheckoutCaptureReleased(sql, projectCwd),
     controls,
     state: () => state,
     restore: (snapshot: OrchestrationReadModel) => {
@@ -336,6 +393,7 @@ const makeHarness = Effect.fn("ThreadPreparationTest.makeHarness")(function* (op
     nextScript: Queue.take(writes),
     nextSignal: Queue.take(signals),
     closeFromUI: terminal.close({ threadId }),
+    stopTerminal: terminal.close({ threadId, waitForProcessExit: true }),
     closeTerminal: Effect.sync(() => {
       for (const listener of exits) listener({ exitCode: 0, signal: null });
     }),
@@ -353,6 +411,185 @@ const testLayer = ServerConfig.layerTest(process.cwd(), { prefix: "t3-preparatio
 );
 
 it.layer(testLayer, { excludeTestServices: true })("ThreadPreparationReactor", (it) => {
+  it.effect(
+    "releases the source checkout after Git stages while target setup and terminal remain active",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* h.enqueue("alice", true);
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadPreparationReactor.ThreadPreparationReactor;
+          yield* reactor.start();
+          const command = yield* h.nextScript;
+          yield* h.awaitPreparation((preparation) => preparation.state === "ready");
+          const sourceScope = { checkoutRoot: h.projectCwd, gitCommonRoot: h.projectCwd };
+          const targetScope = { checkoutRoot: h.targetRoot, gitCommonRoot: h.targetRoot };
+          const owner = {
+            operationId: "source-capture",
+            threadId: "moving-sibling",
+            generation: 1,
+            environmentId: "source",
+          };
+          expect(yield* h.captures.blockers(sourceScope)).toEqual([]);
+          expect(yield* h.captures.blockers(targetScope)).toHaveLength(2);
+          yield* h.captures.acquireDrain({ ...owner, ...sourceScope });
+          yield* h.captures.enterCapturing(owner);
+          yield* h.captures.release(owner, { outcome: "sealed", manifestSha256: "a".repeat(64) });
+          const targetOwner = { ...owner, operationId: "target-capture" };
+          yield* h.captures.acquireDrain({ ...targetOwner, ...targetScope });
+          yield* h.complete(command, 0);
+          yield* reactor.drain;
+          expect((yield* h.captures.blockers(targetScope)).map((row) => row.kind)).toEqual([
+            "terminal",
+          ]);
+          yield* Effect.flip(h.captures.enterCapturing(targetOwner));
+          yield* h.stopTerminal;
+          expect(yield* h.captures.blockers(targetScope)).toEqual([]);
+          yield* h.captures.enterCapturing(targetOwner);
+        }).pipe(Effect.provide(h.layer));
+      }),
+  );
+
+  it.effect("never completes a retry receipt for setup admissions rolled back before commit", () =>
+    Effect.gen(function* () {
+      const rolledBack = yield* Deferred.make<void>();
+      const finishFailure = yield* Deferred.make<void>();
+      const h = yield* makeHarness({
+        async: false,
+        afterAdmissionRollback: Deferred.succeed(rolledBack, undefined).pipe(
+          Effect.andThen(Deferred.await(finishFailure)),
+        ),
+      });
+      const owner = {
+        operationId: "capture",
+        threadId: "moving-sibling",
+        generation: 1,
+        environmentId: "source",
+      };
+      yield* h.captures.acquireDrain({
+        ...owner,
+        checkoutRoot: h.targetRoot,
+        gitCommonRoot: h.targetRoot,
+      });
+      yield* h.enqueue("alice", true);
+      yield* Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Deferred.succeed(finishFailure, undefined));
+        const reactor = yield* ThreadPreparationReactor.ThreadPreparationReactor;
+        yield* reactor.start();
+        yield* Deferred.await(rolledBack);
+        const attemptId = h.state().threads[0]!.promptQueue!.preparation!.attemptId;
+        const work = {
+          threadId,
+          workId: `preparation:${attemptId}:${h.projectCwd}`,
+          kind: "setup" as const,
+          checkoutRoot: h.projectCwd,
+        };
+        expect(yield* h.captures.lookupAdmission(threadId, work.workId, "setup")).toBeNull();
+        yield* h.captures.release(owner, { outcome: "cancelled" });
+        const retry = yield* h.captures.admit(work);
+        yield* Deferred.succeed(finishFailure, undefined);
+        yield* reactor.drain;
+        expect((yield* h.captures.getAdmission(retry.admissionId))?.completed).toBe(0);
+        expect(h.worktreeCreates).toBe(0);
+      }).pipe(Effect.provide(h.layer));
+    }),
+  );
+
+  it.effect.each(["active", "paused"] as const)(
+    "preserves %s setup state at capture release while upload is blocked",
+    (mode) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness({ async: false });
+        const uploading = yield* Deferred.make<void>();
+        const finishUpload = yield* Deferred.make<void>();
+        const scope = { checkoutRoot: h.projectCwd, gitCommonRoot: h.projectCwd };
+        const owner = {
+          operationId: "capture",
+          threadId: "moving-sibling",
+          generation: 1,
+          environmentId: "source",
+        };
+        yield* h.captures.acquireDrain({ ...owner, ...scope });
+        yield* h.captures.enterCapturing(owner);
+        yield* h.enqueue("alice", true);
+        yield* Effect.gen(function* () {
+          yield* Effect.addFinalizer(() => Deferred.succeed(finishUpload, undefined));
+          const reactor = yield* ThreadPreparationReactor.ThreadPreparationReactor;
+          yield* reactor.start();
+          yield* reactor.drain;
+          expect(h.state().threads[0]?.promptQueue?.preparation?.state).toBe("pending");
+          expect(h.worktreeCreates).toBe(0);
+          if (mode === "paused") {
+            yield* h.dispatch({
+              type: "thread.queue.pause",
+              commandId: CommandId.make("pause-during-capture"),
+              threadId,
+              createdAt,
+            });
+            yield* reactor.drain;
+          }
+          const upload = yield* h.captures
+            .release(owner, { outcome: "sealed", manifestSha256: "a".repeat(64) })
+            .pipe(
+              Effect.andThen(h.notifyCaptureRelease),
+              Effect.andThen(h.notifyCaptureRelease),
+              Effect.andThen(Deferred.succeed(uploading, undefined)),
+              Effect.andThen(Deferred.await(finishUpload)),
+              Effect.forkChild,
+            );
+          yield* Deferred.await(uploading);
+          if (mode === "active") {
+            yield* h.complete(yield* h.nextScript, 0);
+            yield* h.awaitPreparation((preparation) => preparation.state === "ready");
+            yield* reactor.drain;
+            expect(h.worktreeCreates).toBe(1);
+          } else {
+            expect(h.worktreeCreates).toBe(0);
+            expect(h.state().threads[0]?.promptQueue?.enabled).toBe(false);
+          }
+          expect(upload.pollUnsafe()).toBeUndefined();
+          yield* Deferred.succeed(finishUpload, undefined);
+          yield* Fiber.join(upload);
+        }).pipe(Effect.provide(h.layer));
+      }),
+  );
+
+  it.effect("lets admitted setup finish its Git stages after checkout draining begins", () =>
+    Effect.gen(function* () {
+      const preparing = yield* Deferred.make<void>();
+      const proceed = yield* Deferred.make<void>();
+      yield* Effect.addFinalizer(() => Deferred.succeed(proceed, undefined));
+      const h = yield* makeHarness({
+        async: false,
+        beforeWorkspace: Deferred.succeed(preparing, undefined).pipe(
+          Effect.andThen(Deferred.await(proceed)),
+        ),
+      });
+      yield* h.enqueue("alice", true);
+      yield* Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Deferred.succeed(proceed, undefined));
+        const reactor = yield* ThreadPreparationReactor.ThreadPreparationReactor;
+        yield* reactor.start();
+        yield* Deferred.await(preparing);
+        const scope = { checkoutRoot: h.projectCwd, gitCommonRoot: h.projectCwd };
+        const owner = {
+          operationId: "capture",
+          threadId: "moving-sibling",
+          generation: 1,
+          environmentId: "source",
+        };
+        expect(yield* h.captures.blockers(scope)).toHaveLength(1);
+        yield* h.captures.acquireDrain({ ...owner, ...scope });
+        yield* Deferred.succeed(proceed, undefined);
+        yield* h.complete(yield* h.nextScript, 0);
+        yield* h.awaitPreparation((preparation) => preparation.state === "ready");
+        yield* reactor.drain;
+        expect(yield* h.captures.blockers(scope)).toEqual([]);
+        yield* h.captures.enterCapturing(owner);
+        expect(h.worktreeCreates).toBe(1);
+      }).pipe(Effect.provide(h.layer));
+    }),
+  );
   it.effect(
     "accepts teammates before setup and waits for deletion cleanup and successful script completion",
     () =>

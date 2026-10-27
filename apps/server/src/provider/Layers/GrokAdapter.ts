@@ -1525,10 +1525,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         const strictSteer = input.delivery?.mode === "steer";
         let promptSlotReserved = false;
         if (/^\/always-approve(?:\s|$)/i.test(input.input?.trim() ?? "")) {
-          return yield* new ProviderAdapterRequestError({
+          return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
-            method: "session/prompt",
-            detail:
+            operation: "sendTurn",
+            issue:
               "Change permissions with Launchpad's permission selector instead of /always-approve.",
           });
         }
@@ -2176,10 +2176,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         const ctx = yield* requireSession(threadId);
         const pending = ctx.pendingApprovals.get(requestId);
         if (!pending) {
-          return yield* new ProviderAdapterRequestError({
+          return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
-            method: "session/request_permission",
-            detail: `Unknown pending approval request: ${requestId}`,
+            operation: "respondToRequest",
+            issue: `Unknown pending approval request: ${requestId}`,
           });
         }
         yield* Deferred.succeed(pending.decision, decision);
@@ -2194,10 +2194,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         const ctx = yield* requireSession(threadId);
         const pending = ctx.pendingUserInputs.get(requestId);
         if (!pending) {
-          return yield* new ProviderAdapterRequestError({
+          return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
-            method: "_x.ai/ask_user_question",
-            detail: `Unknown pending user-input request: ${requestId}`,
+            operation: "respondToUserInput",
+            issue: `Unknown pending user-input request: ${requestId}`,
           });
         }
         yield* Deferred.succeed(pending.resolution, { _tag: "answered", answers });
@@ -2219,10 +2219,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             issue: "numTurns must be an integer >= 1.",
           });
         }
-        return yield* new ProviderAdapterRequestError({
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          method: "thread/rollback",
-          detail: "Grok ACP sessions do not support provider-side rollback yet.",
+          operation: "rollbackThread",
+          issue: "Grok ACP sessions do not support provider-side rollback yet.",
         });
       });
 

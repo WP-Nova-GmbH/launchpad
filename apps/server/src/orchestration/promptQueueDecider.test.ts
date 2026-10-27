@@ -1270,6 +1270,72 @@ it.layer(NodeServices.layer)("move acknowledgements", (it) => {
     }),
   );
 
+  it.effect("clears checkout waiting on claim and capture without changing queue controls", () =>
+    Effect.gen(function* () {
+      let state = yield* apply(yield* readModelWithThread, enqueueMove());
+      const progress = {
+        type: "thread.move.progress" as const,
+        threadId,
+        commandId: CommandId.make("checkout-wait"),
+        messageId: MessageId.make("move"),
+        expectedRevision: 1,
+        detail: "Waiting for other work in this checkout: Build API.",
+        waitingForCheckout: true,
+        blocked: false,
+        createdAt,
+      };
+      state = yield* apply(state, progress);
+      expect(queue(state).entries[0]).toMatchObject({
+        state: "pending",
+        waitingForCheckout: true,
+        detail: progress.detail,
+      });
+      expect(queue(state)).toMatchObject({ enabled: true, pauseReason: null, revision: 0 });
+      state = yield* apply(state, { ...moveClaim, expectedRevision: 2 });
+      expect(queue(state).entries[0]).not.toHaveProperty("waitingForCheckout");
+      expect(queue(state).entries[0]).not.toHaveProperty("detail");
+      state = yield* apply(state, {
+        ...progress,
+        commandId: CommandId.make("claimed-checkout-wait"),
+        operationId: moveClaim.commandId,
+        expectedRevision: 3,
+      });
+      expect(queue(state).entries[0]).toMatchObject({
+        state: "moving",
+        waitingForCheckout: true,
+        detail: progress.detail,
+      });
+      state = yield* apply(state, {
+        type: "thread.queue.pause",
+        threadId,
+        commandId: CommandId.make("manual-pause"),
+        createdAt,
+      });
+      const control = queue(state);
+      state = yield* apply(state, {
+        type: "thread.move.progress",
+        threadId,
+        commandId: CommandId.make("capturing"),
+        messageId: MessageId.make("move"),
+        operationId: moveClaim.commandId,
+        expectedRevision: 4,
+        detail: "Saving conversation",
+        blocked: false,
+        createdAt,
+      });
+      expect(queue(state).entries[0]).toMatchObject({
+        state: "moving",
+        detail: "Saving conversation",
+      });
+      expect(queue(state).entries[0]).not.toHaveProperty("waitingForCheckout");
+      expect(queue(state)).toMatchObject({
+        enabled: control.enabled,
+        pauseReason: control.pauseReason,
+        revision: control.revision,
+      });
+    }),
+  );
+
   it.effect("claims only the ready head and keeps running moves fixed in the queue", () =>
     Effect.gen(function* () {
       let state = yield* apply(yield* readModelWithThread, enqueue("first"));

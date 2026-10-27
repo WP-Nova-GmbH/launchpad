@@ -87,6 +87,7 @@ import Migration0071 from "./Migrations/071_ThreadTransferSetupOutput.ts";
 import Migration0074 from "./Migrations/074_ThreadLocalEnrollmentAbort.ts";
 import Migration0073 from "./Migrations/073_ThreadLocalEnrollment.ts";
 import Migration0072 from "./Migrations/072_ThreadVmMoveCheckout.ts";
+import Migration0075 from "./Migrations/075_CheckoutCapture.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -173,6 +174,7 @@ const migrationEntries = [
   [72, "ThreadVmMoveCheckout", Migration0072],
   [73, "ThreadLocalEnrollment", Migration0073],
   [74, "ThreadLocalEnrollmentAbort", Migration0074],
+  [75, "CheckoutCapture", Migration0075],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -265,6 +267,14 @@ const verifyMigrationHistory = Effect.gen(function* () {
   );
   const mismatches: Array<string> = [];
   for (const { migration_id, name } of recorded) {
+    if (
+      migration_id === 1 &&
+      name === "OrchestrationEvents_CheckoutCaptureReaderV1" &&
+      recorded.some(
+        (migration) => migration.migration_id === 75 && migration.name === "CheckoutCapture",
+      )
+    )
+      continue;
     if (
       migration_id === 1 &&
       name === "OrchestrationEvents_TransferAbortReaderV1" &&

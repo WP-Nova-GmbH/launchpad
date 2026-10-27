@@ -170,6 +170,15 @@ function mapCodexRuntimeError(
   error: CodexSessionRuntimeError,
 ): ProviderAdapterError {
   if (error._tag === "ProviderAdapterValidationError") return error;
+  if (
+    error._tag === "CodexSessionRuntimePendingApprovalNotFoundError" ||
+    error._tag === "CodexSessionRuntimePendingUserInputNotFoundError"
+  )
+    return new ProviderAdapterValidationError({
+      provider: PROVIDER,
+      operation: method,
+      issue: error.message,
+    });
   if (isCodexAppServerProcessExitedError(error) || isCodexAppServerTransportError(error)) {
     return new ProviderAdapterSessionClosedError({
       provider: PROVIDER,

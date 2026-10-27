@@ -1265,10 +1265,10 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       const context = yield* requireSession(threadId);
       const pending = context.approvals.get(requestId);
       if (!pending) {
-        return yield* new ProviderAdapterRequestError({
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          method: "session/request_permission",
-          detail: "This approval request is no longer pending.",
+          operation: "respondToRequest",
+          issue: "This approval request is no longer pending.",
         });
       }
       const optionId =
@@ -1297,10 +1297,10 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       const context = yield* requireSession(threadId);
       const pending = context.questions.get(requestId);
       if (!pending) {
-        return yield* new ProviderAdapterRequestError({
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          method: "session/request_permission",
-          detail: "This question is no longer pending.",
+          operation: "respondToUserInput",
+          issue: "This question is no longer pending.",
         });
       }
       const result = makeAntigravityUserInputResponse(pending.request, answers);

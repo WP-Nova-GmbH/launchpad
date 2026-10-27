@@ -216,6 +216,7 @@ export class ProviderExecutionError extends Schema.TaggedError<ProviderExecution
     threadId: Schema.String,
     operation: Schema.String,
     uncertain: Schema.Boolean,
+    waitingForCheckout: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {

@@ -4,6 +4,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { SqlitePersistenceMemory } from "./Layers/Sqlite.ts";
 import { runMigrations } from "./Migrations.ts";
 import { makeThreadExecutionFence, ThreadExecutionFenceError } from "./ThreadExecutionFence.ts";
+import { makeCheckoutCapture } from "./CheckoutCapture.ts";
 
 const enrollment = {
   threadId: "portable",
@@ -28,6 +29,39 @@ const fixture = Effect.gen(function* () {
 });
 
 describe("durable thread execution ownership", () => {
+  it.effect("scopes capture freeze to the checkout and shared Git operations", () =>
+    Effect.gen(function* () {
+      const { sql, fence } = yield* fixture;
+      const capture = makeCheckoutCapture(sql);
+      yield* fence.activate(enrollment);
+      yield* fence.beginDrain(move);
+      yield* capture.acquireDrain({
+        ...move,
+        environmentId: enrollment.environmentId,
+        checkoutRoot: "/repository/main",
+        gitCommonRoot: "/repository/main/.git",
+      });
+      yield* sql`INSERT INTO checkout_operations(operation_id,kind) VALUES('sibling-file','write-file')`;
+      yield* sql`INSERT INTO checkout_operation_paths(operation_id,path) VALUES('sibling-file','/repository/sibling/file')`;
+      yield* sql`INSERT INTO checkout_operation_projects(operation_id,project_id) VALUES('sibling-file',${enrollment.projectId})`;
+      yield* sql`INSERT INTO checkout_operations(operation_id,kind) VALUES('sibling-git','vcs')`;
+      yield* sql`INSERT INTO checkout_operation_paths(operation_id,path) VALUES('sibling-git','/repository/sibling'),('sibling-git','/repository/main/.git')`;
+      assert.instanceOf(yield* Effect.flip(fence.freeze(move)), ThreadExecutionFenceError);
+      yield* sql`DELETE FROM checkout_operations WHERE operation_id='sibling-git'`;
+      yield* sql`INSERT INTO checkout_operations(operation_id,kind) VALUES('nested-file','write-file')`;
+      yield* sql`INSERT INTO checkout_operation_paths(operation_id,path) VALUES('nested-file','/repository/main/nested/file')`;
+      assert.instanceOf(yield* Effect.flip(fence.freeze(move)), ThreadExecutionFenceError);
+      yield* sql`DELETE FROM checkout_operations WHERE operation_id='nested-file'`;
+      yield* sql`INSERT INTO checkout_operations(operation_id,kind) VALUES('unknown-path','vcs')`;
+      assert.instanceOf(yield* Effect.flip(fence.freeze(move)), ThreadExecutionFenceError);
+      yield* sql`DELETE FROM checkout_operations WHERE operation_id='unknown-path'`;
+      assert.equal(yield* fence.freeze(move), 0);
+      assert.lengthOf(
+        yield* sql`SELECT 1 FROM checkout_operations WHERE operation_id='sibling-file'`,
+        1,
+      );
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
   it.effect("binds held output to the original ownership and still requires a mutable fence", () =>
     Effect.gen(function* () {
       const { fence } = yield* fixture;

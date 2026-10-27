@@ -369,6 +369,25 @@ const sendCompletedClaudeTurn = (
   });
 
 describe("ClaudeAdapterLive", () => {
+  it.effect(
+    "rejects missing local approval and user-input callbacks before native dispatch",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        yield* adapter.startSession({ threadId: THREAD_ID, runtimeMode: "approval-required" });
+        const queries = harness.queries.length;
+        for (const response of [
+          adapter.respondToRequest(THREAD_ID, ApprovalRequestId.make("missing"), "accept"),
+          adapter.respondToUserInput(THREAD_ID, ApprovalRequestId.make("missing"), {}),
+        ])
+          assert.equal((yield* Effect.flip(response))._tag, "ProviderAdapterValidationError");
+        assert.equal(harness.queries.length, queries);
+        yield* adapter.stopSession(THREAD_ID);
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
   it.effect("returns validation error for non-claude provider on startSession", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

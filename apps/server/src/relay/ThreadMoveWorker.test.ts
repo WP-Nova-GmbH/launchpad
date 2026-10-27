@@ -19,10 +19,12 @@ import {
   type ServerProvider,
   type ProviderSession,
   TurnId,
+  TerminalProcessExitError,
 } from "@t3tools/contracts";
 import type { RelayThreadMove } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -32,12 +34,14 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ServerConfig } from "../config.ts";
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import { ThreadBackgroundLivenessService } from "../orchestration/ThreadBackgroundLiveness.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import {
   layer as SessionLayer,
   ProviderSessionRuntimeRepository,
 } from "../persistence/ProviderSessionRuntime.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import { ProcessRunner, layer as RunnerLayer } from "../processRunner.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
@@ -117,10 +121,16 @@ const environment = (root: string) =>
       Layer.effect(
         ThreadExecution,
         Effect.gen(function* () {
-          return makeThreadExecutionRelay(yield* SqlClient.SqlClient, {
-            admit: () => Effect.succeed({ completed: false, newlyAdmitted: true }),
-            complete: () => Effect.void,
-          });
+          const fs = yield* FileSystem.FileSystem;
+          return makeThreadExecutionRelay(
+            yield* SqlClient.SqlClient,
+            {
+              admit: () => Effect.succeed({ completed: false, newlyAdmitted: true }),
+              complete: () => Effect.void,
+            },
+            undefined,
+            { canonicalizeRoot: fs.realPath },
+          );
         }),
       ).pipe(Layer.provide(SqlitePersistenceMemory)),
     ),
@@ -153,6 +163,12 @@ const queue = Effect.gen(function* () {
   }>`SELECT state_json AS state FROM projection_thread_prompt_queues WHERE thread_id=${threadId}`;
   return yield* decodeQueue(row!.state);
 });
+const moveDetail = queue.pipe(
+  Effect.map((state) => {
+    const head = state.entries[0];
+    return head?.kind === "move" ? head.detail : undefined;
+  }),
+);
 
 for (const lost of [
   "published",
@@ -170,6 +186,18 @@ for (const lost of [
   "cancel-report",
   "destination-auth",
   "source-export",
+  "shared-active",
+  "shared-ready-no-git",
+  "capture-cancel",
+  "capture-failure",
+  "capture-stop-failure",
+  "capture-upload-blocked",
+  "capture-retargeted",
+  "capture-retargeted-alias",
+  "capture-retargeted-git",
+  "capture-rename-recovery",
+  "capture-rename-cancel",
+  "sealed-missing",
   "enroll-prepare",
   "enroll-receipts",
   "enroll-confirm",
@@ -194,13 +222,29 @@ for (const lost of [
               ? "activates a verified checkout after a lost commit reply despite changed repository metadata"
               : lost === "source-retargeted-project"
                 ? "retains the exact queued project when the relay returns another destination"
-                : lost === "destination-wrong-repository" ||
-                    lost === "destination-repointed-project" ||
-                    lost === "destination-nested-project" ||
-                    lost === "destination-unconfirmed-repository" ||
-                    lost === "destination-repointed-during-download"
-                  ? `blocks ${lost} before installing a checkout or changing local files`
-                  : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
+                : lost === "shared-active" || lost === "shared-ready-no-git"
+                  ? "drains canonical checkout siblings and checkpoints before sealing, then reuses the archive"
+                  : lost === "capture-cancel"
+                    ? "releases a draining checkout before a lost cancellation reply"
+                    : lost === "capture-failure"
+                      ? "releases a settled capture failure while the moving thread stays frozen"
+                      : lost === "capture-stop-failure"
+                        ? "releases a draining checkout after an uncertain terminal stop"
+                        : lost === "capture-upload-blocked"
+                          ? "releases sibling admission while the sealed source upload waits"
+                          : lost.startsWith("capture-retargeted")
+                            ? `rejects ${lost} after capture admission before exporting`
+                            : lost.startsWith("capture-rename")
+                              ? `syncs the recovered archive rename before releasing ${lost}`
+                              : lost === "sealed-missing"
+                                ? "refuses to recapture a missing sealed source archive after restart"
+                                : lost === "destination-wrong-repository" ||
+                                    lost === "destination-repointed-project" ||
+                                    lost === "destination-nested-project" ||
+                                    lost === "destination-unconfirmed-repository" ||
+                                    lost === "destination-repointed-during-download"
+                                  ? `blocks ${lost} before installing a checkout or changing local files`
+                                  : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -268,6 +312,8 @@ for (const lost of [
             for (let i = 0; i < 8; i++)
               yield* fs.writeFileString(path.join(src, `dirty-${i}`), `unsaved work ${i}\n`);
           const uploadGate = yield* Deferred.make<void>();
+          const uploadEntered = yield* Deferred.make<void>();
+          const uploadRelease = yield* Deferred.make<void>();
           const downloadGate = yield* Deferred.make<void>();
           let activeUploads = 0,
             maximumUploads = 0,
@@ -334,6 +380,10 @@ for (const lost of [
                 activeUploads++;
                 maximumUploads = Math.max(maximumUploads, activeUploads);
                 uploadStarts++;
+                if (lost === "capture-upload-blocked") {
+                  yield* Deferred.succeed(uploadEntered, undefined);
+                  yield* Deferred.await(uploadRelease);
+                }
                 if (lost === "parallel-transfer" && uploadStarts <= 4) {
                   expect(remote?.manifestArtifactId).toBeNull();
                   if (uploadStarts === 4) yield* Deferred.succeed(uploadGate, undefined);
@@ -352,7 +402,7 @@ for (const lost of [
                       if (uploads.has(file.artifactId))
                         expect(bytes).toEqual(Buffer.from(uploads.get(file.artifactId)!));
                       uploads.set(file.artifactId, bytes);
-                      if (lost === "upload" && !lostReply) {
+                      if ((lost === "upload" || lost === "sealed-missing") && !lostReply) {
                         lostReply = true;
                         return yield* failure();
                       }
@@ -436,19 +486,25 @@ for (const lost of [
                 }
                 return remote;
               }),
-            abort: () => Effect.sync(() => (remote = { ...remote!, phase: "aborting" })),
+            abort: () =>
+              lost === "capture-cancel"
+                ? Effect.fail(failure())
+                : Effect.sync(() => (remote = { ...remote!, phase: "aborting" })),
             removed: () => Effect.sync(() => (remote = { ...remote!, phase: "aborted" })),
           };
           yield* Effect.gen(function* () {
             const engine = yield* OrchestrationEngineService,
               sql = yield* SqlClient.SqlClient,
               fences = makeThreadExecutionFence(sql);
+            const sourceBinding =
+              lost === "capture-retargeted-alias" ? path.join(root, "source-alias") : src;
+            if (sourceBinding !== src) yield* fs.symlink(src, sourceBinding);
             yield* engine.dispatch({
               type: "project.create",
               commandId: CommandId.make("source-project"),
               projectId,
               title: "Source",
-              workspaceRoot: src,
+              workspaceRoot: sourceBinding,
               createdAt: at,
             });
             yield* engine.dispatch({
@@ -668,6 +724,411 @@ for (const lost of [
             }
             let source = yield* makeThreadMoveWorker(transport, history, commands);
             const sourceQueue = queue.pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            const captures = makeCheckoutCapture(sql);
+            const execution = yield* ThreadExecution;
+            const sibling = ThreadId.make("sibling");
+            if (lost.startsWith("capture-retargeted")) {
+              const entered = yield* Deferred.make<void>();
+              const release = yield* Deferred.make<void>();
+              const provider = yield* ProviderService;
+              source = yield* makeThreadMoveWorker(transport, history, commands).pipe(
+                Effect.provideService(ProviderService, {
+                  ...provider,
+                  listSessions: () =>
+                    Effect.gen(function* () {
+                      if ((yield* captures.active).some((hold) => hold.phase === "capturing")) {
+                        yield* Deferred.succeed(entered, undefined);
+                        yield* Deferred.await(release);
+                      }
+                      return yield* provider.listSessions();
+                    }),
+                }),
+              );
+              const pending = yield* source
+                .source(threadId)
+                .pipe(
+                  Effect.match({ onFailure: (error) => error, onSuccess: () => null }),
+                  Effect.forkChild,
+                );
+              yield* Deferred.await(entered);
+              if (lost === "capture-retargeted-alias") {
+                yield* fs.remove(sourceBinding);
+                yield* fs.symlink(dst, sourceBinding);
+              } else if (lost === "capture-retargeted-git") {
+                yield* fs.rename(path.join(src, ".git"), path.join(root, "original-git"));
+                yield* fs.symlink(path.join(dst, ".git"), path.join(src, ".git"));
+              } else
+                yield* engine.dispatch({
+                  type: "thread.meta.update",
+                  commandId: CommandId.make("retarget-capturing-source"),
+                  threadId,
+                  worktreePath: dst,
+                });
+              yield* Deferred.succeed(release, undefined);
+              expect(yield* Fiber.join(pending)).toMatchObject({
+                _tag: "ThreadTransferArchiveError",
+                message: expect.stringContaining("checkout changed"),
+              });
+              expect(uploadStarts).toBe(0);
+              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              expect(yield* captures.active).toEqual([]);
+              return;
+            }
+            if (lost.startsWith("capture-rename")) {
+              const renamed = yield* Deferred.make<void>();
+              const sync = yield* Deferred.make<void>();
+              const archiveParent = path.join(
+                (yield* ServerConfig).stateDir,
+                "move-transfers",
+                "source",
+              );
+              source = yield* makeThreadMoveWorker(transport, history, commands).pipe(
+                Effect.provideService(FileSystem.FileSystem, {
+                  ...fs,
+                  open: (file, options) =>
+                    Effect.gen(function* () {
+                      if (file === archiveParent) {
+                        yield* Deferred.succeed(renamed, undefined);
+                        yield* Deferred.await(sync);
+                      }
+                      return yield* fs.open(file, options);
+                    }),
+                }),
+              );
+              const pending = yield* source.source(threadId).pipe(Effect.forkChild);
+              yield* Deferred.await(renamed);
+              yield* Fiber.interrupt(pending);
+              expect((yield* captures.active)[0]?.phase).toBe("capturing");
+              expect(uploadStarts).toBe(0);
+              if (lost === "capture-rename-cancel") remote = { ...remote!, phase: "aborting" };
+              let recoverySynced = false;
+              source = yield* makeThreadMoveWorker(transport, history, commands).pipe(
+                Effect.provideService(FileSystem.FileSystem, {
+                  ...fs,
+                  open: (file, options) =>
+                    fs.open(file, options).pipe(
+                      Effect.map((handle) =>
+                        file === archiveParent
+                          ? {
+                              ...handle,
+                              sync: Effect.gen(function* () {
+                                expect((yield* captures.active)[0]?.phase).toBe("capturing");
+                                yield* handle.sync;
+                                recoverySynced = true;
+                              }),
+                            }
+                          : handle,
+                      ),
+                    ),
+                }),
+              );
+              yield* source.source(threadId);
+              expect(recoverySynced).toBe(true);
+              expect(yield* captures.active).toEqual([]);
+              const [hold] = yield* sql<{
+                phase: string;
+                outcome: string;
+              }>`SELECT phase,release_outcome AS outcome FROM checkout_capture_holds`;
+              expect(hold).toEqual({ phase: "released", outcome: "sealed" });
+              return;
+            }
+            if (lost === "capture-stop-failure") {
+              source = yield* makeThreadMoveWorker(transport, history, commands).pipe(
+                Effect.provideService(TerminalManager, {
+                  ...(yield* TerminalManager),
+                  close: () =>
+                    Effect.fail(
+                      new TerminalProcessExitError({
+                        threadId,
+                        terminalId: "shell",
+                        terminalPid: 123,
+                        detail: "Exit receipt unavailable",
+                      }),
+                    ),
+                }),
+              );
+              expect((yield* Effect.flip(source.source(threadId)))._tag).toBe(
+                "TerminalProcessExitError",
+              );
+              const [hold] = yield* sql<{
+                phase: string;
+                outcome: string;
+              }>`SELECT phase,release_outcome AS outcome FROM checkout_capture_holds`;
+              expect(hold).toEqual({ phase: "released", outcome: "failed" });
+              expect((yield* fences.get(threadId))?.phase).toBe("draining");
+              expect(uploadStarts).toBe(0);
+              return;
+            }
+            if (
+              [
+                "shared-active",
+                "shared-ready-no-git",
+                "capture-cancel",
+                "capture-upload-blocked",
+              ].includes(lost)
+            ) {
+              const alias = path.join(root, "source-alias");
+              yield* fs.symlink(src, alias);
+              const aliasProject = ProjectId.make("alias-project");
+              yield* engine.dispatch({
+                type: "project.create",
+                commandId: CommandId.make("alias-project"),
+                projectId: aliasProject,
+                title: "Alias",
+                workspaceRoot: alias,
+                createdAt: at,
+              });
+              yield* engine.dispatch({
+                type: "thread.create",
+                commandId: CommandId.make("sibling"),
+                threadId: sibling,
+                projectId: aliasProject,
+                title: "Sibling",
+                modelSelection: { instanceId, model: "gpt-5" },
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: null,
+                createdAt: at,
+              });
+            }
+            if (lost.startsWith("shared-") || lost === "capture-cancel") {
+              if (lost === "shared-ready-no-git") {
+                const admitted = yield* captures.admit({
+                  threadId: sibling,
+                  workId: "original-turn",
+                  kind: "provider",
+                  checkoutRoot: src,
+                });
+                yield* captures.bindTurn(admitted.admissionId, "sibling-turn");
+              }
+              yield* sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,checkpoint_files_json,checkpoint_status)
+                VALUES(${sibling},'sibling-turn','running',${at},'[]','pending')`;
+              yield* source.source(threadId);
+              const waiting = yield* queue;
+              expect(waiting.entries[0]).toMatchObject({
+                state: "moving",
+                waitingForCheckout: true,
+                detail: 'Waiting for "Sibling" to finish its current turn.',
+              });
+              const hold = (yield* captures.active)[0]!;
+              expect(hold.phase).toBe("draining");
+              expect(
+                yield* fs.exists(
+                  path.join(
+                    (yield* ServerConfig).stateDir,
+                    "move-transfers",
+                    "source",
+                    hold.operationId,
+                  ),
+                ),
+              ).toBe(false);
+              expect(
+                (yield* Effect.flip(
+                  execution.begin({ threadId: sibling, kind: "provider", workId: "late-turn" }),
+                ))._tag,
+              ).toBe("CheckoutCaptureError");
+              yield* source.source(threadId);
+              expect(yield* queue).toEqual(waiting);
+              if (lost === "capture-cancel") {
+                const head = waiting.entries[0]!;
+                yield* engine.dispatch({
+                  type: "thread.move.cancel",
+                  commandId: CommandId.make("cancel-capture"),
+                  threadId,
+                  messageId: head.messageId,
+                  expectedRevision: head.revision,
+                  createdAt: at,
+                });
+                expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
+                expect(yield* captures.get(hold.operationId)).toMatchObject({
+                  phase: "released",
+                  releaseOutcome: "cancelled",
+                });
+                expect((yield* fences.get(threadId))?.phase).toBe("draining");
+                expect(
+                  yield* execution.begin({
+                    threadId: sibling,
+                    kind: "provider",
+                    workId: "after-cancel",
+                  }),
+                ).toBe("ordinary");
+                return;
+              }
+              const deferredSetup = yield* encodeMoveJson({
+                originalCommandId: "after-hold-setup",
+                attemptId: "after-hold-setup",
+                revision: 0,
+                state: "pending",
+                settled: false,
+                recipe: { projectCwd: src, runSetupScript: true },
+              });
+              yield* sql`UPDATE projection_thread_prompt_queues
+                SET state_json=json_set(state_json,'$.preparation',json(${deferredSetup})) WHERE thread_id=${sibling}`;
+              yield* sql`UPDATE projection_turns SET state='completed',completed_at=${at} WHERE thread_id=${sibling}`;
+              yield* source.source(threadId);
+              expect(yield* captures.get(hold.operationId)).toMatchObject({ phase: "draining" });
+              expect(yield* moveDetail).toBe('Waiting for "Sibling" to finish its checkpoint.');
+              yield* sql`UPDATE projection_turns SET checkpoint_status='ready' WHERE thread_id=${sibling}`;
+              const background = yield* ThreadBackgroundLivenessService;
+              background.recordTaskLiveness({
+                threadId: sibling,
+                taskId: "background",
+                taskType: undefined,
+                status: "running",
+                kind: "started",
+              });
+              yield* source.source(threadId);
+              expect(yield* captures.get(hold.operationId)).toMatchObject({ phase: "draining" });
+              expect(yield* moveDetail).toBe(
+                'Waiting for "Sibling" to finish its background work.',
+              );
+              background.clearThreadLiveness(sibling);
+              yield* sql`UPDATE projection_turns SET state='error',checkpoint_status='error' WHERE thread_id=${sibling}`;
+              if (lost === "shared-ready-no-git") {
+                yield* captures.completeTurn(sibling, "sibling-turn");
+                yield* sql`UPDATE projection_turns SET checkpoint_status='missing' WHERE thread_id=${sibling}`;
+              }
+              yield* (yield* ProviderSessionRuntimeRepository).upsert({
+                threadId: sibling,
+                providerName: "codex",
+                providerInstanceId: instanceId,
+                adapterKey: "codex",
+                runtimeMode: "full-access",
+                status: "running",
+                lastSeenAt: at,
+                resumeCursor: { threadId: "sibling-native" },
+                runtimePayload: { activeTurnId: "sibling-turn" },
+              });
+              const separate = path.join(root, "other-worktree");
+              yield* git(src, ["worktree", "add", "--detach", separate]);
+              const separateId = ThreadId.make("separate");
+              yield* engine.dispatch({
+                type: "thread.create",
+                commandId: CommandId.make("separate"),
+                threadId: separateId,
+                projectId,
+                title: "Separate",
+                modelSelection: { instanceId, model: "gpt-5" },
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: null,
+                worktreePath: separate,
+                createdAt: at,
+              });
+              yield* sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,checkpoint_files_json,checkpoint_status)
+                VALUES(${separateId},'separate-turn','running',${at},'[]','pending')`;
+              yield* execution.begin({
+                threadId: separateId,
+                kind: "provider",
+                workId: "active-separate",
+              });
+              const provider = yield* ProviderService;
+              let siblingStatus: ProviderSession["status"] = "running";
+              source = yield* makeThreadMoveWorker(transport, history, commands).pipe(
+                Effect.provideService(ProviderService, {
+                  ...provider,
+                  listSessions: () =>
+                    Effect.succeed([
+                      {
+                        threadId: sibling,
+                        provider: driverKind,
+                        providerInstanceId: instanceId,
+                        runtimeMode: "full-access",
+                        status: siblingStatus,
+                        activeTurnId: TurnId.make("sibling-turn"),
+                        createdAt: at,
+                        updatedAt: at,
+                      },
+                      {
+                        threadId: separateId,
+                        provider: driverKind,
+                        providerInstanceId: instanceId,
+                        runtimeMode: "full-access",
+                        status: "running",
+                        activeTurnId: TurnId.make("separate-turn"),
+                        createdAt: at,
+                        updatedAt: at,
+                      },
+                    ]),
+                }),
+              );
+              yield* source.source(threadId);
+              expect(yield* captures.get(hold.operationId)).toMatchObject({ phase: "draining" });
+              expect(yield* moveDetail).toBe('Waiting for "Sibling" to finish its provider turn.');
+              siblingStatus = "ready";
+            }
+            if (lost === "capture-failure") {
+              source = yield* makeThreadMoveWorker(transport, history, commands).pipe(
+                Effect.provideService(FileSystem.FileSystem, {
+                  ...fs,
+                  readDirectory: (directory) =>
+                    fs.readDirectory(
+                      directory === src ? path.join(root, "missing-capture-input") : directory,
+                    ),
+                }),
+              );
+              yield* Effect.flip(source.source(threadId));
+              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              const [hold] = yield* sql<{
+                phase: string;
+                outcome: string;
+              }>`SELECT phase,release_outcome AS outcome FROM checkout_capture_holds`;
+              expect(hold).toEqual({ phase: "released", outcome: "failed" });
+              return;
+            }
+            if (lost === "capture-upload-blocked") {
+              const pending = yield* source.source(threadId).pipe(Effect.forkChild);
+              yield* Deferred.await(uploadEntered);
+              const [hold] = yield* sql<{
+                phase: string;
+                outcome: string;
+              }>`SELECT phase,release_outcome AS outcome FROM checkout_capture_holds`;
+              expect(hold).toEqual({ phase: "released", outcome: "sealed" });
+              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              expect(
+                yield* execution.begin({
+                  threadId: sibling,
+                  kind: "provider",
+                  workId: "during-upload",
+                }),
+              ).toBe("ordinary");
+              yield* fs.writeFileString(path.join(src, "after-capture"), "new sibling work\n");
+              yield* Deferred.succeed(uploadRelease, undefined);
+              yield* Fiber.join(pending);
+              source = yield* makeThreadMoveWorker(transport, history, commands);
+            }
+            if (lost === "sealed-missing") {
+              expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
+              const [hold] = yield* sql<{
+                operationId: string;
+                digest: string;
+              }>`SELECT operation_id AS "operationId",manifest_sha256 AS digest FROM checkout_capture_holds WHERE release_outcome='sealed'`;
+              const completedUploads = uploadStarts;
+              yield* fs.remove(
+                path.join(
+                  (yield* ServerConfig).stateDir,
+                  "move-transfers",
+                  "source",
+                  hold!.operationId,
+                ),
+                { recursive: true },
+              );
+              source = yield* makeThreadMoveWorker(transport, history, commands);
+              const error = yield* Effect.flip(source.source(threadId));
+              expect(error).toMatchObject({
+                _tag: "ThreadMoveError",
+                detail: expect.stringContaining("sealed source archive is missing"),
+              });
+              expect(uploadStarts).toBe(completedUploads);
+              expect(yield* captures.get(hold!.operationId)).toMatchObject({
+                phase: "released",
+                releaseOutcome: "sealed",
+                manifestSha256: hold!.digest,
+              });
+              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              return;
+            }
             if (lost === "source-retargeted-project") {
               const error = yield* Effect.flip(source.source(threadId));
               if (error._tag !== "ThreadMoveError") throw error;
@@ -689,7 +1150,8 @@ for (const lost of [
               expect(remote?.phase).toBe("preparing");
               expect(remote?.failureDetail).toBeTruthy();
               expect((yield* queue).entries[0]?.state).toBe("moving");
-              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              expect((yield* fences.get(threadId))?.phase).toBe("draining");
+              expect(yield* captures.active).toEqual([]);
               expect(error._tag).not.toBe("ThreadMoveError");
               expect(commits).toBe(0);
               return;
@@ -723,6 +1185,13 @@ for (const lost of [
             }
             yield* source.source(threadId);
             expect(remote?.phase).toBe(lost === "recovery-ready" ? "committed" : "frozen");
+            const [capture] = yield* sql<{
+              phase: string;
+              outcome: string;
+            }>`SELECT phase,release_outcome AS outcome FROM checkout_capture_holds`;
+            expect(capture).toEqual({ phase: "released", outcome: "sealed" });
+            if (lost.startsWith("shared-"))
+              expect((yield* queue).entries[0]).not.toHaveProperty("waitingForCheckout");
             expect(remote?.manifestArtifactId).not.toBeNull();
             if (lost === "parallel-transfer") expect(maximumUploads).toBe(4);
             if (lost === "published") {
@@ -976,6 +1445,8 @@ for (const lost of [
               expect((yield* destinationFences.get(threadId))?.phase).toBe("active");
               expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
               expect(yield* fs.readFileString(path.join(dst, "README"))).toBe("uncommitted work\n");
+              if (lost === "capture-upload-blocked")
+                expect(yield* fs.exists(path.join(dst, "after-capture"))).toBe(false);
               if (lost === "parallel-transfer") {
                 expect(maximumDownloads).toBe(4);
                 expect(activeDownloads).toBe(0);

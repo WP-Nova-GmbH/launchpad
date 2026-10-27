@@ -2,6 +2,7 @@ import { configureThreadVmMoveRepository } from "./ThreadVmRepositoryBinding.ts"
 import { makeThreadMoveProgress } from "./ThreadMoveProgress.ts";
 import { prepareThreadVmMoveWorkspace } from "./ThreadVmMoveWorkspace.ts";
 import * as NodeCrypto from "node:crypto";
+import * as NodeUtil from "node:util";
 import {
   CommandId,
   ModelSelection,
@@ -22,14 +23,19 @@ import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ServerConfig } from "../config.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import { ThreadBackgroundLivenessService } from "../orchestration/ThreadBackgroundLiveness.ts";
 import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
+import { CheckoutCaptureError, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { ProcessRunner } from "../processRunner.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { inspectVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
+import { resolveCheckoutPath } from "../workspace/CheckoutAccess.ts";
+import { notifyCheckoutCaptureReleased } from "../workspace/CheckoutCaptureSignals.ts";
 import {
   makeThreadTransferArchive,
   ThreadTransferArchiveManifest,
@@ -88,7 +94,9 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const engine = yield* OrchestrationEngineService;
+  const background = yield* ThreadBackgroundLivenessService;
   const provider = yield* ProviderService;
+  const runner = yield* ProcessRunner;
   const registry = yield* ProviderInstanceRegistry;
   const tracked = yield* VmWorkloadTracking;
   const terminals = yield* TerminalManager;
@@ -96,7 +104,8 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
   const repositories = yield* RepositoryIdentityResolver;
   const archive = makeThreadTransferArchive(sql, yield* OrchestrationEventStore);
   const fences = makeThreadExecutionFence(sql),
-    claims = makeThreadCheckoutClaims(sql);
+    claims = makeThreadCheckoutClaims(sql),
+    captures = makeCheckoutCapture(sql);
   const context = yield* Effect.context<
     | Effect.Services<ReturnType<typeof configureThreadVmMoveRepository>>
     | Effect.Services<ReturnType<typeof prepareThreadVmMoveWorkspace>>
@@ -128,6 +137,10 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     if (!/^[0-9a-f-]{36}$/u.test(owner.operationId)) throw new Error("Invalid move operation ID");
     return path.join(root, side, owner.operationId);
   };
+  const syncArchiveParent = (directory: string) =>
+    Effect.scoped(
+      fs.open(path.dirname(directory), { flag: "r" }).pipe(Effect.flatMap((handle) => handle.sync)),
+    );
   const inspectArchive = Effect.fnUntraced(function* (owner: ThreadMoveOwner, directory: string) {
     if ((yield* fs.realPath(directory)) !== directory)
       return yield* fail(owner.threadId, "Move storage cannot follow a linked directory.");
@@ -136,9 +149,26 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     const manifest = yield* decodeArchive(yield* fs.readFileString(manifestPath));
     return { directory, manifest, sha256: digest };
   });
-  const sourceArchive = Effect.fnUntraced(function* (owner: ThreadMoveOwner) {
+  const sourceArchive = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    sealedSha256?: string,
+  ) {
     const target = operationPath(owner, "source");
-    if (yield* fs.exists(target)) return yield* inspectArchive(owner, target);
+    if (yield* fs.exists(target)) {
+      const saved = yield* inspectArchive(owner, target);
+      if (sealedSha256 !== undefined && saved.sha256 !== sealedSha256)
+        return yield* fail(
+          owner.threadId,
+          "The sealed source archive changed. Restore its saved bytes before retrying.",
+        );
+      yield* syncArchiveParent(target);
+      return saved;
+    }
+    if (sealedSha256 !== undefined)
+      return yield* fail(
+        owner.threadId,
+        "The sealed source archive is missing. Restore its saved bytes before retrying.",
+      );
     const exported = yield* archive
       .exportSource(
         {
@@ -152,10 +182,252 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       .pipe(Effect.provideContext(context));
     yield* fs.makeDirectory(path.dirname(target), { recursive: true, mode: 0o700 });
     yield* fs.rename(exported.directory, target);
-    yield* Effect.scoped(
-      fs.open(path.dirname(target), { flag: "r" }).pipe(Effect.flatMap((handle) => handle.sync)),
-    );
+    yield* syncArchiveParent(target);
     return { ...exported, directory: target };
+  });
+  const verifySourceOwner = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    saved: Effect.Success<ReturnType<typeof sourceArchive>>,
+  ) {
+    const current = yield* fences.get(owner.threadId);
+    if (
+      current?.phase !== "frozen" ||
+      current.operationId !== owner.operationId ||
+      saved.manifest.history.threadId !== owner.threadId ||
+      saved.manifest.history.operationId !== owner.operationId ||
+      saved.manifest.history.generation !== owner.generation ||
+      saved.manifest.history.environmentId !== owner.environmentId ||
+      saved.manifest.history.sourceSequence !== current.frozenSequence
+    )
+      return yield* fail(owner.threadId, "The source archive does not match its frozen ownership.");
+  });
+  const within = (root: string, candidate: string) =>
+    candidate === root ||
+    candidate.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`);
+  const readCheckoutBindings = () => sql<{ threadId: string; projectId: string; root: string }>`
+    SELECT t.thread_id AS "threadId",t.project_id AS "projectId",COALESCE(t.worktree_path,p.workspace_root) AS root
+    FROM projection_threads t JOIN projection_projects p USING(project_id)
+    WHERE t.deleted_at IS NULL AND p.deleted_at IS NULL ORDER BY t.thread_id`;
+  const prepareCapture = Effect.fnUntraced(function* (owner: ThreadMoveOwner) {
+    const bindings = yield* readCheckoutBindings();
+    const binding = bindings.find((row) => row.threadId === owner.threadId);
+    if (!binding)
+      return yield* fail(owner.threadId, "The source checkout is no longer registered.");
+    const checkoutRoot = yield* fs.realPath(binding.root);
+    const top = yield* fs.realPath(
+      yield* workspaceGitText(checkoutRoot, ["rev-parse", "--show-toplevel"]).pipe(
+        Effect.provideService(ProcessRunner, runner),
+      ),
+    );
+    if (top !== checkoutRoot)
+      return yield* fail(owner.threadId, "Transfer must start at the repository checkout root.");
+    const gitCommonRoot = yield* fs.realPath(
+      yield* workspaceGitText(checkoutRoot, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+      ]).pipe(Effect.provideService(ProcessRunner, runner)),
+    );
+    const sharedThreadIds: string[] = [];
+    for (const row of bindings) {
+      const candidate = yield* resolveCheckoutPath(row.root, fs, path);
+      if (within(checkoutRoot, candidate) || within(candidate, checkoutRoot))
+        sharedThreadIds.push(row.threadId);
+    }
+    return { bindings, sharedThreadIds, checkoutRoot, gitCommonRoot };
+  });
+  const checkoutNotice = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    waitingForCheckout: boolean,
+    detail: string,
+  ) {
+    const fence = yield* fences.get(owner.threadId);
+    // A frozen thread's event head is part of its immutable source archive.
+    if (fence?.phase !== "draining") return;
+    const head = (yield* readQueue(owner.threadId))?.queue.entries[0];
+    if (
+      !head ||
+      head.kind !== "move" ||
+      head.operationId !== owner.operationId ||
+      head.state === "cancelling"
+    )
+      return;
+    if (
+      waitingForCheckout
+        ? head.waitingForCheckout && head.detail === detail
+        : !head.waitingForCheckout
+    )
+      return;
+    yield* engine.dispatch({
+      type: "thread.move.progress",
+      threadId: ThreadId.make(owner.threadId),
+      commandId: CommandId.make(NodeCrypto.randomUUID()),
+      messageId: head.messageId,
+      operationId: CommandId.make(owner.operationId),
+      expectedRevision: head.revision,
+      blocked: false,
+      waitingForCheckout,
+      detail,
+      createdAt: yield* now,
+    });
+  });
+  const releaseCapture = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    outcome: "failed" | "cancelled",
+  ) {
+    const hold = yield* captures.get(owner.operationId);
+    if (!hold || hold.phase === "released") return;
+    // A persisted capture can outlive its process reply. Cancellation must not
+    // reopen the checkout while that copy's completion is still uncertain.
+    if (hold.phase === "capturing") {
+      const target = operationPath(owner, "source");
+      if (!(yield* fs.exists(target))) return;
+      // The final rename follows export verification and the artifact-tree
+      // durability receipt. Recover a crash before the SQL seal receipt.
+      const saved = yield* inspectArchive(owner, target);
+      yield* verifySourceOwner(owner, saved);
+      yield* syncArchiveParent(target);
+      yield* captures.release(owner, { outcome: "sealed", manifestSha256: saved.sha256 });
+    } else yield* captures.release(owner, { outcome });
+    yield* notifyCheckoutCaptureReleased(sql, hold.checkoutRoot);
+  });
+  const enterCapture = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    prepared: Effect.Success<ReturnType<typeof prepareCapture>>,
+  ) {
+    const live = yield* provider.listSessions();
+    const ids = prepared.sharedThreadIds;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        if (!NodeUtil.isDeepStrictEqual(yield* readCheckoutBindings(), prepared.bindings))
+          return yield* new CheckoutCaptureError({
+            message: "Checkout registrations changed while preparing the snapshot.",
+            waitingForCheckout: true,
+          });
+        const busy = yield* sql<{
+          threadId: string;
+          reason: string;
+        }>`SELECT thread_id AS "threadId",
+          CASE WHEN completed_at IS NULL OR state IN ('pending','running') THEN 'finish its current turn' ELSE 'finish its checkpoint' END AS reason
+          FROM projection_turns WHERE thread_id IN ${sql.in(ids)}
+        AND (completed_at IS NULL OR state IN ('pending','running') OR checkpoint_status='pending')
+        UNION ALL SELECT thread_id AS "threadId",CASE kind WHEN 'terminal' THEN 'confirm its terminal has stopped'
+          WHEN 'setup' THEN 'confirm its setup has stopped' ELSE 'finish its workspace operation' END AS reason
+          FROM thread_execution_work WHERE thread_id IN ${sql.in(ids)} AND kind!='provider' AND completed=0
+        ORDER BY "threadId",reason LIMIT 1`;
+        let blocker = busy[0];
+        const sessions = yield* sql<{
+          threadId: string;
+          status: string | null;
+          activeTurnId: string | null;
+          runtimeTurnId: string | null;
+        }>`
+          SELECT t.thread_id AS "threadId",s.status,s.active_turn_id AS "activeTurnId",json_extract(r.runtime_payload_json,'$.activeTurnId') AS "runtimeTurnId"
+          FROM projection_threads t LEFT JOIN projection_thread_sessions s USING(thread_id)
+          LEFT JOIN provider_session_runtime r USING(thread_id) WHERE t.thread_id IN ${sql.in(ids)}`;
+        const markers = new Set<string>();
+        for (const session of sessions) {
+          if (session.activeTurnId) markers.add(session.activeTurnId);
+          if (session.runtimeTurnId) markers.add(session.runtimeTurnId);
+        }
+        for (const session of live)
+          if (ids.includes(session.threadId) && session.activeTurnId)
+            markers.add(session.activeTurnId);
+        const settled = markers.size
+          ? yield* sql<{ threadId: string; turnId: string }>`
+          SELECT thread_id AS "threadId",turn_id AS "turnId" FROM projection_turns
+          WHERE thread_id IN ${sql.in(ids)} AND turn_id IN ${sql.in([...markers])} AND completed_at IS NOT NULL
+            AND state NOT IN ('pending','running') AND checkpoint_status IN ('ready','skipped','error')
+          UNION SELECT thread_id AS "threadId",turn_id AS "turnId" FROM checkout_work_admissions
+          WHERE thread_id IN ${sql.in(ids)} AND turn_id IN ${sql.in([...markers])} AND turn_finalized=1`
+          : [];
+        const finalized = new Set(settled.map((row) => JSON.stringify([row.threadId, row.turnId])));
+        const isFinalized = (threadId: string, turnId: string) =>
+          finalized.has(JSON.stringify([threadId, turnId]));
+        for (const session of sessions) {
+          if (blocker) break;
+          if (session.status === "starting")
+            blocker = { threadId: session.threadId, reason: "finish starting its provider" };
+          else if (
+            [session.activeTurnId, session.runtimeTurnId].some(
+              (turnId) => turnId !== null && !isFinalized(session.threadId, turnId),
+            )
+          )
+            blocker = { threadId: session.threadId, reason: "confirm its native turn has settled" };
+        }
+        for (const session of live) {
+          if (blocker) break;
+          if (
+            ids.includes(session.threadId) &&
+            (session.status === "running" ||
+              session.status === "connecting" ||
+              (session.activeTurnId !== undefined &&
+                !isFinalized(session.threadId, session.activeTurnId)))
+          )
+            blocker = {
+              threadId: session.threadId,
+              reason:
+                session.status === "connecting"
+                  ? "finish connecting its provider"
+                  : "finish its provider turn",
+            };
+        }
+        const queues = yield* sql<{
+          threadId: string;
+          state: string;
+        }>`SELECT thread_id AS "threadId",state_json AS state FROM projection_thread_prompt_queues WHERE thread_id IN ${sql.in(ids)} ORDER BY thread_id`;
+        for (const row of queues) {
+          if (blocker) break;
+          const queue = yield* decodeQueue(row.state);
+          if (queue.handoff)
+            blocker = { threadId: row.threadId, reason: "finish delivering its queued prompt" };
+          else if (queue.awaitingTurnId)
+            blocker = { threadId: row.threadId, reason: "finish its turn and checkpoint" };
+          else if (
+            queue.preparation?.state === "running" ||
+            (queue.preparation?.state === "failed" && !queue.preparation.settled)
+          )
+            blocker = { threadId: row.threadId, reason: "confirm its setup has stopped" };
+        }
+        for (const threadId of ids) {
+          if (blocker) break;
+          const liveness = background.getThreadBackgroundLiveness(threadId);
+          if (liveness)
+            blocker = {
+              threadId,
+              reason:
+                liveness === "monitoring"
+                  ? "stop its background monitor"
+                  : "finish its background work",
+            };
+        }
+        if (!blocker) {
+          const [admitted] = yield* captures.blockers(prepared);
+          if (admitted)
+            blocker = {
+              threadId: admitted.threadId,
+              reason:
+                admitted.kind === "terminal"
+                  ? "confirm its terminal has stopped"
+                  : admitted.kind === "setup"
+                    ? "confirm its setup has stopped"
+                    : admitted.kind === "provider"
+                      ? "acknowledge its provider request and finish checkpointing"
+                      : "finish its workspace operation",
+            };
+        }
+        if (blocker) {
+          const [thread] = yield* sql<{
+            title: string;
+          }>`SELECT title FROM projection_threads WHERE thread_id=${blocker.threadId}`;
+          return yield* new CheckoutCaptureError({
+            message: `Waiting for "${thread?.title ?? blocker.threadId}" to ${blocker.reason}.`,
+            waitingForCheckout: true,
+          });
+        }
+        return yield* captures.enterCapturing(owner);
+      }),
+    );
   });
   const finish = Effect.fnUntraced(function* (
     owner: ThreadMoveOwner,
@@ -249,222 +521,296 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     }
     if (!head || head.kind !== "move" || !head.operationId) return;
     const owner = { ...fence, operationId: head.operationId };
-    let move;
-    if (fence.phase === "active" && fence.operationId !== owner.operationId) {
-      const actorUserId = (head.editedBy ?? head.author)?.userId;
-      if (!actorUserId) return yield* fail(threadId, "Sign in before moving this private thread.");
-      if (head.destination.kind === "vm") {
-        const result = yield* transport.beginVm(owner, {
-          actorUserId,
-          cancelBeforeStart: head.state === "cancelling",
-        });
-        if (result.status === "quota_reached") {
-          const detail =
-            result.replacement?.phase === "cancelled"
-              ? "VM replacement was cancelled. Cancel this move to continue here."
-              : result.replacement?.phase === "waiting"
-                ? "Saving the selected VM. This move will continue after its slot is safely released."
-                : `VM limit reached (${result.reservedVms}/${result.maxVms}). Select an idle VM to replace before this move can continue.`;
-          if (head.detail !== detail)
-            yield* engine.dispatch({
-              type: "thread.move.progress",
-              threadId: ThreadId.make(threadId),
-              commandId: CommandId.make(`${owner.operationId}:quota:${head.revision}`),
-              messageId: head.messageId,
-              operationId: CommandId.make(owner.operationId),
-              expectedRevision: head.revision,
-              blocked: true,
-              detail,
-              createdAt: yield* now,
-            });
-          return;
-        }
-        move = result.move;
-      } else
-        move = yield* transport.begin(owner, {
-          actorUserId,
-          destinationEnvironmentId: head.destination.environmentId,
-          destinationProjectId: head.destination.projectId,
-        });
-    } else move = yield* transport.get(owner);
-    yield* assertThreadMoveIdentity(owner, move);
-    if (
-      head.destination.kind === "environment" &&
-      (move.destinationEnvironmentId !== head.destination.environmentId ||
-        move.destinationProjectId !== head.destination.projectId)
-    )
-      return yield* fail(
-        threadId,
-        "The relay returned a different destination for the queued move.",
-      );
-    if (fence.phase === "active" && fence.operationId !== owner.operationId) {
-      yield* fences.beginDrain({ ...owner, previousOperationId: fence.operationId });
-      fence = (yield* fences.get(threadId))!;
-    }
-    if (move.sourceEnvironmentId !== owner.environmentId) return;
-    if (["committed", "completed"].includes(move.phase)) {
-      if (fence.phase !== "retired") yield* fences.retire(owner);
-      return;
-    }
-    if (head.state === "cancelling" && !["aborting", "aborted"].includes(move.phase)) {
-      move = yield* transport.abort(owner);
-      yield* assertThreadMoveIdentity(owner, move);
-    }
-    if (move.phase === "aborting") return;
-    if (move.phase === "aborted") {
-      if (tracked) {
-        const inventory = yield* inspectVmWorkloads({ type: "inspect" });
-        if (inventory.sealedBy !== null)
-          yield* inspectVmWorkloads({
-            type: "reopen",
-            bootId: inventory.bootId,
-            operationId: owner.operationId,
+    const claimed = head;
+    const sourceFence = fence;
+    return yield* Effect.gen(function* () {
+      const head = claimed;
+      let fence = sourceFence;
+      let move;
+      if (fence.phase === "active" && fence.operationId !== owner.operationId) {
+        const actorUserId = (head.editedBy ?? head.author)?.userId;
+        if (!actorUserId)
+          return yield* fail(threadId, "Sign in before moving this private thread.");
+        if (head.destination.kind === "vm") {
+          const result = yield* transport.beginVm(owner, {
+            actorUserId,
+            cancelBeforeStart: head.state === "cancelling",
           });
+          if (result.status === "quota_reached") {
+            const detail =
+              result.replacement?.phase === "cancelled"
+                ? "VM replacement was cancelled. Cancel this move to continue here."
+                : result.replacement?.phase === "waiting"
+                  ? "Saving the selected VM. This move will continue after its slot is safely released."
+                  : `VM limit reached (${result.reservedVms}/${result.maxVms}). Select an idle VM to replace before this move can continue.`;
+            if (head.detail !== detail)
+              yield* engine.dispatch({
+                type: "thread.move.progress",
+                threadId: ThreadId.make(threadId),
+                commandId: CommandId.make(`${owner.operationId}:quota:${head.revision}`),
+                messageId: head.messageId,
+                operationId: CommandId.make(owner.operationId),
+                expectedRevision: head.revision,
+                blocked: true,
+                detail,
+                createdAt: yield* now,
+              });
+            return;
+          }
+          move = result.move;
+        } else
+          move = yield* transport.begin(owner, {
+            actorUserId,
+            destinationEnvironmentId: head.destination.environmentId,
+            destinationProjectId: head.destination.projectId,
+          });
+      } else move = yield* transport.get(owner);
+      yield* assertThreadMoveIdentity(owner, move);
+      if (
+        head.destination.kind === "environment" &&
+        (move.destinationEnvironmentId !== head.destination.environmentId ||
+          move.destinationProjectId !== head.destination.projectId)
+      )
+        return yield* fail(
+          threadId,
+          "The relay returned a different destination for the queued move.",
+        );
+      if (fence.phase === "active" && fence.operationId !== owner.operationId) {
+        yield* fences.beginDrain({ ...owner, previousOperationId: fence.operationId });
+        fence = (yield* fences.get(threadId))!;
       }
-      yield* fences.activate(owner);
-      yield* commands.synchronize(threadId);
-      yield* finish(owner, "cancelled");
-      return;
-    }
-    // Repair the exact saved archive even when a failed commit left a retained error.
-    if (move.manifestArtifactId !== null && move.recoveryVerified !== true) {
-      const receipt = yield* transport.publish(owner, move.manifestArtifactId);
-      if (receipt.manifestArtifactId !== move.manifestArtifactId)
-        return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
-    }
-    // Failure details live in relay placement state. Appending local queue
-    // events here would invalidate the immutable source sequence being moved.
-    if (move.failureDetail && move.phase !== "preparing") return;
-    if (move.phase === "ready") {
-      const committed = yield* transport.commit(owner);
-      yield* assertThreadMoveIdentity(owner, committed);
-      if (!["committed", "completed"].includes(committed.phase))
-        return yield* fail(threadId, "Ownership has not been committed.");
-      yield* fences.retire(owner);
-      return;
-    }
-    const [runtime] = yield* sql<{
-      status: string;
-    }>`SELECT status FROM provider_session_runtime WHERE thread_id=${threadId}`;
-    const providerWork = yield* sql`SELECT 1 FROM thread_execution_work WHERE thread_id=${threadId}
+      if (move.sourceEnvironmentId !== owner.environmentId) return;
+      if (["committed", "completed"].includes(move.phase)) {
+        if (fence.phase !== "retired") yield* fences.retire(owner);
+        return;
+      }
+      if (head.state === "cancelling" && !["aborting", "aborted"].includes(move.phase)) {
+        yield* releaseCapture(owner, "cancelled");
+        move = yield* transport.abort(owner);
+        yield* assertThreadMoveIdentity(owner, move);
+      }
+      if (move.phase === "aborting") {
+        yield* releaseCapture(owner, "cancelled");
+        return;
+      }
+      if (move.phase === "aborted") {
+        yield* releaseCapture(owner, "cancelled");
+        const held = yield* captures.get(owner.operationId);
+        if (held?.phase === "capturing") return;
+        if (tracked) {
+          const inventory = yield* inspectVmWorkloads({ type: "inspect" });
+          if (inventory.sealedBy !== null)
+            yield* inspectVmWorkloads({
+              type: "reopen",
+              bootId: inventory.bootId,
+              operationId: owner.operationId,
+            });
+        }
+        yield* fences.activate(owner);
+        yield* commands.synchronize(threadId);
+        yield* finish(owner, "cancelled");
+        return;
+      }
+      // Repair the exact saved archive even when a failed commit left a retained error.
+      if (move.manifestArtifactId !== null && move.recoveryVerified !== true) {
+        const receipt = yield* transport.publish(owner, move.manifestArtifactId);
+        if (receipt.manifestArtifactId !== move.manifestArtifactId)
+          return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
+      }
+      // Failure details live in relay placement state. Appending local queue
+      // events here would invalidate the immutable source sequence being moved.
+      if (move.failureDetail && move.phase !== "preparing") return;
+      if (move.phase === "ready") {
+        const committed = yield* transport.commit(owner);
+        yield* assertThreadMoveIdentity(owner, committed);
+        if (!["committed", "completed"].includes(committed.phase))
+          return yield* fail(threadId, "Ownership has not been committed.");
+        yield* fences.retire(owner);
+        return;
+      }
+      const priorCapture = yield* captures.get(owner.operationId);
+      const sealedSha256 =
+        priorCapture?.releaseOutcome === "sealed" ? priorCapture.manifestSha256! : undefined;
+      const prepared =
+        sealedSha256 === undefined
+          ? yield* prepareCapture(owner).pipe(
+              Effect.tapError((error) => reportFailure(owner, error, "source").pipe(Effect.ignore)),
+            )
+          : null;
+      if (prepared) {
+        const admitted = yield* captures.acquireDrain({ ...owner, ...prepared }).pipe(
+          Effect.as(true),
+          Effect.catchTag(
+            "CheckoutCaptureError",
+            Effect.fnUntraced(function* (error) {
+              if (!error.waitingForCheckout) return yield* error;
+              yield* checkoutNotice(owner, true, error.message);
+              return false;
+            }),
+          ),
+        );
+        if (!admitted) return;
+      }
+      const [runtime] = yield* sql<{
+        status: string;
+      }>`SELECT status FROM provider_session_runtime WHERE thread_id=${threadId}`;
+      const providerWork =
+        yield* sql`SELECT 1 FROM thread_execution_work WHERE thread_id=${threadId}
       AND generation=${owner.generation} AND kind='provider' AND completed=0 LIMIT 1`;
-    if (
-      providerWork.length ||
-      (runtime && runtime.status !== "stopped") ||
-      (yield* provider.listSessions()).some((session) => session.threadId === threadId)
-    )
-      yield* provider.stopSession({ threadId: ThreadId.make(threadId) });
-    if (runtime || providerWork.length) {
-      if (!provider.flushRuntimeEvents)
-        return yield* fail(threadId, "Stopped provider output has not been confirmed.");
-      yield* provider.flushRuntimeEvents(ThreadId.make(threadId));
-      const [session] =
-        yield* sql`SELECT thread_id AS "threadId",status,provider_name AS "providerName",provider_instance_id AS "providerInstanceId",
+      if (
+        providerWork.length ||
+        (runtime && runtime.status !== "stopped") ||
+        (yield* provider.listSessions()).some((session) => session.threadId === threadId)
+      )
+        yield* provider.stopSession({ threadId: ThreadId.make(threadId) });
+      if (runtime || providerWork.length) {
+        if (!provider.flushRuntimeEvents)
+          return yield* fail(threadId, "Stopped provider output has not been confirmed.");
+        yield* provider.flushRuntimeEvents(ThreadId.make(threadId));
+        const [session] =
+          yield* sql`SELECT thread_id AS "threadId",status,provider_name AS "providerName",provider_instance_id AS "providerInstanceId",
         runtime_mode AS "runtimeMode",active_turn_id AS "activeTurnId",last_error AS "lastError",updated_at AS "updatedAt"
         FROM projection_thread_sessions WHERE thread_id=${threadId}`;
-      if (session && session.status !== "stopped")
-        yield* engine.dispatch({
-          type: "thread.session.set",
-          commandId: CommandId.make(`${owner.operationId}:source-stopped`),
-          threadId: ThreadId.make(threadId),
-          createdAt: yield* now,
-          session: yield* decodeSession({
-            ...session,
-            status: "stopped",
-            activeTurnId: null,
-            lastError: null,
-            updatedAt: yield* now,
-          }),
+        if (session && session.status !== "stopped")
+          yield* engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`${owner.operationId}:source-stopped`),
+            threadId: ThreadId.make(threadId),
+            createdAt: yield* now,
+            session: yield* decodeSession({
+              ...session,
+              status: "stopped",
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: yield* now,
+            }),
+          });
+      }
+      yield* terminals.close({ threadId: ThreadId.make(threadId), waitForProcessExit: true });
+      if (tracked) {
+        const inventory = yield* inspectVmWorkloads({ type: "inspect" });
+        const stopped = yield* inspectVmWorkloads({
+          type: "stop",
+          bootId: inventory.bootId,
+          operationId: owner.operationId,
         });
-    }
-    yield* terminals.close({ threadId: ThreadId.make(threadId), waitForProcessExit: true });
-    if (tracked) {
-      const inventory = yield* inspectVmWorkloads({ type: "inspect" });
-      const stopped = yield* inspectVmWorkloads({
-        type: "stop",
-        bootId: inventory.bootId,
-        operationId: owner.operationId,
-      });
-      if (!stopped.stopped) return;
-    }
-    yield* execution.confirmProcessesStopped(threadId, tracked ? "vm" : "provider");
-    const progress = makeThreadMoveProgress(move.progress ?? [], owner.environmentId, (report) =>
-      transport.progress(owner, report),
-    );
-    if (move.manifestArtifactId === null) yield* progress.stage("capturing");
-    const saved = yield* sourceArchive(owner).pipe(
-      Effect.tapError((error) => reportFailure(owner, error, "source").pipe(Effect.ignore)),
-    );
-    // Reused archives must still match the exact frozen placement and event head.
-    const current = yield* fences.get(threadId);
-    if (
-      current?.phase !== "frozen" ||
-      current.operationId !== owner.operationId ||
-      saved.manifest.history.threadId !== threadId ||
-      saved.manifest.history.operationId !== owner.operationId ||
-      saved.manifest.history.generation !== owner.generation ||
-      saved.manifest.history.environmentId !== owner.environmentId ||
-      saved.manifest.history.sourceSequence !== current.frozenSequence
-    )
-      return yield* fail(threadId, "The source archive does not match its frozen ownership.");
-    yield* history.synchronize(threadId);
-    if (move.phase === "preparing") {
-      move = yield* transport.freeze(owner, {
-        sourceCursor: saved.manifest.history.sourceSequence,
-        manifestSha256: saved.sha256,
-      });
-      yield* assertThreadMoveIdentity(owner, move);
-    }
-    if (
-      move.manifestSha256 !== saved.sha256 ||
-      move.sourceCursor !== saved.manifest.history.sourceSequence
-    )
-      return yield* fail(threadId, "The frozen source changed after the move began.");
-    // Publication verifies every artifact. Keep the source frozen while the destination imports it.
-    if (move.manifestArtifactId !== null) return;
-    yield* progress.stage("packing");
-    const packed = yield* packThreadTransferArchive({
-      archiveDirectory: saved.directory,
-      scratchRoot: path.join(root, "chunks"),
-      expectedManifestSha256: saved.sha256,
-    });
-    yield* Effect.gen(function* () {
-      yield* progress.stage("uploading", {
-        bytes: packed.uploads.reduce((sum, file) => sum + file.sizeBytes, 0),
-        artifacts: packed.uploads.length,
-      });
-      yield* Effect.forEach(
-        packed.uploads,
-        Effect.fnUntraced(function* (file) {
-          const expected = {
-            artifactId: file.artifactId,
-            operationId: owner.operationId,
-            kind: file.kind,
-            sha256: file.sha256,
-            sizeBytes: file.sizeBytes,
-          };
-          const receipt = yield* transport.upload(owner, expected, fs.stream(file.path));
-          if (
-            receipt.threadId !== threadId ||
-            receipt.artifactId !== expected.artifactId ||
-            receipt.operationId !== owner.operationId ||
-            receipt.sha256 !== expected.sha256 ||
-            receipt.kind !== expected.kind ||
-            receipt.sizeBytes !== expected.sizeBytes ||
-            receipt.state !== "complete"
-          )
-            return yield* fail(threadId, "The move upload receipt does not match its saved bytes.");
-          yield* progress.verified(file.artifactId, file.sizeBytes);
-        }),
-        { concurrency: 4, discard: true },
+        if (!stopped.stopped) return;
+      }
+      yield* execution.confirmProcessesStopped(threadId, tracked ? "vm" : "provider");
+      const progress = makeThreadMoveProgress(move.progress ?? [], owner.environmentId, (report) =>
+        transport.progress(owner, report),
       );
-      const receipt = yield* transport.publish(owner, packed.artifactId);
+      if (move.manifestArtifactId === null) yield* progress.stage("capturing");
+      if (prepared) {
+        const ready = yield* enterCapture(owner, prepared).pipe(
+          Effect.as(true),
+          Effect.catchTag(
+            "CheckoutCaptureError",
+            Effect.fnUntraced(function* (error) {
+              if (!error.waitingForCheckout) return yield* error;
+              yield* checkoutNotice(owner, true, error.message);
+              return false;
+            }),
+          ),
+        );
+        if (!ready) return;
+      }
+      yield* checkoutNotice(owner, false, "Preparing the source snapshot.");
+      const saved = yield* Effect.gen(function* () {
+        const saved = yield* sourceArchive(owner, sealedSha256);
+        // Reused archives must still match the exact frozen placement and event head.
+        yield* verifySourceOwner(owner, saved);
+        const hold = yield* captures.release(owner, {
+          outcome: "sealed",
+          manifestSha256: saved.sha256,
+        });
+        yield* notifyCheckoutCaptureReleased(sql, hold.checkoutRoot);
+        return saved;
+      }).pipe(
+        Effect.tapError((error) =>
+          Effect.gen(function* () {
+            const hold = yield* captures.get(owner.operationId);
+            // A typed local failure arrives only after the copy's child work settled.
+            // Interruption deliberately retains the hold for recovery.
+            if (hold?.phase === "capturing") {
+              yield* captures.release(owner, { outcome: "failed", expectedPhase: "capturing" });
+              yield* notifyCheckoutCaptureReleased(sql, hold.checkoutRoot);
+            }
+            yield* reportFailure(owner, error, "source").pipe(Effect.ignore);
+          }),
+        ),
+      );
+      yield* history.synchronize(threadId);
+      if (move.phase === "preparing") {
+        move = yield* transport.freeze(owner, {
+          sourceCursor: saved.manifest.history.sourceSequence,
+          manifestSha256: saved.sha256,
+        });
+        yield* assertThreadMoveIdentity(owner, move);
+      }
       if (
-        receipt.manifestArtifactId !== packed.artifactId ||
-        receipt.artifactCount !== packed.uploads.length
+        move.manifestSha256 !== saved.sha256 ||
+        move.sourceCursor !== saved.manifest.history.sourceSequence
       )
-        return yield* fail(threadId, "The relay did not verify this complete move archive.");
-    }).pipe(Effect.ensuring(fs.remove(packed.directory, { recursive: true }).pipe(Effect.ignore)));
+        return yield* fail(threadId, "The frozen source changed after the move began.");
+      // Publication verifies every artifact. Keep the source frozen while the destination imports it.
+      if (move.manifestArtifactId !== null) return;
+      yield* progress.stage("packing");
+      const packed = yield* packThreadTransferArchive({
+        archiveDirectory: saved.directory,
+        scratchRoot: path.join(root, "chunks"),
+        expectedManifestSha256: saved.sha256,
+      });
+      yield* Effect.gen(function* () {
+        yield* progress.stage("uploading", {
+          bytes: packed.uploads.reduce((sum, file) => sum + file.sizeBytes, 0),
+          artifacts: packed.uploads.length,
+        });
+        yield* Effect.forEach(
+          packed.uploads,
+          Effect.fnUntraced(function* (file) {
+            const expected = {
+              artifactId: file.artifactId,
+              operationId: owner.operationId,
+              kind: file.kind,
+              sha256: file.sha256,
+              sizeBytes: file.sizeBytes,
+            };
+            const receipt = yield* transport.upload(owner, expected, fs.stream(file.path));
+            if (
+              receipt.threadId !== threadId ||
+              receipt.artifactId !== expected.artifactId ||
+              receipt.operationId !== owner.operationId ||
+              receipt.sha256 !== expected.sha256 ||
+              receipt.kind !== expected.kind ||
+              receipt.sizeBytes !== expected.sizeBytes ||
+              receipt.state !== "complete"
+            )
+              return yield* fail(
+                threadId,
+                "The move upload receipt does not match its saved bytes.",
+              );
+            yield* progress.verified(file.artifactId, file.sizeBytes);
+          }),
+          { concurrency: 4, discard: true },
+        );
+        const receipt = yield* transport.publish(owner, packed.artifactId);
+        if (
+          receipt.manifestArtifactId !== packed.artifactId ||
+          receipt.artifactCount !== packed.uploads.length
+        )
+          return yield* fail(threadId, "The relay did not verify this complete move archive.");
+      }).pipe(
+        Effect.ensuring(fs.remove(packed.directory, { recursive: true }).pipe(Effect.ignore)),
+      );
+    }).pipe(
+      Effect.tapError(() =>
+        Effect.gen(function* () {
+          const hold = yield* captures.get(owner.operationId);
+          if (hold?.phase === "draining") yield* releaseCapture(owner, "failed");
+        }).pipe(Effect.ignore),
+      ),
+    );
   });
   const destinationArchive = Effect.fnUntraced(function* (
     owner: ThreadMoveOwner,

@@ -46,6 +46,8 @@ import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
+  CodexSessionRuntimePendingApprovalNotFoundError,
+  CodexSessionRuntimePendingUserInputNotFoundError,
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeSendTurnInput,
   type CodexSessionRuntimeShape,
@@ -574,6 +576,27 @@ const sessionErrorLayer = it.layer(
 );
 
 sessionErrorLayer("CodexAdapterLive session errors", (it) => {
+  it.effect("rejects missing local approval and user-input callbacks before native dispatch", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("codex-missing-callback");
+      yield* adapter.startSession({ threadId, runtimeMode: "approval-required" });
+      const runtime: CodexSessionRuntimeShape = sessionRuntimeFactory.lastRuntime!;
+      vi.spyOn(runtime, "respondToRequest").mockImplementation((requestId) =>
+        Effect.fail(new CodexSessionRuntimePendingApprovalNotFoundError({ requestId })),
+      );
+      vi.spyOn(runtime, "respondToUserInput").mockImplementation((requestId) =>
+        Effect.fail(new CodexSessionRuntimePendingUserInputNotFoundError({ requestId })),
+      );
+      for (const response of [
+        adapter.respondToRequest(threadId, ApprovalRequestId.make("missing"), "accept"),
+        adapter.respondToUserInput(threadId, ApprovalRequestId.make("missing"), {}),
+      ])
+        NodeAssert.equal((yield* Effect.flip(response))._tag, "ProviderAdapterValidationError");
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("targets native steering and rejects a finished target before dispatch", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;
