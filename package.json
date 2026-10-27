@@ -16,7 +16,7 @@
     "migrate-dev-db": "node apps/server/scripts/migrate-dev-db.ts",
     "start": "vp run --filter t3 start",
     "start:desktop": "vp run --filter @t3tools/desktop start",
-    "start:orchestrator": "limactl shell --workdir=/ launchpad-e2b sudo -n docker start \"${E2B_ORCHESTRATOR_CONTAINER:-launchpad-e2b-proof-139103cd799f0104-orchestrator-1}\"",
+    "start:vm-host": "node scripts/vm-host.ts",
     "start:marketing": "vp run --filter @t3tools/marketing preview",
     "start:mock-update-server": "node scripts/mock-update-server.ts",
     "screenshots:mobile": "node scripts/mobile-showcase.ts",

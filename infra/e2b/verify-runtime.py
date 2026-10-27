@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -90,6 +91,51 @@ def verify_configuration(build_directory, configuration, project_name=None, *, k
             raise ValueError('build collector differs from its build checksum')
 
 
+def verify_deployment_directory(build_directory):
+    required = ('.env', 'build.json', 'compose.yaml', 'runtime.override.json', 'compose.override.yaml')
+    missing = [name for name in required if not (build_directory / name).is_file()]
+    if missing:
+        raise SystemExit('Selected VM host runtime is incomplete; missing ' + ', '.join(missing)
+                         + '. Set E2B_RUNTIME_DIR to an existing deployment directory.')
+
+
+def verify_exclusive_host(project_name):
+    # Only inspect IDs returned by Docker. Neither environment values nor Docker's
+    # diagnostic output may be printed: both can contain installation secrets.
+    try:
+        running = subprocess.run(
+            ['docker', 'ps', '--filter', 'label=com.docker.compose.service=orchestrator',
+             '--format', '{{.ID}}'], capture_output=True, text=True, check=False)
+        if running.returncode:
+            raise RuntimeError('Could not check running VM hosts; check the local Docker service.')
+        ids = running.stdout.split()
+        if not ids:
+            return
+        if any(not re.fullmatch(r'[a-fA-F0-9]{12,64}', identity) for identity in ids):
+            raise ValueError('Invalid container ID')
+        inspected = subprocess.run(['docker', 'inspect', *ids], capture_output=True,
+                                   text=True, check=False)
+        if inspected.returncode:
+            raise RuntimeError('Could not inspect running VM hosts; retry after Docker settles.')
+        containers = json.loads(inspected.stdout)
+        if not isinstance(containers, list):
+            raise ValueError('Invalid container inspection')
+        for container in containers:
+            config = container['Config']
+            labels = config.get('Labels') or {}
+            # Upstream Embed has the launcher command; generated builds also set OL_COMMAND.
+            e2b_launcher = (any(value.startswith('OL_COMMAND=') for value in config.get('Env') or [])
+                            or config.get('Cmd') == ['/bin/bash', '/opt/e2b/scripts/orchestrator-launch.sh'])
+            if (container['State']['Running']
+                    and labels.get('com.docker.compose.service') == 'orchestrator'
+                    and e2b_launcher
+                    and labels.get('com.docker.compose.project') != project_name):
+                raise RuntimeError('Another E2B deployment is running on this host. Stop that deployment '
+                                   'before starting the selected VM host; no containers were stopped.')
+    except (OSError, ValueError, KeyError, TypeError):
+        raise RuntimeError('Could not verify running VM hosts; check the local Docker service.') from None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-directory', type=Path, required=True)
@@ -99,21 +145,31 @@ def main():
                         help='Preserve this installed keeper path; its content must match the selected build receipt')
     parser.add_argument('--file', action='append', type=Path, required=True,
                         help='Every Compose file, in the same order used to start services')
+    parser.add_argument('--require-exclusive-host', action='store_true',
+                        help='Require a complete deployment and refuse another running E2B host')
     args = parser.parse_args()
+    if args.require_exclusive_host:
+        verify_deployment_directory(args.build_directory)
     command = ['docker', 'compose', '--project-directory', str(args.project_directory.resolve())]
     if args.project_name:
         command += ['--project-name', args.project_name]
     for file in args.file:
         command += ['--file', str(file.resolve())]
-    # The resolved document may contain installation secrets; never print it.
-    result = subprocess.run(command + ['config', '--format', 'json'], capture_output=True, check=False)
-    if result.returncode:
-        raise SystemExit('Compose configuration failed; inspect the installation locally.')
     try:
-        verify_configuration(args.build_directory, json.loads(result.stdout), args.project_name,
+        # The resolved document may contain installation secrets; never print it.
+        result = subprocess.run(command + ['config', '--format', 'json'], capture_output=True, check=False)
+        if result.returncode:
+            raise SystemExit('Compose configuration failed; inspect the installation locally.')
+        configuration = json.loads(result.stdout)
+        verify_configuration(args.build_directory, configuration, args.project_name,
                              keeper_script=args.keeper_script)
     except (ValueError, KeyError, OSError) as error:
         raise SystemExit(f'Runtime verification failed: {type(error).__name__}. Check the build receipt, binary and Compose override order.') from None
+    if args.require_exclusive_host:
+        try:
+            verify_exclusive_host(configuration['name'])
+        except RuntimeError as error:
+            raise SystemExit(str(error)) from None
     print('Runtime image pins and orchestrator launcher match the selected build receipt.')
 
 

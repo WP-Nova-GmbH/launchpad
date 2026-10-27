@@ -9,8 +9,33 @@ the thread VMs on a Linux host.
 Install the checkout's dependencies with `vp i`, then follow
 [E2B host setup](e2b-host-setup.md#macos-development-only). On a Mac, this uses the
 dedicated `launchpad-e2b` Lima VM. On Linux, use the native host instructions.
-Skip creating a host if you already have one. Keep its E2B services running,
-including the API and sandbox proxy; starting only the orchestrator is insufficient.
+For a new installation, prepare the Linux host and
+[build the supported patched runtime](e2b-host-setup.md#build-the-launchpad-runtime),
+including its host safeguards. The optional
+unmodified upstream checks are not required. Reuse an existing supported
+installation if you already have one. Once the Linux host is running, start its
+E2B services from the Launchpad checkout:
+
+```sh
+vp run start:vm-host
+```
+
+The command verifies and starts the existing installation at
+`/var/lib/launchpad-e2b`, including the API, orchestrator and sandbox proxy. On a
+Mac, that path is inside Lima; on Linux, it is on the native host. If your existing
+installation is elsewhere, set `E2B_RUNTIME_DIR` in `infra/relay/.env` to its absolute
+Linux path. Shell environment variables take precedence. Keep that installation
+in place; the override selects it without moving or copying its files.
+
+Startup downloads missing dependency images at the installation's pinned versions.
+The locally built Launchpad runtime images must already exist; they are not rebuilt
+or downloaded by this command.
+The upstream `base-template` job is left to optional smoke tests; Launchpad builds
+its own runner image in step 3.
+
+The Linux host must already be running. This command does not create Lima VMs,
+build images or start the relay. For a separate Linux machine, run it from a
+Launchpad checkout on that machine.
 
 ## 2. Configure the relay once
 
@@ -43,6 +68,9 @@ namespace instead of `dev-alex`.
 
 Get the Clerk keys from your Clerk application's API keys page. Get the E2B key
 from your self-hosted installation using [these instructions](e2b-host-setup.md#retrieve-the-e2b-api-key).
+On a new host, the first E2B startup generates its team credentials. Then complete
+the guide's team restore, lifetime and capacity configuration and run
+`vp run start:vm-host` again before starting Launchpad with VM support.
 The Cloudflare API token needs tunnel editing for the account, and Zone Read plus
 DNS Edit for the zone; the relay uses DNS editing for individual VM endpoints.
 
@@ -117,9 +145,10 @@ inside the new VM when the app asks for it.
 
 ## Later startups
 
-Start your existing Linux host and its E2B services, then run:
+Start your existing Linux host, then run from the Launchpad checkout:
 
 ```sh
+vp run start:vm-host
 docker compose up -d --wait postgres
 vp run dev:vm
 ```

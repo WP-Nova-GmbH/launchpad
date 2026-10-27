@@ -4,9 +4,11 @@ The target compute machine runs Linux natively. On macOS, Lima supplies that Lin
 machine for development. Both follow the same host setup below. The Launchpad app
 and relay can run separately from the compute host.
 
-This guide prepares an upstream E2B sandbox for development and validation.
-Starting E2B does not yet enable VM mode in Launchpad. Product integration and the
-remaining recovery checks are in progress; this stack is for development, not user workloads.
+Launchpad VM support uses the pinned E2B runtime with the full Launchpad patch set.
+Prepare the Linux host, then [build the Launchpad runtime](#build-the-launchpad-runtime).
+The upstream smoke checks and unmodified baseline below are optional maintainer
+checks, not prerequisites for normal setup. Deployment-specific recovery and
+lifetime proofs remain required before using automatic lifecycle cleanup.
 
 ## Start desktop with VM support
 
@@ -134,7 +136,11 @@ resources, check the retained VM catalog, firewall, protected cgroups and servic
 health before admitting work. Keep service connection ports in the saved Compose
 configuration; temporary forwarding processes do not survive host restart.
 
-## Start and verify E2B
+## Optional upstream smoke checks for maintainers
+
+For Launchpad VM support, skip these checks and
+[build the patched runtime](#build-the-launchpad-runtime). This section exercises
+the upstream stack independently; it does not prepare the Launchpad installation.
 
 Use E2B's own Compose deployment in a directory outside the Launchpad checkout.
 It configures the Linux host's kernel modules, network and storage, so it belongs
@@ -166,7 +172,7 @@ Keep Lima's explicit port allowlist in place when connecting Mac clients. The
 template upload endpoint returns a URL on port 5008, so that forward is required
 for builds that copy the runner archive.
 
-### Retrieve the E2B API key
+## Retrieve the E2B API key
 
 The first startup generates a team API key for this self-hosted installation;
 no E2B cloud account is needed. E2B stores it in the `seed-state` Docker volume
@@ -185,7 +191,7 @@ upstream stack, read the `E2B_API_KEY` export from:
 sudo docker compose logs ready
 ```
 
-The Launchpad runtime started in [Build the runtime for development](#build-the-runtime-for-development)
+The Launchpad runtime started in [Build the Launchpad runtime](#build-the-launchpad-runtime)
 does not start `ready`. Read the same key through its running `launchpad-keepalive`
 service instead, using the same Compose files and project name used at startup:
 
@@ -405,7 +411,7 @@ off, neither schedules provisioning nor requires these settings. Use a disposabl
 relay database for integration tests; enabling this switch against existing
 pending records allows those records to be processed.
 
-## Build the runtime for development
+## Build the Launchpad runtime
 
 `infra/e2b/build-runtime.py` builds the API, client proxy, database migrator and
 orchestrator from the source archive in `runtime.lock.json`. The proxy must use
@@ -424,32 +430,29 @@ Copy the builder, lock file, `infra/e2b/verify-runtime.py`, and
 `e2b-keepalive.ts`. The builder copies both host safeguards into its output
 directory and records their checksums. Run with Python 3.12+, Docker
 and Buildx installed. The current lock covers **Linux ARM64**; another architecture
-needs its own verified image and binary pins. The output directory must be new:
-
-```sh
-sudo python3 build-runtime.py /var/lib/launchpad-e2b-baseline
-```
+needs its own verified image and binary pins. Use the complete patched build
+command below; the output directory must be new.
 
 An optional `--archive /path/to/runtime-source.tar.gz` reuses a local download;
 the checksum is still required. The script builds only: it does not start services
 or replace the installed orchestrator. Keep the output directory, since the
 host launcher uses its compiled binary directly.
 
-For the runtime proofs, first stop any other E2B stack on this dedicated host.
-E2B uses host ports, network devices and KVM resources, so separate Compose project
-names do not make concurrent installations safe. Apply the Launchpad host firewall
-as described below, then start the generated development configuration:
+`/var/lib/launchpad-e2b` is the default installation directory for
+`vp run start:vm-host`. On macOS, this directory is inside the dedicated Lima VM.
+For an existing installation elsewhere, set `E2B_RUNTIME_DIR` in
+`infra/relay/.env` to its absolute Linux path; shell environment variables take
+precedence. Keep its current directory and storage in place. From the Launchpad
+checkout on your Mac or native Linux host, `vp run start:vm-host` verifies and
+starts the generated deployment using all three Compose files. It requires the
+Linux host to be running already.
 
-```sh
-cd /var/lib/launchpad-e2b-baseline
-sudo python3 /path/to/verify-runtime.py --build-directory "$PWD" \
-  --project-directory "$PWD" --file compose.yaml --file runtime.override.json \
-  --file compose.override.yaml
-sudo docker compose -f compose.yaml -f runtime.override.json -f compose.override.yaml \
-  up -d --wait api client-proxy base-template launchpad-keepalive
-sudo docker compose -f compose.yaml -f runtime.override.json -f compose.override.yaml \
-  --profile test run --rm smoke
-```
+Before starting the selected runtime, first stop any other E2B stack on this dedicated host.
+E2B uses host ports, network devices and KVM resources, so separate Compose project
+names do not make concurrent installations safe. Install the host safeguards
+below before starting it. The first startup generates the installation's team
+credentials; configure that team's restore, lifetime and capacity settings after
+startup and before moving Launchpad threads.
 
 Pass every Compose override to the verifier in its actual launch order. It checks
 the Compose project name, merged API/proxy/migrator image pins, and host orchestrator command and
@@ -482,10 +485,7 @@ updated automatically. Stop them using their original configuration and create a
 fresh build directory with this script; do not rename a deployment's project while
 keeping its existing disk storage.
 
-This is the unmodified source baseline for the restore/lifetime work. Successfully
-building or starting it does not satisfy either release gate below.
-
-### Develop prepared restore support
+### Build the supported patched runtime
 
 The runtime patches are applied in order: `0001` adds strict offline filesystem
 verification; `0002` adds a durable independent disk, bounded enrollment replacement
@@ -564,10 +564,11 @@ host. Repeat these proofs on the deployment you intend to use. Product provision
 artifact retention and lifecycle integration remain separate release requirements.
 
 Copy the runtime patch files from `infra/e2b/patches/` and `runtime-tests.Dockerfile` beside
-the build script. Apply them explicitly to a fresh source build:
+the build script. For a new Launchpad installation, apply the full patch set to
+the default directory:
 
 ```sh
-sudo python3 build-runtime.py /var/lib/launchpad-e2b-disk-check \
+sudo python3 build-runtime.py /var/lib/launchpad-e2b \
   --patch 0001-offline-restore-filesystem-check.patch \
   --patch 0002-durable-prepared-disk.patch \
   --patch 0003-restore-operation-state.patch \
@@ -611,6 +612,37 @@ sudo python3 build-runtime.py /var/lib/launchpad-e2b-disk-check \
   --patch 0041-orchestrator-service-shutdown.patch \
   --patch 0042-stopped-restore-template-retirement.patch \
   --patch 0043-preserve-finalized-image-permissions.patch
+```
+
+Existing patched installations in other directories keep their current path and
+storage; select them with `E2B_RUNTIME_DIR` rather than moving files or rebuilding
+just to adopt the default. Use a separate fresh output directory for an isolated
+runtime proof, and pass that directory consistently to its verification commands.
+
+After installing the host safeguards below, start the E2B control plane from
+the Launchpad checkout on your Mac or native Linux host:
+
+```sh
+vp run start:vm-host
+```
+
+This verifies the build receipt and starts the required E2B services. Missing
+external dependency images are downloaded at their pinned digests; the locally
+built API, proxy and migrator retain `pull_policy: never`. On first
+startup, retrieve the generated [E2B API key](#retrieve-the-e2b-api-key) and use the
+installation's seeded team UUID for the restore/lifetime settings below. Apply
+the team and capacity configuration before admitting Launchpad threads, then run
+`vp run start:vm-host` again to recreate affected services with those settings.
+Normal startup skips the upstream `base-template` job because Launchpad builds its
+own runner template. For an optional upstream smoke check against that patched
+installation, enter its directory inside Linux and retain the same project
+identity and all three files. The smoke service builds the upstream base template
+and waits for it to finish successfully:
+
+```sh
+cd /var/lib/launchpad-e2b
+sudo docker compose -f compose.yaml -f runtime.override.json -f compose.override.yaml \
+  --profile test run --rm smoke
 ```
 
 Managed VM creation requires `LAUNCHPAD_REQUIRE_EXECUTION_FENCE=true` on every
@@ -788,7 +820,7 @@ Run the focused race tests and export the privileged integration test binary:
 ```sh
 sudo docker build --file runtime-tests.Dockerfile \
   --output type=local,dest=/tmp/launchpad-e2b-rootfs-tests \
-  /var/lib/launchpad-e2b-disk-check/source/e2b-dev-runtime-1599d6e/packages
+  /var/lib/launchpad-e2b/source/e2b-dev-runtime-1599d6e/packages
 sudo env E2B_OFFLINE_RESTORE_TEST=1 \
   /tmp/launchpad-e2b-rootfs-tests/rootfs-tests \
   -test.run '^(TestPrepareRestoreFilesystemOffline|TestPreparedDiskOfflineSurvivesSourceDeletion|TestRestoreBootstrapRejectsSymlinkOffline)$' \
@@ -834,6 +866,20 @@ create the device pool if it cannot confirm that old tools have stopped, includi
 when ordinary startup resource reclamation is disabled. This requires one
 orchestrator per compute host, as the underlying NBD and networking setup already do.
 
+### Optional unmodified baseline for maintainers
+
+To compare the patched runtime with unmodified upstream source, build a separate
+baseline directory without the patch arguments:
+
+```sh
+sudo python3 build-runtime.py /var/lib/launchpad-e2b-baseline
+```
+
+This baseline is for development checks only and cannot provide Launchpad's
+required lifecycle capabilities. Do not select it for normal VM support. It is
+not a prerequisite for the patched build, and building it does not start services
+or replace an existing installation.
+
 ## Launchpad host safeguards
 
 Install `infra/e2b/host-firewall.nft`, `host-firewall.py` and
@@ -847,7 +893,7 @@ sudo install -D -m 0644 launchpad-thread-vm-firewall.service /etc/systemd/system
 sudo systemctl daemon-reload
 sudo systemctl enable --now launchpad-thread-vm-firewall.service
 sudo /usr/local/libexec/launchpad-host-firewall check
-cd /var/lib/launchpad-e2b-disk-check
+cd /var/lib/launchpad-e2b
 sudo docker compose -f compose.yaml -f runtime.override.json -f compose.override.yaml \
   up -d --no-deps launchpad-keepalive
 ```
@@ -1043,15 +1089,23 @@ an independent saved image.
 
 ## Stop and restart
 
-Stop the E2B stack from its deployment directory:
+Stop the generated E2B stack from its existing deployment directory inside Linux,
+using the same project identity and Compose files as startup:
 
 ```sh
-sudo docker compose down
+sudo docker compose -f compose.yaml -f runtime.override.json -f compose.override.yaml down
 ```
 
-This ends running sandboxes; save or pause work first. After a Linux host restart,
-run `sudo docker compose up -d --wait` again to reapply host setup. For destructive
-cleanup or failed startup, use the upstream guide for the installed revision.
+`runtime.override.json` supplies the generated project name. If startup used an
+explicit `--project-name` or additional overrides, include those same arguments
+when stopping it. Do not add `--volumes` (`-v`): its volumes contain installation
+state.
+
+Stopping the host services ends all running thread VMs on that host; save or pause
+their work first. After restarting the Linux host, run `vp run start:vm-host` from
+the Launchpad checkout on your Mac or native Linux host. It reuses the selected
+installation and storage. For destructive cleanup or failed startup, use the
+upstream guide for the installed revision.
 
 ## Private application previews
 
