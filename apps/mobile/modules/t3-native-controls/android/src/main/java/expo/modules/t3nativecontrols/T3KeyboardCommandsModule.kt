@@ -35,8 +35,10 @@ class T3KeyboardCommandsView(
         event.isCtrlPressed
     val command = when {
       !isCommandKeyDown -> null
-      event.keyCode == KeyEvent.KEYCODE_V && event.isAltPressed && !event.isShiftPressed -> "threadVms"
-      event.keyCode == KeyEvent.KEYCODE_C && event.isShiftPressed && !event.isAltPressed -> "copyThreadReference"
+      event.keyCode == KeyEvent.KEYCODE_V && event.isAltPressed && !event.isShiftPressed ->
+        "threadVms"
+      event.keyCode == KeyEvent.KEYCODE_C && event.isShiftPressed && !event.isAltPressed ->
+        "copyThreadReference"
       else -> null
     }
     if (command != null && enabledCommands.contains(command)) {
