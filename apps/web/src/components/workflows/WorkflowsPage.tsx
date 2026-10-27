@@ -1,6 +1,12 @@
 import { useAtomValue } from "@effect/atom-react";
 import { workflowTriggerLabel } from "./WorkflowTriggerInspector";
-import { ArrowLeftIcon, CopyIcon, ChevronDownIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  CopyIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  FolderGit2Icon,
+} from "lucide-react";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { ClerkFailed, ClerkLoaded, ClerkLoading, useAuth } from "@clerk/react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
@@ -31,6 +37,7 @@ import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
+import { DiscoveryList, DiscoveryListRow } from "../ui/discovery-list";
 import { Spinner } from "../ui/spinner";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
 import {
@@ -169,41 +176,48 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
     );
   if (!entry || !scope)
     return (
-      <WorkspacePageContainer>
-        <h1 className="text-xl font-semibold">Workflows</h1>
-        <p className="text-sm text-muted-foreground">Choose a repository.</p>
-        {catalog.data.repositories.length ? (
-          <div className="w-full max-w-sm">
-            <Select
-              value={repositoryId ?? null}
-              onValueChange={(id) => {
-                if (id)
-                  void navigate({
-                    to: "/workflows/$repositoryId",
-                    params: { repositoryId: id },
-                    search: { tab: "workflows" },
-                  });
-              }}
-            >
-              <SelectTrigger aria-label="Workflow repository">
-                <SelectValue placeholder="Select a repository" />
-              </SelectTrigger>
-              <SelectPopup>
-                {catalog.data.repositories.map((entry) => (
-                  <SelectItem
-                    key={entry.repository.repositoryId}
-                    value={entry.repository.repositoryId}
-                  >
-                    {entry.repository.name}
-                  </SelectItem>
+      <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+        <WorkspacePageHeader electron={isElectron}>
+          <h1 className="text-sm font-medium">Workflows</h1>
+        </WorkspacePageHeader>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <WorkspacePageContainer width="expanded">
+            <p className="text-sm text-muted-foreground">Choose a repository.</p>
+            {catalog.data.repositories.length ? (
+              <DiscoveryList>
+                {catalog.data.repositories.map(({ repository }) => (
+                  <DiscoveryListRow
+                    key={repository.repositoryId}
+                    icon={
+                      <FolderGit2Icon
+                        aria-hidden
+                        className="size-4 shrink-0 text-muted-foreground"
+                      />
+                    }
+                    title={repository.name}
+                    description={repository.canonicalKeys.join(" · ")}
+                    action={
+                      <ChevronRightIcon
+                        aria-hidden
+                        className="size-4 shrink-0 text-muted-foreground"
+                      />
+                    }
+                    onClick={() =>
+                      void navigate({
+                        to: "/workflows/$repositoryId",
+                        params: { repositoryId: repository.repositoryId },
+                        search: { tab: "workflows" },
+                      })
+                    }
+                  />
                 ))}
-              </SelectPopup>
-            </Select>
-          </div>
-        ) : (
-          <p>No repositories available. Add one in Organization settings.</p>
-        )}
-      </WorkspacePageContainer>
+              </DiscoveryList>
+            ) : (
+              <p>No repositories available. Add one in Organization settings.</p>
+            )}
+          </WorkspacePageContainer>
+        </div>
+      </div>
     );
   return (
     <WorkflowRepositoryView
@@ -731,7 +745,7 @@ function WorkflowRepositoryView({
       </div>
     );
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col">
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
       {copy ? (
         <Dialog
           open
@@ -791,7 +805,7 @@ function WorkflowRepositoryView({
         </Dialog>
       ) : null}
       <WorkspacePageHeader electron={isElectron}>
-        <span className="text-sm font-medium">Workflows</span>
+        <h1 className="text-sm font-medium">Workflows</h1>
       </WorkspacePageHeader>
       <div className="min-h-0 flex-1 overflow-y-auto">
         <WorkspacePageContainer width="expanded">
