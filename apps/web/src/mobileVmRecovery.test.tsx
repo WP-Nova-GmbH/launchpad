@@ -115,10 +115,12 @@ vi.mock("../../mobile/src/state/server", async () => {
 });
 vi.mock("../../mobile/src/state/threads", async () => {
   const { Atom } = await import("effect/unstable/reactivity");
+  const locationAtom = Atom.make(null);
   return {
     environmentThreadShells: { threadShellsAtom: Atom.make([]).pipe(Atom.keepAlive) },
     threadEnvironment: { enqueuePrompt: "enqueue", getCommandReceipt: "receipt" },
     threadVmControls: {
+      locationViewAtom: () => locationAtom,
       viewAtom: () => vmViewAtom,
       checkBackupRecovery: "backup",
       openPreview: "preview",

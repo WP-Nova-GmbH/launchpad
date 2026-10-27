@@ -10,6 +10,7 @@ const testState = vi.hoisted(() => {
     defaultModelSelection: null,
     defaultRuntimeMode: "full-access" as RuntimeMode,
   };
+  const targetEnvironment: { threadVm?: { threadId: string } } = {};
   let storedDraft: {
     readonly draftId: string;
     readonly environmentId: string;
@@ -45,6 +46,7 @@ const testState = vi.hoisted(() => {
     get targetSettings() {
       return targetSettings;
     },
+    targetEnvironment,
     reset(
       nextStoredDraft: typeof storedDraft,
       workspaceDefaults = {
@@ -53,6 +55,7 @@ const testState = vi.hoisted(() => {
       },
     ) {
       storedDraft = nextStoredDraft;
+      delete targetEnvironment.threadVm;
       targetSettings = {
         defaultThreadEnvMode: workspaceDefaults.envMode,
         newWorktreesStartFromOrigin: workspaceDefaults.startFromOrigin,
@@ -79,13 +82,17 @@ vi.mock("@effect/atom-react", () => ({
           [
             "environment-primary",
             {
+              environment: {},
               settings: {
                 ...testState.targetSettings,
                 newWorktreesStartFromOrigin: !testState.targetSettings.newWorktreesStartFromOrigin,
               },
             },
           ],
-          ["environment-ssh", { settings: testState.targetSettings }],
+          [
+            "environment-ssh",
+            { environment: testState.targetEnvironment, settings: testState.targetSettings },
+          ],
         ]),
 }));
 vi.mock("@t3tools/client-runtime/environment", () => ({
@@ -194,6 +201,21 @@ describe.each([
     },
   ],
 ])("useNewThreadHandler with a %s draft", (_, draft) => {
+  it("does not create or reopen a draft in an assigned thread VM", async () => {
+    testState.reset(draft);
+    testState.targetEnvironment.threadVm = { threadId: "thread-assigned" };
+
+    const opened = await useNewThreadHandler()({
+      environmentId: "environment-ssh",
+      projectId: "project-remote",
+    } as never);
+
+    expect(opened).toBeNull();
+    expect(testState.draftStore.setDraftThreadContext).not.toHaveBeenCalled();
+    expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
+    expect(testState.router.navigate).not.toHaveBeenCalled();
+  });
+
   it.each(["approval-required", "auto-accept-edits", "auto", "full-access"] as const)(
     "uses the target environment's %s permissions for new threads",
     async (runtimeMode) => {
