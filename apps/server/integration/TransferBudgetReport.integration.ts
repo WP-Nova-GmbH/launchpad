@@ -282,6 +282,32 @@ export function formatTransferBudgetReport(runs: ReadonlyArray<TransferBudgetRun
     );
   }
 
+  const diagnosticRuns = runs.filter((run) => run.measuredTurnWebSocket.rpcChunks !== undefined);
+  if (diagnosticRuns.length > 0) {
+    lines.push(
+      "",
+      "## RPC chunk diagnostics",
+      "",
+      "WebSocket messages count transport deliveries, including command responses. RPC chunks contain batches of stream items; their sizes depend on queue draining and acknowledgements. Detail sequence counts cover only the measured turn on the capped thread socket.",
+      "",
+    );
+    for (const run of diagnosticRuns) {
+      const chunks = run.measuredTurnWebSocket.rpcChunks!;
+      const sequences = chunks.flatMap((chunk) => chunk.detailEventSequences);
+      const uniqueSequences = new Set(sequences).size;
+      const chunkSizes = new Map<number, number>();
+      for (const chunk of chunks)
+        chunkSizes.set(chunk.items, (chunkSizes.get(chunk.items) ?? 0) + 1);
+      const histogram = Array.from(chunkSizes)
+        .sort(([left], [right]) => left - right)
+        .map(([size, count]) => `${size} × ${count}`)
+        .join(", ");
+      lines.push(
+        `- ${run.provider}: ${run.measuredTurnWebSocket.messages} WebSocket messages; ${chunks.length} RPC chunks; ${sequences.length} detail events; ${uniqueSequences} unique sequences; ${sequences.length - uniqueSequences} duplicates. Chunk sizes (items × chunks): ${histogram || "none"}.`,
+      );
+    }
+  }
+
   lines.push("", "## Compression diagnostics", "");
   for (const run of runs) {
     lines.push(

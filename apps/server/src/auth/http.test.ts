@@ -121,6 +121,7 @@ it.effect("verifies a paired browser profile without exposing or widening its cr
             postJson("/api/auth/browser-session", { credential: DEV_TOKEN }),
             requestContext,
           );
+          expect(dev.status).toBe(200);
           const devCookie =
             dev.headers
               .getSetCookie()
@@ -142,12 +143,18 @@ it.effect("verifies a paired browser profile without exposing or widening its cr
             ),
             requestContext,
           );
+          expect(pairingResponse.status).toBe(200);
           const pairing = (await pairingResponse.json()) as { credential: string };
           const paired = await api.handler(
-            postJson("/api/auth/browser-session", { credential: pairing.credential }),
+            postJson("/api/auth/browser-session", {
+              credential: pairing.credential,
+              client: { label: "Identity test browser" },
+            }),
             requestContext,
           );
+          expect(paired.status).toBe(200);
           const cookie = paired.headers.getSetCookie()[0]?.split(";", 1)[0] ?? "";
+          expect(cookie).toMatch(/^t3_session_[^=]+=.+/);
           const identityResponse = await api.handler(
             postJson(
               "/api/auth/browser-identity",

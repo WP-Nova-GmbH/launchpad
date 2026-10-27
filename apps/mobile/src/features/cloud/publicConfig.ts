@@ -1,7 +1,8 @@
 import Constants from "expo-constants";
 import { relayClerkTokenOptions } from "@t3tools/shared/relayAuth";
-import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Schema from "effect/Schema";
+
+import { resolveConfiguredRelayUrl } from "../../lib/relayConfig";
 
 export class CloudPublicConfigMissingError extends Schema.TaggedError<CloudPublicConfigMissingError>()(
   "CloudPublicConfigMissingError",
@@ -63,7 +64,7 @@ export function resolveCloudPublicConfig(extra: ExpoExtra = Constants.expoConfig
       jwtTemplate: trimNonEmpty(extra?.clerk?.jwtTemplate),
     },
     relay: {
-      url: normalizeSecureRelayUrl(trimNonEmpty(extra?.relay?.url) ?? ""),
+      url: resolveConfiguredRelayUrl(extra),
     },
     observability: {
       tracesUrl: normalizeSecureUrl(extra?.observability?.tracesUrl),

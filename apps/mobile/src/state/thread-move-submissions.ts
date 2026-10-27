@@ -1,9 +1,8 @@
-import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
-import { resolveCloudPublicConfig } from "../features/cloud/publicConfig";
-export const threadMoveRelayUrl = () =>
-  normalizeSecureRelayUrl(resolveCloudPublicConfig().relay.url ?? "");
 import { createThreadMoveSubmissionJournal } from "@t3tools/client-runtime/relay/threadMoveSubmission";
 import { writeFileAtomically } from "../lib/atomic-file";
+import { resolveConfiguredRelayUrl } from "../lib/relayConfig";
+
+export const threadMoveRelayUrl = () => resolveConfiguredRelayUrl();
 
 async function fileFor(key: string) {
   const { digestStringAsync, CryptoDigestAlgorithm } = await import("expo-crypto");

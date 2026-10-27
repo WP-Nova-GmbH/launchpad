@@ -26,7 +26,10 @@ it.effect(
       yield* sql`INSERT INTO thread_attachment_checkpoints(thread_id,generation,turn_id,environment_id,source_sequence,
       directory,manifest_sha256,published_artifact_id)
       VALUES ('thread',1,'turn','environment',5,'/retained/chat',${"c".repeat(64)},'chat-artifact')`;
-      assert.deepStrictEqual(yield* runMigrations(), [[69, "FrozenThreadCheckpoints"]]);
+      assert.deepStrictEqual(
+        yield* runMigrations(),
+        migrationManifest.filter(([id]) => id > 68),
+      );
       assert.deepStrictEqual(
         yield* sql`SELECT turn_id,checkpoint_id,capture_operation_id,directory,published_artifact_id
       FROM thread_native_checkpoints`,
@@ -161,20 +164,10 @@ describe("migration history guard", () => {
       yield* sql`INSERT INTO orchestration_command_receipts
         (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error)
         VALUES ('old-receipt', 'thread', 'old-shared-thread', '2026-09-28T00:00:00.000Z', 1, 'accepted', NULL)`;
-      assert.deepStrictEqual(yield* runMigrations(), [
-        [58, "CommandReceiptProjectScope"],
-        [59, "ThreadCleanupFences"],
-        [60, "ThreadExecutionFences"],
-        [61, "ThreadTransferBaselines"],
-        [62, "ThreadCheckoutClaims"],
-        [63, "ThreadTransferRuntime"],
-        [64, "CheckoutOperations"],
-        [65, "ThreadTransferReadiness"],
-        [66, "ThreadMoveQueue"],
-        [67, "ThreadNativeCheckpoints"],
-        [68, "ThreadAttachmentCheckpoints"],
-        [69, "FrozenThreadCheckpoints"],
-      ]);
+      assert.deepStrictEqual(
+        yield* runMigrations(),
+        migrationManifest.filter(([id]) => id > 57),
+      );
       assert.deepStrictEqual(yield* sql`SELECT project_id FROM orchestration_command_receipts`, [
         { project_id: null },
       ]);

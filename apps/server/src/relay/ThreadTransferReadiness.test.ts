@@ -20,6 +20,7 @@ import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import { ProviderAdapterRequestError } from "../provider/Errors.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
+import { workspaceGit } from "./ThreadWorkspaceGit.ts";
 
 const encode = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const at = "2026-10-05T10:00:00.000Z";
@@ -38,6 +39,7 @@ const fixture = Effect.fnUntraced(function* (options?: {
     path = yield* Path.Path,
     sql = yield* SqlClient.SqlClient;
   const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "transfer-ready-" }));
+  yield* workspaceGit(root, ["init", "-b", "main"]);
   const threadId = ThreadId.make(`ready-${++serial}`),
     operationId = `move-${threadId}`,
     projectId = `project-${threadId}`;
@@ -268,7 +270,9 @@ it.layer(
     it.effect(`blocks setup when prerequisites fail: ${encode(options)}`, () =>
       Effect.gen(function* () {
         const f = yield* fixture(options);
-        yield* Effect.flip(f.prepare);
+        expect((yield* Effect.flip(f.prepare)).message).toContain(
+          "liveSession" in options ? "provider session is already" : "configured sign-in",
+        );
         expect(yield* f.fs.exists(f.path.join(f.root, "setup-count"))).toBe(false);
         yield* Effect.flip(f.fence.activate(f.input));
       }),

@@ -2532,15 +2532,20 @@ const makeWsRpcLayer = (
                 isThreadDetailEvent(event);
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
-                Stream.tap((event) =>
-                  event.aggregateId === input.threadId && event.type === "thread.placement-imported"
+                // Preserve source batches so synchronization cannot overtake buffered events.
+                Stream.mapArrayEffect((events) =>
+                  events.some(
+                    (event) =>
+                      event.aggregateId === input.threadId &&
+                      event.type === "thread.placement-imported",
+                  )
                     ? Effect.fail(
                         new OrchestrationGetSnapshotError({
                           message: "Thread moved; reload its imported history.",
                           cause: input.threadId,
                         }),
                       )
-                    : Effect.void,
+                    : Effect.succeed(events),
                 ),
                 Stream.filter(isThisThreadDetailEvent),
                 Stream.map((event) => ({
