@@ -254,6 +254,10 @@ Restart the relay after a successful build to use the new selection. Failed
 builds preserve the previous selection. Detailed build receipts are kept in
 `infra/relay/.t3/e2b-builds`; the lower-level builder accepts `--output` to choose
 a new receipt path instead.
+For deployments outside the dev runner, update the relay's configured compute template selection
+(`settings.compute.templateId`) to the new version and verify the next allocation uses that build.
+Existing VMs keep their installed executable; move a thread back to a machine and into a new VM
+to pick up updated Git setup. Rebuilding alone does not update running or paused VMs.
 When the builder and relay run on separate machines, copy the selection file to
 the relay and set `E2B_TEMPLATE_FILE` to its absolute path on both machines.
 An existing successful build receipt can also be used as `E2B_TEMPLATE_FILE`

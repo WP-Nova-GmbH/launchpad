@@ -25,6 +25,10 @@ import { OrchestrationEngineService } from "../orchestration/Services/Orchestrat
 import { forkParked } from "../serverActivation.ts";
 import { makeThreadExecutionAuthority } from "./ThreadExecutionAuthority.ts";
 import { makeThreadHistorySync } from "./ThreadHistorySync.ts";
+import {
+  makeThreadVmGitRefresh,
+  refreshInstalledThreadVmRepository,
+} from "./ThreadVmGitRefresh.ts";
 
 export class ThreadRelayCoordinator extends Context.Service<
   ThreadRelayCoordinator,
@@ -162,6 +166,8 @@ export const layer = Layer.effect(
       yield* Effect.context<Effect.Services<ReturnType<typeof activateRestoredThreadVm>>>();
     const activationContext =
       yield* Effect.context<Effect.Services<ReturnType<typeof activateInitialThreadVm>>>();
+    const gitContext =
+      yield* Effect.context<Effect.Services<typeof refreshInstalledThreadVmRepository>>();
     const execution = yield* ThreadExecution;
     const commands = makeThreadCommandSync(
       sql,
@@ -253,6 +259,9 @@ export const layer = Layer.effect(
       );
     }).pipe(Effect.catch(() => Effect.logDebug("Portable checkpoint sweep will retry")));
     const moveSweep = yield* makeThreadMoveSweep(authority, enrollment, moves);
+    const gitSweep = makeThreadVmGitRefresh(
+      refreshInstalledThreadVmRepository.pipe(Effect.provideContext(gitContext)),
+    );
     const finalSaveSweep = Effect.gen(function* () {
       const vm = yield* readInstalledThreadVm();
       if (!vm) return;
@@ -276,6 +285,7 @@ export const layer = Layer.effect(
       );
     }).pipe(Effect.catch(() => Effect.logDebug("Final VM save discovery will retry")));
     yield* forkParked(finalSaveSweep.pipe(Effect.repeat(Schedule.spaced("5 seconds"))));
+    yield* forkParked(gitSweep.pipe(Effect.repeat(Schedule.spaced("5 seconds"))));
     yield* forkParked(moveSweep.pipe(Effect.repeat(Schedule.spaced("5 seconds"))));
     yield* forkParked(sweep.pipe(Effect.repeat(Schedule.spaced("5 seconds"))));
     yield* forkParked(checkpointSweep.pipe(Effect.repeat(Schedule.spaced("5 seconds"))));

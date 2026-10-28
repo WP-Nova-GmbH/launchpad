@@ -8,10 +8,46 @@ import {
   RelayHealthResponse,
   RelayPortableThreadPlacement,
   RelayThreadMove,
+  RelayThreadVmRepositoryBinding,
 } from "./relay.ts";
 
 const decodeDevice = Schema.decodeUnknownExit(RelayDeviceRegistrationRequest);
 const decodeMove = Schema.decodeUnknownSync(RelayThreadMove);
+
+describe("VM Git metadata compatibility", () => {
+  const decode = Schema.decodeUnknownSync(RelayThreadVmRepositoryBinding);
+  const binding = {
+    environmentId: "environment",
+    threadId: "thread",
+    generation: 2,
+    repositoryId: "repository",
+    canonicalKey: "github.com/team/repo",
+    operationId: "00000000-0000-4000-8000-000000000001",
+  };
+  it("accepts old relay replies and distinguishes unavailable from confirmed missing App", () => {
+    expect(decode(binding)).toEqual(binding);
+    for (const git of [
+      { status: "unknown" },
+      { status: "unconfigured" },
+      { status: "pending", appId: "123" },
+      { status: "pending", appId: "123", appSlug: "launchpad" },
+      {
+        status: "ready",
+        appId: "123",
+        appSlug: "launchpad",
+        botUserId: 456,
+        name: "launchpad[bot]",
+        email: "456+launchpad[bot]@users.noreply.github.com",
+      },
+    ])
+      expect(decode({ ...binding, git }).git).toEqual(git);
+  });
+  it("rejects incomplete bot identities", () => {
+    expect(() =>
+      decode({ ...binding, git: { status: "ready", appId: "123", name: "bot" } }),
+    ).toThrow();
+  });
+});
 const device = {
   deviceId: "device",
   label: "Phone",

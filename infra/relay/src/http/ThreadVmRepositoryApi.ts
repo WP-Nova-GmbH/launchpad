@@ -6,6 +6,7 @@ import { withEnvironmentThread } from "./ThreadEnvironmentApi.ts";
 import { withThreadMoveParticipant } from "./ThreadMovesApi.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
 import { tenancyNotFound, tenancyConflict } from "./tenancyErrors.ts";
+import { GithubApp } from "../tenancy/GithubApp.ts";
 
 type Owner = { threadId: string; environmentId: string; generation: number };
 /** A quarantined move guest can use its one repository for setup, without execution ownership. */
@@ -56,7 +57,7 @@ export const getThreadVmRepositoryBinding = Effect.fn("relay.api.thread_vm.repos
   function* (input: Owner) {
     const principal = yield* RelayEnvironmentPrincipal,
       sql = (yield* RelayDb).$client;
-    return yield* withThreadVmRepositoryScope(
+    const authorize = withThreadVmRepositoryScope(
       input,
       Effect.gen(function* () {
         const aliases = yield* sql<{
@@ -81,6 +82,22 @@ export const getThreadVmRepositoryBinding = Effect.fn("relay.api.thread_vm.repos
         };
       }),
     );
+    const binding = yield* authorize;
+    // Bound the whole optional lookup below the guest binding deadline, including App storage reads.
+    const git = yield* (yield* GithubApp).gitMetadata.pipe(
+      Effect.timeoutOrElse({
+        duration: "7 seconds",
+        orElse: () => Effect.succeed({ status: "unknown" as const }),
+      }),
+    );
+    const current = yield* authorize;
+    if (
+      binding.canonicalKey !== current.canonicalKey ||
+      binding.repositoryId !== current.repositoryId ||
+      binding.operationId !== current.operationId
+    )
+      return yield* tenancyConflict("thread_placement_changed");
+    return { ...current, git };
   },
   Effect.catchTags({
     SqlError: () => relayInternalErrorResponse("persistence_failed"),

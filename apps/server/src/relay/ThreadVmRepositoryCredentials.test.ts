@@ -1,7 +1,4 @@
-import {
-  THREAD_VM_REPOSITORY_BINDING_SECRET,
-  configureThreadVmMoveRepository,
-} from "./ThreadVmRepositoryBinding.ts";
+import { THREAD_VM_REPOSITORY_BINDING_SECRET } from "./ThreadVmRepositoryBinding.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -99,6 +96,7 @@ const fixture = () => {
     provide,
     setInitial: (value: unknown) => {
       initial = encode(value);
+      stored = encode({ ...vm, scope: { ...vm.scope, generation: 1 } });
     },
     setInitialRaw: (value: string | undefined) => {
       initial = value;
@@ -116,7 +114,7 @@ const initial = {
   input: {
     workspace: {
       operationId: vm.operationId,
-      scope: vm.scope,
+      scope: { ...vm.scope, generation: 1 },
       canonicalKey,
       branch: "main",
       revision: "a".repeat(40),
@@ -131,7 +129,7 @@ const initial = {
     operationId: vm.operationId,
     environmentId: vm.environmentId,
     projectId: "vm:thread",
-    scope: vm.scope,
+    scope: { ...vm.scope, generation: 1 },
     workspaceRoot: "/workspace/project",
     revision: "a".repeat(40),
     sequence: 2,
@@ -140,101 +138,45 @@ const initial = {
 };
 
 describe("thread VM repository credentials", () => {
-  it.effect(
-    "binds a moved checkout to the relay repository before setup and reads it offline",
-    () => {
-      const f = fixture();
-      return Effect.scoped(
-        Effect.gen(function* () {
-          const fs = yield* FileSystem.FileSystem,
-            runner = yield* ProcessRunner;
-          const root = yield* fs.realPath(
-            yield* fs.makeTempDirectoryScoped({ prefix: "vm-repository-binding-" }),
-          );
-          const run = (args: ReadonlyArray<string>) =>
-            runner.run({
-              command: "git",
-              cwd: root,
-              args,
-              env: {
-                GIT_CONFIG_GLOBAL: "/dev/null",
-                GIT_CONFIG_NOSYSTEM: "1",
-                GIT_CONFIG_COUNT: "0",
-              },
-            });
-          yield* run(["init", "-b", "main"]);
-          yield* run([
-            "remote",
-            "add",
-            "origin",
-            "https://old-host.invalid/credential-bearing-origin",
-          ]);
-          f.setResponse({
-            environmentId: vm.environmentId,
-            threadId: vm.scope.threadId,
-            generation: vm.scope.generation,
-            repositoryId: vm.scope.repositoryId,
-            operationId: vm.operationId,
-            canonicalKey,
-          });
-          const owner = {
-            threadId: vm.scope.threadId,
-            environmentId: vm.environmentId,
-            relayUrl: vm.relayUrl,
-            generation: vm.scope.generation,
-            operationId: vm.operationId,
-          };
-          yield* configureThreadVmMoveRepository(owner, root).pipe(f.provide);
-          assert.equal(
-            (yield* run(["remote", "get-url", "origin"])).stdout.trim(),
-            "https://github.com/acme/project.git",
-          );
-          assert.equal(yield* readThreadVmRepository().pipe(f.provide), canonicalKey);
-          assert.lengthOf(f.calls, 1);
-          assert.notInclude(f.getBinding()!, "repository-token");
-          f.setResponse(token);
-          assert.include(
-            yield* threadVmGitCredential(
-              "get",
-              "protocol=https\nhost=github.com\npath=acme/project\n",
-            ).pipe(f.provide),
-            "password=repository-token",
-          );
-          assert.equal(
-            yield* threadVmGitCredential(
-              "get",
-              "protocol=https\nhost=github.com\npath=acme/other\n",
-            ).pipe(f.provide),
-            "quit=1\n\n",
-          );
-          assert.lengthOf(f.calls, 2);
-          const good = f.getBinding()!;
-          for (const raw of [
-            undefined,
-            "broken",
-            encode({ ...vm, canonicalKey, scope: { ...vm.scope, generation: 1 } }),
-            encode({ ...vm, canonicalKey, environmentId: "foreign" }),
-          ]) {
-            f.setBindingRaw(raw);
-            yield* readThreadVmRepository().pipe(f.provide, Effect.flip);
-          }
-          f.setBindingRaw(good);
-          f.setResponse({
-            ...vm,
-            threadId: vm.scope.threadId,
-            generation: vm.scope.generation,
-            repositoryId: "foreign",
-            canonicalKey,
-          });
-          yield* configureThreadVmMoveRepository(owner, root).pipe(f.provide, Effect.flip);
-          assert.equal(
-            (yield* run(["remote", "get-url", "origin"])).stdout.trim(),
-            "https://github.com/acme/project.git",
-          );
+  it.effect("uses the current generation binding despite stale or corrupt initial state", () => {
+    const f = fixture();
+    const binding = {
+      operationId: vm.operationId,
+      environmentId: vm.environmentId,
+      scope: vm.scope,
+      canonicalKey,
+    };
+    f.setBindingRaw(encode(binding));
+    return Effect.gen(function* () {
+      for (const stale of [encode(initial), "broken", undefined]) {
+        f.setInitialRaw(stale);
+        assert.equal(yield* readThreadVmRepository(), canonicalKey);
+      }
+      assert.lengthOf(f.calls, 0);
+      for (const raw of [
+        undefined,
+        "broken",
+        encode({ ...binding, scope: { ...vm.scope, generation: 1 } }),
+        encode({ ...binding, environmentId: "foreign" }),
+      ]) {
+        f.setBindingRaw(raw);
+        yield* readThreadVmRepository().pipe(Effect.flip);
+      }
+      f.setInitialRaw(
+        encode({
+          ...initial,
+          input: {
+            ...initial.input,
+            workspace: { ...initial.input.workspace, scope: vm.scope },
+          },
+          receipt: { ...initial.receipt, scope: vm.scope },
         }),
-      ).pipe(Effect.provide(processRunnerLayer.pipe(Layer.provideMerge(NodeServices.layer))));
-    },
-  );
+      );
+      // A matching-looking bootstrap record cannot replace the current binding.
+      yield* readThreadVmRepository().pipe(Effect.flip);
+      assert.lengthOf(f.calls, 0);
+    }).pipe(f.provide);
+  });
   it.effect(
     "supplies credentials through real Git and stops helper fallback for another repository",
     () => {
@@ -353,6 +295,15 @@ describe("thread VM repository credentials", () => {
               },
             },
           }),
+          ...[
+            { operationId: "another-operation" },
+            { environmentId: "another-environment" },
+            { workspaceRoot: "/another/checkout" },
+            { scope: { ...initial.receipt.scope, threadId: "another-thread" } },
+            { scope: { ...initial.receipt.scope, repositoryId: "another-repository" } },
+            { scope: { ...initial.receipt.scope, allocationId: "another-allocation" } },
+            { scope: { ...initial.receipt.scope, generation: 2 } },
+          ].map((receipt) => encode({ ...initial, receipt: { ...initial.receipt, ...receipt } })),
         ]) {
           f.setInitialRaw(record);
           yield* readThreadVmRepository().pipe(Effect.flip);

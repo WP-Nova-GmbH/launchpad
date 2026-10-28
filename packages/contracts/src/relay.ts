@@ -2963,6 +2963,36 @@ export const RelayThreadVmFinalSave = Schema.Struct({
 });
 export type RelayThreadVmFinalSave = typeof RelayThreadVmFinalSave.Type;
 
+export const RelayThreadVmGitMetadata = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("unknown") }),
+  Schema.Struct({ status: Schema.Literal("unconfigured") }),
+  Schema.Struct({
+    status: Schema.Literal("pending"),
+    appId: TrimmedNonEmptyString,
+    appSlug: Schema.optionalKey(TrimmedNonEmptyString),
+  }),
+  Schema.Struct({
+    status: Schema.Literal("ready"),
+    appId: TrimmedNonEmptyString,
+    appSlug: TrimmedNonEmptyString,
+    botUserId: Schema.Int.check(Schema.isGreaterThan(0)),
+    name: TrimmedNonEmptyString,
+    email: TrimmedNonEmptyString,
+  }),
+]);
+export type RelayThreadVmGitMetadata = typeof RelayThreadVmGitMetadata.Type;
+
+export const RelayThreadVmRepositoryBinding = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  ...RelayThreadGeneration,
+  repositoryId: RelayRepositoryId,
+  canonicalKey: RelayRepositoryCanonicalKey,
+  operationId: RelayThreadArtifactId,
+  git: Schema.optionalKey(RelayThreadVmGitMetadata),
+});
+export type RelayThreadVmRepositoryBinding = typeof RelayThreadVmRepositoryBinding.Type;
+
 /** Immutable Git data uploaded by the source environment, independent of VM disk retention. */
 export const RelayThreadVmRepositoryUpload = Schema.Struct({
   operationId: RelayThreadArtifactId,
@@ -3258,14 +3288,7 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
       {
         params: RelayThreadOwnerParams,
         payload: Schema.Struct(RelayThreadGeneration),
-        success: Schema.Struct({
-          environmentId: EnvironmentId,
-          threadId: ThreadId,
-          ...RelayThreadGeneration,
-          repositoryId: RelayRepositoryId,
-          canonicalKey: RelayRepositoryCanonicalKey,
-          operationId: RelayThreadArtifactId,
-        }),
+        success: RelayThreadVmRepositoryBinding,
         error: RelayTenancyErrors,
       },
     ),

@@ -296,6 +296,8 @@ Close local terminals when their work is finished. Programs detached from those 
 this guard; stop any that could change the checkout during the move. If Launchpad cannot confirm
 that managed work has stopped, the move stays queued with an explanation. Cancel it to continue locally.
 Fresh VMs need their own Codex sign-in; follow the sign-in step in the thread to let preparation continue.
+For [Git access inside the VM](./source-control.md#git-inside-a-private-vm), connect the organization's
+GitHub App. New commits use its bot identity; moving the checkout itself still works without GitHub.
 Unsent drafts follow the thread on the device making the move. If both locations have a draft,
 choose which one to continue; Launchpad keeps the other copy. Reattach any files whose original
 machine is no longer reachable before sending them.

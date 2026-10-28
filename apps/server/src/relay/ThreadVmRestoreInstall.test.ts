@@ -693,6 +693,18 @@ it.layer(
                 status = 200;
               const client = HttpClient.make((request) =>
                 Effect.gen(function* () {
+                  if (request.url.endsWith("/repository/binding"))
+                    return HttpClientResponse.fromWeb(
+                      request,
+                      Response.json({
+                        operationId: f.operationId,
+                        environmentId: receipt.environmentId,
+                        repositoryId: receipt.scope.repositoryId,
+                        threadId: f.threadId,
+                        generation: receipt.scope.generation,
+                        canonicalKey: "github.com/acme/project",
+                      }),
+                    );
                   calls++;
                   expect(request.url).toBe(
                     `https://relay.test/v1/environments/fresh-environment/threads/${f.threadId}/restore/activate`,
@@ -736,6 +748,12 @@ it.layer(
               expect((yield* readThreadVmRestoreState())?.phase).toBe("ready");
               expect(yield* activate).toBe(true);
               expect(calls).toBe(4);
+              expect(yield* f.git(f.checkoutPath, ["remote", "get-url", "origin"])).toBe(
+                "https://github.com/acme/project.git",
+              );
+              expect(yield* f.git(f.checkoutPath, ["config", "--get", "commit.gpgsign"])).toBe(
+                "false",
+              );
               expect((yield* readThreadVmRestoreState())?.phase).toBe("activated");
               expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe("active");
               expect(yield* activate).toBe(false);

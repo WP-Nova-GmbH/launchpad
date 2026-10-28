@@ -54,6 +54,7 @@ import { authorizeThreadVmConnection } from "./ThreadVmConnectionAccess.ts";
 import { checkThreadVmClientAccess } from "../http/ThreadEnvironmentApi.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import { makeThreadVmServerWorker } from "./ThreadVmServerWorker.ts";
 import * as Schema from "effect/Schema";
 import { confirmInitialVmActivation } from "../http/ThreadEnvironmentApi.ts";
@@ -3902,11 +3903,13 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           const f = yield* makeEnrollmentFixture({ organizationId, repositoryId });
           yield* f.store.exchange(f.input, f.issue);
           const allocation = (yield* f.allocations.get(f.allocationId))!;
+          const installationId = BigInt(`0x${f.allocationId.replaceAll("-", "")}`).toString();
+          const replacementInstallationId = `${installationId}0`;
           const canonicalKey = `github.com/test-owner/repo-${repositoryId}`;
           yield* f.sql`INSERT INTO relay_repository_aliases (canonical_key,repository_id,organization_id,created_at)
           VALUES (${canonicalKey},${repositoryId},${organizationId},'now')`;
           yield* f.sql`INSERT INTO relay_github_installations (organization_id,installation_id,account_login,account_type,connected_by_user_id,created_at,updated_at)
-          VALUES (${organizationId},'420001','test-owner','Organization',${allocation.ownerUserId},'now','now')`;
+          VALUES (${organizationId},${installationId},'test-owner','Organization',${allocation.ownerUserId},'now','now')`;
           const input = {
             environmentId: f.input.environmentId,
             threadId: allocation.threadId,
@@ -3927,6 +3930,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           let minted = 0;
           let afterMint = Effect.void;
           const github = GithubApp.of({
+            gitMetadata: Effect.succeed({ status: "unconfigured" }),
             installUrl: Effect.succeed(null),
             getInstallation: () => Effect.die("unexpected installation read"),
             listRepositories: () => Effect.die("unexpected repository list"),
@@ -3935,7 +3939,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             mintInstallationToken: () => Effect.die("installation-wide tokens forbidden"),
             mintRepositoryToken: (scope) =>
               Effect.gen(function* () {
-                expect(scope).toEqual({ installationId: "420001", canonicalKey });
+                expect(scope).toEqual({ installationId, canonicalKey });
                 minted++;
                 yield* afterMint;
                 return { token: "repository-test-token", expiresAt: "2099-01-01T00:00:00Z" };
@@ -3983,12 +3987,25 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           expect(minted).toBe(3);
           yield* f.sql`UPDATE relay_thread_vm_bindings SET revoked_at = NULL WHERE allocation_id = ${f.allocationId}`;
           afterMint =
-            f.sql`UPDATE relay_github_installations SET installation_id = '420002' WHERE organization_id = ${organizationId}`.pipe(
+            f.sql`UPDATE relay_github_installations SET installation_id = ${replacementInstallationId} WHERE organization_id = ${organizationId}`.pipe(
               Effect.asVoid,
               Effect.orDie,
             );
           expect(yield* Effect.flip(request())).toMatchObject(denied);
           expect(minted).toBe(4);
+          yield* f.sql`UPDATE relay_github_installations SET installation_id = ${installationId} WHERE organization_id = ${organizationId}`;
+          afterMint = Effect.void;
+          yield* f.sql`UPDATE relay_thread_vm_allocations SET state = 'paused' WHERE allocation_id = ${f.allocationId}`;
+          expect(yield* Effect.flip(request())).toMatchObject(denied);
+          expect(minted).toBe(4);
+          yield* f.sql`UPDATE relay_thread_vm_allocations SET state = 'running' WHERE allocation_id = ${f.allocationId}`;
+          afterMint =
+            f.sql`UPDATE relay_thread_vm_allocations SET state = 'paused' WHERE allocation_id = ${f.allocationId}`.pipe(
+              Effect.asVoid,
+              Effect.orDie,
+            );
+          expect(yield* Effect.flip(request())).toMatchObject(denied);
+          expect(minted).toBe(5);
         }),
     );
 
@@ -6376,10 +6393,11 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           const receipt = yield* f.bind();
           yield* f.destinations.assigned(receipt);
           const placement = (yield* f.placements.get(f.intent.threadId))!,
+            installationId = BigInt(`0x${receipt.allocationId.replaceAll("-", "")}`).toString(),
             canonicalKey = `github.com/test-owner/repo-${placement.repositoryId}`;
           yield* f.sql`INSERT INTO relay_repository_aliases(canonical_key,repository_id,organization_id,created_at) VALUES(${canonicalKey},${placement.repositoryId},${placement.organizationId},'now')`;
           yield* f.sql`INSERT INTO relay_github_installations(organization_id,installation_id,account_login,account_type,connected_by_user_id,created_at,updated_at)
-        VALUES(${placement.organizationId},'420001','test-owner','Organization',${placement.ownerUserId},'now','now')`;
+        VALUES(${placement.organizationId},${installationId},'test-owner','Organization',${placement.ownerUserId},'now','now')`;
           const [key] = yield* f.sql<{
             credentialId: string;
             environmentPublicKey: string;
@@ -6402,8 +6420,13 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
               generation: 2,
             };
           let minted = 0,
-            afterMint = Effect.void;
+            afterMint = Effect.void,
+            afterMetadata = Effect.void;
           const github = GithubApp.of({
+            gitMetadata: Effect.gen(function* () {
+              yield* afterMetadata;
+              return { status: "unconfigured" as const };
+            }),
             installUrl: Effect.succeed(null),
             getInstallation: () => Effect.die("unexpected"),
             listRepositories: () => Effect.die("unexpected"),
@@ -6412,7 +6435,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             mintInstallationToken: () => Effect.die("broad token forbidden"),
             mintRepositoryToken: (scope) =>
               Effect.gen(function* () {
-                expect(scope).toEqual({ installationId: "420001", canonicalKey });
+                expect(scope).toEqual({ installationId, canonicalKey });
                 minted++;
                 yield* afterMint;
                 return { token: "scoped-test-token", expiresAt: "2099-01-01T00:00:00Z" };
@@ -6423,9 +6446,14 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
               provide,
               Effect.provideService(GithubApp, github),
             );
-          expect((yield* Effect.flip(getThreadVmRepositoryBinding(input).pipe(provide)))._tag).toBe(
-            "RelayTenancyNotFoundError",
-          );
+          expect(
+            (yield* Effect.flip(
+              getThreadVmRepositoryBinding(input).pipe(
+                provide,
+                Effect.provideService(GithubApp, github),
+              ),
+            ))._tag,
+          ).toBe("RelayTenancyNotFoundError");
           expect((yield* Effect.flip(mint()))._tag).toBe("RelayTenancyNotFoundError");
           expect(minted).toBe(0);
           yield* makeThreadJournalStore(f.sql).confirmThrough({
@@ -6441,18 +6469,65 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             sourceCursor: 1,
             manifestSha256: "a".repeat(64),
           });
-          expect((yield* Effect.flip(getThreadVmRepositoryBinding(input).pipe(provide)))._tag).toBe(
-            "RelayTenancyNotFoundError",
-          );
+          expect(
+            (yield* Effect.flip(
+              getThreadVmRepositoryBinding(input).pipe(
+                provide,
+                Effect.provideService(GithubApp, github),
+              ),
+            ))._tag,
+          ).toBe("RelayTenancyNotFoundError");
           yield* publishMoveFixture(f.sql, f.intent);
-          expect(yield* getThreadVmRepositoryBinding(input).pipe(provide)).toEqual({
+          expect(
+            yield* getThreadVmRepositoryBinding(input).pipe(
+              provide,
+              Effect.provideService(GithubApp, github),
+            ),
+          ).toEqual({
             ...input,
             canonicalKey,
             repositoryId: placement.repositoryId,
             operationId: f.intent.operationId,
+            git: { status: "unconfigured" },
           });
           expect((yield* mint()).token).toBe("scoped-test-token");
           expect(minted).toBe(1);
+          const readBinding = () =>
+            getThreadVmRepositoryBinding(input).pipe(
+              provide,
+              Effect.provideService(GithubApp, github),
+            );
+          for (const revokeDuringWait of [false, true]) {
+            const entered = yield* Deferred.make<void>(),
+              release = yield* Deferred.make<void>();
+            afterMetadata = Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+            });
+            const startedAt = (yield* DateTime.now).epochMilliseconds;
+            const pendingBinding = yield* readBinding().pipe(Effect.forkChild);
+            yield* Deferred.await(entered);
+            if (revokeDuringWait)
+              yield* f.sql`UPDATE relay_thread_vm_enrollments SET installed_at=NULL WHERE allocation_id=${receipt.allocationId}`;
+            yield* TestClock.adjust("7 seconds");
+            yield* Deferred.succeed(release, undefined);
+            if (revokeDuringWait) {
+              expect((yield* Fiber.join(pendingBinding).pipe(Effect.flip))._tag).toBe(
+                "RelayTenancyNotFoundError",
+              );
+              yield* f.sql`UPDATE relay_thread_vm_enrollments SET installed_at=clock_timestamp() WHERE allocation_id=${receipt.allocationId}`;
+            } else {
+              expect(yield* Fiber.join(pendingBinding)).toEqual({
+                ...input,
+                canonicalKey,
+                repositoryId: placement.repositoryId,
+                operationId: f.intent.operationId,
+                git: { status: "unknown" },
+              });
+              expect((yield* DateTime.now).epochMilliseconds - startedAt).toBe(7000);
+            }
+          }
+          afterMetadata = Effect.void;
           expect((yield* f.placements.get(f.intent.threadId))?.environmentId).toBe(
             f.intent.sourceEnvironmentId,
           );
@@ -6468,19 +6543,42 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           ]) {
             expect(
               (yield* Effect.flip(
-                getThreadVmRepositoryBinding({ ...input, ...changes }).pipe(provide),
+                getThreadVmRepositoryBinding({ ...input, ...changes }).pipe(
+                  provide,
+                  Effect.provideService(GithubApp, github),
+                ),
               ))._tag,
             ).toMatch(/^RelayTenancy/);
           }
           yield* f.sql`UPDATE relay_thread_vm_enrollments SET installed_at=NULL WHERE allocation_id=${receipt.allocationId}`;
           expect((yield* Effect.flip(mint()))._tag).toBe("RelayTenancyNotFoundError");
           yield* f.sql`UPDATE relay_thread_vm_enrollments SET installed_at=clock_timestamp() WHERE allocation_id=${receipt.allocationId}`;
+          afterMetadata =
+            f.sql`UPDATE relay_thread_vm_enrollments SET installed_at=NULL WHERE allocation_id=${receipt.allocationId}`.pipe(
+              Effect.asVoid,
+              Effect.orDie,
+            );
+          expect(
+            (yield* Effect.flip(
+              getThreadVmRepositoryBinding(input).pipe(
+                provide,
+                Effect.provideService(GithubApp, github),
+              ),
+            ))._tag,
+          ).toBe("RelayTenancyNotFoundError");
+          yield* f.sql`UPDATE relay_thread_vm_enrollments SET installed_at=clock_timestamp() WHERE allocation_id=${receipt.allocationId}`;
+          afterMetadata = Effect.void;
           afterMint = f.placements.requestAbort(f.intent).pipe(Effect.orDie, Effect.asVoid);
           expect((yield* Effect.flip(mint()))._tag).toBe("RelayTenancyNotFoundError");
           expect(minted).toBe(2);
-          expect((yield* Effect.flip(getThreadVmRepositoryBinding(input).pipe(provide)))._tag).toBe(
-            "RelayTenancyNotFoundError",
-          );
+          expect(
+            (yield* Effect.flip(
+              getThreadVmRepositoryBinding(input).pipe(
+                provide,
+                Effect.provideService(GithubApp, github),
+              ),
+            ))._tag,
+          ).toBe("RelayTenancyNotFoundError");
         }),
     );
 

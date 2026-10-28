@@ -9,6 +9,7 @@ import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
+import { configureThreadVmRepository } from "./ThreadVmRepositoryBinding.ts";
 import {
   readThreadVmRestoreState,
   encodeThreadVmRestoreState,
@@ -55,6 +56,8 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
     )
       return yield* new ThreadVmRestoreActivationError();
     if (state.phase === "activated" && owner.phase === "active") return false;
+    if (owner.phase === "frozen")
+      yield* configureThreadVmRepository(owner, receipt.checkoutPath, "import");
     const secrets = yield* ServerSecretStore;
     if (state.phase === "installed") {
       if (owner.phase !== "frozen") return yield* new ThreadVmRestoreActivationError();

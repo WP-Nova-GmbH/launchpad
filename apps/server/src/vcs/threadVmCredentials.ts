@@ -1,11 +1,14 @@
 import { RUNNER_CREDENTIAL_ENV_PREFIX } from "@t3tools/shared/runnerCredentials";
 
+export const THREAD_VM_GIT_CREDENTIAL_HELPER =
+  "!/usr/local/bin/launchpad-server __thread-vm-git-credential";
+
 /** The helper runs only when Git actually needs HTTP credentials, so offline status/checkpoints remain local. */
 export const privateThreadVmGitArgs = (args: ReadonlyArray<string>) => [
   "-c",
   "credential.helper=",
   "-c",
-  "credential.helper=!/usr/local/bin/launchpad-server __thread-vm-git-credential",
+  `credential.helper=${THREAD_VM_GIT_CREDENTIAL_HELPER}`,
   "-c",
   "credential.useHttpPath=true",
   ...args,

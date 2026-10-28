@@ -354,6 +354,10 @@ export const mintThreadVmRepositoryToken = Effect.fn("relay.api.thread_environme
     const authorize = withThreadVmRepositoryScope(
       input,
       Effect.gen(function* () {
+        const running = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
+          WHERE allocation_id = ${vmScope.allocationId} AND thread_id = ${input.threadId}
+          AND state = 'running' AND deleted_at IS NULL FOR SHARE`;
+        if (!running.length) return yield* tenancyNotFound("thread_not_found");
         const [scope] = yield* sql<{ installationId: string; accountLogin: string }>`
         SELECT g.installation_id AS "installationId", g.account_login AS "accountLogin"
         FROM relay_repository_aliases r

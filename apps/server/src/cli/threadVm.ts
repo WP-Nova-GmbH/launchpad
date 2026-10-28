@@ -388,6 +388,10 @@ export const threadVmGitCredentialCommand = Command.make("__thread-vm-git-creden
           ),
         );
       }).pipe(Effect.catch(() => Effect.succeed("quit=1\n\n")));
+      if (reply === "quit=1\n\n")
+        yield* Console.error(
+          "Launchpad could not authorize this VM's repository. Check the organization's GitHub connection, repository access, and VM connection, then retry.",
+        );
       yield* Console.log(reply);
     }),
   ),
