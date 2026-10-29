@@ -74,6 +74,9 @@ import { organizationProjectsApi, projectCatalogServerApi } from "./http/Project
 import { executorReleaseServerApi } from "./http/ExecutorReleaseApi.ts";
 import { organizationSkillsServerApi } from "./http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "./http/ProviderAccountsApi.ts";
+import { codexVmConnectionsApi } from "./http/CodexVmConnectionsApi.ts";
+import { threadVmCodexAuthApi } from "./http/ThreadVmCodexAuthApi.ts";
+import * as CodexVmOAuth from "./tenancy/CodexVmOAuth.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "./http/IssueTrackersApi.ts";
 import { turnAuthLayer } from "./issueTrackers/TurnAuthorization.ts";
 import { workflowSourcesApi, workflowSourceCallbackRoute } from "./http/WorkflowSourcesApi.ts";
@@ -191,6 +194,8 @@ const relayApiLayer = Layer.mergeAll(
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
+  codexVmConnectionsApi,
+  threadVmCodexAuthApi,
   issueTrackersApi,
   workflowSourcesApi,
   issueTrackersServerApi,
@@ -428,6 +433,7 @@ export const ApiLive = Api.make(
             GithubApp.layer,
             GithubInstallations.layer,
             ProviderAccounts.layer,
+            CodexVmOAuth.layer,
             IssueTrackerConnectionStore.layer,
             IssueTrackerWriteOperationStore.layer,
             OrganizationSkills.layer,

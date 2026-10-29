@@ -24,7 +24,7 @@ import type {
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
-import type { ProviderAdapterValidationError } from "../Errors.ts";
+import type { ProviderAdapterProbeError, ProviderAdapterValidationError } from "../Errors.ts";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 
@@ -113,11 +113,13 @@ export interface ProviderAdapterShape<TError> {
   readonly provider: ProviderDriverKind;
   readonly capabilities: ProviderAdapterCapabilities;
 
-  /** Resume validation in a private runtime, physically closed before returning.
-   * Its bootstrap events never enter this adapter's normal ingestion stream. */
+  /** Resume validation in a private runtime, physically closed before success.
+   * Only ProviderAdapterProbeError.cleanupConfirmed attests a safe failed retry;
+   * arbitrary errors, defects and interruption retain uncertain native ownership.
+   * Bootstrap events never enter this adapter's normal ingestion stream. */
   readonly probeSession?: (
     input: ProviderSessionStartInput,
-  ) => Effect.Effect<ProviderSession, TError>;
+  ) => Effect.Effect<ProviderSession, TError | ProviderAdapterProbeError>;
   /**
    * Start a provider-backed session.
    */

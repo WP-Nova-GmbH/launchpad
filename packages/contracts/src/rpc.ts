@@ -120,6 +120,12 @@ import {
 } from "./providerAccount.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
+  CodexVmSignInBridge,
+  CodexVmSignInBridgeInput,
+  CodexVmSignInCallback,
+  CodexVmSignInError,
+} from "./codexVmSignIn.ts";
+import {
   PullRequestActionInput,
   PullRequestActivity,
   PullRequestCommentInput,
@@ -321,6 +327,10 @@ export const WS_METHODS = {
   providerAuthCancel: "provider.auth.cancel",
   providerAuthLogout: "provider.auth.logout",
   providerAuthSubscribe: "provider.auth.subscribe",
+  codexVmSignInCapability: "codexVm.signIn.capability",
+  codexVmSignInStart: "codexVm.signIn.start",
+  codexVmSignInWait: "codexVm.signIn.wait",
+  codexVmSignInCancel: "codexVm.signIn.cancel",
   providerInstallStart: "provider.install.start",
   providerInstallCancel: "provider.install.cancel",
   providerInstallSubscribe: "provider.install.subscribe",
@@ -533,6 +543,27 @@ const WsServerUpdateProviderRpc = Rpc.make(WS_METHODS.serverUpdateProvider, {
 });
 
 const ProviderSetupRpcError = Schema.Union([ProviderSetupError, EnvironmentAuthorizationError]);
+const CodexVmSignInRpcError = Schema.Union([CodexVmSignInError, EnvironmentAuthorizationError]);
+const WsCodexVmSignInCapabilityRpc = Rpc.make(WS_METHODS.codexVmSignInCapability, {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({ supported: Schema.Boolean }),
+  error: EnvironmentAuthorizationError,
+});
+const WsCodexVmSignInStartRpc = Rpc.make(WS_METHODS.codexVmSignInStart, {
+  payload: Schema.Struct({}),
+  success: CodexVmSignInBridge,
+  error: CodexVmSignInRpcError,
+});
+const WsCodexVmSignInWaitRpc = Rpc.make(WS_METHODS.codexVmSignInWait, {
+  payload: CodexVmSignInBridgeInput,
+  success: CodexVmSignInCallback,
+  error: CodexVmSignInRpcError,
+});
+const WsCodexVmSignInCancelRpc = Rpc.make(WS_METHODS.codexVmSignInCancel, {
+  payload: CodexVmSignInBridgeInput,
+  success: Schema.Void,
+  error: CodexVmSignInRpcError,
+});
 
 const WsProviderConsumeResetCreditRpc = Rpc.make(WS_METHODS.providerConsumeResetCredit, {
   payload: ProviderConsumeResetCreditInput,
@@ -1487,6 +1518,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,
   WsProviderAuthStartRpc,
+  WsCodexVmSignInCapabilityRpc,
+  WsCodexVmSignInStartRpc,
+  WsCodexVmSignInWaitRpc,
+  WsCodexVmSignInCancelRpc,
   WsProviderAuthCompleteRpc,
   WsProviderAuthRespondRpc,
   WsProviderAuthCancelRpc,

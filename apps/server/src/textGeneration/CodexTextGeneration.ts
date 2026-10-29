@@ -20,7 +20,15 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import { expandHomePath } from "../pathExpansion.ts";
-import { codexExecLaunchArgs, resolveCodexLaunchArgs } from "../provider/Layers/codexLaunchArgs.ts";
+import {
+  managedCodexModelIssue,
+  codexExecLaunchArgs,
+  resolveCodexLaunchArgs,
+} from "../provider/Layers/codexLaunchArgs.ts";
+import type {
+  ManagedThreadVmCodexAuthContext,
+  ThreadVmCodexAuthSourceError,
+} from "../relay/ThreadVmCodexAuthSource.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildApprovalVerdictPrompt,
@@ -49,6 +57,8 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
   codexConfig: CodexSettings,
   environment?: NodeJS.ProcessEnv,
   getModels: Effect.Effect<ReadonlyArray<ServerProviderModel>> = Effect.succeed([]),
+  managedAuth?: ManagedThreadVmCodexAuthContext,
+  authPreflight?: Effect.Effect<void, ThreadVmCodexAuthSourceError>,
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -192,6 +202,13 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           (candidate) => !candidate.isCustom && codexModelFamily(candidate.slug) === requestedModel,
         )?.slug ??
         requestedModel;
+      if (managedAuth) {
+        const issue = managedCodexModelIssue(model);
+        if (issue) return yield* new TextGenerationError({ operation, detail: issue });
+      }
+      yield* (authPreflight ?? managedAuth?.preflight ?? Effect.void).pipe(
+        Effect.mapError((error) => new TextGenerationError({ operation, detail: error.message })),
+      );
       const launchArgs = resolveCodexLaunchArgs(codexConfig.launchArgs, resolvedEnvironment);
       const reasoningEffort =
         getModelSelectionStringOptionValue(modelSelection, "reasoningEffort") ??
@@ -201,7 +218,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         codexConfig.binaryPath || "codex",
         [
           "exec",
-          ...codexExecLaunchArgs(launchArgs),
+          ...codexExecLaunchArgs(launchArgs, managedAuth?.connectionId),
           "--ephemeral",
           "--skip-git-repo-check",
           "-s",
@@ -218,7 +235,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           ...imagePaths.flatMap((imagePath) => ["--image", imagePath]),
           "-",
         ],
-        { env: resolvedEnvironment },
+        { env: resolvedEnvironment, extendEnv: !managedAuth },
       );
       const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
         env: {
@@ -226,6 +243,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           ...(codexConfig.homePath ? { CODEX_HOME: expandHomePath(codexConfig.homePath) } : {}),
         },
         cwd,
+        extendEnv: !managedAuth,
         shell: spawnCommand.shell,
         stdin: {
           stream: Stream.encodeText(Stream.make(prompt)),

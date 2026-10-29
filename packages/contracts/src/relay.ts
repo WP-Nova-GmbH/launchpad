@@ -68,6 +68,18 @@ import {
 } from "./issueTrackers.ts";
 export * from "./issueTrackers.ts";
 export * from "./workflowSources.ts";
+export * from "./codexVmConnection.ts";
+import {
+  CodexVmConnectionError,
+  RelayCodexVmConnection,
+  RelayCodexVmStartSignIn,
+  RelayCodexVmStartSignInResponse,
+  RelayCodexVmCompleteSignIn,
+  RelayCodexVmSignInAttempt,
+  RelayCodexVmToken,
+  RelayThreadVmCodexAuthSelection,
+  RelayThreadVmCodexAuthSource,
+} from "./codexVmConnection.ts";
 import {
   WorkflowSourceError,
   WorkflowSourceOwner,
@@ -2165,6 +2177,7 @@ export const RelayThreadVmProviderAuth = Schema.Struct({
   ...RelayThreadVmProviderAuthBinding.fields,
   requirement: Schema.Literals(["sign_in_required", "authenticated", "provider_unavailable"]),
   auth: ProviderAuthState,
+  authSource: Schema.optionalKey(RelayThreadVmCodexAuthSource),
 });
 export type RelayThreadVmProviderAuth = typeof RelayThreadVmProviderAuth.Type;
 export const RelayThreadVmProviderAuthRequest = Schema.Struct({
@@ -2699,6 +2712,44 @@ const RelayTenancyErrors = [
 ] as const;
 
 const RelayThreadOwnerParams = Schema.Struct({ environmentId: EnvironmentId, threadId: ThreadId });
+const RelayCodexVmConnectionsGroup = HttpApiGroup.make("codexVmConnections")
+  .add(
+    HttpApiEndpoint.get("status", "/v1/organization/codex-vm-connection", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayCodexVmConnection,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("start", "/v1/organization/codex-vm-connection/sign-in", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayCodexVmStartSignIn,
+      success: RelayCodexVmStartSignInResponse,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("complete", "/v1/organization/codex-vm-connection/complete", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayCodexVmCompleteSignIn,
+      success: RelayCodexVmConnection,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.get("attempt", "/v1/organization/codex-vm-connection/attempts/:attemptId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ attemptId: TrimmedNonEmptyString }),
+      success: Schema.NullOr(RelayCodexVmSignInAttempt),
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("cancel", "/v1/organization/codex-vm-connection/cancel", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ attemptId: TrimmedNonEmptyString }),
+      success: RelayCodexVmConnection,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("disconnect", "/v1/organization/codex-vm-connection/disconnect", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayCodexVmConnection,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+  )
+  .middleware(RelayClientAuth);
 const RelayThreadGeneration = {
   generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
 };
@@ -2721,18 +2772,34 @@ export type RelayThreadVmPreviewResponse = typeof RelayThreadVmPreviewResponse.T
 
 const RelayThreadVmsGroup = HttpApiGroup.make("threadVms")
   .add(
+    HttpApiEndpoint.get("getProviderAuthSource", "/v1/threads/:threadId/provider-auth/source", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: Schema.NullOr(RelayThreadVmCodexAuthSource),
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.put("selectProviderAuthSource", "/v1/threads/:threadId/provider-auth/source", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: Schema.Struct({
+        ...RelayThreadVmProviderAuthRequest.fields,
+        source: RelayThreadVmCodexAuthSelection,
+      }),
+      success: RelayThreadVmCodexAuthSource,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
     HttpApiEndpoint.get("getProviderAuth", "/v1/threads/:threadId/provider-auth", {
       headers: RelayBearerRequestHeaders,
       params: Schema.Struct({ threadId: ThreadId }),
       success: Schema.NullOr(RelayThreadVmProviderAuth),
-      error: RelayTenancyErrors,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
     }),
     HttpApiEndpoint.post("startProviderAuth", "/v1/threads/:threadId/provider-auth/start", {
       headers: RelayBearerRequestHeaders,
       params: Schema.Struct({ threadId: ThreadId }),
       payload: RelayThreadVmProviderAuthRequest,
       success: RelayThreadVmProviderAuth,
-      error: RelayTenancyErrors,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
     }),
     HttpApiEndpoint.post("cancelProviderAuth", "/v1/threads/:threadId/provider-auth/cancel", {
       headers: RelayBearerRequestHeaders,
@@ -2742,7 +2809,7 @@ const RelayThreadVmsGroup = HttpApiGroup.make("threadVms")
         flowId: Schema.NonEmptyString,
       }),
       success: RelayThreadVmProviderAuth,
-      error: RelayTenancyErrors,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
     }),
     HttpApiEndpoint.post("openPreview", "/v1/threads/:threadId/vm-previews", {
       headers: RelayBearerRequestHeaders,
@@ -3083,6 +3150,30 @@ export const RelayThreadVmRestoreImportReceipt = Schema.Struct({
 });
 export type RelayThreadVmRestoreImportReceipt = typeof RelayThreadVmRestoreImportReceipt.Type;
 
+const RelayThreadVmCodexAuthGroup = HttpApiGroup.make("threadVmCodexAuth")
+  .add(
+    HttpApiEndpoint.post(
+      "codexAuthSource",
+      "/v1/environments/:environmentId/threads/:threadId/provider-auth/source",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadVmCodexAuthSource,
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "codexAuthToken",
+      "/v1/environments/:environmentId/threads/:threadId/credentials/codex",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, connectionId: TrimmedNonEmptyString }),
+        success: RelayCodexVmToken,
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
+      },
+    ),
+  )
+  .middleware(RelayEnvironmentAuth);
 const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
   .add(
     HttpApiEndpoint.post(
@@ -3118,7 +3209,7 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
         params: RelayThreadOwnerParams,
         payload: RelayThreadVmRestoreImportReceipt,
         success: Schema.Struct({ ready: Schema.Boolean }),
-        error: RelayTenancyErrors,
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
       },
     ),
     HttpApiEndpoint.post("getPause", "/v1/environments/:environmentId/threads/:threadId/pause", {
@@ -3279,7 +3370,7 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
         params: RelayThreadOwnerParams,
         payload: RelayThreadVmSetupReceipt,
         success: Schema.Struct({ ready: Schema.Boolean }),
-        error: RelayTenancyErrors,
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
       },
     ),
     HttpApiEndpoint.post(
@@ -3615,7 +3706,7 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           manifestSha256: RelayThreadArtifactHash,
         }),
         success: RelayThreadMove,
-        error: RelayTenancyErrors,
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
       },
     ),
     HttpApiEndpoint.post(
@@ -4736,12 +4827,14 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayMobileGroup,
     RelayClientGroup,
     RelayOrganizationGroup,
+    RelayCodexVmConnectionsGroup,
     RelayThreadVmPolicyGroup,
     RelayThreadHistoryGroup,
     RelayThreadCommandsGroup,
     RelayThreadArtifactsGroup,
     RelayThreadMovesGroup,
     RelayThreadEnvironmentGroup,
+    RelayThreadVmCodexAuthGroup,
     RelayThreadVmEnrollmentGroup,
     RelayThreadVmsGroup,
     RelayRepositoriesGroup,

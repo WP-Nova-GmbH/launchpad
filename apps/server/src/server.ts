@@ -112,6 +112,7 @@ import * as ThreadRelayCoordinator from "./relay/ThreadRelayCoordinator.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as OrganizationProjectCatalogRelay from "./relay/OrganizationProjectCatalogRelay.ts";
 import * as OrganizationProviderAccounts from "./relay/OrganizationProviderAccounts.ts";
+import { threadVmCodexAuthContextLayer } from "./relay/ThreadVmCodexAuthSource.ts";
 import * as OrganizationSkills from "./relay/OrganizationSkills.ts";
 import * as OrganizationSourceControlCredentials from "./relay/OrganizationSourceControlCredentials.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
@@ -657,6 +658,12 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(
   );
 
 const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
+  Layer.provideMerge(
+    threadVmCodexAuthContextLayer.pipe(
+      Layer.provide(ServerEnvironmentLayerLive),
+      Layer.provide(ServerSecretStore.layer),
+    ),
+  ),
   Layer.provideMerge(GitHubCliAvailability.layer),
   // Misc.
   Layer.provideMerge(BackgroundLayerLive),

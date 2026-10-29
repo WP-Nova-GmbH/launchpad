@@ -15,6 +15,7 @@ import {
 import type {
   RelayThreadVmProviderAuth,
   RelayThreadVmProviderAuthBinding,
+  RelayThreadVmCodexAuthSource,
 } from "@t3tools/contracts/relay";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -25,6 +26,8 @@ import {
   createThreadVmControlAtoms,
   withPortableThreadDeletion,
   threadVmProviderAuthPresentation,
+  threadVmAuthSourcePresentation,
+  threadVmAuthSourceChoice,
 } from "./threadVmControls.ts";
 import {
   portableThreadClientRouteAtom,
@@ -127,8 +130,63 @@ const pendingVmStatus = {
   savedDisk: null,
   pendingProviderAuth: authBinding,
 };
+const managedSource: RelayThreadVmCodexAuthSource = {
+  mode: "organization",
+  connectionId: "org-codex",
+  connection: {
+    connectionId: "org-codex",
+    label: "VM account",
+    status: "connected",
+    epoch: 1,
+    tokenRevision: 1,
+    errorCode: null,
+    refreshing: false,
+  },
+};
 
 describe("pending VM Codex sign-in presentation", () => {
+  it("hides stale personal device actions when an organization account is selected", () => {
+    expect(
+      threadVmProviderAuthPresentation({ ...waitingAuth, authSource: managedSource }),
+    ).toMatchObject({
+      title: "Organization Codex · VM account",
+      url: null,
+      userCode: null,
+      canStart: false,
+      canCancel: false,
+    });
+    expect(threadVmAuthSourcePresentation(managedSource).detail).toContain("ChatGPT plan");
+    if (managedSource.mode !== "organization") throw new Error("Expected organization source");
+    const replacement = threadVmAuthSourceChoice(managedSource, {
+      ...managedSource.connection,
+      connectionId: "replacement",
+    });
+    expect(replacement.selectedValue).not.toBe(replacement.organizationValue);
+    expect(threadVmAuthSourceChoice(managedSource, managedSource.connection).selectedValue).toBe(
+      threadVmAuthSourceChoice(managedSource, managedSource.connection).organizationValue,
+    );
+  });
+  it("requires a current connected selection before claiming managed preparation can continue", () => {
+    if (managedSource.mode !== "organization") throw new Error("Expected organization source");
+    const value = {
+      ...waitingAuth,
+      requirement: "authenticated" as const,
+      authSource: managedSource,
+    };
+    const replaced = { ...managedSource.connection, connectionId: "replacement" };
+    const message = threadVmProviderAuthPresentation({
+      ...value,
+      organizationConnection: replaced,
+    }).message;
+    expect(message).toContain("Choose the replacement account or personal sign-in");
+    expect(message).not.toContain("continues automatically");
+    for (const current of [
+      replaced,
+      { ...managedSource.connection, status: "disconnected" as const },
+      null,
+    ])
+      expect(threadVmAuthSourcePresentation(managedSource, current).usingPlan).toBe(false);
+  });
   it("shows a device code only for the active official sign-in flow", () => {
     expect(threadVmProviderAuthPresentation(waitingAuth)).toMatchObject({
       url: "https://chatgpt.com/activate",
@@ -1616,6 +1674,170 @@ describe("completed thread location handoff", () => {
 });
 
 describe("owner-bound pending VM authentication", () => {
+  for (const lostReply of [false, true])
+    it.effect(
+      `confirms a selected organization account ${lostReply ? "after a lost write reply without repeating the write" : "through guest readiness"}`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            let selected: RelayThreadVmCodexAuthSource = { mode: "personal" };
+            const writes: unknown[] = [],
+              calls: string[] = [];
+            const h = yield* harness(async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              calls.push(`${request.method} ${path}`);
+              if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+              if (path.endsWith("codex-vm-connection"))
+                return Response.json(
+                  managedSource.mode === "organization" ? managedSource.connection : null,
+                );
+              if (path.endsWith("provider-auth/source")) {
+                if (request.method === "PUT") {
+                  writes.push(await request.json());
+                  selected = managedSource;
+                  if (lostReply) throw new TypeError("Synthetic lost response");
+                }
+                return Response.json(selected);
+              }
+              return Response.json({
+                ...waitingAuth,
+                auth: idleAuth,
+                authSource: selected,
+                requirement:
+                  selected.mode === "organization" ? "authenticated" : "sign_in_required",
+              });
+            });
+            yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+            const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+              query = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, view);
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view).data?.source?.mode).toBe("personal");
+            const result = yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                environmentId,
+                threadId,
+                accountId: "owner",
+                binding: authBinding,
+                action: {
+                  type: "select_source",
+                  source: { mode: "organization", connectionId: "org-codex" },
+                },
+              }),
+            );
+            expect(result._tag).toBe(lostReply ? "Failure" : "Success");
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view).data?.source).toEqual(managedSource);
+            expect(writes).toEqual([
+              {
+                operationId: authBinding.operationId,
+                allocationId: authBinding.allocationId,
+                generation: 2,
+                source: { mode: "organization", connectionId: "org-codex" },
+              },
+            ]);
+            if (!lostReply) {
+              const write = calls.findIndex((call) => call.startsWith("PUT"));
+              expect(calls.slice(write + 1)).toContain(`GET /v1/threads/${threadId}/provider-auth`);
+            }
+          }),
+        ),
+    );
+
+  it.effect("reads a paused VM account from relay metadata without inspecting the guest", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const calls: string[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init),
+            path = new URL(request.url).pathname;
+          expect(request.method).toBe("GET");
+          calls.push(path);
+          if (path.endsWith("vm-status"))
+            return Response.json({
+              ...status,
+              allocation: { allocationId: "paused", ownerUserId: "owner", state: "paused" },
+              savedDisk: null,
+            });
+          expect(path.endsWith("provider-auth/source")).toBe(true);
+          return Response.json(managedSource);
+        });
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+          query = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view).data?.source).toEqual(managedSource);
+        expect(calls).toEqual([
+          `/v1/threads/${threadId}/vm-status`,
+          `/v1/threads/${threadId}/provider-auth/source`,
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("keeps personal device sign-in usable when an older relay lacks source endpoints", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path.endsWith("provider-auth/source") || path.endsWith("codex-vm-connection"))
+            return new Response(null, { status: 404 });
+          return Response.json({ ...waitingAuth, auth: idleAuth });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, sourceView);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(h.registry.get(sourceView).data).toMatchObject({ unsupported: true });
+        expect(h.registry.get(sourceView).data?.error).toContain(
+          "personal sign-in remains available",
+        );
+        expect(h.registry.get(view)?.error).toBeNull();
+        expect(threadVmProviderAuthPresentation(h.registry.get(view)!.providerAuth!).canStart).toBe(
+          true,
+        );
+      }),
+    ),
+  );
+  it.effect("discards account metadata arriving after sign-out", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const h = yield* harness(async (url) => {
+          if (new URL(String(url)).pathname.endsWith("vm-status")) return Response.json(status);
+          requested.resolve();
+          await release.promise;
+          return Response.json(managedSource);
+        });
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+          query = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => requested.promise);
+        h.registry.set(managedRelaySessionAtom, null);
+        release.resolve();
+        expect(
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }),
+        ).toBeNull();
+        expect(h.registry.get(view).data).toBeNull();
+      }),
+    ),
+  );
   it.effect("keeps a delayed sign-in read running through unchanged VM status refreshes", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1822,18 +2044,26 @@ describe("owner-bound pending VM authentication", () => {
           binding: { ...authBinding, allocationId: "stale-vm" },
           action: { type: "start" as const },
         };
-        expect(
-          (yield* Effect.promise(() => h.controls.providerAuthAction.run(h.registry, input)))._tag,
-        ).toBe("Failure");
-        expect(
-          (yield* Effect.promise(() =>
-            h.controls.providerAuthAction.run(h.registry, {
-              ...input,
-              binding: authBinding,
-              accountId: "other",
-            }),
-          ))._tag,
-        ).toBe("Failure");
+        for (const action of [
+          { type: "start" },
+          { type: "select_source", source: { mode: "organization", connectionId: "org-codex" } },
+        ] as const) {
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, { ...input, action }),
+            ))._tag,
+          ).toBe("Failure");
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action,
+                binding: authBinding,
+                accountId: "other",
+              }),
+            ))._tag,
+          ).toBe("Failure");
+        }
         expect(calls).toEqual(["GET /v1/threads/vm-thread/vm-status"]);
       }),
     ),

@@ -1,6 +1,7 @@
 import { WorkflowConflictError, WorkflowInvalidError } from "@t3tools/contracts/workflows";
 import {
   RelayAccessTokenType,
+  CodexVmConnectionError,
   RelayApi,
   type RelayClientEnvironmentRecord,
   type RelayClientDeviceRecord,
@@ -85,6 +86,12 @@ export const ManagedRelayDpopSignerError = Schema.Union([
 export type ManagedRelayDpopSignerError = typeof ManagedRelayDpopSignerError.Type;
 
 export const ManagedRelayRequestAction = Schema.Literals([
+  "read Codex VM connection",
+  "start Codex VM sign-in",
+  "complete Codex VM sign-in",
+  "read Codex VM sign-in",
+  "cancel Codex VM sign-in",
+  "disconnect Codex VM sign-in",
   "workflow sources",
   "listWorkflows",
   "saveWorkflow",
@@ -110,6 +117,8 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "read thread VM policy",
   "read thread VM status",
   "read VM Codex sign-in",
+  "read VM Codex account source",
+  "select VM Codex account source",
   "start VM Codex sign-in",
   "cancel VM Codex sign-in",
   "open private VM preview",
@@ -189,6 +198,12 @@ export const ManagedRelayRequestAction = Schema.Literals([
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
 export const ManagedRelayRequestActivity = Schema.Literals([
+  "Codex VM connection",
+  "Codex VM sign-in",
+  "Codex VM sign-in completion",
+  "Codex VM sign-in status",
+  "Codex VM sign-in cancellation",
+  "Codex VM disconnection",
   "Relay health read",
   "workflow sources",
   "listWorkflows",
@@ -214,6 +229,8 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Thread VM policy read",
   "Thread VM status read",
   "VM Codex sign-in read",
+  "VM Codex account source read",
+  "VM Codex account source selection",
   "VM Codex sign-in start",
   "VM Codex sign-in cancellation",
   "Thread VM setup read",
@@ -318,6 +335,7 @@ export class ManagedRelayUrlInvalidError extends Schema.TaggedError<ManagedRelay
 
 const isWorkflowConflictError = Schema.is(WorkflowConflictError);
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
+const isCodexVmConnectionError = Schema.is(CodexVmConnectionError);
 
 export class ManagedRelayRequestFailedError extends Schema.TaggedError<ManagedRelayRequestFailedError>()(
   "ManagedRelayRequestFailedError",
@@ -330,7 +348,11 @@ export class ManagedRelayRequestFailedError extends Schema.TaggedError<ManagedRe
   },
 ) {
   override get message(): string {
-    if (isWorkflowConflictError(this.cause) || isWorkflowInvalidError(this.cause))
+    if (
+      isWorkflowConflictError(this.cause) ||
+      isWorkflowInvalidError(this.cause) ||
+      isCodexVmConnectionError(this.cause)
+    )
       return this.cause.message;
     const message = `Could not ${this.action}.`;
     return this.transportFailed ? `${message} ${NETWORK_BLOCKING_HINT}` : message;
@@ -387,6 +409,7 @@ export const ManagedRelayClientError = Schema.Union([
 export type ManagedRelayClientError = typeof ManagedRelayClientError.Type;
 
 export type RelayHttpRequestError =
+  | import("@t3tools/contracts/relay").CodexVmConnectionError
   | import("@t3tools/contracts/workflows").WorkflowConflictError
   | import("@t3tools/contracts/workflows").WorkflowInvalidError
   | RelayProtectedErrorType

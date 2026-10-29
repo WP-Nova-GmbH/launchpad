@@ -1000,7 +1000,8 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       return yield* rollbackDestination(owner, move);
     if (move.failureDetail) {
       const started = yield* sql`SELECT 1 FROM thread_transfer_readiness
-        WHERE operation_id=${owner.operationId} AND phase='started' LIMIT 1`;
+        WHERE operation_id=${owner.operationId} AND
+          (provider_probe_attempt_id IS NOT NULL OR (phase='started' AND setup_succeeded=0)) LIMIT 1`;
       if (started.length) return;
     }
     const validateProject = Effect.gen(function* () {

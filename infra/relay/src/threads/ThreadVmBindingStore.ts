@@ -1,6 +1,7 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import { ThreadVmProvisionConflict } from "./ThreadVmProvisionStore.ts";
+import { makeThreadVmCodexAuthStore } from "./ThreadVmCodexAuthStore.ts";
 
 /** Called only after verifying the allocation's enrollment proof; never accepts a client-selected scope. */
 export function makeThreadVmBindingStore(sql: PgClient) {
@@ -17,8 +18,9 @@ export function makeThreadVmBindingStore(sql: PgClient) {
           threadId: string;
           repositoryId: string;
           generation: number;
+          organizationId: string;
         }>`
-        SELECT a.thread_id AS "threadId", t.repository_id AS "repositoryId", p.generation
+        SELECT a.thread_id AS "threadId", t.repository_id AS "repositoryId",t.organization_id AS "organizationId", p.generation
         FROM relay_thread_vm_allocations a JOIN relay_thread_vm_provisions p USING (allocation_id)
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
         WHERE a.allocation_id = ${input.allocationId} AND p.operation_id = ${input.operationId}
@@ -54,7 +56,23 @@ export function makeThreadVmBindingStore(sql: PgClient) {
           return yield* new ThreadVmProvisionConflict({
             message: "Environment already has a different or revoked VM binding",
           });
-        return { allocationId: input.allocationId, ...allocation };
+        yield* makeThreadVmCodexAuthStore(sql)
+          .inheritBinding({ ...allocation, ...input })
+          .pipe(
+            Effect.catchTag(
+              "CodexVmConnectionError",
+              () =>
+                new ThreadVmProvisionConflict({
+                  message: "VM provider authentication source is unavailable.",
+                }),
+            ),
+          );
+        return {
+          allocationId: input.allocationId,
+          threadId: allocation.threadId,
+          repositoryId: allocation.repositoryId,
+          generation: allocation.generation,
+        };
       }),
     );
   });

@@ -55,9 +55,9 @@ Jira and Linear connections belong to individual users. See [Personal issue trac
 
 ## Provider accounts
 
-Your executors need to be signed in to Codex, Claude, Cursor, or OpenCode to do anything, and
+Your organization machines need to be signed in to Codex, Claude, Cursor, or OpenCode to do anything, and
 nobody should have to sign in on a machine. So you sign in **once**, on your own device, and share
-that sign-in with the organization: under **Settings → Organization → Provider accounts**, press
+that sign-in with the organization: under **Settings → Organization → Machine provider accounts**, press
 **Share this device's sign-in** next to a provider. Launchpad copies the provider's session from
 this device to the organization, and every executor picks it up within a few minutes, including
 executors you add later. Sign in on this device first if you have not (**Settings → Providers**).
@@ -70,6 +70,41 @@ not be shared.
 
 Providers refresh their own sessions over time. If executors ever fall out of sign-in for a
 provider, share it again from a signed-in device.
+
+Private VMs have a separate [Codex for VMs](#codex-for-vms) connection.
+
+## Codex for VMs
+
+For a private or self-hosted Launchpad organization, an admin can connect a dedicated ChatGPT
+account once in **Settings → Organization → Codex for VMs**. Several VMs can use it at the same
+time and share that account's ChatGPT plan allowance. **Manage usage** opens
+[ChatGPT usage settings](https://chatgpt.com/settings/usage); sign in there with the connected account.
+
+Connect, reconnect or replace the account from Launchpad desktop, or a local web client whose
+browser and Launchpad server run on the same computer. A remote browser, SSH connection or mobile
+client cannot receive this sign-in callback. Those clients can still use the account after it is connected.
+
+During VM preparation, choose **Organization Codex** to use the connected account without signing
+in inside that VM. Choose **Personal sign-in** to use a separate Codex login in the VM instead.
+Account choice is available while preparation is pending; active and paused VMs show their current
+source without changing it or starting the VM. Organization Codex offers a smaller model list;
+choose a supported model on the source thread before moving it. If preparation reports an
+unsupported model, cancel the move and change the source thread's model before trying again.
+The conversation is kept.
+Project setup runs once per preparation. If cleanup cannot be confirmed, preparation stays
+blocked; use the available VM cancellation or recovery controls.
+
+An admin uses **Reconnect with ChatGPT** for the same account when its session expires or needs
+attention. This restores access for VMs already using that connection. **Replace account…** is
+for a different account: existing VM selections remain tied to the previous account. Select the
+replacement during VM preparation; for an active VM, move the thread back to a machine and prepare
+a new VM with the replacement selected.
+
+**Disconnect…** blocks new Codex work through this connection and tries to revoke the session.
+It does not stop VMs or cancel work already in progress, and previously issued access may remain
+valid for a while. If revocation cannot be confirmed, review Launchpad's connection in ChatGPT
+Settings. Changing this connection does not remove personal VM sign-ins or the provider accounts
+shared with organization machines.
 
 ## Skills
 
@@ -295,7 +330,7 @@ files and changes from other threads.
 Close local terminals when their work is finished. Programs detached from those terminals are outside
 this guard; stop any that could change the checkout during the move. If Launchpad cannot confirm
 that managed work has stopped, the move stays queued with an explanation. Cancel it to continue locally.
-Fresh VMs need their own Codex sign-in; follow the sign-in step in the thread to let preparation continue.
+During preparation, choose [the organization's Codex account or personal sign-in](#codex-for-vms).
 For [Git access inside the VM](./source-control.md#git-inside-a-private-vm), connect the organization's
 GitHub App. New commits use its bot identity; moving the checkout itself still works without GitHub.
 Unsent drafts follow the thread on the device making the move. If both locations have a draft,

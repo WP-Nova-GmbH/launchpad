@@ -14,6 +14,7 @@ import {
   ThreadId,
   OrchestrationEvent,
   ProviderInstanceId,
+  ProviderDriverKind,
 } from "@t3tools/contracts";
 import { requireThreadVmRestoreServerStart } from "./ThreadVmServer.ts";
 import {
@@ -38,6 +39,8 @@ import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEv
 import { layer as SessionLayer } from "../persistence/ProviderSessionRuntime.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { ProcessRunner, layer as RunnerLayer } from "../processRunner.ts";
+import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import { ProviderAdapterProbeError } from "../provider/Errors.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { exportCodexConversation } from "../provider/Drivers/CodexConversationTransfer.ts";
 import { resolvePortableCodexHome } from "../provider/Drivers/PortableCodexHome.ts";
@@ -678,6 +681,136 @@ it.layer(
                 }),
               );
               const secrets = yield* Secrets.ServerSecretStore;
+              if (!worktree) {
+                yield* f.fs.writeFileString(
+                  f.path.join(f.checkoutPath, "t3.json"),
+                  encode({
+                    scripts: [
+                      {
+                        id: "prepare",
+                        name: "Prepare",
+                        command: "printf 'setup\\n' >> restore-setup-count",
+                        runOnWorktreeCreate: true,
+                      },
+                    ],
+                  }),
+                );
+                const instanceId = ProviderInstanceId.make("codex"),
+                  driverKind = ProviderDriverKind.make("codex");
+                let failed = true,
+                  probes = 0;
+                const unused = () => Effect.die("Unexpected restored provider operation");
+                const instance: ProviderInstance = {
+                  instanceId,
+                  driverKind,
+                  enabled: true,
+                  displayName: undefined,
+                  continuationIdentity: { driverKind, continuationKey: "restore-test" },
+                  snapshot: {
+                    getSnapshot: unused(),
+                    refresh: Effect.succeed({
+                      instanceId,
+                      driver: driverKind,
+                      enabled: true,
+                      installed: true,
+                      version: "0.159.3",
+                      status: "ready",
+                      auth: { status: "authenticated" },
+                      checkedAt: at,
+                      models: [],
+                      slashCommands: [],
+                      skills: [],
+                    }),
+                    streamChanges: Stream.empty,
+                    applyUsageLimits: unused,
+                    resolveMaintenance: unused,
+                  },
+                  get textGeneration(): never {
+                    throw new Error("Preparation must not generate text");
+                  },
+                  adapter: {
+                    provider: driverKind,
+                    capabilities: { sessionModelSwitch: "in-session" },
+                    hasSession: () => Effect.succeed(false),
+                    probeSession: (request) =>
+                      Effect.suspend(() => {
+                        probes++;
+                        return failed
+                          ? new ProviderAdapterProbeError({
+                              provider: "codex",
+                              threadId: f.threadId,
+                              detail: "Reconnect before resuming.",
+                              cleanupConfirmed: true,
+                            })
+                          : Effect.succeed({
+                              provider: driverKind,
+                              threadId: f.threadId,
+                              runtimeMode: request.runtimeMode,
+                              cwd: f.checkoutPath,
+                              status: "ready",
+                              resumeCursor: request.resumeCursor,
+                              createdAt: at,
+                              updatedAt: at,
+                            });
+                      }),
+                    startSession: unused,
+                    stopSession: unused,
+                    sendTurn: unused,
+                    interruptTurn: unused,
+                    respondToRequest: unused,
+                    respondToUserInput: unused,
+                    listSessions: unused,
+                    readThread: unused,
+                    rollbackThread: unused,
+                    stopAll: unused,
+                    streamEvents: Stream.empty,
+                  },
+                };
+                const preparing = activateRestoredThreadVm(f.threadId).pipe(
+                  Effect.provideService(
+                    HttpClient.HttpClient,
+                    HttpClient.make((request) =>
+                      Effect.succeed(
+                        HttpClientResponse.fromWeb(
+                          request,
+                          Response.json(
+                            request.url.endsWith("/repository/binding")
+                              ? {
+                                  operationId: f.operationId,
+                                  environmentId: receipt.environmentId,
+                                  repositoryId: receipt.scope.repositoryId,
+                                  threadId: f.threadId,
+                                  generation: receipt.scope.generation,
+                                  canonicalKey: "github.com/acme/project",
+                                }
+                              : { ready: false },
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Effect.provide(
+                    Layer.mock(ProviderInstanceRegistry)({
+                      getInstance: () => Effect.succeed(instance),
+                    }),
+                  ),
+                );
+                yield* Effect.flip(preparing);
+                expect((yield* readThreadVmRestoreState())?.phase).toBe("installed");
+                expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe(
+                  "frozen",
+                );
+                failed = false;
+                expect(yield* preparing).toBe(false);
+                expect((yield* readThreadVmRestoreState())?.phase).toBe("ready");
+                expect(probes).toBe(2);
+                expect(
+                  yield* f.fs.readFileString(f.path.join(f.checkoutPath, "restore-setup-count")),
+                ).toBe("setup\n");
+                expect(
+                  (yield* (yield* ProjectionSnapshotQuery).getSnapshot()).threads[0]?.promptQueue,
+                ).toEqual(snapshot.threads[0]?.promptQueue);
+              }
               yield* secrets.set(
                 THREAD_VM_RESTORE_STATE_SECRET,
                 new TextEncoder().encode(
@@ -686,8 +819,9 @@ it.layer(
               );
               // Startup proof uses a verified readiness receipt; provider/setup
               // execution itself has separate real adapter-boundary tests.
-              yield* sql`INSERT INTO thread_transfer_readiness(operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase)
-                  SELECT operation_id,manifest_sha256,native_runtime_json,${"0".repeat(64)},'ready' FROM thread_transfer_baselines WHERE operation_id=${f.operationId}`;
+              if (worktree)
+                yield* sql`INSERT INTO thread_transfer_readiness(operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase,setup_succeeded)
+                  SELECT operation_id,manifest_sha256,native_runtime_json,${"0".repeat(64)},'ready',1 FROM thread_transfer_baselines WHERE operation_id=${f.operationId}`;
               let calls = 0,
                 ready = false,
                 status = 200;

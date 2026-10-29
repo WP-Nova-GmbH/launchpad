@@ -19,6 +19,8 @@ import type {
 import {
   threadVmPresentation,
   threadVmProviderAuthPresentation,
+  threadVmAuthSourcePresentation,
+  threadVmAuthSourceChoice,
   threadVmBackupRecoveryUnavailable,
   type ThreadVmControlAction,
 } from "@t3tools/client-runtime/relay/threadVmControls";
@@ -42,6 +44,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ContextSheetSize } from "../../components/ContextSheetSize";
 import { AppText as Text, AppTextInput } from "../../components/AppText";
 import { SymbolView } from "../../components/AppSymbol";
+import { MaterialListRow } from "../../components/MaterialListRow";
+import { MaterialRadioIndicator } from "../../components/MaterialRadioIndicator";
 import { threadVmControls, threadVmActionJournal } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 function Panel({ children }: { children: ReactNode }) {
@@ -246,6 +250,15 @@ function VmCodexSignIn({
   loading: boolean;
 }) {
   const dispatch = useAtomCommand(threadVmControls.providerAuthAction, { reportFailure: false });
+  const sourceState = useAtomValue(
+    threadVmControls.providerAuthSourceViewAtom(environmentId, threadId),
+  );
+  const sourceData = sourceState.data;
+  const accountSource = sourceData?.source ?? value?.authSource;
+  const accountPresentation = accountSource
+    ? threadVmAuthSourcePresentation(accountSource, sourceData?.connection ?? null)
+    : null;
+  const choice = threadVmAuthSourceChoice(accountSource, sourceData?.connection);
   const [busy, setBusy] = useState(false),
     [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -258,7 +271,16 @@ function VmCodexSignIn({
     );
     return () => clearTimeout(timer);
   }, [expiresAt]);
-  const presentation = value ? threadVmProviderAuthPresentation(value, now) : null;
+  const presentation = value
+    ? threadVmProviderAuthPresentation(
+        {
+          ...value,
+          organizationConnection: sourceData?.connection ?? null,
+          ...(accountSource ? { authSource: accountSource } : {}),
+        },
+        now,
+      )
+    : null;
   const run = async (action: Parameters<typeof dispatch>[0]["action"]) => {
     if (busy) return;
     setBusy(true);
@@ -291,6 +313,76 @@ function VmCodexSignIn({
       accessibilityLabel="VM Codex sign-in"
       className="gap-2 rounded-lg border border-border bg-card p-3"
     >
+      {!sourceData?.unsupported ? (
+        <View
+          accessibilityRole="radiogroup"
+          accessibilityLabel="Codex account for this VM"
+          className="gap-2"
+        >
+          <MaterialListRow
+            title="Personal sign-in"
+            accessibilityRole="radio"
+            accessibilityState={{
+              checked: accountSource?.mode === "personal",
+              disabled: busy || sourceState.isPending,
+            }}
+            disabled={busy || sourceState.isPending}
+            onPress={() => void run({ type: "select_source", source: { mode: "personal" } })}
+            trailing={<MaterialRadioIndicator selected={accountSource?.mode === "personal"} />}
+          />
+          <MaterialListRow
+            title="Organization Codex"
+            subtitle={sourceData?.connection?.label}
+            accessibilityRole="radio"
+            accessibilityState={{
+              checked: choice.selectedValue === choice.organizationValue,
+              disabled:
+                busy || sourceState.isPending || sourceData?.connection?.status !== "connected",
+            }}
+            disabled={
+              busy || sourceState.isPending || sourceData?.connection?.status !== "connected"
+            }
+            onPress={() => {
+              if (sourceData?.connection?.connectionId)
+                void run({
+                  type: "select_source",
+                  source: {
+                    mode: "organization",
+                    connectionId: sourceData.connection.connectionId,
+                  },
+                });
+            }}
+            trailing={
+              <MaterialRadioIndicator
+                selected={choice.selectedValue === choice.organizationValue}
+              />
+            }
+          />
+        </View>
+      ) : null}
+      {sourceData?.connection?.status !== "connected" && !sourceData?.unsupported ? (
+        <Note>
+          Connect or reconnect Codex for VMs in Organization settings to use the organization
+          account.
+        </Note>
+      ) : null}
+      {accountPresentation?.usingPlan ? (
+        <>
+          <Note>
+            Using organization ChatGPT plan. Manage this connection in Organization settings → Codex
+            for VMs.
+          </Note>
+          <ActionButton
+            label="Manage usage"
+            disabled={busy}
+            onPress={() => {
+              void Linking.openURL("https://chatgpt.com/settings/usage").catch(() =>
+                setError("Could not open ChatGPT usage settings."),
+              );
+            }}
+          />
+        </>
+      ) : null}
       <Text className="text-xs font-semibold text-foreground">
         {presentation?.title ?? "Checking Codex sign-in in the new VM"}
       </Text>
@@ -340,6 +432,47 @@ function VmCodexSignIn({
           {error ?? readError}
         </Text>
       ) : null}
+      {sourceData?.error || sourceState.error ? (
+        <Text accessibilityLiveRegion="polite" className="text-xs text-destructive">
+          {sourceData?.error ?? sourceState.error}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+function VmCodexAccountSummary({
+  environmentId,
+  threadId,
+}: {
+  environmentId: EnvironmentId;
+  threadId: ThreadId;
+}) {
+  const state = useAtomValue(threadVmControls.providerAuthSourceViewAtom(environmentId, threadId));
+  const [error, setError] = useState<string | null>(null);
+  const source = state.data?.source;
+  if (!source)
+    return state.data?.error || state.error ? (
+      <Note>{state.data?.error ?? state.error}</Note>
+    ) : null;
+  const presentation = threadVmAuthSourcePresentation(source);
+  return (
+    <View className="gap-1">
+      <Note>
+        {presentation.label}. {presentation.detail}
+      </Note>
+      {source.mode === "organization" ? (
+        <ActionButton
+          label="Manage usage"
+          disabled={false}
+          onPress={() => {
+            void Linking.openURL("https://chatgpt.com/settings/usage").catch(() =>
+              setError("Could not open ChatGPT usage settings."),
+            );
+          }}
+        />
+      ) : null}
+      {error ? <Note>{error}</Note> : null}
     </View>
   );
 }
@@ -636,6 +769,16 @@ function ThreadVmControlPanel({
   );
   const actions = (open: (action: () => void) => void, standalone = false) => (
     <VmActionList>
+      {status?.allocation && !status.pendingProviderAuth ? (
+        <VmCodexAccountSummary environmentId={environmentId} threadId={threadId} />
+      ) : null}
+      {status?.pendingProviderAuth && presentation.primary?.type !== "sign_in" ? (
+        <ActionButton
+          label="Codex account…"
+          disabled={disabled}
+          onPress={() => open(() => openConfirmation("sign_in"))}
+        />
+      ) : null}
       {presentation.primary && !deletionNote && !standalone ? (
         <ActionButton
           label={presentation.primary.label}
@@ -846,7 +989,7 @@ function ThreadVmControlPanel({
                   {confirm === "preview"
                     ? "Open private preview"
                     : confirm === "sign_in"
-                      ? "Sign in to Codex"
+                      ? "Codex account"
                       : confirm === "replacement"
                         ? "Choose a VM to replace"
                         : confirm === "delete"
@@ -863,7 +1006,7 @@ function ThreadVmControlPanel({
                 {confirm === "preview"
                   ? "Enter the port your application is listening on inside this VM."
                   : confirm === "sign_in"
-                    ? "Sign in to Codex inside the destination VM to finish preparation."
+                    ? "Choose personal sign-in or the organization's Codex account to finish preparing this VM."
                     : confirm === "replacement"
                       ? "Your VM allowance is full. Choose a VM to save and stop. The least recently active choice is listed first."
                       : confirm === "delete"

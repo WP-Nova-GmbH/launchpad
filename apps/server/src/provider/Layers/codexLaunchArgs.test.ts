@@ -4,6 +4,9 @@ import { describe, it } from "vite-plus/test";
 
 import {
   codexAppServerArgs,
+  codexSessionAppServerArgs,
+  managedCodexEnvironment,
+  managedCodexModelIssue,
   codexExecLaunchArgs,
   resolveCodexLaunchArgs,
 } from "./codexLaunchArgs.ts";
@@ -55,5 +58,52 @@ describe("codexExecLaunchArgs", () => {
     NodeAssert.deepStrictEqual(codexExecLaunchArgs("--config --strict-config --enable --disable"), [
       "--strict-config",
     ]);
+  });
+});
+
+describe("organization-managed Codex launch", () => {
+  it("pins every launch route after conflicting user, environment and session arguments", () => {
+    const overridden =
+      '-c model_provider="other" -c model_providers.launchpad_vm.env_key="OPENAI_API_KEY"';
+    for (const args of [
+      codexAppServerArgs(overridden, "selected-connection"),
+      codexExecLaunchArgs(overridden, "selected-connection"),
+      codexSessionAppServerArgs(
+        ["-c", 'model_provider="from-session"'],
+        overridden,
+        "selected-connection",
+      ),
+    ]) {
+      const configs = args.flatMap((arg, index) => (arg === "-c" ? [args[index + 1]!] : []));
+      NodeAssert.equal(
+        configs.findLast((value) => value.startsWith("model_provider=")),
+        'model_provider="launchpad_vm"',
+      );
+      const provider = configs.at(-1)!;
+      NodeAssert.ok(provider.startsWith("model_providers.launchpad_vm={"));
+      NodeAssert.ok(provider.includes('base_url="https://api.openai.com/v1"'));
+      NodeAssert.ok(provider.includes("requires_openai_auth=false"));
+      NodeAssert.ok(provider.includes('command="/opt/launchpad/server/t3"'));
+      NodeAssert.ok(
+        provider.includes('"__thread-vm-codex-token","--connection-id","selected-connection"'),
+      );
+      NodeAssert.ok(!provider.includes("env_key"));
+      NodeAssert.ok(!provider.includes("experimental_bearer_token"));
+    }
+  });
+
+  it("does not inherit personal credentials or an overriding Launchpad argument variable", () => {
+    NodeAssert.deepEqual(
+      managedCodexEnvironment({
+        PATH: "/usr/bin",
+        T3CODE_CODEX_LAUNCH_ARGS: "--bad",
+        OPENAI_API_KEY: "personal",
+        CODEX_API_KEY: "other",
+        OPENAI_BASE_URL: "https://other",
+      }),
+      { PATH: "/usr/bin" },
+    );
+    NodeAssert.equal(managedCodexModelIssue("gpt-6-astra"), undefined);
+    NodeAssert.match(managedCodexModelIssue("gpt-5.5")!, /Select a supported model/);
   });
 });

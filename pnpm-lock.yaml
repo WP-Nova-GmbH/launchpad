@@ -820,6 +820,9 @@ importers:
       tldts:
         specifier: 7.4.2
         version: 7.4.2
+      jose:
+        specifier: 'catalog:'
+        version: 6.2.2
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^4.20260601.1

@@ -85,6 +85,22 @@ export class ProviderAdapterProcessError extends Schema.TaggedError<ProviderAdap
   }
 }
 
+/** Private resume probes may be retried only after an affirmative cleanup receipt. */
+export class ProviderAdapterProbeError extends Schema.TaggedError<ProviderAdapterProbeError>()(
+  "ProviderAdapterProbeError",
+  {
+    provider: Schema.String,
+    threadId: Schema.String,
+    detail: Schema.String,
+    cleanupConfirmed: Schema.Boolean,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 /**
  * ProviderWorkspaceMissingError - The session's working directory no longer
  * exists on disk, so no provider process can start in it.

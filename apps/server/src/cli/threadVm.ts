@@ -13,6 +13,7 @@ import {
 } from "../relay/ThreadVmRestoreIdentity.ts";
 import { inspectVmWorkloads } from "../vmWorkload.ts";
 import { withVmWorkloads } from "../vmWorkloadCommand.ts";
+import { mintThreadVmCodexToken, ThreadVmCodexTokenError } from "../relay/ThreadVmCodexToken.ts";
 import * as NodeStream from "@effect/platform-node/NodeStream";
 import * as Stream from "effect/Stream";
 import {
@@ -31,6 +32,7 @@ import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Redacted from "effect/Redacted";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { Argument, Command, Flag } from "effect/unstable/cli";
@@ -67,6 +69,7 @@ const encodeRestoreReceipt = Schema.encodeEffect(
 );
 const encodeReceipt = Schema.encodeEffect(Schema.fromJsonString(RelayThreadVmEnrollmentReceipt));
 const encodeProviderAuth = Schema.encodeEffect(Schema.fromJsonString(RelayThreadVmProviderAuth));
+const isCodexTokenError = Schema.is(ThreadVmCodexTokenError);
 
 /** Fixed loopback bridge; stdin contains identity and action, never credentials or shell commands. */
 export const threadVmProviderAuthCommand = Command.make("__thread-vm-provider-auth").pipe(
@@ -393,6 +396,41 @@ export const threadVmGitCredentialCommand = Command.make("__thread-vm-git-creden
           "Launchpad could not authorize this VM's repository. Check the organization's GitHub connection, repository access, and VM connection, then retry.",
         );
       yield* Console.log(reply);
+    }),
+  ),
+);
+
+/** Native Codex command authentication reads one access token from stdout. */
+export const threadVmCodexTokenCommand = Command.make("__thread-vm-codex-token", {
+  connectionId: Flag.String("connection-id"),
+}).pipe(
+  Command.unlisted,
+  Command.withHandler(
+    Effect.fnUntraced(function* ({ connectionId }) {
+      const token = yield* Effect.gen(function* () {
+        if ((yield* HostProcessPlatform) !== "linux")
+          return yield* new ThreadVmCodexTokenError({ reason: "not_managed" });
+        const config = yield* resolveCliAuthConfig(
+          { baseDir: Option.some("/home/user/.launchpad") },
+          Option.some("None"),
+        ).pipe(
+          Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({})),
+        );
+        return yield* mintThreadVmCodexToken(connectionId).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ServerSecretStore.layer,
+              ServerEnvironment.identityLayer,
+              FetchHttpClient.layer,
+            ).pipe(Layer.provide(ServerConfig.layer(config))),
+          ),
+        );
+      }).pipe(
+        Effect.mapError((error) =>
+          isCodexTokenError(error) ? error : new ThreadVmCodexTokenError({ reason: "unavailable" }),
+        ),
+      );
+      yield* Console.log(Redacted.value(token));
     }),
   ),
 );

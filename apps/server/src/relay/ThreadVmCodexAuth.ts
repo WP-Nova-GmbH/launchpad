@@ -1,12 +1,17 @@
 import { ProviderInstanceId, ProviderSetupError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
+import * as Semaphore from "effect/Semaphore";
+import * as Crypto from "effect/Crypto";
 import * as Stream from "effect/Stream";
 import * as ProviderAuthFlow from "../provider/ProviderAuthFlow.ts";
 import type { ProviderAccountAuthShape } from "../provider/ProviderAccountAuth.ts";
 import { makeProviderAuthService } from "../provider/Layers/ProviderAuthService.ts";
 import { ProviderAuthService } from "../provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
+import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 
 const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "gu");
 /** The transfer version pins the CLI. Keep native terminal text out of the relay;
@@ -99,23 +104,52 @@ export const threadVmCodexAuthServiceLayer = Layer.effect(
   ProviderAuthService,
   Effect.gen(function* () {
     const registry = yield* ProviderInstanceRegistry;
+    const scope = yield* Effect.scope;
+    const lock = yield* Semaphore.make(1);
+    const crypto = yield* Crypto.Crypto;
     const instanceId = ProviderInstanceId.make("codex");
-    const instance = yield* registry.getInstance(instanceId);
-    if (!instance?.accountAuth || instance.auth || instance.driverKind !== "codex")
-      return yield* makeProviderAuthService;
-    const auth = yield* makeThreadVmCodexAuth(
-      instance.accountAuth,
-      instance.snapshot.refresh.pipe(Effect.map((s) => s.auth.status === "authenticated")),
-    );
-    const guestInstance = { ...instance, auth };
+    let cached: {
+      source: ProviderInstance;
+      instance: ProviderInstance;
+      scope: Scope.Closeable;
+    } | null = null;
+    const getGuestInstance = (id: typeof instanceId) =>
+      id !== instanceId
+        ? registry.getInstance(id)
+        : lock.withPermit(
+            Effect.gen(function* () {
+              const instance = yield* registry.getInstance(id);
+              if (cached && cached.source === instance) return cached.instance;
+              if (cached) yield* Scope.close(cached.scope, Exit.void);
+              cached = null;
+              if (!instance?.accountAuth || instance.auth || instance.driverKind !== "codex")
+                return instance;
+              const child = yield* Scope.fork(scope);
+              const auth = yield* makeThreadVmCodexAuth(
+                instance.accountAuth,
+                instance.snapshot.refresh.pipe(
+                  Effect.map((s) => s.auth.status === "authenticated"),
+                ),
+              ).pipe(
+                Effect.provideService(Scope.Scope, child),
+                Effect.provideService(Crypto.Crypto, crypto),
+              );
+              const wrapped = { ...instance, auth };
+              cached = { source: instance, instance: wrapped, scope: child };
+              return wrapped;
+            }),
+          );
     return yield* makeProviderAuthService.pipe(
       Effect.provideService(ProviderInstanceRegistry, {
         ...registry,
-        getInstance: (id) =>
-          id === instanceId ? Effect.succeed(guestInstance) : registry.getInstance(id),
+        getInstance: getGuestInstance,
         listInstances: registry.listInstances.pipe(
-          Effect.map((instances) =>
-            instances.map((i) => (i.instanceId === instanceId ? guestInstance : i)),
+          Effect.flatMap((instances) =>
+            Effect.forEach(instances, (instance) =>
+              instance.instanceId === instanceId
+                ? getGuestInstance(instanceId).pipe(Effect.map((wrapped) => wrapped ?? instance))
+                : Effect.succeed(instance),
+            ),
           ),
         ),
       }),

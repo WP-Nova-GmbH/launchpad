@@ -911,6 +911,64 @@ describe("isRecoverableThreadResumeError", () => {
 });
 
 describe("openCodexThread", () => {
+  it.effect(
+    "rejects a resume that ignores managed provider selection without starting another conversation",
+    () =>
+      Effect.gen(function* () {
+        const error = yield* openCodexThread({
+          client: {
+            request: () => Effect.die("A provider mismatch must never create another conversation"),
+            raw: {
+              request: () => Effect.succeed(makeThreadOpenResponse("personal-native-thread")),
+            },
+          },
+          threadId: ThreadId.make("managed-thread"),
+          runtimeMode: "auto",
+          cwd: "/tmp/project",
+          requestedModel: "gpt-6-astra",
+          serviceTier: undefined,
+          resumeThreadId: "personal-native-thread",
+          resumePolicy: "require-existing",
+          modelProvider: "launchpad_vm",
+        }).pipe(Effect.flip);
+        NodeAssert.match(error.message, /did not use the selected organization model provider/);
+      }),
+  );
+
+  it.effect(
+    "resumes a transferred personal conversation using the managed provider and same required native ID",
+    () =>
+      Effect.gen(function* () {
+        let received: CodexRpc.ClientRequestParamsByMethod["thread/resume"] | undefined;
+        const opened = yield* openCodexThread({
+          client: {
+            request: () => Effect.die("Managed continuation must not start a new native thread"),
+            raw: {
+              request: (_method, payload) => {
+                received = payload;
+                return Effect.succeed({
+                  ...makeThreadOpenResponse("personal-native-thread"),
+                  model: "gpt-6-astra",
+                  modelProvider: "launchpad_vm",
+                });
+              },
+            },
+          },
+          threadId: ThreadId.make("managed-thread"),
+          runtimeMode: "auto",
+          cwd: "/tmp/project",
+          requestedModel: "gpt-6-astra",
+          serviceTier: undefined,
+          resumeThreadId: "personal-native-thread",
+          resumePolicy: "require-existing",
+          modelProvider: "launchpad_vm",
+        });
+        NodeAssert.equal(opened.thread.id, "personal-native-thread");
+        NodeAssert.equal(received?.modelProvider, "launchpad_vm");
+        NodeAssert.equal(received?.model, "gpt-6-astra");
+      }),
+  );
+
   it.effect("resumes metadata when historical turns contain unknown error values", () =>
     Effect.gen(function* () {
       const response = makeThreadOpenResponse("saved-thread");

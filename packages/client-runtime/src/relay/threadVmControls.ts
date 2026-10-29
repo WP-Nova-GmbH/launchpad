@@ -19,11 +19,15 @@ import type {
   RelayThreadVmProviderAuth,
   RelayPortableThreadPlacement,
   ThreadVmCapabilities,
+  RelayThreadVmCodexAuthSource,
+  RelayThreadVmCodexAuthSelection,
+  RelayCodexVmConnection,
 } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import { HttpClientError } from "effect/unstable/http";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import {
   createRuntimeCommand,
@@ -33,6 +37,7 @@ import {
 } from "../state/runtime.ts";
 import type { createThreadVmActionJournal } from "./threadVmActionSubmission.ts";
 import { ManagedRelayTenancyClient } from "./managedRelayTenancy.ts";
+import type { ManagedRelayClientError } from "./managedRelay.ts";
 import {
   managedRelaySessionAtom,
   readManagedRelaySnapshotState,
@@ -101,15 +106,88 @@ export function threadVmBackupRecoveryUnavailable(reason: string | null | undefi
   }
 }
 
-/** Fresh VMs use Codex's own device sign-in while their workspace remains fenced. */
+export function threadVmAuthSourcePresentation(
+  source: RelayThreadVmCodexAuthSource,
+  currentConnection?: RelayCodexVmConnection | null,
+) {
+  const current =
+    currentConnection === undefined && source.mode === "organization"
+      ? source.connection
+      : currentConnection;
+  const usingPlan =
+    source.mode === "organization" &&
+    current?.connectionId === source.connectionId &&
+    current.status === "connected";
+  return source.mode === "personal"
+    ? {
+        label: "Personal Codex sign-in",
+        detail: "Signed in separately inside this VM.",
+        usingPlan: false,
+      }
+    : {
+        label: `Organization Codex${source.connection.label ? ` · ${source.connection.label}` : ""}`,
+        usingPlan,
+        detail: usingPlan
+          ? "Using organization ChatGPT plan."
+          : current === null
+            ? "Could not verify the current organization account. Check sign-in status before continuing."
+            : current?.connectionId && current.connectionId !== source.connectionId
+              ? "The organization account changed. Choose the replacement account or personal sign-in to continue."
+              : "Ask an administrator to reconnect Codex for VMs in Organization settings.",
+      };
+}
+
+/** A replacement organization connection is a new choice, even if the mode is unchanged. */
+export function threadVmAuthSourceChoice(
+  source: RelayThreadVmCodexAuthSource | null | undefined,
+  connection: RelayCodexVmConnection | null | undefined,
+) {
+  return {
+    selectedValue:
+      source?.mode === "organization"
+        ? `organization:${source.connectionId}`
+        : (source?.mode ?? null),
+    organizationValue: connection?.connectionId
+      ? `organization:${connection.connectionId}`
+      : "organization:unavailable",
+  };
+}
+
+const unsupportedAuthSource = (error: ManagedRelayClientError) =>
+  error._tag === "ManagedRelayRequestFailedError" &&
+  HttpClientError.isHttpClientError(error.cause) &&
+  error.cause.response?.status === 404;
+
+/** Managed VMs never expose a device-code prompt or a local account logout. */
 export function threadVmProviderAuthPresentation(
   value: {
     readonly requirement: "sign_in_required" | "authenticated" | "provider_unavailable";
     readonly auth: ProviderAuthState;
+    readonly authSource?: RelayThreadVmCodexAuthSource;
+    readonly organizationConnection?: RelayCodexVmConnection | null;
   },
   now?: number,
 ) {
   const { auth, requirement } = value;
+  if (value.authSource?.mode === "organization") {
+    const source = threadVmAuthSourcePresentation(value.authSource, value.organizationConnection);
+    return {
+      title: source.label,
+      message: !source.usingPlan
+        ? source.detail
+        : requirement === "provider_unavailable"
+          ? (auth.message ?? source.detail)
+          : requirement === "authenticated"
+            ? `${source.detail} VM preparation continues automatically.`
+            : "Checking the organization's Codex account in this VM…",
+      expired: false,
+      url: null,
+      userCode: null,
+      canStart: false,
+      canCancel: false,
+      startLabel: "Sign in to Codex",
+    };
+  }
   const expiresAt = auth.expiresAt === null ? null : Date.parse(auth.expiresAt);
   const expired =
     expiresAt !== null && (now === undefined || !Number.isFinite(expiresAt) || expiresAt <= now);
@@ -1041,6 +1119,70 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       return result;
     }).pipe(Atom.setIdleTTL(0)),
   );
+  // Mounted only by account controls. Older relays must not break ordinary VM reads.
+  const providerAuthSourceQueryAtom = Atom.family((key: string) =>
+    runtime
+      .atom((get) =>
+        Effect.gen(function* () {
+          const session = get(managedRelaySessionAtom),
+            route = get(routeAtom(key)),
+            binding = get(providerAuthBindingAtom(key));
+          if (!session || !route) return null;
+          const registry = yield* AtomRegistry.AtomRegistry;
+          const { relay, clerkToken } = yield* authorize(registry, key);
+          const [, threadId] = decodeKey(key);
+          const source = yield* relay
+            .getThreadVmProviderAuthSource({ clerkToken, threadId })
+            .pipe(Effect.result);
+          const connection = binding
+            ? yield* relay.getCodexVmConnection({ clerkToken }).pipe(Effect.result)
+            : null;
+          const current = pendingAuthBinding(registry, key);
+          if (
+            registry.get(managedRelaySessionAtom) !== session ||
+            (binding === null
+              ? current !== null
+              : current === null || !sameAuthBinding(binding, current))
+          )
+            return null;
+          return {
+            session,
+            route,
+            binding,
+            source: source._tag === "Success" ? source.success : null,
+            connection: connection?._tag === "Success" ? connection.success : null,
+            unsupported: source._tag === "Failure" && unsupportedAuthSource(source.failure),
+            error:
+              source._tag === "Failure"
+                ? unsupportedAuthSource(source.failure)
+                  ? "This Launchpad Connect version does not support VM account selection. Update it to use organization Codex; personal sign-in remains available."
+                  : source.failure.message
+                : connection?._tag === "Failure"
+                  ? connection.failure.message
+                  : null,
+          };
+        }),
+      )
+      .pipe(Atom.setIdleTTL(0)),
+  );
+  const providerAuthSourceViewAtom = Atom.family((key: string) =>
+    Atom.make((get) => {
+      const state = readManagedRelaySnapshotState(get(providerAuthSourceQueryAtom(key))),
+        value = state.data,
+        binding = get(providerAuthBindingAtom(key));
+      return {
+        ...state,
+        data:
+          value?.session === get(managedRelaySessionAtom) &&
+          value.route === get(routeAtom(key)) &&
+          (value.binding === null
+            ? binding === null
+            : binding !== null && sameAuthBinding(value.binding, binding))
+            ? value
+            : null,
+      };
+    }).pipe(Atom.setIdleTTL(0)),
+  );
   const locationQueryAtom = Atom.family((key: string) =>
     runtime
       .atom((get) =>
@@ -1382,7 +1524,10 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         threadId: ThreadId;
         accountId: string;
         binding: RelayThreadVmProviderAuthBinding;
-        action: { type: "start" | "refresh" } | { type: "cancel"; flowId: string };
+        action:
+          | { type: "start" | "refresh" }
+          | { type: "cancel"; flowId: string }
+          | { type: "select_source"; source: RelayThreadVmCodexAuthSelection };
       }) => keyFor(input.environmentId, input.threadId),
     },
     execute: Effect.fnUntraced(function* (input, registry) {
@@ -1400,19 +1545,27 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           generation: current.generation,
         };
       const request =
-        input.action.type === "start"
-          ? relay.startThreadVmProviderAuth({ ...auth, payload })
-          : input.action.type === "cancel"
-            ? relay.cancelThreadVmProviderAuth({
+        input.action.type === "select_source"
+          ? relay
+              .selectThreadVmProviderAuthSource({
                 ...auth,
-                payload: { ...payload, flowId: input.action.flowId },
+                payload: { ...payload, source: input.action.source },
               })
-            : relay.getThreadVmProviderAuth(auth);
+              .pipe(Effect.andThen(relay.getThreadVmProviderAuth(auth)))
+          : input.action.type === "start"
+            ? relay.startThreadVmProviderAuth({ ...auth, payload })
+            : input.action.type === "cancel"
+              ? relay.cancelThreadVmProviderAuth({
+                  ...auth,
+                  payload: { ...payload, flowId: input.action.flowId },
+                })
+              : relay.getThreadVmProviderAuth(auth);
       const reply = yield* request.pipe(
         Effect.ensuring(
           Effect.sync(() => {
             registry.refresh(providerAuthQueryAtom(key));
             registry.refresh(queryAtom(key));
+            registry.refresh(providerAuthSourceQueryAtom(key));
           }),
         ),
       );
@@ -1443,6 +1596,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       registry.refresh(capabilitiesQueryAtom);
       yield* AtomRegistry.getResult(registry, queryAtom(key), { suspendOnWaiting: true });
       registry.refresh(providerAuthQueryAtom(key));
+      registry.refresh(providerAuthSourceQueryAtom(key));
       yield* AtomRegistry.getResult(registry, providerAuthQueryAtom(key), {
         suspendOnWaiting: true,
       });
@@ -1465,6 +1619,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       registry.refresh(queryAtom(key));
       registry.refresh(capabilitiesQueryAtom);
       registry.refresh(providerAuthQueryAtom(key));
+      registry.refresh(providerAuthSourceQueryAtom(key));
       registry.refresh(locationQueryAtom(key));
       registry.refresh(unavailableLocationQueryAtom(key));
     },
@@ -1475,6 +1630,10 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     checkBackupRecovery,
     openPreview,
     providerAuthAction,
+    providerAuthSourceViewAtom: (environmentId: EnvironmentId, threadId: ThreadId) =>
+      providerAuthSourceViewAtom(keyFor(environmentId, threadId)),
+    providerAuthSourceQueryAtom: (environmentId: EnvironmentId, threadId: ThreadId) =>
+      providerAuthSourceQueryAtom(keyFor(environmentId, threadId)),
     providerAuthQueryAtom: (environmentId: EnvironmentId, threadId: ThreadId) =>
       providerAuthQueryAtom(keyFor(environmentId, threadId)),
     locationQueryAtom: (

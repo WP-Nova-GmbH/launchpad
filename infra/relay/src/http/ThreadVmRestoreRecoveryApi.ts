@@ -20,6 +20,8 @@ import { makeThreadVmRecoveryHistory } from "../threads/ThreadVmRecoveryHistory.
 import { withEnvironmentThread } from "./ThreadEnvironmentApi.ts";
 import { tenancyConflict, tenancyNotFound } from "./tenancyErrors.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
+import { makeThreadVmCodexAuthStore } from "../threads/ThreadVmCodexAuthStore.ts";
+import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 
 type Owner = { threadId: string; environmentId: string; generation: number };
 const decodeRecovery = Schema.decodeEffect(RelayThreadVmRestoreRecovery);
@@ -154,6 +156,14 @@ export const confirmThreadVmRestoreActivation = Effect.fn("relay.api.restore.act
       input,
       true,
       Effect.gen(function* () {
+        const principal = yield* RelayEnvironmentPrincipal;
+        const placement = yield* makeThreadPlacementStore(sql).get(input.threadId);
+        if (!principal.threadVm || !placement) return yield* tenancyNotFound("thread_not_found");
+        yield* makeThreadVmCodexAuthStore(sql).requireAcknowledged({
+          ...input,
+          allocationId: principal.threadVm.allocationId,
+          organizationId: placement.organizationId,
+        });
         const reset =
           yield* sql`SELECT 1 FROM relay_thread_vm_resets WHERE operation_id=${receipt.operationId} AND thread_id=${input.threadId}`;
         return yield* reset.length

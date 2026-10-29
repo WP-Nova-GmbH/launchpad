@@ -1,5 +1,9 @@
 import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
-import type { RelayPortableThreadPlacement } from "@t3tools/contracts/relay";
+import type {
+  RelayPortableThreadPlacement,
+  RelayThreadVmCodexAuthSource,
+  RelayCodexVmConnection,
+} from "@t3tools/contracts/relay";
 import { act, useState, type ComponentProps, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -17,6 +21,8 @@ const fixture = vi.hoisted(() => ({
   status: {} as Record<string, unknown>,
   candidates: [] as Record<string, unknown>[],
   auth: null as Record<string, unknown> | null,
+  authSource: null as RelayThreadVmCodexAuthSource | null,
+  codexConnection: null as RelayCodexVmConnection | null,
   queuePaused: false,
   replacementEnabled: true,
   readError: null as string | null,
@@ -87,6 +93,16 @@ vi.mock("../../state/threads", () => ({
     checkLocation: "location",
     hostConfigurationAtom: { isPending: false, unavailableReason: null },
     providerAuthAction: "auth",
+    providerAuthSourceViewAtom: () => ({
+      data: {
+        source: fixture.authSource,
+        connection: fixture.codexConnection,
+        unsupported: false,
+        error: null,
+      },
+      isPending: false,
+      error: null,
+    }),
     checkBackupRecovery: "backup",
     openPreview: "preview",
     refresh: vi.fn(),
@@ -310,6 +326,8 @@ beforeEach(() => {
   fixture.status = {};
   fixture.candidates = [];
   fixture.auth = null;
+  fixture.authSource = null;
+  fixture.codexConnection = null;
   fixture.queuePaused = false;
   fixture.replacementEnabled = true;
   fixture.readError = null;
@@ -657,6 +675,66 @@ describe("simplified VM controls", () => {
         action: { type: "start" },
       }),
     );
+  });
+  it("lets a managed VM with a failed probe reopen account selection without offering personal device actions", async () => {
+    fixture.status = {
+      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      setupPhase: "running",
+    };
+    fixture.codexConnection = {
+      connectionId: "org-codex",
+      label: "VM account",
+      status: "connected",
+      epoch: 1,
+      tokenRevision: 1,
+      errorCode: null,
+      refreshing: false,
+    };
+    fixture.authSource = {
+      mode: "organization",
+      connectionId: "org-codex",
+      connection: fixture.codexConnection,
+    };
+    fixture.auth = {
+      requirement: "provider_unavailable",
+      auth: {
+        phase: "waiting",
+        expiresAt: null,
+        flowId: "stale-personal",
+        authorizationUrl: "https://chatgpt.com/activate",
+        interaction: {
+          type: "deviceCode",
+          url: "https://chatgpt.com/activate",
+          userCode: "STALE-CODE",
+        },
+        message: "Codex probe failed.",
+      },
+    };
+    await mount();
+    await act(async () => button("Codex account…").props.onClick());
+    expect(dialogs()).toHaveLength(1);
+    const text = JSON.stringify(renderer!.toJSON());
+    expect(text).toContain("Codex probe failed.");
+    expect(text).not.toContain("STALE-CODE");
+    expect(dialogButton("Cancel sign-in")).toBeUndefined();
+    expect(dialogButton("Open Codex sign-in page")).toBeUndefined();
+    fixture.openLink.mockResolvedValue(undefined);
+    await act(async () => dialogButton("Manage usage").props.onClick());
+    expect(fixture.openLink).toHaveBeenCalledWith("https://chatgpt.com/settings/usage", {
+      recordHistory: false,
+    });
+    expect(fixture.authAction).not.toHaveBeenCalled();
+    fixture.codexConnection = { ...fixture.codexConnection, connectionId: "replacement" };
+    fixture.auth = { ...fixture.auth, requirement: "authenticated" };
+    await act(async () => renderer!.update(view()));
+    const replaced = dialogs()[0]!
+      .findAllByType("p")
+      .map((node) => node.children.join(" "))
+      .join(" ");
+    expect(replaced).toContain("Choose the replacement account or personal sign-in");
+    expect(replaced).not.toContain("VM preparation continues automatically");
+    expect(replaced).not.toContain("Using organization ChatGPT plan");
+    expect(dialogButton("Manage usage")).toBeUndefined();
   });
   it("chooses and confirms a replacement from a local source", async () => {
     fixture.local = true;

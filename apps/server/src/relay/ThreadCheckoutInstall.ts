@@ -341,6 +341,16 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
           })).workspaceRoot;
         }
         return yield* Effect.gen(function* () {
+          const [readiness] = yield* sql<{
+            output: string | null;
+            started: number;
+            probe: string | null;
+          }>`SELECT setup_output_json AS output,setup_started AS started,provider_probe_attempt_id AS probe
+            FROM thread_transfer_readiness WHERE operation_id=${input.operationId}`;
+          if (readiness?.probe != null)
+            return yield* workspaceFailure(
+              "Destination native validation has no confirmed exit; cancellation remains held.",
+            );
           const exists = yield* fs.exists(claim.checkoutPath);
           if (!exists && claim.mode === "main")
             return yield* workspaceFailure(
@@ -365,11 +375,6 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
               return yield* workspaceFailure(
                 "The checkout has new local commits; rollback remains held.",
               );
-            const [readiness] = yield* sql<{
-              output: string | null;
-              started: number;
-            }>`SELECT setup_output_json AS output,setup_started AS started
-              FROM thread_transfer_readiness WHERE operation_id=${input.operationId}`;
             if (readiness?.started === 1 && readiness.output === null)
               return yield* workspaceFailure(
                 "Destination setup has not confirmed its exit; cancellation remains held.",
@@ -400,6 +405,7 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
               );
             const changed = yield* sql`UPDATE thread_checkout_claims SET phase = 'rolling-back'
             WHERE operation_id = ${input.operationId} AND phase IN ('installing', 'installed', 'rolling-back')
+            AND NOT EXISTS(SELECT 1 FROM thread_transfer_readiness WHERE operation_id=${input.operationId} AND provider_probe_attempt_id IS NOT NULL)
             AND EXISTS (SELECT 1 FROM thread_execution_fences WHERE thread_id = ${input.threadId}
               AND generation = ${input.generation} AND operation_id = ${input.operationId} AND phase = 'frozen') RETURNING operation_id`;
             if (!changed.length)

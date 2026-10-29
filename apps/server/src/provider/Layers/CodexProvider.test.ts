@@ -1,6 +1,26 @@
 import { assert, it } from "@effect/vitest";
+import { CodexSettings } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import { ThreadVmCodexAuthSourceError } from "../../relay/ThreadVmCodexAuthSource.ts";
+const decodeManagedSettings = Schema.decodeUnknownSync(CodexSettings);
+const noManagedSpawn = ChildProcessSpawner.make(() => Effect.die("Unexpected provider spawn"));
+const managedConnection = {
+  connectionId: "selected-connection",
+  label: "Organization account",
+  status: "connected" as const,
+  epoch: 1,
+  tokenRevision: 1,
+  errorCode: null,
+  refreshing: false,
+};
 
-import { applyPreferredCodexDefaultModel, mapCodexModelCapabilities } from "./CodexProvider.ts";
+import {
+  checkCodexProviderStatus,
+  applyPreferredCodexDefaultModel,
+  mapCodexModelCapabilities,
+} from "./CodexProvider.ts";
 
 it("maps current Codex model capability fields", () => {
   const capabilities = mapCodexModelCapabilities({
@@ -188,3 +208,85 @@ it("ignores custom models that shadow a preferred slug", () => {
 
   assert.deepStrictEqual(models.find((model) => model.isDefault)?.slug, "gpt-5.4");
 });
+
+it.effect(
+  "uses organization metadata with a filtered catalog instead of treating native account=null as signed out",
+  () =>
+    Effect.gen(function* () {
+      let received: { managedConnectionId?: string } | undefined;
+      const provider = yield* checkCodexProviderStatus(
+        decodeManagedSettings({}),
+        (input) => {
+          received = input;
+          return Effect.succeed({
+            account: { account: null, requiresOpenaiAuth: false },
+            version: "0.159.3",
+            skills: [],
+            models: ["gpt-6-astra", "gpt-5.5", "custom-unknown"].map((slug) => ({
+              slug,
+              name: slug,
+              isCustom: false,
+              capabilities: null,
+            })),
+          });
+        },
+        {},
+        {
+          connectionId: "selected-connection",
+          label: "Organization account",
+          status: Effect.succeed(managedConnection),
+          preflight: Effect.die("A read-only status probe must not admit a turn"),
+        },
+      ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noManagedSpawn));
+      assert.equal(received?.managedConnectionId, "selected-connection");
+      assert.equal(provider.auth.status, "authenticated");
+      assert.equal(provider.auth.type, "organization-managed");
+      assert.deepEqual(
+        provider.models.map((model) => model.slug),
+        ["gpt-6-astra"],
+      );
+      assert.equal(provider.usageLimits?.unavailable?.reason, "unsupported");
+    }),
+);
+
+it.effect(
+  "distinguishes an unavailable relay from a confirmed organization reconnect requirement",
+  () =>
+    Effect.gen(function* () {
+      for (const unavailable of [false, true]) {
+        const provider = yield* checkCodexProviderStatus(
+          decodeManagedSettings({}),
+          () => Effect.die("An unavailable managed account must not start a probe"),
+          {},
+          {
+            connectionId: "selected-connection",
+            label: "Organization account",
+            status: unavailable
+              ? Effect.fail(new ThreadVmCodexAuthSourceError({ reason: "unavailable" }))
+              : Effect.succeed({ ...managedConnection, status: "reconnect_required" }),
+            preflight: Effect.void,
+          },
+        ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noManagedSpawn));
+        assert.equal(provider.auth.status, unavailable ? "unknown" : "unauthenticated");
+        assert.ok(provider.message);
+        assert.ok(!provider.message!.includes("codex login"));
+      }
+    }),
+);
+
+it.effect(
+  "does not publish personal readiness after the VM selection changed to organization authentication",
+  () =>
+    Effect.gen(function* () {
+      const provider = yield* checkCodexProviderStatus(
+        decodeManagedSettings({}),
+        () => Effect.die("A stale personal provider must not probe native auth"),
+        {},
+        undefined,
+        Effect.fail(new ThreadVmCodexAuthSourceError({ reason: "selection_changed" })),
+      ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noManagedSpawn));
+      assert.equal(provider.status, "error");
+      assert.equal(provider.auth.status, "unknown");
+      assert.match(provider.message!, /selection changed/);
+    }),
+);

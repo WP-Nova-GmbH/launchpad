@@ -163,6 +163,101 @@ export const relayOrganizationProviderAccounts = pgTable(
   (table) => [primaryKey({ columns: [table.organizationId, table.provider] })],
 );
 
+/** The installation identity survives account removal and relay process restarts. */
+export const relayCodexVmInstallation = pgTable("relay_codex_vm_installation", {
+  key: varchar("key", { length: 32 }).primaryKey(),
+  hostId: varchar("host_id", { length: 64 }).notNull(),
+});
+
+/** A tombstone retains OAuth/action fences; renewable credentials never leave the relay. */
+export const relayCodexVmConnections = pgTable(
+  "relay_codex_vm_connections",
+  {
+    organizationId: varchar("organization_id", { length: 64 })
+      .primaryKey()
+      .references(() => relayOrganizations.organizationId, { onDelete: "cascade" }),
+    connectionId: varchar("connection_id", { length: 64 }).notNull(),
+    epoch: integer("epoch").notNull().default(0),
+    tokenRevision: integer("token_revision").notNull().default(0),
+    actionRevision: integer("action_revision").notNull().default(0),
+    latestAttemptId: varchar("latest_attempt_id", { length: 64 }),
+    issuer: text("issuer"),
+    subject: text("subject"),
+    clientId: text("client_id"),
+    label: text("label"),
+    status: varchar("status", { length: 32 })
+      .notNull()
+      .$type<"disconnected" | "connected" | "reconnect_required">(),
+    errorCode: varchar("error_code", { length: 32 }),
+    payloadSealed: text("payload_sealed"),
+    expiresAt: varchar("expires_at", { length: 64 }),
+    earliestRefreshAt: varchar("earliest_refresh_at", { length: 64 }),
+    refreshAttemptId: varchar("refresh_attempt_id", { length: 64 }),
+    lastRefreshAttemptId: varchar("last_refresh_attempt_id", { length: 64 }),
+    refreshStartedAt: varchar("refresh_started_at", { length: 64 }),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_relay_codex_vm_connection_id").on(table.connectionId),
+    check(
+      "relay_codex_vm_connections_status",
+      sql`${table.status} IN ('disconnected','connected','reconnect_required')`,
+    ),
+    check(
+      "relay_codex_vm_connections_active",
+      sql`${table.status} != 'connected' OR (${table.payloadSealed} IS NOT NULL AND ${table.expiresAt} IS NOT NULL AND ${table.issuer} IS NOT NULL AND ${table.subject} IS NOT NULL AND ${table.clientId} IS NOT NULL)`,
+    ),
+    check(
+      "relay_codex_vm_connections_refresh",
+      sql`(${table.refreshAttemptId} IS NULL) = (${table.refreshStartedAt} IS NULL)`,
+    ),
+  ],
+);
+
+/** Pending sign-ins cannot replace an active session before validated, fenced installation. */
+export const relayCodexVmOAuthAttempts = pgTable(
+  "relay_codex_vm_oauth_attempts",
+  {
+    attemptId: varchar("attempt_id", { length: 64 }).primaryKey(),
+    organizationId: varchar("organization_id", { length: 64 })
+      .notNull()
+      .references(() => relayOrganizations.organizationId, { onDelete: "cascade" }),
+    userId: varchar("user_id", { length: 191 }).notNull(),
+    intent: varchar("intent", { length: 16 })
+      .notNull()
+      .$type<"connect" | "reconnect" | "replace">(),
+    redirectUri: text("redirect_uri").notNull(),
+    stateHash: varchar("state_hash", { length: 64 }).notNull().unique(),
+    pendingSealed: text("pending_sealed"),
+    issuedClientId: text("issued_client_id"),
+    expectedConnectionId: varchar("expected_connection_id", { length: 64 }).notNull(),
+    expectedEpoch: integer("expected_epoch").notNull(),
+    actionRevision: integer("action_revision").notNull(),
+    phase: varchar("phase", { length: 16 })
+      .notNull()
+      .$type<
+        | "pending"
+        | "exchanging"
+        | "completed"
+        | "cancelled"
+        | "denied"
+        | "failed"
+        | "expired"
+        | "superseded"
+      >(),
+    expiresAt: varchar("expires_at", { length: 64 }).notNull(),
+    updatedAt: varchar("updated_at", { length: 64 }).notNull(),
+  },
+  (table) => [
+    index("idx_relay_codex_vm_oauth_org").on(table.organizationId),
+    check("relay_codex_vm_oauth_intent", sql`${table.intent} IN ('connect','reconnect','replace')`),
+    check(
+      "relay_codex_vm_oauth_phase",
+      sql`${table.phase} IN ('pending','exchanging','completed','cancelled','denied','failed','expired','superseded')`,
+    ),
+  ],
+);
+
 export interface LinearReplacementRecord {
   readonly id: string;
   readonly payloadSealed: string;
@@ -998,6 +1093,39 @@ export const relayThreadVmAllocations = pgTable(
     check(
       "relay_thread_vm_allocations_native_paused_generation",
       sql`${table.nativePausedGeneration} IS NULL OR ${table.nativePausedGeneration} > 0`,
+    ),
+  ],
+);
+
+/** Non-secret provider selection belongs to one exact guest identity, never its restored disk. */
+export const relayThreadVmCodexAuth = pgTable(
+  "relay_thread_vm_codex_auth",
+  {
+    allocationId: varchar("allocation_id", { length: 64 })
+      .notNull()
+      .references(() => relayThreadVmAllocations.allocationId),
+    environmentId: varchar("environment_id", { length: 191 }).notNull(),
+    generation: integer("generation").notNull(),
+    threadId: varchar("thread_id", { length: 191 })
+      .notNull()
+      .references(() => relayThreadPlacements.threadId),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    mode: varchar("mode", { length: 16 }).notNull().$type<"personal" | "organization">(),
+    // Retain a removed/replaced ID so restoration cannot silently select a different account.
+    connectionId: varchar("connection_id", { length: 64 }),
+    acknowledgedConnectionId: varchar("acknowledged_connection_id", { length: 64 }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.allocationId, table.environmentId, table.generation] }),
+    index("idx_relay_thread_vm_codex_auth_thread").on(table.threadId, table.generation),
+    check(
+      "relay_thread_vm_codex_auth_selection",
+      sql`(${table.mode}='personal' AND ${table.connectionId} IS NULL) OR (${table.mode}='organization' AND ${table.connectionId} IS NOT NULL)`,
+    ),
+    check("relay_thread_vm_codex_auth_generation", sql`${table.generation}>0`),
+    check(
+      "relay_thread_vm_codex_auth_acknowledgement",
+      sql`${table.acknowledgedConnectionId} IS NULL OR (${table.mode}='organization' AND ${table.acknowledgedConnectionId}=${table.connectionId})`,
     ),
   ],
 );

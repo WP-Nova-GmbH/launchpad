@@ -101,6 +101,9 @@ import { organizationProjectsApi, projectCatalogServerApi } from "../src/http/Pr
 import { executorReleaseServerApi } from "../src/http/ExecutorReleaseApi.ts";
 import { organizationSkillsServerApi } from "../src/http/OrganizationSkillsApi.ts";
 import { providerAccountsServerApi } from "../src/http/ProviderAccountsApi.ts";
+import { codexVmConnectionsApi } from "../src/http/CodexVmConnectionsApi.ts";
+import { threadVmCodexAuthApi } from "../src/http/ThreadVmCodexAuthApi.ts";
+import * as CodexVmOAuth from "../src/tenancy/CodexVmOAuth.ts";
 import { issueTrackersApi, issueTrackersServerApi } from "../src/http/IssueTrackersApi.ts";
 import { turnAuthLayer } from "../src/issueTrackers/TurnAuthorization.ts";
 import { workflowSourcesApi, workflowSourceCallbackRoute } from "../src/http/WorkflowSourcesApi.ts";
@@ -420,6 +423,7 @@ const runtimeLayerBase = WorkflowWake.layer
         GithubApp.layer,
         GithubInstallations.layer,
         ProviderAccounts.layer,
+        CodexVmOAuth.layer,
         IssueTrackerConnectionStore.layer,
         IssueTrackerWriteOperationStore.layer,
         OrganizationSkills.layer,
@@ -509,6 +513,8 @@ const relayApiLayer = Layer.mergeAll(
   sourceControlServerApi,
   repositoryAccessServerApi,
   providerAccountsServerApi,
+  codexVmConnectionsApi,
+  threadVmCodexAuthApi,
   issueTrackersApi,
   workflowSourcesApi,
   issueTrackersServerApi,

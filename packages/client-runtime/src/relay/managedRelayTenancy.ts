@@ -15,11 +15,18 @@ import type {
 } from "@t3tools/contracts";
 import {
   RelayApi,
+  type RelayCodexVmConnection,
+  type RelayCodexVmStartSignIn,
+  type RelayCodexVmStartSignInResponse,
+  type RelayCodexVmCompleteSignIn,
+  type RelayCodexVmSignInAttempt,
   type RelayHealthResponse,
   type ThreadVmPolicyRecord,
   type RelayThreadVmStatus,
   type RelayThreadVmProviderAuth,
   type RelayThreadVmProviderAuthRequest,
+  type RelayThreadVmCodexAuthSource,
+  type RelayThreadVmCodexAuthSelection,
   type RelayThreadVmPreviewResponse,
   type RelayThreadVmCreateRequest,
   type RelayThreadVmCreateResponse,
@@ -294,6 +301,17 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly threadId: ThreadId;
     }) => Effect.Effect<RelayThreadVmProviderAuth | null, ManagedRelayClientError>;
+    readonly getThreadVmProviderAuthSource: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmCodexAuthSource | null, ManagedRelayClientError>;
+    readonly selectThreadVmProviderAuthSource: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmProviderAuthRequest & {
+        readonly source: RelayThreadVmCodexAuthSelection;
+      };
+    }) => Effect.Effect<RelayThreadVmCodexAuthSource, ManagedRelayClientError>;
     readonly startThreadVmProviderAuth: (input: {
       readonly clerkToken: string;
       readonly threadId: ThreadId;
@@ -435,6 +453,28 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly listProviderAccounts: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayProviderAccount>, ManagedRelayClientError>;
+    readonly getCodexVmConnection: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<RelayCodexVmConnection, ManagedRelayClientError>;
+    readonly startCodexVmSignIn: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayCodexVmStartSignIn;
+    }) => Effect.Effect<RelayCodexVmStartSignInResponse, ManagedRelayClientError>;
+    readonly completeCodexVmSignIn: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayCodexVmCompleteSignIn;
+    }) => Effect.Effect<RelayCodexVmConnection, ManagedRelayClientError>;
+    readonly getCodexVmSignInAttempt: (input: {
+      readonly clerkToken: string;
+      readonly attemptId: string;
+    }) => Effect.Effect<RelayCodexVmSignInAttempt | null, ManagedRelayClientError>;
+    readonly cancelCodexVmSignIn: (input: {
+      readonly clerkToken: string;
+      readonly attemptId: string;
+    }) => Effect.Effect<RelayCodexVmConnection, ManagedRelayClientError>;
+    readonly disconnectCodexVmConnection: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<RelayCodexVmConnection, ManagedRelayClientError>;
     readonly saveProviderAccount: (input: {
       readonly clerkToken: string;
       readonly provider: RelayProviderAccountProvider;
@@ -555,6 +595,12 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     getThreadVmProviderAuth: unavailable(
       "clientRuntime.managedRelayTenancy.getThreadVmProviderAuth",
     ),
+    getThreadVmProviderAuthSource: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadVmProviderAuthSource",
+    ),
+    selectThreadVmProviderAuthSource: unavailable(
+      "clientRuntime.managedRelayTenancy.selectThreadVmProviderAuthSource",
+    ),
     startThreadVmProviderAuth: unavailable(
       "clientRuntime.managedRelayTenancy.startThreadVmProviderAuth",
     ),
@@ -607,6 +653,16 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     disconnectGithub: unavailable("clientRuntime.managedRelayTenancy.disconnectGithub"),
     listGithubRepositories: unavailable("clientRuntime.managedRelayTenancy.listGithubRepositories"),
     listProviderAccounts: unavailable("clientRuntime.managedRelayTenancy.listProviderAccounts"),
+    getCodexVmConnection: unavailable("clientRuntime.managedRelayTenancy.getCodexVmConnection"),
+    startCodexVmSignIn: unavailable("clientRuntime.managedRelayTenancy.startCodexVmSignIn"),
+    completeCodexVmSignIn: unavailable("clientRuntime.managedRelayTenancy.completeCodexVmSignIn"),
+    getCodexVmSignInAttempt: unavailable(
+      "clientRuntime.managedRelayTenancy.getCodexVmSignInAttempt",
+    ),
+    cancelCodexVmSignIn: unavailable("clientRuntime.managedRelayTenancy.cancelCodexVmSignIn"),
+    disconnectCodexVmConnection: unavailable(
+      "clientRuntime.managedRelayTenancy.disconnectCodexVmConnection",
+    ),
     saveProviderAccount: unavailable("clientRuntime.managedRelayTenancy.saveProviderAccount"),
     deleteProviderAccount: unavailable("clientRuntime.managedRelayTenancy.deleteProviderAccount"),
     listIssueTrackerConnections: unavailable(
@@ -1269,6 +1325,37 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmProviderAuth"),
       withRelayClientTracing,
     ),
+    getThreadVmProviderAuthSource: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getProviderAuthSource({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read VM Codex account source")),
+            timeoutRelayRequest("VM Codex account source read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmProviderAuthSource"),
+      withRelayClientTracing,
+    ),
+    selectThreadVmProviderAuthSource: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .selectProviderAuthSource({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("select VM Codex account source")),
+            timeoutRelayRequest("VM Codex account source selection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.selectThreadVmProviderAuthSource"),
+      withRelayClientTracing,
+    ),
     startThreadVmProviderAuth: Effect.fnUntraced(
       function* (input) {
         return yield* client.threadVms
@@ -1754,6 +1841,60 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       Effect.withSpan("clientRuntime.managedRelayTenancy.listGithubRepositories"),
       withRelayClientTracing,
     ),
+    getCodexVmConnection: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .status({ headers: bearerHeaders(input.clerkToken) })
+        .pipe(
+          Effect.mapError(relayRequestError("read Codex VM connection")),
+          timeoutRelayRequest("Codex VM connection"),
+        );
+    }),
+    startCodexVmSignIn: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .start({ headers: bearerHeaders(input.clerkToken), payload: input.payload })
+        .pipe(
+          Effect.mapError(relayRequestError("start Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM sign-in"),
+        );
+    }),
+    completeCodexVmSignIn: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .complete({ headers: bearerHeaders(input.clerkToken), payload: input.payload })
+        .pipe(
+          Effect.mapError(relayRequestError("complete Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM sign-in completion"),
+        );
+    }),
+    getCodexVmSignInAttempt: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .attempt({
+          headers: bearerHeaders(input.clerkToken),
+          params: { attemptId: input.attemptId },
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("read Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM sign-in status"),
+        );
+    }),
+    cancelCodexVmSignIn: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .cancel({
+          headers: bearerHeaders(input.clerkToken),
+          payload: { attemptId: input.attemptId },
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("cancel Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM sign-in cancellation"),
+        );
+    }),
+    disconnectCodexVmConnection: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .disconnect({ headers: bearerHeaders(input.clerkToken) })
+        .pipe(
+          Effect.mapError(relayRequestError("disconnect Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM disconnection"),
+        );
+    }),
     listProviderAccounts: Effect.fnUntraced(
       function* (input) {
         return yield* client.organization

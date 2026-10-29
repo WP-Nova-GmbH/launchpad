@@ -41,6 +41,7 @@ import { makeThreadJournalStore } from "../threads/ThreadJournalStore.ts";
 import { relayInternalErrorResponse, appendRelayCredentialResponseHeaders } from "./Api.ts";
 import { withPrivateThreadOwnerAccess } from "./privateThreadAccess.ts";
 import { tenancyNotFound, tenancyConflict } from "./tenancyErrors.ts";
+import { makeThreadVmCodexAuthStore } from "../threads/ThreadVmCodexAuthStore.ts";
 
 type Owner = {
   readonly threadId: string;
@@ -213,6 +214,14 @@ export const confirmInitialVmActivation = Effect.fn(
       { ...input, generation: 1 },
       true,
       Effect.gen(function* () {
+        const placement = yield* makeThreadPlacementStore(sql).get(input.threadId);
+        if (!placement) return yield* tenancyNotFound("thread_not_found");
+        yield* makeThreadVmCodexAuthStore(sql).requireAcknowledged({
+          ...input,
+          generation: 1,
+          allocationId: receipt.scope.allocationId,
+          organizationId: placement.organizationId,
+        });
         const crypto = yield* Crypto.Crypto;
         const digest = yield* crypto.digest(
           "SHA-256",

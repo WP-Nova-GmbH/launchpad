@@ -80,6 +80,8 @@ export function threadVmCredentialAllows(
     (parts[6] === "restore" && parts[7] === "activate") ||
     (parts[6] === "access" && parts[7] === "check") ||
     (parts[6] === "credentials" && parts[7] === "github") ||
+    (parts[6] === "credentials" && parts[7] === "codex") ||
+    (parts[6] === "provider-auth" && parts[7] === "source") ||
     (parts[6] === "repository" && parts[7] === "binding") ||
     (parts[6] === "commands" && (parts[7] === "next" || parts[7] === "ack")) ||
     (parts[6] === "work" && (parts[7] === "admit" || parts[7] === "complete"))
