@@ -11,6 +11,7 @@ import {
   UsersIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useAuth } from "@clerk/react";
 import type {
   RelayGithubInstallationCandidate,
   RelayInvitation,
@@ -78,6 +79,7 @@ import {
 } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 import { ThreadVmPolicySettings } from "./ThreadVmPolicySettings";
+import { CodexVmConnectionSettings } from "./CodexVmConnectionSettings";
 
 const ORG_ROLE_LABELS: Readonly<Record<RelayOrgRole, string>> = {
   admin: "Admin",
@@ -796,9 +798,9 @@ function ProviderAccountsSection({ state }: { state: OrganizationAdminState }) {
       icon={<KeyRoundIcon className="size-4 text-muted-foreground" />}
     >
       <SectionNote>
-        Sign in once, here, and every executor of this organization uses that account. Sharing a
-        sign-in copies the provider&apos;s session from this device; a key works for providers you
-        bill through an API key. Nobody signs in on a machine.
+        These sign-ins are copied to organization machines. VMs use the separate Codex for VMs
+        connection above. A provider session is shared from this device; API keys are available for
+        providers billed through an API.
       </SectionNote>
       {isAdmin ? null : (
         <SectionNote>Only admins can see and change what the organization shares.</SectionNote>
@@ -1566,6 +1568,7 @@ function OrganizationSignInButton() {
  * hook above that check would crash the app on a build without it.
  */
 function ConfiguredOrganizationSettings() {
+  const { userId } = useAuth();
   const state = useOrganizationAdmin();
   // The alert sits at the top of a long page while the action that failed may
   // be at the bottom. Bring the message to the person instead of hoping they
@@ -1610,6 +1613,13 @@ function ConfiguredOrganizationSettings() {
           <OrganizationSection state={state} />
           <MembersSection state={state} />
           <GithubSection state={state} />
+          {state.snapshot && state.snapshot.membership.userId === userId ? (
+            <CodexVmConnectionSettings
+              key={state.snapshot.membership.organization.organizationId}
+              organizationId={state.snapshot.membership.organization.organizationId}
+              isAdmin={state.snapshot.membership.role === "admin"}
+            />
+          ) : null}
           <ProviderAccountsSection state={state} />
           <SkillsSection state={state} />
           <RepositoriesSection state={state} />

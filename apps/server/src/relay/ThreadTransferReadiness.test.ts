@@ -7,6 +7,9 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -17,7 +20,7 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { layer as RunnerLayer } from "../processRunner.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
-import { ProviderAdapterRequestError } from "../provider/Errors.ts";
+import { ProviderAdapterProbeError } from "../provider/Errors.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
 import { workspaceGit } from "./ThreadWorkspaceGit.ts";
@@ -34,6 +37,8 @@ const fixture = Effect.fnUntraced(function* (options?: {
   version?: string;
   liveSession?: boolean;
   resumeFailure?: string;
+  cleanupConfirmed?: boolean;
+  probe?: Effect.Effect<void>;
 }) {
   const fs = yield* FileSystem.FileSystem,
     path = yield* Path.Path,
@@ -139,12 +144,14 @@ const fixture = Effect.fnUntraced(function* (options?: {
             "setup\n",
           );
           calls.push("resume");
+          if (options?.probe) yield* options.probe;
           calls.push("stop");
           if (resumeFailure)
-            return yield* new ProviderAdapterRequestError({
+            return yield* new ProviderAdapterProbeError({
               provider: "codex",
-              method: "thread/resume",
+              threadId,
               detail: resumeFailure,
+              cleanupConfirmed: options?.cleanupConfirmed ?? false,
             });
           return {
             provider: driverKind,
@@ -223,7 +230,7 @@ it.layer(
         expect(f.calls).toEqual(["credentials", "resume", "stop"]);
         expect(yield* f.phase).toEqual([{ phase: "ready" }]);
         expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("frozen");
-        yield* f.sql`CREATE TEMP TRIGGER keep_setup_receipt BEFORE UPDATE ON thread_transfer_readiness
+        yield* f.sql`CREATE TEMP TRIGGER keep_setup_receipt BEFORE UPDATE OF setup_output_json,setup_started,setup_succeeded ON thread_transfer_readiness
           BEGIN SELECT RAISE(ABORT, 'setup receipt must not be rewritten'); END`;
         yield* f.prepare;
         expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials", "resume", "stop"]);
@@ -313,10 +320,80 @@ it.layer(
       expect(yield* f.phase).toEqual([{ phase: "started" }]);
       expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("frozen");
       yield* Effect.flip(f.fence.activate(f.input));
-      expect((yield* Effect.flip(f.prepare)).message).toContain("do not replay");
+      expect((yield* Effect.flip(f.prepare)).message).toContain("no confirmed exit");
       expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials"]);
     }),
   );
+  it.effect("retries a positively stopped probe without replaying successful setup", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        resumeFailure: "Reconnect the organization account.",
+        cleanupConfirmed: true,
+      });
+      expect((yield* Effect.flip(f.prepare)).message).toContain(
+        "Reconnect the organization account",
+      );
+      expect(
+        yield* f.sql`SELECT setup_succeeded,provider_probe_attempt_id FROM thread_transfer_readiness WHERE operation_id=${f.input.operationId}`,
+      ).toEqual([{ setup_succeeded: 1, provider_probe_attempt_id: null }]);
+      yield* Effect.flip(f.fence.activate(f.input));
+      f.changeRuntime("0.159.3");
+      yield* f.prepare;
+      expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
+      expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials", "resume", "stop"]);
+      yield* f.fence.activate(f.input);
+    }),
+  );
+  it.effect("invalidates old readiness after a safely stopped re-probe fails", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture({ cleanupConfirmed: true });
+      yield* f.prepare;
+      f.changeRuntime("0.159.3", "Account selection changed.");
+      yield* Effect.flip(f.prepare);
+      expect(yield* f.phase).toEqual([{ phase: "started" }]);
+      yield* Effect.flip(f.fence.activate(f.input));
+      f.changeRuntime("0.159.3");
+      yield* f.prepare;
+      yield* f.fence.activate(f.input);
+      expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
+    }),
+  );
+  it.effect("holds one native probe owner until exact ready publication", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>(),
+        release = yield* Deferred.make<void>();
+      const f = yield* fixture({
+        probe: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      });
+      const first = yield* f.prepare.pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      expect((yield* Effect.flip(f.prepare)).message).toContain("no confirmed exit");
+      yield* Effect.flip(f.fence.activate(f.input));
+      expect(f.calls.filter((call) => call === "resume")).toHaveLength(1);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(first);
+      yield* f.fence.activate(f.input);
+    }),
+  );
+  for (const kind of ["defect", "interruption"] as const)
+    it.effect(`retains uncertain probe ownership after ${kind}`, () =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const f = yield* fixture({
+          probe: Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(kind === "defect" ? Effect.die("probe crash") : Effect.never),
+          ),
+        });
+        const pending = yield* f.prepare.pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        if (kind === "interruption") yield* Fiber.interrupt(pending);
+        const result = yield* Fiber.await(pending);
+        expect(Exit.isFailure(result)).toBe(true);
+        expect((yield* Effect.flip(f.prepare)).message).toContain("no confirmed exit");
+        yield* Effect.flip(f.fence.activate(f.input));
+        expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
+      }),
+    );
   it.effect("rechecks native resume after a runtime update without replaying setup", () =>
     Effect.gen(function* () {
       const f = yield* fixture();
@@ -327,7 +404,8 @@ it.layer(
       expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials", "resume", "stop"]);
       expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
       expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("frozen");
-      expect(yield* f.phase).toEqual([{ phase: "ready" }]);
+      expect(yield* f.phase).toEqual([{ phase: "started" }]);
+      yield* Effect.flip(f.fence.activate(f.input));
     }),
   );
   it.effect(
@@ -358,10 +436,10 @@ it.layer(
         BEGIN SELECT RAISE(ABORT, 'lost receipt'); END`;
       yield* Effect.flip(f.prepare);
       yield* f.sql`DROP TRIGGER fail_ready`;
-      expect((yield* Effect.flip(f.prepare)).message).toContain("do not replay");
-      expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials"]);
+      yield* f.prepare;
+      expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials", "resume", "stop"]);
       expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
-      yield* Effect.flip(f.fence.activate(f.input));
+      yield* f.fence.activate(f.input);
     }),
   );
 });

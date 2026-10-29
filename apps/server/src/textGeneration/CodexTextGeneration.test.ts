@@ -14,6 +14,10 @@ import { CodexSettings, ProviderInstanceId, TextGenerationError } from "@t3tools
 import * as ServerConfig from "../config.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import { makeCodexTextGeneration } from "./CodexTextGeneration.ts";
+import {
+  ThreadVmCodexAuthSourceError,
+  type ManagedThreadVmCodexAuthContext,
+} from "../relay/ThreadVmCodexAuthSource.ts";
 import { writeFakeCli } from "../testUtils/fakeCli.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
@@ -135,6 +139,8 @@ function withFakeCodexEnv<A, E, R>(
     launchArgs?: string;
     environment?: NodeJS.ProcessEnv;
     models?: ReadonlyArray<string>;
+    managedAuth?: ManagedThreadVmCodexAuthContext;
+    authPreflight?: Effect.Effect<void, ThreadVmCodexAuthSourceError>;
   },
   effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
 ) {
@@ -154,12 +160,114 @@ function withFakeCodexEnv<A, E, R>(
           capabilities: null,
         })),
       ),
+      input.managedAuth,
+      input.authPreflight,
     );
     return yield* effectFn(textGeneration);
   }).pipe(Effect.scoped);
 }
 
 it.layer(CodexTextGenerationTestLayer)("CodexTextGeneration", (it) => {
+  it.effect(
+    "pins structured text generation to the managed helper after conflicting environment flags",
+    () =>
+      withFakeCodexEnv(
+        {
+          output: '{"title":"Managed title"}',
+          requireArg: 'model_provider="launchpad_vm"',
+          environment: { ...process.env, T3CODE_CODEX_LAUNCH_ARGS: '-c model_provider="personal"' },
+          managedAuth: {
+            connectionId: "connection",
+            label: "Organization account",
+            status: Effect.die("No status probe required"),
+            preflight: Effect.void,
+          },
+        },
+        (generation) =>
+          generation.generateThreadTitle({
+            cwd: process.cwd(),
+            message: "Title",
+            modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-6-luna"),
+          }),
+      ),
+  );
+
+  it.effect("blocks new auxiliary inference after central disconnection", () =>
+    withFakeCodexEnv(
+      {
+        output: '{"title":"must-not-be-generated"}',
+        managedAuth: {
+          connectionId: "connection",
+          label: "Organization account",
+          status: Effect.die("No status probe required"),
+          preflight: Effect.fail(
+            new ThreadVmCodexAuthSourceError({ reason: "reconnect_required" }),
+          ),
+        },
+      },
+      (generation) =>
+        Effect.gen(function* () {
+          const error = yield* generation
+            .generateThreadTitle({
+              cwd: process.cwd(),
+              message: "Title",
+              modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-6-luna"),
+            })
+            .pipe(Effect.flip);
+          expect(error.detail).toContain("Reconnect the organization's Codex");
+        }),
+    ),
+  );
+
+  it.effect("requires an explicitly supported auxiliary model", () =>
+    withFakeCodexEnv(
+      {
+        output: '{"title":"must-not-be-generated"}',
+        managedAuth: {
+          connectionId: "connection",
+          label: "Organization account",
+          status: Effect.die("No status probe required"),
+          preflight: Effect.die("Unsupported model must fail before token lookup"),
+        },
+      },
+      (generation) =>
+        Effect.gen(function* () {
+          const error = yield* generation
+            .generateThreadTitle({
+              cwd: process.cwd(),
+              message: "Title",
+              modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.5"),
+            })
+            .pipe(Effect.flip);
+          expect(error.detail).toContain("Select a supported model");
+        }),
+    ),
+  );
+
+  it.effect(
+    "blocks a captured personal provider after the VM switches to organization sign-in",
+    () =>
+      withFakeCodexEnv(
+        {
+          output: '{"title":"must-not-be-generated"}',
+          authPreflight: Effect.fail(
+            new ThreadVmCodexAuthSourceError({ reason: "selection_changed" }),
+          ),
+        },
+        (generation) =>
+          Effect.gen(function* () {
+            const error = yield* generation
+              .generateThreadTitle({
+                cwd: process.cwd(),
+                message: "Title",
+                modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+              })
+              .pipe(Effect.flip);
+            expect(error.detail).toContain("selection changed");
+          }),
+      ),
+  );
+
   it.effect("forwards workflow approval context into the actual model prompt", () =>
     withFakeCodexEnv(
       {

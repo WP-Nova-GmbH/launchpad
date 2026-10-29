@@ -57,7 +57,11 @@ import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
 import { ProviderAdapterValidationError, ProviderAdapterProcessError } from "../Errors.ts";
-import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
+import {
+  MANAGED_CODEX_MODEL_PROVIDER,
+  managedCodexModelIssue,
+  codexSessionAppServerArgs,
+} from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
   buildCodexAdditionalContext,
@@ -196,6 +200,7 @@ export interface CodexSessionRuntimeOptions {
   readonly threadId: ThreadId;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly binaryPath: string;
+  readonly managedConnectionId?: string;
   readonly homePath?: string;
   readonly launchArgs?: string;
   readonly environment?: NodeJS.ProcessEnv;
@@ -593,6 +598,7 @@ function buildThreadStartParams(input: {
   readonly runtimeMode: RuntimeMode;
   readonly model: string | undefined;
   readonly serviceTier: CodexServiceTier | undefined;
+  readonly modelProvider?: string;
 }): EffectCodexSchema.V2ThreadStartParams {
   const config = runtimeModeToThreadConfig(input.runtimeMode);
   return {
@@ -601,6 +607,7 @@ function buildThreadStartParams(input: {
     sandbox: config.sandbox,
     approvalsReviewer: config.approvalsReviewer,
     ...(input.model ? { model: input.model } : {}),
+    ...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
     ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
   };
 }
@@ -753,6 +760,9 @@ const CodexThreadResumeMetadata = Schema.Struct({
   thread: Schema.Struct({ id: Schema.String }),
 });
 const decodeCodexThreadResumeMetadata = Schema.decodeUnknownEffect(CodexThreadResumeMetadata);
+const decodeCodexThreadModelProvider = Schema.decodeUnknownEffect(
+  Schema.Struct({ modelProvider: Schema.String }),
+);
 
 interface CodexThreadOpenClient {
   readonly raw: {
@@ -782,14 +792,34 @@ export const openCodexThread = (input: {
   readonly resumeThreadId: string | undefined;
   readonly resumePolicy?: CodexResumeCursor["resumePolicy"];
   readonly requireResume?: boolean | undefined;
+  readonly modelProvider?: string;
 }): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> => {
   const resumeThreadId = input.resumeThreadId;
   const requireResume = input.requireResume === true || input.resumePolicy === "require-existing";
+  const verifyModelProvider = (response: unknown) =>
+    input.modelProvider
+      ? decodeCodexThreadModelProvider(response).pipe(
+          Effect.mapError(() =>
+            CodexErrors.CodexAppServerRequestError.invalidRequest(
+              "Codex did not confirm the selected organization model provider.",
+            ),
+          ),
+          Effect.filterOrFail(
+            (value) => value.modelProvider === input.modelProvider,
+            () =>
+              CodexErrors.CodexAppServerRequestError.invalidRequest(
+                "Codex did not use the selected organization model provider. Finish VM preparation before continuing.",
+              ),
+          ),
+          Effect.asVoid,
+        )
+      : Effect.void;
   const startParams = buildThreadStartParams({
     cwd: input.cwd,
     runtimeMode: input.runtimeMode,
     model: input.requestedModel,
     serviceTier: input.serviceTier,
+    ...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
   });
 
   if (resumeThreadId === undefined) {
@@ -800,7 +830,7 @@ export const openCodexThread = (input: {
         ),
       );
     }
-    return input.client.request("thread/start", startParams);
+    return input.client.request("thread/start", startParams).pipe(Effect.tap(verifyModelProvider));
   }
 
   // Older providers may still return history despite excludeTurns. Only the
@@ -813,6 +843,7 @@ export const openCodexThread = (input: {
       excludeTurns: true,
     })
     .pipe(
+      Effect.tap(verifyModelProvider),
       Effect.flatMap((response) =>
         decodeCodexThreadResumeMetadata(response).pipe(
           Effect.mapError((error) =>
@@ -1476,7 +1507,11 @@ export const makeCodexSessionRuntime = (
       ...(resolvedHomePath ? { CODEX_HOME: resolvedHomePath } : {}),
     };
     const extendEnv = options.environment === undefined;
-    const appServerArgs = codexSessionAppServerArgs(options.appServerArgs, options.launchArgs);
+    const appServerArgs = codexSessionAppServerArgs(
+      options.appServerArgs,
+      options.launchArgs,
+      options.managedConnectionId,
+    );
     const spawnCommand = yield* resolveSpawnCommand(options.binaryPath, appServerArgs, {
       env,
       extendEnv,
@@ -2690,8 +2725,19 @@ export const makeCodexSessionRuntime = (
         ...(options.resumeCursor?.resumePolicy
           ? { resumePolicy: options.resumeCursor.resumePolicy }
           : {}),
-        requireResume: options.requireResume,
+        requireResume:
+          options.managedConnectionId && options.resumeCursor ? true : options.requireResume,
+        ...(options.managedConnectionId ? { modelProvider: MANAGED_CODEX_MODEL_PROVIDER } : {}),
       });
+      if (options.managedConnectionId) {
+        const issue = managedCodexModelIssue(opened.model);
+        if (issue)
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue,
+          });
+      }
 
       const providerThreadId = opened.thread.id;
       const session = {
@@ -2904,6 +2950,15 @@ export const makeCodexSessionRuntime = (
           const normalizedModel = normalizeCodexModelSlug(
             input.model ?? (yield* Ref.get(sessionRef)).model,
           );
+          if (options.managedConnectionId && normalizedModel) {
+            const issue = managedCodexModelIssue(normalizedModel);
+            if (issue)
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "sendTurn",
+                issue,
+              });
+          }
           const models = options.models ? yield* options.models : [];
           const modelName = models.find((model) => model.slug === normalizedModel)?.name;
           const params = yield* buildTurnStartParams({

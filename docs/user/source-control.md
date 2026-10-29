@@ -23,6 +23,23 @@ organization's GitHub App installation, and Source Control shows GitHub as authe
 it. Work done that way is authored by the App, and it reaches exactly the repositories the App was
 installed on.
 
+### Git inside a private VM
+
+Connect GitHub in **Settings → Organization** and grant the App access to the thread's repository
+with **Contents: write**. Inside an updated private VM, agents and terminals can use ordinary
+`git commit`, `git fetch`, `git pull`, and `git push` without signing in again. Git uses the
+App's bot identity for new commits and targets the current branch on `origin`. Push a new branch
+once before pulling it. A detached checkout needs a branch before pushing.
+
+Commits are unsigned; repository rules that require signed commits can reject a push. GitHub's
+branch rules and App permissions still apply. Local commits work offline once the bot identity
+has been verified. Connecting GitHub later or changing the App can take a few minutes to update
+the VM. Previously issued credentials may remain valid until they expire after disconnecting.
+
+Older VMs need to move back to a machine and into a VM built from the updated template.
+If setup reports conflicting included or per-worktree Git settings, use the repository's main
+Git configuration for those settings before retrying.
+
 ### Forgejo and Gitea
 
 Install [Forgejo CLI (`fj`)](https://codeberg.org/forgejo-contrib/forgejo-cli) or

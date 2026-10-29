@@ -200,6 +200,10 @@ Restart the relay to load a successful new selection. Already created VMs retain
 their own image; queued fresh starts use the current selection. Failed builds retain
 the previous selection. When builder and relay run separately, copy this selection
 file to the relay and set `E2B_TEMPLATE_FILE` to its absolute path.
+For deployments outside the dev runner, update the relay's configured compute template
+selection (`settings.compute.templateId`) and verify the next allocation uses that build.
+Move a thread back to a machine and into a new VM to pick up updated Git setup;
+rebuilding alone does not update running or paused VMs.
 
 For relay authentication, database migrations, Cloudflare and app startup, continue
 with [VM development](vm-development.md). The E2B management API and proxy must stay

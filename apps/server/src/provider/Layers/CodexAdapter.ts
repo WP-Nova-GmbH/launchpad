@@ -71,6 +71,7 @@ import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterProcessError,
+  ProviderAdapterProbeError,
   ProviderAdapterSessionClosedError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
@@ -93,7 +94,11 @@ import {
   type CodexSessionRuntimeShape,
 } from "./CodexSessionRuntime.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
-import { resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+import { managedCodexModelIssue, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+import type {
+  ManagedThreadVmCodexAuthContext,
+  ThreadVmCodexAuthSourceError,
+} from "../../relay/ThreadVmCodexAuthSource.ts";
 import {
   type CodexRateLimitSnapshot,
   codexRateLimitsToUpdate,
@@ -113,6 +118,8 @@ const requiresExistingConversation = Schema.is(
 const PROVIDER = ProviderDriverKind.make("codex");
 
 export interface CodexAdapterLiveOptions {
+  readonly managedAuth?: ManagedThreadVmCodexAuthContext;
+  readonly authPreflight?: Effect.Effect<void, ThreadVmCodexAuthSourceError>;
   readonly instanceId?: ProviderInstanceId;
   readonly environment?: NodeJS.ProcessEnv;
   /** The provider's model list; supplies model display names for runtime info. */
@@ -2298,6 +2305,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const managedNativeEventLogger =
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderIngestionEvent>();
+  const authPreflight = options?.authPreflight ?? options?.managedAuth?.preflight ?? Effect.void;
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
   const confirmedStops = new Map<string, ThreadId>();
   const closedVmWriters = new Map<string, ThreadId>();
@@ -2329,6 +2337,25 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           });
         }
 
+        if (options?.managedAuth && input.modelSelection?.instanceId === boundInstanceId) {
+          const issue = managedCodexModelIssue(input.modelSelection.model);
+          if (issue)
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue,
+            });
+        }
+        yield* authPreflight.pipe(
+          Effect.mapError(
+            (error) =>
+              new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "startSession",
+                issue: error.message,
+              }),
+          ),
+        );
         const cursor = isCodexResumeCursorSchema(input.resumeCursor)
           ? input.resumeCursor
           : undefined;
@@ -2347,16 +2374,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 nativeThreadId: cursor.threadId,
                 portableStateId: cursor.portableStateId!,
               });
-              yield* preparePortableCodexAuthentication({
-                homePath: home.homePath,
-                configuredHomePath: path.resolve(
-                  expandHomePath(
-                    codexConfig.homePath ||
-                      (options?.environment ?? process.env).CODEX_HOME ||
-                      path.join(NodeOS.homedir(), ".codex"),
+              if (!options?.managedAuth)
+                yield* preparePortableCodexAuthentication({
+                  homePath: home.homePath,
+                  configuredHomePath: path.resolve(
+                    expandHomePath(
+                      codexConfig.homePath ||
+                        (options?.environment ?? process.env).CODEX_HOME ||
+                        path.join(NodeOS.homedir(), ".codex"),
+                    ),
                   ),
-                ),
-              });
+                });
               return home.homePath;
             }).pipe(
               Effect.provideService(FileSystem.FileSystem, fs),
@@ -2409,6 +2437,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           providerInstanceId: boundInstanceId,
           cwd: input.cwd ?? process.cwd(),
           binaryPath: codexConfig.binaryPath,
+          ...(options?.managedAuth
+            ? { managedConnectionId: options.managedAuth.connectionId }
+            : {}),
           ...(options?.models ? { models: options.models } : {}),
           launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
           ...(options?.environment ? { environment: options.environment } : {}),
@@ -2713,6 +2744,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               issue: "Native checkpoint capture won before this turn could start.",
             });
           yield* hooks?.beforeDispatch ?? Effect.void;
+          yield* authPreflight.pipe(
+            Effect.mapError(
+              (error) =>
+                new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "sendTurn",
+                  issue: error.message,
+                }),
+            ),
+          );
           if (session.stopped || session.checkpointing || sessions.get(input.threadId) !== session)
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
@@ -2788,7 +2829,20 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     beforeDispatch?: ProviderSendTurnCallbacks["beforeDispatch"],
   ) {
     const session = yield* requireSession(threadId);
-    yield* session.runtime.compactThread(beforeDispatch).pipe(
+    const authorizeCompaction = Effect.gen(function* () {
+      yield* beforeDispatch ?? Effect.void;
+      yield* authPreflight.pipe(
+        Effect.mapError(
+          (error) =>
+            new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "compactThread",
+              issue: error.message,
+            }),
+        ),
+      );
+    });
+    yield* session.runtime.compactThread(authorizeCompaction).pipe(
       session.mutations.withPermits(1),
       Effect.mapError((cause) => mapCodexRuntimeError(threadId, "thread/compact/start", cause)),
     );
@@ -2845,15 +2899,24 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   };
 
   const uploadFeedback: CodexAdapterShape["uploadFeedback"] = (input) =>
-    requireSession(input.threadId).pipe(
-      Effect.flatMap((session) => session.runtime.uploadFeedback(input.reason)),
-      Effect.map(({ threadId }) => ({ feedbackId: threadId })),
-      Effect.mapError((cause) =>
-        cause._tag === "ProviderAdapterSessionNotFoundError"
-          ? cause
-          : mapCodexRuntimeError(input.threadId, "feedback/upload", cause),
-      ),
-    );
+    options?.managedAuth
+      ? Effect.fail(
+          new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "uploadFeedback",
+            issue:
+              "Native Codex account feedback is unavailable with organization-managed authentication.",
+          }),
+        )
+      : requireSession(input.threadId).pipe(
+          Effect.flatMap((session) => session.runtime.uploadFeedback(input.reason)),
+          Effect.map(({ threadId }) => ({ feedbackId: threadId })),
+          Effect.mapError((cause) =>
+            cause._tag === "ProviderAdapterSessionNotFoundError"
+              ? cause
+              : mapCodexRuntimeError(input.threadId, "feedback/upload", cause),
+          ),
+        );
 
   const respondToRequest: CodexAdapterShape["respondToRequest"] = (threadId, requestId, decision) =>
     requireSession(threadId).pipe(
@@ -2972,6 +3035,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
                 cwd: source.cwd,
                 environment: options?.environment,
+                ...(options?.managedAuth
+                  ? { managedConnectionId: options.managedAuth.connectionId }
+                  : {}),
               });
               return yield* readCodexConversationSource(client, source.nativeThreadId);
             }).pipe(Effect.timeout("20 seconds")),
@@ -3102,30 +3168,66 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   // adapter keeps their session/config notifications out of normal ingestion,
   // and explicit stop must finish before readiness can be acknowledged.
   const probeSession: NonNullable<CodexAdapterShape["probeSession"]> = (input) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        if (sessions.get(input.threadId) && !sessions.get(input.threadId)?.stopped)
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "probeSession",
-            issue: "A provider session is already using this conversation.",
-          });
-        const probe = yield* makeCodexAdapter(codexConfig, {
-          ...options,
-          ...(nativeEventLogger ? { nativeEventLogger } : {}),
-        }).pipe(
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
-          Effect.provideService(Crypto.Crypto, crypto),
-          Effect.provideService(FileSystem.FileSystem, fs),
-          Effect.provideService(Path.Path, path),
-          Effect.provideService(ServerConfig, serverConfig),
-          Effect.provideService(VmWorkloadTracking, trackWorkloads),
-        );
-        return yield* probe
-          .startSession(input)
-          .pipe(Effect.ensuring(probe.stopSession(input.threadId).pipe(Effect.orDie)));
-      }),
-    );
+    Effect.suspend(() => {
+      let runtimeEpisode: string | undefined;
+      let nativeAcquisitionAttempted = false;
+      return Effect.scoped(
+        Effect.gen(function* () {
+          if (sessions.get(input.threadId) && !sessions.get(input.threadId)?.stopped)
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "probeSession",
+              issue: "A provider session is already using this conversation.",
+            });
+          const probe = yield* makeCodexAdapter(codexConfig, {
+            ...options,
+            makeRuntime: (runtimeInput) =>
+              Effect.suspend(() => {
+                nativeAcquisitionAttempted = true;
+                return options?.makeRuntime
+                  ? options.makeRuntime(runtimeInput)
+                  : makeCodexSessionRuntime(runtimeInput).pipe(
+                      Effect.provideService(Crypto.Crypto, crypto),
+                    );
+              }),
+            ...(nativeEventLogger ? { nativeEventLogger } : {}),
+          }).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.provideService(FileSystem.FileSystem, fs),
+            Effect.provideService(Path.Path, path),
+            Effect.provideService(ServerConfig, serverConfig),
+            Effect.provideService(VmWorkloadTracking, trackWorkloads),
+          );
+          return yield* probe
+            .startSession(input, {
+              beforeStart: (episode) =>
+                Effect.sync(() => {
+                  runtimeEpisode = episode;
+                }),
+            })
+            .pipe(
+              Effect.ensuring(
+                Effect.suspend(() => probe.stopSession(input.threadId, runtimeEpisode)).pipe(
+                  Effect.orDie,
+                ),
+              ),
+            );
+        }),
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterProbeError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+              detail: cause.message,
+              // Native EOF in a VM is not proof that supervised descendants stopped.
+              cleanupConfirmed: !nativeAcquisitionAttempted,
+              cause,
+            }),
+        ),
+      );
+    });
 
   const listSessions: CodexAdapterShape["listSessions"] = () =>
     Effect.forEach(

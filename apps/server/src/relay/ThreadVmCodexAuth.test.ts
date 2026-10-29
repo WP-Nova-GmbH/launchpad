@@ -127,11 +127,12 @@ const harness = Effect.gen(function* () {
       streamEvents: Stream.empty,
     },
   };
+  let currentInstance = instance;
   const changes = yield* PubSub.unbounded<void>();
   const services = Layer.mergeAll(
     Layer.mock(ProviderInstanceRegistry)({
-      getInstance: () => Effect.succeed(instance),
-      listInstances: Effect.succeed([instance]),
+      getInstance: () => Effect.sync(() => currentInstance),
+      listInstances: Effect.sync(() => [currentInstance]),
       subscribeChanges: PubSub.subscribe(changes),
     }),
     Layer.mock(ProviderService)({ listSessions: () => Effect.succeed([]), stopSession: unused }),
@@ -154,6 +155,10 @@ const harness = Effect.gen(function* () {
     stopped,
     emitted,
     attempts: () => attempts,
+    replaceInstance: (personal: boolean) =>
+      Effect.sync(() => {
+        currentInstance = personal ? { ...instance } : { ...instance, accountAuth: undefined };
+      }),
     finish: Effect.sync(() => {
       authenticated = true;
     }).pipe(Effect.andThen(Deferred.succeed(complete, undefined))),
@@ -161,6 +166,27 @@ const harness = Effect.gen(function* () {
 });
 
 describe("VM-only structured native Codex sign-in", () => {
+  it.effect("drops a replaced personal auth controller and cancels its old device process", () =>
+    Effect.gen(function* () {
+      const f = yield* harness;
+      const previous = yield* f.auth.start({ instanceId }, "owner");
+      yield* f.phase("waiting");
+      yield* Deferred.await(f.emitted);
+      yield* f.replaceInstance(false);
+      const unavailable = yield* f.auth
+        .subscribe({ instanceId }, "owner")
+        .pipe(Stream.runHead, Effect.flip);
+      expect(unavailable.detail).toContain("does not support sign-in");
+      yield* Deferred.await(f.stopped);
+      expect(f.attempts()).toBe(1);
+      yield* f.replaceInstance(true);
+      const next = yield* f.auth.start({ instanceId }, "owner");
+      yield* f.phase("waiting");
+      expect(next.flowId).not.toBe(previous.flowId);
+      expect(f.attempts()).toBe(2);
+      yield* f.auth.cancel({ instanceId, flowId: next.flowId! }, "owner");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
   it.effect(
     "binds the guest sign-in service to the real router across requests without replacing ordinary auth",
     () =>

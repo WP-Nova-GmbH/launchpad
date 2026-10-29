@@ -12,6 +12,7 @@ import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
 import { inspectVmWorkloads, withSealedVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
+import { configureThreadVmRepository } from "./ThreadVmRepositoryBinding.ts";
 import {
   readThreadVmRestoreState,
   encodeThreadVmRestoreState,
@@ -77,6 +78,12 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
     if (state.phase === "activated" && owner.phase === "active") {
       yield* reopen;
       return false;
+    }
+    // Activation acknowledgement already includes Git setup; the gate may have
+    // reopened before a crash left the local ownership fence frozen.
+    if (owner.phase === "frozen" && state.phase !== "activated") {
+      const configureGit = configureThreadVmRepository(owner, receipt.checkoutPath, "import");
+      yield* warm ? withSealedVmWorkloads(vm.operationId, configureGit) : configureGit;
     }
     const secrets = yield* ServerSecretStore;
     if (state.phase === "installed") {

@@ -169,6 +169,7 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
           const ready = yield* sql`SELECT 1 FROM thread_transfer_readiness r
             JOIN thread_transfer_baselines b USING(operation_id)
             WHERE r.operation_id = ${input.operationId} AND r.phase = 'ready'
+              AND r.setup_succeeded=1 AND r.provider_probe_attempt_id IS NULL
               AND r.manifest_sha256 = b.manifest_sha256 AND r.native_runtime_json = b.native_runtime_json`;
           if (!ready.length)
             return yield* fail(

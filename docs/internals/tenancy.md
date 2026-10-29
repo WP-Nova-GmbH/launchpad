@@ -171,8 +171,8 @@ before its owner claims it. Close this before the relay is multi-tenant.
 
 An organization holds at most one **provider account** per provider — Codex, Claude, Cursor,
 OpenCode — so its executors sign in to nothing themselves
-([ADR-0003](../adr/0003-provider-credentials-are-fetched-by-executors-not-pushed.md), organization
-provider accounts amendment). An account is either one environment variable (an API key or
+([ADR-0003](../adr/0003-provider-credentials-are-fetched-by-executors-not-pushed.md#organization-machines)).
+An account is either one environment variable (an API key or
 long-lived token) or the provider CLI's own auth store, copied file for file from the device an
 admin signed in on. The admin's client asks its own server to read the store
 (`server.exportProviderAccount`, implemented per driver as `accountExport`) and stores the result

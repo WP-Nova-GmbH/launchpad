@@ -44,7 +44,11 @@ import * as CodexErrors from "effect-codex-app-server/errors";
 
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import { ProviderAdapterValidationError, type ProviderAdapterProcessError } from "../Errors.ts";
+import {
+  ProviderAdapterProbeError,
+  ProviderAdapterValidationError,
+  type ProviderAdapterProcessError,
+} from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
@@ -56,8 +60,10 @@ import {
   type CodexThreadSnapshot,
 } from "./CodexSessionRuntime.ts";
 import { makeCodexAdapter } from "./CodexAdapter.ts";
+import { ThreadVmCodexAuthSourceError } from "../../relay/ThreadVmCodexAuthSource.ts";
 const encodeUnknownJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
+const isProbeError = Schema.is(ProviderAdapterProbeError);
 
 // Test-local service tag so the rest of the file can keep using `yield* CodexAdapter`.
 class CodexAdapter extends Context.Service<CodexAdapter, CodexAdapterShape>()(
@@ -136,13 +142,15 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     this.options = options;
   }
 
-  start() {
+  start(): ReturnType<CodexSessionRuntimeShape["start"]> {
     return Effect.promise(() => this.startImpl());
   }
 
   getSession: Effect.Effect<ProviderSession> = Effect.promise(() => this.startImpl());
 
-  sendTurn(input: CodexSessionRuntimeSendTurnInput) {
+  sendTurn(
+    input: CodexSessionRuntimeSendTurnInput,
+  ): ReturnType<CodexSessionRuntimeShape["sendTurn"]> {
     return Effect.promise(() => this.sendTurnImpl(input));
   }
 
@@ -266,6 +274,142 @@ const validationLayer = it.layer(
 );
 
 validationLayer("CodexAdapterLive validation", (it) => {
+  it.effect("attests failed probe cleanup only when authentication blocks native acquisition", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const factory = makeRuntimeFactory();
+        const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: factory.factory,
+          authPreflight: Effect.fail(
+            new ThreadVmCodexAuthSourceError({ reason: "reconnect_required" }),
+          ),
+        });
+        const error = yield* adapter
+          .probeSession({ threadId: asThreadId("safe-probe"), runtimeMode: "full-access" })
+          .pipe(Effect.flip);
+        NodeAssert.ok(isProbeError(error));
+        NodeAssert.equal(error.cleanupConfirmed, true);
+        NodeAssert.match(error.message, /Reconnect the organization's Codex/);
+        NodeAssert.equal(factory.factory.mock.calls.length, 0);
+      }),
+    ),
+  );
+
+  it.effect(
+    "retains uncertainty after a failed VM probe even when native writer EOF is confirmed",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let nativeStopped = 0;
+          const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
+            makeRuntime: (options) => {
+              const runtime = new FakeCodexRuntime(options);
+              runtime.start = () =>
+                Effect.fail(
+                  new ProviderAdapterValidationError({
+                    provider: "codex",
+                    operation: "start",
+                    issue: "native validation failed",
+                  }),
+                );
+              runtime.closeNativeWriter = Effect.sync(() => {
+                nativeStopped++;
+              }).pipe(Effect.andThen(runtime.endEvents));
+              return Effect.succeed(runtime);
+            },
+          }).pipe(Effect.provideService(VmWorkloadTracking, true));
+          const error = yield* adapter
+            .probeSession({ threadId: asThreadId("vm-probe"), runtimeMode: "full-access" })
+            .pipe(Effect.flip);
+          NodeAssert.ok(isProbeError(error));
+          NodeAssert.equal(error.cleanupConfirmed, false);
+          NodeAssert.equal(nativeStopped, 1);
+        }),
+      ),
+  );
+
+  it.effect("does not turn failed runtime acquisition into a thread-only cleanup receipt", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const factory = makeScopedRuntimeFactory({ failConstruction: true });
+        const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: factory.factory,
+        });
+        const result = yield* adapter
+          .probeSession({ threadId: asThreadId("acquisition-probe"), runtimeMode: "full-access" })
+          .pipe(Effect.exit);
+        NodeAssert.ok(Exit.isFailure(result));
+        const error = Cause.squash(result.cause);
+        NodeAssert.ok(isProbeError(error));
+        NodeAssert.equal(error.cleanupConfirmed, false);
+        NodeAssert.deepStrictEqual(factory.releasedThreadIds, [asThreadId("acquisition-probe")]);
+      }),
+    ),
+  );
+
+  it.effect(
+    "blocks a captured personal provider when the VM switches to organization sign-in",
+    () =>
+      Effect.gen(function* () {
+        const factory = makeRuntimeFactory();
+        const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: factory.factory,
+          authPreflight: Effect.fail(
+            new ThreadVmCodexAuthSourceError({ reason: "selection_changed" }),
+          ),
+        });
+        const error = yield* adapter
+          .startSession({ threadId: asThreadId("personal-thread"), runtimeMode: "full-access" })
+          .pipe(Effect.flip);
+        NodeAssert.match(error.message, /selection changed/);
+        NodeAssert.equal(factory.factory.mock.calls.length, 0);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "rechecks managed authentication before a cached native session accepts another turn",
+    () =>
+      Effect.gen(function* () {
+        let connected = true,
+          dispatched = 0;
+        const factory = makeRuntimeFactory();
+        const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: factory.factory,
+          managedAuth: {
+            connectionId: "connection",
+            label: "Organization account",
+            status: Effect.die("No status probe required"),
+            preflight: Effect.suspend(() =>
+              connected
+                ? Effect.void
+                : Effect.fail(new ThreadVmCodexAuthSourceError({ reason: "reconnect_required" })),
+            ),
+          },
+        });
+        const threadId = asThreadId("managed-cached-thread");
+        yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+        const runtime = factory.lastRuntime!;
+        NodeAssert.equal(runtime.options.managedConnectionId, "connection");
+        runtime.sendTurn = (input) =>
+          (input.beforeDispatch ?? Effect.void).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                dispatched++;
+                return { threadId, turnId: asTurnId("managed-turn") };
+              }),
+            ),
+          );
+        yield* adapter.sendTurn({ threadId, input: "first", attachments: [] });
+        connected = false;
+        const error = yield* adapter
+          .sendTurn({ threadId, input: "second", attachments: [] })
+          .pipe(Effect.flip);
+        NodeAssert.match(error.message, /Reconnect the organization's Codex/);
+        NodeAssert.equal(dispatched, 1);
+        NodeAssert.equal(factory.factory.mock.calls.length, 1);
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("isolates precommit native resume notifications and closes the probe runtime", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -330,7 +474,7 @@ validationLayer("CodexAdapterLive validation", (it) => {
         const rejected = yield* Effect.flip(
           adapter.probeSession({ threadId, runtimeMode: "full-access" }),
         );
-        NodeAssert.equal(rejected._tag, "ProviderAdapterValidationError");
+        NodeAssert.equal(rejected._tag, "ProviderAdapterProbeError");
         NodeAssert.equal(runtimes[1]?.closeImpl.mock.calls.length, 0);
         NodeAssert.equal(yield* adapter.hasSession(threadId), true);
       }),
@@ -459,7 +603,7 @@ else {
             );
           const wrongHomeAdapter = yield* realAdapter({ MOCK_WRONG_HOME: "1" });
           const wrongHome = yield* Effect.flip(wrongHomeAdapter.probeSession(input));
-          NodeAssert.equal(wrongHome._tag, "ProviderAdapterValidationError", wrongHome.message);
+          NodeAssert.equal(wrongHome._tag, "ProviderAdapterProbeError", wrongHome.message);
           NodeAssert.equal(yield* fs.readFileString(requestLog), "initialize\n");
           yield* fs.writeFileString(requestLog, "");
           const compatible = yield* realAdapter();
@@ -473,7 +617,7 @@ else {
           yield* fs.writeFileString(requestLog, "");
           const incompatible = yield* realAdapter({ MOCK_RESUME_ERROR: "1" });
           const failed = yield* Effect.flip(incompatible.probeSession(input));
-          NodeAssert.equal(failed._tag, "ProviderAdapterProcessError");
+          NodeAssert.equal(failed._tag, "ProviderAdapterProbeError");
           NodeAssert.match(failed.message, /incompatible native history/);
           NodeAssert.equal(yield* incompatible.hasSession(input.threadId), false);
           NodeAssert.equal(

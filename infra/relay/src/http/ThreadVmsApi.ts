@@ -5,6 +5,10 @@ import {
   cancelThreadVmBackupRecovery,
 } from "./ThreadVmBackupRecoveryApi.ts";
 import { threadVmProviderAuth } from "./ThreadVmProviderAuthApi.ts";
+import {
+  getThreadVmCodexAuthSource,
+  selectThreadVmCodexAuthSource,
+} from "./ThreadVmCodexAuthApi.ts";
 import { permanentlyDeleteThread, getThreadDeletion } from "./ThreadDeletionApi.ts";
 import { resetThreadVm, getThreadVmReset, cancelThreadVmReset } from "./ThreadVmResetApi.ts";
 import {
@@ -233,6 +237,10 @@ export const cancelThreadVmReplacement = Effect.fn("relay.api.thread_vms.cancel_
 
 export const threadVmsApi = HttpApiBuilder.group(RelayApi, "threadVms", (handlers) =>
   handlers
+    .handle("getProviderAuthSource", ({ params }) => getThreadVmCodexAuthSource(params.threadId))
+    .handle("selectProviderAuthSource", ({ params, payload }) =>
+      selectThreadVmCodexAuthSource(params.threadId, payload),
+    )
     .handle("getProviderAuth", ({ params }) => threadVmProviderAuth(params.threadId, "status"))
     .handle("startProviderAuth", ({ params, payload }) =>
       threadVmProviderAuth(params.threadId, "start", payload).pipe(

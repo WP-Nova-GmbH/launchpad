@@ -140,8 +140,23 @@ the relay, Cloudflare connector and desktop app with matching URLs.
 
 Sign in to Launchpad Connect, open a local Codex thread, and choose
 **Run on → Private VM**. If prompted, connect the local environment for thread moves.
-The move uploads the repository, files and conversation. Complete Codex sign-in
-inside the new VM when the app asks for it.
+The move uploads the repository, files and conversation. During preparation, choose
+personal Codex sign-in or the organization's connected **Codex for VMs** account.
+An admin connects that account from local desktop or web first; see
+[Codex for VMs](../user/organizations.md#codex-for-vms).
+
+## Updating Codex VM authentication
+
+Apply the relay database migrations and deploy the updated relay before enabling the new guest
+build. Build the runner with `vp run build:vm-template`, then restart `dev:vm` to select it.
+For a deployed relay, set `E2B_TEMPLATE_REF` and `E2B_TEMPLATE_BUILD_ID` to the successful build's
+immutable reference and build ID; these determine `settings.compute.templateId` for new allocations.
+Confirm a newly created VM uses that build before choosing organization Codex.
+
+Changing the selected template does not upgrade running VMs or saved snapshots. Older guests
+cannot finish preparation with managed Codex until they support it. Keep personal sign-in for
+those guests, or move the thread back to a machine and into a VM built from the new template.
+Verify sign-in and concurrent work with a dedicated test account before enabling this for normal use.
 
 ## Later startups
 

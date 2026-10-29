@@ -1,4 +1,5 @@
 import { makeThreadHistorySync } from "./ThreadHistorySync.ts";
+import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
@@ -14,6 +15,7 @@ import {
   ThreadId,
   OrchestrationEvent,
   ProviderInstanceId,
+  ProviderDriverKind,
 } from "@t3tools/contracts";
 import { requireThreadVmRestoreServerStart } from "./ThreadVmServer.ts";
 import {
@@ -23,7 +25,11 @@ import {
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import * as Sink from "effect/Sink";
-import { VmControlSpawner, VmWorkloadTracking } from "../vmWorkloadCommand.ts";
+import {
+  VmControlSpawner,
+  VmWorkloadTracking,
+  makeVmWorkloadSpawner,
+} from "../vmWorkloadCommand.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
@@ -39,7 +45,13 @@ import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSna
 import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import { layer as SessionLayer } from "../persistence/ProviderSessionRuntime.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
-import { ProcessRunner, layer as RunnerLayer } from "../processRunner.ts";
+import {
+  ProcessRunner,
+  layer as RunnerLayer,
+  make as makeProcessRunner,
+} from "../processRunner.ts";
+import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import { ProviderAdapterProbeError } from "../provider/Errors.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { exportCodexConversation } from "../provider/Drivers/CodexConversationTransfer.ts";
 import { resolvePortableCodexHome } from "../provider/Drivers/PortableCodexHome.ts";
@@ -680,6 +692,136 @@ it.layer(
                 }),
               );
               const secrets = yield* Secrets.ServerSecretStore;
+              if (!worktree) {
+                yield* f.fs.writeFileString(
+                  f.path.join(f.checkoutPath, "t3.json"),
+                  encode({
+                    scripts: [
+                      {
+                        id: "prepare",
+                        name: "Prepare",
+                        command: "printf 'setup\\n' >> restore-setup-count",
+                        runOnWorktreeCreate: true,
+                      },
+                    ],
+                  }),
+                );
+                const instanceId = ProviderInstanceId.make("codex"),
+                  driverKind = ProviderDriverKind.make("codex");
+                let failed = true,
+                  probes = 0;
+                const unused = () => Effect.die("Unexpected restored provider operation");
+                const instance: ProviderInstance = {
+                  instanceId,
+                  driverKind,
+                  enabled: true,
+                  displayName: undefined,
+                  continuationIdentity: { driverKind, continuationKey: "restore-test" },
+                  snapshot: {
+                    getSnapshot: unused(),
+                    refresh: Effect.succeed({
+                      instanceId,
+                      driver: driverKind,
+                      enabled: true,
+                      installed: true,
+                      version: "0.159.3",
+                      status: "ready",
+                      auth: { status: "authenticated" },
+                      checkedAt: at,
+                      models: [],
+                      slashCommands: [],
+                      skills: [],
+                    }),
+                    streamChanges: Stream.empty,
+                    applyUsageLimits: unused,
+                    resolveMaintenance: unused,
+                  },
+                  get textGeneration(): never {
+                    throw new Error("Preparation must not generate text");
+                  },
+                  adapter: {
+                    provider: driverKind,
+                    capabilities: { sessionModelSwitch: "in-session" },
+                    hasSession: () => Effect.succeed(false),
+                    probeSession: (request) =>
+                      Effect.suspend(() => {
+                        probes++;
+                        return failed
+                          ? new ProviderAdapterProbeError({
+                              provider: "codex",
+                              threadId: f.threadId,
+                              detail: "Reconnect before resuming.",
+                              cleanupConfirmed: true,
+                            })
+                          : Effect.succeed({
+                              provider: driverKind,
+                              threadId: f.threadId,
+                              runtimeMode: request.runtimeMode,
+                              cwd: f.checkoutPath,
+                              status: "ready",
+                              resumeCursor: request.resumeCursor,
+                              createdAt: at,
+                              updatedAt: at,
+                            });
+                      }),
+                    startSession: unused,
+                    stopSession: unused,
+                    sendTurn: unused,
+                    interruptTurn: unused,
+                    respondToRequest: unused,
+                    respondToUserInput: unused,
+                    listSessions: unused,
+                    readThread: unused,
+                    rollbackThread: unused,
+                    stopAll: unused,
+                    streamEvents: Stream.empty,
+                  },
+                };
+                const preparing = activateRestoredThreadVm(f.threadId).pipe(
+                  Effect.provideService(
+                    HttpClient.HttpClient,
+                    HttpClient.make((request) =>
+                      Effect.succeed(
+                        HttpClientResponse.fromWeb(
+                          request,
+                          Response.json(
+                            request.url.endsWith("/repository/binding")
+                              ? {
+                                  operationId: f.operationId,
+                                  environmentId: receipt.environmentId,
+                                  repositoryId: receipt.scope.repositoryId,
+                                  threadId: f.threadId,
+                                  generation: receipt.scope.generation,
+                                  canonicalKey: "github.com/acme/project",
+                                }
+                              : { ready: false },
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Effect.provide(
+                    Layer.mock(ProviderInstanceRegistry)({
+                      getInstance: () => Effect.succeed(instance),
+                    }),
+                  ),
+                );
+                yield* Effect.flip(preparing);
+                expect((yield* readThreadVmRestoreState())?.phase).toBe("installed");
+                expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe(
+                  "frozen",
+                );
+                failed = false;
+                expect(yield* preparing).toBe(false);
+                expect((yield* readThreadVmRestoreState())?.phase).toBe("ready");
+                expect(probes).toBe(2);
+                expect(
+                  yield* f.fs.readFileString(f.path.join(f.checkoutPath, "restore-setup-count")),
+                ).toBe("setup\n");
+                expect(
+                  (yield* (yield* ProjectionSnapshotQuery).getSnapshot()).threads[0]?.promptQueue,
+                ).toEqual(snapshot.threads[0]?.promptQueue);
+              }
               yield* secrets.set(
                 THREAD_VM_RESTORE_STATE_SECRET,
                 new TextEncoder().encode(
@@ -688,12 +830,15 @@ it.layer(
               );
               // Startup proof uses a verified readiness receipt; provider/setup
               // execution itself has separate real adapter-boundary tests.
-              yield* sql`INSERT INTO thread_transfer_readiness(operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase)
-                  SELECT operation_id,manifest_sha256,native_runtime_json,${"0".repeat(64)},'ready' FROM thread_transfer_baselines WHERE operation_id=${f.operationId}`;
+              if (worktree)
+                yield* sql`INSERT INTO thread_transfer_readiness(operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase,setup_succeeded)
+                  SELECT operation_id,manifest_sha256,native_runtime_json,${"0".repeat(64)},'ready',1 FROM thread_transfer_baselines WHERE operation_id=${f.operationId}`;
               let calls = 0,
                 ready = false,
                 status = 200;
-              let reopens = 0;
+              let reopens = 0,
+                sealedGitCommands = 0,
+                expectedReopenPhase = "frozen";
               const gate = {
                 bootId: NodeCrypto.randomUUID(),
                 epoch: 8,
@@ -704,14 +849,31 @@ it.layer(
                 groups: [],
                 stopped: true,
               };
+              const rawSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
               const control = ChildProcessSpawner.make((command) =>
                 Effect.gen(function* () {
                   if (!("args" in command)) throw new Error("Expected one control request");
+                  if (command.args[0] === "run-transfer") {
+                    const [, bootId, operationId, epoch, , separator, executable, ...args] =
+                      command.args;
+                    expect([bootId, operationId, epoch, separator, executable]).toEqual([
+                      gate.bootId,
+                      gate.sealedBy,
+                      String(gate.epoch),
+                      "--",
+                      "git",
+                    ]);
+                    expect(gate.sealedBy).not.toBeNull();
+                    sealedGitCommands++;
+                    return yield* rawSpawner.spawn(
+                      ChildProcess.make(executable!, args, command.options),
+                    );
+                  }
                   if (command.args[0] === "reopen") {
                     expect(ready).toBe(true);
                     expect((yield* readThreadVmRestoreState())?.phase).toBe("activated");
                     expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe(
-                      "frozen",
+                      expectedReopenPhase,
                     );
                     expect(command.args[2]).toBe(gate.sealedBy);
                     gate.sealedBy = null;
@@ -733,8 +895,26 @@ it.layer(
                   });
                 }).pipe(Effect.provideService(Secrets.ServerSecretStore, secrets), Effect.orDie),
               );
+              const trackedRunner = yield* makeProcessRunner().pipe(
+                Effect.provideService(
+                  ChildProcessSpawner.ChildProcessSpawner,
+                  makeVmWorkloadSpawner(control),
+                ),
+              );
               const client = HttpClient.make((request) =>
                 Effect.gen(function* () {
+                  if (request.url.endsWith("/repository/binding"))
+                    return HttpClientResponse.fromWeb(
+                      request,
+                      Response.json({
+                        operationId: f.operationId,
+                        environmentId: receipt.environmentId,
+                        repositoryId: receipt.scope.repositoryId,
+                        threadId: f.threadId,
+                        generation: receipt.scope.generation,
+                        canonicalKey: "github.com/acme/project",
+                      }),
+                    );
                   calls++;
                   expect(request.url).toBe(
                     `https://relay.test/v1/environments/fresh-environment/threads/${f.threadId}/restore/activate`,
@@ -749,6 +929,7 @@ it.layer(
               const activate = activateRestoredThreadVm(f.threadId).pipe(
                 Effect.provideService(VmWorkloadTracking, true),
                 Effect.provideService(VmControlSpawner, control),
+                Effect.provideService(ProcessRunner, trackedRunner),
                 Effect.provideService(HttpClient.HttpClient, client),
                 Effect.provide(
                   Layer.mock(ProviderInstanceRegistry)({
@@ -780,13 +961,38 @@ it.layer(
               expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe("frozen");
               expect((yield* readThreadVmRestoreState())?.phase).toBe("ready");
               expect(yield* activate).toBe(true);
+              expect(sealedGitCommands).toBeGreaterThan(0);
               expect(reopens).toBe(1);
               expect(calls).toBe(4);
+              expect(yield* f.git(f.checkoutPath, ["remote", "get-url", "origin"])).toBe(
+                "https://github.com/acme/project.git",
+              );
+              expect(yield* f.git(f.checkoutPath, ["config", "--get", "commit.gpgsign"])).toBe(
+                "false",
+              );
+              expect(
+                yield* f.git(f.checkoutPath, ["config", "--get-all", "credential.helper"]),
+              ).toBe("!/opt/launchpad/server/t3 __thread-vm-git-credential");
               expect((yield* readThreadVmRestoreState())?.phase).toBe("activated");
               expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe("active");
               expect(yield* activate).toBe(false);
               expect(reopens).toBe(1);
               expect(calls).toBe(4);
+              expectedReopenPhase = "active";
+              gate.sealedBy = NodeCrypto.createHash("sha256")
+                .update(f.operationId)
+                .digest("hex")
+                .slice(0, 32);
+              expect(yield* activate).toBe(false);
+              expect(reopens).toBe(2);
+              expect(calls).toBe(4);
+              // Crash after reopening workloads, before the fence transaction commits.
+              yield* sql`UPDATE thread_execution_fences SET phase='frozen' WHERE thread_id=${f.threadId}`;
+              yield* sql`UPDATE thread_checkout_claims SET phase='installed',release_reason=NULL WHERE operation_id=${f.operationId}`;
+              expect(yield* activate).toBe(true);
+              expect(reopens).toBe(2);
+              expect(calls).toBe(5);
+              expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe("active");
               yield* sql`UPDATE provider_session_runtime SET status='running' WHERE thread_id=${f.threadId}`;
               expect(yield* requireThreadVmRestoreServerStart(digest, f.workspaceRoot)).toEqual(
                 receipt,

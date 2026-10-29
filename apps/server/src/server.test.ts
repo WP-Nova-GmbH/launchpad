@@ -7523,7 +7523,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 return ModelManifest.BUNDLED_MODEL_MANIFEST;
               }),
             },
-            providerInstanceRegistry: { listInstances: Effect.succeed(instances) },
+            providerInstanceRegistry: {
+              listInstances: Effect.succeed(instances),
+              getInstance: (id) =>
+                Effect.succeed(instances.find((instance) => instance.instanceId === id)),
+              listUnavailable: Effect.succeed([]),
+            },
             providerRegistry: { refresh: () => probe, refreshInstance: () => probe },
           },
         });

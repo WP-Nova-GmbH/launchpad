@@ -208,6 +208,7 @@ for (const lost of [
   "destination-nested-project",
   "destination-unconfirmed-repository",
   "destination-repointed-during-download",
+  "destination-ready-receipt",
 ] as const)
   it.effect(
     lost === "published"
@@ -1287,6 +1288,16 @@ for (const lost of [
                 generation: 2,
                 operationId: remote!.operationId,
               };
+              if (lost === "destination-ready-receipt") {
+                yield* destinationSql`CREATE TEMP TRIGGER fail_destination_ready BEFORE UPDATE OF phase ON thread_transfer_readiness
+                  WHEN NEW.phase='ready' BEGIN SELECT RAISE(ABORT,'lost readiness receipt'); END`;
+                yield* Effect.flip(destination.destination(owner));
+                expect(remote?.failureDetail).toBeTruthy();
+                expect(
+                  yield* destinationSql`SELECT setup_succeeded,provider_probe_attempt_id FROM thread_transfer_readiness WHERE operation_id=${owner.operationId}`,
+                ).toEqual([{ setup_succeeded: 1, provider_probe_attempt_id: null }]);
+                yield* destinationSql`DROP TRIGGER fail_destination_ready`;
+              }
               if (validationFailure) {
                 const worktreesRoot = (yield* ServerConfig).worktreesDir;
                 const localWorktrees = yield* fs.readDirectory(worktreesRoot);
@@ -1364,6 +1375,11 @@ for (const lost of [
                   expect(remote?.phase).toBe("aborting");
                   expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
                   yield* destinationSql`UPDATE thread_transfer_readiness SET setup_output_json=${receipt!.output} WHERE operation_id=${owner.operationId}`;
+                  yield* destinationSql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id='uncertain-probe' WHERE operation_id=${owner.operationId}`;
+                  yield* Effect.flip(destination.destination(owner));
+                  expect(remote?.phase).toBe("aborting");
+                  expect(yield* fs.readFileString(path.join(dst, "README"))).toBe("setup edit\n");
+                  yield* destinationSql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id=NULL WHERE operation_id=${owner.operationId}`;
                 }
                 yield* destination.destination(owner);
                 expect(remote?.phase).toBe("aborted");

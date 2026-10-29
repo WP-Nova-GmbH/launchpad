@@ -13,6 +13,9 @@ const migrationsDir = new URL("../../migrations/postgres/", import.meta.url).pat
 const commonHead = "32fe6e1e-3ff0-4c72-bfb6-c7f633904c61";
 const workflowHead = "c88a4021-99f3-4339-b003-118b2ac1c050";
 const vmHead = "d42d70fa-bc6e-4f9a-93db-956ca63fa8e3";
+const codexVmHead = "dab2362b-4578-42d4-a278-a4ee43d1214e";
+const stockVmHead = "c57df92d-b498-403e-9d19-d8453f1502dd";
+const runtimeMigration = "20261028221922_thread_vm_runtime_protocol";
 const prefix = "workflow_vm_merge_20261027_";
 type Snapshot = Awaited<ReturnType<typeof generateDrizzleJson>>;
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
@@ -140,10 +143,19 @@ const seed = (sql: PgClient.PgClient, names: ReadonlySet<string>) =>
       yield* sql`INSERT INTO relay_thread_vm_allocations(allocation_id,thread_id,organization_id,owner_user_id,template_id,compute_ref,state) VALUES ('merge-allocation','merge-thread','merge-org','merge-user','template','compute','running')`;
       yield* sql`INSERT INTO relay_thread_history(thread_id,cursor,environment_id,source_sequence,event_json) VALUES ('merge-thread',1,'environment',1,'{"type":"thread.created","payload":{"projectId":"project"}}')`;
       yield* sql`INSERT INTO relay_thread_current_queues(thread_id,cursor,queue_json) VALUES ('merge-thread',1,'{"entries":[]}')`;
+      if (names.has(runtimeMigration))
+        yield* sql`UPDATE relay_thread_vm_allocations SET sealed_traffic_access_token='preserved-sealed-ingress' WHERE allocation_id='merge-allocation'`;
+    }
+    if (names.has("20261028130056_codex_vm_connections")) {
+      yield* sql`INSERT INTO relay_codex_vm_installation(key,host_id) VALUES ('installation','preserved-host')`;
+      yield* sql`INSERT INTO relay_codex_vm_connections(organization_id,connection_id,epoch,token_revision,action_revision,issuer,subject,client_id,label,status,payload_sealed,expires_at,updated_at)
+        VALUES ('merge-org','preserved-codex-connection',2,3,4,'https://auth.openai.com','preserved-subject','preserved-client','Preserved account','connected','sealed-codex-fixture','2099','2026')`;
+      yield* sql`INSERT INTO relay_thread_vm_codex_auth(allocation_id,environment_id,generation,thread_id,organization_id,mode,connection_id,acknowledged_connection_id)
+        VALUES ('merge-allocation','environment',1,'merge-thread','merge-org','organization','preserved-codex-connection','preserved-codex-connection')`;
     }
   });
 
-const records = (sql: PgClient.PgClient) =>
+const records = (sql: PgClient.PgClient, omitNativeAllocationColumns = false) =>
   Effect.gen(function* () {
     const tables = yield* sql<{
       name: string;
@@ -151,7 +163,7 @@ const records = (sql: PgClient.PgClient) =>
     const values: Record<string, unknown> = {};
     for (const { name } of tables) {
       const rows = yield* sql.unsafe(
-        `SELECT to_jsonb(t) AS row FROM "${name}" t ORDER BY to_jsonb(t)::text`,
+        `SELECT to_jsonb(t)${omitNativeAllocationColumns && name === "relay_thread_vm_allocations" ? "-'runtime_protocol'-'sealed_traffic_access_token'" : ""} AS row FROM "${name}" t ORDER BY to_jsonb(t)::text`,
       );
       if (rows.length) values[name] = rows;
     }
@@ -160,7 +172,7 @@ const records = (sql: PgClient.PgClient) =>
 
 describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => {
   it.live(
-    "upgrades empty, common, workflow and VM databases without losing data or replaying migrations",
+    "upgrades empty, common, workflow, VM, Codex and stock databases without losing data or replaying migrations",
     () =>
       Effect.gen(function* () {
         const adminUrl = new URL(url!);
@@ -191,6 +203,8 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
         const common = ancestors(commonHead);
         const workflows = ancestors(workflowHead);
         const vms = new Set([...ancestors(vmHead), ...common]);
+        const codex = ancestors(codexVmHead);
+        const stock = ancestors(stockVmHead);
         expect([common.size, workflows.size, vms.size]).toEqual([27, 33, 98]);
         const parents = new Set(entries.flatMap((entry) => entry.snapshot.prevIds));
         const leaves = entries.filter((entry) => !parents.has(entry.snapshot.id));
@@ -220,6 +234,8 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
           ["common", common],
           ["workflows", workflows],
           ["vms", vms],
+          ["codex", codex],
+          ["stock", stock],
         ] as const) {
           const baselineFolder = path.join(folder, label);
           yield* fs.makeDirectory(baselineFolder);
@@ -239,12 +255,23 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
                 });
               const beforeLedger = baseline.size ? yield* ledger(sql) : [];
               yield* seed(sql, baseline);
-              const before = yield* records(sql);
+              const omitNativeAllocationColumns = !baseline.has(runtimeMigration);
+              const before = yield* records(sql, omitNativeAllocationColumns);
               yield* migrate(db, {
                 migrationsFolder: migrationsDir,
                 migrationsTable: "relay_migrations",
               });
-              const after = yield* records(sql);
+              const after = yield* records(sql, omitNativeAllocationColumns);
+              if (baseline.has("20261023131714_thread_original_location")) {
+                const [allocation] = yield* sql<{
+                  protocol: string;
+                  ingress: string | null;
+                }>`SELECT runtime_protocol AS protocol,sealed_traffic_access_token AS ingress FROM relay_thread_vm_allocations WHERE allocation_id='merge-allocation'`;
+                expect(allocation, label).toEqual({
+                  protocol: omitNativeAllocationColumns ? "legacy" : "native-v1",
+                  ingress: omitNativeAllocationColumns ? null : "preserved-sealed-ingress",
+                });
+              }
               for (const [table, rows] of Object.entries(before))
                 expect(after[table], label + ": " + table).toEqual(rows);
               expect(yield* catalog(sql), label + ": database schema").toEqual(expected);
@@ -260,7 +287,7 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
                 migrationsTable: "relay_migrations",
               });
               expect(yield* ledger(sql)).toEqual(applied);
-              expect(yield* records(sql)).toEqual(after);
+              expect(yield* records(sql, omitNativeAllocationColumns)).toEqual(after);
               expect(yield* catalog(sql)).toEqual(expected);
             }),
           );

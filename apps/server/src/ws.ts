@@ -71,6 +71,8 @@ import {
   ProjectWriteFileError,
   ProviderUploadFeedbackError,
   ProviderSetupError,
+  ProviderDriverKind,
+  ProviderInstanceId,
   RelayClientInstallFailedError,
   type RelayClientInstallProgressEvent,
   ServerSelfUpdateError,
@@ -147,7 +149,11 @@ import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
+import { makeCodexVmSignIn, supportsCodexVmSignIn } from "./cloud/CodexVmSignIn.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
+import { ProviderInstanceRegistryMutator } from "./provider/Services/ProviderInstanceRegistryMutator.ts";
+import { deriveProviderInstanceConfigMap } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
+import { ThreadVmCodexAuthContext } from "./relay/ThreadVmCodexAuthSource.ts";
 import { makeProviderInstallation } from "./provider/providerInstallation.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -540,6 +546,7 @@ const makeWsRpcLayer = (
   reportSessionPresence: (input: ThreadPresenceReportInput) => Effect.Effect<void>,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  codexVmSignInSupported: boolean,
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -736,6 +743,7 @@ const makeWsRpcLayer = (
       const providerSessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const providerAuth = yield* ProviderAuthService;
+      const codexVmSignIn = yield* makeCodexVmSignIn(codexVmSignInSupported);
       const providerInstances = yield* ProviderInstanceRegistry;
       const providerInstallation = yield* makeProviderInstallation();
       const serverUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
@@ -2894,6 +2902,67 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,
             Effect.gen(function* () {
+              const target =
+                input.instanceId === undefined
+                  ? undefined
+                  : yield* providerInstances.getInstance(input.instanceId);
+              const codexTarget =
+                input.instanceId === undefined ||
+                target?.driverKind === "codex" ||
+                (yield* providerInstances.listUnavailable).some(
+                  (provider) =>
+                    provider.instanceId === input.instanceId && provider.driver === "codex",
+                );
+              if (codexTarget) {
+                const source = yield* ThreadVmCodexAuthContext;
+                yield* source.withReloadLock(
+                  Effect.gen(function* () {
+                    const changed = yield* source.refresh.pipe(
+                      Effect.mapError(
+                        (error) =>
+                          new ProviderSetupError({
+                            instanceId: input.instanceId ?? ProviderInstanceId.make("codex"),
+                            operation: "refresh-models",
+                            detail: error.message,
+                          }),
+                      ),
+                    );
+                    if (changed) {
+                      const mutator = yield* Effect.serviceOption(ProviderInstanceRegistryMutator);
+                      if (Option.isNone(mutator))
+                        return yield* new ProviderSetupError({
+                          instanceId: input.instanceId ?? ProviderInstanceId.make("codex"),
+                          operation: "refresh-models",
+                          detail:
+                            "This server cannot reload VM authentication. Restart the VM server and retry.",
+                        });
+                      yield* mutator.value.reconcile(
+                        deriveProviderInstanceConfigMap(
+                          yield* serverSettings.getSettings.pipe(
+                            Effect.mapError(
+                              () =>
+                                new ProviderSetupError({
+                                  instanceId: input.instanceId ?? ProviderInstanceId.make("codex"),
+                                  operation: "refresh-models",
+                                  detail: "Could not read provider settings. Retry the refresh.",
+                                }),
+                            ),
+                          ),
+                        ),
+                        {
+                          rebuildDrivers: new Set([ProviderDriverKind.make("codex")]),
+                        },
+                      );
+                      if (
+                        (yield* providerInstances.listInstances).some(
+                          (instance) => instance.driverKind === "codex",
+                        )
+                      )
+                        yield* source.markApplied;
+                    }
+                  }),
+                );
+              }
               // Only explicit catalog refreshes bypass T3's caches. Workspace
               // discovery and background status checks retain their timers.
               if (input.refreshModels) {
@@ -3115,6 +3184,17 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "provider" },
             input,
           ),
+        [WS_METHODS.codexVmSignInCapability]: () =>
+          observeRpcEffect(
+            WS_METHODS.codexVmSignInCapability,
+            Effect.succeed({ supported: codexVmSignIn.supported }),
+          ),
+        [WS_METHODS.codexVmSignInStart]: () =>
+          observeRpcEffect(WS_METHODS.codexVmSignInStart, codexVmSignIn.start),
+        [WS_METHODS.codexVmSignInWait]: (input) =>
+          observeRpcEffect(WS_METHODS.codexVmSignInWait, codexVmSignIn.wait(input.bridgeId)),
+        [WS_METHODS.codexVmSignInCancel]: (input) =>
+          observeRpcEffect(WS_METHODS.codexVmSignInCancel, codexVmSignIn.cancel(input.bridgeId)),
         [WS_METHODS.providerAuthRespond]: (input) =>
           observeRpcEffect(
             WS_METHODS.providerAuthRespond,
@@ -5097,6 +5177,14 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               reportSessionPresence,
               clientAnalyticsProps,
               previewAutomationBroker,
+              supportsCodexVmSignIn({
+                origin: request.headers.origin,
+                host: request.headers.host,
+                remoteAddress: Option.getOrUndefined(request.remoteAddress),
+                forwarded: ["forwarded", "x-forwarded-for", "x-forwarded-host"].some(
+                  (header) => request.headers[header] !== undefined,
+                ),
+              }),
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),

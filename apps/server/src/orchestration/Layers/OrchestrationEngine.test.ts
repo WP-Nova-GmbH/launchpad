@@ -4373,7 +4373,7 @@ it("activates a moved checkout only after matching files and history are install
     await f.system.run(
       Effect.gen(function* () {
         const sql = f.system.sql;
-        yield* sql`UPDATE thread_transfer_readiness SET phase = 'ready' WHERE operation_id = ${target.operationId}`;
+        yield* sql`UPDATE thread_transfer_readiness SET phase = 'ready',setup_succeeded=1 WHERE operation_id = ${target.operationId}`;
       }),
     );
     await f.system.run(f.system.fence.activate(target));

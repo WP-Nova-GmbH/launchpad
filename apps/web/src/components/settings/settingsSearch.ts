@@ -839,9 +839,19 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["Linear Jira personal account issues connect disconnect read-only OAuth"],
   },
   {
-    id: "organization-provider-accounts",
-    title: "Provider accounts",
+    id: "organization-codex-vms",
+    title: "Codex for VMs",
     to: "/settings/organization",
+    cloudOnly: true,
+    searchTerms: [
+      "ChatGPT organization shared account sign in connect reconnect disconnect virtual machine VM",
+    ],
+  },
+  {
+    id: "organization-provider-accounts",
+    title: "Machine provider accounts",
+    to: "/settings/organization",
+    searchTerms: ["Provider accounts executor sign in sessions API keys"],
   },
   {
     id: "organization-skills",

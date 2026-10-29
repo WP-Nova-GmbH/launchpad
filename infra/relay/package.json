@@ -26,6 +26,7 @@
     "drizzle-orm": "1.0.0-rc.5-ab785fc",
     "e2b": "2.61.0",
     "effect": "catalog:",
+    "jose": "catalog:",
     "tldts": "7.4.2"
   },
   "devDependencies": {

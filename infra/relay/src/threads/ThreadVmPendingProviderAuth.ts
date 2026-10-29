@@ -47,6 +47,7 @@ export const readPendingThreadVmProviderAuth = Effect.fn("relay.thread_vm.pendin
             AND r.thread_id=t.thread_id AND r.actor_user_id=t.owner_user_id
             AND r.allocation_id=b.allocation_id AND r.phase='importing' AND r.serving_requested AND r.bootstrap_receipt->>'kind'='native-warm-restore-bootstrap-v1'
             AND r.target_generation=t.generation AND b.generation=t.generation
+            AND r.boot_ingress_recovery_claim_id IS NULL AND r.boot_recovery_started_at IS NULL
             AND b.environment_id=t.environment_id)
         ) FOR SHARE OF b,a,e,p,k,cap`;
     if (!row) return null;

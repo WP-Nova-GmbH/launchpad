@@ -42,6 +42,7 @@ import { makeThreadJournalStore } from "../threads/ThreadJournalStore.ts";
 import { relayInternalErrorResponse, appendRelayCredentialResponseHeaders } from "./Api.ts";
 import { withPrivateThreadOwnerAccess } from "./privateThreadAccess.ts";
 import { tenancyNotFound, tenancyConflict } from "./tenancyErrors.ts";
+import { makeThreadVmCodexAuthStore } from "../threads/ThreadVmCodexAuthStore.ts";
 
 type Owner = {
   readonly threadId: string;
@@ -214,6 +215,14 @@ export const confirmInitialVmActivation = Effect.fn(
       { ...input, generation: 1 },
       true,
       Effect.gen(function* () {
+        const placement = yield* makeThreadPlacementStore(sql).get(input.threadId);
+        if (!placement) return yield* tenancyNotFound("thread_not_found");
+        yield* makeThreadVmCodexAuthStore(sql).requireAcknowledged({
+          ...input,
+          generation: 1,
+          allocationId: receipt.scope.allocationId,
+          organizationId: placement.organizationId,
+        });
         const crypto = yield* Crypto.Crypto;
         const digest = yield* crypto.digest(
           "SHA-256",
@@ -355,6 +364,10 @@ export const mintThreadVmRepositoryToken = Effect.fn("relay.api.thread_environme
     const authorize = withThreadVmRepositoryScope(
       input,
       Effect.gen(function* () {
+        const running = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
+          WHERE allocation_id = ${vmScope.allocationId} AND thread_id = ${input.threadId}
+          AND state = 'running' AND deleted_at IS NULL FOR SHARE`;
+        if (!running.length) return yield* tenancyNotFound("thread_not_found");
         const [scope] = yield* sql<{ installationId: string; accountLogin: string }>`
         SELECT g.installation_id AS "installationId", g.account_login AS "accountLogin"
         FROM relay_repository_aliases r

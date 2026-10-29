@@ -588,8 +588,8 @@ it.layer(layer)("destination checkout claims", (it) => {
             expect(receipt.files.some((file) => file.path === fixturePath)).toBe(true);
             expect(receipt.files.some((file) => generated.includes(file.path))).toBe(false);
             yield* f.sql`INSERT INTO thread_transfer_readiness
-              (operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase,setup_started,setup_output_json)
-              VALUES (${input.operationId},${input.manifestSha256},'{}',${"c".repeat(64)},'ready',1,${output})`;
+              (operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase,setup_started,setup_output_json,setup_succeeded)
+              VALUES (${input.operationId},${input.manifestSha256},'{}',${"c".repeat(64)},'ready',1,${output},1)`;
             const unexpected = f.path.join(
               f.destination,
               "fixtures/node_modules/tracked/new-local-file.txt",

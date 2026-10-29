@@ -26,6 +26,7 @@ import { authorizeThreadEnvironment, withEnvironmentThread } from "./ThreadEnvir
 import { withPrivateThreadOwnerAccess } from "./privateThreadAccess.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
 import { tenancyConflict, tenancyNotFound } from "./tenancyErrors.ts";
+import { makeThreadVmCodexAuthStore } from "../threads/ThreadVmCodexAuthStore.ts";
 
 type Participant = {
   readonly threadId: string;
@@ -415,8 +416,17 @@ export const readyPortableThreadMove = Effect.fn("relay.api.thread_moves.ready")
 ) {
   const sql = (yield* RelayDb).$client;
   return yield* response(
-    yield* withThreadMoveParticipant(input, "destination", true, () =>
-      makeThreadPlacementStore(sql).destinationReady(input),
+    yield* withThreadMoveParticipant(input, "destination", true, (_, placement) =>
+      Effect.gen(function* () {
+        const principal = yield* RelayEnvironmentPrincipal;
+        if (principal.threadVm)
+          yield* makeThreadVmCodexAuthStore(sql).requireAcknowledged({
+            ...input,
+            allocationId: principal.threadVm.allocationId,
+            organizationId: placement.organizationId,
+          });
+        return yield* makeThreadPlacementStore(sql).destinationReady(input);
+      }),
     ),
   );
 }, Effect.catchTags(failures));

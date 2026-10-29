@@ -2,11 +2,15 @@
 status: accepted
 ---
 
-# Workflow steps have kinds, and agents never perform irreversible operations
+# Workflow steps have kinds, and workflow agents never publish
 
 Workflows have Agent steps, closed Action operations, and explicit human Review/Input checkpoints rather than making every step "run an agent." Deterministic operations that leave the workspace are `action` steps
-executed by the job runner, which means **agents never push, never open pull requests, and never
+executed by the job runner, which means **workflow agents never push, never open pull requests, and never
 merge**.
+
+This restriction applies while a workflow owns the thread. Ordinary interactive threads, including
+private VMs, can use Git through the organization's GitHub App at the user's direction. Their Git
+access does not change workflow publishing approvals or result-bound runner actions.
 
 | kind               | what it is                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------- |
@@ -26,9 +30,9 @@ escalates on uncertainty, which gives no protection when the supervisor is _conf
 about an irreversible action. Removing those actions from agents entirely converts a judgement
 problem into a structural one:
 
-> **Agents never push. The runner pushes.**
+> **Workflow agents never push. The runner pushes.**
 
-A `git push` originating from an agent is therefore always anomalous and always deniable — no
+A `git push` originating from a workflow Agent step is therefore always anomalous and always deniable — no
 legitimate workflow asks an agent for one, so the supervisor needs no judgement about it.
 
 ## Why human checkpoints are steps
@@ -65,8 +69,8 @@ Local command stopping and remote outcome are separate facts. Workflow Git/forge
 
 ## Consequences
 
-- The runner needs credentials to push and to open pull requests. Those are runner-held, not
-  agent-visible, and should not be materialized into any agent's process environment.
+- The workflow runner needs credentials to push and to open pull requests. Those are runner-held,
+  not workflow-agent-visible, and should not be materialized into a workflow agent's process environment.
 - `action` types are a closed, versioned set. Adding one is a product decision, not
   configuration — a workflow cannot define an arbitrary new side effect.
 - Agent steps that legitimately need to commit locally still may; the restriction is on

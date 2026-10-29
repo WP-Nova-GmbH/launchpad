@@ -55,8 +55,9 @@ export const readThreadVmRepository = Effect.fn("ThreadVmRepositoryCredentials.r
   function* () {
     const vm = yield* readInstalledThreadVm();
     if (!vm) return null;
-    const initial = yield* readThreadVmInitialState();
-    if (!initial && vm.scope.generation > 1) {
+    // A restored disk can retain its original bootstrap record. Later generations
+    // must use the binding installed for their current operation, even offline.
+    if (vm.scope.generation > 1) {
       const binding = yield* readThreadVmRepositoryBinding();
       if (
         !binding ||
@@ -71,17 +72,25 @@ export const readThreadVmRepository = Effect.fn("ThreadVmRepositoryCredentials.r
         return yield* unavailable();
       return binding.canonicalKey;
     }
-    const workspace = initial?.input.workspace;
+    const initial = yield* readThreadVmInitialState();
+    const workspace = initial?.input.workspace,
+      receipt = initial?.receipt;
     if (
       !workspace ||
-      !initial.receipt ||
+      !receipt ||
       vm.environmentId !== (yield* (yield* ServerEnvironmentIdentity).getEnvironmentId) ||
       workspace.scope.repositoryId !== vm.scope.repositoryId ||
       workspace.scope.threadId !== vm.scope.threadId ||
       workspace.scope.allocationId !== vm.scope.allocationId ||
       workspace.scope.generation !== vm.scope.generation ||
       workspace.operationId !== vm.operationId ||
-      initial.receipt.environmentId !== vm.environmentId
+      receipt.environmentId !== vm.environmentId ||
+      receipt.operationId !== vm.operationId ||
+      receipt.scope.repositoryId !== vm.scope.repositoryId ||
+      receipt.scope.threadId !== vm.scope.threadId ||
+      receipt.scope.allocationId !== vm.scope.allocationId ||
+      receipt.scope.generation !== vm.scope.generation ||
+      receipt.workspaceRoot !== initial.workspaceRoot
     )
       return yield* unavailable();
     return workspace.canonicalKey;

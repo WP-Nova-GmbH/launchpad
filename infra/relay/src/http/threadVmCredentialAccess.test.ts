@@ -15,6 +15,8 @@ const path = "/v1/environments/vm-env/threads/private-thread";
 describe("thread VM credential HTTP boundary", () => {
   it("permits only the assigned thread's command/history/work protocol", () => {
     expect(threadVmCredentialAllows(principal, "POST", path + "/credentials/github")).toBe(true);
+    expect(threadVmCredentialAllows(principal, "POST", path + "/credentials/codex")).toBe(true);
+    expect(threadVmCredentialAllows(principal, "POST", path + "/provider-auth/source")).toBe(true);
     expect(threadVmCredentialAllows(principal, "POST", path + "/repository/binding")).toBe(true);
     expect(threadVmCredentialAllows(principal, "POST", path + "/history")).toBe(true);
     expect(threadVmCredentialAllows(principal, "POST", path + "/final-save")).toBe(true);
@@ -41,6 +43,11 @@ describe("thread VM credential HTTP boundary", () => {
       path + "/repository/another",
       path + "/credentials/provider-accounts",
       path + "/credentials/github/extra",
+      path + "/credentials/codex/extra",
+      path + "/credentials/codex/refresh",
+      path + "/provider-auth/source/extra",
+      path.replace("private-thread", "another-thread") + "/credentials/codex",
+      path.replace("vm-env", "another-env") + "/provider-auth/source",
       path + "/history/extra",
       path + "/final-save/delete",
       path + "/pause/activate/extra",
@@ -63,6 +70,14 @@ describe("thread VM credential HTTP boundary", () => {
     ])
       expect(threadVmCredentialAllows(principal, "POST", forbidden)).toBe(false);
     expect(threadVmCredentialAllows(principal, "GET", path + "/history")).toBe(false);
+    expect(threadVmCredentialAllows(principal, "PUT", path + "/provider-auth/source")).toBe(false);
+    expect(
+      threadVmCredentialAllows(
+        principal,
+        "POST",
+        "/v1/organization/codex-vm-connection/disconnect",
+      ),
+    ).toBe(false);
   });
 });
 

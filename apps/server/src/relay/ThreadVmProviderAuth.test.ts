@@ -29,6 +29,11 @@ import {
   controlThreadVmProviderAuth,
   handleThreadVmProviderAuthRequest,
 } from "./ThreadVmProviderAuth.ts";
+import {
+  ThreadVmCodexAuthContext,
+  ThreadVmCodexAuthSourceError,
+  type ManagedThreadVmCodexAuthContext,
+} from "./ThreadVmCodexAuthSource.ts";
 
 const instanceId = ProviderInstanceId.make("codex"),
   driverKind = ProviderDriverKind.make("codex");
@@ -141,6 +146,9 @@ const harness = Effect.gen(function* () {
     setInstalled: (installed: boolean) => {
       status = { ...status, installed };
     },
+    setStatus: (next: Partial<ServerProvider>) => {
+      status = { ...status, ...next };
+    },
     waitSuccess: auth.subscribe(`thread-vm-auth:move:allocation:2`).pipe(
       Stream.filter((s) => s.phase === "succeeded"),
       Stream.runHead,
@@ -150,6 +158,86 @@ const harness = Effect.gen(function* () {
 });
 
 describe("pending VM provider sign-in", () => {
+  it.effect("uses organization connection metadata and rejects device sign-in actions", () =>
+    Effect.gen(function* () {
+      const f = yield* harness;
+      f.setStatus({ auth: { status: "authenticated" } });
+      const connection = {
+        connectionId: "managed-connection",
+        label: "Organization account",
+        status: "connected" as const,
+        epoch: 1,
+        tokenRevision: 1,
+        errorCode: null,
+        refreshing: false,
+      };
+      const managed: ManagedThreadVmCodexAuthContext = {
+        connectionId: connection.connectionId,
+        label: connection.label,
+        status: Effect.succeed(connection),
+        preflight: Effect.void,
+      };
+      const source = {
+        current: Effect.succeed(managed),
+        refresh: Effect.succeed(false),
+        markApplied: Effect.void,
+        withReloadLock: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+        personalPreflight: Effect.void,
+      };
+      const status = yield* f.run().pipe(Effect.provideService(ThreadVmCodexAuthContext, source));
+      expect(status).toMatchObject({
+        requirement: "authenticated",
+        authSource: { mode: "organization", connectionId: connection.connectionId },
+        auth: { phase: "succeeded", interaction: null },
+      });
+      f.setStatus({
+        status: "error",
+        auth: { status: "unknown" },
+        message: "Codex app-server probe failed. Check its configuration.",
+      });
+      const failedProbe = yield* f
+        .run()
+        .pipe(Effect.provideService(ThreadVmCodexAuthContext, source));
+      expect(failedProbe).toMatchObject({
+        requirement: "provider_unavailable",
+        auth: {
+          phase: "failed",
+          message: "Codex app-server probe failed. Check its configuration.",
+        },
+      });
+      f.setStatus({ status: "ready" });
+      expect(
+        (yield* f.run().pipe(Effect.provideService(ThreadVmCodexAuthContext, source))).requirement,
+      ).toBe("provider_unavailable");
+      for (const action of ["start", "cancel"] as const) {
+        const result = yield* f
+          .run({ ...input, action, flowId: "old-flow" })
+          .pipe(Effect.provideService(ThreadVmCodexAuthContext, source));
+        expect(result.requirement).toBe("provider_unavailable");
+        expect(result.auth.message).toContain("device sign-in is unavailable");
+      }
+      expect(f.attempts()).toBe(0);
+    }).pipe(Effect.provide(base), Effect.scoped),
+  );
+
+  it.effect("keeps unavailable source discovery out of the personal device flow", () =>
+    Effect.gen(function* () {
+      const f = yield* harness;
+      const failure = new ThreadVmCodexAuthSourceError({ reason: "unavailable" });
+      const result = yield* f.run({ ...input, action: "start" }).pipe(
+        Effect.provideService(ThreadVmCodexAuthContext, {
+          current: Effect.fail(failure),
+          refresh: Effect.fail(failure),
+          markApplied: Effect.void,
+          withReloadLock: (effect) => effect,
+          personalPreflight: Effect.fail(failure),
+        }),
+      );
+      expect(result.requirement).toBe("provider_unavailable");
+      expect(result.auth.message).toContain("Could not verify");
+      expect(f.attempts()).toBe(0);
+    }).pipe(Effect.provide(base), Effect.scoped),
+  );
   it.effect(
     "discovers login without starting it and reuses the same code after a lost start reply",
     () =>

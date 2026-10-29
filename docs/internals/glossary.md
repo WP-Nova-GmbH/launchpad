@@ -189,8 +189,8 @@ An [organization](#organization)-owned sign-in or key for one provider: either
 an environment variable the provider CLI reads, or the CLI's own auth store copied from the
 device an admin signed in on. Held **sealed** by the [relay](#relay), one per provider per
 organization; enrolled agent [executors](#executor) fetch the set over their environment
-credential and place it before building each provider instance. See [ADR-0003][adr3],
-organization provider accounts amendment.
+credential and place it before building each provider instance. See [ADR-0003][adr3]
+for this organization-machine delivery and the separate managed Codex VM connection.
 
 ### Provider credential
 

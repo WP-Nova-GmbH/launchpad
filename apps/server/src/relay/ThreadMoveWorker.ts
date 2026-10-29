@@ -981,8 +981,17 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     if (owner.environmentId !== move.destinationEnvironmentId) return;
     const previous = yield* fences.get(owner.threadId);
     if (move.phase === "completed") {
-      if (previous?.operationId === owner.operationId && previous.phase === "frozen")
+      if (previous?.operationId === owner.operationId && previous.phase === "frozen") {
+        if (tracked) {
+          const claim = yield* claims.get(owner.operationId);
+          if (!claim || claim.phase !== "installed")
+            return yield* fail(owner.threadId, "The completed move is missing its checkout claim.");
+          yield* configureThreadVmMoveRepository(owner, claim.checkoutPath).pipe(
+            Effect.provideContext(context),
+          );
+        }
         yield* fences.activate(owner);
+      }
       if (previous?.operationId === owner.operationId) yield* finish(owner, "completed");
       return;
     }
@@ -991,7 +1000,8 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       return yield* rollbackDestination(owner, move);
     if (move.failureDetail) {
       const started = yield* sql`SELECT 1 FROM thread_transfer_readiness
-        WHERE operation_id=${owner.operationId} AND phase='started' LIMIT 1`;
+        WHERE operation_id=${owner.operationId} AND
+          (provider_probe_attempt_id IS NOT NULL OR (phase='started' AND setup_succeeded=0)) LIMIT 1`;
       if (started.length) return;
     }
     const validateProject = Effect.gen(function* () {
