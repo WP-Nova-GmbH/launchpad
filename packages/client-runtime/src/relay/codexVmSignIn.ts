@@ -38,6 +38,7 @@ export interface CodexVmSignInState {
   readonly supported: boolean | null;
   readonly loading: boolean;
   readonly busy: boolean;
+  readonly connectionReadError: string | null;
   readonly error: string | null;
   readonly warning: string | null;
   readonly attempt: RelayCodexVmSignInAttempt | null;
@@ -129,6 +130,7 @@ export function makeCodexVmSignInController(deps: CodexVmSignInDependencies) {
     supported: null,
     loading: false,
     busy: false,
+    connectionReadError: null,
     error: null,
     warning: null,
     attempt: null,
@@ -164,6 +166,7 @@ export function makeCodexVmSignInController(deps: CodexVmSignInDependencies) {
       return;
     update({
       connection,
+      connectionReadError: null,
       warning:
         unconfirmedRevocation ||
         connection.revocationUnconfirmed ||
@@ -172,6 +175,19 @@ export function makeCodexVmSignInController(deps: CodexVmSignInDependencies) {
           : null,
     });
   };
+  const readConnection = (isCurrent: () => boolean) =>
+    deps.readConnection.pipe(
+      Effect.tapError((error) =>
+        Effect.sync(() => {
+          if (!isCurrent()) return;
+          rememberWarning(error);
+          update({
+            connectionReadError: failureMessage(error),
+            ...(unconfirmedRevocation ? { warning: revocationWarning } : {}),
+          });
+        }),
+      ),
+    );
   const closeBridge = (owner: Flow) =>
     Effect.suspend(() => {
       const bridge = owner.bridge;
@@ -211,17 +227,18 @@ export function makeCodexVmSignInController(deps: CodexVmSignInDependencies) {
       needsPlanConfirmation: owner.intent === "connect" && owner.previousConnectionId === null,
     });
   };
-  const recoverCompletion = (owner: Flow) =>
+  const recoverCompletion = (owner: Flow, started = revision) =>
     Effect.gen(function* () {
       if (!owner.attempt) return false;
       const attempt = yield* deps.readAttempt(owner.attempt.attemptId);
-      yield* check(owner);
+      const isCurrent = () => current(owner) && started === revision;
+      if (!isCurrent()) return false;
       if (!attempt) return false;
       owner.attempt = attempt;
       update({ attempt, retryable: attempt.phase === "failed" });
       if (attempt.phase !== "completed") return false;
-      const connection = yield* deps.readConnection;
-      yield* check(owner);
+      const connection = yield* readConnection(isCurrent);
+      if (!isCurrent()) return false;
       succeed(owner, connection);
       return true;
     });
@@ -231,15 +248,22 @@ export function makeCodexVmSignInController(deps: CodexVmSignInDependencies) {
     update({ loading: true });
     return Effect.gen(function* () {
       const [connection, supported] = yield* Effect.all(
-        [deps.readConnection, deps.capability.pipe(Effect.orElseSucceed(() => false))],
+        [
+          readConnection(() => active && started === revision).pipe(Effect.result),
+          deps.capability.pipe(Effect.orElseSucceed(() => false)),
+        ],
         {
           concurrency: "unbounded",
         },
       );
       if (!active || started !== revision) return;
-      applyConnection(connection);
+      if (connection._tag === "Failure") {
+        update({ supported });
+        return;
+      }
+      applyConnection(connection.success);
       update({ supported, error: null });
-      if (flow?.completionDispatched) yield* recoverCompletion(flow);
+      if (flow?.completionDispatched) yield* recoverCompletion(flow, started);
     }).pipe(
       Effect.catch((error) =>
         Effect.sync(() => {
@@ -378,7 +402,7 @@ export function makeCodexVmSignInController(deps: CodexVmSignInDependencies) {
   const cancel = Effect.suspend(() => {
     const old = flow;
     flow = null;
-    revision++;
+    const started = ++revision;
     update({
       busy: false,
       loading: false,
@@ -387,11 +411,12 @@ export function makeCodexVmSignInController(deps: CodexVmSignInDependencies) {
       error: null,
       authorizationUrl: null,
     });
-    const started = revision;
     return cleanup(old).pipe(
       Effect.andThen(
         Effect.gen(function* () {
-          const connection = yield* deps.readConnection.pipe(Effect.result);
+          const connection = yield* readConnection(() => active && revision === started).pipe(
+            Effect.result,
+          );
           if (!active || revision !== started) return;
           if (connection._tag === "Success") applyConnection(connection.success);
           if (connection._tag === "Failure" || old?.cancellationUnconfirmed)
@@ -436,7 +461,9 @@ export function makeCodexVmSignInController(deps: CodexVmSignInDependencies) {
           Effect.gen(function* () {
             rememberWarning(error);
             // A lost reply must be read back, never replayed as another disconnect.
-            const connection = yield* deps.readConnection.pipe(Effect.result);
+            const connection = yield* readConnection(() => active && revision === started).pipe(
+              Effect.result,
+            );
             if (active && revision === started) {
               if (connection._tag === "Success") applyConnection(connection.success);
               update({

@@ -131,6 +131,347 @@ const fixture = Effect.gen(function* () {
 });
 
 describe("organization Codex sign-in controller", () => {
+  it.effect(
+    "retains an account through a failed lookup and clears the read error only after retry",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture,
+          entered = yield* Deferred.make<void>(),
+          reply = yield* Deferred.make<RelayCodexVmConnection>();
+        let mode: "ready" | "failed" | "retrying" = "ready";
+        f.setConnection(connected);
+        const controller = makeCodexVmSignInController({
+          ...f.deps,
+          readConnection: Effect.suspend(() =>
+            mode === "failed"
+              ? Effect.fail(new CodexVmSignInClientError({ reason: "unavailable" }))
+              : mode === "retrying"
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(reply)))
+                : f.deps.readConnection,
+          ),
+        });
+        yield* controller.refresh;
+        mode = "failed";
+        yield* controller.refresh;
+        expect(controller.getSnapshot()).toMatchObject({
+          connection: connected,
+          connectionReadError: expect.stringContaining("Could not reach"),
+          error: null,
+          loading: false,
+        });
+        mode = "retrying";
+        const retry = yield* controller.refresh.pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        expect(controller.getSnapshot()).toMatchObject({
+          loading: true,
+          connectionReadError: expect.stringContaining("Could not reach"),
+        });
+        yield* Deferred.succeed(reply, connected);
+        yield* Fiber.join(retry);
+        expect(controller.getSnapshot()).toMatchObject({
+          connection: connected,
+          connectionReadError: null,
+          error: null,
+          loading: false,
+        });
+        expect(f.starts).toEqual([]);
+        expect(f.completions).toEqual([]);
+      }),
+  );
+
+  it.effect("keeps an initial failed lookup unknown until a disconnected snapshot is read", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      let failRead = true;
+      const controller = makeCodexVmSignInController({
+        ...f.deps,
+        readConnection: Effect.suspend(() =>
+          failRead
+            ? Effect.fail(new CodexVmSignInClientError({ reason: "signed_out" }))
+            : f.deps.readConnection,
+        ),
+      });
+      yield* controller.refresh;
+      expect(controller.getSnapshot()).toMatchObject({
+        connection: null,
+        connectionReadError: "Sign in to Launchpad Connect first.",
+        error: null,
+      });
+      failRead = false;
+      yield* controller.refresh;
+      expect(controller.getSnapshot()).toMatchObject({
+        connection: disconnected,
+        connectionReadError: null,
+        error: null,
+      });
+    }),
+  );
+
+  it.effect(
+    "keeps a lookup error through sign-in setup and clears it on the authoritative reply",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        let failRead = false;
+        f.setConnection(connected);
+        const controller = makeCodexVmSignInController({
+          ...f.deps,
+          readConnection: Effect.suspend(() =>
+            failRead
+              ? Effect.fail(new CodexVmSignInClientError({ reason: "unavailable" }))
+              : f.deps.readConnection,
+          ),
+        });
+        yield* controller.refresh;
+        failRead = true;
+        yield* controller.refresh;
+        const work = yield* controller.reconnect.pipe(Effect.forkChild);
+        const bridgeId = yield* Deferred.await(f.waiting);
+        expect(controller.getSnapshot()).toMatchObject({
+          busy: true,
+          connectionReadError: expect.stringContaining("Could not reach"),
+        });
+        yield* f.callback(bridgeId);
+        yield* Fiber.join(work);
+        expect(controller.getSnapshot()).toMatchObject({
+          connection: connected,
+          busy: false,
+          connectionReadError: null,
+          error: null,
+        });
+        expect(f.starts[0]?.intent).toBe("reconnect");
+      }),
+  );
+
+  it.effect("does not let an older account snapshot clear a newer lookup error", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      let failRead = false;
+      f.setConnection(connected);
+      const controller = makeCodexVmSignInController({
+        ...f.deps,
+        readConnection: Effect.suspend(() =>
+          failRead
+            ? Effect.fail(new CodexVmSignInClientError({ reason: "unavailable" }))
+            : f.deps.readConnection,
+        ),
+      });
+      yield* controller.refresh;
+      failRead = true;
+      yield* controller.refresh;
+      failRead = false;
+      f.setConnection(disconnected);
+      yield* controller.refresh;
+      expect(controller.getSnapshot()).toMatchObject({
+        connection: connected,
+        connectionReadError: expect.stringContaining("Could not reach"),
+      });
+      f.setConnection(connected);
+      yield* controller.refresh;
+      expect(controller.getSnapshot().connectionReadError).toBeNull();
+    }),
+  );
+
+  it.effect(
+    "keeps failed attempt recovery separate from metadata and recovers without another exchange",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        let completions = 0,
+          failRecovery = false;
+        const controller = makeCodexVmSignInController({
+          ...f.deps,
+          completeAttempt: () =>
+            Effect.sync(() => {
+              completions++;
+              f.setConnection(connected);
+            }).pipe(
+              Effect.andThen(Effect.fail(new CodexVmSignInClientError({ reason: "unavailable" }))),
+            ),
+          readAttempt: (id) =>
+            failRecovery
+              ? Effect.fail(new CodexVmSignInError({ reason: "expired" }))
+              : f.deps.readAttempt(id),
+        });
+        yield* controller.refresh;
+        const work = yield* controller.connect.pipe(Effect.forkChild);
+        yield* f.callback(yield* Deferred.await(f.waiting));
+        yield* Fiber.join(work);
+        expect(controller.getSnapshot()).toMatchObject({
+          busy: false,
+          attempt: { phase: "exchanging" },
+          connectionReadError: null,
+          error: expect.stringContaining("Could not reach"),
+        });
+        failRecovery = true;
+        yield* controller.refresh;
+        expect(controller.getSnapshot()).toMatchObject({
+          connection: connected,
+          connectionReadError: null,
+          error: "Codex sign-in expired. Start again.",
+        });
+        failRecovery = false;
+        f.recover({
+          attemptId: "attempt-1",
+          expiresAt: "2099-01-01T00:00:00Z",
+          phase: "completed",
+        });
+        yield* controller.refresh;
+        expect(controller.getSnapshot()).toMatchObject({
+          connection: connected,
+          connectionReadError: null,
+          error: null,
+          attempt: { phase: "completed" },
+        });
+        expect(completions).toBe(1);
+        expect(f.starts).toHaveLength(1);
+      }),
+  );
+
+  it.effect(
+    "retains cancellation uncertainty after a failed readback and repairs it through metadata",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        let failRead = false;
+        f.setConnection({ ...connected, revocationUnconfirmed: true });
+        const controller = makeCodexVmSignInController({
+          ...f.deps,
+          readConnection: Effect.suspend(() =>
+            failRead
+              ? Effect.fail(new CodexVmSignInClientError({ reason: "unavailable" }))
+              : f.deps.readConnection,
+          ),
+        });
+        yield* controller.refresh;
+        const work = yield* controller.reconnect.pipe(Effect.forkChild);
+        yield* Deferred.await(f.waiting);
+        failRead = true;
+        yield* controller.cancel;
+        yield* Fiber.join(work);
+        expect(controller.getSnapshot()).toMatchObject({
+          connectionReadError: expect.stringContaining("Could not reach"),
+          error: expect.stringContaining("Could not confirm cancellation"),
+          warning: expect.stringContaining("revocation could not be confirmed"),
+        });
+        failRead = false;
+        yield* controller.refresh;
+        expect(controller.getSnapshot()).toMatchObject({
+          connection: { status: "connected" },
+          connectionReadError: null,
+          error: null,
+          warning: expect.stringContaining("revocation could not be confirmed"),
+        });
+      }),
+  );
+
+  it.effect("distinguishes a disconnect failure from an unavailable readback", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      let failRead = false;
+      f.setConnection(connected);
+      const controller = makeCodexVmSignInController({
+        ...f.deps,
+        disconnect: Effect.fail(new CodexVmSignInClientError({ reason: "unavailable" })),
+        readConnection: Effect.suspend(() =>
+          failRead
+            ? Effect.fail(new CodexVmSignInClientError({ reason: "signed_out" }))
+            : f.deps.readConnection,
+        ),
+      });
+      yield* controller.refresh;
+      yield* controller.disconnect;
+      expect(controller.getSnapshot()).toMatchObject({
+        connection: connected,
+        connectionReadError: null,
+        error: expect.stringContaining("Could not reach"),
+      });
+      failRead = true;
+      yield* controller.disconnect;
+      expect(controller.getSnapshot()).toMatchObject({
+        connection: connected,
+        connectionReadError: "Sign in to Launchpad Connect first.",
+        error: expect.stringContaining("Could not reach"),
+      });
+    }),
+  );
+
+  it.effect("ignores a stale failed lookup after a newer sign-in succeeds", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture,
+        entered = yield* Deferred.make<void>(),
+        reply = yield* Deferred.make<RelayCodexVmConnection, CodexVmSignInClientError>();
+      const controller = makeCodexVmSignInController({
+        ...f.deps,
+        readConnection: Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(reply)),
+        ),
+      });
+      const lookup = yield* controller.refresh.pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const work = yield* controller.connect.pipe(Effect.forkChild);
+      yield* f.callback(yield* Deferred.await(f.waiting));
+      yield* Fiber.join(work);
+      yield* Deferred.fail(reply, new CodexVmSignInClientError({ reason: "unavailable" }));
+      yield* Fiber.join(lookup);
+      expect(controller.getSnapshot()).toMatchObject({
+        connection: connected,
+        connectionReadError: null,
+        error: null,
+      });
+    }),
+  );
+
+  it.effect(
+    "fences a completion-recovery read when a later refresh already recovered the same flow",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture,
+          entered = yield* Deferred.make<void>(),
+          reply = yield* Deferred.make<RelayCodexVmConnection, CodexVmSignInClientError>();
+        let completions = 0,
+          reads = 0,
+          holdRecovery = false;
+        const controller = makeCodexVmSignInController({
+          ...f.deps,
+          completeAttempt: () =>
+            Effect.sync(() => {
+              completions++;
+              f.setConnection(connected);
+            }).pipe(
+              Effect.andThen(Effect.fail(new CodexVmSignInClientError({ reason: "unavailable" }))),
+            ),
+          readConnection: Effect.suspend(() =>
+            holdRecovery && ++reads === 2
+              ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(reply)))
+              : f.deps.readConnection,
+          ),
+        });
+        const work = yield* controller.connect.pipe(Effect.forkChild);
+        yield* f.callback(yield* Deferred.await(f.waiting));
+        yield* Fiber.join(work);
+        f.recover({
+          attemptId: "attempt-1",
+          expiresAt: "2099-01-01T00:00:00Z",
+          phase: "completed",
+        });
+        holdRecovery = true;
+        const oldLookup = yield* controller.refresh.pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* controller.refresh;
+        yield* Deferred.fail(reply, new CodexVmSignInClientError({ reason: "unavailable" }));
+        yield* Fiber.join(oldLookup);
+        expect(controller.getSnapshot()).toMatchObject({
+          connection: connected,
+          connectionReadError: null,
+          error: null,
+          attempt: { phase: "completed" },
+        });
+        expect(completions).toBe(1);
+        expect(f.starts).toHaveLength(1);
+      }),
+  );
+
   it.effect("keeps metadata available when a downlevel server lacks the callback capability", () =>
     Effect.gen(function* () {
       const f = yield* fixture;
