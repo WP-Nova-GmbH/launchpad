@@ -1,608 +1,750 @@
+import { makeThreadVmFinalSaveWorker } from "./ThreadVmFinalSaveWorker.ts";
+import { makeThreadVmFinalSaveAbortWorker } from "./ThreadVmFinalSaveAbortWorker.ts";
+import { makeThreadVmResumeStore } from "./ThreadVmResumeStore.ts";
+import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
+import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
+import { makeThreadVmPauseStore } from "./ThreadVmPauseStore.ts";
+import { makeThreadVmPauseRecoveryStore } from "./ThreadVmPauseRecoveryStore.ts";
 import * as NodeCrypto from "node:crypto";
 import { describe, expect, layer } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import { E2BRestoreError, type E2BRestoreStatus } from "../machines/E2BRestoreClient.ts";
+import { CommandId, ThreadId } from "@t3tools/contracts";
 import { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
+import { makeThreadVmBackupWorker } from "./ThreadVmBackupWorker.ts";
+import { makeThreadVmBackupSourceStore } from "./ThreadVmBackupSourceStore.ts";
 import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
 import { makeThreadVmBackupRetentionWorker } from "./ThreadVmBackupRetentionWorker.ts";
-import { makeThreadVmBackupWorker } from "./ThreadVmBackupWorker.ts";
-import { makeThreadVmPauseStore } from "./ThreadVmPauseStore.ts";
-import { makeThreadVmFinalSaveDeletionWorker } from "./ThreadVmFinalSaveDeletionWorker.ts";
-import { finalSaveCatalogFixture } from "./testUtils/finalSaveCatalog.ts";
-import { nativeCheckpointCatalogTestLayer } from "./testUtils/nativeCheckpointCatalog.ts";
+import { makeThreadNativeCheckpointStore } from "./ThreadNativeCheckpointStore.ts";
 import { makeThreadDeletionStore } from "./ThreadDeletionStore.ts";
+import { finalSaveCatalogFixture } from "./testUtils/finalSaveCatalog.ts";
+import { laterAttachmentCheckpoint } from "./testUtils/attachmentCheckpointCatalog.ts";
+import { nativeCheckpointCatalogTestLayer } from "./testUtils/nativeCheckpointCatalog.ts";
 
-const fixture = Effect.fnUntraced(function* (failCandidate = true, uncertainCapture = false) {
+const fixture = Effect.fnUntraced(function* () {
   const f = yield* finalSaveCatalogFixture();
-  const capture = Effect.fnUntraced(function* (record = true) {
-    const id = (yield* f.backup.enqueueDue(f.hostId))!;
-    const claim = (yield* f.backup.claim(f.hostId))!;
-    yield* f.backup.beginCapture(claim);
-    if (!record) return claim;
-    yield* f.backup.recordCapture(claim, {
-      snapshotId: `snapshot-${id}`,
-      sourceTemplateId: `template-${id}`,
-      sourceBuildId: NodeCrypto.randomUUID(),
+  const source = makeThreadVmBackupSourceStore(f.sql, f.objects),
+    natives = makeThreadNativeCheckpointStore(f.sql, f.objects);
+  let offset = 0;
+  const enqueue = Effect.gen(function* () {
+    yield* f.sql`UPDATE relay_thread_vm_activity SET activity='idle',observed_at=clock_timestamp() WHERE allocation_id=${f.input.allocationId}`;
+    const operationId = (yield* f.backup.enqueueDue(f.hostId))!;
+    expect(operationId).toBeTypeOf("string");
+    return operationId;
+  });
+  const freeze = Effect.fnUntraced(function* (operationId: string) {
+    const point = yield* laterAttachmentCheckpoint(f, ++offset, operationId);
+    yield* f.upload(point.attachments);
+    yield* f.attachmentStore.publish({
+      threadId: f.threadId,
+      operationId: point.attachments.header.operationId,
+      manifestArtifactId: point.attachments.artifactId,
+      nativeCheckpointOperationId: point.native.header.operationId,
     });
-    return (yield* f.backup.claim(f.hostId))!;
+    const input = {
+      ...f.owner,
+      operationId,
+      nativeCheckpointOperationId: point.native.header.operationId,
+      bootId: NodeCrypto.randomUUID(),
+      sealEpoch: 1,
+    };
+    yield* source.sourceFrozen(input);
+    return { ...input, sourceSequence: point.sourceSequence };
   });
-  const good = yield* capture(),
-    build = NodeCrypto.randomUUID();
-  yield* f.backup.markProbeReady(good, {
-    operationID: good.operationId,
-    generation: `backup-${good.operationId}`,
-    preparedBuildID: build,
-    manifestSHA256: "a".repeat(64),
-    coldProbe: {
-      version: 1,
-      preparedBuildID: build,
-      rootfsSHA256: "b".repeat(64),
-      initSHA256: "c".repeat(64),
-      physicalStopConfirmed: true,
-      mountOnly: true,
-    },
+  const complete = Effect.fnUntraced(function* (operationId: string) {
+    const claim = (yield* f.backup.claim(f.hostId))!;
+    expect(claim.operationId).toBe(operationId);
+    expect(yield* f.backup.beginCapture(claim)).toBe(true);
+    expect(
+      yield* f.backup.recordCapture(claim, {
+        snapshotId: `snapshot-${operationId}`,
+        sourceTemplateId: `snapshot-${operationId}`,
+        sourceBuildId: NodeCrypto.randomUUID(),
+      }),
+    ).toBe(true);
+    return (yield* f.backup.get(operationId))!;
   });
-  yield* f.backup.complete(good);
-  yield* f.sql`UPDATE relay_thread_vm_backups SET verified_at=clock_timestamp()-interval '1 hour' WHERE operation_id=${good.operationId}`;
-  const failed = yield* capture(!uncertainCapture);
-  if (failCandidate) yield* f.backup.fail(failed);
-  const cancelled: E2BRestoreStatus = {
-    operationID: failed.operationId,
-    generation: `backup-${failed.operationId}`,
-    sandboxID: "disposable-probe",
-    executionID: NodeCrypto.randomUUID(),
-    preparedBuildID: NodeCrypto.randomUUID(),
-    state: "cancelled",
-  };
-  const retry = f.sql`UPDATE relay_thread_vm_backups SET retry_at=clock_timestamp(), claim_until=NULL, claim_id=NULL WHERE operation_id=${failed.operationId}`;
+  const queue = Effect.gen(function* () {
+    const commandId = CommandId.make(NodeCrypto.randomUUID());
+    yield* f.journal.stage({
+      threadId: f.threadId,
+      actor: { userId: f.input.actorUserId, displayName: "Test", imageUrl: null },
+      command: {
+        type: "thread.queue.pause",
+        commandId,
+        threadId: ThreadId.make(f.threadId),
+        createdAt: "2026-10-28T10:00:00Z",
+      },
+    });
+    return commandId;
+  });
+  const pinPhase = Effect.fnUntraced(function* (id: string) {
+    const [row] = yield* f.sql<{
+      phase: string;
+    }>`SELECT phase FROM relay_thread_native_checkpoint_operations WHERE operation_id=${id}`;
+    return row?.phase;
+  });
   return {
     ...f,
-    good,
-    failed,
-    cancelled,
-    retry,
-    retention: makeThreadVmBackupRetentionStore(f.sql),
+    finalFreeze: f.freeze,
+    source,
+    natives,
+    enqueue,
+    freeze,
+    complete,
+    queue,
+    pinPhase,
   };
 });
 
 describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
-  "failed periodic VM backup cleanup (Postgres)",
+  "native full snapshot capture and retention (Postgres)",
   () => {
     layer(nativeCheckpointCatalogTestLayer)((it) => {
-      for (const outcome of [
-        "deletion-wins",
-        "capture-wins",
-        "unavailable",
-        "foreign",
-        "expired",
-      ] as const) {
-        it.effect(`serializes pending capture and explicit deletion when ${outcome}`, () =>
+      for (const activity of ["busy", "unknown"] as const)
+        it.effect(`does not interrupt ${activity} work for a periodic backup`, () =>
           Effect.scoped(
             Effect.gen(function* () {
-              const f = yield* finalSaveCatalogFixture();
-              const operationId = (yield* f.backup.enqueueDue(f.hostId))!;
+              const f = yield* fixture();
+              yield* f.sql`UPDATE relay_thread_vm_activity SET activity=${activity} WHERE allocation_id=${f.input.allocationId}`;
+              expect(yield* f.backup.enqueueDue(f.hostId)).toBeNull();
+            }),
+          ),
+        );
+      it.effect(
+        "waits for source history, attachments and an exact closed seal before snapshot dispatch",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                id = yield* f.enqueue;
+              const worker = makeThreadVmBackupWorker(
+                f.sql,
+                {
+                  inspect: () => Effect.die("No source acknowledgement"),
+                  snapshot: () => Effect.die("No source acknowledgement"),
+                  findSnapshot: () => Effect.die("No POST dispatched"),
+                  restore: {
+                    resolveNamedSnapshot: () => Effect.die("No capture"),
+                    resolveFailedNamedSnapshot: () => Effect.die("No capture"),
+                  },
+                },
+                f.hostId,
+                false,
+              );
+              expect(yield* worker.runOne()).toBe(false);
+              const frozen = yield* f.freeze(id);
+              const claim = (yield* f.backup.claim(f.hostId))!;
+              expect(claim.sourceReceipt.bootId).toBe(frozen.bootId);
+              expect(claim.sourceReceipt.sealEpoch).toBe(1);
+              expect(yield* f.pinPhase(id)).toBe("active");
+            }),
+          ),
+      );
+      it.effect(
+        "a new queued command cancels only an undispatched capture and waits for source reopening",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                id = yield* f.enqueue;
+              yield* f.freeze(id);
+              const claim = (yield* f.backup.claim(f.hostId))!;
+              const commandId = yield* f.queue;
+              expect((yield* f.backup.get(id))?.phase).toBe("failed");
+              expect(yield* f.backup.beginCapture(claim)).toBe(false);
+              expect(yield* f.journal.next(f.owner)).toBeNull();
+              const ack = yield* f.source.confirmActivation({ ...f.owner, operationId: id });
+              expect(ack.sourceReopened).toBe(true);
+              expect(yield* f.pinPhase(id)).toBe("released");
+              expect((yield* f.journal.next(f.owner))?.command.commandId).toBe(commandId);
+            }),
+          ),
+      );
+      it.effect("queued commands cannot cancel or reopen an uncertain native snapshot", () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture(),
+              id = yield* f.enqueue;
+            yield* f.freeze(id);
+            const claim = (yield* f.backup.claim(f.hostId))!;
+            yield* f.backup.beginCapture(claim);
+            yield* f.queue;
+            expect((yield* f.backup.get(id))?.phase).toBe("creating");
+            yield* Effect.flip(f.source.cancelPending({ ...f.owner, operationId: id }));
+            yield* Effect.flip(f.source.confirmActivation({ ...f.owner, operationId: id }));
+            expect(yield* f.journal.next(f.owner)).toBeNull();
+          }),
+        ),
+      );
+      it.effect(
+        "a lost snapshot reply uses one POST then read-only alias reconciliation even after native pause",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                id = yield* f.enqueue;
+              yield* f.freeze(id);
+              let posts = 0,
+                lookups = 0;
+              const worker = makeThreadVmBackupWorker(
+                f.sql,
+                {
+                  inspect: () => Effect.succeed(f.info),
+                  snapshot: () =>
+                    Effect.gen(function* () {
+                      posts++;
+                      return yield* new ThreadVmComputeError({
+                        operation: "snapshot",
+                        message: "lost native reply",
+                      });
+                    }),
+                  findSnapshot: () =>
+                    Effect.sync(() => {
+                      lookups++;
+                      const alias = `native-team/launchpad-backup-${id}`;
+                      return { snapshotId: `${alias}:default`, names: [alias] };
+                    }),
+                  restore: {
+                    resolveFailedNamedSnapshot: () => Effect.succeed(null),
+                    resolveNamedSnapshot: (name) => {
+                      expect(name).toBe(`launchpad-backup-${id}`);
+                      return Effect.succeed({
+                        sourceTemplateID: `snapshot-${id}`,
+                        sourceBuildID: NodeCrypto.randomUUID(),
+                      });
+                    },
+                  },
+                },
+                f.hostId,
+                false,
+              );
+              expect(yield* worker.runOne()).toBe(true);
+              expect(posts).toBe(1);
+              expect((yield* f.backup.get(id))?.phase).toBe("creating");
+              yield* f.sql`UPDATE relay_thread_vm_allocations SET state='paused' WHERE allocation_id=${f.input.allocationId}`;
+              yield* f.sql`UPDATE relay_thread_vm_capacity SET state='released' WHERE allocation_id=${f.input.allocationId}`;
+              yield* f.sql`UPDATE relay_thread_vm_backups SET retry_at=clock_timestamp() WHERE operation_id=${id}`;
+              expect(yield* worker.runOne()).toBe(true);
+              expect(posts).toBe(1);
+              expect(lookups).toBe(1);
+              expect((yield* f.backup.get(id))?.nativeCaptureReceipt?.kind).toBe(
+                "native-full-snapshot-v1",
+              );
+              expect((yield* f.backup.get(id))?.nativeCaptureReceipt?.snapshotId).toBe(
+                `snapshot-${id}`,
+              );
+              expect((yield* f.source.get(f.owner))?.canActivate).toBe(false);
+              yield* f.sql`UPDATE relay_thread_vm_allocations SET state='running' WHERE allocation_id=${f.input.allocationId}`;
+              yield* f.source.confirmActivation({ ...f.owner, operationId: id });
+              expect(yield* f.pinPhase(id)).toBe("active");
+            }),
+          ),
+      );
+      it.effect(
+        "native completion retains independent recovery after source reopening until catalog retirement",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                old = yield* f.enqueue;
+              yield* f.freeze(old);
+              yield* f.complete(old);
+              yield* f.source.confirmActivation({ ...f.owner, operationId: old });
+              yield* f.sql`UPDATE relay_thread_vm_backups SET verified_at=clock_timestamp()-interval '1 hour' WHERE operation_id=${old}`;
+              const current = yield* f.enqueue;
+              yield* f.freeze(current);
+              yield* f.complete(current);
+              yield* f.source.confirmActivation({ ...f.owner, operationId: current });
+              const retention = makeThreadVmBackupRetentionStore(f.sql);
+              yield* retention.pin({
+                threadId: f.threadId,
+                backupOperationId: old,
+                operationId: "restore-pin",
+              });
+              const worker = makeThreadVmBackupRetentionWorker(
+                f.sql,
+                {
+                  deleteSnapshot: (id) =>
+                    Effect.sync(() => {
+                      expect(id).toBe(`snapshot-${old}`);
+                      return true;
+                    }),
+                },
+                f.hostId,
+              );
+              expect(yield* worker.runOne()).toBe(false);
+              yield* retention.releasePin({ backupOperationId: old, operationId: "restore-pin" });
+              expect(yield* worker.runOne()).toBe(true);
+              expect(yield* f.pinPhase(old)).toBe("released");
+              expect(yield* f.pinPhase(current)).toBe("active");
+              expect((yield* f.backup.get(current))?.phase).toBe("verified");
+            }),
+          ),
+      );
+      it.effect(
+        "new execution and moves stay fenced until the captured source acknowledges reopening",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                id = yield* f.enqueue,
+                placements = makeThreadPlacementStore(f.sql);
+              const move = {
+                threadId: f.threadId,
+                operationId: NodeCrypto.randomUUID(),
+                actorUserId: f.input.actorUserId,
+                sourceEnvironmentId: f.sourceEnvironmentId,
+                expectedGeneration: 1,
+                destinationEnvironmentId: "local-destination",
+                destinationProjectId: "original-project",
+              };
+              const work = { ...f.owner, workId: "later-work" };
+              yield* Effect.flip(placements.admit(work));
+              yield* Effect.flip(placements.beginMove(move));
+              const point = yield* f.freeze(id);
+              yield* Effect.flip(placements.admit(work));
+              yield* Effect.flip(placements.beginMove(move));
+              yield* f.complete(id);
+              yield* Effect.flip(placements.admit(work));
+              yield* Effect.flip(placements.beginMove(move));
+              yield* Effect.flip(
+                f.journal.confirmThrough({ ...f.owner, sourceSequence: point.sourceSequence + 1 }),
+              );
+              yield* f.source.confirmActivation({ ...f.owner, operationId: id });
+              expect((yield* placements.admit(work)).newlyAdmitted).toBe(true);
+              yield* placements.completeWork(work);
+              expect((yield* placements.beginMove(move)).phase).toBe("preparing");
+            }),
+          ),
+      );
+      it.effect(
+        "an uncaptured cancelled drain holds lifecycle admission until the guest reopens it",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                id = yield* f.enqueue,
+                pauses = makeThreadVmPauseStore(f.sql);
+              yield* f.source.cancelPending({ ...f.owner, operationId: id });
+              expect(yield* pauses.reserveIdle(f.hostId)).toBeNull();
+              yield* Effect.flip(f.store.begin(f.input));
+              yield* Effect.flip(
+                makeThreadPlacementStore(f.sql).beginMove({
+                  threadId: f.threadId,
+                  operationId: NodeCrypto.randomUUID(),
+                  actorUserId: f.input.actorUserId,
+                  sourceEnvironmentId: f.sourceEnvironmentId,
+                  expectedGeneration: 1,
+                  destinationEnvironmentId: "local-destination",
+                  destinationProjectId: "original-project",
+                }),
+              );
+              yield* f.source.confirmActivation({ ...f.owner, operationId: id });
+              expect(yield* pauses.reserveIdle(f.hostId)).toBe(f.input.allocationId);
+            }),
+          ),
+      );
+      it.effect("managed pause waits for a native backup even with periodic backups disabled", () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture(),
+              pauses = makeThreadVmPauseStore(f.sql),
+              recovery = makeThreadVmPauseRecoveryStore(f.sql, f.objects);
+            yield* pauses.reserveIdle(f.hostId);
+            const pause = (yield* recovery.get(f.owner))!,
+              point = yield* laterAttachmentCheckpoint(f, 1, pause.operationId);
+            yield* f.upload(point.attachments);
+            yield* f.attachmentStore.publish({
+              threadId: f.threadId,
+              operationId: point.attachments.header.operationId,
+              manifestArtifactId: point.attachments.artifactId,
+              nativeCheckpointOperationId: point.native.header.operationId,
+            });
+            const source = yield* recovery.sourceFrozen({
+              ...f.owner,
+              operationId: pause.operationId,
+              nativeCheckpointOperationId: point.native.header.operationId,
+              bootId: NodeCrypto.randomUUID(),
+              sealEpoch: 1,
+            });
+            expect(yield* pauses.claim(f.hostId)).toBeNull();
+            let posts = 0;
+            const worker = makeThreadVmBackupWorker(
+              f.sql,
+              {
+                inspect: () => Effect.succeed(f.info),
+                snapshot: (_id, name) =>
+                  Effect.sync(() => {
+                    posts++;
+                    return {
+                      snapshotId: `native-team/${name}:default`,
+                      names: [`native-team/${name}`],
+                    };
+                  }),
+                findSnapshot: () => Effect.die("One successful dispatch needs no reconciliation"),
+                restore: {
+                  resolveFailedNamedSnapshot: () => Effect.succeed(null),
+                  resolveNamedSnapshot: () =>
+                    Effect.succeed({
+                      sourceTemplateID: "pause-snapshot",
+                      sourceBuildID: NodeCrypto.randomUUID(),
+                    }),
+                },
+              },
+              f.hostId,
+              false,
+            );
+            expect(yield* worker.runOne()).toBe(true);
+            expect(posts).toBe(1);
+            expect(
+              (yield* f.backup.get(source.backupOperationId!))?.nativeCaptureReceipt?.source
+                .captureOperationId,
+            ).toBe(pause.operationId);
+            expect((yield* pauses.claim(f.hostId))?.operationId).toBe(pause.operationId);
+          }),
+        ),
+      );
+      for (const queuedWake of [false, true])
+        it.effect(
+          `native timeout before pause snapshot dispatch retains the sealed source for ${queuedWake ? "queued" : "explicit"} wake`,
+          () =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                const f = yield* fixture(),
+                  pauses = makeThreadVmPauseStore(f.sql),
+                  recovery = makeThreadVmPauseRecoveryStore(f.sql, f.objects);
+                yield* pauses.reserveIdle(f.hostId);
+                const pause = (yield* recovery.get(f.owner))!,
+                  point = yield* laterAttachmentCheckpoint(f, 1, pause.operationId);
+                yield* f.upload(point.attachments);
+                yield* f.attachmentStore.publish({
+                  threadId: f.threadId,
+                  operationId: point.attachments.header.operationId,
+                  manifestArtifactId: point.attachments.artifactId,
+                  nativeCheckpointOperationId: point.native.header.operationId,
+                });
+                const frozen = yield* recovery.sourceFrozen({
+                  ...f.owner,
+                  operationId: pause.operationId,
+                  nativeCheckpointOperationId: point.native.header.operationId,
+                  bootId: NodeCrypto.randomUUID(),
+                  sealEpoch: 1,
+                });
+                if (queuedWake)
+                  yield* f.journal.stage({
+                    threadId: f.threadId,
+                    actor: { userId: f.input.actorUserId, displayName: null, imageUrl: null },
+                    command: {
+                      type: "thread.queue.resume",
+                      commandId: CommandId.make(NodeCrypto.randomUUID()),
+                      threadId: ThreadId.make(f.threadId),
+                      expectedRevision: 0,
+                      createdAt: "2026-10-29T10:00:00Z",
+                    },
+                  });
+                const worker = makeThreadVmBackupWorker(
+                  f.sql,
+                  {
+                    inspect: () => Effect.succeed({ ...f.info, state: "paused" as const }),
+                    snapshot: () => Effect.die("Never dispatch a snapshot for stopped compute"),
+                    findSnapshot: () => Effect.die("No snapshot was dispatched"),
+                    restore: {
+                      resolveNamedSnapshot: () => Effect.die("No snapshot exists"),
+                      resolveFailedNamedSnapshot: () => Effect.die("No snapshot was dispatched"),
+                    },
+                  },
+                  f.hostId,
+                  false,
+                );
+                expect(yield* worker.runOne()).toBe(true);
+                expect((yield* f.backup.get(frozen.backupOperationId!))?.phase).toBe("retired");
+                expect(yield* f.pinPhase(frozen.backupOperationId!)).toBe("released");
+                expect(yield* f.pinPhase(pause.operationId)).toBe("active");
+                expect(yield* recovery.get(f.owner)).toMatchObject({
+                  operationId: pause.operationId,
+                  phase: "cancelled",
+                  sourceReopened: false,
+                  canActivate: false,
+                  nativeCheckpointOperationId: point.native.header.operationId,
+                });
+                const [allocation] =
+                  yield* f.sql`SELECT state,native_paused_generation FROM relay_thread_vm_allocations WHERE allocation_id=${f.input.allocationId}`;
+                expect(allocation).toMatchObject({ state: "paused", native_paused_generation: 1 });
+                const [capacity] =
+                  yield* f.sql`SELECT state FROM relay_thread_vm_capacity WHERE operation_id=${f.input.allocationId}`;
+                expect(capacity?.state).toBe("released");
+                const resumes = makeThreadVmResumeStore(f.sql);
+                if (queuedWake)
+                  expect((yield* resumes.get(f.input.allocationId))?.phase).toBe("waiting");
+                else yield* resumes.request(f.threadId);
+                yield* makeThreadVmCapacityStore(f.sql).admitNext(f.hostId);
+                const resume = (yield* resumes.claim(f.hostId))!;
+                expect(resume.pauseOperationId).toBe(pause.operationId);
+                if (!queuedWake) {
+                  yield* f.sql`INSERT INTO relay_organizations(organization_id,name,created_at,updated_at) VALUES('org','Tests','now','now') ON CONFLICT DO NOTHING`;
+                  yield* f.sql`INSERT INTO relay_repositories(repository_id,organization_id,name,created_at,updated_at) VALUES('repo','org','Tests','now','now') ON CONFLICT DO NOTHING`;
+                  yield* f.sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at) VALUES('org',${f.input.actorUserId},'admin','now','now') ON CONFLICT DO NOTHING`;
+                  yield* resumes.begin(resume);
+                  yield* resumes.finishPower(resume, "sealed-resumed-test-token");
+                  yield* resumes.complete(resume);
+                  yield* recovery.confirmActivation({ ...f.owner, operationId: pause.operationId });
+                  const acknowledged = Effect.gen(function* () {
+                    const [row] =
+                      yield* f.sql`SELECT source_reopened_at IS NOT NULL AS reopened FROM relay_thread_vm_backups WHERE operation_id=${frozen.backupOperationId}`;
+                    return row?.reopened;
+                  });
+                  expect(yield* acknowledged).toBe(true);
+                  // Older pause ACKs did not copy their timestamp to the linked backup.
+                  yield* f.sql`UPDATE relay_thread_vm_backups SET source_reopened_at=NULL WHERE operation_id=${frozen.backupOperationId}`;
+                  yield* recovery.confirmActivation({ ...f.owner, operationId: pause.operationId });
+                  expect(yield* acknowledged).toBe(true);
+                  yield* f.sql`UPDATE relay_thread_vm_backups SET source_reopened_at=NULL WHERE operation_id=${frozen.backupOperationId}`;
+                  yield* f.sql`UPDATE relay_thread_vm_activity SET activity='idle',observed_at=clock_timestamp(),idle_since=clock_timestamp()-interval '10 days' WHERE allocation_id=${f.input.allocationId}`;
+                  expect(yield* pauses.reserveIdle(f.hostId)).toBe(f.input.allocationId);
+                  expect((yield* recovery.get(f.owner))?.operationId).not.toBe(pause.operationId);
+                  expect(yield* acknowledged).toBe(true);
+                }
+              }),
+            ),
+        );
+      it.effect("a named native reply must resolve the same unique snapshot ID", () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture(),
+              id = yield* f.enqueue;
+            yield* f.freeze(id);
+            let posts = 0;
+            const worker = makeThreadVmBackupWorker(
+              f.sql,
+              {
+                inspect: () => Effect.succeed(f.info),
+                snapshot: (_id, name) =>
+                  Effect.sync(() => {
+                    posts++;
+                    return { snapshotId: "native-id", names: [name] };
+                  }),
+                findSnapshot: () => Effect.die("No reconciliation"),
+                restore: {
+                  resolveFailedNamedSnapshot: () => Effect.succeed(null),
+                  resolveNamedSnapshot: (name) => {
+                    expect(name).toBe(`launchpad-backup-${id}`);
+                    return Effect.succeed({
+                      sourceTemplateID: "different-native-id",
+                      sourceBuildID: NodeCrypto.randomUUID(),
+                    });
+                  },
+                },
+              },
+              f.hostId,
+              false,
+            );
+            yield* worker.runOne();
+            expect(posts).toBe(1);
+            expect((yield* f.backup.get(id))?.phase).toBe("creating");
+            expect((yield* f.backup.get(id))?.nativeCaptureReceipt).toBeNull();
+            expect((yield* f.source.get(f.owner))?.canActivate).toBe(false);
+          }),
+        ),
+      );
+      for (const reply of ["raw-default", "foreign-alias", "foreign-tag"] as const)
+        it.effect(`native snapshot ${reply} identity is checked before capture completion`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                id = yield* f.enqueue;
+              yield* f.freeze(id);
+              const alias = `native-team/launchpad-backup-${id}`;
+              const worker = makeThreadVmBackupWorker(
+                f.sql,
+                {
+                  inspect: () => Effect.succeed(f.info),
+                  snapshot: () =>
+                    Effect.succeed({
+                      snapshotId:
+                        reply === "raw-default"
+                          ? "native-id:default"
+                          : reply === "foreign-alias"
+                            ? "native-team/another-capture:default"
+                            : `${alias}:another-tag`,
+                      names: [alias],
+                    }),
+                  findSnapshot: () => Effect.die("No reconciliation"),
+                  restore: {
+                    resolveFailedNamedSnapshot: () => Effect.succeed(null),
+                    resolveNamedSnapshot: () =>
+                      Effect.succeed({
+                        sourceTemplateID: "native-id",
+                        sourceBuildID: NodeCrypto.randomUUID(),
+                      }),
+                  },
+                },
+                f.hostId,
+                false,
+              );
+              expect(yield* worker.runOne()).toBe(true);
+              const saved = yield* f.backup.get(id);
+              if (reply === "raw-default") {
+                expect(saved?.phase).toBe("verified");
+                expect(saved?.nativeCaptureReceipt?.snapshotId).toBe("native-id");
+              } else {
+                expect(saved?.phase).toBe("creating");
+                expect(saved?.nativeCaptureReceipt).toBeNull();
+                expect((yield* f.source.get(f.owner))?.canActivate).toBe(false);
+              }
+            }),
+          ),
+        );
+      for (const kind of ["periodic", "pause", "final-save"] as const)
+        it.effect(
+          `a terminal native snapshot failure releases its ${kind} source without claiming a backup`,
+          () =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                const f = yield* fixture();
+                let id: string, pauseOperationId: string | undefined;
+                const pauses = makeThreadVmPauseStore(f.sql),
+                  recovery = makeThreadVmPauseRecoveryStore(f.sql, f.objects);
+                if (kind === "final-save") {
+                  yield* f.store.begin(f.input);
+                  yield* f.finalFreeze;
+                  id = (yield* f.store.reserveBackup(f.input.operationId)).backupOperationId!;
+                } else if (kind === "pause") {
+                  yield* pauses.reserveIdle(f.hostId);
+                  const pause = (yield* recovery.get(f.owner))!;
+                  pauseOperationId = pause.operationId;
+                  const point = yield* laterAttachmentCheckpoint(f, 1, pause.operationId);
+                  yield* f.upload(point.attachments);
+                  yield* f.attachmentStore.publish({
+                    threadId: f.threadId,
+                    operationId: point.attachments.header.operationId,
+                    manifestArtifactId: point.attachments.artifactId,
+                    nativeCheckpointOperationId: point.native.header.operationId,
+                  });
+                  id = (yield* recovery.sourceFrozen({
+                    ...f.owner,
+                    operationId: pause.operationId,
+                    nativeCheckpointOperationId: point.native.header.operationId,
+                    bootId: NodeCrypto.randomUUID(),
+                    sealEpoch: 1,
+                  })).backupOperationId!;
+                } else {
+                  id = yield* f.enqueue;
+                  yield* f.freeze(id);
+                }
+                const claim = (yield* f.backup.claim(f.hostId))!;
+                yield* f.backup.beginCapture(claim);
+                yield* f.backup.defer(claim);
+                yield* f.sql`UPDATE relay_thread_vm_backups SET retry_at=clock_timestamp() WHERE operation_id=${id}`;
+                const failedSnapshot = `failed-${id}`;
+                const worker = makeThreadVmBackupWorker(
+                  f.sql,
+                  {
+                    inspect: () => Effect.die("Read-only capture reconciliation"),
+                    snapshot: () => Effect.die("Never repeat unknown POST"),
+                    findSnapshot: () => Effect.succeed(null),
+                    restore: {
+                      resolveNamedSnapshot: () => Effect.die("No ready snapshot"),
+                      resolveFailedNamedSnapshot: (name) => {
+                        expect(name).toBe(claim.snapshotName);
+                        return Effect.succeed({
+                          snapshotId: failedSnapshot,
+                          sourceTemplateID: failedSnapshot,
+                          sourceBuildID: NodeCrypto.randomUUID(),
+                        });
+                      },
+                    },
+                  },
+                  f.hostId,
+                  false,
+                );
+                expect(yield* worker.runOne()).toBe(true);
+                const failed = (yield* f.backup.get(id))!;
+                expect(failed.phase).toBe("failed");
+                expect(failed.nativeCaptureReceipt).toBeNull();
+                expect(yield* f.pinPhase(id)).toBe("active");
+                if (kind === "final-save") {
+                  yield* makeThreadVmFinalSaveWorker(f.sql, f.objects, f.hostId).runOne();
+                  expect((yield* f.store.get(f.input.operationId))?.phase).toBe("aborting");
+                  yield* makeThreadVmFinalSaveAbortWorker(
+                    f.sql,
+                    f.objects,
+                    {
+                      findSnapshot: () => Effect.die("Known failed identity"),
+                      deleteSnapshot: (snapshotId) => {
+                        expect(snapshotId).toBe(failedSnapshot);
+                        return Effect.succeed(true);
+                      },
+                    },
+                    f.hostId,
+                  ).runOne();
+                  expect((yield* f.store.get(f.input.operationId))?.phase).toBe("aborted");
+                  expect(yield* f.pinPhase(id)).toBe("released");
+                } else {
+                  if (kind === "periodic") {
+                    expect((yield* f.source.get(f.owner))?.canActivate).toBe(true);
+                    yield* f.source.confirmActivation({ ...f.owner, operationId: id });
+                    expect(yield* f.pinPhase(id)).toBe("active");
+                  } else {
+                    const cancelled = (yield* recovery.get(f.owner))!;
+                    expect(cancelled.phase).toBe("cancelled");
+                    expect(cancelled.canActivate).toBe(true);
+                    expect(yield* pauses.claim(f.hostId)).toBeNull();
+                    // A native timeout may have paused the VM while the failed capture settled.
+                    expect(
+                      yield* makeThreadVmResumeStore(f.sql).reconcileNativePause({
+                        allocationId: f.input.allocationId,
+                        computeRef: f.computeRef,
+                        threadId: f.threadId,
+                        generation: 1,
+                        operationId: f.input.allocationId,
+                        capacityOperationId: f.input.allocationId,
+                        hostId: f.hostId,
+                      }),
+                    ).toBe(true);
+                    expect((yield* recovery.get(f.owner))?.canActivate).toBe(false);
+                    yield* makeThreadVmResumeStore(f.sql).request(f.threadId);
+                    yield* makeThreadVmCapacityStore(f.sql).admitNext(f.hostId);
+                    expect(
+                      (yield* makeThreadVmResumeStore(f.sql).claim(f.hostId))?.pauseOperationId,
+                    ).toBe(pauseOperationId);
+                  }
+                  yield* makeThreadVmBackupRetentionWorker(
+                    f.sql,
+                    {
+                      deleteSnapshot: (snapshotId) => {
+                        expect(snapshotId).toBe(failedSnapshot);
+                        return Effect.succeed(true);
+                      },
+                    },
+                    f.hostId,
+                  ).runOne();
+                  expect((yield* f.backup.get(id))?.phase).toBe("retired");
+                  expect(yield* f.pinPhase(id)).toBe("released");
+                }
+              }),
+            ),
+        );
+      it.effect(
+        "permanent deletion wins before POST while a dispatched snapshot keeps cleanup blocked",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                id = yield* f.enqueue;
+              yield* f.freeze(id);
+              const claim = (yield* f.backup.claim(f.hostId))!;
               const deletion = makeThreadDeletionStore(f.sql);
-              const request = {
+              yield* deletion.begin({
                 threadId: f.threadId,
                 operationId: NodeCrypto.randomUUID(),
                 ownerUserId: f.input.actorUserId,
                 generation: 1,
                 hostId: f.hostId,
-              };
-              let captures = 0;
-              const worker = makeThreadVmBackupWorker(
-                f.sql,
-                {
-                  inspect: () =>
-                    Effect.gen(function* () {
-                      expect((yield* f.backup.get(operationId).pipe(Effect.orDie))?.phase).toBe(
-                        "pending",
-                      );
-                      if (outcome === "deletion-wins")
-                        yield* deletion.begin(request).pipe(Effect.orDie);
-                      if (outcome === "expired")
-                        yield* f.sql`UPDATE relay_thread_vm_backups SET claim_until=clock_timestamp()-interval '1 second' WHERE operation_id=${operationId}`.pipe(
-                          Effect.orDie,
-                        );
-                      if (outcome === "unavailable")
-                        return yield* new ThreadVmComputeError({
-                          operation: "inspect",
-                          message: "HTTP409: source unavailable",
-                        });
-                      return outcome === "foreign"
-                        ? {
-                            ...f.info,
-                            metadata: { ...f.info.metadata, "launchpad.generation": "999" },
-                          }
-                        : f.info;
-                    }),
-                  snapshot: () =>
-                    Effect.gen(function* () {
-                      captures++;
-                      expect(outcome).toBe("capture-wins");
-                      expect((yield* f.backup.get(operationId).pipe(Effect.orDie))?.phase).toBe(
-                        "creating",
-                      );
-                      yield* Effect.flip(deletion.begin(request)).pipe(Effect.orDie);
-                      return {
-                        snapshotId: `snapshot-${operationId}`,
-                        names: [`launchpad-backup-${operationId}`],
-                      };
-                    }),
-                  findSnapshot: () => Effect.die("No uncertain capture exists"),
-                  restore: {
-                    resolveNamedSnapshot: () =>
-                      Effect.succeed({
-                        sourceTemplateID: "capture",
-                        sourceBuildID: NodeCrypto.randomUUID(),
-                      }),
-                    prepare: () => Effect.die("This pass only captures"),
-                    cancel: () => Effect.die("No verification operation was started"),
-                  },
-                },
-                f.hostId,
-              );
-              expect(yield* worker.runOne()).toBe(true);
-              expect(captures).toBe(outcome === "capture-wins" ? 1 : 0);
-              if (outcome === "capture-wins") {
-                expect((yield* f.backup.get(operationId))?.phase).toBe("captured");
-                expect(yield* deletion.get(f.threadId)).toBeNull();
-              } else {
-                if (outcome !== "deletion-wins") {
-                  expect((yield* f.backup.get(operationId))?.phase).toBe("pending");
-                  expect(yield* deletion.begin(request)).toMatchObject({ phase: "stopping" });
-                }
-                expect((yield* f.backup.get(operationId))?.phase).toBe("retired");
-                expect((yield* f.allocations.get(f.input.allocationId))?.deletedAt).toBeNull();
-              }
-            }),
-          ),
-        );
-      }
-      for (const field of [
-        "snapshot_id",
-        "source_template_id",
-        "source_build_id",
-        "probe_receipt",
-      ] as const) {
-        it.effect(`retains a malformed pending capture with ${field} during deletion`, () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* finalSaveCatalogFixture();
-              const operationId = (yield* f.backup.enqueueDue(f.hostId))!;
-              const claim = (yield* f.backup.claim(f.hostId))!;
-              if (field === "snapshot_id")
-                yield* f.sql`UPDATE relay_thread_vm_backups SET snapshot_id='unexpected' WHERE operation_id=${operationId}`;
-              if (field === "source_template_id")
-                yield* f.sql`UPDATE relay_thread_vm_backups SET source_template_id='unexpected' WHERE operation_id=${operationId}`;
-              if (field === "source_build_id")
-                yield* f.sql`UPDATE relay_thread_vm_backups SET source_build_id=${NodeCrypto.randomUUID()} WHERE operation_id=${operationId}`;
-              if (field === "probe_receipt")
-                yield* f.sql`UPDATE relay_thread_vm_backups SET probe_receipt='{}'::jsonb WHERE operation_id=${operationId}`;
+              });
               expect(yield* f.backup.beginCapture(claim)).toBe(false);
-              const deletion = makeThreadDeletionStore(f.sql);
-              yield* Effect.flip(
-                deletion.begin({
-                  threadId: f.threadId,
-                  operationId: NodeCrypto.randomUUID(),
-                  ownerUserId: f.input.actorUserId,
-                  generation: 1,
-                  hostId: f.hostId,
-                }),
-              );
-              expect(yield* deletion.get(f.threadId)).toBeNull();
-              expect((yield* f.backup.get(operationId))?.phase).toBe("pending");
+              expect((yield* f.backup.get(id))?.phase).toBe("retired");
             }),
           ),
-        );
-      }
-      for (const outcome of [
-        "failed",
-        "building",
-        "missing",
-        "transport",
-        "expired",
-        "moved",
-      ] as const) {
-        it.effect(
-          `reconciles an uncertain capture ${outcome} before inspecting its failed source`,
-          () =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const f = yield* fixture(false, true);
-                yield* f.retry;
-                const snapshotId = `failed-${f.failed.operationId}`;
-                const sourceBuildId = NodeCrypto.randomUUID();
-                let inspections = 0;
-                const worker = makeThreadVmBackupWorker(
-                  f.sql,
-                  {
-                    inspect: () =>
-                      Effect.suspend(() => {
-                        inspections++;
-                        return Effect.fail(
-                          new ThreadVmComputeError({
-                            operation: "inspect",
-                            message: "HTTP409: no certified paused disk",
-                          }),
-                        );
-                      }),
-                    snapshot: () => Effect.die("An uncertain capture must never be repeated"),
-                    findSnapshot: () => Effect.die("The source inspection remains unavailable"),
-                    restore: {
-                      resolveFailedNamedSnapshot: (name) =>
-                        Effect.gen(function* () {
-                          expect(name).toBe(f.failed.snapshotName);
-                          if (outcome === "missing" || outcome === "transport")
-                            return yield* new E2BRestoreError({
-                              operation: "failed snapshot alias",
-                              reason: outcome === "transport" ? "transport" : "http",
-                              status: 404,
-                            });
-                          if (outcome === "building") return null;
-                          if (outcome === "expired")
-                            yield* f.sql`UPDATE relay_thread_vm_backups SET claim_until=clock_timestamp()-interval '1 second' WHERE operation_id=${f.failed.operationId}`.pipe(
-                              Effect.orDie,
-                            );
-                          if (outcome === "moved")
-                            yield* f.sql`UPDATE relay_thread_placements SET generation=generation+1 WHERE thread_id=${f.threadId}`.pipe(
-                              Effect.orDie,
-                            );
-                          return {
-                            snapshotId,
-                            sourceTemplateID: snapshotId,
-                            sourceBuildID: sourceBuildId,
-                          };
-                        }),
-                      resolveNamedSnapshot: () => Effect.die("No ready capture was found"),
-                      prepare: () =>
-                        Effect.die("A failed capture must never boot a verification probe"),
-                      cancel: () => Effect.die("Failure reconciliation is not cleanup"),
-                    },
-                  },
-                  f.hostId,
-                );
-                expect(yield* worker.runOne()).toBe(true);
-                expect(inspections).toBe(outcome === "building" ? 1 : 0);
-                const candidate = yield* f.backup.get(f.failed.operationId);
-                expect(candidate?.phase).toBe(outcome === "failed" ? "failed" : "creating");
-                expect(candidate?.snapshotId).toBe(outcome === "failed" ? snapshotId : null);
-                expect((yield* f.backup.get(f.good.operationId))?.phase).toBe("verified");
-                expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("running");
-                const [capacity] =
-                  yield* f.sql`SELECT state FROM relay_thread_vm_capacity WHERE allocation_id=${f.input.allocationId}`;
-                expect(capacity?.state).toBe("started");
-                const deletion = makeThreadDeletionStore(f.sql);
-                const request = {
-                  threadId: f.threadId,
-                  operationId: NodeCrypto.randomUUID(),
-                  ownerUserId: f.input.actorUserId,
-                  generation: 1,
-                  hostId: f.hostId,
-                };
-                if (outcome === "failed") {
-                  expect(yield* deletion.begin(request)).toMatchObject({ phase: "stopping" });
-                  expect((yield* f.allocations.get(f.input.allocationId))?.deletedAt).toBeNull();
-                } else {
-                  yield* Effect.flip(deletion.begin(request));
-                  expect(yield* deletion.get(f.threadId)).toBeNull();
-                }
-              }),
-            ),
-        );
-      }
-
-      for (const problem of [
-        "too-large",
-        "occupied",
-        "unavailable",
-        "transport",
-        "foreign-operation",
-        "expired-claim",
-      ] as const) {
-        it.effect(
-          `reconciles backup preparation ${problem} without releasing or deleting the VM`,
-          () =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const f = yield* fixture(false);
-                yield* f.retry;
-                const pauses = makeThreadVmPauseStore(f.sql);
-                expect(yield* pauses.reserveIdle(f.hostId)).toBeNull();
-                const worker = makeThreadVmBackupWorker(
-                  f.sql,
-                  {
-                    inspect: () => Effect.die("No new capture is needed"),
-                    snapshot: () => Effect.die("The captured disk must be preserved"),
-                    findSnapshot: () => Effect.die("The captured disk is already recorded"),
-                    restore: {
-                      resolveNamedSnapshot: () =>
-                        Effect.die("The immutable source is already recorded"),
-                      prepare: () =>
-                        Effect.gen(function* () {
-                          if (problem === "expired-claim")
-                            yield* f.sql`UPDATE relay_thread_vm_backups SET claim_until=clock_timestamp()-interval '1 second' WHERE operation_id=${f.failed.operationId}`.pipe(
-                              Effect.orDie,
-                            );
-                          return yield* new E2BRestoreError({
-                            operation:
-                              problem === "foreign-operation" ? "snapshot alias" : "prepare",
-                            reason: problem === "transport" ? "transport" : "http",
-                            status:
-                              problem === "occupied" ? 429 : problem === "unavailable" ? 503 : 413,
-                          });
-                        }),
-                      cancel: () => Effect.die("A rejected request is not cleanup authorization"),
-                    },
-                  },
-                  f.hostId,
-                );
-                expect(yield* worker.runOne()).toBe(true);
-                const candidate = yield* f.backup.get(f.failed.operationId);
-                expect(candidate?.phase).toBe(problem === "too-large" ? "failed" : "verifying");
-                expect(candidate?.snapshotId).toBe(f.failed.snapshotId);
-                expect((yield* f.backup.get(f.good.operationId))?.phase).toBe("verified");
-                expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("running");
-                const [capacity] =
-                  yield* f.sql`SELECT state FROM relay_thread_vm_capacity WHERE allocation_id=${f.input.allocationId}`;
-                expect(capacity?.state).toBe("started");
-                expect((yield* pauses.reserveIdle(f.hostId)) !== null).toBe(
-                  problem === "too-large",
-                );
-              }),
-            ),
-        );
-      }
-
-      it.effect("an oversized final backup never authorizes automatic source deletion", () =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const f = yield* finalSaveCatalogFixture();
-            yield* f.store.begin(f.input);
-            yield* f.freeze;
-            const save = yield* f.store.reserveBackup(f.input.operationId);
-            const captured = (yield* f.backup.claim(f.hostId))!;
-            yield* f.backup.beginCapture(captured);
-            yield* f.backup.recordCapture(captured, {
-              snapshotId: `snapshot-${captured.operationId}`,
-              sourceTemplateId: "oversized-source",
-              sourceBuildId: NodeCrypto.randomUUID(),
-            });
-            const worker = makeThreadVmBackupWorker(
-              f.sql,
-              {
-                inspect: () => Effect.die("No new capture is needed"),
-                snapshot: () => Effect.die("The captured disk must be preserved"),
-                findSnapshot: () => Effect.die("The captured disk is already recorded"),
-                restore: {
-                  resolveNamedSnapshot: () => Effect.die("The immutable source is recorded"),
-                  prepare: () =>
-                    Effect.fail(
-                      new E2BRestoreError({ operation: "prepare", reason: "http", status: 413 }),
-                    ),
-                  cancel: () => Effect.die("A rejected request cannot authorize cleanup"),
-                },
-              },
-              f.hostId,
-            );
-            expect(yield* worker.runOne()).toBe(true);
-            expect((yield* f.backup.get(save.backupOperationId!))?.phase).toBe("failed");
-            const deletion = makeThreadVmFinalSaveDeletionWorker(
-              f.sql,
-              f.objects,
-              {
-                inspect: () => Effect.die("A verified final save is required"),
-                inspectCreation: () => Effect.die("A verified final save is required"),
-                destroy: () => Effect.die("The source VM must survive"),
-              },
-              f.hostId,
-            );
-            expect(yield* deletion.runOne()).toBe(false);
-            expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("running");
-            expect((yield* f.store.get(f.input.operationId))?.phase).toBe("saving");
-          }),
-        ),
-      );
-
-      it.effect(
-        "retires only the failed candidate, preserves recovery and permits the next capture",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              expect(yield* f.backup.enqueueDue(f.hostId)).toBeNull();
-              const calls: string[] = [];
-              const worker = makeThreadVmBackupRetentionWorker(
-                f.sql,
-                {
-                  restore: {
-                    cancel: (id, generation) =>
-                      Effect.sync(() => {
-                        expect(id).toBe(f.failed.operationId);
-                        expect(generation).toBe(f.cancelled.generation);
-                        calls.push("stop");
-                        return f.cancelled;
-                      }),
-                  },
-                  deleteSnapshot: (id) =>
-                    Effect.sync(() => {
-                      expect(id).toBe(f.failed.snapshotId);
-                      calls.push("delete");
-                      return true;
-                    }),
-                },
-                f.hostId,
-              );
-              expect(yield* worker.runOne()).toBe(true);
-              expect(calls).toEqual(["stop", "delete"]);
-              expect((yield* f.backup.get(f.failed.operationId))?.phase).toBe("retired");
-              expect((yield* f.backup.get(f.good.operationId))?.phase).toBe("verified");
-              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("running");
-              const [capacity] =
-                yield* f.sql`SELECT state FROM relay_thread_vm_capacity WHERE allocation_id=${f.input.allocationId}`;
-              expect(capacity?.state).toBe("started");
-              expect(yield* f.backup.enqueueDue(f.hostId)).not.toBeNull();
-            }),
-          ),
-      );
-
-      for (const problem of [
-        "missing",
-        "wrong-operation",
-        "wrong-generation",
-        "cancelling",
-        "malformed",
-      ] as const) {
-        it.effect(`keeps failed recovery while probe stop is ${problem}`, () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              let deletes = 0;
-              const worker = makeThreadVmBackupRetentionWorker(
-                f.sql,
-                {
-                  restore: {
-                    cancel: () =>
-                      problem === "missing"
-                        ? Effect.fail(
-                            new E2BRestoreError({
-                              operation: "cancel",
-                              reason: "http",
-                              status: 404,
-                            }),
-                          )
-                        : Effect.succeed({
-                            ...f.cancelled,
-                            ...(problem === "wrong-operation"
-                              ? { operationID: NodeCrypto.randomUUID() }
-                              : {}),
-                            ...(problem === "wrong-generation" ? { generation: "foreign" } : {}),
-                            ...(problem === "cancelling" ? { state: "cancelling" as const } : {}),
-                            ...(problem === "malformed" ? { preparedBuildID: "invalid" } : {}),
-                          }),
-                  },
-                  deleteSnapshot: () =>
-                    Effect.sync(() => {
-                      deletes++;
-                      return true;
-                    }),
-                },
-                f.hostId,
-              );
-              expect(yield* worker.runOne()).toBe(true);
-              expect(deletes).toBe(0);
-              expect((yield* f.backup.get(f.failed.operationId))?.phase).toBe("failed");
-              expect((yield* f.backup.get(f.good.operationId))?.phase).toBe("verified");
-              expect(yield* f.backup.enqueueDue(f.hostId)).toBeNull();
-            }),
-          ),
-        );
-      }
-
-      it.effect("reconciles a lost root-deletion reply without cancelling the probe twice", () =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const f = yield* fixture();
-            let stops = 0,
-              deletes = 0;
-            const worker = makeThreadVmBackupRetentionWorker(
-              f.sql,
-              {
-                restore: {
-                  cancel: () =>
-                    Effect.sync(() => {
-                      stops++;
-                      return f.cancelled;
-                    }),
-                },
-                deleteSnapshot: () =>
-                  Effect.gen(function* () {
-                    deletes++;
-                    if (deletes === 1)
-                      return yield* new ThreadVmComputeError({
-                        operation: "delete snapshot",
-                        message: "lost deletion reply",
-                      });
-                    return false;
-                  }),
-              },
-              f.hostId,
-            );
-            expect(yield* worker.runOne()).toBe(true);
-            expect((yield* f.backup.get(f.failed.operationId))?.phase).toBe("retiring");
-            const [row] =
-              yield* f.sql`SELECT failed_probe_stopped_at FROM relay_thread_vm_backups WHERE operation_id=${f.failed.operationId}`;
-            expect(row?.failed_probe_stopped_at).not.toBeNull();
-            expect(yield* f.backup.enqueueDue(f.hostId)).toBeNull();
-            yield* f.retry;
-            expect(yield* worker.runOne()).toBe(true);
-            expect(stops).toBe(1);
-            expect(deletes).toBe(2);
-            expect((yield* f.backup.get(f.good.operationId))?.phase).toBe("verified");
-            expect(yield* f.backup.enqueueDue(f.hostId)).not.toBeNull();
-          }),
-        ),
-      );
-
-      for (const hold of [
-        "pin",
-        "placement-operation",
-        "unknown-snapshot",
-        "wrong-name",
-        "final-save",
-      ] as const) {
-        it.effect(`does not claim a failed candidate with ${hold}`, () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              if (hold === "pin")
-                yield* f.sql`INSERT INTO relay_thread_vm_backup_pins(backup_operation_id,operation_id) VALUES(${f.failed.operationId},${NodeCrypto.randomUUID()})`;
-              if (hold === "placement-operation")
-                yield* f.sql`UPDATE relay_thread_placements SET operation_id=${NodeCrypto.randomUUID()} WHERE thread_id=${f.threadId}`;
-              if (hold === "unknown-snapshot")
-                yield* f.sql`UPDATE relay_thread_vm_backups SET snapshot_id=NULL WHERE operation_id=${f.failed.operationId}`;
-              if (hold === "wrong-name")
-                yield* f.sql`UPDATE relay_thread_vm_backups SET snapshot_name='foreign' WHERE operation_id=${f.failed.operationId}`;
-              if (hold === "final-save") {
-                yield* f.store.begin(f.input);
-                yield* f.freeze;
-                yield* f.store.reserveBackup(f.input.operationId);
-                yield* f.sql`UPDATE relay_thread_vm_final_saves SET backup_operation_id=${f.failed.operationId} WHERE operation_id=${f.input.operationId}`;
-                yield* f.sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${f.threadId}`;
-              }
-              expect(yield* f.retention.claimFailed(f.hostId)).toBeNull();
-              expect((yield* f.backup.get(f.good.operationId))?.phase).toBe("verified");
-            }),
-          ),
-        );
-      }
-
-      it.effect("does not authorize retirement from an expired or replaced claim", () =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const f = yield* fixture();
-            const claim = (yield* f.retention.claimFailed(f.hostId))!;
-            expect(yield* f.retention.claimFailed(f.hostId)).toBeNull();
-            yield* f.sql`UPDATE relay_thread_vm_backups SET claim_until=clock_timestamp()-interval '1 second' WHERE operation_id=${claim.operationId}`;
-            expect(yield* f.retention.retireFailed(claim, f.cancelled)).toBe(false);
-            const replacement = (yield* f.retention.claimFailed(f.hostId))!;
-            expect(replacement.claimId).not.toBe(claim.claimId);
-            expect(yield* f.retention.retireFailed(claim, f.cancelled)).toBe(false);
-            expect(yield* f.retention.retireFailed(replacement, f.cancelled)).toBe(true);
-          }),
-        ),
-      );
-
-      it.effect("rechecks new operation pins after probe cancellation", () =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const f = yield* fixture();
-            const claim = (yield* f.retention.claimFailed(f.hostId))!;
-            yield* f.sql`INSERT INTO relay_thread_vm_backup_pins(backup_operation_id,operation_id) VALUES(${f.failed.operationId},${NodeCrypto.randomUUID()})`;
-            expect(yield* f.retention.retireFailed(claim, f.cancelled)).toBe(false);
-            expect((yield* f.backup.get(f.failed.operationId))?.phase).toBe("failed");
-          }),
-        ),
       );
     });
   },

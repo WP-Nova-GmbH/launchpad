@@ -91,6 +91,8 @@ import * as EnvironmentCredentials from "../environments/EnvironmentCredentials.
 import * as Option from "effect/Option";
 import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
 import { makeThreadVmProvisionWorker } from "./ThreadVmProvisionWorker.ts";
+import { readThreadVmTrafficAccessToken } from "./ThreadVmIngressToken.ts";
+import { confirmThreadVmCleanupIdentity } from "./ThreadVmCleanupIdentity.ts";
 import { ThreadVmComputeError, type ThreadVmCreateInput } from "../machines/E2BThreadVmCompute.ts";
 import {
   nextPortableThreadCommand,
@@ -145,7 +147,7 @@ import { makeThreadVmResumeWorker } from "./ThreadVmResumeWorker.ts";
 import { makeThreadVmLeaseWorker } from "./ThreadVmLeaseWorker.ts";
 import { makeThreadVmReplacementStore } from "./ThreadVmReplacementStore.ts";
 import { makeThreadVmBackupStore } from "./ThreadVmBackupStore.ts";
-import { makeThreadVmBackupWorker } from "./ThreadVmBackupWorker.ts";
+import { makeThreadVmBackupSourceStore } from "./ThreadVmBackupSourceStore.ts";
 import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
 import { makeThreadVmBackupRetentionWorker } from "./ThreadVmBackupRetentionWorker.ts";
 import { makeThreadVmSavedDiskStore } from "./ThreadVmSavedDiskStore.ts";
@@ -524,8 +526,13 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         yield* capacity.configure(hostId, 100);
         const intent = { allocationId, operationId, generation: 2, hostId };
         yield* provisions.enqueue(intent);
-        const matches = [] as Array<{ sandboxId: string; metadata: Record<string, string> }>;
+        const matches: Array<{
+          sandboxId: string;
+          state: "running" | "paused";
+          metadata: Record<string, string>;
+        }> = [];
         let creates = 0;
+        let recoveries = 0;
         const compute = {
           create: (input: ThreadVmCreateInput) =>
             Effect.sync(() => {
@@ -533,6 +540,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
               expect(input.environment).toEqual({});
               const resource = {
                 sandboxId: `vm-${allocationId}`,
+                state: "running" as const,
                 metadata: {
                   "launchpad.managed": "thread-vm-v1",
                   "launchpad.operation_id": operationId,
@@ -542,20 +550,33 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
                 },
               };
               matches.push(resource);
-              return resource;
+              return { ...resource, trafficAccessToken: Redacted.make(`traffic-${allocationId}`) };
             }),
-          cancelCreate: () =>
-            Effect.succeed({
-              operationId,
-              computeRef: matches[0]?.sandboxId ?? null,
-              metadata: matches[0]?.metadata ?? {},
+          recoverIngress: (
+            sandboxId: string,
+            identity: Pick<
+              ThreadVmCreateInput,
+              "allocationId" | "operationId" | "threadId" | "generation"
+            > & { templateId: string },
+          ) =>
+            Effect.sync(() => {
+              recoveries++;
+              expect(sandboxId).toBe(`vm-${allocationId}`);
+              expect(identity).toMatchObject({
+                allocationId,
+                operationId,
+                threadId: enrollment.threadId,
+                generation: 2,
+              });
+              return { sandboxId, trafficAccessToken: Redacted.make(`traffic-${allocationId}`) };
             }),
           findOperation: () => Effect.sync(() => [...matches]),
         };
         const worker = (
           client: Parameters<typeof makeThreadVmProvisionWorker>[1] = compute,
           template = "template:immutable-build",
-        ) => makeThreadVmProvisionWorker(sql, client, template, hostId);
+          verifyTemplate: Parameters<typeof makeThreadVmProvisionWorker>[4] = Effect.void,
+        ) => makeThreadVmProvisionWorker(sql, client, template, hostId, verifyTemplate);
         const eligible = sql`UPDATE relay_thread_vm_provisions SET retry_at = clock_timestamp() WHERE allocation_id = ${allocationId}`;
         return {
           sql,
@@ -570,6 +591,9 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           worker,
           eligible,
           creates: () => creates,
+          recoveries: () => recoveries,
+          ownerUserId,
+          threadId: enrollment.threadId,
         };
       });
 
@@ -836,7 +860,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
     );
 
     it.effect(
-      "does not contact compute while idle and blocks provisioning on incompatible runtime or changed runner",
+      "does not contact compute while idle and blocks provisioning when the runner build changed",
       () =>
         Effect.gen(function* () {
           const sql = yield* PgClient.PgClient;
@@ -860,14 +884,9 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
               hostAddresses: ["192.0.2.1"],
             },
           };
-          const transport = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-            Response.json({
-              version: 1,
-              diskRestore: true,
-              quiescedSnapshots: true,
-              renewableLifetime: false,
-            }),
-          );
+          const transport = vi
+            .spyOn(globalThis, "fetch")
+            .mockResolvedValue(new Response(null, { status: 404 }));
           const tags = vi.spyOn(Template, "getTags").mockResolvedValue([]);
           const create = vi
             .spyOn(Sandbox, "create")
@@ -878,31 +897,21 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             expect(transport).not.toHaveBeenCalled();
             expect(tags).not.toHaveBeenCalled();
             const f = yield* makeProvisionFixture({}, settings.hostId);
-            expect(yield* Effect.flip(reconcileThreadVmProvisioning(settings))).toMatchObject({
-              _tag: "ThreadVmRuntimeConfigurationError",
-            });
-            expect(tags).not.toHaveBeenCalled();
-            transport.mockImplementation(async () =>
-              Response.json({
-                version: 1,
-                diskRestore: true,
-                quiescedSnapshots: true,
-                renewableLifetime: true,
-                durableCreationIdentity: true,
-              }),
-            );
-            expect(yield* Effect.flip(reconcileThreadVmProvisioning(settings))).toMatchObject({
-              _tag: "ThreadVmRuntimeConfigurationError",
-            });
+            yield* reconcileThreadVmProvisioning(settings);
+            expect(transport).not.toHaveBeenCalled();
             expect(tags).toHaveBeenCalledTimes(1);
             expect(create).not.toHaveBeenCalled();
-            expect((yield* f.provisions.get(f.allocationId))?.phase).toBe("pending");
+            expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+              phase: "pending",
+              errorCode: "compute_unavailable",
+            });
             expect((yield* makeThreadVmCapacityStore(sql).get(f.operationId))?.state).toBe(
-              "waiting",
+              "reserved",
             );
             // Another worker holds the only slot. A younger capacity waiter does
             // not make the idle reconciler poll the external runtime every tick.
             yield* makeThreadVmCapacityStore(sql).admitNext(settings.hostId);
+            yield* f.eligible;
             yield* f.provisions.claim("in-flight-worker", settings.hostId);
             yield* makeProvisionFixture({}, settings.hostId);
             transport.mockClear();
@@ -957,6 +966,52 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       }),
     );
 
+    it.effect(
+      "checks the base image before dispatch but never gates recovery on a newer image",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* provisionFixture;
+          const unavailable = new ThreadVmComputeError({
+            operation: "verify runner",
+            message: "Base image unavailable",
+          });
+          yield* f.worker(f.compute, "template:immutable-build", Effect.fail(unavailable)).runOne();
+          expect(f.creates()).toBe(0);
+          expect((yield* f.provisions.get(f.allocationId))?.phase).toBe("pending");
+          yield* f.eligible;
+          yield* f
+            .worker({
+              ...f.compute,
+              create: (input) =>
+                f.compute
+                  .create(input)
+                  .pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new ThreadVmComputeError({ operation: "create", message: "Lost reply" }),
+                      ),
+                    ),
+                  ),
+            })
+            .runOne();
+          expect(f.creates()).toBe(1);
+          expect((yield* f.provisions.get(f.allocationId))?.phase).toBe("creating");
+          yield* f.eligible;
+          yield* f
+            .worker(
+              f.compute,
+              "new-runner:unavailable-build",
+              Effect.die("An existing VM must not check the current base image"),
+            )
+            .runOne();
+          expect(f.creates()).toBe(1);
+          expect((yield* f.provisions.get(f.allocationId))?.phase).toBe("created");
+          expect((yield* f.allocations.get(f.allocationId))?.templateId).toBe(
+            "template:immutable-build",
+          );
+        }),
+    );
+
     it.effect("reconciles a lost create reply after restart without starting another VM", () =>
       Effect.gen(function* () {
         const f = yield* provisionFixture;
@@ -985,14 +1040,381 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           errorCode: "compute_unavailable",
         });
         yield* f.eligible;
-        // Changed configuration must not prevent discovering the old immutable operation.
-        yield* f.worker(f.compute, "new-template").runOne();
+        // Discovery includes a paused inert VM; recovery keeps its original admitted image.
+        f.matches[0]!.state = "paused";
+        yield* f
+          .worker(
+            {
+              ...f.compute,
+              recoverIngress: (sandboxId, identity) => {
+                expect(identity.templateId).toBe("template:immutable-build");
+                return f.compute.recoverIngress(sandboxId, identity);
+              },
+            },
+            "new-template",
+          )
+          .runOne();
         expect(f.creates()).toBe(1);
+        expect(f.recoveries()).toBe(1);
+        expect(
+          Redacted.value(
+            yield* readThreadVmTrafficAccessToken(f.sql, {
+              allocationId: f.allocationId,
+              computeRef: `vm-${f.allocationId}`,
+              operationId: f.operationId,
+              threadId: f.threadId,
+              generation: 2,
+            }),
+          ),
+        ).toBe(`traffic-${f.allocationId}`);
         expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
           phase: "created",
           computeRef: `vm-${f.allocationId}`,
           templateId: "template:immutable-build",
         });
+      }),
+    );
+
+    it.effect("recovers a missing create token only through the admitted exact compute ID", () =>
+      Effect.gen(function* () {
+        const f = yield* provisionFixture;
+        yield* f
+          .worker({
+            ...f.compute,
+            create: (input) =>
+              f.compute.create(input).pipe(Effect.map(({ sandboxId }) => ({ sandboxId }))),
+          })
+          .runOne();
+        expect(f.creates()).toBe(1);
+        expect(f.recoveries()).toBe(1);
+        expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+          phase: "created",
+          allocationState: "running",
+        });
+        expect(
+          Redacted.value(
+            yield* readThreadVmTrafficAccessToken(f.sql, {
+              allocationId: f.allocationId,
+              computeRef: `vm-${f.allocationId}`,
+              operationId: f.operationId,
+              threadId: f.threadId,
+              generation: 2,
+            }),
+          ),
+        ).toBe(`traffic-${f.allocationId}`);
+      }),
+    );
+
+    it.effect("holds an uncertain ingress attempt without reconnecting or repeating create", () =>
+      Effect.gen(function* () {
+        const f = yield* provisionFixture;
+        let recoveries = 0;
+        const failed = {
+          ...f.compute,
+          create: (input: ThreadVmCreateInput) =>
+            f.compute.create(input).pipe(Effect.map(({ sandboxId }) => ({ sandboxId }))),
+          recoverIngress: () => {
+            recoveries++;
+            return Effect.fail(
+              new ThreadVmComputeError({ operation: "recover ingress", message: "Reply lost" }),
+            );
+          },
+        };
+        yield* f.worker(failed).runOne();
+        expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+          phase: "creating",
+          allocationState: "creating",
+          computeRef: `vm-${f.allocationId}`,
+        });
+        expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe("started");
+        expect((yield* f.provisions.get(f.allocationId))?.ingressRecoveryClaimId).toEqual(
+          expect.any(String),
+        );
+        yield* f.eligible;
+        expect(yield* f.worker(failed).runOne()).toBe(false);
+        yield* f.allocations.requestDeletion(f.allocationId);
+        expect(yield* f.worker(failed).runOne()).toBe(false);
+        expect(f.creates()).toBe(1);
+        expect(recoveries).toBe(1);
+        const [row] =
+          yield* f.sql`SELECT sealed_traffic_access_token FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`;
+        expect(row?.sealed_traffic_access_token).toBeNull();
+        yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp()+interval '1 day' WHERE allocation_id=${f.allocationId}`;
+      }),
+    );
+
+    it.effect(
+      "retries recovery only after the adapter proves the previous connect is not outstanding",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* provisionFixture;
+          yield* f
+            .worker({
+              ...f.compute,
+              create: (input) =>
+                f.compute.create(input).pipe(Effect.map(({ sandboxId }) => ({ sandboxId }))),
+              recoverIngress: () =>
+                Effect.fail(
+                  new ThreadVmComputeError({
+                    operation: "recover ingress",
+                    message: "Preflight failed before connect",
+                    connectUncertain: false,
+                  }),
+                ),
+            })
+            .runOne();
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "creating",
+            ingressRecoveryClaimId: null,
+          });
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
+            "started",
+          );
+          yield* f.eligible;
+          yield* f.worker().runOne();
+          expect(f.creates()).toBe(1);
+          expect(f.recoveries()).toBe(1);
+          expect((yield* f.provisions.get(f.allocationId))?.phase).toBe("created");
+        }),
+    );
+
+    it.effect(
+      "retains a cancelled VM and slot through claim expiry until the exact in-flight recovery acknowledges",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* provisionFixture;
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          let connects = 0;
+          const running = yield* f
+            .worker({
+              ...f.compute,
+              create: (input) =>
+                f.compute.create(input).pipe(Effect.map(({ sandboxId }) => ({ sandboxId }))),
+              recoverIngress: (sandboxId, identity) =>
+                Effect.gen(function* () {
+                  connects++;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                  return yield* f.compute.recoverIngress(sandboxId, identity);
+                }),
+            })
+            .runOne()
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(entered);
+          const row = (yield* f.provisions.get(f.allocationId))!;
+          const attempt = {
+            allocationId: f.allocationId,
+            computeRef: `vm-${f.allocationId}`,
+            claimId: row.ingressRecoveryClaimId!,
+          };
+          expect(attempt.claimId).toBe(row.claimId);
+          expect(attempt.claimId).toEqual(expect.any(String));
+          yield* f.allocations.requestDeletion(f.allocationId);
+          expect(yield* f.provisions.recordCreated(attempt).pipe(Effect.flip)).toMatchObject({
+            _tag: "ThreadVmProvisionConflict",
+          });
+          expect(
+            yield* f.provisions
+              .settleIngressRecovery({ ...attempt, claimId: "another-attempt" })
+              .pipe(Effect.flip),
+          ).toMatchObject({ _tag: "ThreadVmProvisionConflict" });
+          expect(
+            yield* f.provisions
+              .settleIngressRecovery({ ...attempt, computeRef: "another-vm" })
+              .pipe(Effect.flip),
+          ).toMatchObject({ _tag: "ThreadVmProvisionConflict" });
+          yield* f.sql`UPDATE relay_thread_vm_provisions SET claim_until=clock_timestamp()-interval '1 second' WHERE allocation_id=${f.allocationId}`;
+          expect(yield* f.worker().runOne()).toBe(false);
+          let inspections = 0;
+          const cleanupIdentity = {
+            ...attempt,
+            threadId: f.threadId,
+            operationId: f.operationId,
+            generation: 2,
+          };
+          const inspect = {
+            inspect: () =>
+              Effect.sync(() => {
+                inspections++;
+                return null;
+              }),
+          };
+          expect(yield* confirmThreadVmCleanupIdentity(f.sql, inspect, cleanupIdentity)).toBe(
+            false,
+          );
+          expect(inspections).toBe(0);
+          expect(connects).toBe(1);
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "creating",
+            allocationState: "deleting",
+            ingressRecoveryClaimId: attempt.claimId,
+          });
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
+            "started",
+          );
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(running);
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "creating",
+            allocationState: "deleting",
+            ingressRecoveryClaimId: null,
+          });
+          expect(yield* confirmThreadVmCleanupIdentity(f.sql, inspect, cleanupIdentity)).toBe(
+            false,
+          );
+          expect(inspections).toBe(0);
+          expect(yield* f.worker().runOne()).toBe(true);
+          expect(connects).toBe(1);
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "created",
+            allocationState: "deleting",
+            ingressRecoveryClaimId: null,
+          });
+          const [secret] =
+            yield* f.sql`SELECT sealed_traffic_access_token FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`;
+          expect(secret?.sealed_traffic_access_token).toBeNull();
+          expect(yield* confirmThreadVmCleanupIdentity(f.sql, inspect, cleanupIdentity)).toBe(true);
+          expect(inspections).toBe(1);
+        }),
+    );
+
+    it.effect("refuses an ingress recovery reply after its worker claim expires", () =>
+      Effect.gen(function* () {
+        const f = yield* provisionFixture;
+        yield* f
+          .worker({
+            ...f.compute,
+            create: (input) =>
+              f.compute.create(input).pipe(Effect.map(({ sandboxId }) => ({ sandboxId }))),
+            recoverIngress: (sandboxId, identity) =>
+              Effect.gen(function* () {
+                const reply = yield* f.compute.recoverIngress(sandboxId, identity);
+                yield* f.sql`UPDATE relay_thread_vm_provisions SET claim_until=clock_timestamp()-interval '1 second' WHERE allocation_id=${f.allocationId}`.pipe(
+                  Effect.orDie,
+                );
+                return reply;
+              }),
+          })
+          .runOne();
+        expect(f.creates()).toBe(1);
+        expect(f.recoveries()).toBe(1);
+        expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+          phase: "creating",
+          computeRef: `vm-${f.allocationId}`,
+        });
+        expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe("started");
+        const [row] =
+          yield* f.sql`SELECT sealed_traffic_access_token FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`;
+        expect(row?.sealed_traffic_access_token).toBeNull();
+        yield* f.eligible;
+        yield* f.worker().runOne();
+        expect(f.creates()).toBe(1);
+        expect(f.recoveries()).toBe(2);
+        expect((yield* f.provisions.get(f.allocationId))?.phase).toBe("created");
+      }),
+    );
+
+    it.effect(
+      "does not publish ingress credentials after owner access is revoked during recovery",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* provisionFixture;
+          const allocation = (yield* f.allocations.get(f.allocationId))!;
+          yield* f
+            .worker({
+              ...f.compute,
+              create: (input) =>
+                f.compute.create(input).pipe(Effect.map(({ sandboxId }) => ({ sandboxId }))),
+              recoverIngress: (sandboxId, identity) =>
+                Effect.gen(function* () {
+                  const reply = yield* f.compute.recoverIngress(sandboxId, identity);
+                  yield* f.sql`DELETE FROM relay_organization_members WHERE organization_id=${allocation.organizationId} AND user_id=${f.ownerUserId}`.pipe(
+                    Effect.orDie,
+                  );
+                  return reply;
+                }),
+            })
+            .runOne();
+          expect(f.recoveries()).toBe(1);
+          expect(yield* f.provisions.get(f.allocationId)).not.toMatchObject({
+            phase: "created",
+            allocationState: "running",
+          });
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
+            "started",
+          );
+          const [row] =
+            yield* f.sql`SELECT sealed_traffic_access_token FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`;
+          expect(row?.sealed_traffic_access_token).toBeNull();
+          yield* f.eligible;
+          yield* f.worker().runOne();
+          expect(f.recoveries()).toBe(1);
+          expect(f.creates()).toBe(1);
+        }),
+    );
+
+    it.effect(
+      "completes cancellation during ingress recovery without publishing a credential or waiting for claim expiry",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* provisionFixture;
+          yield* f
+            .worker({
+              ...f.compute,
+              create: (input) =>
+                f.compute.create(input).pipe(Effect.map(({ sandboxId }) => ({ sandboxId }))),
+              recoverIngress: (sandboxId, identity) =>
+                Effect.gen(function* () {
+                  const reply = yield* f.compute.recoverIngress(sandboxId, identity);
+                  yield* f.allocations.requestDeletion(f.allocationId).pipe(Effect.orDie);
+                  return reply;
+                }),
+            })
+            .runOne();
+          expect(f.creates()).toBe(1);
+          expect(f.recoveries()).toBe(1);
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "created",
+            allocationState: "deleting",
+            computeRef: `vm-${f.allocationId}`,
+            claimId: null,
+          });
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
+            "started",
+          );
+          const [row] =
+            yield* f.sql`SELECT sealed_traffic_access_token FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`;
+          expect(row?.sealed_traffic_access_token).toBeNull();
+          expect(
+            yield* f.provisions.claimEnrollment("cannot-enroll-cancelled", f.hostId),
+          ).toBeNull();
+        }),
+    );
+
+    it.effect("requires the same started capacity reservation after ingress recovery", () =>
+      Effect.gen(function* () {
+        const f = yield* provisionFixture;
+        yield* f
+          .worker({
+            ...f.compute,
+            create: (input) =>
+              f.compute.create(input).pipe(Effect.map(({ sandboxId }) => ({ sandboxId }))),
+            recoverIngress: (sandboxId, identity) =>
+              Effect.gen(function* () {
+                const reply = yield* f.compute.recoverIngress(sandboxId, identity);
+                yield* f.sql`UPDATE relay_thread_vm_capacity SET state='released' WHERE operation_id=${f.operationId}`.pipe(
+                  Effect.orDie,
+                );
+                return reply;
+              }),
+          })
+          .runOne();
+        expect(f.recoveries()).toBe(1);
+        expect((yield* f.provisions.get(f.allocationId))?.phase).toBe("creating");
+        const [row] =
+          yield* f.sql`SELECT sealed_traffic_access_token FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`;
+        expect(row?.sealed_traffic_access_token).toBeNull();
       }),
     );
 
@@ -1073,142 +1495,90 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         }),
     );
 
-    it.effect("frees capacity only after a failed creation is sealed and positively stopped", () =>
-      Effect.gen(function* () {
-        const f = yield* provisionFixture;
-        let creates = 0;
-        let cancels = 0;
-        const failed = {
-          ...f.compute,
-          create: () => {
-            creates++;
-            return Effect.fail(
-              new ThreadVmComputeError({
-                operation: "create",
-                message: "Boot failed before routing",
-              }),
-            );
-          },
-          cancelCreate: (operationId: string) => {
-            cancels++;
-            return Effect.succeed({
-              operationId,
-              computeRef: "failed-boot",
-              metadata: {
-                "launchpad.managed": "thread-vm-v1",
-                "launchpad.operation_id": operationId,
-                "launchpad.allocation_id": f.allocationId,
-                "launchpad.thread_id": "unused",
-                "launchpad.generation": "2",
-              },
-            });
-          },
-        };
-        yield* f.worker(failed).runOne();
-        const row = (yield* f.provisions.get(f.allocationId))!;
-        expect(row).toMatchObject({
-          phase: "creating",
-          creationIdentityFenced: true,
-          computeRef: null,
-        });
-        yield* f.allocations.requestDeletion(f.allocationId);
-        yield* f.eligible;
-        const valid = {
-          ...failed,
-          cancelCreate: (operationId: string) => {
-            cancels++;
-            return Effect.succeed({
-              operationId,
-              computeRef: "failed-boot",
-              metadata: {
-                "launchpad.managed": "thread-vm-v1",
-                "launchpad.operation_id": operationId,
-                "launchpad.allocation_id": f.allocationId,
-                "launchpad.thread_id": row.threadId,
-                "launchpad.generation": "2",
-              },
-            });
-          },
-        };
-        yield* f
-          .worker({
-            ...valid,
-            cancelCreate: () =>
-              Effect.fail(
-                new ThreadVmComputeError({ operation: "cancel create", message: "Reply lost" }),
-              ),
-          })
-          .runOne();
-        expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe("started");
-        expect((yield* f.allocations.get(f.allocationId))?.deletedAt).toBeNull();
-        yield* f.eligible;
-        // A positive receipt for the wrong thread is still not this allocation's proof.
-        yield* f.worker(failed).runOne();
-        expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe("started");
-        expect((yield* f.allocations.get(f.allocationId))?.deletedAt).toBeNull();
-        yield* f.sql`UPDATE relay_thread_vm_provisions SET claim_until = clock_timestamp() - interval '1 second' WHERE allocation_id = ${f.allocationId}`;
-        yield* f.eligible;
-        yield* f.worker(valid).runOne();
-        expect(creates).toBe(1);
-        expect(cancels).toBe(2);
-        expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
-          phase: "cancelled",
-          allocationState: "deleted",
-          computeRef: "failed-boot",
-        });
-        expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
-          "released",
-        );
-      }),
-    );
-
     it.effect(
-      "seals a lost pre-send creation and refuses to release legacy or foreign identities",
+      "keeps cancelled uncertain creation reserved and binds a late discovery for cleanup without connecting",
       () =>
         Effect.gen(function* () {
-          for (const mode of ["new", "foreign", "legacy"] as const) {
-            const f = yield* provisionFixture;
-            yield* makeThreadVmCapacityStore(f.sql).admitNext(f.hostId);
-            yield* f.provisions.claim("creator", f.hostId);
-            yield* f.provisions.beginCreate({
-              allocationId: f.allocationId,
-              claimId: "creator",
-              templateId: "template:immutable-build",
-            });
-            yield* f.provisions.defer({
-              allocationId: f.allocationId,
-              claimId: "creator",
-              errorCode: "create_uncertain",
-            });
-            if (mode === "legacy")
-              yield* f.sql`UPDATE relay_thread_vm_provisions SET creation_identity_fenced = false WHERE allocation_id = ${f.allocationId}`;
-            yield* f.allocations.requestDeletion(f.allocationId);
-            yield* f.eligible;
-            let cancels = 0;
-            yield* f
-              .worker({
-                ...f.compute,
-                cancelCreate: () => {
-                  cancels++;
-                  return Effect.succeed({
-                    operationId: mode === "foreign" ? "wrong-operation" : f.operationId,
-                    computeRef: null,
-                    metadata: {},
-                  });
-                },
-              })
-              .runOne();
-            expect(f.creates()).toBe(0);
-            expect(cancels).toBe(mode === "legacy" ? 0 : 1);
-            expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
-              mode === "new" ? "released" : "started",
-            );
-            expect((yield* f.allocations.get(f.allocationId))?.deletedAt === null).toBe(
-              mode !== "new",
-            );
-            yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at = clock_timestamp() + interval '1 day' WHERE allocation_id = ${f.allocationId}`;
-          }
+          const f = yield* provisionFixture;
+          yield* f
+            .worker({
+              ...f.compute,
+              create: (input) =>
+                f.compute
+                  .create(input)
+                  .pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new ThreadVmComputeError({ operation: "create", message: "Reply lost" }),
+                      ),
+                    ),
+                  ),
+            })
+            .runOne();
+          yield* f.allocations.requestDeletion(f.allocationId);
+          const discovered = f.matches.splice(0);
+          yield* f.eligible;
+          yield* f.worker().runOne();
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "creating",
+            allocationState: "deleting",
+            computeRef: null,
+            errorCode: "create_uncertain",
+          });
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
+            "started",
+          );
+          f.matches.push(...discovered);
+          yield* f.eligible;
+          yield* f.worker().runOne();
+          expect(f.creates()).toBe(1);
+          expect(f.recoveries()).toBe(0);
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "created",
+            allocationState: "deleting",
+            computeRef: `vm-${f.allocationId}`,
+          });
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
+            "started",
+          );
+          const [row] =
+            yield* f.sql`SELECT sealed_traffic_access_token FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`;
+          expect(row?.sealed_traffic_access_token).toBeNull();
         }),
+    );
+
+    it.effect("does not release uncertain creation from a stale custom creation-fence flag", () =>
+      Effect.gen(function* () {
+        for (const fenced of [false, true]) {
+          const f = yield* provisionFixture;
+          yield* makeThreadVmCapacityStore(f.sql).admitNext(f.hostId);
+          yield* f.provisions.claim("creator", f.hostId);
+          yield* f.provisions.beginCreate({
+            allocationId: f.allocationId,
+            claimId: "creator",
+            templateId: "template:immutable-build",
+          });
+          yield* f.provisions.defer({
+            allocationId: f.allocationId,
+            claimId: "creator",
+            errorCode: "create_uncertain",
+          });
+          yield* f.sql`UPDATE relay_thread_vm_provisions SET creation_identity_fenced=${fenced} WHERE allocation_id=${f.allocationId}`;
+          yield* f.allocations.requestDeletion(f.allocationId);
+          yield* f.eligible;
+          yield* f.worker().runOne();
+          expect(f.creates()).toBe(0);
+          expect(f.recoveries()).toBe(0);
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(f.operationId))?.state).toBe(
+            "started",
+          );
+          expect(yield* f.allocations.get(f.allocationId)).toMatchObject({
+            state: "deleting",
+            deletedAt: null,
+          });
+          yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp()+interval '1 day' WHERE allocation_id=${f.allocationId}`;
+        }
+      }),
     );
 
     it.effect("rejects foreign or duplicate compute matches and keeps the reservation", () =>
@@ -1394,6 +1764,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           allocationId: input.allocationId,
           claimId: "setup-test",
           computeRef: `compute-${input.allocationId}`,
+          sealedTrafficAccessToken: "sealed-setup-fixture",
         });
         const enrollments = makeThreadVmEnrollmentStore(sql);
         const intent = { allocationId: input.allocationId, operationId: input.allocationId };
@@ -1732,9 +2103,12 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             ),
           ).toContain(f.input.allocationId);
           const backup = makeThreadVmBackupStore(f.sql);
-          expect(yield* backup.enqueueDue(f.input.hostId)).not.toBeNull();
-          // A finished backup no longer competes with the pause candidate.
-          yield* f.sql`UPDATE relay_thread_vm_backups SET phase='failed' WHERE allocation_id=${f.input.allocationId}`;
+          const backupOperationId = yield* backup.enqueueDue(f.input.hostId);
+          expect(backupOperationId).not.toBeNull();
+          const source = makeThreadVmBackupSourceStore(f.sql, yield* ThreadArtifactObjectStorage),
+            owner = { ...f.owner, generation: 2, operationId: backupOperationId! };
+          yield* source.cancelPending(owner);
+          yield* source.confirmActivation(owner);
           yield* f.sql`UPDATE relay_thread_vm_activity SET idle_since=clock_timestamp()-interval '31 minutes' WHERE allocation_id=${f.input.allocationId}`;
           expect(yield* makeThreadVmPauseStore(f.sql).reserveIdle(f.input.hostId)).toBe(
             f.input.allocationId,
@@ -1905,14 +2279,36 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       });
       const old = NodeCrypto.randomUUID(),
         current = NodeCrypto.randomUUID();
-      const insert = (operationId: string, minutesAgo: number) => f.sql`
-        INSERT INTO relay_thread_vm_backups
-          (operation_id,allocation_id,generation,compute_ref,snapshot_name,snapshot_id,
-            source_template_id,source_build_id,phase,verified_at,probe_receipt)
-        VALUES (${operationId},${f.input.allocationId},1,${`compute-${f.input.allocationId}`},
-          ${`backup-${operationId}`},${`snapshot-${operationId}`},${`snapshot-${operationId}`},
-          ${NodeCrypto.randomUUID()},'verified',clock_timestamp() - make_interval(mins => ${minutesAgo}),
-          ${f.sql.json({ operationID: operationId, generation: `backup-${operationId}`, preparedBuildID: "d9dc0c90-8d53-447e-997f-40359797d086", manifestSHA256: "c".repeat(64), coldProbe: { version: 1, preparedBuildID: "d9dc0c90-8d53-447e-997f-40359797d086", rootfsSHA256: "a".repeat(64), initSHA256: "b".repeat(64), physicalStopConfirmed: true, mountOnly: true } })})`;
+      const insert = (operationId: string, minutesAgo: number) =>
+        Effect.gen(function* () {
+          const sourceBuildId = NodeCrypto.randomUUID(),
+            checkpointId = NodeCrypto.randomUUID(),
+            manifestId = NodeCrypto.randomUUID();
+          const source = {
+            environmentId: f.environmentId,
+            provisionOperationId: f.input.allocationId,
+            captureOperationId: operationId,
+            bootId: NodeCrypto.randomUUID(),
+            sealEpoch: 1,
+            sourceSequence: 1,
+            nativeCheckpointOperationId: checkpointId,
+          };
+          yield* f.sql`INSERT INTO relay_thread_artifacts
+          (artifact_id,thread_id,operation_id,kind,storage_key,sha256,size_bytes,state)
+          VALUES(${manifestId},${f.input.threadId},${checkpointId},'manifest',${manifestId},${"a".repeat(64)},0,'complete')`;
+          yield* f.sql`INSERT INTO relay_thread_native_checkpoints
+          (operation_id,thread_id,turn_id,capture_operation_id,source_environment_id,generation,source_sequence,
+            native_thread_id,native_manifest_sha256,archive_sha256,manifest_artifact_id,manifest_sha256,artifact_count)
+          VALUES(${checkpointId},${f.input.threadId},${checkpointId},${operationId},${f.environmentId},1,1,
+            ${NodeCrypto.randomUUID()},${"a".repeat(64)},${"b".repeat(64)},${manifestId},${"a".repeat(64)},1)`;
+          yield* f.sql`INSERT INTO relay_thread_native_checkpoint_operations(operation_id,checkpoint_operation_id,phase)
+          VALUES(${operationId},${checkpointId},'active')`;
+          yield* f.sql`INSERT INTO relay_thread_vm_backups
+          (operation_id,allocation_id,generation,compute_ref,snapshot_name,snapshot_id,source_template_id,source_build_id,phase,verified_at,native_capture_receipt,source_receipt)
+          VALUES(${operationId},${f.input.allocationId},1,${`compute-${f.input.allocationId}`},${`backup-${operationId}`},${`snapshot-${operationId}`},${`snapshot-${operationId}`},${sourceBuildId},'verified',clock_timestamp()-make_interval(mins=>${minutesAgo}),
+            ${f.sql.json({ version: 1, kind: "native-full-snapshot-v1", operationId, allocationId: f.input.allocationId, computeRef: `compute-${f.input.allocationId}`, threadId: f.input.threadId, generation: 1, snapshotId: `snapshot-${operationId}`, sourceTemplateId: `snapshot-${operationId}`, sourceBuildId, source })},
+            ${f.sql.json({ allocationId: f.input.allocationId, computeRef: `compute-${f.input.allocationId}`, threadId: f.input.threadId, generation: 1, ...source })})`;
+        });
       yield* insert(old, 20);
       return {
         ...f,
@@ -1959,10 +2355,10 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       };
     });
 
-    it.effect("refuses restore when a retained disk has no cold proof", () =>
+    it.effect("refuses restore when a retained disk has no native completion", () =>
       Effect.gen(function* () {
         const f = yield* savedDiskFixture;
-        yield* f.sql`UPDATE relay_thread_vm_backups SET probe_receipt=NULL WHERE operation_id=${f.old}`;
+        yield* f.sql`UPDATE relay_thread_vm_backups SET native_capture_receipt=${f.sql.json({})} WHERE operation_id=${f.old}`;
         expect(yield* Effect.flip(f.savedDisks.beginRestore(f.restore))).toMatchObject({
           _tag: "ThreadVmSavedDiskConflict",
         });
@@ -2223,7 +2619,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         expect(yield* Effect.flip(f.savedDisks.completeRestore(f.restore))).toMatchObject({
           _tag: "ThreadVmSavedDiskConflict",
         });
-        // This fixture represents the ownership/activation receipt, not a real cold boot.
+        // This fixture represents the independently admitted ownership and activation receipt.
         yield* f.sql`UPDATE relay_thread_placements SET environment_id=${environmentId},
           generation=2,operation_id=NULL WHERE thread_id=${f.input.threadId}`;
         yield* f.savedDisks.completeRestore(f.restore);
@@ -2427,160 +2823,6 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
     );
 
     it.effect(
-      "reconciles a lost backup reply and verifies cold recovery before publishing it",
-      () =>
-        Effect.gen(function* () {
-          const f = yield* initialSetupFixture;
-          yield* f.prepare;
-          yield* f.setup.begin({
-            allocationId: f.input.allocationId,
-            environmentId: f.environmentId,
-          });
-          yield* f.setup.finish({
-            allocationId: f.input.allocationId,
-            environmentId: f.environmentId,
-            receiptSha256: "a".repeat(64),
-          });
-          const allocation = (yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))!;
-          const provision = (yield* makeThreadVmProvisionStore(f.sql).get(f.input.allocationId))!;
-          const backup = makeThreadVmBackupStore(f.sql);
-          const info: SandboxInfo = {
-            sandboxId: allocation.computeRef!,
-            templateId: f.input.templateId,
-            metadata: {
-              "launchpad.managed": "thread-vm-v1",
-              "launchpad.allocation_id": f.input.allocationId,
-              "launchpad.operation_id": provision.operationId,
-              "launchpad.thread_id": f.input.threadId,
-              "launchpad.generation": "1",
-            },
-            startedAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
-            endAt: DateTime.toDateUtc(DateTime.makeUnsafe(900_000)),
-            state: "running",
-            cpuCount: 2,
-            memoryMB: 4096,
-            envdVersion: "test",
-          };
-          let captures = 0;
-          let probes = 0;
-          let cancellations = 0;
-          const worker = makeThreadVmBackupWorker(
-            f.sql,
-            {
-              inspect: () => Effect.succeed(info),
-              snapshot: (_sandbox, name) =>
-                Effect.gen(function* () {
-                  captures++;
-                  expect(name).toMatch(/^launchpad-backup-/);
-                  return yield* new ThreadVmComputeError({
-                    operation: "snapshot",
-                    message: "response lost after capture",
-                  });
-                }),
-              findSnapshot: () =>
-                Effect.succeed({
-                  snapshotId: "snapshot-1",
-                  names: ["launchpad-backup:latest"],
-                }),
-              restore: {
-                resolveNamedSnapshot: () =>
-                  Effect.succeed({
-                    sourceTemplateID: "snapshot-template",
-                    sourceBuildID: NodeCrypto.randomUUID(),
-                  }),
-                prepare: (operationID, request) =>
-                  Effect.sync(() => {
-                    probes++;
-                    expect(request.bootstrap).toBeUndefined();
-                    return {
-                      operationID,
-                      generation: request.generation,
-                      sandboxID: allocation.computeRef!,
-                      executionID: NodeCrypto.randomUUID(),
-                      preparedBuildID: "d9dc0c90-8d53-447e-997f-40359797d086",
-                      manifestSHA256: "c".repeat(64),
-                      ...(probes < 2
-                        ? {}
-                        : {
-                            coldProbe: {
-                              version: 1,
-                              preparedBuildID: "d9dc0c90-8d53-447e-997f-40359797d086",
-                              rootfsSHA256: "a".repeat(64),
-                              initSHA256: "b".repeat(64),
-                              physicalStopConfirmed: true,
-                              mountOnly: true,
-                            },
-                          }),
-                      state: "prepared" as const,
-                    };
-                  }),
-                cancel: (operationID, generation) =>
-                  Effect.sync(() => {
-                    cancellations++;
-                    return {
-                      operationID,
-                      generation,
-                      sandboxID: allocation.computeRef!,
-                      executionID: NodeCrypto.randomUUID(),
-                      preparedBuildID: NodeCrypto.randomUUID(),
-                      state: cancellations === 1 ? ("cancelling" as const) : ("cancelled" as const),
-                    };
-                  }),
-              },
-            },
-            f.input.hostId,
-          );
-          expect(yield* worker.runOne()).toBe(true);
-          const [candidate] = yield* f.sql<{ operationId: string }>`
-          SELECT operation_id AS "operationId" FROM relay_thread_vm_backups
-          WHERE allocation_id = ${f.input.allocationId}`;
-          expect((yield* backup.get(candidate!.operationId))?.phase).toBe("creating");
-          expect(
-            yield* Effect.flip(
-              makeThreadVmAllocationStore(f.sql).requestDeletion(f.input.allocationId),
-            ),
-          ).toMatchObject({ _tag: "ThreadVmAllocationConflict" });
-          expect(
-            yield* Effect.flip(
-              makeThreadPlacementStore(f.sql).beginMove({
-                operationId: NodeCrypto.randomUUID(),
-                threadId: f.input.threadId,
-                actorUserId: f.input.ownerUserId,
-                sourceEnvironmentId: f.environmentId,
-                expectedGeneration: 1,
-                destinationEnvironmentId: "local",
-                destinationProjectId: "local-project",
-              }),
-            ),
-          ).toMatchObject({ _tag: "ThreadPlacementConflict" });
-          yield* f.sql`UPDATE relay_thread_vm_backups SET retry_at = clock_timestamp()
-          WHERE operation_id = ${candidate!.operationId}`;
-          expect(yield* worker.runOne()).toBe(true);
-          expect((yield* backup.get(candidate!.operationId))?.phase).toBe("captured");
-          expect(yield* worker.runOne()).toBe(true);
-          expect((yield* backup.get(candidate!.operationId))?.phase).toBe("verifying");
-          expect(cancellations).toBe(0);
-          yield* f.sql`UPDATE relay_thread_vm_backups SET retry_at = clock_timestamp()
-            WHERE operation_id = ${candidate!.operationId}`;
-          expect(yield* worker.runOne()).toBe(true);
-          expect((yield* backup.get(candidate!.operationId))?.phase).toBe("cleanup");
-          yield* f.sql`UPDATE relay_thread_vm_backups SET retry_at = clock_timestamp()
-          WHERE operation_id = ${candidate!.operationId}`;
-          expect(yield* worker.runOne()).toBe(true);
-          expect((yield* backup.get(candidate!.operationId))?.phase).toBe("verified");
-          expect((yield* backup.get(candidate!.operationId))?.probeReceipt).toMatchObject({
-            operationID: candidate!.operationId,
-            manifestSHA256: "c".repeat(64),
-            coldProbe: { physicalStopConfirmed: true },
-          });
-          expect(captures).toBe(1);
-          expect(probes).toBe(2);
-          expect(cancellations).toBe(2);
-          expect(yield* worker.runOne()).toBe(false);
-        }),
-    );
-
-    it.effect(
       "reads current VM lifecycle without waking compute or exposing it to another user",
       () =>
         Effect.gen(function* () {
@@ -2609,7 +2851,16 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             activity: "unknown",
             backupPhase: null,
           });
-          yield* makeThreadVmBackupStore(f.sql).enqueueDue(f.input.hostId);
+          const backups = makeThreadVmBackupStore(f.sql);
+          expect(yield* backups.enqueueDue(f.input.hostId)).toBeNull();
+          const activity = makeThreadVmActivityStore(f.sql);
+          const revision = yield* activity.beginInspection(f.input.allocationId);
+          yield* activity.finishInspection({
+            allocationId: f.input.allocationId,
+            revision,
+            activity: "idle",
+          });
+          yield* backups.enqueueDue(f.input.hostId);
           expect(yield* read(f.input.ownerUserId)).toMatchObject({ backupPhase: "pending" });
         }),
     );
@@ -2778,216 +3029,214 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       );
     }
 
-    it.effect("wakes a paused VM through FIFO capacity and recovers a lost resume reply", () =>
-      Effect.gen(function* () {
-        const f = yield* initialSetupFixture;
-        yield* f.prepare;
-        yield* f.setup.begin({
-          allocationId: f.input.allocationId,
-          environmentId: f.environmentId,
-        });
-        yield* f.setup.finish({
-          allocationId: f.input.allocationId,
-          environmentId: f.environmentId,
-          receiptSha256: "a".repeat(64),
-        });
-        const provision = (yield* makeThreadVmProvisionStore(f.sql).get(f.input.allocationId))!;
-        const allocation = (yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))!;
-        const pauseOperationId = NodeCrypto.randomUUID();
-        yield* makeThreadVmAllocationStore(f.sql).recordPowerState({
-          allocationId: f.input.allocationId,
-          computeRef: allocation.computeRef!,
-          state: "paused",
-          capacityOperationId: provision.operationId,
-        });
-        yield* f.sql`INSERT INTO relay_thread_vm_pauses (allocation_id, operation_id, generation, phase)
+    it.effect(
+      "wakes a paused VM through FIFO capacity and refreshes private routing before reopening",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* initialSetupFixture;
+          yield* f.prepare;
+          yield* f.setup.begin({
+            allocationId: f.input.allocationId,
+            environmentId: f.environmentId,
+          });
+          yield* f.setup.finish({
+            allocationId: f.input.allocationId,
+            environmentId: f.environmentId,
+            receiptSha256: "a".repeat(64),
+          });
+          const provision = (yield* makeThreadVmProvisionStore(f.sql).get(f.input.allocationId))!;
+          const allocation = (yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))!;
+          const pauseOperationId = NodeCrypto.randomUUID();
+          yield* makeThreadVmAllocationStore(f.sql).recordPowerState({
+            allocationId: f.input.allocationId,
+            computeRef: allocation.computeRef!,
+            state: "paused",
+            capacityOperationId: provision.operationId,
+          });
+          yield* f.sql`INSERT INTO relay_thread_vm_pauses (allocation_id, operation_id, generation, phase)
           VALUES (${f.input.allocationId}, ${pauseOperationId}, 1, 'completed')`;
-        const resumes = makeThreadVmResumeStore(f.sql);
-        const settings = {
-          hostId: f.input.hostId,
-          maxRunningVms: 1,
-          publicRelayUrl: "https://relay.test",
-          autoPauseEnabled: false,
-          autoBackupEnabled: false,
-          autoDeleteEnabled: false,
-          replacementEnabled: false,
-          restoreEnabled: false,
-          resetEnabled: false,
-          templateBuildId: "verified",
-          compute: {
-            apiUrl: "https://compute.test",
-            sandboxUrl: "https://proxy.test",
-            apiKey: Redacted.make("test-key"),
-            templateId: "next-allocation-template:verified",
-            hostAddresses: ["192.0.2.1"],
-            timeoutMs: 600000,
-          },
-        };
-        const asUser = (userId: string) =>
-          resumeThreadVm(f.input.threadId).pipe(
-            Effect.provideService(RelayClientPrincipal, { userId, token: "test" }),
-            Effect.provideService(ThreadVmRuntimeConfiguration, { settings }),
+          const resumes = makeThreadVmResumeStore(f.sql);
+          const settings = {
+            hostId: f.input.hostId,
+            maxRunningVms: 1,
+            publicRelayUrl: "https://relay.test",
+            autoPauseEnabled: false,
+            autoBackupEnabled: false,
+            autoDeleteEnabled: false,
+            replacementEnabled: false,
+            restoreEnabled: false,
+            resetEnabled: false,
+            templateBuildId: "verified",
+            compute: {
+              apiUrl: "https://compute.test",
+              sandboxUrl: "https://proxy.test",
+              apiKey: Redacted.make("test-key"),
+              templateId: "next-allocation-template:verified",
+              hostAddresses: ["192.0.2.1"],
+              timeoutMs: 600000,
+            },
+          };
+          const asUser = (userId: string) =>
+            resumeThreadVm(f.input.threadId).pipe(
+              Effect.provideService(RelayClientPrincipal, { userId, token: "test" }),
+              Effect.provideService(ThreadVmRuntimeConfiguration, { settings }),
+            );
+          expect(yield* Effect.flip(asUser(NodeCrypto.randomUUID()))).toMatchObject({
+            _tag: "RelayTenancyNotFoundError",
+          });
+          const queued = yield* makeThreadJournalStore(f.sql).stage({
+            threadId: f.input.threadId,
+            actor: { userId: f.input.ownerUserId, displayName: null, imageUrl: null },
+            command: {
+              type: "thread.queue.pause",
+              commandId: CommandId.make(NodeCrypto.randomUUID()),
+              threadId: ThreadId.make(f.input.threadId),
+              createdAt: "2026-10-06T00:00:00Z",
+            },
+          });
+          expect(queued?.receipt).toBeNull();
+          expect(yield* makeThreadJournalStore(f.sql).next(f.owner)).toBeNull();
+          const requested = yield* asUser(f.input.ownerUserId);
+          expect(requested.phase).toBe("waiting");
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(requested.operationId))?.state).toBe(
+            "waiting",
           );
-        expect(yield* Effect.flip(asUser(NodeCrypto.randomUUID()))).toMatchObject({
-          _tag: "RelayTenancyNotFoundError",
-        });
-        const queued = yield* makeThreadJournalStore(f.sql).stage({
-          threadId: f.input.threadId,
-          actor: { userId: f.input.ownerUserId, displayName: null, imageUrl: null },
-          command: {
-            type: "thread.queue.pause",
-            commandId: CommandId.make(NodeCrypto.randomUUID()),
-            threadId: ThreadId.make(f.input.threadId),
-            createdAt: "2026-10-06T00:00:00Z",
-          },
-        });
-        expect(queued?.receipt).toBeNull();
-        expect(yield* makeThreadJournalStore(f.sql).next(f.owner)).toBeNull();
-        const requested = yield* asUser(f.input.ownerUserId);
-        expect(requested.phase).toBe("waiting");
-        expect((yield* makeThreadVmCapacityStore(f.sql).get(requested.operationId))?.state).toBe(
-          "waiting",
-        );
-        let state: "running" | "paused" = "paused";
-        let wakeCalls = 0;
-        let gateCalls = 0;
-        const allocationInfo: SandboxInfo = {
-          sandboxId: allocation.computeRef!,
-          templateId: f.input.templateId,
-          metadata: {
-            "launchpad.managed": "thread-vm-v1",
-            "launchpad.allocation_id": f.input.allocationId,
-            "launchpad.operation_id": provision.operationId,
-            "launchpad.thread_id": f.input.threadId,
-            "launchpad.generation": "1",
-          },
-          startedAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
-          endAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
-          state,
-          cpuCount: 2,
-          memoryMB: 4096,
-          envdVersion: "test",
-        };
-        const worker = makeThreadVmResumeWorker(
-          f.sql,
-          {
-            inspect: () => Effect.sync(() => ({ ...allocationInfo, state })),
-            resume: () =>
-              Effect.gen(function* () {
-                wakeCalls++;
-                state = "running";
-                return yield* new ThreadVmComputeError({
-                  operation: "resume",
-                  message: "lost reply",
-                });
-              }),
-          },
-          {
-            reopenAfterResume: (_sandbox, identity, operationId) =>
-              Effect.gen(function* () {
-                gateCalls++;
+          let state: "running" | "paused" = "paused";
+          let wakeCalls = 0;
+          let gateCalls = 0;
+          const allocationInfo: SandboxInfo = {
+            sandboxId: allocation.computeRef!,
+            templateId: f.input.templateId.split(":")[0]!,
+            network: { allowPublicTraffic: false },
+            lifecycle: { onTimeout: "pause", autoResume: false },
+            metadata: {
+              "launchpad.managed": "thread-vm-v1",
+              "launchpad.allocation_id": f.input.allocationId,
+              "launchpad.operation_id": provision.operationId,
+              "launchpad.thread_id": f.input.threadId,
+              "launchpad.generation": "1",
+            },
+            startedAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
+            endAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
+            state,
+            cpuCount: 2,
+            memoryMB: 4096,
+            envdVersion: "test",
+          };
+          const worker = makeThreadVmResumeWorker(
+            f.sql,
+            {
+              inspect: () => Effect.sync(() => ({ ...allocationInfo, state })),
+              recoverIngress: () =>
+                Effect.sync(() => {
+                  wakeCalls++;
+                  state = "running";
+                  return {
+                    sandboxId: allocation.computeRef!,
+                    trafficAccessToken: Redacted.make("resumed-private-token"),
+                  };
+                }),
+            },
+            {
+              reopenAfterResume: (_sandbox, identity, operationId) =>
+                Effect.gen(function* () {
+                  gateCalls++;
+                  expect(identity.scope.allocationId).toBe(f.input.allocationId);
+                  expect(identity.templateId).toBe(f.input.templateId);
+                  expect(identity.templateId).not.toBe(settings.compute.templateId);
+                  expect(operationId).toBe(pauseOperationId);
+                  expect(
+                    yield* Effect.flip(
+                      makeThreadPlacementStore(f.sql).admit({
+                        ...f.owner,
+                        workId: "racing-wake",
+                      }),
+                    ),
+                  ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+                }).pipe(Effect.orDie),
+            },
+            f.input.hostId,
+          );
+          expect(yield* worker.runOne()).toBe(true);
+          expect(yield* worker.runOne()).toBe(false);
+          expect(wakeCalls).toBe(1);
+          expect(gateCalls).toBe(1);
+          expect((yield* resumes.get(f.input.allocationId))?.phase).toBe("completed");
+          expect((yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))?.state).toBe(
+            "running",
+          );
+          expect((yield* makeThreadVmCapacityStore(f.sql).get(requested.operationId))?.state).toBe(
+            "started",
+          );
+          expect(yield* makeThreadJournalStore(f.sql).next(f.owner)).toBeNull();
+          yield* makeThreadVmPauseRecoveryStore(
+            f.sql,
+            yield* ThreadArtifactObjectStorage,
+          ).confirmActivation({
+            ...f.owner,
+            operationId: pauseOperationId,
+          });
+          expect((yield* makeThreadJournalStore(f.sql).next(f.owner))?.commandId).toBe(
+            queued?.commandId,
+          );
+          let renewals = 0;
+          const lease = makeThreadVmLeaseWorker(
+            f.sql,
+            (_sandbox, identity) =>
+              Effect.sync(() => {
                 expect(identity.scope.allocationId).toBe(f.input.allocationId);
-                expect(identity.templateId).toBe(f.input.templateId);
-                expect(identity.templateId).not.toBe(settings.compute.templateId);
-                expect(operationId).toBe(pauseOperationId);
-                expect(
-                  yield* Effect.flip(
-                    makeThreadPlacementStore(f.sql).admit({
-                      ...f.owner,
-                      workId: "racing-wake",
-                    }),
-                  ),
-                ).toMatchObject({ _tag: "ThreadPlacementConflict" });
-              }).pipe(Effect.orDie),
-          },
-          f.input.hostId,
-        );
-        expect(yield* worker.runOne()).toBe(true);
-        expect((yield* resumes.get(f.input.allocationId))?.phase).toBe("resuming");
-        expect((yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))?.state).toBe(
-          "paused",
-        );
-        yield* f.sql`UPDATE relay_thread_vm_resumes SET retry_at = clock_timestamp()
-          WHERE allocation_id = ${f.input.allocationId}`;
-        expect(yield* worker.runOne()).toBe(true);
-        expect(wakeCalls).toBe(1);
-        expect(gateCalls).toBe(1);
-        expect((yield* resumes.get(f.input.allocationId))?.phase).toBe("completed");
-        expect((yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))?.state).toBe(
-          "running",
-        );
-        expect((yield* makeThreadVmCapacityStore(f.sql).get(requested.operationId))?.state).toBe(
-          "started",
-        );
-        expect(yield* makeThreadJournalStore(f.sql).next(f.owner)).toBeNull();
-        yield* makeThreadVmPauseRecoveryStore(
-          f.sql,
-          yield* ThreadArtifactObjectStorage,
-        ).confirmActivation({
-          ...f.owner,
-          operationId: pauseOperationId,
-        });
-        expect((yield* makeThreadJournalStore(f.sql).next(f.owner))?.commandId).toBe(
-          queued?.commandId,
-        );
-        let renewals = 0;
-        const lease = makeThreadVmLeaseWorker(
-          f.sql,
-          (_sandbox, identity) =>
-            Effect.sync(() => {
-              expect(identity.scope.allocationId).toBe(f.input.allocationId);
-              renewals++;
-            }),
-          f.input.hostId,
-        );
-        expect(yield* lease.runOne()).toBe(true);
-        expect(renewals).toBe(1);
-        expect(yield* lease.runOne()).toBe(false);
-        yield* makeThreadJournalStore(f.sql).acknowledge({
-          ...f.owner,
-          commandId: queued!.commandId,
-          receipt: { status: "accepted", sequence: 1 },
-        });
-        const inspector = makeThreadVmActivityWorker(
-          f.sql,
-          () => Effect.succeed("idle" as const),
-          f.input.hostId,
-        );
-        expect(yield* inspector.runOne()).toBe(true);
-        yield* f.sql`UPDATE relay_thread_vm_activity SET idle_since=clock_timestamp()-interval '31 minutes' WHERE allocation_id=${f.input.allocationId}`;
-        let secondPauseOperation: string | undefined;
-        const pauseAgain = makeThreadVmPauseWorker(
-          f.sql,
-          {
-            inspect: () => Effect.succeed({ ...allocationInfo, state }),
-            pause: () =>
-              Effect.sync(() => {
-                state = "paused";
+                renewals++;
               }),
-          },
-          {
-            seal: (_sandbox, _identity, operationId) =>
-              Effect.sync(() => {
-                secondPauseOperation = operationId;
-                return { bootId: NodeCrypto.randomUUID(), idle: true };
-              }),
-            reopen: () => Effect.die("Unexpected reopen"),
-          },
-          f.input.hostId,
-        );
-        expect(yield* pauseAgain.runOne()).toBe(false);
-        expect(secondPauseOperation).toBeUndefined();
-        const [pendingPause] = yield* f.sql<{
-          operationId: string;
-          phase: string;
-        }>`SELECT operation_id AS "operationId",phase
+            f.input.hostId,
+          );
+          expect(yield* lease.runOne()).toBe(true);
+          expect(renewals).toBe(1);
+          expect(yield* lease.runOne()).toBe(false);
+          yield* makeThreadJournalStore(f.sql).acknowledge({
+            ...f.owner,
+            commandId: queued!.commandId,
+            receipt: { status: "accepted", sequence: 1 },
+          });
+          const inspector = makeThreadVmActivityWorker(
+            f.sql,
+            () => Effect.succeed("idle" as const),
+            f.input.hostId,
+          );
+          expect(yield* inspector.runOne()).toBe(true);
+          yield* f.sql`UPDATE relay_thread_vm_activity SET idle_since=clock_timestamp()-interval '31 minutes' WHERE allocation_id=${f.input.allocationId}`;
+          let secondPauseOperation: string | undefined;
+          const pauseAgain = makeThreadVmPauseWorker(
+            f.sql,
+            {
+              inspect: () => Effect.succeed({ ...allocationInfo, state }),
+              pause: () =>
+                Effect.sync(() => {
+                  state = "paused";
+                }),
+            },
+            {
+              seal: (_sandbox, _identity, operationId) =>
+                Effect.sync(() => {
+                  secondPauseOperation = operationId;
+                  return { bootId: NodeCrypto.randomUUID(), idle: true };
+                }),
+              reopen: () => Effect.die("Unexpected reopen"),
+            },
+            f.input.hostId,
+          );
+          expect(yield* pauseAgain.runOne()).toBe(false);
+          expect(secondPauseOperation).toBeUndefined();
+          const [pendingPause] = yield* f.sql<{
+            operationId: string;
+            phase: string;
+          }>`SELECT operation_id AS "operationId",phase
           FROM relay_thread_vm_pauses WHERE allocation_id=${f.input.allocationId}`;
-        expect(pendingPause?.operationId).not.toBe(pauseOperationId);
-        expect(pendingPause?.phase).toBe("pending");
-        expect((yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))?.state).toBe(
-          "running",
-        );
-      }),
+          expect(pendingPause?.operationId).not.toBe(pauseOperationId);
+          expect(pendingPause?.phase).toBe("pending");
+          expect((yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))?.state).toBe(
+            "running",
+          );
+        }),
     );
 
     it.effect(
@@ -6062,8 +6311,13 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         makeThreadVmProvisionWorker(
           sql,
           {
-            create: () => Effect.succeed({ sandboxId: computeRef, metadata }),
-            cancelCreate: () => Effect.die("Unexpected creation cancellation"),
+            create: () =>
+              Effect.succeed({
+                sandboxId: computeRef,
+                metadata,
+                trafficAccessToken: Redacted.make("move-fixture-token"),
+              }),
+            recoverIngress: () => Effect.die("Unexpected ingress recovery"),
             findOperation: () => Effect.succeed([]),
           },
           intent.templateId,
@@ -6229,7 +6483,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
     );
 
     for (const problem of ["none", "foreign", "unknown", "lost-stop", "stale-placement"] as const) {
-      it.effect(`cancelled VM cleanup reconciles an unreadable pause: ${problem}`, () =>
+      it.effect(`cancelled VM cleanup reconciles native identity: ${problem}`, () =>
         Effect.gen(function* () {
           const f = yield* vmMoveFixture();
           yield* f.begin();
@@ -6243,31 +6497,31 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             f.sql,
             {
               inspect: () =>
-                Effect.fail(
-                  new ThreadVmComputeError({
-                    operation: "inspect",
-                    message: "Paused disk readiness is unavailable",
-                  }),
-                ),
-              inspectCreation: (operationId) =>
                 Effect.gen(function* () {
                   identityReads++;
                   if (problem === "stale-placement" && identityReads === 1)
                     yield* f.sql`UPDATE relay_thread_placements SET generation=2 WHERE thread_id=${f.intent.threadId}`.pipe(
                       Effect.orDie,
                     );
-                  return problem === "unknown"
-                    ? null
-                    : {
-                        operationId,
-                        computeRef: f.computeRef,
-                        metadata: {
-                          ...f.metadata,
-                          ...(problem === "foreign"
-                            ? { "launchpad.thread_id": "another-thread" }
-                            : {}),
-                        },
-                      };
+                  if (problem === "unknown")
+                    return yield* new ThreadVmComputeError({
+                      operation: "inspect",
+                      message: "Native GET unavailable",
+                    });
+                  return {
+                    sandboxId: f.computeRef,
+                    templateId: "template",
+                    metadata: {
+                      ...f.metadata,
+                      ...(problem === "foreign" ? { "launchpad.thread_id": "another-thread" } : {}),
+                    },
+                    state: "running" as const,
+                    cpuCount: 2,
+                    memoryMB: 4096,
+                    envdVersion: "test",
+                    startedAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
+                    endAt: DateTime.toDateUtc(DateTime.makeUnsafe(86400000)),
+                  };
                 }),
               destroy: (id) =>
                 Effect.gen(function* () {
@@ -6613,14 +6867,17 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           f.sql,
           {
             inspect: () =>
-              Effect.fail(
-                new ThreadVmComputeError({
-                  operation: "inspect",
-                  message: "Paused source readiness is unavailable",
-                }),
-              ),
-            inspectCreation: (operationId) =>
-              Effect.succeed({ operationId, computeRef: f.computeRef, metadata: f.metadata }),
+              Effect.succeed({
+                sandboxId: f.computeRef,
+                templateId: "template",
+                metadata: f.metadata,
+                state: "running" as const,
+                cpuCount: 2,
+                memoryMB: 4096,
+                envdVersion: "test",
+                startedAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
+                endAt: DateTime.toDateUtc(DateTime.makeUnsafe(86400000)),
+              }),
             destroy: () =>
               Effect.sync(() => {
                 deleted++;

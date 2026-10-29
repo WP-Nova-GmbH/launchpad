@@ -1,34 +1,21 @@
-import { makeThreadCurrentQueueStore } from "./ThreadCurrentQueueStore.ts";
-import { restoreBootOperationId } from "../machines/E2BThreadVmRestoreAttempt.ts";
-import * as Deferred from "effect/Deferred";
-import * as Fiber from "effect/Fiber";
-import { makeThreadArtifactStore } from "./ThreadArtifactStore.ts";
-import { makeThreadArtifactTransfer } from "./ThreadArtifactTransfer.ts";
 import * as NodeCrypto from "node:crypto";
 import { describe, expect, layer } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import * as Redacted from "effect/Redacted";
-import { RelayClientPrincipal } from "@t3tools/contracts/relay";
-import { ThreadId, CommandId, EventId, type OrchestrationEvent } from "@t3tools/contracts";
+import { RelayClientPrincipal, RelayThreadDeletionRequest } from "@t3tools/contracts/relay";
 import { RelayDb } from "../db.ts";
 import { ThreadVmRuntimeConfiguration } from "./ThreadVmRuntime.ts";
 import { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import { nativeCheckpointCatalogTestLayer } from "./testUtils/nativeCheckpointCatalog.ts";
 import { finalSaveCatalogFixture } from "./testUtils/finalSaveCatalog.ts";
 import { repositoryUploadCatalogFixture } from "./testUtils/repositoryUploadCatalog.ts";
-import {
-  makeThreadVmRestoreStore,
-  restoreProbeOperationId,
-  restoreComputeGeneration,
-} from "./ThreadVmRestoreStore.ts";
-import { E2BRestoreError, type E2BRestoreStatus } from "../machines/E2BRestoreClient.ts";
 import { makeThreadDeletionStore } from "./ThreadDeletionStore.ts";
+import { makeThreadVmBackupSourceStore } from "./ThreadVmBackupSourceStore.ts";
 import { makeThreadDeletionWorker } from "./ThreadDeletionWorker.ts";
-import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
-import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
-import { makeThreadJournalStore } from "./ThreadJournalStore.ts";
 import { permanentlyDeleteThread, getThreadDeletion } from "../http/ThreadDeletionApi.ts";
+const decodeDeletionRequest = Schema.decodeUnknownEffect(RelayThreadDeletionRequest);
 const fixture = Effect.fnUntraced(function* () {
   const f = yield* finalSaveCatalogFixture();
   yield* repositoryUploadCatalogFixture(f.sql, f.objects, f.threadId);
@@ -46,7 +33,7 @@ const fixture = Effect.fnUntraced(function* () {
   const db = yield* PgDrizzle.makeWithDefaults();
   const authorized = <A, E, R>(
     action: Effect.Effect<A, E, R>,
-    userId = input.ownerUserId,
+    userId: string = input.ownerUserId,
     enabled = true,
   ) =>
     action.pipe(
@@ -89,1449 +76,542 @@ const fixture = Effect.fnUntraced(function* () {
     },
   };
 });
+const nativeCompute = (f: Effect.Success<ReturnType<typeof fixture>>) =>
+  ({
+    inspect: () => Effect.succeed(f.info),
+    destroy: () => Effect.void,
+    deleteSnapshot: () => Effect.succeed(true),
+    restore: { resolveTerminalNamedSnapshot: () => Effect.succeed(null) },
+  }) satisfies Parameters<typeof makeThreadDeletionWorker>[2];
+const addCapture = Effect.fnUntraced(function* (
+  f: Effect.Success<ReturnType<typeof fixture>>,
+  phase: "creating" | "verified" | "pending" = "creating",
+) {
+  const operationId = NodeCrypto.randomUUID(),
+    sourceBuildId = NodeCrypto.randomUUID(),
+    snapshotId = `snapshot-${operationId}`;
+  const source = {
+    allocationId: f.allocationId,
+    computeRef: f.computeRef,
+    threadId: f.threadId,
+    generation: 1,
+    environmentId: f.sourceEnvironmentId,
+    provisionOperationId: f.allocationId,
+    captureOperationId: NodeCrypto.randomUUID(),
+    bootId: NodeCrypto.randomUUID(),
+    sealEpoch: 1,
+    sourceSequence: 1,
+    nativeCheckpointOperationId: NodeCrypto.randomUUID(),
+  };
+  const { allocationId, computeRef, threadId, generation, ...seal } = source;
+  const receipt = {
+    version: 1,
+    kind: "native-full-snapshot-v1",
+    operationId,
+    allocationId,
+    computeRef,
+    threadId,
+    generation,
+    snapshotId,
+    sourceTemplateId: snapshotId,
+    sourceBuildId,
+    source: seal,
+  };
+  yield* f.sql`INSERT INTO relay_thread_vm_backups(operation_id,allocation_id,generation,compute_ref,snapshot_name,phase,source_receipt,native_capture_receipt,snapshot_id,source_template_id,source_build_id,capture_started_at,verified_at)
+    VALUES(${operationId},${f.allocationId},1,${f.computeRef},${`launchpad-backup-${operationId}`},${phase},${f.sql.json(source)},${phase === "verified" ? f.sql.json(receipt) : null},${phase === "verified" ? snapshotId : null},${phase === "verified" ? snapshotId : null},${phase === "verified" ? sourceBuildId : null},${phase === "pending" ? null : "2026-10-01T00:00:00Z"}::timestamptz,${phase === "verified" ? "2026-10-01T00:00:00Z" : null}::timestamptz)`;
+  return { operationId, snapshotId, sourceBuildId, source, receipt };
+});
+const drain = Effect.fnUntraced(function* (
+  f: Effect.Success<ReturnType<typeof fixture>>,
+  worker: ReturnType<typeof makeThreadDeletionWorker>,
+) {
+  for (let i = 0; i < 120; i++) {
+    if ((yield* f.deletions.get(f.threadId))?.phase === "completed") return;
+    yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
+    yield* worker.runOne();
+  }
+  expect((yield* f.deletions.get(f.threadId))?.phase).toBe("completed");
+});
+
 describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
-  "permanent VM thread deletion (Postgres)",
+  "native permanent thread deletion (Postgres)",
   () => {
     layer(nativeCheckpointCatalogTestLayer)((it) => {
-      for (const finalAlias of ["missing", "ready"] as const)
-        it.effect(
-          `explicit deletion seals an uncertain periodic capture before releasing quota, then reconciles ${finalAlias} alias`,
-          () =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const f = yield* fixture(),
-                  operationId = NodeCrypto.randomUUID(),
-                  buildId = NodeCrypto.randomUUID();
-                yield* f.sql`INSERT INTO relay_thread_vm_backups(operation_id,allocation_id,generation,compute_ref,snapshot_name,phase) VALUES(${operationId},${f.allocationId},1,${f.computeRef},${`launchpad-backup-${operationId}`},'creating')`;
-                expect(yield* f.deletions.needsUncertainCaptureCleanup(f.threadId)).toBe(true);
-                yield* Effect.flip(f.deletions.begin(f.deletionInput));
-                yield* f.deletions.begin({
-                  ...f.deletionInput,
-                  allowUncertainCaptureCleanup: true,
-                });
-                let stops = 0,
-                  supportsFence = false,
-                  alias: "building" | "missing" | "ready" = "building";
-                const deleted: string[] = [];
-                const worker = makeThreadDeletionWorker(
-                  f.sql,
-                  f.objects,
-                  {
-                    inspect: () => Effect.succeed(f.info),
-                    destroy: () =>
-                      Effect.gen(function* () {
-                        stops++;
-                        if (stops === 1)
-                          return yield* new ThreadVmComputeError({
-                            operation: "delete",
-                            message: "Lost positive stop reply",
-                          });
-                      }),
-                    deleteSnapshot: (id) =>
-                      Effect.sync(() => {
-                        deleted.push(id);
-                        return true;
-                      }),
-                    restore: {
-                      inspect: () => Effect.die("No serving recovery is needed"),
-                      requireExecutionRetention: () =>
-                        supportsFence
-                          ? Effect.void
-                          : Effect.fail(
-                              new E2BRestoreError({
-                                operation: "execution retention capability",
-                                reason: "unsupported",
-                              }),
-                            ),
-                      cancel: () =>
-                        Effect.fail(
-                          new E2BRestoreError({ operation: "cancel", reason: "http", status: 404 }),
-                        ),
-                      resolveStoppedNamedSnapshot: () =>
-                        alias === "ready"
-                          ? Effect.succeed({
-                              snapshotId: `snapshot-${operationId}`,
-                              sourceTemplateID: `snapshot-${operationId}`,
-                              sourceBuildID: buildId,
-                            })
-                          : alias === "missing"
-                            ? Effect.succeed(null)
-                            : Effect.fail(
-                                new E2BRestoreError({
-                                  operation: "stopped snapshot",
-                                  reason: "http",
-                                  status: 409,
-                                }),
-                              ),
-                    },
-                  },
-                  f.hostId,
-                  () => Effect.succeed(true),
-                );
-                const retry = f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                yield* worker.runOne();
-                expect(stops).toBe(0);
-                supportsFence = true;
-                yield* retry;
-                yield* worker.runOne();
-                expect(yield* makeThreadVmAllocationStore(f.sql).get(f.allocationId)).toMatchObject(
-                  {
-                    state: "deleting",
-                    deletedAt: null,
-                  },
-                );
-                let [row] = yield* f.sql<{
-                  proof: unknown;
-                  phase: string;
-                }>`SELECT a.deletion_stop_receipt AS proof,b.phase FROM relay_thread_vm_allocations a JOIN relay_thread_vm_backups b USING(allocation_id) WHERE b.operation_id=${operationId}`;
-                expect(row).toEqual({ proof: null, phase: "creating" });
-                yield* retry;
-                yield* worker.runOne();
-                expect(yield* makeThreadVmAllocationStore(f.sql).get(f.allocationId)).toMatchObject(
-                  {
-                    state: "deleted",
-                  },
-                );
-                [row] = yield* f.sql<{
-                  proof: unknown;
-                  phase: string;
-                }>`SELECT a.deletion_stop_receipt AS proof,b.phase FROM relay_thread_vm_allocations a JOIN relay_thread_vm_backups b USING(allocation_id) WHERE b.operation_id=${operationId}`;
-                expect(row?.proof).toMatchObject({
-                  operationId: f.deletionInput.operationId,
-                  allocationId: f.allocationId,
-                  computeRef: f.computeRef,
-                  physicallyStopped: true,
-                  captureAdmissionSealed: true,
-                });
-                expect(row?.phase).toBe("creating");
-                yield* retry;
-                yield* worker.runOne();
-                expect(deleted).toEqual([]);
-                expect((yield* f.deletions.get(f.threadId))?.errorCode).toBe(
-                  "snapshot_cleanup_unconfirmed",
-                );
-                alias = finalAlias;
-                yield* retry;
-                yield* worker.runOne();
-                expect(deleted).toEqual(finalAlias === "ready" ? [`snapshot-${operationId}`] : []);
-                const [backup] = yield* f.sql<{
-                  phase: string;
-                }>`SELECT phase FROM relay_thread_vm_backups WHERE operation_id=${operationId}`;
-                expect(backup?.phase).toBe("retired");
-                expect(stops).toBe(2);
-              }),
-            ),
-        );
-      for (const [phase, lookupFails] of [
-        ["creating", false],
-        ["captured", false],
-        ["captured", true],
-        ["verifying", false],
-      ] as const)
-        it.effect(
-          `deletion durably reconciles ${phase} capture${lookupFails ? " after a lost alias lookup" : ""} before a committed alias delete loses its reply`,
-          () =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const f = yield* fixture();
-                yield* f.backup.enqueueDue(f.hostId);
-                const capture = (yield* f.backup.claim(f.hostId))!,
-                  snapshotId = `snapshot-${capture.operationId}`,
-                  sourceBuildID = NodeCrypto.randomUUID(),
-                  identity = {
-                    snapshotId: `local-dev-team/${capture.snapshotName}:default`,
-                    sourceTemplateId: snapshotId,
-                    sourceBuildId: sourceBuildID,
-                  };
-                yield* f.backup.beginCapture(capture);
-                if (phase !== "creating") yield* f.backup.recordCapture(capture, identity);
-                if (phase === "verifying") yield* f.backup.claim(f.hostId);
-                yield* f.deletions.begin({
-                  ...f.deletionInput,
-                  allowUncertainCaptureCleanup: true,
-                });
-                let deletes = 0,
-                  resolves = 0,
-                  cancels = 0,
-                  cancelReady = phase !== "verifying";
-                const worker = makeThreadDeletionWorker(
-                  f.sql,
-                  f.objects,
-                  {
-                    inspect: () => Effect.succeed(f.info),
-                    destroy: () => Effect.void,
-                    deleteSnapshot: (id) =>
-                      Effect.gen(function* () {
-                        expect(id).toBe(snapshotId);
-                        expect(
-                          yield* f.backup.get(capture.operationId).pipe(Effect.orDie),
-                        ).toMatchObject({ phase: "retiring", ...identity, snapshotId });
-                        if (++deletes === 1)
-                          return yield* new ThreadVmComputeError({
-                            operation: "delete snapshot",
-                            message: "Committed alias deletion lost its reply",
-                          });
-                        return false;
-                      }),
-                    restore: {
-                      inspect: () => Effect.die("No boot restore"),
-                      requireExecutionRetention: () => Effect.void,
-                      cancel: (operationID, generation) =>
-                        Effect.gen(function* () {
-                          cancels++;
-                          if (!cancelReady || phase !== "verifying")
-                            return yield* new E2BRestoreError({
-                              operation: "cancel",
-                              reason: "http",
-                              status: 404,
-                            });
-                          return {
-                            operationID,
-                            generation,
-                            state: "cancelled" as const,
-                            sandboxID: "probe",
-                            executionID: NodeCrypto.randomUUID(),
-                            preparedBuildID: NodeCrypto.randomUUID(),
-                          };
-                        }),
-                      resolveStoppedNamedSnapshot: () =>
-                        Effect.gen(function* () {
-                          resolves++;
-                          if (lookupFails && resolves === 1)
-                            return yield* new E2BRestoreError({
-                              operation: "snapshot",
-                              reason: "transport",
-                            });
-                          if (resolves > (lookupFails ? 2 : 1))
-                            throw new Error("The committed delete removed this alias");
-                          return { snapshotId, sourceTemplateID: snapshotId, sourceBuildID };
-                        }),
-                    },
-                  },
-                  f.hostId,
-                  () => Effect.succeed(true),
-                );
-                const retry = Effect.gen(function* () {
-                  yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                  yield* worker.runOne();
-                });
-                yield* retry;
-                if (phase === "verifying") {
-                  yield* retry;
-                  expect((yield* f.backup.get(capture.operationId))?.phase).toBe("verifying");
-                  expect(deletes).toBe(0);
-                  expect(resolves).toBe(0);
-                  cancelReady = true;
-                }
-                yield* retry;
-                expect((yield* f.backup.get(capture.operationId))?.phase).toBe("retiring");
-                if (lookupFails) {
-                  expect((yield* f.backup.get(capture.operationId))?.snapshotId).toBe(
-                    identity.snapshotId,
-                  );
-                  expect(deletes).toBe(0);
-                  yield* retry;
-                }
-                yield* retry;
-                yield* retry;
-                expect((yield* f.backup.get(capture.operationId))?.phase).toBe("retired");
-                const [row] =
-                  yield* f.sql`SELECT failed_probe_stopped_at FROM relay_thread_vm_backups WHERE operation_id=${capture.operationId}`;
-                expect(row?.failed_probe_stopped_at === null).toBe(phase !== "verifying");
-                expect(resolves).toBe(lookupFails ? 2 : 1);
-                expect(deletes).toBe(2);
-                expect(cancels).toBe(phase === "verifying" ? 3 : 0);
-              }),
-            ),
-        );
-      for (const captureWins of [false, true])
-        it.effect(
-          `creating retirement CAS ${captureWins ? "loses to" : "fences"} a delayed production recordCapture`,
-          () =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const f = yield* fixture();
-                yield* f.backup.enqueueDue(f.hostId);
-                const capture = (yield* f.backup.claim(f.hostId))!,
-                  snapshotId = `snapshot-${capture.operationId}`,
-                  sourceBuildID = NodeCrypto.randomUUID(),
-                  identity = {
-                    snapshotId,
-                    sourceTemplateId: snapshotId,
-                    sourceBuildId: sourceBuildID,
-                  };
-                yield* f.backup.beginCapture(capture);
-                yield* f.deletions.begin({
-                  ...f.deletionInput,
-                  allowUncertainCaptureCleanup: true,
-                });
-                let hooked = false,
-                  resolves = 0;
-                const sql = new Proxy(f.sql, {
-                  apply(target, thisArg, args) {
-                    const statement: ReturnType<typeof f.sql<Record<string, unknown>>> =
-                      Reflect.apply(target, thisArg, args);
-                    // Complete the real capture between the worker's read and CAS.
-                    if (
-                      captureWins &&
-                      !hooked &&
-                      Array.isArray(args[0]) &&
-                      args[0]
-                        .join("")
-                        .includes(
-                          'SELECT x.operation_id AS "operationId",x.snapshot_name AS "snapshotName"',
-                        )
-                    ) {
-                      hooked = true;
-                      return statement.pipe(
-                        Effect.tap(() =>
-                          f.backup
-                            .recordCapture(capture, identity)
-                            .pipe(Effect.tap((ok) => Effect.sync(() => expect(ok).toBe(true)))),
-                        ),
-                      );
-                    }
-                    return statement;
-                  },
-                });
-                const worker = makeThreadDeletionWorker(
-                  sql,
-                  f.objects,
-                  {
-                    inspect: () => Effect.succeed(f.info),
-                    destroy: () => Effect.void,
-                    deleteSnapshot: () => Effect.succeed(true),
-                    restore: {
-                      inspect: () => Effect.die("No boot restore"),
-                      requireExecutionRetention: () => Effect.void,
-                      cancel: () =>
-                        Effect.fail(
-                          new E2BRestoreError({ operation: "cancel", reason: "http", status: 404 }),
-                        ),
-                      resolveStoppedNamedSnapshot: () =>
-                        Effect.gen(function* () {
-                          resolves++;
-                          expect(
-                            yield* f.backup.recordCapture(capture, identity).pipe(Effect.orDie),
-                          ).toBe(false);
-                          return { snapshotId, sourceTemplateID: snapshotId, sourceBuildID };
-                        }),
-                    },
-                  },
-                  f.hostId,
-                  () => Effect.succeed(true),
-                );
-                yield* worker.runOne();
-                yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                yield* worker.runOne();
-                expect((yield* f.backup.get(capture.operationId))?.phase).toBe(
-                  captureWins ? "captured" : "retired",
-                );
-                expect(resolves).toBe(captureWins ? 0 : 1);
-              }),
-            ),
-        );
-      for (const problem of [
-        "old host",
-        "foreign generation",
-        "final-save name",
-        "malformed pending",
-      ] as const) {
-        it.effect(`uncertain capture deletion remains blocked for ${problem}`, () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture(),
-                operationId = NodeCrypto.randomUUID();
-              yield* f.sql`INSERT INTO relay_thread_vm_backups(operation_id,allocation_id,generation,compute_ref,snapshot_name,phase,snapshot_id) VALUES(${operationId},${f.allocationId},${problem === "foreign generation" ? 2 : 1},${f.computeRef},${problem === "final-save name" ? `launchpad-final-${operationId}` : `launchpad-backup-${operationId}`},${problem === "malformed pending" ? "pending" : "creating"},${problem === "malformed pending" ? "unexpected-snapshot" : null})`;
-              yield* Effect.flip(
-                f.deletions.begin({
-                  ...f.deletionInput,
-                  allowUncertainCaptureCleanup: problem !== "old host",
-                }),
-              );
-              expect(yield* f.deletions.get(f.threadId)).toBeNull();
-              expect(yield* makeThreadVmAllocationStore(f.sql).get(f.allocationId)).toMatchObject({
-                state: "running",
-                deletedAt: null,
-              });
-            }),
-          ),
-        );
-      }
-      it.effect(
-        "authorizes one explicit deletion, hides the thread immediately and retains its quota until physical stop",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              yield* Effect.flip(
-                f.authorized(
-                  permanentlyDeleteThread(f.threadId, f.payload),
-                  f.deletionInput.ownerUserId,
-                  false,
-                ),
-              );
-              yield* Effect.flip(
-                f.authorized(
-                  permanentlyDeleteThread(f.threadId, f.payload),
-                  NodeCrypto.randomUUID(),
-                ),
-              );
-              expect(yield* f.deletions.get(f.threadId)).toBeNull();
-              const admissions = yield* Effect.all(
-                [
-                  f.authorized(permanentlyDeleteThread(f.threadId, f.payload)),
-                  f.authorized(permanentlyDeleteThread(f.threadId, f.payload)),
-                ],
-                { concurrency: 2 },
-              );
-              expect(admissions[0]).toEqual(admissions[1]);
-              expect(admissions[0]).toMatchObject({
-                operationId: f.payload.operationId,
-                phase: "stopping",
-              });
-              expect(yield* makeThreadPlacementStore(f.sql).get(f.threadId)).toBeNull();
-              expect(yield* makeThreadVmAllocationStore(f.sql).get(f.allocationId)).toMatchObject({
-                state: "deleting",
-                deletedAt: null,
-              });
-              yield* Effect.flip(makeThreadJournalStore(f.sql).next(f.owner));
-              const [key] = yield* f.sql<{
-                revoked: boolean;
-              }>`SELECT revoked_at IS NOT NULL AS revoked FROM relay_environment_credentials WHERE credential_id=${f.credentialId}`;
-              expect(key?.revoked).toBe(true);
-              yield* f.sql`DELETE FROM relay_repository_access WHERE user_id=${f.deletionInput.ownerUserId}`;
-              expect(yield* f.authorized(getThreadDeletion(f.threadId))).toMatchObject({
-                phase: "stopping",
-              });
-              yield* Effect.flip(
-                f.authorized(getThreadDeletion(f.threadId), NodeCrypto.randomUUID()),
-              );
-              yield* Effect.flip(
-                f.authorized(
-                  permanentlyDeleteThread(f.threadId, {
-                    ...f.payload,
-                    operationId: NodeCrypto.randomUUID(),
-                  }),
-                ),
-              );
-            }),
-          ),
-      );
-      it.effect(
-        "a lost physical-stop reply keeps quota and retries before collecting conversation objects",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              yield* makeThreadCurrentQueueStore(f.sql).read(f.threadId);
-              expect(
-                yield* f.sql`SELECT 1 FROM relay_thread_current_queues WHERE thread_id=${f.threadId}`,
-              ).toHaveLength(1);
-              yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
-              let absent = false,
-                stops = 0;
-              const worker = makeThreadDeletionWorker(
-                f.sql,
-                f.objects,
-                {
-                  inspect: () => Effect.succeed(absent ? null : f.info),
-                  destroy: () =>
-                    Effect.gen(function* () {
-                      stops++;
-                      absent = true;
-                      if (stops === 1)
-                        return yield* new ThreadVmComputeError({
-                          operation: "delete",
-                          message: "Lost stop reply",
-                        });
-                    }),
-                  deleteSnapshot: () => Effect.die("Deletion must not create or save a disk"),
-                  restore: {
-                    inspect: () => Effect.die("No boot restore"),
-                    cancel: () => Effect.die("No snapshot preparation"),
-                  },
-                },
-                f.hostId,
-                () => Effect.succeed(true),
-              );
-              expect(yield* worker.runOne()).toBe(true);
-              expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleting");
-              const [retained] = yield* f.sql<{
-                count: number;
-              }>`SELECT count(*)::int AS count FROM relay_thread_artifacts WHERE thread_id=${f.threadId} AND state='complete'`;
-              expect(retained!.count).toBeGreaterThan(0);
-              for (
-                let pass = 0;
-                pass < 40 && (yield* f.deletions.get(f.threadId))?.phase !== "completed";
-                pass++
-              ) {
-                yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                expect(yield* worker.runOne()).toBe(true);
-              }
-              expect(stops).toBe(2);
-              expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleted");
-              expect((yield* f.deletions.get(f.threadId))?.phase).toBe("completed");
-              const [remaining] = yield* f.sql<{
-                count: number;
-              }>`SELECT count(*)::int AS count FROM relay_thread_artifacts WHERE thread_id=${f.threadId} AND state!='deleted'`;
-              expect(remaining?.count).toBe(0);
-              expect(
-                yield* f.sql`SELECT 1 FROM relay_thread_history WHERE thread_id=${f.threadId}`,
-              ).toHaveLength(0);
-              expect(
-                yield* f.sql`SELECT 1 FROM relay_thread_current_queues WHERE thread_id=${f.threadId}`,
-              ).toHaveLength(0);
-              expect(yield* worker.runOne()).toBe(false);
-            }),
-          ),
-      );
-      it.effect("physically stops a recovered restore boot using its exact child identity", () =>
+      it.effect("quarantines legacy allocations before deletion admission or worker cleanup", () =>
         Effect.scoped(
           Effect.gen(function* () {
             const f = yield* fixture();
-            yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
-            const parent = f.info.metadata["launchpad.operation_id"]!;
-            const info = {
-              ...f.info,
-              metadata: {
-                ...f.info.metadata,
-                "launchpad.restore": "v1",
-                "launchpad.restore_parent_operation_id": parent,
-                "launchpad.restore_boot_attempt": "1",
-                "launchpad.operation_id": restoreBootOperationId(parent, 1),
-              },
-            };
-            let absent = false;
-            const worker = makeThreadDeletionWorker(
-              f.sql,
-              f.objects,
-              {
-                inspect: () => Effect.succeed(absent ? null : info),
-                destroy: (id) =>
-                  Effect.sync(() => {
-                    expect(id).toBe(f.info.sandboxId);
-                    absent = true;
-                  }),
-                deleteSnapshot: () => Effect.die("No snapshot collection before stop"),
-                restore: {
-                  inspect: () => Effect.die("No restore collection before stop"),
-                  cancel: () => Effect.die("No restore cancellation before stop"),
-                },
-              },
-              f.hostId,
+            yield* f.sql`UPDATE relay_thread_vm_allocations SET runtime_protocol='legacy' WHERE allocation_id=${f.allocationId}`;
+            expect((yield* Effect.flip(f.deletions.begin(f.deletionInput)))._tag).toBe(
+              "ThreadDeletionConflict",
             );
-            expect(yield* worker.runOne()).toBe(true);
-            expect(absent).toBe(true);
-            expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleted");
+            expect((yield* f.allocations.get(f.allocationId))?.state).toBe("running");
+            expect(
+              (yield* f.sql`SELECT 1 FROM relay_thread_vm_bindings WHERE allocation_id=${f.allocationId} AND revoked_at IS NULL`)
+                .length,
+            ).toBe(1);
+            expect(yield* f.deletions.get(f.threadId)).toBeNull();
+            // An old in-progress tombstone is preserved too, rather than resumed natively.
+            yield* f.sql`UPDATE relay_thread_vm_allocations SET runtime_protocol='native-v1' WHERE allocation_id=${f.allocationId}`;
+            yield* f.deletions.begin(f.deletionInput);
+            const claim = (yield* f.deletions.claim(f.hostId))!;
+            yield* f.sql`UPDATE relay_thread_vm_allocations SET runtime_protocol='legacy' WHERE allocation_id=${f.allocationId}`;
+            expect((yield* Effect.flip(f.deletions.authorize(claim)))._tag).toBe(
+              "ThreadDeletionConflict",
+            );
+            yield* f.sql`UPDATE relay_thread_deletions SET claim_id=NULL,claim_until=NULL WHERE thread_id=${f.threadId}`;
+            expect(
+              yield* makeThreadDeletionWorker(
+                f.sql,
+                f.objects,
+                {
+                  ...nativeCompute(f),
+                  inspect: () => Effect.die("Legacy allocation must not be inspected"),
+                  destroy: () => Effect.die("Legacy allocation must not be deleted"),
+                },
+                f.hostId,
+              ).runOne(),
+            ).toBe(false);
+            expect((yield* f.deletions.get(f.threadId))?.phase).toBe("stopping");
+            expect(
+              (yield* f.sql<{
+                state: string;
+              }>`SELECT state FROM relay_thread_vm_capacity WHERE allocation_id=${f.allocationId}`)[0]
+                ?.state,
+            ).toBe("started");
+            const artifacts = yield* f.sql`SELECT artifact_id,state FROM relay_thread_artifacts
+              WHERE thread_id=${f.threadId} ORDER BY artifact_id`;
+            yield* f.sql`UPDATE relay_thread_vm_allocations SET state='deleted',deleted_at=clock_timestamp()
+              WHERE allocation_id=${f.allocationId}`;
+            expect(
+              yield* makeThreadDeletionWorker(
+                f.sql,
+                f.objects,
+                nativeCompute(f),
+                f.hostId,
+              ).runOne(),
+            ).toBe(false);
+            expect(
+              yield* f.sql`SELECT artifact_id,state FROM relay_thread_artifacts
+              WHERE thread_id=${f.threadId} ORDER BY artifact_id`,
+            ).toEqual(artifacts);
+            expect((yield* f.deletions.get(f.threadId))?.phase).toBe("stopping");
           }),
         ),
       );
-      for (const problem of [
-        "none",
-        "lost-stop",
-        "foreign-thread",
-        "foreign-generation",
-        "foreign-compute",
-        "unknown",
-      ] as const) {
+      it.effect(
+        "known cancelled provisioning keeps quota until its creating phase is durably settled",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              yield* f.sql`UPDATE relay_thread_vm_provisions SET phase='creating' WHERE allocation_id=${f.allocationId}`;
+              yield* f.deletions.begin(f.deletionInput);
+              const worker = makeThreadDeletionWorker(
+                f.sql,
+                f.objects,
+                {
+                  ...nativeCompute(f),
+                  inspect: () => Effect.die("Creating allocation must not be inspected"),
+                  destroy: () => Effect.die("Creating allocation must not be deleted"),
+                },
+                f.hostId,
+              );
+              yield* worker.runOne();
+              expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleting");
+              expect(
+                (yield* f.sql<{
+                  state: string;
+                }>`SELECT state FROM relay_thread_vm_capacity WHERE allocation_id=${f.allocationId}`)[0]
+                  ?.state,
+              ).toBe("started");
+              yield* f.sql`UPDATE relay_thread_vm_provisions SET phase='created' WHERE allocation_id=${f.allocationId}`;
+              const settled = makeThreadDeletionWorker(
+                f.sql,
+                f.objects,
+                nativeCompute(f),
+                f.hostId,
+                () => Effect.succeed(true),
+              );
+              yield* drain(f, settled);
+              expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleted");
+            }),
+          ),
+      );
+      for (const marker of ["provision", "resume"] as const) {
         it.effect(
-          `explicit deletion reconciles an unreadable pause with durable creation identity: ${problem}`,
+          `an unsettled ${marker} ingress call blocks inspect/delete and quota release after claim expiry`,
           () =>
             Effect.scoped(
               Effect.gen(function* () {
                 const f = yield* fixture();
-                yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
-                let stops = 0;
-                const worker = makeThreadDeletionWorker(
-                  f.sql,
-                  f.objects,
-                  {
-                    inspect: () =>
-                      Effect.fail(
-                        new ThreadVmComputeError({
-                          operation: "inspect",
-                          message: "Paused disk is unconfirmed (409)",
-                        }),
-                      ),
-                    inspectCreation: (operationId) =>
-                      Effect.succeed(
-                        problem === "unknown"
-                          ? null
-                          : {
-                              operationId,
-                              computeRef:
-                                problem === "foreign-compute" ? "another-vm" : f.computeRef,
-                              metadata: {
-                                ...f.info.metadata,
-                                ...(problem === "foreign-thread"
-                                  ? { "launchpad.thread_id": NodeCrypto.randomUUID() }
-                                  : {}),
-                                ...(problem === "foreign-generation"
-                                  ? { "launchpad.generation": "2" }
-                                  : {}),
-                              },
-                            },
-                      ),
-                    destroy: (id) =>
-                      Effect.gen(function* () {
-                        expect(id).toBe(f.computeRef);
-                        stops++;
-                        if (problem === "lost-stop" && stops === 1)
-                          return yield* new ThreadVmComputeError({
-                            operation: "destroy",
-                            message: "Lost physical-stop reply",
-                          });
-                      }),
-                    deleteSnapshot: () =>
-                      Effect.die("No final save is needed for explicit deletion"),
-                    restore: {
-                      inspect: () => Effect.die("This is an original creation"),
-                      cancel: () => Effect.die("No restore probe was created"),
-                    },
-                  },
-                  f.hostId,
-                );
-                yield* worker.runOne();
-                const accepted = problem === "none" || problem === "lost-stop";
-                expect(stops).toBe(accepted ? 1 : 0);
-                expect((yield* f.allocations.get(f.allocationId))?.state).toBe(
-                  problem === "none" ? "deleted" : "deleting",
-                );
-                if (!accepted)
-                  expect((yield* f.deletions.get(f.threadId))?.errorCode).toBe("identity_conflict");
-                if (problem === "lost-stop") {
-                  expect((yield* f.deletions.get(f.threadId))?.errorCode).toBe("stop_unconfirmed");
-                  yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                  yield* worker.runOne();
-                  expect(stops).toBe(2);
-                  expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleted");
+                if (marker === "provision")
+                  yield* f.sql`UPDATE relay_thread_vm_provisions SET ingress_recovery_claim_id='old-claim',claim_id='old-claim',claim_until=clock_timestamp()-interval '1 minute' WHERE allocation_id=${f.allocationId}`;
+                if (marker === "resume")
+                  yield* f.sql`INSERT INTO relay_thread_vm_resumes(allocation_id,operation_id,generation,phase,connect_claim_id) VALUES(${f.allocationId},${NodeCrypto.randomUUID()},1,'resuming','old-claim')`;
+                if (marker === "resume") {
+                  expect((yield* Effect.flip(f.deletions.begin(f.deletionInput)))._tag).toBe(
+                    "ThreadDeletionConflict",
+                  );
+                  expect((yield* f.allocations.get(f.allocationId))?.state).toBe("running");
+                  return;
                 }
-              }),
-            ),
-        );
-      }
-      for (const foreign of [false, true]) {
-        it.effect(
-          `an unreadable restored VM requires its exact persisted child receipt (${foreign ? "foreign" : "matching"})`,
-          () =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const f = yield* fixture();
-                yield* f.store.begin(f.input);
-                yield* f.freeze;
-                yield* f.verifyBackup;
-                yield* f.store.recordSaved(f.input.operationId);
-                const deletion = (yield* f.store.claimDeletion(f.hostId))!;
-                yield* f.store.beginDeletion(deletion);
-                yield* f.store.confirmDeleted(deletion);
-                const operationId = NodeCrypto.randomUUID(),
-                  allocationId = NodeCrypto.randomUUID();
-                yield* makeThreadVmRestoreStore(f.sql, f.objects).begin({
-                  operationId,
-                  allocationId,
-                  threadId: f.threadId,
-                  savedDiskOperationId: f.input.operationId,
-                  actorUserId: f.input.actorUserId,
-                  expectedGeneration: 1,
-                  serving: true,
-                });
-                const boot: E2BRestoreStatus = {
-                  operationID: restoreBootOperationId(operationId, 1),
-                  generation: "2",
-                  sandboxID: `boot-${allocationId}`,
-                  executionID: NodeCrypto.randomUUID(),
-                  preparedBuildID: NodeCrypto.randomUUID(),
-                  state: "active",
-                };
-                const probe = {
-                  ...boot,
-                  operationID: restoreProbeOperationId(operationId),
-                  generation: restoreComputeGeneration(operationId),
-                  state: "prepared" as const,
-                };
-                yield* f.sql`UPDATE relay_thread_vm_restores SET phase='completed',boot_attempt=1,prepare_started_at=clock_timestamp(),prepared_receipt=${f.sql.json(probe)},probe_removed_at=clock_timestamp(),boot_prepare_started_at=clock_timestamp(),boot_receipt=${f.sql.json(boot)},committed_at=clock_timestamp() WHERE operation_id=${operationId}`;
-                yield* f.sql`UPDATE relay_thread_vm_allocations SET state='running',compute_ref=${boot.sandboxID} WHERE allocation_id=${allocationId}`;
-                yield* f.sql`INSERT INTO relay_thread_vm_provisions(allocation_id,operation_id,generation,phase) VALUES(${allocationId},${operationId},2,'created')`;
-                yield* f.sql`UPDATE relay_thread_placements SET generation=2,operation_id=NULL WHERE thread_id=${f.threadId}`;
-                yield* f.deletions.begin({
-                  ...f.deletionInput,
-                  generation: 2,
-                  sourceDeleted: true,
-                });
-                let stops = 0;
+                yield* f.deletions.begin(f.deletionInput);
                 const worker = makeThreadDeletionWorker(
                   f.sql,
                   f.objects,
                   {
-                    inspect: () =>
-                      Effect.fail(
-                        new ThreadVmComputeError({
-                          operation: "inspect",
-                          message: "Paused disk is unconfirmed (409)",
-                        }),
-                      ),
-                    inspectCreation: () =>
-                      Effect.die("Restored boot cannot use original creation identity"),
-                    destroy: (id) =>
-                      Effect.sync(() => {
-                        expect(id).toBe(boot.sandboxID);
-                        stops++;
-                      }),
-                    deleteSnapshot: () =>
-                      Effect.die("Allocation must be stopped before disk cleanup"),
-                    restore: {
-                      inspect: (id, generation) =>
-                        Effect.sync(() => {
-                          expect(id).toBe(boot.operationID);
-                          expect(generation).toBe("2");
-                          return {
-                            ...boot,
-                            ...(foreign ? { executionID: NodeCrypto.randomUUID() } : {}),
-                          };
-                        }),
-                      cancel: () => Effect.die("Completed boot must be physically stopped"),
-                    },
+                    ...nativeCompute(f),
+                    inspect: () => Effect.die("Unsettled connect must not inspect"),
+                    destroy: () => Effect.die("Unsettled connect must not delete"),
                   },
                   f.hostId,
                 );
                 yield* worker.runOne();
-                expect(stops).toBe(foreign ? 0 : 1);
-                expect((yield* f.allocations.get(allocationId))?.state).toBe(
-                  foreign ? "deleting" : "deleted",
-                );
-                if (foreign)
-                  expect((yield* f.deletions.get(f.threadId))?.errorCode).toBe("identity_conflict");
+                expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleting");
+                expect(
+                  (yield* f.sql<{
+                    state: string;
+                  }>`SELECT state FROM relay_thread_vm_capacity WHERE allocation_id=${f.allocationId}`)[0]
+                    ?.state,
+                ).toBe("started");
               }),
             ),
         );
       }
       it.effect(
-        "identity conflicts and uncertain creates never stop foreign compute or release a slot",
+        "a missing terminal capture alias holds the VM and quota after deletion revoked its old binding",
         () =>
           Effect.scoped(
             Effect.gen(function* () {
               const f = yield* fixture();
+              yield* addCapture(f);
               yield* f.deletions.begin(f.deletionInput);
-              let stops = 0;
+              let reads = 0;
               const worker = makeThreadDeletionWorker(
                 f.sql,
                 f.objects,
                 {
-                  inspect: () =>
-                    Effect.succeed({
-                      ...f.info,
-                      metadata: {
-                        ...f.info.metadata,
-                        "launchpad.thread_id": NodeCrypto.randomUUID(),
-                      },
-                    }),
+                  ...nativeCompute(f),
+                  destroy: () => Effect.die("Unresolved upload must not delete"),
+                  restore: {
+                    resolveTerminalNamedSnapshot: () => {
+                      reads++;
+                      return Effect.succeed(null);
+                    },
+                  },
+                },
+                f.hostId,
+              );
+              yield* worker.runOne();
+              expect(reads).toBe(1);
+              expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleting");
+              expect(
+                (yield* f.sql<{
+                  state: string;
+                }>`SELECT state FROM relay_thread_vm_capacity WHERE allocation_id=${f.allocationId}`)[0]
+                  ?.state,
+              ).toBe("started");
+              expect(
+                (yield* f.sql<{
+                  revoked: boolean;
+                }>`SELECT revoked_at IS NOT NULL AS revoked FROM relay_thread_vm_bindings WHERE allocation_id=${f.allocationId}`)[0]
+                  ?.revoked,
+              ).toBe(true);
+            }),
+          ),
+      );
+      it.effect(
+        "observes the exact terminal native capture before deleting its VM and retiring its logical snapshot",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                capture = yield* addCapture(f);
+              yield* f.deletions.begin(f.deletionInput);
+              const calls: string[] = [];
+              const worker = makeThreadDeletionWorker(
+                f.sql,
+                f.objects,
+                {
+                  ...nativeCompute(f),
                   destroy: () =>
                     Effect.sync(() => {
-                      stops++;
+                      calls.push("vm-delete");
                     }),
-                  deleteSnapshot: () => Effect.die("no snapshots"),
-                  restore: {
-                    inspect: () => Effect.die("No boot restore"),
-                    cancel: () => Effect.die("no preparation"),
-                  },
-                },
-                f.hostId,
-                () => Effect.succeed(true),
-              );
-              yield* worker.runOne();
-              expect(stops).toBe(0);
-              expect((yield* f.deletions.get(f.threadId))?.errorCode).toBe("identity_conflict");
-              yield* f.sql`UPDATE relay_thread_vm_allocations SET compute_ref=NULL WHERE allocation_id=${f.allocationId}`;
-              yield* f.sql`UPDATE relay_thread_vm_provisions SET phase='creating' WHERE allocation_id=${f.allocationId}`;
-              yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-              yield* worker.runOne();
-              expect(stops).toBe(0);
-              expect((yield* f.deletions.get(f.threadId))?.errorCode).toBe("create_unconfirmed");
-              expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleting");
-            }),
-          ),
-      );
-      it.effect(
-        "permanent deletion waits for an in-flight artifact upload and prevents a late upload from recreating bytes",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture(),
-                started = yield* Deferred.make<void>(),
-                finish = yield* Deferred.make<void>();
-              const bytes = new TextEncoder().encode("thread-owned upload"),
-                artifact = yield* makeThreadArtifactStore(f.sql).begin({
-                  artifactId: NodeCrypto.randomUUID(),
-                  operationId: NodeCrypto.randomUUID(),
-                  threadId: f.threadId,
-                  kind: "attachment",
-                  sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
-                  sizeBytes: bytes.length,
-                });
-              const transfer = makeThreadArtifactTransfer(f.sql, {
-                ...f.objects,
-                put: (input) =>
-                  Effect.gen(function* () {
-                    yield* Deferred.succeed(started, undefined);
-                    yield* Deferred.await(finish);
-                    return yield* f.objects.put(input);
-                  }),
-              });
-              const body = () =>
-                new ReadableStream<Uint8Array>({
-                  start(controller) {
-                    controller.enqueue(bytes);
-                    controller.close();
-                  },
-                });
-              const upload = yield* transfer.uploadBytes(artifact, body()).pipe(Effect.forkScoped);
-              yield* Deferred.await(started);
-              yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
-              const claim = (yield* f.deletions.claim(f.hostId))!;
-              yield* f.deletions.stopped(claim, f.allocationId, f.computeRef);
-              yield* f.deletions.clean(claim);
-              for (let pass = 0; pass < 40; pass++)
-                if (!(yield* f.transfer.collectOne(f.threadId))) break;
-              expect((yield* makeThreadArtifactStore(f.sql).get(artifact.artifactId))?.state).toBe(
-                "deleting",
-              );
-              expect(yield* f.deletions.finish(claim)).toBe(false);
-              yield* Deferred.succeed(finish, undefined);
-              yield* Fiber.join(upload);
-              yield* f.objects.verify({
-                key: artifact.storageKey,
-                sha256: artifact.sha256,
-                sizeBytes: artifact.sizeBytes,
-              });
-              expect(yield* f.transfer.collectOne(f.threadId)).toBe(true);
-              expect((yield* makeThreadArtifactStore(f.sql).get(artifact.artifactId))?.state).toBe(
-                "deleted",
-              );
-              yield* Effect.flip(f.transfer.uploadBytes(artifact, body()));
-              expect(yield* f.deletions.finish(claim)).toBe(false); // Endpoint receipt is still required.
-            }),
-          ),
-      );
-      it.effect(
-        "ordinary Delete is reconciled only after its accepted receipt and deleted history event both arrive",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture(),
-                journal = makeThreadJournalStore(f.sql),
-                commandId = CommandId.make(NodeCrypto.randomUUID());
-              yield* journal.stage({
-                threadId: f.threadId,
-                actor: { userId: f.deletionInput.ownerUserId, displayName: null, imageUrl: null },
-                command: { type: "thread.delete", commandId, threadId: ThreadId.make(f.threadId) },
-              });
-              const [tail] = yield* f.sql<{
-                sequence: number;
-              }>`SELECT max(source_sequence)::int AS sequence FROM relay_thread_history WHERE thread_id=${f.threadId}`;
-              const sequence = tail!.sequence + 1;
-              const event: OrchestrationEvent = {
-                type: "thread.deleted",
-                sequence,
-                eventId: EventId.make(NodeCrypto.randomUUID()),
-                aggregateKind: "thread",
-                aggregateId: ThreadId.make(f.threadId),
-                occurredAt: "2026-10-07T00:00:00.000Z",
-                commandId,
-                causationEventId: null,
-                correlationId: null,
-                metadata: {},
-                payload: {
-                  threadId: ThreadId.make(f.threadId),
-                  deletedAt: "2026-10-07T00:00:00.000Z",
-                },
-              };
-              yield* journal.append({ ...f.owner, event });
-              expect(yield* f.deletions.admitMirrored(f.hostId)).toBe(false);
-              yield* journal.acknowledge({
-                ...f.owner,
-                commandId,
-                receipt: { status: "accepted", sequence },
-              });
-              expect(yield* f.deletions.admitMirrored(f.hostId)).toBe(true);
-              expect((yield* f.deletions.get(f.threadId))?.phase).toBe("stopping");
-              expect(yield* f.deletions.admitMirrored(f.hostId)).toBe(false);
-            }),
-          ),
-      );
-      it.effect(
-        "a failed capture with no admitted verifier retires after exact stop, including a lost delete reply",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              yield* f.backup.enqueueDue(f.hostId);
-              const capture = (yield* f.backup.claim(f.hostId))!,
-                snapshotId = `failed-${capture.operationId}`,
-                sourceBuildID = NodeCrypto.randomUUID();
-              expect(yield* f.backup.beginCapture(capture)).toBe(true);
-              expect(
-                yield* f.backup.failCapture(capture, {
-                  snapshotId,
-                  sourceTemplateId: snapshotId,
-                  sourceBuildId: sourceBuildID,
-                }),
-              ).toBe(true);
-              yield* f.deletions.begin(f.deletionInput);
-              let resolves = 0,
-                deletes = 0;
-              const worker = makeThreadDeletionWorker(
-                f.sql,
-                f.objects,
-                {
-                  inspect: () => Effect.succeed(f.info),
-                  destroy: () => Effect.void,
                   deleteSnapshot: (id) =>
-                    Effect.gen(function* () {
-                      expect(id).toBe(snapshotId);
-                      expect(
-                        (yield* f.backup.get(capture.operationId).pipe(Effect.orDie))?.phase,
-                      ).toBe("retiring");
-                      deletes++;
-                      if (deletes === 1)
-                        return yield* new ThreadVmComputeError({
-                          operation: "delete snapshot",
-                          message: "Delete committed but its reply was lost",
-                        });
-                      return false; // Native confirmed 404 on the idempotent retry.
-                    }),
-                  restore: {
-                    inspect: () => Effect.die("No boot restore"),
-                    cancel: () => Effect.die("A failed native source never admitted a verifier"),
-                    resolveFailedNamedSnapshot: (name) =>
-                      Effect.sync(() => {
-                        expect(name).toBe(capture.snapshotName);
-                        resolves++;
-                        if (resolves > 1) throw new Error("The committed delete removed the alias");
-                        return { snapshotId, sourceTemplateID: snapshotId, sourceBuildID };
-                      }),
-                  },
-                },
-                f.hostId,
-                () => Effect.succeed(true),
-              );
-              const retry = Effect.gen(function* () {
-                yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                yield* worker.runOne();
-              });
-              yield* retry; // Positive physical stop is persisted first.
-              yield* retry; // Endpoint removal.
-              yield* retry; // Proof, durable retirement, committed delete/lost reply.
-              expect((yield* f.backup.get(capture.operationId))?.phase).toBe("retiring");
-              yield* retry;
-              expect((yield* f.backup.get(capture.operationId))?.phase).toBe("retired");
-              const [row] =
-                yield* f.sql`SELECT failed_probe_stopped_at FROM relay_thread_vm_backups WHERE operation_id=${capture.operationId}`;
-              expect(row?.failed_probe_stopped_at).toBeNull();
-              expect(resolves).toBe(1);
-              expect(deletes).toBe(2);
-            }),
-          ),
-      );
-      for (const problem of [
-        "verifier failure or lost prepare acknowledgement",
-        "building source",
-        "lookup unavailable",
-        "missing resolver",
-        "wrong snapshot",
-        "wrong template",
-        "wrong build",
-        "wrong stop generation",
-        "stop changed during lookup",
-        "expired deletion claim",
-        "probe evidence",
-      ] as const)
-        it.effect(`failed capture cleanup holds on ${problem} without a cancellation receipt`, () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              yield* f.backup.enqueueDue(f.hostId);
-              const capture = (yield* f.backup.claim(f.hostId))!,
-                snapshotId = `failed-${capture.operationId}`,
-                sourceBuildID = NodeCrypto.randomUUID(),
-                identity = {
-                  snapshotId,
-                  sourceTemplateId: snapshotId,
-                  sourceBuildId: sourceBuildID,
-                };
-              yield* f.backup.beginCapture(capture);
-              if (problem === "verifier failure or lost prepare acknowledgement") {
-                yield* f.backup.recordCapture(capture, identity);
-                const verifier = (yield* f.backup.claim(f.hostId))!;
-                // The external prepare may have committed before its reply failed.
-                yield* f.backup.fail(verifier);
-              } else yield* f.backup.failCapture(capture, identity);
-              if (problem === "probe evidence")
-                yield* f.sql`UPDATE relay_thread_vm_backups SET probe_receipt='{}'::jsonb WHERE operation_id=${capture.operationId}`;
-              yield* f.deletions.begin(f.deletionInput);
-              let deletes = 0,
-                cancels = 0;
-              const changeStop =
-                f.sql`UPDATE relay_thread_vm_allocations SET deletion_stop_receipt=jsonb_set(deletion_stop_receipt,'{generation}','2'::jsonb) WHERE allocation_id=${f.allocationId}`.pipe(
-                  Effect.orDie,
-                );
-              const worker = makeThreadDeletionWorker(
-                f.sql,
-                f.objects,
-                {
-                  inspect: () => Effect.succeed(f.info),
-                  destroy: () => Effect.void,
-                  deleteSnapshot: () =>
                     Effect.sync(() => {
-                      deletes++;
+                      calls.push(`snapshot-delete:${id}`);
                       return true;
                     }),
                   restore: {
-                    inspect: () => Effect.die("No boot restore"),
-                    cancel: () =>
-                      Effect.gen(function* () {
-                        cancels++;
-                        return yield* new E2BRestoreError({
-                          operation: "cancel",
-                          reason: "http",
-                          status: 404,
-                        });
-                      }),
-                    ...(problem === "missing resolver"
-                      ? {}
-                      : {
-                          resolveFailedNamedSnapshot: () =>
-                            Effect.gen(function* () {
-                              if (problem === "lookup unavailable")
-                                return yield* new E2BRestoreError({
-                                  operation: "failed snapshot",
-                                  reason: "http",
-                                  status: 503,
-                                });
-                              if (
-                                problem === "building source" ||
-                                problem === "verifier failure or lost prepare acknowledgement"
-                              )
-                                return null;
-                              if (problem === "stop changed during lookup") yield* changeStop;
-                              if (problem === "expired deletion claim")
-                                yield* f.sql`UPDATE relay_thread_deletions SET claim_until=clock_timestamp()-interval '1 second' WHERE thread_id=${f.threadId}`.pipe(
-                                  Effect.orDie,
-                                );
-                              return {
-                                snapshotId: problem === "wrong snapshot" ? "different" : snapshotId,
-                                sourceTemplateID:
-                                  problem === "wrong template" ? "different" : snapshotId,
-                                sourceBuildID:
-                                  problem === "wrong build"
-                                    ? NodeCrypto.randomUUID()
-                                    : sourceBuildID,
-                              };
-                            }),
-                        }),
-                  },
-                },
-                f.hostId,
-                () => Effect.succeed(true),
-              );
-              const retry = Effect.gen(function* () {
-                yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                yield* worker.runOne();
-              });
-              yield* retry;
-              if (problem === "wrong stop generation") yield* changeStop;
-              yield* retry;
-              yield* retry;
-              expect(deletes).toBe(0);
-              expect((yield* f.backup.get(capture.operationId))?.phase).toBe("failed");
-              expect((yield* f.deletions.get(f.threadId))?.phase).toBe("cleaning");
-              if (
-                ![
-                  "lookup unavailable",
-                  "stop changed during lookup",
-                  "expired deletion claim",
-                ].includes(problem)
-              )
-                expect(cancels).toBe(1);
-            }),
-          ),
-        );
-      it.effect(
-        "saved-only deletion waits for tunnel and cold-probe cleanup before retiring its disk root",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              yield* f.store.begin(f.input);
-              yield* f.freeze;
-              yield* f.verifyBackup;
-              yield* f.store.recordSaved(f.input.operationId);
-              const stop = (yield* f.store.claimDeletion(f.hostId))!;
-              yield* f.store.beginDeletion(stop);
-              yield* f.store.confirmDeleted(stop);
-              yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
-              let endpointReady = false,
-                probeReady = false,
-                snapshots = 0,
-                cancels = 0;
-              const worker = makeThreadDeletionWorker(
-                f.sql,
-                f.objects,
-                {
-                  inspect: () => Effect.die("Saved VM cannot be inspected or woken"),
-                  destroy: () => Effect.die("Saved VM is already physically stopped"),
-                  deleteSnapshot: () =>
-                    Effect.sync(() => {
-                      snapshots++;
-                      return true;
-                    }),
-                  restore: {
-                    inspect: () => Effect.die("No boot restore"),
-                    cancel: (operationID, generation) =>
+                    resolveTerminalNamedSnapshot: (name) =>
                       Effect.sync(() => {
-                        cancels++;
+                        calls.push(`terminal:${name}`);
                         return {
-                          operationID,
-                          generation,
-                          sandboxID: "probe",
-                          executionID: NodeCrypto.randomUUID(),
-                          preparedBuildID: NodeCrypto.randomUUID(),
-                          state: probeReady ? ("cancelled" as const) : ("active" as const),
+                          snapshotId: capture.snapshotId,
+                          sourceTemplateID: capture.snapshotId,
+                          sourceBuildID: capture.sourceBuildId,
                         };
                       }),
                   },
                 },
                 f.hostId,
-                () => Effect.succeed(endpointReady),
+                () => Effect.succeed(true),
               );
-              yield* worker.runOne();
-              expect((yield* f.deletions.get(f.threadId))?.errorCode).toBe(
-                "endpoint_cleanup_unconfirmed",
+              yield* drain(f, worker);
+              expect(calls[0]).toBe(`terminal:launchpad-backup-${capture.operationId}`);
+              expect(calls.indexOf("vm-delete")).toBeGreaterThan(0);
+              expect(calls.indexOf(`snapshot-delete:${capture.snapshotId}`)).toBeGreaterThan(
+                calls.indexOf("vm-delete"),
               );
-              expect(snapshots).toBe(0);
-              const retry = Effect.gen(function* () {
-                yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                yield* worker.runOne();
-              });
-              endpointReady = true;
-              yield* retry;
-              yield* retry;
-              expect((yield* f.deletions.get(f.threadId))?.errorCode).toBe(
-                "snapshot_cleanup_unconfirmed",
-              );
-              expect(snapshots).toBe(0);
-              expect(cancels).toBe(1);
-              probeReady = true;
-              yield* retry;
-              expect(snapshots).toBe(1);
-              const [pending] = yield* f.sql<{
-                count: number;
-              }>`SELECT count(*)::int AS count FROM relay_thread_artifacts WHERE thread_id=${f.threadId} AND state!='deleted'`;
-              for (let pass = 0; pass < pending!.count; pass++) yield* retry;
+              const [row] = yield* f.sql<{
+                phase: string;
+                receipt: unknown;
+              }>`SELECT phase,native_capture_receipt AS receipt FROM relay_thread_vm_backups WHERE operation_id=${capture.operationId}`;
+              expect(row).toEqual({ phase: "retired", receipt: null });
               expect((yield* f.deletions.get(f.threadId))?.phase).toBe("completed");
-              expect(snapshots).toBe(1);
             }),
           ),
       );
+      for (const problem of ["source", "operation", "alias"] as const) {
+        it.effect(
+          `an uncertain native capture with wrong ${problem} cannot reach external deletion`,
+          () =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                const f = yield* fixture(),
+                  capture = yield* addCapture(f);
+                yield* f.deletions.begin(f.deletionInput);
+                if (problem === "source")
+                  yield* f.sql`UPDATE relay_thread_vm_backups SET source_receipt=${f.sql.json({ ...capture.source, computeRef: "other" })} WHERE operation_id=${capture.operationId}`;
+                if (problem === "operation")
+                  yield* f.sql`UPDATE relay_thread_vm_backups SET source_receipt=${f.sql.json({ ...capture.source, provisionOperationId: NodeCrypto.randomUUID() })} WHERE operation_id=${capture.operationId}`;
+                if (problem === "alias")
+                  yield* f.sql`UPDATE relay_thread_vm_backups SET snapshot_name='other' WHERE operation_id=${capture.operationId}`;
+                const worker = makeThreadDeletionWorker(
+                  f.sql,
+                  f.objects,
+                  {
+                    ...nativeCompute(f),
+                    destroy: () => Effect.die("Wrong snapshot must not delete"),
+                    restore: {
+                      resolveTerminalNamedSnapshot: () =>
+                        Effect.die("Wrong identity must not inspect alias"),
+                    },
+                  },
+                  f.hostId,
+                );
+                yield* worker.runOne();
+                expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleting");
+              }),
+            ),
+        );
+      }
+      it.effect("lost VM DELETE reply holds quota and retries only the same exact ID", () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture();
+            yield* f.deletions.begin(f.deletionInput);
+            let calls = 0;
+            const worker = makeThreadDeletionWorker(
+              f.sql,
+              f.objects,
+              {
+                ...nativeCompute(f),
+                destroy: (id) => {
+                  expect(id).toBe(f.computeRef);
+                  return ++calls === 1
+                    ? Effect.fail(
+                        new ThreadVmComputeError({ operation: "destroy", message: "lost reply" }),
+                      )
+                    : Effect.void;
+                },
+              },
+              f.hostId,
+              () => Effect.succeed(true),
+            );
+            yield* worker.runOne();
+            expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleting");
+            yield* drain(f, worker);
+            expect(calls).toBe(2);
+            expect(
+              (yield* f.sql<{
+                receipt: unknown;
+              }>`SELECT deletion_stop_receipt AS receipt FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`)[0]
+                ?.receipt,
+            ).toMatchObject({ kind: "native-delete-acknowledgement", acknowledged: true });
+          }),
+        ),
+      );
       it.effect(
-        "deleting one saved thread leaves another thread's disk and conversation intact",
+        "native deletion preserves existing historical certificates and never sends their extension commands",
         () =>
           Effect.scoped(
             Effect.gen(function* () {
               const f = yield* fixture(),
-                other = yield* fixture();
-              let otherNativePoint: string | undefined;
-              for (const source of [f, other]) {
-                yield* source.store.begin(source.input);
-                const point = yield* source.freeze;
-                if (source.threadId === other.threadId)
-                  otherNativePoint = point.native.header.operationId;
-                yield* source.verifyBackup;
-                yield* source.store.recordSaved(source.input.operationId);
-                const stop = (yield* source.store.claimDeletion(source.hostId))!;
-                yield* source.store.beginDeletion(stop);
-                yield* source.store.confirmDeleted(stop);
-              }
-              const [saved] = yield* f.sql<{
-                snapshotId: string;
-              }>`SELECT snapshot_id AS "snapshotId" FROM relay_thread_vm_backups WHERE allocation_id=${f.allocationId}`;
-              const [otherSaved] = yield* f.sql<{
-                snapshotId: string;
-              }>`SELECT snapshot_id AS "snapshotId" FROM relay_thread_vm_backups WHERE allocation_id=${other.allocationId}`;
-              expect(saved!.snapshotId).not.toBe(otherSaved!.snapshotId);
-              yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
-              const snapshots: string[] = [];
+                historical = {
+                  physicallyStopped: true,
+                  captureAdmissionSealed: true,
+                  from: "old-host",
+                };
+              yield* f.sql`UPDATE relay_thread_vm_allocations SET deletion_stop_receipt=${f.sql.json(historical)} WHERE allocation_id=${f.allocationId}`;
+              yield* f.deletions.begin(f.deletionInput);
+              yield* drain(
+                f,
+                makeThreadDeletionWorker(f.sql, f.objects, nativeCompute(f), f.hostId, () =>
+                  Effect.succeed(true),
+                ),
+              );
+              expect(
+                (yield* f.sql<{
+                  receipt: unknown;
+                }>`SELECT deletion_stop_receipt AS receipt FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`)[0]
+                  ?.receipt,
+              ).toEqual(historical);
+            }),
+          ),
+      );
+      it.effect(
+        "historical cold snapshot evidence stays quarantined rather than being treated as native completion",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                capture = yield* addCapture(f, "verified");
+              yield* f.sql`UPDATE relay_thread_vm_backups SET native_capture_receipt=NULL,source_receipt=NULL,probe_receipt=${f.sql.json({ legacy: true })} WHERE operation_id=${capture.operationId}`;
+              yield* f.deletions.begin(f.deletionInput);
               const worker = makeThreadDeletionWorker(
                 f.sql,
                 f.objects,
                 {
-                  inspect: () => Effect.die("Saved compute must not be resumed"),
-                  destroy: () => Effect.die("Saved compute was already physically stopped"),
-                  deleteSnapshot: (snapshotId) =>
+                  ...nativeCompute(f),
+                  deleteSnapshot: () => Effect.die("Historical root requires migration"),
+                },
+                f.hostId,
+                () => Effect.succeed(true),
+              );
+              for (let i = 0; i < 5; i++) {
+                yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
+                yield* worker.runOne();
+              }
+              expect((yield* f.deletions.get(f.threadId))?.phase).not.toBe("completed");
+              expect(
+                (yield* f.sql<{
+                  phase: string;
+                }>`SELECT phase FROM relay_thread_vm_backups WHERE operation_id=${capture.operationId}`)[0]
+                  ?.phase,
+              ).toBe("verified");
+            }),
+          ),
+      );
+      it.effect(
+        "permanent deletion requires explicit workspace-loss confirmation and current private owner access",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              yield* Effect.flip(
+                decodeDeletionRequest({
+                  ...f.payload,
+                  confirmWorkspaceLoss: false,
+                }),
+              );
+              yield* Effect.flip(
+                f.authorized(permanentlyDeleteThread(f.threadId, f.payload), "other-user"),
+              );
+              expect(yield* f.deletions.get(f.threadId)).toBeNull();
+              const deletion = yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
+              expect(deletion.phase).toBe("stopping");
+              expect((yield* f.authorized(getThreadDeletion(f.threadId)))?.operationId).toBe(
+                f.deletionInput.operationId,
+              );
+            }),
+          ),
+      );
+      it.effect(
+        "uses durable native terminal failure identity without inventing a completed backup or re-reading its alias",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                capture = yield* addCapture(f),
+                claim = (yield* f.backup.claim(f.hostId))!;
+              yield* f.backup.recordFailure(claim, {
+                snapshotId: capture.snapshotId,
+                sourceTemplateId: capture.snapshotId,
+                sourceBuildId: capture.sourceBuildId,
+              });
+              yield* f.deletions.begin(f.deletionInput);
+              let deletes = 0;
+              const worker = makeThreadDeletionWorker(
+                f.sql,
+                f.objects,
+                {
+                  ...nativeCompute(f),
+                  deleteSnapshot: (id) =>
                     Effect.sync(() => {
-                      snapshots.push(snapshotId);
+                      expect(id).toBe(capture.snapshotId);
+                      deletes++;
                       return true;
                     }),
                   restore: {
-                    inspect: () => Effect.die("No boot restore"),
-                    cancel: (operationID, generation) =>
-                      Effect.succeed({
-                        operationID,
-                        generation,
-                        state: "cancelled" as const,
-                        sandboxID: "backup-probe",
-                        executionID: NodeCrypto.randomUUID(),
-                        preparedBuildID: NodeCrypto.randomUUID(),
-                      }),
+                    resolveTerminalNamedSnapshot: () =>
+                      Effect.die("Positive failure was durably recorded"),
                   },
                 },
                 f.hostId,
                 () => Effect.succeed(true),
               );
-              const [pending] = yield* f.sql<{
-                count: number;
-              }>`SELECT count(*)::int AS count FROM relay_thread_artifacts WHERE thread_id=${f.threadId}`;
-              for (let pass = 0; pass < pending!.count + 4; pass++) {
-                yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                yield* worker.runOne();
-              }
-              expect((yield* f.deletions.get(f.threadId))?.phase).toBe("completed");
-              expect(snapshots).toEqual([saved!.snapshotId]);
-              const rows = yield* f.sql<{
-                allocationId: string;
+              yield* drain(f, worker);
+              expect(deletes).toBe(1);
+              const [row] = yield* f.sql<{
                 phase: string;
-              }>`SELECT allocation_id AS "allocationId",phase FROM relay_thread_vm_backups WHERE allocation_id IN (${f.allocationId},${other.allocationId})`;
-              expect(rows).toContainEqual({ allocationId: f.allocationId, phase: "retired" });
-              expect(rows).toContainEqual({ allocationId: other.allocationId, phase: "verified" });
-              expect(yield* other.deletions.get(other.threadId)).toBeNull();
-              expect(yield* other.attachmentStore.get(otherNativePoint!)).not.toBeNull();
+                receipt: unknown;
+              }>`SELECT phase,native_capture_receipt AS receipt FROM relay_thread_vm_backups WHERE operation_id=${capture.operationId}`;
+              expect(row).toEqual({ phase: "retired", receipt: null });
             }),
           ),
       );
+      it.effect("never-dispatched native failures do not create an upload hold", () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture();
+            const capture = yield* addCapture(f, "pending");
+            const cancelled = yield* makeThreadVmBackupSourceStore(f.sql, f.objects).cancelPending({
+              threadId: f.threadId,
+              environmentId: f.sourceEnvironmentId,
+              generation: 1,
+              operationId: capture.operationId,
+            });
+            expect(cancelled.phase).toBe("failed");
+            yield* f.deletions.begin(f.deletionInput);
+            const worker = makeThreadDeletionWorker(
+              f.sql,
+              f.objects,
+              {
+                ...nativeCompute(f),
+                restore: {
+                  resolveTerminalNamedSnapshot: () => Effect.die("No upload was dispatched"),
+                },
+              },
+              f.hostId,
+              () => Effect.succeed(true),
+            );
+            yield* drain(f, worker);
+            expect((yield* f.allocations.get(f.allocationId))?.state).toBe("deleted");
+          }),
+        ),
+      );
       it.effect(
-        "a crashed reader's finite lease delays object deletion until its recorded expiry",
+        "legacy failed captures with a dispatch intent remain quarantined with their VM quota",
         () =>
           Effect.scoped(
             Effect.gen(function* () {
               const f = yield* fixture(),
-                catalog = makeThreadArtifactStore(f.sql);
-              const bytes = new TextEncoder().encode("retained reader bytes");
-              const artifact = yield* f.transfer.upload({
-                artifactId: NodeCrypto.randomUUID(),
-                operationId: NodeCrypto.randomUUID(),
-                threadId: f.threadId,
-                kind: "attachment",
-                sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
-                sizeBytes: bytes.length,
-                retentionDays: null,
-                body: new ReadableStream<Uint8Array>({
-                  start(controller) {
-                    controller.enqueue(bytes);
-                    controller.close();
-                  },
-                }),
-              });
-              const readerId = NodeCrypto.randomUUID();
-              yield* catalog.pin({
-                artifactId: artifact.artifactId,
-                threadId: f.threadId,
-                operationId: readerId,
-                leaseMinutes: 60,
-              });
-              yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
-              const worker = makeThreadDeletionWorker(
-                f.sql,
-                f.objects,
-                {
-                  inspect: () => Effect.succeed(null),
-                  destroy: () => Effect.void,
-                  deleteSnapshot: () => Effect.die("No disk snapshots were created"),
-                  restore: {
-                    inspect: () => Effect.die("No boot restore"),
-                    cancel: () => Effect.die("No restore was started"),
-                  },
-                },
-                f.hostId,
-                () => Effect.succeed(true),
-              );
-              const [pending] = yield* f.sql<{
-                count: number;
-              }>`SELECT count(*)::int AS count FROM relay_thread_artifacts WHERE thread_id=${f.threadId}`;
-              const drain = Effect.gen(function* () {
-                for (let pass = 0; pass < pending!.count + 4; pass++) {
-                  yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                  yield* worker.runOne();
-                }
-              });
-              yield* drain;
-              expect((yield* f.deletions.get(f.threadId))?.phase).toBe("cleaning");
-              expect((yield* catalog.get(artifact.artifactId))?.state).toBe("deleting");
-              yield* f.objects.verify({
-                key: artifact.storageKey,
-                sha256: artifact.sha256,
-                sizeBytes: artifact.sizeBytes,
-              });
-              yield* f.sql`UPDATE relay_thread_artifact_pins SET expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=${readerId}`;
-              yield* drain;
-              expect((yield* f.deletions.get(f.threadId))?.phase).toBe("completed");
-              expect((yield* catalog.get(artifact.artifactId))?.state).toBe("deleted");
-              yield* Effect.flip(
-                f.objects.verify({
-                  key: artifact.storageKey,
-                  sha256: artifact.sha256,
-                  sizeBytes: artifact.sizeBytes,
-                }),
-              );
-            }),
-          ),
-      );
-      for (const problem of [
-        "lost-stop",
-        "lost-snapshot",
-        "foreign-receipt",
-        "activating",
-      ] as const) {
-        it.effect(`cleans a completed restore safely after ${problem}`, () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              yield* f.store.begin(f.input);
-              yield* f.freeze;
-              yield* f.verifyBackup;
-              yield* f.store.recordSaved(f.input.operationId);
-              const deletion = (yield* f.store.claimDeletion(f.hostId))!;
-              yield* f.store.beginDeletion(deletion);
-              yield* f.store.confirmDeleted(deletion);
-              const operationId = NodeCrypto.randomUUID(),
-                allocationId = NodeCrypto.randomUUID();
-              yield* makeThreadVmRestoreStore(f.sql, f.objects).begin({
-                operationId,
-                allocationId,
-                threadId: f.threadId,
-                savedDiskOperationId: f.input.operationId,
-                actorUserId: f.input.actorUserId,
-                expectedGeneration: 1,
-                serving: true,
-              });
-              const boot: E2BRestoreStatus = {
-                operationID: operationId,
-                generation: "2",
-                sandboxID: `boot-${allocationId}`,
-                executionID: NodeCrypto.randomUUID(),
-                preparedBuildID: NodeCrypto.randomUUID(),
-                state: "active",
-              };
-              const probe = {
-                ...boot,
-                operationID: restoreProbeOperationId(operationId),
-                generation: restoreComputeGeneration(operationId),
-                state: "prepared" as const,
-              };
-              // Seed an already completed restore whose allocation catalog was retired.
-              // Its historical runtime receipt still requires a positive physical stop.
-              yield* f.sql`UPDATE relay_thread_vm_restores SET phase='completed',prepare_started_at=clock_timestamp(),prepared_receipt=${f.sql.json(probe)},probe_removed_at=clock_timestamp(),boot_prepare_started_at=clock_timestamp(),boot_receipt=${f.sql.json(boot)},committed_at=clock_timestamp() WHERE operation_id=${operationId}`;
-              yield* f.sql`UPDATE relay_thread_vm_allocations SET state='deleted',compute_ref=${boot.sandboxID},deleted_at=clock_timestamp() WHERE allocation_id=${allocationId}`;
-              yield* f.sql`UPDATE relay_thread_placements SET generation=2,operation_id=NULL WHERE thread_id=${f.threadId}`;
-              yield* f.deletions.begin({ ...f.deletionInput, generation: 2, sourceDeleted: true });
-              let ready = false,
-                stops = 0;
-              const deleted: string[] = [];
-              const worker = makeThreadDeletionWorker(
-                f.sql,
-                f.objects,
-                {
-                  inspect: () => Effect.succeed(null),
-                  destroy: (id) =>
-                    Effect.gen(function* () {
-                      expect(id).toBe(boot.sandboxID);
-                      stops++;
-                      if (!ready && problem === "lost-stop")
-                        return yield* new ThreadVmComputeError({
-                          operation: "delete",
-                          message: "Lost stop reply",
-                        });
-                    }),
-                  deleteSnapshot: (id) =>
-                    Effect.gen(function* () {
-                      const removed = !deleted.includes(id);
-                      if (removed) deleted.push(id);
-                      if (!ready && problem === "lost-snapshot")
-                        return yield* new ThreadVmComputeError({
-                          operation: "delete snapshot",
-                          message: "Lost snapshot reply",
-                        });
-                      return removed;
-                    }),
-                  restore: {
-                    inspect: () =>
-                      Effect.succeed({
-                        ...boot,
-                        ...(!ready && problem === "foreign-receipt"
-                          ? { executionID: NodeCrypto.randomUUID() }
-                          : {}),
-                        state:
-                          problem === "activating"
-                            ? ready
-                              ? ("failed" as const)
-                              : ("activating" as const)
-                            : ("active" as const),
-                      }),
-                    cancel: (operationID, generation) => {
-                      expect(operationID).not.toBe(boot.operationID);
-                      return Effect.succeed({
-                        ...probe,
-                        operationID,
-                        generation,
-                        state: "cancelled" as const,
-                      });
-                    },
-                  },
-                },
-                f.hostId,
-                () => Effect.succeed(true),
-              );
-              const retry = Effect.gen(function* () {
-                yield* f.sql`UPDATE relay_thread_deletions SET retry_at=clock_timestamp() WHERE thread_id=${f.threadId}`;
-                yield* worker.runOne();
-              });
-              yield* retry; // Remove the old endpoint.
-              yield* retry; // Reconcile the exact completed boot.
-              const cleaned = Effect.gen(function* () {
-                const [row] = yield* f.sql<{
-                  cleaned: boolean;
-                }>`SELECT deletion_cleaned_at IS NOT NULL AS cleaned FROM relay_thread_vm_restores WHERE operation_id=${operationId}`;
-                return row!.cleaned;
-              });
-              expect(yield* cleaned).toBe(false);
-              expect(deleted).toEqual(problem === "lost-snapshot" ? [boot.sandboxID] : []);
-              if (problem === "foreign-receipt") expect(stops).toBe(0);
-              ready = true;
-              yield* retry;
-              expect(yield* cleaned).toBe(true);
-              expect(deleted).toEqual([boot.sandboxID]);
-              expect(stops).toBe(problem === "foreign-receipt" ? 1 : 2);
-              const [pending] = yield* f.sql<{
-                count: number;
-              }>`SELECT count(*)::int AS count FROM relay_thread_artifacts WHERE thread_id=${f.threadId}`;
-              for (let pass = 0; pass < pending!.count + 4; pass++) yield* retry;
-              expect((yield* f.deletions.get(f.threadId))?.phase).toBe("completed");
-            }),
-          ),
-        );
-      }
-      it.effect(
-        "active operation admission rejects permanent deletion without revoking its source",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              yield* f.store.begin(f.input);
-              yield* Effect.flip(f.authorized(permanentlyDeleteThread(f.threadId, f.payload)));
-              expect(yield* f.deletions.get(f.threadId)).toBeNull();
-              const [key] = yield* f.sql<{
-                revoked: boolean;
-              }>`SELECT revoked_at IS NOT NULL AS revoked FROM relay_environment_credentials WHERE credential_id=${f.credentialId}`;
-              expect(key?.revoked).toBe(false);
+                capture = yield* addCapture(f);
+              yield* f.sql`UPDATE relay_thread_vm_backups SET phase='failed',source_receipt=NULL WHERE operation_id=${capture.operationId}`;
+              yield* Effect.flip(f.deletions.begin(f.deletionInput));
               expect((yield* f.allocations.get(f.allocationId))?.state).toBe("running");
             }),
           ),

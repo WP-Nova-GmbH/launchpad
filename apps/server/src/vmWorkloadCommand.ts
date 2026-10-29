@@ -7,7 +7,16 @@ import * as Context from "effect/Context";
 export const VmWorkloadTracking = Context.Reference<boolean>("t3/VmWorkloadTracking", {
   defaultValue: () => false,
 });
-const helper = "/usr/local/bin/launchpad-workload";
+/** One stopped-source transfer/setup may launch tracked helpers while its gate stays closed. */
+export const VmSealedWorkloadAdmission = Context.Reference<
+  | {
+      readonly bootId: string;
+      readonly operationId: string;
+      readonly epoch: number;
+    }
+  | undefined
+>("t3/VmSealedWorkloadAdmission", { defaultValue: () => undefined });
+const helper = "/opt/launchpad/bin/launchpad-workload";
 /** exec preserves stdio, cwd and environment; forked and detached children inherit
  * the kernel group. The group ID is created before the requested command runs.
  */
@@ -31,26 +40,55 @@ export const VmControlSpawner = Context.Reference<
 >("t3/VmControlSpawner", { defaultValue: () => undefined });
 
 export function makeVmWorkloadSpawner(raw: ChildProcessSpawner.ChildProcessSpawner["Service"]) {
-  const wrap = (command: ChildProcess.Command): ChildProcess.Command => {
+  const wrap = (
+    command: ChildProcess.Command,
+    admission: typeof VmSealedWorkloadAdmission.Service,
+  ): ChildProcess.Command => {
     if (ChildProcess.isPipedCommand(command))
-      return ChildProcess.pipeTo(wrap(command.left), wrap(command.right), command.options);
+      return ChildProcess.pipeTo(
+        wrap(command.left, admission),
+        wrap(command.right, admission),
+        command.options,
+      );
     if (command.options.shell)
       throw new Error("VM processes require an explicit shell executable.");
     // Provider and PTY adapters can choose a more specific workload kind.
-    if (command.command === helper) return command;
-    const launch = vmWorkloadCommand(command.command, command.args, "process");
-    return ChildProcess.make(launch.command, launch.args, command.options);
+    const launch =
+      command.command === helper
+        ? command
+        : vmWorkloadCommand(command.command, command.args, "process");
+    if (!admission || launch.args[0] !== "run")
+      return ChildProcess.make(helper, launch.args, command.options);
+    const [, workloadId, , separator, ...args] = launch.args;
+    if (!workloadId || separator !== "--") throw new Error("Invalid sealed workload launch");
+    return ChildProcess.make(
+      helper,
+      [
+        "run-transfer",
+        admission.bootId,
+        admission.operationId,
+        String(admission.epoch),
+        workloadId,
+        "--",
+        ...args,
+      ],
+      command.options,
+    );
   };
   return ChildProcessSpawner.make((command) =>
-    Effect.try({
-      try: () => wrap(command),
-      catch: () =>
-        PlatformError.badArgument({
-          module: "VmWorkload",
-          method: "spawn",
-          description: "VM workload launch could not be tracked.",
-        }),
-    }).pipe(Effect.flatMap((wrapped) => raw.spawn(wrapped))),
+    Effect.gen(function* () {
+      const admission = yield* VmSealedWorkloadAdmission;
+      const wrapped = yield* Effect.try({
+        try: () => wrap(command, admission),
+        catch: () =>
+          PlatformError.badArgument({
+            module: "VmWorkload",
+            method: "spawn",
+            description: "VM workload launch could not be tracked.",
+          }),
+      });
+      return yield* raw.spawn(wrapped);
+    }),
   );
 }
 

@@ -2,8 +2,15 @@ import { ThreadVmPreviewWebSocket } from "./ThreadVmPreviewWebSocket.ts";
 export { ThreadVmPreviewWebSocket } from "./ThreadVmPreviewWebSocket.ts";
 import { threadVmPreviewRequestUrl as previewRequestUrl } from "./threadVmPreviewHost.ts";
 import { ThreadId } from "@t3tools/contracts";
+import {
+  normalizeRelayIssuer,
+  RELAY_THREAD_VM_PREVIEW_HEADER,
+  RELAY_THREAD_VM_PREVIEW_TYP,
+  signRelayJwt,
+} from "@t3tools/shared/relayJwt";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
@@ -20,6 +27,9 @@ import {
 } from "effect/unstable/http";
 import type { ThreadVmConnectionTarget } from "../threads/ThreadVmConnection.ts";
 import { RelayDb } from "../db.ts";
+import { RelayConfiguration } from "../Config.ts";
+import { RelaySecretBox } from "../auth/SecretBox.ts";
+import { readThreadVmTrafficAccessToken } from "../threads/ThreadVmIngressToken.ts";
 import { inspectE2BThreadVmIngress } from "../machines/E2BThreadVmConnection.ts";
 import { authorizeThreadVmConnection } from "../threads/ThreadVmConnectionAccess.ts";
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
@@ -192,6 +202,11 @@ const handle = Effect.fn("relay.thread_vm.preview.proxy")(function* (
     target = yield* authorize(grant);
   const { settings } = yield* ThreadVmRuntimeConfiguration;
   if (!settings) return yield* new ThreadVmPreviewDenied();
+  const token = yield* readThreadVmTrafficAccessToken(sql, {
+    ...target.identity.scope,
+    computeRef: target.sandboxId,
+    operationId: target.identity.operationId,
+  });
   const ingress = yield* Effect.tryPromise({
     try: (signal) =>
       inspectE2BThreadVmIngress(
@@ -200,10 +215,29 @@ const handle = Effect.fn("relay.thread_vm.preview.proxy")(function* (
         target.identity,
         transport,
         signal,
+        token,
       ),
     catch: () => new ThreadVmPreviewDenied(),
   });
   yield* authorize(grant);
+  const config = yield* RelayConfiguration;
+  const now = Math.floor((yield* DateTime.now).epochMilliseconds / 1000);
+  const proof = yield* signRelayJwt({
+    privateKey: Redacted.value(config.cloudMintPrivateKey),
+    typ: RELAY_THREAD_VM_PREVIEW_TYP,
+    payload: {
+      iss: normalizeRelayIssuer(config.relayIssuer),
+      aud: `t3-env:${target.environmentId}`,
+      sub: target.identity.scope.threadId,
+      jti: yield* (yield* Crypto.Crypto).randomUUIDv4,
+      iat: now,
+      exp: now + 30,
+      environmentId: target.environmentId,
+      operationId: target.identity.operationId,
+      scope: target.identity.scope,
+      port: grant.port,
+    },
+  });
   const upstream = new URL(ingress.origin);
   // Preserve the request path without URL resolution allowing an authority change.
   upstream.pathname = url.pathname;
@@ -212,8 +246,11 @@ const handle = Effect.fn("relay.thread_vm.preview.proxy")(function* (
   const headers = {
     ...previewRequestHeaders(request, upstream.origin),
     "E2b-Sandbox-Id": ingress.sandboxId,
-    "E2b-Sandbox-Port": String(grant.port),
+    // Native ingress may forward its credential. Only the trusted guest hop
+    // receives it; the signed proof selects the sanitized application request.
+    "E2b-Sandbox-Port": "3773",
     "e2b-traffic-access-token": Redacted.value(ingress.trafficAccessToken),
+    [RELAY_THREAD_VM_PREVIEW_HEADER]: proof,
   };
   const context = Context.make(RelayDb, yield* RelayDb);
   const guard = Effect.gen(function* () {
@@ -279,6 +316,8 @@ export const makeThreadVmPreviewRoutes = (transport: typeof fetch = fetch) =>
     Effect.gen(function* () {
       const context = Context.pick(
         RelayDb,
+        RelayConfiguration,
+        RelaySecretBox,
         ThreadVmRuntimeConfiguration,
         HttpClient.HttpClient,
         ThreadVmPreviewWebSocket,
@@ -286,6 +325,8 @@ export const makeThreadVmPreviewRoutes = (transport: typeof fetch = fetch) =>
       )(
         yield* Effect.context<
           | RelayDb
+          | RelayConfiguration
+          | RelaySecretBox
           | ThreadVmRuntimeConfiguration
           | HttpClient.HttpClient
           | ThreadVmPreviewWebSocket

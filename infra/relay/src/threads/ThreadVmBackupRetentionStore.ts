@@ -1,11 +1,8 @@
+import { releaseThreadNativeCheckpointOperation } from "./ThreadNativeCheckpointStore.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
-import * as Schema from "effect/Schema";
-import { E2BRestoreStatus } from "../machines/E2BRestoreClient.ts";
 import { ThreadVmBackupConflict } from "./ThreadVmBackupStore.ts";
-
-const decodeRestoreStatus = Schema.decodeUnknownEffect(E2BRestoreStatus);
 
 export interface BackupRetirementClaim {
   readonly operationId: string;
@@ -26,8 +23,8 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         WHERE thread_id = ${input.threadId} FOR UPDATE`;
         const [backup] = yield* sql`SELECT x.operation_id FROM relay_thread_vm_backups x
         JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
-        WHERE a.thread_id = ${input.threadId} AND x.operation_id = ${input.backupOperationId}
-          AND x.phase = 'verified' AND x.snapshot_id IS NOT NULL
+        WHERE a.runtime_protocol='native-v1' AND a.thread_id = ${input.threadId} AND x.operation_id = ${input.backupOperationId}
+          AND x.phase = 'verified' AND x.snapshot_id IS NOT NULL AND x.native_capture_receipt IS NOT NULL
         FOR UPDATE OF x`;
         if (!backup)
           return yield* new ThreadVmBackupConflict({
@@ -57,7 +54,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         FROM relay_thread_vm_backups x
         JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-        WHERE x.phase IN ('verified','retiring') AND x.snapshot_id IS NOT NULL
+        WHERE a.runtime_protocol='native-v1' AND x.phase IN ('verified','retiring') AND x.snapshot_id IS NOT NULL AND x.native_capture_receipt IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_saved_disks s
             WHERE s.backup_operation_id=x.operation_id AND s.phase='expiring')
           AND x.retry_at <= clock_timestamp()
@@ -71,7 +68,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
               WHERE active.allocation_id = a.allocation_id
                 AND active.phase IN ('pending','creating','captured','verifying','cleanup'))
             AND EXISTS (SELECT 1 FROM relay_thread_vm_backups newer
-              WHERE newer.allocation_id = x.allocation_id AND newer.phase = 'verified'
+              WHERE newer.allocation_id = x.allocation_id AND newer.phase = 'verified' AND newer.native_capture_receipt IS NOT NULL
                 AND (newer.verified_at,newer.operation_id) > (x.verified_at,x.operation_id))))
         ORDER BY x.verified_at,x.operation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
         if (!candidate) return null;
@@ -95,7 +92,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
           WHERE backup_operation_id = ${candidate.operationId}`;
           const [newer] = yield* sql`SELECT 1 FROM relay_thread_vm_backups n
           JOIN relay_thread_vm_backups x ON x.allocation_id = n.allocation_id
-          WHERE x.operation_id = ${candidate.operationId} AND n.phase = 'verified'
+          WHERE x.operation_id = ${candidate.operationId} AND n.phase = 'verified' AND n.native_capture_receipt IS NOT NULL
             AND (n.verified_at,n.operation_id) > (x.verified_at,x.operation_id) LIMIT 1`;
           if (!placement || active.length || pins.length || !newer) return null;
         }
@@ -115,95 +112,68 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
     );
   });
 
-  // Failed periodic candidates have no recovery value. A final-save candidate
-  // belongs to its separate abort protocol and must never be collected here.
-  const claimFailed = Effect.fn("relay.thread_vm.backup.failed_claim")(function* (hostId: string) {
+  /** Only a positive native terminal-error identity permits failed-root cleanup. */
+  const claimFailed = Effect.fn("relay.thread_vm.backup.failed_retirement_claim")(function* (
+    hostId: string,
+  ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const [candidate] = yield* sql<{ operationId: string; threadId: string }>`
-        SELECT x.operation_id AS "operationId", t.thread_id AS "threadId"
-        FROM relay_thread_vm_backups x
-        JOIN relay_thread_vm_allocations a ON a.allocation_id=x.allocation_id
+        const [candidate] = yield* sql<{
+          operationId: string;
+          threadId: string;
+        }>`SELECT x.operation_id AS "operationId",a.thread_id AS "threadId"
+        FROM relay_thread_vm_backups x JOIN relay_thread_vm_allocations a USING(allocation_id)
         JOIN relay_thread_placements t ON t.thread_id=a.thread_id
-        WHERE x.phase='failed' AND x.snapshot_id IS NOT NULL
-          AND x.source_template_id IS NOT NULL AND x.source_build_id IS NOT NULL
-          AND x.snapshot_name='launchpad-backup-' || x.operation_id::text
-          AND t.operation_id IS NULL AND x.retry_at <= clock_timestamp()
-          AND (x.claim_until IS NULL OR x.claim_until <= clock_timestamp())
-          AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_final_saves f WHERE f.backup_operation_id=x.operation_id)
-          AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_backup_pins pin WHERE pin.backup_operation_id=x.operation_id)
-          AND EXISTS (SELECT 1 FROM relay_thread_vm_capacity c WHERE c.allocation_id=a.allocation_id AND c.host_id=${hostId})
+        WHERE a.runtime_protocol='native-v1' AND x.phase IN ('failed','retiring') AND x.source_receipt IS NOT NULL AND x.native_capture_receipt IS NULL AND x.capture_started_at IS NOT NULL
+          AND x.snapshot_id IS NOT NULL AND x.source_template_id IS NOT NULL AND x.source_build_id IS NOT NULL
+          AND x.retry_at<=clock_timestamp() AND (x.claim_until IS NULL OR x.claim_until<=clock_timestamp())
+          AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_final_saves f WHERE f.backup_operation_id=x.operation_id)
+          AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_backup_pins p WHERE p.backup_operation_id=x.operation_id)
+          AND EXISTS(SELECT 1 FROM relay_thread_vm_capacity c WHERE c.allocation_id=a.allocation_id AND c.host_id=${hostId})
         ORDER BY x.created_at,x.operation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
         if (!candidate) return null;
-        yield* sql`SELECT operation_id FROM relay_thread_vm_backups WHERE operation_id=${candidate.operationId} FOR UPDATE`;
         const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
-        const [row] = yield* sql<{ snapshotId: string }>`
-        UPDATE relay_thread_vm_backups x SET claim_id=${claimId}, claim_until=clock_timestamp()+interval '2 minutes'
-        WHERE x.operation_id=${candidate.operationId} AND x.phase='failed'
-          AND (x.claim_until IS NULL OR x.claim_until <= clock_timestamp())
-          AND EXISTS (SELECT 1 FROM relay_thread_placements t WHERE t.thread_id=${candidate.threadId} AND t.operation_id IS NULL)
-          AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_final_saves f WHERE f.backup_operation_id=x.operation_id)
-          AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_backup_pins pin WHERE pin.backup_operation_id=x.operation_id)
+        const [row] = yield* sql<{
+          snapshotId: string;
+        }>`UPDATE relay_thread_vm_backups x SET phase='retiring',claim_id=${claimId},claim_until=clock_timestamp()+interval '2 minutes'
+        WHERE x.operation_id=${candidate.operationId} AND x.phase IN ('failed','retiring') AND x.native_capture_receipt IS NULL
+          AND (x.claim_until IS NULL OR x.claim_until<=clock_timestamp())
+          AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_backup_pins p WHERE p.backup_operation_id=x.operation_id)
         RETURNING x.snapshot_id AS "snapshotId"`;
         return row
-          ? ({
-              operationId: candidate.operationId,
-              claimId,
-              snapshotId: row.snapshotId,
-            } satisfies BackupRetirementClaim)
+          ? { operationId: candidate.operationId, claimId, snapshotId: row.snapshotId }
           : null;
       }),
     );
   });
-
-  const retireFailed = Effect.fn("relay.thread_vm.backup.failed_probe_stopped")(function* (
-    input: BackupRetirementClaim,
-    receipt: unknown,
-  ) {
-    const stopped = yield* decodeRestoreStatus(receipt).pipe(
-      Effect.mapError(
-        () => new ThreadVmBackupConflict({ message: "Failed recovery probe stop is unconfirmed" }),
-      ),
-    );
-    if (
-      stopped.operationID !== input.operationId ||
-      stopped.generation !== `backup-${input.operationId}` ||
-      stopped.state !== "cancelled"
-    )
-      return yield* new ThreadVmBackupConflict({
-        message: "Failed recovery probe stop belongs to a different preparation",
-      });
-    return yield* sql.withTransaction(
-      Effect.gen(function* () {
-        const [placement] = yield* sql<{ threadId: string }>`SELECT t.thread_id AS "threadId"
-        FROM relay_thread_placements t JOIN relay_thread_vm_allocations a ON a.thread_id=t.thread_id
-        JOIN relay_thread_vm_backups x ON x.allocation_id=a.allocation_id
-        WHERE x.operation_id=${input.operationId} FOR UPDATE OF t`;
-        if (!placement) return false;
-        yield* sql`SELECT operation_id FROM relay_thread_vm_backups WHERE operation_id=${input.operationId} FOR UPDATE`;
-        const rows =
-          yield* sql`UPDATE relay_thread_vm_backups x SET phase='retiring', failed_probe_stopped_at=clock_timestamp()
-        WHERE x.operation_id=${input.operationId} AND x.snapshot_id=${input.snapshotId}
-          AND x.phase='failed' AND x.claim_id=${input.claimId} AND x.claim_until > clock_timestamp()
-          AND (x.probe_receipt IS NULL OR x.probe_receipt->>'preparedBuildID'=${stopped.preparedBuildID})
-          AND EXISTS (SELECT 1 FROM relay_thread_placements t WHERE t.thread_id=${placement.threadId} AND t.operation_id IS NULL)
-          AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_final_saves f WHERE f.backup_operation_id=x.operation_id)
-          AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_backup_pins pin WHERE pin.backup_operation_id=x.operation_id)
-        RETURNING operation_id`;
-        return rows.length === 1;
-      }),
-    );
-  });
-
   const complete = Effect.fn("relay.thread_vm.backup.retirement_complete")(function* (
     input: BackupRetirementClaim,
   ) {
-    const rows = yield* sql`UPDATE relay_thread_vm_backups SET phase = 'retired',
-      claim_id = NULL, claim_until = NULL
-      WHERE operation_id = ${input.operationId} AND snapshot_id = ${input.snapshotId}
-        AND phase = 'retiring' AND claim_id = ${input.claimId}
-        AND claim_until > clock_timestamp() RETURNING operation_id`;
-    return rows.length === 1;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [owner] = yield* sql<{
+          threadId: string;
+        }>`SELECT a.thread_id AS "threadId" FROM relay_thread_vm_backups x
+        JOIN relay_thread_vm_allocations a USING(allocation_id) WHERE a.runtime_protocol='native-v1' AND x.operation_id=${input.operationId}`;
+        if (!owner) return false;
+        yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${owner.threadId} FOR UPDATE`;
+        const [row] = yield* sql<{
+          operationId: string;
+          allocationId: string;
+          sourceReceipt: unknown;
+        }>`UPDATE relay_thread_vm_backups SET phase='retired',claim_id=NULL,claim_until=NULL
+        WHERE operation_id=${input.operationId} AND snapshot_id=${input.snapshotId} AND phase='retiring'
+          AND claim_id=${input.claimId} AND claim_until>clock_timestamp()
+        RETURNING operation_id AS "operationId",allocation_id AS "allocationId",source_receipt AS "sourceReceipt"`;
+        if (!row) return false;
+        if (row.sourceReceipt)
+          yield* releaseThreadNativeCheckpointOperation(sql, {
+            threadId: owner.threadId,
+            operationId: row.operationId,
+          });
+        return true;
+      }),
+    );
   });
   const defer = Effect.fn("relay.thread_vm.backup.retirement_defer")(function* (
     input: BackupRetirementClaim,
@@ -213,5 +183,5 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
       WHERE operation_id = ${input.operationId} AND snapshot_id = ${input.snapshotId}
         AND phase IN ('failed','retiring') AND claim_id = ${input.claimId}`;
   });
-  return { pin, releasePin, claim, claimFailed, retireFailed, complete, defer };
+  return { pin, releasePin, claim, claimFailed, complete, defer };
 }

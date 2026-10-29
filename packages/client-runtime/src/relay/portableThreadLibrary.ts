@@ -601,6 +601,10 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
     status.generation !== placement.generation
   )
     return yield* changed();
+  if (status.allocation?.state === "running" && status.sourceActivationPending)
+    return yield* new OrchestrationDispatchCommandError({
+      message: "The VM is still reopening this conversation. Try again once it is ready.",
+    });
   if (
     status.allocation &&
     (status.allocation.state !== "running" ||

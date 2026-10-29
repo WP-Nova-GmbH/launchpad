@@ -61,18 +61,18 @@ beforeEach(() => vi.spyOn(console, "log").mockImplementation(() => {}));
 afterEach(() => vi.restoreAllMocks());
 
 describe("Lima image-build hugepage memory", () => {
-  it("temporarily reserves 12 GiB in addition to occupied/reserved pages, then restores the original pool", async () => {
+  it("temporarily reserves 8 GiB in addition to occupied/reserved pages, then restores the original pool", async () => {
     const f = host({ used: 10, reserved: 20 });
     const value = await withVmBuildMemory(
       input,
       async () => {
-        expect(f.settings()).toEqual(["vm.nr_hugepages=6174"]);
+        expect(f.settings()).toEqual(["vm.nr_hugepages=4126"]);
         return "image";
       },
       f.run,
     );
     expect(value).toBe("image");
-    expect(f.settings()).toEqual(["vm.nr_hugepages=6174", "vm.nr_hugepages=3072"]);
+    expect(f.settings()).toEqual(["vm.nr_hugepages=4126", "vm.nr_hugepages=3072"]);
     expect(f.calls.at(-1)?.args).toEqual([
       "shell",
       "--workdir=/",
@@ -86,6 +86,12 @@ describe("Lima image-build hugepage memory", () => {
   it("preserves a larger existing pool without writing memory settings", async () => {
     const f = host({ total: 7168 });
     await withVmBuildMemory(input, async () => "image", f.run);
+    expect(f.settings()).toEqual([]);
+  });
+
+  it("uses the measured 8 GiB pool on a 12 GiB stock host without growing it", async () => {
+    const f = host({ total: 4096, available: 4 * 1024 * 1024 });
+    expect(await withVmBuildMemory(input, async () => "image", f.run)).toBe("image");
     expect(f.settings()).toEqual([]);
   });
 
@@ -103,7 +109,7 @@ describe("Lima image-build hugepage memory", () => {
           f.run,
         ),
       ).rejects.toThrow(failure);
-      expect(f.settings()).toEqual(["vm.nr_hugepages=6144", "vm.nr_hugepages=3072"]);
+      expect(f.settings()).toEqual(["vm.nr_hugepages=4096", "vm.nr_hugepages=3072"]);
       const cleanup = f.calls.slice(
         f.calls.findIndex((call) => call.args.at(-1) === "vm.nr_hugepages=3072"),
       );
@@ -112,7 +118,7 @@ describe("Lima image-build hugepage memory", () => {
   }
 
   it("refuses insufficient normal RAM before changing the pool or starting the build", async () => {
-    const f = host({ available: 8 * 1024 * 1024 });
+    const f = host({ available: 4 * 1024 * 1024 });
     const build = vi.fn();
     await expect(withVmBuildMemory(input, build, f.run)).rejects.toThrow("3 GiB of normal RAM");
     expect(f.settings()).toEqual([]);
@@ -127,7 +133,7 @@ describe("Lima image-build hugepage memory", () => {
       "could not reserve enough",
     );
     expect(build).not.toHaveBeenCalled();
-    expect(f.settings()).toEqual(["vm.nr_hugepages=6144", "vm.nr_hugepages=3072"]);
+    expect(f.settings()).toEqual(["vm.nr_hugepages=4096", "vm.nr_hugepages=3072"]);
   });
 
   it("reports restoration failure even after a successful build", async () => {
@@ -145,7 +151,7 @@ describe("Lima image-build hugepage memory", () => {
       "allocation command failed",
     );
     expect(build).not.toHaveBeenCalled();
-    expect(f.settings()).toEqual(["vm.nr_hugepages=6144", "vm.nr_hugepages=3072"]);
+    expect(f.settings()).toEqual(["vm.nr_hugepages=4096", "vm.nr_hugepages=3072"]);
   });
 
   it("reports a pool that remains allocated after a successful restore command", async () => {

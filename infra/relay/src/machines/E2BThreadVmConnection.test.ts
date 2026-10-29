@@ -2,7 +2,10 @@ import { describe, expect, it } from "vite-plus/test";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as Redacted from "effect/Redacted";
 import { restoreBootOperationId } from "./E2BThreadVmRestoreAttempt.ts";
-import { inspectE2BThreadVmIngress } from "./E2BThreadVmConnection.ts";
+import {
+  inspectE2BThreadVmIngress,
+  inspectE2BThreadVmConnection,
+} from "./E2BThreadVmConnection.ts";
 const settings = {
   apiUrl: "https://api.test",
   sandboxUrl: "https://ingress.test",
@@ -27,7 +30,6 @@ const info = {
   state: "running",
   envdVersion: "version",
   envdAccessToken: "envd-secret",
-  trafficAccessToken: "traffic-secret",
   network: { allowPublicTraffic: false },
   lifecycle: { autoResume: false },
   metadata: {
@@ -38,12 +40,12 @@ const info = {
     "launchpad.generation": "3",
   },
 };
-function inspect(capability: unknown, sandbox: unknown = info, templateId = settings.templateId) {
+function inspect(sandbox: unknown = info, templateId = settings.templateId) {
   const calls: Request[] = [];
   const transport: typeof fetch = async (url, init) => {
     const request = new Request(url, init);
     calls.push(request);
-    return Response.json(request.url.endsWith("/capabilities") ? capability : sandbox);
+    return Response.json(sandbox);
   };
   return {
     calls,
@@ -54,26 +56,25 @@ function inspect(capability: unknown, sandbox: unknown = info, templateId = sett
         { ...identity, templateId },
         transport,
         new AbortController().signal,
+        Redacted.make("sealed-traffic-secret"),
       ),
   };
 }
 describe("private application ingress", () => {
-  it("reads without waking and returns only relay-owned traffic credentials after the patched capability", async () => {
-    const h = inspect({ version: 1, privatePreviewHeaderBoundary: true });
+  it("reads native GET without waking and uses only the separately stored relay credential", async () => {
+    const h = inspect();
     const target = await h.read();
     expect(target.origin).toBe(settings.sandboxUrl);
     expect(target.sandboxId).toBe("sandbox");
-    expect(Redacted.value(target.trafficAccessToken)).toBe("traffic-secret");
+    expect(Redacted.value(target.trafficAccessToken)).toBe("sealed-traffic-secret");
     expect(target).not.toHaveProperty("envdAccessToken");
     expect(h.calls.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
       ["GET", "/sandboxes/sandbox"],
-      ["GET", "/extensions/launchpad/v1/capabilities"],
     ]);
     expect(h.calls.every((r) => r.headers.get("x-api-key") === "host-key")).toBe(true);
   });
   it("keeps an admitted guest accessible after the configured template changes", async () => {
     const h = inspect(
-      { version: 1, privatePreviewHeaderBoundary: true },
       {
         ...info,
         templateID: "previously-admitted-template",
@@ -81,11 +82,10 @@ describe("private application ingress", () => {
       "previously-admitted-template:verified",
     );
     expect((await h.read()).sandboxId).toBe("sandbox");
-    expect(h.calls).toHaveLength(2);
+    expect(h.calls).toHaveLength(1);
   });
   it("rejects a previous-template guest belonging to another allocation", async () => {
     const h = inspect(
-      { version: 1, privatePreviewHeaderBoundary: true },
       {
         ...info,
         templateID: "previously-admitted-template",
@@ -105,8 +105,7 @@ describe("private application ingress", () => {
       "launchpad.operation_id": restoreBootOperationId(identity.operationId, 2),
     };
     const restored = { ...info, templateID: "sandbox", metadata };
-    const capability = { version: 1, privatePreviewHeaderBoundary: true };
-    expect((await inspect(capability, restored).read()).sandboxId).toBe("sandbox");
+    expect((await inspect(restored).read()).sandboxId).toBe("sandbox");
     for (const change of [
       { "launchpad.restore_parent_operation_id": "another-operation" },
       { "launchpad.restore_boot_attempt": "1" },
@@ -117,18 +116,31 @@ describe("private application ingress", () => {
       { "launchpad.generation": "4" },
       { "launchpad.restore": "v2" },
     ]) {
-      const h = inspect(capability, { ...restored, metadata: { ...metadata, ...change } });
+      const h = inspect({ ...restored, metadata: { ...metadata, ...change } });
       await expect(h.read()).rejects.toThrow();
       expect(h.calls).toHaveLength(1);
     }
   });
-  it("rejects old runtimes before any traffic credential can be sent to an application", async () => {
-    for (const capability of [
-      { version: 1 },
-      { version: 1, privatePreviewHeaderBoundary: false },
-      { version: 2, privatePreviewHeaderBoundary: true },
-    ])
-      await expect(inspect(capability).read()).rejects.toThrow();
+  it("ignores a traffic token supplied by GET and never includes one in an envd connection", async () => {
+    const h = inspect({ ...info, trafficAccessToken: "untrusted-response-token" });
+    expect(Redacted.value((await h.read()).trafficAccessToken)).toBe("sealed-traffic-secret");
+    const calls: Request[] = [];
+    const options = await inspectE2BThreadVmConnection(
+      settings,
+      "sandbox",
+      identity,
+      async (url, init) => {
+        calls.push(new Request(url, init));
+        return Response.json(info);
+      },
+      new AbortController().signal,
+    );
+    expect(options.envdAccessToken).toBe("envd-secret");
+    expect(options.retries).toBe(0);
+    expect(options).not.toHaveProperty("trafficAccessToken");
+    expect(calls.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["GET", "/sandboxes/sandbox"],
+    ]);
   });
   it("never wakes paused, public or differently scoped guests", async () => {
     for (const sandbox of [
@@ -138,7 +150,7 @@ describe("private application ingress", () => {
       { ...info, lifecycle: { autoResume: true } },
       { ...info, metadata: { ...info.metadata, "launchpad.generation": "4" } },
     ]) {
-      const h = inspect({ version: 1, privatePreviewHeaderBoundary: true }, sandbox);
+      const h = inspect(sandbox);
       await expect(h.read()).rejects.toThrow();
       expect(h.calls).toHaveLength(1);
     }

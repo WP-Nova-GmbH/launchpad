@@ -7,6 +7,8 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   cleanupThreadVmRestoreIdentity,
   prepareThreadVmRestoreIdentity,
+  completeThreadVmWarmRestoreBootstrap,
+  requireThreadVmWarmRestoreBootstrap,
 } from "./ThreadVmRestoreIdentity.ts";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -80,7 +82,100 @@ async function mockLinuxOwnership(f: Awaited<ReturnType<typeof fixture>>) {
   };
 }
 
-describe("cold restore identity quarantine", () => {
+describe("restore identity quarantine", () => {
+  it("freshens identity only after exact stopped-coordinator and closed-gate proof, including later target generations", async () => {
+    const f = await fixture();
+    try {
+      const input = {
+        boot: { ...f.boot, generation: 5 },
+        source: {
+          allocationId: NodeCrypto.randomUUID(),
+          operationId: NodeCrypto.randomUUID(),
+          threadId: f.boot.threadId,
+          generation: 2,
+          bootId: NodeCrypto.randomUUID(),
+          captureOperationId: NodeCrypto.randomUUID(),
+          sealEpoch: 3,
+        },
+      };
+      const gate = {
+        bootId: input.source.bootId,
+        targetSealEpoch: 4,
+        coordinatorStopped: true,
+        sealRebound: true,
+      };
+      await expect(
+        completeThreadVmWarmRestoreBootstrap(
+          { ...input, source: { ...input.source, sealEpoch: 0 } },
+          { ...gate, targetSealEpoch: 1 },
+          f.baseDir,
+          f.bootstrapPath,
+          "darwin",
+        ),
+      ).rejects.toThrow();
+      expect(await NodeFSP.readFile(NodePath.join(f.baseDir, "old-identity"), "utf8")).toBe(
+        "old-narrow-credential",
+      );
+      for (const changed of [
+        { ...gate, coordinatorStopped: false },
+        { ...gate, bootId: NodeCrypto.randomUUID() },
+        { ...gate, targetSealEpoch: 5 },
+      ]) {
+        await expect(
+          completeThreadVmWarmRestoreBootstrap(
+            input,
+            changed,
+            f.baseDir,
+            f.bootstrapPath,
+            "darwin",
+          ),
+        ).rejects.toThrow();
+        expect(await NodeFSP.readFile(NodePath.join(f.baseDir, "old-identity"), "utf8")).toBe(
+          "old-narrow-credential",
+        );
+      }
+      const receipt = await completeThreadVmWarmRestoreBootstrap(
+        input,
+        gate,
+        f.baseDir,
+        f.bootstrapPath,
+        "darwin",
+      );
+      expect(receipt).toMatchObject({
+        kind: "native-warm-restore-bootstrap-v1",
+        ...input,
+        targetSealEpoch: 4,
+      });
+      expect(await NodeFSP.readdir(f.baseDir)).toEqual([]);
+      expect((await NodeFSP.stat(f.bootstrapPath)).mode & 0o777).toBe(0o644);
+      expect((await NodeFSP.stat(f.bootstrapPath + ".receipt.json")).mode & 0o777).toBe(0o644);
+      expect(
+        await requireThreadVmWarmRestoreBootstrap(input.boot, f.bootstrapPath, "darwin"),
+      ).toEqual(receipt);
+      await NodeFSP.writeFile(NodePath.join(f.baseDir, "fresh-identity"), "new-credential");
+      expect(
+        await completeThreadVmWarmRestoreBootstrap(
+          input,
+          gate,
+          f.baseDir,
+          f.bootstrapPath,
+          "darwin",
+        ),
+      ).toEqual(receipt);
+      expect(await NodeFSP.readFile(NodePath.join(f.baseDir, "fresh-identity"), "utf8")).toBe(
+        "new-credential",
+      );
+      await expect(
+        requireThreadVmWarmRestoreBootstrap(
+          { ...input.boot, generation: 6 },
+          f.bootstrapPath,
+          "darwin",
+        ),
+      ).rejects.toThrow();
+    } finally {
+      await f.cleanup();
+    }
+  });
   it("keeps thread worktree files at their original Git path while quarantining userdata and secrets", async () => {
     const f = await fixture();
     try {

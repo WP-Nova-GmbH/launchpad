@@ -1,7 +1,6 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import type { SnapshotInfo } from "e2b";
 import * as Effect from "effect/Effect";
-import type { E2BRestoreError, E2BRestoreStatus } from "../machines/E2BRestoreClient.ts";
 import { matchesSnapshotAlias } from "../machines/E2BRestoreClient.ts";
 import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
@@ -17,12 +16,6 @@ export function makeThreadVmFinalSaveAbortWorker(
       name: string,
     ) => Effect.Effect<SnapshotInfo | null, ThreadVmComputeError>;
     readonly deleteSnapshot: (snapshotId: string) => Effect.Effect<boolean, ThreadVmComputeError>;
-    readonly restore: {
-      readonly cancel: (
-        operationId: string,
-        generation: string,
-      ) => Effect.Effect<E2BRestoreStatus, E2BRestoreError>;
-    };
   },
   hostId: string,
 ) {
@@ -43,28 +36,6 @@ export function makeThreadVmFinalSaveAbortWorker(
         }
         current = yield* store.adoptAbortCapture(claim, snapshot.snapshotId);
       }
-      if (!current.operation.abortProbeStoppedAt) {
-        const needsStop =
-          current.backup &&
-          current.backup.sourceBuildId !== null &&
-          ["verifying", "cleanup", "failed", "retiring"].includes(current.backup.phase);
-        if (needsStop && current.backup) {
-          const generation = `backup-${current.backup.operationId}`;
-          const result = yield* compute.restore.cancel(current.backup.operationId, generation);
-          if (
-            result.state !== "cancelled" ||
-            result.operationID !== current.backup.operationId ||
-            result.generation !== generation
-          ) {
-            yield* store.deferAbort(claim, "probe_stop_unconfirmed");
-            return;
-          }
-        }
-        current = yield* store.recordAbortProbeStopped(
-          claim,
-          needsStop ? "confirmed-stop" : "not-required",
-        );
-      }
       current = yield* store.retireAbortCapture(claim);
       if (current.backup?.phase === "retiring" && current.backup.snapshotId)
         yield* compute.deleteSnapshot(current.backup.snapshotId);
@@ -72,7 +43,6 @@ export function makeThreadVmFinalSaveAbortWorker(
     }).pipe(
       Effect.catchTags({
         ThreadVmComputeError: () => store.deferAbort(claim, "capture_cleanup_unconfirmed"),
-        E2BRestoreError: () => store.deferAbort(claim, "probe_stop_unconfirmed"),
         ThreadVmFinalSaveConflict: () => store.deferAbort(claim, "recovery_cleanup_unavailable"),
         ThreadNativeCheckpointConflict: () =>
           store.deferAbort(claim, "recovery_cleanup_unavailable"),

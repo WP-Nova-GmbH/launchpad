@@ -3,6 +3,8 @@ import { ThreadId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import type { SandboxInfo } from "e2b";
 import { describe, expect, it, vi } from "@effect/vitest";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import { restoreBootOperationId } from "./E2BThreadVmRestoreAttempt.ts";
@@ -127,7 +129,7 @@ describe("thread VM infrastructure lease", () => {
     }),
   );
 
-  it.effect("does not confirm a lease silently shortened by E2B", () =>
+  it.effect("accepts a live native lease clamped to the continuous-run limit", () =>
     Effect.gen(function* () {
       const transport = vi.fn(async () =>
         Response.json({
@@ -141,17 +143,20 @@ describe("thread VM infrastructure lease", () => {
         }),
       );
       const setTimeout = vi.fn(async () => {});
+      const now = yield* Clock.currentTimeMillis;
       const inspect = vi.fn(async (): Promise<SandboxInfo> => ({
         ...info,
-        endAt: new Date(60_000),
+        endAt: DateTime.toDateUtc(DateTime.makeUnsafe(now + 60_000)),
       }));
       const renew = makeE2BThreadVmLease(settings, transport as typeof fetch, setTimeout, inspect);
+      yield* renew("sandbox", identity);
+      inspect.mockResolvedValue({ ...info, endAt: DateTime.toDateUtc(DateTime.makeUnsafe(now)) });
       expect(yield* Effect.flip(renew("sandbox", identity))).toMatchObject({
         _tag: "ThreadVmComputeError",
         operation: "renew lease",
       });
-      expect(setTimeout).toHaveBeenCalledOnce();
-      expect(inspect).toHaveBeenCalledOnce();
+      expect(setTimeout).toHaveBeenCalledTimes(2);
+      expect(inspect).toHaveBeenCalledTimes(2);
     }),
   );
 });

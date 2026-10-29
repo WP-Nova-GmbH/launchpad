@@ -1,6 +1,11 @@
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import { confirmThreadVmCleanupIdentity } from "../threads/ThreadVmCleanupIdentity.ts";
+import * as Redacted from "effect/Redacted";
+import { nativeRestoreSecretBoxTestLayer } from "../threads/testUtils/nativeRestoreCatalog.ts";
 import * as NodeCrypto from "node:crypto";
 import { describe, expect, layer } from "@effect/vitest";
-import { ThreadId, ClientOrchestrationCommand } from "@t3tools/contracts";
+import { CommandId, ThreadId, ClientOrchestrationCommand } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { makeThreadJournalStore } from "../threads/ThreadJournalStore.ts";
 import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
@@ -31,13 +36,36 @@ import {
 const decodeCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 
 const services = Layer.effect(RelayDb, PgDrizzle.makeWithDefaults()).pipe(
-  Layer.provideMerge(nativeCheckpointCatalogTestLayer),
+  Layer.provideMerge(
+    Layer.mergeAll(nativeCheckpointCatalogTestLayer, nativeRestoreSecretBoxTestLayer),
+  ),
 );
 const fixture = Effect.fnUntraced(function* () {
   const f = yield* finalSaveCatalogFixture();
+  yield* f.sql`INSERT INTO relay_organizations(organization_id,name,created_at,updated_at) VALUES('org','Tests','now','now') ON CONFLICT DO NOTHING`;
+  yield* f.sql`INSERT INTO relay_repositories(repository_id,organization_id,name,created_at,updated_at) VALUES('repo','org','Tests','now','now') ON CONFLICT DO NOTHING`;
+  yield* f.sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at) VALUES('org',${f.input.actorUserId},'admin','now','now')`;
   const pauses = makeThreadVmPauseStore(f.sql),
-    recovery = makeThreadVmPauseRecoveryStore(f.sql, f.objects);
+    rawRecovery = makeThreadVmPauseRecoveryStore(f.sql, f.objects);
   yield* pauses.reserveIdle(f.hostId);
+  const recovery = {
+    ...rawRecovery,
+    sourceFrozen: Effect.fnUntraced(function* (
+      input: Parameters<typeof rawRecovery.sourceFrozen>[0],
+    ) {
+      const result = yield* rawRecovery.sourceFrozen(input);
+      const claim = yield* f.backup.claim(f.hostId);
+      if (claim) {
+        yield* f.backup.beginCapture(claim);
+        yield* f.backup.recordCapture(claim, {
+          snapshotId: `snapshot-${claim.operationId}`,
+          sourceTemplateId: `snapshot-${claim.operationId}`,
+          sourceBuildId: NodeCrypto.randomUUID(),
+        });
+      }
+      return result;
+    }),
+  };
   const pause = (yield* recovery.get(f.owner))!,
     bootId = NodeCrypto.randomUUID();
   const publish = Effect.gen(function* () {
@@ -78,6 +106,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 operationId: f.pause.operationId,
                 nativeCheckpointOperationId: point.native.header.operationId,
                 bootId: f.bootId,
+                sealEpoch: 1,
               });
               const claim = (yield* f.pauses.claim(f.hostId))!;
               yield* f.pauses.markSealed(claim, f.bootId);
@@ -117,6 +146,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   ...f.owner,
                   operationId: f.pause.operationId,
                   bootId: f.bootId,
+                  sealEpoch: 1,
                   nativeCheckpointOperationId: point.native.header.operationId,
                 });
               }
@@ -181,9 +211,13 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   f.sql,
                   {
                     inspect: () => Effect.succeed({ ...f.info, state }),
-                    resume: () =>
+                    recoverIngress: () =>
                       Effect.sync(() => {
                         state = "running";
+                        return {
+                          sandboxId: f.computeRef,
+                          trafficAccessToken: Redacted.make("resumed-native-token"),
+                        };
                       }),
                   },
                   { reopenAfterResume: () => Effect.void },
@@ -229,6 +263,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 ...f.owner,
                 operationId: f.pause.operationId,
                 bootId: f.bootId,
+                sealEpoch: 1,
                 nativeCheckpointOperationId: point.native.header.operationId,
               });
               const stage = Effect.fnUntraced(function* (data: object) {
@@ -338,6 +373,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 freeze = f.recovery.sourceFrozen({
                   ...input,
                   bootId: f.bootId,
+                  sealEpoch: 1,
                   nativeCheckpointOperationId: point.native.header.operationId,
                 });
               if (winner === "cancel") yield* cancel;
@@ -396,6 +432,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   problem === "wrong-operation" ? NodeCrypto.randomUUID() : f.pause.operationId,
                 nativeCheckpointOperationId: checkpoint,
                 bootId: f.bootId,
+                sealEpoch: 1,
               };
               const result = yield* Effect.result(f.recovery.sourceFrozen(input));
               if (problem !== "none") {
@@ -428,6 +465,169 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
           ),
         );
       }
+      it.effect(
+        "a delayed native pause holds power and blocks queued resume until its exact acknowledgement settles",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                point = yield* f.publish;
+              yield* f.recovery.sourceFrozen({
+                ...f.owner,
+                operationId: f.pause.operationId,
+                nativeCheckpointOperationId: point.native.header.operationId,
+                bootId: f.bootId,
+                sealEpoch: 1,
+              });
+              const entered = yield* Deferred.make<void>(),
+                ack = yield* Deferred.make<void>();
+              let nativeState: "running" | "paused" = "running",
+                calls = 0;
+              const worker = makeThreadVmPauseWorker(
+                f.sql,
+                {
+                  inspect: () => Effect.succeed({ ...f.info, state: nativeState }),
+                  pause: () =>
+                    Effect.gen(function* () {
+                      calls++;
+                      yield* Deferred.succeed(entered, undefined);
+                      yield* Deferred.await(ack);
+                    }),
+                },
+                {
+                  seal: () => Effect.succeed({ bootId: f.bootId, idle: true }),
+                  reopen: () => Effect.die("An unsettled pause cannot reopen"),
+                },
+                f.hostId,
+              );
+              const pending = yield* worker.runOne().pipe(Effect.forkScoped);
+              yield* Deferred.await(entered);
+              // Native timeout can make GET paused while the older POST is still delayed.
+              nativeState = "paused";
+              yield* f.sql`UPDATE relay_thread_vm_pauses SET claim_until=clock_timestamp()-interval '1 second',retry_at=clock_timestamp() WHERE allocation_id=${f.input.allocationId}`;
+              const queued = yield* f.journal.stage({
+                threadId: f.threadId,
+                actor: { userId: f.input.actorUserId, displayName: "Owner", imageUrl: null },
+                command: {
+                  type: "thread.queue.resume",
+                  expectedRevision: 0,
+                  commandId: CommandId.make(NodeCrypto.randomUUID()),
+                  threadId: ThreadId.make(f.threadId),
+                  createdAt: "2026-10-28T10:00:00Z",
+                },
+              });
+              expect(queued?.receipt).toBeNull();
+              expect(yield* worker.runOne()).toBe(false);
+              expect(
+                yield* makeThreadVmResumeStore(f.sql).request(f.threadId).pipe(Effect.isFailure),
+              ).toBe(true);
+              expect(
+                yield* f.recovery.get(f.owner).pipe(Effect.map((value) => value?.canActivate)),
+              ).toBe(false);
+              const [held] = yield* f.sql<{
+                state: string;
+              }>`SELECT state FROM relay_thread_vm_capacity WHERE allocation_id=${f.input.allocationId} ORDER BY position DESC LIMIT 1`;
+              expect(held?.state).toBe("started");
+              expect(
+                yield* confirmThreadVmCleanupIdentity(
+                  f.sql,
+                  {
+                    inspect: () => Effect.die("Unknown pause must block before compute inspection"),
+                  },
+                  {
+                    allocationId: f.input.allocationId,
+                    threadId: f.threadId,
+                    operationId: f.input.allocationId,
+                    generation: 1,
+                    computeRef: f.computeRef,
+                  },
+                ),
+              ).toBe(false);
+              yield* Deferred.succeed(ack, undefined);
+              yield* Fiber.join(pending);
+              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("running");
+              const [settled] = yield* f.sql<{
+                marker: string | null;
+                ack: boolean;
+              }>`SELECT pause_dispatch_claim_id AS marker,pause_acknowledged_at IS NOT NULL AS ack FROM relay_thread_vm_pauses WHERE allocation_id=${f.input.allocationId}`;
+              expect(settled).toEqual({ marker: null, ack: true });
+              yield* f.sql`UPDATE relay_thread_vm_pauses SET retry_at=clock_timestamp() WHERE allocation_id=${f.input.allocationId}`;
+              expect(yield* worker.runOne()).toBe(true);
+              expect(calls).toBe(1);
+              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("paused");
+              expect((yield* makeThreadVmResumeStore(f.sql).get(f.input.allocationId))?.phase).toBe(
+                "waiting",
+              );
+            }),
+          ),
+      );
+      it.effect(
+        "an acknowledged native pause uses GET only while status still reports running",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                point = yield* f.publish;
+              yield* f.recovery.sourceFrozen({
+                ...f.owner,
+                operationId: f.pause.operationId,
+                nativeCheckpointOperationId: point.native.header.operationId,
+                bootId: f.bootId,
+                sealEpoch: 1,
+              });
+              let nativeState: "running" | "paused" = "running",
+                calls = 0;
+              const worker = makeThreadVmPauseWorker(
+                f.sql,
+                {
+                  inspect: () => Effect.succeed({ ...f.info, state: nativeState }),
+                  pause: () =>
+                    Effect.sync(() => {
+                      calls++;
+                    }),
+                },
+                {
+                  seal: () => Effect.succeed({ bootId: f.bootId, idle: true }),
+                  reopen: () => Effect.die("No reopen"),
+                },
+                f.hostId,
+                false,
+              );
+              expect(yield* worker.runOne()).toBe(true);
+              expect(calls).toBe(1);
+              yield* f.sql`UPDATE relay_thread_vm_pauses SET retry_at=clock_timestamp() WHERE allocation_id=${f.input.allocationId}`;
+              expect(yield* worker.runOne()).toBe(true);
+              expect(calls).toBe(1);
+              nativeState = "paused";
+              yield* f.sql`UPDATE relay_thread_vm_pauses SET retry_at=clock_timestamp() WHERE allocation_id=${f.input.allocationId}`;
+              expect(yield* worker.runOne()).toBe(true);
+              expect(calls).toBe(1);
+              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("paused");
+            }),
+          ),
+      );
+      it.effect("disabled idle policy never reserves a new native pause", () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* finalSaveCatalogFixture();
+            const worker = makeThreadVmPauseWorker(
+              f.sql,
+              {
+                inspect: () => Effect.die("Disabled new admission"),
+                pause: () => Effect.die("No dispatch"),
+              },
+              {
+                seal: () => Effect.die("No source reservation"),
+                reopen: () => Effect.die("No source reservation"),
+              },
+              f.hostId,
+              false,
+            );
+            expect(yield* worker.runOne()).toBe(false);
+            expect(yield* makeThreadVmPauseRecoveryStore(f.sql, f.objects).get(f.owner)).toBeNull();
+          }),
+        ),
+      );
       for (const problem of ["lost-reply", "new-boot"] as const) {
         it.effect(`retains recovery across physical pause (${problem})`, () =>
           Effect.scoped(
@@ -439,6 +639,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 operationId: f.pause.operationId,
                 nativeCheckpointOperationId: point.native.header.operationId,
                 bootId: f.bootId,
+                sealEpoch: 1,
               });
               let state: "running" | "paused" = "running",
                 pauses = 0;
@@ -472,30 +673,13 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               yield* f.sql`UPDATE relay_thread_vm_pauses SET retry_at=clock_timestamp() WHERE allocation_id=${f.input.allocationId}`;
               yield* worker.runOne();
               if (problem === "new-boot") return;
+              // An unacknowledged POST can still arrive after this GET. Keep
+              // power capacity and the source closed instead of retrying it.
               expect(pauses).toBe(1);
-              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("paused");
-              const saved = yield* f.store.begin(f.input);
-              expect(saved.phase).toBe("frozen");
-              expect(saved.nativeCheckpointOperationId).toBe(point.native.header.operationId);
-              expect(
-                yield* f.storeNative.getForOperation({
-                  threadId: f.threadId,
-                  operationId: f.input.operationId,
-                }),
-              ).toMatchObject({ operationId: point.native.header.operationId });
-              expect((yield* f.recovery.get(f.owner))?.canActivate).toBe(false);
-              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("paused");
-              yield* f.verifyBackup;
-              expect((yield* f.store.recordSaved(f.input.operationId)).phase).toBe("deleting");
-              const deletion = (yield* f.store.claimDeletion(f.hostId))!;
-              yield* f.store.beginDeletion(deletion);
-              yield* f.store.confirmDeleted(deletion);
-              const retained = yield* f.sql`SELECT 1 FROM relay_thread_native_checkpoint_operations
-                WHERE operation_id IN (${f.pause.operationId},${f.input.operationId}) AND phase='active'`;
-              expect(retained).toHaveLength(0);
-              expect((yield* f.storeNative.latestComplete(f.threadId))?.operationId).toBe(
-                point.native.header.operationId,
-              );
+              expect(yield* f.pauses.claim(f.hostId)).toBeNull();
+              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("running");
+              yield* Effect.flip(makeThreadVmResumeStore(f.sql).request(f.threadId));
+              return;
             }),
           ),
         );
@@ -554,6 +738,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               operationId: f.pause.operationId,
               nativeCheckpointOperationId: point.native.header.operationId,
               bootId: f.bootId,
+              sealEpoch: 1,
             });
             const claim = (yield* f.pauses.claim(f.hostId))!;
             yield* f.pauses.markSealed(claim, f.bootId);
@@ -567,9 +752,13 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               f.sql,
               {
                 inspect: () => Effect.succeed({ ...f.info, state }),
-                resume: () =>
+                recoverIngress: () =>
                   Effect.sync(() => {
                     state = "running";
+                    return {
+                      sandboxId: f.computeRef,
+                      trafficAccessToken: Redacted.make("resumed-native-token"),
+                    };
                   }),
               },
               { reopenAfterResume: () => Effect.void },
@@ -660,6 +849,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   ...owner,
                   operationId: f.pause.operationId,
                   bootId: f.bootId,
+                  sealEpoch: 1,
                   nativeCheckpointOperationId: point.native.header.operationId,
                 }).pipe(provide, objects),
               );

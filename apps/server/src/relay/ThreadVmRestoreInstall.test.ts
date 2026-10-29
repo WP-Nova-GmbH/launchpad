@@ -22,6 +22,8 @@ import {
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
+import * as Sink from "effect/Sink";
+import { VmControlSpawner, VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
@@ -691,6 +693,46 @@ it.layer(
               let calls = 0,
                 ready = false,
                 status = 200;
+              let reopens = 0;
+              const gate = {
+                bootId: NodeCrypto.randomUUID(),
+                epoch: 8,
+                sealedBy: NodeCrypto.createHash("sha256")
+                  .update(f.operationId)
+                  .digest("hex")
+                  .slice(0, 32) as string | null,
+                groups: [],
+                stopped: true,
+              };
+              const control = ChildProcessSpawner.make((command) =>
+                Effect.gen(function* () {
+                  if (!("args" in command)) throw new Error("Expected one control request");
+                  if (command.args[0] === "reopen") {
+                    expect(ready).toBe(true);
+                    expect((yield* readThreadVmRestoreState())?.phase).toBe("activated");
+                    expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe(
+                      "frozen",
+                    );
+                    expect(command.args[2]).toBe(gate.sealedBy);
+                    gate.sealedBy = null;
+                    gate.epoch++;
+                    reopens++;
+                  } else expect(command.args[0]).toBe("inspect");
+                  return ChildProcessSpawner.makeHandle({
+                    pid: ChildProcessSpawner.ProcessId(1),
+                    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                    isRunning: Effect.succeed(false),
+                    kill: () => Effect.void,
+                    unref: Effect.succeed(Effect.void),
+                    stdin: Sink.drain,
+                    stdout: Stream.encodeText(Stream.make(encode(gate))),
+                    stderr: Stream.empty,
+                    all: Stream.empty,
+                    getInputFd: () => Sink.drain,
+                    getOutputFd: () => Stream.empty,
+                  });
+                }).pipe(Effect.provideService(Secrets.ServerSecretStore, secrets), Effect.orDie),
+              );
               const client = HttpClient.make((request) =>
                 Effect.gen(function* () {
                   calls++;
@@ -705,6 +747,8 @@ it.layer(
                 }),
               );
               const activate = activateRestoredThreadVm(f.threadId).pipe(
+                Effect.provideService(VmWorkloadTracking, true),
+                Effect.provideService(VmControlSpawner, control),
                 Effect.provideService(HttpClient.HttpClient, client),
                 Effect.provide(
                   Layer.mock(ProviderInstanceRegistry)({
@@ -713,6 +757,7 @@ it.layer(
                 ),
               );
               expect(yield* activate).toBe(false);
+              expect(reopens).toBe(0);
               expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe("frozen");
               status = 503;
               yield* Effect.flip(activate);
@@ -735,10 +780,12 @@ it.layer(
               expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe("frozen");
               expect((yield* readThreadVmRestoreState())?.phase).toBe("ready");
               expect(yield* activate).toBe(true);
+              expect(reopens).toBe(1);
               expect(calls).toBe(4);
               expect((yield* readThreadVmRestoreState())?.phase).toBe("activated");
               expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe("active");
               expect(yield* activate).toBe(false);
+              expect(reopens).toBe(1);
               expect(calls).toBe(4);
               yield* sql`UPDATE provider_session_runtime SET status='running' WHERE thread_id=${f.threadId}`;
               expect(yield* requireThreadVmRestoreServerStart(digest, f.workspaceRoot)).toEqual(

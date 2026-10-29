@@ -1,3 +1,4 @@
+import { makeThreadVmBackupSourceStore } from "../threads/ThreadVmBackupSourceStore.ts";
 import type { OrchestrationCommandReceipt } from "@t3tools/contracts/threadTransfer";
 import {
   confirmThreadVmRestoreActivation,
@@ -394,6 +395,69 @@ export const mintThreadVmRepositoryToken = Effect.fn("relay.api.thread_environme
   }),
 );
 
+const backupSourceOperation = Effect.fn("relay.api.thread_vm.backup_source")(
+  function* (
+    input: Owner & {
+      operationId?: string;
+      nativeCheckpointOperationId?: string;
+      bootId?: string;
+      sealEpoch?: number;
+    },
+    action: "get" | "freeze" | "cancel" | "activate",
+  ) {
+    return yield* withEnvironmentThread(
+      input,
+      false,
+      Effect.gen(function* () {
+        const principal = yield* RelayEnvironmentPrincipal;
+        if (!principal.threadVm) return yield* tenancyNotFound("thread_not_found");
+        const store = makeThreadVmBackupSourceStore(
+          (yield* RelayDb).$client,
+          yield* ThreadArtifactObjectStorage,
+        );
+        const current = yield* store.get(input);
+        if (!current) {
+          if (action === "get") return null;
+          return yield* tenancyNotFound("thread_not_found");
+        }
+        if (
+          current.allocationId !== principal.threadVm.allocationId ||
+          (action !== "get" && current.operationId !== input.operationId)
+        )
+          return yield* tenancyNotFound("thread_not_found");
+        const owned = { ...input, operationId: current.operationId };
+        const value =
+          action === "get"
+            ? current
+            : action === "cancel"
+              ? yield* store.cancelPending(owned)
+              : action === "activate"
+                ? yield* store.confirmActivation(owned)
+                : yield* store.sourceFrozen({
+                    ...owned,
+                    nativeCheckpointOperationId: input.nativeCheckpointOperationId!,
+                    bootId: input.bootId!,
+                    sealEpoch: input.sealEpoch!,
+                  });
+        return {
+          threadId: ThreadId.make(value.threadId),
+          environmentId: EnvironmentId.make(value.environmentId),
+          generation: value.generation,
+          operationId: value.operationId,
+          phase: value.phase,
+          nativeCheckpointOperationId: value.sourceReceipt?.nativeCheckpointOperationId ?? null,
+          canActivate: value.canActivate,
+          sourceReopened: value.sourceReopened,
+        };
+      }),
+    );
+  },
+  Effect.catchTags({
+    ThreadVmBackupConflict: () => tenancyConflict("thread_placement_changed"),
+    ThreadNativeCheckpointConflict: () => tenancyConflict("thread_checkpoint_conflict"),
+    SchemaError: () => relayInternalErrorResponse("persistence_failed"),
+  }),
+);
 const serializePause = (pause: ThreadVmPauseRecovery) => ({
   threadId: ThreadId.make(pause.threadId),
   environmentId: EnvironmentId.make(pause.environmentId),
@@ -427,7 +491,12 @@ export const getThreadVmPause = Effect.fn("relay.api.thread_vm.pause.get")(funct
 });
 export const freezeThreadVmPause = Effect.fn("relay.api.thread_vm.pause.freeze")(
   function* (
-    input: Owner & { operationId: string; nativeCheckpointOperationId: string; bootId: string },
+    input: Owner & {
+      operationId: string;
+      nativeCheckpointOperationId: string;
+      bootId: string;
+      sealEpoch: number;
+    },
   ) {
     return yield* withEnvironmentThread(
       input,
@@ -454,6 +523,7 @@ export const freezeThreadVmPause = Effect.fn("relay.api.thread_vm.pause.freeze")
     ThreadVmPauseConflict: () => tenancyConflict("thread_placement_changed"),
     ThreadNativeCheckpointConflict: () => tenancyConflict("thread_checkpoint_conflict"),
     SchemaError: () => relayInternalErrorResponse("persistence_failed"),
+    PlatformError: () => relayInternalErrorResponse("persistence_failed"),
   }),
 );
 export const confirmThreadVmPauseActivation = Effect.fn("relay.api.thread_vm.pause.activate")(
@@ -518,6 +588,7 @@ const serializeFinalSave = (operation: FinalSave) => ({
   operationId: operation.operationId,
   phase: operation.phase,
   nativeCheckpointOperationId: operation.nativeCheckpointOperationId,
+  sourceActivationPending: operation.sourceActivationPending,
 });
 
 /** Only the enrolled allocation may acknowledge the frozen source; access removal still permits draining. */
@@ -545,7 +616,14 @@ export const getThreadVmFinalSave = Effect.fn("relay.api.thread_vm.final_save.ge
   );
 });
 export const freezeThreadVmFinalSave = Effect.fn("relay.api.thread_vm.final_save.freeze")(
-  function* (input: Owner & { operationId: string; nativeCheckpointOperationId: string }) {
+  function* (
+    input: Owner & {
+      operationId: string;
+      nativeCheckpointOperationId: string;
+      bootId: string;
+      sealEpoch: number;
+    },
+  ) {
     const sql = (yield* RelayDb).$client;
     return yield* withEnvironmentThread(
       input,
@@ -600,6 +678,34 @@ export const cancelThreadVmFinalSave = Effect.fn("relay.api.thread_vm.final_save
   }),
 );
 
+export const confirmThreadVmFinalSaveActivation = Effect.fn(
+  "relay.api.thread_vm.final_save.confirm_activation",
+)(
+  function* (input: Owner & { operationId: string }) {
+    const sql = (yield* RelayDb).$client;
+    return yield* withEnvironmentThread(
+      input,
+      false,
+      Effect.gen(function* () {
+        const principal = yield* RelayEnvironmentPrincipal;
+        if (!principal.threadVm) return yield* tenancyNotFound("thread_not_found");
+        const store = makeThreadVmFinalSaveStore(sql, yield* ThreadArtifactObjectStorage);
+        const operation = yield* store.get(input.operationId);
+        if (
+          !operation ||
+          operation.threadId !== input.threadId ||
+          operation.allocationId !== principal.threadVm.allocationId
+        )
+          return yield* tenancyNotFound("thread_not_found");
+        return serializeFinalSave(yield* store.confirmActivation(input));
+      }),
+    );
+  },
+  Effect.catchTags({
+    ThreadVmFinalSaveConflict: () => tenancyConflict("thread_placement_changed"),
+  }),
+);
+
 export const threadEnvironmentApi = HttpApiBuilder.group(
   RelayApi,
   "threadEnvironment",
@@ -616,6 +722,30 @@ export const threadEnvironmentApi = HttpApiBuilder.group(
       )
       .handle("restoreArtifact", ({ params, query }) =>
         readThreadVmRestoreArtifact({ ...params, ...query }),
+      )
+      .handle("getBackupSource", ({ params, payload }) =>
+        backupSourceOperation({ ...params, ...payload }, "get"),
+      )
+      .handle("freezeBackupSource", ({ params, payload }) =>
+        backupSourceOperation({ ...params, ...payload }, "freeze").pipe(
+          Effect.flatMap((value) =>
+            value ? Effect.succeed(value) : tenancyNotFound("thread_not_found"),
+          ),
+        ),
+      )
+      .handle("cancelBackupSource", ({ params, payload }) =>
+        backupSourceOperation({ ...params, ...payload }, "cancel").pipe(
+          Effect.flatMap((value) =>
+            value ? Effect.succeed(value) : tenancyNotFound("thread_not_found"),
+          ),
+        ),
+      )
+      .handle("confirmBackupSourceActivation", ({ params, payload }) =>
+        backupSourceOperation({ ...params, ...payload }, "activate").pipe(
+          Effect.flatMap((value) =>
+            value ? Effect.succeed(value) : tenancyNotFound("thread_not_found"),
+          ),
+        ),
       )
       .handle("cancelPause", ({ params, payload }) =>
         cancelThreadVmPause({ ...params, ...payload }),
@@ -635,6 +765,9 @@ export const threadEnvironmentApi = HttpApiBuilder.group(
       )
       .handle("freezeFinalSave", ({ params, payload }) =>
         freezeThreadVmFinalSave({ ...params, ...payload }),
+      )
+      .handle("confirmFinalSaveActivation", ({ params, payload }) =>
+        confirmThreadVmFinalSaveActivation({ ...params, ...payload }),
       )
       .handle("repositoryBinding", ({ params, payload }) =>
         getThreadVmRepositoryBinding({ ...params, ...payload }),

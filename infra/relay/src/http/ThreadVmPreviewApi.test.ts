@@ -7,6 +7,8 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Redacted from "effect/Redacted";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as TestClock from "effect/testing/TestClock";
 import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 import {
@@ -17,6 +19,10 @@ import {
 } from "effect/unstable/http";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import { RelayDb } from "../db.ts";
+import { RelayConfiguration } from "../Config.ts";
+import { RelaySecretBox, make as makeSecretBox } from "../auth/SecretBox.ts";
+import { sealThreadVmTrafficAccessToken } from "../threads/ThreadVmIngressToken.ts";
+import { RELAY_THREAD_VM_PREVIEW_TYP, verifyRelayJwt } from "@t3tools/shared/relayJwt";
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import { makeThreadVmPreviewStore } from "../threads/ThreadVmPreviewStore.ts";
 import { authorizeThreadVmConnection } from "../threads/ThreadVmConnectionAccess.ts";
@@ -34,6 +40,22 @@ import {
 import { makeRelayCors } from "./Api.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const relayKeys = NodeCrypto.generateKeyPairSync("ed25519", {
+  privateKeyEncoding: { format: "pem", type: "pkcs8" },
+  publicKeyEncoding: { format: "pem", type: "spki" },
+});
+const relayConfiguration: RelayConfiguration["Service"] = {
+  relayIssuer: "https://relay.test",
+  cloudMintPrivateKey: Redacted.make(relayKeys.privateKey),
+  cloudMintPublicKey: relayKeys.publicKey,
+  apns: null,
+  clerkSecretKey: Redacted.make("clerk-secret"),
+  clerkPublishableKey: "clerk-public",
+  clerkJwtAudience: "test",
+  apnsDeliveryJobSigningSecret: Redacted.make("test"),
+  managedEndpointBaseDomain: undefined,
+  managedEndpointNamespace: undefined,
+};
 
 const fixture = Effect.fnUntraced(function* () {
   const f = yield* finalSaveCatalogFixture();
@@ -45,6 +67,20 @@ const fixture = Effect.fnUntraced(function* () {
   yield* f.sql`INSERT INTO relay_thread_vm_enrollments(allocation_id,operation_id,seed_hash,expires_at,environment_id,environment_public_key,sealed_response,credential_id,installed_at)
     VALUES(${allocationId},${allocationId},${NodeCrypto.randomBytes(32).toString("hex")},clock_timestamp()+interval '1 hour',${f.sourceEnvironmentId},'test-key','sealed',${f.credentialId},clock_timestamp())`;
   const db = yield* PgDrizzle.makeWithDefaults();
+  const box = yield* makeSecretBox.pipe(
+    Effect.provideService(RelayConfiguration, relayConfiguration),
+  );
+  const token = yield* sealThreadVmTrafficAccessToken(
+    {
+      allocationId,
+      computeRef: f.computeRef,
+      operationId: allocationId,
+      threadId: f.threadId,
+      generation: 1,
+    },
+    Redacted.make("traffic-secret"),
+  ).pipe(Effect.provideService(RelaySecretBox, box));
+  yield* f.sql`UPDATE relay_thread_vm_allocations SET sealed_traffic_access_token=${token} WHERE allocation_id=${allocationId}`;
   const settings = {
     compute: {
       apiUrl: "http://e2b.test",
@@ -69,6 +105,8 @@ const fixture = Effect.fnUntraced(function* () {
   const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(
       Effect.provideService(RelayDb, db),
+      Effect.provideService(RelayConfiguration, relayConfiguration),
+      Effect.provideService(RelaySecretBox, box),
       Effect.provideService(RelayClientPrincipal, { userId, token: "test-token" }),
       Effect.provideService(ThreadVmRuntimeConfiguration, { settings }),
     );
@@ -211,8 +249,6 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 }),
               );
               const inspect: typeof fetch = async (input) => {
-                if (String(input) === "http://e2b.test/extensions/launchpad/v1/capabilities")
-                  return Response.json({ version: 1, privatePreviewHeaderBoundary: true });
                 expect(String(input)).toBe(`http://e2b.test/sandboxes/${f.computeRef}`);
                 return Response.json({
                   sandboxID: f.computeRef,
@@ -220,7 +256,6 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   state: "running",
                   envdVersion: "test",
                   envdAccessToken: "envd-secret",
-                  trafficAccessToken: "traffic-secret",
                   network: { allowPublicTraffic: false },
                   lifecycle: { autoResume: false },
                   metadata: {
@@ -234,11 +269,19 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               };
               const ctx = Context.pick(
                 RelayDb,
+                RelayConfiguration,
+                RelaySecretBox,
                 ThreadVmRuntimeConfiguration,
                 Crypto.Crypto,
               )(
                 yield* f.provide(
-                  Effect.context<RelayDb | ThreadVmRuntimeConfiguration | Crypto.Crypto>(),
+                  Effect.context<
+                    | RelayDb
+                    | RelayConfiguration
+                    | RelaySecretBox
+                    | ThreadVmRuntimeConfiguration
+                    | Crypto.Crypto
+                  >(),
                 ),
               );
               const router = Layer.mergeAll(
@@ -314,12 +357,34 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               expect(calls[0]?.url).toBe("http://ingress.test/v1/secret?app=1");
               expect(calls[0]?.headers).toMatchObject({
                 "e2b-sandbox-id": f.computeRef,
-                "e2b-sandbox-port": "4080",
+                "e2b-sandbox-port": "3773",
                 "e2b-traffic-access-token": "traffic-secret",
               });
-              expect(encodeJson(calls[0]?.headers)).not.toMatch(
-                /caller-clerk-secret|caller-dpop|launchpad-vm-preview/,
-              );
+              expect(encodeJson(calls[0]?.headers)).not.toMatch(/caller-clerk-secret|caller-dpop/);
+              const proof = yield* verifyRelayJwt({
+                publicKey: relayKeys.publicKey,
+                token: calls[0]!.headers["x-launchpad-vm-preview"]!,
+                typ: RELAY_THREAD_VM_PREVIEW_TYP,
+                issuer: relayConfiguration.relayIssuer,
+                audience: `t3-env:${f.sourceEnvironmentId}`,
+                nowEpochSeconds: Math.floor(
+                  (yield* TestClock.withLive(DateTime.now)).epochMilliseconds / 1000,
+                ),
+                maxTokenAge: "30 seconds",
+              });
+              expect(proof).toMatchObject({
+                environmentId: f.sourceEnvironmentId,
+                operationId: f.allocationId,
+                sub: f.threadId,
+                port: 4080,
+                scope: {
+                  allocationId: f.allocationId,
+                  threadId: f.threadId,
+                  repositoryId: "repo",
+                  generation: 1,
+                },
+              });
+              expect(proof.exp! - proof.iat!).toBe(30);
               expect(app.headers.get("location")).toBe(url.origin + "/next");
               expect(app.headers.get("set-cookie")).toContain("app_session=app-cookie");
               expect(app.headers.get("set-cookie")).not.toContain("Domain=");

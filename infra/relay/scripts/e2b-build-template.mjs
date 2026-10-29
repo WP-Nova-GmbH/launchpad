@@ -48,7 +48,7 @@ export async function prepareTemplateContext(archive, expectedSha256) {
       `${expectedSha256}  server.tar.gz\n`,
       { mode: 0o600 },
     );
-    for (const file of ["workload.py", "activity.py", "launchpad-workloads.service"])
+    for (const file of ["workload.py", "activity.py", "launchpad-workloads.service", "install.sh"])
       await NodeFSP.copyFile(NodePath.join(templateDirectory, file), NodePath.join(context, file));
     return context;
   } catch (error) {
@@ -114,6 +114,9 @@ export async function buildTemplate(args, apiKey) {
       workloadServiceSha256: NodeCrypto.createHash("sha256")
         .update(await NodeFSP.readFile(NodePath.join(context, "launchpad-workloads.service")))
         .digest("hex"),
+      installerSha256: NodeCrypto.createHash("sha256")
+        .update(await NodeFSP.readFile(NodePath.join(context, "install.sh")))
+        .digest("hex"),
       dockerfileSha256: NodeCrypto.createHash("sha256").update(dockerfile).digest("hex"),
     };
     // Reserve a new local receipt before the remote operation. On failure retain
@@ -127,9 +130,9 @@ export async function buildTemplate(args, apiKey) {
     const result = await Template.build(template, name, {
       apiUrl,
       apiKey,
+      retries: 0,
       cpuCount: standardResources.cpuCount,
       memoryMB: standardResources.memoryMB,
-      // The pinned SDK patch forwards this to E2B's template-build API.
       minFreeDiskMb: standardResources.minFreeDiskMb,
       tags: [buildTag],
       skipCache: args["skip-cache"] === true,

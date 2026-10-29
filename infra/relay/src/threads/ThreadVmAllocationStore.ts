@@ -2,6 +2,7 @@ import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { threadVmQuotaUsage } from "./ThreadVmQuota.ts";
+import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
 
 export class ThreadVmQuotaExceeded extends Schema.TaggedError<ThreadVmQuotaExceeded>()(
   "ThreadVmQuotaExceeded",
@@ -17,11 +18,15 @@ export interface ThreadVmAllocation {
   readonly organizationId: string;
   readonly ownerUserId: string;
   readonly templateId: string;
+  readonly runtimeProtocol: "legacy" | "native-v1";
   readonly computeRef: string | null;
   readonly state: "creating" | "running" | "paused" | "deleting" | "deleted";
   readonly deletedAt: string | null;
 }
-type AllocationIntent = Omit<ThreadVmAllocation, "computeRef" | "state" | "deletedAt">;
+type AllocationIntent = Omit<
+  ThreadVmAllocation,
+  "computeRef" | "state" | "deletedAt" | "runtimeProtocol"
+>;
 const conflict = (message: string) => new ThreadVmAllocationConflict({ message });
 
 /** Private storage API: callers authorize the thread and reserve before contacting compute. */
@@ -30,7 +35,7 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
     const [row] =
       yield* sql<ThreadVmAllocation>`SELECT allocation_id AS "allocationId", thread_id AS "threadId",
       organization_id AS "organizationId", owner_user_id AS "ownerUserId", template_id AS "templateId",
-      compute_ref AS "computeRef", state, deleted_at AS "deletedAt"
+      compute_ref AS "computeRef",runtime_protocol AS "runtimeProtocol", state, deleted_at AS "deletedAt"
       FROM relay_thread_vm_allocations WHERE allocation_id = ${allocationId}`;
     return row ?? null;
   });
@@ -38,6 +43,10 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
     yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id = ${allocationId} FOR UPDATE`;
     const row = yield* get(allocationId);
     if (!row) return yield* conflict("VM allocation does not exist");
+    if (row.runtimeProtocol !== "native-v1")
+      return yield* conflict(
+        "This VM belongs to an earlier runtime. Preserve it and complete manual migration before changing it.",
+      );
     return row;
   });
   const reserve = Effect.fn("relay.thread_vm.reserve")(function* (
@@ -57,6 +66,10 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
         yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.allocationId}, 721865))`;
         const prior = yield* get(input.allocationId);
         if (prior) {
+          if (prior.runtimeProtocol !== "native-v1")
+            return yield* conflict(
+              "This VM belongs to an earlier runtime and requires manual migration.",
+            );
           if (
             prior.threadId !== input.threadId ||
             prior.ownerUserId !== input.ownerUserId ||
@@ -139,7 +152,8 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
         const saved = yield* sql<{ restoreOperationId: string | null; operationId: string | null }>`
           SELECT s.restore_operation_id AS "restoreOperationId", t.operation_id AS "operationId"
           FROM relay_thread_vm_saved_disks s JOIN relay_thread_placements t USING(thread_id)
-          WHERE s.thread_id=${input.threadId} AND s.generation=t.generation AND s.phase != 'restored'`;
+          WHERE s.thread_id=${input.threadId} AND s.phase != 'restored'
+            AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}))`;
         const reset = input.savedDiskResetOperationId
           ? yield* sql`SELECT 1 FROM relay_thread_vm_resets r
               JOIN relay_thread_placements t USING(thread_id)
@@ -147,7 +161,8 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
               WHERE r.operation_id=${input.savedDiskResetOperationId} AND r.allocation_id=${input.allocationId}
                 AND r.thread_id=${input.threadId} AND r.actor_user_id=${input.ownerUserId}
                 AND r.expected_generation=t.generation AND t.operation_id=r.operation_id
-                AND r.phase='pending' AND s.thread_id=t.thread_id AND s.generation=t.generation AND s.phase='expired'`
+                AND r.phase='pending' AND s.thread_id=t.thread_id AND s.phase='expired'
+                AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}))`
           : [];
         if (input.savedDiskResetOperationId && !reset.length)
           return yield* conflict("Reset reservation no longer owns this expired workspace");
@@ -165,8 +180,8 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
         const existing =
           yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE thread_id = ${input.threadId} AND deleted_at IS NULL`;
         if (existing.length) return yield* conflict("Thread already has a VM allocation");
-        yield* sql`INSERT INTO relay_thread_vm_allocations (allocation_id, thread_id, organization_id, owner_user_id, template_id, state)
-        VALUES (${input.allocationId}, ${input.threadId}, ${input.organizationId}, ${input.ownerUserId}, ${input.templateId}, 'creating')`;
+        yield* sql`INSERT INTO relay_thread_vm_allocations (allocation_id, thread_id, organization_id, owner_user_id, template_id, state,runtime_protocol)
+        VALUES (${input.allocationId}, ${input.threadId}, ${input.organizationId}, ${input.ownerUserId}, ${input.templateId}, 'creating','native-v1')`;
         if (replacement?.phase === "awaiting_choice")
           yield* sql`UPDATE relay_thread_vm_replacements SET phase='admitted',error_code=NULL WHERE request_id=${replacement.requestId}`;
         return yield* lock(input.allocationId);
@@ -176,6 +191,7 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
   const recordCreated = Effect.fn("relay.thread_vm.record_created")(function* (input: {
     allocationId: string;
     computeRef: string;
+    sealedTrafficAccessToken?: string;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -186,6 +202,8 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
           return yield* conflict("Allocation has already been removed");
         // An ambiguous create may resolve after deletion was requested. Keep deletion pending.
         yield* sql`UPDATE relay_thread_vm_allocations SET compute_ref = ${input.computeRef},
+        sealed_traffic_access_token = COALESCE(${input.sealedTrafficAccessToken ?? null},
+          CASE WHEN compute_ref = ${input.computeRef} THEN sealed_traffic_access_token END),
         state = CASE WHEN state = 'creating' THEN 'running' ELSE state END WHERE allocation_id = ${input.allocationId}`;
         return yield* lock(input.allocationId);
       }),
@@ -295,7 +313,8 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
         )
           return yield* conflict("Unknown external execution still holds host capacity");
         yield* sql`UPDATE relay_thread_vm_capacity SET state = 'released' WHERE allocation_id = ${input.allocationId}`;
-        yield* sql`UPDATE relay_thread_vm_allocations SET state = 'deleted', deleted_at = to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+        yield* sql`UPDATE relay_thread_vm_allocations SET state = 'deleted', sealed_traffic_access_token = NULL,
+        deleted_at = to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
         WHERE allocation_id = ${input.allocationId}`;
         return yield* lock(input.allocationId);
       }),

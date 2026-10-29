@@ -12,7 +12,7 @@ import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { verifyEnvironmentResponse } from "../environments/EnvironmentConnector.ts";
 import type { E2BThreadVmIdentity } from "../machines/E2BThreadVmConnection.ts";
-import type { makeE2BThreadVmEndpoint } from "../machines/E2BThreadVmEndpoint.ts";
+import type { makeManagedThreadVmEndpoint } from "../machines/E2BThreadVmEndpoint.ts";
 
 export interface ThreadVmConnectionTarget {
   readonly environmentId: EnvironmentId;
@@ -45,7 +45,7 @@ export const mintThreadVmConnection = <E, R>(input: {
     userId: string,
     threadId: ThreadId,
   ) => Effect.Effect<ThreadVmConnectionTarget, E, R>;
-  readonly endpoint: ReturnType<typeof makeE2BThreadVmEndpoint>;
+  readonly endpoint: Pick<ReturnType<typeof makeManagedThreadVmEndpoint>, "mintCredential">;
 }) =>
   Effect.gen(function* () {
     if (!input.clientProofKeyThumbprint.trim()) return yield* new ThreadVmConnectionUnavailable();

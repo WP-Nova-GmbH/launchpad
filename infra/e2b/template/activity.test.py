@@ -2,12 +2,44 @@ import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import unittest
+import venv
 
 spec = importlib.util.spec_from_file_location("activity", Path(__file__).with_name("activity.py"))
 activity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(activity)
+
+
+class HelperStartupTests(unittest.TestCase):
+    def test_writable_system_site_hooks_do_not_run_before_helpers(self):
+        with tempfile.TemporaryDirectory(prefix="launchpad-python-isolation-") as directory:
+            root = Path(directory)
+            venv.EnvBuilder(with_pip=False).create(root / "python")
+            python = root / "python/bin/python"
+            site_packages = Path(subprocess.run(
+                [str(python), "-I", "-B", "-c", "import site; print(site.getsitepackages()[0])"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip())
+            marker = root / "pth-ran"
+            (site_packages / "launchpad-proof.pth").write_text(
+                f"import pathlib; pathlib.Path({str(marker)!r}).write_text('injected')\n"
+            )
+            # Prove this is an executable system-site hook even in isolated mode.
+            subprocess.run([str(python), "-I", "-B", "-c", "pass"], check=True)
+            self.assertTrue(marker.exists())
+            for helper in ("activity.py", "workload.py"):
+                with self.subTest(helper=helper):
+                    marker.unlink(missing_ok=True)
+                    script = Path(__file__).with_name(helper)
+                    _, arguments = script.read_text().splitlines()[0][2:].split(maxsplit=1)
+                    subprocess.run([
+                        str(python), arguments, "-B", "-c",
+                        "import runpy,sys; runpy.run_path(sys.argv[1], run_name='isolated_helper')",
+                        str(script),
+                    ], check=True)
+                    self.assertFalse(marker.exists())
 
 
 class DurableActivityTests(unittest.TestCase):

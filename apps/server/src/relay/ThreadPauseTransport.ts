@@ -23,7 +23,12 @@ export interface ThreadPauseTransport {
   ) => Effect.Effect<RelayThreadVmPause | null, ThreadPauseError>;
   readonly freeze: (
     owner: ThreadHistoryOwner,
-    input: { operationId: string; nativeCheckpointOperationId: string; bootId: string },
+    input: {
+      operationId: string;
+      nativeCheckpointOperationId: string;
+      bootId: string;
+      sealEpoch: number;
+    },
   ) => Effect.Effect<RelayThreadVmPause, ThreadPauseError>;
 }
 export function makeThreadPauseTransport<E, R>(
@@ -56,7 +61,12 @@ export function makeThreadPauseTransport<E, R>(
   const freeze = Effect.fn("ThreadPauseTransport.freeze")(
     function* (
       owner: ThreadHistoryOwner,
-      input: { operationId: string; nativeCheckpointOperationId: string; bootId: string },
+      input: {
+        operationId: string;
+        nativeCheckpointOperationId: string;
+        bootId: string;
+        sealEpoch: number;
+      },
     ) {
       const client = yield* clientFor(owner);
       return yield* client.threadEnvironment.freezePause({

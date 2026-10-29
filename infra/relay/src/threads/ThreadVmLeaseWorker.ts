@@ -16,6 +16,7 @@ interface LeaseCandidate {
   readonly threadId: string;
   readonly repositoryId: string;
   readonly generation: number;
+  readonly capacityOperationId: string;
 }
 type Renew = (
   sandboxId: string,
@@ -38,7 +39,6 @@ export function makeThreadVmLeaseWorker(
   renew: Renew,
   hostId: string,
   compute?: {
-    readonly pausedSnapshotsSupported: Effect.Effect<boolean>;
     readonly inspect: (
       sandboxId: string,
     ) => Effect.Effect<SandboxInfo | null, ThreadVmComputeError>;
@@ -47,13 +47,13 @@ export function makeThreadVmLeaseWorker(
   const runOne = Effect.fn("relay.thread_vm.lease.run_one")(function* () {
     const [row] = yield* sql<LeaseCandidate>`SELECT a.allocation_id AS "allocationId",
       a.compute_ref AS "computeRef", a.template_id AS "templateId", p.operation_id AS "operationId",
-      a.thread_id AS "threadId", t.repository_id AS "repositoryId", p.generation
+      a.thread_id AS "threadId", t.repository_id AS "repositoryId", p.generation,c.operation_id AS "capacityOperationId"
       FROM relay_thread_vm_allocations a
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_capacity c ON c.allocation_id = a.allocation_id AND c.state = 'started'
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
       LEFT JOIN relay_thread_vm_leases l ON l.allocation_id = a.allocation_id
-      WHERE c.host_id = ${hostId} AND c.state = 'started'
+      WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'started'
         AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
         AND p.phase = 'created'
         AND (l.renewed_at IS NULL OR l.renewed_at < clock_timestamp() - interval '4 minutes')
@@ -85,22 +85,29 @@ export function makeThreadVmLeaseWorker(
         generation: row.generation,
       },
     }).pipe(Effect.option);
-    if (renewed._tag === "None" && compute && (yield* compute.pausedSnapshotsSupported)) {
-      // Certified GET refuses an ambiguous/memory pause (409). It never wakes
-      // compute and proves all registered old executions stopped before paused.
+    if (renewed._tag === "None" && compute) {
+      // Native paused state releases power capacity, without claiming a sealed
+      // source or an independently recoverable backup. GET never wakes it.
       const info = yield* compute.inspect(row.computeRef).pipe(Effect.option);
       if (info._tag === "Some" && info.value?.state === "paused") {
         const paused = info.value;
         if (
           paused.sandboxId === row.computeRef &&
+          paused.templateId === row.templateId.split(":")[0] &&
+          paused.network?.allowPublicTraffic === false &&
+          paused.lifecycle?.autoResume === false &&
           paused.metadata["launchpad.managed"] === "thread-vm-v1" &&
           paused.metadata["launchpad.allocation_id"] === row.allocationId &&
           threadVmOperationMatches(paused.metadata, row.operationId) &&
           paused.metadata["launchpad.thread_id"] === row.threadId &&
           paused.metadata["launchpad.generation"] === String(row.generation)
         )
-          if (yield* makeThreadVmResumeStore(sql).reconcileNativePause({ ...row, hostId }))
-            yield* wakeQueuedThreadVm(sql, row.threadId);
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              if (yield* makeThreadVmResumeStore(sql).reconcileNativePause({ ...row, hostId }))
+                yield* wakeQueuedThreadVm(sql, row.threadId);
+            }),
+          );
       }
     }
     if (renewed._tag === "Some")
@@ -109,7 +116,7 @@ export function makeThreadVmLeaseWorker(
         SELECT 1 FROM relay_thread_vm_allocations a
         JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
         JOIN relay_thread_vm_capacity c ON c.allocation_id = a.allocation_id
-        WHERE a.allocation_id = ${row.allocationId} AND a.compute_ref = ${row.computeRef}
+        WHERE a.runtime_protocol='native-v1' AND a.allocation_id = ${row.allocationId} AND a.compute_ref = ${row.computeRef}
           AND a.state = 'running' AND a.deleted_at IS NULL AND p.phase = 'created'
           AND p.operation_id = ${row.operationId} AND p.generation = ${row.generation}
           AND c.host_id = ${hostId} AND c.state = 'started')`;

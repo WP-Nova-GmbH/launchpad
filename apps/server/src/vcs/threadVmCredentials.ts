@@ -5,7 +5,7 @@ export const privateThreadVmGitArgs = (args: ReadonlyArray<string>) => [
   "-c",
   "credential.helper=",
   "-c",
-  "credential.helper=!/usr/local/bin/launchpad-server __thread-vm-git-credential",
+  "credential.helper=!/opt/launchpad/server/t3 __thread-vm-git-credential",
   "-c",
   "credential.useHttpPath=true",
   ...args,

@@ -20,7 +20,7 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 
-/** Public cold-boot scope installed by the host while the destination disk is stopped. */
+/** Public target scope installed by trusted guest bootstrap before fresh enrollment. */
 export const ThreadVmRestoreBoot = Schema.Struct({
   version: Schema.Literal(1),
   operationId: Schema.String.check(
@@ -33,6 +33,32 @@ export const ThreadVmRestoreBoot = Schema.Struct({
   generation: PositiveInt,
 });
 export type ThreadVmRestoreBoot = typeof ThreadVmRestoreBoot.Type;
+
+export const ThreadVmWarmRestoreSource = Schema.Struct({
+  allocationId: ThreadVmRestoreBoot.fields.allocationId,
+  operationId: ThreadVmRestoreBoot.fields.operationId,
+  threadId: ThreadVmRestoreBoot.fields.threadId,
+  generation: PositiveInt,
+  bootId: Schema.String.check(
+    Schema.isPattern(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u),
+  ),
+  captureOperationId: ThreadVmRestoreBoot.fields.operationId,
+  sealEpoch: PositiveInt,
+});
+export const ThreadVmWarmRestoreBootstrap = Schema.Struct({
+  boot: ThreadVmRestoreBoot,
+  source: ThreadVmWarmRestoreSource,
+});
+export type ThreadVmWarmRestoreBootstrap = typeof ThreadVmWarmRestoreBootstrap.Type;
+export const ThreadVmWarmRestoreBootstrapReceipt = Schema.Struct({
+  version: Schema.Literal(1),
+  kind: Schema.Literal("native-warm-restore-bootstrap-v1"),
+  ...ThreadVmWarmRestoreBootstrap.fields,
+  targetSealEpoch: PositiveInt,
+  coordinatorStopped: Schema.Literal(true),
+  sealRebound: Schema.Literal(true),
+});
+export type ThreadVmWarmRestoreBootstrapReceipt = typeof ThreadVmWarmRestoreBootstrapReceipt.Type;
 
 export const ThreadVmPolicy = Schema.Struct({
   maxVmsPerUser: NonNegativeInt,

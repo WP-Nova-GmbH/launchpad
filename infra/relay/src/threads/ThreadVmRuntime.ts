@@ -7,6 +7,7 @@ import { makeThreadVmResetCancellationWorker } from "./ThreadVmResetCancellation
 import {
   makeE2BThreadVmRestoreCleanup,
   makeE2BThreadVmRestoreImport,
+  makeE2BThreadVmWarmRestoreBootstrap,
 } from "../machines/E2BThreadVmRestoreImport.ts";
 import { makeThreadVmResetImportWorker } from "./ThreadVmResetImportWorker.ts";
 import { makeThreadVmRestoreImportWorker } from "./ThreadVmRestoreImportWorker.ts";
@@ -28,6 +29,7 @@ import { RelayConfiguration } from "../Config.ts";
 import { RelayDb } from "../db.ts";
 import {
   makeE2BThreadVmCompute,
+  ThreadVmComputeError,
   type E2BThreadVmSettings,
 } from "../machines/E2BThreadVmCompute.ts";
 import { makeE2BThreadVmEnrollment } from "../machines/E2BThreadVmEnrollment.ts";
@@ -263,10 +265,7 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
   yield* makeThreadVmCapacityStore(sql).configure(settings.hostId, settings.maxRunningVms);
   const compute = makeE2BThreadVmCompute(settings.compute);
   if (settings.permanentDeleteEnabled)
-    yield* makeThreadDeletionStore(sql).admitMirrored(
-      settings.hostId,
-      compute.restore.requireExecutionRetention(),
-    );
+    yield* makeThreadDeletionStore(sql).admitMirrored(settings.hostId);
   const deleting =
     yield* sql`SELECT 1 FROM relay_thread_deletions WHERE host_id=${settings.hostId} AND phase!='completed' AND retry_at<=clock_timestamp() LIMIT 1`;
   if (deleting.length)
@@ -306,7 +305,7 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
       yield* makeThreadVmBackupRecoveryWorker(
         sql,
         yield* ThreadArtifactObjectStorage,
-        compute.restore,
+        compute,
         settings.hostId,
       ).runOne();
   }
@@ -317,14 +316,16 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
     const objects = yield* ThreadArtifactObjectStorage;
     yield* makeThreadVmRestoreWorker(sql, objects, compute.restore, settings.hostId).runOne();
   }
+  yield* makeThreadVmRestoreServingWorker(
+    sql,
+    yield* ThreadArtifactObjectStorage,
+    compute,
+    settings.hostId,
+    makeE2BThreadVmWarmRestoreBootstrap(settings.compute),
+    settings.restoreEnabled,
+  ).runOne();
   if (settings.restoreEnabled) {
     const objects = yield* ThreadArtifactObjectStorage;
-    yield* makeThreadVmRestoreServingWorker(
-      sql,
-      objects,
-      compute.restore,
-      settings.hostId,
-    ).runOne();
     yield* makeThreadVmRestoreImportWorker(
       sql,
       objects,
@@ -351,6 +352,7 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
     LEFT JOIN relay_thread_vm_move_destinations d ON d.allocation_id=p.allocation_id
     LEFT JOIN relay_thread_moves m ON m.operation_id=d.operation_id
     WHERE c.host_id = ${settings.hostId} AND p.retry_at <= clock_timestamp()
+      AND p.ingress_recovery_claim_id IS NULL
       AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
       AND (p.phase = 'creating' OR (p.phase = 'created' AND a.state = 'running' AND (e.installed_at IS NULL OR (d.operation_id IS NOT NULL AND m.phase IN ('frozen','ready','committed','completed') AND t.generation IN (p.generation-1,p.generation)) OR s.phase IN ('pending','running') OR (s.phase = 'ready' AND t.environment_id = s.environment_id AND t.generation = p.generation AND t.operation_id IS NULL)))
         OR (p.phase = 'pending' AND (a.state = 'deleting' OR c.state = 'reserved'
@@ -359,40 +361,36 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
     LIMIT 1`;
   if (!pending.length) return;
   const relay = yield* RelayConfiguration;
-  const capabilities = yield* compute.restore.capabilities();
-  if (!capabilities.renewableLifetime)
-    return yield* new ThreadVmRuntimeConfigurationError({
-      message: "The compute team does not permit renewable VM lifetime.",
+  const verifyTemplate = Effect.gen(function* () {
+    const separator = settings.compute.templateId.indexOf(":");
+    const templateId = settings.compute.templateId.slice(0, separator);
+    const tag = settings.compute.templateId.slice(separator + 1);
+    const tags = yield* Effect.tryPromise({
+      try: (signal) =>
+        Template.getTags(templateId, {
+          apiUrl: settings.compute.apiUrl,
+          apiKey: Redacted.value(settings.compute.apiKey),
+          requestTimeoutMs: 30_000,
+          signal,
+        }),
+      catch: () =>
+        new ThreadVmComputeError({
+          operation: "verify runner",
+          message: "Runner build verification is unavailable.",
+        }),
     });
-  if (capabilities.durableCreationIdentity !== true)
-    return yield* new ThreadVmRuntimeConfigurationError({
-      message: "The compute runtime cannot safely recover failed VM creation.",
-    });
-  const separator = settings.compute.templateId.indexOf(":");
-  const templateId = settings.compute.templateId.slice(0, separator);
-  const tag = settings.compute.templateId.slice(separator + 1);
-  const tags = yield* Effect.tryPromise({
-    try: (signal) =>
-      Template.getTags(templateId, {
-        apiUrl: settings.compute.apiUrl,
-        apiKey: Redacted.value(settings.compute.apiKey),
-        requestTimeoutMs: 30_000,
-        signal,
-      }),
-    catch: () =>
-      new ThreadVmRuntimeConfigurationError({
-        message: "Runner build verification is unavailable.",
-      }),
+    if (!tags.some((entry) => entry.tag === tag && entry.buildId === settings.templateBuildId))
+      return yield* new ThreadVmComputeError({
+        operation: "verify runner",
+        message: "Runner template no longer resolves to the verified build.",
+      });
   });
-  if (!tags.some((entry) => entry.tag === tag && entry.buildId === settings.templateBuildId))
-    return yield* new ThreadVmRuntimeConfigurationError({
-      message: "Runner template no longer resolves to the verified build.",
-    });
   const provision = makeThreadVmProvisionWorker(
     sql,
     compute,
     settings.compute.templateId,
     settings.hostId,
+    verifyTemplate,
   );
   const enrollment = makeThreadVmEnrollmentWorker(
     sql,
@@ -433,17 +431,18 @@ export const reconcileThreadVmActivity = Effect.fn("relay.thread_vm.reconcile_ac
   for (let index = 0; index < 8; index++) if (!(yield* worker.runOne())) return;
 });
 
-/** Pause only after a fresh idle report; the durable claim and guest seal fence work. */
+/** Policy gates new drains; existing pause requests still need reconciliation. */
 export const reconcileThreadVmPauses = Effect.fn("relay.thread_vm.reconcile_pauses")(function* (
   settings: ThreadVmRuntimeSettings | undefined,
 ) {
-  if (!settings?.autoPauseEnabled) return;
+  if (!settings) return;
   const sql = (yield* RelayDb).$client;
   const worker = makeThreadVmPauseWorker(
     sql,
     makeE2BThreadVmCompute(settings.compute),
     makeE2BThreadVmPause(settings.compute),
     settings.hostId,
+    settings.autoPauseEnabled,
   );
   for (let index = 0; index < 4; index++) if (!(yield* worker.runOne())) return;
 });
@@ -489,12 +488,12 @@ export const reconcileThreadVmIdleDeletion = Effect.fn("relay.thread_vm.reconcil
   },
 );
 
-/** A backup is published only after a trusted cold probe stopped and its preparation was cancelled. */
+/** Native captures keep their independent source checkpoint pinned through retention. */
 export const reconcileThreadVmBackups = Effect.fn("relay.thread_vm.reconcile_backups")(function* (
   settings: ThreadVmRuntimeSettings | undefined,
 ) {
-  if (!settings?.autoBackupEnabled) return;
-  yield* reconcileThreadVmIdleDeletion(settings);
+  if (!settings) return;
+  if (settings.autoBackupEnabled) yield* reconcileThreadVmIdleDeletion(settings);
   const sql = (yield* RelayDb).$client;
   const compute = makeE2BThreadVmCompute(settings.compute);
   if (settings.replacementEnabled) {
@@ -504,9 +503,16 @@ export const reconcileThreadVmBackups = Effect.fn("relay.thread_vm.reconcile_bac
       if (!(yield* replacements.runOne(settings.hostId))) break;
   }
   yield* makeThreadVmBackupRetentionWorker(sql, compute, settings.hostId).runOne();
-  yield* makeThreadVmBackupWorker(sql, compute, settings.hostId).runOne();
-  // Admission only requests a drain. Independently certified recovery and a verified
-  // whole-disk save still precede every physical deletion.
+  // Periodic policy can be off while a managed pause still needs its own save.
+  // Already dispatched captures must also reconcile and reopen after policy changes.
+  yield* makeThreadVmBackupWorker(
+    sql,
+    compute,
+    settings.hostId,
+    settings.autoBackupEnabled,
+  ).runOne();
+  // Admission only requests a drain. Independent recovery and a completed native
+  // snapshot precede deletion of the source VM.
   const finalSaves =
     yield* sql`SELECT 1 FROM relay_thread_vm_final_saves WHERE host_id=${settings.hostId} AND phase IN ('frozen','saving','deleting','aborting') LIMIT 1`;
   if (finalSaves.length) {

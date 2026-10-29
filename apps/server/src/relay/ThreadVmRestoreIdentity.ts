@@ -3,10 +3,24 @@ import * as NodeCrypto from "node:crypto";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
-import { ThreadVmRestoreBoot } from "@t3tools/contracts/relay";
+import {
+  ThreadVmRestoreBoot,
+  ThreadVmWarmRestoreBootstrap,
+  ThreadVmWarmRestoreBootstrapReceipt,
+} from "@t3tools/contracts/relay";
 import * as Schema from "effect/Schema";
 
 const decode = Schema.decodeUnknownSync(ThreadVmRestoreBoot);
+const decodeWarmBootstrap = Schema.decodeUnknownSync(ThreadVmWarmRestoreBootstrap);
+const decodeWarmReceipt = Schema.decodeUnknownSync(ThreadVmWarmRestoreBootstrapReceipt);
+const decodeGate = Schema.decodeUnknownSync(
+  Schema.Struct({
+    bootId: ThreadVmWarmRestoreBootstrap.fields.source.fields.bootId,
+    targetSealEpoch: Schema.Int.check(Schema.isGreaterThan(0)),
+    coordinatorStopped: Schema.Literal(true),
+    sealRebound: Schema.Literal(true),
+  }),
+);
 const decodeRecord = Schema.decodeUnknownSync(
   Schema.Struct({
     boot: ThreadVmRestoreBoot,
@@ -42,6 +56,98 @@ async function sync(file: string) {
   } finally {
     await handle.close();
   }
+}
+
+async function writeRootRecord(file: string, value: unknown, platform: NodeJS.Platform) {
+  const existing = await stat(file);
+  if (
+    existing &&
+    (!existing.isFile() ||
+      existing.isSymbolicLink() ||
+      existing.nlink !== 1 ||
+      existing.mode & 0o022 ||
+      (platform === "linux" && existing.uid !== 0))
+  )
+    throw new Error("Invalid root restore record");
+  const temporary = NodePath.join(NodePath.dirname(file), `.restore-${NodeCrypto.randomUUID()}`);
+  try {
+    // Public identity proof is read by the unprivileged enrollment CLI.
+    await NodeFSP.writeFile(temporary, JSON.stringify(value), { flag: "wx", mode: 0o644 });
+    await NodeFSP.chmod(temporary, 0o644);
+    await sync(temporary);
+    await NodeFSP.rename(temporary, file);
+    await sync(NodePath.dirname(file));
+  } finally {
+    await NodeFSP.rm(temporary, { force: true });
+  }
+}
+
+/** Called only after the trusted helper stopped the captured coordinator and
+ * rebound its closed gate. No source SQLite/home is touched before that proof. */
+export async function completeThreadVmWarmRestoreBootstrap(
+  input: ThreadVmWarmRestoreBootstrap,
+  gate: unknown,
+  baseDir = "/home/user/.launchpad",
+  bootstrapPath = "/launchpad-restore.json",
+  platform: NodeJS.Platform = HostProcessPlatform.defaultValue(),
+) {
+  const expected = decodeWarmBootstrap(input),
+    observed = decodeGate(gate);
+  if (
+    expected.boot.threadId !== expected.source.threadId ||
+    expected.boot.generation <= expected.source.generation ||
+    observed.bootId !== expected.source.bootId ||
+    observed.targetSealEpoch !== expected.source.sealEpoch + 1
+  )
+    throw new Error("Warm restore bootstrap differs");
+  await writeRootRecord(bootstrapPath, expected.boot, platform);
+  await prepareThreadVmRestoreIdentity(expected.boot, baseDir, bootstrapPath, platform);
+  const receipt: ThreadVmWarmRestoreBootstrapReceipt = {
+    version: 1,
+    kind: "native-warm-restore-bootstrap-v1",
+    ...expected,
+    targetSealEpoch: observed.targetSealEpoch,
+    coordinatorStopped: true,
+    sealRebound: true,
+  };
+  await writeRootRecord(bootstrapPath + ".receipt.json", receipt, platform);
+  return receipt;
+}
+
+export async function requireThreadVmWarmRestoreBootstrap(
+  boot: ThreadVmRestoreBoot,
+  bootstrapPath = "/launchpad-restore.json",
+  platform: NodeJS.Platform = HostProcessPlatform.defaultValue(),
+) {
+  const file = bootstrapPath + ".receipt.json",
+    info = await NodeFSP.lstat(file);
+  if (
+    !info.isFile() ||
+    info.isSymbolicLink() ||
+    info.nlink !== 1 ||
+    info.size > 16384 ||
+    info.mode & 0o022 ||
+    (platform === "linux" && info.uid !== 0)
+  )
+    throw new Error("Warm restore bootstrap is not confirmed");
+  const receipt = decodeWarmReceipt(JSON.parse(await NodeFSP.readFile(file, "utf8")));
+  const bootstrap = await NodeFSP.lstat(bootstrapPath);
+  if (
+    !bootstrap.isFile() ||
+    bootstrap.isSymbolicLink() ||
+    bootstrap.nlink !== 1 ||
+    bootstrap.size > 16384 ||
+    bootstrap.mode & 0o022 ||
+    (platform === "linux" && bootstrap.uid !== 0) ||
+    !sameBoot(decode(JSON.parse(await NodeFSP.readFile(bootstrapPath, "utf8"))), receipt.boot)
+  )
+    throw new Error("Warm restore envelope changed");
+  if (
+    !sameBoot(receipt.boot, decode(boot)) ||
+    receipt.targetSealEpoch !== receipt.source.sealEpoch + 1
+  )
+    throw new Error("Warm restore bootstrap identity differs");
+  return receipt;
 }
 
 /** Called as root under the enrollment flock, before any identity/database layer

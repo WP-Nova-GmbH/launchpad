@@ -3,6 +3,8 @@ import { makeThreadMoveProgressStore } from "../threads/ThreadMoveProgressStore.
 import { makeThreadCurrentQueueStore } from "../threads/ThreadCurrentQueueStore.ts";
 import { threadVmQuotaUsage } from "../threads/ThreadVmQuota.ts";
 import { makeThreadVmPolicyStore } from "../threads/ThreadVmPolicy.ts";
+import { savedDiskHasCancelledRestorePlacement } from "../threads/ThreadVmSavedDiskPlacement.ts";
+import { threadVmSourceActivationPending } from "../threads/ThreadVmSourceActivation.ts";
 import { attachmentRelativePath } from "@t3tools/shared/attachmentLayout";
 import {
   ThreadAttachmentCheckpointArchiveManifest,
@@ -64,6 +66,7 @@ export const listPortableThreads = Effect.fn("relay.api.thread_history.list")(
         WHEN saved.phase IN ('expired','expiring') OR (saved.phase='available' AND saved.expires_at<=clock_timestamp()) THEN 'expired'
         WHEN saved.phase IN ('available','restoring') THEN 'saved'
         WHEN a.state='paused' THEN 'paused'
+        WHEN a.state='running' AND ${threadVmSourceActivationPending(sql)} THEN 'preparing'
         WHEN a.state='running' AND ready.phase='ready' THEN 'running'
         WHEN a.state IN ('creating','running') THEN 'preparing'
         WHEN a.allocation_id IS NOT NULL THEN 'unavailable' ELSE 'on_machine' END,
@@ -83,12 +86,17 @@ export const listPortableThreads = Effect.fn("relay.api.thread_history.list")(
       LEFT JOIN relay_thread_vm_ready ready ON ready.allocation_id=a.allocation_id
       LEFT JOIN relay_thread_vm_activity activity ON activity.allocation_id=a.allocation_id
       LEFT JOIN relay_thread_moves move ON move.operation_id=t.operation_id AND move.phase NOT IN ('completed','aborted')
-      LEFT JOIN relay_thread_vm_final_saves final ON final.operation_id=t.operation_id AND final.phase NOT IN ('completed','aborted')
+      LEFT JOIN relay_thread_vm_final_saves final ON final.operation_id=t.operation_id AND final.phase != 'completed'
+        AND (final.phase != 'aborted' OR a.state IS DISTINCT FROM 'paused')
       LEFT JOIN relay_thread_vm_resets reset ON reset.operation_id=t.operation_id AND reset.thread_id=t.thread_id
         AND (reset.expected_generation=t.generation OR reset.expected_generation+1=t.generation) AND reset.phase NOT IN ('completed','cancelled')
       LEFT JOIN relay_thread_vm_restores restore ON restore.operation_id=t.operation_id AND restore.thread_id=t.thread_id
-        AND (restore.generation=t.generation OR restore.generation+1=t.generation) AND restore.phase NOT IN ('completed','aborted')
-      LEFT JOIN LATERAL(SELECT operation_id,backup_operation_id,saved_at,phase,((saved_at AT TIME ZONE coalesce(policy.calendar_time_zone,'UTC') + coalesce(policy.saved_disk_retention_days,30)*interval '1 day') AT TIME ZONE coalesce(policy.calendar_time_zone,'UTC')) AS expires_at FROM relay_thread_vm_saved_disks WHERE thread_id=t.thread_id AND phase!='restored' AND (generation=t.generation OR (phase='restoring' AND restore_operation_id=t.operation_id)) ORDER BY saved_at DESC LIMIT 1) saved ON true
+        AND (restore.generation=t.generation OR restore.target_generation=t.generation) AND restore.phase NOT IN ('completed','aborted')
+      LEFT JOIN LATERAL(SELECT s.operation_id,s.backup_operation_id,s.saved_at,s.phase,
+        ((s.saved_at AT TIME ZONE coalesce(policy.calendar_time_zone,'UTC') + coalesce(policy.saved_disk_retention_days,30)*interval '1 day') AT TIME ZONE coalesce(policy.calendar_time_zone,'UTC')) AS expires_at
+        FROM relay_thread_vm_saved_disks s WHERE s.thread_id=t.thread_id AND s.phase!='restored'
+          AND (s.generation=t.generation OR (s.phase='restoring' AND s.restore_operation_id=t.operation_id)
+            OR (${savedDiskHasCancelledRestorePlacement(sql)})) ORDER BY s.saved_at DESC LIMIT 1) saved ON true
       LEFT JOIN LATERAL(SELECT verified_at FROM relay_thread_vm_backups WHERE (allocation_id=a.allocation_id OR operation_id=saved.backup_operation_id) AND phase='verified' ORDER BY verified_at DESC LIMIT 1) backup ON true
       WHERE t.thread_id=ANY(${scanned.map((row) => row.threadId)}::varchar[])`
       : [];

@@ -1,5 +1,5 @@
 import json,os,pathlib,subprocess,uuid,select,time
-helper=pathlib.Path('/usr/local/bin/launchpad-workload')
+helper=pathlib.Path('/opt/launchpad/bin/launchpad-workload')
 subprocess.run([str(helper),'initialize'],check=True)
 def run(*args,check=True,env=None):
  return subprocess.run(['runuser','-u','user','--',str(helper),*args],capture_output=True,text=True,check=check,timeout=10,env=env)

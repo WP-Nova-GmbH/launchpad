@@ -54,17 +54,28 @@ export function makeThreadPlacementStore(sql: PgClient) {
       WHERE thread_id=${input.threadId} AND generation=${input.generation} AND phase != 'restored'`;
     if (saved.length && requireRunning)
       return yield* conflict("VM disk requires an explicit restore or reset");
-    const [binding] = yield* sql<{ allocationId: string; state: string }>`
-      SELECT a.allocation_id AS "allocationId", a.state
+    const [binding] = yield* sql<{ allocationId: string; state: string; runtimeProtocol: string }>`
+      SELECT a.allocation_id AS "allocationId", a.state,a.runtime_protocol AS "runtimeProtocol"
       FROM relay_thread_vm_bindings b
       JOIN relay_thread_vm_allocations a ON a.allocation_id = b.allocation_id
       WHERE b.thread_id = ${input.threadId} AND b.environment_id = ${input.environmentId}
         AND b.generation = ${input.generation} AND b.revoked_at IS NULL AND a.deleted_at IS NULL
       FOR SHARE OF a`;
     if (!binding) return;
+    if (binding.runtimeProtocol !== "native-v1") {
+      if (requireRunning)
+        return yield* conflict(
+          "This VM belongs to an earlier runtime and requires manual migration.",
+        );
+      return;
+    }
     const pausing = yield* sql`SELECT 1 FROM relay_thread_vm_pauses
       WHERE allocation_id = ${binding.allocationId} AND generation=${input.generation}
-        AND (phase IN ('pending','sealed') OR (phase IN ('cancelled','completed') AND source_reopened_at IS NULL))`;
+        AND (phase IN ('pending','sealed') OR (phase IN ('cancelled','completed') AND source_reopened_at IS NULL))
+      UNION ALL SELECT 1 FROM relay_thread_vm_backups x WHERE x.allocation_id=${binding.allocationId} AND x.generation=${input.generation}
+        AND x.source_reopened_at IS NULL AND (x.phase IN ('pending','creating') OR x.source_receipt IS NOT NULL
+          OR (x.phase='failed' AND x.capture_started_at IS NULL))
+        AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses p WHERE p.backup_operation_id=x.operation_id)`;
     if (pausing.length && requireRunning) return yield* conflict("VM pause is in progress");
     const resuming = yield* sql`SELECT 1 FROM relay_thread_vm_resumes
       WHERE allocation_id = ${binding.allocationId} AND phase IN ('waiting','resuming')`;
@@ -242,6 +253,12 @@ export function makeThreadPlacementStore(sql: PgClient) {
           generation: input.expectedGeneration,
         });
         if (placement.operationId !== null) return yield* conflict("Another move is in progress");
+        const legacy =
+          yield* sql`SELECT 1 FROM relay_thread_vm_allocations WHERE thread_id=${input.threadId} AND deleted_at IS NULL AND runtime_protocol<>'native-v1'`;
+        if (legacy.length)
+          return yield* conflict(
+            "This VM belongs to an earlier runtime and requires manual migration.",
+          );
         const saved = yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks
           WHERE thread_id=${input.threadId} AND generation=${input.expectedGeneration} AND phase != 'restored'`;
         if (saved.length)
@@ -258,7 +275,8 @@ export function makeThreadPlacementStore(sql: PgClient) {
         const backingUp = yield* sql`SELECT 1 FROM relay_thread_vm_backups x
           JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
           WHERE a.thread_id = ${input.threadId}
-            AND x.phase IN ('pending','creating','captured','verifying','cleanup')`;
+            AND (x.phase IN ('pending','creating','captured','verifying','cleanup') OR ((x.source_receipt IS NOT NULL OR (x.phase='failed' AND x.capture_started_at IS NULL)) AND x.source_reopened_at IS NULL
+              AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses p WHERE p.backup_operation_id=x.operation_id)))`;
         if (backingUp.length) return yield* conflict("VM backup is in progress");
         if (input.sourceEnvironmentId === input.destinationEnvironmentId)
           return yield* conflict("Destination is already the current environment");

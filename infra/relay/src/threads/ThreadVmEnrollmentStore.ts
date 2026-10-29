@@ -51,13 +51,14 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
     const rows = yield* sql`SELECT a.allocation_id FROM relay_thread_vm_allocations a
       JOIN relay_thread_vm_provisions p USING (allocation_id)
       WHERE a.allocation_id = ${input.allocationId} AND p.operation_id = ${input.operationId}
-      AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL FOR UPDATE OF a`;
+      AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
+      AND a.runtime_protocol='native-v1' FOR UPDATE OF a`;
     if (!rows.length) return yield* new ThreadVmEnrollmentInvalid();
     // Read after the allocation lock is acquired: an exchange already waiting on
     // that lock must see a recovery fence committed by the stop worker.
     const recovering = yield* sql`SELECT 1 FROM relay_thread_vm_restores
       WHERE allocation_id=${input.allocationId} AND operation_id=${input.operationId}
-        AND boot_recovery_started_at IS NOT NULL`;
+        AND (boot_recovery_started_at IS NOT NULL OR boot_ingress_recovery_claim_id IS NOT NULL)`;
     if (recovering.length) return yield* new ThreadVmEnrollmentInvalid();
   });
   const prepare = Effect.fn("relay.thread_vm_enrollment.prepare")(function* (input: {

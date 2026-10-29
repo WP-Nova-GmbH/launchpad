@@ -1,6 +1,11 @@
 import { sendThreadVmCommandInput } from "./E2BThreadVmGuestCommand.ts";
 import { Sandbox } from "e2b";
-import { ThreadVmRestoreBoot, RelayThreadVmRestoreImportReceipt } from "@t3tools/contracts/relay";
+import {
+  ThreadVmRestoreBoot,
+  ThreadVmWarmRestoreBootstrap,
+  ThreadVmWarmRestoreBootstrapReceipt,
+  RelayThreadVmRestoreImportReceipt,
+} from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { ThreadVmComputeError, type E2BThreadVmSettings } from "./E2BThreadVmCompute.ts";
@@ -13,10 +18,74 @@ type Guest = (
   connection: ConstructorParameters<typeof Sandbox>[0],
   payload: string,
 ) => Promise<string>;
+const encodeWarmBootstrap = Schema.encodeSync(Schema.fromJsonString(ThreadVmWarmRestoreBootstrap));
+const decodeWarmBootstrap = Schema.decodeUnknownSync(ThreadVmWarmRestoreBootstrap);
+const decodeWarmReceipt = Schema.decodeUnknownSync(
+  Schema.fromJsonString(ThreadVmWarmRestoreBootstrapReceipt),
+);
+const bootstrapGuest: Guest = async (connection, payload) => {
+  const vm = new Sandbox(connection);
+  const command = await vm.commands.run(
+    "/usr/bin/flock --no-fork -x /run/launchpad-restore-identity.lock /opt/launchpad/server/t3 __thread-vm-restore-identity --base-dir /home/user/.launchpad",
+    { user: "root", background: true, stdin: true, timeoutMs: 60_000 },
+  );
+  const result = await sendThreadVmCommandInput(command, payload);
+  if (result.exitCode !== 0) throw new Error("Warm restore bootstrap is unconfirmed");
+  return result.stdout;
+};
+
+/** Native envd is independent of app ingress. This never connects or wakes a VM. */
+export function makeE2BThreadVmWarmRestoreBootstrap(
+  settings: E2BThreadVmSettings,
+  transport: typeof fetch = fetch,
+  guest: Guest = bootstrapGuest,
+) {
+  return Effect.fn("relay.thread_vm.restore.bootstrap_guest")(function* (
+    sandboxId: string,
+    identity: E2BThreadVmIdentity,
+    input: ThreadVmWarmRestoreBootstrap,
+  ) {
+    return yield* Effect.tryPromise({
+      try: async (signal) => {
+        const expected = decodeWarmBootstrap(input);
+        if (
+          expected.boot.operationId !== identity.operationId ||
+          expected.boot.allocationId !== identity.scope.allocationId ||
+          expected.boot.threadId !== identity.scope.threadId ||
+          expected.boot.generation !== identity.scope.generation ||
+          expected.boot.threadId !== expected.source.threadId ||
+          expected.boot.generation <= expected.source.generation
+        )
+          throw new Error("Warm restore scope differs");
+        const connection = await inspectE2BThreadVmConnection(
+          settings,
+          sandboxId,
+          identity,
+          transport,
+          signal,
+        );
+        const receipt = decodeWarmReceipt(
+          (await guest(connection, encodeWarmBootstrap(expected))).trim(),
+        );
+        if (
+          encodeWarmBootstrap(receipt) !== encodeWarmBootstrap(expected) ||
+          receipt.targetSealEpoch !== expected.source.sealEpoch + 1
+        )
+          throw new Error("Warm restore bootstrap receipt differs");
+        return receipt;
+      },
+      catch: () =>
+        new ThreadVmComputeError({
+          operation: "bootstrap",
+          message: "Saved VM bootstrap is unconfirmed. Execution remains blocked.",
+        }),
+    });
+  });
+}
 const importGuest: Guest = async (connection, payload) => {
   const vm = new Sandbox(connection);
   const command = await vm.commands.run(
-    "flock --no-fork -x /home/user/.launchpad-enrollment.lock launchpad-server __thread-vm-restore-import --base-dir /home/user/.launchpad",
+    "/usr/bin/flock --no-fork -x /home/user/.launchpad-enrollment.lock /opt/launchpad/server/t3 __thread-vm-restore-import --base-dir /home/user/.launchpad",
     {
       user: "user",
       background: true,
@@ -106,7 +175,7 @@ export function makeE2BThreadVmRestoreCleanup(
           ),
           vm = new Sandbox(connection);
         const command = await vm.commands.run(
-          "flock --no-fork -x /run/launchpad-restore-identity.lock launchpad-server __thread-vm-restore-cleanup --base-dir /home/user/.launchpad",
+          "/usr/bin/flock --no-fork -x /run/launchpad-restore-identity.lock /opt/launchpad/server/t3 __thread-vm-restore-cleanup --base-dir /home/user/.launchpad",
           { user: "root", background: true, stdin: true, timeoutMs: 60_000 },
         );
         const result = await sendThreadVmCommandInput(

@@ -1,11 +1,19 @@
 import { Sandbox, SandboxNotFoundError } from "e2b";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeAssert from "node:assert/strict";
+NodeAssert.equal(
+  JSON.parse(
+    await NodeFSP.readFile(new URL("./node_modules/e2b/package.json", import.meta.url), "utf8"),
+  ).version,
+  "2.61.0",
+  "Network proof requires the unmodified stock runtime E2B 2.61.0 helper",
+);
 const options = {
   apiUrl: process.env.LAUNCHPAD_PROOF_API_URL,
   sandboxUrl: process.env.LAUNCHPAD_PROOF_PROXY_URL,
   apiKey: (await NodeFSP.readFile("/run/e2b/team-api-key", "utf8")).trim(),
   requestTimeoutMs: 30000,
+  retries: 0,
 };
 const proof = process.env.LAUNCHPAD_PROOF_ID;
 NodeAssert.ok(proof?.startsWith("launchpad-network-"));

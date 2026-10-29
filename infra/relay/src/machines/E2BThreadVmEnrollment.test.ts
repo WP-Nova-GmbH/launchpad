@@ -59,7 +59,6 @@ const receipt = {
   generation: 2,
 };
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
-const decodePublic = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decode = Schema.decodeUnknownSync(Schema.fromJsonString(RelayThreadVmBootstrap));
 function fixture() {
   const transport = vi.fn<typeof fetch>(async () => Response.json(info));
@@ -70,93 +69,26 @@ function fixture() {
 }
 describe("non-waking E2B enrollment delivery", () => {
   it.effect(
-    "prepares restore identity as root using public scope before enrolling as user with the narrow seed",
+    "delivers a restored enrollment only to the user CLI after separate trusted bootstrap",
     () =>
       Effect.gen(function* () {
         sdk.run.mockReset();
-        const input = {
-          ...bootstrap,
-          restore: true as const,
-          operationId: "00000000-0000-4000-8000-000000000001",
-          scope: { ...bootstrap.scope, allocationId: "00000000-0000-4000-8000-000000000002" },
-        };
-        const rootStdin = vi.fn(async (_bytes: string) => {}),
-          userStdin = vi.fn(async (_bytes: string) => {});
-        const root = {
-          sendStdin: rootStdin,
-          wait: async () => ({ exitCode: 0, stdout: '{"prepared":true}' }),
-        };
-        const installed = {
-          ...receipt,
-          operationId: input.operationId,
-          allocationId: input.scope.allocationId,
-        };
-        sdk.run.mockResolvedValueOnce(root).mockResolvedValueOnce({
-          sendStdin: userStdin,
-          wait: async () => ({ exitCode: 0, stdout: encode(installed) }),
+        const input = { ...bootstrap, restore: true as const };
+        const stdin = vi.fn(async (_bytes: string) => {});
+        sdk.run.mockResolvedValueOnce({
+          sendStdin: stdin,
+          wait: async () => ({ exitCode: 0, stdout: encode(receipt) }),
         });
-        const transport = vi.fn<typeof fetch>(async () =>
-          Response.json({
-            ...info,
-            templateID: "sandbox",
-            metadata: {
-              ...info.metadata,
-              "launchpad.operation_id": input.operationId,
-              "launchpad.allocation_id": input.scope.allocationId,
-              "launchpad.restore": "v1",
-            },
-          }),
-        );
+        const transport = vi.fn<typeof fetch>(async () => Response.json(info));
         expect(yield* makeE2BThreadVmEnrollment(settings, transport)("sandbox", input)).toEqual(
-          installed,
+          receipt,
         );
-        expect(sdk.run.mock.calls[0]![1]).toMatchObject({ user: "root", stdin: true });
-        expect(sdk.run.mock.calls[0]![0]).toContain("__thread-vm-restore-identity");
-        const publicInput = yield* decodePublic(rootStdin.mock.calls[0]![0]);
-        expect(publicInput).toEqual({
-          version: 1,
-          operationId: input.operationId,
-          allocationId: input.scope.allocationId,
-          threadId: "thread",
-          generation: 2,
-        });
-        expect(rootStdin.mock.calls[0]![0]).not.toContain("secret");
-        expect(sdk.run.mock.calls[1]![1]).toMatchObject({ user: "user", stdin: true });
-        expect(decode(userStdin.mock.calls[0]![0].trim())).toEqual(input);
+        expect(sdk.run).toHaveBeenCalledTimes(1);
+        expect(sdk.run.mock.calls[0]![1]).toMatchObject({ user: "user", stdin: true });
+        expect(sdk.run.mock.calls[0]![0]).toContain("__thread-vm-enroll");
+        expect(decode(stdin.mock.calls[0]![0].trim())).toEqual(input);
       }),
   );
-  it.effect("never delivers the enrollment seed if restore identity preparation fails", () =>
-    Effect.gen(function* () {
-      sdk.run.mockReset();
-      const input = {
-        ...bootstrap,
-        restore: true as const,
-        operationId: "00000000-0000-4000-8000-000000000001",
-        scope: { ...bootstrap.scope, allocationId: "00000000-0000-4000-8000-000000000002" },
-      };
-      const stdin = vi.fn(async (_bytes: string) => {});
-      sdk.run.mockResolvedValueOnce({
-        sendStdin: stdin,
-        wait: async () => ({ exitCode: 1, stdout: "failed" }),
-      });
-      const transport = vi.fn<typeof fetch>(async () =>
-        Response.json({
-          ...info,
-          metadata: {
-            ...info.metadata,
-            "launchpad.operation_id": input.operationId,
-            "launchpad.allocation_id": input.scope.allocationId,
-          },
-        }),
-      );
-      expect(
-        yield* Effect.flip(makeE2BThreadVmEnrollment(settings, transport)("sandbox", input)),
-      ).toMatchObject({ _tag: "ThreadVmComputeError", operation: "enroll" });
-      expect(sdk.run).toHaveBeenCalledTimes(1);
-      expect(stdin.mock.calls[0]![0]).not.toContain("seed-secret");
-    }),
-  );
-
   it.effect("discovers with GET and delivers only the thread bootstrap on stdin", () =>
     Effect.gen(function* () {
       const f = fixture();

@@ -3,13 +3,19 @@ import {
   importInstalledThreadVmRestore,
   ThreadVmRestoreInstallError,
 } from "../relay/ThreadVmRestoreInstall.ts";
-import { ThreadVmRestoreBoot, RelayThreadVmRestoreImportReceipt } from "@t3tools/contracts/relay";
+import {
+  ThreadVmRestoreBoot,
+  ThreadVmWarmRestoreBootstrap,
+  ThreadVmWarmRestoreBootstrapReceipt,
+  RelayThreadVmRestoreImportReceipt,
+} from "@t3tools/contracts/relay";
 import { ThreadVmProviderAuthControl, RelayThreadVmProviderAuth } from "@t3tools/contracts/relay";
 import { THREAD_VM_PROVIDER_AUTH_PATH } from "../relay/ThreadVmProviderAuth.ts";
 import { readInstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
 import {
   cleanupThreadVmRestoreIdentity,
-  prepareThreadVmRestoreIdentity,
+  completeThreadVmWarmRestoreBootstrap,
+  requireThreadVmWarmRestoreBootstrap,
 } from "../relay/ThreadVmRestoreIdentity.ts";
 import { inspectVmWorkloads } from "../vmWorkload.ts";
 import { withVmWorkloads } from "../vmWorkloadCommand.ts";
@@ -67,6 +73,13 @@ const encodeRestoreReceipt = Schema.encodeEffect(
 );
 const encodeReceipt = Schema.encodeEffect(Schema.fromJsonString(RelayThreadVmEnrollmentReceipt));
 const encodeProviderAuth = Schema.encodeEffect(Schema.fromJsonString(RelayThreadVmProviderAuth));
+const encodeWarmBootstrap = Schema.encodeEffect(
+  Schema.fromJsonString(ThreadVmWarmRestoreBootstrap),
+);
+const encodeWarmReceipt = Schema.encodeEffect(
+  Schema.fromJsonString(ThreadVmWarmRestoreBootstrapReceipt),
+);
+const decodeControlJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 /** Fixed loopback bridge; stdin contains identity and action, never credentials or shell commands. */
 export const threadVmProviderAuthCommand = Command.make("__thread-vm-provider-auth").pipe(
@@ -114,7 +127,7 @@ export const threadVmProviderAuthCommand = Command.make("__thread-vm-provider-au
   ),
 );
 
-/** Root-only offline identity rotation, called under the guest enrollment flock. */
+/** Root-only warm identity rotation, before any restored SQLite/identity layer opens. */
 export const threadVmRestoreIdentityCommand = Command.make("__thread-vm-restore-identity", {
   baseDir: Flag.String("base-dir"),
 }).pipe(
@@ -127,18 +140,32 @@ export const threadVmRestoreIdentityCommand = Command.make("__thread-vm-restore-
         baseDir !== "/home/user/.launchpad"
       )
         return yield* new ThreadVmEnrollmentError({ stage: "configuration" });
-      const input = yield* readBootstrapEnvelope(ThreadVmRestoreBoot, 0, {
+      const input = yield* readBootstrapEnvelope(ThreadVmWarmRestoreBootstrap, 0, {
         timeoutMs: 30_000,
       }).pipe(Effect.mapError(() => new ThreadVmEnrollmentError({ stage: "configuration" })));
       if (Option.isNone(input))
         return yield* new ThreadVmEnrollmentError({ stage: "configuration" });
-      if (!(yield* inspectVmWorkloads({ type: "inspect" })).stopped)
-        return yield* new ThreadVmEnrollmentError({ stage: "identity" });
-      yield* Effect.tryPromise({
-        try: () => prepareThreadVmRestoreIdentity(input.value, baseDir),
+      const runner = yield* ProcessRunner.make();
+      const gate = yield* runner
+        .run({
+          command: "/opt/launchpad/bin/launchpad-workload",
+          args: ["prepare-warm-restore"],
+          stdin: yield* encodeWarmBootstrap(input.value),
+          timeout: "30 seconds",
+          maxOutputBytes: 16384,
+        })
+        .pipe(Effect.mapError(() => new ThreadVmEnrollmentError({ stage: "identity" })));
+      if (gate.code !== 0) return yield* new ThreadVmEnrollmentError({ stage: "identity" });
+      const receipt = yield* Effect.tryPromise({
+        try: () =>
+          completeThreadVmWarmRestoreBootstrap(
+            input.value,
+            decodeControlJson(gate.stdout),
+            baseDir,
+          ),
         catch: () => new ThreadVmEnrollmentError({ stage: "identity" }),
       });
-      yield* Console.log('{"prepared":true}');
+      yield* Console.log(yield* encodeWarmReceipt(receipt));
     }),
   ),
 );
@@ -222,6 +249,18 @@ export const threadVmEnrollmentCommand = Command.make("__thread-vm-enroll", {
       }).pipe(Effect.mapError(() => new ThreadVmEnrollmentError({ stage: "configuration" })));
       if (Option.isNone(input))
         return yield* new ThreadVmEnrollmentError({ stage: "configuration" });
+      if (input.value.restore)
+        yield* Effect.tryPromise({
+          try: () =>
+            requireThreadVmWarmRestoreBootstrap({
+              version: 1,
+              operationId: input.value.operationId,
+              allocationId: input.value.scope.allocationId,
+              threadId: input.value.scope.threadId,
+              generation: input.value.scope.generation,
+            }),
+          catch: () => new ThreadVmEnrollmentError({ stage: "identity" }),
+        });
       const config = yield* resolveCliAuthConfig(
         { baseDir: Option.some(baseDir) },
         Option.some("Error"),

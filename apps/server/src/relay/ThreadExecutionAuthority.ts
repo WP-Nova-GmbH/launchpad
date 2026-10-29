@@ -1,3 +1,4 @@
+import { makeThreadBackupSourceTransport } from "./ThreadBackupSourceTransport.ts";
 import { makeThreadPauseTransport } from "./ThreadPauseTransport.ts";
 import { makeThreadFinalSaveTransport } from "./ThreadFinalSaveTransport.ts";
 import { makeThreadLocalEnrollmentTransport } from "./ThreadLocalEnrollmentTransport.ts";
@@ -316,6 +317,7 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
     commands,
     checkpoints,
     discoveryOwner,
+    backups: makeThreadBackupSourceTransport((owner) => configuredClient(owner, "history")),
     pauses: makeThreadPauseTransport((owner) => configuredClient(owner, "history")),
     finalSaves: makeThreadFinalSaveTransport((owner) => configuredClient(owner, "history")),
     enrollment: makeThreadLocalEnrollmentTransport((owner) => configuredClient(owner, "history")),

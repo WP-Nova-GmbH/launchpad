@@ -8,14 +8,17 @@ namespace routes, addresses, and forwarding state must also be restored.
 """
 
 from pathlib import Path
-import subprocess, json, time, os, socket, ipaddress, argparse, uuid
+import subprocess, json, time, os, socket, ipaddress, argparse, uuid, re
 from urllib.parse import urlparse
 parser = argparse.ArgumentParser(description='Exercise the dedicated E2B host boundary with two disposable root guests.')
+parser.add_argument('--sdk-image', required=True, help='Immutable local node-e2b image ID from the stock runtime build receipt')
 parser.add_argument('--seed-volume', required=True, help='Docker volume containing team-api-key')
 parser.add_argument('--output', type=Path, required=True, help='New evidence directory; must not exist')
 parser.add_argument('--api-url', default='http://127.0.0.1:3000')
 parser.add_argument('--proxy-url', default='http://127.0.0.1:3002')
 args = parser.parse_args()
+if not re.fullmatch(r'sha256:[0-9a-f]{64}', args.sdk_image):
+    parser.error('--sdk-image must be an immutable local sha256 image ID from build.json')
 for url in (args.api_url, args.proxy_url):
     parsed = urlparse(url)
     if parsed.scheme != 'http' or parsed.hostname not in ('127.0.0.1', 'localhost') or parsed.username or parsed.password or (parsed.path not in ('', '/')):
@@ -26,9 +29,7 @@ root = args.output.resolve()
 root.mkdir(exist_ok=False)
 (root / 'probe.mjs').write_bytes(Path(__file__).with_name('network-proof.mjs').read_bytes())
 proof = 'launchpad-network-' + str(uuid.uuid4())
-lock = json.loads(Path(__file__).with_name('runtime.lock.json').read_text())
-image = lock['embed']['images']['node-e2b']
-sdk_image = image['tag'].rsplit(':', 1)[0] + '@' + image['digest']
+sdk_image = args.sdk_image
 public = '9.9.9.254'
 additions = []
 servers = []
@@ -95,15 +96,20 @@ try:
     slot = int(guestNs[3:])
     peerSlot = int(peerNs[3:])
     peerAddress = str(ipaddress.ip_address('10.11.0.0') + peerSlot)
+    host_interface = 'e2b-' + str(slot)
+    host_link, = json.loads(subprocess.check_output(['ip', '-j', 'link', 'show', 'dev', host_interface], text=True))
+    guest_link, = json.loads(subprocess.check_output(['ip', 'netns', 'exec', guestNs, 'ip', '-j', 'link', 'show', 'dev', 'eth0'], text=True))
+    if host_link['ifindex'] != guest_link['link_index'] or host_link['link_index'] != guest_link['ifindex']:
+        raise RuntimeError('Guest namespace does not match its stock E2B host interface')
     with socket.create_connection((peerAddress, 18374), 2) as s:
         pass
-    add('ip', '-6', 'addr', 'add', 'fd42:2::1/64', 'dev', 'veth-' + str(slot))
+    add('ip', '-6', 'addr', 'add', 'fd42:2::1/64', 'dev', host_interface)
     restore_forwarding = (guestNs, subprocess.check_output(['ip', 'netns', 'exec', guestNs, 'sysctl', '-n', 'net.ipv6.conf.all.forwarding'], text=True).strip())
     run('ip', 'netns', 'exec', guestNs, 'sysctl', '-q', '-w', 'net.ipv6.conf.all.forwarding=1')
     add('ip', 'netns', 'exec', guestNs, 'ip', '-6', 'addr', 'add', 'fd42:2::2/64', 'dev', 'eth0')
     add('ip', 'netns', 'exec', guestNs, 'ip', '-6', 'addr', 'add', 'fd42:3::1/64', 'dev', 'tap0')
     add('ip', 'netns', 'exec', guestNs, 'ip', '-6', 'route', 'add', 'default', 'via', 'fd42:2::1', 'dev', 'eth0')
-    add('ip', '-6', 'route', 'add', 'fd42:3::/64', 'via', 'fd42:2::2', 'dev', 'veth-' + str(slot))
+    add('ip', '-6', 'route', 'add', 'fd42:3::/64', 'via', 'fd42:2::2', 'dev', host_interface)
     (root / 'before-rules.json').write_bytes(subprocess.check_output(['nft', '-j', 'list', 'table', 'inet', 'launchpad_thread_vm']))
     (root / 'host.json').write_text(json.dumps({'proof': info['proof'], 'peerAddress': peerAddress, 'publicHost': public}))
     p.wait(timeout=90)

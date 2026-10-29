@@ -1,4 +1,4 @@
-#!/usr/bin/python3 -I
+#!/usr/bin/python3 -IS
 """Guest workload tracking, not a security boundary against guest root.
 
 The VM remains the isolation boundary. Delegated cgroups retain ordinary detached
@@ -48,6 +48,10 @@ def initialize():
     parent.mkdir(exist_ok=True)
     ROOT.mkdir(exist_ok=True)
     STATE.mkdir(mode=0o700, exist_ok=True)
+    COORDINATORS.mkdir(mode=0o755, exist_ok=True)
+    COORDINATOR_STATE.mkdir(mode=0o755, exist_ok=True)
+    immutable(COORDINATORS, True)
+    immutable(COORDINATOR_STATE, True)
     # cgroup v2 requires write access at the common ancestor when moving the
     # launcher from envd's /user group into its newly created child group.
     for path in [ROOT, ROOT / "cgroup.procs", parent / "cgroup.procs", STATE]:
@@ -109,7 +113,7 @@ def inventory(gate):
 def process_identity(pid):
     raw = Path(f'/proc/{pid}/stat').read_text()
     fields = raw[raw.rindex(') ') + 2:].split()
-    return {'startTicks': fields[19], 'processGroup': int(fields[2])}
+    return {'startTicks': fields[19], 'processGroup': int(fields[2]), 'state': fields[0]}
 
 
 def native_identity(gate, work_id, pid):
@@ -217,10 +221,214 @@ def stop_idle_provider(gate, expected, operation):
             os.close(pidfd)
 
 
+COORDINATORS = ROOT.parent / 'launchpad-coordinators'
+COORDINATOR_STATE = Path('/run/launchpad-coordinators')
+SERVER = Path('/opt/launchpad/server/t3')
+
+
+def immutable(path, directory=False):
+    info = path.lstat()
+    import stat
+    valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if not valid_type or info.st_uid != 0 or info.st_mode & 0o022 or (not directory and info.st_nlink != 1):
+        raise RuntimeError('Coordinator ownership changed')
+    return info
+
+
+def coordinator_scope(value):
+    keys = ('allocationId', 'operationId', 'threadId', 'generation')
+    scope = {key: value[key] for key in keys}
+    if (any(not isinstance(scope[key], str) or not scope[key] or len(scope[key]) > 1024 for key in keys[:-1])
+            or type(scope['generation']) is not int or scope['generation'] < 1):
+        raise ValueError('Invalid coordinator scope')
+    return scope
+
+
+def coordinator_id(scope):
+    import hashlib
+    return hashlib.sha256(json.dumps(coordinator_scope(scope), sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:32]
+
+
+def sync_json(path, value, mode=0o600):
+    import tempfile
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as output:
+            json.dump(value, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextlib.contextmanager
+def coordinator_locked():
+    if os.getuid() != 0:
+        raise RuntimeError('Coordinator control requires root')
+    immutable(COORDINATORS, True)
+    immutable(COORDINATOR_STATE, True)
+    with (COORDINATOR_STATE / 'lock').open('a+') as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def coordinator_record(scope, boot_id):
+    group_id = coordinator_id(scope)
+    record_path = COORDINATOR_STATE / (group_id + '.json')
+    immutable(record_path)
+    record = read_json(record_path)
+    if record['scope'] != coordinator_scope(scope) or record['bootId'] != boot_id or record['groupId'] != group_id:
+        raise RuntimeError('Saved coordinator identity differs')
+    group = COORDINATORS / group_id
+    immutable(group, True)
+    return group, record
+
+
+def coordinator_admission(scope):
+    binding = COORDINATOR_STATE / 'restore-binding.json'
+    if binding.exists():
+        immutable(binding)
+        if coordinator_scope(read_json(binding)['boot']) != coordinator_scope(scope):
+            raise RuntimeError('A newer restore owns coordinator admission')
+
+
+def run_coordinator(receipt, mode):
+    import pwd, hashlib
+    if not re.fullmatch(r'[a-f0-9]{64}', receipt) or mode not in {'initial', 'move', 'restore'}:
+        raise ValueError('Invalid coordinator launch')
+    scope = coordinator_scope(json.loads(os.environ['LAUNCHPAD_COORDINATOR_SCOPE']))
+    with coordinator_locked():
+        coordinator_admission(scope)
+        immutable(SERVER)
+        group_id = coordinator_id(scope)
+        group = COORDINATORS / group_id
+        record_path = COORDINATOR_STATE / (group_id + '.json')
+        if group.exists():
+            immutable(group, True)
+            if populated(group):
+                prior_group, prior = coordinator_record(scope, BOOT.read_text().strip())
+                # A repeat start never creates a second coordinator.
+                if process_identity(prior['pid'])['startTicks'] != prior['startTicks']:
+                    raise RuntimeError('Coordinator leader changed')
+                return
+            group.rmdir()
+        group.mkdir(mode=0o755)
+        record = {'version': 1, 'scope': scope, 'groupId': group_id,
+                  'bootId': BOOT.read_text().strip(), 'pid': os.getpid(),
+                  'startTicks': process_identity(os.getpid())['startTicks'],
+                  'executableSha256': hashlib.sha256(SERVER.read_bytes()).hexdigest()}
+        (group / 'cgroup.procs').write_text(str(os.getpid()))
+        sync_json(record_path, record, 0o644)
+    owner = pwd.getpwnam('user')
+    os.setgroups([])
+    os.setgid(owner.pw_gid)
+    os.setuid(owner.pw_uid)
+    os.environ.pop('LAUNCHPAD_COORDINATOR_SCOPE', None)
+    os.environ.update(HOME=owner.pw_dir, USER=owner.pw_name, LOGNAME=owner.pw_name)
+    os.chdir(owner.pw_dir)
+    command = ['/usr/bin/flock', '--nonblock', '--conflict-exit-code', '75', '--no-fork',
+               '/home/user/.launchpad/thread-server.lock', str(SERVER), '__thread-vm-serve',
+               '--receipt-sha256', receipt]
+    if mode != 'initial':
+        command.append('--' + mode)
+    os.execv(command[0], command)
+
+
+def stop_coordinator(scope, boot_id):
+    import hashlib, signal
+    group, record = coordinator_record(scope, boot_id)
+    own_group = Path('/proc/self/cgroup').read_text().strip().split('::', 1)[-1]
+    if own_group == str(group).removeprefix('/sys/fs/cgroup') or own_group.startswith(str(group).removeprefix('/sys/fs/cgroup') + '/'):
+        raise RuntimeError('Restore control cannot stop its own transport group')
+    try:
+        identity = process_identity(record['pid'])
+    except FileNotFoundError:
+        identity = None
+    if identity is not None and identity['startTicks'] != record['startTicks']:
+        if populated(group):
+            raise RuntimeError('Coordinator PID was reused while children remain')
+        return
+    if identity is not None and identity['state'] not in {'Z', 'X'}:
+        membership = Path(f"/proc/{record['pid']}/cgroup").read_text().strip().split('::', 1)[-1]
+        if membership != str(group).removeprefix('/sys/fs/cgroup'):
+            raise RuntimeError('Coordinator escaped its captured group')
+        if (identity['startTicks'] != record['startTicks']
+                or Path(f"/proc/{record['pid']}/exe").resolve() != SERVER.resolve()
+                or hashlib.sha256(SERVER.read_bytes()).hexdigest() != record['executableSha256']):
+            raise RuntimeError('Coordinator process identity changed')
+        descriptor = os.pidfd_open(record['pid'])
+        try:
+            if process_identity(record['pid'])['startTicks'] != record['startTicks']:
+                raise RuntimeError('Coordinator process changed before stop')
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        finally:
+            os.close(descriptor)
+        try:
+            wait_cgroup_event(group, 'populated', '0')
+        except RuntimeError:
+            pass
+    if populated(group):
+        (group / 'cgroup.kill').write_text('1')
+        wait_cgroup_event(group, 'populated', '0')
+    if populated(group):
+        raise RuntimeError('Coordinator stop is unconfirmed')
+
+
+def prepare_warm_restore(value):
+    import hashlib
+    boot, source = value['boot'], value['source']
+    target_scope = coordinator_scope(boot)
+    source_scope = coordinator_scope(source)
+    if (boot['version'] != 1 or target_scope['threadId'] != source_scope['threadId']
+            or target_scope['generation'] <= source_scope['generation']
+            or target_scope['operationId'] == source_scope['operationId']
+            or type(source['sealEpoch']) is not int or source['sealEpoch'] < 1):
+        raise RuntimeError('Warm restore scope differs')
+    source_operation = hashlib.sha256(source['captureOperationId'].encode()).hexdigest()[:32]
+    target_operation = hashlib.sha256(boot['operationId'].encode()).hexdigest()[:32]
+    with coordinator_locked(), locked() as gate:
+        if gate['bootId'] != source['bootId'] or not inventory(gate)['stopped']:
+            raise RuntimeError('Saved source is not stopped')
+        rebound = gate.get('warmRestore') == value
+        if rebound:
+            if gate['sealedBy'] != target_operation or gate['epoch'] != source['sealEpoch'] + 1:
+                raise RuntimeError('Restored workload gate changed')
+        elif (gate['sealedBy'] != source_operation or gate['epoch'] != source['sealEpoch']):
+            raise RuntimeError('Saved source seal differs')
+        stop_coordinator(source_scope, source['bootId'])
+        # Root-owned admission also blocks a late old start between this command
+        # and identity rotation; the user-owned workload gate alone is insufficient.
+        sync_json(COORDINATOR_STATE / 'restore-binding.json', value)
+        if not rebound:
+            gate.update(sealedBy=target_operation, epoch=source['sealEpoch'] + 1, warmRestore=value)
+            sync_json(STATE / 'gate.json', gate, 0o600)
+        # A retry also repairs a crash between atomic replacement and ownership.
+        import pwd
+        owner = pwd.getpwnam('user')
+        os.chown(STATE / 'gate.json', owner.pw_uid, owner.pw_gid)
+        return {'bootId': gate['bootId'], 'targetSealEpoch': gate['epoch'],
+                'coordinatorStopped': True, 'sealRebound': True}
+
+
 def main(args):
     action = args[0]
     if action == "initialize" and len(args) == 1:
         initialize()
+        return
+    if action == 'coordinator-run' and len(args) == 3:
+        run_coordinator(args[1], args[2])
+        return
+    if action == 'prepare-warm-restore' and len(args) == 1:
+        print(json.dumps(prepare_warm_restore(json.load(sys.stdin))))
         return
     if action in {"run", "run-transfer"}:
         transfer = action == "run-transfer"

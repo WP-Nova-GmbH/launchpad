@@ -20,6 +20,10 @@ export function makeThreadVmFinalSaveWorker(
       const backup = current.backupOperationId
         ? yield* backups.get(current.backupOperationId)
         : null;
+      if (backup?.phase === "failed" && backup.sourceReceipt) {
+        yield* store.requestAbort(claim.operationId);
+        return;
+      }
       if (backup?.phase !== "verified") {
         yield* store.deferSave(
           claim,

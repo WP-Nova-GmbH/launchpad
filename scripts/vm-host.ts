@@ -2,6 +2,7 @@
 // @effect-diagnostics globalConsole:off - CLI startup progress and errors.
 /* oxlint-disable t3code/no-global-process-runtime -- This CLI owns its child environment. */
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
@@ -79,31 +80,15 @@ export function startVmHost(
       env,
       ...(source === undefined ? {} : { input: source }),
     });
-  const files = ["compose.yaml", "runtime.override.json", "compose.override.yaml"].map((name) =>
-    NodePath.posix.join(runtimeDirectory, name),
-  );
-  const configuration = [
-    "--project-directory",
-    runtimeDirectory,
-    ...files.flatMap((file) => ["--file", file]),
-  ];
+  const firewall = NodeCrypto.createHash("sha256")
+    .update(NodeFS.readFileSync(NodePath.join(repoRoot, "infra/e2b/host-firewall.nft")))
+    .digest("hex");
   host(
-    "Runtime verification",
+    "Stock VM host startup",
     "python3",
-    ["-", "--build-directory", runtimeDirectory, ...configuration, "--require-exclusive-host"],
-    NodeFS.readFileSync(NodePath.join(repoRoot, "infra/e2b/verify-runtime.py"), "utf8"),
+    ["-", "--runtime-dir", runtimeDirectory, "--firewall-policy-sha256", firewall, "--start"],
+    NodeFS.readFileSync(NodePath.join(repoRoot, "infra/e2b/verify-stock-runtime.py"), "utf8"),
   );
-  host("VM host startup", "docker", [
-    "compose",
-    ...configuration,
-    "up",
-    "--no-build",
-    "-d",
-    "--wait",
-    "api",
-    "client-proxy",
-    "launchpad-keepalive",
-  ]);
   return runtimeDirectory;
 }
 

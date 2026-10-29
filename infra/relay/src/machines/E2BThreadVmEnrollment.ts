@@ -1,5 +1,4 @@
 import { sendThreadVmCommandInput } from "./E2BThreadVmGuestCommand.ts";
-import { ThreadVmRestoreBoot } from "@t3tools/contracts/relay";
 import { inspectE2BThreadVmConnection } from "./E2BThreadVmConnection.ts";
 import { Sandbox } from "e2b";
 import { RelayThreadVmBootstrap, RelayThreadVmEnrollmentReceipt } from "@t3tools/contracts/relay";
@@ -9,8 +8,6 @@ import * as Schema from "effect/Schema";
 import { ThreadVmComputeError, type E2BThreadVmSettings } from "./E2BThreadVmCompute.ts";
 
 const encodeBootstrap = Schema.encodeEffect(Schema.fromJsonString(RelayThreadVmBootstrap));
-const encodeRestoreBoot = Schema.encodeSync(Schema.fromJsonString(ThreadVmRestoreBoot));
-const decodeBootstrap = Schema.decodeUnknownSync(Schema.fromJsonString(RelayThreadVmBootstrap));
 const decodeReceipt = Schema.decodeUnknownSync(
   Schema.fromJsonString(RelayThreadVmEnrollmentReceipt),
 );
@@ -20,27 +17,8 @@ const runGuest: GuestEnroll = async (connection, payload) => {
   // The pinned SDK's constructor opens a transport only. Sandbox.connect() can
   // resume a paused machine and must not be used by this retryable setup step.
   const vm = new Sandbox(connection);
-  const bootstrap = decodeBootstrap(Redacted.value(payload));
-  if (bootstrap.restore) {
-    const preparation = await vm.commands.run(
-      "flock --no-fork -x /run/launchpad-restore-identity.lock launchpad-server __thread-vm-restore-identity --base-dir /home/user/.launchpad",
-      { user: "root", background: true, stdin: true, timeoutMs: 60_000 },
-    );
-    const result = await sendThreadVmCommandInput(
-      preparation,
-      encodeRestoreBoot({
-        version: 1,
-        operationId: bootstrap.operationId,
-        allocationId: bootstrap.scope.allocationId,
-        threadId: bootstrap.scope.threadId,
-        generation: bootstrap.scope.generation,
-      }),
-    );
-    if (result.exitCode !== 0 || result.stdout.trim() !== '{"prepared":true}')
-      throw new Error("Restore identity preparation did not complete");
-  }
   const command = await vm.commands.run(
-    "flock --no-fork -x /home/user/.launchpad-enrollment.lock launchpad-server __thread-vm-enroll --base-dir /home/user/.launchpad",
+    "/usr/bin/flock --no-fork -x /home/user/.launchpad-enrollment.lock /opt/launchpad/server/t3 __thread-vm-enroll --base-dir /home/user/.launchpad",
     {
       user: "user",
       background: true,

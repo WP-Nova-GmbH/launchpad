@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -IS
 """Read one VM's durable work state without starting the server or exposing message contents."""
 import json
 import sqlite3
@@ -65,7 +65,7 @@ def projection_activity(db_path=DB_PATH):
 
 
 def main():
-    inventory = subprocess.run(["/usr/local/bin/launchpad-workload", "inspect"], check=True, capture_output=True, text=True, timeout=5)
+    inventory = subprocess.run(["/opt/launchpad/bin/launchpad-workload", "inspect"], check=True, capture_output=True, text=True, timeout=5)
     print(json.dumps({"workloads": json.loads(inventory.stdout), "projection": projection_activity()}, separators=(",", ":")))
 
 

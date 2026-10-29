@@ -7,7 +7,9 @@ import type {
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import { makeThreadVmSavedDiskStore } from "./ThreadVmSavedDiskStore.ts";
+import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
 import { readPendingThreadVmProviderAuth } from "./ThreadVmPendingProviderAuth.ts";
+import { threadVmSourceActivationPending } from "./ThreadVmSourceActivation.ts";
 
 /** Database-only observation. The caller holds current thread read access;
  * querying this store never creates, inspects, resumes or renews compute. */
@@ -25,6 +27,7 @@ export function makeThreadVmStatusStore(sql: PgClient) {
       activity: "busy" | "idle" | "unknown";
       pausePhase: "pending" | "sealed" | "completed" | "cancelled" | null;
       resumePhase: "waiting" | "resuming" | "completed" | null;
+      sourceActivationPending: boolean;
       backupPhase:
         | "pending"
         | "creating"
@@ -56,13 +59,16 @@ export function makeThreadVmStatusStore(sql: PgClient) {
       CASE WHEN v.observed_at >= clock_timestamp() - interval '2 minutes'
         THEN v.activity ELSE 'unknown' END AS activity,
       pause.phase AS "pausePhase", resume.phase AS "resumePhase",
+      ${threadVmSourceActivationPending(sql)} AS "sourceActivationPending",
       backup.phase AS "backupPhase", verified.at AS "lastVerifiedBackupAt",
-      final.operation_id AS "finalSaveOperationId",final.phase AS "finalSavePhase",
+      final.operation_id AS "finalSaveOperationId",CASE WHEN final.phase='aborted' THEN 'aborting' ELSE final.phase END AS "finalSavePhase",
       final.reason AS "finalSaveReason",final.error_code AS "finalSaveErrorCode",
       coalesce(restore.operation_id,recovery.operation_id) AS "restoreOperationId",
       CASE WHEN restore.operation_id IS NOT NULL THEN restore.phase WHEN recovery.operation_id IS NOT NULL THEN 'pending' END AS "restorePhase",
       coalesce(restore.error_code,recovery.error_code) AS "restoreErrorCode",
-      ((restore.saved_disk_operation_id IS NOT NULL AND restore.phase IN ('pending','preparing','prepared','boot_preparing','boot_prepared'))
+      ((restore.saved_disk_operation_id IS NOT NULL AND restore.phase IN ('pending','preparing','prepared','committed','creating','bootstrapping','booted')
+          AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_enrollments e WHERE e.allocation_id=restore.allocation_id AND e.environment_id IS NOT NULL
+            UNION ALL SELECT 1 FROM relay_thread_vm_bindings b WHERE b.allocation_id=restore.allocation_id))
         OR (restore.operation_id IS NULL AND recovery.phase='pending')) AS "restoreCanCancel",
       CASE WHEN restore.operation_id IS NOT NULL THEN NULL WHEN recovery.phase='pending' THEN 'saving_history'
         WHEN recovery.phase='retaining' THEN 'retaining_source' WHEN recovery.phase='retained' THEN 'stopping_source'
@@ -84,21 +90,24 @@ export function makeThreadVmStatusStore(sql: PgClient) {
         LIMIT 1) backup ON true
       LEFT JOIN LATERAL (SELECT to_char(verified_at AT TIME ZONE 'UTC',
         'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at FROM relay_thread_vm_backups
-        WHERE allocation_id = a.allocation_id AND phase = 'verified'
+        WHERE allocation_id = a.allocation_id AND phase = 'verified' AND native_capture_receipt IS NOT NULL
         ORDER BY verified_at DESC LIMIT 1) verified ON true
       LEFT JOIN relay_thread_vm_final_saves final ON final.thread_id=t.thread_id
         AND final.generation=t.generation AND final.operation_id=t.operation_id
-        AND final.phase NOT IN ('completed','aborted')
+        AND final.phase != 'completed'
+        AND (final.phase != 'aborted' OR a.state IS DISTINCT FROM 'paused')
       LEFT JOIN relay_thread_vm_restores restore ON restore.thread_id=t.thread_id
-        AND (restore.generation=t.generation OR restore.generation+1=t.generation)
+        AND (restore.generation=t.generation OR restore.target_generation=t.generation)
         AND restore.operation_id=t.operation_id AND restore.phase NOT IN ('aborted','completed')
       LEFT JOIN relay_thread_vm_backup_recoveries recovery ON recovery.thread_id=t.thread_id AND recovery.generation=t.generation
         AND recovery.operation_id=t.operation_id AND recovery.phase NOT IN ('completed','cancelled')
       WHERE t.thread_id = ${threadId} AND t.generation=${generation}`;
-    const [saved] = yield* sql<{ operationId: string }>`SELECT operation_id AS "operationId"
-      FROM relay_thread_vm_saved_disks WHERE thread_id=${threadId}
-        AND (generation=${generation} OR (phase='restoring' AND restore_operation_id=(SELECT operation_id FROM relay_thread_placements WHERE thread_id=${threadId} AND generation=${generation}))) AND phase != 'restored'
-      ORDER BY saved_at DESC LIMIT 1`;
+    const [saved] = yield* sql<{ operationId: string }>`SELECT s.operation_id AS "operationId"
+      FROM relay_thread_vm_saved_disks s JOIN relay_thread_placements t USING(thread_id)
+      WHERE s.thread_id=${threadId} AND t.generation=${generation} AND s.phase!='restored'
+        AND (s.generation=t.generation OR (s.phase='restoring' AND s.restore_operation_id=t.operation_id)
+          OR (${savedDiskHasCancelledRestorePlacement(sql)}))
+      ORDER BY s.saved_at DESC LIMIT 1`;
     const disk = saved ? yield* makeThreadVmSavedDiskStore(sql).get(saved.operationId) : null;
     const [reset] = yield* sql<
       Pick<RelayThreadVmReset, "operationId" | "phase" | "errorCode">
@@ -137,6 +146,7 @@ export function makeThreadVmStatusStore(sql: PgClient) {
       activity: row?.activity ?? "unknown",
       pausePhase: row?.pausePhase ?? null,
       resumePhase: row?.resumePhase ?? null,
+      sourceActivationPending: row?.sourceActivationPending ?? false,
       backupPhase: row?.backupPhase ?? null,
       lastVerifiedBackupAt: row?.lastVerifiedBackupAt ?? null,
       finalSave:

@@ -15,10 +15,12 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
     const [row] = yield* sql`SELECT 1 FROM relay_thread_vm_restores r
       JOIN relay_thread_placements t USING(thread_id)
       JOIN relay_thread_vm_provisions p ON p.allocation_id=r.allocation_id
+      JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
       WHERE r.operation_id=${input.operationId} AND r.allocation_id=${input.allocationId}
-        AND r.thread_id=${input.threadId} AND r.generation+1=${input.generation}
-        AND r.serving_requested AND r.phase='booted' AND t.operation_id=r.operation_id
-        AND t.generation=r.generation+1 AND p.operation_id=r.operation_id AND p.phase='created'`;
+        AND a.runtime_protocol='native-v1'
+        AND r.thread_id=${input.threadId} AND r.target_generation=${input.generation}
+        AND r.serving_requested AND r.phase='booted' AND r.boot_ingress_recovery_claim_id IS NULL AND r.boot_recovery_started_at IS NULL AND t.operation_id=r.operation_id
+        AND t.generation=r.target_generation AND p.operation_id=r.operation_id AND p.phase='created'`;
     return Boolean(row);
   });
   const assigned = Effect.fn("relay.thread_vm.restore.assign_enrolled")(function* (
@@ -26,12 +28,19 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const [restore] = yield* sql<{ phase: string; generation: number; actorUserId: string }>`
-        SELECT r.phase,r.generation,r.actor_user_id AS "actorUserId"
+        const [restore] = yield* sql<{
+          phase: string;
+          targetGeneration: number;
+          actorUserId: string;
+          recoveryBlocked: boolean;
+        }>`
+        SELECT r.phase,r.target_generation AS "targetGeneration",r.actor_user_id AS "actorUserId",
+          (r.boot_ingress_recovery_claim_id IS NOT NULL OR r.boot_recovery_started_at IS NOT NULL) AS "recoveryBlocked"
         FROM relay_thread_vm_restores r JOIN relay_thread_placements t USING(thread_id)
         WHERE r.operation_id=${receipt.operationId} AND r.allocation_id=${receipt.allocationId}
           AND r.thread_id=${receipt.threadId} FOR UPDATE OF t,r`;
         if (!restore) return false;
+        if (restore.recoveryBlocked) return yield* new ThreadVmEnrollmentInvalid();
         const [confirmed] = yield* sql`SELECT 1 FROM relay_thread_placements t
         JOIN relay_thread_vm_bindings b ON b.thread_id=t.thread_id
         JOIN relay_thread_vm_enrollments e ON e.allocation_id=b.allocation_id
@@ -46,7 +55,7 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
           AND e.environment_id=b.environment_id AND e.credential_id=b.credential_id
           AND e.environment_public_key=b.environment_public_key AND c.revoked_at IS NULL
           AND p.operation_id=${receipt.operationId} AND p.generation=t.generation AND p.phase='created'
-          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
+          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND a.runtime_protocol='native-v1'
           AND b.environment_id<> COALESCE((SELECT environment_id FROM relay_thread_vm_final_saves
             WHERE operation_id=(SELECT saved_disk_operation_id FROM relay_thread_vm_restores WHERE operation_id=${receipt.operationId})),
             (SELECT environment_id FROM relay_thread_vm_backup_recoveries WHERE operation_id=${receipt.operationId}))
@@ -54,7 +63,7 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
         FOR SHARE OF b,e,p,a,c`;
         if (
           !confirmed ||
-          receipt.generation !== restore.generation + 1 ||
+          receipt.generation !== restore.targetGeneration ||
           !["booted", "importing"].includes(restore.phase)
         )
           return yield* new ThreadVmEnrollmentInvalid();

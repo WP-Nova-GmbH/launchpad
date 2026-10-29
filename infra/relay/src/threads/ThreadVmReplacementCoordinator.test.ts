@@ -714,6 +714,10 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   threadId: f.threadId,
                   state: "running",
                   title: "Retained history",
+                  lastWorkAt: expect.stringMatching(
+                    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u,
+                  ),
+                  lastVerifiedBackupAt: null,
                 },
               ]);
               expect(

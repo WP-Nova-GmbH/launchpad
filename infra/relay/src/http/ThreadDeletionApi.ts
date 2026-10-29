@@ -3,7 +3,6 @@ import { RelayClientPrincipal, type RelayThreadDeletionRequest } from "@t3tools/
 import * as Effect from "effect/Effect";
 import { RelayDb } from "../db.ts";
 import { makeThreadDeletionStore, type ThreadDeletion } from "../threads/ThreadDeletionStore.ts";
-import { makeE2BRestoreClient } from "../machines/E2BRestoreClient.ts";
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import { withPrivateThreadAccess } from "./privateThreadAccess.ts";
 import { tenancyNotFound, tenancyConflict } from "./tenancyErrors.ts";
@@ -23,19 +22,6 @@ export const permanentlyDeleteThread = Effect.fn("relay.api.thread.permanently_d
     const { userId } = yield* RelayClientPrincipal,
       sql = (yield* RelayDb).$client,
       store = makeThreadDeletionStore(sql);
-    const allowUncertainCaptureCleanup = yield* sql.withTransaction(
-      Effect.gen(function* () {
-        // A duplicate may have admitted its tombstone before this preflight.
-        // Read both under the same lock; the write transaction below validates its owner and intent.
-        yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${threadId} FOR UPDATE`;
-        if (yield* store.get(threadId)) return false;
-        return yield* withPrivateThreadAccess(threadId, "read", () =>
-          store.needsUncertainCaptureCleanup(threadId),
-        );
-      }),
-    );
-    if (allowUncertainCaptureCleanup)
-      yield* makeE2BRestoreClient(settings.compute).requireExecutionRetention();
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${threadId} FOR UPDATE`;
@@ -57,7 +43,6 @@ export const permanentlyDeleteThread = Effect.fn("relay.api.thread.permanently_d
               ownerUserId: userId,
               generation: input.expectedGeneration,
               hostId: settings.hostId,
-              allowUncertainCaptureCleanup,
             })
             .pipe(Effect.map(serialize)),
         );
@@ -66,7 +51,6 @@ export const permanentlyDeleteThread = Effect.fn("relay.api.thread.permanently_d
   },
   Effect.catchTags({
     ThreadDeletionConflict: () => tenancyConflict("thread_deletion_conflict"),
-    E2BRestoreError: () => relayInternalErrorResponse("upstream_unavailable"),
     SqlError: () => relayInternalErrorResponse("persistence_failed"),
   }),
 );

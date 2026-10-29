@@ -182,6 +182,67 @@ it.effect("publishes an export only while its original stop seal is unchanged", 
   }),
 );
 
+it.effect(
+  "a provider spawner captured before restore setup inherits only that exact sealed transfer admission",
+  () =>
+    Effect.gen(function* () {
+      const operationId = "restore-setup";
+      const sealedBy = NodeCrypto.createHash("sha256")
+        .update(operationId)
+        .digest("hex")
+        .slice(0, 32);
+      const gate = { ...empty, epoch: 8, sealedBy };
+      let executed: ReadonlyArray<string> = [];
+      const raw = ChildProcessSpawner.make((command) => {
+        if (ChildProcess.isPipedCommand(command)) throw new Error("Expected one probe");
+        executed = command.args;
+        return respond("").spawn(command);
+      });
+      const captured = makeVmWorkloadSpawner(raw);
+      yield* withSealedVmWorkloads(
+        operationId,
+        Effect.gen(function* () {
+          const child = yield* captured.spawn(
+            ChildProcess.make("/opt/launchpad/bin/launchpad-workload", [
+              "run",
+              "b".repeat(32),
+              "provider",
+              "--",
+              "codex",
+              "app-server",
+            ]),
+          );
+          yield* child.exitCode;
+        }),
+      ).pipe(
+        Effect.provideService(VmWorkloadTracking, true),
+        Effect.provideService(VmControlSpawner, respond([json(gate), json(gate)])),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, raw),
+      );
+      expect(executed).toEqual([
+        "run-transfer",
+        bootId,
+        sealedBy,
+        "8",
+        "b".repeat(32),
+        "--",
+        "codex",
+        "app-server",
+      ]);
+      yield* (yield* captured.spawn(
+        ChildProcess.make("/opt/launchpad/bin/launchpad-workload", [
+          "run",
+          "c".repeat(32),
+          "provider",
+          "--",
+          "codex",
+          "app-server",
+        ]),
+      )).exitCode;
+      expect(executed[0]).toBe("run");
+    }),
+);
+
 it.effect("wraps both sides of a pipeline and refuses implicit shell execution", () =>
   Effect.gen(function* () {
     const captured: ChildProcess.Command[] = [];
@@ -205,7 +266,7 @@ it.effect("wraps both sides of a pipeline and refuses implicit shell execution",
       for (const side of [actual.left, actual.right]) {
         expect(ChildProcess.isStandardCommand(side)).toBe(true);
         if (ChildProcess.isStandardCommand(side))
-          expect(side.command).toBe("/usr/local/bin/launchpad-workload");
+          expect(side.command).toBe("/opt/launchpad/bin/launchpad-workload");
       }
       expect(actual.options).toEqual(command.options);
       if (ChildProcess.isStandardCommand(actual.left))

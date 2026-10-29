@@ -5,7 +5,7 @@ Before=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/launchpad-workload initialize
+ExecStart=/opt/launchpad/bin/launchpad-workload initialize
 RemainAfterExit=yes
 
 [Install]

@@ -2,7 +2,7 @@ import type { PgClient } from "@effect/sql-pg/PgClient";
 import { ClientOrchestrationCommand } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { makeThreadVmResumeStore } from "./ThreadVmResumeStore.ts";
+import { makeThreadVmResumeStore, threadVmResumePlacement } from "./ThreadVmResumeStore.ts";
 
 type ThreadCommand = Extract<ClientOrchestrationCommand, { readonly threadId: string }>;
 const decodeCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
@@ -73,11 +73,13 @@ export const wakeQueuedThreadVm = Effect.fn("relay.thread_vm.wake_queued")(funct
       }>`
       SELECT generation, environment_id AS "environmentId", operation_id AS "operationId"
       FROM relay_thread_placements WHERE thread_id=${threadId} FOR UPDATE`;
-      if (!placement || placement.operationId !== null) return false;
+      if (!placement) return false;
       const [paused] = yield* sql`SELECT 1 FROM relay_thread_vm_allocations a
+      JOIN relay_thread_placements t USING(thread_id)
       JOIN relay_thread_vm_bindings b USING(allocation_id) LEFT JOIN relay_thread_vm_pauses x USING(allocation_id)
       WHERE a.thread_id=${threadId} AND a.state='paused' AND a.deleted_at IS NULL
         AND b.environment_id=${placement.environmentId} AND b.generation=${placement.generation} AND b.revoked_at IS NULL
+        AND ${threadVmResumePlacement(sql)}
         AND (a.native_paused_generation=${placement.generation} OR (x.phase='completed' AND x.generation=${placement.generation}))`;
       if (!paused) return false;
       const [candidate] = yield* sql<{

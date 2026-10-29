@@ -5,38 +5,19 @@ import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
-import { E2BRestoreError, makeE2BRestoreClient, matchesSnapshotAlias } from "./E2BRestoreClient.ts";
+import { makeE2BRestoreClient, matchesSnapshotAlias } from "./E2BRestoreClient.ts";
+import { restoreBootOperationId, threadVmOperationMatches } from "./E2BThreadVmRestoreAttempt.ts";
 
-const decodePhysicalStopReceipt = Schema.decodeUnknownSync(
-  Schema.Struct({ sandboxID: Schema.String, physicallyStopped: Schema.Literal(true) }),
-);
-const decodeCreationIdentity = Schema.decodeUnknownSync(
-  Schema.Struct({
-    operationID: Schema.String,
-    sandboxID: Schema.NullOr(Schema.String.check(Schema.isMinLength(1))),
-    metadata: Schema.Record(Schema.String, Schema.String),
-    cancelled: Schema.Boolean,
-  }),
-);
-
-const decodeCreationStopReceipt = Schema.decodeUnknownSync(
-  Schema.Struct({
-    operationID: Schema.String,
-    sandboxID: Schema.NullOr(Schema.String.check(Schema.isMinLength(1))),
-    metadata: Schema.Record(Schema.String, Schema.String),
-    cancelled: Schema.Literal(true),
-    physicallyStopped: Schema.Literal(true),
-  }),
-);
-export interface ThreadVmCreationStopReceipt {
-  readonly operationId: string;
-  readonly computeRef: string | null;
-  readonly metadata: Readonly<Record<string, string>>;
+export interface ThreadVmCreated {
+  readonly sandboxId: string;
+  readonly trafficAccessToken?: Redacted.Redacted<string>;
 }
-export interface ThreadVmCreationIdentity {
+export interface ThreadVmKnownIdentity {
+  readonly allocationId: string;
   readonly operationId: string;
-  readonly computeRef: string | null;
-  readonly metadata: Readonly<Record<string, string>>;
+  readonly threadId: string;
+  readonly generation: number;
+  readonly templateId: string;
 }
 
 /** Defense in depth alongside the required host firewall, including its public addresses. */
@@ -73,6 +54,7 @@ export class ThreadVmComputeError extends Schema.TaggedError<ThreadVmComputeErro
     operation: Schema.String,
     message: Schema.String,
     cause: Schema.optional(Schema.Defect()),
+    connectUncertain: Schema.optional(Schema.Boolean),
   },
 ) {}
 
@@ -85,11 +67,24 @@ export interface ThreadVmCreateInput {
   readonly environment: Readonly<Record<string, string>>;
 }
 
+export interface ThreadVmSnapshotCreateInput extends ThreadVmCreateInput {
+  readonly sourceTemplateId: string;
+  readonly sourceBuildId: string;
+  readonly restoreOperationId: string;
+  readonly bootAttempt: number;
+}
+
 interface E2BComputeClient {
-  readonly create: (template: string, options: SandboxOpts) => Promise<{ sandboxId: string }>;
+  readonly create: (
+    template: string,
+    options: SandboxOpts,
+  ) => Promise<{ sandboxId: string; trafficAccessToken?: string }>;
   readonly getInfo: typeof Sandbox.getInfo;
+  readonly kill: typeof Sandbox.kill;
   readonly pause: typeof Sandbox.pause;
-  readonly connect: (...args: Parameters<typeof Sandbox.connect>) => Promise<{ sandboxId: string }>;
+  readonly connect: (
+    ...args: Parameters<typeof Sandbox.connect>
+  ) => Promise<{ sandboxId: string; trafficAccessToken?: string }>;
   readonly createSnapshot: typeof Sandbox.createSnapshot;
   readonly listSnapshots: (
     ...args: Parameters<typeof Sandbox.listSnapshots>
@@ -110,6 +105,7 @@ export const makeE2BThreadVmCompute = (
     sandboxUrl: settings.sandboxUrl,
     apiKey: Redacted.value(settings.apiKey),
     requestTimeoutMs: 60_000,
+    retries: 0,
   };
   const configurationError = (() => {
     for (const value of [settings.apiUrl, settings.sandboxUrl]) {
@@ -145,11 +141,10 @@ export const makeE2BThreadVmCompute = (
         )
       : Effect.tryPromise({
           try: run,
-          catch: (cause) =>
+          catch: () =>
             new ThreadVmComputeError({
               operation,
               message: `E2B ${operation} failed. Reconcile the operation before retrying.`,
-              cause,
             }),
         });
 
@@ -164,119 +159,148 @@ export const makeE2BThreadVmCompute = (
     });
 
   const restore = makeE2BRestoreClient(settings, transport);
-  const requirePausedSnapshots = Effect.gen(function* () {
-    const capabilities = yield* restore.capabilities();
-    if (capabilities.pausedSnapshots !== true || capabilities.certifiedPauses !== true)
-      return yield* new E2BRestoreError({ operation: "paused snapshot", reason: "unsupported" });
+  const create = Effect.fn("E2BThreadVmCompute.create")(function* (
+    input: ThreadVmCreateInput,
+    templateId = settings.templateId,
+    restoreMetadata: Readonly<Record<string, string>> = {},
+  ) {
+    if (configurationError !== null)
+      return yield* new ThreadVmComputeError({
+        operation: "configuration",
+        message: configurationError,
+      });
+    return yield* request("create", async (signal) => {
+      const sandbox = await client.create(templateId, {
+        ...options,
+        // Cold boots can use the host's five-minute budget plus recovery time.
+        requestTimeoutMs: 420_000,
+        signal,
+        timeoutMs: settings.timeoutMs,
+        secure: true,
+        metadata: {
+          "launchpad.managed": "thread-vm-v1",
+          "launchpad.allocation_id": input.allocationId,
+          "launchpad.operation_id": input.operationId,
+          "launchpad.thread_id": input.threadId,
+          "launchpad.generation": String(input.generation),
+          ...restoreMetadata,
+        },
+        envs: { ...input.environment },
+        network: {
+          denyOut: [...THREAD_VM_BLOCKED_NETWORKS, ...settings.hostAddresses],
+          allowPublicTraffic: false,
+        },
+        lifecycle: { onTimeout: { action: "pause", mode: "full" }, autoResume: false },
+      });
+      return {
+        sandboxId: sandbox.sandboxId,
+        ...(sandbox.trafficAccessToken?.trim()
+          ? { trafficAccessToken: Redacted.make(sandbox.trafficAccessToken) }
+          : {}),
+      };
+    });
   });
   return {
     restore,
-    pausedSnapshotsSupported: restore.capabilities().pipe(
-      Effect.map(
-        (capabilities) =>
-          capabilities.pausedSnapshots === true && capabilities.certifiedPauses === true,
-      ),
-      Effect.catch(() => Effect.succeed(false)),
-    ),
-    create: Effect.fn("E2BThreadVmCompute.create")(function* (input: ThreadVmCreateInput) {
+    pausedSnapshotsSupported: Effect.succeed(true),
+    create: (input: ThreadVmCreateInput) => create(input),
+    /** Native restore starts executing immediately; callers must commit ownership first. */
+    createFromSnapshot: Effect.fn("E2BThreadVmCompute.createFromSnapshot")(function* (
+      input: ThreadVmSnapshotCreateInput,
+    ) {
+      if (
+        !Number.isSafeInteger(input.bootAttempt) ||
+        input.bootAttempt < 0 ||
+        input.bootAttempt > 999_999_999 ||
+        restoreBootOperationId(input.restoreOperationId, input.bootAttempt) !== input.operationId
+      )
+        return yield* new ThreadVmComputeError({
+          operation: "restore",
+          message: "The restore boot attempt does not match its durable operation.",
+        });
+      yield* restore.resolveSource(input.sourceTemplateId, input.sourceBuildId);
+      // Snapshot templates have one immutable build. Native create accepts that
+      // template ID, not a fabricated tag derived from the build UUID.
+      return yield* create(input, input.sourceTemplateId, {
+        "launchpad.restore": "v1",
+        "launchpad.restore_parent_operation_id": input.restoreOperationId,
+        "launchpad.restore_boot_attempt": String(input.bootAttempt),
+      });
+    }),
+    inspect,
+    /** Explicit provisioning recovery only: connecting can resume this exact inert VM. */
+    recoverIngress: Effect.fn("E2BThreadVmCompute.recoverIngress")(function* (
+      sandboxId: string,
+      identity: ThreadVmKnownIdentity,
+    ) {
       if (configurationError !== null)
         return yield* new ThreadVmComputeError({
           operation: "configuration",
           message: configurationError,
+          connectUncertain: false,
         });
-      const capabilities = yield* restore.capabilities().pipe(
-        Effect.mapError(
-          () =>
-            new ThreadVmComputeError({
-              operation: "create",
-              message: "Durable creation identity is unavailable. VM creation was not sent.",
-            }),
-        ),
-      );
-      if (capabilities.durableCreationIdentity !== true)
-        return yield* new ThreadVmComputeError({
-          operation: "create",
-          message: "The compute runtime cannot safely recover failed VM creation.",
-        });
-      return yield* request("create", async (signal) => {
-        const sandbox = await client.create(settings.templateId, {
-          ...options,
-          // Cold boots can use the host's five-minute budget plus recovery time.
-          requestTimeoutMs: 420_000,
-          signal,
-          timeoutMs: settings.timeoutMs,
-          secure: true,
-          metadata: {
-            "launchpad.managed": "thread-vm-v1",
-            "launchpad.allocation_id": input.allocationId,
-            "launchpad.operation_id": input.operationId,
-            "launchpad.thread_id": input.threadId,
-            "launchpad.generation": String(input.generation),
-          },
-          envs: { ...input.environment },
-          network: {
-            denyOut: [...THREAD_VM_BLOCKED_NETWORKS, ...settings.hostAddresses],
-            allowPublicTraffic: false,
-          },
-          lifecycle: { onTimeout: { action: "pause", keepMemory: false }, autoResume: false },
-        });
-        return { sandboxId: sandbox.sandboxId };
+      // This state belongs to one execution. A lost native connect reply must
+      // retain the durable recovery marker even if this claim later expires.
+      let connectUncertain = false;
+      return yield* Effect.tryPromise({
+        try: async (signal): Promise<ThreadVmCreated> => {
+          const verify = async () => {
+            const info = await client.getInfo(sandboxId, { ...options, signal });
+            if (
+              info.sandboxId !== sandboxId ||
+              info.templateId !== identity.templateId.split(":")[0] ||
+              info.metadata["launchpad.managed"] !== "thread-vm-v1" ||
+              info.metadata["launchpad.allocation_id"] !== identity.allocationId ||
+              !threadVmOperationMatches(info.metadata, identity.operationId) ||
+              info.metadata["launchpad.thread_id"] !== identity.threadId ||
+              info.metadata["launchpad.generation"] !== String(identity.generation) ||
+              info.network?.allowPublicTraffic !== false ||
+              info.lifecycle?.autoResume !== false
+            )
+              throw new Error("VM identity or private ingress differs");
+            return info;
+          };
+          await verify();
+          connectUncertain = true;
+          const sandbox = await client.connect(sandboxId, {
+            ...options,
+            signal,
+            timeoutMs: settings.timeoutMs,
+            requestTimeoutMs: 420_000,
+          });
+          if (sandbox.sandboxId !== sandboxId)
+            throw new Error("VM ingress recovery returned another identity");
+          connectUncertain = false;
+          if (!sandbox.trafficAccessToken?.trim())
+            throw new Error("VM ingress recovery returned no token");
+          const info = await verify();
+          if (info.state !== "running") throw new Error("VM ingress is not running");
+          return { sandboxId, trafficAccessToken: Redacted.make(sandbox.trafficAccessToken) };
+        },
+        catch: () =>
+          new ThreadVmComputeError({
+            operation: "recover ingress",
+            message: "E2B recover ingress failed. Reconcile the operation before retrying.",
+            connectUncertain,
+          }),
       });
     }),
-    inspect,
-    /** Original control-plane identity survives a failed pause and lost routing. */
-    inspectCreation: (operationId: string) =>
-      request("inspect creation", async (signal): Promise<ThreadVmCreationIdentity | null> => {
-        const response = await transport(
-          `${settings.apiUrl.replace(/\/$/u, "")}/extensions/launchpad/v1/creations/${encodeURIComponent(operationId)}`,
-          {
-            method: "GET",
-            headers: { "X-API-Key": Redacted.value(settings.apiKey) },
-            redirect: "error",
-            signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
-          },
-        );
-        if (!response.ok) {
-          await response.body?.cancel();
-          if (response.status === 404) return null;
-          throw new Error("Managed creation identity is unavailable. Retain the allocation.");
-        }
-        let receipt: ReturnType<typeof decodeCreationIdentity>;
-        try {
-          receipt = decodeCreationIdentity(await response.json());
-        } catch {
-          throw new Error("Invalid managed creation identity. Retain the allocation.");
-        }
-        if (receipt.operationID !== operationId)
-          throw new Error("Managed creation identity belongs to another operation.");
-        return { operationId, computeRef: receipt.sandboxID, metadata: receipt.metadata };
-      }),
     /** Listing is read-only. In particular it must not connect to paused sandboxes. */
     findOperation: (operationId: string) =>
       request("find operation", async () => {
         const paginator = client.list({
           ...options,
-          query: { metadata: { "launchpad.operation_id": operationId } },
+          query: {
+            state: ["running", "paused"],
+            metadata: { "launchpad.operation_id": operationId },
+          },
         });
         const matches: Array<SandboxInfo> = [];
         while (paginator.hasNext) matches.push(...(await paginator.nextItems()));
         return matches;
       }),
     pause: (sandboxId: string) =>
-      requirePausedSnapshots.pipe(
-        Effect.mapError(
-          () =>
-            new ThreadVmComputeError({
-              operation: "pause",
-              message: "This host cannot retain a paused recovery disk. Keep the VM running.",
-            }),
-        ),
-        Effect.andThen(
-          request("pause", (signal) =>
-            client.pause(sandboxId, { ...options, signal, keepMemory: false }),
-          ),
-        ),
-      ),
+      request("pause", (signal) => client.pause(sandboxId, { ...options, signal, mode: "full" })),
     /** Call only for an explicitly admitted wake, never for status or history reads. */
     resume: (sandboxId: string) =>
       request("resume", async (signal) => {
@@ -287,23 +311,23 @@ export const makeE2BThreadVmCompute = (
           signal,
           timeoutMs: settings.timeoutMs,
         });
-        return { sandboxId: sandbox.sandboxId };
+        return {
+          sandboxId: sandbox.sandboxId,
+          ...(sandbox.trafficAccessToken?.trim()
+            ? { trafficAccessToken: Redacted.make(sandbox.trafficAccessToken) }
+            : {}),
+        };
       }),
-    /** Managed recovery capture freezes and flushes the guest filesystem, then thaws it. */
+    /** Call after the managed source has stopped and sealed its independent checkpoint. */
     snapshot: (sandboxId: string, name?: string) =>
-      Effect.gen(function* () {
-        yield* restore.capabilities();
-        return yield* request("snapshot", (signal) =>
-          client.createSnapshot(sandboxId, { ...options, signal, ...(name ? { name } : {}) }),
-        );
-      }),
-    /** Retain the immutable pause disk through the patched host; never connect or wake. */
-    snapshotPaused: (sandboxId: string, name: string) =>
-      requirePausedSnapshots.pipe(Effect.andThen(restore.retainPausedSnapshot(sandboxId, name))),
-    retentionCandidate: restore.retentionCandidate,
-    requireExecutionRetention: restore.requireExecutionRetention,
-    retainForStop: restore.retainForStop,
-    stopRetained: restore.stopRetained,
+      request("snapshot", (signal) =>
+        client.createSnapshot(sandboxId, {
+          ...options,
+          signal,
+          mode: "full",
+          ...(name ? { name } : {}),
+        }),
+      ),
     /** Reconcile an uncertain named capture without issuing another snapshot request. */
     findSnapshot: (sandboxId: string, name: string) =>
       request("find snapshot", async () => {
@@ -323,54 +347,13 @@ export const makeE2BThreadVmCompute = (
       request("delete snapshot", (signal) =>
         client.deleteSnapshot(snapshotId, { ...options, signal }),
       ),
-    cancelCreate: (operationId: string) =>
-      request("cancel create", async (signal): Promise<ThreadVmCreationStopReceipt> => {
-        const response = await transport(
-          `${settings.apiUrl.replace(/\/$/u, "")}/extensions/launchpad/v1/creations/${encodeURIComponent(operationId)}`,
-          {
-            method: "DELETE",
-            headers: { "X-API-Key": Redacted.value(settings.apiKey) },
-            redirect: "error",
-            signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
-          },
-        );
-        if (!response.ok) {
-          await response.body?.cancel();
-          throw new Error("Creation stop is unconfirmed. Retain capacity and retry.");
-        }
-        let receipt: ReturnType<typeof decodeCreationStopReceipt>;
-        try {
-          receipt = decodeCreationStopReceipt(await response.json());
-        } catch {
-          throw new Error("Invalid creation stop receipt. Retain capacity.");
-        }
-        if (receipt.operationID !== operationId)
-          throw new Error("Creation stop receipt belongs to another operation. Retain capacity.");
-        return { operationId, computeRef: receipt.sandboxID, metadata: receipt.metadata };
-      }),
+    /** Native acknowledgement for one durable ID; it is not a physical-stop certificate. */
     destroy: (sandboxId: string) =>
       request("destroy", async (signal) => {
-        const response = await transport(
-          `${settings.apiUrl.replace(/\/$/u, "")}/extensions/launchpad/v1/executions/${encodeURIComponent(sandboxId)}`,
-          {
-            method: "DELETE",
-            headers: { "X-API-Key": Redacted.value(settings.apiKey) },
-            redirect: "error",
-            signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
-          },
-        );
-        if (!response.ok) {
-          await response.body?.cancel();
-          throw new Error("Physical stop is unconfirmed. Retain the allocation and retry.");
-        }
-        let receipt: { sandboxID: string; physicallyStopped: true };
         try {
-          receipt = decodePhysicalStopReceipt(await response.json());
-        } catch {
-          throw new Error("Invalid physical stop receipt. Retain the allocation.");
-        }
-        if (receipt.sandboxID !== sandboxId) {
-          throw new Error("Physical stop receipt belongs to another VM. Retain the allocation.");
+          await client.kill(sandboxId, { ...options, signal });
+        } catch (error) {
+          if (!(error instanceof SandboxNotFoundError)) throw error;
         }
       }),
   };

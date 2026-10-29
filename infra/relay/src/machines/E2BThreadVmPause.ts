@@ -44,7 +44,7 @@ export function makeE2BThreadVmPause(
           transport,
           signal,
         );
-        const initial = await guest(connection, "/usr/local/bin/launchpad-workload inspect");
+        const initial = await guest(connection, "/opt/launchpad/bin/launchpad-workload inspect");
         if (initial.exitCode !== 0) throw new Error("Workload inventory unavailable");
         const inventory = decode(initial.stdout);
         const bootId = inventory.bootId;
@@ -70,7 +70,7 @@ export function makeE2BThreadVmPause(
     return run(
       sandboxId,
       identity,
-      ({ bootId }) => `/usr/local/bin/launchpad-workload seal ${bootId} ${operationId}`,
+      ({ bootId }) => `/opt/launchpad/bin/launchpad-workload seal ${bootId} ${operationId}`,
     ).pipe(
       Effect.flatMap((inventory) =>
         inventory.sealedBy === operationId
@@ -96,7 +96,7 @@ export function makeE2BThreadVmPause(
     return run(
       sandboxId,
       identity,
-      ({ bootId }) => `/usr/local/bin/launchpad-workload reopen ${bootId} ${operationId}`,
+      ({ bootId }) => `/opt/launchpad/bin/launchpad-workload reopen ${bootId} ${operationId}`,
     );
   };
   const reopenAfterResume = (
@@ -109,7 +109,7 @@ export function makeE2BThreadVmPause(
       if (inventory.sealedBy === null) return null;
       if (inventory.sealedBy !== operationId)
         throw new Error("Another operation owns the workload gate");
-      return `/usr/local/bin/launchpad-workload reopen ${inventory.bootId} ${operationId}`;
+      return `/opt/launchpad/bin/launchpad-workload reopen ${inventory.bootId} ${operationId}`;
     }).pipe(
       Effect.flatMap((inventory) =>
         inventory.sealedBy === null

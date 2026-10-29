@@ -1,3 +1,4 @@
+import { makeThreadBackupSourceWorker } from "./ThreadBackupSourceWorker.ts";
 import { activateRestoredThreadVm } from "./ThreadVmRestoreActivation.ts";
 import { makeThreadPauseWorker } from "./ThreadPauseWorker.ts";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
@@ -177,6 +178,7 @@ export const layer = Layer.effect(
 
     const moves = yield* makeThreadMoveWorker(authority.moves, history, commands);
     const enrollment = yield* makeThreadLocalEnrollmentWorker(authority.enrollment, history);
+    const backups = yield* makeThreadBackupSourceWorker(authority.backups, history, checkpoints);
     const pauses = yield* makeThreadPauseWorker(authority.pauses, history, checkpoints);
     const finalSaves = yield* makeThreadFinalSaveWorker(authority.finalSaves, history, checkpoints);
     // The durable cursor is the retry queue. Each pass is bounded by an engine head;
@@ -263,7 +265,8 @@ export const layer = Layer.effect(
       yield* Effect.forEach(
         owners,
         ({ threadId }) =>
-          pauses.synchronize(threadId).pipe(
+          backups.synchronize(threadId).pipe(
+            Effect.andThen(pauses.synchronize(threadId)),
             Effect.andThen(finalSaves.synchronize(threadId)),
             Effect.provideContext(checkpointContext),
             Effect.catch(() =>

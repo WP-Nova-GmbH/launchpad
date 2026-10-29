@@ -10,10 +10,10 @@ Install the checkout's dependencies with `vp i`, then follow
 [E2B host setup](e2b-host-setup.md#macos-development-only). On a Mac, this uses the
 dedicated `launchpad-e2b` Lima VM. On Linux, use the native host instructions.
 For a new installation, prepare the Linux host and
-[build the supported patched runtime](e2b-host-setup.md#build-the-launchpad-runtime),
-including its host safeguards. The optional
-unmodified upstream checks are not required. Reuse an existing supported
-installation if you already have one. Once the Linux host is running, start its
+[build the stock runtime](e2b-host-setup.md#build-the-launchpad-runtime),
+including its guest firewall. Preserve old patched deployments separately; startup
+refuses to overwrite their storage. Reuse an existing supported stock installation
+if you already have one. Once the Linux host is running, start its
 E2B services from the Launchpad checkout:
 
 ```sh
@@ -68,9 +68,9 @@ namespace instead of `dev-alex`.
 
 Get the Clerk keys from your Clerk application's API keys page. Get the E2B key
 from your self-hosted installation using [these instructions](e2b-host-setup.md#retrieve-the-e2b-api-key).
-On a new host, the first E2B startup generates its team credentials. Then complete
-the guide's team restore, lifetime and capacity configuration and run
-`vp run start:vm-host` again before starting Launchpad with VM support.
+On a new host, the first E2B startup generates its team credentials. Then verify
+the startup-reported native project limits before starting Launchpad with VM support.
+The launcher configures a fresh project before its first API start.
 The Cloudflare API token needs tunnel editing for the account, and Zone Read plus
 DNS Edit for the zone; the relay uses DNS editing for individual VM endpoints.
 
@@ -95,7 +95,7 @@ build files are removed afterward. On macOS it uses `launchpad-e2b`; on native
 Linux it uses the local Docker host.
 
 With the local Lima URLs above, startup also prepares build memory automatically.
-After packaging finishes, it temporarily reserves and verifies at least 12 GiB of
+After packaging finishes, it temporarily reserves and verifies at least 8 GiB of
 unreserved hugepage memory for E2B's image build, then restores the original pool
 after success, failure or cancellation. It leaves the saved host configuration
 unchanged. Other hosts need their build memory sized manually using the

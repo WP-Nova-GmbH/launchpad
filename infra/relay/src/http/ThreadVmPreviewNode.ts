@@ -1,3 +1,5 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import * as NodeHttp from "node:http";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Socket from "effect/unstable/socket/Socket";
@@ -12,6 +14,7 @@ export const threadVmPreviewNode = Layer.succeed(
     open: (input) =>
       Effect.scoped(
         Effect.gen(function* () {
+          let protocol = "";
           const upstream = yield* Socket.makeWebSocket(input.url, {
             openTimeout: "10 seconds",
           }).pipe(
@@ -26,6 +29,9 @@ export const threadVmPreviewNode = Layer.succeed(
               );
               // ws emits cancellation errors after the scoped Effect reader detaches.
               socket.on("error", () => {});
+              socket.once("open", () => {
+                protocol = socket.protocol;
+              });
               return socket;
             }),
           );
@@ -34,6 +40,11 @@ export const threadVmPreviewNode = Layer.succeed(
           );
           const upstreamWriter = yield* upstream.writer;
           // Connect upstream before upgrading the client, so a rejected handshake stays an HTTP error.
+          // Node otherwise selects the first offer, even when the app selected another.
+          if (input.request.source instanceof NodeHttp.IncomingMessage) {
+            if (protocol) input.request.source.headers["sec-websocket-protocol"] = protocol;
+            else delete input.request.source.headers["sec-websocket-protocol"];
+          }
           const client = yield* input.request.upgrade;
           const { pull: clientPull } = yield* client.reader;
           const clientWriter = yield* client.writer;

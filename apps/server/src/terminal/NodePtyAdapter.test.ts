@@ -225,7 +225,7 @@ it.effect("keeps the captured setup owner inside the VM workload boundary", () =
       env: {},
     });
     const [command, args] = spawn.mock.calls.at(-1)! as unknown as [string, string[]];
-    assert.equal(command, "/usr/local/bin/launchpad-workload");
+    assert.equal(command, "/opt/launchpad/bin/launchpad-workload");
     assert.deepEqual(args.slice(2, 7), [
       "terminal",
       "--",

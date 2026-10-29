@@ -8,19 +8,30 @@ export const serializeThreadVmRestore = (
     | "allocationId"
     | "threadId"
     | "generation"
+    | "targetGeneration"
     | "phase"
     | "savedDiskOperationId"
     | "errorCode"
+    | "enrollmentIssued"
   >,
 ) => ({
   operationId: restore.operationId,
   allocationId: restore.allocationId,
   threadId: ThreadId.make(restore.threadId),
-  generation: restore.generation + 1,
+  generation: restore.targetGeneration ?? restore.generation + 1,
   phase: restore.phase,
   canCancel:
     !!restore.savedDiskOperationId &&
-    ["pending", "preparing", "prepared", "boot_preparing", "boot_prepared"].includes(restore.phase),
+    !restore.enrollmentIssued &&
+    [
+      "pending",
+      "preparing",
+      "prepared",
+      "committed",
+      "creating",
+      "bootstrapping",
+      "booted",
+    ].includes(restore.phase),
   errorCode: restore.errorCode,
 });
 

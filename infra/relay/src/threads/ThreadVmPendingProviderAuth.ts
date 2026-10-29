@@ -45,8 +45,8 @@ export const readPendingThreadVmProviderAuth = Effect.fn("relay.thread_vm.pendin
             AND b.environment_id=t.environment_id)
           OR EXISTS(SELECT 1 FROM relay_thread_vm_restores r WHERE r.operation_id=t.operation_id
             AND r.thread_id=t.thread_id AND r.actor_user_id=t.owner_user_id
-            AND r.allocation_id=b.allocation_id AND r.phase='importing' AND r.serving_requested
-            AND r.generation+1=t.generation AND b.generation=t.generation
+            AND r.allocation_id=b.allocation_id AND r.phase='importing' AND r.serving_requested AND r.bootstrap_receipt->>'kind'='native-warm-restore-bootstrap-v1'
+            AND r.target_generation=t.generation AND b.generation=t.generation
             AND b.environment_id=t.environment_id)
         ) FOR SHARE OF b,a,e,p,k,cap`;
     if (!row) return null;

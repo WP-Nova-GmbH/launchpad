@@ -1,6 +1,7 @@
 import * as CheckoutAccess from "./workspace/CheckoutAccess.ts";
 import { readInstalledThreadVm } from "./relay/ThreadVmEnrollment.ts";
 import { threadVmProviderAuthRouteLayer } from "./relay/ThreadVmProviderAuth.ts";
+import { threadVmPreviewMiddlewareLayer } from "./relay/ThreadVmPreview.ts";
 import { managedTunnelsDisabled } from "./cloud/config.ts";
 import { runThreadVmManagedEndpoint } from "./relay/ThreadVmManagedEndpoint.ts";
 import * as ThreadPreparationReactor from "./orchestration/ThreadPreparationReactor.ts";
@@ -704,6 +705,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(PreviewAutomationBroker.layer),
   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(DesktopAppUpdateLayerLive))),
   Layer.provide(commandReadinessLayer),
+  Layer.provide(threadVmPreviewMiddlewareLayer),
   Layer.provide(browserApiCorsLayer),
   Layer.provide(httpCompressionLayer),
 );

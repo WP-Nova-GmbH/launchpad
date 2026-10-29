@@ -34,6 +34,7 @@ const ready = {
   activity: "idle",
   pausePhase: null,
   resumePhase: null,
+  sourceActivationPending: false,
   backupPhase: null,
   lastVerifiedBackupAt: null,
 };
@@ -96,6 +97,35 @@ const respond: typeof fetch = async (url, init) => {
 };
 
 describe("explicit saved-thread chat connection", () => {
+  it.effect("waits for the source acknowledgement before registering a resumed VM", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let sourceActivationPending = true;
+        const h = yield* harness(async (url) =>
+          Response.json(
+            String(url).endsWith("vm-status")
+              ? {
+                  ...ready,
+                  pausePhase: "cancelled",
+                  resumePhase: "completed",
+                  backupPhase: "retired",
+                  sourceActivationPending,
+                }
+              : placement,
+          ),
+        );
+        const pending = yield* Effect.result(h.open);
+        expect(pending._tag).toBe("Failure");
+        if (pending._tag === "Failure") expect(pending.failure.message).toContain("reopening");
+        expect(h.registered).toEqual([]);
+        expect(h.enabled).toEqual([]);
+        sourceActivationPending = false;
+        expect(yield* h.open).toEqual({ environmentId, threadId });
+        expect(h.registered).toHaveLength(1);
+      }),
+    ),
+  );
+
   it.effect("does not follow a cutover notice after ownership advances to another generation", () =>
     Effect.scoped(
       Effect.gen(function* () {

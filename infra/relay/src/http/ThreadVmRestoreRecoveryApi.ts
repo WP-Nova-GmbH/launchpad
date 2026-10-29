@@ -42,7 +42,7 @@ const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string
       FROM relay_thread_vm_restores r JOIN relay_thread_placements t USING(thread_id)
       JOIN relay_thread_vm_enrollments e ON e.allocation_id=r.allocation_id
       WHERE r.thread_id=${input.threadId} AND r.allocation_id=${principal.threadVm!.allocationId}
-        AND r.generation+1=${input.generation} AND r.phase='importing' AND r.serving_requested
+        AND r.target_generation=${input.generation} AND r.phase='importing' AND r.serving_requested AND r.bootstrap_receipt->>'kind'='native-warm-restore-bootstrap-v1'
         AND t.operation_id=r.operation_id AND t.environment_id=${input.environmentId}
         AND e.installed_at IS NOT NULL AND e.environment_id=t.environment_id
         AND e.operation_id=r.operation_id AND (${operationId === undefined} OR r.operation_id=${operationId ?? ""})`;

@@ -2,6 +2,8 @@
 import * as NodeHttp from "node:http";
 import { expect, it } from "@effect/vitest";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -9,6 +11,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Socket from "effect/unstable/socket/Socket";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
+import { HttpRouter, HttpServer } from "effect/unstable/http";
 import { threadVmPreviewNode } from "./ThreadVmPreviewNode.ts";
 import { ThreadVmPreviewWebSocket } from "./ThreadVmPreviewWebSocket.ts";
 import { ThreadVmPreviewDenied } from "../threads/ThreadVmPreviewStore.ts";
@@ -27,6 +30,74 @@ const listen = (server: NodeHttp.Server) =>
       }),
     catch: () => new ThreadVmPreviewDenied(),
   });
+it.effect(
+  "returns the application's selected protocol through the real Node relay upgrade",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const app = NodeHttp.createServer();
+        const appSockets = new NodeSocket.NodeWS.WebSocketServer({
+          server: app,
+          handleProtocols: (protocols) => (protocols.has("vite-hmr") ? "vite-hmr" : false),
+        });
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(async () => {
+            for (const socket of appSockets.clients) socket.terminate();
+            appSockets.close();
+            await new Promise<void>((resolve) => app.close(() => resolve()));
+          }),
+        );
+        const appPort = yield* listen(app);
+        appSockets.on("connection", (socket) => {
+          socket.on("message", (data, binary) => socket.send(data, { binary }));
+        });
+        const transport = Context.get(
+          yield* Layer.build(threadVmPreviewNode),
+          ThreadVmPreviewWebSocket,
+        );
+        const serving = HttpRouter.serve(
+          HttpRouter.add(
+            "GET",
+            "/hmr",
+            Effect.gen(function* () {
+              const request = yield* HttpServerRequest.HttpServerRequest;
+              return yield* transport.open({
+                request,
+                url: `ws://127.0.0.1:${appPort}/hmr`,
+                headers: {},
+                guard: Effect.never,
+              });
+            }),
+          ),
+          { disableLogger: true, disableListenLog: true },
+        ).pipe(
+          Layer.provideMerge(
+            NodeHttpServer.layer(NodeHttp.createServer, { host: "127.0.0.1", port: 0 }),
+          ),
+          Layer.provide(NodeServices.layer),
+        );
+        const address = Context.get(yield* Layer.build(serving), HttpServer.HttpServer).address;
+        const origin = HttpServer.formatAddress(address).replace(/^http/u, "ws");
+        const client = new NodeSocket.NodeWS.WebSocket(`${origin}/hmr`, ["first", "vite-hmr"]);
+        yield* Effect.addFinalizer(() => Effect.sync(() => client.terminate()));
+        yield* Effect.promise(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              client.once("open", resolve);
+              client.once("error", reject);
+            }),
+        );
+        expect(client.protocol).toBe("vite-hmr");
+        const echoed = new Promise<Buffer>((resolve) =>
+          client.once("message", (data) => resolve(Buffer.from(data as Buffer))),
+        );
+        client.send(Buffer.from([0, 1, 255]));
+        expect(yield* Effect.promise(() => echoed)).toEqual(Buffer.from([0, 1, 255]));
+        client.close();
+      }),
+    ),
+  { timeout: 10_000 },
+);
 it.effect(
   "forwards real HMR WebSocket frames and closes both sides on revoked access",
   () =>

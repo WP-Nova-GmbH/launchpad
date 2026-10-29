@@ -2,7 +2,7 @@
 import * as NodeHttp from "node:http";
 import * as NodeCrypto from "node:crypto";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
-import { describe, expect, it } from "@effect/vitest";
+import { describe, expect, it, layer } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import {
@@ -16,6 +16,9 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
+import * as Layer from "effect/Layer";
+import { RelayDb } from "../src/db.ts";
+import { RelaySecretBox } from "../src/auth/SecretBox.ts";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import {
@@ -73,7 +76,6 @@ const nativeInfo = {
   state: "running",
   envdVersion: "test",
   envdAccessToken: "envd-secret",
-  trafficAccessToken: "traffic-secret",
   network: { allowPublicTraffic: false },
   lifecycle: { autoResume: false },
   metadata: {
@@ -274,7 +276,28 @@ describe("local VM connection configuration", () => {
     }
   });
 });
-describe("private local client proxy", () => {
+const ingressTestLayer = Layer.mergeAll(
+  Layer.succeed(RelayDb, {
+    $client: (_strings: TemplateStringsArray, ...values: ReadonlyArray<unknown>) => {
+      const [allocationId, threadId, computeRef] = values;
+      return Effect.succeed([
+        {
+          sealed: JSON.stringify({
+            version: 1,
+            allocationId,
+            threadId,
+            computeRef,
+            operationId: "operation",
+            generation: 1,
+            token: "traffic-secret",
+          }),
+        },
+      ]);
+    },
+  } as unknown as RelayDb["Service"]),
+  Layer.succeed(RelaySecretBox, { seal: Effect.succeed, open: Effect.succeed }),
+);
+layer(ingressTestLayer)("private local client proxy", (it) => {
   it.effect(
     "preserves exact DPoP URL, Authorization, path and query while separating cookie/private headers",
     () =>
@@ -522,9 +545,6 @@ describe("private local client proxy", () => {
             .spyOn(globalThis, "fetch")
             .mockResolvedValueOnce(Response.json(nativeInfo))
             .mockResolvedValueOnce(
-              Response.json({ version: 1, privatePreviewHeaderBoundary: true }),
-            )
-            .mockResolvedValueOnce(
               Response.json({
                 environmentId: target.environmentId,
                 status: "online",
@@ -564,7 +584,6 @@ describe("private local client proxy", () => {
         const transport = vi
           .spyOn(globalThis, "fetch")
           .mockResolvedValueOnce(Response.json(nativeInfo))
-          .mockResolvedValueOnce(Response.json({ version: 1, privatePreviewHeaderBoundary: true }))
           .mockResolvedValueOnce(
             Response.json({
               credential: "minted-credential",
@@ -602,7 +621,6 @@ describe("private local client proxy", () => {
           .spyOn(globalThis, "fetch")
           .mockResolvedValueOnce(new Response(null, { status: 503 }))
           .mockResolvedValueOnce(Response.json(nativeInfo))
-          .mockResolvedValueOnce(Response.json({ version: 1, privatePreviewHeaderBoundary: true }))
           .mockResolvedValueOnce(
             Response.json({
               credential: "minted-credential",
@@ -635,7 +653,7 @@ describe("private local client proxy", () => {
             dpop: proof(url, "fresh-entry-proof"),
           }),
         ).toMatchObject({ status: 200 });
-        expect(transport).toHaveBeenCalledTimes(4);
+        expect(transport).toHaveBeenCalledTimes(3);
       }),
     ),
   );
@@ -654,8 +672,6 @@ describe("private local client proxy", () => {
             let mints = 0;
             const transport = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
               const path = new URL(url instanceof Request ? url.url : url).pathname;
-              if (path.endsWith("/capabilities"))
-                return Response.json({ version: 1, privatePreviewHeaderBoundary: true });
               if (path.startsWith("/sandboxes/")) return Response.json(nativeInfo);
               if (++mints === 1) {
                 Deferred.doneUnsafe(started, Effect.void);

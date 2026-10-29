@@ -21,7 +21,6 @@ type Identity = {
 interface PauseCompute {
   readonly inspect: (sandboxId: string) => Effect.Effect<SandboxInfo | null, ThreadVmComputeError>;
   readonly pause: (sandboxId: string) => Effect.Effect<unknown, ThreadVmComputeError>;
-  readonly pausedSnapshotsSupported?: Effect.Effect<boolean>;
 }
 interface PauseGuest {
   readonly seal: (
@@ -53,13 +52,11 @@ export function makeThreadVmPauseWorker(
   compute: PauseCompute,
   guest: PauseGuest,
   hostId: string,
+  enqueueIdle = true,
 ) {
   const store = makeThreadVmPauseStore(sql);
   const runOne = Effect.fn("relay.thread_vm.pause.run_one")(function* () {
-    // Older hosts report "paused" for a lost route even when the disk build failed.
-    if (compute.pausedSnapshotsSupported && !(yield* compute.pausedSnapshotsSupported))
-      return false;
-    yield* store.reserveIdle(hostId);
+    if (enqueueIdle) yield* store.reserveIdle(hostId);
     const claim = yield* store.claim(hostId);
     if (!claim) return false;
     const identity: Identity = {
@@ -83,6 +80,9 @@ export function makeThreadVmPauseWorker(
         return;
       }
       if (before.state !== "running") return;
+      // A positive earlier call is reconciled by GET only. Never repeat native
+      // pause against a later same-ID execution after an ambiguous observation.
+      if (claim.pauseDispatched) return;
       const seal = yield* guest.seal(claim.computeRef, identity, claim.operationId);
       // A fresh boot cannot certify the conversation captured by the old server.
       if (seal.bootId !== claim.bootId) return;
@@ -92,7 +92,9 @@ export function makeThreadVmPauseWorker(
         return;
       }
       if (!(yield* store.markSealed(claim, seal.bootId))) return;
+      if (!(yield* store.beginPause(claim))) return;
       yield* compute.pause(claim.computeRef);
+      if (!(yield* store.acknowledgePause(claim))) return;
       const after = yield* compute.inspect(claim.computeRef);
       if (after && matches(after, claim) && after.state === "paused") yield* store.finish(claim);
     });

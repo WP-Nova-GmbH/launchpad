@@ -3,17 +3,12 @@ import type { RelayThreadVmIndependentHistory } from "@t3tools/contracts/relay";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import {
-  E2BBackupColdProof,
-  E2BExecutionRetentionCandidate,
-  E2BExecutionRetentionReceipt,
-  sameRetentionCandidate,
-} from "../machines/E2BRestoreClient.ts";
+import { E2BNativeSnapshotReceipt } from "../machines/E2BNativeSnapshotReceipt.ts";
+import { NativeThreadVmRecoverySourceDeletedReceipt } from "./NativeThreadVmRestoreReceipt.ts";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
 import { makeThreadNativeCheckpointStore } from "./ThreadNativeCheckpointStore.ts";
 import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
 import { makeThreadVmRecoveryHistory } from "./ThreadVmRecoveryHistory.ts";
-import { threadVmOperationMatches } from "../machines/E2BThreadVmRestoreAttempt.ts";
 
 export class ThreadVmBackupRecoveryConflict extends Schema.TaggedError<ThreadVmBackupRecoveryConflict>()(
   "ThreadVmBackupRecoveryConflict",
@@ -21,35 +16,8 @@ export class ThreadVmBackupRecoveryConflict extends Schema.TaggedError<ThreadVmB
 ) {}
 const conflict = (message: string) => new ThreadVmBackupRecoveryConflict({ message });
 const decodeId = Schema.decodeEffect(Schema.String.check(Schema.isUUID()));
-const decodeProof = Schema.decodeUnknownEffect(E2BBackupColdProof);
-const decodeCandidate = Schema.decodeUnknownEffect(E2BExecutionRetentionCandidate);
-const decodeRetention = Schema.decodeUnknownEffect(E2BExecutionRetentionReceipt);
-const decodeStop = Schema.decodeUnknownEffect(
-  Schema.Struct({
-    ...E2BExecutionRetentionReceipt.fields,
-    physicallyStopped: Schema.Literal(true),
-  }),
-);
-const matchesSource = (row: ThreadVmBackupRecovery, candidate: E2BExecutionRetentionCandidate) =>
-  candidate.sandboxID === row.computeRef &&
-  Object.keys(candidate.metadata).every((key) =>
-    [
-      "launchpad.managed",
-      "launchpad.allocation_id",
-      "launchpad.operation_id",
-      "launchpad.thread_id",
-      "launchpad.generation",
-      "launchpad.restore",
-      "launchpad.restore_parent_operation_id",
-      "launchpad.restore_boot_attempt",
-    ].includes(key),
-  ) &&
-  candidate.metadata["launchpad.managed"] === "thread-vm-v1" &&
-  candidate.metadata["launchpad.allocation_id"] === row.sourceAllocationId &&
-  candidate.metadata["launchpad.thread_id"] === row.threadId &&
-  threadVmOperationMatches(candidate.metadata, row.sourceOperationId) &&
-  candidate.metadata["launchpad.generation"] === String(row.generation);
-
+const decodeProof = Schema.decodeUnknownEffect(E2BNativeSnapshotReceipt);
+const decodeStop = Schema.decodeUnknownEffect(NativeThreadVmRecoverySourceDeletedReceipt);
 export interface ThreadVmBackupRecoveryInput {
   readonly threadId: string;
   readonly actorUserId: string;
@@ -83,7 +51,7 @@ export interface ThreadVmBackupRecovery {
   readonly sourceTemplateId: string;
   readonly sourceBuildId: string;
   readonly independentHistory: RelayThreadVmIndependentHistory | null;
-  readonly retentionCandidate: E2BExecutionRetentionCandidate | null;
+  readonly retentionCandidate: unknown;
   readonly retentionReceipt: unknown;
   readonly stopReceipt: unknown;
   readonly phase:
@@ -142,7 +110,7 @@ export function makeThreadVmBackupRecoveryStore(
       -- placements have no visibility/deleted_at fields. begin also requires that exact actor.
       WHERE t.thread_id=${threadId} AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=t.thread_id)
         AND NOT EXISTS(SELECT 1 FROM relay_thread_local_enrollments e WHERE e.thread_id=t.thread_id AND e.phase='aborted')
-        AND a.owner_user_id=t.owner_user_id AND a.thread_id=t.thread_id AND a.deleted_at IS NULL AND a.state IN ('running','paused')
+        AND a.owner_user_id=t.owner_user_id AND a.thread_id=t.thread_id AND a.deleted_at IS NULL AND a.state IN ('running','paused') AND a.runtime_protocol='native-v1'
         AND a.compute_ref IS NOT NULL AND p.phase='created' AND p.generation=t.generation
         AND b.environment_id=t.environment_id AND b.generation=t.generation AND b.revoked_at IS NULL AND k.revoked_at IS NULL`;
     return row ?? null;
@@ -161,21 +129,25 @@ export function makeThreadVmBackupRecoveryStore(
       proof: unknown;
     }>`
       SELECT b.operation_id AS "backupOperationId",to_char(b.capture_started_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "capturedAt",
-        b.source_template_id AS "sourceTemplateId",b.source_build_id AS "sourceBuildId",b.probe_receipt AS proof
+        b.source_template_id AS "sourceTemplateId",b.source_build_id AS "sourceBuildId",b.native_capture_receipt AS proof
       FROM relay_thread_vm_backups b JOIN relay_thread_vm_allocations a USING(allocation_id)
-      WHERE a.thread_id=${input.threadId} AND b.allocation_id=${input.sourceAllocationId} AND b.generation=${input.generation}
+      WHERE a.thread_id=${input.threadId} AND b.allocation_id=${input.sourceAllocationId} AND b.generation=${input.generation} AND a.runtime_protocol='native-v1'
         AND (${input.backupOperationId ?? null}::text IS NULL OR b.operation_id=${input.backupOperationId ?? null})
-        AND b.phase='verified' AND b.snapshot_id IS NOT NULL AND b.source_template_id IS NOT NULL AND b.source_build_id IS NOT NULL
+        AND b.phase='verified' AND b.native_capture_receipt IS NOT NULL AND b.snapshot_id IS NOT NULL AND b.source_template_id IS NOT NULL AND b.source_build_id IS NOT NULL
       ORDER BY b.capture_started_at DESC NULLS LAST,b.created_at DESC,b.operation_id DESC LIMIT 1`;
     if (!backup) return null;
     const proof = yield* decodeProof(backup.proof).pipe(
-      Effect.mapError(() => conflict("Backup cold proof is invalid.")),
+      Effect.mapError(() => conflict("Native snapshot completion is invalid.")),
     );
     if (
-      proof.operationID !== backup.backupOperationId ||
-      proof.generation !== `backup-${backup.backupOperationId}`
+      proof.operationId !== backup.backupOperationId ||
+      proof.threadId !== input.threadId ||
+      proof.allocationId !== input.sourceAllocationId ||
+      proof.generation !== input.generation ||
+      proof.sourceTemplateId !== backup.sourceTemplateId ||
+      proof.sourceBuildId !== backup.sourceBuildId
     )
-      return yield* conflict("Backup cold proof belongs to another capture.");
+      return yield* conflict("Native snapshot completion belongs to another capture.");
     return backup;
   });
   const candidate = Effect.fn("relay.thread_vm.backup_recovery.candidate")(function* (
@@ -229,7 +201,10 @@ export function makeThreadVmBackupRecoveryStore(
     yield* sql`SELECT operation_id FROM relay_thread_vm_backup_recoveries WHERE operation_id=${operationId} FOR UPDATE`;
     const row = (yield* get(operationId))!;
     if (row.phase === "cancelled" || row.phase === "completed") return row;
+    const [nativeSource] = yield* sql`SELECT 1 FROM relay_thread_vm_allocations
+      WHERE allocation_id=${row.sourceAllocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
     if (
+      !nativeSource ||
       !placement ||
       placement.operationId !== operationId ||
       placement.actorUserId !== row.actorUserId ||
@@ -294,6 +269,7 @@ export function makeThreadVmBackupRecoveryStore(
         const active =
           yield* sql`SELECT 1 FROM relay_thread_vm_pauses WHERE allocation_id=${current.sourceAllocationId} AND phase IN ('pending','sealed')
         UNION ALL SELECT 1 FROM relay_thread_vm_resumes WHERE allocation_id=${current.sourceAllocationId} AND phase IN ('waiting','resuming')
+        UNION ALL SELECT 1 FROM relay_thread_vm_backups WHERE allocation_id=${current.sourceAllocationId} AND phase IN ('creating','captured','verifying','cleanup')
         UNION ALL SELECT 1 FROM relay_thread_deletions WHERE thread_id=${input.threadId}`;
         if (active.length) return yield* conflict("Another VM lifecycle operation is pending.");
         const backup = yield* selected({
@@ -344,7 +320,9 @@ export function makeThreadVmBackupRecoveryStore(
       Effect.gen(function* () {
         const [next] = yield* sql<{
           operationId: string;
-        }>`SELECT r.operation_id AS "operationId" FROM relay_thread_vm_backup_recoveries r JOIN relay_thread_placements t USING(thread_id) WHERE r.host_id=${hostId} AND r.phase IN ('pending','retaining','retained','stopped') AND t.operation_id=r.operation_id AND t.generation=r.generation AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp()) ORDER BY r.created_at,r.operation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
+        }>`SELECT r.operation_id AS "operationId" FROM relay_thread_vm_backup_recoveries r JOIN relay_thread_placements t USING(thread_id)
+          JOIN relay_thread_vm_allocations a ON a.allocation_id=r.source_allocation_id
+          WHERE r.host_id=${hostId} AND a.runtime_protocol='native-v1' AND r.phase IN ('pending','retaining','retained','stopped') AND t.operation_id=r.operation_id AND t.generation=r.generation AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp()) ORDER BY r.created_at,r.operation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
         if (!next) return null;
         const row = yield* lock(next.operationId),
           claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
@@ -363,7 +341,42 @@ export function makeThreadVmBackupRecoveryStore(
     const [pin] =
       yield* sql`SELECT 1 FROM relay_thread_vm_backups b JOIN relay_thread_vm_backup_pins p ON p.backup_operation_id=b.operation_id WHERE p.operation_id=${row.operationId} AND b.operation_id=${row.backupOperationId} AND b.phase='verified' AND b.source_template_id=${row.sourceTemplateId} AND b.source_build_id=${row.sourceBuildId} AND b.capture_started_at=${row.capturedAt}::timestamptz`;
     if (!pin) return yield* conflict("Selected backup pin or immutable identity changed.");
+    const current = yield* source(row.threadId);
+    if (
+      !current ||
+      current.operationId !== row.operationId ||
+      current.generation !== row.generation ||
+      current.actorUserId !== row.actorUserId ||
+      current.sourceAllocationId !== row.sourceAllocationId ||
+      current.computeRef !== row.computeRef ||
+      current.hostId !== row.hostId ||
+      current.environmentId !== row.environmentId ||
+      current.sourceOperationId !== row.sourceOperationId
+    )
+      return yield* conflict("The broken source ownership or execution changed.");
     return row;
+  });
+  const selectedReceipt = Effect.fn("relay.thread_vm.backup_recovery.selected_receipt")(function* (
+    row: ThreadVmBackupRecovery,
+  ) {
+    const [backup] = yield* sql<{ receipt: unknown }>`SELECT b.native_capture_receipt AS receipt
+      FROM relay_thread_vm_backups b JOIN relay_thread_vm_backup_pins pin ON pin.backup_operation_id=b.operation_id
+      WHERE pin.operation_id=${row.operationId} AND b.operation_id=${row.backupOperationId} AND b.phase='verified'
+        AND b.allocation_id=${row.sourceAllocationId} AND b.generation=${row.generation}
+        AND b.source_template_id=${row.sourceTemplateId} AND b.source_build_id=${row.sourceBuildId} AND b.capture_started_at=${row.capturedAt}::timestamptz`;
+    const receipt = yield* decodeProof(backup?.receipt).pipe(
+      Effect.mapError(() => conflict("Selected native snapshot is incomplete or changed.")),
+    );
+    if (
+      receipt.operationId !== row.backupOperationId ||
+      receipt.allocationId !== row.sourceAllocationId ||
+      receipt.threadId !== row.threadId ||
+      receipt.generation !== row.generation ||
+      receipt.sourceTemplateId !== row.sourceTemplateId ||
+      receipt.sourceBuildId !== row.sourceBuildId
+    )
+      return yield* conflict("Selected native snapshot belongs to another source.");
+    return receipt;
   });
   const recordHistory = Effect.fn("relay.thread_vm.backup_recovery.history")(function* (
     claim: ThreadVmBackupRecoveryClaim,
@@ -391,93 +404,49 @@ export function makeThreadVmBackupRecoveryStore(
       }),
     );
   });
+  /** Retain only the selected completed backup and independent history, not the damaged live disk. */
   const beginRetention = Effect.fn("relay.thread_vm.backup_recovery.retain")(function* (
     claim: ThreadVmBackupRecoveryClaim,
-    candidate: E2BExecutionRetentionCandidate,
   ) {
-    const decoded = yield* decodeCandidate(candidate).pipe(
-      Effect.mapError(() => conflict("Native retention candidate is invalid.")),
-    );
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const row = yield* authorize(claim);
-        if (
-          !row.independentHistory ||
-          !["pending", "retaining"].includes(row.phase) ||
-          !matchesSource(row, decoded) ||
-          (row.retentionCandidate && !sameRetentionCandidate(decoded, row.retentionCandidate))
-        )
+        if (!row.independentHistory || !["pending", "retained"].includes(row.phase))
           return yield* conflict(
-            "Independent history and the exact native source must be retained before sealing.",
+            "Independent conversation must be retained before source deletion.",
           );
-        yield* sql`UPDATE relay_thread_vm_backup_recoveries SET phase='retaining',retention_candidate=${sql.json(decoded)} WHERE operation_id=${row.operationId}`;
-        return { ...row, phase: "retaining" as const, retentionCandidate: decoded };
-      }),
-    );
-  });
-  const recordRetention = Effect.fn("relay.thread_vm.backup_recovery.retained")(function* (
-    claim: ThreadVmBackupRecoveryClaim,
-    receipt: E2BExecutionRetentionReceipt,
-  ) {
-    const decoded = yield* decodeRetention(receipt).pipe(
-      Effect.mapError(() => conflict("Native retention receipt is invalid.")),
-    );
-    return yield* sql.withTransaction(
-      Effect.gen(function* () {
-        const row = yield* authorize(claim);
-        if (
-          !["retaining", "retained"].includes(row.phase) ||
-          !row.retentionCandidate ||
-          !matchesSource(row, decoded) ||
-          decoded.recoveryOperationID !== row.operationId ||
-          !sameRetentionCandidate(decoded, row.retentionCandidate) ||
-          (decoded.retainedTemplateID === null) !== (decoded.buildID === null) ||
-          (decoded.buildID !== null && !decoded.retainedBuildIDs.includes(decoded.buildID)) ||
-          (decoded.buildID === null && decoded.retainedBuildIDs.length !== 0)
-        )
-          return yield* conflict("Native retention does not certify this exact damaged execution.");
-        const changed =
-          yield* sql`UPDATE relay_thread_vm_backup_recoveries SET phase='retained',retention_receipt=${sql.json(decoded)} WHERE operation_id=${row.operationId} AND (retention_receipt IS NULL OR retention_receipt=${sql.json(decoded)}) RETURNING operation_id`;
-        if (!changed.length) return yield* conflict("The retained source receipt changed.");
+        yield* selectedReceipt(row);
+        yield* history.verify({
+          ...row,
+          sourceEnvironmentId: row.environmentId,
+          independentHistory: row.independentHistory,
+        });
+        yield* sql`UPDATE relay_thread_vm_backup_recoveries SET phase='retained' WHERE operation_id=${row.operationId}`;
         return (yield* get(row.operationId))!;
       }),
     );
   });
-  const candidateChanged = Effect.fn("relay.thread_vm.backup_recovery.candidate_changed")(
-    function* (claim: ThreadVmBackupRecoveryClaim) {
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const row = yield* authorize(claim);
-          if (row.phase !== "retaining" || row.retentionReceipt !== null)
-            return yield* conflict("An accepted native retention cannot change its candidate.");
-          yield* sql`UPDATE relay_thread_vm_backup_recoveries SET phase='pending',retention_candidate=NULL,claim_id=NULL,claim_until=NULL,error_code='native_candidate_changed',retry_at=clock_timestamp() WHERE operation_id=${row.operationId}`;
-        }),
-      );
-    },
-  );
   const recordStopped = Effect.fn("relay.thread_vm.backup_recovery.stopped")(function* (
     claim: ThreadVmBackupRecoveryClaim,
-    receipt: unknown,
+    receipt: NativeThreadVmRecoverySourceDeletedReceipt,
   ) {
     const decoded = yield* decodeStop(receipt).pipe(
-      Effect.mapError(() => conflict("Physical source stop is unconfirmed.")),
+      Effect.mapError(() => conflict("Native source deletion acknowledgement is invalid.")),
     );
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const row = yield* authorize(claim);
+        yield* selectedReceipt(row);
         if (
           row.phase !== "retained" ||
-          !row.retentionReceipt ||
-          !row.retentionCandidate ||
-          !matchesSource(row, decoded) ||
-          decoded.recoveryOperationID !== row.operationId ||
-          !sameRetentionCandidate(decoded, row.retentionCandidate)
+          !row.independentHistory ||
+          decoded.operationId !== row.operationId ||
+          decoded.sourceAllocationId !== row.sourceAllocationId ||
+          decoded.computeRef !== row.computeRef ||
+          decoded.sourceOperationId !== row.sourceOperationId ||
+          decoded.generation !== row.generation
         )
-          return yield* conflict("Physical stop does not belong to the retained source.");
-        const { physicallyStopped: _stopped, ...retained } = decoded;
-        const [same] =
-          yield* sql`SELECT 1 FROM relay_thread_vm_backup_recoveries WHERE operation_id=${row.operationId} AND retention_receipt=${sql.json(retained)}`;
-        if (!same) return yield* conflict("Physical stop changed the preservation receipt.");
+          return yield* conflict("Native source deletion belongs to a different recovery.");
         yield* sql`UPDATE relay_thread_vm_backup_recoveries SET phase='stopped',stop_receipt=${sql.json(decoded)} WHERE operation_id=${row.operationId}`;
         return (yield* get(row.operationId))!;
       }),
@@ -553,9 +522,8 @@ export function makeThreadVmBackupRecoveryStore(
     authorize,
     recordHistory,
     beginRetention,
-    recordRetention,
+    selectedReceipt,
     recordStopped,
-    candidateChanged,
     cancel,
     cancelIntent,
     defer,

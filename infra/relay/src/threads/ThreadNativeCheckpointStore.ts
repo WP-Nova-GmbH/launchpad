@@ -36,6 +36,28 @@ export class ThreadNativeCheckpointConflict extends Schema.TaggedError<ThreadNat
 const conflict = (message: string) => new ThreadNativeCheckpointConflict({ message });
 type Receipt = ThreadNativeCheckpointPublicationReceipt;
 
+/** Release durable recovery pins only after their lifecycle operation has ended. */
+export const releaseThreadNativeCheckpointOperation = Effect.fn(
+  "relay.native_checkpoint.operation.release",
+)(function* (sql: PgClient, input: { readonly threadId: string; readonly operationId: string }) {
+  return yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${input.threadId} FOR UPDATE`;
+      const [operation] = yield* sql<{
+        phase: string;
+        threadId: string;
+      }>`SELECT o.phase,n.thread_id AS "threadId"
+      FROM relay_thread_native_checkpoint_operations o JOIN relay_thread_native_checkpoints n ON n.operation_id=o.checkpoint_operation_id
+      WHERE o.operation_id=${input.operationId}`;
+      if (!operation || operation.threadId !== input.threadId)
+        return yield* conflict("Recovery operation belongs to a different thread.");
+      if (operation.phase === "released") return;
+      yield* sql`UPDATE relay_thread_native_checkpoint_operations SET phase='released',released_at=clock_timestamp() WHERE operation_id=${input.operationId} AND phase='active'`;
+      yield* sql`DELETE FROM relay_thread_artifact_pins WHERE operation_id=${`native-recovery:${input.operationId}`}`;
+    }),
+  );
+});
+
 /** Internal object-store publication. It does not send credentials or thread data over HTTP. */
 export function makeThreadNativeCheckpointStore(
   sql: PgClient,
@@ -198,15 +220,16 @@ export function makeThreadNativeCheckpointStore(
               const previous = yield* latest(input.threadId);
               const pauseCapture =
                 header.recoveryHistory && placement?.operationId !== header.captureOperationId
-                  ? yield* sql`SELECT 1 FROM relay_thread_vm_pauses pause
-                  JOIN relay_thread_vm_bindings binding USING(allocation_id)
+                  ? yield* sql`SELECT 1 FROM relay_thread_vm_bindings binding
                   JOIN relay_environment_credentials credential USING(credential_id)
                   JOIN relay_thread_vm_allocations allocation USING(allocation_id)
-                  WHERE pause.operation_id=${header.captureOperationId ?? null} AND pause.phase IN('pending','sealed')
+                  WHERE (EXISTS(SELECT 1 FROM relay_thread_vm_pauses pause WHERE pause.allocation_id=allocation.allocation_id AND pause.operation_id=${header.captureOperationId ?? null} AND pause.phase IN('pending','sealed'))
+                    OR EXISTS(SELECT 1 FROM relay_thread_vm_backups backup WHERE backup.allocation_id=allocation.allocation_id AND backup.operation_id=${header.captureOperationId ?? null}
+                      AND backup.generation=${header.generation} AND backup.phase='pending' AND backup.capture_started_at IS NULL))
                     AND binding.thread_id=${input.threadId} AND binding.environment_id=${header.sourceEnvironmentId}
                     AND binding.generation=${header.generation} AND binding.revoked_at IS NULL AND credential.revoked_at IS NULL
                     AND allocation.thread_id=${input.threadId} AND allocation.state='running' AND allocation.deleted_at IS NULL
-                  FOR SHARE OF pause,binding,credential,allocation`
+                  FOR SHARE OF binding,credential,allocation`
                   : [];
               if (
                 !placement ||
@@ -335,24 +358,8 @@ export function makeThreadNativeCheckpointStore(
       );
     },
   );
-  /** The lifecycle caller releases this only after its operation has durably ended. */
-  const releaseOperation = Effect.fn("relay.native_checkpoint.operation.release")(
-    function* (input: { readonly threadId: string; readonly operationId: string }) {
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${input.threadId} FOR UPDATE`;
-          const operation = yield* getOperation(input.operationId);
-          const point = operation ? yield* getStored(operation.checkpointOperationId) : null;
-          if (!operation || point?.threadId !== input.threadId)
-            return yield* conflict("Recovery operation belongs to a different thread.");
-          if (operation.phase === "released") return;
-          yield* sql`UPDATE relay_thread_native_checkpoint_operations SET phase='released',released_at=clock_timestamp()
-        WHERE operation_id=${input.operationId} AND phase='active'`;
-          yield* sql`DELETE FROM relay_thread_artifact_pins WHERE operation_id=${operationPin(input.operationId)}`;
-        }),
-      );
-    },
-  );
+  const releaseOperation = (input: { readonly threadId: string; readonly operationId: string }) =>
+    releaseThreadNativeCheckpointOperation(sql, input);
   const openForOperation = Effect.fn("relay.native_checkpoint.operation.open")(function* (input: {
     readonly threadId: string;
     readonly operationId: string;

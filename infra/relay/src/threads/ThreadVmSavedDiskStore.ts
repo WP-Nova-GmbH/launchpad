@@ -4,13 +4,17 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
+import { releaseThreadNativeCheckpointOperation } from "./ThreadNativeCheckpointStore.ts";
+import { E2BNativeSnapshotReceipt } from "../machines/E2BNativeSnapshotReceipt.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
+import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
 
 export class ThreadVmSavedDiskConflict extends Schema.TaggedError<ThreadVmSavedDiskConflict>()(
   "ThreadVmSavedDiskConflict",
   { message: Schema.String },
 ) {}
 const conflict = (message: string) => new ThreadVmSavedDiskConflict({ message });
+const decodeNativeCapture = Schema.decodeUnknownEffect(E2BNativeSnapshotReceipt);
 const savePin = (operationId: string) => `saved-${operationId}`;
 
 export interface SavedDisk {
@@ -36,6 +40,43 @@ export interface SavedDiskExpiryClaim {
  * after confirmed absence. This store does not certify native/history export. */
 export function makeThreadVmSavedDiskStore(sql: PgClient) {
   const backups = makeThreadVmBackupRetentionStore(sql);
+  const requireCapture = Effect.fnUntraced(function* (
+    threadId: string,
+    backupOperationId: string,
+    generation: number,
+    retiring = false,
+  ) {
+    const [backup] = yield* sql<{
+      receipt: unknown;
+      allocationId: string;
+      computeRef: string;
+      sourceTemplateId: string;
+      sourceBuildId: string;
+      snapshotId: string;
+    }>`
+      SELECT b.native_capture_receipt AS receipt,b.allocation_id AS "allocationId",b.compute_ref AS "computeRef",
+        b.source_template_id AS "sourceTemplateId",b.source_build_id AS "sourceBuildId",b.snapshot_id AS "snapshotId"
+      FROM relay_thread_vm_backups b JOIN relay_thread_vm_allocations a USING(allocation_id)
+      WHERE b.operation_id=${backupOperationId} AND b.generation=${generation}
+        AND (b.phase='verified' OR (${retiring} AND b.phase IN ('retiring','retired')))
+        AND a.thread_id=${threadId} AND a.runtime_protocol='native-v1'`;
+    const receipt = yield* decodeNativeCapture(backup?.receipt).pipe(
+      Effect.mapError(() => conflict("Saved disk has no completed native snapshot.")),
+    );
+    if (
+      !backup ||
+      receipt.operationId !== backupOperationId ||
+      receipt.threadId !== threadId ||
+      receipt.generation !== generation ||
+      receipt.allocationId !== backup.allocationId ||
+      receipt.computeRef !== backup.computeRef ||
+      receipt.snapshotId !== backup.snapshotId ||
+      receipt.sourceTemplateId !== backup.sourceTemplateId ||
+      receipt.sourceBuildId !== backup.sourceBuildId
+    )
+      return yield* conflict("Saved disk snapshot identity changed.");
+    return receipt;
+  });
   const get = Effect.fn("relay.thread_vm.saved_disk.get")(function* (operationId: string) {
     const [row] = yield* sql<SavedDisk>`SELECT s.operation_id AS "operationId",
       s.thread_id AS "threadId", s.backup_operation_id AS "backupOperationId",
@@ -91,13 +132,14 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         JOIN relay_thread_vm_bindings b ON b.allocation_id=a.allocation_id
         JOIN relay_thread_placements t ON t.thread_id=a.thread_id
         WHERE x.operation_id=${input.backupOperationId} AND a.thread_id=${input.threadId}
-          AND x.generation=${input.generation} AND x.phase='verified' AND x.probe_receipt IS NOT NULL
+          AND x.generation=${input.generation} AND x.phase='verified' AND x.native_capture_receipt IS NOT NULL
           AND a.state='deleted' AND a.deleted_at IS NOT NULL
           AND b.thread_id=t.thread_id AND b.environment_id=t.environment_id AND b.generation=t.generation
           AND EXISTS (SELECT 1 FROM relay_thread_vm_backup_pins p
             WHERE p.backup_operation_id=x.operation_id AND p.operation_id=${input.operationId})
         ORDER BY c.position DESC LIMIT 1 FOR UPDATE OF x`;
         if (!source) return yield* conflict("Final disk save or confirmed VM deletion is missing");
+        yield* requireCapture(input.threadId, input.backupOperationId, input.generation);
         const active = yield* sql`SELECT 1 FROM relay_thread_vm_allocations
         WHERE thread_id=${input.threadId} AND deleted_at IS NULL`;
         const existing = yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks
@@ -144,16 +186,9 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         yield* sql`SELECT operation_id FROM relay_thread_vm_saved_disks
         WHERE operation_id=${input.savedDiskOperationId} FOR UPDATE`;
         const save = yield* get(input.savedDiskOperationId);
-        if (
-          !save ||
-          save.threadId !== input.threadId ||
-          save.generation !== input.expectedGeneration
-        )
+        if (!save || save.threadId !== input.threadId || save.generation > input.expectedGeneration)
           return yield* conflict("Saved disk does not belong to this thread generation");
-        const verified = yield* sql`SELECT 1 FROM relay_thread_vm_backups
-          WHERE operation_id = ${save.backupOperationId} AND phase='verified' AND probe_receipt IS NOT NULL`;
-        if (!verified.length)
-          return yield* conflict("Saved disk lacks a verified cold recovery receipt");
+        yield* requireCapture(input.threadId, save.backupOperationId, save.generation);
         if (save.phase === "restoring" && save.restoreOperationId === input.operationId) {
           if (
             save.restoreAllocationId !== input.allocationId ||
@@ -166,8 +201,10 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         if (save.restoreOperationId === input.operationId)
           return yield* conflict("Restore already ended; use a new operation identity");
         const [valid] = yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks s
+        JOIN relay_thread_placements t USING(thread_id)
         JOIN relay_thread_vm_policies p ON p.organization_id=${placement.organizationId}
-        WHERE s.operation_id=${save.operationId} AND s.phase='available'
+        WHERE s.operation_id=${save.operationId} AND s.phase='available' AND t.generation=${input.expectedGeneration}
+          AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}))
           AND ((s.saved_at AT TIME ZONE p.calendar_time_zone
             + make_interval(days => p.saved_disk_retention_days)) AT TIME ZONE p.calendar_time_zone)
             > clock_timestamp() FOR SHARE OF p`;
@@ -236,14 +273,15 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
           save.phase === "available" &&
           save.restoreOperationId === input.operationId &&
           placement?.operationId === null &&
-          placement.generation === save.generation
+          placement.generation >= save.generation
         )
           return save;
         if (
           save.phase !== "restoring" ||
           save.restoreOperationId !== input.operationId ||
           placement?.operationId !== input.operationId ||
-          placement.generation !== save.generation
+          (yield* sql`SELECT 1 FROM relay_thread_vm_restores WHERE operation_id=${input.operationId} AND committed_at IS NOT NULL`)
+            .length > 0
         )
           return yield* conflict("Restore no longer owns this placement");
         const [absent] = yield* sql`SELECT 1 FROM relay_thread_vm_allocations
@@ -260,6 +298,41 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
       }),
     );
   });
+
+  /** Cancel a committed target without reviving the revoked source generation. */
+  const cancelCommittedRestore = Effect.fn("relay.thread_vm.saved_disk.cancel_committed_restore")(
+    function* (input: {
+      threadId: string;
+      savedDiskOperationId: string;
+      operationId: string;
+      targetGeneration: number;
+    }) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const [owned] = yield* sql`SELECT 1 FROM relay_thread_placements t
+        JOIN relay_thread_vm_saved_disks s ON s.thread_id=t.thread_id
+        JOIN relay_thread_vm_restores r ON r.operation_id=s.restore_operation_id
+        JOIN relay_thread_vm_allocations a ON a.allocation_id=s.restore_allocation_id
+        WHERE t.thread_id=${input.threadId} AND t.operation_id=${input.operationId} AND t.generation=${input.targetGeneration}
+          AND s.operation_id=${input.savedDiskOperationId} AND s.phase='restoring' AND s.restore_operation_id=${input.operationId}
+          AND r.phase='aborting' AND r.target_generation=t.generation AND r.boot_create_started_at IS NULL AND r.boot_receipt IS NULL AND r.boot_ingress_recovery_claim_id IS NULL
+          AND a.state='deleted' AND a.deleted_at IS NOT NULL FOR UPDATE OF t,s,r`;
+          if (!owned)
+            return yield* conflict(
+              "Committed cancellation has an unsettled target or changed ownership.",
+            );
+          const save = (yield* get(input.savedDiskOperationId))!;
+          yield* backups.releasePin({
+            backupOperationId: save.backupOperationId,
+            operationId: input.operationId,
+          });
+          yield* sql`UPDATE relay_thread_vm_saved_disks SET phase='available' WHERE operation_id=${save.operationId}`;
+          yield* sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${input.threadId} AND operation_id=${input.operationId} AND generation=${input.targetGeneration}`;
+          return (yield* get(save.operationId))!;
+        }),
+      );
+    },
+  );
 
   const completeRestore = Effect.fn("relay.thread_vm.saved_disk.complete_restore")(
     function* (input: {
@@ -285,8 +358,10 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         JOIN relay_thread_vm_bindings b ON b.thread_id=t.thread_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=b.allocation_id
         JOIN relay_thread_vm_setups s ON s.allocation_id=a.allocation_id
+        JOIN relay_thread_vm_provisions provision ON provision.allocation_id=a.allocation_id
         JOIN relay_thread_vm_capacity c ON c.allocation_id=a.allocation_id
-        WHERE t.thread_id=${input.threadId} AND t.generation=${save.generation + 1}
+        WHERE t.thread_id=${input.threadId} AND t.generation=provision.generation AND provision.generation>${save.generation}
+          AND provision.operation_id=${input.operationId} AND provision.phase='created'
           AND t.operation_id IS NULL AND a.allocation_id=${save.restoreAllocationId}
           AND a.state='running' AND a.deleted_at IS NULL AND s.phase='ready'
           AND s.environment_id=b.environment_id
@@ -319,7 +394,10 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         FROM relay_thread_vm_saved_disks s
         JOIN relay_thread_placements t ON t.thread_id=s.thread_id
         JOIN relay_thread_vm_policies p ON p.organization_id=t.organization_id
+        JOIN relay_thread_vm_backups b ON b.operation_id=s.backup_operation_id
+        JOIN relay_thread_vm_allocations a ON a.allocation_id=b.allocation_id
         WHERE s.host_id=${hostId} AND s.phase IN ('available','expiring')
+          AND b.native_capture_receipt IS NOT NULL AND a.runtime_protocol='native-v1'
           AND s.retry_at <= clock_timestamp()
           AND (s.claim_until IS NULL OR s.claim_until <= clock_timestamp())
           AND (s.phase='expiring' OR (t.operation_id IS NULL AND
@@ -336,6 +414,7 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         SELECT snapshot_id AS "snapshotId",phase FROM relay_thread_vm_backups
         WHERE operation_id=${save.backupOperationId} FOR UPDATE`;
         if (!backup?.snapshotId) return yield* conflict("Saved disk snapshot identity is missing");
+        yield* requireCapture(save.threadId, save.backupOperationId, save.generation, true);
         if (save.phase === "available") {
           const [due] = yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks s
           JOIN relay_thread_placements t ON t.thread_id=s.thread_id
@@ -378,14 +457,37 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const rows = yield* sql`UPDATE relay_thread_vm_saved_disks s SET phase='expired',
+        const prior = yield* get(claim.operationId);
+        if (!prior) return false;
+        // Restore, expiry and checkpoint release all lock placement before roots.
+        yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${prior.threadId} FOR UPDATE`;
+        const [save] = yield* sql<{ threadId: string; generation: number }>`
+        SELECT s.thread_id AS "threadId",s.generation FROM relay_thread_vm_saved_disks s
+        JOIN relay_thread_vm_backups x ON x.operation_id=s.backup_operation_id
+        WHERE s.operation_id=${claim.operationId} AND s.backup_operation_id=${claim.backupOperationId}
+          AND s.phase='expiring' AND s.claim_id=${claim.claimId} AND s.claim_until>clock_timestamp()
+          AND x.snapshot_id=${claim.snapshotId} AND x.phase IN ('retiring','retired')
+          AND x.native_capture_receipt IS NOT NULL FOR UPDATE OF s,x`;
+        if (!save) return false;
+        yield* requireCapture(save.threadId, claim.backupOperationId, save.generation, true);
+        const rows = yield* sql<{
+          threadId: string;
+        }>`UPDATE relay_thread_vm_saved_disks s SET phase='expired',
         claim_id=NULL,claim_until=NULL FROM relay_thread_vm_backups x
         WHERE s.operation_id=${claim.operationId}
         AND s.backup_operation_id=${claim.backupOperationId} AND s.phase='expiring'
         AND s.claim_id=${claim.claimId} AND s.claim_until>clock_timestamp()
         AND x.operation_id=s.backup_operation_id AND x.snapshot_id=${claim.snapshotId}
-        AND x.phase IN ('retiring','retired') RETURNING s.operation_id`;
+        AND x.phase IN ('retiring','retired') AND x.native_capture_receipt IS NOT NULL
+        RETURNING s.thread_id AS "threadId"`;
         if (!rows.length) return false;
+        const [nativePin] =
+          yield* sql`SELECT 1 FROM relay_thread_native_checkpoint_operations WHERE operation_id=${claim.backupOperationId}`;
+        if (nativePin)
+          yield* releaseThreadNativeCheckpointOperation(sql, {
+            threadId: rows[0]!.threadId,
+            operationId: claim.backupOperationId,
+          });
         yield* sql`UPDATE relay_thread_vm_backups SET phase='retired',claim_id=NULL,claim_until=NULL
         WHERE operation_id=${claim.backupOperationId} AND snapshot_id=${claim.snapshotId}
           AND phase='retiring'`;
@@ -405,6 +507,7 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
     retain,
     beginRestore,
     cancelRestore,
+    cancelCommittedRestore,
     completeRestore,
     claimExpired,
     completeExpiry,

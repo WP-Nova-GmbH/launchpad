@@ -34,20 +34,39 @@ export const makeThreadFinalSaveWorker = Effect.fn("ThreadFinalSaveWorker.make")
     const input = { ...owner, operationId: operation.operationId };
     if (operation.phase === "aborted") {
       if (
-        owner.operationId !== operation.operationId ||
-        !["draining", "frozen"].includes(owner.phase)
+        !operation.sourceActivationPending &&
+        (owner.operationId !== operation.operationId ||
+          !["draining", "frozen"].includes(owner.phase))
       )
         return;
-      if (tracked) {
-        const inventory = yield* inspectVmWorkloads({ type: "inspect" });
-        if (inventory.sealedBy !== null)
-          yield* inspectVmWorkloads({
-            type: "reopen",
-            bootId: inventory.bootId,
-            operationId: operation.operationId,
-          });
+      if (owner.operationId !== operation.operationId) {
+        // Cancellation may finish before this guest observes the reservation.
+        // Install its identity so a delayed draining receipt cannot restart it.
+        if (owner.phase !== "active" || operation.nativeCheckpointOperationId !== null) return;
+        yield* fences.beginDrain({ ...input, previousOperationId: owner.operationId });
       }
-      yield* fences.activate(input);
+      if (owner.phase !== "active" || owner.operationId !== operation.operationId) {
+        if (!["active", "draining", "frozen"].includes(owner.phase)) return;
+        if (tracked) {
+          const inventory = yield* inspectVmWorkloads({ type: "inspect" });
+          if (inventory.sealedBy !== null)
+            yield* inspectVmWorkloads({
+              type: "reopen",
+              bootId: inventory.bootId,
+              operationId: operation.operationId,
+            });
+        }
+        yield* fences.activate(input);
+      }
+      if (!operation.sourceActivationPending) return;
+      const receipt = yield* transport.activate(input, { operationId: operation.operationId });
+      if (
+        !matches(owner, receipt) ||
+        receipt.operationId !== operation.operationId ||
+        receipt.phase !== "aborted" ||
+        receipt.sourceActivationPending
+      )
+        return yield* fail(threadId, "Relay acknowledged a different final-save activation.");
       return;
     }
     if (operation.phase === "aborting") return;
@@ -86,6 +105,8 @@ export const makeThreadFinalSaveWorker = Effect.fn("ThreadFinalSaveWorker.make")
     const receipt = yield* transport.freeze(input, {
       operationId: operation.operationId,
       nativeCheckpointOperationId,
+      bootId: point.bootId,
+      sealEpoch: point.sealEpoch,
     });
     if (
       !matches(input, receipt) ||

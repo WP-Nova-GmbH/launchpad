@@ -9,7 +9,7 @@ import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 
 interface Compute extends ThreadVmCleanupCompute {
-  /** Returns only after the patched host confirms all executions are stopped. */
+  /** Acknowledges native DELETE of this known sandbox ID. */
   readonly destroy: (id: string) => Effect.Effect<void, ThreadVmComputeError>;
 }
 /** Cleanup is independent of guest availability and user access revocation.
@@ -36,7 +36,7 @@ export function makeThreadVmMoveCleanupWorker(sql: PgClient, compute: Compute, h
         JOIN relay_thread_placements t ON t.thread_id=a.thread_id
         LEFT JOIN relay_thread_vm_move_destinations d ON d.operation_id=m.operation_id AND d.allocation_id=a.allocation_id
         LEFT JOIN relay_thread_vm_bindings b ON b.allocation_id=a.allocation_id
-      WHERE c.host_id=${hostId} AND (
+      WHERE a.runtime_protocol='native-v1' AND c.host_id=${hostId} AND (
         (d.allocation_id IS NOT NULL AND m.phase='aborting' AND t.operation_id=m.operation_id
           AND t.generation=m.expected_generation AND p.generation=m.expected_generation+1)
         OR (d.allocation_id IS NULL AND m.phase='completed' AND a.deleted_at IS NULL
@@ -107,7 +107,7 @@ export function makeThreadVmMoveCleanupWorker(sql: PgClient, compute: Compute, h
           const current = yield* lockCleanup(row, before.computeRef);
           if (!current || !["deleting", "deleted"].includes(current.state)) return;
           // Recheck admission after remote identity lookup and hold this thread's
-          // placement lock through the certified stop, so cutover cannot race it.
+          // placement lock through the native DELETE acknowledgement, so cutover cannot race it.
           if (current.state !== "deleted" && current.computeRef)
             yield* compute.destroy(current.computeRef);
           yield* sql`UPDATE relay_environment_credentials SET revoked_at=COALESCE(revoked_at,
@@ -129,7 +129,6 @@ export function makeThreadVmMoveCleanupWorker(sql: PgClient, compute: Compute, h
     },
     Effect.catchTags({
       ThreadVmComputeError: () => Effect.succeed(true),
-      E2BRestoreError: () => Effect.succeed(true),
       ThreadVmAllocationConflict: () => Effect.succeed(true),
     }),
   );

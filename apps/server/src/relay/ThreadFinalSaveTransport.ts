@@ -13,6 +13,10 @@ export class ThreadFinalSaveError extends Schema.TaggedError<ThreadFinalSaveErro
   },
 ) {}
 export interface ThreadFinalSaveTransport {
+  readonly activate: (
+    owner: ThreadHistoryOwner,
+    input: { operationId: string },
+  ) => Effect.Effect<RelayThreadVmFinalSave, ThreadFinalSaveError>;
   readonly cancel: (
     owner: ThreadHistoryOwner,
     input: { operationId: string },
@@ -22,7 +26,12 @@ export interface ThreadFinalSaveTransport {
   ) => Effect.Effect<RelayThreadVmFinalSave | null, ThreadFinalSaveError>;
   readonly freeze: (
     owner: ThreadHistoryOwner,
-    input: { operationId: string; nativeCheckpointOperationId: string },
+    input: {
+      operationId: string;
+      nativeCheckpointOperationId: string;
+      bootId: string;
+      sealEpoch: number;
+    },
   ) => Effect.Effect<RelayThreadVmFinalSave, ThreadFinalSaveError>;
 }
 export function makeThreadFinalSaveTransport<E, R>(
@@ -55,7 +64,12 @@ export function makeThreadFinalSaveTransport<E, R>(
   const freeze = Effect.fn("ThreadFinalSaveTransport.freeze")(
     function* (
       owner: ThreadHistoryOwner,
-      input: { operationId: string; nativeCheckpointOperationId: string },
+      input: {
+        operationId: string;
+        nativeCheckpointOperationId: string;
+        bootId: string;
+        sealEpoch: number;
+      },
     ) {
       const client = yield* clientFor(owner);
       return yield* client.threadEnvironment.freezeFinalSave({
@@ -89,5 +103,22 @@ export function makeThreadFinalSaveTransport<E, R>(
         Effect.mapError(() => fail(owner)),
       ),
   );
-  return { get, freeze, cancel };
+  const activate = Effect.fn("ThreadFinalSaveTransport.activate")(
+    function* (owner: ThreadHistoryOwner, input: { operationId: string }) {
+      const client = yield* clientFor(owner);
+      return yield* client.threadEnvironment.confirmFinalSaveActivation({
+        params: {
+          environmentId: EnvironmentId.make(owner.environmentId),
+          threadId: ThreadId.make(owner.threadId),
+        },
+        payload: { generation: owner.generation, ...input },
+      });
+    },
+    (effect, owner) =>
+      effect.pipe(
+        Effect.timeout("15 seconds"),
+        Effect.mapError(() => fail(owner)),
+      ),
+  );
+  return { get, freeze, cancel, activate };
 }

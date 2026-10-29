@@ -1,17 +1,16 @@
 import * as NodeCrypto from "node:crypto";
 import { describe, expect, layer } from "@effect/vitest";
-import { CommandId, ThreadId } from "@t3tools/contracts";
+import { CommandId, EventId, MessageId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import { makeThreadVmFinalSaveAbortWorker } from "./ThreadVmFinalSaveAbortWorker.ts";
 import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
-import { E2BRestoreError, type E2BRestoreStatus } from "../machines/E2BRestoreClient.ts";
 import { makeThreadVmStatusStore } from "./ThreadVmStatusStore.ts";
 import { makeThreadVmFinalSaveWorker } from "./ThreadVmFinalSaveWorker.ts";
 import { makeThreadVmFinalSaveDeletionWorker } from "./ThreadVmFinalSaveDeletionWorker.ts";
-import { makeThreadVmBackupWorker } from "./ThreadVmBackupWorker.ts";
 import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
 import { makeThreadVmSavedDiskStore } from "./ThreadVmSavedDiskStore.ts";
+import { makeThreadVmPauseStore } from "./ThreadVmPauseStore.ts";
 import { laterAttachmentCheckpoint } from "./testUtils/attachmentCheckpointCatalog.ts";
 import { finalSaveCatalogFixture as fixture } from "./testUtils/finalSaveCatalog.ts";
 import { nativeCheckpointCatalogTestLayer } from "./testUtils/nativeCheckpointCatalog.ts";
@@ -31,8 +30,6 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               f.objects,
               {
                 inspect: () => Effect.die("Unverified saving cannot authorize cleanup"),
-                inspectCreation: () =>
-                  Effect.die("Unverified saving cannot inspect cleanup identity"),
                 destroy: () => Effect.die("A verified final save is required"),
               },
               f.hostId,
@@ -43,7 +40,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
         ),
       );
       for (const problem of ["none", "foreign", "unknown", "lost-stop"] as const) {
-        it.effect(`certified final-save cleanup reconciles an unreadable pause: ${problem}`, () =>
+        it.effect(`verified final-save cleanup reconciles native identity: ${problem}`, () =>
           Effect.scoped(
             Effect.gen(function* () {
               const f = yield* fixture("paused");
@@ -57,25 +54,20 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 f.objects,
                 {
                   inspect: () =>
-                    Effect.fail(
-                      new ThreadVmComputeError({
-                        operation: "inspect",
-                        message: "Paused disk readiness is unavailable",
-                      }),
-                    ),
-                  inspectCreation: (operationId) =>
-                    Effect.succeed(
-                      problem === "unknown"
-                        ? null
-                        : {
-                            operationId,
-                            computeRef: f.computeRef,
-                            metadata: {
-                              ...f.info.metadata,
-                              ...(problem === "foreign" ? { "launchpad.generation": "2" } : {}),
-                            },
+                    problem === "unknown"
+                      ? Effect.fail(
+                          new ThreadVmComputeError({
+                            operation: "inspect",
+                            message: "Native GET unavailable",
+                          }),
+                        )
+                      : Effect.succeed({
+                          ...f.info,
+                          metadata: {
+                            ...f.info.metadata,
+                            ...(problem === "foreign" ? { "launchpad.generation": "2" } : {}),
                           },
-                    ),
+                        }),
                   destroy: (id) =>
                     Effect.gen(function* () {
                       expect(id).toBe(f.computeRef);
@@ -105,73 +97,6 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               ).toBe("available");
             }),
           ),
-        );
-      }
-      for (const statusCode of [409, 503]) {
-        it.effect(
-          `reconciles a paused capture refusal (${statusCode}) without treating an outage as cancellation proof`,
-          () =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const f = yield* fixture("paused");
-                yield* f.store.begin(f.input);
-                yield* f.freeze;
-                const save = yield* f.store.reserveBackup(f.input.operationId);
-                const first = (yield* f.backup.claim(f.hostId, true))!;
-                yield* f.backup.beginCapture(first);
-                yield* f.backup.defer(first);
-                yield* f.sql`UPDATE relay_thread_vm_backups SET retry_at=clock_timestamp() WHERE operation_id=${first.operationId}`;
-                const worker = makeThreadVmBackupWorker(
-                  f.sql,
-                  {
-                    inspect: () =>
-                      Effect.die("A refused retention must not be misread as a completed pause"),
-                    snapshot: () => Effect.die("Paused capture must never snapshot a live VM"),
-                    snapshotPaused: () =>
-                      Effect.fail(
-                        new E2BRestoreError({
-                          operation: "paused snapshot",
-                          reason: "http",
-                          status: statusCode,
-                        }),
-                      ),
-                    findSnapshot: () => Effect.succeed(null),
-                    restore: {
-                      resolveNamedSnapshot: () => Effect.die("No capture exists"),
-                      prepare: () => Effect.die("No probe may start"),
-                      cancel: () => Effect.die("No probe exists"),
-                    },
-                  },
-                  f.hostId,
-                );
-                expect(yield* worker.runOne()).toBe(true);
-                expect((yield* f.backup.get(save.backupOperationId!))?.phase).toBe(
-                  statusCode === 409 ? "failed" : "creating",
-                );
-                yield* f.store.requestAbort(f.input.operationId);
-                const abort = makeThreadVmFinalSaveAbortWorker(
-                  f.sql,
-                  f.objects,
-                  {
-                    findSnapshot: () => Effect.succeed(null),
-                    deleteSnapshot: () => Effect.die("No snapshot exists"),
-                    restore: { cancel: () => Effect.die("No probe was issued") },
-                  },
-                  f.hostId,
-                );
-                expect(yield* abort.runOne()).toBe(true);
-                expect((yield* f.store.get(f.input.operationId))?.phase).toBe(
-                  statusCode === 409 ? "aborted" : "aborting",
-                );
-                expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("paused");
-                if (statusCode === 409) {
-                  expect((yield* f.backup.get(save.backupOperationId!))?.phase).toBe("retired");
-                  expect(
-                    (yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId,
-                  ).toBeNull();
-                }
-              }),
-            ),
         );
       }
       it.effect("reports final-save blockage while retaining the original VM and ownership", () =>
@@ -265,6 +190,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 environmentId: f.sourceEnvironmentId,
                 generation: 1,
                 nativeCheckpointOperationId: point.native.header.operationId,
+                bootId: NodeCrypto.randomUUID(),
+                sealEpoch: 1,
               }),
             );
             yield* f.upload(point.attachments);
@@ -279,6 +206,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               environmentId: f.sourceEnvironmentId,
               generation: 1,
               nativeCheckpointOperationId: point.native.header.operationId,
+              bootId: NodeCrypto.randomUUID(),
+              sealEpoch: 1,
             });
             expect(frozen.phase).toBe("frozen");
             yield* Effect.flip(
@@ -293,7 +222,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
         ),
       );
       it.effect(
-        "cannot delete before a fresh final backup and cold probe; retries retain the saved-only placement",
+        "cannot delete before a completed native final backup; retries retain the saved-only placement",
         () =>
           Effect.scoped(
             Effect.gen(function* () {
@@ -320,7 +249,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
           ),
       );
       it.effect(
-        "workers advance only a frozen source, wait for its cold proof, then release the deleted allocation",
+        "workers advance only a frozen source, wait for native completion, then release the deleted allocation",
         () =>
           Effect.scoped(
             Effect.gen(function* () {
@@ -399,12 +328,15 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               {
                 findSnapshot: () => Effect.die("Unexpected lookup"),
                 deleteSnapshot: () => Effect.die("Unexpected snapshot deletion"),
-                restore: { cancel: () => Effect.die("Unexpected probe stop") },
               },
               f.hostId,
             );
             expect(yield* worker.runOne()).toBe(true);
             expect((yield* f.store.get(f.input.operationId))?.phase).toBe("aborted");
+            expect((yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId).toBe(
+              f.input.operationId,
+            );
+            yield* f.store.confirmActivation({ ...f.owner, operationId: f.input.operationId });
             expect(
               (yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId,
             ).toBeNull();
@@ -429,17 +361,35 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   {
                     findSnapshot: () => Effect.die("Unexpected capture lookup"),
                     deleteSnapshot: () => Effect.die("Unexpected snapshot delete"),
-                    restore: { cancel: () => Effect.die("Unexpected probe cancellation") },
                   },
                   f.hostId,
                 );
                 expect(yield* worker.runOne()).toBe(true);
                 expect((yield* f.store.get(f.input.operationId))?.phase).toBe("aborted");
-                expect((yield* f.backup.get(pending.backupOperationId!))?.phase).toBe("retired");
+                expect((yield* f.backup.get(pending.backupOperationId!))?.phase).toBe(
+                  originalState === "paused" ? "verified" : "retired",
+                );
                 expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe(originalState);
-                expect(
-                  (yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId,
-                ).toBeNull();
+                expect((yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId).toBe(
+                  originalState === "running" ? f.input.operationId : null,
+                );
+                if (originalState === "running")
+                  yield* f.store.confirmActivation({
+                    ...f.owner,
+                    operationId: f.input.operationId,
+                  });
+                else {
+                  yield* Effect.flip(
+                    f.store.confirmActivation({ ...f.owner, operationId: f.input.operationId }),
+                  );
+                  expect(
+                    (yield* f.sql<{
+                      reopened: boolean;
+                    }>`SELECT source_reopened_at IS NOT NULL AS reopened
+                    FROM relay_thread_vm_backups WHERE operation_id=${pending.backupOperationId!}`)[0]
+                      ?.reopened,
+                  ).toBe(false);
+                }
                 expect(yield* worker.runOne()).toBe(false);
               }),
             ),
@@ -480,7 +430,6 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                       deleted++;
                       return true;
                     }),
-                  restore: { cancel: () => Effect.die("Capture never started a probe") },
                 },
                 f.hostId,
               );
@@ -539,83 +488,18 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                         });
                       return false;
                     }),
-                  restore: { cancel: () => Effect.die("Probe was never started") },
                 },
                 f.hostId,
               );
               yield* worker.runOne();
               expect((yield* f.backup.get(capture.operationId))?.phase).toBe("retiring");
               expect((yield* f.store.get(f.input.operationId))?.phase).toBe("aborting");
-              expect((yield* f.store.get(f.input.operationId))?.abortProbeStoppedAt).not.toBeNull();
+              expect((yield* f.store.get(f.input.operationId))?.abortProbeStoppedAt).toBeNull();
               lost = false;
               yield* f.sql`UPDATE relay_thread_vm_final_saves SET retry_at=clock_timestamp() WHERE operation_id=${f.input.operationId}`;
               yield* worker.runOne();
               expect(deletes).toBe(2);
               expect((yield* f.store.get(f.input.operationId))?.phase).toBe("aborted");
-            }),
-          ),
-      );
-      it.effect(
-        "stops the correct recovery probe before deleting its candidate and releasing the source hold",
-        () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture();
-              yield* f.store.begin(f.input);
-              yield* f.freeze;
-              yield* f.store.reserveBackup(f.input.operationId);
-              const capture = (yield* f.backup.claim(f.hostId))!;
-              yield* f.backup.beginCapture(capture);
-              yield* f.backup.recordCapture(capture, {
-                snapshotId: `snapshot-${capture.operationId}`,
-                sourceTemplateId: "snapshot",
-                sourceBuildId: NodeCrypto.randomUUID(),
-              });
-              const probe = (yield* f.backup.claim(f.hostId))!;
-              yield* f.store.requestAbort(f.input.operationId);
-              yield* f.sql`UPDATE relay_thread_vm_backups SET claim_until=clock_timestamp()-interval '1 second' WHERE operation_id=${probe.operationId}`;
-              let response: "foreign" | "cancelling" | "cancelled" = "foreign",
-                deletes = 0;
-              const worker = makeThreadVmFinalSaveAbortWorker(
-                f.sql,
-                f.objects,
-                {
-                  findSnapshot: () => Effect.die("Unexpected lookup"),
-                  deleteSnapshot: () =>
-                    Effect.sync(() => {
-                      deletes++;
-                      return true;
-                    }),
-                  restore: {
-                    cancel: (operationID, generation) =>
-                      Effect.sync((): E2BRestoreStatus => ({
-                        operationID: response === "foreign" ? NodeCrypto.randomUUID() : operationID,
-                        generation,
-                        sandboxID: "probe",
-                        executionID: NodeCrypto.randomUUID(),
-                        preparedBuildID: NodeCrypto.randomUUID(),
-                        state: response === "cancelling" ? "cancelling" : "cancelled",
-                      })),
-                  },
-                },
-                f.hostId,
-              );
-              for (const state of ["foreign", "cancelling"] as const) {
-                response = state;
-                yield* f.sql`UPDATE relay_thread_vm_final_saves SET retry_at=clock_timestamp() WHERE operation_id=${f.input.operationId}`;
-                yield* worker.runOne();
-                expect(deletes).toBe(0);
-                expect((yield* f.store.get(f.input.operationId))?.abortProbeStoppedAt).toBeNull();
-                expect((yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId).toBe(
-                  f.input.operationId,
-                );
-              }
-              response = "cancelled";
-              yield* f.sql`UPDATE relay_thread_vm_final_saves SET retry_at=clock_timestamp() WHERE operation_id=${f.input.operationId}`;
-              yield* worker.runOne();
-              expect(deletes).toBe(1);
-              expect((yield* f.store.get(f.input.operationId))?.phase).toBe("aborted");
-              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("running");
             }),
           ),
       );
@@ -638,7 +522,6 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               {
                 findSnapshot: () => Effect.die("Unexpected lookup"),
                 deleteSnapshot: () => Effect.die("Pinned recovery root"),
-                restore: { cancel: () => Effect.die("Unexpected probe stop") },
               },
               f.hostId,
             );
@@ -910,6 +793,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               yield* f.store.requestAbort(f.input.operationId);
               yield* f.store.confirmAborted(f.input.operationId);
               yield* f.store.confirmAborted(f.input.operationId);
+              yield* f.store.confirmActivation({ ...f.owner, operationId: f.input.operationId });
               expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("running");
               expect(
                 (yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId,
@@ -917,6 +801,79 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
             }),
           ),
       );
+      for (const stage of ["before-export", "reserved-backup", "previously-released"] as const) {
+        it.effect(`holds final-save cancellation until exact source activation (${stage})`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              const owner = { ...f.owner, operationId: f.input.operationId };
+              yield* f.store.begin(f.input);
+              if (stage !== "before-export") {
+                yield* f.freeze;
+                yield* f.store.reserveBackup(f.input.operationId);
+              }
+              yield* f.store.requestAbort(f.input.operationId);
+              const cleanup = makeThreadVmFinalSaveAbortWorker(
+                f.sql,
+                f.objects,
+                {
+                  findSnapshot: () => Effect.die("Never-dispatched capture has no native snapshot"),
+                  deleteSnapshot: () =>
+                    Effect.die("Never-dispatched capture cannot delete a snapshot"),
+                },
+                f.hostId,
+              );
+              expect(yield* cleanup.runOne()).toBe(true);
+              if (stage === "previously-released")
+                yield* f.sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${f.threadId}`;
+              expect((yield* f.store.get(f.input.operationId))?.sourceActivationPending).toBe(true);
+              if (stage !== "previously-released")
+                expect(
+                  (yield* makeThreadVmStatusStore(f.sql).read(f.threadId, 1)).finalSave,
+                ).toMatchObject({
+                  operationId: f.input.operationId,
+                  phase: "aborting",
+                });
+              // A fresh idle observation must not let a successor hide the
+              // operation that can still reopen this guest's frozen fence.
+              yield* f.sql`UPDATE relay_thread_vm_activity SET activity='idle',observed_at=clock_timestamp(),
+                idle_since=clock_timestamp()-interval '10 days' WHERE allocation_id=${f.input.allocationId}`;
+              expect(yield* f.backup.enqueueDue(f.hostId)).toBeNull();
+              expect(yield* makeThreadVmPauseStore(f.sql).reserveIdle(f.hostId)).toBeNull();
+              const successor = { ...f.input, operationId: NodeCrypto.randomUUID() };
+              yield* Effect.flip(f.store.begin(successor));
+              const commandId = NodeCrypto.randomUUID();
+              yield* f.sql`INSERT INTO relay_thread_commands(command_id,thread_id,position,accepted_generation,actor_json,payload_json)
+                VALUES(${commandId},${f.threadId},1,1,'{}',${f.sql.json({ type: "thread.queue.resume", threadId: f.threadId, commandId })})`;
+              expect(yield* f.journal.next(f.owner)).toBeNull();
+              const [tail] = yield* f.sql<{
+                sequence: number;
+              }>`SELECT max(source_sequence)::int AS sequence
+                FROM relay_thread_history WHERE thread_id=${f.threadId}`;
+              const message = f.history.find((event) => event.type === "thread.message-sent")!;
+              const event = {
+                ...message,
+                eventId: EventId.make(NodeCrypto.randomUUID()),
+                sequence: tail!.sequence + 1,
+                payload: { ...message.payload, messageId: MessageId.make(NodeCrypto.randomUUID()) },
+              };
+              yield* Effect.flip(f.journal.append({ ...f.owner, event }));
+              const activated = yield* f.store.confirmActivation(owner);
+              expect(activated.sourceActivationPending).toBe(false);
+              expect(yield* f.store.confirmActivation(owner)).toEqual(activated);
+              expect((yield* f.journal.next(f.owner))?.commandId).toBe(commandId);
+              expect(yield* f.journal.append({ ...f.owner, event })).toBeGreaterThan(0);
+              yield* f.sql`DELETE FROM relay_thread_commands WHERE thread_id=${f.threadId}`;
+              yield* f.store.begin(successor);
+              // A delayed duplicate activation must not clear a successor hold.
+              expect((yield* f.store.confirmActivation(owner)).sourceActivationPending).toBe(false);
+              expect((yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId).toBe(
+                successor.operationId,
+              );
+            }),
+          ),
+        );
+      }
       it.effect(
         "cancellation cannot discard an uncertain capture or undo saved-only ownership",
         () =>
@@ -995,88 +952,11 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               ).toHaveLength(0);
               yield* f.freeze;
               const saved = yield* f.store.reserveBackup(f.input.operationId);
-              const claim = yield* f.backup.claim(f.hostId, true);
-              expect(claim?.finalSaveOperationId).toBe(f.input.operationId);
-              expect(claim?.originalState).toBe("paused");
-              expect(saved.backupOperationId).toBe(claim?.operationId);
+              expect(yield* f.backup.claim(f.hostId)).toBeNull();
+              expect((yield* f.backup.get(saved.backupOperationId!))?.phase).toBe("verified");
               expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("paused");
             }),
           ),
-      );
-      for (const adapter of ["missing", "older-host"] as const) {
-        it.effect(`does not claim a paused capture with ${adapter} support`, () =>
-          Effect.scoped(
-            Effect.gen(function* () {
-              const f = yield* fixture("paused");
-              yield* f.store.begin(f.input);
-              yield* f.freeze;
-              const save = yield* f.store.reserveBackup(f.input.operationId);
-              const worker = makeThreadVmBackupWorker(
-                f.sql,
-                {
-                  inspect: () => Effect.die("unsupported capture must not inspect"),
-                  snapshot: () => Effect.die("must not use an ordinary snapshot"),
-                  ...(adapter === "older-host"
-                    ? {
-                        snapshotPaused: () => Effect.die("unsupported host must not capture"),
-                        pausedSnapshotsSupported: Effect.succeed(false),
-                      }
-                    : {}),
-                  findSnapshot: () => Effect.die("no capture was attempted"),
-                  restore: {
-                    resolveNamedSnapshot: () => Effect.die("no snapshot"),
-                    prepare: () => Effect.die("no snapshot"),
-                    cancel: () => Effect.die("no probe"),
-                  },
-                },
-                f.hostId,
-              );
-              expect(yield* worker.runOne()).toBe(false);
-              const [candidate] = yield* f.sql<{
-                phase: string;
-                claimId: string | null;
-              }>`SELECT phase,claim_id AS "claimId" FROM relay_thread_vm_backups WHERE operation_id=${save.backupOperationId}`;
-              expect(candidate).toMatchObject({ phase: "pending", claimId: null });
-              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("paused");
-            }),
-          ),
-        );
-      }
-      it.effect("a paused capture failure never resumes or deletes the source", () =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const f = yield* fixture("paused");
-            yield* f.store.begin(f.input);
-            yield* f.freeze;
-            yield* f.store.reserveBackup(f.input.operationId);
-            const worker = makeThreadVmBackupWorker(
-              f.sql,
-              {
-                inspect: () => Effect.succeed(f.info),
-                snapshot: () =>
-                  Effect.die("A paused VM must never use the ordinary capture method"),
-                snapshotPaused: () =>
-                  Effect.fail(
-                    new ThreadVmComputeError({
-                      operation: "snapshot",
-                      message: "paused capture unavailable",
-                    }),
-                  ),
-                findSnapshot: () => Effect.succeed(null),
-                restore: {
-                  resolveNamedSnapshot: () => Effect.die("no snapshot"),
-                  prepare: () => Effect.die("no snapshot"),
-                  cancel: () => Effect.die("no probe"),
-                },
-              },
-              f.hostId,
-            );
-            yield* worker.runOne();
-            expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("paused");
-            expect((yield* f.store.get(f.input.operationId))?.phase).toBe("saving");
-            yield* Effect.flip(f.store.recordSaved(f.input.operationId));
-          }),
-        ),
       );
     });
   },

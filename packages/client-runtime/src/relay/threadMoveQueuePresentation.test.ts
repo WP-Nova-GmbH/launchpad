@@ -59,6 +59,7 @@ const status: RelayThreadVmStatus = {
   setupPhase: "pending",
   capacityState: "started",
   activity: "unknown",
+  sourceActivationPending: false,
   pausePhase: null,
   resumePhase: null,
   backupPhase: null,

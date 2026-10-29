@@ -1,5 +1,5 @@
 import { threadVmSmokeMetadata } from "./e2b-smoke-metadata.ts";
-import { Sandbox, Template } from "e2b";
+import { Sandbox, SandboxNotFoundError, Template } from "e2b";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
@@ -22,38 +22,29 @@ const options = {
   sandboxUrl: process.env.E2B_SANDBOX_URL,
   apiKey: (await NodeFSP.readFile(process.env.E2B_API_KEY_FILE, "utf8")).trim(),
   requestTimeoutMs: 30000,
+  retries: 0,
 };
 const save = (name, data) =>
   NodeFSP.writeFile(NodePath.join(values.output, name), JSON.stringify(data, null, 2) + "\n", {
     mode: 0o600,
   });
-const stop = async (sandboxId) => {
-  const response = await fetch(
-    `${options.apiUrl.replace(/\/$/u, "")}/extensions/launchpad/v1/executions/${encodeURIComponent(sandboxId)}`,
-    {
-      method: "DELETE",
-      headers: { "X-API-Key": options.apiKey },
-      redirect: "error",
-      signal: AbortSignal.timeout(60000),
-    },
-  );
-  NodeAssert.equal(
-    response.status,
-    200,
-    "Physical stop is unconfirmed; keep the allocation identity.",
-  );
-  const receipt = await response.json();
-  NodeAssert.equal(receipt.sandboxID, sandboxId);
-  NodeAssert.equal(receipt.physicallyStopped, true);
-  return receipt;
+const stop = async (sandboxId, proof) => {
+  const current = await Sandbox.getInfo(sandboxId, options).catch((error) => {
+    if (error instanceof SandboxNotFoundError) return null;
+    throw error;
+  });
+  if (current)
+    NodeAssert.equal(current.metadata["launchpad.proof"], proof, "Cleanup identity differs");
+  await Sandbox.kill(sandboxId, options);
+  return { sandboxId, kind: "native-delete-acknowledgement", acknowledged: true };
 };
 
 if (values.replay) {
   const allocation = JSON.parse(
     await NodeFSP.readFile(NodePath.join(values.output, "allocation.json"), "utf8"),
   );
-  await save("replay.json", await stop(allocation.sandboxId));
-  console.log("Saved physical-stop receipt replayed successfully.");
+  await save("replay.json", await stop(allocation.sandboxId, allocation.proof));
+  console.log("Native DELETE for the saved identity acknowledged.");
 } else {
   const template = JSON.parse(await NodeFSP.readFile(values.receipt, "utf8"));
   NodeAssert.equal(template.state, "built");
@@ -73,7 +64,7 @@ if (values.replay) {
       timeoutMs: 600000,
       secure: true,
       network: { allowPublicTraffic: false },
-      lifecycle: { onTimeout: "kill", autoResume: false },
+      lifecycle: { onTimeout: { action: "kill" }, autoResume: false },
       metadata: threadVmSmokeMetadata(proof),
     });
     sandboxId = vm.sandboxId;
@@ -86,13 +77,13 @@ if (values.replay) {
       },
     );
     NodeAssert.equal(result.stdout.trim(), "ready");
-    await save("stop.json", await stop(sandboxId));
-    await save("replay.json", await stop(sandboxId));
-    console.log("Running VM physically stopped; repeated request returned the matching receipt.");
+    await save("stop.json", await stop(sandboxId, proof));
+    await save("replay.json", await stop(sandboxId, proof));
+    console.log("Native DELETE and repeated request acknowledged for the exact VM.");
   } catch (error) {
     // SDK exceptions can contain authorization headers; persist only their type.
     await save("failure.json", { proof, errorType: error?.name ?? "Error" });
-    console.error(`Physical-stop proof failed (${error?.name ?? "Error"}).`);
+    console.error(`Native delete proof failed (${error?.name ?? "Error"}).`);
     process.exitCode = 1;
   } finally {
     try {
@@ -103,16 +94,16 @@ if (values.replay) {
         identities.size > 0,
         "Creation outcome is unknown; reconcile by saved proof identity.",
       );
-      for (const id of identities) await stop(id);
+      for (const id of identities) await stop(id, proof);
       await save("cleanup.json", {
         proof,
         sandboxIds: [...identities],
-        physicalStopVerified: true,
+        nativeDeleteAcknowledged: true,
       });
     } catch (error) {
       await save("cleanup.json", {
         proof,
-        physicalStopVerified: false,
+        nativeDeleteAcknowledged: false,
         errorType: error?.name ?? "Error",
       });
       console.error("Cleanup is unconfirmed; reconcile using the saved proof identity.");

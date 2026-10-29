@@ -14,8 +14,8 @@ import { makeThreadVmResetStore, ThreadVmResetConflict } from "./ThreadVmResetSt
 interface Compute extends ThreadVmCleanupCompute {
   readonly destroy: (sandboxId: string) => Effect.Effect<void, ThreadVmComputeError>;
 }
-/** Cleanup never needs the revoked owner's access. Unknown creation or stop keeps
- * quota and the placement hold; absence of a catalog entry is not a stop receipt. */
+/** Cleanup never needs the revoked owner's access. Unknown creation or deletion keeps
+ * quota and the placement hold until native DELETE is acknowledged. */
 export function makeThreadVmResetCancellationWorker(
   sql: PgClient,
   objects: ReturnType<typeof makeThreadArtifactObjects>,
@@ -110,7 +110,7 @@ export function makeThreadVmResetCancellationWorker(
                 message: "Replacement cleanup identity changed",
               });
             // Cancellation still owns the expired source placement; its new
-            // uncommitted VM stays fenced while the exact physical stop completes.
+            // uncommitted VM stays fenced while native DELETE is acknowledged.
             yield* compute.destroy(current.computeRef).pipe(Effect.timeout("60 seconds"));
             yield* allocations.confirmDeleted({
               allocationId: claim.allocationId,
@@ -123,7 +123,6 @@ export function makeThreadVmResetCancellationWorker(
     }).pipe(
       Effect.catchTags({
         ThreadVmComputeError: () => resets.deferCancellation(claim, "stop_unconfirmed"),
-        E2BRestoreError: () => resets.deferCancellation(claim, "stop_unconfirmed"),
         TimeoutError: () => resets.deferCancellation(claim, "stop_unconfirmed"),
         ThreadVmResetConflict: () => resets.deferCancellation(claim, "cleanup_unconfirmed"),
         ThreadVmCapacityConflict: () => resets.deferCancellation(claim, "cleanup_unconfirmed"),

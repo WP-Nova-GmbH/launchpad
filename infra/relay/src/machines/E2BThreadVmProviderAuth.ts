@@ -15,7 +15,7 @@ type Guest = (
 ) => Promise<string>;
 const guest: Guest = async (connection, payload) => {
   const vm = new Sandbox(connection);
-  const command = await vm.commands.run("launchpad-server __thread-vm-provider-auth", {
+  const command = await vm.commands.run("/opt/launchpad/server/t3 __thread-vm-provider-auth", {
     user: "user",
     background: true,
     stdin: true,

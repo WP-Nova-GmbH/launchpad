@@ -2,6 +2,7 @@ import type { PgClient } from "@effect/sql-pg/PgClient";
 import type { RelayThreadVmEnrollmentReceipt } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import { ThreadVmEnrollmentInvalid } from "./ThreadVmEnrollmentStore.ts";
+import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
 
 /** Fresh enrollment commits reset ownership exactly once. Execution stays held
  * until the separately retained conversation, setup and paused queue are ready. */
@@ -15,8 +16,9 @@ export function makeThreadVmResetEnrollmentStore(sql: PgClient) {
           phase: string;
           expectedGeneration: number;
           sourceEnvironmentId: string;
+          savedDiskOperationId: string;
           actorUserId: string;
-        }>`SELECT r.phase,r.expected_generation AS "expectedGeneration",r.source_environment_id AS "sourceEnvironmentId",r.actor_user_id AS "actorUserId"
+        }>`SELECT r.phase,r.expected_generation AS "expectedGeneration",r.source_environment_id AS "sourceEnvironmentId",r.actor_user_id AS "actorUserId",r.saved_disk_operation_id AS "savedDiskOperationId"
         FROM relay_thread_vm_resets r JOIN relay_thread_placements t USING(thread_id)
         WHERE r.operation_id=${receipt.operationId} AND r.allocation_id=${receipt.allocationId} AND r.thread_id=${receipt.threadId} FOR UPDATE OF t,r`;
         if (!reset) return false;
@@ -40,7 +42,9 @@ export function makeThreadVmResetEnrollmentStore(sql: PgClient) {
           AND p.operation_id=${receipt.operationId} AND p.generation=b.generation AND p.phase='created'
           AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
           AND cap.state='started' AND cap.compute_ref=a.compute_ref
-          AND ((t.generation=${reset.expectedGeneration} AND t.environment_id=${reset.sourceEnvironmentId})
+          AND ((t.generation=${reset.expectedGeneration} AND (t.environment_id=${reset.sourceEnvironmentId}
+              OR EXISTS(SELECT 1 FROM relay_thread_vm_saved_disks s WHERE s.operation_id=${reset.savedDiskOperationId}
+                AND s.thread_id=t.thread_id AND (${savedDiskHasCancelledRestorePlacement(sql)}))))
             OR (t.generation=${receipt.generation} AND t.environment_id=b.environment_id AND ${reset.phase === "importing"}))
         FOR SHARE OF b,e,p,a,c,cap`;
         if (!confirmed) return yield* new ThreadVmEnrollmentInvalid();

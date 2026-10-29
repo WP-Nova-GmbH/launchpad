@@ -256,6 +256,8 @@ for (const problem of [
             freeze: (_owner, input) =>
               Effect.gen(function* () {
                 acknowledgements++;
+                expect(input.bootId).toBe(bootId);
+                expect(input.sealEpoch).toBe(1);
                 operation = {
                   ...operation,
                   phase: "pending",

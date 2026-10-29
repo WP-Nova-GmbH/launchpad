@@ -18,7 +18,7 @@ export function makeThreadVmActivityStore(sql: PgClient) {
       state: string;
       organizationId: string;
     }>`SELECT state,organization_id AS "organizationId" FROM relay_thread_vm_allocations
-      WHERE allocation_id = ${allocationId} AND deleted_at IS NULL FOR SHARE`;
+      WHERE allocation_id = ${allocationId} AND runtime_protocol='native-v1' AND deleted_at IS NULL FOR SHARE`;
     if (allocation?.state !== "running")
       return yield* new ThreadVmActivityConflict({ message: "VM is not running" });
     return allocation.organizationId;

@@ -1,9 +1,18 @@
 import { describe, expect, it } from "@effect/vitest";
 import { ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Redacted from "effect/Redacted";
 import { vi } from "vite-plus/test";
 import { makeE2BThreadVmServer } from "./E2BThreadVmServer.ts";
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeUnknown = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const sdk = vi.hoisted(() => ({ run: vi.fn() }));
+vi.mock("e2b", () => ({
+  Sandbox: class {
+    commands = { run: sdk.run };
+  },
+}));
 
 const settings = {
   apiUrl: "http://127.0.0.1:3000",
@@ -39,10 +48,27 @@ const info = {
 };
 const fixture = () => {
   const transport = vi.fn<typeof fetch>(async () => Response.json(info));
-  const guest = vi.fn(async (_connection: unknown, _command: string) => {});
+  const guest = vi.fn(async (_connection: unknown, _command: string, _identity: unknown) => {});
   return { transport, guest, start: makeE2BThreadVmServer(settings, transport, guest) };
 };
 describe("private VM server launch", () => {
+  it.effect(
+    "starts only the root-owned fixed coordinator launcher with public scope, then drops privilege in the helper",
+    () =>
+      Effect.gen(function* () {
+        sdk.run.mockResolvedValueOnce({});
+        const transport = vi.fn<typeof fetch>(async () => Response.json(info));
+        yield* makeE2BThreadVmServer(settings, transport)("sandbox", identity, "a".repeat(64));
+        expect(sdk.run.mock.lastCall?.[1]).toMatchObject({ user: "root", background: true });
+        expect(decodeJson(sdk.run.mock.lastCall?.[1].envs.LAUNCHPAD_COORDINATOR_SCOPE)).toEqual({
+          allocationId: identity.scope.allocationId,
+          operationId: identity.operationId,
+          threadId: identity.scope.threadId,
+          generation: identity.scope.generation,
+        });
+        expect(encodeUnknown(sdk.run.mock.lastCall?.[1])).not.toContain("secret");
+      }),
+  );
   it.effect(
     "requests an idempotent start without exporting management secrets or granting readiness",
     () =>
@@ -50,8 +76,10 @@ describe("private VM server launch", () => {
         const f = fixture();
         expect(yield* f.start("sandbox", identity, "a".repeat(64))).toBeUndefined();
         const command = f.guest.mock.calls[0]![1];
-        expect(command).toContain("flock --nonblock --conflict-exit-code 75 --no-fork");
-        expect(command).toContain("__thread-vm-serve --receipt-sha256 " + "a".repeat(64));
+        expect(command).toBe(
+          "/opt/launchpad/bin/launchpad-workload coordinator-run " + "a".repeat(64) + " initial",
+        );
+        expect(f.guest.mock.calls[0]![2]).toEqual(identity);
         expect(command).not.toContain("secret");
         expect(f.transport.mock.calls[0]?.[1]?.method).toBeUndefined();
       }),
@@ -64,7 +92,9 @@ describe("private VM server launch", () => {
         Response.json({ ...info, metadata: { ...info.metadata, "launchpad.generation": "2" } }),
       );
       yield* f.start("sandbox", next, "a".repeat(64), "move");
-      expect(f.guest.mock.calls[0]![1]).toContain("--receipt-sha256 " + "a".repeat(64) + " --move");
+      expect(f.guest.mock.calls[0]![1]).toBe(
+        "/opt/launchpad/bin/launchpad-workload coordinator-run " + "a".repeat(64) + " move",
+      );
     }),
   );
   it.effect("never wakes paused VMs or launches under changed ownership", () =>

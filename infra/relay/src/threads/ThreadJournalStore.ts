@@ -10,7 +10,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { ThreadPlacementConflict } from "./ThreadPlacementStore.ts";
-import { makeThreadVmResumeStore } from "./ThreadVmResumeStore.ts";
+import { makeThreadVmResumeStore, threadVmResumePlacement } from "./ThreadVmResumeStore.ts";
 import { makeThreadVmPauseStore } from "./ThreadVmPauseStore.ts";
 import { threadCommandRequestsWake } from "./ThreadVmWakeAdmission.ts";
 
@@ -49,7 +49,11 @@ export function makeThreadJournalStore(sql: PgClient) {
       WHERE a.thread_id=${input.threadId} AND x.generation=${input.generation}
         AND x.native_checkpoint_operation_id IS NOT NULL AND (x.phase IN ('pending','sealed') OR (x.phase='completed'
         AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_resumes r WHERE r.allocation_id=a.allocation_id
-          AND r.generation=x.generation AND r.phase='completed' AND a.state='running'))) `;
+          AND r.generation=x.generation AND r.phase='completed' AND a.state='running')))
+      UNION ALL SELECT 1 FROM relay_thread_vm_backups x JOIN relay_thread_vm_allocations a USING(allocation_id)
+        WHERE a.thread_id=${input.threadId} AND x.generation=${input.generation}
+          AND x.source_receipt IS NOT NULL AND x.source_reopened_at IS NULL
+          AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses p WHERE p.backup_operation_id=x.operation_id) `;
     if (frozen.length) return yield* conflict("Source history is frozen for VM pause");
   });
   const lock = Effect.fnUntraced(function* (threadId: string) {
@@ -146,11 +150,20 @@ export function makeThreadJournalStore(sql: PgClient) {
           : null;
         const [pausing] = yield* sql<{
           operationId: string;
-        }>`SELECT x.operation_id AS "operationId" FROM relay_thread_vm_pauses x
+          kind: "pause" | "backup";
+        }>`SELECT x.operation_id AS "operationId",'pause' AS kind FROM relay_thread_vm_pauses x
           JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
           WHERE a.thread_id = ${input.threadId} AND x.generation=${placement.generation} AND x.phase='pending'
-            AND x.native_checkpoint_operation_id IS NULL AND x.source_frozen_at IS NULL`;
-        if (pausing && baselineResult === null)
+            AND x.native_checkpoint_operation_id IS NULL AND x.source_frozen_at IS NULL
+          UNION ALL SELECT x.operation_id AS "operationId",'backup' AS kind FROM relay_thread_vm_backups x
+            JOIN relay_thread_vm_allocations a USING(allocation_id) WHERE a.thread_id=${input.threadId}
+              AND x.generation=${placement.generation} AND x.phase='pending' AND x.capture_started_at IS NULL
+              AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_final_saves f WHERE f.backup_operation_id=x.operation_id)
+              AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses p WHERE p.backup_operation_id=x.operation_id)`;
+        if (pausing && baselineResult === null && pausing.kind === "backup")
+          yield* sql`UPDATE relay_thread_vm_backups SET phase='failed',claim_id=NULL,claim_until=NULL
+            WHERE operation_id=${pausing.operationId} AND phase='pending' AND capture_started_at IS NULL`;
+        if (pausing && baselineResult === null && pausing.kind === "pause")
           yield* makeThreadVmPauseStore(sql).cancelBeforeFreeze({
             threadId: input.threadId,
             environmentId: placement.environmentId,
@@ -164,14 +177,15 @@ export function makeThreadJournalStore(sql: PgClient) {
         SELECT ${input.command.commandId}, ${input.threadId}, COALESCE(MAX(position), 0) + 1, ${placement.generation}, ${actor}::jsonb, ${payload}::jsonb, ${baselineResult}::jsonb,${baselineArchive}::jsonb
         FROM relay_thread_commands WHERE thread_id = ${input.threadId}`;
         const [paused] = yield* sql`SELECT 1 FROM relay_thread_vm_allocations a
+          JOIN relay_thread_placements t USING(thread_id)
           JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
           WHERE a.thread_id = ${input.threadId} AND a.state = 'paused'
             AND a.deleted_at IS NULL AND b.environment_id = ${placement.environmentId}
-            AND b.generation = ${placement.generation} AND b.revoked_at IS NULL`;
+            AND b.generation = ${placement.generation} AND b.revoked_at IS NULL
+            AND ${threadVmResumePlacement(sql)}`;
         if (
           paused &&
           baselineResult === null &&
-          placement.operationId === null &&
           (yield* threadCommandRequestsWake(sql, input.threadId, input.command))
         )
           yield* makeThreadVmResumeStore(sql).request(input.threadId);
@@ -189,13 +203,17 @@ export function makeThreadJournalStore(sql: PgClient) {
         if (saved.length) return null;
         const asleep = yield* sql`SELECT 1 FROM relay_thread_vm_allocations a
           JOIN relay_thread_vm_bindings b USING(allocation_id)
-          WHERE a.thread_id=${input.threadId} AND a.deleted_at IS NULL AND a.state='paused'
+          WHERE a.thread_id=${input.threadId} AND a.deleted_at IS NULL AND (a.state='paused' OR a.runtime_protocol<>'native-v1')
             AND b.environment_id=${input.environmentId} AND b.generation=${input.generation} AND b.revoked_at IS NULL`;
         if (asleep.length) return null;
         const pausing = yield* sql`SELECT 1 FROM relay_thread_vm_pauses x
           JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
           WHERE a.thread_id = ${input.threadId} AND x.generation=${input.generation}
-            AND (x.phase IN ('pending','sealed') OR (x.phase IN ('cancelled','completed') AND x.source_reopened_at IS NULL))`;
+            AND (x.phase IN ('pending','sealed') OR (x.phase IN ('cancelled','completed') AND x.source_reopened_at IS NULL))
+          UNION ALL SELECT 1 FROM relay_thread_vm_backups x JOIN relay_thread_vm_allocations a USING(allocation_id)
+            WHERE a.thread_id=${input.threadId} AND x.generation=${input.generation} AND x.source_reopened_at IS NULL
+              AND (x.phase IN ('pending','creating') OR x.source_receipt IS NOT NULL OR (x.phase='failed' AND x.capture_started_at IS NULL))
+              AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses p WHERE p.backup_operation_id=x.operation_id)`;
         if (pausing.length) return null;
         const resuming = yield* sql`SELECT 1 FROM relay_thread_vm_resumes r
           JOIN relay_thread_vm_allocations a ON a.allocation_id = r.allocation_id

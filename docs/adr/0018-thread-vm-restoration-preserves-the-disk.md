@@ -7,21 +7,37 @@ status: accepted
 For the planned per-thread VM mode, restoring a deleted VM within its saved-disk retention
 period preserves its whole saved disk, including installed tools, dependencies, and local
 database files, because rebuilding only the repository would discard work users expect to
-keep. Routine VM deletion while retaining the thread requires a verified,
-recoverable final save; running processes and memory are not restored, and unexpected disk loss
-can only recover the latest successful backup. An environment move transfers the
+keep. Routine VM deletion while retaining the thread requires a completed native
+full snapshot and an independently retained conversation checkpoint. Native E2B saves
+the disk and RAM; Launchpad stops managed work and seals its execution gate before taking
+that snapshot. Unexpected disk loss can only recover the latest completed backup.
+An environment move transfers the
 thread's work into a different environment rather than restoring the guest operating system
 there, so restoration and moves need not share one persistence format.
 
-Cold boot alone is not an execution fence: systemd services and other saved startup
-hooks can run even when RAM is discarded. Recovery must prevent those workloads
-from executing until placement ownership is committed. Unmodified E2B snapshot
-recovery fails this constraint. Offline preparation prevents startup while a disk
-is being inspected, but ordinary systemd activation can still run saved services.
-A recoverability probe must use a trusted boot path that does not execute those
-services. Only committed placement may authorize an ordinary workload boot.
-The pinned prepared-restore protocol and its runtime proofs do not replace
-the [product restore release gate](../operations/e2b-host-setup.md#restore-release-gate).
+Automatic VM backups wait for a safe idle point instead of interrupting active work. The
+configured interval determines when a backup becomes due, not the maximum age of the latest
+recovery point.
+
+Physical snapshot cleanup is separate from backup retention and uses an external host
+collector rather than E2B patches. The first version waits for the host to become idle,
+then briefly stops its E2B writers; it never pauses active work to create a collection
+window. Snapshot and template ancestry must remain protected throughout deletion.
+
+Native E2B restoration boots immediately, so the relay commits the new placement
+generation before requesting the restored VM. There is no inactive prepared VM or
+offline recoverability probe. A completed backup records the immutable snapshot build
+and the exact stopped source checkpoint; it does not claim a cold-boot or filesystem
+repair certificate.
+
+RAM restoration also resumes the old Launchpad coordinator and its old runtime identity.
+A trusted guest bootstrap stops that exact coordinator, verifies and rebinds the closed
+workload seal, and replaces the serving identity before enrollment and import. Only relay
+activation opens the new execution gate. An uncertain create, pause or resume retains
+capacity until its outcome is reconciled; an expired worker claim does not authorize
+another dispatch or permission to resume through an unsettled pause.
+These boundaries and the native runtime proofs do not replace the
+[product restore release gate](../operations/e2b-host-setup.md#restore-release-gate).
 
 The first version keeps saved disks outside individual VM allocations but may store them
 on the same E2B host. Off-host backups and whole-host disaster recovery are deferred to

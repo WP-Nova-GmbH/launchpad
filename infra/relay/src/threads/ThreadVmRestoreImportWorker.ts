@@ -28,7 +28,7 @@ export function makeThreadVmRestoreImportWorker(
         identity = { operationId: row.operationId, scope: row.scope, templateId: row.templateId };
       const receipt =
         row.receipt ??
-        (yield* deliver(row.bootReceipt!.sandboxID, row.environmentId, identity).pipe(
+        (yield* deliver(row.bootReceipt!.sandboxId, row.environmentId, identity).pipe(
           Effect.timeout("60 seconds"),
         ));
       if (!row.receipt) yield* store.record(claim, receipt);
@@ -39,14 +39,14 @@ export function makeThreadVmRestoreImportWorker(
         new TextEncoder().encode(yield* encodeReceipt(receipt)),
       );
       yield* start(
-        row.bootReceipt!.sandboxID,
+        row.bootReceipt!.sandboxId,
         identity,
         Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join(""),
         "restore",
       ).pipe(Effect.timeout("45 seconds"));
       const current = yield* store.authorize(claim);
       if (current.phase === "completed" && !current.identityCleaned) {
-        yield* cleanup(row.bootReceipt!.sandboxID, identity).pipe(Effect.timeout("60 seconds"));
+        yield* cleanup(row.bootReceipt!.sandboxId, identity).pipe(Effect.timeout("60 seconds"));
         yield* store.recordCleanup(claim);
       }
       yield* store.defer(claim, null);

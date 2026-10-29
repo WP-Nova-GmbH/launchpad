@@ -66,7 +66,7 @@ export function makeThreadVmResetImportStore(
             (!native?.recoveryHistory ||
               !attachments ||
               native.operationId !== row.nativeCheckpointOperationId ||
-              native.generation !== row.expectedGeneration ||
+              native.generation !== row.sourceGeneration ||
               native.sourceEnvironmentId !== row.sourceEnvironmentId ||
               native.sourceSequence !== row.sourceSequence ||
               attachments.nativeArchiveSha256 !== native.archiveSha256 ||

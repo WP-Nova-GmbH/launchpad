@@ -15,6 +15,7 @@ import { makeThreadVmResetStore } from "./ThreadVmResetStore.ts";
 import { makeThreadVmRestoreStore } from "./ThreadVmRestoreStore.ts";
 import { lockThreadVmPolicy } from "./ThreadVmPolicy.ts";
 import { threadVmQuotaUsage } from "./ThreadVmQuota.ts";
+import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
 
 export class ThreadVmReplacementConflict extends Schema.TaggedError<ThreadVmReplacementConflict>()(
   "ThreadVmReplacementConflict",
@@ -124,7 +125,7 @@ export function makeThreadVmReplacementCoordinator(
     const intent = request.intent;
     if (intent.kind === "reset" || intent.kind === "restore") {
       const [saved] = yield* sql`SELECT 1 FROM relay_thread_placements t
-        JOIN relay_thread_vm_saved_disks s ON s.thread_id=t.thread_id AND s.generation=t.generation
+        JOIN relay_thread_vm_saved_disks s ON s.thread_id=t.thread_id
         JOIN relay_thread_vm_final_saves f ON f.operation_id=s.operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=f.allocation_id
         JOIN relay_thread_native_checkpoints n ON n.operation_id=f.native_checkpoint_operation_id
@@ -137,9 +138,11 @@ export function makeThreadVmReplacementCoordinator(
         WHERE t.thread_id=${request.threadId} AND t.owner_user_id=${request.ownerUserId}
           AND t.organization_id=${request.organizationId} AND t.repository_id=${request.repositoryId}
           AND t.environment_id=${intent.sourceEnvironmentId} AND t.generation=${intent.request.expectedGeneration}
+          AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}))
           AND t.operation_id IS NULL AND (${intent.kind !== "restore"} OR s.host_id=${request.hostId}) AND f.phase='completed'
           AND a.deleted_at IS NOT NULL AND a.state='deleted' AND n.retained AND n.recovery_history_json IS NOT NULL
-          AND n.generation=t.generation AND n.source_environment_id=t.environment_id
+          AND f.thread_id=s.thread_id AND f.generation=s.generation
+          AND n.generation=s.generation AND n.source_environment_id=f.environment_id
           AND n.source_sequence=f.source_sequence
           AND n.capture_operation_id=CASE WHEN f.original_state='paused' THEN pause.operation_id ELSE f.operation_id END
           AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=t.thread_id)

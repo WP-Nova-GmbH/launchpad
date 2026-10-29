@@ -11,6 +11,9 @@ import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import { inspectE2BThreadVmIngress } from "../src/machines/E2BThreadVmConnection.ts";
+import { RelayDb } from "../src/db.ts";
+import type { RelaySecretBox } from "../src/auth/SecretBox.ts";
+import { readThreadVmTrafficAccessToken } from "../src/threads/ThreadVmIngressToken.ts";
 import type { E2BThreadVmSettings } from "../src/machines/E2BThreadVmCompute.ts";
 import {
   makeE2BThreadVmEndpoint,
@@ -135,7 +138,7 @@ export const makeDevThreadVmClientProxy = <E, R>(input: {
   Effect.gen(function* () {
     const parentScope = yield* Scope.Scope;
     const resolveLock = yield* Semaphore.make(1);
-    const context = yield* Effect.context<R>();
+    const context = yield* Effect.context<R | RelayDb | RelaySecretBox>();
     const run = Effect.runPromiseWith(context);
     const entries = new Map<
       string,
@@ -236,12 +239,23 @@ export const makeDevThreadVmClientProxy = <E, R>(input: {
         const prepare = async (request: NodeHttp.IncomingMessage, signal: AbortSignal) => {
           if (closed || !allowedRequest(request, host)) throw new Error("Invalid local request");
           await run(verify, { signal });
+          const token = await run(
+            Effect.gen(function* () {
+              return yield* readThreadVmTrafficAccessToken((yield* RelayDb).$client, {
+                ...target.identity.scope,
+                computeRef: target.sandboxId,
+                operationId: target.identity.operationId,
+              });
+            }),
+            { signal },
+          );
           const ingress = await inspect(
             input.compute,
             target.sandboxId,
             target.identity,
             fetch,
             signal,
+            token,
           );
           await run(verify, { signal });
           if (ingress.sandboxId !== target.sandboxId) throw new Error("Changed VM ingress");
@@ -422,6 +436,7 @@ export const makeDevThreadVmClientProxy = <E, R>(input: {
           mintCredential: (...args) =>
             runControl(
               control.mintCredential(...args).pipe(
+                Effect.provide(context),
                 Effect.tap(() =>
                   Effect.sync(() => {
                     minted = true;
@@ -429,7 +444,10 @@ export const makeDevThreadVmClientProxy = <E, R>(input: {
                 ),
               ),
             ),
-          health: (proof) => runControl(health(target.sandboxId, target.identity, proof)),
+          health: (proof) =>
+            runControl(
+              health(target.sandboxId, target.identity, proof).pipe(Effect.provide(context)),
+            ),
         };
         entries.set(key, { userId, target, host, scope, control: entryControl });
         if (target.state === "running") {

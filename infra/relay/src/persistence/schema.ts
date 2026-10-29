@@ -960,18 +960,34 @@ export const relayThreadVmAllocations = pgTable(
       .references(() => relayThreadPlacements.threadId),
     organizationId: varchar("organization_id", { length: 64 }).notNull(),
     ownerUserId: varchar("owner_user_id", { length: 191 }).notNull(),
+    runtimeProtocol: varchar("runtime_protocol", { length: 16 })
+      .$type<"legacy" | "native-v1">()
+      .notNull()
+      .default("native-v1"),
     templateId: varchar("template_id", { length: 191 }).notNull(),
     computeRef: varchar("compute_ref", { length: 191 }),
+    sealedTrafficAccessToken: text("sealed_traffic_access_token"),
     nativePausedGeneration: integer("native_paused_generation"),
-    deletionStopReceipt: jsonb("deletion_stop_receipt").$type<{
-      operationId: string;
-      allocationId: string;
-      computeRef: string;
-      sourceOperationId: string;
-      generation: number;
-      physicallyStopped: true;
-      captureAdmissionSealed: boolean;
-    }>(),
+    deletionStopReceipt: jsonb("deletion_stop_receipt").$type<
+      | {
+          operationId: string;
+          allocationId: string;
+          computeRef: string;
+          sourceOperationId: string;
+          generation: number;
+          physicallyStopped: true;
+          captureAdmissionSealed: boolean;
+        }
+      | {
+          kind: "native-delete-acknowledgement";
+          operationId: string;
+          allocationId: string;
+          computeRef: string;
+          sourceOperationId: string;
+          generation: number;
+          acknowledged: true;
+        }
+    >(),
     state: varchar("state", { length: 16 })
       .notNull()
       .$type<"creating" | "running" | "paused" | "deleting" | "deleted">(),
@@ -1062,9 +1078,19 @@ export const relayThreadVmPauses = pgTable(
       .$type<"pending" | "sealed" | "completed" | "cancelled">(),
     bootId: varchar("boot_id", { length: 64 }),
     nativeCheckpointOperationId: varchar("native_checkpoint_operation_id", { length: 64 }),
+    backupOperationId: varchar("backup_operation_id", { length: 64 }).references(
+      () => relayThreadVmBackups.operationId,
+    ),
+    sourceReceipt:
+      jsonb("source_receipt").$type<
+        import("../machines/E2BNativeSnapshotReceipt.ts").ThreadVmCaptureSourceReceipt
+      >(),
     sourceSequence: integer("source_sequence"),
     sourceFrozenAt: timestamp("source_frozen_at", { withTimezone: true }),
     sourceReopenedAt: timestamp("source_reopened_at", { withTimezone: true }),
+    pauseDispatchClaimId: varchar("pause_dispatch_claim_id", { length: 64 }),
+    pauseDispatchedAt: timestamp("pause_dispatched_at", { withTimezone: true }),
+    pauseAcknowledgedAt: timestamp("pause_acknowledged_at", { withTimezone: true }),
     claimId: varchar("claim_id", { length: 64 }),
     claimUntil: timestamp("claim_until", { withTimezone: true }),
     retryAt: timestamp("retry_at", { withTimezone: true }).notNull().defaultNow(),
@@ -1099,6 +1125,7 @@ export const relayThreadVmResumes = pgTable(
     operationId: varchar("operation_id", { length: 64 }).notNull().unique(),
     generation: integer("generation").notNull(),
     phase: varchar("phase", { length: 16 }).notNull().$type<"waiting" | "resuming" | "completed">(),
+    connectClaimId: varchar("connect_claim_id", { length: 64 }),
     claimId: varchar("claim_id", { length: 64 }),
     claimUntil: timestamp("claim_until", { withTimezone: true }),
     retryAt: timestamp("retry_at", { withTimezone: true }).notNull().defaultNow(),
@@ -1137,7 +1164,16 @@ export const relayThreadVmBackups = pgTable(
     sourceTemplateId: varchar("source_template_id", { length: 191 }),
     sourceBuildId: varchar("source_build_id", { length: 64 }),
     probeReceipt:
-      jsonb("probe_receipt").$type<import("../machines/E2BRestoreClient.ts").E2BBackupColdProof>(),
+      jsonb("probe_receipt").$type<import("../machines/LegacyE2BReceipts.ts").E2BBackupColdProof>(),
+    nativeCaptureReceipt:
+      jsonb("native_capture_receipt").$type<
+        import("../machines/E2BNativeSnapshotReceipt.ts").E2BNativeSnapshotReceipt
+      >(),
+    sourceReceipt:
+      jsonb("source_receipt").$type<
+        import("../machines/E2BNativeSnapshotReceipt.ts").ThreadVmCaptureSourceReceipt
+      >(),
+    sourceReopenedAt: timestamp("source_reopened_at", { withTimezone: true }),
     failedProbeStoppedAt: timestamp("failed_probe_stopped_at", { withTimezone: true }),
     phase: varchar("phase", { length: 16 })
       .notNull()
@@ -1444,6 +1480,7 @@ export const relayThreadVmProvisions = pgTable(
     operationId: varchar("operation_id", { length: 64 }).notNull().unique(),
     generation: integer("generation").notNull(),
     creationIdentityFenced: boolean("creation_identity_fenced").notNull().default(false),
+    ingressRecoveryClaimId: varchar("ingress_recovery_claim_id", { length: 64 }),
     position: bigserial("position", { mode: "number" }).notNull(),
     phase: varchar("phase", { length: 16 })
       .notNull()
@@ -1676,7 +1713,7 @@ export const relayThreadVmSetups = pgTable(
   ],
 );
 
-/** A final save holds execution and quota until independent recovery and physical absence are verified. */
+/** A final save retains execution and quota until recovery and native deletion are acknowledged. */
 export const relayThreadVmFinalSaves = pgTable(
   "relay_thread_vm_final_saves",
   {
@@ -1699,6 +1736,10 @@ export const relayThreadVmFinalSaves = pgTable(
     activityRevision: integer("activity_revision").notNull(),
     idleSince: timestamp("idle_since", { withTimezone: true }).notNull(),
     sourceSequence: integer("source_sequence"),
+    sourceReceipt:
+      jsonb("source_receipt").$type<
+        import("../machines/E2BNativeSnapshotReceipt.ts").ThreadVmCaptureSourceReceipt
+      >(),
     nativeCheckpointOperationId: varchar("native_checkpoint_operation_id", {
       length: 64,
     }).references(() => relayThreadNativeCheckpoints.operationId),
@@ -1803,7 +1844,7 @@ export const relayThreadVmBackupRecoveries = pgTable(
       >(),
     retentionCandidate:
       jsonb("retention_candidate").$type<
-        import("../machines/E2BRestoreClient.ts").E2BExecutionRetentionCandidate
+        import("../machines/LegacyE2BReceipts.ts").E2BExecutionRetentionCandidate
       >(),
     retentionReceipt: jsonb("retention_receipt").$type<unknown>(),
     retentionRetiredAt: timestamp("retention_retired_at", { withTimezone: true }),
@@ -1830,7 +1871,7 @@ export const relayThreadVmBackupRecoveries = pgTable(
     ),
     check(
       "relay_thread_vm_backup_recoveries_retained",
-      sql`${table.phase} NOT IN ('retained','stopped','restoring','completed') OR (${table.retentionReceipt} IS NOT NULL AND ${table.independentHistory} IS NOT NULL)`,
+      sql`${table.phase} NOT IN ('retained','stopped','restoring','completed') OR ${table.independentHistory} IS NOT NULL`,
     ),
     check(
       "relay_thread_vm_backup_recoveries_stopped",
@@ -1871,6 +1912,8 @@ export const relayThreadVmRestores = pgTable(
       .references(() => relayThreadVmAllocations.allocationId),
     actorUserId: varchar("actor_user_id", { length: 191 }).notNull(),
     generation: integer("generation").notNull(),
+    sourceGeneration: integer("source_generation"),
+    targetGeneration: integer("target_generation"),
     hostId: varchar("host_id", { length: 191 }).notNull(),
     nativeCheckpointOperationId: varchar("native_checkpoint_operation_id", { length: 64 })
       .notNull()
@@ -1886,6 +1929,8 @@ export const relayThreadVmRestores = pgTable(
         | "boot_preparing"
         | "boot_prepared"
         | "committed"
+        | "creating"
+        | "bootstrapping"
         | "booted"
         | "importing"
         | "completed"
@@ -1895,14 +1940,22 @@ export const relayThreadVmRestores = pgTable(
     servingRequested: boolean("serving_requested").notNull().default(false),
     probeRemovedAt: timestamp("probe_removed_at", { withTimezone: true }),
     bootPrepareStartedAt: timestamp("boot_prepare_started_at", { withTimezone: true }),
+    bootCreateStartedAt: timestamp("boot_create_started_at", { withTimezone: true }),
+    bootIngressRecoveryClaimId: varchar("boot_ingress_recovery_claim_id", { length: 64 }),
+    bootstrapReceipt:
+      jsonb("bootstrap_receipt").$type<
+        import("@t3tools/contracts/relay").ThreadVmWarmRestoreBootstrapReceipt
+      >(),
     bootRecoveryStartedAt: timestamp("boot_recovery_started_at", { withTimezone: true }),
     bootAttempt: integer("boot_attempt").notNull().default(0),
     retiredBootReceipts: jsonb("retired_boot_receipts")
       .notNull()
       .default(sql`'[]'::jsonb`)
       .$type<ReadonlyArray<unknown>>(),
-    bootReceipt:
-      jsonb("boot_receipt").$type<import("../machines/E2BRestoreClient.ts").E2BRestoreStatus>(),
+    bootReceipt: jsonb("boot_receipt").$type<
+      | import("../machines/LegacyE2BReceipts.ts").E2BRestoreStatus
+      | import("../threads/NativeThreadVmRestoreReceipt.ts").NativeThreadVmRestoreBootReceipt
+    >(),
     identityCleanedAt: timestamp("identity_cleaned_at", { withTimezone: true }),
     importReceipt:
       jsonb("import_receipt").$type<
@@ -1910,8 +1963,10 @@ export const relayThreadVmRestores = pgTable(
       >(),
     committedAt: timestamp("committed_at", { withTimezone: true }),
     prepareStartedAt: timestamp("prepare_started_at", { withTimezone: true }),
-    preparedReceipt:
-      jsonb("prepared_receipt").$type<import("../machines/E2BRestoreClient.ts").E2BRestoreStatus>(),
+    preparedReceipt: jsonb("prepared_receipt").$type<
+      | import("../machines/LegacyE2BReceipts.ts").E2BRestoreStatus
+      | import("../threads/NativeThreadVmRestoreReceipt.ts").NativeThreadVmRestoreCatalogReceipt
+    >(),
     claimId: varchar("claim_id", { length: 64 }),
     claimUntil: timestamp("claim_until", { withTimezone: true }),
     retryAt: timestamp("retry_at", { withTimezone: true }).notNull().defaultNow(),
@@ -1933,7 +1988,7 @@ export const relayThreadVmRestores = pgTable(
     check("relay_thread_vm_restores_generation", sql`${table.generation} > 0`),
     check(
       "relay_thread_vm_restores_phase",
-      sql`${table.phase} IN ('pending','preparing','prepared','boot_preparing','boot_prepared','committed','booted','importing','completed','aborting','aborted')`,
+      sql`${table.phase} IN ('pending','preparing','prepared','boot_preparing','boot_prepared','committed','creating','bootstrapping','booted','importing','completed','aborting','aborted')`,
     ),
     check(
       "relay_thread_vm_restores_started",
@@ -1945,15 +2000,31 @@ export const relayThreadVmRestores = pgTable(
     ),
     check(
       "relay_thread_vm_restores_boot_started",
-      sql`${table.bootPrepareStartedAt} IS NULL OR (${table.servingRequested} AND ${table.probeRemovedAt} IS NOT NULL AND ${table.preparedReceipt} IS NOT NULL)`,
+      sql`${table.bootPrepareStartedAt} IS NULL OR COALESCE(${table.preparedReceipt}->>'kind' = 'native-restore-catalog-v1',false) OR (${table.servingRequested} AND ${table.probeRemovedAt} IS NOT NULL AND ${table.preparedReceipt} IS NOT NULL)`,
     ),
     check(
       "relay_thread_vm_restores_boot_prepared",
-      sql`${table.phase} NOT IN ('boot_prepared','committed','booted','importing','completed') OR (${table.bootPrepareStartedAt} IS NOT NULL AND ${table.bootReceipt} IS NOT NULL) OR (${table.phase} = 'committed' AND ${table.bootReceipt} IS NULL AND ${table.bootAttempt} > 0 AND jsonb_array_length(${table.retiredBootReceipts}) = ${table.bootAttempt} AND ${table.retiredBootReceipts}->-1->>'physicallyStopped' = 'true')`,
+      sql`COALESCE(${table.preparedReceipt}->>'kind' = 'native-restore-catalog-v1',false) OR ${table.phase} NOT IN ('boot_prepared','committed','booted','importing','completed') OR (${table.bootPrepareStartedAt} IS NOT NULL AND ${table.bootReceipt} IS NOT NULL) OR (${table.phase} = 'committed' AND ${table.bootReceipt} IS NULL AND ${table.bootAttempt} > 0 AND jsonb_array_length(${table.retiredBootReceipts}) = ${table.bootAttempt} AND ${table.retiredBootReceipts}->-1->>'physicallyStopped' = 'true')`,
     ),
     check(
       "relay_thread_vm_restores_committed",
-      sql`(${table.committedAt} IS NOT NULL) = (${table.phase} IN ('committed','booted','importing','completed'))`,
+      sql`((${table.committedAt} IS NOT NULL) = (${table.phase} IN ('committed','creating','bootstrapping','booted','importing','completed'))) OR (COALESCE(${table.preparedReceipt}->>'kind' = 'native-restore-catalog-v1',false) AND ${table.phase} IN ('aborting','aborted'))`,
+    ),
+    check(
+      "relay_thread_vm_restores_native_generation",
+      sql`NOT COALESCE(${table.preparedReceipt}->>'kind' = 'native-restore-catalog-v1',false) OR (${table.sourceGeneration} IS NOT NULL AND ${table.sourceGeneration}>0 AND (${table.committedAt} IS NULL OR (${table.targetGeneration} IS NOT NULL AND ${table.targetGeneration}>${table.generation})))`,
+    ),
+    check(
+      "relay_thread_vm_restores_native_boot_intent",
+      sql`${table.bootCreateStartedAt} IS NULL OR (${table.committedAt} IS NOT NULL AND COALESCE(${table.preparedReceipt}->>'kind' = 'native-restore-catalog-v1',false))`,
+    ),
+    check(
+      "relay_thread_vm_restores_native_boot_phase",
+      sql`${table.phase} NOT IN ('creating','bootstrapping') OR (${table.committedAt} IS NOT NULL AND ${table.bootCreateStartedAt} IS NOT NULL AND ${table.targetGeneration} IS NOT NULL AND COALESCE(${table.preparedReceipt}->>'kind' = 'native-restore-catalog-v1',false) AND (${table.phase}!='bootstrapping' OR COALESCE(${table.bootReceipt}->>'kind'='native-restore-boot-v1',false)))`,
+    ),
+    check(
+      "relay_thread_vm_restores_native_bootstrap",
+      sql`NOT COALESCE(${table.preparedReceipt}->>'kind' = 'native-restore-catalog-v1',false) OR ${table.phase} NOT IN ('booted','importing','completed') OR (${table.bootstrapReceipt} IS NOT NULL AND COALESCE(${table.bootstrapReceipt}->>'kind'='native-warm-restore-bootstrap-v1',false))`,
     ),
     uniqueIndex("idx_relay_thread_vm_restores_active")
       .on(table.threadId)

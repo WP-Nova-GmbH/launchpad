@@ -60,7 +60,7 @@ describe("thread VM guest pause gate", () => {
             .pipe(Effect.result);
           expect(result._tag).toBe(sealedBy === null ? "Success" : "Failure");
           expect(guest.mock.calls).toEqual([
-            [expect.anything(), "/usr/local/bin/launchpad-workload inspect"],
+            [expect.anything(), "/opt/launchpad/bin/launchpad-workload inspect"],
           ]);
         }),
     );
@@ -72,7 +72,7 @@ describe("thread VM guest pause gate", () => {
         Effect.gen(function* () {
           let sealed = initiallySealed;
           const guest = vi.fn(async (_connection: unknown, command: string) => {
-            if (command === "/usr/local/bin/launchpad-workload inspect")
+            if (command === "/opt/launchpad/bin/launchpad-workload inspect")
               return {
                 exitCode: 0,
                 stdout: JSON.stringify({
@@ -82,10 +82,14 @@ describe("thread VM guest pause gate", () => {
                   groups: [],
                 }),
               };
-            if (command === `/usr/local/bin/launchpad-workload seal ${bootId} ${sealedOperationId}`)
+            if (
+              command ===
+              `/opt/launchpad/bin/launchpad-workload seal ${bootId} ${sealedOperationId}`
+            )
               sealed = true;
             else if (
-              command === `/usr/local/bin/launchpad-workload reopen ${bootId} ${sealedOperationId}`
+              command ===
+              `/opt/launchpad/bin/launchpad-workload reopen ${bootId} ${sealedOperationId}`
             )
               sealed = false;
             else throw new Error("Unexpected guest command");
@@ -125,7 +129,7 @@ describe("thread VM guest pause gate", () => {
       const error = yield* gate.reopenAfterResume("sandbox", identity, pauseId).pipe(Effect.flip);
       expect(error._tag).toBe("ThreadVmComputeError");
       expect(guest.mock.calls).toEqual([
-        [expect.anything(), "/usr/local/bin/launchpad-workload inspect"],
+        [expect.anything(), "/opt/launchpad/bin/launchpad-workload inspect"],
       ]);
     }),
   );

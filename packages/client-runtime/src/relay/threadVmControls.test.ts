@@ -78,6 +78,7 @@ const status = {
   setupPhase: null,
   capacityState: null,
   activity: "unknown",
+  sourceActivationPending: false,
   pausePhase: null,
   resumePhase: null,
   backupPhase: null,

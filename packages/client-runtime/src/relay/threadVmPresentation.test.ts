@@ -20,6 +20,7 @@ const status: RelayThreadVmStatus = {
   activity: "idle",
   pausePhase: null,
   resumePhase: null,
+  sourceActivationPending: false,
   backupPhase: null,
   lastVerifiedBackupAt: null,
 };
@@ -32,6 +33,111 @@ const savedDisk = {
 };
 
 describe("VM presentation uses confirmed runtime state", () => {
+  it("waits for source activation after power resume before advertising readiness", () => {
+    for (const [pausePhase, backupPhase] of [
+      ["cancelled", "retired"],
+      ["completed", "verified"],
+      [null, "failed"],
+      [null, "verified"],
+    ] as const) {
+      const resumed = {
+        ...status,
+        pausePhase,
+        backupPhase,
+        resumePhase: "completed" as const,
+        sourceActivationPending: true,
+      };
+      expect(threadVmPresentation({ status: resumed, queuePaused: true })).toMatchObject({
+        label: "Waiting for VM",
+        ready: false,
+        held: true,
+        canPreview: false,
+        primary: null,
+        detail: "The VM is running. Waiting for this conversation to reopen.",
+      });
+      expect(
+        threadVmPresentation({
+          status: { ...resumed, sourceActivationPending: false },
+          queuePaused: true,
+        }),
+      ).toMatchObject({
+        label: "VM ready · queue paused",
+        ready: true,
+        held: false,
+        canPreview: true,
+      });
+    }
+  });
+
+  it("keeps Resume available for a paused source awaiting activation", () => {
+    for (const pausePhase of ["completed", "cancelled"] as const) {
+      expect(
+        threadVmPresentation({
+          status: {
+            ...status,
+            allocation: { ...status.allocation!, state: "paused" },
+            pausePhase,
+            resumePhase: "completed",
+            sourceActivationPending: true,
+          },
+        }),
+      ).toMatchObject({
+        label: "VM paused",
+        ready: false,
+        held: false,
+        canPreview: false,
+        primary: { type: "resume" },
+      });
+    }
+  });
+
+  it("uses native restore progress and offers cancellation only when the relay admits it", () => {
+    for (const phase of ["committed", "creating", "bootstrapping", "booted"] as const) {
+      const restore = { operationId: "restore", phase, errorCode: null };
+      expect(
+        threadVmPresentation({ status: { ...status, restore: { ...restore, canCancel: true } } }),
+      ).toMatchObject({
+        ready: false,
+        primary: { type: "cancel_restore" },
+        canCancelRestore: true,
+      });
+      for (const canCancel of [false, undefined])
+        expect(
+          threadVmPresentation({
+            status: {
+              ...status,
+              restore: { ...restore, ...(canCancel === undefined ? {} : { canCancel }) },
+            },
+          }),
+        ).toMatchObject({ primary: null, canCancelRestore: false });
+      expect(
+        threadVmActionUnavailableReason(
+          { type: "cancel_restore", operationId: "restore" },
+          { ...status, restore: { ...restore, canCancel: false } },
+        ),
+      ).toContain("can no longer be cancelled");
+    }
+    expect(
+      threadVmStatusLabel({
+        ...status,
+        restore: {
+          operationId: "restore",
+          phase: "creating",
+          errorCode: null,
+        },
+      }),
+    ).toBe("Starting replacement VM");
+    expect(
+      threadVmStatusLabel({
+        ...status,
+        restore: {
+          operationId: "restore",
+          phase: "bootstrapping",
+          errorCode: null,
+        },
+      }),
+    ).toBe("Preparing restored VM");
+  });
   it("does not describe missing or unfinished allocations as running", () => {
     expect(threadVmStatusLabel({ ...status, allocation: null, setupPhase: null })).toBe(
       "VM status unavailable",

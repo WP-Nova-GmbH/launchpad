@@ -119,6 +119,7 @@ vi.mock("../../state/threads", () => ({
           allocation: fixture.expired ? null : { state: "running", allocationId: "allocation" },
           activity: "idle",
           setupPhase: "ready",
+          sourceActivationPending: false,
           lastVerifiedBackupAt: "2026-10-22T10:00:00Z",
           savedDisk: fixture.expired
             ? { phase: "expired", expiresAt: "2026-10-21T10:00:00Z" }

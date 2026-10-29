@@ -36,7 +36,7 @@ async function runMemoryCommand(input: MemoryCommand): Promise<string> {
   });
 }
 
-const buildMemoryKiB = 12 * 1024 * 1024;
+const buildMemoryKiB = 8 * 1024 * 1024;
 const hostHeadroomKiB = 3 * 1024 * 1024;
 const lock = "/tmp/launchpad-vm-build-memory.lock";
 
@@ -118,7 +118,7 @@ export async function withVmBuildMemory<T>(
     const additional = Math.max(0, needed - (original.free - original.reserved));
     if (original.available < additional * original.size + hostHeadroomKiB)
       throw new Error(
-        "The Lima host needs 12 GiB of available hugepages for an image build, plus 3 GiB of normal RAM. Increase launchpad-e2b memory or stop unused guest workloads before retrying.",
+        "The Lima host needs 8 GiB of available hugepages for an image build, plus 3 GiB of normal RAM. Increase launchpad-e2b memory or stop unused guest workloads before retrying.",
       );
     if (additional) {
       const requested = Math.max(original.requested, original.total + additional);

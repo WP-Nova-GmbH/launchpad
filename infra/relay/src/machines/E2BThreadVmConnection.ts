@@ -10,10 +10,6 @@ export type E2BThreadVmIdentity = Pick<RelayThreadVmBootstrap, "scope" | "operat
   readonly templateId?: string;
 };
 
-const decodePreviewCapability = Schema.decodeUnknownSync(
-  Schema.Struct({ version: Schema.Literal(1), privatePreviewHeaderBoundary: Schema.Literal(true) }),
-);
-
 const decodeConnection = Schema.decodeUnknownSync(
   Schema.Struct({
     sandboxID: Schema.String,
@@ -21,7 +17,6 @@ const decodeConnection = Schema.decodeUnknownSync(
     state: Schema.Literal("running"),
     envdVersion: Schema.String,
     envdAccessToken: Schema.NonEmptyString,
-    trafficAccessToken: Schema.optional(Schema.NonEmptyString),
     network: Schema.optional(Schema.Struct({ allowPublicTraffic: Schema.Literal(false) })),
     domain: Schema.optional(Schema.NullOr(Schema.String)),
     metadata: Schema.Record(Schema.String, Schema.String),
@@ -96,6 +91,7 @@ export async function inspectE2BThreadVmConnection(
     apiUrl: settings.apiUrl,
     sandboxUrl: settings.sandboxUrl,
     apiKey: Redacted.value(settings.apiKey),
+    retries: 0,
     requestTimeoutMs: 30_000,
   };
 }
@@ -107,26 +103,14 @@ export async function inspectE2BThreadVmIngress(
   identity: E2BThreadVmIdentity,
   transport: typeof fetch,
   signal: AbortSignal,
+  trafficAccessToken: Redacted.Redacted<string>,
 ) {
   const info = await inspectThreadVm(settings, sandboxId, identity, transport, signal);
-  if (!info.trafficAccessToken || !info.network)
-    throw new Error("Private VM ingress is unavailable; read-only token inspection is required.");
-  const capability = await transport(
-    `${settings.apiUrl.replace(/\/$/u, "")}/extensions/launchpad/v1/capabilities`,
-    {
-      headers: { "X-API-Key": Redacted.value(settings.apiKey) },
-      redirect: "error",
-      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
-    },
-  );
-  if (!capability.ok) {
-    await capability.body?.cancel();
-    throw new Error("Private preview runtime capability is unavailable.");
-  }
-  decodePreviewCapability(await capability.json());
+  if (!info.network || !Redacted.value(trafficAccessToken).trim())
+    throw new Error("Private VM ingress is unavailable.");
   return {
     origin: settings.sandboxUrl,
     sandboxId,
-    trafficAccessToken: Redacted.make(info.trafficAccessToken),
+    trafficAccessToken,
   };
 }

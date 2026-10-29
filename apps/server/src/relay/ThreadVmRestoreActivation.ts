@@ -1,4 +1,5 @@
 import { ThreadId } from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -9,6 +10,8 @@ import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
+import { inspectVmWorkloads, withSealedVmWorkloads } from "../vmWorkload.ts";
+import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import {
   readThreadVmRestoreState,
   encodeThreadVmRestoreState,
@@ -54,16 +57,37 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
       vm.environmentId !== (yield* (yield* ServerEnvironmentIdentity).getEnvironmentId)
     )
       return yield* new ThreadVmRestoreActivationError();
-    if (state.phase === "activated" && owner.phase === "active") return false;
+    const warm = !state.recovery.reset && (yield* VmWorkloadTracking);
+    const reopen = Effect.gen(function* () {
+      if (!warm) return;
+      const inventory = yield* inspectVmWorkloads({ type: "inspect" });
+      if (inventory.sealedBy === null) return;
+      const operation = NodeCrypto.createHash("sha256")
+        .update(vm.operationId)
+        .digest("hex")
+        .slice(0, 32);
+      if (inventory.sealedBy !== operation || !inventory.stopped)
+        return yield* new ThreadVmRestoreActivationError();
+      yield* inspectVmWorkloads({
+        type: "reopen",
+        bootId: inventory.bootId,
+        operationId: vm.operationId,
+      });
+    });
+    if (state.phase === "activated" && owner.phase === "active") {
+      yield* reopen;
+      return false;
+    }
     const secrets = yield* ServerSecretStore;
     if (state.phase === "installed") {
       if (owner.phase !== "frozen") return yield* new ThreadVmRestoreActivationError();
-      yield* prepareThreadTransfer({
+      const readiness = prepareThreadTransfer({
         threadId: ThreadId.make(threadId),
         operationId: vm.operationId,
         generation: vm.scope.generation,
         manifestSha256: receipt.manifestSha256,
       });
+      yield* warm ? withSealedVmWorkloads(vm.operationId, readiness) : readiness;
       yield* secrets.set(
         THREAD_VM_RESTORE_STATE_SECRET,
         new TextEncoder().encode(yield* encodeThreadVmRestoreState({ ...state, phase: "ready" })),
@@ -89,6 +113,7 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
       THREAD_VM_RESTORE_STATE_SECRET,
       new TextEncoder().encode(yield* encodeThreadVmRestoreState({ ...state, phase: "activated" })),
     );
+    yield* reopen;
     if (owner.phase === "frozen")
       yield* fences.activate({
         threadId,

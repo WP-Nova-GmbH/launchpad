@@ -13,6 +13,7 @@ import {
   getThreadVmFinalSave,
   freezeThreadVmFinalSave,
   cancelThreadVmFinalSave,
+  confirmThreadVmFinalSaveActivation,
 } from "./ThreadEnvironmentApi.ts";
 
 const services = Layer.effect(RelayDb, PgDrizzle.makeWithDefaults()).pipe(
@@ -22,6 +23,66 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
   "source final-save acknowledgement (Postgres)",
   () => {
     layer(services)((it) => {
+      for (const problem of [
+        "none",
+        "foreign-operation",
+        "foreign-allocation",
+        "stale-generation",
+        "revoked-credential",
+        "ordinary-environment",
+      ] as const) {
+        it.effect(`acknowledges only the exact cancelled source activation (${problem})`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* finalSaveCatalogFixture();
+              yield* f.store.begin(f.input);
+              yield* f.store.requestAbort(f.input.operationId);
+              yield* f.store.confirmAborted(f.input.operationId);
+              if (problem === "revoked-credential")
+                yield* f.sql`UPDATE relay_environment_credentials SET revoked_at='now' WHERE credential_id=${f.credentialId}`;
+              const principal = {
+                environmentId: f.sourceEnvironmentId,
+                environmentPublicKey: "test-key",
+                credentialId: f.credentialId,
+                ...(problem === "ordinary-environment"
+                  ? {}
+                  : {
+                      threadVm: {
+                        allocationId:
+                          problem === "foreign-allocation"
+                            ? NodeCrypto.randomUUID()
+                            : f.input.allocationId,
+                        threadId: ThreadId.make(f.threadId),
+                        repositoryId: "repo",
+                        generation: 1,
+                      },
+                    }),
+              };
+              const input = {
+                ...f.owner,
+                generation: problem === "stale-generation" ? 2 : 1,
+                operationId:
+                  problem === "foreign-operation" ? NodeCrypto.randomUUID() : f.input.operationId,
+              };
+              const activate = confirmThreadVmFinalSaveActivation(input).pipe(
+                Effect.provideService(RelayEnvironmentPrincipal, principal),
+                Effect.provideService(ThreadArtifactObjectStorage, f.objects),
+              );
+              const result = yield* Effect.result(activate);
+              expect(result._tag).toBe(problem === "none" ? "Success" : "Failure");
+              if (problem === "none") {
+                expect(result).toMatchObject({
+                  success: { phase: "aborted", sourceActivationPending: false },
+                });
+                expect(yield* activate).toEqual(result._tag === "Success" ? result.success : null);
+              } else
+                expect((yield* f.store.get(f.input.operationId))?.sourceActivationPending).toBe(
+                  true,
+                );
+            }),
+          ),
+        );
+      }
       for (const certified of [false, true]) {
         it.effect(
           `source cancellation is limited to the pre-capture phase (certified=${certified})`,
@@ -135,6 +196,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   ...owner,
                   operationId: f.input.operationId,
                   nativeCheckpointOperationId: f.native.header.operationId,
+                  bootId: NodeCrypto.randomUUID(),
+                  sealEpoch: 1,
                 }).pipe(provide, objects),
               );
               expect(older._tag).toBe("Failure");
@@ -144,6 +207,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 ...owner,
                 operationId: f.input.operationId,
                 nativeCheckpointOperationId: operation.nativeCheckpointOperationId!,
+                bootId: operation.sourceReceipt!.bootId,
+                sealEpoch: operation.sourceReceipt!.sealEpoch,
               };
               const receipt = yield* freezeThreadVmFinalSave(input).pipe(provide, objects);
               expect(receipt.phase).toBe("frozen");

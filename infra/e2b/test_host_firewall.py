@@ -3,6 +3,9 @@ import os
 import subprocess
 import tempfile
 import importlib.util
+import socket
+import sys
+import uuid
 from pathlib import Path
 import unittest
 
@@ -18,7 +21,7 @@ class FirewallFingerprintTest(unittest.TestCase):
             {'table': {'name': 'launchpad_thread_vm', 'family': 'inet', 'handle': 1}},
             {'chain': {'name': 'input', 'type': 'filter', 'hook': 'input', 'prio': -190, 'policy': 'accept'}},
             {'rule': {'chain': 'input', 'handle': 2, 'expr': [
-                {'match': {'left': {'meta': {'key': 'iifname'}}, 'op': '==', 'right': 'veth-*'}},
+                {'match': {'left': {'meta': {'key': 'iifname'}}, 'op': '==', 'right': 'e2b-*'}},
                 {'counter': {'packets': 0, 'bytes': 0}}, {'drop': None}]}},
             {'rule': {'chain': 'input', 'expr': [{'accept': None}]}}
         ]}
@@ -53,6 +56,45 @@ class FirewallFingerprintTest(unittest.TestCase):
 
 
 class FirewallKernelTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('LAUNCHPAD_FIREWALL_NAMESPACE_TEST') == '1',
+                         'requires sudo unshare --net on the dedicated Linux host')
+    def test_stock_guest_interface_is_blocked_without_filtering_docker_interfaces(self):
+        self.assertNotEqual(os.readlink('/proc/self/ns/net'), os.readlink('/proc/1/ns/net'),
+                            'refusing to change the host network namespace')
+        # The receipt test may have loaded this table in our isolated namespace.
+        subprocess.run(['nft', 'delete', 'table', 'inet', 'launchpad_thread_vm'],
+                       check=False, capture_output=True)
+        namespace = 'lp-proof-' + uuid.uuid4().hex[:12]
+        host_interface, peer_interface = 'e2b-32766', 'lp-proof-peer'
+        subprocess.run(['ip', 'netns', 'add', namespace], check=True)
+        try:
+            subprocess.run(['ip', 'link', 'add', host_interface, 'type', 'veth',
+                            'peer', 'name', peer_interface], check=True)
+            subprocess.run(['ip', 'link', 'set', peer_interface, 'netns', namespace], check=True)
+            subprocess.run(['ip', 'addr', 'add', '192.0.2.1/24', 'dev', host_interface], check=True)
+            subprocess.run(['ip', 'link', 'set', host_interface, 'up'], check=True)
+            subprocess.run(['ip', 'netns', 'exec', namespace, 'ip', 'addr', 'add',
+                            '192.0.2.2/24', 'dev', peer_interface], check=True)
+            subprocess.run(['ip', 'netns', 'exec', namespace, 'ip', 'link', 'set', peer_interface, 'up'], check=True)
+            with socket.socket() as listener:
+                listener.bind(('192.0.2.1', 18371))
+                listener.listen(8)
+                probe = ['ip', 'netns', 'exec', namespace, sys.executable, '-I', '-c',
+                         "import socket; socket.create_connection(('192.0.2.1', 18371), .5).close()"]
+                subprocess.run(probe, check=True, capture_output=True, timeout=3)
+                subprocess.run(['nft', '--file', str(Path(__file__).with_name('host-firewall.nft'))], check=True)
+                denied = subprocess.run(probe, capture_output=True, timeout=3)
+                self.assertNotEqual(denied.returncode, 0, 'Stock E2B guest reached a private host service')
+                subprocess.run(['ip', 'link', 'set', host_interface, 'down'], check=True)
+                subprocess.run(['ip', 'link', 'set', host_interface, 'name', 'vethproof1234'], check=True)
+                host_interface = 'vethproof1234'
+                subprocess.run(['ip', 'link', 'set', host_interface, 'up'], check=True)
+                subprocess.run(probe, check=True, capture_output=True, timeout=3)
+        finally:
+            subprocess.run(['ip', 'netns', 'del', namespace], check=True)
+            subprocess.run(['nft', 'delete', 'table', 'inet', 'launchpad_thread_vm'],
+                           check=False, capture_output=True)
+
     @unittest.skipUnless(os.environ.get('LAUNCHPAD_FIREWALL_NAMESPACE_TEST') == '1',
                          'requires sudo unshare --net on the dedicated Linux host')
     def test_real_rules_and_receipt(self):

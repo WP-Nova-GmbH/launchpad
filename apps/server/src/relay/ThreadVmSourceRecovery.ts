@@ -144,7 +144,20 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
       frozen.nativeCheckpointTurnId,
       point,
     );
-    return { sourceSequence: frozen.sourceSequence, nativeCheckpointOperationId };
+    if (!tracked) return yield* fail(threadId, "Native VM snapshots require tracked workloads.");
+    const inventory = yield* inspectVmWorkloads({ type: "inspect" });
+    if (!inventory.stopped) return yield* fail(threadId, "VM workloads did not remain stopped.");
+    const seal = yield* inspectVmWorkloads({
+      type: "seal",
+      bootId: inventory.bootId,
+      operationId: input.operationId,
+    });
+    return {
+      sourceSequence: frozen.sourceSequence,
+      nativeCheckpointOperationId,
+      bootId: seal.bootId,
+      sealEpoch: seal.epoch,
+    };
   });
   return { capture };
 });

@@ -101,7 +101,12 @@ const created = Effect.fnUntraced(function* (f: Effect.Success<ReturnType<typeof
     templateId: f.input.templateId,
   });
   const computeRef = "reset-" + f.input.allocationId;
-  yield* provisions.recordCreated({ allocationId: f.input.allocationId, claimId, computeRef });
+  yield* provisions.recordCreated({
+    allocationId: f.input.allocationId,
+    claimId,
+    computeRef,
+    sealedTrafficAccessToken: "sealed-reset-fixture",
+  });
   return { computeRef, provisions };
 });
 const enrolled = Effect.fnUntraced(function* (f: Effect.Success<ReturnType<typeof fixture>>) {
@@ -218,111 +223,99 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
         "changed-placement",
         "changed-provision",
       ] as const) {
-        it.effect(
-          `cancelled Reset VM cleanup reconciles unavailable pause status: ${problem}`,
-          () =>
-            Effect.scoped(
-              Effect.gen(function* () {
-                const f = yield* fixture(),
-                  e = yield* enrolled(f);
-                yield* f.resets.requestCancellation(f.input.operationId);
-                let stops = 0;
-                const worker = makeThreadVmResetCancellationWorker(
-                  f.sql,
-                  f.objects,
-                  {
-                    inspect: () =>
-                      Effect.fail(
-                        new ThreadVmComputeError({
-                          operation: "inspect",
-                          message: "Paused disk readiness is unavailable (409)",
-                        }),
-                      ),
-                    inspectCreation: (operationId) =>
-                      Effect.gen(function* () {
-                        if (problem === "unavailable")
-                          return yield* new ThreadVmComputeError({
-                            operation: "inspect creation",
-                            message: "Control plane unavailable",
-                          });
-                        if (problem === "changed-claim")
-                          yield* f.sql`UPDATE relay_thread_vm_resets SET claim_id=${NodeCrypto.randomUUID()} WHERE operation_id=${f.input.operationId}`.pipe(
-                            Effect.orDie,
-                          );
-                        if (problem === "changed-placement")
-                          yield* f.sql`UPDATE relay_thread_placements SET generation=2 WHERE thread_id=${f.threadId}`.pipe(
-                            Effect.orDie,
-                          );
-                        if (problem === "changed-provision")
-                          yield* f.sql`UPDATE relay_thread_vm_allocations SET compute_ref='changed-guest' WHERE allocation_id=${f.input.allocationId}`.pipe(
-                            Effect.orDie,
-                          );
-                        return problem === "missing"
-                          ? null
-                          : {
-                              operationId:
+        it.effect(`cancelled Reset VM cleanup reconciles native identity: ${problem}`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture(),
+                e = yield* enrolled(f);
+              yield* f.resets.requestCancellation(f.input.operationId);
+              let stops = 0;
+              const worker = makeThreadVmResetCancellationWorker(
+                f.sql,
+                f.objects,
+                {
+                  inspect: () =>
+                    Effect.gen(function* () {
+                      if (problem === "unavailable")
+                        return yield* new ThreadVmComputeError({
+                          operation: "inspect creation",
+                          message: "Control plane unavailable",
+                        });
+                      if (problem === "changed-claim")
+                        yield* f.sql`UPDATE relay_thread_vm_resets SET claim_id=${NodeCrypto.randomUUID()} WHERE operation_id=${f.input.operationId}`.pipe(
+                          Effect.orDie,
+                        );
+                      if (problem === "changed-placement")
+                        yield* f.sql`UPDATE relay_thread_placements SET generation=2 WHERE thread_id=${f.threadId}`.pipe(
+                          Effect.orDie,
+                        );
+                      if (problem === "changed-provision")
+                        yield* f.sql`UPDATE relay_thread_vm_allocations SET compute_ref='changed-guest' WHERE allocation_id=${f.input.allocationId}`.pipe(
+                          Effect.orDie,
+                        );
+                      return problem === "missing"
+                        ? null
+                        : {
+                            ...f.info,
+                            sandboxId:
+                              problem === "foreign-compute" ? "foreign-guest" : e.computeRef,
+                            metadata: {
+                              "launchpad.managed": "thread-vm-v1",
+                              "launchpad.allocation_id": f.input.allocationId,
+                              "launchpad.operation_id":
                                 problem === "foreign-operation"
                                   ? NodeCrypto.randomUUID()
-                                  : operationId,
-                              computeRef:
-                                problem === "foreign-compute" ? "foreign-guest" : e.computeRef,
-                              metadata: {
-                                "launchpad.managed": "thread-vm-v1",
-                                "launchpad.allocation_id": f.input.allocationId,
-                                "launchpad.operation_id": f.input.operationId,
-                                "launchpad.thread_id":
-                                  problem === "foreign-thread"
-                                    ? NodeCrypto.randomUUID()
-                                    : f.threadId,
-                                "launchpad.generation":
-                                  problem === "foreign-generation" ? "1" : "2",
-                              },
-                            };
-                      }),
-                    destroy: (id) =>
-                      Effect.gen(function* () {
-                        expect(id).toBe(e.computeRef);
-                        expect(id).not.toBe(f.computeRef);
-                        stops++;
-                        if (problem === "lost-stop" && stops === 1)
-                          return yield* new ThreadVmComputeError({
-                            operation: "destroy",
-                            message: "Lost certified physical-stop reply",
-                          });
-                      }),
-                  },
-                  f.hostId,
-                );
+                                  : f.input.operationId,
+                              "launchpad.thread_id":
+                                problem === "foreign-thread" ? NodeCrypto.randomUUID() : f.threadId,
+                              "launchpad.generation": problem === "foreign-generation" ? "1" : "2",
+                            },
+                          };
+                    }),
+                  destroy: (id) =>
+                    Effect.gen(function* () {
+                      expect(id).toBe(e.computeRef);
+                      expect(id).not.toBe(f.computeRef);
+                      stops++;
+                      if (problem === "lost-stop" && stops === 1)
+                        return yield* new ThreadVmComputeError({
+                          operation: "destroy",
+                          message: "Lost certified physical-stop reply",
+                        });
+                    }),
+                },
+                f.hostId,
+              );
+              yield* worker.runOne();
+              expect(stops).toBe(
+                problem === "none" || problem === "missing" || problem === "lost-stop" ? 1 : 0,
+              );
+              expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe(
+                problem === "none" || problem === "missing" ? "deleted" : "deleting",
+              );
+              expect((yield* f.resets.get(f.input.operationId))?.phase).toBe(
+                problem === "none" || problem === "missing" ? "cancelled" : "cancelling",
+              );
+              if (problem === "lost-stop") {
+                yield* f.sql`UPDATE relay_thread_vm_resets SET retry_at=clock_timestamp() WHERE operation_id=${f.input.operationId}`;
                 yield* worker.runOne();
-                expect(stops).toBe(problem === "none" || problem === "lost-stop" ? 1 : 0);
-                expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe(
-                  problem === "none" ? "deleted" : "deleting",
-                );
-                expect((yield* f.resets.get(f.input.operationId))?.phase).toBe(
-                  problem === "none" ? "cancelled" : "cancelling",
-                );
-                if (problem === "lost-stop") {
-                  yield* f.sql`UPDATE relay_thread_vm_resets SET retry_at=clock_timestamp() WHERE operation_id=${f.input.operationId}`;
-                  yield* worker.runOne();
-                  expect(stops).toBe(2);
-                  expect((yield* f.resets.get(f.input.operationId))?.phase).toBe("cancelled");
-                }
-                const retained = yield* f.natives.latestComplete(f.threadId);
-                expect(retained).not.toBeNull();
-                expect(yield* f.attachmentStore.get(retained!.operationId)).not.toBeNull();
-                expect(
-                  yield* makeThreadMoveCheckpointStore(f.sql, f.objects).repositoryUpload(
-                    f.threadId,
-                  ),
-                ).toEqual(f.repositoryUpload);
-                expect((yield* f.allocations.get(f.sourceAllocationId))?.state).toBe("deleted");
-                expect(
-                  (yield* f.saved.get(
-                    (yield* f.resets.get(f.input.operationId))!.savedDiskOperationId,
-                  ))?.phase,
-                ).toBe("expired");
-              }),
-            ),
+                expect(stops).toBe(2);
+                expect((yield* f.resets.get(f.input.operationId))?.phase).toBe("cancelled");
+              }
+              const retained = yield* f.natives.latestComplete(f.threadId);
+              expect(retained).not.toBeNull();
+              expect(yield* f.attachmentStore.get(retained!.operationId)).not.toBeNull();
+              expect(
+                yield* makeThreadMoveCheckpointStore(f.sql, f.objects).repositoryUpload(f.threadId),
+              ).toEqual(f.repositoryUpload);
+              expect((yield* f.allocations.get(f.sourceAllocationId))?.state).toBe("deleted");
+              expect(
+                (yield* f.saved.get(
+                  (yield* f.resets.get(f.input.operationId))!.savedDiskOperationId,
+                ))?.phase,
+              ).toBe("expired");
+            }),
+          ),
         );
       }
       it.effect(
@@ -339,8 +332,6 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 f.objects,
                 {
                   inspect: () => Effect.die("Committed reset cannot enter cancellation cleanup"),
-                  inspectCreation: () =>
-                    Effect.die("Committed reset cannot inspect cleanup identity"),
                   destroy: () => Effect.die("Committed reset cannot destroy current compute"),
                 },
                 f.hostId,

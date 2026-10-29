@@ -7,10 +7,25 @@ import { inspectE2BThreadVmConnection } from "./E2BThreadVmConnection.ts";
 type GuestStart = (
   connection: ConstructorParameters<typeof Sandbox>[0],
   command: string,
+  identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId">,
 ) => Promise<void>;
-const startGuest: GuestStart = async (connection, command) => {
+const startGuest: GuestStart = async (connection, command, identity) => {
   const vm = new Sandbox(connection);
-  await vm.commands.run(command, { user: "user", background: true, timeoutMs: 0 });
+  await vm.commands.run(command, {
+    user: "root",
+    background: true,
+    timeoutMs: 0,
+    // Public identity only. The root launcher moves itself into an owned sibling
+    // cgroup, records its PID/startticks, drops privilege and execs the fixed server.
+    envs: {
+      LAUNCHPAD_COORDINATOR_SCOPE: JSON.stringify({
+        allocationId: identity.scope.allocationId,
+        operationId: identity.operationId,
+        threadId: identity.scope.threadId,
+        generation: identity.scope.generation,
+      }),
+    },
+  });
 };
 
 /** Reconciliation never wakes a paused VM. flock owns the singleton across transport retries. */
@@ -38,9 +53,8 @@ export function makeE2BThreadVmServer(
         );
         await start(
           connection,
-          "flock --nonblock --conflict-exit-code 75 --no-fork /home/user/.launchpad/thread-server.lock launchpad-server __thread-vm-serve --receipt-sha256 " +
-            receiptSha256 +
-            (mode === "move" ? " --move" : mode === "restore" ? " --restore" : ""),
+          "/opt/launchpad/bin/launchpad-workload coordinator-run " + receiptSha256 + " " + mode,
+          identity,
         );
         // This acknowledges a launch request only. Execution readiness comes from the guest's relay handshake.
       },

@@ -37,8 +37,9 @@ export function makeThreadVmRestoreImportStore(
           operationId: string;
         }>`SELECT r.operation_id AS "operationId" FROM relay_thread_vm_restores r
         JOIN relay_thread_placements t USING(thread_id) JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
-        WHERE r.host_id=${hostId} AND r.serving_requested AND r.phase IN ('importing','completed') AND a.state='running' AND a.deleted_at IS NULL
-          AND t.generation=r.generation+1 AND (t.operation_id=r.operation_id OR (r.phase='completed' AND t.operation_id IS NULL))
+        WHERE r.host_id=${hostId} AND r.serving_requested AND r.phase IN ('importing','completed') AND a.state='running' AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1'
+          AND r.boot_ingress_recovery_claim_id IS NULL AND r.boot_recovery_started_at IS NULL
+          AND t.generation=r.target_generation AND (t.operation_id=r.operation_id OR (r.phase='completed' AND t.operation_id IS NULL))
           AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp())
         ORDER BY r.retry_at,r.created_at,r.operation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
         if (!candidate) return null;
@@ -51,7 +52,12 @@ export function makeThreadVmRestoreImportStore(
   });
   const current = Effect.fnUntraced(function* (operationId: string) {
     const row = yield* restores.lock(operationId);
-    if (!row.servingRequested || !["importing", "completed"].includes(row.phase))
+    if (
+      !row.servingRequested ||
+      row.bootIngressRecoveryClaimId ||
+      row.bootRecoveryStarted ||
+      !["importing", "completed"].includes(row.phase)
+    )
       return yield* fail();
     return yield* withPrivateThreadOwnerAccess(
       ThreadId.make(row.threadId),
@@ -70,12 +76,12 @@ export function makeThreadVmRestoreImportStore(
         JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id JOIN relay_environment_credentials k ON k.credential_id=b.credential_id
         JOIN relay_thread_vm_capacity c ON c.operation_id=p.operation_id
         JOIN LATERAL (SELECT canonical_key FROM relay_repository_aliases WHERE repository_id=t.repository_id AND organization_id=t.organization_id AND canonical_key LIKE 'github.com/%' ORDER BY canonical_key LIMIT 1) alias ON true
-        WHERE t.thread_id=${row.threadId} AND t.generation=${row.generation + 1} AND t.owner_user_id=${row.actorUserId}
+        WHERE t.thread_id=${row.threadId} AND t.generation=${row.targetGeneration!} AND t.owner_user_id=${row.actorUserId}
           AND (t.operation_id=${row.operationId} OR (${row.phase === "completed"} AND t.operation_id IS NULL))
           AND b.allocation_id=${row.allocationId} AND b.environment_id=t.environment_id AND b.generation=t.generation AND b.repository_id=t.repository_id
           AND b.revoked_at IS NULL AND e.operation_id=${row.operationId} AND e.installed_at IS NOT NULL AND e.environment_id=b.environment_id
           AND e.credential_id=b.credential_id AND e.environment_public_key=b.environment_public_key AND k.revoked_at IS NULL
-          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${row.bootReceipt?.sandboxID ?? ""}
+          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${row.bootReceipt?.sandboxId ?? ""} AND a.runtime_protocol='native-v1'
           AND p.operation_id=${row.operationId} AND p.phase='created' AND p.generation=t.generation
           AND c.state='started' AND c.compute_ref=a.compute_ref FOR SHARE OF b,e,a,p,k,c`;
           if (!binding) return yield* fail();
@@ -93,7 +99,7 @@ export function makeThreadVmRestoreImportStore(
               allocationId: row.allocationId,
               threadId: ThreadId.make(row.threadId),
               repositoryId: binding.repositoryId,
-              generation: row.generation + 1,
+              generation: row.targetGeneration!,
             },
           };
         }),
@@ -128,7 +134,7 @@ export function makeThreadVmRestoreImportStore(
           decoded.scope.allocationId !== row.allocationId ||
           decoded.scope.threadId !== row.threadId ||
           decoded.scope.repositoryId !== row.repositoryId ||
-          decoded.scope.generation !== row.generation + 1 ||
+          decoded.scope.generation !== row.targetGeneration! ||
           decoded.projectId !== `vm:${row.threadId}` ||
           decoded.workspaceRoot !== "/workspace/project" ||
           (decoded.checkoutPath !== decoded.workspaceRoot &&
@@ -167,7 +173,7 @@ export function makeThreadVmRestoreImportStore(
         VALUES(${row.allocationId},${row.canonicalKey},${decoded.branch ?? "detached"},${decoded.revision},'ready',${row.environmentId},${sha256})`;
         const changed =
           yield* sql`UPDATE relay_thread_placements SET operation_id=NULL,project_id=${decoded.projectId}
-        WHERE thread_id=${row.threadId} AND generation=${row.generation + 1} AND environment_id=${row.environmentId} AND operation_id=${row.operationId} RETURNING thread_id`;
+        WHERE thread_id=${row.threadId} AND generation=${row.targetGeneration!} AND environment_id=${row.environmentId} AND operation_id=${row.operationId} RETURNING thread_id`;
         if (!changed.length) return yield* fail();
         if (row.savedDiskOperationId)
           yield* makeThreadVmSavedDiskStore(sql).completeRestore({

@@ -6,11 +6,9 @@ import { Sandbox, SandboxNotFoundError, type SandboxInfo } from "e2b";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import * as Schema from "effect/Schema";
 
 import { makeE2BThreadVmCompute, type E2BThreadVmSettings } from "./E2BThreadVmCompute.ts";
 
-const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 const settings: E2BThreadVmSettings = {
   apiUrl: "http://127.0.0.1:3000",
   sandboxUrl: "http://127.0.0.1:3002",
@@ -40,11 +38,15 @@ const info: SandboxInfo = {
 
 function fixture(overrides: Partial<E2BThreadVmSettings> = {}) {
   const client = {
-    create: vi.fn(async () => ({ sandboxId: "sandbox-1" })),
+    create: vi.fn(async (): Promise<{ sandboxId: string; trafficAccessToken?: string }> => ({
+      sandboxId: "sandbox-1",
+    })),
     getInfo: vi.fn(async (): Promise<SandboxInfo> => info),
     kill: vi.fn(async () => true),
     pause: vi.fn(async () => true),
-    connect: vi.fn(async () => ({ sandboxId: "sandbox-1" })),
+    connect: vi.fn(async (): Promise<{ sandboxId: string; trafficAccessToken?: string }> => ({
+      sandboxId: "sandbox-1",
+    })),
     createSnapshot: vi.fn(async () => ({ snapshotId: "snapshot-1", names: [] })),
     listSnapshots: vi.fn(() => {
       let page = 0;
@@ -61,19 +63,7 @@ function fixture(overrides: Partial<E2BThreadVmSettings> = {}) {
     deleteSnapshot: vi.fn(async () => true),
     list: vi.fn(() => ({ hasNext: false, nextItems: async (): Promise<SandboxInfo[]> => [] })),
   };
-  const transport = vi.fn<typeof fetch>(async (url) =>
-    Response.json(
-      String(url).endsWith("/capabilities")
-        ? {
-            version: 1,
-            diskRestore: true,
-            quiescedSnapshots: true,
-            renewableLifetime: true,
-            durableCreationIdentity: true,
-          }
-        : { sandboxID: "sandbox-1", physicallyStopped: true },
-    ),
-  );
+  const transport = vi.fn<typeof fetch>(async () => Response.json({}, { status: 404 }));
   return {
     client,
     transport,
@@ -82,200 +72,243 @@ function fixture(overrides: Partial<E2BThreadVmSettings> = {}) {
 }
 
 describe("E2B thread VM compute", () => {
-  it.effect("sends a filesystem-only timeout pause through the real SDK", () =>
-    Effect.gen(function* () {
-      const created: unknown[] = [];
-      const server = NodeHttp.createServer((request, response) => {
-        let body = "";
-        request.setEncoding("utf8");
-        request.on("data", (chunk: string) => {
-          body += chunk;
-        });
-        request.on("end", () => {
-          if (request.url !== "/sandboxes" || request.method !== "POST") {
-            response.writeHead(404).end();
-            return;
-          }
-          created.push(JSON.parse(body));
-          response.writeHead(200, { "content-type": "application/json" }).end(
-            JSON.stringify({
-              sandboxID: "sandbox-1",
-              templateID: settings.templateId,
-              clientID: "test-client",
-              envdVersion: "0.5.0",
-            }),
-          );
-        });
-      });
-      yield* Effect.promise(
-        () =>
-          new Promise<void>((resolve, reject) => {
-            server.once("error", reject);
-            server.listen(0, "127.0.0.1", resolve);
-          }),
-      );
-      try {
-        const address = server.address();
-        if (!address || typeof address === "string") throw new Error("No test listener");
-        const transport: typeof fetch = async () =>
-          Response.json({
-            version: 1,
-            diskRestore: true,
-            renewableLifetime: true,
-            quiescedSnapshots: true,
-            durableCreationIdentity: true,
+  it.effect(
+    "sends full-memory native lifecycle and never retries a 503 create or uses an idempotency key",
+    () =>
+      Effect.gen(function* () {
+        const created: unknown[] = [],
+          snapshots: unknown[] = [],
+          idempotencyKeys: unknown[] = [],
+          deleted: string[] = [],
+          connects: string[] = [];
+        let rejectCreate = false;
+        const server = NodeHttp.createServer((request, response) => {
+          let body = "";
+          request.setEncoding("utf8");
+          request.on("data", (chunk: string) => {
+            body += chunk;
           });
-        const compute = makeE2BThreadVmCompute(
-          {
-            ...settings,
-            apiUrl: `http://127.0.0.1:${address.port}`,
-          },
-          Sandbox,
-          transport,
-        );
-        expect(yield* compute.create(input)).toEqual({ sandboxId: "sandbox-1" });
-        expect(created).toHaveLength(1);
-        expect(created[0]).toMatchObject({
-          autoPause: true,
-          autoPauseMemory: false,
-          autoResume: { enabled: false },
-          timeout: settings.timeoutMs / 1000,
+          request.on("end", () => {
+            if (request.url === "/sandboxes/sandbox-1" && request.method === "GET") {
+              response.writeHead(200, { "content-type": "application/json" }).end(
+                JSON.stringify({
+                  sandboxID: "sandbox-1",
+                  templateID: settings.templateId,
+                  state: "paused",
+                  startedAt: "2026-10-28T00:00:00Z",
+                  endAt: "2026-10-28T01:00:00Z",
+                  cpuCount: 2,
+                  memoryMB: 4096,
+                  envdVersion: "0.5.0",
+                  metadata: {
+                    "launchpad.managed": "thread-vm-v1",
+                    "launchpad.allocation_id": input.allocationId,
+                    "launchpad.operation_id": input.operationId,
+                    "launchpad.thread_id": input.threadId,
+                    "launchpad.generation": String(input.generation),
+                  },
+                  network: { allowPublicTraffic: false },
+                  lifecycle: { onTimeout: "pause", autoResume: false },
+                }),
+              );
+              return;
+            }
+            if (request.url === "/v2/sandboxes/sandbox-1/connect" && request.method === "POST") {
+              connects.push(request.url);
+              response
+                .writeHead(503, { "content-type": "application/json" })
+                .end(JSON.stringify({ code: 503, message: "management-key lost connect reply" }));
+              return;
+            }
+            if (request.url === "/sandboxes/sandbox-1" && request.method === "DELETE") {
+              deleted.push(request.url);
+              response.writeHead(204).end();
+              return;
+            }
+            if (request.url === "/sandboxes/sandbox-1/snapshots" && request.method === "POST") {
+              snapshots.push(JSON.parse(body));
+              response
+                .writeHead(200, { "content-type": "application/json" })
+                .end(JSON.stringify({ snapshotID: "snapshot-1", names: [] }));
+              return;
+            }
+            if (request.url !== "/v2/sandboxes" || request.method !== "POST") {
+              response.writeHead(404).end();
+              return;
+            }
+            created.push(JSON.parse(body));
+            idempotencyKeys.push(request.headers["idempotency-key"]);
+            if (rejectCreate) {
+              response.writeHead(503, { "content-type": "application/json" }).end(
+                JSON.stringify({
+                  code: 503,
+                  message: "management-key native-traffic-secret ambiguous reply",
+                }),
+              );
+              return;
+            }
+            response.writeHead(200, { "content-type": "application/json" }).end(
+              JSON.stringify({
+                sandboxID: "sandbox-1",
+                templateID: settings.templateId,
+                clientID: "test-client",
+                envdVersion: "0.5.0",
+                trafficAccessToken: "native-traffic-secret",
+              }),
+            );
+          });
         });
-      } finally {
-        server.closeAllConnections();
         yield* Effect.promise(
           () =>
             new Promise<void>((resolve, reject) => {
-              server.close((error) => (error ? reject(error) : resolve()));
+              server.once("error", reject);
+              server.listen(0, "127.0.0.1", resolve);
             }),
         );
-      }
-    }),
+        try {
+          const address = server.address();
+          if (!address || typeof address === "string") throw new Error("No test listener");
+          const transport = vi.fn<typeof fetch>();
+          const api = { ...settings, apiUrl: `http://127.0.0.1:${address.port}` };
+          const compute = makeE2BThreadVmCompute(api, Sandbox, transport);
+          const result = yield* compute.create(input);
+          expect(result.sandboxId).toBe("sandbox-1");
+          expect(Redacted.value(result.trafficAccessToken!)).toBe("native-traffic-secret");
+          expect(String(result.trafficAccessToken)).not.toContain("native-traffic-secret");
+          expect(created).toHaveLength(1);
+          expect(created[0]).toMatchObject({
+            autoPause: true,
+            autoPauseMemory: true,
+            autoResume: { enabled: false },
+            timeout: settings.timeoutMs / 1000,
+            network: { allowPublicTraffic: false },
+          });
+          rejectCreate = true;
+          const error = yield* compute.create(input).pipe(Effect.flip);
+          expect(error.operation).toBe("create");
+          expect(error).not.toHaveProperty("cause");
+          expect(String(error)).not.toMatch(/management-key|native-traffic-secret/);
+          expect(created).toHaveLength(2);
+          expect(idempotencyKeys).toEqual([undefined, undefined]);
+          const recoveryError = yield* compute
+            .recoverIngress("sandbox-1", {
+              ...input,
+              templateId: settings.templateId,
+            })
+            .pipe(Effect.flip);
+          expect(recoveryError.connectUncertain).toBe(true);
+          expect(recoveryError).not.toHaveProperty("cause");
+          expect(String(recoveryError)).not.toContain("management-key");
+          expect(connects).toEqual(["/v2/sandboxes/sandbox-1/connect"]);
+          yield* Effect.promise(async () => {
+            const connection = { apiUrl: api.apiUrl, apiKey: "fixture-key", retries: 0 };
+            expect(
+              await Sandbox.createSnapshot("sandbox-1", {
+                ...connection,
+                mode: "full",
+              }),
+            ).toEqual({ snapshotId: "snapshot-1", names: [] });
+          });
+          expect(snapshots).toEqual([{ memory: true }]);
+          yield* compute.destroy("sandbox-1");
+          expect(deleted).toEqual(["/sandboxes/sandbox-1"]);
+          expect(transport).not.toHaveBeenCalled();
+        } finally {
+          server.closeAllConnections();
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve, reject) => {
+                server.close((error) => (error ? reject(error) : resolve()));
+              }),
+          );
+        }
+      }),
   );
-  it.effect("reads durable creation identity without waking an unreadable paused VM", () =>
-    Effect.gen(function* () {
-      const { compute, transport, client } = fixture();
-      const metadata = { "launchpad.thread_id": input.threadId };
-      transport.mockResolvedValueOnce(
-        Response.json({
-          operationID: input.operationId,
-          sandboxID: "sandbox-1",
-          metadata,
-          cancelled: false,
-        }),
-      );
-      expect(yield* compute.inspectCreation(input.operationId)).toEqual({
-        operationId: input.operationId,
-        computeRef: "sandbox-1",
-        metadata,
-      });
-      expect(transport).toHaveBeenCalledWith(
-        `${settings.apiUrl}/extensions/launchpad/v1/creations/${input.operationId}`,
-        expect.objectContaining({ method: "GET", redirect: "error" }),
-      );
-      expect(client.getInfo).not.toHaveBeenCalled();
-      expect(client.connect).not.toHaveBeenCalled();
-      expect(client.kill).not.toHaveBeenCalled();
-    }),
-  );
-  it.effect("missing, foreign and unavailable creation identities never certify a VM", () =>
-    Effect.gen(function* () {
-      const { compute, transport } = fixture();
-      transport.mockResolvedValueOnce(new Response(null, { status: 404 }));
-      expect(yield* compute.inspectCreation(input.operationId)).toBeNull();
-      for (const response of [
-        new Response(null, { status: 503 }),
-        Response.json({
-          operationID: "another-operation",
-          sandboxID: "sandbox-1",
-          metadata: {},
-          cancelled: false,
-        }),
-        Response.json({
-          operationID: input.operationId,
-          sandboxID: "",
-          metadata: {},
-          cancelled: false,
-        }),
-      ]) {
-        transport.mockResolvedValueOnce(response);
-        expect(yield* Effect.flip(compute.inspectCreation(input.operationId))).toMatchObject({
-          operation: "inspect creation",
-        });
-      }
-    }),
-  );
-  it.effect("refuses backups on runtimes that can lose the guest page cache", () =>
+  it.effect("takes a full native backup without querying extension capabilities", () =>
     Effect.gen(function* () {
       const { client, compute, transport } = fixture();
-      transport.mockResolvedValueOnce(
-        Response.json({ version: 1, diskRestore: true, renewableLifetime: false }),
-      );
-      expect(yield* Effect.flip(compute.snapshot("sandbox-1"))).toMatchObject({
-        reason: "unsupported",
+      transport.mockRejectedValue(new Error("No custom endpoint exists"));
+      expect(yield* compute.snapshot("sandbox-1", "capture-1")).toEqual({
+        snapshotId: "snapshot-1",
+        names: [],
       });
-      expect(client.createSnapshot).not.toHaveBeenCalled();
-      transport.mockResolvedValueOnce(
-        Response.json({
-          version: 1,
-          diskRestore: true,
-          renewableLifetime: false,
-          quiescedSnapshots: true,
+      expect(client.createSnapshot).toHaveBeenCalledWith(
+        "sandbox-1",
+        expect.objectContaining({
+          mode: "full",
+          name: "capture-1",
+          retries: 0,
         }),
       );
-      expect(yield* compute.snapshot("sandbox-1")).toEqual({ snapshotId: "snapshot-1", names: [] });
-      expect(client.createSnapshot).toHaveBeenCalledTimes(1);
+      expect(transport).not.toHaveBeenCalled();
+      expect(client.connect).not.toHaveBeenCalled();
     }),
   );
 
-  it.effect("pauses without memory and retains that disk without resuming it", () =>
+  it.effect("pauses with memory using only native E2B", () =>
     Effect.gen(function* () {
       const { client, compute, transport } = fixture();
-      const capabilities = {
-        version: 1,
-        diskRestore: true,
-        renewableLifetime: true,
-        quiescedSnapshots: true,
-        pausedSnapshots: true,
-        certifiedPauses: true,
-      };
-      transport.mockImplementation(async (url) =>
-        String(url).endsWith("/snapshots")
-          ? Response.json({
-              snapshotID: "saved:default",
-              names: ["team/launchpad-backup-test:default"],
-            })
-          : Response.json(capabilities),
-      );
+      transport.mockRejectedValue(new Error("No custom endpoint exists"));
       yield* compute.pause("sandbox-1");
       expect(client.pause).toHaveBeenCalledWith(
         "sandbox-1",
-        expect.objectContaining({ keepMemory: false }),
+        expect.objectContaining({
+          mode: "full",
+          retries: 0,
+        }),
       );
-      yield* compute.snapshotPaused("sandbox-1", "launchpad-backup-test");
-      expect(transport.mock.lastCall?.[0]).toBe(`${settings.apiUrl}/sandboxes/sandbox-1/snapshots`);
-      expect(yield* decodeJson(String(transport.mock.lastCall?.[1]?.body))).toEqual({
-        name: "launchpad-backup-test",
-      });
       expect(client.connect).not.toHaveBeenCalled();
-      expect(client.create).not.toHaveBeenCalled();
-      transport.mockImplementation(async () =>
-        Response.json({ ...capabilities, certifiedPauses: false }),
-      );
-      expect(yield* compute.pausedSnapshotsSupported).toBe(false);
-      expect(yield* Effect.flip(compute.pause("sandbox-1"))).toMatchObject({ operation: "pause" });
-      expect(yield* Effect.flip(compute.snapshotPaused("sandbox-1", "other"))).toMatchObject({
-        reason: "unsupported",
-      });
-      transport.mockImplementation(async () =>
-        Response.json({ ...capabilities, pausedSnapshots: false }),
-      );
-      expect(yield* Effect.flip(compute.pause("sandbox-1"))).toMatchObject({ operation: "pause" });
-      expect(yield* Effect.flip(compute.snapshotPaused("sandbox-1", "other"))).toMatchObject({
-        reason: "unsupported",
-      });
-      expect(client.pause).toHaveBeenCalledTimes(1);
       expect(client.createSnapshot).not.toHaveBeenCalled();
+      expect(transport).not.toHaveBeenCalled();
+    }),
+  );
+
+  it.effect("starts one private restore from the validated immutable native snapshot", () =>
+    Effect.gen(function* () {
+      const { client, compute, transport } = fixture();
+      const sourceBuildId = "d9dc0c90-8d53-447e-997f-40359797d086";
+      transport.mockImplementation(async () =>
+        Response.json({
+          templateID: "snapshot-template",
+          builds: [{ buildID: sourceBuildId, status: "ready" }],
+        }),
+      );
+      const restored = {
+        ...input,
+        sourceTemplateId: "snapshot-template",
+        sourceBuildId,
+        restoreOperationId: input.operationId,
+        bootAttempt: 0,
+      };
+      yield* compute.createFromSnapshot(restored);
+      expect(client.create).toHaveBeenCalledOnce();
+      expect(client.create).toHaveBeenCalledWith(
+        "snapshot-template",
+        expect.objectContaining({
+          retries: 0,
+          secure: true,
+          network: expect.objectContaining({ allowPublicTraffic: false }),
+          lifecycle: { onTimeout: { action: "pause", mode: "full" }, autoResume: false },
+          metadata: expect.objectContaining({
+            "launchpad.restore": "v1",
+            "launchpad.generation": "2",
+            "launchpad.restore_parent_operation_id": input.operationId,
+          }),
+        }),
+      );
+      const mismatch = yield* compute
+        .createFromSnapshot({ ...restored, sourceBuildId: "11111111-1111-4111-8111-111111111111" })
+        .pipe(Effect.flip);
+      expect(mismatch).toMatchObject({ reason: "identity" });
+      expect(client.create).toHaveBeenCalledOnce();
+      client.create.mockRejectedValue(new Error("management-key lost create reply"));
+      expect(yield* compute.createFromSnapshot(restored).pipe(Effect.flip)).toMatchObject({
+        operation: "create",
+      });
+      expect(client.create).toHaveBeenCalledTimes(2);
+      expect(
+        transport.mock.calls.every(([url]) => String(url).endsWith("/templates/snapshot-template")),
+      ).toBe(true);
     }),
   );
 
@@ -342,7 +375,8 @@ describe("E2B thread VM compute", () => {
               allowPublicTraffic: false,
               denyOut: expect.arrayContaining(["10.0.0.0/8", "fc00::/7", "203.0.113.4/32"]),
             }),
-            lifecycle: { onTimeout: { action: "pause", keepMemory: false }, autoResume: false },
+            lifecycle: { onTimeout: { action: "pause", mode: "full" }, autoResume: false },
+            retries: 0,
           }),
         ],
       ]);
@@ -366,6 +400,15 @@ describe("E2B thread VM compute", () => {
           operation: "configuration",
         });
         expect(client.create).not.toHaveBeenCalled();
+        const recoveryError = yield* compute
+          .recoverIngress("sandbox-1", {
+            ...input,
+            templateId: settings.templateId,
+          })
+          .pipe(Effect.flip);
+        expect(recoveryError.connectUncertain).toBe(false);
+        expect(client.getInfo).not.toHaveBeenCalled();
+        expect(client.connect).not.toHaveBeenCalled();
       }),
     );
   }
@@ -381,60 +424,173 @@ describe("E2B thread VM compute", () => {
     }),
   );
 
+  it.effect("creates without querying a patched capability or durable-create endpoint", () =>
+    Effect.gen(function* () {
+      const { compute, client, transport } = fixture();
+      transport.mockRejectedValue(new Error("No custom E2B endpoint exists"));
+      expect(yield* compute.create(input)).toEqual({ sandboxId: "sandbox-1" });
+      expect(client.create).toHaveBeenCalledTimes(1);
+      expect(transport).not.toHaveBeenCalled();
+    }),
+  );
+
+  it.effect("treats a whitespace create token as unavailable so provisioning can recover it", () =>
+    Effect.gen(function* () {
+      const { compute, client } = fixture();
+      client.create.mockResolvedValueOnce({ sandboxId: "sandbox-1", trafficAccessToken: "  " });
+      expect(yield* compute.create(input)).toEqual({ sandboxId: "sandbox-1" });
+    }),
+  );
+
   it.effect(
-    "refuses creation before sending it when durable pre-boot identity is unsupported",
+    "recovers ingress only by explicitly connecting the already admitted exact identity",
     () =>
       Effect.gen(function* () {
         const { compute, client, transport } = fixture();
-        transport.mockResolvedValue(
-          Response.json({
-            version: 1,
-            diskRestore: true,
-            quiescedSnapshots: true,
-            renewableLifetime: true,
+        const expected = { ...input, templateId: settings.templateId };
+        const known: SandboxInfo = {
+          ...info,
+          metadata: {
+            "launchpad.managed": "thread-vm-v1",
+            "launchpad.allocation_id": input.allocationId,
+            "launchpad.operation_id": input.operationId,
+            "launchpad.thread_id": input.threadId,
+            "launchpad.generation": String(input.generation),
+          },
+          network: { allowPublicTraffic: false },
+          lifecycle: { onTimeout: "pause", autoResume: false },
+        };
+        client.getInfo
+          .mockResolvedValueOnce(known)
+          .mockResolvedValueOnce({ ...known, state: "running" });
+        client.connect.mockResolvedValueOnce({
+          sandboxId: "sandbox-1",
+          trafficAccessToken: "recovered-secret",
+        });
+        const result = yield* compute.recoverIngress("sandbox-1", expected);
+        expect(result.sandboxId).toBe("sandbox-1");
+        expect(Redacted.value(result.trafficAccessToken!)).toBe("recovered-secret");
+        expect(String(result.trafficAccessToken)).not.toContain("recovered-secret");
+        expect(client.connect).toHaveBeenCalledWith(
+          "sandbox-1",
+          expect.objectContaining({
+            retries: 0,
+            timeoutMs: settings.timeoutMs,
+            requestTimeoutMs: 420_000,
           }),
         );
-        expect(yield* Effect.flip(compute.create(input))).toMatchObject({ operation: "create" });
+        expect(client.getInfo).toHaveBeenCalledTimes(2);
         expect(client.create).not.toHaveBeenCalled();
+        expect(transport).not.toHaveBeenCalled();
       }),
   );
 
-  it.effect("accepts only exact positive creation-stop receipts and never uses SDK absence", () =>
+  it.effect("refuses ingress recovery for any foreign, public, auto-resuming or changed VM", () =>
     Effect.gen(function* () {
-      const { compute, client, transport } = fixture();
-      const receipt = {
-        operationID: input.operationId,
-        sandboxID: "failed-before-routing",
-        metadata: { "launchpad.operation_id": input.operationId },
-        cancelled: true,
-        physicallyStopped: true,
+      const expected = { ...input, templateId: settings.templateId };
+      const known: SandboxInfo = {
+        ...info,
+        state: "running",
+        metadata: {
+          "launchpad.managed": "thread-vm-v1",
+          "launchpad.allocation_id": input.allocationId,
+          "launchpad.operation_id": input.operationId,
+          "launchpad.thread_id": input.threadId,
+          "launchpad.generation": String(input.generation),
+        },
+        network: { allowPublicTraffic: false },
+        lifecycle: { onTimeout: "pause", autoResume: false },
       };
-      for (const invalid of [
-        { ...receipt, operationID: "other-operation" },
-        { ...receipt, physicallyStopped: false },
-        { ...receipt, cancelled: false },
-        { operationID: input.operationId, sandboxID: null },
+      const { network: _network, ...withoutNetwork } = known;
+      const { lifecycle: _lifecycle, ...withoutLifecycle } = known;
+      for (const foreign of [
+        { ...known, sandboxId: "another-vm" },
+        { ...known, templateId: "another-template" },
+        { ...known, network: { allowPublicTraffic: true } },
+        withoutNetwork,
+        { ...known, lifecycle: { onTimeout: "pause" as const, autoResume: true } },
+        withoutLifecycle,
+        ...Object.keys(known.metadata).map((key) => ({
+          ...known,
+          metadata: { ...known.metadata, [key]: "other" },
+        })),
       ]) {
-        transport.mockResolvedValueOnce(Response.json(invalid));
-        expect(yield* Effect.flip(compute.cancelCreate(input.operationId))).toMatchObject({
-          operation: "cancel create",
-        });
+        const { compute, client } = fixture();
+        client.getInfo.mockResolvedValueOnce(foreign);
+        const error = yield* compute.recoverIngress("sandbox-1", expected).pipe(Effect.flip);
+        expect(error.operation).toBe("recover ingress");
+        expect(error.connectUncertain).toBe(false);
+        expect(error).not.toHaveProperty("cause");
+        expect(client.connect).not.toHaveBeenCalled();
+        expect(client.create).not.toHaveBeenCalled();
       }
-      transport.mockResolvedValueOnce(Response.json(receipt));
-      expect(yield* compute.cancelCreate(input.operationId)).toEqual({
-        operationId: input.operationId,
-        computeRef: "failed-before-routing",
-        metadata: receipt.metadata,
-      });
-      transport.mockResolvedValueOnce(Response.json({ ...receipt, sandboxID: null, metadata: {} }));
-      expect(yield* compute.cancelCreate(input.operationId)).toEqual({
-        operationId: input.operationId,
-        computeRef: null,
-        metadata: {},
-      });
-      expect(client.list).not.toHaveBeenCalled();
-      expect(client.create).not.toHaveBeenCalled();
+      for (const stage of [
+        "reply",
+        "missing-token",
+        "blank-token",
+        "post-inspect",
+        "post-paused",
+      ] as const) {
+        const { compute, client } = fixture();
+        client.getInfo.mockResolvedValueOnce(known).mockResolvedValueOnce(
+          stage === "post-paused"
+            ? { ...known, state: "paused" }
+            : {
+                ...known,
+                metadata: { ...known.metadata, "launchpad.generation": "3" },
+              },
+        );
+        client.connect.mockResolvedValueOnce(
+          stage === "reply"
+            ? { sandboxId: "another-vm", trafficAccessToken: "secret" }
+            : stage === "missing-token"
+              ? { sandboxId: "sandbox-1" }
+              : stage === "blank-token"
+                ? { sandboxId: "sandbox-1", trafficAccessToken: "  " }
+                : { sandboxId: "sandbox-1", trafficAccessToken: "secret" },
+        );
+        const error = yield* compute.recoverIngress("sandbox-1", expected).pipe(Effect.flip);
+        expect(error.operation).toBe("recover ingress");
+        expect(error.connectUncertain).toBe(stage === "reply");
+        expect(client.connect).toHaveBeenCalledTimes(1);
+        expect(client.create).not.toHaveBeenCalled();
+      }
     }),
+  );
+
+  it.effect(
+    "classifies uncertain connect replies per execution and never shares state across retries",
+    () =>
+      Effect.gen(function* () {
+        const { compute, client } = fixture();
+        const known: SandboxInfo = {
+          ...info,
+          metadata: {
+            "launchpad.managed": "thread-vm-v1",
+            "launchpad.allocation_id": input.allocationId,
+            "launchpad.operation_id": input.operationId,
+            "launchpad.thread_id": input.threadId,
+            "launchpad.generation": String(input.generation),
+          },
+          network: { allowPublicTraffic: false },
+          lifecycle: { onTimeout: "pause", autoResume: false },
+        };
+        const attempt = compute.recoverIngress("sandbox-1", {
+          ...input,
+          templateId: settings.templateId,
+        });
+        client.getInfo.mockResolvedValueOnce(known);
+        client.connect.mockRejectedValueOnce(new Error("management-key lost connect reply"));
+        const uncertain = yield* attempt.pipe(Effect.flip);
+        expect(uncertain.connectUncertain).toBe(true);
+        expect(uncertain).not.toHaveProperty("cause");
+        expect(String(uncertain)).not.toContain("management-key");
+        client.getInfo.mockRejectedValueOnce(new Error("preflight unavailable"));
+        const preflight = yield* attempt.pipe(Effect.flip);
+        expect(preflight.connectUncertain).toBe(false);
+        expect(client.connect).toHaveBeenCalledTimes(1);
+        expect(client.create).not.toHaveBeenCalled();
+      }),
   );
 
   it.effect("does not mistake an unavailable control plane for an absent VM", () =>
@@ -450,34 +606,30 @@ describe("E2B thread VM compute", () => {
   );
 
   it.effect(
-    "requires a matching physical stop receipt, even when the routing entry is absent",
+    "acknowledges only native DELETE or native absence without claiming a physical stop",
     () =>
       Effect.gen(function* () {
-        const { client, transport, compute } = fixture();
-        client.getInfo.mockRejectedValue(new SandboxNotFoundError("not found"));
-        for (const response of [
-          new Response(null, { status: 404 }),
-          new Response(null, { status: 503 }),
-          Response.json({ sandboxID: "sandbox-1", physicallyStopped: false }),
-          Response.json({ sandboxID: "other-vm", physicallyStopped: true }),
-          new Response("invalid JSON"),
-        ]) {
-          transport.mockResolvedValueOnce(response);
-          expect(yield* Effect.flip(compute.destroy("sandbox-1"))).toMatchObject({
-            operation: "destroy",
-          });
-        }
-        transport.mockRejectedValueOnce(new Error("reply lost after stop"));
-        expect(yield* Effect.flip(compute.destroy("sandbox-1"))).toMatchObject({
-          operation: "destroy",
-        });
+        const { compute, client, transport } = fixture();
         yield* compute.destroy("sandbox-1");
-        expect(client.kill).not.toHaveBeenCalled();
-        expect(client.getInfo).not.toHaveBeenCalled();
-        expect(transport).toHaveBeenLastCalledWith(
-          "http://127.0.0.1:3000/extensions/launchpad/v1/executions/sandbox-1",
-          expect.objectContaining({ method: "DELETE", redirect: "error" }),
+        client.kill.mockResolvedValueOnce(false);
+        yield* compute.destroy("sandbox-1");
+        client.kill.mockRejectedValueOnce(new SandboxNotFoundError("missing"));
+        yield* compute.destroy("sandbox-1");
+        client.kill.mockRejectedValueOnce(
+          new Error("management-key traffic-secret lost delete reply"),
         );
+        const error = yield* compute.destroy("sandbox-1").pipe(Effect.flip);
+        expect(error.operation).toBe("destroy");
+        expect(error).not.toHaveProperty("cause");
+        expect(String(error)).not.toMatch(/management-key|traffic-secret/);
+        expect(client.kill).toHaveBeenCalledTimes(4);
+        expect(client.kill).toHaveBeenLastCalledWith(
+          "sandbox-1",
+          expect.objectContaining({ retries: 0 }),
+        );
+        expect(client.getInfo).not.toHaveBeenCalled();
+        expect(client.connect).not.toHaveBeenCalled();
+        expect(transport).not.toHaveBeenCalled();
       }),
   );
 
@@ -495,6 +647,15 @@ describe("E2B thread VM compute", () => {
         "sandbox-1",
         "sandbox-2",
       ]);
+      expect(client.list).toHaveBeenCalledWith(
+        expect.objectContaining({
+          retries: 0,
+          query: {
+            state: ["running", "paused"],
+            metadata: { "launchpad.operation_id": "operation-1" },
+          },
+        }),
+      );
       expect(client.create).not.toHaveBeenCalled();
       expect(client.connect).not.toHaveBeenCalled();
     }),

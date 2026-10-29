@@ -107,9 +107,7 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
       vm.scope.generation !== recovery.scope.generation ||
       point.threadId !== vm.scope.threadId ||
       chat.threadId !== point.threadId ||
-      (independent
-        ? point.generation >= vm.scope.generation
-        : point.generation + 1 !== vm.scope.generation) ||
+      point.generation >= vm.scope.generation ||
       chat.generation !== point.generation ||
       chat.sourceEnvironmentId !== point.sourceEnvironmentId ||
       point.sourceEnvironmentId === environmentId ||

@@ -1,7 +1,10 @@
-import { describe, expect, it } from "@effect/vitest";
+import { describe, expect, it, layer } from "@effect/vitest";
 import { ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
+import * as Layer from "effect/Layer";
+import { RelayDb } from "../db.ts";
+import { RelaySecretBox } from "../auth/SecretBox.ts";
 import * as Schema from "effect/Schema";
 import { vi } from "vite-plus/test";
 import { inspectE2BThreadVmIngress } from "./E2BThreadVmConnection.ts";
@@ -34,7 +37,6 @@ const info = {
   state: "running",
   envdVersion: "0.9",
   envdAccessToken: "envd-secret",
-  trafficAccessToken: "traffic-secret",
   network: { allowPublicTraffic: false },
   lifecycle: { autoResume: false },
   metadata: {
@@ -51,7 +53,43 @@ const response = {
   expiresAt: "2099-01-01T00:00:00Z",
 };
 const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
-describe("private VM endpoint transport", () => {
+const ingressTestLayer = Layer.mergeAll(
+  Layer.succeed(RelayDb, {
+    $client: () =>
+      Effect.succeed([
+        {
+          sealed: JSON.stringify({
+            version: 1,
+            ...identity.scope,
+            operationId: identity.operationId,
+            computeRef: "sandbox",
+            token: "traffic-secret",
+          }),
+        },
+      ]),
+  } as unknown as RelayDb["Service"]),
+  Layer.succeed(RelaySecretBox, { seal: Effect.succeed, open: Effect.succeed }),
+);
+layer(ingressTestLayer)("private VM endpoint transport", (it) => {
+  it.effect(
+    "retains an unavailable stored token without attempting native connect or traffic",
+    () =>
+      Effect.gen(function* () {
+        const transport = vi.fn<typeof fetch>();
+        const error = yield* makeE2BThreadVmEndpoint(settings, transport)
+          .mintCredential("sandbox", identity, "proof")
+          .pipe(
+            Effect.provideService(RelayDb, {
+              $client: () => Effect.succeed([]),
+            } as unknown as RelayDb["Service"]),
+            Effect.flip,
+          );
+        expect(transport).not.toHaveBeenCalled();
+        expect(String(error)).toContain("private VM connection is unavailable");
+        expect(error).not.toHaveProperty("cause");
+      }),
+  );
+
   it.effect("cancels an oversized guest response before buffering more data", () =>
     Effect.gen(function* () {
       let cancelled = false;
@@ -68,7 +106,6 @@ describe("private VM endpoint transport", () => {
       const transport = vi
         .fn<typeof fetch>()
         .mockResolvedValueOnce(Response.json(info))
-        .mockResolvedValueOnce(Response.json({ version: 1, privatePreviewHeaderBoundary: true }))
         .mockResolvedValueOnce(new Response(body));
       yield* makeE2BThreadVmEndpoint(settings, transport)
         .mintCredential("sandbox", identity, "proof")
@@ -85,13 +122,12 @@ describe("private VM endpoint transport", () => {
         const transport = vi
           .fn<typeof fetch>()
           .mockResolvedValueOnce(Response.json(info))
-          .mockResolvedValueOnce(Response.json({ version: 1, privatePreviewHeaderBoundary: true }))
           .mockResolvedValueOnce(Response.json(response));
         const endpoint = makeE2BThreadVmEndpoint(settings, transport);
         expect(yield* endpoint.mintCredential("sandbox", identity, "signed-proof")).toEqual(
           response,
         );
-        const [inspect, capability, mint] = transport.mock.calls;
+        const [inspect, mint] = transport.mock.calls;
         expect(inspect?.[0]).toBe("http://127.0.0.1:3000/sandboxes/sandbox");
         expect(inspect?.[1]?.method).toBeUndefined();
         expect(String(mint?.[0])).toBe("http://127.0.0.1:3002/api/t3-connect/mint-credential");
@@ -105,10 +141,7 @@ describe("private VM endpoint transport", () => {
         expect(headers.get("authorization")).toBeNull();
         expect(headers.get("cookie")).toBeNull();
         expect(decodeJson(mint?.[1]?.body)).toEqual({ proof: "signed-proof" });
-        expect(transport).toHaveBeenCalledTimes(3);
-        expect(String(capability?.[0])).toBe(
-          "http://127.0.0.1:3000/extensions/launchpad/v1/capabilities",
-        );
+        expect(transport).toHaveBeenCalledTimes(2);
       }),
   );
 
@@ -132,17 +165,16 @@ describe("private VM endpoint transport", () => {
         const transport = vi
           .fn<typeof fetch>()
           .mockResolvedValueOnce(Response.json(info))
-          .mockResolvedValueOnce(Response.json({ version: 1, privatePreviewHeaderBoundary: true }))
           .mockResolvedValueOnce(Response.json(health));
         expect(
           yield* makeE2BThreadVmHealth(settings, transport)("sandbox", identity, "signed-proof"),
         ).toEqual(health);
-        const request = transport.mock.calls[2];
+        const request = transport.mock.calls[1];
         expect(String(request?.[0])).toBe("http://127.0.0.1:3002/api/t3-connect/health");
         expect(new Headers(request?.[1]?.headers).get("e2b-traffic-access-token")).toBe(
           "traffic-secret",
         );
-        expect(transport).toHaveBeenCalledTimes(3);
+        expect(transport).toHaveBeenCalledTimes(2);
       }),
   );
 
@@ -155,8 +187,6 @@ describe("private VM endpoint transport", () => {
         { lifecycle: { autoResume: true } },
         { network: { allowPublicTraffic: true } },
         { network: undefined },
-        { trafficAccessToken: undefined },
-        { trafficAccessToken: "" },
         { metadata: { ...info.metadata, "launchpad.generation": "2" } },
         { metadata: { ...info.metadata, "launchpad.allocation_id": "other" } },
         { metadata: { ...info.metadata, "launchpad.operation_id": "other" } },
@@ -184,7 +214,6 @@ describe("private VM endpoint transport", () => {
         const transport = vi
           .fn<typeof fetch>()
           .mockResolvedValueOnce(Response.json(info))
-          .mockResolvedValueOnce(Response.json({ version: 1, privatePreviewHeaderBoundary: true }))
           .mockImplementationOnce(reply);
         const error = yield* makeE2BThreadVmEndpoint(settings, transport)
           .mintCredential("sandbox", identity, "proof")
@@ -196,21 +225,14 @@ describe("private VM endpoint transport", () => {
   );
 
   it("retains the traffic token as redacted data and never returns the envd or API key", async () => {
-    const transport = vi
-      .fn<typeof fetch>()
-      .mockImplementation(async (url) =>
-        Response.json(
-          String(url).endsWith("/capabilities")
-            ? { version: 1, privatePreviewHeaderBoundary: true }
-            : info,
-        ),
-      );
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(Response.json(info));
     const ingress = await inspectE2BThreadVmIngress(
       settings,
       "sandbox",
       identity,
       transport,
       new AbortController().signal,
+      Redacted.make("traffic-secret"),
     );
     expect(String(ingress.trafficAccessToken)).not.toContain("traffic-secret");
     expect(ingress).not.toHaveProperty("apiKey");

@@ -15,7 +15,20 @@ export interface PauseClaim {
   readonly generation: number;
   readonly phase: "pending" | "sealed";
   readonly bootId: string;
+  readonly pauseDispatched: boolean;
 }
+
+/** Preserve the actual guest acknowledgement before the allocation's pause row is reused. */
+export const acknowledgeThreadVmPauseBackup = Effect.fnUntraced(function* (
+  sql: PgClient,
+  allocationId: string,
+) {
+  yield* sql`UPDATE relay_thread_vm_backups x SET source_reopened_at=COALESCE(x.source_reopened_at,p.source_reopened_at)
+    FROM relay_thread_vm_pauses p WHERE p.allocation_id=${allocationId}
+      AND p.phase IN ('cancelled','completed') AND p.source_reopened_at IS NOT NULL
+      AND x.operation_id=p.backup_operation_id AND x.allocation_id=p.allocation_id
+      AND x.generation=p.generation AND x.source_receipt=p.source_receipt`;
+});
 
 /** A placement lock is shared with command admission and moves. The claim survives worker loss. */
 export function makeThreadVmPauseStore(sql: PgClient) {
@@ -32,7 +45,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           JOIN relay_thread_vm_ready s ON s.allocation_id = a.allocation_id
           JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
           JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-          WHERE c.host_id = ${hostId} AND c.state = 'started'
+          WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'started'
             AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
             AND p.phase = 'created' AND s.phase = 'ready' AND b.revoked_at IS NULL
             AND b.generation = p.generation AND t.environment_id = b.environment_id
@@ -51,16 +64,19 @@ export function makeThreadVmPauseStore(sql: PgClient) {
               WHERE x.allocation_id=a.allocation_id)
             AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_backups x
               WHERE x.allocation_id = a.allocation_id
-                AND x.phase IN ('pending','creating','captured','verifying','cleanup'))
+                AND (x.phase IN ('pending','creating','captured','verifying','cleanup') OR ((x.source_receipt IS NOT NULL OR (x.phase='failed' AND x.capture_started_at IS NULL)) AND x.source_reopened_at IS NULL
+                  AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses p WHERE p.backup_operation_id=x.operation_id))))
           ORDER BY v.idle_since, a.allocation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
         if (!candidate) return null;
         // The candidate query owns the placement lock, shared with new commands and moves.
+        yield* acknowledgeThreadVmPauseBackup(sql, candidate.allocationId);
         const operationId = yield* (yield* Crypto.Crypto).randomUUIDv4;
         yield* sql`INSERT INTO relay_thread_vm_pauses (allocation_id, operation_id, generation, phase)
           VALUES (${candidate.allocationId}, ${operationId}, ${candidate.generation}, 'pending')
           ON CONFLICT (allocation_id) DO UPDATE SET operation_id = excluded.operation_id,
             generation = excluded.generation, phase = 'pending', boot_id = NULL,
-            native_checkpoint_operation_id = NULL, source_sequence = NULL, source_frozen_at = NULL, source_reopened_at = NULL,
+            native_checkpoint_operation_id = NULL, source_receipt=NULL,backup_operation_id=NULL,source_sequence = NULL, source_frozen_at = NULL, source_reopened_at = NULL,
+            pause_dispatch_claim_id=NULL,pause_dispatched_at=NULL,pause_acknowledged_at=NULL,
             claim_id = NULL, claim_until = NULL, retry_at = clock_timestamp()
           WHERE relay_thread_vm_pauses.phase IN ('cancelled','completed')`;
         return candidate.allocationId;
@@ -86,7 +102,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
             allocationId: string;
           }>`SELECT a.allocation_id AS "allocationId" FROM relay_thread_vm_allocations a
         JOIN relay_thread_vm_bindings b USING(allocation_id)
-        WHERE a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
           AND b.environment_id=${input.environmentId} AND b.generation=${input.generation} AND b.revoked_at IS NULL FOR UPDATE OF a`;
           if (!allocation) return false;
           const rows =
@@ -111,7 +127,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           SELECT x.allocation_id AS "allocationId", x.operation_id AS "operationId",
             a.compute_ref AS "computeRef", a.template_id AS "templateId", p.operation_id AS "provisionOperationId",
             a.thread_id AS "threadId", b.repository_id AS "repositoryId",
-            x.generation, x.phase, x.boot_id AS "bootId"
+            x.generation, x.phase, x.boot_id AS "bootId",(x.pause_dispatched_at IS NOT NULL) AS "pauseDispatched"
           FROM relay_thread_vm_pauses x
           JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
           JOIN relay_thread_vm_provisions p ON p.allocation_id = x.allocation_id
@@ -119,14 +135,18 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           JOIN relay_thread_vm_bindings b ON b.allocation_id = x.allocation_id
             AND b.generation = x.generation AND b.revoked_at IS NULL
           JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-          WHERE c.host_id = ${hostId} AND x.phase IN ('pending','sealed')
+          WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND x.phase IN ('pending','sealed')
             AND a.state = 'running' AND a.deleted_at IS NULL
             AND t.generation = x.generation AND t.environment_id = b.environment_id
             AND t.operation_id IS NULL
             AND x.native_checkpoint_operation_id IS NOT NULL AND x.source_sequence IS NOT NULL
             AND x.source_frozen_at IS NOT NULL AND x.boot_id IS NOT NULL
+            AND EXISTS(SELECT 1 FROM relay_thread_vm_backups z WHERE z.operation_id=x.backup_operation_id
+              AND z.phase='verified' AND z.native_capture_receipt IS NOT NULL AND z.source_receipt=x.source_receipt)
             AND EXISTS (SELECT 1 FROM relay_thread_native_checkpoint_operations n
               WHERE n.operation_id=x.operation_id AND n.checkpoint_operation_id=x.native_checkpoint_operation_id AND n.phase='active')
+            AND x.pause_dispatch_claim_id IS NULL
+            AND (x.pause_dispatched_at IS NULL OR x.pause_acknowledged_at IS NOT NULL)
             AND x.retry_at <= clock_timestamp()
             AND (x.claim_until IS NULL OR x.claim_until <= clock_timestamp())
           ORDER BY x.retry_at, x.allocation_id LIMIT 1 FOR UPDATE OF x SKIP LOCKED`;
@@ -149,10 +169,48 @@ export function makeThreadVmPauseStore(sql: PgClient) {
         AND claim_id = ${claim.claimId} AND claim_until > clock_timestamp()
         AND phase IN ('pending','sealed') AND boot_id=${bootId}
         AND native_checkpoint_operation_id IS NOT NULL AND source_frozen_at IS NOT NULL
+        AND EXISTS(SELECT 1 FROM relay_thread_vm_backups z WHERE z.operation_id=relay_thread_vm_pauses.backup_operation_id
+          AND z.phase='verified' AND z.native_capture_receipt IS NOT NULL AND z.source_receipt=relay_thread_vm_pauses.source_receipt)
       RETURNING allocation_id`;
     return rows.length === 1;
   });
 
+  /** Persist before POST; neither claim expiry nor a paused GET settles this request. */
+  const beginPause = Effect.fn("relay.thread_vm.pause.begin_dispatch")(function* (
+    claim: PauseClaim,
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${claim.threadId} FOR UPDATE`;
+        yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id=${claim.allocationId} FOR UPDATE`;
+        const rows =
+          yield* sql`UPDATE relay_thread_vm_pauses x SET pause_dispatch_claim_id=${claim.claimId},pause_dispatched_at=clock_timestamp()
+        WHERE x.allocation_id=${claim.allocationId} AND x.operation_id=${claim.operationId} AND x.generation=${claim.generation}
+          AND x.claim_id=${claim.claimId} AND x.claim_until>clock_timestamp() AND x.phase='sealed'
+          AND x.pause_dispatched_at IS NULL AND x.pause_dispatch_claim_id IS NULL
+          AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a JOIN relay_thread_placements t USING(thread_id)
+            JOIN relay_thread_vm_bindings b USING(allocation_id) JOIN relay_thread_vm_provisions p USING(allocation_id)
+            WHERE a.runtime_protocol='native-v1' AND a.allocation_id=x.allocation_id AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${claim.computeRef}
+              AND t.thread_id=${claim.threadId} AND t.generation=x.generation AND t.operation_id IS NULL
+              AND b.generation=x.generation AND b.environment_id=t.environment_id AND b.revoked_at IS NULL
+              AND p.phase='created' AND p.operation_id=${claim.provisionOperationId})
+        RETURNING x.allocation_id`;
+        return rows.length === 1;
+      }),
+    );
+  });
+  /** An exact call acknowledgement can settle transport after its worker claim expires. */
+  const acknowledgePause = Effect.fn("relay.thread_vm.pause.acknowledge_dispatch")(function* (
+    claim: PauseClaim,
+  ) {
+    const rows =
+      yield* sql`UPDATE relay_thread_vm_pauses x SET pause_dispatch_claim_id=NULL,pause_acknowledged_at=clock_timestamp()
+      WHERE x.allocation_id=${claim.allocationId} AND x.operation_id=${claim.operationId} AND x.generation=${claim.generation}
+        AND x.pause_dispatch_claim_id=${claim.claimId} AND x.pause_dispatched_at IS NOT NULL
+        AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.runtime_protocol='native-v1' AND a.allocation_id=x.allocation_id AND a.thread_id=${claim.threadId} AND a.compute_ref=${claim.computeRef})
+      RETURNING x.allocation_id`;
+    return rows.length === 1;
+  });
   const finish = Effect.fn("relay.thread_vm.pause.finish")(function* (claim: PauseClaim) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -161,9 +219,12 @@ export function makeThreadVmPauseStore(sql: PgClient) {
         const [allocation] = yield* sql<{ state: string; computeRef: string }>`
           SELECT state, compute_ref AS "computeRef" FROM relay_thread_vm_allocations
           WHERE allocation_id = ${claim.allocationId} FOR UPDATE`;
-        const [pause] = yield* sql<{ phase: string }>`SELECT phase FROM relay_thread_vm_pauses
-          WHERE allocation_id = ${claim.allocationId} AND operation_id = ${claim.operationId}
-            AND claim_id = ${claim.claimId} AND claim_until > clock_timestamp() FOR UPDATE`;
+        const [pause] = yield* sql<{ phase: string }>`SELECT x.phase FROM relay_thread_vm_pauses x
+          JOIN relay_thread_vm_backups z ON z.operation_id=x.backup_operation_id AND z.phase='verified'
+            AND z.native_capture_receipt IS NOT NULL AND z.source_receipt=x.source_receipt
+          WHERE x.allocation_id = ${claim.allocationId} AND x.operation_id = ${claim.operationId}
+            AND x.claim_id = ${claim.claimId} AND x.claim_until > clock_timestamp()
+            AND x.pause_dispatch_claim_id IS NULL AND (x.pause_dispatched_at IS NULL OR x.pause_acknowledged_at IS NOT NULL) FOR UPDATE OF x`;
         if (pause?.phase === "completed" && allocation?.state === "paused") return true;
         if (
           pause?.phase !== "sealed" ||
@@ -201,7 +262,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
         const rows = yield* sql`UPDATE relay_thread_vm_pauses SET phase = 'cancelled',
         claim_id = NULL, claim_until = NULL WHERE allocation_id = ${claim.allocationId}
         AND operation_id = ${claim.operationId} AND claim_id = ${claim.claimId}
-        AND phase IN ('pending','sealed') RETURNING allocation_id`;
+        AND phase IN ('pending','sealed') AND pause_dispatched_at IS NULL AND pause_dispatch_claim_id IS NULL RETURNING allocation_id`;
         if (rows.length)
           yield* sql`UPDATE relay_thread_vm_activity SET revision = revision + 1,
         activity = 'unknown', observed_at = NULL, idle_since = NULL
@@ -216,5 +277,15 @@ export function makeThreadVmPauseStore(sql: PgClient) {
       WHERE allocation_id = ${claim.allocationId} AND operation_id = ${claim.operationId}
         AND claim_id = ${claim.claimId} AND phase IN ('pending','sealed')`;
   });
-  return { reserveIdle, cancelBeforeFreeze, claim, markSealed, finish, cancel, defer };
+  return {
+    reserveIdle,
+    cancelBeforeFreeze,
+    claim,
+    markSealed,
+    beginPause,
+    acknowledgePause,
+    finish,
+    cancel,
+    defer,
+  };
 }

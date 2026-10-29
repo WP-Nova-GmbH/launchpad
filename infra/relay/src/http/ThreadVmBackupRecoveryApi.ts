@@ -7,7 +7,6 @@ import * as Effect from "effect/Effect";
 import { RelayDb } from "../db.ts";
 import { ThreadArtifactObjectStorage } from "../threads/ThreadArtifactObjects.ts";
 import { makeThreadVmBackupRecoveryStore } from "../threads/ThreadVmBackupRecoveryStore.ts";
-import { makeE2BRestoreClient } from "../machines/E2BRestoreClient.ts";
 import { makeThreadVmRestoreStore } from "../threads/ThreadVmRestoreStore.ts";
 import {
   serializeBackupRecovery,
@@ -54,7 +53,6 @@ export const restoreThreadVmBackup = Effect.fn("relay.api.thread_vm.restore_back
       sql = (yield* RelayDb).$client,
       objects = yield* ThreadArtifactObjectStorage;
     yield* withPrivateThreadAccess(threadId, "read", () => Effect.void);
-    yield* makeE2BRestoreClient(settings.compute).requireExecutionRetention();
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${userId},721864))`;
@@ -66,7 +64,7 @@ export const restoreThreadVmBackup = Effect.fn("relay.api.thread_vm.restore_back
               threadId,
               actorUserId: userId,
             });
-            // A lost admission reply can be retried after the cold restore has advanced.
+            // A lost admission reply can be retried after the native restore has advanced.
             const restore = yield* makeThreadVmRestoreStore(sql, objects).get(row.operationId);
             if (
               restore &&
@@ -89,7 +87,6 @@ export const restoreThreadVmBackup = Effect.fn("relay.api.thread_vm.restore_back
     ThreadVmBackupRecoveryConflict: errors.ThreadVmBackupRecoveryConflict,
     ThreadNativeCheckpointConflict: errors.ThreadNativeCheckpointConflict,
     ThreadVmBackupConflict: errors.ThreadVmBackupConflict,
-    E2BRestoreError: () => relayInternalErrorResponse("upstream_unavailable"),
     SqlError: errors.SqlError,
     SchemaError: errors.SchemaError,
   }),

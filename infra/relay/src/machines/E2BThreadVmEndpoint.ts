@@ -10,6 +10,8 @@ import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import type { E2BThreadVmSettings } from "./E2BThreadVmCompute.ts";
 import { inspectE2BThreadVmIngress } from "./E2BThreadVmConnection.ts";
+import { RelayDb } from "../db.ts";
+import { readThreadVmTrafficAccessToken } from "../threads/ThreadVmIngressToken.ts";
 
 const encodeRequest = Schema.encodeSync(Schema.fromJsonString(RelayCloudMintCredentialRequest));
 const decodeResponse = Schema.decodeUnknownSync(
@@ -115,39 +117,50 @@ export const makeManagedThreadVmEndpoint = (origin: string, transport: typeof fe
     }),
 });
 
-const privateProof = (
-  settings: E2BThreadVmSettings,
-  transport: typeof fetch,
-  sandboxId: string,
-  identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId">,
-  proof: string,
-  path?: string,
-) =>
-  Effect.tryPromise({
-    try: async (signal) => {
-      const ingress = await inspectE2BThreadVmIngress(
-        settings,
-        sandboxId,
-        identity,
-        transport,
-        signal,
-      );
-      return postProof(
-        new URL(ingress.origin),
-        proof,
-        {
-          "E2b-Sandbox-Id": ingress.sandboxId,
-          "E2b-Sandbox-Port": "3773",
-          "e2b-traffic-access-token": Redacted.value(ingress.trafficAccessToken),
-        },
-        transport,
-        signal,
-        path,
-      );
-    },
-    // Transport exceptions and response bodies can contain credentials. Never retain them in errors.
-    catch: () => new ThreadVmEndpointError(),
-  });
+const privateProof = Effect.fnUntraced(
+  function* (
+    settings: E2BThreadVmSettings,
+    transport: typeof fetch,
+    sandboxId: string,
+    identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId">,
+    proof: string,
+    path?: string,
+  ) {
+    const sql = (yield* RelayDb).$client;
+    const token = yield* readThreadVmTrafficAccessToken(sql, {
+      ...identity.scope,
+      computeRef: sandboxId,
+      operationId: identity.operationId,
+    });
+    return yield* Effect.tryPromise({
+      try: async (signal) => {
+        const ingress = await inspectE2BThreadVmIngress(
+          settings,
+          sandboxId,
+          identity,
+          transport,
+          signal,
+          token,
+        );
+        return postProof(
+          new URL(ingress.origin),
+          proof,
+          {
+            "E2b-Sandbox-Id": ingress.sandboxId,
+            "E2b-Sandbox-Port": "3773",
+            "e2b-traffic-access-token": Redacted.value(ingress.trafficAccessToken),
+          },
+          transport,
+          signal,
+          path,
+        );
+      },
+      // Transport exceptions and response bodies can contain credentials. Never retain them in errors.
+      catch: () => new ThreadVmEndpointError(),
+    });
+  },
+  Effect.mapError(() => new ThreadVmEndpointError()),
+);
 
 /** Relay control request, never a user-selected port or URL. The guest verifies the signed proof. */
 export const makeE2BThreadVmEndpoint = (

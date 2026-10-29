@@ -1,5 +1,5 @@
 import { threadVmSmokeMetadata } from "./e2b-smoke-metadata.ts";
-import { Sandbox, Template, CommandExitError } from "e2b";
+import { Sandbox, SandboxNotFoundError, Template, CommandExitError } from "e2b";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
@@ -18,6 +18,7 @@ const options = {
   sandboxUrl: process.env.E2B_SANDBOX_URL,
   apiKey: (await NodeFSP.readFile(process.env.E2B_API_KEY_FILE, "utf8")).trim(),
   requestTimeoutMs: 30000,
+  retries: 0,
 };
 const receipt = JSON.parse(await NodeFSP.readFile(values.receipt, "utf8"));
 NodeAssert.equal(receipt.state, "built");
@@ -33,6 +34,7 @@ await NodeFSP.mkdir(values.output, { mode: 0o700 });
 const resources = receipt.resources ?? receipt.versions?.resources;
 NodeAssert.match(receipt.workloadSha256, /^[a-f0-9]{64}$/);
 NodeAssert.match(receipt.workloadServiceSha256, /^[a-f0-9]{64}$/);
+NodeAssert.match(receipt.installerSha256, /^[a-f0-9]{64}$/);
 NodeAssert.ok(
   resources && resources.cpuCount > 0 && resources.memoryMB > 0 && resources.minFreeDiskMb > 0,
 );
@@ -49,7 +51,7 @@ try {
     timeoutMs: 600000,
     secure: true,
     network: { allowPublicTraffic: false },
-    lifecycle: { onTimeout: "kill", autoResume: false },
+    lifecycle: { onTimeout: { action: "kill" }, autoResume: false },
     metadata: threadVmSmokeMetadata(proof),
   });
   sandboxId = vm.sandboxId;
@@ -65,6 +67,7 @@ try {
       LAUNCHPAD_EXPECTED_RESOURCES: JSON.stringify(resources),
       LAUNCHPAD_WORKLOAD_SHA256: receipt.workloadSha256,
       LAUNCHPAD_WORKLOAD_SERVICE_SHA256: receipt.workloadServiceSha256,
+      LAUNCHPAD_INSTALLER_SHA256: receipt.installerSha256,
     },
   });
   await save("result.json", {
@@ -91,8 +94,7 @@ try {
   } catch (error) {
     await save("cleanup.json", {
       proof,
-      absentFromApi: false,
-      physicalStopVerified: false,
+      nativeDeleteAcknowledged: false,
       errorType: error?.name ?? "Error",
     });
     console.error("Runner proof cleanup needs reconciliation using its saved identity.");
@@ -110,20 +112,15 @@ async function cleanup() {
   if (ids.size === 0)
     throw new Error("Create outcome is unknown; retain the proof identity for reconciliation.");
   for (const id of ids) {
-    const response = await fetch(
-      `${options.apiUrl}/extensions/launchpad/v1/executions/${encodeURIComponent(id)}`,
-      {
-        method: "DELETE",
-        headers: { "X-API-Key": options.apiKey },
-        signal: AbortSignal.timeout(30000),
-      },
-    );
-    NodeAssert.equal(response.status, 200);
-    const stopped = await response.json();
-    NodeAssert.equal(stopped.sandboxID, id);
-    NodeAssert.equal(stopped.physicallyStopped, true);
-    await save(`stop-${id}.json`, stopped);
+    const current = await Sandbox.getInfo(id, options).catch((error) => {
+      if (error instanceof SandboxNotFoundError) return null;
+      throw error;
+    });
+    if (current)
+      NodeAssert.equal(current.metadata["launchpad.proof"], proof, "Cleanup identity differs");
+    await Sandbox.kill(id, options);
+    await save(`stop-${id}.json`, { sandboxId: id, nativeDeleteAcknowledged: true });
   }
-  await save("cleanup.json", { proof, physicalStopVerified: true });
-  console.log("Runner proof allocations physically stopped.");
+  await save("cleanup.json", { proof, nativeDeleteAcknowledged: true });
+  console.log("Runner proof native DELETE acknowledgements received.");
 }

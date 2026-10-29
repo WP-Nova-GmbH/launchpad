@@ -10,14 +10,19 @@ def immutable_image_file(name):
   assert stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022, f'Writable image directory: {parent}'
  return path
 # Inspect the finalized image, after E2B's post-Dockerfile configuration has run.
-for name in ('/usr/local/bin/launchpad-workload','/usr/local/bin/launchpad-activity','/usr/local/bin/codex'):
+for name in ('/opt/launchpad/bin/launchpad-workload','/opt/launchpad/bin/launchpad-activity',
+             '/opt/launchpad/node/bin/codex','/opt/launchpad/node/bin/node',
+             '/opt/launchpad/bin/cloudflared','/opt/launchpad/server/t3',
+             '/opt/launchpad/install.sh'):
  immutable_image_file(name)
+immutable_image_file(str(pathlib.Path('/usr/bin/python3').resolve(strict=True)))
 native=json.loads(immutable_image_file('/opt/launchpad/codex-native.json').read_text())
 immutable_image_file(native['executable'])
-inventory=json.loads(subprocess.run(['launchpad-workload','inspect'],check=True,capture_output=True,text=True,timeout=10).stdout)
+inventory=json.loads(subprocess.run(['/opt/launchpad/bin/launchpad-workload','inspect'],check=True,capture_output=True,text=True,timeout=10).stdout)
 assert inventory['stopped'] and inventory['sealedBy'] is None, 'workload tracker did not initialize at boot'
 import hashlib
-assert hashlib.sha256(pathlib.Path('/usr/local/bin/launchpad-workload').read_bytes()).hexdigest()==os.environ['LAUNCHPAD_WORKLOAD_SHA256']
+assert hashlib.sha256(pathlib.Path('/opt/launchpad/install.sh').read_bytes()).hexdigest()==os.environ['LAUNCHPAD_INSTALLER_SHA256']
+assert hashlib.sha256(pathlib.Path('/opt/launchpad/bin/launchpad-workload').read_bytes()).hexdigest()==os.environ['LAUNCHPAD_WORKLOAD_SHA256']
 assert hashlib.sha256(pathlib.Path('/etc/systemd/system/launchpad-workloads.service').read_bytes()).hexdigest()==os.environ['LAUNCHPAD_WORKLOAD_SERVICE_SHA256']
 assert pathlib.Path('/workspace').is_dir() and os.access('/workspace',os.W_OK)
 assert not pathlib.Path('/run/e2b/team-api-key').exists()
@@ -40,7 +45,9 @@ assert versions['codex']=='codex-cli 0.159.3'
 assert versions['pnpm']=='11.10.0'
 assert versions['cloudflared'].startswith('cloudflared version 2026.5.2 ')
 # SDK commands need not inherit template ENV; the server also resolves tools on PATH.
-assert pathlib.Path(shutil.which('cloudflared')).resolve()==pathlib.Path('/usr/local/bin/cloudflared')
+for tool, expected in [('node','/opt/launchpad/node/bin/node'),('codex','/opt/launchpad/node/bin/codex'),
+                       ('cloudflared','/opt/launchpad/bin/cloudflared')]:
+ assert pathlib.Path(shutil.which(tool)).resolve()==pathlib.Path(expected), f'Unexpected tool on PATH: {tool}'
 ptyjs="""const pty=require('/opt/launchpad/server/node_modules/node-pty');
 const p=pty.spawn('/bin/bash',['-lc','printf runner-pty-ok'],{cwd:'/workspace',env:process.env});
 let data='';const timer=setTimeout(()=>{p.kill();process.exit(2)},10000);

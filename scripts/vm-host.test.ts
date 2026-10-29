@@ -25,7 +25,7 @@ describe("VM host startup", () => {
       DOCKER_CONTEXT: "other-context",
     };
     expect(startVmHost({ env, platform: "darwin" }, run)).toBe("/var/lib/launchpad-e2b");
-    expect(run).toHaveBeenCalledTimes(2);
+    expect(run).toHaveBeenCalledOnce();
     for (const [command] of run.mock.calls) {
       expect(command.command).toBe("limactl");
       expect(command.args.slice(0, 6)).toEqual([
@@ -51,45 +51,26 @@ describe("VM host startup", () => {
     const directory = "/var/lib/E2B developer's runtime $(echo literal)";
     startVmHost({ env: { E2B_RUNTIME_DIR: directory }, platform: "linux" }, run);
     const verify = run.mock.calls[0]![0];
-    const start = run.mock.calls[1]![0];
-    const configuration = [
-      "--project-directory",
-      directory,
-      "--file",
-      `${directory}/compose.yaml`,
-      "--file",
-      `${directory}/runtime.override.json`,
-      "--file",
-      `${directory}/compose.override.yaml`,
-    ];
+    const firewall = NodeCrypto.createHash("sha256")
+      .update(
+        NodeFS.readFileSync(
+          NodePath.resolve(import.meta.dirname, "../infra/e2b/host-firewall.nft"),
+        ),
+      )
+      .digest("hex");
     expect(verify.command).toBe("sudo");
     expect(verify.cwd).toBe(directory);
     expect(verify.args).toEqual([
       "-n",
       "python3",
       "-",
-      "--build-directory",
+      "--runtime-dir",
       directory,
-      ...configuration,
-      "--require-exclusive-host",
+      "--firewall-policy-sha256",
+      firewall,
+      "--start",
     ]);
-    expect(start.command).toBe("sudo");
-    expect(start.cwd).toBe(directory);
-    expect(start.env).toEqual(verify.env);
-    expect(start.args).toEqual([
-      "-n",
-      "docker",
-      "compose",
-      ...configuration,
-      "up",
-      "--no-build",
-      "-d",
-      "--wait",
-      "api",
-      "client-proxy",
-      "launchpad-keepalive",
-    ]);
-    expect(start.input).toBeUndefined();
+    expect(verify.input).toContain("def configure_limits(");
   });
 
   it("never starts services after failed runtime verification", () => {

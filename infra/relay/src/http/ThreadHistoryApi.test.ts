@@ -170,7 +170,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
             yield* f.sql`UPDATE relay_thread_vm_saved_disks SET phase='restoring' WHERE operation_id=${f.input.operationId}`;
             yield* f.sql`UPDATE relay_thread_placements SET generation=2,environment_id='replacement-vm',operation_id=${operationId} WHERE thread_id=${f.threadId}`;
             for (const phase of ["committed", "booted", "importing"]) {
-              yield* f.sql`UPDATE relay_thread_vm_restores SET phase=${phase},committed_at=clock_timestamp() WHERE operation_id=${operationId}`;
+              yield* f.sql`UPDATE relay_thread_vm_restores SET phase=${phase},committed_at=clock_timestamp(),target_generation=2 WHERE operation_id=${operationId}`;
               expect((yield* summary())?.state).toBe("preparing");
             }
             yield* f.sql`UPDATE relay_thread_placements SET generation=3 WHERE thread_id=${f.threadId}`;

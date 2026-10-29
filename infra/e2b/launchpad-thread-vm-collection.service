@@ -1,17 +1,17 @@
 [Unit]
-Description=Collect released Launchpad VM disk layers
+Description=Report unused Launchpad VM snapshot layers
 After=network-online.target docker.service
 Wants=network-online.target
-ConditionPathExists=/etc/launchpad-e2b/build-collector.json
+ConditionPathExists=/etc/launchpad-e2b/snapshot-collector.json
 
 [Service]
 Type=oneshot
 User=root
-ExecStart=/opt/launchpad-e2b/launchpad-build-collector --live --apply
-StandardInput=file:/etc/launchpad-e2b/build-collector.json
+ExecStart=/opt/launchpad-e2b/launchpad-snapshot-collector
+StandardInput=file:/etc/launchpad-e2b/snapshot-collector.json
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=6min
+TimeoutStartSec=10min
 KillMode=control-group
 NoNewPrivileges=yes
 PrivateTmp=yes

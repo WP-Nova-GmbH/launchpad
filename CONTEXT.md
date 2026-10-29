@@ -192,6 +192,14 @@ _Avoid_: Copy thread, switch account
 Recreation of a deleted thread VM from its saved disk state, including installed tools and local
 data. It is distinct from moving the thread's work into another existing environment.
 
+**VM snapshot**:
+A point-in-time capture of a thread VM's state used as a candidate recovery point. Capturing it
+does not establish that the thread VM can be safely restored.
+
+**VM backup**:
+A retained, verified recovery point for a thread VM's workspace, installed tools, and local data.
+Conversation history and attachments have their own thread-lifetime retention.
+
 **VM reset**:
 Recreation of a thread's VM and workspace from the Git commit uploaded during its local move while preserving its
 conversation, including the agent's resumable conversation state. The user-facing action is "Reset VM".

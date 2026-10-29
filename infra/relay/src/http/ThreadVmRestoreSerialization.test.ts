@@ -11,6 +11,8 @@ const identity = {
   allocationId: "359d5916-d0d9-4cf2-a3a7-13fd5ec87dd4",
   threadId: "thread",
   generation: 2,
+  targetGeneration: null,
+  enrollmentIssued: false,
   errorCode: null,
 };
 const decode = Schema.decodeUnknownSync(RelayThreadVmRestore);
@@ -48,14 +50,35 @@ describe("VM recovery progress replies", () => {
     },
   );
 
-  it("only offers precommit cancellation for an ordinary saved-disk restore", () => {
-    const restored = { ...identity, phase: "prepared" as const };
+  it("offers native cancellation through bootstrap and reports the actual committed generation", () => {
+    for (const phase of ["prepared", "committed", "creating", "bootstrapping", "booted"] as const) {
+      const restored = { ...identity, phase, targetGeneration: 5 };
+      expect(
+        decode(
+          serializeThreadVmRestore({
+            ...restored,
+            savedDiskOperationId: identity.operationId,
+          }),
+        ),
+      ).toMatchObject({ phase, generation: 5, canCancel: true });
+      expect(serializeThreadVmRestore({ ...restored, savedDiskOperationId: null }).canCancel).toBe(
+        false,
+      );
+      expect(
+        serializeThreadVmRestore({
+          ...restored,
+          savedDiskOperationId: identity.operationId,
+          enrollmentIssued: true,
+        }).canCancel,
+      ).toBe(false);
+    }
     expect(
-      serializeThreadVmRestore({ ...restored, savedDiskOperationId: identity.operationId })
-        .canCancel,
-    ).toBe(true);
-    expect(serializeThreadVmRestore({ ...restored, savedDiskOperationId: null }).canCancel).toBe(
-      false,
-    );
+      serializeThreadVmRestore({
+        ...identity,
+        phase: "importing",
+        targetGeneration: 5,
+        savedDiskOperationId: identity.operationId,
+      }).canCancel,
+    ).toBe(false);
   });
 });

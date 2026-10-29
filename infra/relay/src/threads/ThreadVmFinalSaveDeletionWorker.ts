@@ -8,7 +8,7 @@ import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
 import { makeThreadVmFinalSaveStore } from "./ThreadVmFinalSaveStore.ts";
 
-/** Only a certified final save can reach physical deletion; this worker cannot create or resume a VM. */
+/** Only a verified final save can reach native deletion; this worker cannot create or resume a VM. */
 export function makeThreadVmFinalSaveDeletionWorker(
   sql: PgClient,
   objects: ReturnType<typeof makeThreadArtifactObjects>,
@@ -42,15 +42,13 @@ export function makeThreadVmFinalSaveDeletionWorker(
         yield* store.deferDeletion(claim, "identity_conflict");
         return;
       }
-      // A 404 from the catalog is insufficient: the patched physical-stop endpoint
-      // must confirm absence even when a previous stop response was lost.
+      // A catalog 404 still requires native DELETE of the exact saved sandbox ID.
       yield* store.beginDeletion(claim);
       yield* compute.destroy(current.computeRef);
       yield* store.confirmDeleted(claim);
     }).pipe(
       Effect.catchTags({
         ThreadVmComputeError: () => store.deferDeletion(claim, "stop_unconfirmed"),
-        E2BRestoreError: () => store.deferDeletion(claim, "stop_unconfirmed"),
         ThreadVmFinalSaveConflict: () => store.deferDeletion(claim, "recovery_unavailable"),
         ThreadNativeCheckpointConflict: () => store.deferDeletion(claim, "recovery_unavailable"),
       }),

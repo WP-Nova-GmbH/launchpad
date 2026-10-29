@@ -1,4 +1,8 @@
-export { ThreadVmRestoreBoot } from "./threadVm.ts";
+export {
+  ThreadVmRestoreBoot,
+  ThreadVmWarmRestoreBootstrap,
+  ThreadVmWarmRestoreBootstrapReceipt,
+} from "./threadVm.ts";
 import { OrchestrationCommandReceipt, ThreadWorkspaceManifest } from "./threadTransfer.ts";
 import { ThreadMoveProgressReport, ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
 export { ThreadMoveProgressReport, ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
@@ -2040,6 +2044,8 @@ export const RelayThreadVmRestorePhase = Schema.Literals([
   "boot_preparing",
   "boot_prepared",
   "committed",
+  "creating",
+  "bootstrapping",
   "booted",
   "importing",
   "completed",
@@ -2196,6 +2202,7 @@ export const RelayThreadVmStatus = Schema.Struct({
   activity: Schema.Literals(["busy", "idle", "unknown"]),
   pausePhase: Schema.NullOr(Schema.Literals(["pending", "sealed", "completed", "cancelled"])),
   resumePhase: Schema.NullOr(Schema.Literals(["waiting", "resuming", "completed"])),
+  sourceActivationPending: Schema.Boolean,
   backupPhase: Schema.NullOr(
     Schema.Literals([
       "pending",
@@ -2716,6 +2723,14 @@ export const RelayThreadVmPreviewPort = Schema.Int.check(
   Schema.isBetween({ minimum: 1024, maximum: 65535 }),
   Schema.makeFilter((port) => port !== 3773 && port !== 49983),
 );
+export const RelayThreadVmPreviewProofPayload = Schema.Struct({
+  ...RelaySignedJwtRegisteredClaims,
+  environmentId: EnvironmentId,
+  operationId: TrimmedNonEmptyString,
+  scope: RelayThreadVmCredentialScope,
+  port: RelayThreadVmPreviewPort,
+});
+export type RelayThreadVmPreviewProofPayload = typeof RelayThreadVmPreviewProofPayload.Type;
 export const RelayThreadVmPreviewResponse = Schema.Struct({ url: TrimmedNonEmptyString });
 export type RelayThreadVmPreviewResponse = typeof RelayThreadVmPreviewResponse.Type;
 
@@ -2945,6 +2960,17 @@ export const RelayThreadVmPause = Schema.Struct({
   sourceReopened: Schema.Boolean,
 });
 export type RelayThreadVmPause = typeof RelayThreadVmPause.Type;
+export const RelayThreadVmBackupSource = Schema.Struct({
+  threadId: ThreadId,
+  environmentId: EnvironmentId,
+  ...RelayThreadGeneration,
+  operationId: RelayThreadArtifactId,
+  phase: Schema.Literals(["pending", "creating", "verified", "failed", "retiring", "retired"]),
+  nativeCheckpointOperationId: Schema.NullOr(RelayThreadArtifactId),
+  canActivate: Schema.Boolean,
+  sourceReopened: Schema.Boolean,
+});
+export type RelayThreadVmBackupSource = typeof RelayThreadVmBackupSource.Type;
 export const RelayThreadVmFinalSave = Schema.Struct({
   threadId: ThreadId,
   environmentId: EnvironmentId,
@@ -2960,6 +2986,7 @@ export const RelayThreadVmFinalSave = Schema.Struct({
     "aborted",
   ]),
   nativeCheckpointOperationId: Schema.NullOr(RelayThreadArtifactId),
+  sourceActivationPending: Schema.Boolean,
 });
 export type RelayThreadVmFinalSave = typeof RelayThreadVmFinalSave.Type;
 
@@ -3091,6 +3118,52 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
         error: RelayTenancyErrors,
       },
     ),
+    HttpApiEndpoint.post(
+      "getBackupSource",
+      "/v1/environments/:environmentId/threads/:threadId/backup-source",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: Schema.NullOr(RelayThreadVmBackupSource),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "freezeBackupSource",
+      "/v1/environments/:environmentId/threads/:threadId/backup-source/freeze",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          operationId: RelayThreadArtifactId,
+          nativeCheckpointOperationId: RelayThreadArtifactId,
+          bootId: Schema.String.check(Schema.isUUID()),
+          sealEpoch: Schema.Int.check(Schema.isGreaterThan(0)),
+        }),
+        success: RelayThreadVmBackupSource,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "cancelBackupSource",
+      "/v1/environments/:environmentId/threads/:threadId/backup-source/cancel",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmBackupSource,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmBackupSourceActivation",
+      "/v1/environments/:environmentId/threads/:threadId/backup-source/activate",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmBackupSource,
+        error: RelayTenancyErrors,
+      },
+    ),
     HttpApiEndpoint.post("getPause", "/v1/environments/:environmentId/threads/:threadId/pause", {
       params: RelayThreadOwnerParams,
       payload: Schema.Struct(RelayThreadGeneration),
@@ -3116,9 +3189,8 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
           ...RelayThreadGeneration,
           operationId: RelayThreadArtifactId,
           nativeCheckpointOperationId: RelayThreadArtifactId,
-          bootId: Schema.String.check(
-            Schema.isPattern(/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u),
-          ),
+          bootId: Schema.String.check(Schema.isUUID()),
+          sealEpoch: Schema.Int.check(Schema.isGreaterThan(0)),
         }),
         success: RelayThreadVmPause,
         error: RelayTenancyErrors,
@@ -3155,6 +3227,16 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
       },
     ),
     HttpApiEndpoint.post(
+      "confirmFinalSaveActivation",
+      "/v1/environments/:environmentId/threads/:threadId/final-save/activate",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmFinalSave,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
       "freezeFinalSave",
       "/v1/environments/:environmentId/threads/:threadId/final-save/freeze",
       {
@@ -3163,6 +3245,8 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
           ...RelayThreadGeneration,
           operationId: RelayThreadArtifactId,
           nativeCheckpointOperationId: RelayThreadArtifactId,
+          bootId: Schema.String.check(Schema.isUUID()),
+          sealEpoch: Schema.Int.check(Schema.isGreaterThan(0)),
         }),
         success: RelayThreadVmFinalSave,
         error: RelayTenancyErrors,

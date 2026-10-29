@@ -288,6 +288,7 @@ const initialVmStatus: RelayThreadVmStatus = {
   activity: "idle",
   setupPhase: "ready",
   capacityState: null,
+  sourceActivationPending: false,
   pausePhase: null,
   resumePhase: null,
   backupPhase: null,

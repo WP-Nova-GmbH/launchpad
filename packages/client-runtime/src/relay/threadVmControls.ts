@@ -300,8 +300,11 @@ export function threadVmStatusLabel(status: RelayThreadVmStatus) {
       case "boot_prepared":
         return "Preparing replacement VM";
       case "committed":
+      case "creating":
       case "booted":
         return "Starting replacement VM";
+      case "bootstrapping":
+        return "Preparing restored VM";
       case "importing":
         return "Restoring conversation — queue stays paused";
       case "aborting":
@@ -312,6 +315,8 @@ export function threadVmStatusLabel(status: RelayThreadVmStatus) {
   }
   if (status.resumePhase && status.resumePhase !== "completed") return "Resume requested";
   if (status.pausePhase === "pending" || status.pausePhase === "sealed") return "Pausing VM";
+  if (status.allocation?.state === "running" && status.sourceActivationPending)
+    return "Waiting for VM";
   if (status.savedDisk?.phase === "expired") return "Saved workspace expired";
   if (status.savedDisk?.phase === "expiring") return "Saved workspace is expiring";
   if (status.savedDisk) return "VM stopped — workspace saved";
@@ -363,8 +368,11 @@ export function threadVmPresentation(input: {
   readonly providerAuth?: RelayThreadVmProviderAuth | null;
 }) {
   const { status } = input;
+  const awaitingSourceActivation =
+    status?.allocation?.state === "running" && status.sourceActivationPending;
   const held = !!(
     input.pendingRequest ||
+    awaitingSourceActivation ||
     status?.pendingProviderAuth ||
     status?.pausePhase === "pending" ||
     status?.pausePhase === "sealed" ||
@@ -414,13 +422,7 @@ export function threadVmPresentation(input: {
             };
   else if (status.replacement?.phase === "awaiting_choice")
     primary = { type: "replace", label: "Choose a VM to replace" };
-  else if (
-    status.restore &&
-    status.restore.canCancel !== false &&
-    ["pending", "preparing", "prepared", "boot_preparing", "boot_prepared"].includes(
-      status.restore.phase,
-    )
-  )
+  else if (status.restore && status.restore.canCancel === true)
     primary = { type: "cancel_restore", label: "Cancel restore" };
   else if (status.reset && ["pending", "creating"].includes(status.reset.phase))
     primary = { type: "cancel_reset", label: "Cancel reset" };
@@ -448,15 +450,17 @@ export function threadVmPresentation(input: {
           ? "The last step could not be confirmed. Your saved data is kept; check status or use the available cancellation."
           : status?.allocation?.state === "paused"
             ? "The conversation is available. Resume the VM when you need to continue working."
-            : status?.savedDisk?.phase === "available"
-              ? "The VM is stopped. Restore its saved workspace to continue."
-              : status?.savedDisk?.phase === "expired"
-                ? "The saved workspace expired. Reset from the original uploaded commit; the conversation is kept."
-                : ready && input.queuePaused
-                  ? "The VM is ready. Queued messages stay paused until you resume the queue."
-                  : status?.resumePhase && status.resumePhase !== "completed"
-                    ? "The relay accepted your request. Waiting for the VM to confirm it is ready."
-                    : null);
+            : awaitingSourceActivation
+              ? "The VM is running. Waiting for this conversation to reopen."
+              : status?.savedDisk?.phase === "available"
+                ? "The VM is stopped. Restore its saved workspace to continue."
+                : status?.savedDisk?.phase === "expired"
+                  ? "The saved workspace expired. Reset from the original uploaded commit; the conversation is kept."
+                  : ready && input.queuePaused
+                    ? "The VM is ready. Queued messages stay paused until you resume the queue."
+                    : status?.resumePhase && status.resumePhase !== "completed"
+                      ? "The relay accepted your request. Waiting for the VM to confirm it is ready."
+                      : null);
   const capability =
     primary?.type === "restore"
       ? "restore"
@@ -505,12 +509,7 @@ export function threadVmPresentation(input: {
       !held &&
       (input.capabilities === undefined || input.capabilities?.permanentDelete === true),
     canCancelSetup: !held && ["pending", "running", "failed"].includes(status?.setupPhase ?? ""),
-    canCancelRestore:
-      !!status?.restore &&
-      status.restore.canCancel !== false &&
-      ["pending", "preparing", "prepared", "boot_preparing", "boot_prepared"].includes(
-        status.restore.phase,
-      ),
+    canCancelRestore: !!status?.restore && status.restore.canCancel === true,
     canCancelReset: !!status?.reset && ["pending", "creating"].includes(status.reset.phase),
   };
 }
@@ -587,6 +586,8 @@ export function threadVmActionUnavailableReason(
     return "This saved workspace is no longer available to restore.";
   if (action.type === "cancel_restore" && status.restore?.operationId !== action.operationId)
     return "This restore request changed. Check its current status.";
+  if (action.type === "cancel_restore" && !presentation.canCancelRestore)
+    return "This restore can no longer be cancelled. Check its current status.";
   if (action.type === "cancel_reset" && status.reset?.operationId !== action.operationId)
     return "This reset request changed. Check its current status.";
   return null;

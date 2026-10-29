@@ -110,17 +110,11 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
         ),
       );
     if (!point) return;
-    const inventory = yield* inspectVmWorkloads({ type: "inspect" });
-    if (!inventory.stopped) return yield* fail("VM workspace processes have not stopped.");
-    const seal = yield* inspectVmWorkloads({
-      type: "seal",
-      bootId: inventory.bootId,
-      operationId: pause.operationId,
-    });
     const receipt = yield* transport.freeze(input, {
       operationId: pause.operationId,
       nativeCheckpointOperationId: point.nativeCheckpointOperationId,
-      bootId: seal.bootId,
+      bootId: point.bootId,
+      sealEpoch: point.sealEpoch,
     });
     if (
       receipt.threadId !== threadId ||
@@ -128,7 +122,7 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
       receipt.generation !== owner.generation ||
       receipt.operationId !== pause.operationId ||
       receipt.nativeCheckpointOperationId !== point.nativeCheckpointOperationId ||
-      receipt.bootId !== seal.bootId ||
+      receipt.bootId !== point.bootId ||
       !["pending", "sealed", "completed"].includes(receipt.phase)
     )
       return yield* fail("Relay acknowledged a different pause recovery point.");

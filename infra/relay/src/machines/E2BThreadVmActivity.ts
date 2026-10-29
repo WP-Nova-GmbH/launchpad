@@ -74,7 +74,7 @@ export function classifyThreadVmActivity(inventory: Inventory) {
 type InspectGuest = (connection: ConstructorParameters<typeof Sandbox>[0]) => Promise<string>;
 const inspectGuest: InspectGuest = async (connection) => {
   const vm = new Sandbox(connection);
-  const result = await vm.commands.run("/usr/local/bin/launchpad-activity", {
+  const result = await vm.commands.run("/opt/launchpad/bin/launchpad-activity", {
     user: "user",
     timeoutMs: 10_000,
   });

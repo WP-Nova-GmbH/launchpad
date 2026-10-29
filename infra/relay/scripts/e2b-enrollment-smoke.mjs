@@ -21,6 +21,7 @@ const options = {
   apiUrl: process.env.E2B_API_URL,
   sandboxUrl: process.env.E2B_SANDBOX_URL,
   apiKey: (await NodeFSP.readFile(process.env.E2B_API_KEY_FILE, "utf8")).trim(),
+  retries: 0,
 };
 const receipt = JSON.parse(await NodeFSP.readFile(values.receipt, "utf8"));
 NodeAssert.equal(receipt.state, "built");
@@ -56,9 +57,11 @@ let sandboxId;
 let stage = "create";
 let diagnosticVm;
 try {
-  ({ sandboxId } = await Effect.runPromise(
+  const created = await Effect.runPromise(
     compute.create({ ...scope, operationId, environment: {} }),
-  ));
+  );
+  sandboxId = created.sandboxId;
+  NodeAssert.ok(created.trafficAccessToken, "Native create omitted its private routing credential");
   await save("allocation.json", { sandboxId, operationId });
   const response = await fetch(`${options.apiUrl}/sandboxes/${sandboxId}`, {
     headers: { "X-API-Key": options.apiKey },
@@ -172,7 +175,10 @@ http.createServer(async(req,res)=>{
     { scope, operationId },
     fetch,
     AbortSignal.timeout(30000),
+    created.trafficAccessToken,
   );
+  // Fixture-only native authentication check. Product previews route through
+  // the signed, sanitizing guest hop on port 3773; HTTP/WS guest-hop tests cover that boundary.
   const preview = (token) =>
     fetch(options.sandboxUrl, {
       headers: {
@@ -253,9 +259,9 @@ http.createServer(async(req,res)=>{
       ids.add(vm.sandboxId);
     NodeAssert.ok(ids.size > 0, "Unknown create outcome requires reconciliation");
     for (const id of ids) await Effect.runPromise(compute.destroy(id));
-    await save("cleanup.json", { physicallyStopped: true, operationId });
+    await save("cleanup.json", { nativeDeleteAcknowledged: true, operationId });
   } catch {
-    await save("cleanup.json", { physicallyStopped: false, operationId });
+    await save("cleanup.json", { nativeDeleteAcknowledged: false, operationId });
     console.error("Enrollment proof cleanup requires reconciliation using its saved operation.");
     process.exitCode = 1;
   }

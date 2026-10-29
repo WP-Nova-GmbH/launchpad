@@ -9,13 +9,26 @@ import { type E2BThreadVmIdentity, inspectE2BThreadVmConnection } from "./E2BThr
 type Renew = (
   sandboxId: string,
   timeoutMs: number,
-  options: { apiUrl: string; sandboxUrl: string; apiKey: string; signal: AbortSignal },
+  options: {
+    apiUrl: string;
+    sandboxUrl: string;
+    apiKey: string;
+    signal: AbortSignal;
+    retries: 0;
+    requestTimeoutMs: number;
+  },
 ) => Promise<void>;
 const renewE2B: Renew = (sandboxId, timeoutMs, options) =>
   Sandbox.setTimeout(sandboxId, timeoutMs, options);
 type Inspect = (
   sandboxId: string,
-  options: { apiUrl: string; apiKey: string; signal: AbortSignal },
+  options: {
+    apiUrl: string;
+    apiKey: string;
+    signal: AbortSignal;
+    retries: 0;
+    requestTimeoutMs: number;
+  },
 ) => Promise<SandboxInfo>;
 const inspectE2B: Inspect = (sandboxId, options) => Sandbox.getInfo(sandboxId, options);
 
@@ -30,7 +43,7 @@ export function makeE2BThreadVmLease(
     sandboxId: string,
     identity: E2BThreadVmIdentity,
   ) {
-    const requestedEnd = (yield* Clock.currentTimeMillis) + settings.timeoutMs;
+    const requestedAt = yield* Clock.currentTimeMillis;
     return yield* Effect.tryPromise({
       try: async (signal) => {
         await inspectE2BThreadVmConnection(settings, sandboxId, identity, transport, signal);
@@ -38,11 +51,15 @@ export function makeE2BThreadVmLease(
           apiUrl: settings.apiUrl,
           sandboxUrl: settings.sandboxUrl,
           apiKey: Redacted.value(settings.apiKey),
+          retries: 0,
+          requestTimeoutMs: 30_000,
           signal,
         });
         const info = await inspect(sandboxId, {
           apiUrl: settings.apiUrl,
           apiKey: Redacted.value(settings.apiKey),
+          retries: 0,
+          requestTimeoutMs: 30_000,
           signal,
         });
         if (
@@ -53,10 +70,15 @@ export function makeE2BThreadVmLease(
           !threadVmOperationMatches(info.metadata, identity.operationId) ||
           info.metadata["launchpad.thread_id"] !== identity.scope.threadId ||
           info.metadata["launchpad.generation"] !== String(identity.scope.generation) ||
+          !Number.isFinite(info.startedAt.getTime()) ||
           !Number.isFinite(info.endAt.getTime()) ||
-          info.endAt.getTime() < requestedEnd - 1_000
+          info.endAt.getTime() <= requestedAt ||
+          info.endAt.getTime() <= info.startedAt.getTime()
         )
-          throw new Error("E2B did not confirm the requested finite VM lease.");
+          throw new Error("E2B did not confirm a live finite VM lease.");
+        // Native E2B clamps renewals to the project's continuous-run limit.
+        // An accepted shorter deadline is valid; it does not promise that the
+        // VM can run beyond that limit without a later pause and explicit wake.
       },
       catch: () =>
         new ThreadVmComputeError({

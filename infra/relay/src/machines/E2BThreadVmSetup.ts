@@ -15,7 +15,7 @@ type GuestSetup = (
 const runGuest: GuestSetup = async (connection, payload) => {
   const vm = new Sandbox(connection);
   const command = await vm.commands.run(
-    "launchpad-server __thread-vm-setup --base-dir /home/user/.launchpad",
+    "/opt/launchpad/server/t3 __thread-vm-setup --base-dir /home/user/.launchpad",
     {
       user: "user",
       background: true,

@@ -1,4 +1,4 @@
-import { threadVmOperationMatches } from "../machines/E2BThreadVmRestoreAttempt.ts";
+import { confirmThreadVmCleanupIdentity } from "./ThreadVmCleanupIdentity.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import type { SandboxInfo } from "e2b";
 import * as Effect from "effect/Effect";
@@ -7,7 +7,7 @@ import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 
 interface CleanupCompute {
   readonly inspect: (sandboxId: string) => Effect.Effect<SandboxInfo | null, ThreadVmComputeError>;
-  /** The patched host returns only after every registered execution is physically stopped. */
+  /** Success acknowledges native DELETE of this known sandbox ID. */
   readonly destroy: (sandboxId: string) => Effect.Effect<void, ThreadVmComputeError>;
 }
 
@@ -30,26 +30,16 @@ export function makeThreadVmCancelledSetupCleanupWorker(
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-      WHERE c.host_id = ${hostId} AND c.state = 'started'
+      WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'started'
         AND a.state = 'deleting' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
         AND p.phase = 'created' AND p.generation = 1
         AND t.operation_id = a.allocation_id AND t.generation = 1
       ORDER BY c.position LIMIT 1`;
     if (!row) return false;
     const attempt = Effect.gen(function* () {
-      const info = yield* compute.inspect(row.computeRef);
-      if (
-        info &&
-        (info.sandboxId !== row.computeRef ||
-          info.metadata["launchpad.managed"] !== "thread-vm-v1" ||
-          info.metadata["launchpad.allocation_id"] !== row.allocationId ||
-          !threadVmOperationMatches(info.metadata, row.operationId) ||
-          info.metadata["launchpad.thread_id"] !== row.threadId ||
-          info.metadata["launchpad.generation"] !== String(row.generation))
-      )
-        return;
-      // A missing catalog entry is not proof of absence; obtain the patched host's
-      // physical receipt even after an earlier stop reply was lost.
+      if (!(yield* confirmThreadVmCleanupIdentity(sql, compute, row))) return;
+      // A missing catalog entry still requires exact native DELETE reconciliation,
+      // including after a previous acknowledgement was lost.
       yield* compute.destroy(row.computeRef);
       yield* sql.withTransaction(
         Effect.gen(function* () {

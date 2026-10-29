@@ -1,4 +1,3 @@
-import type { ThreadVmCreationStopReceipt } from "../machines/E2BThreadVmCompute.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import type { RelayThreadVmEnrollmentReceipt } from "@t3tools/contracts/relay";
 import { makeThreadVmEnrollmentStore } from "./ThreadVmEnrollmentStore.ts";
@@ -15,13 +14,13 @@ export interface ThreadVmProvision {
   readonly allocationId: string;
   readonly operationId: string;
   readonly generation: number;
-  readonly creationIdentityFenced: boolean;
   readonly threadId: string;
   readonly templateId: string;
   readonly computeRef: string | null;
   readonly allocationState: "creating" | "running" | "paused" | "deleting" | "deleted";
   readonly phase: "pending" | "creating" | "created" | "cancelled";
   readonly claimId: string | null;
+  readonly ingressRecoveryClaimId: string | null;
   readonly errorCode: string | null;
 }
 const conflict = (message: string) => new ThreadVmProvisionConflict({ message });
@@ -34,9 +33,9 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     const [row] =
       yield* sql<ThreadVmProvision>`SELECT p.allocation_id AS "allocationId", p.operation_id AS "operationId", p.generation,
       a.thread_id AS "threadId", a.template_id AS "templateId", a.compute_ref AS "computeRef", a.state AS "allocationState",
-      p.phase, p.creation_identity_fenced AS "creationIdentityFenced", p.claim_id AS "claimId", p.error_code AS "errorCode"
+      p.phase, p.claim_id AS "claimId", p.ingress_recovery_claim_id AS "ingressRecoveryClaimId", p.error_code AS "errorCode"
       FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
-      WHERE p.allocation_id = ${allocationId}`;
+      WHERE a.runtime_protocol='native-v1' AND p.allocation_id = ${allocationId}`;
     return row ?? null;
   });
   const enqueue = Effect.fn("relay.thread_vm_provision.enqueue")(function* (input: {
@@ -49,7 +48,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
       Effect.gen(function* () {
         const [allocation] = yield* sql<{
           state: string;
-        }>`SELECT state FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} FOR UPDATE`;
+        }>`SELECT state FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
         if (!allocation) return yield* conflict("Reserve the VM allocation before provisioning");
         const prior = yield* get(input.allocationId);
         if (prior) {
@@ -81,8 +80,9 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         }>`SELECT p.allocation_id AS "allocationId" FROM relay_thread_vm_provisions p
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id = p.allocation_id
-        WHERE c.host_id = ${hostId} AND p.phase IN ('pending', 'creating') AND p.retry_at <= clock_timestamp()
+        WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND p.phase IN ('pending', 'creating') AND p.retry_at <= clock_timestamp()
         AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
+        AND p.ingress_recovery_claim_id IS NULL
         AND (c.state IN ('reserved', 'started') OR a.state = 'deleting')
         ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
         if (!candidate) return null;
@@ -94,11 +94,19 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
   });
   const locked = Effect.fnUntraced(function* (input: { allocationId: string; claimId: string }) {
     // All writers take allocation then operation, including cancellation and late create receipts.
-    yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} FOR UPDATE`;
+    const [allocation] =
+      yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
+    if (!allocation)
+      return yield* conflict(
+        "This VM belongs to an earlier runtime and requires manual migration.",
+      );
     const rows = yield* sql`SELECT allocation_id FROM relay_thread_vm_provisions
       WHERE allocation_id = ${input.allocationId} AND claim_id = ${input.claimId} AND claim_until > clock_timestamp() FOR UPDATE`;
     if (!rows.length) return yield* conflict("Provisioning worker claim expired or changed");
-    return (yield* get(input.allocationId))!;
+    const row = (yield* get(input.allocationId))!;
+    if (row.ingressRecoveryClaimId !== null)
+      return yield* conflict("VM ingress recovery is in flight or unconfirmed; retain capacity");
+    return row;
   });
   const beginCreate = Effect.fn("relay.thread_vm_provision.begin_create")(function* (input: {
     allocationId: string;
@@ -114,17 +122,18 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         yield* sql`UPDATE relay_thread_vm_allocations SET template_id = ${input.templateId}
           WHERE allocation_id = ${input.allocationId}`;
         yield* capacity.beginExecution(row.operationId);
-        yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'creating', creation_identity_fenced = true WHERE allocation_id = ${input.allocationId}`;
+        yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'creating' WHERE allocation_id = ${input.allocationId}`;
         return {
           ...row,
           templateId: input.templateId,
           phase: "creating" as const,
-          creationIdentityFenced: true,
         };
       }),
     );
   });
-  const recordCreated = Effect.fn("relay.thread_vm_provision.record_created")(function* (input: {
+  // A known ID is durable even when the create reply omitted its ingress token.
+  // Keep provisioning incomplete until token recovery is explicitly admitted.
+  const recordObserved = Effect.fn("relay.thread_vm_provision.record_observed")(function* (input: {
     allocationId: string;
     claimId: string;
     computeRef: string;
@@ -132,8 +141,110 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const row = yield* locked(input);
+        if (
+          row.phase !== "creating" ||
+          row.allocationState === "deleted" ||
+          (row.computeRef !== null && row.computeRef !== input.computeRef)
+        )
+          return yield* conflict("Provisioning no longer accepts this compute identity");
+        yield* capacity.recordCreated(row.operationId, input.computeRef);
+        yield* sql`UPDATE relay_thread_vm_allocations SET compute_ref=${input.computeRef}
+        WHERE allocation_id=${input.allocationId}`;
+        return (yield* get(input.allocationId))!;
+      }),
+    );
+  });
+  const admitIngressRecovery = Effect.fn("relay.thread_vm_provision.admit_ingress")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      computeRef: string;
+      hostId: string;
+    }) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const row = yield* locked(input);
+          const reservation = yield* capacity.get(row.operationId);
+          if (
+            row.phase !== "creating" ||
+            !["creating", "running"].includes(row.allocationState) ||
+            row.computeRef !== input.computeRef ||
+            reservation?.state !== "started" ||
+            reservation.computeRef !== input.computeRef ||
+            reservation.allocationId !== row.allocationId ||
+            reservation.hostId !== input.hostId
+          )
+            return yield* conflict(
+              "Ingress recovery requires the current admitted compute identity",
+            );
+          return row;
+        }),
+      );
+    },
+  );
+  const beginIngressRecovery = Effect.fn("relay.thread_vm_provision.begin_ingress_recovery")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      computeRef: string;
+      hostId: string;
+    }) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const row = yield* admitIngressRecovery(input);
+          yield* sql`UPDATE relay_thread_vm_provisions SET ingress_recovery_claim_id=${input.claimId}
+          WHERE allocation_id=${input.allocationId}`;
+          return row;
+        }),
+      );
+    },
+  );
+  // A reply settles its own network attempt, not a worker lease or execution admission.
+  const settleIngressRecovery = Effect.fn("relay.thread_vm_provision.settle_ingress_recovery")(
+    function* (input: { allocationId: string; claimId: string; computeRef: string }) {
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const allocation = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
+          WHERE allocation_id=${input.allocationId} AND compute_ref=${input.computeRef}
+            AND deleted_at IS NULL FOR UPDATE`;
+          if (!allocation.length)
+            return yield* conflict("Ingress recovery compute identity changed");
+          const rows =
+            yield* sql`UPDATE relay_thread_vm_provisions SET ingress_recovery_claim_id=NULL
+          WHERE allocation_id=${input.allocationId} AND phase='creating'
+            AND ingress_recovery_claim_id=${input.claimId} RETURNING allocation_id`;
+          if (!rows.length) return yield* conflict("Ingress recovery belongs to another attempt");
+        }),
+      );
+    },
+  );
+  const cancelKnown = Effect.fn("relay.thread_vm_provision.cancel_known")(function* (input: {
+    allocationId: string;
+    claimId: string;
+    computeRef: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* locked(input);
+        if (row.phase !== "creating" || row.computeRef !== input.computeRef)
+          return yield* conflict("Cancellation requires the current known compute identity");
+        yield* allocations.requestDeletion(row.allocationId);
+      }),
+    );
+  });
+  const recordCreated = Effect.fn("relay.thread_vm_provision.record_created")(function* (input: {
+    allocationId: string;
+    claimId: string;
+    computeRef: string;
+    sealedTrafficAccessToken?: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* locked(input);
         if (row.phase !== "creating")
           return yield* conflict("Provisioning does not accept a create receipt");
+        if (row.allocationState !== "deleting" && !input.sealedTrafficAccessToken)
+          return yield* conflict("Provisioning requires its private ingress credential");
         yield* capacity.recordCreated(row.operationId, input.computeRef);
         yield* allocations.recordCreated(input);
         yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'created', claim_id = NULL, claim_until = NULL, error_code = NULL WHERE allocation_id = ${input.allocationId}`;
@@ -170,49 +281,6 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
       );
     },
   );
-  const confirmCreateCancelled = Effect.fn("relay.thread_vm_provision.confirm_create_cancelled")(
-    function* (input: {
-      allocationId: string;
-      claimId: string;
-      receipt: ThreadVmCreationStopReceipt;
-    }) {
-      yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const row = yield* locked(input);
-          const receipt = input.receipt;
-          if (
-            row.phase !== "creating" ||
-            !row.creationIdentityFenced ||
-            row.allocationState !== "deleting" ||
-            receipt.operationId !== row.operationId ||
-            (row.computeRef !== null && row.computeRef !== receipt.computeRef)
-          )
-            return yield* conflict("Creation stop receipt does not match the cancelled operation");
-          if (receipt.computeRef !== null) {
-            const metadata = receipt.metadata;
-            if (
-              metadata["launchpad.managed"] !== "thread-vm-v1" ||
-              metadata["launchpad.operation_id"] !== row.operationId ||
-              metadata["launchpad.allocation_id"] !== row.allocationId ||
-              metadata["launchpad.thread_id"] !== row.threadId ||
-              metadata["launchpad.generation"] !== String(row.generation)
-            )
-              return yield* conflict("Creation stop identity belongs to another allocation");
-            yield* allocations.recordCreated({
-              allocationId: row.allocationId,
-              computeRef: receipt.computeRef,
-            });
-          }
-          yield* capacity.confirmCreateCancelled(row.operationId, receipt.computeRef);
-          yield* allocations.confirmDeleted({
-            allocationId: row.allocationId,
-            computeRef: receipt.computeRef,
-          });
-          yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'cancelled', claim_id = NULL, claim_until = NULL, error_code = NULL WHERE allocation_id = ${row.allocationId}`;
-        }),
-      );
-    },
-  );
   const rejectUnstarted = Effect.fn("relay.thread_vm_provision.reject_unstarted")(
     function* (input: { allocationId: string; claimId: string }) {
       yield* sql.withTransaction(
@@ -238,7 +306,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         LEFT JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
-        WHERE c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND e.installed_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND e.installed_at IS NULL
           AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
         ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
         if (!candidate) return null;
@@ -296,7 +364,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
       JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
       JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
       JOIN relay_thread_vm_setups s ON s.allocation_id = p.allocation_id
-      WHERE c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
+      WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
       AND e.installed_at IS NOT NULL AND s.phase IN ('pending','running')
       AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
       ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
@@ -319,7 +387,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         JOIN relay_thread_vm_setups s ON s.allocation_id = p.allocation_id
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-        WHERE c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
         AND p.generation=1 AND s.phase = 'ready' AND s.receipt_sha256 IS NOT NULL
         AND t.environment_id = s.environment_id AND t.generation = p.generation AND t.operation_id IS NULL
         AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
@@ -348,7 +416,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
           JOIN relay_thread_vm_bindings b ON b.allocation_id=p.allocation_id
           JOIN relay_environment_credentials k ON k.credential_id=b.credential_id
           JOIN relay_thread_move_artifacts r ON r.operation_id=m.operation_id
-        WHERE c.host_id=${hostId} AND p.phase='created' AND a.state='running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND c.host_id=${hostId} AND p.phase='created' AND a.state='running' AND a.deleted_at IS NULL
           AND e.installed_at IS NOT NULL AND b.revoked_at IS NULL AND k.revoked_at IS NULL
           AND b.environment_id=m.destination_environment_id AND b.generation=p.generation
           AND ((m.phase IN ('frozen','ready') AND t.operation_id=m.operation_id AND t.generation=m.expected_generation)
@@ -404,10 +472,14 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     enqueue,
     claim,
     beginCreate,
+    recordObserved,
+    admitIngressRecovery,
+    beginIngressRecovery,
+    settleIngressRecovery,
+    cancelKnown,
     recordCreated,
     defer,
     cancelUnstarted,
-    confirmCreateCancelled,
     rejectUnstarted,
     claimStartup,
     claimMoveStartup,

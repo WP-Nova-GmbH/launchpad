@@ -4,7 +4,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
-import { Sandbox, Template, CommandExitError } from "e2b";
+import { Sandbox, SandboxNotFoundError, Template, CommandExitError } from "e2b";
 import * as Schema from "effect/Schema";
 import { THREAD_VM_BLOCKED_NETWORKS } from "../src/machines/E2BThreadVmCompute.ts";
 
@@ -54,6 +54,7 @@ const options = {
   sandboxUrl: process.env.E2B_SANDBOX_URL,
   apiKey: (await NodeFSP.readFile(process.env.E2B_API_KEY_FILE, "utf8")).trim(),
   requestTimeoutMs: 60_000,
+  retries: 0,
 };
 const receipt = JSON.parse(await NodeFSP.readFile(values.receipt, "utf8"));
 const source = JSON.parse(await NodeFSP.readFile(values.source, "utf8"));
@@ -88,7 +89,7 @@ try {
     timeoutMs: 20 * 60_000,
     secure: true,
     network: { allowPublicTraffic: false, denyOut: [...THREAD_VM_BLOCKED_NETWORKS] },
-    lifecycle: { onTimeout: "pause", autoResume: false },
+    lifecycle: { onTimeout: { action: "pause", mode: "full" }, autoResume: false },
     metadata: threadVmSmokeMetadata(proof),
   });
   await save("allocation.json", { proof, sandboxId: vm.sandboxId });
@@ -166,25 +167,19 @@ try {
       while (page.hasNext) for (const found of await page.nextItems()) ids.add(found.sandboxId);
     }
     for (const id of ids) {
-      const response = await fetch(
-        `${options.apiUrl.replace(/\/$/, "")}/extensions/launchpad/v1/executions/${encodeURIComponent(id)}`,
-        {
-          method: "DELETE",
-          headers: { "X-API-Key": options.apiKey },
-          redirect: "error",
-          signal: AbortSignal.timeout(60_000),
-        },
-      );
-      NodeAssert.equal(response.status, 200);
-      const stopped = await response.json();
-      NodeAssert.equal(stopped.sandboxID, id);
-      NodeAssert.equal(stopped.physicallyStopped, true);
+      const current = await Sandbox.getInfo(id, options).catch((error) => {
+        if (error instanceof SandboxNotFoundError) return null;
+        throw error;
+      });
+      if (current)
+        NodeAssert.equal(current.metadata["launchpad.proof"], proof, "Cleanup identity differs");
+      await Sandbox.kill(id, options);
     }
     NodeAssert.ok(
       vm || !createAttempted,
       "Create result was uncertain; reconcile tagged resources before retrying",
     );
-    await save("cleanup.json", { proof, physicallyStopped: [...ids] });
+    await save("cleanup.json", { proof, nativeDeleteAcknowledged: [...ids] });
   } catch {
     await save("cleanup-pending.json", { proof, sandboxIds: [...ids] });
     console.error("Native VM cleanup is unconfirmed; reconcile the saved proof identity.");

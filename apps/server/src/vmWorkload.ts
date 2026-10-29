@@ -1,9 +1,13 @@
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import * as ProcessRunner from "./processRunner.ts";
-import { VmControlSpawner, VmWorkloadTracking } from "./vmWorkloadCommand.ts";
+import {
+  VmControlSpawner,
+  VmWorkloadTracking,
+  VmSealedWorkloadAdmission,
+  makeVmWorkloadSpawner,
+} from "./vmWorkloadCommand.ts";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
-import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 const Identifier = Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u));
@@ -55,7 +59,7 @@ const harnessCommand = Effect.fn("VmWorkload.owned_harness")(
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, control),
     );
     const result = yield* runner.run({
-      command: "/usr/local/bin/launchpad-workload",
+      command: "/opt/launchpad/bin/launchpad-workload",
       args,
       timeout: "10 seconds",
       maxOutputBytes: 4096,
@@ -114,7 +118,7 @@ export const inspectVmWorkloads = Effect.fn("VmWorkload.inspect")(
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, control),
     );
     const result = yield* runner.run({
-      command: "/usr/local/bin/launchpad-workload",
+      command: "/opt/launchpad/bin/launchpad-workload",
       args,
       timeout: "10 seconds",
       maxOutputBytes: 1024 * 1024,
@@ -154,40 +158,16 @@ export const withSealedVmWorkloads = <A, E, R>(
       .slice(0, 32);
     const before = yield* inspectVmWorkloads({ type: "inspect" });
     if (!before.stopped || before.sealedBy !== operation) return yield* new VmWorkloadError();
-    const wrap = (command: ChildProcess.Command): ChildProcess.Command => {
-      if (ChildProcess.isPipedCommand(command))
-        return ChildProcess.pipeTo(wrap(command.left), wrap(command.right), command.options);
-      if (command.options.shell) throw new Error("Transfer requires a direct executable.");
-      return ChildProcess.make(
-        "/usr/local/bin/launchpad-workload",
-        [
-          "run-transfer",
-          before.bootId,
-          operation,
-          String(before.epoch),
-          NodeCrypto.randomBytes(16).toString("hex"),
-          "--",
-          command.command,
-          ...command.args,
-        ],
-        command.options,
-      );
-    };
-    const spawner = ChildProcessSpawner.make((command) =>
-      Effect.try({
-        try: () => wrap(command),
-        catch: () =>
-          PlatformError.badArgument({
-            module: "VmWorkload",
-            method: "export",
-            description: "Transfer command could not be tracked.",
-          }),
-      }).pipe(Effect.flatMap((wrapped) => control.spawn(wrapped))),
-    );
+    const spawner = makeVmWorkloadSpawner(control);
     const runner = yield* ProcessRunner.make().pipe(
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
     const result = yield* effect.pipe(
+      Effect.provideService(VmSealedWorkloadAdmission, {
+        bootId: before.bootId,
+        operationId: operation,
+        epoch: before.epoch,
+      }),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       Effect.provideService(ProcessRunner.ProcessRunner, runner),
     );

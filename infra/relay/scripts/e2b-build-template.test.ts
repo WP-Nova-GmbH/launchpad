@@ -40,7 +40,6 @@ const decodeTemplate = Schema.decodeSync(
     }),
   ),
 );
-const decodeCommand = Schema.decodeUnknownSync(Schema.String);
 const decodeJsonObject = Schema.decodeSync(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
 );
@@ -183,6 +182,7 @@ describe("runner build publication", () => {
             "launchpad-arm64",
             expect.objectContaining({
               apiUrl: "http://127.0.0.1:3000",
+              retries: 0,
               cpuCount: 2,
               memoryMB: 4096,
               minFreeDiskMb: 21504,
@@ -213,8 +213,16 @@ describe("runner build publication", () => {
             "activitySha256",
             "workloadSha256",
             "workloadServiceSha256",
+            "installerSha256",
           ])
             expect(receipt[field]).toMatch(/^[a-f0-9]{64}$/);
+          expect(receipt.installerSha256).toBe(
+            NodeCrypto.createHash("sha256")
+              .update(
+                await NodeFSP.readFile(new URL("../../e2b/template/install.sh", import.meta.url)),
+              )
+              .digest("hex"),
+          );
           expect(await NodeFSP.readdir(NodePath.dirname(fixture.selected))).toEqual([
             "template.json",
           ]);
@@ -305,7 +313,7 @@ describe("runner build publication", () => {
 
 describe("E2B runner build inputs", () => {
   it.skipIf(hostPlatform === "win32")(
-    "executes the pinned SDK's parsed native shim step without losing shell quoting",
+    "executes the parsed native shim and preserves trusted tools under stock finalization",
     async () => {
       const dockerfile = await NodeFSP.readFile(
         new URL("../../e2b/template/Dockerfile", import.meta.url),
@@ -314,21 +322,34 @@ describe("E2B runner build inputs", () => {
       const template = decodeTemplate(
         await Template.toJSON(Template().fromDockerfile(dockerfile), false),
       );
-      const steps = template.steps.filter(
-        (step) => step.type === "RUN" && decodeCommand(step.args[0]).includes("codex-native.json"),
+      const installer = await NodeFSP.readFile(
+        new URL("../../e2b/template/install.sh", import.meta.url),
+        "utf8",
       );
-      expect(steps).toHaveLength(1);
-      const parsedCommand = decodeCommand(steps[0]!.args[0]);
+      expect(template.steps.filter((step) => step.type === "RUN").map((step) => step.args)).toEqual(
+        [["bash /opt/launchpad-package/install.sh"]],
+      );
+      expect(template.steps.filter((step) => step.type === "COPY")).toHaveLength(1);
+      expect(template.steps).toHaveLength(7);
+      const syntax = NodeChildProcess.spawnSync("/bin/bash", ["-n"], {
+        input: installer,
+        encoding: "utf8",
+      });
+      expect(syntax.status, syntax.stderr).toBe(0);
+      const nativeSetup =
+        /^node --input-type=module <<'JAVASCRIPT'\n([\s\S]*?)\nJAVASCRIPT$/mu.exec(installer)?.[1];
+      expect(nativeSetup).toBeDefined();
       const fixture = await NodeFSP.realpath(
         await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-shim-")),
       );
       try {
-        const prefix = fixture + "/node_modules/";
+        const image = fixture + "/image";
+        const prefix = image + "/opt/launchpad/node/lib/node_modules/";
         const root = prefix + "@openai/codex";
         const optional = root + "/node_modules/@openai/codex-linux-arm64";
         const native = optional + "/vendor/aarch64-unknown-linux-musl/bin/codex";
-        const shim = fixture + "/bin/codex";
-        const manifest = fixture + "/manifest/codex-native.json";
+        const shim = image + "/opt/launchpad/node/bin/codex";
+        const manifest = image + "/opt/launchpad/codex-native.json";
         await NodeFSP.mkdir(NodePath.dirname(native), { recursive: true });
         await NodeFSP.mkdir(NodePath.dirname(shim));
         await NodeFSP.writeFile(root + "/package.json", JSON.stringify({ version: "0.159.3" }));
@@ -341,21 +362,22 @@ describe("E2B runner build inputs", () => {
           '#!/bin/sh\nif [ "$1" = --version ]; then printf "codex-cli 0.159.3\\n"; exit 0; fi\nprintf "%s\\n" "$$" "$1" "$CODEX_MANAGED_PACKAGE_ROOT" "$CODEX_MANAGED_BY_NPM" "${CODEX_MANAGED_BY_PNPM-unset}"\n',
           { mode: 0o755 },
         );
-        const command = parsedCommand
-          .replaceAll("/usr/local/lib/node_modules/", prefix)
-          .replaceAll("/opt/launchpad", fixture + "/manifest")
-          .replaceAll("/usr/local/bin/codex", shim);
+        const command = nativeSetup!.replaceAll("/opt/launchpad", image + "/opt/launchpad");
         const environment = {
-          PATH: `${NodePath.dirname(process.execPath)}:${fixture}/bin:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          PATH: `${NodePath.dirname(process.execPath)}:${NodePath.dirname(shim)}:${process.env.PATH ?? "/usr/bin:/bin"}`,
           CODEX_MANAGED_BY_PNPM: "stale",
         };
         await NodeFSP.writeFile(shim, "old shim", { mode: 0o755 });
-        const setup = NodeChildProcess.spawnSync("/bin/sh", ["-c", command], {
-          env: environment,
-          encoding: "utf8",
-        });
+        const setup = NodeChildProcess.spawnSync(
+          process.execPath,
+          ["--input-type=module", "-e", command],
+          {
+            env: environment,
+            encoding: "utf8",
+          },
+        );
         expect(setup.status, setup.stderr).toBe(0);
-        expect(setup.stdout.trim()).toBe("codex-cli 0.159.3");
+        expect(setup.stdout).toBe("");
         expect(JSON.parse(await NodeFSP.readFile(manifest, "utf8"))).toEqual({
           version: "0.159.3",
           executable: native,
@@ -375,6 +397,54 @@ describe("E2B runner build inputs", () => {
           "1",
           "unset",
         ]);
+        // Exercise stock finalization's mode change on the installer's helper destinations.
+        // The native distribution and its manifest retain the protected parent chain.
+        const protectedFiles = [shim, native, manifest];
+        for (const installation of installer
+          .split("\n")
+          .filter((line) => /^install -m0(?:644|755) \S+ \/opt\/launchpad\//u.test(line))) {
+          const [, , source, destination] = installation.split(" ");
+          expect([
+            "/opt/launchpad-package/workload.py",
+            "/opt/launchpad-package/activity.py",
+            "/opt/launchpad-package/install.sh",
+          ]).toContain(source);
+          expect([
+            "/opt/launchpad/bin/launchpad-workload",
+            "/opt/launchpad/bin/launchpad-activity",
+            "/opt/launchpad/install.sh",
+          ]).toContain(destination);
+          const staged = image + source;
+          await NodeFSP.mkdir(NodePath.dirname(staged), { recursive: true });
+          await NodeFSP.copyFile(
+            new URL("../../e2b/template/" + NodePath.basename(source!), import.meta.url),
+            staged,
+          );
+          const target = image + destination;
+          await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
+          const copied = NodeChildProcess.spawnSync(
+            "/bin/sh",
+            ["-c", installation.replaceAll("/opt/launchpad", image + "/opt/launchpad")],
+            { encoding: "utf8" },
+          );
+          expect(copied.status, copied.stderr).toBe(0);
+          protectedFiles.push(target);
+        }
+        expect(protectedFiles).toHaveLength(6);
+        const local = image + "/usr/local";
+        await NodeFSP.mkdir(local, { recursive: true });
+        const finalized = NodeChildProcess.spawnSync("chmod", ["-R", "777", local]);
+        expect(finalized.status).toBe(0);
+        expect((await NodeFSP.stat(local)).mode & 0o777).toBe(0o777);
+        for (const file of protectedFiles) {
+          expect((await NodeFSP.stat(file)).mode & 0o022, file).toBe(0);
+          for (
+            let parent = NodePath.dirname(file);
+            parent !== image;
+            parent = NodePath.dirname(parent)
+          )
+            expect((await NodeFSP.stat(parent)).mode & 0o022, parent).toBe(0);
+        }
         // Wrong optional distribution must fail before exchanging either artifact.
         const manifestBefore = await NodeFSP.readFile(manifest);
         const shimBefore = await NodeFSP.readFile(shim);
@@ -382,10 +452,14 @@ describe("E2B runner build inputs", () => {
           optional + "/package.json",
           JSON.stringify({ version: "0.159.2-linux-arm64" }),
         );
-        const rejected = NodeChildProcess.spawnSync("/bin/sh", ["-c", command], {
-          env: environment,
-          encoding: "utf8",
-        });
+        const rejected = NodeChildProcess.spawnSync(
+          process.execPath,
+          ["--input-type=module", "-e", command],
+          {
+            env: environment,
+            encoding: "utf8",
+          },
+        );
         expect(rejected.status).not.toBe(0);
         expect(await NodeFSP.readFile(manifest)).toEqual(manifestBefore);
         expect(await NodeFSP.readFile(shim)).toEqual(shimBefore);
@@ -407,12 +481,16 @@ describe("E2B runner build inputs", () => {
       await NodeFSP.writeFile(archive, "replaced after staging");
       expect((await NodeFSP.readdir(context)).sort()).toEqual([
         "activity.py",
+        "install.sh",
         "launchpad-workloads.service",
         "server.sha256",
         "server.tar.gz",
         "workload.py",
       ]);
       expect(await NodeFSP.readFile(NodePath.join(context, "server.tar.gz"))).toEqual(payload);
+      expect(await NodeFSP.readFile(NodePath.join(context, "install.sh"))).toEqual(
+        await NodeFSP.readFile(new URL("../../e2b/template/install.sh", import.meta.url)),
+      );
       expect(await NodeFSP.readFile(NodePath.join(context, "server.sha256"), "utf8")).toBe(
         `${hash}  server.tar.gz\n`,
       );

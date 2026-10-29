@@ -44,7 +44,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
           state: string;
           computeRef: string | null;
         }>`SELECT state, compute_ref AS "computeRef" FROM relay_thread_vm_allocations
-        WHERE allocation_id = ${input.allocationId} FOR UPDATE`;
+        WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
         const prior = yield* get(input.operationId);
         if (prior) {
           if (
@@ -98,7 +98,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
           operationId: string;
         }>`SELECT c.operation_id AS "operationId" FROM relay_thread_vm_capacity c
         JOIN relay_thread_vm_allocations a USING (allocation_id)
-        WHERE c.host_id = ${hostId} AND c.state = 'waiting' AND a.state IN ('creating', 'paused')
+        WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'waiting' AND a.state IN ('creating', 'paused')
         ORDER BY c.position FOR UPDATE OF c LIMIT 1`;
         if (!row) return null;
         yield* sql`UPDATE relay_thread_vm_capacity SET state = 'reserved' WHERE operation_id = ${row.operationId}`;
@@ -116,7 +116,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
         const [allocation] = yield* sql<{
           state: string;
         }>`SELECT state FROM relay_thread_vm_allocations
-        WHERE allocation_id = ${request.allocationId} FOR UPDATE`;
+        WHERE allocation_id = ${request.allocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
         if (allocation?.state !== (request.kind === "create" ? "creating" : "paused"))
           return yield* conflict("Allocation no longer accepts execution");
         const rows = yield* sql`UPDATE relay_thread_vm_capacity SET state = 'started'
@@ -139,24 +139,9 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
     operationId: string,
   ) {
     const rows = yield* sql`UPDATE relay_thread_vm_capacity SET state = 'released'
-      WHERE operation_id = ${operationId} AND state IN ('waiting', 'reserved', 'released') RETURNING operation_id`;
+      WHERE operation_id = ${operationId} AND state IN ('waiting', 'reserved', 'released')
+        AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.allocation_id=relay_thread_vm_capacity.allocation_id AND a.runtime_protocol='native-v1') RETURNING operation_id`;
     if (!rows.length) return yield* conflict("External execution may already have started");
-  });
-  // Called only after the fenced creation API has sealed the exact operation and
-  // returned a positive physical-stop receipt. A missing SDK row is never proof.
-  const confirmCreateCancelled = Effect.fn("relay.vm_capacity.confirm_create_cancelled")(function* (
-    operationId: string,
-    computeRef: string | null,
-  ) {
-    const rows =
-      yield* sql`UPDATE relay_thread_vm_capacity c SET state = 'released', compute_ref = ${computeRef}
-      FROM relay_thread_vm_provisions p, relay_thread_vm_allocations a
-      WHERE c.operation_id = ${operationId} AND c.kind = 'create' AND c.state = 'started'
-        AND (c.compute_ref IS NULL OR c.compute_ref = ${computeRef})
-        AND p.operation_id = c.operation_id AND p.phase = 'creating' AND p.creation_identity_fenced
-        AND a.allocation_id = c.allocation_id AND a.state = 'deleting'
-      RETURNING c.operation_id`;
-    if (!rows.length) return yield* conflict("Creation does not accept a physical-stop receipt");
   });
   return {
     get,
@@ -166,6 +151,5 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
     beginExecution,
     recordCreated,
     cancelUnstarted,
-    confirmCreateCancelled,
   };
 }

@@ -8,6 +8,7 @@ import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
 import { RelayThreadVmRepositoryUpload } from "@t3tools/contracts/relay";
 import { makeThreadMoveCheckpointStore } from "./ThreadMoveCheckpointStore.ts";
+import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
 export class ThreadVmResetConflict extends Schema.TaggedError<ThreadVmResetConflict>()(
   "ThreadVmResetConflict",
   { message: Schema.String },
@@ -21,6 +22,7 @@ export interface ThreadVmReset {
   readonly allocationId: string;
   readonly actorUserId: string;
   readonly expectedGeneration: number;
+  readonly sourceGeneration: number;
   readonly savedDiskOperationId: string;
   readonly nativeCheckpointOperationId: string;
   readonly sourceEnvironmentId: string;
@@ -66,6 +68,7 @@ export function makeThreadVmResetStore(
     const [row] =
       yield* sql<ThreadVmReset>`SELECT operation_id AS "operationId",thread_id AS "threadId",allocation_id AS "allocationId",actor_user_id AS "actorUserId",
       expected_generation AS "expectedGeneration",saved_disk_operation_id AS "savedDiskOperationId",native_checkpoint_operation_id AS "nativeCheckpointOperationId",
+      (SELECT s.generation FROM relay_thread_vm_saved_disks s WHERE s.operation_id=saved_disk_operation_id) AS "sourceGeneration",
       source_environment_id AS "sourceEnvironmentId",source_sequence AS "sourceSequence",host_id AS "hostId",template_id AS "templateId",canonical_key AS "canonicalKey",branch,revision,repository_upload AS "repositoryUpload",phase,error_code AS "errorCode"
       FROM relay_thread_vm_resets WHERE operation_id=${operationId}`;
     return row ?? null;
@@ -93,11 +96,19 @@ export function makeThreadVmResetStore(
           repositoryId: string;
           ownerUserId: string;
           operationId: string | null;
+          legacyRuntime: boolean;
         }>`
-        SELECT generation,environment_id AS "environmentId",organization_id AS "organizationId",repository_id AS "repositoryId",owner_user_id AS "ownerUserId",operation_id AS "operationId"
+        SELECT EXISTS(SELECT 1 FROM relay_thread_vm_saved_disks s JOIN relay_thread_vm_final_saves f ON f.operation_id=s.operation_id
+          JOIN relay_thread_vm_allocations a ON a.allocation_id=f.allocation_id WHERE s.thread_id=relay_thread_placements.thread_id
+            AND s.generation=relay_thread_placements.generation AND a.runtime_protocol<>'native-v1') AS "legacyRuntime",
+          generation,environment_id AS "environmentId",organization_id AS "organizationId",repository_id AS "repositoryId",owner_user_id AS "ownerUserId",operation_id AS "operationId"
         FROM relay_thread_placements WHERE thread_id=${input.threadId} FOR UPDATE`;
         if (!placement || placement.ownerUserId !== input.actorUserId)
           return yield* conflict("Only the private thread owner can reset its VM");
+        if (placement.legacyRuntime)
+          return yield* conflict(
+            "This VM belongs to an earlier runtime and requires manual migration.",
+          );
         const prior = yield* get(input.operationId);
         if (prior) {
           for (const key of [
@@ -125,7 +136,7 @@ export function makeThreadVmResetStore(
             checkpointOperationId: prior.nativeCheckpointOperationId,
             expected: {
               sourceEnvironmentId: prior.sourceEnvironmentId,
-              generation: prior.expectedGeneration,
+              generation: prior.sourceGeneration,
               sourceSequence: prior.sourceSequence,
               nativeThreadId: (yield* natives.getForOperation(prior))?.nativeThreadId ?? "",
             },
@@ -154,31 +165,35 @@ export function makeThreadVmResetStore(
           nativeCheckpointOperationId: string;
           sourceSequence: number;
           environmentId: string;
+          generation: number;
           captureOperationId: string | null;
         }>`
-        SELECT s.operation_id AS "savedDiskOperationId",f.native_checkpoint_operation_id AS "nativeCheckpointOperationId",f.source_sequence AS "sourceSequence",f.environment_id AS "environmentId",
+        SELECT s.operation_id AS "savedDiskOperationId",s.generation,f.native_checkpoint_operation_id AS "nativeCheckpointOperationId",f.source_sequence AS "sourceSequence",f.environment_id AS "environmentId",
           CASE WHEN f.original_state='paused' THEN p.operation_id ELSE f.operation_id END AS "captureOperationId"
         FROM relay_thread_vm_saved_disks s JOIN relay_thread_vm_final_saves f ON f.operation_id=s.operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=f.allocation_id
+        JOIN relay_thread_placements t ON t.thread_id=s.thread_id
         LEFT JOIN relay_thread_vm_pauses p ON f.original_state='paused' AND p.allocation_id=f.allocation_id
           AND p.generation=f.generation AND p.phase='completed' AND p.boot_id IS NOT NULL
           AND p.native_checkpoint_operation_id=f.native_checkpoint_operation_id AND p.source_sequence=f.source_sequence
           AND p.source_frozen_at IS NOT NULL AND p.source_reopened_at IS NULL
-        WHERE s.thread_id=${input.threadId} AND s.generation=${input.expectedGeneration} AND s.phase='expired' AND f.phase='completed'
+        WHERE s.thread_id=${input.threadId} AND t.generation=${input.expectedGeneration} AND s.phase='expired' AND f.phase='completed'
+          AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}))
           AND f.thread_id=s.thread_id AND f.generation=s.generation
-          AND a.state='deleted' AND a.deleted_at IS NOT NULL AND f.environment_id=${placement.environmentId}
+          AND a.runtime_protocol='native-v1' AND a.state='deleted' AND a.deleted_at IS NOT NULL
+          AND (s.generation<t.generation OR f.environment_id=${placement.environmentId})
           AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations live WHERE live.thread_id=s.thread_id AND live.deleted_at IS NULL)
           AND NOT EXISTS(SELECT 1 FROM relay_thread_execution_admissions w WHERE w.thread_id=s.thread_id AND NOT w.completed)
           AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_bindings b JOIN relay_environment_credentials k ON k.credential_id=b.credential_id
             WHERE b.allocation_id=a.allocation_id AND (b.revoked_at IS NULL OR k.revoked_at IS NULL))
         FOR UPDATE OF s`;
-        const point = source ? yield* natives.latestComplete(input.threadId) : null;
+        const point = source ? yield* natives.get(source.nativeCheckpointOperationId) : null;
         if (
           !source ||
           !point ||
           !point.recoveryHistory ||
           point.operationId !== source.nativeCheckpointOperationId ||
-          point.generation !== input.expectedGeneration ||
+          point.generation !== source.generation ||
           point.sourceEnvironmentId !== source.environmentId ||
           point.sourceSequence !== source.sourceSequence ||
           !source.captureOperationId ||
@@ -222,7 +237,13 @@ export function makeThreadVmResetStore(
     const candidate = yield* get(operationId);
     if (!candidate) return yield* conflict("Reset does not exist");
     yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${candidate.threadId} FOR UPDATE`;
-    yield* sql`SELECT operation_id FROM relay_thread_vm_resets WHERE operation_id=${operationId} FOR UPDATE`;
+    const owned =
+      yield* sql`SELECT r.operation_id FROM relay_thread_vm_resets r WHERE r.operation_id=${operationId} AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations legacy WHERE legacy.runtime_protocol<>'native-v1'
+          AND (legacy.allocation_id=r.allocation_id OR legacy.allocation_id IN(SELECT f.allocation_id FROM relay_thread_vm_saved_disks s JOIN relay_thread_vm_final_saves f ON f.operation_id=s.operation_id WHERE s.operation_id=r.saved_disk_operation_id))) FOR UPDATE`;
+    if (!owned.length)
+      return yield* conflict(
+        "This VM belongs to an earlier runtime and requires manual migration.",
+      );
     return (yield* get(operationId))!;
   });
   const requestCancellation = Effect.fn("relay.thread_vm.reset.cancel")(function* (
@@ -235,8 +256,11 @@ export function makeThreadVmResetStore(
         if (!["pending", "creating", "cancelling"].includes(row.phase))
           return yield* conflict("A reset that committed fresh ownership cannot be cancelled");
         const [owner] =
-          yield* sql`SELECT 1 FROM relay_thread_placements WHERE thread_id=${row.threadId}
-        AND generation=${row.expectedGeneration} AND environment_id=${row.sourceEnvironmentId} AND operation_id=${row.operationId}`;
+          yield* sql`SELECT 1 FROM relay_thread_placements t WHERE t.thread_id=${row.threadId}
+        AND t.generation=${row.expectedGeneration} AND t.operation_id=${row.operationId}
+        AND (t.environment_id=${row.sourceEnvironmentId} OR EXISTS(
+          SELECT 1 FROM relay_thread_vm_saved_disks s WHERE s.operation_id=${row.savedDiskOperationId}
+            AND s.thread_id=t.thread_id AND (${savedDiskHasCancelledRestorePlacement(sql)})))`;
         if (!owner) return yield* conflict("Reset no longer owns this expired workspace");
         // Revoke even a delivered-but-unconfirmed credential before cleanup. The
         // replacement remains inert; old expired credentials are never revived.
@@ -259,8 +283,12 @@ export function makeThreadVmResetStore(
           operationId: string;
         }>`SELECT r.operation_id AS "operationId"
         FROM relay_thread_vm_resets r JOIN relay_thread_placements t USING(thread_id)
-        WHERE r.host_id=${hostId} AND r.phase='cancelling' AND t.operation_id=r.operation_id
-          AND t.generation=r.expected_generation AND t.environment_id=r.source_environment_id
+        WHERE NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations legacy WHERE legacy.runtime_protocol<>'native-v1'
+          AND (legacy.allocation_id=r.allocation_id OR legacy.allocation_id IN(SELECT f.allocation_id FROM relay_thread_vm_saved_disks s JOIN relay_thread_vm_final_saves f ON f.operation_id=s.operation_id WHERE s.operation_id=r.saved_disk_operation_id))) AND r.host_id=${hostId} AND r.phase='cancelling' AND t.operation_id=r.operation_id
+          AND t.generation=r.expected_generation
+          AND (t.environment_id=r.source_environment_id OR EXISTS(
+            SELECT 1 FROM relay_thread_vm_saved_disks s WHERE s.operation_id=r.saved_disk_operation_id
+              AND s.thread_id=t.thread_id AND (${savedDiskHasCancelledRestorePlacement(sql)})))
           AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp())
         ORDER BY r.retry_at,r.created_at,r.operation_id FOR UPDATE OF t SKIP LOCKED LIMIT 1`;
         if (!candidate) return null;
@@ -279,7 +307,9 @@ export function makeThreadVmResetStore(
       yield* sql`SELECT 1 FROM relay_thread_vm_resets r JOIN relay_thread_placements t USING(thread_id)
       WHERE r.operation_id=${claim.operationId} AND r.claim_id=${claim.claimId} AND r.claim_until>clock_timestamp()
         AND r.phase='cancelling' AND t.operation_id=r.operation_id AND t.generation=r.expected_generation
-        AND t.environment_id=r.source_environment_id`;
+        AND (t.environment_id=r.source_environment_id OR EXISTS(
+          SELECT 1 FROM relay_thread_vm_saved_disks s WHERE s.operation_id=r.saved_disk_operation_id
+            AND s.thread_id=t.thread_id AND (${savedDiskHasCancelledRestorePlacement(sql)})))`;
     if (!current) return yield* conflict("Reset cleanup claim expired or ownership changed");
     return row;
   });

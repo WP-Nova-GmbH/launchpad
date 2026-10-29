@@ -94,7 +94,7 @@ export const exportThreadVmRestoreHistory = Effect.fn("ThreadVmRestoreHistory.ex
       point = yield* decodePoint(input.native);
     if (
       boot.threadId !== point.threadId ||
-      boot.generation !== point.generation + 1 ||
+      boot.generation <= point.generation ||
       !point.captureOperationId
     )
       return yield* fail("scope");
