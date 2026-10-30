@@ -7,7 +7,11 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 
-import { makeE2BThreadVmCompute, type E2BThreadVmSettings } from "./E2BThreadVmCompute.ts";
+import {
+  makeE2BThreadVmCompute,
+  THREAD_VM_BLOCKED_NETWORKS,
+  type E2BThreadVmSettings,
+} from "./E2BThreadVmCompute.ts";
 
 const settings: E2BThreadVmSettings = {
   apiUrl: "http://127.0.0.1:3000",
@@ -382,6 +386,75 @@ describe("E2B thread VM compute", () => {
       ]);
     }),
   );
+
+  it.effect(
+    "sends disjoint IPv4 deny ranges while retaining public hosts and IPv6 protections",
+    () =>
+      Effect.gen(function* () {
+        const redundantHosts = [
+          ...Array.from({ length: 32 }, (_, index) => `10.12.0.${index + 1}`),
+          "172.17.0.1/32",
+          "172.18.0.1/24",
+          "192.168.5.1",
+        ];
+        const { client, compute } = fixture({
+          hostAddresses: [
+            ...redundantHosts,
+            "10.0.0.0/8",
+            "10.12.0.1",
+            "203.0.113.4/32",
+            "203.0.113.4/32",
+            "fc00::/7",
+            "2001:db8::9/128",
+          ],
+        });
+        yield* compute.create(input);
+        expect(client.create).toHaveBeenCalledWith(
+          settings.templateId,
+          expect.objectContaining({
+            network: {
+              denyOut: [...THREAD_VM_BLOCKED_NETWORKS, "203.0.113.4/32", "2001:db8::9/128"],
+              allowPublicTraffic: false,
+            },
+          }),
+        );
+      }),
+  );
+
+  for (const { hostAddresses, expected } of [
+    {
+      hostAddresses: ["192.0.0.0/8"],
+      expected: [
+        ...THREAD_VM_BLOCKED_NETWORKS.filter(
+          (range) => range !== "192.0.0.0/24" && range !== "192.168.0.0/16",
+        ),
+        "192.0.0.0/8",
+      ],
+    },
+    {
+      hostAddresses: ["203.0.113.14", "203.0.113.11/29", "203.0.113.8/29", "203.0.113.16"],
+      expected: [...THREAD_VM_BLOCKED_NETWORKS, "203.0.113.11/29", "203.0.113.16"],
+    },
+    {
+      hostAddresses: ["0.0.0.0/0"],
+      expected: [...THREAD_VM_BLOCKED_NETWORKS.filter((range) => range.includes(":")), "0.0.0.0/0"],
+    },
+  ]) {
+    it.effect(
+      `keeps the complete deny union when host ranges include ${hostAddresses.join(", ")}`,
+      () =>
+        Effect.gen(function* () {
+          const { client, compute } = fixture({ hostAddresses });
+          yield* compute.create(input);
+          expect(client.create).toHaveBeenCalledWith(
+            settings.templateId,
+            expect.objectContaining({
+              network: { denyOut: expected, allowPublicTraffic: false },
+            }),
+          );
+        }),
+    );
+  }
 
   for (const override of [
     { apiUrl: "" },

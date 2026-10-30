@@ -5,6 +5,7 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import {
   CommandId,
+  type MessageId,
   type ScopedThreadRef,
   type ThreadMoveQueueEntry,
   type ThreadPromptQueue,
@@ -23,7 +24,7 @@ import {
 import { useAtomValue } from "@effect/atom-react";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { Clock3Icon, PauseIcon, PlayIcon } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
 import { randomUUID } from "../../lib/utils";
 import { threadMoveRelayUrl } from "../../state/thread-move-submissions";
 import { threadEnvironment } from "../../state/threads";
@@ -41,6 +42,13 @@ type SharedPromptQueueProps = {
   workflowControlled?: boolean;
   supportsPreparation?: boolean;
   canWorkLocally?: boolean;
+  visibleEntryIds?: ReadonlyArray<string>;
+  controlsRef?: Ref<SharedPromptQueueHandle>;
+};
+
+export type SharedPromptQueueHandle = {
+  edit: (messageId: MessageId) => void;
+  remove: (messageId: MessageId) => void;
 };
 
 export function SharedPromptQueue(props: SharedPromptQueueProps) {
@@ -62,6 +70,8 @@ function SharedPromptQueueContent({
   workflowControlled = false,
   supportsPreparation = false,
   canWorkLocally = false,
+  visibleEntryIds,
+  controlsRef,
 }: SharedPromptQueueProps) {
   const placement = useThreadMovePlacement(threadRef.environmentId, threadRef.threadId);
   const fallbackMove = threadMoveQueueOwnership({ entries: queue.entries, placement }).fallback;
@@ -165,6 +175,27 @@ function SharedPromptQueueContent({
   };
   const input = { threadId: threadRef.threadId };
   const request = <T,>(value: T) => ({ environmentId: threadRef.environmentId, input: value });
+  useImperativeHandle(controlsRef, () => ({
+    edit: (messageId) => {
+      const entry = queue.entries.find((candidate) => candidate.messageId === messageId);
+      if (disabled || !entry || entry.kind === "move" || entry.state !== "pending") return;
+      setEdit({ messageId, revision: entry.revision, text: entry.text });
+      setError(null);
+    },
+    remove: (messageId) => {
+      const entry = queue.entries.find((candidate) => candidate.messageId === messageId);
+      if (disabled || !entry || entry.kind === "move" || entry.state !== "pending") return;
+      void run(() =>
+        removePrompt(
+          request({
+            ...input,
+            messageId,
+            expectedRevision: entry.revision,
+          }),
+        ),
+      );
+    },
+  }));
   const requestCancellation = async (entry: ThreadMoveQueueEntry) => {
     const isCurrent = () => mounted.current;
     const command = cancellation.prepare(cancellationScope, entry, () => ({
@@ -217,10 +248,15 @@ function SharedPromptQueueContent({
       }
     }
   };
+  const visibleIds = visibleEntryIds ? new Set(visibleEntryIds) : null;
+  const visibleCount = visibleIds
+    ? queue.entries.filter((entry) => visibleIds.has(entry.messageId)).length
+    : queue.entries.length;
   if (
-    queue.entries.length === 0 &&
+    visibleCount === 0 &&
     queue.pauseReason === null &&
     edit === null &&
+    error === null &&
     !preparing &&
     !fallbackMove &&
     !setupActive
@@ -239,7 +275,7 @@ function SharedPromptQueueContent({
           <Clock3Icon aria-hidden="true" className="size-3.5" />
           {queue.pauseReason ? "Queue paused" : "Queued"}
           <span className="rounded bg-muted px-1 text-3xs tabular-nums">
-            {queue.entries.length + (fallbackMove ? 1 : 0)}
+            {visibleCount + (fallbackMove ? 1 : 0)}
           </span>
         </span>
         {setupActive ? (
@@ -429,7 +465,7 @@ function SharedPromptQueueContent({
           </li>
         )}
         {queue.entries.map((entry, index) =>
-          entry.kind === "move" ? (
+          visibleIds && !visibleIds.has(entry.messageId) ? null : entry.kind === "move" ? (
             <li key={entry.messageId}>
               <ThreadMoveQueueItem
                 environmentId={threadRef.environmentId}

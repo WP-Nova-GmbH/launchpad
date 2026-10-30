@@ -50,7 +50,32 @@ function read(): ReadonlyArray<SharedPromptSubmission> {
 
 export const useSharedPromptSubmissions = create<{
   entries: ReadonlyArray<SharedPromptSubmission>;
-}>(() => ({ entries: read() }));
+  activeCommandIds: ReadonlyArray<CommandId>;
+}>(() => ({ entries: read(), activeCommandIds: [] }));
+
+const activeAttempts = new Map<string, { commandId: CommandId; count: number }>();
+const activeCommandIds = () =>
+  [...activeAttempts].flatMap(([key, attempt]) =>
+    key.startsWith(storagePrefix()) ? [attempt.commandId] : [],
+  );
+
+/** Active attempts render inline; the durable journal remains available after failure or reload. */
+export function beginSharedPromptSubmission(commandId: CommandId) {
+  const key = storageKey(commandId);
+  const previous = activeAttempts.get(key);
+  activeAttempts.set(key, { commandId, count: (previous?.count ?? 0) + 1 });
+  useSharedPromptSubmissions.setState({ activeCommandIds: activeCommandIds() });
+  let finished = false;
+  return () => {
+    if (finished) return;
+    finished = true;
+    const current = activeAttempts.get(key);
+    if (current && current.count > 1)
+      activeAttempts.set(key, { ...current, count: current.count - 1 });
+    else activeAttempts.delete(key);
+    useSharedPromptSubmissions.setState({ activeCommandIds: activeCommandIds() });
+  };
+}
 
 function write(entry: SharedPromptSubmission) {
   // Persist before dispatch. A storage failure must leave the composer intact.
@@ -178,7 +203,7 @@ export function reviseRejectedSharedPrompt(
 export function setSharedPromptSubmissionAccount(nextAccountId: string | null) {
   if (accountId === nextAccountId) return;
   accountId = nextAccountId;
-  useSharedPromptSubmissions.setState({ entries: read() });
+  useSharedPromptSubmissions.setState({ entries: read(), activeCommandIds: activeCommandIds() });
 }
 
 export const sharedPromptSubmissionAccount = () => accountId;

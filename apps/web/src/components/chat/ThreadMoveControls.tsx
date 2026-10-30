@@ -437,7 +437,7 @@ function DestinationRow({
       disabled={disabled}
       aria-current={current ? "location" : undefined}
       onClick={onClick}
-      className="flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+      className="flex w-full cursor-pointer items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
     >
       <EnvironmentMachineIcon
         kind={machine}

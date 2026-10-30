@@ -77,6 +77,37 @@ function registry(shared = true, queued = false) {
 }
 
 describe("shared startTurn ownership", () => {
+  it.each(["accepted", "failed"] as const)(
+    "tracks active presentation until the %s dispatch settles",
+    async (outcome) => {
+      const failed = AsyncResult.failure<never>(Cause.die(new Error("Connection lost")));
+      const accepted = AsyncResult.success({ sequence: 2 });
+      let finish!: (value: typeof failed | typeof accepted) => void;
+      vi.spyOn(threadEnvironment.enqueuePrompt, "run").mockReturnValue(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      vi.spyOn(threadEnvironment.getCommandReceipt, "run").mockResolvedValue(failed);
+      const result = runAtomCommand(
+        registry(),
+        threadEnvironment.startTurn,
+        { environmentId, input },
+        { reportFailure: false, reportDefect: false },
+      );
+      const saved = useSharedPromptSubmissions.getState().entries[0]!;
+      expect(useSharedPromptSubmissions.getState().activeCommandIds).toEqual([
+        saved.command.commandId,
+      ]);
+      finish(outcome === "accepted" ? accepted : failed);
+      await result;
+      expect(useSharedPromptSubmissions.getState().activeCommandIds).toEqual([]);
+      expect(useSharedPromptSubmissions.getState().entries).toHaveLength(
+        outcome === "accepted" ? 0 : 1,
+      );
+    },
+  );
+
   it.each([false, true])(
     "keeps invocation ownership after another tab cleans acceptance (delayed storage event: %s)",
     async (delayedEvent) => {

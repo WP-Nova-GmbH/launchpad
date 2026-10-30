@@ -9,6 +9,8 @@ import {
   type ThreadId,
   type ThreadMoveQueueEntry,
   type ThreadPromptQueue,
+  type ThreadPromptQueueEntry,
+  type ThreadQueueEntry,
   type TurnId,
 } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
@@ -25,9 +27,10 @@ import {
   moveQueueEntryLater,
   type QueuedPromptEdit,
 } from "@t3tools/client-runtime/state/threads";
-import { useEffect, useRef, useState } from "react";
-import { Alert, Pressable, ScrollView, TextInput, View } from "react-native";
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
+import { Alert, Pressable, ScrollView, TextInput, View, type ColorValue } from "react-native";
 import { AppText as Text } from "../../components/AppText";
+import { SymbolView } from "../../components/AppSymbol";
 import { threadEnvironment } from "../../state/threads";
 import { threadMoveRelayUrl } from "../../state/thread-move-submissions";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -55,7 +58,66 @@ function QueueButton({
   );
 }
 
+export function InlinePromptActions({
+  prompt,
+  disabled,
+  onEdit,
+  onRemove,
+  onPause,
+  tintColor,
+}: {
+  prompt: ThreadPromptQueueEntry;
+  disabled?: boolean;
+  onEdit?: (messageId: string) => void;
+  onRemove?: (messageId: string) => void;
+  onPause?: () => void;
+  tintColor?: ColorValue;
+}) {
+  if (prompt.state === "unknown") return null;
+  return (
+    <>
+      {onPause ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Pause queue"
+          disabled={disabled}
+          hitSlop={8}
+          className="size-7 items-center justify-center"
+          onPress={onPause}
+        >
+          <SymbolView name="pause" size={14} tintColor={tintColor} />
+        </Pressable>
+      ) : null}
+      {prompt.state === "pending" ? (
+        <>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Edit queued prompt"
+            disabled={disabled}
+            hitSlop={8}
+            className="size-7 items-center justify-center"
+            onPress={() => onEdit?.(prompt.messageId)}
+          >
+            <SymbolView name="pencil" size={14} tintColor={tintColor} />
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Remove queued prompt"
+            disabled={disabled}
+            hitSlop={8}
+            className="size-7 items-center justify-center"
+            onPress={() => onRemove?.(prompt.messageId)}
+          >
+            <SymbolView name="trash" size={14} tintColor={tintColor} />
+          </Pressable>
+        </>
+      ) : null}
+    </>
+  );
+}
+
 type SharedPromptQueueProps = {
+  ref?: Ref<SharedPromptQueueHandle>;
   environmentId: EnvironmentId;
   threadId: ThreadId;
   queue: ThreadPromptQueue;
@@ -64,7 +126,13 @@ type SharedPromptQueueProps = {
   workflowControlled?: boolean;
   supportsPreparation?: boolean;
   hasStartedTurn?: boolean;
+  visibleEntries?: ReadonlyArray<ThreadQueueEntry>;
 };
+
+export interface SharedPromptQueueHandle {
+  edit: (messageId: string) => void;
+  remove: (messageId: string) => void;
+}
 
 export function SharedPromptQueue(props: SharedPromptQueueProps) {
   const account = useAtomValue(managedRelaySessionAtom);
@@ -78,6 +146,7 @@ export function SharedPromptQueue(props: SharedPromptQueueProps) {
 }
 
 function SharedPromptQueueContent({
+  ref,
   environmentId,
   threadId,
   queue,
@@ -86,6 +155,7 @@ function SharedPromptQueueContent({
   workflowControlled = false,
   supportsPreparation = false,
   hasStartedTurn = false,
+  visibleEntries = queue.entries,
 }: SharedPromptQueueProps) {
   const placement = useThreadMovePlacement(environmentId, threadId);
   const fallbackMove = threadMoveQueueOwnership({ entries: queue.entries, placement }).fallback;
@@ -236,41 +306,59 @@ function SharedPromptQueueContent({
       }
     }
   };
-  if (
-    queue.entries.length === 0 &&
-    queue.pauseReason === null &&
-    edit === null &&
-    !blockedByPreparation &&
-    !fallbackMove &&
-    !setupActive
-  )
-    return null;
+  useImperativeHandle(ref, () => ({
+    edit(messageId) {
+      const entry = queue.entries.find((item) => item.messageId === messageId);
+      if (disabled || !entry || entry.kind === "move" || entry.state !== "pending") return;
+      setEdit({ messageId: entry.messageId, revision: entry.revision, text: entry.text });
+      setError(null);
+    },
+    remove(messageId) {
+      const entry = queue.entries.find((item) => item.messageId === messageId);
+      if (disabled || !entry || entry.kind === "move" || entry.state !== "pending") return;
+      void run(() =>
+        removePrompt(
+          request({ threadId, messageId: entry.messageId, expectedRevision: entry.revision }),
+        ),
+      );
+    },
+  }));
+  const visibleIds = new Set(visibleEntries.map((entry) => entry.messageId));
+  const hasQueueChrome =
+    visibleEntries.length > 0 ||
+    queue.pauseReason !== null ||
+    blockedByPreparation ||
+    fallbackMove ||
+    setupActive;
+  if (!hasQueueChrome && edit === null && error === null) return null;
   return (
     <ScrollView
       className="mx-3 mb-2 bg-background px-1 py-2"
       style={{ maxHeight: 260 }}
       keyboardShouldPersistTaps="handled"
     >
-      <View className="mb-2 flex-row items-center justify-between gap-2">
-        <Text className="font-t3-medium text-sm text-foreground">
-          Queued {queue.entries.length + (fallbackMove ? 1 : 0)}
-        </Text>
-        {queue.pauseReason === null || setupActive ? (
-          <QueueButton
-            label={setupActive ? "Stop setup" : "Pause queue"}
-            disabled={disabled || (setupActive && !supportsPreparation)}
-            onPress={() => void run(() => pauseQueue(request({ threadId })))}
-          />
-        ) : queue.pauseReason.code !== "delivery-unknown" ? (
-          <QueueButton
-            label="Resume queue"
-            disabled={disabled || queue.handoff !== null || blockedByPreparation}
-            onPress={() =>
-              void run(() => resumeQueue(request({ threadId, expectedRevision: queue.revision })))
-            }
-          />
-        ) : null}
-      </View>
+      {hasQueueChrome ? (
+        <View className="mb-2 flex-row items-center justify-between gap-2">
+          <Text className="font-t3-medium text-sm text-foreground">
+            Queued {visibleEntries.length + (fallbackMove ? 1 : 0)}
+          </Text>
+          {queue.pauseReason === null || setupActive ? (
+            <QueueButton
+              label={setupActive ? "Stop setup" : "Pause queue"}
+              disabled={disabled || (setupActive && !supportsPreparation)}
+              onPress={() => void run(() => pauseQueue(request({ threadId })))}
+            />
+          ) : queue.pauseReason.code !== "delivery-unknown" ? (
+            <QueueButton
+              label="Resume queue"
+              disabled={disabled || queue.handoff !== null || blockedByPreparation}
+              onPress={() =>
+                void run(() => resumeQueue(request({ threadId, expectedRevision: queue.revision })))
+              }
+            />
+          ) : null}
+        </View>
+      ) : null}
       {workflowControlled ? (
         <Text className="mb-2 text-xs text-foreground-muted">
           Use this job’s review or Cancel controls in Settings → Workflow jobs.
@@ -347,11 +435,13 @@ function SharedPromptQueueContent({
           )}
         </View>
       ) : null}
-      <Text accessibilityLiveRegion="polite" className="mb-2 text-xs text-foreground-muted">
-        {queue.pauseReason
-          ? `Paused: ${queue.pauseReason.detail}`
-          : "Prompts wait for the current turn to finish."}
-      </Text>
+      {hasQueueChrome ? (
+        <Text accessibilityLiveRegion="polite" className="mb-2 text-xs text-foreground-muted">
+          {queue.pauseReason
+            ? `Paused: ${queue.pauseReason.detail}`
+            : "Prompts wait for the current turn to finish."}
+        </Text>
+      ) : null}
       {queue.pauseReason?.code === "delivery-unknown" ? (
         <View className="mb-2 flex-row gap-2">
           {(["retry", "dismiss"] as const).map((resolution) => (
@@ -391,7 +481,7 @@ function SharedPromptQueueContent({
         />
       )}
       {queue.entries.map((entry, index) =>
-        entry.kind === "move" ? (
+        !visibleIds.has(entry.messageId) ? null : entry.kind === "move" ? (
           <ThreadMoveQueueItem
             key={entry.messageId}
             environmentId={environmentId}

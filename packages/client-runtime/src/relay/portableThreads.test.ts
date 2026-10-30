@@ -24,6 +24,7 @@ import {
   threadCommandAcceptance,
   pauseThreadQueue,
   cancelThreadMove,
+  settleThread,
   startThreadTurn,
 } from "../operations/commands.ts";
 import { ThreadCommandRouting } from "../operations/commandRouting.ts";
@@ -34,6 +35,7 @@ import { layer as tenancyLayer } from "./managedRelayTenancy.ts";
 import {
   createPortableThreadCommandAtoms,
   portableCommandStatesAtom,
+  portableThreadCommandPresentation,
   portableThreadCommandLayer,
   refreshPortableCommandReceipt,
 } from "./portableThreads.ts";
@@ -158,6 +160,32 @@ const harness = Effect.fn("PortableThreadCommandsTest.harness")(function* (fetch
     ),
   };
 });
+
+function completionCacheRemoval(registry: AtomRegistry.AtomRegistry) {
+  return new Promise<void>((resolve) => {
+    const previous = registry.onNodeRemoved;
+    registry.onNodeRemoved = (node) => {
+      previous?.(node);
+      if (!node.atom.label?.[0].startsWith("portable-thread:completed:")) return;
+      registry.onNodeRemoved = previous;
+      resolve();
+    };
+  });
+}
+
+const promptInput = {
+  threadId,
+  commandId,
+  createdAt,
+  message: {
+    messageId: MessageId.make("represented-prompt"),
+    role: "user" as const,
+    text: "Work",
+    attachments: [],
+  },
+  runtimeMode: "full-access" as const,
+  interactionMode: "default" as const,
+};
 
 describe("portable command routing", () => {
   it.effect("leaves ordinary local commands independent of the relay", () =>
@@ -382,6 +410,157 @@ describe("portable command routing", () => {
       ),
     );
   }
+
+  for (const action of ["settle", "cancel"] as const) {
+    it.effect(`routes ${action} from a verified previous location through the current relay`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            expect(new URL(request.url).origin).toBe(relayUrl);
+            const path = new URL(request.url).pathname;
+            calls.push(request.method + " " + path);
+            if (path.endsWith("/placement"))
+              return Response.json({
+                ...placementSummary("current-vm", 2).placement,
+                previousLocations: [{ environmentId, generation: 1 }],
+              });
+            if (request.method === "POST")
+              expect((await request.json()).command.type).toBe(
+                action === "settle" ? "thread.settle" : "thread.move.cancel",
+              );
+            return Response.json(pending);
+          });
+          const retired: OrchestrationShellSnapshot = {
+            ...snapshot,
+            threads: snapshot.threads.map((thread) => ({
+              ...thread,
+              relayRouting: {
+                relayUrl: "http://127.0.0.1:8610",
+                generation: 1,
+                phase: "retired",
+              },
+            })),
+          };
+          yield* Effect.gen(function* () {
+            const routing = yield* ThreadCommandRouting;
+            routing!.remember(retired, environmentId);
+            const command =
+              action === "settle"
+                ? settleThread({ threadId, commandId })
+                : cancelThreadMove({
+                    threadId,
+                    commandId,
+                    createdAt,
+                    messageId: MessageId.make("moving-entry"),
+                    expectedRevision: 2,
+                  });
+            expect(yield* command).toEqual({ relay: pending });
+            expect(yield* routing!.receipt(threadId, commandId, environmentId)).toEqual(pending);
+          }).pipe(Effect.provide(h.layer));
+          const controls = createThreadVmControlAtoms(Atom.runtime(h.relay), () =>
+            Atom.make(retired),
+          );
+          expect(h.registry.get(controls.routeAtom(environmentId, threadId))).toEqual({
+            relayUrl,
+            generation: 1,
+            phase: "retired",
+          });
+          expect(calls).toEqual([
+            "GET /v1/threads/portable/placement",
+            "POST /v1/threads/portable/commands",
+            "GET /v1/threads/portable/commands/stable-command",
+          ]);
+          expect(h.direct).toEqual([]);
+        }),
+      ),
+    );
+  }
+
+  for (const mismatch of [
+    "missing",
+    "environment",
+    "generation",
+    "current-generation",
+    "thread",
+  ] as const) {
+    it.effect(`rejects a previous-location transport proof with ${mismatch} history`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            calls.push(request.method + " " + new URL(request.url).pathname);
+            return Response.json({
+              ...placementSummary("current-vm", mismatch === "current-generation" ? 1 : 2)
+                .placement,
+              threadId: mismatch === "thread" ? "unrelated-thread" : threadId,
+              previousLocations:
+                mismatch === "missing"
+                  ? []
+                  : [
+                      {
+                        environmentId:
+                          mismatch === "environment" ? "unrelated-environment" : environmentId,
+                        generation: mismatch === "generation" ? 3 : 1,
+                      },
+                    ],
+            });
+          });
+          yield* Effect.gen(function* () {
+            const routing = yield* ThreadCommandRouting;
+            routing!.remember(guestSnapshot, environmentId);
+            expect((yield* Effect.result(settleThread({ threadId, commandId })))._tag).toBe(
+              "Failure",
+            );
+          }).pipe(Effect.provide(h.layer));
+          expect(calls).toEqual(["GET /v1/threads/portable/placement"]);
+          expect(h.direct).toEqual([]);
+        }),
+      ),
+    );
+  }
+
+  it.effect(
+    "does not apply a previous-location proof to a source generation that advanced during verification",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          let advance = () => {};
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            calls.push(request.method + " " + new URL(request.url).pathname);
+            advance();
+            return Response.json({
+              ...placementSummary("current-vm", 2).placement,
+              previousLocations: [{ environmentId, generation: 1 }],
+            });
+          });
+          yield* Effect.gen(function* () {
+            const routing = yield* ThreadCommandRouting;
+            routing!.remember(guestSnapshot, environmentId);
+            advance = () =>
+              routing!.remember(
+                {
+                  ...guestSnapshot,
+                  threads: guestSnapshot.threads.map((thread) => ({
+                    ...thread,
+                    relayRouting: { ...thread.relayRouting!, generation: 2 },
+                  })),
+                },
+                environmentId,
+              );
+            expect((yield* Effect.result(settleThread({ threadId, commandId })))._tag).toBe(
+              "Failure",
+            );
+          }).pipe(Effect.provide(h.layer));
+          expect(calls).toEqual(["GET /v1/threads/portable/placement"]);
+          expect(h.direct).toEqual([]);
+        }),
+      ),
+  );
 
   for (const mismatch of ["account", "session", "generation", "environment"] as const) {
     it.effect(`refuses alias cancellation when the verified ${mismatch} changes`, () =>
@@ -812,6 +991,289 @@ describe("portable command routing", () => {
         expect(state?.waitingForEnvironment).toBe(0);
         expect(state?.hasMore).toBe(false);
         expect(state?.error).not.toBeNull();
+      }),
+    ),
+  );
+
+  it.effect("counts distinct local and remote changes before hiding represented prompts", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const remote = { ...pending, commandId: "remote-change" };
+        const h = yield* harness(async (input) =>
+          Response.json(
+            new URL(String(input)).pathname.endsWith("/stable-command")
+              ? pending
+              : { entries: [remote], hasMore: false },
+          ),
+        );
+        h.registry.set(portableCommandStatesAtom, [
+          {
+            accountId: "account",
+            relayUrl,
+            environmentId,
+            threadId,
+            commandId,
+            promptMessageId: MessageId.make("represented-prompt"),
+            receipt: pending,
+          },
+        ]);
+        const commands = createPortableThreadCommandAtoms(Atom.runtime(h.layer), () =>
+          Atom.make(snapshot),
+        );
+        const query = commands.pendingAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, query);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(
+          h.registry.get(commands.viewAtom(environmentId, threadId))?.waitingForEnvironment,
+        ).toBe(2);
+        expect(
+          portableThreadCommandPresentation(
+            h.registry.get(commands.viewAtom(environmentId, threadId)),
+            ["represented-prompt"],
+          )?.waitingForEnvironment,
+        ).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect("does not resurrect an admitted prompt from a cached pending page", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let admitted = false;
+        const accepted = { ...pending, receipt: { status: "accepted", sequence: 200 } };
+        const h = yield* harness(async (input, init) => {
+          const request = new Request(input, init);
+          if (request.method === "POST") return Response.json(pending);
+          if (new URL(request.url).pathname.endsWith("/stable-command"))
+            return Response.json(admitted ? accepted : pending);
+          return Response.json({ entries: admitted ? [] : [pending], hasMore: false });
+        });
+        yield* Effect.gen(function* () {
+          const routing = yield* ThreadCommandRouting;
+          routing!.remember(snapshot, environmentId);
+          yield* startThreadTurn({
+            threadId,
+            commandId,
+            createdAt,
+            message: {
+              messageId: MessageId.make("represented-prompt"),
+              role: "user",
+              text: "Work",
+              attachments: [],
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          });
+        }).pipe(Effect.provide(h.layer));
+        const commands = createPortableThreadCommandAtoms(Atom.runtime(h.layer), () =>
+          Atom.make(snapshot),
+        );
+        const query = commands.pendingAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, commands.viewAtom(environmentId, threadId));
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(portableCommandStatesAtom)[0]?.promptMessageId).toBe(
+          "represented-prompt",
+        );
+        admitted = true;
+        yield* refreshPortableCommandReceipt(
+          h.registry,
+          h.registry.get(portableCommandStatesAtom)[0]!,
+        ).pipe(Effect.provide(h.layer));
+        expect(
+          h.registry.get(commands.viewAtom(environmentId, threadId))?.waitingForEnvironment,
+        ).toBe(0);
+        expect(h.registry.get(portableCommandStatesAtom)).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect(
+    "does not retain completion knowledge for a background send without a status cache",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const accepted = { ...pending, receipt: { status: "accepted", sequence: 200 } };
+          const h = yield* harness(async () => Response.json(accepted));
+          const removed = completionCacheRemoval(h.registry);
+          yield* Effect.gen(function* () {
+            const routing = yield* ThreadCommandRouting;
+            routing!.remember(snapshot, environmentId);
+            yield* startThreadTurn(promptInput);
+          }).pipe(Effect.provide(h.layer));
+          expect(h.registry.get(portableCommandStatesAtom)).toEqual([]);
+          yield* Effect.promise(() => removed);
+          expect(
+            [...h.registry.getNodes().values()].some((node) =>
+              node.atom.label?.[0].startsWith("portable-thread:completed:"),
+            ),
+          ).toBe(false);
+        }),
+      ),
+  );
+
+  for (const action of ["unmount", "sign out"] as const) {
+    it.effect(`releases active completion knowledge after ${action}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let admitted = false;
+          const accepted = { ...pending, receipt: { status: "accepted", sequence: 200 } };
+          const h = yield* harness(async (input, init) => {
+            const request = new Request(input, init);
+            if (request.method === "POST") return Response.json(pending);
+            if (new URL(request.url).pathname.endsWith("/stable-command"))
+              return Response.json(admitted ? accepted : pending);
+            return Response.json({ entries: [pending], hasMore: false });
+          });
+          yield* Effect.gen(function* () {
+            const routing = yield* ThreadCommandRouting;
+            routing!.remember(snapshot, environmentId);
+            yield* startThreadTurn(promptInput);
+          }).pipe(Effect.provide(h.layer));
+          const commands = createPortableThreadCommandAtoms(Atom.runtime(h.layer), () =>
+            Atom.make(snapshot),
+          );
+          const view = commands.viewAtom(environmentId, threadId);
+          const unmount = h.registry.mount(view);
+          yield* AtomRegistry.getResult(h.registry, commands.pendingAtom(environmentId, threadId), {
+            suspendOnWaiting: true,
+          });
+          admitted = true;
+          yield* refreshPortableCommandReceipt(
+            h.registry,
+            h.registry.get(portableCommandStatesAtom)[0]!,
+          ).pipe(Effect.provide(h.layer));
+          expect(h.registry.get(view)?.waitingForEnvironment).toBe(0);
+          expect(h.registry.get(portableCommandStatesAtom)).toEqual([]);
+          const removed = completionCacheRemoval(h.registry);
+          if (action === "unmount") unmount();
+          else h.registry.set(managedRelaySessionAtom, null);
+          yield* Effect.promise(() => removed);
+          if (action === "sign out") {
+            expect(h.registry.get(view)).toBeNull();
+            unmount();
+          }
+          expect(
+            [...h.registry.getNodes().values()].some((node) =>
+              node.atom.label?.[0].startsWith("portable-thread:completed:"),
+            ),
+          ).toBe(false);
+          expect(h.registry.get(portableCommandStatesAtom)).toEqual([]);
+        }),
+      ),
+    );
+  }
+
+  it.effect("keeps unknown commands and represented prompt rejections visible", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const remote = { ...pending, commandId: "prompt-represented-prompt" };
+        const rejected = { ...pending, receipt: { status: "rejected" as const, detail: "Denied" } };
+        const h = yield* harness(async () => Response.json({ entries: [remote], hasMore: false }));
+        h.registry.set(portableCommandStatesAtom, [
+          {
+            accountId: "account",
+            relayUrl,
+            environmentId,
+            threadId,
+            commandId,
+            promptMessageId: MessageId.make("represented-prompt"),
+            receipt: rejected,
+          },
+          {
+            accountId: "another-account",
+            relayUrl,
+            environmentId,
+            threadId,
+            commandId: remote.commandId,
+            promptMessageId: MessageId.make("represented-prompt"),
+            receipt: remote,
+          },
+        ]);
+        const commands = createPortableThreadCommandAtoms(Atom.runtime(h.layer), () =>
+          Atom.make(snapshot),
+        );
+        const query = commands.pendingAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, query);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        const state = portableThreadCommandPresentation(
+          h.registry.get(commands.viewAtom(environmentId, threadId)),
+          ["represented-prompt"],
+        );
+        expect(state?.waitingForEnvironment).toBe(1);
+        expect(state?.rejections).toEqual([{ commandId, detail: "Denied" }]);
+      }),
+    ),
+  );
+
+  it.effect("does not borrow prompt representation from another thread, environment or relay", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const remote = ["other-thread", "other-environment", "other-relay"].map((id) => ({
+          ...pending,
+          commandId: id,
+        }));
+        const h = yield* harness(async () => Response.json({ entries: remote, hasMore: false }));
+        h.registry.set(
+          portableCommandStatesAtom,
+          remote.map((receipt, index) => ({
+            accountId: "account",
+            relayUrl: index === 2 ? "https://another-relay.example.test" : relayUrl,
+            environmentId: index === 1 ? EnvironmentId.make("another-environment") : environmentId,
+            threadId: index === 0 ? ThreadId.make("another-thread") : threadId,
+            commandId: receipt.commandId,
+            promptMessageId: MessageId.make("represented-prompt"),
+            receipt,
+          })),
+        );
+        const commands = createPortableThreadCommandAtoms(Atom.runtime(h.layer), () =>
+          Atom.make(snapshot),
+        );
+        const query = commands.pendingAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, query);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(
+          portableThreadCommandPresentation(
+            h.registry.get(commands.viewAtom(environmentId, threadId)),
+            ["represented-prompt"],
+          )?.waitingForEnvironment,
+        ).toBe(3);
+      }),
+    ),
+  );
+
+  it.effect("preserves notice of unclassified changes beyond the pending page", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(async (input) =>
+          Response.json(
+            new URL(String(input)).pathname.endsWith("/stable-command")
+              ? pending
+              : { entries: [pending], hasMore: true },
+          ),
+        );
+        h.registry.set(portableCommandStatesAtom, [
+          {
+            accountId: "account",
+            relayUrl,
+            environmentId,
+            threadId,
+            commandId,
+            promptMessageId: MessageId.make("represented-prompt"),
+            receipt: pending,
+          },
+        ]);
+        const commands = createPortableThreadCommandAtoms(Atom.runtime(h.layer), () =>
+          Atom.make(snapshot),
+        );
+        const query = commands.pendingAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, query);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        const state = portableThreadCommandPresentation(
+          h.registry.get(commands.viewAtom(environmentId, threadId)),
+          ["represented-prompt"],
+        );
+        expect(state?.waitingForEnvironment).toBe(0);
+        expect(state?.hasMore).toBe(true);
       }),
     ),
   );

@@ -102,7 +102,7 @@ const authorize = Effect.fnUntraced(function* (registry: AtomRegistry.AtomRegist
   return { relay, clerkToken, session, request };
 });
 
-/** A cold deep link verifies only its exact placement; it never connects or wakes the VM. */
+/** Verify a current or completed source location's relay transport without connecting or waking compute. */
 export const verifyPortableThreadClientRoute = Effect.fnUntraced(function* (
   registry: AtomRegistry.AtomRegistry,
   input: {
@@ -122,11 +122,19 @@ export const verifyPortableThreadClientRoute = Effect.fnUntraced(function* (
     clerkToken,
     threadId: input.threadId,
   });
+  const matchesLocation =
+    (placement.environmentId === input.environmentId &&
+      placement.generation === input.generation) ||
+    (input.generation < placement.generation &&
+      placement.previousLocations?.some(
+        (location) =>
+          location.environmentId === input.environmentId &&
+          location.generation === input.generation,
+      ) === true);
   if (
     registry.get(managedRelaySessionAtom) !== session ||
     placement.threadId !== input.threadId ||
-    placement.environmentId !== input.environmentId ||
-    placement.generation !== input.generation
+    !matchesLocation
   )
     return yield* changed();
   if (
@@ -143,7 +151,7 @@ export const verifyPortableThreadClientRoute = Effect.fnUntraced(function* (
   rememberVerifiedRelay(registry, input.environmentId, input.threadId, {
     session,
     relayUrl: relay.relayUrl,
-    generation: placement.generation,
+    generation: input.generation,
   });
 });
 

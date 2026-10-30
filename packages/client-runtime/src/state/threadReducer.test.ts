@@ -12,10 +12,11 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import type { OrchestrationThread } from "@t3tools/contracts";
+import type { OrchestrationThread, ThreadPromptQueueChangedPayload } from "@t3tools/contracts";
 
 import { applyThreadDetailEvent } from "./threadReducer.ts";
 import { scopeThread } from "./models.ts";
+import { queuedPromptMessage, threadPromptQueuePresentation } from "./threadPromptQueue.ts";
 
 const baseEventFields = {
   eventId: EventId.make("event-1"),
@@ -616,7 +617,198 @@ describe("applyThreadDetailEvent", () => {
     expect(displayed.messages).toHaveLength(0);
     expect(displayed.promptQueue?.entries).toHaveLength(1);
     expect(admitted.thread.promptQueue?.entries).toHaveLength(1);
+    expect(
+      threadPromptQueuePresentation({
+        queue: displayed.promptQueue,
+        messages: displayed.messages,
+      }),
+    ).toEqual({
+      inline: { prompt: displayed.promptQueue!.entries[0], status: "Waiting to start…" },
+      queuedEntries: [],
+    });
+
+    const restored = scopeThread(EnvironmentId.make("environment"), {
+      ...admitted.thread,
+      promptQueue: {
+        ...admitted.thread.promptQueue!,
+        entries: [{ ...entry, state: "unknown" }],
+      },
+    });
+    expect(restored.messages).toHaveLength(0);
+    expect(
+      threadPromptQueuePresentation({ queue: restored.promptQueue, messages: restored.messages }),
+    ).toEqual({ inline: null, queuedEntries: [{ ...entry, state: "unknown" }] });
   });
+
+  it("keeps an uncertain admitted prompt visible throughout retry and readmission", () => {
+    const entry = {
+      messageId: MessageId.make("retry"),
+      text: "Retry this work",
+      attachments: [],
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      revision: 1,
+      acceptedSequence: 10,
+      createdAt: baseThread.createdAt,
+      state: "pending" as const,
+    };
+    let state: OrchestrationThread = { ...baseThread, messages: [queuedPromptMessage(entry)] };
+    let sequence = 50;
+    const change = (delta: Omit<ThreadPromptQueueChangedPayload, "threadId" | "updatedAt">) => {
+      const result = applyThreadDetailEvent(state, {
+        ...baseEventFields,
+        sequence: sequence++,
+        occurredAt: baseThread.updatedAt,
+        aggregateKind: "thread",
+        aggregateId: state.id,
+        type: "thread.prompt-queue-changed",
+        payload: { ...delta, threadId: state.id, updatedAt: baseThread.updatedAt },
+      });
+      if (result.kind !== "updated") throw new Error("Queue did not update");
+      state = result.thread;
+      return scopeThread(EnvironmentId.make("environment"), state);
+    };
+    const presentation = () => {
+      const scoped = scopeThread(EnvironmentId.make("environment"), state);
+      expect(scoped.messages).toHaveLength(0);
+      expect(state.messages).toHaveLength(1);
+      return threadPromptQueuePresentation({
+        queue: scoped.promptQueue,
+        messages: scoped.messages,
+      });
+    };
+    change({
+      entry: { ...entry, state: "unknown" },
+      control: {
+        enabled: false,
+        revision: 1,
+        pauseReason: { code: "delivery-unknown", detail: "Lost acknowledgement" },
+      },
+    });
+    expect(presentation().queuedEntries).toMatchObject([
+      { messageId: entry.messageId, state: "unknown" },
+    ]);
+    // These are the separate deltas emitted by thread.queue.resolve(retry).
+    change({ entry });
+    expect(presentation().queuedEntries).toEqual([entry]);
+    change({
+      handoff: null,
+      awaitingTurnId: null,
+      control: {
+        enabled: false,
+        revision: 2,
+        pauseReason: { code: "stopped", detail: "Resume to continue" },
+      },
+    });
+    expect(presentation().queuedEntries).toEqual([entry]);
+    change({ control: { enabled: true, revision: 3, pauseReason: null } });
+    expect(presentation().inline).toEqual({ prompt: entry, status: "Waiting to start…" });
+    const delivering = { ...entry, state: "delivering" as const };
+    change({
+      entry: delivering,
+      handoff: {
+        attemptId: CommandId.make("retry-delivery"),
+        messageId: entry.messageId,
+        revision: 1,
+        controlRevision: 3,
+        mode: "next-turn",
+      },
+    });
+    expect(presentation().inline).toEqual({ prompt: delivering, status: "Sending…" });
+    const admitted = applyThreadDetailEvent(state, {
+      ...baseEventFields,
+      sequence: sequence++,
+      occurredAt: baseThread.updatedAt,
+      aggregateKind: "thread",
+      aggregateId: state.id,
+      type: "thread.message-sent",
+      payload: {
+        threadId: state.id,
+        messageId: entry.messageId,
+        role: "user",
+        text: entry.text,
+        attachments: entry.attachments,
+        turnId: TurnId.make("retried-turn"),
+        streaming: false,
+        createdAt: entry.createdAt,
+        updatedAt: baseThread.updatedAt,
+      },
+    });
+    if (admitted.kind !== "updated") throw new Error("Retry was not admitted");
+    state = admitted.thread;
+    expect(presentation().inline?.status).toBe("Sending…");
+    const removed = change({
+      removedMessageId: entry.messageId,
+      handoff: null,
+      awaitingTurnId: TurnId.make("retried-turn"),
+    });
+    expect(removed.messages).toHaveLength(1);
+    expect(removed.messages[0]?.turnId).toBe("retried-turn");
+    expect(
+      threadPromptQueuePresentation({ queue: removed.promptQueue, messages: removed.messages }),
+    ).toEqual({ inline: null, queuedEntries: [] });
+  });
+
+  it.each(["message-first", "removal-first"] as const)(
+    "keeps one identity when ordinary admission arrives %s",
+    (order) => {
+      const message = {
+        id: MessageId.make("ordinary-admission"),
+        role: "user" as const,
+        text: "Work",
+        turnId: null,
+        streaming: false,
+        createdAt: baseThread.createdAt,
+        updatedAt: baseThread.createdAt,
+      };
+      const entry = {
+        messageId: message.id,
+        text: message.text,
+        attachments: [],
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        revision: 1,
+        acceptedSequence: 1,
+        createdAt: message.createdAt,
+        state: "pending" as const,
+      };
+      const queue = {
+        enabled: true,
+        revision: 0,
+        pauseReason: null,
+        entries: [entry],
+        handoff: null,
+        awaitingTurnId: null,
+        admissions: [],
+        finalizedTurnId: null,
+      };
+      const snapshots =
+        order === "message-first"
+          ? [
+              { messages: [message], promptQueue: queue },
+              { messages: [message], promptQueue: { ...queue, entries: [] } },
+            ]
+          : [
+              { messages: [], promptQueue: { ...queue, entries: [] } },
+              { messages: [message], promptQueue: { ...queue, entries: [] } },
+            ];
+      for (const snapshot of snapshots) {
+        const scoped = scopeThread(EnvironmentId.make("environment"), {
+          ...baseThread,
+          ...snapshot,
+        });
+        const view = threadPromptQueuePresentation({
+          queue: scoped.promptQueue,
+          messages: scoped.messages,
+        });
+        expect(scoped.messages.length + (view.inline ? 1 : 0)).toBeLessThanOrEqual(1);
+      }
+      expect(
+        scopeThread(EnvironmentId.make("environment"), { ...baseThread, ...snapshots[1]! })
+          .messages,
+      ).toEqual([message]);
+    },
+  );
 
   describe("thread.message-sent", () => {
     it("retains authenticated authors in live insertion and later message updates", () => {

@@ -35,6 +35,7 @@ import {
   sharedPromptSubmissionAccount,
   forgetSharedPromptSubmission,
   rejectSharedPromptSubmission,
+  beginSharedPromptSubmission,
 } from "../sharedPromptSubmissionStore";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -89,6 +90,7 @@ export const threadEnvironment = {
       ) {
         return baseThreadEnvironment.startTurn.run(registry, value);
       }
+      let finishAttempt: (() => void) | undefined;
       try {
         const account = sharedPromptSubmissionAccount();
         const supportsPreparation =
@@ -100,6 +102,7 @@ export const threadEnvironment = {
           supportsPreparation,
         );
         if (pending.command.type !== "thread.turn.start") throw new Error("Invalid saved prompt.");
+        finishAttempt = beginSharedPromptSubmission(pending.command.commandId);
         const result = await baseThreadEnvironment.enqueuePrompt.run(registry, {
           ...value,
           input: { ...pending.command, expectedAccountId: value.input.expectedAccountId },
@@ -172,6 +175,8 @@ export const threadEnvironment = {
         return result;
       } catch (error) {
         return AsyncResult.failure(Cause.die(error));
+      } finally {
+        finishAttempt?.();
       }
     }) satisfies typeof baseThreadEnvironment.startTurn.run,
   },

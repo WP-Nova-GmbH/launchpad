@@ -171,9 +171,14 @@ import {
   THREAD_DISCLOSURE_TRANSITION_MS,
   WORK_GROUP_TOGGLE_HEIGHT,
 } from "./thread-work-log";
-import { appendPendingThreadMessages, type PendingThreadFeedEntry } from "./pending-thread-feed";
+import {
+  appendPendingThreadMessages,
+  type InlineThreadPrompt,
+  type PendingThreadFeedEntry,
+} from "./pending-thread-feed";
 import type { QueuedThreadMessage } from "../../state/thread-outbox-model";
 import { promptAttributionLabel } from "@t3tools/client-runtime/state/threads";
+import { InlinePromptActions } from "./SharedPromptQueue";
 import { useMarkdownCodeHighlight } from "./markdownCodeHighlightState";
 import {
   assetEnvironment,
@@ -251,6 +256,11 @@ export interface ThreadFeedProps {
   readonly queuedMessages: ReadonlyArray<QueuedThreadMessage>;
   readonly dispatchingMessageId: MessageId | null;
   readonly onEditPendingMessage: (message: QueuedThreadMessage) => void;
+  readonly inlinePrompt?: InlineThreadPrompt | null;
+  readonly onEditSharedPrompt?: (messageId: string) => void;
+  readonly onRemoveSharedPrompt?: (messageId: string) => void;
+  readonly onPauseSharedPrompt?: () => void;
+  readonly sharedPromptActionsDisabled?: boolean;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly workspaceRoot?: string | null;
@@ -1360,6 +1370,10 @@ function renderFeedEntry(
     | "skills"
     | "dispatchingMessageId"
     | "onEditPendingMessage"
+    | "onEditSharedPrompt"
+    | "onRemoveSharedPrompt"
+    | "onPauseSharedPrompt"
+    | "sharedPromptActionsDisabled"
   > & {
     readonly copiedRowId: string | null;
     readonly expandedWorkRows: Record<string, boolean>;
@@ -1642,12 +1656,17 @@ function renderFeedEntry(
             ) : null}
           </View>
           <View className="mt-1 flex-row items-center justify-end gap-1 pr-0.5">
-            <Text className="font-t3-medium text-xs tabular-nums text-foreground-secondary">
-              {entry.pendingMessage && !entry.acknowledged
-                ? entry.pendingMessage.submissionProtocol === "review-required"
-                  ? "Delivery unknown · Review required"
-                  : "Waiting to submit"
-                : timestampLabel}
+            <Text
+              accessibilityLiveRegion={entry.queuedPrompt ? "polite" : undefined}
+              className="font-t3-medium text-xs tabular-nums text-foreground-secondary"
+            >
+              {entry.queuedPrompt
+                ? entry.queuedPrompt.status
+                : entry.pendingMessage && !entry.acknowledged
+                  ? entry.pendingMessage.submissionProtocol === "review-required"
+                    ? "Delivery unknown · Review required"
+                    : "Waiting to submit"
+                  : timestampLabel}
             </Text>
             {entry.pendingMessage &&
             !entry.acknowledged &&
@@ -1678,6 +1697,16 @@ function renderFeedEntry(
               >
                 <SymbolView name="pencil" size={14} tintColor={iconSubtleColor} />
               </Pressable>
+            ) : null}
+            {entry.queuedPrompt ? (
+              <InlinePromptActions
+                prompt={entry.queuedPrompt.prompt}
+                disabled={props.sharedPromptActionsDisabled}
+                onEdit={props.onEditSharedPrompt}
+                onRemove={props.onRemoveSharedPrompt}
+                onPause={props.onPauseSharedPrompt}
+                tintColor={iconSubtleColor}
+              />
             ) : null}
             {message.text.trim().length > 0 ? (
               <CopyTextButton
@@ -2484,9 +2513,11 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         ),
         props.feed,
         props.queuedMessages,
+        props.inlinePrompt,
       ),
     [
       props.queuedMessages,
+      props.inlinePrompt,
       expandedTurnIds,
       expandedWorkGroupIds,
       props.activeWorkStartedAt,
@@ -2778,6 +2809,10 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             environmentId: props.environmentId,
             dispatchingMessageId: props.dispatchingMessageId,
             onEditPendingMessage: props.onEditPendingMessage,
+            onEditSharedPrompt: props.onEditSharedPrompt,
+            onRemoveSharedPrompt: props.onRemoveSharedPrompt,
+            onPauseSharedPrompt: props.onPauseSharedPrompt,
+            sharedPromptActionsDisabled: props.sharedPromptActionsDisabled,
             copiedRowId,
             expandedWorkRows,
             expandedReasoningMessageIds,
@@ -2823,6 +2858,10 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       setupAnchorIndex,
       props.dispatchingMessageId,
       props.onEditPendingMessage,
+      props.onEditSharedPrompt,
+      props.onRemoveSharedPrompt,
+      props.onPauseSharedPrompt,
+      props.sharedPromptActionsDisabled,
       copiedRowId,
       disclosureToggleSettling,
       expandedWorkRows,

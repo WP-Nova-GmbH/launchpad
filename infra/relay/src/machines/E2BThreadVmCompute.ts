@@ -38,6 +38,37 @@ export const THREAD_VM_BLOCKED_NETWORKS = [
   "ff00::/8",
 ] as const;
 
+function ipv4Range(network: string) {
+  const [, address, prefixText] =
+    /^((?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3})(?:\/(0|[1-9]\d?))?$/.exec(network) ?? [];
+  if (address === undefined) return null;
+  const octets = address.split(".").map(Number);
+  const prefix = Number(prefixText ?? "32");
+  if (prefix > 32 || octets.some((octet) => octet > 255)) return null;
+  const size = 2 ** (32 - prefix);
+  const start = Math.floor(octets.reduce((value, octet) => value * 256 + octet, 0) / size) * size;
+  return { start, end: start + size - 1 };
+}
+
+function normalizeDenyOut(networks: ReadonlyArray<string>) {
+  const entries = [...new Set(networks)].map((network) => ({ network, range: ipv4Range(network) }));
+  // Stock E2B's nftables interval set rejects overlapping IPv4 ranges in one update.
+  // ponytail: quadratic scan for the small host-address list; sort ranges if that list grows large.
+  return entries
+    .filter(
+      ({ range }, index) =>
+        range === null ||
+        !entries.some(
+          ({ range: other }, otherIndex) =>
+            other !== null &&
+            other.start <= range.start &&
+            other.end >= range.end &&
+            (other.start < range.start || other.end > range.end || otherIndex < index),
+        ),
+    )
+    .map(({ network }) => network);
+}
+
 export interface E2BThreadVmSettings {
   readonly apiUrl: string;
   readonly sandboxUrl: string;
@@ -100,6 +131,7 @@ export const makeE2BThreadVmCompute = (
   client: E2BComputeClient = Sandbox,
   transport: typeof fetch = fetch,
 ) => {
+  const denyOut = normalizeDenyOut([...THREAD_VM_BLOCKED_NETWORKS, ...settings.hostAddresses]);
   const options = {
     apiUrl: settings.apiUrl,
     sandboxUrl: settings.sandboxUrl,
@@ -187,7 +219,7 @@ export const makeE2BThreadVmCompute = (
         },
         envs: { ...input.environment },
         network: {
-          denyOut: [...THREAD_VM_BLOCKED_NETWORKS, ...settings.hostAddresses],
+          denyOut,
           allowPublicTraffic: false,
         },
         lifecycle: { onTimeout: { action: "pause", mode: "full" }, autoResume: false },

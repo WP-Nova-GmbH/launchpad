@@ -3,20 +3,27 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { View } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { portableThreadCommands } from "../../state/threads";
+import { portableThreadCommandPresentation } from "@t3tools/client-runtime/relay/portableThreads";
 
 export function PortableThreadCommandStatus({
   environmentId,
   threadId,
+  representedMessageIds,
 }: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
+  representedMessageIds?: ReadonlyArray<string>;
 }) {
-  const state = useAtomValue(portableThreadCommands.viewAtom(environmentId, threadId));
+  const state = portableThreadCommandPresentation(
+    useAtomValue(portableThreadCommands.viewAtom(environmentId, threadId)),
+    representedMessageIds,
+  );
   if (
     !state ||
     !(
       state.waitingForRelay ||
       state.waitingForEnvironment ||
+      state.hasMore ||
       state.rejections.length ||
       state.error
     )
@@ -30,7 +37,11 @@ export function PortableThreadCommandStatus({
           with Launchpad Connect.
         </Text>
       ) : null}
-      {state.waitingForEnvironment > 0 ? (
+      {state.waitingForEnvironment === 0 && state.hasMore ? (
+        <Text className="text-xs text-muted-foreground">
+          Additional changes are waiting for this environment.
+        </Text>
+      ) : state.waitingForEnvironment > 0 ? (
         <Text className="text-xs text-muted-foreground">
           {state.waitingForEnvironment}
           {state.hasMore ? "+" : ""} change

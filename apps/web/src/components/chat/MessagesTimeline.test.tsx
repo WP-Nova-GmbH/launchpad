@@ -282,6 +282,73 @@ function buildUserTimelineEntry(text: string) {
   };
 }
 
+it.each([false, true])(
+  "keeps delivery status and Pause available before admission (working: %s)",
+  async (isWorking) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const entry = buildUserTimelineEntry("Visible during delivery");
+    const pending = {
+      ...entry,
+      message: {
+        ...entry.message,
+        pendingStatus: "Sending…" as const,
+        pendingPrompt: {
+          messageId: entry.message.id,
+          text: entry.message.text,
+          attachments: [],
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          state: "delivering" as const,
+          revision: 1,
+          acceptedSequence: 1,
+          createdAt: entry.createdAt,
+        },
+      },
+    };
+    const onPauseSharedPrompt = vi.fn();
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline
+            {...buildProps()}
+            isWorking={isWorking}
+            onPauseSharedPrompt={onPauseSharedPrompt}
+            timelineEntries={[pending]}
+          />,
+        );
+      });
+      expect(
+        renderer!.root
+          .findAllByProps({ role: "status" })
+          .some((node) => node.children.includes("Sending…")),
+      ).toBe(true);
+      const pause = renderer!.root
+        .findAllByType("button")
+        .find((node) => node.props["aria-label"] === "Pause message delivery")!;
+      await act(() => pause.props.onClick());
+      expect(onPauseSharedPrompt).toHaveBeenCalledOnce();
+      await act(() =>
+        renderer!.update(
+          <MessagesTimeline {...buildProps()} isWorking={isWorking} timelineEntries={[entry]} />,
+        ),
+      );
+      expect(
+        renderer!.root
+          .findAllByProps({ role: "status" })
+          .some((node) => node.children.includes("Sending…")),
+      ).toBe(false);
+      expect(
+        renderer!.root
+          .findAllByType("button")
+          .some((node) => node.props["aria-label"] === "Pause message delivery"),
+      ).toBe(false);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  },
+);
+
 function buildAssistantTimelineEntry(text: string) {
   const entry = buildUserTimelineEntry(text);
   return {

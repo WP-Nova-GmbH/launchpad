@@ -1,4 +1,4 @@
-import { ArrowUpIcon, ClockIcon } from "lucide-react";
+import { ArrowUpIcon, ClockIcon, PauseIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { ReadOnlySourcePreview } from "../files/AttachmentFilePreview";
 import { useRightPanelStore } from "~/rightPanelStore";
 import {
@@ -303,6 +303,9 @@ interface TimelineRowSharedState {
   onSteerQueuedMessage: (id: string) => void;
   steerQueuedMessageShortcutLabel: string | null;
   onRemoveQueuedMessage: (id: string) => void;
+  onEditSharedPrompt: ((id: MessageId) => void) | undefined;
+  onRemoveSharedPrompt: ((id: MessageId) => void) | undefined;
+  onPauseSharedPrompt: (() => void) | undefined;
 }
 
 interface TimelineRowActivityState {
@@ -469,6 +472,9 @@ interface MessagesTimelineProps {
   onSteerQueuedMessage?: (id: string) => void;
   steerQueuedMessageShortcutLabel?: string | null;
   onRemoveQueuedMessage?: (id: string) => void;
+  onEditSharedPrompt?: ((id: MessageId) => void) | undefined;
+  onRemoveSharedPrompt?: ((id: MessageId) => void) | undefined;
+  onPauseSharedPrompt?: (() => void) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +533,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onSteerQueuedMessage = NOOP_QUEUED_MESSAGE_ACTION,
   steerQueuedMessageShortcutLabel = null,
   onRemoveQueuedMessage = NOOP_QUEUED_MESSAGE_ACTION,
+  onEditSharedPrompt,
+  onRemoveSharedPrompt,
+  onPauseSharedPrompt,
 }: MessagesTimelineProps) {
   const listIdentityKey = displayThreadKey ?? routeThreadKey;
   const rememberedPosition = useMemo(
@@ -1167,6 +1176,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onSteerQueuedMessage,
       steerQueuedMessageShortcutLabel,
       onRemoveQueuedMessage,
+      onEditSharedPrompt,
+      onRemoveSharedPrompt,
+      onPauseSharedPrompt,
     }),
     [
       readyCitationRequest,
@@ -1203,6 +1215,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onSteerQueuedMessage,
       steerQueuedMessageShortcutLabel,
       onRemoveQueuedMessage,
+      onEditSharedPrompt,
+      onRemoveSharedPrompt,
+      onPauseSharedPrompt,
     ],
   );
   const backgroundWorktreeSetup =
@@ -2223,6 +2238,11 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         </div>
       </div>
       {author ? <UserMessageAuthorSignature author={author} /> : null}
+      {row.message.pendingStatus ? (
+        <p role="status" className="max-w-[80%] pe-1 text-right text-xs text-muted-foreground">
+          {row.message.pendingStatus}
+        </p>
+      ) : null}
       {modificationAttribution ? (
         <p className="max-w-[80%] pe-1 text-right text-2xs text-muted-foreground">
           {modificationAttribution}
@@ -2239,7 +2259,37 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             </TooltipPopup>
           </Tooltip>
           <div className="flex items-center gap-0.5">
-            {typeof revertTurnCount === "number" && (
+            {row.message.pendingPrompt && ctx.onPauseSharedPrompt ? (
+              <Button
+                size="icon-xs"
+                variant="ghost-muted"
+                aria-label="Pause message delivery"
+                onClick={ctx.onPauseSharedPrompt}
+              >
+                <PauseIcon />
+              </Button>
+            ) : null}
+            {row.message.pendingPrompt?.state === "pending" && ctx.onEditSharedPrompt ? (
+              <Button
+                size="icon-xs"
+                variant="ghost-muted"
+                aria-label="Edit pending message"
+                onClick={() => ctx.onEditSharedPrompt?.(row.message.id)}
+              >
+                <PencilIcon />
+              </Button>
+            ) : null}
+            {row.message.pendingPrompt?.state === "pending" && ctx.onRemoveSharedPrompt ? (
+              <Button
+                size="icon-xs"
+                variant="ghost-muted"
+                aria-label="Remove pending message"
+                onClick={() => ctx.onRemoveSharedPrompt?.(row.message.id)}
+              >
+                <Trash2Icon />
+              </Button>
+            ) : null}
+            {!row.message.pendingStatus && typeof revertTurnCount === "number" && (
               <RevertUserMessageButton turnCount={revertTurnCount} messageId={row.message.id} />
             )}
             {resolvedContext.text && (

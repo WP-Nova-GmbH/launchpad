@@ -408,7 +408,9 @@ import {
 } from "./chat/ContextWindowMeter.logic";
 import { deriveLatestContextWindowSnapshot, formatContextWindowTokens } from "../lib/contextWindow";
 import { ThreadPresencePill } from "./chat/ThreadPresencePill";
-import { SharedPromptQueue } from "./chat/SharedPromptQueue";
+import { SharedPromptQueue, type SharedPromptQueueHandle } from "./chat/SharedPromptQueue";
+import { threadPromptQueuePresentation } from "@t3tools/client-runtime/state/threads";
+import { projectSharedPromptTimeline } from "../lib/sharedPromptTimeline";
 import { SharedPromptSubmissions } from "./chat/SharedPromptSubmissions";
 import {
   hasSharedPromptSubmission,
@@ -439,6 +441,7 @@ import {
   latestTurnStartFailureId,
   scheduleEnvironmentReconnectWarning,
   hasServerAcknowledgedLocalDispatch,
+  hasTimelineWork,
   isBranchMismatchDismissedForSession,
   shouldDockDraftHeroForSubmission,
   shouldReleaseTimelineAnchorForToolActivity,
@@ -1700,6 +1703,15 @@ export default function ChatView(props: ChatViewProps) {
     return () => revokeBlobPreviewUrl(src);
   }, [expandedImage]);
   const [optimisticUserMessages, setOptimisticUserMessages] = useState<ChatMessage[]>([]);
+  const sharedQueueControls = useRef<SharedPromptQueueHandle | null>(null);
+  const editSharedPrompt = useCallback(
+    (id: MessageId) => sharedQueueControls.current?.edit(id),
+    [],
+  );
+  const removeSharedPrompt = useCallback(
+    (id: MessageId) => sharedQueueControls.current?.remove(id),
+    [],
+  );
   // Last live snapshot from the setup stream. The server drops a finished
   // snapshot after a grace period and emits null; holding it here bridges the
   // gap until the settled activity arrives on the thread projection.
@@ -3497,8 +3509,46 @@ export default function ChatView(props: ChatViewProps) {
     };
   }, [attachmentPreviewHandoffByMessageId, clearAttachmentPreviewHandoff, displayServerMessages]);
   const sharedTransportSubmissions = useSharedPromptSubmissions((state) => state.entries);
+  const activeSubmissionIds = useSharedPromptSubmissions((state) => state.activeCommandIds);
+  const sharedQueuePresentation = useMemo(
+    () =>
+      threadPromptQueuePresentation({
+        queue: activeThread?.promptQueue,
+        messages: activeThread?.messages ?? [],
+        sessionStatus: activeThread?.session?.status,
+        archived: activeThread?.archivedAt != null,
+        unavailable: activeEnvironmentUnavailable || threadDetailLoading,
+        workflowControlled: activeThread?.workflowJob != null,
+        moving:
+          routeServerThreadShell?.relayRouting !== undefined &&
+          routeServerThreadShell.relayRouting.phase !== "active",
+      }),
+    [
+      activeThread?.promptQueue,
+      activeThread?.messages,
+      activeThread?.session?.status,
+      activeThread?.archivedAt,
+      activeThread?.workflowJob,
+      routeServerThreadShell?.relayRouting,
+      activeEnvironmentUnavailable,
+      threadDetailLoading,
+    ],
+  );
   const timelineMessages = useMemo(() => {
-    const messages = displayServerMessages;
+    const messages = projectSharedPromptTimeline({
+      messages: displayServerMessages,
+      optimistic: optimisticUserMessages,
+      submissions: sharedTransportSubmissions.filter(
+        (submission) =>
+          submission.environmentId === activeThread?.environmentId &&
+          submission.command.type === "thread.turn.start" &&
+          submission.command.threadId === activeThread.id,
+      ),
+      activeCommandIds: activeSubmissionIds,
+      queueMessageIds: activeThread?.promptQueue?.entries.map((entry) => entry.messageId) ?? [],
+      presentation: sharedQueuePresentation,
+      shared: supportsSharedPromptQueue,
+    });
     const serverMessagesWithPreviewHandoff =
       Object.keys(attachmentPreviewHandoffByMessageId).length === 0
         ? messages
@@ -3526,29 +3576,7 @@ export default function ChatView(props: ChatViewProps) {
             });
           });
 
-    const acceptedQueueIds = new Set(
-      activeThread?.promptQueue?.entries.map((entry) => entry.messageId),
-    );
-    for (const submission of sharedTransportSubmissions) {
-      if (
-        submission.environmentId === activeThread?.environmentId &&
-        submission.command.type === "thread.turn.start" &&
-        submission.command.threadId === activeThread.id
-      )
-        acceptedQueueIds.add(submission.command.message.messageId);
-    }
-    const localMessages = optimisticUserMessages.filter(
-      (message) => !acceptedQueueIds.has(message.id),
-    );
-    if (localMessages.length === 0) {
-      return serverMessagesWithPreviewHandoff;
-    }
-    const serverIds = new Set(serverMessagesWithPreviewHandoff.map((message) => message.id));
-    const pendingMessages = localMessages.filter((message) => !serverIds.has(message.id));
-    if (pendingMessages.length === 0) {
-      return serverMessagesWithPreviewHandoff;
-    }
-    return [...serverMessagesWithPreviewHandoff, ...pendingMessages];
+    return serverMessagesWithPreviewHandoff;
   }, [
     attachmentPreviewHandoffByMessageId,
     displayServerMessages,
@@ -3557,8 +3585,40 @@ export default function ChatView(props: ChatViewProps) {
     activeThread?.environmentId,
     activeThread?.id,
     sharedTransportSubmissions,
+    activeSubmissionIds,
+    sharedQueuePresentation,
+    supportsSharedPromptQueue,
     projectHandoffMessagePreviews,
   ]);
+  const representedSharedMessageIds = useMemo(
+    () => [
+      ...new Set([
+        ...timelineMessages.map((message) => message.id),
+        ...(activeThread?.promptQueue?.entries.map((entry) => entry.messageId) ?? []),
+      ]),
+    ],
+    [timelineMessages, activeThread?.promptQueue],
+  );
+  const relayRepresentedMessageIds = useMemo(
+    () => [
+      ...new Set([
+        ...representedSharedMessageIds,
+        ...sharedTransportSubmissions.flatMap((submission) =>
+          submission.environmentId === activeThread?.environmentId &&
+          submission.command.type === "thread.turn.start" &&
+          submission.command.threadId === activeThread.id
+            ? [submission.command.message.messageId]
+            : [],
+        ),
+      ]),
+    ],
+    [
+      representedSharedMessageIds,
+      activeThread?.environmentId,
+      activeThread?.id,
+      sharedTransportSubmissions,
+    ],
+  );
   const timelineProjectionRef = useRef<{
     threadKey: string | null;
     projection: TimelineEntriesProjection;
@@ -5862,11 +5922,10 @@ export default function ChatView(props: ChatViewProps) {
     if (removedMessages.length === 0) {
       return;
     }
-    const timer = window.setTimeout(() => {
-      setOptimisticUserMessages((existing) =>
-        existing.filter((message) => !serverIds.has(message.id)),
-      );
-    }, 0);
+    // oxlint-disable-next-line react/set-state-in-effect -- Authoritative queue acceptance transfers ownership away from local optimistic rows.
+    setOptimisticUserMessages((existing) =>
+      existing.filter((message) => !serverIds.has(message.id)),
+    );
     for (const removedMessage of removedMessages) {
       const previewUrls = collectUserMessageBlobPreviewUrls(removedMessage);
       if (previewUrls.length > 0) {
@@ -5875,9 +5934,6 @@ export default function ChatView(props: ChatViewProps) {
       }
       revokeUserMessagePreviewUrls(removedMessage);
     }
-    return () => {
-      window.clearTimeout(timer);
-    };
   }, [
     activeThread?.id,
     activeThread?.messages,
@@ -10086,6 +10142,7 @@ export default function ChatView(props: ChatViewProps) {
         <PortableThreadCommandStatus
           environmentId={activeThread.environmentId}
           threadId={activeThread.id}
+          representedMessageIds={relayRepresentedMessageIds}
         />
         {/* Main content area with optional plan sidebar */}
         <div className="flex min-h-0 min-w-0 flex-1">
@@ -10143,7 +10200,17 @@ export default function ChatView(props: ChatViewProps) {
                       ...(activeProject ? { onRunShellCommand: runShellCommand } : {}),
                     }
                   : {})}
-                isWorking={!paintOnlyDisplayedTimeline && isWorking}
+                isWorking={
+                  !paintOnlyDisplayedTimeline &&
+                  hasTimelineWork({
+                    sharedPromptQueue: supportsSharedPromptQueue,
+                    isWorking,
+                    runningTurnId: activeRunningTurnId,
+                    isPreparingWorktree,
+                    isCompacting,
+                    isRevertingCheckpoint,
+                  })
+                }
                 isPreparingWorktree={!paintOnlyDisplayedTimeline && isPreparingWorktree}
                 isCompacting={!paintOnlyDisplayedTimeline && isCompacting}
                 activeTurnStartedAt={paintOnlyDisplayedTimeline ? null : activeWorkStartedAt}
@@ -10215,6 +10282,9 @@ export default function ChatView(props: ChatViewProps) {
                   { context: { terminalFocus: false } },
                 )}
                 onRemoveQueuedMessage={onRemoveQueuedMessage}
+                onEditSharedPrompt={paintOnlyDisplayedTimeline ? undefined : editSharedPrompt}
+                onRemoveSharedPrompt={paintOnlyDisplayedTimeline ? undefined : removeSharedPrompt}
+                onPauseSharedPrompt={paintOnlyDisplayedTimeline ? undefined : onInterrupt}
               />
 
               {/* scroll to end pill — shown when user has scrolled away from the live edge */}
@@ -10293,6 +10363,7 @@ export default function ChatView(props: ChatViewProps) {
                         threadRef={activeThreadRef}
                         {...(activeProject ? { projectId: activeProject.id } : {})}
                         unavailable={activeEnvironmentUnavailable}
+                        representedMessageIds={representedSharedMessageIds}
                       />
                     ) : null}
                     {supportsSharedPromptQueue && activeThreadRef && activeThread?.promptQueue ? (
@@ -10300,6 +10371,10 @@ export default function ChatView(props: ChatViewProps) {
                         key={activeThreadKey}
                         threadRef={activeThreadRef}
                         queue={activeThread.promptQueue}
+                        controlsRef={sharedQueueControls}
+                        visibleEntryIds={sharedQueuePresentation.queuedEntries.map(
+                          (entry) => entry.messageId,
+                        )}
                         workflowControlled={activeThread.workflowJob != null}
                         supportsPreparation={supportsSharedPreparation}
                         canWorkLocally={

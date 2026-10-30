@@ -49,8 +49,8 @@ export function scopeThread(
   if (!queue || queue.entries.length === 0) return { ...thread, environmentId };
   const staged = new Set(queue.entries.map((entry) => entry.messageId));
   const messages = thread.messages.filter((message) => !staged.has(message.id));
-  // Admission/removal can arrive in separate frames; recovery can also restore
-  // an admitted entry. Keep one visible identity until the queue resolves it.
+  // Retries retain their historical message ID. The queue owns that identity
+  // until removal, including admission/removal arriving in separate frames.
   return {
     ...thread,
     environmentId,

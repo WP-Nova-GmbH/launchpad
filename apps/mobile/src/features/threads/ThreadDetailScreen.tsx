@@ -1,5 +1,10 @@
 import { ThreadRunOnControl } from "./ThreadMoveControls";
-import { ThreadVmControlsProvider, ThreadVmNotice } from "./ThreadVmControls";
+import {
+  ThreadVmControlsProvider,
+  ThreadVmNotice,
+  useThreadMovePlacement,
+} from "./ThreadVmControls";
+import { threadMoveQueueOwnership } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import type { WorktreeSetupCardProps } from "./worktree-setup-card";
 import type { ComposerTextPaste } from "../../native/T3ComposerEditor.types";
 import { type EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
@@ -7,14 +12,16 @@ import {
   appendCodexArtifactTemplateUsePrompt,
   type CodexArtifactTemplate,
 } from "@t3tools/client-runtime/codex-artifact-templates";
-import type {
-  CodexFeedbackSubmission,
-  EnvironmentThreadStatus,
+import {
+  threadPromptQueuePresentation,
+  type CodexFeedbackSubmission,
+  type EnvironmentThreadStatus,
 } from "@t3tools/client-runtime/state/threads";
 import { PortableThreadCommandStatus } from "./PortableThreadCommandStatus";
 import { ThreadPresence } from "./ThreadPresence";
 import { useThreadPresenceReporter } from "../../state/thread-presence";
-import { SharedPromptQueue } from "./SharedPromptQueue";
+import { SharedPromptQueue, type SharedPromptQueueHandle } from "./SharedPromptQueue";
+import { pendingThreadFeedVisibility } from "./pending-thread-feed";
 import { useKeyboardChatComposerInset, useKeyboardScrollToEnd } from "@legendapp/list/keyboard";
 import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSkills";
 import type { LegendListRef } from "@legendapp/list/react-native";
@@ -274,6 +281,63 @@ const USER_INPUT_TOGGLE_TIMING = {
 };
 
 export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: ThreadDetailScreenProps) {
+  const sharedQueueRef = useRef<SharedPromptQueueHandle>(null);
+  const placement = useThreadMovePlacement(props.environmentId, props.selectedThread.id);
+  const queueUnavailable =
+    props.connectionStateLabel !== "connected" || props.threadSyncStatus !== "live";
+  const queuePresentation = useMemo(
+    () =>
+      threadPromptQueuePresentation({
+        queue: props.promptQueue,
+        messages: props.selectedThreadFeed.flatMap((entry) =>
+          entry.type === "message" ? [entry.message] : [],
+        ),
+        sessionStatus: props.selectedThread.session?.status,
+        archived: props.selectedThread.archivedAt !== null,
+        unavailable: queueUnavailable,
+        workflowControlled: props.selectedThread.workflowJob != null,
+        moving: threadMoveQueueOwnership({ entries: props.promptQueue?.entries, placement })
+          .ownsNotice,
+      }),
+    [
+      props.promptQueue,
+      props.selectedThreadFeed,
+      props.selectedThread.session?.status,
+      props.selectedThread.archivedAt,
+      props.selectedThread.workflowJob,
+      queueUnavailable,
+      placement,
+    ],
+  );
+  const representedMessageIds = useMemo(
+    () => [
+      ...new Set([
+        ...props.selectedThreadFeed.flatMap((entry) =>
+          entry.type === "message" ? [entry.message.id] : [],
+        ),
+        ...(props.promptQueue?.entries.map((entry) => entry.messageId) ?? []),
+        ...props.queuedMessages.map((message) => message.messageId),
+      ]),
+    ],
+    [props.selectedThreadFeed, props.promptQueue, props.queuedMessages],
+  );
+  const pendingFeed = useMemo(
+    () =>
+      pendingThreadFeedVisibility(
+        props.selectedThreadFeed,
+        props.queuedMessages,
+        queuePresentation.inline,
+      ),
+    [props.selectedThreadFeed, props.queuedMessages, queuePresentation.inline],
+  );
+  const editSharedPrompt = useCallback(
+    (messageId: string) => sharedQueueRef.current?.edit(messageId),
+    [],
+  );
+  const removeSharedPrompt = useCallback(
+    (messageId: string) => sharedQueueRef.current?.remove(messageId),
+    [],
+  );
   const navigation = useNavigation();
   const deviceState = useEnvironmentQuery(
     deviceEnvironment.state({ environmentId: props.environmentId, input: {} }),
@@ -425,10 +489,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     showWorkingControl ||
     devicePreviews.length > 0 ||
     props.connectionStateLabel !== "connected" ||
-    props.queuedMessages.length > 0 ||
-    props.selectedThreadFeed.some(
-      (entry) => "acknowledged" in entry && entry.acknowledged === true,
-    );
+    pendingFeed.hasPending;
   const selectedThreadFeed = props.selectedThreadFeed;
   useThreadPresenceReporter(props.environmentId, props.selectedThread.id, props.draftMessage);
 
@@ -726,10 +787,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
       anchorMessageId !== submittedMessageId ||
       lastScrolledSubmittedMessageIdRef.current === submittedMessageId ||
       contentPresentationKind !== "ready" ||
-      (!selectedThreadFeed.some(
-        (entry) => entry.type === "message" && entry.id === submittedMessageId,
-      ) &&
-        !props.queuedMessages.some((message) => message.messageId === submittedMessageId))
+      !pendingFeed.messageIds.has(submittedMessageId)
     ) {
       return;
     }
@@ -772,8 +830,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     submittedMessageId,
     freeze,
     contentPresentationKind,
-    props.queuedMessages,
-    selectedThreadFeed,
+    pendingFeed,
     scrollMessageToEnd,
     selectedThreadKey,
   ]);
@@ -929,6 +986,13 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               queuedMessages={props.queuedMessages}
               dispatchingMessageId={props.dispatchingMessageId}
               onEditPendingMessage={handleEditPendingMessage}
+              inlinePrompt={queuePresentation.inline}
+              onEditSharedPrompt={editSharedPrompt}
+              onRemoveSharedPrompt={removeSharedPrompt}
+              onPauseSharedPrompt={props.onStopThread}
+              sharedPromptActionsDisabled={
+                queueUnavailable || props.selectedThread.workflowJob != null
+              }
               contentPresentation={props.contentPresentation}
               agentLabel={agentLabel}
               latestTurn={props.selectedThread.latestTurn}
@@ -1082,14 +1146,17 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                 <PortableThreadCommandStatus
                   environmentId={props.environmentId}
                   threadId={props.selectedThread.id}
+                  representedMessageIds={representedMessageIds}
                 />
                 <ThreadVmNotice queue={props.promptQueue} />
                 {props.promptQueue ? (
                   <SharedPromptQueue
+                    ref={sharedQueueRef}
                     key={`${props.environmentId}:${props.selectedThread.id}`}
                     environmentId={props.environmentId}
                     threadId={props.selectedThread.id}
                     queue={props.promptQueue}
+                    visibleEntries={queuePresentation.queuedEntries}
                     workflowControlled={props.selectedThread.workflowJob != null}
                     supportsPreparation={
                       props.serverConfig?.environment.capabilities.sharedPreparation === true
@@ -1139,6 +1206,12 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                     hasCompactableConversation={hasCompactableConversation && !props.isCompacting}
                     serverConfig={props.serverConfig}
                     queueCount={props.selectedThreadQueueCount}
+                    hasQueuedWork={
+                      !queueUnavailable &&
+                      props.promptQueue?.enabled === true &&
+                      props.promptQueue.entries.length > 0 &&
+                      props.selectedThread.workflowJob == null
+                    }
                     environmentId={props.environmentId}
                     projectCwd={props.threadCwd ?? props.projectWorkspaceRoot}
                     // Follow-ups typed during setup wait in the draft: queueing

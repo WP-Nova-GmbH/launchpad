@@ -3,7 +3,7 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { useCallback } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
@@ -21,6 +21,7 @@ const primarySessionStateAtom = Atom.make(
   Atom.setIdleTTL(5 * 60_000),
   Atom.withLabel("primary-environment:session"),
 );
+const primarySessionRefreshKeyAtom = Atom.make<string | null>(null).pipe(Atom.keepAlive);
 
 function refreshPrimarySessionState(): void {
   appAtomRegistry.refresh(primarySessionStateAtom);
@@ -32,14 +33,30 @@ export function usePrimarySessionState() {
   const live = useEnvironmentQuery(
     environmentId === null ? null : authEnvironment.currentSession({ environmentId, input: null }),
   );
-  let data = Option.getOrNull(AsyncResult.value(result));
-  if (data?.authenticated && live.isSuccess) {
-    const { currentSession: _currentSession, ...state } = data;
-    data =
-      live.data === null
-        ? { ...state, authenticated: false }
-        : { ...state, currentSession: live.data };
-  }
+  const httpData = Option.getOrNull(AsyncResult.value(result));
+  const httpSessionId = httpData?.currentSession?.sessionId ?? null;
+  const liveSessionId = live.isSuccess ? (live.data?.sessionId ?? null) : null;
+  useEffect(() => {
+    if (liveSessionId === null) {
+      appAtomRegistry.set(primarySessionRefreshKeyAtom, null);
+      return;
+    }
+    // Pairing can replace the cookie while Clerk's existing account stays put.
+    // Refresh its method and scopes before synchronizing that account's identity.
+    if (liveSessionId === httpSessionId) return;
+    const key = JSON.stringify([environmentId, liveSessionId]);
+    if (appAtomRegistry.get(primarySessionRefreshKeyAtom) === key) return;
+    // All mounted consumers share one read; reconnecting permits another attempt.
+    appAtomRegistry.set(primarySessionRefreshKeyAtom, key);
+    refreshPrimarySessionState();
+  }, [environmentId, liveSessionId, httpSessionId]);
+  const data = useMemo(() => {
+    if (!httpData?.authenticated || !live.isSuccess) return httpData;
+    const { currentSession: _currentSession, ...state } = httpData;
+    return live.data === null
+      ? { ...state, authenticated: false }
+      : { ...state, currentSession: live.data };
+  }, [httpData, live.isSuccess, live.data]);
   const refresh = useCallback(() => {
     refreshPrimarySessionState();
   }, []);

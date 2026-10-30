@@ -20,6 +20,7 @@ import {
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { SharedPromptSubmissions } from "./SharedPromptSubmissions";
 import { AppAtomRegistryProvider, appAtomRegistry } from "../../rpc/atomRegistry";
@@ -30,6 +31,9 @@ import {
   retainSharedPromptSubmission,
   setSharedPromptSubmissionAccount,
   useSharedPromptSubmissions,
+  beginSharedPromptSubmission,
+  rejectSharedPromptSubmission,
+  forgetSharedPromptSubmission,
 } from "../../sharedPromptSubmissionStore";
 import { makeSubmissionRuntime, preparationBarrier } from "./submissionTestUtils";
 
@@ -134,11 +138,16 @@ afterEach(async () => {
 });
 afterAll(() => appAtomRegistry.dispose());
 
-async function render() {
+async function render(representedMessageIds?: ReadonlyArray<string>) {
   await act(() => {
     renderer = create(
       <AppAtomRegistryProvider>
-        <SharedPromptSubmissions threadRef={threadRef} projectId={projectId} unavailable={false} />
+        <SharedPromptSubmissions
+          threadRef={threadRef}
+          projectId={projectId}
+          unavailable={false}
+          representedMessageIds={representedMessageIds}
+        />
       </AppAtomRegistryProvider>,
     );
   });
@@ -151,6 +160,84 @@ function retryButton() {
 }
 
 describe("saved submission ownership", () => {
+  it("removes stale recovery errors when the final saved copy is dismissed", async () => {
+    await render();
+    receipt.mockResolvedValueOnce(AsyncResult.failure(Cause.die(new Error("Offline"))));
+    const click = async (label: string) => {
+      const button = renderer!.root
+        .findAllByType("button")
+        .find((node) => node.children.includes(label))!;
+      await act(() => button.props.onClick());
+    };
+    await click("Check outcome");
+    expect(renderer!.root.findAllByProps({ role: "alert" }).length).toBeGreaterThan(0);
+    await click("Dismiss saved copy");
+    await click("I reviewed the task; dismiss");
+    expect(
+      renderer!.root.findAllByProps({ "aria-label": "Prompts waiting for acceptance" }),
+    ).toHaveLength(0);
+    expect(useSharedPromptSubmissions.getState().entries).toEqual([]);
+  });
+
+  it("preserves open dismissal controls during acceptance and closes them when its journal resolves", async () => {
+    await render();
+    const dismiss = renderer!.root
+      .findAllByType("button")
+      .find((button) => button.children.includes("Dismiss saved copy"))!;
+    await act(() => dismiss.props.onClick());
+    await act(() =>
+      renderer!.update(
+        <AppAtomRegistryProvider>
+          <SharedPromptSubmissions
+            threadRef={threadRef}
+            projectId={projectId}
+            unavailable={false}
+            representedMessageIds={["retry-message"]}
+          />
+        </AppAtomRegistryProvider>,
+      ),
+    );
+    expect(
+      renderer!.root
+        .findAllByType("button")
+        .some((button) => button.children.includes("Keep saved copy")),
+    ).toBe(true);
+    await act(() => forgetSharedPromptSubmission(original.command.commandId));
+    expect(
+      renderer!.root.findAllByProps({ "aria-label": "Prompts waiting for acceptance" }),
+    ).toHaveLength(0);
+  });
+
+  it("keeps active delivery inline and restores recovery after an unsuccessful attempt", async () => {
+    const finish = beginSharedPromptSubmission(original.command.commandId);
+    try {
+      await render();
+      expect(
+        renderer!.root.findAllByProps({ "aria-label": "Prompts waiting for acceptance" }),
+      ).toHaveLength(0);
+      expect(useSharedPromptSubmissions.getState().entries).toEqual([original]);
+      await act(() => finish());
+      expect(retryButton()).toBeDefined();
+      expect(useSharedPromptSubmissions.getState().entries).toEqual([original]);
+    } finally {
+      finish();
+    }
+  });
+
+  it("hides a stale saved copy already represented by the queue while preserving rejection recovery", async () => {
+    await render(["retry-message"]);
+    expect(
+      renderer!.root.findAllByProps({ "aria-label": "Prompts waiting for acceptance" }),
+    ).toHaveLength(0);
+    expect(useSharedPromptSubmissions.getState().entries).toEqual([original]);
+    await act(() => rejectSharedPromptSubmission(original.command.commandId, "Not authorized"));
+    expect(
+      renderer!.root
+        .findAllByProps({ role: "alert" })
+        .some((node) => node.children.includes("Not authorized")),
+    ).toBe(true);
+  });
+
   it.each(["receipt", "attachment"] as const)(
     "holds the original submission when the account changes during %s checks",
     async (waitingOn) => {
