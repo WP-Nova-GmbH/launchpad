@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { IsoDateTime, NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 export const CodexVmConnectionFailureReason = Schema.Literals([
   "invalid_request",
@@ -82,6 +82,20 @@ export const RelayThreadVmCodexAuthSelection = Schema.Union([
   Schema.Struct({ mode: Schema.Literal("organization"), connectionId: TrimmedNonEmptyString }),
 ]);
 export type RelayThreadVmCodexAuthSelection = typeof RelayThreadVmCodexAuthSelection.Type;
+/** A future VM default, independent of any guest's authorization or credentials. */
+export const RelayThreadVmCodexPreference = Schema.Struct({
+  generation: PositiveInt,
+  revision: NonNegativeInt,
+  selection: Schema.NullOr(RelayThreadVmCodexAuthSelection),
+  editable: Schema.Boolean,
+});
+export type RelayThreadVmCodexPreference = typeof RelayThreadVmCodexPreference.Type;
+export const RelayThreadVmCodexPreferenceRequest = Schema.Struct({
+  expectedGeneration: PositiveInt,
+  expectedRevision: NonNegativeInt,
+  selection: Schema.NullOr(RelayThreadVmCodexAuthSelection),
+});
+export type RelayThreadVmCodexPreferenceRequest = typeof RelayThreadVmCodexPreferenceRequest.Type;
 export const RelayThreadVmCodexAuthSource = Schema.Union([
   Schema.Struct({ mode: Schema.Literal("personal") }),
   Schema.Struct({

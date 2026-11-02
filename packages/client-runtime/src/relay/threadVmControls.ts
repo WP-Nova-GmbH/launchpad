@@ -48,6 +48,7 @@ import {
 } from "../state/runtime.ts";
 import type { createThreadVmActionJournal } from "./threadVmActionSubmission.ts";
 import { ManagedRelayTenancyClient } from "./managedRelayTenancy.ts";
+import { createThreadVmCodexPreferenceAtoms } from "./threadVmCodexPreference.ts";
 import type { ManagedRelayClientError } from "./managedRelay.ts";
 import {
   managedRelaySessionAtom,
@@ -150,7 +151,7 @@ export function threadVmAuthSourcePresentation(
 
 /** A replacement organization connection is a new choice, even if the mode is unchanged. */
 export function threadVmAuthSourceChoice(
-  source: RelayThreadVmCodexAuthSource | null | undefined,
+  source: RelayThreadVmCodexAuthSelection | null | undefined,
   connection: RelayCodexVmConnection | null | undefined,
 ) {
   return {
@@ -2377,6 +2378,9 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     }),
   });
   return {
+    ...createThreadVmCodexPreferenceAtoms(runtime, (environmentId, threadId) =>
+      routeAtom(keyFor(environmentId, threadId)),
+    ),
     refreshStatus,
     capabilitiesQueryAtom,
     capabilitiesAtom,

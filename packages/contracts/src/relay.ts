@@ -96,6 +96,8 @@ import {
   RelayCodexVmToken,
   RelayThreadVmCodexAuthSelection,
   RelayThreadVmCodexAuthSource,
+  RelayThreadVmCodexPreference,
+  RelayThreadVmCodexPreferenceRequest,
 } from "./codexVmConnection.ts";
 import {
   WorkflowSourceError,
@@ -2805,6 +2807,19 @@ export type RelayThreadVmPreviewResponse = typeof RelayThreadVmPreviewResponse.T
 
 const RelayThreadVmsGroup = HttpApiGroup.make("threadVms")
   .add(
+    HttpApiEndpoint.get("getCodexPreference", "/v1/threads/:threadId/provider-auth/preference", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: RelayThreadVmCodexPreference,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.put("setCodexPreference", "/v1/threads/:threadId/provider-auth/preference", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: RelayThreadVmCodexPreferenceRequest,
+      success: RelayThreadVmCodexPreference,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
     HttpApiEndpoint.get("getProviderAuthSource", "/v1/threads/:threadId/provider-auth/source", {
       headers: RelayBearerRequestHeaders,
       params: Schema.Struct({ threadId: ThreadId }),

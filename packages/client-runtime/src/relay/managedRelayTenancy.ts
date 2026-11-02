@@ -27,6 +27,8 @@ import {
   type RelayThreadVmProviderAuthRequest,
   type RelayThreadVmCodexAuthSource,
   type RelayThreadVmCodexAuthSelection,
+  type RelayThreadVmCodexPreference,
+  type RelayThreadVmCodexPreferenceRequest,
   type RelayThreadVmPreviewResponse,
   type RelayThreadVmCreateRequest,
   type RelayThreadVmCreateResponse,
@@ -305,6 +307,15 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly threadId: ThreadId;
     }) => Effect.Effect<RelayThreadVmCodexAuthSource | null, ManagedRelayClientError>;
+    readonly getThreadVmCodexPreference: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmCodexPreference, ManagedRelayClientError>;
+    readonly setThreadVmCodexPreference: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmCodexPreferenceRequest;
+    }) => Effect.Effect<RelayThreadVmCodexPreference, ManagedRelayClientError>;
     readonly selectThreadVmProviderAuthSource: (input: {
       readonly clerkToken: string;
       readonly threadId: ThreadId;
@@ -597,6 +608,12 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     ),
     getThreadVmProviderAuthSource: unavailable(
       "clientRuntime.managedRelayTenancy.getThreadVmProviderAuthSource",
+    ),
+    getThreadVmCodexPreference: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadVmCodexPreference",
+    ),
+    setThreadVmCodexPreference: unavailable(
+      "clientRuntime.managedRelayTenancy.setThreadVmCodexPreference",
     ),
     selectThreadVmProviderAuthSource: unavailable(
       "clientRuntime.managedRelayTenancy.selectThreadVmProviderAuthSource",
@@ -1338,6 +1355,37 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmProviderAuthSource"),
+      withRelayClientTracing,
+    ),
+    getThreadVmCodexPreference: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getCodexPreference({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read saved VM Codex account")),
+            timeoutRelayRequest("Saved VM Codex account read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmCodexPreference"),
+      withRelayClientTracing,
+    ),
+    setThreadVmCodexPreference: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .setCodexPreference({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("save VM Codex account")),
+            timeoutRelayRequest("Saved VM Codex account write"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.setThreadVmCodexPreference"),
       withRelayClientTracing,
     ),
     selectThreadVmProviderAuthSource: Effect.fnUntraced(

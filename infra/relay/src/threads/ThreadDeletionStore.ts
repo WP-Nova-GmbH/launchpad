@@ -263,6 +263,7 @@ export function makeThreadDeletionStore(sql: PgClient) {
     UNION ALL SELECT 1 FROM relay_thread_vm_backups x JOIN relay_thread_vm_allocations a USING(allocation_id) WHERE a.thread_id=${claim.threadId} AND x.snapshot_id IS NOT NULL AND x.phase!='retired'`;
         if (remaining.length) return false;
         yield* sql`DELETE FROM relay_thread_vm_replacements WHERE thread_id=${claim.threadId}`;
+        yield* sql`DELETE FROM relay_thread_vm_codex_preferences WHERE thread_id=${claim.threadId}`;
         yield* sql`UPDATE relay_thread_vm_setups SET initial_state=NULL WHERE allocation_id IN (SELECT allocation_id FROM relay_thread_vm_allocations WHERE thread_id=${claim.threadId})`;
         yield* sql`DELETE FROM relay_thread_vm_enrollments WHERE allocation_id IN (SELECT allocation_id FROM relay_thread_vm_allocations WHERE thread_id=${claim.threadId})`;
         yield* sql`DELETE FROM relay_thread_current_queues WHERE thread_id=${claim.threadId}`;

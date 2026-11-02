@@ -18,8 +18,18 @@ const fixture = vi.hoisted(() => ({
   preview: vi.fn(),
   openLink: vi.fn(),
   run: vi.fn(),
+  enqueue: vi.fn(),
   expired: false,
   local: false,
+  defaultCodex: false,
+  cloudConfigured: false,
+  vmAccountPending: false,
+  localThread: null as Record<string, unknown> | null,
+  route: null as {
+    phase: "active" | "retired";
+    relayUrl: string;
+    generation: number;
+  } | null,
   status: {} as Record<string, unknown>,
   candidates: [] as Record<string, unknown>[],
   auth: null as Record<string, unknown> | null,
@@ -91,18 +101,26 @@ vi.mock("../../state/use-atom-command", () => ({
           ? fixture.authAction
           : command === "location"
             ? fixture.checkLocation
-            : vi.fn(),
+            : command === "enqueue"
+              ? fixture.enqueue
+              : vi.fn(),
 }));
 vi.mock("../../state/threads", () => ({
   openPortableThreadChat: "open",
   threadVmActionJournal: {},
-  threadEnvironment: {},
+  threadEnvironment: { enqueueMove: "enqueue" },
   environmentThreadDetails: {
-    stateAtom: () => ({ status: "live", data: { _tag: "None" } }),
+    stateAtom: () => ({
+      status: "live",
+      data: fixture.cloudConfigured
+        ? { _tag: "Some", value: { promptQueue: emptyThreadPromptQueue() } }
+        : { _tag: "None" },
+    }),
   },
   threadVmControls: {
+    codexPreferencePendingAtom: () => fixture.vmAccountPending,
     locationViewAtom: () => fixture.location,
-    routeAtom: () => null,
+    routeAtom: () => fixture.route,
     confirmedLocationAtom: () => null,
     checkLocation: "location",
     hostConfigurationAtom: { isPending: false, unavailableReason: null },
@@ -174,33 +192,64 @@ vi.mock("@t3tools/client-runtime/relay/portableThreadPresentation", () => ({
 }));
 vi.mock("../../composerDraftStore", () => ({ handoffMovedThreadDraft: vi.fn() }));
 vi.mock("../../lib/movedThreadDraft", () => ({ recoverMovedDraftFile: vi.fn() }));
-vi.mock("../../state/projects", () => ({ environmentProjects: { projectsAtom: [] } }));
+vi.mock("../../state/projects", () => ({
+  environmentProjects: {
+    get projectsAtom() {
+      return fixture.localThread
+        ? [
+            {
+              id: "project",
+              environmentId: "vm",
+              title: "Project",
+              workspaceRoot: "/project",
+              repositoryIdentity: { canonicalKey: "github.com/org/project" },
+            },
+          ]
+        : [];
+    },
+  },
+}));
 vi.mock("../../state/shell", () => ({
   environmentShell: { stateValueAtom: () => ({ status: "live", snapshot: { _tag: "None" } }) },
 }));
-vi.mock("../../state/entities", () => ({ useThreadShell: () => null }));
+vi.mock("../../state/entities", () => ({ useThreadShell: () => fixture.localThread }));
 vi.mock("../../state/server", () => ({
   serverEnvironment: {
     configValueAtom: () => ({
       environment: {
         threadVm: fixture.local ? null : { threadId: "thread" },
-        capabilities: {},
+        capabilities: fixture.cloudConfigured ? { threadMoves: true } : {},
         platform: { machine: "cloud" },
       },
-      providers: [],
+      providers: fixture.defaultCodex ? [{ instanceId: "codex", driver: "codex" }] : [],
     }),
   },
 }));
-vi.mock("../../state/environments", () => ({ useEnvironments: () => ({ environments: [] }) }));
+vi.mock("../../state/environments", () => ({
+  useEnvironments: () => ({
+    environments: fixture.cloudConfigured
+      ? [{ environmentId: "vm", label: "Akina", connection: { phase: "connected" } }]
+      : [],
+  }),
+}));
 vi.mock("../../state/query", () => ({ useEnvironmentQuery: vi.fn() }));
 vi.mock("../../rpc/atomRegistry", () => ({
   appAtomRegistry: { get: (value: unknown) => value, refresh: vi.fn() },
 }));
 vi.mock("../../cloud/useCloudLinkController", () => ({ useCloudLinkController: vi.fn() }));
-vi.mock("../../cloud/publicConfig", () => ({ hasCloudPublicConfig: () => false }));
+vi.mock("../../cloud/publicConfig", () => ({
+  hasCloudPublicConfig: () => fixture.cloudConfigured,
+}));
 vi.mock("../clerk/useT3ConnectAuthPrompt", () => ({ useT3ConnectAuthPrompt: vi.fn() }));
 vi.mock("../../connection/catalog", () => ({ environmentCatalog: {} }));
 vi.mock("./MovedThreadDraftRecovery", () => ({ MovedThreadDraftRecovery: () => null }));
+vi.mock("./ThreadVmAccountPreference", () => ({
+  ThreadVmAccountPreference: ({ onClose }: { onClose: () => void }) => (
+    <dialog open>
+      <button onClick={onClose}>Close account editor</button>
+    </dialog>
+  ),
+}));
 vi.mock("./composerEventScope", () => ({ useComposerMenuProps: () => ({}) }));
 vi.mock("../EnvironmentMachineIcon", () => ({ EnvironmentMachineIcon: () => null }));
 vi.mock("../ui/tooltip", () => ({
@@ -355,6 +404,11 @@ beforeEach(() => {
   fixture.readMove.mockResolvedValue(null);
   fixture.expired = false;
   fixture.local = false;
+  fixture.defaultCodex = false;
+  fixture.cloudConfigured = false;
+  fixture.vmAccountPending = false;
+  fixture.localThread = null;
+  fixture.route = null;
   fixture.status = {};
   fixture.candidates = [];
   fixture.auth = null;
@@ -526,6 +580,67 @@ describe("simplified VM controls", () => {
     expect(button("Recover from backup…")).toBeDefined();
     expect(button("Reset VM…")).toBeUndefined();
     expect(button("Permanently delete thread")).toBeUndefined();
+  });
+  it("offers the next VM account editor only for a registered current local chat", async () => {
+    fixture.signedIn = true;
+    fixture.local = true;
+    fixture.defaultCodex = true;
+    fixture.localThread = {
+      id: "thread",
+      projectId: "project",
+      modelSelection: { instanceId: "codex" },
+      archivedAt: null,
+    };
+    await mount(true);
+    await openRunOn();
+    expect(button("VM account…")).toBeUndefined();
+    fixture.route = { phase: "active", relayUrl: "https://relay.example.test", generation: 3 };
+    await act(async () => renderer!.update(view(true)));
+    expect(button("VM account…")).toBeDefined();
+    fixture.route.phase = "retired";
+    await act(async () => renderer!.update(view(true)));
+    expect(button("VM account…")).toBeUndefined();
+    fixture.route.phase = "active";
+    fixture.local = false;
+    await act(async () => renderer!.update(view(true)));
+    expect(button("VM account…")).toBeUndefined();
+  });
+  it("keeps a pending VM account recoverable after closing its editor and blocks only the VM move", async () => {
+    fixture.signedIn = true;
+    fixture.local = true;
+    fixture.defaultCodex = true;
+    fixture.cloudConfigured = true;
+    fixture.vmAccountPending = true;
+    fixture.route = { phase: "active", relayUrl: "https://relay.example.test", generation: 3 };
+    fixture.localThread = {
+      id: "thread",
+      projectId: "project",
+      modelSelection: { instanceId: "codex" },
+      archivedAt: null,
+    };
+    const vmDestination = () =>
+      renderer!.root
+        .findAllByType("button")
+        .find((node) =>
+          node.findAllByType("span").some((span) => span.children.includes("Private VM")),
+        )!;
+    await mount(true);
+    await openRunOn();
+    expect(vmDestination().props.disabled).toBe(true);
+    expect(button("VM account…").props.disabled).toBe(false);
+    await act(async () => button("VM account…").props.onClick());
+    await act(async () => button("Close account editor").props.onClick());
+    await openRunOn();
+    expect(vmDestination().props.disabled).toBe(true);
+    expect(button("VM account…").props.disabled).toBe(false);
+    fixture.vmAccountPending = false;
+    await act(async () => renderer!.update(view(true)));
+    expect(vmDestination().props.disabled).toBe(false);
+    const sendToVm = vmDestination().props.onClick;
+    // A command that outlives its render still checks the current pending choice.
+    fixture.vmAccountPending = true;
+    await act(async () => sendToVm());
+    expect(fixture.enqueue).not.toHaveBeenCalled();
   });
   it("does not treat an explicitly paused queue as a VM problem", async () => {
     fixture.queuePaused = true;

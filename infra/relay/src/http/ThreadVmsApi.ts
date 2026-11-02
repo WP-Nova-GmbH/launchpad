@@ -8,6 +8,8 @@ import { threadVmProviderAuth } from "./ThreadVmProviderAuthApi.ts";
 import {
   getThreadVmCodexAuthSource,
   selectThreadVmCodexAuthSource,
+  getThreadVmCodexPreference,
+  setThreadVmCodexPreference,
 } from "./ThreadVmCodexAuthApi.ts";
 import { permanentlyDeleteThread, getThreadDeletion } from "./ThreadDeletionApi.ts";
 import { resetThreadVm, getThreadVmReset, cancelThreadVmReset } from "./ThreadVmResetApi.ts";
@@ -237,6 +239,10 @@ export const cancelThreadVmReplacement = Effect.fn("relay.api.thread_vms.cancel_
 
 export const threadVmsApi = HttpApiBuilder.group(RelayApi, "threadVms", (handlers) =>
   handlers
+    .handle("getCodexPreference", ({ params }) => getThreadVmCodexPreference(params.threadId))
+    .handle("setCodexPreference", ({ params, payload }) =>
+      setThreadVmCodexPreference(params.threadId, payload),
+    )
     .handle("getProviderAuthSource", ({ params }) => getThreadVmCodexAuthSource(params.threadId))
     .handle("selectProviderAuthSource", ({ params, payload }) =>
       selectThreadVmCodexAuthSource(params.threadId, payload),

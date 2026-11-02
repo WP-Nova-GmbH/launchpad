@@ -5,6 +5,7 @@ import {
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import { makeCodexVmConnections } from "../tenancy/CodexVmConnections.ts";
+import { makeThreadVmCodexPreferenceStore } from "./ThreadVmCodexPreferenceStore.ts";
 
 export interface ThreadVmCodexAuthIdentity {
   readonly allocationId: string;
@@ -18,6 +19,7 @@ const unavailable = () => new CodexVmConnectionError({ reason: "source_unavailab
 /** Callers own placement/binding authorization. Rows retain removed account IDs instead of falling back. */
 export function makeThreadVmCodexAuthStore(sql: PgClient) {
   const accounts = makeCodexVmConnections(sql);
+  const preferences = makeThreadVmCodexPreferenceStore(sql);
   const exact = Effect.fn("relay.vm_codex_auth.exact")(function* (
     input: ThreadVmCodexAuthIdentity,
   ) {
@@ -37,7 +39,12 @@ export function makeThreadVmCodexAuthStore(sql: PgClient) {
     const selected = yield* exact(input);
     if (selected) return selected;
     const prior =
-      yield* sql`SELECT 1 FROM relay_thread_vm_codex_auth WHERE thread_id=${input.threadId} AND organization_id=${input.organizationId} LIMIT 1`;
+      yield* sql`SELECT 1 FROM relay_thread_vm_codex_auth WHERE thread_id=${input.threadId} AND organization_id=${input.organizationId}
+        UNION ALL SELECT 1 FROM relay_thread_vm_codex_preferences WHERE thread_id=${input.threadId} AND organization_id=${input.organizationId}
+        UNION ALL SELECT 1 FROM relay_thread_vm_bindings b JOIN relay_thread_vm_allocations a USING(allocation_id)
+          WHERE b.thread_id=${input.threadId} AND a.organization_id=${input.organizationId}
+            AND (b.allocation_id,b.environment_id,b.generation) IS DISTINCT FROM
+              (${input.allocationId},${input.environmentId},${input.generation}) LIMIT 1`;
     if (prior.length) return yield* unavailable();
     return { mode: "personal" as const };
   });
@@ -60,12 +67,7 @@ export function makeThreadVmCodexAuthStore(sql: PgClient) {
     input: ThreadVmCodexAuthIdentity,
     selection: RelayThreadVmCodexAuthSelection,
   ) {
-    if (selection.mode === "organization") {
-      const rows =
-        yield* sql`SELECT connection_id FROM relay_codex_vm_connections WHERE organization_id=${input.organizationId}
-        AND connection_id=${selection.connectionId} AND status='connected' FOR SHARE`;
-      if (!rows.length) return yield* new CodexVmConnectionError({ reason: "not_connected" });
-    }
+    yield* preferences.save(input, selection);
     yield* sql`INSERT INTO relay_thread_vm_codex_auth(allocation_id,environment_id,generation,thread_id,organization_id,mode,connection_id)
       VALUES(${input.allocationId},${input.environmentId},${input.generation},${input.threadId},${input.organizationId},${selection.mode},${selection.mode === "organization" ? selection.connectionId : null})
       ON CONFLICT(allocation_id,environment_id,generation) DO UPDATE SET mode=excluded.mode,connection_id=excluded.connection_id,acknowledged_connection_id=NULL
@@ -119,7 +121,10 @@ export function makeThreadVmCodexAuthStore(sql: PgClient) {
       AND environment_id=${input.sourceEnvironmentId} AND generation=${input.sourceGeneration} FOR SHARE`;
     if (!source) {
       const prior =
-        yield* sql`SELECT 1 FROM relay_thread_vm_codex_auth WHERE thread_id=${input.threadId} AND organization_id=${input.organizationId} LIMIT 1`;
+        yield* sql`SELECT 1 FROM relay_thread_vm_codex_auth WHERE thread_id=${input.threadId} AND organization_id=${input.organizationId}
+          UNION ALL SELECT 1 FROM relay_thread_vm_codex_preferences WHERE thread_id=${input.threadId} AND organization_id=${input.organizationId}
+          UNION ALL SELECT 1 FROM relay_thread_vm_bindings WHERE environment_id=${input.sourceEnvironmentId}
+            AND thread_id=${input.threadId} LIMIT 1`;
       if (prior.length) return null;
     }
     // A missing historical binding cannot adopt a different account or expose copied guest secrets.
@@ -137,14 +142,35 @@ export function makeThreadVmCodexAuthStore(sql: PgClient) {
       generation: number;
       restoreEnvironmentId: string | null;
       restoreGeneration: number | null;
+      localMove: boolean;
     }>`
       SELECT t.environment_id AS "environmentId",t.generation,
-      coalesce(f.environment_id,b.environment_id) AS "restoreEnvironmentId",r.source_generation AS "restoreGeneration"
+      coalesce(f.environment_id,b.environment_id) AS "restoreEnvironmentId",r.source_generation AS "restoreGeneration",
+      EXISTS(SELECT 1 FROM relay_thread_moves m JOIN relay_thread_vm_move_destinations d USING(operation_id)
+        WHERE m.operation_id=t.operation_id AND m.thread_id=t.thread_id AND d.allocation_id=${input.allocationId}
+        AND m.actor_user_id=t.owner_user_id
+        AND m.source_environment_id=t.environment_id AND m.expected_generation=t.generation
+        AND m.phase IN ('preparing','frozen') AND ${input.generation}=t.generation+1
+        AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_bindings source_vm WHERE source_vm.environment_id=t.environment_id)) AS "localMove"
       FROM relay_thread_placements t LEFT JOIN relay_thread_vm_restores r ON r.operation_id=t.operation_id AND r.thread_id=t.thread_id
       LEFT JOIN relay_thread_vm_final_saves f ON f.operation_id=r.saved_disk_operation_id
       LEFT JOIN relay_thread_vm_backup_recoveries b ON b.operation_id=r.operation_id
       WHERE t.thread_id=${input.threadId} AND t.organization_id=${input.organizationId}`;
     if (!source) return yield* unavailable();
+    if (source.localMove) {
+      const existing = yield* exact(input);
+      if (existing) return yield* connection(input);
+      const preference = yield* preferences.read(input);
+      if (preference.revision > 0) {
+        if (!preference.selection) return null;
+        const selection = preference.selection;
+        // Preserve the chosen ID even when disconnected; enrollment must leave account recovery reachable.
+        yield* sql`INSERT INTO relay_thread_vm_codex_auth(allocation_id,environment_id,generation,thread_id,organization_id,mode,connection_id)
+          VALUES(${input.allocationId},${input.environmentId},${input.generation},${input.threadId},${input.organizationId},${selection.mode},${selection.mode === "organization" ? selection.connectionId : null})
+          ON CONFLICT DO NOTHING`;
+        return yield* connection(input);
+      }
+    }
     const restoring = source.environmentId.startsWith("pending-restore:");
     if (restoring && (!source.restoreEnvironmentId || source.restoreGeneration === null))
       return null;

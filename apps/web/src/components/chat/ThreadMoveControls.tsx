@@ -68,6 +68,7 @@ import { environmentCatalog } from "../../connection/catalog";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ComposerControl } from "./ComposerControl";
 import { ThreadVmMenuActions, ThreadVmRefreshButton, useThreadVmUi } from "./ThreadVmControls";
+import { ThreadVmAccountPreference } from "./ThreadVmAccountPreference";
 import { useComposerMenuProps } from "./composerEventScope";
 
 function FollowThreadLocation({
@@ -522,6 +523,9 @@ function RunOnPicker({
   const location = useAtomValue(threadVmControls.locationViewAtom(environmentId, threadId));
   const routeAtom = threadVmControls.routeAtom(environmentId, threadId);
   const route = useAtomValue(routeAtom);
+  const vmAccountPending = useAtomValue(
+    threadVmControls.codexPreferencePendingAtom(environmentId, threadId),
+  );
   const confirmedLocationAtom = threadVmControls.confirmedLocationAtom(environmentId, threadId);
   const placement = useAtomValue(confirmedLocationAtom);
   const host = useAtomValue(threadVmControls.hostConfigurationAtom);
@@ -536,6 +540,7 @@ function RunOnPicker({
   const reconnect = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
   const checkLocation = useAtomCommand(threadVmControls.checkLocation, { reportFailure: false });
   const [open, setOpen] = useState(false),
+    [accountEditorGeneration, setAccountEditorGeneration] = useState<number | null>(null),
     [busy, setBusy] = useState(false),
     [saved, setSaved] = useState<ThreadMoveSubmission | null>(null),
     [ready, setReady] = useState(!session || !relayUrl),
@@ -809,6 +814,8 @@ function RunOnPicker({
                             : null));
   const disabled =
     busy || !ready || blocker !== null || status !== null || movePending || movedAway;
+  const canChooseVmAccount =
+    session !== null && route?.phase === "active" && vmSupported && !isVm && !movedAway;
   const originalLocationAttempted = useRef(false);
   const canCheckOriginalLocation =
     isVm &&
@@ -860,6 +867,12 @@ function RunOnPicker({
   };
   const run = async (kind: "send" | "check" | "discard", destination?: ThreadMoveDestination) => {
     if (submitting.current || !session || !relayUrl || !ready) return;
+    if (
+      kind === "send" &&
+      destination?.kind === "vm" &&
+      appAtomRegistry.get(threadVmControls.codexPreferencePendingAtom(environmentId, threadId))
+    )
+      return;
     if (kind === "send" && destination && disabled) return;
     const scope = {
       accountId: session.accountId,
@@ -994,6 +1007,14 @@ function RunOnPicker({
             <DestinationRow
               label="Private VM"
               detail={
+                (!blocker &&
+                !status &&
+                !movePending &&
+                !movedAway &&
+                vmSupported &&
+                vmAccountPending
+                  ? "Confirm the saved VM account choice before moving"
+                  : null) ??
                 (!blocker && !status && !movePending && !movedAway
                   ? host.unavailableReason
                   : null) ??
@@ -1002,7 +1023,9 @@ function RunOnPicker({
                   : "Dedicated to this thread")
               }
               machine="cloud"
-              disabled={disabled || !vmSupported || host.unavailableReason !== null}
+              disabled={
+                disabled || !vmSupported || vmAccountPending || host.unavailableReason !== null
+              }
               onClick={() => void run("send", { kind: "vm" })}
             />
           ) : null}
@@ -1030,6 +1053,21 @@ function RunOnPicker({
                 />
               );
             })}
+          {canChooseVmAccount ? (
+            <div className="border-t border-border pt-2">
+              <Button
+                variant="ghost"
+                size="xs"
+                disabled={disabled}
+                onClick={() => {
+                  setOpen(false);
+                  setAccountEditorGeneration(route.generation);
+                }}
+              >
+                VM account…
+              </Button>
+            </div>
+          ) : null}
           <ThreadVmMenuActions onAction={() => setOpen(false)} />
           <div className="mt-2 space-y-2 border-t border-border px-1 pb-1 pt-3 text-xs text-muted-foreground">
             {movedAway ? (
@@ -1144,6 +1182,16 @@ function RunOnPicker({
           </div>
         </PopoverPopup>
       </Popover>
+      {canChooseVmAccount && accountEditorGeneration === route.generation ? (
+        <ThreadVmAccountPreference
+          environmentId={environmentId}
+          threadId={threadId}
+          accountId={session.accountId}
+          disabled={disabled}
+          onClose={() => setAccountEditorGeneration(null)}
+          finalFocus={vmUi?.trigger ?? runOnTrigger}
+        />
+      ) : null}
       {movedAway ? (
         <span role="status" className="text-xs text-muted-foreground">
           Moved

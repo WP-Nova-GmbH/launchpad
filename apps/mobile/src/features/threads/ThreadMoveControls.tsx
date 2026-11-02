@@ -8,6 +8,7 @@ import {
 } from "../../state/use-composer-drafts";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { ThreadVmMenuActions, ThreadVmRefreshButton, useThreadVmUi } from "./ThreadVmControls";
+import { ThreadVmAccountPreference } from "./ThreadVmAccountPreference";
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
@@ -497,6 +498,9 @@ function ThreadMachinePicker({
   const placement = useAtomValue(confirmedPlacementAtom);
   const routeAtom = threadVmControls.routeAtom(environmentId, threadId);
   const route = useAtomValue(routeAtom);
+  const vmAccountPending = useAtomValue(
+    threadVmControls.codexPreferencePendingAtom(environmentId, threadId),
+  );
   const currentEnvironmentId = location?.destination?.environmentId ?? environmentId;
   const currentConfig = useAtomValue(serverEnvironment.configValueAtom(currentEnvironmentId));
   const locationKey = location?.destination
@@ -528,6 +532,7 @@ function ThreadMachinePicker({
   });
   const checkLocation = useAtomCommand(threadVmControls.checkLocation, { reportFailure: false });
   const [openedLocation, setOpenedLocation] = useState<string | null>(null),
+    [accountEditorGeneration, setAccountEditorGeneration] = useState<number | null>(null),
     [busy, setBusy] = useState(false),
     [saved, setSaved] = useState<ThreadMoveSubmission | null>(null),
     [ready, setReady] = useState(!session || !relayUrl),
@@ -758,6 +763,12 @@ function ThreadMachinePicker({
     location?.movePending === true ||
     location?.destination != null;
   const disabled = busy || !ready || outstanding || setupBlocker !== null;
+  const canChooseVmAccount =
+    session !== null &&
+    route?.phase === "active" &&
+    vmSupported &&
+    !currentIsVm &&
+    currentEnvironmentId === environmentId;
   const pickerVisible = openedLocation === locationKey;
   const originalLocationEligible =
     config?.environment.threadVm?.threadId === threadId &&
@@ -805,7 +816,9 @@ function ThreadMachinePicker({
   ]);
   const vmBlocker = !vmSupported
     ? "Private VMs currently require the default Codex provider."
-    : host.unavailableReason;
+    : vmAccountPending
+      ? "Confirm the saved VM account choice before moving"
+      : host.unavailableReason;
   const destinationLabel = (destination: ThreadMoveDestination) => {
     if (destination.kind === "vm") return "Private VM";
     const target = projects.find(
@@ -849,6 +862,12 @@ function ThreadMachinePicker({
   };
   const run = async (kind: "send" | "check" | "discard", destination?: ThreadMoveDestination) => {
     if (submitting.current || !session || !relayUrl || !ready) return;
+    if (
+      kind === "send" &&
+      destination?.kind === "vm" &&
+      appAtomRegistry.get(threadVmControls.codexPreferencePendingAtom(environmentId, threadId))
+    )
+      return;
     // A selected row creates a new move; recovery always uses the exact saved intent.
     if (destination && (disabled || (destination.kind === "vm" && vmBlocker))) return;
     if (kind === "send" && !destination && !saved) return;
@@ -1089,6 +1108,20 @@ function ThreadMachinePicker({
                     );
                   })}
               </View>
+              {canChooseVmAccount ? (
+                <Action
+                  label="VM account…"
+                  disabled={disabled}
+                  onPress={() => {
+                    close();
+                    const openAccount = () => {
+                      if (isCurrent()) setAccountEditorGeneration(route.generation);
+                    };
+                    if (Platform.OS === "ios") pendingVmAction.current = openAccount;
+                    else openAccount();
+                  }}
+                />
+              ) : null}
               <ThreadVmMenuActions
                 onAction={(action) => {
                   close();
@@ -1156,7 +1189,11 @@ function ThreadMachinePicker({
                     onPress={setup}
                   />
                 </View>
-              ) : !outstanding && !currentIsVm && vmBlocker && !host.isPending ? (
+              ) : !outstanding &&
+                !currentIsVm &&
+                vmBlocker &&
+                !vmAccountPending &&
+                !host.isPending ? (
                 <Action label="View VM setup instructions" onPress={setup} />
               ) : null}
               {visibleError ? (
@@ -1168,6 +1205,15 @@ function ThreadMachinePicker({
           </View>
         </View>
       </Modal>
+      {canChooseVmAccount && accountEditorGeneration === route.generation ? (
+        <ThreadVmAccountPreference
+          environmentId={environmentId}
+          threadId={threadId}
+          accountId={session.accountId}
+          disabled={disabled}
+          onClose={() => setAccountEditorGeneration(null)}
+        />
+      ) : null}
     </View>
   );
 }

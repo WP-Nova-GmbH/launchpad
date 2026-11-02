@@ -3,6 +3,7 @@ import type {
   RelayThreadVmCodexAuthSelection,
   RelayThreadVmCodexAuthSource,
   RelayThreadVmProviderAuthRequest,
+  RelayThreadVmCodexPreferenceRequest,
 } from "@t3tools/contracts/relay";
 import {
   RelayApi,
@@ -21,6 +22,7 @@ import {
   type ThreadVmCodexAuthIdentity,
 } from "../threads/ThreadVmCodexAuthStore.ts";
 import { readPendingThreadVmProviderAuth } from "../threads/ThreadVmPendingProviderAuth.ts";
+import { makeThreadVmCodexPreferenceStore } from "../threads/ThreadVmCodexPreferenceStore.ts";
 import { authorizeThreadEnvironment } from "./ThreadEnvironmentApi.ts";
 import { withPrivateThreadOwnerAccess, withPrivateThreadAccess } from "./privateThreadAccess.ts";
 import { tenancyConflict, tenancyNotFound } from "./tenancyErrors.ts";
@@ -141,6 +143,60 @@ export const getThreadVmCodexAuthSource = Effect.fn("relay.vm_codex_auth.private
   },
 );
 
+const preferenceEditable = Effect.fn("relay.vm_codex_preference.editable")(function* (
+  placement: RelayPortableThreadPlacement,
+) {
+  if (placement.operationId !== null) return false;
+  const sql = (yield* RelayDb).$client;
+  const bindings = yield* sql`SELECT 1 FROM relay_thread_vm_bindings
+    WHERE environment_id=${placement.environmentId} LIMIT 1`;
+  return bindings.length === 0;
+});
+
+export const getThreadVmCodexPreference = Effect.fn("relay.vm_codex_preference.status")(function* (
+  threadId: string,
+) {
+  return yield* withPrivateThreadAccess(threadId, "read", (placement) =>
+    Effect.gen(function* () {
+      const preference = yield* makeThreadVmCodexPreferenceStore((yield* RelayDb).$client).read({
+        threadId,
+        organizationId: placement.organizationId,
+      });
+      return {
+        ...preference,
+        generation: placement.generation,
+        editable: yield* preferenceEditable(placement),
+      };
+    }),
+  );
+});
+
+export const setThreadVmCodexPreference = Effect.fn("relay.vm_codex_preference.set")(
+  function* (threadId: string, input: RelayThreadVmCodexPreferenceRequest) {
+    return yield* withPrivateThreadAccess(threadId, "write", (placement) =>
+      Effect.gen(function* () {
+        if (
+          placement.generation !== input.expectedGeneration ||
+          !(yield* preferenceEditable(placement))
+        )
+          return yield* tenancyConflict("thread_placement_changed");
+        const preference = yield* makeThreadVmCodexPreferenceStore((yield* RelayDb).$client).save(
+          {
+            threadId,
+            organizationId: placement.organizationId,
+            expectedRevision: input.expectedRevision,
+          },
+          input.selection,
+        );
+        return { ...preference, generation: placement.generation, editable: true };
+      }),
+    );
+  },
+  Effect.catchTag("ThreadVmCodexPreferenceConflict", () =>
+    tenancyConflict("thread_placement_changed"),
+  ),
+);
+
 /** Selection is possible only at the existing, quarantined provider preparation boundary. */
 export const selectThreadVmCodexAuthSource = Effect.fn("relay.vm_codex_auth.select_source")(
   function* (
@@ -164,6 +220,9 @@ export const selectThreadVmCodexAuthSource = Effect.fn("relay.vm_codex_auth.sele
       }),
     );
   },
+  Effect.catchTag("ThreadVmCodexPreferenceConflict", () =>
+    tenancyConflict("thread_placement_changed"),
+  ),
 );
 
 export const getEnvironmentThreadVmCodexAuthSource = (input: Owner) =>

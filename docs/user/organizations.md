@@ -86,8 +86,12 @@ client cannot receive this sign-in callback. Those clients can still use the acc
 
 During VM preparation, choose **Organization Codex** to use the connected account without signing
 in inside that VM. Choose **Personal sign-in** to use a separate Codex login in the VM instead.
-Account choice is available while preparation is pending; active and paused VMs show their current
-source without changing it or starting the VM. Organization Codex offers a smaller model list;
+Launchpad remembers the choice for that chat's next move from a local machine to a new VM.
+When a previously moved chat is back on your machine, use **Run on → VM account…** to change or
+clear that choice. Personal mode still requires Codex sign-in when the new VM has no
+login. Reset and restore keep the source VM's account choice.
+The current VM's account can be changed while preparation is pending; active and paused VMs show
+their current source without changing it or starting the VM. Organization Codex offers a smaller model list;
 choose a supported model on the source thread before moving it. If preparation reports an
 unsupported model, cancel the move and change the source thread's model before trying again.
 The conversation is kept.

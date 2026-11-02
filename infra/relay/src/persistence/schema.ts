@@ -1167,6 +1167,30 @@ export const relayThreadVmAllocations = pgTable(
   ],
 );
 
+/** A cleared default retains its revision so an old save cannot recreate it. */
+export const relayThreadVmCodexPreferences = pgTable(
+  "relay_thread_vm_codex_preferences",
+  {
+    threadId: varchar("thread_id", { length: 191 })
+      .primaryKey()
+      .references(() => relayThreadPlacements.threadId),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    revision: bigint("revision", { mode: "number" }).notNull(),
+    mode: varchar("mode", { length: 16 }).$type<"personal" | "organization">(),
+    connectionId: varchar("connection_id", { length: 64 }),
+  },
+  (table) => [
+    check(
+      "relay_thread_vm_codex_preferences_revision",
+      sql`${table.revision} BETWEEN 1 AND 9007199254740991`,
+    ),
+    check(
+      "relay_thread_vm_codex_preferences_selection",
+      sql`(${table.mode} IS NULL AND ${table.connectionId} IS NULL) OR (${table.mode} IS NOT NULL AND ((${table.mode}='personal' AND ${table.connectionId} IS NULL) OR (${table.mode}='organization' AND ${table.connectionId} IS NOT NULL)))`,
+    ),
+  ],
+);
+
 /** Non-secret provider selection belongs to one exact guest identity, never its restored disk. */
 export const relayThreadVmCodexAuth = pgTable(
   "relay_thread_vm_codex_auth",

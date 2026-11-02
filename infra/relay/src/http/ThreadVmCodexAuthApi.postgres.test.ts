@@ -28,6 +28,8 @@ import {
   connect,
 } from "../tenancy/CodexVmConnections.test-fixture.ts";
 import { makeThreadVmCodexAuthStore } from "../threads/ThreadVmCodexAuthStore.ts";
+import { makeThreadVmCodexPreferenceStore } from "../threads/ThreadVmCodexPreferenceStore.ts";
+import { makeThreadDeletionStore } from "../threads/ThreadDeletionStore.ts";
 import { makeThreadVmBindingStore } from "../threads/ThreadVmBindingStore.ts";
 import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 import { makeThreadMoveProgressStore } from "../threads/ThreadMoveProgressStore.ts";
@@ -52,6 +54,8 @@ import {
   getEnvironmentThreadVmCodexAuthToken,
   getThreadVmCodexAuthSource,
   selectThreadVmCodexAuthSource,
+  getThreadVmCodexPreference,
+  setThreadVmCodexPreference,
 } from "./ThreadVmCodexAuthApi.ts";
 
 const guest = vi.hoisted(() => ({
@@ -311,6 +315,375 @@ const fixture = Effect.fnUntraced(function* (connectionId: string) {
 });
 
 describe.skipIf(!databaseUrl)("generation-bound VM Codex authentication (PostgreSQL)", () => {
+  it.effect(
+    "saves and clears local defaults with monotonic revisions and stale-write protection",
+    () =>
+      withDatabase((request) =>
+        Effect.gen(function* () {
+          const connected = yield* connect(request);
+          yield* request(() =>
+            Effect.gen(function* () {
+              const vm = yield* fixture(connected.connectionId);
+              yield* vm.sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${threadId}`;
+              const before = yield* vm.provide(getThreadVmCodexPreference(threadId));
+              expect(before).toEqual({
+                generation: 1,
+                revision: 0,
+                selection: null,
+                editable: true,
+              });
+              const source = {
+                mode: "organization" as const,
+                connectionId: connected.connectionId,
+              };
+              expect(
+                yield* vm.provide(
+                  setThreadVmCodexPreference(threadId, {
+                    expectedGeneration: 1,
+                    expectedRevision: 0,
+                    selection: source,
+                  }),
+                ),
+              ).toEqual({ ...before, revision: 1, selection: source });
+              expect(
+                yield* vm.provide(
+                  setThreadVmCodexPreference(threadId, {
+                    expectedGeneration: 1,
+                    expectedRevision: 1,
+                    selection: null,
+                  }),
+                ),
+              ).toEqual({ ...before, revision: 2 });
+              for (const expectedRevision of [0, 1])
+                expect(
+                  yield* vm
+                    .provide(
+                      setThreadVmCodexPreference(threadId, {
+                        expectedGeneration: 1,
+                        expectedRevision,
+                        selection: source,
+                      }),
+                    )
+                    .pipe(Effect.flip),
+                ).toMatchObject({ _tag: "RelayTenancyConflictError" });
+              expect(
+                yield* vm.provide(
+                  setThreadVmCodexPreference(threadId, {
+                    expectedGeneration: 1,
+                    expectedRevision: 2,
+                    selection: { mode: "personal" },
+                  }),
+                ),
+              ).toMatchObject({ revision: 3, selection: { mode: "personal" } });
+              expect(guest.calls).toBe(0);
+            }),
+          );
+        }),
+      ),
+  );
+
+  it.effect("rejects stale, foreign-owner, active-move and VM-side preference edits", () =>
+    withDatabase((request) =>
+      Effect.gen(function* () {
+        const connected = yield* connect(request);
+        yield* request(() =>
+          Effect.gen(function* () {
+            const vm = yield* fixture(connected.connectionId);
+            const input = {
+              expectedGeneration: 1,
+              expectedRevision: 0,
+              selection: { mode: "personal" as const },
+            };
+            expect(
+              yield* vm.provide(setThreadVmCodexPreference(threadId, input)).pipe(Effect.flip),
+            ).toMatchObject({ _tag: "RelayTenancyConflictError" });
+            expect(
+              yield* vm
+                .provide(getThreadVmCodexPreference(threadId), "second-admin")
+                .pipe(Effect.flip),
+            ).toMatchObject({ _tag: "RelayTenancyNotFoundError" });
+            expect(
+              yield* vm
+                .provide(setThreadVmCodexPreference(threadId, input), "second-admin")
+                .pipe(Effect.flip),
+            ).toMatchObject({ _tag: "RelayTenancyNotFoundError" });
+            yield* vm.sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${threadId}`;
+            expect(
+              yield* vm
+                .provide(setThreadVmCodexPreference(threadId, { ...input, expectedGeneration: 2 }))
+                .pipe(Effect.flip),
+            ).toMatchObject({ _tag: "RelayTenancyConflictError" });
+            yield* vm.sql`UPDATE relay_thread_placements SET environment_id=${environmentId},generation=2 WHERE thread_id=${threadId}`;
+            expect(yield* vm.provide(getThreadVmCodexPreference(threadId))).toMatchObject({
+              editable: false,
+            });
+            expect(
+              yield* vm
+                .provide(setThreadVmCodexPreference(threadId, { ...input, expectedGeneration: 2 }))
+                .pipe(Effect.flip),
+            ).toMatchObject({ _tag: "RelayTenancyConflictError" });
+            expect(yield* makeThreadVmCodexPreferenceStore(vm.sql).read(identity)).toEqual({
+              revision: 0,
+              selection: null,
+            });
+          }),
+        );
+      }),
+    ),
+  );
+
+  it.effect("remembers only accepted pending selections and retains them after cancellation", () =>
+    withDatabase((request) =>
+      Effect.gen(function* () {
+        const connected = yield* connect(request);
+        yield* request(() =>
+          Effect.gen(function* () {
+            const vm = yield* fixture(connected.connectionId);
+            const store = makeThreadVmCodexPreferenceStore(vm.sql);
+            yield* vm.select();
+            const remembered = yield* store.read(identity);
+            expect(remembered).toEqual({
+              revision: 1,
+              selection: { mode: "organization", connectionId: connected.connectionId },
+            });
+            expect(
+              yield* vm
+                .select({ mode: "organization", connectionId: "replaced-account" })
+                .pipe(Effect.flip),
+            ).toMatchObject({ reason: "not_connected" });
+            expect(yield* store.read(identity)).toEqual(remembered);
+            expect(yield* makeThreadVmCodexAuthStore(vm.sql).read(identity)).toEqual(
+              remembered.selection,
+            );
+            yield* vm.sql`UPDATE relay_thread_moves SET phase='aborting' WHERE operation_id=${operationId}`;
+            expect(yield* vm.provide(getThreadVmCodexPreference(threadId))).toMatchObject(
+              remembered,
+            );
+            expect(guest.calls).toBe(0);
+          }),
+        );
+      }),
+    ),
+  );
+
+  it.effect(
+    "a cleared first preference requires account selection rather than defaulting to personal",
+    () =>
+      withDatabase((request) =>
+        Effect.gen(function* () {
+          const connected = yield* connect(request);
+          yield* request(() =>
+            Effect.gen(function* () {
+              const vm = yield* fixture(connected.connectionId);
+              yield* vm.sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${threadId}`;
+              yield* vm.provide(
+                setThreadVmCodexPreference(threadId, {
+                  expectedGeneration: 1,
+                  expectedRevision: 0,
+                  selection: null,
+                }),
+              );
+              yield* vm.sql`UPDATE relay_thread_placements SET operation_id=${operationId} WHERE thread_id=${threadId}`;
+              yield* vm.sql`INSERT INTO relay_thread_vm_move_destinations(operation_id,allocation_id) VALUES(${operationId},${allocationId})`;
+              yield* makeThreadVmBindingStore(vm.sql).bind({
+                allocationId,
+                operationId,
+                environmentId,
+                environmentPublicKey: "vm-public-key",
+                credentialId,
+              });
+              expect(
+                yield* makeThreadVmCodexAuthStore(vm.sql).read(identity).pipe(Effect.flip),
+              ).toMatchObject({ reason: "source_unavailable" });
+              expect(
+                yield* vm.sql`SELECT 1 FROM relay_thread_vm_codex_auth WHERE thread_id=${threadId}`,
+              ).toEqual([]);
+            }),
+          );
+        }),
+      ),
+  );
+
+  it.effect(
+    "does not use the preference for a missing historical VM selection or an unrelated allocation",
+    () =>
+      withDatabase((request) =>
+        Effect.gen(function* () {
+          const connected = yield* connect(request);
+          yield* request(() =>
+            Effect.gen(function* () {
+              const vm = yield* fixture(connected.connectionId);
+              yield* vm.select();
+              const auth = makeThreadVmCodexAuthStore(vm.sql);
+              yield* vm.sql`INSERT INTO relay_thread_vm_move_destinations(operation_id,allocation_id) VALUES(${operationId},${allocationId})`;
+              expect(
+                yield* auth.inheritBinding({
+                  ...identity,
+                  allocationId: "unrelated-allocation",
+                  environmentId: "unrelated-environment",
+                }),
+              ).toBeNull();
+              yield* vm.sql`DELETE FROM relay_thread_vm_codex_auth WHERE allocation_id=${allocationId}`;
+              expect(
+                yield* auth.transfer({
+                  ...identity,
+                  environmentId: "next-environment",
+                  generation: 3,
+                  sourceEnvironmentId: environmentId,
+                  sourceGeneration: 2,
+                }),
+              ).toBeNull();
+              expect(
+                yield* auth
+                  .read({ ...identity, environmentId: "next-environment", generation: 3 })
+                  .pipe(Effect.flip),
+              ).toMatchObject({ reason: "source_unavailable" });
+            }),
+          );
+        }),
+      ),
+  );
+
+  it.effect("does not default to personal after a legacy VM's account history is missing", () =>
+    withDatabase((request) =>
+      Effect.gen(function* () {
+        const connected = yield* connect(request);
+        yield* request(() =>
+          Effect.gen(function* () {
+            const vm = yield* fixture(connected.connectionId);
+            const auth = makeThreadVmCodexAuthStore(vm.sql);
+            expect(yield* auth.read(identity)).toEqual({ mode: "personal" });
+            const target = { ...identity, environmentId: "next-environment", generation: 3 };
+            expect(
+              yield* auth.transfer({
+                ...target,
+                sourceEnvironmentId: environmentId,
+                sourceGeneration: 2,
+              }),
+            ).toBeNull();
+            expect(yield* auth.read(target).pipe(Effect.flip)).toMatchObject({
+              reason: "source_unavailable",
+            });
+          }),
+        );
+      }),
+    ),
+  );
+
+  it.effect(
+    "removes the saved preference when permanent deletion completes while retaining its placement tombstone",
+    () =>
+      withDatabase((request) =>
+        Effect.gen(function* () {
+          const connected = yield* connect(request);
+          yield* request(() =>
+            Effect.gen(function* () {
+              const vm = yield* fixture(connected.connectionId);
+              yield* vm.select();
+              yield* vm.sql`UPDATE relay_thread_vm_allocations SET state='deleted',deleted_at='now' WHERE allocation_id=${allocationId}`;
+              yield* vm.sql`UPDATE relay_thread_vm_bindings SET revoked_at=clock_timestamp(),deletion_endpoint_removed_at=clock_timestamp() WHERE allocation_id=${allocationId}`;
+              yield* vm.sql`UPDATE relay_thread_placements SET operation_id='delete-operation' WHERE thread_id=${threadId}`;
+              yield* vm.sql`INSERT INTO relay_thread_deletions(thread_id,operation_id,owner_user_id,generation,host_id,phase,claim_id,claim_until)
+          VALUES(${threadId},'delete-operation',${userId},1,'host','cleaning','delete-claim',clock_timestamp()+interval '1 minute')`;
+              expect(
+                yield* makeThreadDeletionStore(vm.sql).finish({
+                  threadId,
+                  claimId: "delete-claim",
+                }),
+              ).toBe(true);
+              expect(
+                yield* vm.sql`SELECT 1 FROM relay_thread_vm_codex_preferences WHERE thread_id=${threadId}`,
+              ).toEqual([]);
+              expect(
+                (yield* vm.sql`SELECT 1 FROM relay_thread_placements WHERE thread_id=${threadId}`)
+                  .length,
+              ).toBe(1);
+            }),
+          );
+        }),
+      ),
+  );
+
+  for (const saved of ["organization", "personal", "cleared", "disconnected", "replaced"] as const)
+    it.effect(`inherits the ${saved} default on a new VM after returning locally`, () =>
+      withDatabase((request) =>
+        Effect.gen(function* () {
+          const connected = yield* connect(request);
+          yield* request(() =>
+            Effect.gen(function* () {
+              const vm = yield* fixture(connected.connectionId);
+              yield* vm.select(saved === "personal" ? { mode: "personal" } : undefined);
+              if (saved === "cleared")
+                yield* makeThreadVmCodexPreferenceStore(vm.sql).save(identity, null);
+              if (saved === "disconnected")
+                yield* vm.sql`UPDATE relay_codex_vm_connections SET status='disconnected',payload_sealed=NULL WHERE organization_id=${organizationId}`;
+              if (saved === "replaced")
+                yield* vm.sql`UPDATE relay_codex_vm_connections SET connection_id='replacement-account' WHERE organization_id=${organizationId}`;
+              yield* vm.sql`UPDATE relay_thread_vm_allocations SET state='deleted',deleted_at='now' WHERE allocation_id=${allocationId}`;
+              yield* vm.sql`UPDATE relay_thread_vm_bindings SET revoked_at=clock_timestamp() WHERE allocation_id=${allocationId}`;
+              yield* vm.sql`UPDATE relay_thread_placements SET environment_id='returned-local',generation=3,operation_id='next-move' WHERE thread_id=${threadId}`;
+              yield* vm.sql`INSERT INTO relay_thread_moves(operation_id,thread_id,actor_user_id,source_environment_id,expected_generation,destination_environment_id,destination_project_id,phase)
+              VALUES('next-move',${threadId},${userId},'returned-local',3,'pending-vm:next-move','vm-project','preparing')`;
+              yield* vm.sql`INSERT INTO relay_thread_vm_allocations(allocation_id,thread_id,organization_id,owner_user_id,template_id,state,compute_ref)
+              VALUES('next-allocation',${threadId},${organizationId},${userId},'template:build','running','next-sandbox')`;
+              yield* vm.sql`INSERT INTO relay_thread_vm_provisions(allocation_id,operation_id,generation,phase) VALUES('next-allocation','next-move',4,'created')`;
+              yield* vm.sql`INSERT INTO relay_thread_vm_move_destinations(operation_id,allocation_id) VALUES('next-move','next-allocation')`;
+              yield* vm.sql`INSERT INTO relay_environment_credentials(credential_id,environment_id,environment_public_key,credential_hash,created_at,updated_at)
+              VALUES('next-credential','next-environment','next-public-key','next-credential','now','now')`;
+              yield* makeThreadVmBindingStore(vm.sql).bind({
+                allocationId: "next-allocation",
+                operationId: "next-move",
+                environmentId: "next-environment",
+                environmentPublicKey: "next-public-key",
+                credentialId: "next-credential",
+              });
+              const target = {
+                ...identity,
+                allocationId: "next-allocation",
+                environmentId: "next-environment",
+                generation: 4,
+              };
+              const auth = makeThreadVmCodexAuthStore(vm.sql);
+              if (saved === "cleared") {
+                expect(yield* auth.read(target).pipe(Effect.flip)).toMatchObject({
+                  reason: "source_unavailable",
+                });
+                return;
+              }
+              expect(yield* auth.read(target)).toEqual(
+                saved === "personal"
+                  ? { mode: "personal" }
+                  : { mode: "organization", connectionId: connected.connectionId },
+              );
+              if (saved === "disconnected" || saved === "replaced")
+                expect(yield* auth.requireAcknowledged(target).pipe(Effect.flip)).toMatchObject({
+                  reason: "not_connected",
+                });
+              else if (saved === "organization")
+                expect(yield* auth.requireAcknowledged(target).pipe(Effect.flip)).toMatchObject({
+                  reason: "vm_update_required",
+                });
+              expect(
+                yield* vm.sql`SELECT acknowledged_connection_id AS "acknowledgedConnectionId" FROM relay_thread_vm_codex_auth WHERE allocation_id='next-allocation'`,
+              ).toEqual([{ acknowledgedConnectionId: null }]);
+              yield* makeThreadVmBindingStore(vm.sql).bind({
+                allocationId: "next-allocation",
+                operationId: "next-move",
+                environmentId: "next-environment",
+                environmentPublicKey: "next-public-key",
+                credentialId: "next-credential",
+              });
+              expect(yield* auth.read(target)).toEqual(
+                saved === "personal"
+                  ? { mode: "personal" }
+                  : { mode: "organization", connectionId: connected.connectionId },
+              );
+            }),
+          );
+        }),
+      ),
+    );
+
   it.effect(
     "keeps managed renewable sessions out of the real legacy executor account delivery",
     () =>
@@ -1243,6 +1616,7 @@ describe.skipIf(!databaseUrl)("generation-bound VM Codex authentication (Postgre
           Effect.gen(function* () {
             const vm = yield* fixture(connected.connectionId);
             yield* vm.select();
+            yield* makeThreadVmCodexPreferenceStore(vm.sql).save(identity, { mode: "personal" });
             yield* vm.sql`UPDATE relay_thread_placements SET environment_id=${environmentId},generation=2 WHERE thread_id=${threadId}`;
             yield* vm.sql`UPDATE relay_thread_vm_allocations SET state='deleted',deleted_at='now' WHERE allocation_id=${allocationId}`;
             yield* vm.sql`INSERT INTO relay_thread_vm_allocations(allocation_id,thread_id,organization_id,owner_user_id,template_id,state,compute_ref)
