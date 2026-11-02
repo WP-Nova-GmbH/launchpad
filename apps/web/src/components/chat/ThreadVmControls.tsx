@@ -278,12 +278,26 @@ function VmCodexSignIn({
     threadVmControls.providerAuthSourceViewAtom(environmentId, threadId),
   );
   const sourceData = sourceState.data;
+  const selection = sourceState.selection;
+  const savingChoice = selection.phase === "saving";
+  const unknownChoice = selection.phase === "unknown";
+  const choiceLocked = savingChoice || unknownChoice;
+  const requested = choiceLocked ? selection.requested : null;
   const accountSelectionRequired = sourceData?.accountSelectionRequired === true;
   const accountSource = accountSelectionRequired ? null : (sourceData?.source ?? value?.authSource);
   const accountPresentation = accountSource
     ? threadVmAuthSourcePresentation(accountSource, sourceData?.connection ?? null)
     : null;
   const choice = threadVmAuthSourceChoice(accountSource, sourceData?.connection);
+  const selectedValue = requested
+    ? requested.mode === "organization"
+      ? `organization:${requested.connectionId}`
+      : "personal"
+    : choice.selectedValue;
+  const organizationValue =
+    requested?.mode === "organization"
+      ? `organization:${requested.connectionId}`
+      : choice.organizationValue;
   const openLink = useOpenLink(null);
   const [busy, setBusy] = useState(false),
     [error, setError] = useState<string | null>(null);
@@ -298,7 +312,7 @@ function VmCodexSignIn({
     return () => clearTimeout(timer);
   }, [expiresAt]);
   const presentation =
-    value && !accountSelectionRequired
+    value && !accountSelectionRequired && !choiceLocked
       ? threadVmProviderAuthPresentation(
           {
             ...value,
@@ -309,12 +323,22 @@ function VmCodexSignIn({
         )
       : null;
   const run = async (action: Parameters<typeof dispatch>[0]["action"]) => {
-    if (busy) return;
+    if (
+      busy ||
+      savingChoice ||
+      (unknownChoice && action.type !== "check_selection" && action.type !== "retry_selection")
+    )
+      return;
     setBusy(true);
     setError(null);
     try {
       const result = await dispatch({ environmentId, threadId, accountId, binding, action });
-      if (result._tag === "Failure") {
+      if (
+        result._tag === "Failure" &&
+        action.type !== "select_source" &&
+        action.type !== "check_selection" &&
+        action.type !== "retry_selection"
+      ) {
         const failure = squashAtomCommandFailure(result);
         setError(
           failure instanceof Error
@@ -343,12 +367,12 @@ function VmCodexSignIn({
       {!sourceData?.unsupported ? (
         <RadioGroup
           aria-label="Codex account for this VM"
-          value={choice.selectedValue}
-          disabled={busy || sourceState.isPending}
+          value={selectedValue}
+          disabled={busy || choiceLocked || sourceState.isPending}
           onValueChange={(mode) => {
             if (mode === "personal")
               void run({ type: "select_source", source: { mode: "personal" } });
-            else if (mode === choice.organizationValue && sourceData?.connection?.connectionId)
+            else if (mode === organizationValue && sourceData?.connection?.connectionId)
               void run({
                 type: "select_source",
                 source: { mode: "organization", connectionId: sourceData.connection.connectionId },
@@ -361,7 +385,7 @@ function VmCodexSignIn({
           </label>
           <label className="flex items-center gap-2">
             <Radio
-              value={choice.organizationValue}
+              value={organizationValue}
               disabled={sourceData?.connection?.status !== "connected"}
             />
             Organization Codex
@@ -377,13 +401,13 @@ function VmCodexSignIn({
           <div>
             <ActionButton
               label="Open organization settings"
-              disabled={busy || sourceState.isPending}
+              disabled={busy || choiceLocked || sourceState.isPending}
               onPress={onOpenOrganizationSettings}
             />
           </div>
         </>
       ) : null}
-      {accountPresentation?.usingPlan ? (
+      {accountPresentation?.usingPlan && !choiceLocked ? (
         <div className="flex flex-wrap items-center gap-2">
           <Note>
             Using organization ChatGPT plan. Manage this connection in Organization settings → Codex
@@ -400,16 +424,30 @@ function VmCodexSignIn({
           />
         </div>
       ) : null}
-      <p className="font-medium">
-        {accountSelectionRequired
-          ? "Choose a Codex account"
-          : (presentation?.title ?? "Checking Codex sign-in in the new VM")}
+      <p className="font-medium" role="status" aria-live="polite">
+        {savingChoice
+          ? "Saving choice…"
+          : unknownChoice
+            ? "Could not confirm choice"
+            : accountSelectionRequired
+              ? "Choose a Codex account"
+              : readError && selection.phase === "confirmed" && !presentation
+                ? "Could not check Codex sign-in"
+                : (presentation?.title ?? "Checking Codex sign-in in the new VM")}
       </p>
       <Note>
-        {accountSelectionRequired
-          ? "Choose personal sign-in or a connected organization account to continue."
-          : (presentation?.message ??
-            "The VM is preparing. Its Codex sign-in status will appear here.")}
+        {savingChoice
+          ? "Saving the account selected for this VM."
+          : unknownChoice
+            ? "Check the saved choice before selecting another account."
+            : accountSelectionRequired
+              ? "Choose personal sign-in or a connected organization account to continue."
+              : selection.phase === "confirmed" && !presentation
+                ? readError
+                  ? "Your account choice is saved. Check sign-in status to try again."
+                  : "Your account choice is saved. Checking Codex sign-in in this VM."
+                : (presentation?.message ??
+                  "The VM is preparing. Its Codex sign-in status will appear here.")}
       </Note>
       {presentation?.userCode ? (
         <p>
@@ -421,6 +459,20 @@ function VmCodexSignIn({
         </p>
       ) : null}
       <div className="flex flex-wrap gap-2">
+        {unknownChoice ? (
+          <>
+            <ActionButton
+              label={busy ? "Checking choice…" : "Check selection"}
+              disabled={busy}
+              onPress={() => void run({ type: "check_selection" })}
+            />
+            <ActionButton
+              label="Retry same choice"
+              disabled={busy}
+              onPress={() => void run({ type: "retry_selection" })}
+            />
+          </>
+        ) : null}
         {presentation?.userCode ? (
           <ActionButton
             label="Copy code"
@@ -453,7 +505,7 @@ function VmCodexSignIn({
             onPress={() => void run({ type: "cancel", flowId: value.auth.flowId! })}
           />
         ) : null}
-        {!accountSelectionRequired ? (
+        {!accountSelectionRequired && !choiceLocked ? (
           <ActionButton
             label={busy || loading ? "Checking sign-in…" : "Check sign-in status"}
             disabled={busy || loading}
@@ -461,7 +513,13 @@ function VmCodexSignIn({
           />
         ) : null}
       </div>
-      {[...new Set([error ?? readError, sourceData?.error ?? sourceState.error])].map((message) =>
+      {[
+        ...new Set([
+          selection.error,
+          error ?? (choiceLocked ? null : readError),
+          choiceLocked ? null : (sourceData?.error ?? sourceState.error),
+        ]),
+      ].map((message) =>
         message ? (
           <p key={message} role="alert" className="text-destructive">
             {message}

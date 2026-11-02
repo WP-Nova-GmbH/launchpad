@@ -2,6 +2,7 @@ import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
 import type {
   RelayPortableThreadPlacement,
   RelayThreadVmCodexAuthSource,
+  RelayThreadVmCodexAuthSelection,
   RelayCodexVmConnection,
   ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
@@ -24,6 +25,11 @@ const fixture = vi.hoisted(() => ({
   auth: null as Record<string, unknown> | null,
   authSource: null as RelayThreadVmCodexAuthSource | null,
   accountSelectionRequired: false,
+  authSelection: {
+    phase: "idle" as "idle" | "saving" | "confirmed" | "unknown" | "rejected",
+    requested: null as RelayThreadVmCodexAuthSelection | null,
+    error: null as string | null,
+  },
   authSourceError: null as string | null,
   authReadError: null as string | null,
   workerAuth: undefined as ThreadMoveWaitingForAuth | null | undefined,
@@ -102,6 +108,7 @@ vi.mock("../../state/threads", () => ({
     hostConfigurationAtom: { isPending: false, unavailableReason: null },
     providerAuthAction: "auth",
     providerAuthSourceViewAtom: () => ({
+      selection: fixture.authSelection,
       data: {
         source: fixture.authSource,
         connection: fixture.codexConnection,
@@ -306,6 +313,10 @@ const dialogButton = (label: string) =>
   dialogs()[0]!
     .findAllByType("button")
     .find((node) => node.children.join("") === label)!;
+const accountPicker = () =>
+  dialogs()[0]!
+    .findAllByProps({ "aria-label": "Codex account for this VM" })
+    .find((node) => typeof node.props.onValueChange === "function")!;
 const openRunOn = async () => {
   await act(async () => {
     renderer!.root
@@ -349,6 +360,7 @@ beforeEach(() => {
   fixture.auth = null;
   fixture.authSource = null;
   fixture.accountSelectionRequired = false;
+  fixture.authSelection = { phase: "idle", requested: null, error: null };
   fixture.authSourceError = null;
   fixture.authReadError = null;
   fixture.workerAuth = undefined;
@@ -965,6 +977,210 @@ describe("simplified VM controls", () => {
     expect(fixture.authAction).toHaveBeenCalledWith(
       expect.objectContaining({ action: { type: "start" } }),
     );
+  });
+  it("shows a saving choice across an auth remount and keeps its acknowledgment when verification fails", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = {
+      requirement: "sign_in_required",
+      auth: {
+        phase: "waiting",
+        expiresAt: null,
+        interaction: {
+          type: "deviceCode",
+          url: "https://chatgpt.com/activate",
+          userCode: "PREVIOUS-ACCOUNT-CODE",
+        },
+      },
+    };
+    fixture.codexConnection = {
+      connectionId: "org-codex",
+      label: "VM account",
+      status: "connected",
+      epoch: 1,
+      tokenRevision: 1,
+      errorCode: null,
+      refreshing: false,
+    };
+    const requested = { mode: "organization", connectionId: "org-codex" } as const;
+    const pending = deferred();
+    fixture.authAction.mockImplementationOnce(async () => {
+      fixture.authSelection = { phase: "saving", requested, error: null };
+      await pending.promise;
+      fixture.authSelection = { phase: "confirmed", requested, error: null };
+      fixture.authSource = {
+        ...requested,
+        connection: fixture.codexConnection!,
+      };
+      fixture.auth = null;
+      fixture.accountSelectionRequired = false;
+      return AsyncResult.success(null);
+    });
+    await mount(true);
+    await act(async () => button("Finish Codex sign-in").props.onClick());
+    expect(JSON.stringify(renderer!.toJSON())).toContain("PREVIOUS-ACCOUNT-CODE");
+    await act(async () => accountPicker().props.onValueChange("organization:org-codex"));
+    expect(accountPicker().props.value).toBe("organization:org-codex");
+    expect(accountPicker().props.disabled).toBe(true);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Saving choice…");
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain("PREVIOUS-ACCOUNT-CODE");
+    expect(
+      dialogs()[0]!
+        .findAllByType("p")
+        .filter((node) => node.props.role === "status" && node.children.includes("Saving choice…")),
+    ).toHaveLength(1);
+
+    fixture.authTransitionKey = "same-binding-new-worker-state";
+    await act(async () => renderer!.update(view(true)));
+    expect(accountPicker().props.value).toBe("organization:org-codex");
+    expect(accountPicker().props.disabled).toBe(true);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Saving choice…");
+    await act(async () => accountPicker().props.onValueChange("personal"));
+    expect(fixture.authAction).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pending.resolve();
+      await pending.promise;
+      renderer!.update(view(true));
+    });
+    expect(accountPicker().props.value).toBe("organization:org-codex");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Your account choice is saved.");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Checking Codex sign-in");
+    expect(dialogButton("Open Codex sign-in page")).toBeUndefined();
+
+    fixture.authReadError = "The VM could not be reached.";
+    await act(async () => renderer!.update(view(true)));
+    expect(accountPicker().props.value).toBe("organization:org-codex");
+    const text = JSON.stringify(renderer!.toJSON());
+    expect(text).toContain("Your account choice is saved.");
+    expect(text).toContain("Could not check Codex sign-in");
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(1);
+    expect(dialogButton("Check sign-in status")).toBeDefined();
+    expect(fixture.authAction).toHaveBeenCalledTimes(1);
+  });
+  it("keeps an unknown choice actionable without allowing a different account or duplicating its error", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.accountSelectionRequired = true;
+    fixture.workerAuth = "account_selection";
+    const message = "The relay did not confirm the saved choice.";
+    fixture.authSelection = {
+      phase: "unknown",
+      requested: { mode: "personal" },
+      error: message,
+    };
+    fixture.authSourceError = message;
+    fixture.authReadError = message;
+    await mount(true);
+    await act(async () => button("Choose account").props.onClick());
+    expect(accountPicker().props.value).toBe("personal");
+    expect(accountPicker().props.disabled).toBe(true);
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(1);
+    expect(dialogButton("Sign in to Codex")).toBeUndefined();
+    expect(dialogButton("Check sign-in status")).toBeUndefined();
+    await act(async () => accountPicker().props.onValueChange("organization:other"));
+    expect(fixture.authAction).not.toHaveBeenCalled();
+
+    await act(async () => dialogButton("Check selection").props.onClick());
+    expect(fixture.authAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: { type: "check_selection" } }),
+    );
+    const pending = deferred();
+    fixture.authAction.mockImplementationOnce(async () => {
+      fixture.authSelection = {
+        phase: "saving",
+        requested: { mode: "personal" },
+        error: null,
+      };
+      await pending.promise;
+      fixture.authSelection = {
+        phase: "confirmed",
+        requested: { mode: "personal" },
+        error: null,
+      };
+      fixture.authSource = { mode: "personal" };
+      fixture.accountSelectionRequired = false;
+      fixture.authSourceError = null;
+      fixture.authReadError = null;
+      fixture.auth = { requirement: "sign_in_required", auth: { phase: "idle", expiresAt: null } };
+      return AsyncResult.success(null);
+    });
+    await act(async () => dialogButton("Retry same choice").props.onClick());
+    expect(fixture.authAction).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: { type: "retry_selection" } }),
+    );
+    expect(accountPicker().props.value).toBe("personal");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Saving choice…");
+    await act(async () => {
+      pending.resolve();
+      await pending.promise;
+      renderer!.update(view(true));
+    });
+    expect(accountPicker().props.value).toBe("personal");
+    expect(dialogButton("Sign in to Codex")).toBeDefined();
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(0);
+  });
+  it("retains the confirmed account and shows one selection failure after a rejected choice", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = { requirement: "sign_in_required", auth: { phase: "idle", expiresAt: null } };
+    fixture.codexConnection = {
+      connectionId: "org-codex",
+      label: "VM account",
+      status: "connected",
+      epoch: 1,
+      tokenRevision: 1,
+      errorCode: null,
+      refreshing: false,
+    };
+    const message = "The organization account is no longer available.";
+    fixture.authAction.mockImplementationOnce(async () => {
+      fixture.authSelection = {
+        phase: "rejected",
+        requested: { mode: "organization", connectionId: "org-codex" },
+        error: message,
+      };
+      fixture.authSourceError = message;
+      return AsyncResult.fail(new Error(message));
+    });
+    await mount(true);
+    await act(async () => button("Sign in to Codex").props.onClick());
+    await act(async () => accountPicker().props.onValueChange("organization:org-codex"));
+    await act(async () => renderer!.update(view(true)));
+    expect(accountPicker().props.value).toBe("personal");
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(1);
+    expect(JSON.stringify(renderer!.toJSON())).toContain(message);
+    expect(dialogButton("Sign in to Codex")).toBeDefined();
+
+    fixture.authAction.mockImplementationOnce(async () => {
+      fixture.authSelection = { phase: "idle", requested: null, error: null };
+      fixture.authSourceError = null;
+      fixture.auth = {
+        requirement: "sign_in_required",
+        auth: {
+          phase: "waiting",
+          expiresAt: null,
+          interaction: {
+            type: "deviceCode",
+            url: "https://chatgpt.com/activate",
+            userCode: "NEW-PERSONAL-CODE",
+          },
+        },
+      };
+      return AsyncResult.success(null);
+    });
+    await act(async () => dialogButton("Sign in to Codex").props.onClick());
+    await act(async () => renderer!.update(view(true)));
+    expect(fixture.authAction).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: { type: "start" } }),
+    );
+    expect(JSON.stringify(renderer!.toJSON())).toContain("NEW-PERSONAL-CODE");
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain(message);
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(0);
   });
   it("opens organization account setup without selecting an account or changing the move", async () => {
     fixture.local = true;

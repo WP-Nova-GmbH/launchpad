@@ -8,7 +8,17 @@ import {
   type ThreadPromptQueue,
 } from "@t3tools/contracts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
-import { CodexVmConnectionError, RelayThreadVmPreviewPort } from "@t3tools/contracts/relay";
+import {
+  CodexVmConnectionError,
+  RelayAuthInvalidError,
+  RelayTenancyConflictError,
+  RelayTenancyForbiddenError,
+  RelayTenancyInvalidError,
+  RelayTenancyNotFoundError,
+  RelayThreadVmCodexAuthSource,
+  RelayCodexVmConnection,
+  RelayThreadVmPreviewPort,
+} from "@t3tools/contracts/relay";
 import type {
   RelayThreadVmStatus,
   RelayThreadVmResetRequest,
@@ -19,9 +29,7 @@ import type {
   RelayThreadVmProviderAuth,
   RelayPortableThreadPlacement,
   ThreadVmCapabilities,
-  RelayThreadVmCodexAuthSource,
   RelayThreadVmCodexAuthSelection,
-  RelayCodexVmConnection,
   ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
@@ -152,7 +160,9 @@ export function threadVmAuthSourceChoice(
         : (source?.mode ?? null),
     organizationValue: connection?.connectionId
       ? `organization:${connection.connectionId}`
-      : "organization:unavailable",
+      : source?.mode === "organization"
+        ? `organization:${source.connectionId}`
+        : "organization:unavailable",
   };
 }
 
@@ -162,6 +172,23 @@ const unsupportedAuthSource = (error: ManagedRelayClientError) =>
   error.cause.response?.status === 404;
 
 const isCodexVmConnectionError = Schema.is(CodexVmConnectionError);
+const isRejectedAccountSelection = Schema.is(
+  Schema.Union([
+    CodexVmConnectionError,
+    RelayAuthInvalidError,
+    RelayTenancyConflictError,
+    RelayTenancyForbiddenError,
+    RelayTenancyInvalidError,
+    RelayTenancyNotFoundError,
+  ]),
+);
+const sameAccountMetadata = Schema.toEquivalence(
+  Schema.Struct({
+    source: Schema.NullOr(RelayThreadVmCodexAuthSource),
+    connection: Schema.NullOr(RelayCodexVmConnection),
+    sourceReadError: Schema.NullOr(Schema.String),
+  }),
+);
 const requiresVmAccountSelection = (error: ManagedRelayClientError) =>
   error._tag === "ManagedRelayRequestFailedError" &&
   isCodexVmConnectionError(error.cause) &&
@@ -1188,6 +1215,72 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       Atom.setIdleTTL(0),
     ),
   );
+  type AccountSelection = {
+    phase: "idle" | "saving" | "confirmed" | "unknown" | "rejected";
+    requested: RelayThreadVmCodexAuthSelection | null;
+    error: string | null;
+  };
+  type AccountSelectionState = AccountSelection & {
+    session: ManagedRelaySession;
+    relayUrl: string;
+    binding: RelayThreadVmProviderAuthBinding;
+    revision: number;
+    source: RelayThreadVmCodexAuthSource | null;
+    connection: RelayCodexVmConnection | null;
+    sourceReadError: string | null;
+  };
+  const idleSelection: AccountSelection = { phase: "idle", requested: null, error: null };
+  const selectionStateAtom = Atom.family((_key: string) =>
+    Atom.make<AccountSelectionState | null>(null).pipe(Atom.keepAlive),
+  );
+  const selectionAtom = Atom.family((key: string) =>
+    Atom.make((get) => {
+      const state = get(selectionStateAtom(key)),
+        binding = get(providerAuthBindingAtom(key)),
+        configured = readManagedRelaySnapshotState(get(configuredRelayAtom));
+      return state &&
+        state.session === get(managedRelaySessionAtom) &&
+        !configured.isPending &&
+        !configured.error &&
+        state.relayUrl === configured.data &&
+        state.relayUrl === normalizeSecureRelayUrl(get(routeAtom(key))?.relayUrl ?? "") &&
+        binding &&
+        sameAuthBinding(state.binding, binding)
+        ? state
+        : null;
+    }),
+  );
+  const sameSource = (
+    source: RelayThreadVmCodexAuthSource | null | undefined,
+    requested: RelayThreadVmCodexAuthSelection | null | undefined,
+  ) =>
+    source != null &&
+    requested != null &&
+    source.mode === requested.mode &&
+    (source.mode === "personal" ||
+      (requested.mode === "organization" && source.connectionId === requested.connectionId));
+  const confirmSelection = (
+    registry: AtomRegistry.AtomRegistry,
+    key: string,
+    state: AccountSelectionState,
+    source: RelayThreadVmCodexAuthSource,
+  ) => {
+    if (registry.get(selectionAtom(key)) !== state) return;
+    // A second barrier also rejects reads that began while the PUT was in flight.
+    registry.set(selectionStateAtom(key), {
+      ...state,
+      phase: "confirmed",
+      requested:
+        source.mode === "personal"
+          ? { mode: "personal" }
+          : { mode: "organization", connectionId: source.connectionId },
+      source,
+      connection: source.mode === "organization" ? source.connection : state.connection,
+      revision: state.revision + 1,
+      error: null,
+      sourceReadError: null,
+    });
+  };
   type AuthTransition = {
     session: ManagedRelaySession | null;
     route: ThreadRelayRouting | null;
@@ -1268,17 +1361,20 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     message: string;
     cause: unknown;
     transition: AuthTransition;
+    selectionRevision: number;
   }> {}
   const currentAuthReadError = (
     result: AsyncResult.AsyncResult<unknown, unknown>,
     transition: AuthTransition,
+    selectionRevision: number,
   ) => {
     if (result._tag !== "Failure") return null;
     const error = Cause.squash(result.cause);
     return error instanceof AuthReadError &&
       error.transition.session === transition.session &&
       error.transition.route === transition.route &&
-      error.transition.key === transition.key
+      error.transition.key === transition.key &&
+      error.selectionRevision === selectionRevision
       ? error.message
       : null;
   };
@@ -1297,10 +1393,20 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
   const providerAuthQueryAtom = Atom.family((key: string) =>
     runtime
       .atom((get) => {
-        const transition = get(providerAuthTransitionAtom(key));
+        const transition = get(providerAuthTransitionAtom(key)),
+          selection = get(selectionAtom(key)),
+          selectionRevision = selection?.revision ?? 0;
         return Effect.gen(function* () {
           const { session, route, binding } = transition;
-          if (!session || !route || !binding || !transition.authReady) return null;
+          if (
+            !session ||
+            !route ||
+            !binding ||
+            !transition.authReady ||
+            selection?.phase === "saving" ||
+            selection?.phase === "unknown"
+          )
+            return null;
           const registry = yield* AtomRegistry.AtomRegistry;
           const { relay, clerkToken } = yield* authorize(registry, key);
           if (registry.get(providerAuthTransitionAtom(key)).key !== transition.key) return null;
@@ -1312,6 +1418,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           if (
             registry.get(managedRelaySessionAtom) !== session ||
             registry.get(providerAuthTransitionAtom(key)).key !== transition.key ||
+            (registry.get(selectionAtom(key))?.revision ?? 0) !== selectionRevision ||
             !current ||
             !sameAuthBinding(binding, current)
           )
@@ -1319,11 +1426,18 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           yield* validateAuthBinding(binding, reply);
           // AsyncResult retains the previous value during refresh; never show its code to a new account.
           return reply
-            ? { ...reply, accountId: session.accountId, route, transition: transition.key }
+            ? {
+                ...reply,
+                accountId: session.accountId,
+                route,
+                transition: transition.key,
+                selectionRevision,
+              }
             : null;
         }).pipe(
           Effect.mapError(
-            (cause): Error => new AuthReadError({ message: cause.message, cause, transition }),
+            (cause): Error =>
+              new AuthReadError({ message: cause.message, cause, transition, selectionRevision }),
           ),
         );
       })
@@ -1352,7 +1466,9 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
   const providerAuthSourceQueryAtom = Atom.family((key: string) =>
     runtime
       .atom((get) => {
-        const transition = get(providerAuthTransitionAtom(key));
+        const transition = get(providerAuthTransitionAtom(key)),
+          selection = get(selectionAtom(key)),
+          selectionRevision = selection?.revision ?? 0;
         return Effect.gen(function* () {
           const { session, route, binding } = transition;
           if (
@@ -1376,11 +1492,72 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           if (
             registry.get(managedRelaySessionAtom) !== session ||
             registry.get(providerAuthTransitionAtom(key)).key !== transition.key ||
+            (registry.get(selectionAtom(key))?.revision ?? 0) !== selectionRevision ||
             (binding === null
               ? current !== null
               : current === null || !sameAuthBinding(binding, current))
           )
             return null;
+          if (selection?.phase === "unknown") {
+            if (source._tag === "Success" && sameSource(source.success, selection.requested))
+              confirmSelection(registry, key, selection, source.success!);
+          } else if (selection?.phase === "confirmed" || selection?.phase === "rejected") {
+            if (source._tag === "Success" && source.success) {
+              const sourceChanged = !sameSource(source.success, selection.source);
+              if (sourceChanged && selection.phase === "confirmed")
+                confirmSelection(registry, key, selection, source.success);
+              else {
+                const nextConnection = connection?._tag === "Success" ? connection.success : null;
+                const sourceReadError =
+                  connection?._tag === "Failure" ? connection.failure.message : null;
+                if (
+                  !sameAccountMetadata(selection, {
+                    source: source.success,
+                    connection: nextConnection,
+                    sourceReadError,
+                  })
+                )
+                  registry.set(selectionStateAtom(key), {
+                    ...selection,
+                    source: source.success,
+                    connection: nextConnection,
+                    sourceReadError,
+                    revision: selection.revision + (sourceChanged ? 1 : 0),
+                  });
+              }
+            } else if (
+              (source._tag === "Success" && source.success === null) ||
+              (source._tag === "Failure" && requiresVmAccountSelection(source.failure))
+            ) {
+              if (
+                selection.phase === "confirmed" ||
+                !sameAccountMetadata(selection, {
+                  source: null,
+                  connection: null,
+                  sourceReadError: null,
+                })
+              )
+                registry.set(selectionStateAtom(key), {
+                  ...selection,
+                  ...(selection.phase === "confirmed" ? idleSelection : {}),
+                  source: null,
+                  connection: null,
+                  sourceReadError: null,
+                  revision:
+                    selection.revision +
+                    (selection.phase === "confirmed" || selection.source !== null ? 1 : 0),
+                });
+            } else if (
+              source._tag === "Failure" &&
+              selection.sourceReadError !== source.failure.message
+            ) {
+              registry.set(selectionStateAtom(key), {
+                ...selection,
+                connection: null,
+                sourceReadError: source.failure.message,
+              });
+            }
+          }
           const accountSelectionRequired =
             binding !== null &&
             source._tag === "Failure" &&
@@ -1390,7 +1567,15 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
             route,
             binding,
             transition: transition.key,
-            source: source._tag === "Success" ? source.success : null,
+            selectionRevision,
+            source:
+              source._tag === "Success"
+                ? source.success
+                : (selection?.phase === "confirmed" || selection?.phase === "rejected") &&
+                    !accountSelectionRequired &&
+                    !unsupportedAuthSource(source.failure)
+                  ? selection.source
+                  : null,
             connection: connection?._tag === "Success" ? connection.success : null,
             accountSelectionRequired,
             unsupported: source._tag === "Failure" && unsupportedAuthSource(source.failure),
@@ -1405,7 +1590,8 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           };
         }).pipe(
           Effect.mapError(
-            (cause): Error => new AuthReadError({ message: cause.message, cause, transition }),
+            (cause): Error =>
+              new AuthReadError({ message: cause.message, cause, transition, selectionRevision }),
           ),
         );
       })
@@ -1417,19 +1603,48 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         state = readManagedRelaySnapshotState(result),
         value = state.data,
         binding = get(providerAuthBindingAtom(key)),
-        transition = get(providerAuthTransitionAtom(key));
+        transition = get(providerAuthTransitionAtom(key)),
+        selection = get(selectionAtom(key)),
+        selectionRevision = selection?.revision ?? 0;
+      const current =
+        value?.session === get(managedRelaySessionAtom) &&
+        value.transition === transition.key &&
+        value.selectionRevision === selectionRevision &&
+        value.route === get(routeAtom(key)) &&
+        (value.binding === null
+          ? binding === null
+          : binding !== null && sameAuthBinding(value.binding, binding))
+          ? value
+          : null;
+      const retained =
+        selection && selection.phase !== "idle"
+          ? {
+              session: selection.session,
+              route: get(routeAtom(key)),
+              binding: selection.binding,
+              transition: transition.key,
+              selectionRevision,
+              source: selection.source,
+              connection: selection.connection,
+              accountSelectionRequired: selection.source === null,
+              unsupported: false,
+              error: selection.sourceReadError,
+            }
+          : null;
       return {
         ...state,
-        error: currentAuthReadError(result, transition),
+        selection: selection
+          ? {
+              phase: selection.phase,
+              requested: selection.requested,
+              error: selection.error,
+            }
+          : idleSelection,
+        error: currentAuthReadError(result, transition, selectionRevision),
         data:
-          value?.session === get(managedRelaySessionAtom) &&
-          value.transition === transition.key &&
-          value.route === get(routeAtom(key)) &&
-          (value.binding === null
-            ? binding === null
-            : binding !== null && sameAuthBinding(value.binding, binding))
-            ? value
-            : null,
+          selection?.phase === "saving" || selection?.phase === "unknown"
+            ? retained
+            : (current ?? retained),
       };
     }).pipe(Atom.setIdleTTL(0)),
   );
@@ -1607,7 +1822,9 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       const providerAuth = authResult ? readManagedRelaySnapshotState(authResult) : null;
       const authValue = providerAuth?.data;
       const binding = state.data?.status?.pendingProviderAuth;
-      const transition = get(providerAuthTransitionAtom(key));
+      const transition = get(providerAuthTransitionAtom(key)),
+        selection = get(selectionAtom(key)),
+        selectionRevision = selection?.revision ?? 0;
       return {
         ...state,
         workerAuth: transition.receipt?.waitingForAuth,
@@ -1619,10 +1836,15 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           authValue.accountId === session.accountId &&
           authValue.route === route &&
           authValue.transition === transition.key &&
+          authValue.selectionRevision === selectionRevision &&
+          selection?.phase !== "saving" &&
+          selection?.phase !== "unknown" &&
           sameAuthBinding(binding, authValue)
             ? authValue
             : null,
-        providerAuthError: authResult ? currentAuthReadError(authResult, transition) : null,
+        providerAuthError: authResult
+          ? currentAuthReadError(authResult, transition, selectionRevision)
+          : null,
         providerAuthPending: providerAuth?.isPending ?? false,
         accountId: session.accountId,
         queuePaused: threadDetailAtom
@@ -1771,11 +1993,41 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       return link;
     }),
   });
-  const providerAuthAction = createRuntimeCommand(runtime, {
+  const authSessions = new WeakMap<ManagedRelaySession, number>();
+  let authSessionSequence = 0;
+  const providerAuthScopeKey = (
+    registry: AtomRegistry.AtomRegistry,
+    input: {
+      environmentId: EnvironmentId;
+      threadId: ThreadId;
+      accountId: string;
+      binding: RelayThreadVmProviderAuthBinding;
+    },
+  ) => {
+    const key = keyFor(input.environmentId, input.threadId),
+      session = registry.get(managedRelaySessionAtom),
+      route = registry.get(routeAtom(key)),
+      configured = readManagedRelaySnapshotState(registry.get(configuredRelayAtom));
+    if (session && !authSessions.has(session)) authSessions.set(session, ++authSessionSequence);
+    return JSON.stringify([
+      key,
+      session ? authSessions.get(session) : null,
+      input.accountId,
+      configured.data ?? normalizeSecureRelayUrl(route?.relayUrl ?? ""),
+      normalizeSecureRelayUrl(route?.relayUrl ?? ""),
+      input.binding.operationId,
+      input.binding.allocationId,
+      input.binding.environmentId,
+      input.binding.generation,
+      input.binding.instanceId,
+    ]);
+  };
+  const providerAuthCommand = createRuntimeCommand(runtime, {
     label: "VM Codex sign-in",
     concurrency: {
       mode: "serial",
       key: (input: {
+        scopeKey: string;
         environmentId: EnvironmentId;
         threadId: ThreadId;
         accountId: string;
@@ -1783,22 +2035,185 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         action:
           | { type: "start" | "refresh" }
           | { type: "cancel"; flowId: string }
-          | { type: "select_source"; source: RelayThreadVmCodexAuthSelection };
-      }) => keyFor(input.environmentId, input.threadId),
+          | { type: "select_source"; source: RelayThreadVmCodexAuthSelection }
+          | { type: "check_selection" | "retry_selection" };
+      }) => input.scopeKey,
     },
     execute: Effect.fnUntraced(function* (input, registry) {
       const key = keyFor(input.environmentId, input.threadId),
         current = pendingAuthBinding(registry, key),
         transition = registry.get(providerAuthTransitionAtom(key));
-      if (!current || !sameAuthBinding(current, input.binding) || !transition.canManageProviderAuth)
+      if (
+        !current ||
+        !sameAuthBinding(current, input.binding) ||
+        input.scopeKey !== providerAuthScopeKey(registry, input)
+      )
         return yield* new OrchestrationDispatchCommandError({
           message: "VM preparation changed. Refresh before signing in.",
+        });
+      const selectionAction =
+        input.action.type === "select_source" ||
+        input.action.type === "retry_selection" ||
+        input.action.type === "check_selection";
+      const previousSelection = registry.get(selectionAtom(key));
+      if (selectionAction) {
+        const session = registry.get(managedRelaySessionAtom),
+          relayUrl = normalizeSecureRelayUrl(registry.get(routeAtom(key))?.relayUrl ?? ""),
+          retry = input.action.type === "retry_selection",
+          checking = input.action.type === "check_selection",
+          requested =
+            input.action.type === "select_source"
+              ? input.action.source
+              : (previousSelection?.requested ?? null);
+        if (!session || session.accountId !== input.accountId || !relayUrl)
+          return yield* new OrchestrationDispatchCommandError({
+            message: "Your account changed. Check this thread again.",
+          });
+        if (
+          !checking &&
+          ((retry && previousSelection?.phase !== "unknown") ||
+            (!retry && previousSelection?.phase === "unknown"))
+        )
+          return yield* new OrchestrationDispatchCommandError({
+            message: "Check the unconfirmed account choice or retry that same choice first.",
+          });
+        if (checking && previousSelection?.phase !== "unknown") {
+          registry.refresh(providerAuthSourceQueryAtom(key));
+          yield* AtomRegistry.getResult(registry, providerAuthSourceQueryAtom(key), {
+            suspendOnWaiting: true,
+          }).pipe(Effect.result);
+          return null;
+        }
+        const source = registry.get(providerAuthSourceViewAtom(key)).data;
+        let selection: AccountSelectionState = {
+          session,
+          relayUrl,
+          binding: current,
+          revision: (registry.get(selectionStateAtom(key))?.revision ?? 0) + 1,
+          phase: checking ? (previousSelection?.phase ?? "unknown") : "saving",
+          requested,
+          source: source ? source.source : (previousSelection?.source ?? null),
+          connection: source ? source.connection : (previousSelection?.connection ?? null),
+          sourceReadError: null,
+          error: null,
+        };
+        registry.set(selectionStateAtom(key), selection);
+        const isCurrent = () => registry.get(selectionAtom(key)) === selection;
+        const feedback = (phase: "unknown" | "rejected", error: string) => {
+          if (!isCurrent()) return;
+          selection = { ...selection, phase, error, revision: selection.revision + 1 };
+          registry.set(selectionStateAtom(key), selection);
+        };
+        const refresh = () => {
+          registry.refresh(providerAuthQueryAtom(key));
+          registry.refresh(queryAtom(key));
+          registry.refresh(providerAuthSourceQueryAtom(key));
+        };
+        if (!checking && !transition.canManageProviderAuth) {
+          const error = new OrchestrationDispatchCommandError({
+            message: "VM preparation changed. Refresh before choosing an account.",
+          });
+          feedback(retry ? "unknown" : "rejected", error.message);
+          return yield* error;
+        }
+        const authorized = yield* authorize(registry, key, input.accountId).pipe(Effect.result);
+        if (authorized._tag === "Failure") {
+          feedback(retry || checking ? "unknown" : "rejected", authorized.failure.message);
+          return yield* authorized.failure;
+        }
+        if (!isCurrent() || registry.get(providerAuthTransitionAtom(key)).key !== transition.key) {
+          const error = new OrchestrationDispatchCommandError({
+            message: "VM preparation changed. Refresh before choosing an account.",
+          });
+          feedback(retry || checking ? "unknown" : "rejected", error.message);
+          return yield* error;
+        }
+        const { relay, clerkToken } = authorized.success,
+          auth = { clerkToken, threadId: input.threadId };
+        if (checking || retry) {
+          const read = yield* relay.getThreadVmProviderAuthSource(auth).pipe(Effect.result);
+          if (!isCurrent()) return null;
+          if (read._tag === "Success" && sameSource(read.success, requested)) {
+            confirmSelection(registry, key, selection, read.success!);
+            refresh();
+            return null;
+          }
+          if (checking || read._tag === "Failure") {
+            feedback("unknown", "Could not confirm the account choice. Check selection again.");
+            refresh();
+            return null;
+          }
+          if (
+            registry.get(providerAuthTransitionAtom(key)).key !== transition.key ||
+            !sameAuthBinding(pendingAuthBinding(registry, key) ?? input.binding, current)
+          ) {
+            feedback("unknown", "VM preparation changed. Check the account choice again.");
+            refresh();
+            return null;
+          }
+        }
+        if (!requested) {
+          feedback("rejected", "Choose a Codex account before saving.");
+          return null;
+        }
+        const reply = yield* relay
+          .selectThreadVmProviderAuthSource({
+            ...auth,
+            payload: {
+              operationId: current.operationId,
+              allocationId: current.allocationId,
+              generation: current.generation,
+              source: requested,
+            },
+          })
+          .pipe(Effect.result);
+        if (!isCurrent()) {
+          // A successful write may be the last step before the worker removes its binding.
+          if (reply._tag === "Success" && registry.get(managedRelaySessionAtom) === session)
+            return null;
+          return yield* new OrchestrationDispatchCommandError({
+            message: "Your account or VM preparation changed. Refresh the thread.",
+          });
+        }
+        if (reply._tag === "Success" && sameSource(reply.success, requested)) {
+          confirmSelection(registry, key, selection, reply.success);
+          refresh();
+          return null;
+        }
+        if (reply._tag === "Failure") {
+          const rejected =
+            !retry &&
+            reply.failure._tag === "ManagedRelayRequestFailedError" &&
+            isRejectedAccountSelection(reply.failure.cause);
+          feedback(
+            rejected ? "rejected" : "unknown",
+            rejected
+              ? reply.failure.message
+              : "Could not confirm the account choice. Check selection before retrying.",
+          );
+          refresh();
+          return yield* reply.failure;
+        }
+        feedback("unknown", "The relay returned a different account choice. Check selection.");
+        refresh();
+        return null;
+      }
+      if (
+        !transition.canManageProviderAuth ||
+        previousSelection?.phase === "saving" ||
+        previousSelection?.phase === "unknown"
+      )
+        return yield* new OrchestrationDispatchCommandError({
+          message: "Confirm the account choice before continuing Codex sign-in.",
         });
       const { relay, clerkToken, session } = yield* authorize(registry, key, input.accountId);
       if (registry.get(providerAuthTransitionAtom(key)).key !== transition.key)
         return yield* new OrchestrationDispatchCommandError({
           message: "VM preparation changed. Refresh before signing in.",
         });
+      const rejectedSelection = registry.get(selectionAtom(key));
+      if (rejectedSelection?.phase === "rejected")
+        registry.set(selectionStateAtom(key), { ...rejectedSelection, ...idleSelection });
       const auth = { clerkToken, threadId: input.threadId },
         payload = {
           operationId: current.operationId,
@@ -1806,21 +2221,14 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           generation: current.generation,
         };
       const request =
-        input.action.type === "select_source"
-          ? relay
-              .selectThreadVmProviderAuthSource({
+        input.action.type === "start"
+          ? relay.startThreadVmProviderAuth({ ...auth, payload })
+          : input.action.type === "cancel"
+            ? relay.cancelThreadVmProviderAuth({
                 ...auth,
-                payload: { ...payload, source: input.action.source },
+                payload: { ...payload, flowId: input.action.flowId },
               })
-              .pipe(Effect.andThen(relay.getThreadVmProviderAuth(auth)))
-          : input.action.type === "start"
-            ? relay.startThreadVmProviderAuth({ ...auth, payload })
-            : input.action.type === "cancel"
-              ? relay.cancelThreadVmProviderAuth({
-                  ...auth,
-                  payload: { ...payload, flowId: input.action.flowId },
-                })
-              : relay.getThreadVmProviderAuth(auth);
+            : relay.getThreadVmProviderAuth(auth);
       const reply = yield* request.pipe(
         Effect.result,
         Effect.ensuring(
@@ -1883,6 +2291,70 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       });
     }),
   });
+  const pendingSelections = new WeakMap<
+    AtomRegistry.AtomRegistry,
+    Map<
+      string,
+      {
+        session: ManagedRelaySession | null;
+        scope: string;
+        fingerprint: string;
+        promise: ReturnType<typeof providerAuthCommand.run>;
+      }
+    >
+  >();
+  const providerAuthAction = {
+    label: providerAuthCommand.label,
+    run(
+      registry: AtomRegistry.AtomRegistry,
+      input: Omit<Parameters<typeof providerAuthCommand.run>[1], "scopeKey">,
+    ) {
+      const key = keyFor(input.environmentId, input.threadId),
+        session = registry.get(managedRelaySessionAtom),
+        scope = providerAuthScopeKey(registry, input),
+        scopedInput = { ...input, scopeKey: scope };
+      if (
+        input.action.type !== "select_source" &&
+        input.action.type !== "retry_selection" &&
+        input.action.type !== "check_selection"
+      )
+        return providerAuthCommand.run(registry, scopedInput);
+      const fingerprint = JSON.stringify([
+        input.action.type,
+        input.action.type === "select_source" ? input.action.source.mode : null,
+        input.action.type === "select_source" && input.action.source.mode === "organization"
+          ? input.action.source.connectionId
+          : null,
+      ]);
+      let pending = pendingSelections.get(registry);
+      if (!pending) {
+        pending = new Map();
+        pendingSelections.set(registry, pending);
+      }
+      const current = pending.get(key);
+      if (current?.session === session && current.scope === scope) {
+        if (current.fingerprint === fingerprint) return current.promise;
+        return Promise.resolve(
+          AsyncResult.fail(
+            new OrchestrationDispatchCommandError({
+              message: "Wait for the current account choice before choosing another.",
+            }),
+          ),
+        );
+      }
+      const entry = {
+        session,
+        scope,
+        fingerprint,
+        promise: providerAuthCommand.run(registry, scopedInput),
+      };
+      entry.promise = entry.promise.finally(() => {
+        if (pending.get(key) === entry) pending.delete(key);
+      });
+      pending.set(key, entry);
+      return entry.promise;
+    },
+  };
   const refreshStatus = createRuntimeCommand(runtime, {
     label: "refresh saved VM status",
     concurrency: {

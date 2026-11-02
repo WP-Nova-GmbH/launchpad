@@ -1716,6 +1716,1079 @@ describe("owner-bound pending VM authentication", () => {
     rememberAuthPlacement(h);
     return h;
   });
+  describe("VM Codex account selection", () => {
+    const input = { environmentId, threadId, accountId: "owner", binding: authBinding };
+    const organization = { mode: "organization", connectionId: "org-codex" } as const;
+    const accountHarness = Effect.fnUntraced(function* (
+      fetchFn: typeof fetch,
+      waitingForAuth: ThreadMoveWaitingForAuth = "personal_sign_in",
+    ) {
+      const h = yield* authHarness(async (url, init) => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+        if (path.endsWith("codex-vm-connection"))
+          return Response.json(
+            managedSource.mode === "organization" ? managedSource.connection : null,
+          );
+        return fetchFn(url, init);
+      });
+      rememberAuthPlacement(h, authPlacement(waitingForAuth));
+      yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+      const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+        sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+      yield* AtomRegistry.mount(h.registry, sourceView);
+      yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+      return { ...h, sourceView, sourceQuery };
+    });
+
+    it.effect(
+      "shows a held selection immediately and confirms its ACK before guest verification",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const putStarted = Promise.withResolvers<void>(),
+              putReply = Promise.withResolvers<Response>(),
+              authStarted = Promise.withResolvers<void>(),
+              authReply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                putReply.resolve(Response.json(managedSource));
+                authReply.resolve(Response.json(null));
+              }),
+            );
+            let selected = false;
+            const h = yield* authHarness(async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+              if (path.endsWith("codex-vm-connection"))
+                return Response.json(
+                  managedSource.mode === "organization" ? managedSource.connection : null,
+                );
+              if (path.endsWith("provider-auth/source")) {
+                if (request.method === "PUT") {
+                  putStarted.resolve();
+                  const reply = await putReply.promise;
+                  selected = true;
+                  return reply;
+                }
+                return Response.json(selected ? managedSource : { mode: "personal" });
+              }
+              if (!selected) return Response.json(waitingAuth);
+              authStarted.resolve();
+              return authReply.promise;
+            });
+            const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+              sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+              authView = h.controls.viewAtom(environmentId, threadId),
+              authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, sourceView);
+            yield* AtomRegistry.mount(h.registry, authView);
+            yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+            yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(authView)?.providerAuth?.auth.interaction?.type).toBe(
+              "deviceCode",
+            );
+            const command = yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "select_source", source: organization },
+              }),
+            ).pipe(Effect.forkScoped);
+            yield* Effect.promise(() => putStarted.promise);
+            expect(h.registry.get(sourceView).selection).toMatchObject({
+              phase: "saving",
+              requested: organization,
+              error: null,
+            });
+            expect(h.registry.get(authView)?.providerAuth).toBeNull();
+            putReply.resolve(Response.json(managedSource));
+            expect((yield* Fiber.join(command))._tag).toBe("Success");
+            yield* Effect.promise(() => authStarted.promise);
+            expect(h.registry.get(sourceView).data).toMatchObject({
+              source: managedSource,
+              accountSelectionRequired: false,
+            });
+            expect(h.registry.get(sourceView).selection.phase).toBe("confirmed");
+            expect(h.registry.get(authView)?.providerAuth).toBeNull();
+            authReply.resolve(new Response(null, { status: 503 }));
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true }).pipe(
+              Effect.result,
+            );
+            expect(h.registry.get(sourceView).data?.source).toEqual(managedSource);
+            expect(h.registry.get(sourceView).selection.phase).toBe("confirmed");
+            expect(h.registry.get(authView)?.providerAuthError).toBeTruthy();
+          }),
+        ),
+    );
+
+    for (const phase of ["confirmed", "rejected"] as const)
+      for (const result of ["source failure", "all reads fail", "empty", "unavailable"] as const)
+        it.effect(`handles ${result} after the account choice is ${phase}`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const readStarted = Promise.withResolvers<void>(),
+                readReply = Promise.withResolvers<Response>();
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => readReply.resolve(Response.json(null))),
+              );
+              let selected = false,
+                refreshed = false,
+                held = false,
+                writes = 0;
+              const h = yield* authHarness(async (url, init) => {
+                const request = new Request(url, init),
+                  path = new URL(request.url).pathname;
+                if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+                if (path.endsWith("codex-vm-connection"))
+                  return refreshed && result === "all reads fail"
+                    ? new Response(null, { status: 503 })
+                    : Response.json(
+                        managedSource.mode === "organization" ? managedSource.connection : null,
+                      );
+                if (path.endsWith("provider-auth/source")) {
+                  if (request.method === "PUT") {
+                    selected = true;
+                    writes++;
+                    return phase === "rejected"
+                      ? Response.json(
+                          { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                          { status: 409 },
+                        )
+                      : Response.json(managedSource);
+                  }
+                  if (held) {
+                    readStarted.resolve();
+                    return (await readReply.promise).clone();
+                  }
+                  if (refreshed) {
+                    if (result === "empty") return Response.json(null);
+                    if (result === "unavailable")
+                      return Response.json(
+                        { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+                        { status: 409 },
+                      );
+                    return new Response(null, { status: 503 });
+                  }
+                  return Response.json(
+                    selected || phase === "rejected" ? managedSource : { mode: "personal" },
+                  );
+                }
+                return selected ? new Response(null, { status: 503 }) : Response.json(waitingAuth);
+              });
+              const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+                sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+                authView = h.controls.viewAtom(environmentId, threadId),
+                authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+              yield* AtomRegistry.mount(h.registry, sourceView);
+              yield* AtomRegistry.mount(h.registry, authView);
+              yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              expect(
+                (yield* Effect.promise(() =>
+                  h.controls.providerAuthAction.run(h.registry, {
+                    ...input,
+                    action: {
+                      type: "select_source",
+                      source: phase === "confirmed" ? organization : { mode: "personal" },
+                    },
+                  }),
+                ))._tag,
+              ).toBe(phase === "confirmed" ? "Success" : "Failure");
+              yield* AtomRegistry.getResult(h.registry, authQuery, {
+                suspendOnWaiting: true,
+              }).pipe(Effect.result);
+              refreshed = true;
+              h.registry.refresh(sourceQuery);
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              const view = h.registry.get(sourceView);
+              expect(h.registry.get(authView)?.providerAuth).toBeNull();
+              expect(writes).toBe(1);
+              if (result === "empty" || result === "unavailable") {
+                expect(view.selection.phase).toBe(phase === "confirmed" ? "idle" : "rejected");
+                expect(view.data?.source).toBeNull();
+                held = true;
+                rememberAuthPlacement(h, authPlacement("account_selection"));
+                yield* Effect.promise(() => readStarted.promise);
+                expect(h.registry.get(sourceView).data?.source ?? null).toBeNull();
+                readReply.resolve(Response.json(null));
+                yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+                expect(h.registry.get(sourceView).data?.source).toBeNull();
+                return;
+              }
+              expect(view.selection.phase).toBe(phase);
+              if (phase === "rejected") expect(view.selection.error).toBeTruthy();
+              expect(view.data?.source).toEqual(managedSource);
+              expect(view.data?.error).toBeTruthy();
+              const choice = threadVmAuthSourceChoice(view.data?.source, view.data?.connection);
+              expect(choice.selectedValue).toBe(choice.organizationValue);
+              if (result === "all reads fail") {
+                expect(view.data?.connection).toBeNull();
+                expect(threadVmAuthSourcePresentation(view.data!.source!, null).usingPlan).toBe(
+                  false,
+                );
+              }
+              refreshed = false;
+              h.registry.refresh(sourceQuery);
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              expect(h.registry.get(sourceView).data?.source).toEqual(managedSource);
+              expect(h.registry.get(sourceView).data?.error).toBeNull();
+              expect(h.registry.get(sourceView).selection.phase).toBe(phase);
+              if (phase === "rejected")
+                expect(h.registry.get(sourceView).selection.error).toBeTruthy();
+              expect(writes).toBe(1);
+            }),
+          ),
+        );
+
+    it.effect("coalesces concurrent account selections into one PUT", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const started = Promise.withResolvers<void>(),
+            reply = Promise.withResolvers<Response>();
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => reply.resolve(Response.json(managedSource))),
+          );
+          let writes = 0;
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (request.method === "PUT") {
+              writes++;
+              started.resolve();
+              return reply.promise;
+            }
+            return Response.json(
+              new URL(request.url).pathname.endsWith("/source")
+                ? writes
+                  ? managedSource
+                  : { mode: "personal" }
+                : { ...waitingAuth, auth: idleAuth, authSource: managedSource },
+            );
+          });
+          const action = {
+            ...input,
+            action: { type: "select_source" as const, source: organization },
+          };
+          const first = h.controls.providerAuthAction.run(h.registry, action),
+            second = h.controls.providerAuthAction.run(h.registry, action);
+          yield* Effect.promise(() => started.promise);
+          expect(writes).toBe(1);
+          reply.resolve(Response.json(managedSource));
+          yield* Effect.promise(() => Promise.all([first, second]));
+          expect(writes).toBe(1);
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+        }),
+      ),
+    );
+
+    for (const when of ["before", "during"] as const)
+      it.effect(`rejects an old metadata read started ${when} the selection PUT`, () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const putStarted = Promise.withResolvers<void>(),
+              putReply = Promise.withResolvers<Response>(),
+              readStarted = Promise.withResolvers<void>(),
+              readReply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                putReply.resolve(Response.json(managedSource));
+                readReply.resolve(Response.json({ mode: "personal" }));
+              }),
+            );
+            let selected = false,
+              holdRead = false,
+              heldRead = false;
+            const h = yield* accountHarness(async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              if (request.method === "PUT") {
+                putStarted.resolve();
+                const reply = await putReply.promise;
+                selected = true;
+                return reply;
+              }
+              if (path.endsWith("/source")) {
+                if (holdRead && !heldRead) {
+                  heldRead = true;
+                  readStarted.resolve();
+                  return readReply.promise;
+                }
+                return Response.json(selected ? managedSource : { mode: "personal" });
+              }
+              return Response.json({
+                ...waitingAuth,
+                auth: idleAuth,
+                authSource: selected ? managedSource : { mode: "personal" },
+              });
+            });
+            if (when === "before") {
+              holdRead = true;
+              h.registry.refresh(h.sourceQuery);
+              yield* Effect.promise(() => readStarted.promise);
+            }
+            const command = h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            });
+            yield* Effect.promise(() => putStarted.promise);
+            if (when === "during") {
+              holdRead = true;
+              h.registry.refresh(h.sourceQuery);
+              yield* Effect.promise(() => readStarted.promise);
+            }
+            putReply.resolve(Response.json(managedSource));
+            expect((yield* Effect.promise(() => command))._tag).toBe("Success");
+            expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+            readReply.resolve(Response.json({ mode: "personal" }));
+            yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+            expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+          }),
+        ),
+      );
+
+    it.effect(
+      "keeps an ambiguous selection locked until metadata confirms the requested account",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            for (const failure of ["lost-reply", "server-error", "invalid-ack"] as const) {
+              for (const readback of ["personal", "null"] as const) {
+                let writes = 0,
+                  confirmed = false;
+                const h = yield* accountHarness(async (url, init) => {
+                  const request = new Request(url, init);
+                  if (request.method === "PUT") {
+                    writes++;
+                    // @effect-diagnostics-next-line globalErrorInEffectFailure:off - Fetch rejects lost replies with TypeError.
+                    if (failure === "lost-reply") throw new TypeError("Synthetic lost reply");
+                    return failure === "server-error"
+                      ? new Response(null, { status: 503 })
+                      : Response.json({ malformed: "ACK" });
+                  }
+                  expect(new URL(request.url).pathname.endsWith("/source")).toBe(true);
+                  return Response.json(
+                    confirmed
+                      ? managedSource
+                      : writes && readback === "null"
+                        ? null
+                        : { mode: "personal" },
+                  );
+                });
+                const selected = yield* Effect.promise(() =>
+                  h.controls.providerAuthAction.run(h.registry, {
+                    ...input,
+                    action: { type: "select_source", source: organization },
+                  }),
+                );
+                expect(selected._tag).toBe("Failure");
+                expect(h.registry.get(h.sourceView).selection).toMatchObject({
+                  phase: "unknown",
+                  requested: organization,
+                });
+                expect(
+                  (yield* Effect.promise(() =>
+                    h.controls.providerAuthAction.run(h.registry, {
+                      ...input,
+                      action: { type: "select_source", source: { mode: "personal" } },
+                    }),
+                  ))._tag,
+                ).toBe("Failure");
+                expect(writes).toBe(1);
+                expect(
+                  (yield* Effect.promise(() =>
+                    h.controls.providerAuthAction.run(h.registry, {
+                      ...input,
+                      action: { type: "check_selection" },
+                    }),
+                  ))._tag,
+                ).toBe("Success");
+                expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+                confirmed = true;
+                expect(
+                  (yield* Effect.promise(() =>
+                    h.controls.providerAuthAction.run(h.registry, {
+                      ...input,
+                      action: { type: "check_selection" },
+                    }),
+                  ))._tag,
+                ).toBe("Success");
+                expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+                expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+                expect(writes).toBe(1);
+              }
+            }
+          }),
+        ),
+    );
+    it.effect("checks selection through metadata even while the worker requires an account", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            calls.push(request.method + " " + path);
+            expect(request.method).toBe("GET");
+            expect(path.endsWith("provider-auth/source")).toBe(true);
+            return Response.json(
+              { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+              { status: 409 },
+            );
+          }, "account_selection");
+          expect(h.registry.get(h.sourceView).data?.accountSelectionRequired).toBe(true);
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "check_selection" },
+              }),
+            ))._tag,
+          ).toBe("Success");
+          yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+          expect(calls.length).toBeGreaterThan(1);
+          expect(
+            calls.every((call) => call === `GET /v1/threads/${threadId}/provider-auth/source`),
+          ).toBe(true);
+        }),
+      ),
+    );
+
+    it.effect("only explicitly retries the same unknown selection", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const writes: unknown[] = [];
+          let selected = false;
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (request.method === "PUT") {
+              writes.push(await request.json());
+              selected = writes.length > 2;
+              return selected
+                ? Response.json(managedSource)
+                : writes.length === 1
+                  ? new Response(null, { status: 503 })
+                  : Response.json(
+                      { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                      { status: 409 },
+                    );
+            }
+            expect(new URL(request.url).pathname.endsWith("/source")).toBe(true);
+            return Response.json(selected ? managedSource : { mode: "personal" });
+          });
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "retry_selection" },
+              }),
+            ))._tag,
+          ).toBe("Failure");
+          expect(writes).toEqual([]);
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            }),
+          );
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "retry_selection" },
+            }),
+          );
+          expect(writes).toHaveLength(2);
+          expect(writes[1]).toEqual(writes[0]);
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "retry_selection" },
+              }),
+            ))._tag,
+          ).toBe("Success");
+          expect(writes).toHaveLength(3);
+          expect(writes[2]).toEqual(writes[0]);
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+          expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "retry_selection" },
+            }),
+          );
+          expect(writes).toHaveLength(3);
+        }),
+      ),
+    );
+
+    it.effect("keeps the previous source after a definite typed selection rejection", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let writes = 0,
+            hasSource = true;
+          const h = yield* accountHarness(async (url, init) => {
+            if (new Request(url, init).method === "PUT") {
+              writes++;
+              return Response.json(
+                { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                { status: 409 },
+              );
+            }
+            return Response.json(hasSource ? { mode: "personal" } : null);
+          });
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "select_source", source: organization },
+              }),
+            ))._tag,
+          ).toBe("Failure");
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("rejected");
+          expect(h.registry.get(h.sourceView).selection.error).toBeTruthy();
+          expect(h.registry.get(h.sourceView).data?.source).toEqual({ mode: "personal" });
+          expect(writes).toBe(1);
+          hasSource = false;
+          h.registry.refresh(h.sourceQuery);
+          yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(h.sourceView).data?.source).toBeNull();
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            }),
+          );
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("rejected");
+          expect(h.registry.get(h.sourceView).data?.source).toBeNull();
+          expect(writes).toBe(2);
+        }),
+      ),
+    );
+
+    it.effect("clears a rejected account-choice error when personal sign-in continues", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          for (const action of [
+            { type: "start" },
+            { type: "refresh" },
+            { type: "cancel", flowId: "flow-1" },
+          ] as const) {
+            let auth: RelayThreadVmProviderAuth = {
+              ...waitingAuth,
+              auth: action.type === "start" ? idleAuth : waitingAuth.auth,
+              authSource: { mode: "personal" },
+            };
+            const nativeStarted = Promise.withResolvers<void>(),
+              nativeReply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => nativeReply.resolve(Response.json(auth))),
+            );
+            let holdNative = false;
+            const h = yield* accountHarness(async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              if (request.method === "PUT")
+                return Response.json(
+                  { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                  { status: 409 },
+                );
+              if (path.endsWith("/source")) return Response.json({ mode: "personal" });
+              if (request.method === "POST")
+                auth = path.endsWith("/cancel")
+                  ? { ...auth, auth: { ...waitingAuth.auth, phase: "cancelled" } }
+                  : { ...auth, auth: waitingAuth.auth };
+              if (holdNative) {
+                nativeStarted.resolve();
+                return (await nativeReply.promise).clone();
+              }
+              return Response.json(auth);
+            });
+            const authView = h.controls.viewAtom(environmentId, threadId),
+              authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, authView);
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "select_source", source: organization },
+              }),
+            );
+            expect(h.registry.get(h.sourceView).selection).toMatchObject({ phase: "rejected" });
+            expect(h.registry.get(h.sourceView).selection.error).toBeTruthy();
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            holdNative = true;
+            const command = h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action,
+            });
+            yield* Effect.promise(() => nativeStarted.promise);
+            expect(h.registry.get(h.sourceView).selection).toMatchObject({
+              phase: "idle",
+              error: null,
+            });
+            holdNative = false;
+            nativeReply.resolve(Response.json(auth));
+            expect((yield* Effect.promise(() => command))._tag).toBe("Success");
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(h.sourceView).selection).toMatchObject({
+              phase: "idle",
+              error: null,
+            });
+            expect(h.registry.get(authView)?.providerAuth?.auth.phase).toBe(
+              action.type === "cancel" ? "cancelled" : "waiting",
+            );
+          }
+        }),
+      ),
+    );
+
+    it.effect(
+      "treats a timed-out PUT and its late ACK as unknown without repeating the write",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            vi.useFakeTimers();
+            yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+            const started = Promise.withResolvers<void>(),
+              reply = Promise.withResolvers<Response>(),
+              returned = Promise.withResolvers<void>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => reply.resolve(Response.json(managedSource))),
+            );
+            let writes = 0;
+            const h = yield* accountHarness(async (url, init) => {
+              if (new Request(url, init).method === "PUT") {
+                writes++;
+                started.resolve();
+                const response = await reply.promise;
+                returned.resolve();
+                return response;
+              }
+              return Response.json({ mode: "personal" });
+            });
+            const pending = h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            });
+            yield* Effect.promise(() => started.promise);
+            yield* Effect.promise(() => vi.advanceTimersByTimeAsync(10_000));
+            expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+            expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+            reply.resolve(Response.json(managedSource));
+            yield* Effect.promise(() => returned.promise);
+            expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+            expect(writes).toBe(1);
+          }),
+        ),
+    );
+
+    it.effect("confirms a lost write reply from metadata without repeating the PUT", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let writes = 0;
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (request.method === "PUT") {
+              writes++;
+              // @effect-diagnostics-next-line globalErrorInEffectFailure:off - Fetch rejects lost replies with TypeError.
+              throw new TypeError("Synthetic lost successful reply");
+            }
+            expect(new URL(request.url).pathname.endsWith("/source")).toBe(true);
+            return Response.json(writes ? managedSource : { mode: "personal" });
+          });
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            }),
+          );
+          yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+          expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+          expect(writes).toBe(1);
+        }),
+      ),
+    );
+
+    it.effect(
+      "hides an older personal code until the new selection's fresh auth read completes",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const oldStarted = Promise.withResolvers<void>(),
+              oldReply = Promise.withResolvers<Response>(),
+              oldReturned = Promise.withResolvers<void>(),
+              freshStarted = Promise.withResolvers<void>(),
+              freshReply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                oldReply.resolve(Response.json(null));
+                freshReply.resolve(Response.json(null));
+              }),
+            );
+            let selected = false,
+              reads = 0;
+            const h = yield* accountHarness(async (url, init) => {
+              const request = new Request(url, init);
+              if (request.method === "PUT") {
+                selected = true;
+                return Response.json(managedSource);
+              }
+              if (new URL(request.url).pathname.endsWith("/source"))
+                return Response.json(selected ? managedSource : { mode: "personal" });
+              if (++reads === 1) return Response.json(waitingAuth);
+              if (reads === 2) {
+                oldStarted.resolve();
+                const reply = await oldReply.promise;
+                oldReturned.resolve();
+                return reply;
+              }
+              freshStarted.resolve();
+              return freshReply.promise;
+            });
+            const authView = h.controls.viewAtom(environmentId, threadId),
+              authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, authView);
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(authView)?.providerAuth?.auth.interaction?.type).toBe(
+              "deviceCode",
+            );
+            h.registry.refresh(authQuery);
+            yield* Effect.promise(() => oldStarted.promise);
+            expect(
+              (yield* Effect.promise(() =>
+                h.controls.providerAuthAction.run(h.registry, {
+                  ...input,
+                  action: { type: "select_source", source: organization },
+                }),
+              ))._tag,
+            ).toBe("Success");
+            yield* Effect.promise(() => freshStarted.promise);
+            expect(h.registry.get(authView)?.providerAuth).toBeNull();
+            oldReply.resolve(Response.json(waitingAuth));
+            yield* Effect.promise(() => oldReturned.promise);
+            expect(h.registry.get(authView)?.providerAuth).toBeNull();
+            freshReply.resolve(
+              Response.json({
+                ...waitingAuth,
+                auth: idleAuth,
+                authSource: managedSource,
+                requirement: "authenticated",
+              }),
+            );
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(authView)?.providerAuth?.authSource).toEqual(managedSource);
+            expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+          }),
+        ),
+    );
+    for (const changed of ["session", "binding", "relay"] as const)
+      it.effect(`ignores a selection ACK after its ${changed} scope changes`, () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const registry = AtomRegistry.make();
+            yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+            const configured = Atom.make(relayUrl),
+              started = Promise.withResolvers<void>(),
+              reply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => reply.resolve(Response.json(managedSource))),
+            );
+            registry.set(managedRelaySessionAtom, {
+              accountId: "owner",
+              readClerkToken: () => Effect.succeed("owner-token"),
+            });
+            let binding = authBinding,
+              writes = 0;
+            const fetchFn: typeof fetch = async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              if (path.endsWith("vm-status"))
+                return Response.json({ ...pendingVmStatus, pendingProviderAuth: binding });
+              if (path.endsWith("/placement")) return Response.json(currentPlacement);
+              if (path.endsWith("codex-vm-connection"))
+                return Response.json(
+                  managedSource.mode === "organization" ? managedSource.connection : null,
+                );
+              if (request.method === "PUT") {
+                writes++;
+                started.resolve();
+                return reply.promise;
+              }
+              return Response.json({ mode: "personal" });
+            };
+            const controls = createThreadVmControlAtoms(
+              Atom.runtime((get) =>
+                tenancyLayer({ relayUrl: get(configured) }).pipe(
+                  Layer.provide(remoteHttpClientLayer(fetchFn)),
+                ),
+              ),
+              () => Atom.make(snapshot),
+            );
+            const h = { registry, controls, query: controls.queryAtom(environmentId, threadId) };
+            rememberAuthPlacement(h);
+            yield* AtomRegistry.getResult(registry, h.query, { suspendOnWaiting: true });
+            const sourceView = controls.providerAuthSourceViewAtom(environmentId, threadId),
+              sourceQuery = controls.providerAuthSourceQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(registry, sourceView);
+            yield* AtomRegistry.getResult(registry, sourceQuery, { suspendOnWaiting: true });
+            const command = controls.providerAuthAction.run(registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            });
+            yield* Effect.promise(() => started.promise);
+            if (changed === "session")
+              registry.set(managedRelaySessionAtom, {
+                accountId: "other",
+                readClerkToken: () => Effect.succeed("other-token"),
+              });
+            else if (changed === "relay")
+              registry.set(configured, "https://other-relay.example.test");
+            else {
+              binding = { ...authBinding, allocationId: "replacement-vm" };
+              rememberAuthPlacement(h, authPlacement("personal_sign_in", binding));
+              registry.refresh(h.query);
+            }
+            yield* AtomRegistry.getResult(registry, h.query, { suspendOnWaiting: true });
+            reply.resolve(Response.json(managedSource));
+            yield* Effect.promise(() => command);
+            expect(registry.get(sourceView).selection.phase).toBe("idle");
+            expect(registry.get(sourceView).data?.source).not.toEqual(managedSource);
+            expect(writes).toBe(1);
+          }),
+        ),
+      );
+
+    it.effect("lets a replacement binding select an account before the old PUT replies", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const oldStarted = Promise.withResolvers<void>(),
+            oldReply = Promise.withResolvers<Response>(),
+            nextStarted = Promise.withResolvers<void>();
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => oldReply.resolve(Response.json(managedSource))),
+          );
+          const nextBinding = {
+            ...authBinding,
+            operationId: "replacement-move",
+            allocationId: "replacement-vm",
+            environmentId: EnvironmentId.make("replacement-environment"),
+          };
+          let binding = authBinding,
+            oldFinished = false;
+          const writes: unknown[] = [];
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            if (path.endsWith("vm-status"))
+              return Response.json({ ...pendingVmStatus, pendingProviderAuth: binding });
+            if (path.endsWith("codex-vm-connection"))
+              return Response.json(
+                managedSource.mode === "organization" ? managedSource.connection : null,
+              );
+            if (request.method === "PUT") {
+              writes.push(await request.json());
+              if (writes.length === 1) {
+                oldStarted.resolve();
+                return oldReply.promise;
+              }
+              expect(writes).toHaveLength(2);
+              nextStarted.resolve();
+              return Response.json({ mode: "personal" });
+            }
+            return Response.json({ mode: "personal" });
+          });
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+            sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, sourceView);
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          const old = h.controls.providerAuthAction
+            .run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            })
+            .then((result) => {
+              oldFinished = true;
+              return result;
+            });
+          yield* Effect.promise(() => oldStarted.promise);
+          binding = nextBinding;
+          rememberAuthPlacement(h, authPlacement("personal_sign_in", nextBinding));
+          h.registry.refresh(h.query);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          const next = h.controls.providerAuthAction.run(h.registry, {
+            ...input,
+            binding: nextBinding,
+            action: { type: "select_source", source: { mode: "personal" } },
+          });
+          yield* Effect.promise(() => nextStarted.promise);
+          expect(oldFinished).toBe(false);
+          expect((yield* Effect.promise(() => next))._tag).toBe("Success");
+          expect(h.registry.get(sourceView).selection.phase).toBe("confirmed");
+          expect(h.registry.get(sourceView).data?.source).toEqual({ mode: "personal" });
+          oldReply.resolve(Response.json(managedSource));
+          yield* Effect.promise(() => old);
+          expect(h.registry.get(sourceView).data?.source).toEqual({ mode: "personal" });
+          expect(writes).toEqual([
+            {
+              operationId: authBinding.operationId,
+              allocationId: authBinding.allocationId,
+              generation: authBinding.generation,
+              source: organization,
+            },
+            {
+              operationId: nextBinding.operationId,
+              allocationId: nextBinding.allocationId,
+              generation: nextBinding.generation,
+              source: { mode: "personal" },
+            },
+          ]);
+        }),
+      ),
+    );
+
+    it.effect("settles selection when the auth wait changes while its token lookup is held", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            token = Promise.withResolvers<string>();
+          yield* Effect.addFinalizer(() => Effect.sync(() => token.resolve("owner-token")));
+          let held = false,
+            writes = 0;
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (request.method === "PUT") writes++;
+            return Response.json({ mode: "personal" });
+          });
+          h.registry.set(managedRelaySessionAtom, {
+            accountId: "owner",
+            readClerkToken: () =>
+              Effect.suspend(() =>
+                held
+                  ? Effect.promise(() => {
+                      requested.resolve();
+                      return token.promise;
+                    })
+                  : Effect.succeed("owner-token"),
+              ),
+          });
+          rememberAuthPlacement(h);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+          held = true;
+          const command = h.controls.providerAuthAction.run(h.registry, {
+            ...input,
+            action: { type: "select_source", source: organization },
+          });
+          yield* Effect.promise(() => requested.promise);
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("saving");
+          const updated = authPlacement("account_selection");
+          rememberAuthPlacement(h, {
+            ...updated,
+            moveProgress: updated.moveProgress!.map((progress) => ({ ...progress, attempt: 2 })),
+          });
+          token.resolve("owner-token");
+          expect((yield* Effect.promise(() => command))._tag).toBe("Failure");
+          expect(["rejected", "unknown"]).toContain(h.registry.get(h.sourceView).selection.phase);
+          expect(writes).toBe(0);
+        }),
+      ),
+    );
+
+    for (const phase of ["confirmed", "rejected"] as const)
+      for (const change of ["reconnect", "replacement"] as const)
+        it.effect(`retains newer ${change} metadata after the account choice is ${phase}`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              if (managedSource.mode !== "organization") return;
+              const requested = Promise.withResolvers<void>(),
+                reply = Promise.withResolvers<Response>();
+              const connectionId =
+                change === "replacement" ? "replacement-codex" : managedSource.connectionId;
+              const disconnected = {
+                ...managedSource,
+                connectionId,
+                connection: {
+                  ...managedSource.connection,
+                  connectionId,
+                  status:
+                    change === "replacement"
+                      ? ("connected" as const)
+                      : ("reconnect_required" as const),
+                },
+              };
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => reply.resolve(Response.json(disconnected))),
+              );
+              let selected = false,
+                reconnect = false,
+                held = false;
+              const h = yield* authHarness(async (url, init) => {
+                const request = new Request(url, init),
+                  path = new URL(request.url).pathname;
+                if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+                if (path.endsWith("codex-vm-connection"))
+                  return Response.json(
+                    reconnect ? disconnected.connection : managedSource.connection,
+                  );
+                if (request.method === "PUT") {
+                  selected = true;
+                  return phase === "rejected"
+                    ? Response.json(
+                        { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                        { status: 409 },
+                      )
+                    : Response.json(managedSource);
+                }
+                if (held) {
+                  requested.resolve();
+                  return (await reply.promise).clone();
+                }
+                return Response.json(
+                  selected || phase === "rejected"
+                    ? reconnect
+                      ? disconnected
+                      : managedSource
+                    : { mode: "personal" },
+                );
+              });
+              yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+              const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+                sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+              yield* AtomRegistry.mount(h.registry, sourceView);
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              yield* Effect.promise(() =>
+                h.controls.providerAuthAction.run(h.registry, {
+                  ...input,
+                  action: {
+                    type: "select_source",
+                    source: phase === "confirmed" ? organization : { mode: "personal" },
+                  },
+                }),
+              );
+              reconnect = true;
+              h.registry.refresh(sourceQuery);
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              expect(h.registry.get(sourceView).data?.source).toEqual(disconnected);
+              expect(h.registry.get(sourceView).selection.phase).toBe(phase);
+              if (phase === "rejected")
+                expect(h.registry.get(sourceView).selection.error).toBeTruthy();
+              held = true;
+              rememberAuthPlacement(h, authPlacement("organization_connection"));
+              yield* Effect.promise(() => requested.promise);
+              expect(h.registry.get(sourceView).data?.source).toEqual(disconnected);
+              reply.resolve(Response.json(disconnected));
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              expect(h.registry.get(sourceView).data?.source).toEqual(disconnected);
+            }),
+          ),
+        );
+  });
   it.effect("does not inspect or change move auth before an exact destination wait", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -2451,7 +3524,7 @@ describe("owner-bound pending VM authentication", () => {
   );
   for (const lostReply of [false, true])
     it.effect(
-      `confirms a selected organization account ${lostReply ? "after a lost write reply without repeating the write" : "through guest readiness"}`,
+      `confirms a selected organization account ${lostReply ? "after a lost write reply without repeating the write" : "from its ACK before guest verification"}`,
       () =>
         Effect.scoped(
           Effect.gen(function* () {
@@ -2514,7 +3587,10 @@ describe("owner-bound pending VM authentication", () => {
             ]);
             if (!lostReply) {
               const write = calls.findIndex((call) => call.startsWith("PUT"));
-              expect(calls.slice(write + 1)).toContain(`GET /v1/threads/${threadId}/provider-auth`);
+              expect(calls.slice(write + 1)).not.toContain(
+                `GET /v1/threads/${threadId}/provider-auth`,
+              );
+              expect(h.registry.get(view).selection.phase).toBe("confirmed");
             }
           }),
         ),
