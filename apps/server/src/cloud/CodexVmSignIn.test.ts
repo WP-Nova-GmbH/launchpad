@@ -7,6 +7,7 @@ import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import {
+  getCodexVmSignInReturnUrl,
   makeCodexVmSignIn,
   parseCodexVmSignInCallback,
   supportsCodexVmSignIn,
@@ -79,14 +80,50 @@ describe("local callback capability", () => {
   });
 });
 
+describe("Codex sign-in return destination", () => {
+  it.each([
+    ["http://localhost:6280", "http://localhost:6280/settings/organization"],
+    ["http://127.0.0.1:3773", "http://127.0.0.1:3773/settings/organization"],
+    ["http://[::1]:3773", "http://[::1]:3773/settings/organization"],
+    ["https://localhost:6280", "https://localhost:6280/settings/organization"],
+    ["t3code://app", "t3code://codex-vm-sign-in"],
+    ["t3code-dev://app", "t3code-dev://codex-vm-sign-in"],
+  ])("returns to the client that started sign-in at %s", (origin, destination) => {
+    expect(getCodexVmSignInReturnUrl(origin)).toBe(destination);
+  });
+
+  it.each([
+    undefined,
+    "null",
+    "https://app.example.com",
+    "http://localhost.example.com",
+    "http://localhost@evil.example.com",
+    "http://user:password@localhost:6280",
+    "http://localhost:6280/elsewhere",
+    "http://localhost:6280/?return_to=https://evil.example.com",
+    "http://localhost:6280/#fragment",
+    "javascript:alert(1)",
+    "t3code://app/elsewhere",
+    "t3code://app?return_to=elsewhere",
+    "t3code://other",
+    "t3code-alpha://app",
+  ])("does not create a return link for %s", (origin) => {
+    expect(getCodexVmSignInReturnUrl(origin)).toBeUndefined();
+  });
+});
+
 const fetchCallback = (url: string) =>
   HttpClient.get(url).pipe(
     Effect.flatMap((response) =>
       response.text.pipe(
-        Effect.as({
+        Effect.map((body) => ({
           status: response.status,
           cache: response.headers["cache-control"],
-        }),
+          contentType: response.headers["content-type"],
+          referrerPolicy: response.headers["referrer-policy"],
+          contentSecurityPolicy: response.headers["content-security-policy"],
+          body,
+        })),
       ),
     ),
     Effect.provide(FetchHttpClient.layer),
@@ -95,22 +132,95 @@ const fetchCallback = (url: string) =>
 it.layer(NodeServices.layer)("Codex VM sign-in listener", (it) => {
   it.effect("rejects invalid callbacks, receives once, and isolates other connections", () =>
     Effect.gen(function* () {
-      const owner = yield* makeCodexVmSignIn(true);
+      const owner = yield* makeCodexVmSignIn(true, "http://localhost:6280");
       const other = yield* makeCodexVmSignIn(true);
       const bridge = yield* owner.start;
       const wrong = yield* fetchCallback(`${bridge.redirectUri}?state=wrong&code=code`);
       assert.equal(wrong.status, 400);
+      assert.include(wrong.contentType ?? "", "text/html");
+      assert.include(wrong.body, "This sign-in link is invalid");
+      assert.equal(wrong.cache, "no-store");
+      assert.equal(wrong.referrerPolicy, "no-referrer");
       const foreign = yield* other.wait(bridge.bridgeId).pipe(Effect.flip);
       assert.equal(foreign.reason, "not_found");
       const response = yield* fetchCallback(
-        `${bridge.redirectUri}?state=${bridge.state}&code=code&client_id=issued-client`,
+        `${bridge.redirectUri}?state=${bridge.state}&code=authorization-code-secret&client_id=issued-client&return_to=https://evil.example.com`,
       );
-      assert.deepEqual(response, { status: 200, cache: "no-store" });
+      assert.equal(response.status, 200);
+      assert.equal(response.cache, "no-store");
+      assert.include(response.contentType ?? "", "text/html");
+      assert.equal(response.referrerPolicy, "no-referrer");
+      assert.include(response.contentSecurityPolicy ?? "", "default-src 'none'");
+      assert.include(response.body, "Sign-in received");
+      assert.include(response.body, 'href="http://localhost:6280/settings/organization"');
+      assert.notInclude(response.body, "authorization-code-secret");
+      assert.notInclude(response.body, "issued-client");
+      assert.notInclude(response.body, bridge.state);
+      assert.notInclude(response.body, "evil.example.com");
       assert.deepEqual(yield* owner.wait(bridge.bridgeId), {
         state: bridge.state,
-        code: "code",
+        code: "authorization-code-secret",
         clientId: "issued-client",
       });
+    }).pipe(Effect.scoped),
+  );
+
+  for (const [origin, destination] of [
+    ["t3code://app", "t3code://codex-vm-sign-in"],
+    ["t3code-dev://app", "t3code-dev://codex-vm-sign-in"],
+  ])
+    it.effect(`returns ${origin} to the matching desktop app`, () =>
+      Effect.gen(function* () {
+        const owner = yield* makeCodexVmSignIn(true, origin);
+        const bridge = yield* owner.start;
+        const response = yield* fetchCallback(
+          `${bridge.redirectUri}?state=${bridge.state}&code=desktop-code-secret`,
+        );
+        assert.equal(response.status, 200);
+        assert.include(response.body, `href="${destination}"`);
+        assert.notInclude(response.body, "desktop-code-secret");
+        assert.deepEqual(yield* owner.wait(bridge.bridgeId), {
+          state: bridge.state,
+          code: "desktop-code-secret",
+        });
+      }).pipe(Effect.scoped),
+    );
+
+  it.effect("shows a failed sign-in without hiding a denied callback from the client", () =>
+    Effect.gen(function* () {
+      const owner = yield* makeCodexVmSignIn(true, "http://localhost:6280");
+      const bridge = yield* owner.start;
+      const errorDescription = "untrusted-description-<script>alert(1)</script>";
+      const response = yield* fetchCallback(
+        `${bridge.redirectUri}?state=${bridge.state}&error=access_denied&error_description=${encodeURIComponent(errorDescription)}`,
+      );
+      assert.equal(response.status, 200);
+      assert.match(response.body, /Sign-in (?:was not|wasn[’']t) completed/u);
+      assert.notInclude(response.body, "Sign-in received");
+      assert.notInclude(response.body, errorDescription);
+      assert.notInclude(response.body, "access_denied");
+      assert.notInclude(response.body, bridge.state);
+      assert.equal(response.cache, "no-store");
+      assert.equal(response.referrerPolicy, "no-referrer");
+      assert.include(response.body, 'href="http://localhost:6280/settings/organization"');
+      assert.deepEqual(yield* owner.wait(bridge.bridgeId), {
+        state: bridge.state,
+        error: "access_denied",
+      });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("does not turn an untrusted origin into a browser return destination", () =>
+    Effect.gen(function* () {
+      const owner = yield* makeCodexVmSignIn(true, "https://evil.example.com");
+      const bridge = yield* owner.start;
+      const response = yield* fetchCallback(
+        `${bridge.redirectUri}?state=${bridge.state}&code=code`,
+      );
+      assert.equal(response.status, 200);
+      assert.notInclude(response.body, "evil.example.com");
+      assert.notMatch(response.body, /href=/u);
+      assert.deepEqual(yield* owner.wait(bridge.bridgeId), { state: bridge.state, code: "code" });
     }).pipe(Effect.scoped),
   );
 

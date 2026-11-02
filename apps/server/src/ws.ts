@@ -547,6 +547,7 @@ const makeWsRpcLayer = (
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
   codexVmSignInSupported: boolean,
+  codexVmSignInOrigin: string | undefined,
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -743,7 +744,7 @@ const makeWsRpcLayer = (
       const providerSessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const providerAuth = yield* ProviderAuthService;
-      const codexVmSignIn = yield* makeCodexVmSignIn(codexVmSignInSupported);
+      const codexVmSignIn = yield* makeCodexVmSignIn(codexVmSignInSupported, codexVmSignInOrigin);
       const providerInstances = yield* ProviderInstanceRegistry;
       const providerInstallation = yield* makeProviderInstallation();
       const serverUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
@@ -5185,6 +5186,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
                   (header) => request.headers[header] !== undefined,
                 ),
               }),
+              request.headers.origin,
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),

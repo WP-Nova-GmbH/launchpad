@@ -16,10 +16,46 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import { renderCodexVmSignInHtml } from "./codexVmSignInHtml.ts";
 
 const CALLBACK_LIFETIME_MS = 10 * 60_000;
 const isCodexVmSignInError = Schema.is(CodexVmSignInError);
 const loopback = (host: string) => ["localhost", "127.0.0.1", "::1", "[::1]"].includes(host);
+
+/** The return destination comes from the initiating local client, never callback query parameters. */
+export function getCodexVmSignInReturnUrl(origin?: string): string | undefined {
+  if (origin === "t3code://app") return "t3code://codex-vm-sign-in";
+  if (origin === "t3code-dev://app") return "t3code-dev://codex-vm-sign-in";
+  if (!origin) return undefined;
+  try {
+    const url = new URL(origin);
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      !loopback(url.hostname) ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash
+    )
+      return undefined;
+    return new URL("/settings/organization", url).href;
+  } catch {
+    return undefined;
+  }
+}
+
+const callbackPage = (outcome: "received" | "denied" | "invalid", returnUrl?: string) =>
+  HttpServerResponse.text(renderCodexVmSignInHtml(outcome, returnUrl), {
+    contentType: "text/html; charset=utf-8",
+    status: outcome === "invalid" ? 400 : 200,
+    headers: {
+      "cache-control": "no-store",
+      "referrer-policy": "no-referrer",
+      "content-security-policy":
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    },
+  });
 
 /** A callback on this server is useful only when the client browser shares its loopback host. */
 export function supportsCodexVmSignIn(input: {
@@ -38,17 +74,7 @@ export function supportsCodexVmSignIn(input: {
     return false;
   try {
     if (!loopback(new URL(`http://${input.host}`).hostname)) return false;
-    if (["t3code://app", "t3code-dev://app"].includes(input.origin)) return true;
-    const origin = new URL(input.origin);
-    return (
-      ["http:", "https:"].includes(origin.protocol) &&
-      loopback(origin.hostname) &&
-      !origin.username &&
-      !origin.password &&
-      origin.pathname === "/" &&
-      !origin.search &&
-      !origin.hash
-    );
+    return getCodexVmSignInReturnUrl(input.origin) !== undefined;
   } catch {
     return false;
   }
@@ -110,10 +136,11 @@ interface Attempt {
 }
 
 /** One ephemeral listener per authenticated WebSocket connection. No OAuth tokens are stored here. */
-export const makeCodexVmSignIn = Effect.fnUntraced(function* (supported: boolean) {
+export const makeCodexVmSignIn = Effect.fnUntraced(function* (supported: boolean, origin?: string) {
   const ownerScope = yield* Effect.scope;
   const crypto = yield* Crypto.Crypto;
   const lock = yield* Semaphore.make(1);
+  const returnUrl = getCodexVmSignInReturnUrl(origin);
   let current: Attempt | null = null;
   const finish = (attempt: Attempt, result: Exit.Exit<CodexVmSignInCallback, CodexVmSignInError>) =>
     Effect.gen(function* () {
@@ -186,13 +213,9 @@ export const makeCodexVmSignIn = Effect.fnUntraced(function* (supported: boolean
                 !payload ||
                 (yield* DateTime.now).epochMilliseconds >= now + CALLBACK_LIFETIME_MS
               )
-                return HttpServerResponse.text("Invalid or expired Codex sign-in callback.", {
-                  status: 400,
-                });
+                return callbackPage("invalid", returnUrl);
               yield* finish(attempt, Exit.succeed(payload));
-              return HttpServerResponse.text("Codex sign-in received. Return to Launchpad.", {
-                headers: { "cache-control": "no-store", "referrer-policy": "no-referrer" },
-              });
+              return callbackPage(payload.error ? "denied" : "received", returnUrl);
             }),
           )
           .pipe(Effect.provideService(Scope.Scope, scope));
