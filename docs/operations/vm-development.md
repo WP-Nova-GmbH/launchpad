@@ -171,3 +171,15 @@ vp run dev:vm
 The image, tunnel and published hostname are reused. `Ctrl+C` stops the relay, connector
 and desktop started by the command. It leaves the database, E2B host and thread
 VMs running; stop those separately when finished.
+
+## A move keeps waiting for shared checkout
+
+Finish other work and close Launchpad terminals using the same checkout first. A move
+also waits for Git commands that could change its shared repository metadata.
+
+If an interrupted command from an older build left a reservation behind, start the
+updated app once, then restart the source machine. The first startup records the host's
+current boot; the next startup can safely release old reservations after confirming a
+reboot of that same host. Restarting only Launchpad does not provide that evidence.
+New command failures release their reservation when process cleanup confirms stopping;
+uncertain cleanup remains protected.

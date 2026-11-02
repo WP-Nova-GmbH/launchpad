@@ -1,4 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off - Windows tree termination must not use a leader-only fallback.
+import * as NodeChildProcess from "node:child_process";
 import * as Context from "effect/Context";
+import * as Exit from "effect/Exit";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -35,6 +38,10 @@ export const CurrentWorkflowCommand = Context.Reference<Effect.Effect<
 
 export interface ProcessRunInput {
   readonly owner?: OwnedCommand;
+  /** Pair with onExitConfirmed to reserve work in the same masked acquisition as spawning. */
+  readonly beforeSpawn?: Effect.Effect<void, ProcessOwnershipError>;
+  /** Runs only after no child was started, normal completion, or confirmed native-tree shutdown. */
+  readonly onExitConfirmed?: Effect.Effect<void, ProcessOwnershipError>;
   readonly command: string;
   readonly args: ReadonlyArray<string>;
   readonly cwd?: string | undefined;
@@ -316,13 +323,10 @@ function finalizeRunProcess<R>(
   );
 }
 
-const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
+const spawnChild = Effect.fn("processRunner.spawnChild")(function* (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   input: ProcessRunInput,
-): Effect.fn.Return<ProcessRunOutput, ProcessRunError, Scope.Scope> {
-  const maxOutputBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-  const outputMode = input.outputMode ?? "error";
-  const truncatedMarker = input.truncatedMarker ?? "";
+): Effect.fn.Return<ChildProcessSpawner.ChildProcessHandle, ProcessRunError, Scope.Scope> {
   const extendEnv = input.env !== undefined;
   const spawnCommand = yield* resolveSpawnCommand(
     input.command,
@@ -375,6 +379,16 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
       ),
     );
 
+  return child;
+});
+
+const useChild = Effect.fn("processRunner.useChild")(function* (
+  child: ChildProcessSpawner.ChildProcessHandle,
+  input: ProcessRunInput,
+) {
+  const maxOutputBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const outputMode = input.outputMode ?? "error";
+  const truncatedMarker = input.truncatedMarker ?? "";
   const stdin = input.stdin;
   const onStdoutChunk = input.onStdoutChunk;
   const writeStdin =
@@ -402,6 +416,7 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
       spawnCwd: input.spawnCwd,
       cause,
     });
+  const owner = input.owner;
   const stopOwner = owner ? owner.stop.pipe(Effect.mapError(ownershipError)) : Effect.void;
   const ownedResult = !owner
     ? Effect.succeed(null)
@@ -483,12 +498,127 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
   } satisfies ProcessRunOutput;
 });
 
+const isMissingProcess = Schema.is(Schema.Struct({ code: Schema.Literal("ESRCH") }));
+
+/** A stopped leader alone does not prove that its original process group stopped. */
+const confirmNativeStop = Effect.fn("processRunner.confirmNativeStop")(function* (
+  child: ChildProcessSpawner.ChildProcessHandle,
+  input: ProcessRunInput,
+) {
+  const failure = (cause: unknown) =>
+    new ProcessOwnershipError({
+      command: input.command,
+      argumentCount: input.args.length,
+      ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+      ...(input.spawnCwd !== undefined ? { spawnCwd: input.spawnCwd } : {}),
+      cause,
+    });
+  const platform = yield* HostProcessPlatform;
+  const running = yield* child.isRunning.pipe(Effect.mapError(failure));
+  if (platform === "win32") {
+    if (!running) return yield* failure("The original native tree ownership was lost.");
+    yield* Effect.callback<void, ProcessOwnershipError>((resume) => {
+      NodeChildProcess.execFile(
+        "taskkill",
+        ["/pid", String(child.pid), "/t", "/f"],
+        { windowsHide: true, timeout: 3_000 },
+        (error) => resume(error ? Effect.fail(failure(error)) : Effect.void),
+      );
+    });
+    yield* child.exitCode.pipe(Effect.ignore);
+  } else if (running)
+    yield* child.kill({ forceKillAfter: "2 seconds" }).pipe(Effect.mapError(failure));
+  if (yield* child.isRunning.pipe(Effect.mapError(failure)))
+    return yield* failure("The original native child is still running.");
+  if (platform === "win32") return;
+  const absent = yield* Effect.try({
+    try: () => {
+      try {
+        process.kill(-Number(child.pid), 0);
+        return false;
+      } catch (cause) {
+        if (isMissingProcess(cause)) return true;
+        throw cause;
+      }
+    },
+    catch: failure,
+  });
+  if (!absent) return yield* failure("The original process group is still present.");
+});
+
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.fn("ProcessRunner.make")(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 
-  const run: ProcessRunner["Service"]["run"] = (input) =>
-    finalizeRunProcess(runProcessCore(spawner, input), input);
+  const run: ProcessRunner["Service"]["run"] = (input) => {
+    if (!input.onExitConfirmed)
+      return finalizeRunProcess(
+        Effect.flatMap(
+          input.beforeSpawn
+            ? Effect.uninterruptible(
+                input.beforeSpawn.pipe(Effect.andThen(spawnChild(spawner, input))),
+              )
+            : spawnChild(spawner, input),
+          (child) => useChild(child, input),
+        ),
+        input,
+      );
+    const confirm = input.onExitConfirmed;
+    return Effect.suspend(() => {
+      let acquired = false;
+      let stopConfirmed = false;
+      let ownerStopped = false;
+      const owner = input.owner;
+      const childInput = owner
+        ? {
+            ...input,
+            owner: {
+              ...owner,
+              stop: owner.stop.pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    ownerStopped = true;
+                  }),
+                ),
+              ),
+            },
+          }
+        : input;
+      const execution = Effect.acquireUseRelease(
+        (input.beforeSpawn ?? Effect.void).pipe(
+          Effect.andThen(spawnChild(spawner, input)),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              acquired = true;
+            }),
+          ),
+        ),
+        (child) => useChild(child, childInput),
+        (child, exit) =>
+          Exit.isSuccess(exit)
+            ? Effect.void
+            : (owner
+                ? ownerStopped
+                  ? Effect.void
+                  : childInput.owner!.stop
+                : confirmNativeStop(child, input)
+              ).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    stopConfirmed = true;
+                  }),
+                ),
+              ),
+      );
+      return finalizeRunProcess(execution, input).pipe(
+        Effect.onExit((exit) =>
+          !acquired || stopConfirmed || ownerStopped || Exit.isSuccess(exit)
+            ? confirm
+            : Effect.void,
+        ),
+      );
+    });
+  };
 
   return ProcessRunner.of({
     run,

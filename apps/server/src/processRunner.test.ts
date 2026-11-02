@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - Mock native taskkill completion independently of the process handle.
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
@@ -8,12 +9,17 @@ import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import type * as Scope from "effect/Scope";
 import { TestClock } from "effect/testing";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
+import { vi } from "vite-plus/test";
+import * as NodeChildProcess from "node:child_process";
 
 import * as ProcessRunner from "./processRunner.ts";
+
+vi.mock("node:child_process", { spy: true });
 
 type ChildProcessCommand = {
   readonly command: string;
@@ -29,18 +35,20 @@ function asChildProcessCommand(command: unknown): ChildProcessCommand {
 }
 
 function makeHandle(input: {
-  readonly control?: string;
-  readonly stdout?: string | Stream.Stream<Uint8Array>;
+  readonly control?: string | Stream.Stream<Uint8Array, PlatformError.PlatformError>;
+  readonly stdout?: string | Stream.Stream<Uint8Array, PlatformError.PlatformError>;
   readonly stderr?: string | Stream.Stream<Uint8Array>;
   readonly code?: number;
   readonly stdin?: ChildProcessSpawner.ChildProcessHandle["stdin"];
   readonly exitCode?: Effect.Effect<ChildProcessSpawner.ExitCode>;
+  readonly isRunning?: ChildProcessSpawner.ChildProcessHandle["isRunning"];
+  readonly kill?: ChildProcessSpawner.ChildProcessHandle["kill"];
 }) {
   return ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(1),
     exitCode: input.exitCode ?? Effect.succeed(ChildProcessSpawner.ExitCode(input.code ?? 0)),
-    isRunning: Effect.succeed(false),
-    kill: () => Effect.void,
+    isRunning: input.isRunning ?? Effect.succeed(false),
+    kill: input.kill ?? (() => Effect.void),
     unref: Effect.succeed(Effect.void),
     stdin: input.stdin ?? Sink.drain,
     stdout:
@@ -54,14 +62,22 @@ function makeHandle(input: {
     all: Stream.empty,
     getInputFd: () => Sink.drain,
     getOutputFd: (fd) =>
-      fd === 3 && input.control ? Stream.encodeText(Stream.make(input.control)) : Stream.empty,
+      fd === 3 && input.control
+        ? typeof input.control === "string"
+          ? Stream.encodeText(Stream.make(input.control))
+          : input.control
+        : Stream.empty,
   });
 }
 
 function makeSpawner(
   f: (
     command: ChildProcessCommand,
-  ) => Effect.Effect<ChildProcessSpawner.ChildProcessHandle, PlatformError.PlatformError>,
+  ) => Effect.Effect<
+    ChildProcessSpawner.ChildProcessHandle,
+    PlatformError.PlatformError,
+    Scope.Scope
+  >,
 ) {
   return ChildProcessSpawner.make((command) => f(asChildProcessCommand(command)));
 }
@@ -411,6 +427,480 @@ describe("runProcess", () => {
       });
     }),
   );
+});
+
+describe("confirmed process cleanup", () => {
+  const failure = () =>
+    new PlatformError.PlatformError(
+      new PlatformError.BadArgument({
+        module: "ChildProcess",
+        method: "test",
+        description: "failed",
+      }),
+    );
+  it.effect("confirms a failed spawn without attempting native termination", () =>
+    Effect.gen(function* () {
+      let confirmed = 0;
+      const outcome = yield* runWith(makeSpawner(() => Effect.fail(failure())))({
+        command: "fixture",
+        args: [],
+        onExitConfirmed: Effect.sync(() => {
+          confirmed++;
+        }),
+      }).pipe(Effect.result);
+      expect(outcome._tag).toBe("Failure");
+      expect(confirmed).toBe(1);
+    }),
+  );
+  it.effect("does not reserve work when interrupted before the runner is entered", () =>
+    Effect.gen(function* () {
+      const admitted = yield* Deferred.make<void>(),
+        releaseAdmission = yield* Deferred.make<void>();
+      let spawned = 0,
+        reserved = 0;
+      const runner = yield* ProcessRunner.make().pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          makeSpawner(() =>
+            Effect.sync(() => {
+              spawned++;
+              return makeHandle({});
+            }),
+          ),
+        ),
+      );
+      const fiber = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(admitted, undefined);
+          yield* Deferred.await(releaseAdmission);
+          return yield* restore(
+            runner.run({
+              command: "fixture",
+              args: [],
+              beforeSpawn: Effect.sync(() => {
+                reserved++;
+              }),
+              onExitConfirmed: Effect.void,
+            }),
+          );
+        }),
+      ).pipe(Effect.forkScoped);
+      yield* Deferred.await(admitted);
+      const interruption = yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseAdmission, undefined);
+      yield* Fiber.join(interruption);
+      expect(spawned).toBe(0);
+      expect(reserved).toBe(0);
+    }),
+  );
+  it.effect("settles an interruption at the admission-to-spawn boundary", () =>
+    Effect.gen(function* () {
+      const admitted = yield* Deferred.make<void>(),
+        releaseAdmission = yield* Deferred.make<void>();
+      let spawned = 0,
+        confirmed = 0;
+      const fiber = yield* runWith(
+        makeSpawner(() =>
+          Effect.sync(() => {
+            spawned++;
+            return makeHandle({ control: Stream.never });
+          }),
+        ),
+      )({
+        command: "fixture",
+        args: [],
+        beforeSpawn: Deferred.succeed(admitted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseAdmission)),
+        ),
+        owner: {
+          executable: "owned-fixture",
+          capture: () => Effect.void,
+          arm: Effect.void,
+          completed: () => Effect.void,
+          stop: Effect.void,
+        },
+        onExitConfirmed: Effect.sync(() => {
+          confirmed++;
+        }),
+      }).pipe(Effect.forkScoped);
+      yield* Deferred.await(admitted);
+      const interruption = yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseAdmission, undefined);
+      yield* Fiber.join(interruption);
+      expect(spawned).toBe(1);
+      expect(confirmed).toBe(1);
+    }),
+  );
+  it.effect("runs a standalone before-spawn hook before acquiring the child", () =>
+    Effect.gen(function* () {
+      const events: string[] = [];
+      yield* runWith(
+        makeSpawner(() =>
+          Effect.sync(() => {
+            events.push("spawn");
+            return makeHandle({});
+          }),
+        ),
+      )({
+        command: "fixture",
+        args: [],
+        beforeSpawn: Effect.sync(() => {
+          events.push("reserve");
+        }),
+      });
+      expect(events).toEqual(["reserve", "spawn"]);
+    }),
+  );
+  it.effect("records completion only after the child scope has finalized", () =>
+    Effect.gen(function* () {
+      const events: string[] = [];
+      yield* runWith(
+        makeSpawner(() =>
+          Effect.acquireRelease(Effect.succeed(makeHandle({})), () =>
+            Effect.sync(() => {
+              events.push("scope-closed");
+            }),
+          ),
+        ),
+      )({
+        command: "fixture",
+        args: [],
+        onExitConfirmed: Effect.sync(() => {
+          events.push("confirmed");
+        }),
+      });
+      expect(events).toEqual(["scope-closed", "confirmed"]);
+    }),
+  );
+  for (const owned of [false, true])
+    it.effect(`does not reuse stop proof when the same effect runs again (owned: ${owned})`, () =>
+      Effect.gen(function* () {
+        let run = 0,
+          confirmed = 0;
+        const probe = vi.spyOn(process, "kill").mockReturnValue(true);
+        try {
+          const runner = yield* ProcessRunner.make().pipe(
+            Effect.provideService(
+              ChildProcessSpawner.ChildProcessSpawner,
+              makeSpawner(() =>
+                Effect.sync(() => {
+                  run++;
+                  return makeHandle({
+                    stdout: run === 1 ? "" : "too much",
+                    control: '{"protocol":1,"code":0}\n',
+                  });
+                }),
+              ),
+            ),
+          );
+          const operation = runner.run({
+            command: "fixture",
+            args: [],
+            maxOutputBytes: 1,
+            ...(owned
+              ? {
+                  owner: {
+                    executable: "owned-fixture",
+                    capture: () => Effect.void,
+                    arm: Effect.void,
+                    completed: () => Effect.void,
+                    stop: Effect.suspend(() =>
+                      run === 1
+                        ? Effect.void
+                        : Effect.fail(
+                            new ProcessRunner.ProcessOwnershipError({
+                              command: "fixture",
+                              argumentCount: 0,
+                              cause: "stop failed",
+                            }),
+                          ),
+                    ),
+                  },
+                }
+              : {}),
+            onExitConfirmed: Effect.sync(() => {
+              confirmed++;
+            }),
+          });
+          yield* operation;
+          expect(confirmed).toBe(1);
+          expect((yield* operation.pipe(Effect.exit))._tag).toBe("Failure");
+          expect(confirmed).toBe(1);
+        } finally {
+          probe.mockRestore();
+        }
+      }).pipe(Effect.provideService(HostProcessPlatform, "linux")),
+    );
+  it.effect("does not confirm normal completion when child-scope finalization fails", () =>
+    Effect.gen(function* () {
+      let confirmed = 0;
+      const result = yield* runWith(
+        makeSpawner(() =>
+          Effect.acquireRelease(Effect.succeed(makeHandle({})), () =>
+            Effect.die("scope finalization failed"),
+          ),
+        ),
+      )({
+        command: "fixture",
+        args: [],
+        onExitConfirmed: Effect.sync(() => {
+          confirmed++;
+        }),
+      }).pipe(Effect.exit);
+      expect(result._tag).toBe("Failure");
+      expect(confirmed).toBe(0);
+    }),
+  );
+  it.effect(
+    "does not confirm normal completion when timeout interrupts child-scope finalization",
+    () =>
+      Effect.gen(function* () {
+        let confirmed = 0;
+        const finalizing = yield* Deferred.make<void>();
+        const fiber = yield* runWith(
+          makeSpawner(() =>
+            Effect.acquireRelease(Effect.succeed(makeHandle({})), () =>
+              Deferred.succeed(finalizing, undefined).pipe(
+                Effect.andThen(Effect.sleep("100 millis")),
+              ),
+            ),
+          ),
+        )({
+          command: "fixture",
+          args: [],
+          timeout: "50 millis",
+          onExitConfirmed: Effect.sync(() => {
+            confirmed++;
+          }),
+        }).pipe(Effect.result, Effect.forkScoped);
+        yield* Deferred.await(finalizing);
+        yield* TestClock.adjust("100 millis");
+        const result = yield* Fiber.join(fiber);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") expect(result.failure._tag).toBe("ProcessTimeoutError");
+        expect(confirmed).toBe(0);
+      }),
+  );
+  it.effect("reports a confirmation callback failure instead of returning success", () =>
+    Effect.gen(function* () {
+      const callbackError = new ProcessRunner.ProcessOwnershipError({
+        command: "fixture",
+        argumentCount: 0,
+        cause: "receipt failed",
+      });
+      const outcome = yield* runWith(makeSpawner(() => Effect.succeed(makeHandle({}))))({
+        command: "fixture",
+        args: [],
+        onExitConfirmed: Effect.fail(callbackError),
+      }).pipe(Effect.result);
+      expect(outcome._tag).toBe("Failure");
+      if (outcome._tag === "Failure") expect(outcome.failure).toBe(callbackError);
+    }),
+  );
+  for (const kind of ["timeout", "interrupt", "output", "read"] as const)
+    it.effect(`waits for owned stop confirmation before releasing after ${kind}`, () =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>(),
+          stopping = yield* Deferred.make<void>(),
+          stopped = yield* Deferred.make<void>();
+        let confirmed = 0;
+        const spawner = makeSpawner(() =>
+          Effect.succeed(
+            makeHandle({
+              stdout:
+                kind === "read" ? Stream.fail(failure()) : kind === "output" ? "too much" : "",
+              control: Stream.never,
+              exitCode: Effect.never,
+            }),
+          ),
+        );
+        const running = yield* runWith(spawner)({
+          command: "fixture",
+          args: [],
+          timeout: "50 millis",
+          maxOutputBytes: 1,
+          owner: {
+            executable: "owned-fixture",
+            capture: () => Deferred.succeed(entered, undefined).pipe(Effect.asVoid),
+            arm: Effect.void,
+            completed: () => Effect.void,
+            stop: Deferred.succeed(stopping, undefined).pipe(
+              Effect.andThen(Deferred.await(stopped)),
+            ),
+          },
+          onExitConfirmed: Effect.sync(() => {
+            confirmed++;
+          }),
+        }).pipe(Effect.result, Effect.forkScoped);
+        if (kind === "timeout" || kind === "interrupt") yield* Deferred.await(entered);
+        const interruption =
+          kind === "interrupt" ? yield* Fiber.interrupt(running).pipe(Effect.forkScoped) : null;
+        if (kind === "timeout") yield* TestClock.adjust("50 millis");
+        yield* Deferred.await(stopping);
+        expect(confirmed).toBe(0);
+        expect(running.pollUnsafe()).toBeUndefined();
+        yield* Deferred.succeed(stopped, undefined);
+        if (interruption) yield* Fiber.join(interruption);
+        else expect((yield* Fiber.join(running))._tag).toBe("Failure");
+        expect(confirmed).toBe(1);
+      }),
+    );
+  it.effect("retains the reservation when owned shutdown cannot be confirmed", () =>
+    Effect.gen(function* () {
+      let confirmed = 0;
+      const outcome = yield* runWith(
+        makeSpawner(() =>
+          Effect.succeed(
+            makeHandle({
+              stdout: "too much",
+              control: Stream.never,
+            }),
+          ),
+        ),
+      )({
+        command: "fixture",
+        args: [],
+        maxOutputBytes: 1,
+        owner: {
+          executable: "owned-fixture",
+          capture: () => Effect.void,
+          arm: Effect.void,
+          completed: () => Effect.void,
+          stop: Effect.fail(
+            new ProcessRunner.ProcessOwnershipError({
+              command: "fixture",
+              argumentCount: 0,
+              cause: "tree remains",
+            }),
+          ),
+        },
+        onExitConfirmed: Effect.sync(() => {
+          confirmed++;
+        }),
+      }).pipe(Effect.exit);
+      expect(outcome._tag).toBe("Failure");
+      expect(confirmed).toBe(0);
+    }),
+  );
+  for (const stopped of [false, true])
+    it.effect(`requires owner stop proof after ownership capture fails (${stopped})`, () =>
+      Effect.gen(function* () {
+        let confirmed = 0;
+        const ownerError = new ProcessRunner.ProcessOwnershipError({
+          command: "fixture",
+          argumentCount: 0,
+          cause: "ownership unavailable",
+        });
+        const result = yield* runWith(
+          makeSpawner(() =>
+            Effect.succeed(
+              makeHandle({
+                control: Stream.never,
+              }),
+            ),
+          ),
+        )({
+          command: "fixture",
+          args: [],
+          owner: {
+            executable: "owned-fixture",
+            capture: () => Effect.fail(ownerError),
+            arm: Effect.die("must not arm"),
+            completed: () => Effect.void,
+            stop: stopped ? Effect.void : Effect.fail(ownerError),
+          },
+          onExitConfirmed: Effect.sync(() => {
+            confirmed++;
+          }),
+        }).pipe(Effect.exit);
+        expect(result._tag).toBe("Failure");
+        expect(confirmed).toBe(stopped ? 1 : 0);
+      }),
+    );
+  for (const stopped of [false, true])
+    it.effect(`requires successful Windows tree termination before confirming (${stopped})`, () =>
+      Effect.gen(function* () {
+        let running = true,
+          confirmed = 0;
+        const taskkill = vi.mocked(NodeChildProcess.execFile).mockImplementation((...args) => {
+          expect(args.slice(0, 2)).toEqual(["taskkill", ["/pid", "1", "/t", "/f"]]);
+          const callback = args.at(-1);
+          if (stopped) running = false;
+          if (typeof callback === "function")
+            callback(stopped ? null : new Error("denied"), "", "");
+          return new NodeChildProcess.ChildProcess();
+        });
+        try {
+          const result = yield* runWith(
+            makeSpawner(() =>
+              Effect.succeed(
+                makeHandle({
+                  stdout: "too much",
+                  isRunning: Effect.sync(() => running),
+                  kill: () => Effect.die("leader-only fallback is not tree proof"),
+                }),
+              ),
+            ),
+          )({
+            command: "fixture",
+            args: [],
+            maxOutputBytes: 1,
+            onExitConfirmed: Effect.sync(() => {
+              confirmed++;
+            }),
+          }).pipe(Effect.exit);
+          expect(result._tag).toBe("Failure");
+          expect(confirmed).toBe(stopped ? 1 : 0);
+        } finally {
+          taskkill.mockRestore();
+        }
+      }).pipe(Effect.provideService(HostProcessPlatform, "win32")),
+    );
+  for (const absent of [false, true])
+    it.effect(`requires exact process group absence after an unowned failure (${absent})`, () =>
+      Effect.gen(function* () {
+        let running = true,
+          confirmed = 0,
+          kills = 0;
+        const probe = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+          expect(pid).toBe(-1);
+          expect(signal).toBe(0);
+          if (absent) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+          return true;
+        });
+        try {
+          const outcome = yield* runWith(
+            makeSpawner(() =>
+              Effect.succeed(
+                makeHandle({
+                  stdout: "too much",
+                  isRunning: Effect.sync(() => running),
+                  kill: () =>
+                    Effect.sync(() => {
+                      kills++;
+                      running = false;
+                    }),
+                }),
+              ),
+            ),
+          )({
+            command: "fixture",
+            args: [],
+            maxOutputBytes: 1,
+            onExitConfirmed: Effect.sync(() => {
+              confirmed++;
+            }),
+          }).pipe(Effect.exit);
+          expect(outcome._tag).toBe("Failure");
+          expect(kills).toBe(1);
+          expect(confirmed).toBe(absent ? 1 : 0);
+        } finally {
+          probe.mockRestore();
+        }
+      }).pipe(Effect.provideService(HostProcessPlatform, "linux")),
+    );
 });
 
 describe("isWindowsCommandNotFound", () => {

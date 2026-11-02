@@ -1,4 +1,4 @@
-import { CheckoutAccess } from "../workspace/CheckoutAccess.ts";
+import { CheckoutAccess, CheckoutReservedError } from "../workspace/CheckoutAccess.ts";
 import * as Redacted from "effect/Redacted";
 import { privateThreadVmGitArgs, privateThreadVmSourceControlEnv } from "./threadVmCredentials.ts";
 import * as Context from "effect/Context";
@@ -7,6 +7,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Match from "effect/Match";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
@@ -64,6 +65,7 @@ const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
 const VCS_PROCESS_CONCURRENCY = 8;
 const GITHUB_PROCESS_CONCURRENCY = 4;
+const isCheckoutReservedError = Schema.is(CheckoutReservedError);
 
 export const CHECKPOINT_CAPTURE_OPERATION = "GitVcsDriver.checkpoints.captureCheckpoint";
 
@@ -118,7 +120,7 @@ const isTransientGitExit = (stderr: string) =>
   /unable to create [^\n]*\.lock['"]?: file exists/i.test(stderr) ||
   /(?:unable to stat|lstat\(|error: open\()[^\n]+: no such file or directory/i.test(stderr);
 
-export const make = Effect.gen(function* () {
+const makeWithAccess = Effect.fnUntraced(function* (access?: CheckoutAccess["Service"]) {
   const processRunner = yield* ProcessRunner.ProcessRunner;
   // On a managed executor the organization's GitHub installation stands in
   // for a runner token nobody configured by hand (ADR-0015); everywhere else
@@ -187,8 +189,39 @@ export const make = Effect.gen(function* () {
           Effect.mapError((cause) => new VcsProcessSpawnError({ ...baseError, cause })),
         )
       : null;
+    let operationId: string | null = null;
+    const checkoutError = (cause: unknown) =>
+      new ProcessRunner.ProcessOwnershipError({
+        command: input.command,
+        argumentCount: input.args.length,
+        cwd: input.cwd,
+        cause,
+      });
     const result = yield* processRunner
       .run({
+        ...(access
+          ? {
+              beforeSpawn: access
+                .begin({
+                  paths: input.spawnCwd === undefined ? [input.cwd] : [input.cwd, input.spawnCwd],
+                  kind: "vcs",
+                })
+                .pipe(
+                  Effect.tap((id) =>
+                    Effect.sync(() => {
+                      operationId = id;
+                    }),
+                  ),
+                  Effect.asVoid,
+                  Effect.mapError(checkoutError),
+                ),
+              onExitConfirmed: Effect.suspend(() =>
+                operationId === null
+                  ? Effect.void
+                  : access.complete(operationId).pipe(Effect.mapError(checkoutError)),
+              ),
+            }
+          : {}),
         ...(owner ? { owner } : {}),
         command: input.command,
         args,
@@ -207,7 +240,14 @@ export const make = Effect.gen(function* () {
         Effect.mapError(
           Match.valueTags({
             ProcessSpawnError: (error) =>
-              VcsProcessSpawnError.fromProcessSpawnError(baseError, error),
+              isCheckoutReservedError(error.cause)
+                ? new VcsProcessExitError({
+                    ...baseError,
+                    exitCode: 1,
+                    detail: error.cause.message,
+                    failureKind: "command-failed",
+                  })
+                : VcsProcessSpawnError.fromProcessSpawnError(baseError, error),
             ProcessOutputLimitError: (error) =>
               new VcsProcessOutputLimitError({
                 ...baseError,
@@ -291,51 +331,10 @@ export const make = Effect.gen(function* () {
 
   return VcsProcess.of({ run });
 });
+export const make = makeWithAccess();
 
-/** Production process boundary: even background Git must respect a frozen checkout. */
-export const guarded = Effect.gen(function* () {
-  const raw = yield* make;
-  const access = yield* CheckoutAccess;
-  return VcsProcess.of({
-    run: (input) =>
-      Effect.uninterruptibleMask((restore) =>
-        Effect.gen(function* () {
-          const mapHold = (error: { readonly message: string }) =>
-            new VcsProcessExitError({
-              operation: input.operation,
-              command: input.command,
-              cwd: input.cwd,
-              argumentCount: input.args.length,
-              exitCode: 1,
-              detail: error.message,
-              failureKind: "command-failed",
-            });
-          const operationId = yield* access
-            .begin({
-              paths: input.spawnCwd === undefined ? [input.cwd] : [input.cwd, input.spawnCwd],
-              kind: "vcs",
-            })
-            .pipe(Effect.mapError(mapHold));
-          // Timeout/interruption/read failures do not establish that the process stopped.
-          // Retain those records until the workload supervisor supplies stop evidence.
-          const output = yield* restore(raw.run(input)).pipe(
-            Effect.catchTags({
-              VcsProcessExitError: (error) =>
-                access
-                  .complete(operationId)
-                  .pipe(Effect.mapError(mapHold), Effect.andThen(Effect.fail(error))),
-              VcsProcessSpawnError: (error) =>
-                access
-                  .complete(operationId)
-                  .pipe(Effect.mapError(mapHold), Effect.andThen(Effect.fail(error))),
-            }),
-          );
-          yield* access.complete(operationId).pipe(Effect.mapError(mapHold));
-          return output;
-        }),
-      ),
-  });
-});
+/** Reserve only at launch; uncertain process cleanup keeps its checkout protected. */
+export const guarded = Effect.flatMap(CheckoutAccess, makeWithAccess);
 export const layer = Layer.effect(VcsProcess, guarded).pipe(Layer.provide(ProcessRunner.layer));
 
 /** VcsProcess with no organization behind it: tests and non-executor tooling. */

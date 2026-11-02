@@ -1162,7 +1162,17 @@ const makeServerLayer = Layer.unwrap(
       Layer.provideMerge(FetchHttpClient.layer),
       // PR reads, Git operations, and WebSocket discovery share one process limiter.
       Layer.provide(VcsProcess.layer),
-      Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(PersistenceLayerLive))),
+      Layer.provide(
+        CheckoutAccess.layer.pipe(
+          Layer.provide(PersistenceLayerLive),
+          Layer.provide(
+            SetupProcessAdapter.layer.pipe(
+              Layer.provide(ResourceMonitorBinary.layer),
+              Layer.provide(ProcessRunner.layer),
+            ),
+          ),
+        ),
+      ),
       // Below VcsProcess on purpose: it is what VcsProcess picks up when this
       // environment is a managed executor.
       Layer.provideMerge(

@@ -7,9 +7,15 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { TestClock } from "effect/testing";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
-import { ProcessRunner } from "../processRunner.ts";
+import {
+  ProcessRunner,
+  ProcessSpawnError,
+  ProcessTimeoutError,
+  make as makeProcessRunner,
+} from "../processRunner.ts";
 import * as Credentials from "../relay/OrganizationSourceControlCredentials.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
@@ -305,9 +311,11 @@ it.layer(
       const vcs = yield* VcsProcess.guarded.pipe(
         Effect.provide(Credentials.layerNone),
         Effect.provideService(ProcessRunner, {
-          run: () =>
-            Effect.sync(() => {
+          run: (input) =>
+            Effect.gen(function* () {
+              yield* input.beforeSpawn ?? Effect.void;
               executions++;
+              yield* input.onExitConfirmed ?? Effect.void;
               return {
                 code: ChildProcessSpawner.ExitCode(0),
                 stdout: "",
@@ -341,8 +349,9 @@ it.layer(
       const vcs = yield* VcsProcess.guarded.pipe(
         Effect.provide(Credentials.layerNone),
         Effect.provideService(ProcessRunner, {
-          run: () =>
-            Effect.sync(() => {
+          run: (input) =>
+            Effect.gen(function* () {
+              yield* input.beforeSpawn ?? Effect.void;
               spawned = true;
               throw new Error("must not spawn");
             }),
@@ -374,7 +383,11 @@ it.layer(
       const vcs = yield* VcsProcess.guarded.pipe(
         Effect.provide(Credentials.layerNone),
         Effect.provideService(ProcessRunner, {
-          run: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+          run: (input) =>
+            (input.beforeSpawn ?? Effect.void).pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(Effect.never),
+            ),
         }),
       );
       const running = yield* vcs
@@ -389,6 +402,218 @@ it.layer(
       expect(pending).toHaveLength(1);
       // Test-only stop acknowledgement, never inferred from the interrupted fiber.
       yield* f.access.complete(pending[0]!.operationId);
+    }),
+  );
+  it.effect("does not reserve a checkout while waiting for credentials", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      const waiting = yield* Deferred.make<void>();
+      let spawned = false;
+      const vcs = yield* VcsProcess.guarded.pipe(
+        Effect.provideService(Credentials.OrganizationSourceControlCredentials, {
+          github: Effect.succeed(null),
+          threadVm: {
+            github: Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Effect.never)),
+          },
+        }),
+        Effect.provideService(ProcessRunner, {
+          run: () =>
+            Effect.sync(() => {
+              spawned = true;
+              throw new Error("must not spawn");
+            }),
+        }),
+      );
+      const running = yield* vcs
+        .run({ command: "gh", args: ["api", "repos"], cwd: f.main, operation: "credentials" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(waiting);
+      expect(
+        yield* f.sql`SELECT 1 FROM checkout_operation_projects WHERE project_id=${f.id}`,
+      ).toEqual([]);
+      yield* Fiber.interrupt(running);
+      expect(spawned).toBe(false);
+      expect(
+        yield* f.sql`SELECT 1 FROM checkout_operation_projects WHERE project_id=${f.id}`,
+      ).toEqual([]);
+    }),
+  );
+  it.effect("releases a failed Git operation only after its runner confirms stopping", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      const started = yield* Deferred.make<void>();
+      const stopped = yield* Deferred.make<void>();
+      const vcs = yield* VcsProcess.guarded.pipe(
+        Effect.provide(Credentials.layerNone),
+        Effect.provideService(ProcessRunner, {
+          run: (input) =>
+            Effect.gen(function* () {
+              yield* input.beforeSpawn ?? Effect.void;
+              yield* Deferred.succeed(started, undefined);
+              yield* Deferred.await(stopped);
+              yield* input.onExitConfirmed ?? Effect.void;
+              return yield* new ProcessTimeoutError({
+                command: input.command,
+                argumentCount: input.args.length,
+                cwd: input.cwd,
+                timeoutMs: 1,
+              });
+            }),
+        }),
+      );
+      const running = yield* vcs
+        .run({ command: "git", args: ["fetch"], cwd: f.main, operation: "timeout" })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(started);
+      const capture = makeCheckoutCapture(f.sql);
+      const owner = {
+        threadId: f.id,
+        operationId: f.id,
+        generation: 2,
+        environmentId: "destination",
+      };
+      yield* capture.acquireDrain({
+        ...owner,
+        checkoutRoot: f.main,
+        gitCommonRoot: f.path.join(f.main, ".git"),
+      });
+      expect((yield* Effect.flip(capture.enterCapturing(owner))).message).toContain(
+        "checkout operations",
+      );
+      yield* Deferred.succeed(stopped, undefined);
+      expect((yield* Fiber.join(running))._tag).toBe("VcsProcessTimeoutError");
+      expect(
+        yield* f.sql`SELECT 1 FROM checkout_operation_projects WHERE project_id=${f.id}`,
+      ).toEqual([]);
+      yield* capture.enterCapturing(owner);
+      yield* capture.release(owner, { outcome: "failed", expectedPhase: "capturing" });
+    }),
+  );
+  it.effect("keeps ownership failures held even when they use the spawn-error tag", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      const vcs = yield* VcsProcess.guarded.pipe(
+        Effect.provide(Credentials.layerNone),
+        Effect.provideService(ProcessRunner, {
+          run: (input) =>
+            (input.beforeSpawn ?? Effect.void).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new ProcessSpawnError({
+                    command: input.command,
+                    argumentCount: input.args.length,
+                    cwd: input.cwd,
+                    cause: new Error("Owned process stop was not confirmed."),
+                  }),
+                ),
+              ),
+            ),
+        }),
+      );
+      expect(
+        (yield* Effect.flip(
+          vcs.run({ command: "git", args: ["fetch"], cwd: f.main, operation: "ownership" }),
+        ))._tag,
+      ).toBe("VcsProcessSpawnError");
+      const pending = yield* f.sql<{
+        operationId: string;
+      }>`SELECT operation_id AS "operationId" FROM checkout_operation_projects WHERE project_id=${f.id}`;
+      expect(pending).toHaveLength(1);
+      yield* f.access.complete(pending[0]!.operationId);
+    }),
+  );
+  it.effect("releases a timed-out native Git operation and lets its move capture continue", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      const ready = yield* Deferred.make<void>();
+      const runner = yield* makeProcessRunner();
+      const vcs = yield* VcsProcess.guarded.pipe(
+        Effect.provide(Credentials.layerNone),
+        Effect.provideService(ProcessRunner, runner),
+      );
+      let output = "";
+      const running = yield* vcs
+        .run({
+          command: process.execPath,
+          args: ["-e", "process.stdout.write('ready\\n'); setInterval(() => {}, 1000)"],
+          cwd: f.main,
+          operation: "native-timeout",
+          timeoutMs: 50,
+          onStdoutChunk: (chunk) => {
+            output += Buffer.from(chunk).toString();
+            if (output === "ready\n") Deferred.doneUnsafe(ready, Effect.void);
+          },
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(ready);
+      expect(
+        yield* f.sql`SELECT 1 FROM checkout_operation_projects WHERE project_id=${f.id}`,
+      ).toHaveLength(1);
+      const capture = makeCheckoutCapture(f.sql);
+      const owner = {
+        threadId: f.id,
+        operationId: f.id,
+        generation: 2,
+        environmentId: "destination",
+      };
+      yield* capture.acquireDrain({
+        ...owner,
+        checkoutRoot: f.main,
+        gitCommonRoot: f.path.join(f.main, ".git"),
+      });
+      expect((yield* Effect.flip(capture.enterCapturing(owner))).message).toContain(
+        "checkout operations",
+      );
+      yield* TestClock.adjust("50 millis");
+      expect((yield* Fiber.join(running))._tag).toBe("VcsProcessTimeoutError");
+      expect(
+        yield* f.sql`SELECT 1 FROM checkout_operation_projects WHERE project_id=${f.id}`,
+      ).toEqual([]);
+      yield* capture.enterCapturing(owner);
+      yield* capture.release(owner, { outcome: "failed", expectedPhase: "capturing" });
+    }),
+  );
+  it.effect("keeps an interrupted operation held until delayed stop acknowledgement", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.sql`UPDATE thread_checkout_claims SET phase='released' WHERE operation_id=${f.id}`;
+      const started = yield* Deferred.make<void>();
+      const stopping = yield* Deferred.make<void>();
+      const stopped = yield* Deferred.make<void>();
+      const vcs = yield* VcsProcess.guarded.pipe(
+        Effect.provide(Credentials.layerNone),
+        Effect.provideService(ProcessRunner, {
+          run: (input) =>
+            (input.beforeSpawn ?? Effect.void).pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(Effect.never),
+              Effect.onExit(() =>
+                Deferred.succeed(stopping, undefined).pipe(
+                  Effect.andThen(Deferred.await(stopped)),
+                  Effect.andThen(input.onExitConfirmed ?? Effect.void),
+                ),
+              ),
+            ),
+        }),
+      );
+      const running = yield* vcs
+        .run({ command: "git", args: ["fetch"], cwd: f.main, operation: "interrupted" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(started);
+      const interrupting = yield* Fiber.interrupt(running).pipe(Effect.forkChild);
+      yield* Deferred.await(stopping);
+      expect(
+        yield* f.sql`SELECT 1 FROM checkout_operation_projects WHERE project_id=${f.id}`,
+      ).toHaveLength(1);
+      yield* Deferred.succeed(stopped, undefined);
+      yield* Fiber.join(interrupting);
+      expect(
+        yield* f.sql`SELECT 1 FROM checkout_operation_projects WHERE project_id=${f.id}`,
+      ).toEqual([]);
     }),
   );
   it.effect("serializes freeze against an already admitted checkout write", () =>

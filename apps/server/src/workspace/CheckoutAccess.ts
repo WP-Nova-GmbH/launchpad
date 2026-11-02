@@ -4,10 +4,16 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
+import { SetupProcessAdapter } from "../terminal/SetupProcessAdapter.ts";
+import {
+  encodeCheckoutOperationBoot,
+  recoverCheckoutOperations,
+} from "./CheckoutOperationRecovery.ts";
 
 export class CheckoutReservedError extends Schema.TaggedError<CheckoutReservedError>()(
   "CheckoutReservedError",
@@ -51,6 +57,21 @@ export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const adapter = yield* Effect.serviceOption(SetupProcessAdapter);
+  const boot = Option.isSome(adapter)
+    ? yield* adapter.value.host.pipe(
+        Effect.catch((error) =>
+          Effect.logWarning(
+            "Checkout operation boot evidence is unavailable; reservations are kept",
+            {
+              detail: error.message,
+            },
+          ).pipe(Effect.as(null)),
+        ),
+      )
+    : null;
+  yield* recoverCheckoutOperations(sql, boot);
+  const bootJson = boot ? encodeCheckoutOperationBoot(boot) : null;
   const captures = makeCheckoutCapture(sql);
   const within = (root: string, candidate: string) =>
     candidate === root ||
@@ -298,7 +319,8 @@ export const make = Effect.gen(function* () {
               )
                 ids.add(projectId);
             const operationId = NodeCrypto.randomUUID();
-            yield* sql`INSERT INTO checkout_operations (operation_id, kind) VALUES (${operationId}, ${input.kind})`;
+            yield* sql`INSERT INTO checkout_operations (operation_id, kind, boot_json)
+              VALUES (${operationId}, ${input.kind}, ${bootJson})`;
             for (const candidate of new Set(candidates))
               yield* sql`INSERT INTO checkout_operation_paths (operation_id, path) VALUES (${operationId}, ${candidate})`;
             for (const common of new Set(commonRoots))

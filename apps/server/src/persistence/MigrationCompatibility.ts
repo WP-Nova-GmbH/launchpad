@@ -89,6 +89,7 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
   vmThrough: number,
   combined: boolean,
   probeReceipt: boolean,
+  checkoutOperationBoot: boolean,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const schema = yield* sql<{
@@ -173,6 +174,7 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
   for (const [introduced, table] of vmTables) {
     if (vmThrough < introduced) continue;
     let expected = vmColumns[table];
+    if (table === "checkout_operations" && checkoutOperationBoot) expected += ",boot_json";
     if (table === "thread_transfer_baselines" && vmThrough >= 63)
       expected += ",native_runtime_json";
     if (table === "thread_checkout_claims" && vmThrough >= 72) expected += ",fresh_checkout";
@@ -259,7 +261,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
       return yield* fail("Migration IDs must be positive.");
     const legacy = recorded.some((row) => row.migration_id === 60 && row.name === workflowNames[0]);
     const highest = Math.max(0, ...recorded.map((row) => row.migration_id));
-    const through = Math.min(highest, 85);
+    const through = Math.min(highest, 88);
     const marker = recorded.find((row) => row.migration_id === 1)?.name;
     const has = (id: number, name: string) =>
       recorded.some((row) => row.migration_id === id && row.name === name);
@@ -297,7 +299,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
         );
     }
     // Unknown future rows remain tolerated only after the complete known prefix.
-    if (!legacy && highest > 85 && through !== 85)
+    if (!legacy && highest > 88 && through !== 88)
       return yield* fail("Future migration skips the required prefix.");
     if (through >= 59)
       yield* verifySchema(
@@ -305,6 +307,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
         vmThrough,
         combined,
         !legacy && through >= 85,
+        !legacy && through >= 88,
       );
     return {
       kind: legacy ? ("legacy-workflow" as const) : ("canonical" as const),

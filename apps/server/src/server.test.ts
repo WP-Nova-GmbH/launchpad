@@ -13239,6 +13239,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               Effect.provideService(SqlClient.SqlClient, sql),
               Effect.provideService(FileSystem.FileSystem, fileSystem),
               Effect.provideService(Path.Path, pathService),
+              Effect.orDie,
             );
           }),
         layers: {
