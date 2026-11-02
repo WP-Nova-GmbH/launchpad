@@ -1716,6 +1716,157 @@ describe("owner-bound pending VM authentication", () => {
     rememberAuthPlacement(h);
     return h;
   });
+  it.effect(
+    "reads account metadata during verification, recovers errors, and clears identity on sign-out",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let metadataFailed = false;
+          const h = yield* authHarness(async (url) => {
+            const path = new URL(String(url)).pathname;
+            if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+            if (path.endsWith("provider-auth/source"))
+              return metadataFailed
+                ? Response.json({ error: "upstream_unavailable" }, { status: 503 })
+                : Response.json(managedSource);
+            if (path.endsWith("codex-vm-connection"))
+              return Response.json(
+                managedSource.mode === "organization" ? managedSource.connection : null,
+              );
+            return Response.json({
+              ...waitingAuth,
+              requirement: "authenticated",
+              authSource: managedSource,
+            });
+          });
+          const dialog = h.controls.providerAuthDialogViewAtom(environmentId, threadId),
+            sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+            authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, dialog);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(dialog)).toMatchObject({
+            phase: "connected",
+            source: managedSource,
+          });
+          metadataFailed = true;
+          rememberAuthPlacement(h, authPlacement("verification"));
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(dialog)).toMatchObject({ phase: "attention", canManage: false });
+          metadataFailed = false;
+          h.registry.refresh(sourceQuery);
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(dialog)).toMatchObject({
+            phase: "connected",
+            source: managedSource,
+            canManage: false,
+          });
+          h.registry.set(managedRelaySessionAtom, null);
+          expect(h.registry.get(dialog)).toMatchObject({
+            phase: "changed",
+            source: null,
+            binding: null,
+          });
+        }),
+      ),
+  );
+  it.effect(
+    "does not read account metadata before the exact destination is ready for authentication",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let metadataReads = 0;
+          const h = yield* authHarness(async (url) => {
+            const path = new URL(String(url)).pathname;
+            if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+            metadataReads++;
+            return Response.json(null);
+          });
+          rememberAuthPlacement(h, authPlacement(null));
+          const dialog = h.controls.providerAuthDialogViewAtom(environmentId, threadId),
+            sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.mount(h.registry, dialog);
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          expect(metadataReads).toBe(0);
+          expect(h.registry.get(dialog).phase).toBe("checking");
+        }),
+      ),
+  );
+  it.effect("confirms a fast completion only at the exact destination allocation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let finished = false;
+        const h = yield* authHarness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status"))
+            return Response.json(
+              finished
+                ? {
+                    ...pendingVmStatus,
+                    generation: authBinding.generation,
+                    pendingProviderAuth: null,
+                    allocation: {
+                      allocationId: authBinding.allocationId,
+                      ownerUserId: "owner",
+                      state: "running",
+                    },
+                    setupPhase: "ready",
+                  }
+                : pendingVmStatus,
+            );
+          if (path.endsWith("provider-auth/source")) return Response.json(managedSource);
+          if (path.endsWith("codex-vm-connection"))
+            return Response.json(
+              managedSource.mode === "organization" ? managedSource.connection : null,
+            );
+          return Response.json({ ...waitingAuth, authSource: managedSource });
+        });
+        const dialog = h.controls.providerAuthDialogViewAtom(environmentId, threadId),
+          sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.mount(h.registry, dialog);
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        const selected = yield* Effect.promise(() =>
+          h.controls.providerAuthAction.run(h.registry, {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            binding: authBinding,
+            action: {
+              type: "select_source",
+              source: { mode: "organization", connectionId: "org-codex" },
+            },
+          }),
+        );
+        expect(selected._tag).toBe("Success");
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(dialog).phase).toBe("checking");
+        finished = true;
+        rememberAuthPlacement(h, {
+          ...currentPlacement,
+          operationId: null,
+          environmentId: authBinding.environmentId,
+          generation: authBinding.generation,
+          moveProgress: [],
+        });
+        h.registry.refresh(h.query);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(dialog)).toMatchObject({
+          phase: "connected",
+          source: managedSource,
+          binding: authBinding,
+          canManage: false,
+        });
+      }),
+    ),
+  );
   describe("VM Codex account selection", () => {
     const input = { environmentId, threadId, accountId: "owner", binding: authBinding };
     const organization = { mode: "organization", connectionId: "org-codex" } as const;

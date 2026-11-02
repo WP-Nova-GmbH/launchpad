@@ -4,6 +4,8 @@ import type {
   RelayThreadVmCodexAuthSource,
   RelayThreadVmCodexAuthSelection,
   RelayCodexVmConnection,
+  RelayThreadVmStatus,
+  RelayThreadVmProviderAuth,
   ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
 import { act, useState, type ComponentProps, type PropsWithChildren } from "react";
@@ -12,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { CommandId, EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
 import { AsyncResult } from "effect/unstable/reactivity";
 import type { ThreadVmActionSubmission } from "@t3tools/client-runtime/relay/threadVmActionSubmission";
+import type { ThreadVmProviderAuthDialogEvidence } from "@t3tools/client-runtime/relay/threadVmControls";
 
 const fixture = vi.hoisted(() => ({
   backup: vi.fn(),
@@ -44,6 +47,9 @@ const fixture = vi.hoisted(() => ({
   authReadError: null as string | null,
   workerAuth: undefined as ThreadMoveWaitingForAuth | null | undefined,
   authTransitionKey: "initial",
+  dialogEvidence: null as ThreadVmProviderAuthDialogEvidence | null,
+  dialogCompleted: false,
+  selectionRevision: 0,
   codexConnection: null as RelayCodexVmConnection | null,
   queuePaused: false,
   replacementEnabled: true,
@@ -105,84 +111,128 @@ vi.mock("../../state/use-atom-command", () => ({
               ? fixture.enqueue
               : vi.fn(),
 }));
-vi.mock("../../state/threads", () => ({
-  openPortableThreadChat: "open",
-  threadVmActionJournal: {},
-  threadEnvironment: { enqueueMove: "enqueue" },
-  environmentThreadDetails: {
-    stateAtom: () => ({
-      status: "live",
-      data: fixture.cloudConfigured
-        ? { _tag: "Some", value: { promptQueue: emptyThreadPromptQueue() } }
-        : { _tag: "None" },
-    }),
-  },
-  threadVmControls: {
-    codexPreferencePendingAtom: () => fixture.vmAccountPending,
-    locationViewAtom: () => fixture.location,
-    routeAtom: () => fixture.route,
-    confirmedLocationAtom: () => null,
-    checkLocation: "location",
-    hostConfigurationAtom: { isPending: false, unavailableReason: null },
-    providerAuthAction: "auth",
-    providerAuthSourceViewAtom: () => ({
-      selection: fixture.authSelection,
-      data: {
-        source: fixture.authSource,
-        connection: fixture.codexConnection,
-        unsupported: false,
-        accountSelectionRequired: fixture.accountSelectionRequired,
-        error: fixture.authSourceError,
-      },
-      isPending: false,
-      error: null,
-    }),
-    checkBackupRecovery: "backup",
-    openPreview: "preview",
-    refresh: fixture.refresh,
-    capabilitiesAtom: {
-      data: {
-        configured: true,
-        get replacement() {
-          return fixture.replacementEnabled;
-        },
-        restore: true,
-        reset: true,
-        permanentDelete: true,
-        privatePreview: true,
-      },
-      isPending: false,
-      error: null,
+vi.mock("../../state/threads", async () => {
+  const { deriveThreadVmProviderAuthDialog, threadVmPresentation } =
+    await import("@t3tools/client-runtime/relay/threadVmControls");
+  return {
+    openPortableThreadChat: "open",
+    threadVmActionJournal: {},
+    threadEnvironment: { enqueueMove: "enqueue" },
+    environmentThreadDetails: {
+      stateAtom: () => ({
+        status: "live",
+        data: fixture.cloudConfigured
+          ? { _tag: "Some", value: { promptQueue: emptyThreadPromptQueue() } }
+          : { _tag: "None" },
+      }),
     },
-    viewAtom: () => ({
-      accountId: "owner",
-      error: fixture.readError,
-      providerAuth: fixture.auth,
-      providerAuthError: fixture.authReadError,
-      providerAuthPending: false,
-      workerAuth: fixture.workerAuth,
-      authTransitionKey: fixture.authTransitionKey,
-      queuePaused: fixture.queuePaused,
-      data: {
-        candidates: fixture.candidates,
-        status: {
+    threadVmControls: {
+      codexPreferencePendingAtom: () => fixture.vmAccountPending,
+      locationViewAtom: () => fixture.location,
+      routeAtom: () => fixture.route,
+      confirmedLocationAtom: () => null,
+      checkLocation: "location",
+      hostConfigurationAtom: { isPending: false, unavailableReason: null },
+      providerAuthAction: "auth",
+      providerAuthDialogViewAtom: () => {
+        const status = {
           threadId: "thread",
           generation: 2,
-          allocation: fixture.expired ? null : { state: "running", allocationId: "allocation" },
-          activity: "idle",
-          setupPhase: "ready",
-          sourceActivationPending: false,
-          lastVerifiedBackupAt: "2026-10-22T10:00:00Z",
-          savedDisk: fixture.expired
-            ? { phase: "expired", expiresAt: "2026-10-21T10:00:00Z" }
-            : null,
-          repository: { canonicalKey: "test-repo", branch: "main", revision: "abcdef012345" },
           ...fixture.status,
-        },
+        } as RelayThreadVmStatus;
+        const canManage = threadVmPresentation({
+          status,
+          workerAuth: fixture.workerAuth,
+        }).canManageProviderAuth;
+        const ready = canManage || fixture.workerAuth === "verification";
+        const auth = ready ? (fixture.auth as RelayThreadVmProviderAuth | null) : null;
+        const source =
+          fixture.authSource ?? auth?.authSource ?? (auth ? { mode: "personal" as const } : null);
+        const result = deriveThreadVmProviderAuthDialog(
+          {
+            binding: status.pendingProviderAuth ?? null,
+            source,
+            connection: fixture.codexConnection,
+            sourceKnown: source !== null || fixture.accountSelectionRequired,
+            connectionKnown: fixture.codexConnection !== null,
+            auth: auth
+              ? { requirement: auth.requirement, source, message: auth.auth.message ?? null }
+              : null,
+            selectionPhase: fixture.authSelection.phase,
+            selectionRevision: fixture.selectionRevision,
+            accountSelectionRequired: fixture.accountSelectionRequired,
+            attempt: null,
+            canManage,
+            error: ready
+              ? (fixture.authSelection.error ?? fixture.authReadError ?? fixture.authSourceError)
+              : null,
+            completed: fixture.dialogCompleted,
+          },
+          fixture.dialogEvidence,
+        );
+        fixture.dialogEvidence = result.evidence;
+        return result.view;
       },
-    }),
-  },
-}));
+      providerAuthSourceViewAtom: () => ({
+        selection: fixture.authSelection,
+        data: {
+          source: fixture.authSource,
+          connection: fixture.codexConnection,
+          unsupported: false,
+          accountSelectionRequired: fixture.accountSelectionRequired,
+          selectionRevision: fixture.selectionRevision,
+          error: fixture.authSourceError,
+        },
+        isPending: false,
+        error: null,
+      }),
+      checkBackupRecovery: "backup",
+      openPreview: "preview",
+      refresh: fixture.refresh,
+      capabilitiesAtom: {
+        data: {
+          configured: true,
+          get replacement() {
+            return fixture.replacementEnabled;
+          },
+          restore: true,
+          reset: true,
+          permanentDelete: true,
+          privatePreview: true,
+        },
+        isPending: false,
+        error: null,
+      },
+      viewAtom: () => ({
+        accountId: "owner",
+        error: fixture.readError,
+        providerAuth: fixture.auth,
+        providerAuthError: fixture.authReadError,
+        providerAuthPending: false,
+        workerAuth: fixture.workerAuth,
+        authTransitionKey: fixture.authTransitionKey,
+        queuePaused: fixture.queuePaused,
+        data: {
+          candidates: fixture.candidates,
+          status: {
+            threadId: "thread",
+            generation: 2,
+            allocation: fixture.expired ? null : { state: "running", allocationId: "allocation" },
+            activity: "idle",
+            setupPhase: "ready",
+            sourceActivationPending: false,
+            lastVerifiedBackupAt: "2026-10-22T10:00:00Z",
+            savedDisk: fixture.expired
+              ? { phase: "expired", expiresAt: "2026-10-21T10:00:00Z" }
+              : null,
+            repository: { canonicalKey: "test-repo", branch: "main", revision: "abcdef012345" },
+            ...fixture.status,
+          },
+        },
+      }),
+    },
+  };
+});
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
   useLocation: () => ({ state: null }),
@@ -362,6 +412,11 @@ const dialogButton = (label: string) =>
   dialogs()[0]!
     .findAllByType("button")
     .find((node) => node.children.join("") === label)!;
+const dialogText = () =>
+  dialogs()[0]!
+    .findAll((node) => typeof node.type === "string")
+    .flatMap((node) => node.children.filter((child) => typeof child === "string"))
+    .join("\n");
 const accountPicker = () =>
   dialogs()[0]!
     .findAllByProps({ "aria-label": "Codex account for this VM" })
@@ -419,6 +474,9 @@ beforeEach(() => {
   fixture.authReadError = null;
   fixture.workerAuth = undefined;
   fixture.authTransitionKey = "initial";
+  fixture.dialogEvidence = null;
+  fixture.dialogCompleted = false;
+  fixture.selectionRevision = 0;
   fixture.codexConnection = null;
   fixture.queuePaused = false;
   fixture.replacementEnabled = true;
@@ -983,7 +1041,8 @@ describe("simplified VM controls", () => {
     await act(async () => renderer!.update(view(true)));
     expect(dialogs()).toHaveLength(1);
     const preparing = JSON.stringify(renderer!.toJSON());
-    expect(preparing.includes("VM preparation continues automatically.")).toBe(true);
+    expect(preparing.includes("Account connected")).toBe(false);
+    expect(preparing.includes("Checking whether Codex is ready in this VM.")).toBe(true);
     expect(preparing.includes("OLD-MOVE-CODE")).toBe(false);
     expect(preparing.includes("Earlier sign-in read failed.")).toBe(false);
     expect(dialogButton("Check sign-in status")).toBeUndefined();
@@ -1092,6 +1151,374 @@ describe("simplified VM controls", () => {
     expect(fixture.authAction).toHaveBeenCalledWith(
       expect.objectContaining({ action: { type: "start" } }),
     );
+  });
+  it("replaces the account choices with one connected identity only after Codex is verified", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "account_selection";
+    fixture.accountSelectionRequired = true;
+    fixture.codexConnection = {
+      connectionId: "org-codex",
+      label: "account@example.test",
+      status: "connected",
+      epoch: 1,
+      tokenRevision: 1,
+      errorCode: null,
+      refreshing: false,
+    };
+    fixture.authAction.mockImplementationOnce(async () => {
+      fixture.authSelection = {
+        phase: "confirmed",
+        requested: { mode: "organization", connectionId: "org-codex" },
+        error: null,
+      };
+      fixture.authSource = {
+        mode: "organization",
+        connectionId: "org-codex",
+        connection: fixture.codexConnection!,
+      };
+      fixture.accountSelectionRequired = false;
+      return AsyncResult.success(null);
+    });
+    await mount(true);
+    await act(async () => button("Choose account").props.onClick());
+    expect(dialogText().split("account@example.test")).toHaveLength(2);
+    expect(dialogText()).toContain("Your choice will be used for future VM moves.");
+    expect(dialogText()).not.toContain("Account connected");
+    await act(async () => accountPicker().props.onValueChange("organization:org-codex"));
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).not.toContain("Account connected");
+    expect(accountPicker()).toBeDefined();
+    fixture.auth = {
+      requirement: "authenticated",
+      auth: { phase: "idle", expiresAt: null },
+      authSource: fixture.authSource,
+    };
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).toContain("Account connected");
+    expect(dialogText().split("account@example.test")).toHaveLength(2);
+    expect(dialogText().split("VM preparation continues automatically.")).toHaveLength(2);
+    expect(accountPicker()).toBeUndefined();
+    expect(dialogButton("Manage usage")).toBeUndefined();
+    expect(dialogButton("Check sign-in status")).toBeUndefined();
+    expect(dialogs()[0]!.findAllByType("button")).toHaveLength(2);
+    expect(dialogButton("Close")).toBeDefined();
+    await act(async () =>
+      dialogs()[0]!.findByProps({ "aria-label": "Close Codex account" }).props.onClick(),
+    );
+    expect(dialogs()).toHaveLength(0);
+  });
+  it("retains the same connected dialog through verification and completed move handoff", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = { requirement: "sign_in_required", auth: { phase: "idle", expiresAt: null } };
+    await mount(true);
+    await act(async () => button("Sign in to Codex").props.onClick());
+    fixture.auth = {
+      requirement: "authenticated",
+      auth: { phase: "idle", expiresAt: null },
+      authSource: fixture.authSource,
+    };
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).toContain("Account connected");
+    fixture.workerAuth = "verification";
+    fixture.authTransitionKey = "verification";
+    fixture.auth = null;
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogs()).toHaveLength(1);
+    expect(dialogText()).toContain("Account connected");
+    expect(dialogText().split("Personal sign-in")).toHaveLength(2);
+    expect(accountPicker()).toBeUndefined();
+    fixture.dialogCompleted = true;
+    fixture.workerAuth = undefined;
+    fixture.status = { generation: 3, setupPhase: "ready", pendingProviderAuth: null };
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogs()).toHaveLength(1);
+    expect(dialogText()).toContain("Account connected");
+    expect(dialogText().split("VM preparation continues automatically.")).toHaveLength(2);
+    await closeDialog();
+    expect(dialogs()).toHaveLength(0);
+  });
+  it("does not turn a finished personal device flow into success before the authenticated probe", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = { requirement: "sign_in_required", auth: { phase: "idle", expiresAt: null } };
+    await mount(true);
+    await act(async () => button("Sign in to Codex").props.onClick());
+    fixture.auth = {
+      requirement: "sign_in_required",
+      auth: { phase: "succeeded", expiresAt: null },
+    };
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).toContain("Checking whether Codex is ready in this VM.");
+    expect(dialogText()).not.toContain("Account connected");
+    expect(dialogText()).not.toContain("Codex signed in");
+    expect(dialogText()).not.toContain("Signed in to Codex.");
+    expect(dialogText()).not.toContain("VM preparation continues automatically.");
+  });
+  it("clears a former account confirmation on cancellation and does not carry it to a new VM", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = { requirement: "sign_in_required", auth: { phase: "idle", expiresAt: null } };
+    await mount(true);
+    await act(async () => button("Sign in to Codex").props.onClick());
+    fixture.auth = { requirement: "authenticated", auth: { phase: "idle", expiresAt: null } };
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).toContain("Account connected");
+    fixture.status = { pendingProviderAuth: null, setupPhase: "ready" };
+    fixture.auth = null;
+    fixture.authSource = null;
+    fixture.workerAuth = null;
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).toContain("This VM request changed");
+    expect(dialogText()).not.toContain("Account connected");
+    expect(dialogText()).not.toContain("Personal sign-in");
+    fixture.status = {
+      pendingProviderAuth: {
+        ...moveAuthBinding,
+        allocationId: "replacement-vm",
+        operationId: "replacement-move",
+      },
+      setupPhase: "running",
+    };
+    fixture.workerAuth = "account_selection";
+    fixture.accountSelectionRequired = true;
+    fixture.authTransitionKey = "replacement";
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).not.toContain("Account connected");
+    expect(accountPicker().props.value).toBeNull();
+    expect(dialogText()).toContain("Choose an account for this chat.");
+  });
+  it("consumes Change account through saving, a form remount, and an unknown reply", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = { requirement: "authenticated", auth: { phase: "idle", expiresAt: null } };
+    fixture.codexConnection = {
+      connectionId: "org-codex",
+      label: "account@example.test",
+      status: "connected",
+      epoch: 1,
+      tokenRevision: 1,
+      errorCode: null,
+      refreshing: false,
+    };
+    const pending = deferred();
+    fixture.authAction.mockImplementationOnce(async () => {
+      fixture.selectionRevision++;
+      fixture.authSelection = {
+        phase: "saving",
+        requested: { mode: "organization", connectionId: "org-codex" },
+        error: null,
+      };
+      await pending.promise;
+      fixture.authSelection = {
+        ...fixture.authSelection,
+        phase: "unknown",
+        error: "The choice could not be confirmed.",
+      };
+      return AsyncResult.fail(new Error("The choice could not be confirmed."));
+    });
+    await mount(true);
+    await openRunOn();
+    await act(async () => button("Change Codex account…").props.onClick());
+    expect(accountPicker()).toBeDefined();
+    expect(dialogText()).toContain("Choose an account for this chat.");
+    await act(async () => accountPicker().props.onValueChange("organization:org-codex"));
+    expect(dialogText()).toContain("Saving choice…");
+    fixture.authTransitionKey = "new-selection";
+    fixture.auth = null;
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).toContain("Saving choice…");
+    await act(async () => pending.resolve());
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogButton("Check selection")).toBeDefined();
+    fixture.authSelection = { ...fixture.authSelection, phase: "confirmed", error: null };
+    fixture.authSource = {
+      mode: "organization",
+      connectionId: "org-codex",
+      connection: fixture.codexConnection,
+    };
+    fixture.auth = {
+      requirement: "authenticated",
+      auth: { phase: "idle", expiresAt: null },
+      authSource: fixture.authSource,
+    };
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).toContain("Account connected");
+    expect(dialogText()).not.toContain("Choose an account for this chat.");
+    expect(accountPicker()).toBeUndefined();
+  });
+  it("does not reopen a closed account dialog when its old selection reply arrives", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "account_selection";
+    fixture.accountSelectionRequired = true;
+    const pending = deferred();
+    fixture.authAction.mockImplementationOnce(async () => {
+      await pending.promise;
+      return AsyncResult.success(null);
+    });
+    await mount(true);
+    await act(async () => button("Choose account").props.onClick());
+    await act(async () => accountPicker().props.onValueChange("personal"));
+    await closeDialog();
+    await act(async () => pending.resolve());
+    expect(dialogs()).toHaveLength(0);
+  });
+  it("keeps the personal device-code copy, open, cancel, and retry flow available", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = {
+      requirement: "sign_in_required",
+      auth: {
+        phase: "waiting",
+        expiresAt: null,
+        flowId: "personal-flow",
+        interaction: {
+          type: "deviceCode",
+          url: "https://auth.openai.com/codex/device",
+          userCode: "PERSONAL-CODE",
+        },
+      },
+    };
+    const copy = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText: copy } });
+    fixture.openLink.mockResolvedValue(undefined);
+    fixture.authAction.mockImplementationOnce(async () => {
+      fixture.auth = {
+        requirement: "sign_in_required",
+        auth: { phase: "cancelled", expiresAt: null },
+      };
+      return AsyncResult.success(null);
+    });
+    await mount(true);
+    await act(async () => button("Finish Codex sign-in").props.onClick());
+    expect(dialogText()).toContain("PERSONAL-CODE");
+    await act(async () => dialogButton("Copy code").props.onClick());
+    expect(copy).toHaveBeenCalledWith("PERSONAL-CODE");
+    await act(async () => dialogButton("Open Codex sign-in page").props.onClick());
+    expect(fixture.openLink).toHaveBeenCalledWith("https://auth.openai.com/codex/device", {
+      recordHistory: false,
+    });
+    await act(async () => dialogButton("Cancel sign-in").props.onClick());
+    await act(async () => renderer!.update(view(true)));
+    expect(fixture.authAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: { type: "cancel", flowId: "personal-flow" } }),
+    );
+    expect(dialogText()).not.toContain("PERSONAL-CODE");
+    await act(async () => dialogButton("Retry Codex sign-in").props.onClick());
+    expect(fixture.authAction).toHaveBeenLastCalledWith(
+      expect.objectContaining({ action: { type: "start" } }),
+    );
+    expect(dialogText()).not.toContain("Account connected");
+  });
+  it("discards a late personal-page error after switching to the organization account", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = {
+      requirement: "sign_in_required",
+      auth: {
+        phase: "waiting",
+        expiresAt: null,
+        flowId: "personal-flow",
+        interaction: {
+          type: "deviceCode",
+          url: "https://auth.openai.com/codex/device",
+          userCode: "PERSONAL-CODE",
+        },
+      },
+    };
+    fixture.codexConnection = {
+      connectionId: "org-codex",
+      label: "account@example.test",
+      status: "connected",
+      epoch: 1,
+      tokenRevision: 1,
+      errorCode: null,
+      refreshing: false,
+    };
+    const pending = deferred();
+    fixture.openLink.mockImplementationOnce(async () => {
+      await pending.promise;
+      throw new Error("Old link failed");
+    });
+    fixture.authAction.mockImplementationOnce(async () => {
+      fixture.authSource = {
+        mode: "organization",
+        connectionId: "org-codex",
+        connection: fixture.codexConnection!,
+      };
+      fixture.auth = { ...fixture.auth, authSource: fixture.authSource };
+      return AsyncResult.success(null);
+    });
+    await mount(true);
+    await act(async () => button("Finish Codex sign-in").props.onClick());
+    await act(async () => dialogButton("Open Codex sign-in page").props.onClick());
+    await act(async () => accountPicker().props.onValueChange("organization:org-codex"));
+    await act(async () => renderer!.update(view(true)));
+    await act(async () => pending.resolve());
+    expect(dialogText()).not.toContain("Could not open the Codex sign-in page");
+    expect(dialogText()).not.toContain("PERSONAL-CODE");
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(0);
+    expect(accountPicker().props.value).toBe("organization:org-codex");
+  });
+  it("hides a visible personal-page failure when external account selection changes without a form remount", async () => {
+    fixture.local = true;
+    fixture.status = { pendingProviderAuth: moveAuthBinding, setupPhase: "running" };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = {
+      requirement: "sign_in_required",
+      auth: {
+        phase: "waiting",
+        expiresAt: null,
+        interaction: {
+          type: "deviceCode",
+          url: "https://auth.openai.com/codex/device",
+          userCode: "PERSONAL-CODE",
+        },
+      },
+    };
+    fixture.openLink.mockRejectedValueOnce(new Error("Browser unavailable"));
+    await mount(true);
+    await act(async () => button("Finish Codex sign-in").props.onClick());
+    await act(async () => dialogButton("Open Codex sign-in page").props.onClick());
+    expect(dialogText()).toContain("Could not open the Codex sign-in page");
+    fixture.codexConnection = {
+      connectionId: "org-codex",
+      label: "account@example.test",
+      status: "connected",
+      epoch: 1,
+      tokenRevision: 1,
+      errorCode: null,
+      refreshing: false,
+    };
+    fixture.authSource = {
+      mode: "organization",
+      connectionId: "org-codex",
+      connection: fixture.codexConnection,
+    };
+    fixture.selectionRevision++;
+    fixture.auth = { ...fixture.auth, authSource: fixture.authSource };
+    fixture.authReadError = "The current VM could not be reached.";
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogText()).not.toContain("Could not open the Codex sign-in page");
+    expect(dialogText()).toContain("The current VM could not be reached.");
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(1);
+    expect(fixture.authTransitionKey).toBe("initial");
+    expect(fixture.authAction).not.toHaveBeenCalled();
   });
   it("shows a saving choice across an auth remount and keeps its acknowledgment when verification fails", async () => {
     fixture.local = true;
@@ -1434,11 +1861,7 @@ describe("simplified VM controls", () => {
     expect(text).not.toContain("STALE-CODE");
     expect(dialogButton("Cancel sign-in")).toBeUndefined();
     expect(dialogButton("Open Codex sign-in page")).toBeUndefined();
-    fixture.openLink.mockResolvedValue(undefined);
-    await act(async () => dialogButton("Manage usage").props.onClick());
-    expect(fixture.openLink).toHaveBeenCalledWith("https://chatgpt.com/settings/usage", {
-      recordHistory: false,
-    });
+    expect(dialogButton("Manage usage")).toBeUndefined();
     expect(fixture.authAction).not.toHaveBeenCalled();
     fixture.codexConnection = { ...fixture.codexConnection, connectionId: "replacement" };
     fixture.auth = { ...fixture.auth, requirement: "authenticated" };

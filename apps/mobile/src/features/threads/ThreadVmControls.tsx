@@ -21,6 +21,7 @@ import {
   threadVmAuthSourcePresentation,
   threadVmAuthSourceChoice,
   threadVmBackupRecoveryUnavailable,
+  type ThreadVmProviderAuthDialogView,
   type ThreadVmControlAction,
 } from "@t3tools/client-runtime/relay/threadVmControls";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -80,6 +81,7 @@ function ActionButton({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={label}
+      accessibilityState={{ disabled }}
       disabled={disabled}
       onPress={onPress}
       className="rounded-lg bg-card px-3 py-2"
@@ -237,6 +239,101 @@ export function ThreadVmControlsProvider({
   );
 }
 
+function VmCodexAccountIdentity({ source }: { source: ThreadVmProviderAuthDialogView["source"] }) {
+  if (!source) return null;
+  return (
+    <View className="gap-1">
+      <Text className="text-sm font-t3-medium text-foreground">
+        {source.mode === "organization" ? "Organization Codex" : "Personal sign-in"}
+      </Text>
+      {source.mode === "organization" && source.connection.label ? (
+        <Text className="text-sm text-muted-foreground">{source.connection.label}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+function VmCodexAccountDialog({
+  environmentId,
+  threadId,
+  accountId,
+  value,
+  readError,
+  loading,
+  authTransitionKey,
+  forceChoice,
+  onChoiceSaved,
+  onRefresh,
+}: {
+  environmentId: EnvironmentId;
+  threadId: ThreadId;
+  accountId: string;
+  value: RelayThreadVmProviderAuth | null;
+  readError: string | null;
+  loading: boolean;
+  authTransitionKey: string | null;
+  forceChoice: boolean;
+  onChoiceSaved: () => void;
+  onRefresh: () => void;
+}) {
+  const display = useAtomValue(
+    threadVmControls.providerAuthDialogViewAtom(environmentId, threadId),
+  );
+  if (display.phase === "connected" && !(forceChoice && display.canManage)) {
+    return (
+      <View className="gap-5 py-3">
+        <View className="flex-row items-center gap-2">
+          <SymbolView name="checkmark.circle" size={24} tintColorClassName="accent-icon" />
+          <Text
+            accessibilityLiveRegion="polite"
+            className="text-base font-t3-semibold text-foreground"
+          >
+            Account connected
+          </Text>
+        </View>
+        <VmCodexAccountIdentity source={display.source} />
+        <Note>VM preparation continues automatically.</Note>
+      </View>
+    );
+  }
+  if (display.canManage && display.binding) {
+    return (
+      <VmCodexSignIn
+        key={`${accountId}:${display.binding.allocationId}:${display.binding.operationId}:${authTransitionKey}`}
+        environmentId={environmentId}
+        threadId={threadId}
+        accountId={accountId}
+        binding={display.binding}
+        value={value}
+        readError={readError}
+        loading={loading}
+        display={display}
+        onChoiceSaved={onChoiceSaved}
+      />
+    );
+  }
+  return (
+    <View className="gap-4 py-3">
+      <Text accessibilityLiveRegion="polite" className="text-sm font-t3-medium text-foreground">
+        {display.phase === "changed"
+          ? "This VM request changed. Close this dialog to check its current status."
+          : display.error
+            ? "Could not check the selected account"
+            : "Checking the selected account…"}
+      </Text>
+      <VmCodexAccountIdentity source={display.source} />
+      {display.error ? (
+        <>
+          <Text accessibilityLiveRegion="polite" className="text-sm text-destructive">
+            {display.error}
+          </Text>
+          <ActionButton label="Check status" disabled={loading} onPress={onRefresh} />
+        </>
+      ) : null}
+    </View>
+  );
+}
+
 function VmCodexSignIn({
   environmentId,
   threadId,
@@ -245,6 +342,8 @@ function VmCodexSignIn({
   value,
   readError,
   loading,
+  display,
+  onChoiceSaved,
 }: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
@@ -253,6 +352,8 @@ function VmCodexSignIn({
   value: RelayThreadVmProviderAuth | null;
   readError: string | null;
   loading: boolean;
+  display: ThreadVmProviderAuthDialogView;
+  onChoiceSaved: () => void;
 }) {
   const dispatch = useAtomCommand(threadVmControls.providerAuthAction, { reportFailure: false });
   const sourceState = useAtomValue(
@@ -265,10 +366,9 @@ function VmCodexSignIn({
   const choiceLocked = savingChoice || unknownChoice;
   const requested = choiceLocked ? selection.requested : null;
   const accountSelectionRequired = sourceData?.accountSelectionRequired === true;
-  const accountSource = accountSelectionRequired ? null : (sourceData?.source ?? value?.authSource);
-  const accountPresentation = accountSource
-    ? threadVmAuthSourcePresentation(accountSource, sourceData?.connection ?? null)
-    : null;
+  const accountSource = accountSelectionRequired
+    ? null
+    : (sourceData?.source ?? display.source ?? value?.authSource);
   const choice = threadVmAuthSourceChoice(accountSource, sourceData?.connection);
   const selectedValue = requested
     ? requested.mode === "organization"
@@ -279,8 +379,28 @@ function VmCodexSignIn({
     requested?.mode === "organization"
       ? `organization:${requested.connectionId}`
       : choice.organizationValue;
-  const [busy, setBusy] = useState(false),
-    [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const scopeKey = JSON.stringify([
+    accountSource,
+    sourceData?.selectionRevision,
+    selection.phase,
+    selection.requested,
+  ]);
+  const actionScope = useRef(scopeKey);
+  useLayoutEffect(() => {
+    actionScope.current = scopeKey;
+  }, [scopeKey]);
+  const [failure, setFailure] = useState<{ scope: string; message: string } | null>(null);
+  const error = failure?.scope === scopeKey ? failure.message : null;
+  const setError = (message: string | null) =>
+    setFailure(message === null ? null : { scope: actionScope.current, message });
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [now, setNow] = useState(() => Date.now());
   const expiresAt = value?.auth.expiresAt;
   useEffect(() => {
@@ -305,14 +425,24 @@ function VmCodexSignIn({
   const run = async (action: Parameters<typeof dispatch>[0]["action"]) => {
     if (
       busy ||
+      !display.canManage ||
       savingChoice ||
       (unknownChoice && action.type !== "check_selection" && action.type !== "retry_selection")
     )
       return;
     setBusy(true);
     setError(null);
+    const scope = actionScope.current;
     try {
-      const result = await dispatch({ environmentId, threadId, accountId, binding, action });
+      const request = dispatch({ environmentId, threadId, accountId, binding, action });
+      if (
+        action.type === "select_source" ||
+        action.type === "check_selection" ||
+        action.type === "retry_selection"
+      )
+        onChoiceSaved();
+      const result = await request;
+      if (!mounted.current || actionScope.current !== scope) return;
       if (
         result._tag === "Failure" &&
         action.type !== "select_source" &&
@@ -327,13 +457,14 @@ function VmCodexSignIn({
         );
       }
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   };
   const errors = [
     ...new Set(
       [
         selection.error,
+        display.error,
         error ?? (choiceLocked ? null : readError),
         choiceLocked ? null : (sourceData?.error ?? sourceState.error),
       ].filter((message) => message !== null && message !== undefined),
@@ -342,17 +473,23 @@ function VmCodexSignIn({
   const open = async () => {
     if (!presentation?.url || busy) return;
     setError(null);
+    const scope = actionScope.current;
     try {
       await Linking.openURL(presentation.url);
     } catch {
-      setError("Could not open the Codex sign-in page. Try opening the link again.");
+      if (mounted.current && actionScope.current === scope)
+        setError("Could not open the Codex sign-in page. Try opening the link again.");
     }
   };
   return (
-    <View
-      accessibilityLabel="VM Codex sign-in"
-      className="gap-2 rounded-lg border border-border bg-card p-3"
-    >
+    <View accessibilityLabel="VM Codex sign-in" className="gap-4">
+      <Text className="text-sm text-muted-foreground">
+        {unknownChoice
+          ? "Check the saved choice before selecting another account."
+          : display.phase === "checking"
+            ? "Checking the selected account…"
+            : "Choose an account for this chat."}
+      </Text>
       {!sourceData?.unsupported ? (
         <View
           accessibilityRole="radiogroup"
@@ -360,19 +497,9 @@ function VmCodexSignIn({
           className="gap-2"
         >
           <MaterialListRow
-            title="Personal sign-in"
-            accessibilityRole="radio"
-            accessibilityState={{
-              checked: selectedValue === "personal",
-              disabled: busy || choiceLocked || sourceState.isPending,
-            }}
-            disabled={busy || choiceLocked || sourceState.isPending}
-            onPress={() => void run({ type: "select_source", source: { mode: "personal" } })}
-            trailing={<MaterialRadioIndicator selected={selectedValue === "personal"} />}
-          />
-          <MaterialListRow
             title="Organization Codex"
             subtitle={sourceData?.connection?.label}
+            className="rounded-xl border border-border"
             accessibilityRole="radio"
             accessibilityState={{
               checked: selectedValue === organizationValue,
@@ -398,58 +525,62 @@ function VmCodexSignIn({
                   },
                 });
             }}
-            trailing={<MaterialRadioIndicator selected={selectedValue === organizationValue} />}
+            leading={<MaterialRadioIndicator selected={selectedValue === organizationValue} />}
+            trailing={
+              sourceData?.connection?.status === "connected" ? (
+                <View className="rounded-md border border-border px-2 py-1">
+                  <Text className="text-xs text-muted-foreground">Connected</Text>
+                </View>
+              ) : null
+            }
+          />
+          <MaterialListRow
+            title="Personal sign-in"
+            subtitle="Sign in separately inside this VM"
+            className="rounded-xl border border-border"
+            accessibilityRole="radio"
+            accessibilityState={{
+              checked: selectedValue === "personal",
+              disabled: busy || choiceLocked || sourceState.isPending,
+            }}
+            disabled={busy || choiceLocked || sourceState.isPending}
+            onPress={() => void run({ type: "select_source", source: { mode: "personal" } })}
+            leading={<MaterialRadioIndicator selected={selectedValue === "personal"} />}
+            trailing={null}
           />
         </View>
       ) : null}
+      {!sourceData?.unsupported ? <Note>Your choice will be used for future VM moves.</Note> : null}
       {sourceData?.connection?.status !== "connected" && !sourceData?.unsupported ? (
         <Note>
-          Connect or reconnect Codex for VMs in Organization settings to use the organization
-          account.
+          Connect or reconnect Codex for VMs in Organization settings on your computer to use the
+          organization account.
         </Note>
       ) : null}
-      {accountPresentation?.usingPlan && !choiceLocked ? (
-        <>
-          <Note>
-            Using organization ChatGPT plan. Manage this connection in Organization settings → Codex
-            for VMs.
-          </Note>
-          <ActionButton
-            label="Manage usage"
-            disabled={busy}
-            onPress={() => {
-              void Linking.openURL("https://chatgpt.com/settings/usage").catch(() =>
-                setError("Could not open ChatGPT usage settings."),
-              );
-            }}
-          />
-        </>
+      {savingChoice ||
+      unknownChoice ||
+      presentation?.canStart ||
+      presentation?.url ||
+      presentation?.canCancel ||
+      errors.length > 0 ? (
+        <Text accessibilityLiveRegion="polite" className="text-sm font-t3-semibold text-foreground">
+          {savingChoice
+            ? "Saving choice…"
+            : unknownChoice
+              ? "Could not confirm choice"
+              : errors.length > 0
+                ? "Codex needs attention"
+                : presentation?.title}
+        </Text>
       ) : null}
-      <Text accessibilityLiveRegion="polite" className="text-xs font-semibold text-foreground">
-        {savingChoice
-          ? "Saving choice…"
-          : unknownChoice
-            ? "Could not confirm choice"
-            : accountSelectionRequired
-              ? "Choose a Codex account"
-              : readError && selection.phase === "confirmed" && !presentation
-                ? "Could not check Codex sign-in"
-                : (presentation?.title ?? "Checking Codex sign-in in the new VM")}
-      </Text>
-      <Note>
-        {savingChoice
-          ? "Saving the account selected for this VM."
-          : unknownChoice
-            ? "Check the saved choice before selecting another account."
-            : accountSelectionRequired
-              ? "Choose personal sign-in or a connected organization account to continue."
-              : selection.phase === "confirmed" && !presentation
-                ? readError
-                  ? "Your account choice is saved. Check sign-in status to try again."
-                  : "Your account choice is saved. Checking Codex sign-in in this VM."
-                : (presentation?.message ??
-                  "The VM is preparing. Its Codex sign-in status will appear here.")}
-      </Note>
+      {presentation?.message &&
+      accountSource?.mode !== "organization" &&
+      value?.requirement !== "authenticated" &&
+      value?.auth.phase !== "succeeded" &&
+      !choiceLocked &&
+      !errors.includes(presentation.message) ? (
+        <Note>{presentation.message}</Note>
+      ) : null}
       {unknownChoice ? (
         <>
           <ActionButton
@@ -474,9 +605,11 @@ function VmCodexSignIn({
           label="Copy code"
           disabled={busy}
           onPress={() => {
-            void Clipboard.setStringAsync(presentation.userCode!).catch(() =>
-              setError("Could not copy the code. Select and copy it above."),
-            );
+            const scope = actionScope.current;
+            void Clipboard.setStringAsync(presentation.userCode!).catch(() => {
+              if (mounted.current && actionScope.current === scope)
+                setError("Could not copy the code. Select and copy it above.");
+            });
           }}
         />
       ) : null}
@@ -497,7 +630,7 @@ function VmCodexSignIn({
           onPress={() => void run({ type: "cancel", flowId: value.auth.flowId! })}
         />
       ) : null}
-      {!accountSelectionRequired && !choiceLocked ? (
+      {!accountSelectionRequired && !choiceLocked && errors.length > 0 ? (
         <ActionButton
           label={busy || loading ? "Checking sign-in…" : "Check sign-in status"}
           disabled={busy || loading}
@@ -599,6 +732,8 @@ function ThreadVmControlPanel({
   const dialogRevision = useRef(0);
   const hasStatus = status !== null;
   const dialogOpen = hasStatus && confirm !== null;
+  const isAccountDialog = confirm === "sign_in" || confirm === "change_account";
+  const accountDialogRevision = dialogRevision.current;
   useLayoutEffect(() => {
     if (!hasStatus && confirm !== null) {
       dialogRevision.current++;
@@ -852,9 +987,19 @@ function ThreadVmControlPanel({
       ) : null}
       {presentation.canManageProviderAuth && presentation.primary?.type !== "sign_in" ? (
         <ActionButton
-          label="Codex account…"
+          label={
+            providerAuth?.requirement === "authenticated"
+              ? "Change Codex account…"
+              : "Codex account…"
+          }
           disabled={disabled}
-          onPress={() => open(() => openConfirmation("sign_in"))}
+          onPress={() =>
+            open(() =>
+              openConfirmation(
+                providerAuth?.requirement === "authenticated" ? "change_account" : "sign_in",
+              ),
+            )
+          }
         />
       ) : null}
       {presentation.primary && !deletionNote && !standalone ? (
@@ -1048,7 +1193,7 @@ function ThreadVmControlPanel({
                 >
                   {confirm === "preview"
                     ? "Open private preview"
-                    : confirm === "sign_in"
+                    : isAccountDialog
                       ? "Codex account"
                       : confirm === "replacement"
                         ? "Choose a VM to replace"
@@ -1060,15 +1205,23 @@ function ThreadVmControlPanel({
                               ? "Recover from backup?"
                               : "Replace this VM?"}
                 </Text>
-                <ActionButton label="Close" disabled={false} onPress={closeConfirmation} />
+                {isAccountDialog ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Close Codex account"
+                    className="size-11 items-center justify-center rounded-lg"
+                    onPress={closeConfirmation}
+                  >
+                    <SymbolView name="xmark" size={18} tintColorClassName="accent-icon-muted" />
+                  </Pressable>
+                ) : (
+                  <ActionButton label="Close" disabled={false} onPress={closeConfirmation} />
+                )}
               </View>
-              <Note>
-                {confirm === "preview"
-                  ? "Enter the port your application is listening on inside this VM."
-                  : confirm === "sign_in"
-                    ? presentation.canManageProviderAuth
-                      ? "Choose personal sign-in or the organization's Codex account to finish preparing this VM."
-                      : "VM preparation continues automatically."
+              {!isAccountDialog ? (
+                <Note>
+                  {confirm === "preview"
+                    ? "Enter the port your application is listening on inside this VM."
                     : confirm === "replacement"
                       ? "Your VM allowance is full. Choose a VM to save and stop. The least recently active choice is listed first."
                       : confirm === "delete"
@@ -1078,7 +1231,8 @@ function ThreadVmControlPanel({
                           : confirm === "backup"
                             ? "The conversation is kept. Workspace changes after the selected backup may be lost. The queue stays paused."
                             : "Save and stop the selected VM before using its slot. Replacement waits until its backup is verified and stopping is confirmed."}
-              </Note>
+                </Note>
+              ) : null}
               <Panel>
                 {confirm === "preview" ? (
                   <>
@@ -1094,30 +1248,22 @@ function ThreadVmControlPanel({
                       onPress={() => void openPreview()}
                     />
                   </>
-                ) : confirm === "sign_in" &&
-                  presentation.canManageProviderAuth &&
-                  status?.pendingProviderAuth ? (
-                  <VmCodexSignIn
-                    key={`${accountId}:${status?.pendingProviderAuth.allocationId}:${status?.pendingProviderAuth.operationId}:${authTransitionKey}`}
+                ) : isAccountDialog ? (
+                  <VmCodexAccountDialog
                     environmentId={environmentId}
                     threadId={threadId}
                     accountId={accountId}
-                    binding={status?.pendingProviderAuth}
                     value={providerAuth}
                     readError={providerAuthError}
                     loading={providerAuthPending}
+                    authTransitionKey={authTransitionKey}
+                    forceChoice={confirm === "change_account"}
+                    onChoiceSaved={() => {
+                      if (dialogRevision.current !== accountDialogRevision) return;
+                      setConfirm((current) => (current === "change_account" ? "sign_in" : current));
+                    }}
+                    onRefresh={() => threadVmControls.refresh(registry, environmentId, threadId)}
                   />
-                ) : confirm === "sign_in" ? (
-                  <>
-                    <Note>
-                      {status?.pendingProviderAuth
-                        ? (presentation.detail ?? "VM preparation continues automatically.")
-                        : "This VM no longer needs Codex sign-in."}
-                    </Note>
-                    {presentation.primary?.type === "check" ? (
-                      <ActionButton label="Check status" disabled={disabled} onPress={primary} />
-                    ) : null}
-                  </>
                 ) : confirm === "replacement" &&
                   status?.replacement?.phase !== "awaiting_choice" ? (
                   <Note>
@@ -1245,6 +1391,11 @@ function ThreadVmControlPanel({
                   </>
                 ) : null}
               </Panel>
+              {isAccountDialog ? (
+                <View className="items-end border-t border-border pt-4">
+                  <ActionButton label="Close" disabled={false} onPress={closeConfirmation} />
+                </View>
+              ) : null}
               {requestFeedback}
             </ScrollView>
           </View>

@@ -24,6 +24,7 @@ import {
   threadVmAuthSourceChoice,
   threadVmBackupRecoveryUnavailable,
   type ThreadVmControlAction,
+  type ThreadVmProviderAuthDialogView,
 } from "@t3tools/client-runtime/relay/threadVmControls";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
@@ -44,7 +45,7 @@ import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Radio, RadioGroup } from "../ui/radio-group";
-import { RefreshCwIcon } from "lucide-react";
+import { CheckCircle2Icon, RefreshCwIcon, XIcon } from "lucide-react";
 import {
   AlertDialog,
   AlertDialogPopup,
@@ -254,23 +255,132 @@ export function ThreadVmControlsProvider({
   );
 }
 
+function VmCodexAccountDialog({
+  environmentId,
+  threadId,
+  accountId,
+  value,
+  readError,
+  loading,
+  authTransitionKey,
+  forceChoice,
+  onChoiceSaved,
+  onOpenOrganizationSettings,
+  onCheckStatus,
+}: {
+  environmentId: EnvironmentId;
+  threadId: ThreadId;
+  accountId: string;
+  value: RelayThreadVmProviderAuth | null;
+  readError: string | null;
+  loading: boolean;
+  authTransitionKey: string | null;
+  forceChoice: boolean;
+  onChoiceSaved: () => void;
+  onOpenOrganizationSettings: () => void;
+  onCheckStatus: () => void;
+}) {
+  const display = useAtomValue(
+    threadVmControls.providerAuthDialogViewAtom(environmentId, threadId),
+  );
+  useEffect(() => {
+    if (forceChoice && display.phase === "saving") onChoiceSaved();
+  }, [forceChoice, display.phase, onChoiceSaved]);
+  const connected = display.phase === "connected" && !(forceChoice && display.canManage);
+  return (
+    <div className="grid w-full gap-4 px-3 pb-4 text-sm">
+      {connected ? (
+        <>
+          <div className="flex items-center gap-2 font-medium" role="status" aria-live="polite">
+            <CheckCircle2Icon className="size-5 text-success" aria-hidden />
+            Account connected
+          </div>
+          <VmCodexAccountIdentity source={display.source} />
+          <Note>VM preparation continues automatically.</Note>
+        </>
+      ) : display.canManage && display.binding ? (
+        <VmCodexSignIn
+          key={`${accountId}:${display.binding.allocationId}:${display.binding.operationId}:${authTransitionKey}`}
+          environmentId={environmentId}
+          threadId={threadId}
+          accountId={accountId}
+          binding={display.binding}
+          display={display}
+          value={value}
+          readError={readError}
+          loading={loading}
+          forceChoice={forceChoice}
+          onChoiceSaved={onChoiceSaved}
+          onOpenOrganizationSettings={onOpenOrganizationSettings}
+        />
+      ) : (
+        <>
+          <p className="font-medium" role="status" aria-live="polite">
+            {display.phase === "changed"
+              ? "This VM request changed"
+              : display.error
+                ? "Could not check Codex sign-in"
+                : "Checking Codex sign-in"}
+          </p>
+          <VmCodexAccountIdentity source={display.source} />
+          <Note>
+            {display.phase === "changed"
+              ? "Close this dialog to check the thread’s current VM request."
+              : "Checking whether Codex is ready in this VM."}
+          </Note>
+          {display.error ? (
+            <>
+              <p role="alert" className="text-destructive">
+                {display.error}
+              </p>
+              <div>
+                <ActionButton label="Check status" disabled={loading} onPress={onCheckStatus} />
+              </div>
+            </>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+function VmCodexAccountIdentity({ source }: { source: ThreadVmProviderAuthDialogView["source"] }) {
+  if (!source) return null;
+  return (
+    <div className="grid gap-1">
+      <p className="font-medium">
+        {source.mode === "organization" ? "Organization Codex" : "Personal sign-in"}
+      </p>
+      {source.mode === "organization" && source.connection.label ? (
+        <p className="text-muted-foreground">{source.connection.label}</p>
+      ) : null}
+    </div>
+  );
+}
+
 function VmCodexSignIn({
   environmentId,
   threadId,
   accountId,
   binding,
+  display,
   value,
   readError,
   loading,
+  forceChoice,
+  onChoiceSaved,
   onOpenOrganizationSettings,
 }: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
   accountId: string;
   binding: RelayThreadVmProviderAuthBinding;
+  display: ThreadVmProviderAuthDialogView;
   value: RelayThreadVmProviderAuth | null;
   readError: string | null;
   loading: boolean;
+  forceChoice: boolean;
+  onChoiceSaved: () => void;
   onOpenOrganizationSettings: () => void;
 }) {
   const dispatch = useAtomCommand(threadVmControls.providerAuthAction, { reportFailure: false });
@@ -285,9 +395,6 @@ function VmCodexSignIn({
   const requested = choiceLocked ? selection.requested : null;
   const accountSelectionRequired = sourceData?.accountSelectionRequired === true;
   const accountSource = accountSelectionRequired ? null : (sourceData?.source ?? value?.authSource);
-  const accountPresentation = accountSource
-    ? threadVmAuthSourcePresentation(accountSource, sourceData?.connection ?? null)
-    : null;
   const choice = threadVmAuthSourceChoice(accountSource, sourceData?.connection);
   const selectedValue = requested
     ? requested.mode === "organization"
@@ -300,7 +407,17 @@ function VmCodexSignIn({
       : choice.organizationValue;
   const openLink = useOpenLink(null);
   const [busy, setBusy] = useState(false),
-    [error, setError] = useState<string | null>(null);
+    [failure, setFailure] = useState<{ scope: string; message: string } | null>(null);
+  const scopeKey = JSON.stringify([
+    accountSource,
+    sourceData?.selectionRevision,
+    selection.phase,
+    selection.requested,
+  ]);
+  const error = failure?.scope === scopeKey ? failure.message : null;
+  const setError = (message: string | null) =>
+    setFailure(message ? { scope: scopeKey, message } : null);
+  const actionRevision = useRef(0);
   const [now, setNow] = useState(() => Date.now());
   const expiresAt = value?.auth.expiresAt;
   useEffect(() => {
@@ -322,19 +439,33 @@ function VmCodexSignIn({
           now,
         )
       : null;
+  const waitingForVerification =
+    display.phase !== "connected" &&
+    accountSource?.mode !== "organization" &&
+    (value?.requirement === "authenticated" || value?.auth.phase === "succeeded");
+  const errors = new Set([
+    selection.error,
+    display.error,
+    error ?? (choiceLocked ? null : readError),
+    choiceLocked ? null : (sourceData?.error ?? sourceState.error),
+  ]);
   const run = async (action: Parameters<typeof dispatch>[0]["action"]) => {
     if (
       busy ||
+      !display.canManage ||
       savingChoice ||
       (unknownChoice && action.type !== "check_selection" && action.type !== "retry_selection")
     )
       return;
     setBusy(true);
     setError(null);
+    const revision = ++actionRevision.current;
     try {
       const result = await dispatch({ environmentId, threadId, accountId, binding, action });
+      if (action.type === "select_source") onChoiceSaved();
       if (
         result._tag === "Failure" &&
+        actionRevision.current === revision &&
         action.type !== "select_source" &&
         action.type !== "check_selection" &&
         action.type !== "retry_selection"
@@ -353,17 +484,19 @@ function VmCodexSignIn({
   const open = async () => {
     if (!presentation?.url || busy) return;
     setError(null);
+    const revision = ++actionRevision.current;
     try {
       await openLink(presentation.url, { recordHistory: false });
     } catch {
-      setError("Could not open the Codex sign-in page. Try opening the link again.");
+      if (actionRevision.current === revision)
+        setError("Could not open the Codex sign-in page. Try opening the link again.");
     }
   };
   return (
-    <section
-      aria-label="VM Codex sign-in"
-      className="grid w-full gap-2 rounded-lg border border-border bg-muted/30 p-3"
-    >
+    <section aria-label="VM Codex sign-in" className="grid w-full gap-4">
+      {accountSelectionRequired || forceChoice ? (
+        <Note>Choose an account for this chat.</Note>
+      ) : null}
       {!sourceData?.unsupported ? (
         <RadioGroup
           aria-label="Codex account for this VM"
@@ -379,20 +512,39 @@ function VmCodexSignIn({
               });
           }}
         >
-          <label className="flex items-center gap-2">
-            <Radio value="personal" />
-            Personal sign-in
-          </label>
-          <label className="flex items-center gap-2">
+          <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-border p-4 focus-within:ring-2 focus-within:ring-ring has-[[data-checked]]:border-primary has-[[data-disabled]]:cursor-not-allowed has-[[data-disabled]]:opacity-60">
             <Radio
               value={organizationValue}
               disabled={sourceData?.connection?.status !== "connected"}
             />
-            Organization Codex
-            {sourceData?.connection?.label ? ` · ${sourceData.connection.label}` : ""}
+            <span className="grid min-w-0 flex-1 gap-1">
+              <span className="flex flex-wrap items-center justify-between gap-2 font-medium">
+                Organization Codex
+                {sourceData?.connection?.status === "connected" ? (
+                  <span className="rounded-md border border-border px-1.5 py-0.5 text-xs font-normal text-muted-foreground">
+                    Connected
+                  </span>
+                ) : null}
+              </span>
+              {sourceData?.connection?.label ? (
+                <span className="break-words text-xs text-muted-foreground">
+                  {sourceData.connection.label}
+                </span>
+              ) : null}
+            </span>
+          </label>
+          <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-border p-4 focus-within:ring-2 focus-within:ring-ring has-[[data-checked]]:border-primary has-[[data-disabled]]:cursor-not-allowed has-[[data-disabled]]:opacity-60">
+            <Radio value="personal" />
+            <span className="grid gap-1">
+              <span className="font-medium">Personal sign-in</span>
+              <span className="text-xs text-muted-foreground">
+                Sign in separately inside this VM
+              </span>
+            </span>
           </label>
         </RadioGroup>
       ) : null}
+      {!sourceData?.unsupported ? <Note>Your choice will be used for future VM moves.</Note> : null}
       {sourceData?.connection?.status !== "connected" && !sourceData?.unsupported ? (
         <>
           <Note>
@@ -407,48 +559,45 @@ function VmCodexSignIn({
           </div>
         </>
       ) : null}
-      {accountPresentation?.usingPlan && !choiceLocked ? (
-        <div className="flex flex-wrap items-center gap-2">
+      {(!accountSelectionRequired && !forceChoice) || choiceLocked ? (
+        <div className="grid gap-2">
+          <p className="font-medium" role="status" aria-live="polite">
+            {savingChoice
+              ? "Saving choice…"
+              : unknownChoice
+                ? "Could not confirm choice"
+                : accountSelectionRequired
+                  ? "Choose a Codex account"
+                  : readError && selection.phase === "confirmed" && !presentation
+                    ? "Could not check Codex sign-in"
+                    : accountSource?.mode === "organization"
+                      ? display.phase === "attention"
+                        ? "Codex needs attention"
+                        : "Checking Codex sign-in"
+                      : waitingForVerification
+                        ? "Checking Codex sign-in"
+                        : (presentation?.title ?? "Checking Codex sign-in in the new VM")}
+          </p>
           <Note>
-            Using organization ChatGPT plan. Manage this connection in Organization settings → Codex
-            for VMs.
+            {savingChoice
+              ? "Saving the account selected for this VM."
+              : unknownChoice
+                ? "Check the saved choice before selecting another account."
+                : accountSelectionRequired
+                  ? "Choose personal sign-in or a connected organization account to continue."
+                  : selection.phase === "confirmed" && !presentation
+                    ? readError
+                      ? "Your account choice is saved. Check sign-in status to try again."
+                      : "Your account choice is saved. Checking Codex sign-in in this VM."
+                    : waitingForVerification
+                      ? "Checking whether Codex is ready in this VM."
+                      : errors.has(presentation?.message ?? null)
+                        ? null
+                        : (presentation?.message ??
+                          "The VM is preparing. Its Codex sign-in status will appear here.")}
           </Note>
-          <ActionButton
-            label="Manage usage"
-            disabled={busy}
-            onPress={() => {
-              void openLink("https://chatgpt.com/settings/usage", { recordHistory: false }).catch(
-                () => setError("Could not open ChatGPT usage settings."),
-              );
-            }}
-          />
         </div>
       ) : null}
-      <p className="font-medium" role="status" aria-live="polite">
-        {savingChoice
-          ? "Saving choice…"
-          : unknownChoice
-            ? "Could not confirm choice"
-            : accountSelectionRequired
-              ? "Choose a Codex account"
-              : readError && selection.phase === "confirmed" && !presentation
-                ? "Could not check Codex sign-in"
-                : (presentation?.title ?? "Checking Codex sign-in in the new VM")}
-      </p>
-      <Note>
-        {savingChoice
-          ? "Saving the account selected for this VM."
-          : unknownChoice
-            ? "Check the saved choice before selecting another account."
-            : accountSelectionRequired
-              ? "Choose personal sign-in or a connected organization account to continue."
-              : selection.phase === "confirmed" && !presentation
-                ? readError
-                  ? "Your account choice is saved. Check sign-in status to try again."
-                  : "Your account choice is saved. Checking Codex sign-in in this VM."
-                : (presentation?.message ??
-                  "The VM is preparing. Its Codex sign-in status will appear here.")}
-      </Note>
       {presentation?.userCode ? (
         <p>
           Enter code{" "}
@@ -478,9 +627,11 @@ function VmCodexSignIn({
             label="Copy code"
             disabled={busy}
             onPress={() => {
-              void navigator.clipboard
-                .writeText(presentation.userCode!)
-                .catch(() => setError("Could not copy the code. Select and copy it above."));
+              const revision = actionRevision.current;
+              void navigator.clipboard.writeText(presentation.userCode!).catch(() => {
+                if (actionRevision.current === revision)
+                  setError("Could not copy the code. Select and copy it above.");
+              });
             }}
           />
         ) : null}
@@ -505,7 +656,9 @@ function VmCodexSignIn({
             onPress={() => void run({ type: "cancel", flowId: value.auth.flowId! })}
           />
         ) : null}
-        {!accountSelectionRequired && !choiceLocked ? (
+        {!accountSelectionRequired &&
+        !choiceLocked &&
+        (readError || display.error || display.phase === "attention") ? (
           <ActionButton
             label={busy || loading ? "Checking sign-in…" : "Check sign-in status"}
             disabled={busy || loading}
@@ -513,13 +666,7 @@ function VmCodexSignIn({
           />
         ) : null}
       </div>
-      {[
-        ...new Set([
-          selection.error,
-          error ?? (choiceLocked ? null : readError),
-          choiceLocked ? null : (sourceData?.error ?? sourceState.error),
-        ]),
-      ].map((message) =>
+      {[...errors].map((message) =>
         message ? (
           <p key={message} role="alert" className="text-destructive">
             {message}
@@ -616,7 +763,9 @@ function ThreadVmControlPanel({
   const [busy, setBusy] = useState(false),
     [error, setError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
+  const isAccountDialog = confirm === "sign_in" || confirm === "change_account";
   const dialogRevision = useRef(0);
+  const openedRevision = dialogRevision.current;
   const hasStatus = status !== null;
   const dialogOpen = hasStatus && confirm !== null;
   useLayoutEffect(() => {
@@ -877,9 +1026,17 @@ function ThreadVmControlPanel({
       ) : null}
       {presentation.canManageProviderAuth && presentation.primary?.type !== "sign_in" ? (
         <MenuAction
-          label="Codex account…"
+          label={
+            providerAuth?.requirement === "authenticated"
+              ? "Change Codex account…"
+              : "Codex account…"
+          }
           disabled={disabled}
-          onPress={perform(close, () => openConfirmation("sign_in"))}
+          onPress={perform(close, () =>
+            openConfirmation(
+              providerAuth?.requirement === "authenticated" ? "change_account" : "sign_in",
+            ),
+          )}
         />
       ) : null}
       {presentation.primary && !deletionNote && !standalone ? (
@@ -1050,40 +1207,52 @@ function ThreadVmControlPanel({
         }}
       >
         <AlertDialogPopup variant="scrollable" finalFocus={trigger}>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {confirm === "preview"
-                ? "Open private preview"
-                : confirm === "sign_in"
-                  ? "Codex account"
-                  : confirm === "replacement"
-                    ? "Choose a VM to replace"
-                    : confirm === "delete"
-                      ? "Permanently delete thread?"
-                      : confirm === "reset"
-                        ? "Reset VM?"
-                        : confirm === "backup"
-                          ? "Recover from backup?"
-                          : "Replace this VM?"}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {confirm === "preview"
-                ? "Enter the port your application is listening on inside this VM."
-                : confirm === "sign_in"
-                  ? presentation.canManageProviderAuth
-                    ? "Choose personal sign-in or the organization's Codex account to finish preparing this VM."
-                    : "VM preparation continues automatically."
-                  : confirm === "replacement"
-                    ? "Your VM allowance is full. Choose a VM to save and stop. The least recently active choice is listed first."
-                    : confirm === "delete"
-                      ? "This removes the conversation, attachments, VM and all saved workspaces. This cannot be undone."
-                      : confirm === "reset"
-                        ? "Keep the conversation and rebuild from the original uploaded Git commit. Workspace changes inside the VM are discarded. The queue stays paused."
-                        : confirm === "backup"
-                          ? "The conversation is kept. Workspace changes after the selected backup may be lost. The queue stays paused."
-                          : "Save and stop the selected VM before using its slot. Replacement waits until its backup is verified and stopping is confirmed."}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
+          <div className="relative">
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {confirm === "preview"
+                  ? "Open private preview"
+                  : isAccountDialog
+                    ? "Codex account"
+                    : confirm === "replacement"
+                      ? "Choose a VM to replace"
+                      : confirm === "delete"
+                        ? "Permanently delete thread?"
+                        : confirm === "reset"
+                          ? "Reset VM?"
+                          : confirm === "backup"
+                            ? "Recover from backup?"
+                            : "Replace this VM?"}
+              </AlertDialogTitle>
+              {!isAccountDialog ? (
+                <AlertDialogDescription>
+                  {confirm === "preview"
+                    ? "Enter the port your application is listening on inside this VM."
+                    : confirm === "replacement"
+                      ? "Your VM allowance is full. Choose a VM to save and stop. The least recently active choice is listed first."
+                      : confirm === "delete"
+                        ? "This removes the conversation, attachments, VM and all saved workspaces. This cannot be undone."
+                        : confirm === "reset"
+                          ? "Keep the conversation and rebuild from the original uploaded Git commit. Workspace changes inside the VM are discarded. The queue stays paused."
+                          : confirm === "backup"
+                            ? "The conversation is kept. Workspace changes after the selected backup may be lost. The queue stays paused."
+                            : "Save and stop the selected VM before using its slot. Replacement waits until its backup is verified and stopping is confirmed."}
+                </AlertDialogDescription>
+              ) : null}
+            </AlertDialogHeader>
+            {isAccountDialog ? (
+              <div className="absolute right-4 top-4">
+                <Button
+                  variant="ghost-muted"
+                  size="icon-sm"
+                  aria-label="Close Codex account"
+                  onClick={closeConfirmation}
+                >
+                  <XIcon aria-hidden />
+                </Button>
+              </div>
+            ) : null}
+          </div>
           <div className="min-h-0 overflow-y-auto overscroll-contain">
             <Panel>
               {confirm === "preview" ? (
@@ -1100,18 +1269,20 @@ function ThreadVmControlPanel({
                     onPress={() => void openPreview()}
                   />
                 </>
-              ) : confirm === "sign_in" &&
-                presentation.canManageProviderAuth &&
-                status?.pendingProviderAuth ? (
-                <VmCodexSignIn
-                  key={`${accountId}:${status?.pendingProviderAuth.allocationId}:${status?.pendingProviderAuth.operationId}:${authTransitionKey}`}
+              ) : isAccountDialog ? (
+                <VmCodexAccountDialog
                   environmentId={environmentId}
                   threadId={threadId}
                   accountId={accountId}
-                  binding={status?.pendingProviderAuth}
                   value={providerAuth}
                   readError={providerAuthError}
                   loading={providerAuthPending}
+                  authTransitionKey={authTransitionKey}
+                  forceChoice={confirm === "change_account"}
+                  onChoiceSaved={() => {
+                    if (dialogRevision.current === openedRevision) setConfirm("sign_in");
+                  }}
+                  onCheckStatus={() => threadVmControls.refresh(registry, environmentId, threadId)}
                   onOpenOrganizationSettings={() => {
                     closeConfirmation();
                     void navigate({
@@ -1121,17 +1292,6 @@ function ThreadVmControlPanel({
                     });
                   }}
                 />
-              ) : confirm === "sign_in" ? (
-                <>
-                  <Note>
-                    {status?.pendingProviderAuth
-                      ? (presentation.detail ?? "VM preparation continues automatically.")
-                      : "This VM no longer needs Codex sign-in."}
-                  </Note>
-                  {presentation.primary?.type === "check" ? (
-                    <ActionButton label="Check status" disabled={disabled} onPress={primary} />
-                  ) : null}
-                </>
               ) : confirm === "replacement" && status?.replacement?.phase !== "awaiting_choice" ? (
                 <Note>This VM request changed. Close this dialog to check its current status.</Note>
               ) : confirm === "replacement" ? (
@@ -1260,7 +1420,7 @@ function ThreadVmControlPanel({
             </Panel>
             {requestFeedback}
           </div>
-          <AlertDialogFooter>
+          <AlertDialogFooter variant={isAccountDialog ? "bare" : "default"}>
             <Button variant="outline" onClick={closeConfirmation}>
               Close
             </Button>

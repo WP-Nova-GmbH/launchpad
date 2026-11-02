@@ -49,6 +49,17 @@ import {
 import type { createThreadVmActionJournal } from "./threadVmActionSubmission.ts";
 import { ManagedRelayTenancyClient } from "./managedRelayTenancy.ts";
 import { createThreadVmCodexPreferenceAtoms } from "./threadVmCodexPreference.ts";
+import {
+  deriveThreadVmProviderAuthDialog,
+  type ThreadVmProviderAuthDialogEvidence,
+  type ThreadVmProviderAuthDialogView,
+} from "./threadVmAccountDialog.ts";
+export {
+  deriveThreadVmProviderAuthDialog,
+  type ThreadVmProviderAuthDialogInput,
+  type ThreadVmProviderAuthDialogEvidence,
+  type ThreadVmProviderAuthDialogView,
+} from "./threadVmAccountDialog.ts";
 import type { ManagedRelayClientError } from "./managedRelay.ts";
 import {
   managedRelaySessionAtom,
@@ -1472,12 +1483,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           selectionRevision = selection?.revision ?? 0;
         return Effect.gen(function* () {
           const { session, route, binding } = transition;
-          if (
-            !session ||
-            !route ||
-            !transition.valid ||
-            (binding && !transition.canManageProviderAuth)
-          )
+          if (!session || !route || !transition.valid || (binding && !transition.authReady))
             return null;
           const registry = yield* AtomRegistry.AtomRegistry;
           const { relay, clerkToken } = yield* authorize(registry, key);
@@ -1853,6 +1859,118 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           : false,
       };
     }).pipe(Atom.setIdleTTL(0)),
+  );
+  type DialogState = {
+    session: ManagedRelaySession | null;
+    relayUrl: string | null;
+    evidence: ThreadVmProviderAuthDialogEvidence | null;
+    view: ThreadVmProviderAuthDialogView;
+  };
+  // Only the open dialog mounts this read. Retain safe identity across the worker's
+  // verification handoff without retaining a device code or loosening auth fences.
+  const providerAuthDialogStateAtom = Atom.family((key: string) =>
+    Atom.make((get): DialogState => {
+      const session = get(managedRelaySessionAtom),
+        route = get(routeAtom(key)),
+        configured = readManagedRelaySnapshotState(get(configuredRelayAtom)),
+        relayUrl = normalizeSecureRelayUrl(route?.relayUrl ?? ""),
+        transition = get(providerAuthTransitionAtom(key)),
+        state = get(viewAtom(key)),
+        selection = get(selectionAtom(key)),
+        sourceView = get(providerAuthSourceViewAtom(key)),
+        sourceResult = get(providerAuthSourceQueryAtom(key)),
+        sourceData = readManagedRelaySnapshotState(sourceResult).data,
+        status = readManagedRelaySnapshotState(get(queryAtom(key))).data?.status,
+        previous = Option.getOrUndefined(get.self<DialogState>());
+      const scoped =
+        session !== null &&
+        relayUrl !== null &&
+        !configured.isPending &&
+        !configured.error &&
+        configured.data === relayUrl;
+      const retained =
+        scoped && previous?.session === session && previous.relayUrl === relayUrl
+          ? previous.evidence
+          : null;
+      const binding = scoped ? (status?.pendingProviderAuth ?? null) : null;
+      const revision =
+        selection?.revision ?? (binding === null ? retained?.selectionRevision : 0) ?? 0;
+      const currentSource =
+        sourceData?.session === session &&
+        sourceData.route === route &&
+        sourceData.transition === transition.key &&
+        sourceData.selectionRevision === (selection?.revision ?? 0) &&
+        (sourceData.binding === null
+          ? binding === null
+          : binding !== null && sameAuthBinding(sourceData.binding, binding))
+          ? sourceData
+          : null;
+      const [, threadId] = decodeKey(key),
+        proofs = get(portableThreadPlacementsAtom),
+        placement =
+          proofs?.session === session && proofs.relayUrl === relayUrl
+            ? proofs.placements.get(threadId)
+            : undefined;
+      const completed =
+        scoped &&
+        retained !== null &&
+        binding === null &&
+        !status?.pendingProviderAuth &&
+        placement?.operationId === null &&
+        placement.environmentId === retained.binding.environmentId &&
+        placement.generation === retained.binding.generation &&
+        status?.generation === retained.binding.generation &&
+        status.allocation?.allocationId === retained.binding.allocationId &&
+        status.allocation.state === "running" &&
+        status.setupPhase === "ready";
+      const auth =
+        binding &&
+        state?.providerAuth &&
+        state.authTransitionKey === transition.key &&
+        sameAuthBinding(binding, state.providerAuth)
+          ? state.providerAuth
+          : null;
+      const result = deriveThreadVmProviderAuthDialog(
+        {
+          binding,
+          bindingCurrent: transition.valid || completed,
+          source: currentSource ? currentSource.source : (selection?.source ?? null),
+          sourceKnown: currentSource !== null || selection?.source != null,
+          connection:
+            currentSource?.binding === null && currentSource.source?.mode === "organization"
+              ? currentSource.source.connection
+              : currentSource
+                ? currentSource.connection
+                : (selection?.connection ?? null),
+          connectionKnown: currentSource !== null,
+          auth: auth
+            ? {
+                requirement: auth.requirement,
+                source: auth.authSource ?? null,
+                message: auth.auth.message,
+              }
+            : null,
+          selectionPhase: selection?.phase ?? "idle",
+          selectionRevision: revision,
+          accountSelectionRequired: currentSource?.accountSelectionRequired ?? false,
+          attempt: transition.receipt?.attempt ?? null,
+          canManage: scoped && binding !== null && transition.canManageProviderAuth,
+          error:
+            state?.error ??
+            state?.providerAuthError ??
+            sourceView.error ??
+            currentSource?.error ??
+            selection?.error ??
+            null,
+          completed,
+        },
+        retained,
+      );
+      return { session, relayUrl, ...result };
+    }).pipe(Atom.setIdleTTL(0)),
+  );
+  const providerAuthDialogViewAtom = Atom.family((key: string) =>
+    Atom.make((get) => get(providerAuthDialogStateAtom(key)).view).pipe(Atom.setIdleTTL(0)),
   );
   const action = createRuntimeCommand(runtime, {
     label: "thread VM action",
@@ -2407,6 +2525,8 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     checkBackupRecovery,
     openPreview,
     providerAuthAction,
+    providerAuthDialogViewAtom: (environmentId: EnvironmentId, threadId: ThreadId) =>
+      providerAuthDialogViewAtom(keyFor(environmentId, threadId)),
     providerAuthSourceViewAtom: (environmentId: EnvironmentId, threadId: ThreadId) =>
       providerAuthSourceViewAtom(keyFor(environmentId, threadId)),
     providerAuthSourceQueryAtom: (environmentId: EnvironmentId, threadId: ThreadId) =>
