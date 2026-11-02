@@ -4,7 +4,9 @@ import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
   RelayThreadVmEnrollProofPayload,
   RelayThreadVmEnrollRequest,
+  type RelayThreadVmEnrollResponse,
 } from "@t3tools/contracts/relay";
+import { THREAD_TRANSFER_SUPPORTED_FORMATS } from "@t3tools/shared/threadTransferEncoding";
 import {
   decodeRelayJwt,
   RELAY_THREAD_VM_ENROLL_PROOF_TYP,
@@ -51,7 +53,7 @@ const decodeProof = Schema.decodeUnknownEffect(RelayThreadVmEnrollProofPayload);
 function harness() {
   const values = new Map<string, Uint8Array>();
   const requests: Array<typeof RelayThreadVmEnrollProofPayload.Type> = [];
-  let reply = response;
+  let reply: RelayThreadVmEnrollResponse = response;
   let failPersistence = false;
   let status = 200;
   const store: ServerSecretStore["Service"] = {
@@ -98,7 +100,7 @@ function harness() {
     values,
     requests,
     provide,
-    setReply: (value: typeof response) => {
+    setReply: (value: RelayThreadVmEnrollResponse) => {
       reply = value;
     },
     setStatus: (value: number) => {
@@ -123,7 +125,9 @@ describe("thread VM enrollment", () => {
           operationId: "operation",
           seed: "seed-secret",
           environmentId: "environment",
+          threadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS,
         });
+        expect(enrolled.threadTransferFormats).toEqual(["launchpad-thread-chunks-v1"]);
         expect(yield* readInstalledThreadVm()).toEqual(enrolled);
         expect(yield* enrollThreadVm(input)).toEqual(enrolled);
         expect(h.requests).toHaveLength(1);
@@ -135,6 +139,27 @@ describe("thread VM enrollment", () => {
       }).pipe(h.provide);
     },
   );
+  it.effect("persists the admitted formats before server startup and reuses them on retry", () => {
+    const h = harness();
+    h.setReply({ ...response, threadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS });
+    return Effect.gen(function* () {
+      const enrolled = yield* enrollThreadVm(input);
+      expect(enrolled.threadTransferFormats).toEqual(THREAD_TRANSFER_SUPPORTED_FORMATS);
+      expect((yield* readInstalledThreadVm())?.threadTransferFormats).toEqual(
+        THREAD_TRANSFER_SUPPORTED_FORMATS,
+      );
+      expect(yield* enrollThreadVm(input)).toEqual(enrolled);
+      expect(h.requests).toHaveLength(1);
+    }).pipe(h.provide);
+  });
+  it.effect("rejects an explicit response that changes the signed format offer", () => {
+    const h = harness();
+    h.setReply({ ...response, threadTransferFormats: ["launchpad-thread-chunks-v1"] });
+    return Effect.gen(function* () {
+      expect(yield* Effect.flip(enrollThreadVm(input))).toMatchObject({ stage: "response" });
+      expect(h.values.has(THREAD_VM_IDENTITY_SECRET)).toBe(false);
+    }).pipe(h.provide);
+  });
   it.effect("keeps its identity across a lost reply and a failed local write", () => {
     const h = harness();
     return Effect.gen(function* () {

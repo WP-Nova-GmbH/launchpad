@@ -12,9 +12,12 @@ import {
   OrchestrationSession,
 } from "@t3tools/contracts";
 import {
-  ThreadTransferChunkManifest,
+  ThreadTransferArtifactManifest,
+  ThreadTransferEncodingPolicy,
   CODEX_CONVERSATION_TRANSFER_VERSION,
 } from "@t3tools/contracts/relay";
+import { normalizeThreadTransferManifest } from "@t3tools/shared/threadTransferManifest";
+import { threadTransferFormatForPolicy } from "@t3tools/shared/threadTransferEncoding";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -28,6 +31,11 @@ import { ThreadBackgroundLivenessService } from "../orchestration/ThreadBackgrou
 import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import { CheckoutCaptureError, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { makeThreadMoveTransferIntent } from "../persistence/ThreadMoveTransferIntent.ts";
+import {
+  makeThreadMoveAttemptJournal,
+  type ThreadMoveAttempt,
+} from "../persistence/ThreadMoveAttempt.ts";
 import { ProcessRunner } from "../processRunner.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
@@ -45,9 +53,18 @@ import {
 import {
   materializeThreadTransferChunks,
   packThreadTransferArchive,
+  packThreadTransferArchiveV2,
 } from "./ThreadTransferChunks.ts";
 import { installThreadTransferArchive } from "./ThreadTransferInstall.ts";
-import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
+import {
+  assertThreadTransferReady,
+  prepareThreadTransfer,
+  readThreadTransferInstallation,
+} from "./ThreadTransferReadiness.ts";
+import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
+import { ThreadVmProviderAuth } from "./ThreadVmProviderAuth.ts";
+import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
+import * as Option from "effect/Option";
 import { ThreadExecution } from "./ThreadExecution.ts";
 import { makeThreadCheckoutClaims } from "./ThreadCheckoutClaim.ts";
 import { makeThreadCheckoutInstaller } from "./ThreadCheckoutInstall.ts";
@@ -68,7 +85,8 @@ const decodeQueue = Schema.decodeEffect(Schema.fromJsonString(ThreadPromptQueue)
 const decodeModel = Schema.decodeEffect(Schema.fromJsonString(ModelSelection));
 const decodeArchive = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferArchiveManifest));
 const decodeSession = Schema.decodeUnknownEffect(OrchestrationSession);
-const decodeChunks = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferChunkManifest));
+const decodeChunks = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferArtifactManifest));
+const decodeEncodingPolicy = Schema.decodeUnknownEffect(ThreadTransferEncodingPolicy);
 const hasErrorDetail = Schema.is(Schema.Struct({ detail: Schema.NonEmptyString }));
 const hasErrorMessage = Schema.is(Schema.Struct({ message: Schema.NonEmptyString }));
 const failureDetail = (error: unknown) =>
@@ -100,13 +118,17 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
   const runner = yield* ProcessRunner;
   const registry = yield* ProviderInstanceRegistry;
   const tracked = yield* VmWorkloadTracking;
+  const vmAuth = yield* Effect.serviceOption(ThreadVmProviderAuth);
+  const environmentIdentity = yield* ServerEnvironmentIdentity;
   const terminals = yield* TerminalManager;
   const execution = yield* ThreadExecution;
   const repositories = yield* RepositoryIdentityResolver;
   const archive = makeThreadTransferArchive(sql, yield* OrchestrationEventStore);
   const fences = makeThreadExecutionFence(sql),
     claims = makeThreadCheckoutClaims(sql),
-    captures = makeCheckoutCapture(sql);
+    captures = makeCheckoutCapture(sql),
+    transferIntents = makeThreadMoveTransferIntent(sql);
+  const attempts = makeThreadMoveAttemptJournal(sql);
   const context = yield* Effect.context<
     | Effect.Services<ReturnType<typeof configureThreadVmMoveRepository>>
     | Effect.Services<ReturnType<typeof prepareThreadVmMoveWorkspace>>
@@ -453,7 +475,10 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     owner: ThreadMoveOwner,
     error: unknown,
     side: "source" | "destination",
+    attempt?: ThreadMoveAttempt,
   ) {
+    if (!attempt) return;
+    yield* attempt.end;
     const detail = failureDetail(error);
     const move = yield* transport.get(owner);
     yield* assertThreadMoveIdentity(owner, move);
@@ -463,7 +488,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         (side === "source" ? move.sourceEnvironmentId : move.destinationEnvironmentId)
     )
       return;
-    const reported = yield* transport.failed(owner, detail);
+    const reported = yield* transport.failed(owner, detail, attempt.attempt);
     yield* assertThreadMoveIdentity(owner, reported);
   });
   const source = Effect.fn("ThreadMoveWorker.source")(function* (threadId: string) {
@@ -525,11 +550,23 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     }
     if (!head || head.kind !== "move" || !head.operationId) return;
     const owner = { ...fence, operationId: head.operationId };
+    let attempt: ThreadMoveAttempt | undefined;
     const claimed = head;
     const sourceFence = fence;
     return yield* Effect.gen(function* () {
       const head = claimed;
       let fence = sourceFence;
+      const intent =
+        (yield* transferIntents.get(owner)) ??
+        (yield* transferIntents.create(
+          owner,
+          head.state === "cancelling"
+            ? ["launchpad-thread-chunks-v1"]
+            : yield* transport.sourceFormats(owner),
+        ));
+      const offers = intent.sourceThreadTransferFormats.includes("launchpad-thread-chunks-v2")
+        ? { sourceThreadTransferFormats: intent.sourceThreadTransferFormats }
+        : {};
       let move;
       if (fence.phase === "active" && fence.operationId !== owner.operationId) {
         const actorUserId = (head.editedBy ?? head.author)?.userId;
@@ -539,6 +576,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
           const result = yield* transport.beginVm(owner, {
             actorUserId,
             cancelBeforeStart: head.state === "cancelling",
+            ...offers,
           });
           if (result.status === "quota_reached") {
             const detail =
@@ -567,6 +605,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
             actorUserId,
             destinationEnvironmentId: head.destination.environmentId,
             destinationProjectId: head.destination.projectId,
+            ...offers,
           });
       } else move = yield* transport.get(owner);
       yield* assertThreadMoveIdentity(owner, move);
@@ -574,11 +613,13 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         head.destination.kind === "environment" &&
         (move.destinationEnvironmentId !== head.destination.environmentId ||
           move.destinationProjectId !== head.destination.projectId)
-      )
+      ) {
+        attempt = yield* attempts.begin(owner, move);
         return yield* fail(
           threadId,
           "The relay returned a different destination for the queued move.",
         );
+      }
       if (fence.phase === "active" && fence.operationId !== owner.operationId) {
         yield* fences.beginDrain({ ...owner, previousOperationId: fence.operationId });
         fence = (yield* fences.get(threadId))!;
@@ -615,15 +656,71 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         yield* finish(owner, "cancelled");
         return;
       }
+      const sourceState = move.participantStates?.find(
+        (participant) =>
+          participant.environmentId === owner.environmentId &&
+          participant.generation === owner.generation,
+      );
+      const sourceProgress = move.progress?.find(
+        (report) =>
+          report.environmentId === owner.environmentId && report.generation === owner.generation,
+      );
+      const sourceFailed =
+        sourceState?.failure != null &&
+        sourceState.failure.attempt >= sourceState.resolvedBeforeAttempt &&
+        sourceState.failure.attempt >= (sourceProgress?.attempt ?? 0);
+      if (
+        move.phase === "frozen" &&
+        move.manifestArtifactId !== null &&
+        move.recoveryVerified === true &&
+        !sourceFailed
+      )
+        return;
+      if (
+        move.phase === "ready" &&
+        move.failureDetail &&
+        !sourceFailed &&
+        move.recoveryVerified === true
+      )
+        return;
+      attempt = yield* attempts.begin(owner, move);
+      const progress = makeThreadMoveProgress(
+        move.progress ?? [],
+        owner.environmentId,
+        (report) => transport.progress(owner, report),
+        attempt,
+      );
       // Repair the exact saved archive even when a failed commit left a retained error.
       if (move.manifestArtifactId !== null && move.recoveryVerified !== true) {
         const receipt = yield* transport.publish(owner, move.manifestArtifactId);
         if (receipt.manifestArtifactId !== move.manifestArtifactId)
           return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
       }
+      if (move.manifestArtifactId !== null && sourceFailed) {
+        const saved = yield* inspectArchive(owner, operationPath(owner, "source"));
+        if (
+          saved.sha256 !== move.manifestSha256 ||
+          saved.manifest.history.environmentId !== owner.environmentId ||
+          saved.manifest.history.sourceSequence !== move.sourceCursor
+        )
+          return yield* fail(threadId, "The published move no longer matches its sealed source.");
+        yield* verifySourceOwner(owner, saved);
+        const retained = yield* transport.get(owner);
+        yield* assertThreadMoveIdentity(owner, retained);
+        if (
+          retained.manifestArtifactId !== move.manifestArtifactId ||
+          retained.manifestSha256 !== saved.sha256 ||
+          retained.recoveryVerified !== true
+        )
+          return yield* fail(threadId, "The frozen recovery save has not been verified.");
+        yield* progress.stage("uploading");
+        // Re-read participant failures on the next sweep before committing.
+        // This receipt supersedes only the source's prior failed attempt.
+        return;
+      }
       // Failure details live in relay placement state. Appending local queue
       // events here would invalidate the immutable source sequence being moved.
-      if (move.failureDetail && move.phase !== "preparing") return;
+      if (move.failureDetail && move.phase !== "preparing" && !sourceFailed) return;
       if (move.phase === "ready") {
         const committed = yield* transport.commit(owner);
         yield* assertThreadMoveIdentity(owner, committed);
@@ -632,15 +729,36 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         yield* fences.retire(owner);
         return;
       }
+      if (move.transferEncodingPolicy === null) {
+        move = yield* transport.selectEncoding(owner);
+        yield* assertThreadMoveIdentity(owner, move);
+        if (move.transferEncodingPolicy === null) return;
+        if (move.transferEncodingPolicy === undefined) {
+          const error = fail(threadId, "The relay did not confirm this move's transfer encoding.");
+          return yield* error;
+        }
+      }
+      const encodingPolicy = yield* decodeEncodingPolicy(
+        move.transferEncodingPolicy === undefined ? "v1-64MiB" : move.transferEncodingPolicy,
+      ).pipe(
+        Effect.mapError(() =>
+          fail(threadId, "The relay selected an unsupported transfer encoding."),
+        ),
+      );
+      if (
+        intent.transferEncodingPolicy !== null &&
+        intent.transferEncodingPolicy !== encodingPolicy
+      ) {
+        const error = fail(
+          threadId,
+          "This move's transfer encoding changed. Cancel it and start a new move.",
+        );
+        return yield* error;
+      }
       const priorCapture = yield* captures.get(owner.operationId);
       const sealedSha256 =
         priorCapture?.releaseOutcome === "sealed" ? priorCapture.manifestSha256! : undefined;
-      const prepared =
-        sealedSha256 === undefined
-          ? yield* prepareCapture(owner).pipe(
-              Effect.tapError((error) => reportFailure(owner, error, "source").pipe(Effect.ignore)),
-            )
-          : null;
+      const prepared = sealedSha256 === undefined ? yield* prepareCapture(owner) : null;
       if (prepared) {
         const admitted = yield* captures.acquireDrain({ ...owner, ...prepared }).pipe(
           Effect.as(true),
@@ -701,9 +819,6 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         if (!stopped.stopped) return;
       }
       yield* execution.confirmProcessesStopped(threadId, tracked ? "vm" : "provider");
-      const progress = makeThreadMoveProgress(move.progress ?? [], owner.environmentId, (report) =>
-        transport.progress(owner, report),
-      );
       if (move.manifestArtifactId === null) yield* progress.stage("capturing");
       if (prepared) {
         const ready = yield* enterCapture(owner, prepared).pipe(
@@ -731,7 +846,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         yield* notifyCheckoutCaptureReleased(sql, hold.checkoutRoot);
         return saved;
       }).pipe(
-        Effect.tapError((error) =>
+        Effect.tapError(() =>
           Effect.gen(function* () {
             const hold = yield* captures.get(owner.operationId);
             // A typed local failure arrives only after the copy's child work settled.
@@ -740,15 +855,16 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
               yield* captures.release(owner, { outcome: "failed", expectedPhase: "capturing" });
               yield* notifyCheckoutCaptureReleased(sql, hold.checkoutRoot);
             }
-            yield* reportFailure(owner, error, "source").pipe(Effect.ignore);
           }),
         ),
       );
+      yield* transferIntents.bind(owner, encodingPolicy, saved.sha256);
       yield* history.synchronize(threadId);
       if (move.phase === "preparing") {
         move = yield* transport.freeze(owner, {
           sourceCursor: saved.manifest.history.sourceSequence,
           manifestSha256: saved.sha256,
+          attempt: attempt.attempt,
         });
         yield* assertThreadMoveIdentity(owner, move);
       }
@@ -760,7 +876,11 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       // Publication verifies every artifact. Keep the source frozen while the destination imports it.
       if (move.manifestArtifactId !== null) return;
       yield* progress.stage("packing");
-      const packed = yield* packThreadTransferArchive({
+      const pack =
+        encodingPolicy === "workspace-raw-v2-8MiB"
+          ? packThreadTransferArchiveV2
+          : packThreadTransferArchive;
+      const packed = yield* pack({
         archiveDirectory: saved.directory,
         scratchRoot: path.join(root, "chunks"),
         expectedManifestSha256: saved.sha256,
@@ -814,6 +934,9 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
           if (hold?.phase === "draining") yield* releaseCapture(owner, "failed");
         }).pipe(Effect.ignore),
       ),
+      Effect.tapError((error) =>
+        reportFailure(owner, error, "source", attempt).pipe(Effect.ignore),
+      ),
     );
   });
   const destinationArchive = Effect.fnUntraced(function* (
@@ -821,6 +944,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     manifestArtifactId: string,
     expectedSha256: string,
     progress: ReturnType<typeof makeThreadMoveProgress>,
+    encodingPolicy: ThreadTransferEncodingPolicy,
   ) {
     const target = operationPath(owner, "destination");
     if (yield* fs.exists(target)) {
@@ -854,34 +978,28 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
           offset += part.length;
         }
         const manifest = yield* decodeChunks(new TextDecoder().decode(bytes));
+        const normalized = yield* Effect.try({
+          try: () => normalizeThreadTransferManifest(manifest),
+          catch: () => fail(owner.threadId, "The move index has invalid files, objects or ranges."),
+        });
         if (
           manifest.threadId !== owner.threadId ||
           manifest.operationId !== owner.operationId ||
           manifest.generation + 1 !== owner.generation ||
           manifest.transferManifestSha256 !== expectedSha256 ||
-          manifest.files.length > 100_000 ||
-          manifest.files.reduce((total, file) => total + file.sizeBytes, 0) > 64 * 1024 ** 3
+          manifest.format !== threadTransferFormatForPolicy(encodingPolicy) ||
+          normalized.objects.some((object) => object.artifactId === manifestArtifactId)
         )
           return yield* fail(
             owner.threadId,
             "The move index belongs to another placement or exceeds its limit.",
           );
-        const ids = new Set<string>();
-        for (const file of manifest.files)
-          for (const chunk of file.chunks) {
-            if (
-              ids.has(chunk.artifactId) ||
-              ids.size >= 100_000 ||
-              chunk.sizeBytes > 64 * 1024 * 1024
-            )
-              return yield* fail(owner.threadId, "The move index has invalid or repeated chunks.");
-            ids.add(chunk.artifactId);
-          }
-        const chunks = manifest.files.flatMap((file) => file.chunks);
+        const chunks = normalized.objects;
         yield* progress.stage("downloading", {
-          bytes: chunks.reduce((sum, chunk) => sum + chunk.sizeBytes, 0),
-          artifacts: chunks.length,
+          bytes: manifestBytes + chunks.reduce((sum, chunk) => sum + chunk.sizeBytes, 0),
+          artifacts: chunks.length + 1,
         });
+        yield* progress.verified(manifestArtifactId, manifestBytes);
         yield* Effect.forEach(
           chunks,
           Effect.fnUntraced(function* (chunk) {
@@ -976,175 +1094,289 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     yield* makeThreadTransferAborts(sql).record(owner, aborted);
   });
   const destination = Effect.fn("ThreadMoveWorker.destination")(function* (owner: ThreadMoveOwner) {
-    const move = yield* transport.get(owner);
-    yield* assertThreadMoveIdentity(owner, move);
-    if (owner.environmentId !== move.destinationEnvironmentId) return;
-    const previous = yield* fences.get(owner.threadId);
-    if (move.phase === "completed") {
-      if (previous?.operationId === owner.operationId && previous.phase === "frozen") {
-        if (tracked) {
-          const claim = yield* claims.get(owner.operationId);
-          if (!claim || claim.phase !== "installed")
-            return yield* fail(owner.threadId, "The completed move is missing its checkout claim.");
-          yield* configureThreadVmMoveRepository(owner, claim.checkoutPath).pipe(
-            Effect.provideContext(context),
-          );
+    let attempt: ThreadMoveAttempt | undefined;
+    return yield* Effect.gen(function* () {
+      const move = yield* transport.get(owner);
+      yield* assertThreadMoveIdentity(owner, move);
+      if (owner.environmentId !== move.destinationEnvironmentId) return;
+      const previous = yield* fences.get(owner.threadId);
+      if (move.phase === "completed") {
+        if (previous?.operationId === owner.operationId && previous.phase === "frozen") {
+          if (tracked) {
+            const claim = yield* claims.get(owner.operationId);
+            if (!claim || claim.phase !== "installed")
+              return yield* fail(
+                owner.threadId,
+                "The completed move is missing its checkout claim.",
+              );
+            yield* configureThreadVmMoveRepository(owner, claim.checkoutPath).pipe(
+              Effect.provideContext(context),
+            );
+          }
+          yield* fences.activate(owner);
         }
-        yield* fences.activate(owner);
+        if (previous?.operationId === owner.operationId) yield* finish(owner, "completed");
+        return;
       }
-      if (previous?.operationId === owner.operationId) yield* finish(owner, "completed");
-      return;
-    }
-    if (move.phase === "preparing") return;
-    if (move.phase === "aborting" || move.phase === "aborted")
-      return yield* rollbackDestination(owner, move);
-    if (move.failureDetail) {
-      const started = yield* sql`SELECT 1 FROM thread_transfer_readiness
+      if (move.phase === "preparing") return;
+      if (move.phase === "aborting" || move.phase === "aborted")
+        return yield* rollbackDestination(owner, move);
+      if (!move.manifestArtifactId || !move.manifestSha256 || move.sourceCursor === null) return;
+      const identity = {
+        ...owner,
+        threadId: ThreadId.make(owner.threadId),
+        projectId: move.destinationProjectId,
+        manifestSha256: move.manifestSha256,
+      };
+      const activate = Effect.gen(function* () {
+        const committed = move.phase === "committed" ? move : yield* transport.commit(owner);
+        yield* assertThreadMoveIdentity(owner, committed);
+        if (!["committed", "completed"].includes(committed.phase))
+          return yield* fail(owner.threadId, "The relay has not committed destination ownership.");
+        const activated = yield* transport.activate(owner);
+        yield* assertThreadMoveIdentity(owner, activated);
+        if (activated.phase !== "completed")
+          return yield* fail(owner.threadId, "The relay has not confirmed destination activation.");
+        yield* fences.activate(owner);
+        yield* finish(owner, "completed");
+      });
+      // Once the relay accepted readiness, only recover the fenced handoff.
+      // Re-entering pending auth here cannot succeed and can replay setup/probes.
+      if (move.phase === "ready" || move.phase === "committed") {
+        attempt = yield* attempts.begin(owner, move);
+        yield* assertThreadTransferReady(identity).pipe(Effect.provideContext(context));
+        const progress = makeThreadMoveProgress(
+          move.progress ?? [],
+          owner.environmentId,
+          (report) => transport.progress(owner, report),
+          attempt,
+        );
+        if (move.phase === "ready") {
+          yield* progress.stage("activating");
+          const ready = yield* transport.ready(owner, {
+            sourceCursor: move.sourceCursor,
+            manifestSha256: move.manifestSha256,
+            attempt: attempt.attempt,
+          });
+          yield* assertThreadMoveIdentity(owner, ready);
+          if (ready.recoveryVerified !== true) return;
+        }
+        yield* activate;
+        return;
+      }
+      // The persisted child/setup owner, rather than presentation errors, prevents replay.
+      const held = yield* sql`SELECT 1 FROM thread_transfer_readiness
         WHERE operation_id=${owner.operationId} AND
           (provider_probe_attempt_id IS NOT NULL OR (phase='started' AND setup_succeeded=0)) LIMIT 1`;
-      if (started.length) return;
-    }
-    const validateProject = Effect.gen(function* () {
-      // Installation retries verify the durable claim and readiness; mutable
-      // remotes or relay aliases must not strand an already installed checkout.
-      if (tracked || (yield* claims.get(owner.operationId))?.phase === "installed") return;
-      const [project] = yield* sql<{ root: string }>`SELECT workspace_root AS root
-        FROM projection_projects WHERE project_id=${move.destinationProjectId} AND deleted_at IS NULL`;
-      if (!project) return yield* fail(owner.threadId, "The destination project no longer exists.");
-      const projectRoot = yield* fs.realPath(project.root);
-      if (
-        (yield* fs.realPath(
-          yield* workspaceGitText(projectRoot, ["rev-parse", "--show-toplevel"]).pipe(
-            Effect.provideContext(context),
-          ),
-        )) !== projectRoot
-      )
+      if (held.length) {
+        if (move.failureDetail) return;
+        attempt = yield* attempts.begin(owner, move);
         return yield* fail(
           owner.threadId,
-          "The destination project must point to a Git checkout root.",
+          "Destination setup or native validation has no confirmed exit; cleanup remains held.",
         );
-      const repository = yield* repositories.resolve(projectRoot, { refresh: true });
-      if (!move.repositoryCanonicalKeys?.length)
-        return yield* fail(owner.threadId, "The relay did not confirm the transferred repository.");
-      if (!repository || !move.repositoryCanonicalKeys.includes(repository.canonicalKey))
-        return yield* fail(
-          owner.threadId,
-          "The destination project no longer matches the transferred repository. Its local files were left untouched.",
-        );
-    });
-    yield* validateProject;
-    if (!move.manifestArtifactId || !move.manifestSha256 || move.sourceCursor === null) return;
-    const progress = makeThreadMoveProgress(move.progress ?? [], owner.environmentId, (report) =>
-      transport.progress(owner, report),
-    );
-    yield* progress.stage("downloading");
-    const saved = yield* destinationArchive(
-      owner,
-      move.manifestArtifactId,
-      move.manifestSha256,
-      progress,
-    );
-    if (
-      saved.manifest.history.environmentId !== move.sourceEnvironmentId ||
-      saved.manifest.history.sourceSequence !== move.sourceCursor
-    )
-      return yield* fail(owner.threadId, "The destination archive has a different frozen source.");
-    if (!tracked) yield* fences.prepare({ ...owner, projectId: move.destinationProjectId });
-    yield* progress.stage("installing");
-    const selected = yield* stageThreadTransferArchive({
-      owner: { ...saved.manifest.history },
-      expectedSha256: saved.sha256,
-      artifactDirectory: saved.directory,
-      destinationRoot: path.join(root, "validation"),
-      codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
-    }).pipe(Effect.provideContext(context));
-    let model: ModelSelection | undefined;
-    yield* selected.history.events.pipe(
-      Stream.runForEach((event) =>
-        Effect.sync(() => {
-          if (
-            (event.type === "thread.created" || event.type === "thread.meta-updated") &&
-            event.payload.modelSelection
-          )
-            model = event.payload.modelSelection;
-        }),
-      ),
-      Effect.ensuring(fs.remove(selected.directory, { recursive: true }).pipe(Effect.ignore)),
-    );
-    if (!model || (yield* registry.getInstance(model.instanceId))?.driverKind !== "codex")
-      return yield* fail(
-        owner.threadId,
-        "The moved thread does not have a supported Codex instance.",
+      }
+      attempt = yield* attempts.begin(owner, move, { resumeWaiting: true });
+      let progress = makeThreadMoveProgress(
+        move.progress ?? [],
+        owner.environmentId,
+        (report) => transport.progress(owner, report),
+        attempt,
       );
-    const freshCheckoutRoot = tracked
-      ? yield* prepareThreadVmMoveWorkspace(owner, move.destinationProjectId).pipe(
-          Effect.provideContext(context),
+      const checkAuth = Effect.gen(function* () {
+        if (!tracked) return true;
+        const vm = yield* readInstalledThreadVm().pipe(Effect.provideContext(context));
+        if (
+          !vm ||
+          vm.scope.generation <= 1 ||
+          vm.scope.threadId !== owner.threadId ||
+          vm.scope.generation !== owner.generation ||
+          vm.operationId !== owner.operationId ||
+          vm.environmentId !== owner.environmentId ||
+          vm.environmentId !== (yield* environmentIdentity.getEnvironmentId) ||
+          vm.relayUrl !== owner.relayUrl ||
+          move.destinationProjectId !== `vm:${owner.threadId}`
         )
-      : undefined;
-    if (tracked) yield* fences.prepare({ ...owner, projectId: move.destinationProjectId });
-    yield* validateProject;
-    const claim = yield* claims.get(owner.operationId);
-    if (claim?.phase === "installing")
-      yield* makeThreadCheckoutInstaller(sql)
-        .reconcile({
-          ...owner,
-          projectId: move.destinationProjectId,
+          return yield* fail(
+            owner.threadId,
+            "The VM move does not match its installed enrollment.",
+          );
+        if (Option.isNone(vmAuth))
+          return yield* fail(owner.threadId, "This VM cannot verify its Codex account.");
+        const auth = yield* vmAuth.value
+          .readiness(vm, {
+            operationId: owner.operationId,
+            allocationId: vm.scope.allocationId,
+            environmentId: vm.environmentId,
+            generation: owner.generation,
+            instanceId: "codex",
+          })
+          .pipe(
+            Effect.mapError(() =>
+              fail(owner.threadId, "Could not verify Codex sign-in in this VM."),
+            ),
+          );
+        if (auth._tag === "Unavailable") return yield* fail(owner.threadId, auth.message);
+        if (auth._tag === "Waiting") {
+          yield* progress.waitForAuth(auth.reason);
+          return false;
+        }
+        return true;
+      });
+      if (!(yield* checkAuth)) return;
+      if (attempt.report?.waitingForAuth != null) {
+        attempt = yield* attempts.begin(owner, move);
+        progress = makeThreadMoveProgress(
+          move.progress ?? [],
+          owner.environmentId,
+          (report) => transport.progress(owner, report),
+          attempt,
+        );
+      }
+      const validateProject = Effect.gen(function* () {
+        if (tracked || (yield* claims.get(owner.operationId))?.phase === "installed") return;
+        const [project] = yield* sql<{ root: string }>`SELECT workspace_root AS root
+          FROM projection_projects WHERE project_id=${move.destinationProjectId} AND deleted_at IS NULL`;
+        if (!project)
+          return yield* fail(owner.threadId, "The destination project no longer exists.");
+        const projectRoot = yield* fs.realPath(project.root);
+        if (
+          (yield* fs.realPath(
+            yield* workspaceGitText(projectRoot, ["rev-parse", "--show-toplevel"]).pipe(
+              Effect.provideContext(context),
+            ),
+          )) !== projectRoot
+        )
+          return yield* fail(
+            owner.threadId,
+            "The destination project must point to a Git checkout root.",
+          );
+        const repository = yield* repositories.resolve(projectRoot, { refresh: true });
+        if (!move.repositoryCanonicalKeys?.length)
+          return yield* fail(
+            owner.threadId,
+            "The relay did not confirm the transferred repository.",
+          );
+        if (!repository || !move.repositoryCanonicalKeys.includes(repository.canonicalKey))
+          return yield* fail(
+            owner.threadId,
+            "The destination project no longer matches the transferred repository. Its local files were left untouched.",
+          );
+      });
+      yield* validateProject;
+      const claim = yield* claims.get(owner.operationId);
+      const installedBaseline =
+        claim?.phase === "installed"
+          ? yield* sql`SELECT 1 FROM thread_transfer_baselines WHERE operation_id=${owner.operationId}
+            AND thread_id=${owner.threadId} AND generation=${owner.generation}
+            AND manifest_sha256=${move.manifestSha256} AND source_environment_id=${move.sourceEnvironmentId}
+            AND source_sequence=${move.sourceCursor} AND native_runtime_json IS NOT NULL`
+          : [];
+      if (claim?.phase === "installed" && installedBaseline.length) {
+        // A later auth wait keeps the existing imported baseline and checkout receipts.
+        yield* readThreadTransferInstallation(identity).pipe(Effect.provideContext(context));
+      } else {
+        yield* progress.stage("downloading");
+        if (move.transferEncodingPolicy === null) return;
+        const encodingPolicy = yield* decodeEncodingPolicy(
+          move.transferEncodingPolicy === undefined ? "v1-64MiB" : move.transferEncodingPolicy,
+        );
+        const saved = yield* destinationArchive(
+          owner,
+          move.manifestArtifactId,
+          move.manifestSha256,
+          progress,
+          encodingPolicy,
+        );
+        if (
+          saved.manifest.history.environmentId !== move.sourceEnvironmentId ||
+          saved.manifest.history.sourceSequence !== move.sourceCursor
+        )
+          return yield* fail(
+            owner.threadId,
+            "The destination archive has a different frozen source.",
+          );
+        if (!tracked) yield* fences.prepare({ ...owner, projectId: move.destinationProjectId });
+        yield* progress.stage("installing");
+        const selected = yield* stageThreadTransferArchive({
+          owner: { ...saved.manifest.history },
+          expectedSha256: saved.sha256,
+          artifactDirectory: saved.directory,
+          destinationRoot: path.join(root, "validation"),
+          codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
+        }).pipe(Effect.provideContext(context));
+        let model: ModelSelection | undefined;
+        yield* selected.history.events.pipe(
+          Stream.runForEach((event) =>
+            Effect.sync(() => {
+              if (
+                (event.type === "thread.created" || event.type === "thread.meta-updated") &&
+                event.payload.modelSelection
+              )
+                model = event.payload.modelSelection;
+            }),
+          ),
+          Effect.ensuring(fs.remove(selected.directory, { recursive: true }).pipe(Effect.ignore)),
+        );
+        if (!model || (yield* registry.getInstance(model.instanceId))?.driverKind !== "codex")
+          return yield* fail(
+            owner.threadId,
+            "The moved thread does not have a supported Codex instance.",
+          );
+        const freshCheckoutRoot = tracked
+          ? yield* prepareThreadVmMoveWorkspace(owner, move.destinationProjectId).pipe(
+              Effect.provideContext(context),
+            )
+          : undefined;
+        if (tracked) yield* fences.prepare({ ...owner, projectId: move.destinationProjectId });
+        yield* validateProject;
+        if (claim?.phase === "installing")
+          yield* makeThreadCheckoutInstaller(sql)
+            .reconcile({
+              ...owner,
+              projectId: move.destinationProjectId,
+              manifestSha256: saved.sha256,
+              workspace: saved.manifest.workspace,
+              stagedWorkspaceRoot: saved.directory,
+              worktreesRoot: config.worktreesDir,
+            })
+            .pipe(Effect.provideContext(context));
+        yield* installThreadTransferArchive({
+          source: saved.manifest.history,
+          destination: { ...owner, projectId: move.destinationProjectId },
           manifestSha256: saved.sha256,
-          workspace: saved.manifest.workspace,
-          stagedWorkspaceRoot: saved.directory,
+          artifactDirectory: saved.directory,
+          recoveryRoot: path.join(root, "recovery"),
           worktreesRoot: config.worktreesDir,
-        })
-        .pipe(Effect.provideContext(context));
-    yield* installThreadTransferArchive({
-      source: saved.manifest.history,
-      destination: { ...owner, projectId: move.destinationProjectId },
-      manifestSha256: saved.sha256,
-      artifactDirectory: saved.directory,
-      recoveryRoot: path.join(root, "recovery"),
-      worktreesRoot: config.worktreesDir,
-      stateDir: config.stateDir,
-      attachmentsDir: config.attachmentsDir,
-      providerInstanceId: model.instanceId,
-      codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
-      importedAt: yield* now,
-      ...(freshCheckoutRoot ? { freshCheckoutRoot } : {}),
-    }).pipe(Effect.provideContext(context));
-    if (freshCheckoutRoot)
-      yield* configureThreadVmMoveRepository(owner, freshCheckoutRoot).pipe(
-        Effect.provideContext(context),
-      );
-    yield* progress.stage("setup");
-    yield* prepareThreadTransfer({
-      ...owner,
-      threadId: ThreadId.make(owner.threadId),
-      manifestSha256: saved.sha256,
-    }).pipe(Effect.provideContext(context));
-    yield* progress.stage("activating");
-    if (move.phase === "frozen" || move.phase === "ready") {
+          stateDir: config.stateDir,
+          attachmentsDir: config.attachmentsDir,
+          providerInstanceId: model.instanceId,
+          codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
+          importedAt: yield* now,
+          ...(freshCheckoutRoot ? { freshCheckoutRoot } : {}),
+        }).pipe(Effect.provideContext(context));
+        if (freshCheckoutRoot)
+          yield* configureThreadVmMoveRepository(owner, freshCheckoutRoot).pipe(
+            Effect.provideContext(context),
+          );
+      }
+      if (!(yield* checkAuth)) return;
+      yield* progress.stage("setup");
+      yield* prepareThreadTransfer(identity).pipe(Effect.provideContext(context));
+      yield* progress.stage("activating");
       const ready = yield* transport.ready(owner, {
         sourceCursor: move.sourceCursor,
-        manifestSha256: saved.sha256,
+        manifestSha256: move.manifestSha256,
+        attempt: attempt.attempt,
       });
       yield* assertThreadMoveIdentity(owner, ready);
-      // A failed commit would hide the missing save behind another retained error.
       if (ready.recoveryVerified !== true) return;
-    }
-    const committed = yield* transport.commit(owner);
-    yield* assertThreadMoveIdentity(owner, committed);
-    if (!["committed", "completed"].includes(committed.phase))
-      return yield* fail(owner.threadId, "The relay has not committed destination ownership.");
-    const activated = yield* transport.activate(owner);
-    yield* assertThreadMoveIdentity(owner, activated);
-    if (activated.phase !== "completed")
-      return yield* fail(owner.threadId, "The relay has not confirmed destination activation.");
-    yield* fences.activate(owner);
-    yield* finish(owner, "completed");
-  });
-  return {
-    source,
-    destination: (owner: ThreadMoveOwner) =>
-      destination(owner).pipe(
-        Effect.tapError((error) => reportFailure(owner, error, "destination").pipe(Effect.ignore)),
+      yield* activate;
+    }).pipe(
+      Effect.tapError((error) =>
+        reportFailure(owner, error, "destination", attempt).pipe(Effect.ignore),
       ),
-  };
+    );
+  });
+  return { source, destination };
 });

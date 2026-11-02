@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -10,10 +11,12 @@ import {
 import type { ThreadVmProviderAuthControl } from "@t3tools/contracts/relay";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { HttpServerRequest } from "effect/unstable/http";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
@@ -24,10 +27,14 @@ import * as ProviderAuthFlow from "../provider/ProviderAuthFlow.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import { ProviderAuthService } from "../provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
+import { ProviderInstanceRegistryMutator } from "../provider/Services/ProviderInstanceRegistryMutator.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import { THREAD_VM_IDENTITY_SECRET, type InstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import {
   controlThreadVmProviderAuth,
   handleThreadVmProviderAuthRequest,
+  makeThreadVmProviderAuth,
+  ThreadVmProviderAuth,
 } from "./ThreadVmProviderAuth.ts";
 import {
   ThreadVmCodexAuthContext,
@@ -70,6 +77,8 @@ const harness = Effect.gen(function* () {
   const started = yield* Deferred.make<void>(),
     finish = yield* Deferred.make<void>();
   let attempts = 0;
+  let cancellations = 0;
+  let available = true;
   let status: ServerProvider = {
     instanceId,
     driver: driverKind,
@@ -126,20 +135,30 @@ const harness = Effect.gen(function* () {
     },
   };
   const services = Layer.mergeAll(
-    Layer.mock(ProviderInstanceRegistry)({ getInstance: () => Effect.succeed(instance) }),
+    Layer.mock(ProviderInstanceRegistry)({
+      getInstance: () => Effect.sync(() => (available ? instance : undefined)),
+    }),
     Layer.mock(ProviderAuthService)({
       subscribe: (_, owner) => auth.subscribe(owner),
       start: (_, owner) => auth.start(owner),
-      cancel: (request, owner) => auth.cancel(owner, request.flowId),
+      cancel: (request, owner) =>
+        Effect.sync(() => {
+          cancellations++;
+        }).pipe(Effect.andThen(auth.cancel(owner, request.flowId))),
     }),
   );
   const run = (request = input) =>
     controlThreadVmProviderAuth(vm, request).pipe(Effect.provide(services));
   return {
     run,
+    controller: makeThreadVmProviderAuth.pipe(Effect.provide(services)),
     started,
     finish,
     attempts: () => attempts,
+    cancellations: () => cancellations,
+    setAvailable: (value: boolean) => {
+      available = value;
+    },
     setVersion: (version: string | null) => {
       status = { ...status, version };
     },
@@ -158,6 +177,165 @@ const harness = Effect.gen(function* () {
 });
 
 describe("pending VM provider sign-in", () => {
+  it.effect(
+    "rebuilds an initially unavailable organization provider without a client request",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* harness;
+        f.setAvailable(false);
+        f.setStatus({ auth: { status: "authenticated" } });
+        const connection = {
+          connectionId: "org-account",
+          label: "Organization account",
+          status: "connected" as const,
+          epoch: 1,
+          tokenRevision: 1,
+          errorCode: null,
+          refreshing: false,
+        };
+        const managed: ManagedThreadVmCodexAuthContext = {
+          connectionId: connection.connectionId,
+          label: connection.label,
+          status: Effect.succeed(connection),
+          preflight: Effect.void,
+        };
+        let selected = false,
+          applied = false,
+          rebuilds = 0;
+        const absent = new ThreadVmCodexAuthSourceError({ reason: "account_selection_required" });
+        const controller = yield* f.controller.pipe(
+          Effect.provideService(ThreadVmCodexAuthContext, {
+            current: Effect.suspend(() =>
+              selected ? Effect.succeed(managed) : Effect.fail(absent),
+            ),
+            refresh: Effect.suspend(() =>
+              selected ? Effect.succeed(!applied) : Effect.fail(absent),
+            ),
+            markApplied: Effect.sync(() => {
+              applied = true;
+            }),
+            withReloadLock: (effect) => effect,
+            personalPreflight: Effect.fail(absent),
+          }),
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.mock(ServerSettingsService)({
+                getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+              }),
+              Layer.succeed(ProviderInstanceRegistryMutator, {
+                reconcile: (_, options) =>
+                  Effect.sync(() => {
+                    expect(options?.rebuildDrivers?.has(driverKind)).toBe(true);
+                    rebuilds++;
+                    f.setAvailable(true);
+                  }),
+              }),
+            ),
+          ),
+        );
+        expect(yield* controller.readiness(vm, input.binding)).toEqual({
+          _tag: "Waiting",
+          reason: "account_selection",
+        });
+        selected = true;
+        expect(yield* controller.readiness(vm, input.binding)).toEqual({ _tag: "Ready" });
+        expect(yield* controller.readiness(vm, input.binding)).toEqual({ _tag: "Ready" });
+        expect(rebuilds).toBe(1);
+        expect(f.attempts()).toBe(0);
+        expect(f.cancellations()).toBe(0);
+      }).pipe(Effect.scoped, Effect.provide(base)),
+  );
+
+  it.effect("shares a private flow between UI controls and client-independent readiness", () =>
+    Effect.gen(function* () {
+      const f = yield* harness,
+        controller = yield* f.controller;
+      expect(yield* controller.readiness(vm, input.binding)).toEqual({
+        _tag: "Waiting",
+        reason: "personal_sign_in",
+      });
+      expect(f.attempts()).toBe(0);
+      const first = yield* controller.control(vm, { ...input, action: "start" });
+      yield* Deferred.await(f.started);
+      expect(yield* controller.readiness(vm, input.binding)).toEqual({
+        _tag: "Waiting",
+        reason: "personal_sign_in",
+      });
+      expect((yield* controller.control(vm, input)).auth.flowId).toBe(first.auth.flowId);
+      expect(f.attempts()).toBe(1);
+      yield* Deferred.succeed(f.finish, undefined);
+      yield* f.waitSuccess;
+      expect(yield* controller.readiness(vm, input.binding)).toEqual({ _tag: "Ready" });
+      expect(f.attempts()).toBe(1);
+    }).pipe(Effect.scoped, Effect.provide(base)),
+  );
+
+  for (const [reason, expected] of [
+    ["account_selection_required", "account_selection"],
+    ["reconnect_required", "organization_connection"],
+    ["selection_changed", "account_selection"],
+    ["unavailable", null],
+    ["configuration", null],
+    ["access_denied", null],
+  ] as const)
+    it.effect(`distinguishes ${reason} from personal sign-in`, () =>
+      Effect.gen(function* () {
+        const f = yield* harness,
+          failure = new ThreadVmCodexAuthSourceError({ reason });
+        const controller = yield* f.controller.pipe(
+          Effect.provideService(ThreadVmCodexAuthContext, {
+            current: Effect.fail(failure),
+            refresh: Effect.fail(failure),
+            markApplied: Effect.void,
+            withReloadLock: (effect) => effect,
+            personalPreflight: Effect.fail(failure),
+          }),
+        );
+        const result = yield* controller.readiness(vm, input.binding);
+        expect(result).toEqual(
+          expected
+            ? { _tag: "Waiting", reason: expected }
+            : { _tag: "Unavailable", message: failure.message },
+        );
+        expect(f.attempts()).toBe(0);
+        expect(f.cancellations()).toBe(0);
+      }).pipe(Effect.scoped, Effect.provide(base)),
+    );
+
+  it.effect("bounds a blocked readiness check without cancelling an existing sign-in", () =>
+    Effect.gen(function* () {
+      const f = yield* harness,
+        entered = yield* Deferred.make<void>();
+      let blocked = false;
+      const controller = yield* f.controller.pipe(
+        Effect.provideService(ThreadVmCodexAuthContext, {
+          current: Effect.succeed(null),
+          refresh: Effect.succeed(false),
+          markApplied: Effect.void,
+          personalPreflight: Effect.void,
+          withReloadLock: (effect) =>
+            Effect.suspend(() =>
+              blocked
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                : effect,
+            ),
+        }),
+      );
+      const first = yield* controller.control(vm, { ...input, action: "start" });
+      yield* Deferred.await(f.started);
+      blocked = true;
+      const pending = yield* controller.readiness(vm, input.binding).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("45 seconds");
+      expect(yield* Fiber.join(pending)).toMatchObject({ _tag: "Unavailable" });
+      expect(f.cancellations()).toBe(0);
+      blocked = false;
+      expect((yield* controller.control(vm, input)).auth.flowId).toBe(first.auth.flowId);
+      yield* controller.control(vm, { ...input, action: "cancel", flowId: first.auth.flowId! });
+      expect(f.cancellations()).toBe(1);
+      expect(f.attempts()).toBe(1);
+    }).pipe(Effect.scoped, Effect.provide(base)),
+  );
   it.effect("uses organization connection metadata and rejects device sign-in actions", () =>
     Effect.gen(function* () {
       const f = yield* harness;
@@ -363,6 +541,9 @@ describe("pending VM provider sign-in", () => {
                 }),
                 Layer.mock(ProviderInstanceRegistry)({
                   getInstance: () => Effect.die("Unauthorized request reached registry"),
+                }),
+                Layer.mock(ThreadVmProviderAuth)({
+                  control: () => Effect.die("Unauthorized request reached guest auth"),
                 }),
               ),
             ),

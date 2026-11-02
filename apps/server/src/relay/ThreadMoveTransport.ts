@@ -3,7 +3,9 @@ import type {
   RelayThreadMove,
   RelayThreadArtifactReceipt,
   ThreadMoveProgressReport,
+  ThreadTransferFormats,
 } from "@t3tools/contracts/relay";
+import { THREAD_TRANSFER_SUPPORTED_FORMATS } from "@t3tools/shared/threadTransferEncoding";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -58,12 +60,23 @@ export function makeThreadMoveTransport<E, R>(
       Effect.mapError(() => fail(owner.threadId)),
     );
   return {
+    sourceFormats: (owner: ThreadMoveOwner) =>
+      Effect.gen(function* () {
+        const client = yield* clientFor(owner);
+        const health = yield* client.health.health();
+        return health.threadTransferFormats?.includes("launchpad-thread-chunks-v2")
+          ? THREAD_TRANSFER_SUPPORTED_FORMATS
+          : (["launchpad-thread-chunks-v1"] as const);
+      }).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.mapError(() => fail(owner.threadId)),
+      ),
     pending: (owner: ThreadHistoryOwner, after: string | null) =>
       Effect.gen(function* () {
         const client = yield* clientFor(owner);
         return yield* client.threadMoves.pending({
           params: { environmentId: EnvironmentId.make(owner.environmentId) },
-          payload: { after, limit: 50 },
+          payload: { after, limit: 50, threadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS },
         });
       }).pipe(
         Effect.timeout("15 seconds"),
@@ -75,18 +88,30 @@ export function makeThreadMoveTransport<E, R>(
         actorUserId: string;
         destinationEnvironmentId: EnvironmentId;
         destinationProjectId: import("@t3tools/contracts").ProjectId;
+        sourceThreadTransferFormats?: ThreadTransferFormats;
       },
     ) =>
       request(owner, (client, params) =>
         client.threadMoves.begin({ params, payload: { generation: owner.generation, ...input } }),
       ),
-    beginVm: (owner: ThreadMoveOwner, input: { actorUserId: string; cancelBeforeStart: boolean }) =>
+    beginVm: (
+      owner: ThreadMoveOwner,
+      input: {
+        actorUserId: string;
+        cancelBeforeStart: boolean;
+        sourceThreadTransferFormats?: ThreadTransferFormats;
+      },
+    ) =>
       request(owner, (client, params) =>
         client.threadMoves.beginVm({ params, payload: { generation: owner.generation, ...input } }),
       ),
     get: (owner: ThreadMoveOwner) =>
       request(owner, (client, params) =>
         client.threadMoves.get({ params, payload: { generation: owner.generation } }),
+      ),
+    selectEncoding: (owner: ThreadMoveOwner) =>
+      request(owner, (client, params) =>
+        client.threadMoves.selectEncoding({ params, payload: { generation: owner.generation } }),
       ),
     progress: (owner: ThreadMoveOwner, report: ThreadMoveProgressReport) =>
       request(owner, (client, params) =>
@@ -95,15 +120,28 @@ export function makeThreadMoveTransport<E, R>(
           payload: { generation: owner.generation, ...report },
         }),
       ),
-    failed: (owner: ThreadMoveOwner, detail: string) =>
+    failed: (owner: ThreadMoveOwner, detail: string, attempt?: number) =>
       request(owner, (client, params) =>
-        client.threadMoves.failed({ params, payload: { generation: owner.generation, detail } }),
+        client.threadMoves.failed({
+          params,
+          payload: {
+            generation: owner.generation,
+            detail,
+            ...(attempt === undefined ? {} : { attempt }),
+          },
+        }),
       ),
-    freeze: (owner: ThreadMoveOwner, input: { sourceCursor: number; manifestSha256: string }) =>
+    freeze: (
+      owner: ThreadMoveOwner,
+      input: { sourceCursor: number; manifestSha256: string; attempt?: number },
+    ) =>
       request(owner, (client, params) =>
         client.threadMoves.freeze({ params, payload: { generation: owner.generation, ...input } }),
       ),
-    ready: (owner: ThreadMoveOwner, input: { sourceCursor: number; manifestSha256: string }) =>
+    ready: (
+      owner: ThreadMoveOwner,
+      input: { sourceCursor: number; manifestSha256: string; attempt?: number },
+    ) =>
       request(owner, (client, params) =>
         client.threadMoves.ready({ params, payload: { generation: owner.generation, ...input } }),
       ),

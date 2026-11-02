@@ -386,6 +386,14 @@
     "./threadVmServerStart": {
       "types": "./src/threadVmServerStart.ts",
       "import": "./src/threadVmServerStart.ts"
+    },
+    "./threadTransferManifest": {
+      "types": "./src/threadTransferManifest.ts",
+      "import": "./src/threadTransferManifest.ts"
+    },
+    "./threadTransferEncoding": {
+      "types": "./src/threadTransferEncoding.ts",
+      "import": "./src/threadTransferEncoding.ts"
     }
   },
   "scripts": {

@@ -12,6 +12,7 @@ import { makeThreadAttachmentCheckpoint } from "../../../../../apps/server/src/r
 import { makeThreadAttachmentCheckpointTransfer } from "../../../../../apps/server/src/relay/ThreadAttachmentCheckpointTransfer.ts";
 import { makeThreadAttachmentCheckpointStore } from "../ThreadAttachmentCheckpointStore.ts";
 import { makeThreadJournalStore } from "../ThreadJournalStore.ts";
+import { makeThreadPlacementStore } from "../ThreadPlacementStore.ts";
 import {
   nativeCheckpointCatalogFixture,
   packedCheckpoint,
@@ -180,10 +181,21 @@ export const laterAttachmentCheckpoint = Effect.fnUntraced(function* (
     | "owner"
     | "upload"
     | "storeNative"
+    | "sql"
   >,
   offset: number,
   captureOperationId?: string,
 ) {
+  if (captureOperationId !== undefined)
+    yield* makeThreadPlacementStore(f.sql).beginMove({
+      threadId: f.threadId,
+      operationId: captureOperationId,
+      actorUserId: "user",
+      sourceEnvironmentId: f.sourceEnvironmentId,
+      expectedGeneration: f.owner.generation,
+      destinationEnvironmentId: `destination-${f.threadId}`,
+      destinationProjectId: "destination-project",
+    });
   const bundle = yield* Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient,
       events = yield* OrchestrationEventStore;

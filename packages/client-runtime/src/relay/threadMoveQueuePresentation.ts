@@ -3,8 +3,13 @@ import type {
   RelayPortableThreadPlacement,
   RelayThreadVmProviderAuth,
   RelayThreadVmStatus,
+  ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
-import { threadMoveProgressPresentation, threadVmPresentation } from "./threadVmControls.ts";
+import {
+  threadMoveProgressPresentation,
+  threadVmPresentation,
+  threadVmWorkerAuthState,
+} from "./threadVmControls.ts";
 
 function currentMoveSnapshots(placement: RelayPortableThreadPlacement | null | undefined) {
   return placement?.operationId
@@ -60,6 +65,7 @@ export function threadMoveQueuePresentation(input: {
   placement?: RelayPortableThreadPlacement | null | undefined;
   status?: RelayThreadVmStatus | null | undefined;
   providerAuth?: RelayThreadVmProviderAuth | null | undefined;
+  workerAuth?: ThreadMoveWaitingForAuth | null | undefined;
   cancellation?: "sending" | "requested" | "unknown" | undefined;
   queuePaused?: boolean | undefined;
   error?: string | null | undefined;
@@ -105,14 +111,27 @@ export function threadMoveQueuePresentation(input: {
     (outbound || !entry) && status && (!binding || binding.operationId === matching?.operationId)
       ? status
       : null;
+  const workerAuth =
+    matching && currentStatus
+      ? input.workerAuth !== undefined
+        ? input.workerAuth
+        : threadVmWorkerAuthState(matching, currentStatus)
+      : undefined;
   const vm = currentStatus
-    ? threadVmPresentation({ status: currentStatus, providerAuth: auth })
+    ? threadVmPresentation({ status: currentStatus, providerAuth: auth, workerAuth })
     : null;
   const snapshots = currentMoveSnapshots(matching);
   const progress = matching
     ? threadMoveProgressPresentation({
         ...matching,
-        moveProgress: snapshots,
+        moveProgress:
+          workerAuth === null
+            ? snapshots.map((snapshot) =>
+                snapshot.participant === "destination"
+                  ? { ...snapshot, waitingForAuth: null }
+                  : snapshot,
+              )
+            : snapshots,
       })
     : null;
   const uploadVerified = snapshots.some(
@@ -145,10 +164,10 @@ export function threadMoveQueuePresentation(input: {
     label = "Could not check move status";
     detail = input.error;
     tone = "attention";
-  } else if (vm && (vm.tone === "danger" || vm.tone === "attention")) {
+  } else if (vm && (vm.tone === "danger" || vm.tone === "attention" || workerAuth != null)) {
     label = vm.label;
     detail = vm.detail;
-    tone = vm.tone;
+    tone = vm.tone === "success" ? "neutral" : vm.tone;
     step = 1;
   } else if (entry?.waitingForCheckout) {
     label = "Waiting for shared checkout";
@@ -185,6 +204,7 @@ export function threadMoveQueuePresentation(input: {
     step = null;
   }
   return {
+    previousErrors: matching?.moveFailures?.filter((failure) => !failure.active).slice(0, 2) ?? [],
     ownsNotice: ownership.ownsNotice,
     label,
     detail,

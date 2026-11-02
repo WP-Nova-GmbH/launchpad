@@ -1,17 +1,21 @@
 import { makeThreadMoveCheckpointStore } from "./ThreadMoveCheckpointStore.ts";
 import { makeThreadNativeCheckpointStore } from "./ThreadNativeCheckpointStore.ts";
-import { ThreadTransferChunkManifest } from "@t3tools/contracts/relay";
+import {
+  normalizeThreadTransferManifest,
+  THREAD_TRANSFER_MANIFEST_MAX_BYTES,
+} from "@t3tools/shared/threadTransferManifest";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
-import { makeThreadArtifactStore, type ThreadArtifactKind } from "./ThreadArtifactStore.ts";
+import { makeThreadArtifactStore } from "./ThreadArtifactStore.ts";
 import { makeThreadArtifactTransfer } from "./ThreadArtifactTransfer.ts";
+import { threadTransferFormatForPolicy } from "@t3tools/shared/threadTransferEncoding";
+import type { ThreadTransferEncodingPolicy } from "@t3tools/contracts/threadTransferFormat";
 
 type Objects = ReturnType<typeof makeThreadArtifactObjects>;
-const decodeManifest = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferChunkManifest));
 const ExpectedArtifact = Schema.Struct({
   artifactId: Schema.String,
   sha256: Schema.String,
@@ -24,69 +28,6 @@ export class ThreadMoveArtifactConflict extends Schema.TaggedError<ThreadMoveArt
   { message: Schema.String },
 ) {}
 const conflict = (message: string) => new ThreadMoveArtifactConflict({ message });
-
-const kindFor = (file: string): ThreadArtifactKind | null => {
-  if (file === "manifest.json") return "manifest";
-  if (file.startsWith("history/")) return "history";
-  if (file.startsWith("workspace/")) return "workspace";
-  if (file.startsWith("attachments/")) return "attachment";
-  if (file.startsWith("native/")) return "native";
-  return null;
-};
-const expectedArtifacts = (manifest: ThreadTransferChunkManifest) => {
-  const entries: Array<typeof ExpectedArtifact.Type> = [];
-  const ids = new Set<string>();
-  const paths = new Map<string, string>();
-  const filePaths = new Set<string>();
-  let manifestFile = false;
-  for (const file of manifest.files) {
-    const kind = kindFor(file.path);
-    const parts = file.path.split("/");
-    if (
-      !kind ||
-      file.path.length > 4096 ||
-      parts.some(
-        (part) =>
-          !part ||
-          part === "." ||
-          part === ".." ||
-          part.includes("\\") ||
-          part.includes(":") ||
-          /[. ]$/u.test(part) ||
-          [...part].some((character) => character.charCodeAt(0) < 32),
-      )
-    )
-      return null;
-    if (filePaths.has(file.path)) return null;
-    filePaths.add(file.path);
-    for (let index = 1; index <= parts.length; index++) {
-      const prefix = parts.slice(0, index).join("/");
-      const folded = prefix.normalize("NFD").toLowerCase();
-      const prior = paths.get(folded);
-      if (prior && prior !== prefix) return null;
-      paths.set(folded, prefix);
-    }
-    if (file.path === "manifest.json") {
-      if (file.sha256 !== manifest.transferManifestSha256) return null;
-      manifestFile = true;
-    }
-    let size = 0;
-    for (const chunk of file.chunks) {
-      if (ids.has(chunk.artifactId) || chunk.sizeBytes > 64 * 1024 * 1024) return null;
-      ids.add(chunk.artifactId);
-      size += chunk.sizeBytes;
-      entries.push({ ...chunk, kind });
-    }
-    if (size !== file.sizeBytes) return null;
-  }
-  for (const filePath of filePaths) {
-    const parts = filePath.split("/");
-    for (let index = 1; index < parts.length; index++)
-      if (filePaths.has(parts.slice(0, index).join("/"))) return null;
-  }
-  if (!manifestFile || filePaths.size > 100_000 || entries.length > 100_000) return null;
-  return entries;
-};
 
 /** Publishing is an atomic pointer and pin set, never evidence that an upload merely started. */
 export function makeThreadMoveArtifactStore(sql: PgClient, objects: Objects) {
@@ -110,7 +51,7 @@ export function makeThreadMoveArtifactStore(sql: PgClient, objects: Objects) {
       artifact.threadId !== input.threadId ||
       artifact.operationId !== input.operationId ||
       artifact.kind !== "manifest" ||
-      artifact.sizeBytes > 32 * 1024 * 1024
+      artifact.sizeBytes > THREAD_TRANSFER_MANIFEST_MAX_BYTES
     )
       return yield* conflict("Move artifact manifest is unavailable.");
     const [current] = yield* sql`SELECT 1 FROM relay_thread_moves m
@@ -131,13 +72,13 @@ export function makeThreadMoveArtifactStore(sql: PgClient, objects: Objects) {
         Stream.runForEach((part) =>
           Effect.gen(function* () {
             length += part.length;
-            if (length > 32 * 1024 * 1024)
+            if (length > THREAD_TRANSFER_MANIFEST_MAX_BYTES)
               return yield* conflict("Move artifact manifest is too large.");
             chunks.push(part);
           }),
         ),
       );
-      if (length !== artifact.sizeBytes || length > 32 * 1024 * 1024)
+      if (length !== artifact.sizeBytes || length > THREAD_TRANSFER_MANIFEST_MAX_BYTES)
         return yield* conflict("Move artifact manifest size changed.");
       const bytes = new Uint8Array(length);
       let offset = 0;
@@ -149,13 +90,20 @@ export function makeThreadMoveArtifactStore(sql: PgClient, objects: Objects) {
         try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes),
         catch: () => conflict("Move artifact manifest is not UTF-8."),
       });
-      const manifest = yield* decodeManifest(encoded).pipe(
-        Effect.mapError(() => conflict("Move artifact manifest is invalid.")),
-      );
+      const manifest = yield* Effect.try({
+        try: () => normalizeThreadTransferManifest(encoded),
+        catch: () => conflict("Move artifact manifest is invalid."),
+      });
       if (manifest.threadId !== input.threadId || manifest.operationId !== input.operationId)
         return yield* conflict("Move artifact manifest belongs to another operation.");
-      const entries = expectedArtifacts(manifest);
-      if (!entries) return yield* conflict("Move artifact file set is invalid.");
+      if (
+        manifest.files.find((file) => file.path === "manifest.json")?.sha256 !==
+        manifest.transferManifestSha256
+      )
+        return yield* conflict("Move artifact manifest has no matching frozen archive header.");
+      if (manifest.objects.some((object) => object.artifactId === input.manifestArtifactId))
+        return yield* conflict("Move payload cannot alias its artifact index.");
+      const entries: Array<typeof ExpectedArtifact.Type> = [...manifest.objects];
       entries.push({
         artifactId: input.manifestArtifactId,
         sha256: artifact.sha256,
@@ -172,10 +120,11 @@ export function makeThreadMoveArtifactStore(sql: PgClient, objects: Objects) {
             sourceEnvironmentId: string;
             expectedGeneration: number;
             manifestSha256: string | null;
+            transferEncodingPolicy: ThreadTransferEncodingPolicy | null;
           }>`SELECT phase,
           source_environment_id AS "sourceEnvironmentId",
           expected_generation AS "expectedGeneration",
-          manifest_sha256 AS "manifestSha256"
+          manifest_sha256 AS "manifestSha256",transfer_encoding_policy AS "transferEncodingPolicy"
           FROM relay_thread_moves WHERE operation_id = ${input.operationId}
             AND thread_id = ${input.threadId} FOR UPDATE`;
           if (
@@ -187,6 +136,11 @@ export function makeThreadMoveArtifactStore(sql: PgClient, objects: Objects) {
             move.manifestSha256 !== manifest.transferManifestSha256
           )
             return yield* conflict("Move no longer owns this frozen source.");
+          if (
+            move.transferEncodingPolicy == null ||
+            threadTransferFormatForPolicy(move.transferEncodingPolicy) !== manifest.format
+          )
+            return yield* conflict("Move artifacts do not match its selected transfer encoding.");
           const prior = yield* get(input.operationId);
           if (prior && prior.manifestArtifactId !== input.manifestArtifactId)
             return yield* conflict("Move already published a different artifact manifest.");

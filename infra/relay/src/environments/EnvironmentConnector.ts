@@ -198,6 +198,7 @@ export class EnvironmentConnector extends Context.Service<
     readonly status: (input: {
       readonly userId: string;
       readonly environmentId: string;
+      readonly expectedEnvironmentPublicKey?: string;
     }) => Effect.Effect<RelayEnvironmentStatusResponse, EnvironmentConnectorError>;
     readonly dispatchJob: (input: {
       readonly userId?: string | null;
@@ -598,6 +599,14 @@ const make = Effect.gen(function* () {
         environmentId: input.environmentId,
         operation: "status",
       });
+      if (
+        input.expectedEnvironmentPublicKey !== undefined &&
+        link.environmentPublicKey !== input.expectedEnvironmentPublicKey
+      )
+        return yield* new EnvironmentMintResponseInvalid({
+          environmentId: input.environmentId,
+          operation: "status",
+        });
       const endpoint = yield* resolveManagedEndpoint({
         operation: "status",
         link,

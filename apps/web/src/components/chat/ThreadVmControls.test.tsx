@@ -3,6 +3,7 @@ import type {
   RelayPortableThreadPlacement,
   RelayThreadVmCodexAuthSource,
   RelayCodexVmConnection,
+  ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
 import { act, useState, type ComponentProps, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
@@ -22,11 +23,17 @@ const fixture = vi.hoisted(() => ({
   candidates: [] as Record<string, unknown>[],
   auth: null as Record<string, unknown> | null,
   authSource: null as RelayThreadVmCodexAuthSource | null,
+  accountSelectionRequired: false,
+  authSourceError: null as string | null,
+  authReadError: null as string | null,
+  workerAuth: undefined as ThreadMoveWaitingForAuth | null | undefined,
+  authTransitionKey: "initial",
   codexConnection: null as RelayCodexVmConnection | null,
   queuePaused: false,
   replacementEnabled: true,
   readError: null as string | null,
   authAction: vi.fn(),
+  navigate: vi.fn(),
   signedIn: false,
   session: { accountId: "owner" },
   checkLocation: vi.fn(),
@@ -98,7 +105,8 @@ vi.mock("../../state/threads", () => ({
         source: fixture.authSource,
         connection: fixture.codexConnection,
         unsupported: false,
-        error: null,
+        accountSelectionRequired: fixture.accountSelectionRequired,
+        error: fixture.authSourceError,
       },
       isPending: false,
       error: null,
@@ -124,8 +132,10 @@ vi.mock("../../state/threads", () => ({
       accountId: "owner",
       error: fixture.readError,
       providerAuth: fixture.auth,
-      providerAuthError: null,
+      providerAuthError: fixture.authReadError,
       providerAuthPending: false,
+      workerAuth: fixture.workerAuth,
+      authTransitionKey: fixture.authTransitionKey,
       queuePaused: fixture.queuePaused,
       data: {
         candidates: fixture.candidates,
@@ -148,7 +158,7 @@ vi.mock("../../state/threads", () => ({
   },
 }));
 vi.mock("@tanstack/react-router", () => ({
-  useNavigate: () => vi.fn(),
+  useNavigate: () => fixture.navigate,
   useLocation: () => ({ state: null }),
 }));
 vi.mock("@t3tools/client-runtime/relay/portableThreadPresentation", () => ({
@@ -260,6 +270,7 @@ import {
   ThreadVmNotice,
 } from "./ThreadVmControls";
 import { CurrentThreadLocation, ThreadRunOnPicker } from "./ThreadMoveControls";
+import { ThreadMoveQueueItem } from "./ThreadMoveQueueItem";
 
 function deferred() {
   let resolve!: () => void;
@@ -316,6 +327,7 @@ beforeEach(() => {
   fixture.run.mockResolvedValue(true);
   fixture.backup.mockResolvedValue(AsyncResult.success(backup));
   fixture.authAction.mockResolvedValue(AsyncResult.success({}));
+  fixture.navigate.mockReset();
   fixture.signedIn = false;
   fixture.checkLocation.mockReset();
   fixture.checkLocation.mockResolvedValue(AsyncResult.success({}));
@@ -328,6 +340,11 @@ beforeEach(() => {
   fixture.candidates = [];
   fixture.auth = null;
   fixture.authSource = null;
+  fixture.accountSelectionRequired = false;
+  fixture.authSourceError = null;
+  fixture.authReadError = null;
+  fixture.workerAuth = undefined;
+  fixture.authTransitionKey = "initial";
   fixture.codexConnection = null;
   fixture.queuePaused = false;
   fixture.replacementEnabled = true;
@@ -575,6 +592,114 @@ describe("simplified VM controls", () => {
     expect(renderer!.root.findAllByProps({ "aria-label": "VM needs attention" })).toHaveLength(1);
   });
   it.each([
+    ["account_selection", "Choose a Codex account", "Choose account", undefined],
+    ["personal_sign_in", "Waiting for Codex sign-in", "Sign in to Codex", undefined],
+    ["organization_connection", "Connect organization Codex", "Connect Codex", undefined],
+    ["verification", "Checking Codex sign-in", null, undefined],
+    ["personal_sign_in", "Downloading files", null, null],
+    ["personal_sign_in", "Waiting for Codex sign-in", "Sign in to Codex", "personal_sign_in"],
+  ] as const)(
+    "presents %s as %s with one notice and the appropriate action (%s, %s)",
+    async (reason, label, action, workerAuth) => {
+      const binding = {
+        operationId: "move",
+        allocationId: "allocation",
+        environmentId: EnvironmentId.make("guest"),
+        generation: 3,
+        instanceId: "codex",
+      };
+      fixture.status = { allocation: null, setupPhase: "pending", pendingProviderAuth: binding };
+      fixture.workerAuth = workerAuth;
+      fixture.auth = {
+        ...binding,
+        requirement: "provider_unavailable",
+        auth: {
+          instanceId: "codex",
+          phase: "error",
+          flowId: null,
+          authorizationUrl: null,
+          expiresAt: null,
+          message: "Earlier Codex read failed",
+          interaction: null,
+        },
+      };
+      const placement: RelayPortableThreadPlacement = {
+        threadId: thread,
+        environmentId: env,
+        projectId: "project",
+        generation: 2,
+        organizationId: "org",
+        repositoryId: "repo",
+        ownerUserId: "owner",
+        operationId: "move",
+        moveProgress:
+          typeof workerAuth === "string"
+            ? []
+            : [
+                {
+                  threadId: thread,
+                  operationId: "move",
+                  environmentId: "guest",
+                  generation: 3,
+                  participant: "destination",
+                  attempt: 1,
+                  revision: 1,
+                  stage: "downloading",
+                  completedBytes: 0,
+                  totalBytes: null,
+                  completedArtifacts: 0,
+                  totalArtifacts: null,
+                  waitingForAuth: reason,
+                  updatedAt: "2026-10-30T09:00:00Z",
+                },
+              ],
+      };
+      fixture.location = {
+        placement,
+        recoveryRequested: false,
+        isPending: false,
+        movePending: true,
+        destination: null,
+        error: null,
+      };
+      const entry = {
+        kind: "move" as const,
+        state: "moving" as const,
+        messageId: MessageId.make("message"),
+        operationId: CommandId.make("move"),
+        revision: 1,
+        acceptedSequence: 1,
+        destination: { kind: "vm" as const },
+        createdAt: "2026-10-30T09:00:00Z",
+      };
+      const queue = { ...emptyThreadPromptQueue(), entries: [entry] };
+      await act(async () => {
+        renderer = create(
+          <ThreadVmControlsProvider environmentId={env} threadId={thread}>
+            <ThreadVmNotice queue={queue} />
+            <ThreadVmRecoveryControls hideRefresh queue={queue} />
+            <ThreadMoveQueueItem environmentId={env} threadId={thread} entry={entry} />
+          </ThreadVmControlsProvider>,
+        );
+      });
+      expect(JSON.stringify(renderer!.toJSON()).split(label)).toHaveLength(2);
+      expect(JSON.stringify(renderer!.toJSON())).not.toContain("Earlier Codex read failed");
+      expect(renderer!.root.findAllByProps({ "aria-label": "VM needs attention" })).toHaveLength(0);
+      if (action === null) {
+        expect(button("Sign in to Codex")).toBeUndefined();
+      } else {
+        const actions = renderer!.root
+          .findAllByType("button")
+          .filter((node) => node.children.join("") === action);
+        expect(actions).toHaveLength(1);
+        await act(async () => actions[0]!.props.onClick());
+        expect(dialogs()).toHaveLength(1);
+      }
+      expect(fixture.authAction).not.toHaveBeenCalled();
+      expect(fixture.run).not.toHaveBeenCalled();
+    },
+  );
+  it.each([
     [
       "restore",
       "Cancel restore",
@@ -676,6 +801,123 @@ describe("simplified VM controls", () => {
         action: { type: "start" },
       }),
     );
+  });
+  it("shows account selection as a normal step before offering provider actions", async () => {
+    fixture.local = true;
+    fixture.status = {
+      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      setupPhase: "running",
+    };
+    fixture.accountSelectionRequired = true;
+    await mount(true);
+    await act(async () => button("Sign in to Codex").props.onClick());
+    const dialog = dialogs()[0]!;
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Choose a Codex account");
+    expect(dialog.findAllByProps({ role: "alert" })).toHaveLength(0);
+    expect(dialogButton("Check sign-in status")).toBeUndefined();
+    expect(dialogButton("Sign in to Codex")).toBeUndefined();
+    expect(fixture.authAction).not.toHaveBeenCalled();
+    fixture.accountSelectionRequired = false;
+    fixture.authSource = { mode: "personal" };
+    fixture.auth = { requirement: "sign_in_required", auth: { phase: "idle", expiresAt: null } };
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogButton("Sign in to Codex")).toBeDefined();
+    await act(async () => dialogButton("Sign in to Codex").props.onClick());
+    expect(fixture.authAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: { type: "start" } }),
+    );
+  });
+  it("opens organization account setup without selecting an account or changing the move", async () => {
+    fixture.local = true;
+    fixture.status = {
+      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      setupPhase: "running",
+    };
+    fixture.accountSelectionRequired = true;
+    await mount(true);
+    await act(async () => button("Sign in to Codex").props.onClick());
+    await act(async () => dialogButton("Open organization settings").props.onClick());
+    expect(dialogs()).toHaveLength(0);
+    expect(fixture.navigate).toHaveBeenCalledWith({
+      to: "/settings/organization",
+      hash: "organization-codex-vms",
+      hashScrollIntoView: false,
+    });
+    expect(fixture.authAction).not.toHaveBeenCalled();
+    expect(fixture.run).not.toHaveBeenCalled();
+  });
+  it("shows each real sign-in error once while keeping different failures visible", async () => {
+    fixture.local = true;
+    fixture.status = {
+      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      setupPhase: "running",
+    };
+    fixture.authSourceError = "Could not reach the relay.";
+    fixture.authReadError = "Could not reach the relay.";
+    await mount(true);
+    await act(async () => button("Sign in to Codex").props.onClick());
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(1);
+    fixture.authSourceError = "Could not read the organization account.";
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogs()[0]!.findAllByProps({ role: "alert" })).toHaveLength(2);
+  });
+  it.each([false, true])(
+    "discards an earlier sign-in action failure when worker preparation resumes (late reply: %s)",
+    async (lateReply) => {
+      fixture.local = true;
+      fixture.status = {
+        pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+        setupPhase: "running",
+      };
+      fixture.authSource = { mode: "personal" };
+      fixture.auth = { requirement: "sign_in_required", auth: { phase: "idle", expiresAt: null } };
+      fixture.workerAuth = "personal_sign_in";
+      const pending = deferred();
+      fixture.authAction.mockImplementationOnce(async () => {
+        if (lateReply) await pending.promise;
+        return AsyncResult.fail(new Error("Earlier sign-in request failed."));
+      });
+      await mount(true);
+      await act(async () => button("Sign in to Codex").props.onClick());
+      await act(async () => dialogButton("Sign in to Codex").props.onClick());
+      if (!lateReply)
+        expect(JSON.stringify(renderer!.toJSON())).toContain("Earlier sign-in request failed.");
+      fixture.workerAuth = null;
+      fixture.authTransitionKey = "new-work-attempt";
+      fixture.auth = null;
+      await act(async () => renderer!.update(view(true)));
+      await act(async () => pending.resolve());
+      expect(dialogs()).toHaveLength(1);
+      expect(JSON.stringify(renderer!.toJSON())).not.toContain("Earlier sign-in request failed.");
+      expect(fixture.authAction).toHaveBeenCalledTimes(1);
+    },
+  );
+  it("hides an old personal challenge when an account choice is required", async () => {
+    fixture.local = true;
+    fixture.status = {
+      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      setupPhase: "running",
+    };
+    fixture.accountSelectionRequired = true;
+    fixture.auth = {
+      requirement: "sign_in_required",
+      auth: {
+        phase: "waiting",
+        expiresAt: null,
+        flowId: "old-flow",
+        authorizationUrl: "https://chatgpt.com/activate",
+        interaction: {
+          type: "deviceCode",
+          url: "https://chatgpt.com/activate",
+          userCode: "OLD-CODE",
+        },
+      },
+    };
+    await mount(true);
+    await act(async () => button("Finish Codex sign-in").props.onClick());
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain("OLD-CODE");
+    expect(dialogButton("Open Codex sign-in page")).toBeUndefined();
+    expect(dialogButton("Cancel sign-in")).toBeUndefined();
   });
   it("lets a managed VM with a failed probe reopen account selection without offering personal device actions", async () => {
     fixture.status = {

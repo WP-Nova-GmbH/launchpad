@@ -2,7 +2,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   ThreadAttachmentCheckpointArchiveManifest,
   ThreadAttachmentManifest,
-  ThreadTransferChunkManifest,
+  ThreadTransferArtifactManifest,
   THREAD_ATTACHMENT_CHECKPOINT_MAX_FILES,
   THREAD_ATTACHMENT_CHECKPOINT_MAX_BYTES,
 } from "@t3tools/contracts/relay";
@@ -34,7 +34,7 @@ const encodeHeader = Schema.encodeEffect(
   Schema.fromJsonString(ThreadAttachmentCheckpointArchiveManifest),
 );
 const encodeAttachments = Schema.encodeSync(Schema.fromJsonString(ThreadAttachmentManifest));
-const decodeChunks = Schema.decodeEffect(ThreadTransferChunkManifest);
+const decodeChunks = Schema.decodeUnknownEffect(ThreadTransferArtifactManifest);
 const fail = (message: string) => new ThreadAttachmentCheckpointError({ message });
 const hash = (bytes: Uint8Array) => NodeCrypto.createHash("sha256").update(bytes).digest("hex");
 type Header = ThreadAttachmentCheckpointArchiveManifest;

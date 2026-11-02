@@ -4,6 +4,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type { ThreadMove } from "./ThreadPlacementStore.ts";
+import { makeThreadMoveParticipantStatus } from "./ThreadMoveParticipantStatus.ts";
 
 const decode = Schema.decodeUnknownEffect(Schema.Array(ThreadMoveProgressSnapshot));
 const stages = [
@@ -36,6 +37,14 @@ export function makeThreadMoveProgressStore(sql: PgClient) {
       input.environmentId === move.destinationEnvironmentId &&
       input.generation === move.expectedGeneration + 1;
     if (!source && !destination) return;
+    if (source && input.waitingForAuth != null) return;
+    if (
+      !(yield* makeThreadMoveParticipantStatus(sql).acceptsProgress({
+        ...input,
+        operationId: move.operationId,
+      }))
+    )
+      return;
     if (
       (input.totalBytes !== null && input.completedBytes > input.totalBytes) ||
       (input.totalArtifacts !== null && input.completedArtifacts > input.totalArtifacts)

@@ -4,7 +4,7 @@ import {
   OrchestrationCommandReceipt,
   ThreadHistoryArchiveManifest,
 } from "@t3tools/contracts/threadTransfer";
-import type { ThreadTransferChunkManifest } from "@t3tools/contracts/relay";
+import type { NormalizedThreadTransferManifest } from "@t3tools/shared/threadTransferManifest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -13,7 +13,7 @@ const decodeEvent = Schema.decodeEffect(Schema.fromJsonString(OrchestrationEvent
 const decodeReceipt = Schema.decodeEffect(Schema.fromJsonString(OrchestrationCommandReceipt));
 const encodeEvent = Schema.encodeSync(Schema.fromJsonString(OrchestrationEvent));
 const encodeHistory = Schema.encodeSync(Schema.fromJsonString(ThreadHistoryArchiveManifest));
-type File = ThreadTransferChunkManifest["files"][number];
+type File = NormalizedThreadTransferManifest["files"][number];
 
 /** Validate complete frozen recovery history against the independent relay mirror.
  * Environment-global event sequences may change on import; stable event contents and cursor order may not. */

@@ -435,6 +435,332 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         ),
     );
 
+    it.effect(
+      "supersedes only an older failed participant attempt and retains its diagnostic",
+      () =>
+        run((store, sql) =>
+          Effect.gen(function* () {
+            const { enrollment, move, owner, manifest } = fixture();
+            yield* store.enroll(enrollment);
+            yield* store.beginMove(move);
+            yield* makeThreadJournalStore(sql).confirmThrough({
+              ...owner,
+              sourceSequence: manifest.sourceCursor,
+            });
+            yield* store.sourceFrozen({ ...move, ...owner, ...manifest });
+            const destination = { ...move, environmentId: "vm", generation: 2 };
+            yield* store.reportFailure({
+              ...destination,
+              attempt: 26,
+              detail: "Earlier Codex failure",
+            });
+            const progress = makeThreadMoveProgressStore(sql);
+            const report = {
+              ...destination,
+              attempt: 27,
+              revision: 1,
+              stage: "installing" as const,
+              completedBytes: 0,
+              totalBytes: null,
+              completedArtifacts: 0,
+              totalArtifacts: null,
+            };
+            yield* progress.report(yield* store.getMove(move), report);
+            expect((yield* store.getMove(move)).failureDetail).toBeNull();
+            expect((yield* store.getMove(move)).participantStates).toMatchObject([
+              {
+                environmentId: "vm",
+                generation: 2,
+                failure: { attempt: 26, detail: "Earlier Codex failure" },
+              },
+            ]);
+            yield* store.reportFailure({
+              ...destination,
+              attempt: 26,
+              detail: "Delayed old failure",
+            });
+            expect((yield* store.getMove(move)).failureDetail).toBeNull();
+            yield* store.reportFailure({
+              ...destination,
+              attempt: 27,
+              detail: "Current install failure",
+            });
+            yield* store.reportFailure({
+              ...destination,
+              attempt: 27,
+              detail: "Duplicate changed detail",
+            });
+            yield* progress.report(yield* store.getMove(move), { ...report, revision: 2 });
+            expect((yield* store.getMove(move)).failureDetail).toBe("Current install failure");
+            expect(yield* progress.read(move.operationId)).toMatchObject([
+              { attempt: 27, revision: 1 },
+            ]);
+            yield* progress.report(yield* store.getMove(move), { ...report, attempt: 28 });
+            expect((yield* store.getMove(move)).failureDetail).toBeNull();
+            expect((yield* store.get(move.threadId))?.environmentId).toBe("local");
+          }),
+        ),
+    );
+
+    it.effect("fences ready replays and blocks direct commit on a correlated current failure", () =>
+      run((store, sql) =>
+        Effect.gen(function* () {
+          const { enrollment, move, owner, manifest } = fixture();
+          yield* store.enroll(enrollment);
+          yield* store.beginMove(move);
+          yield* makeThreadJournalStore(sql).confirmThrough({
+            ...owner,
+            sourceSequence: manifest.sourceCursor,
+          });
+          yield* store.sourceFrozen({ ...move, ...owner, ...manifest, attempt: 1 });
+          yield* publishMoveFixture(sql, move);
+          const destination = { ...move, environmentId: "vm", generation: 2 };
+          yield* store.destinationReady({ ...destination, ...manifest, attempt: 2 });
+          yield* store.reportFailure({
+            ...destination,
+            attempt: 3,
+            detail: "Current commit failure",
+          });
+          yield* store.destinationReady({ ...destination, ...manifest, attempt: 2 });
+          expect((yield* store.getMove(move)).failureDetail).toBe("Current commit failure");
+          expect(yield* Effect.flip(store.commitMove(move))).toMatchObject({
+            _tag: "ThreadPlacementConflict",
+          });
+          const progress = makeThreadMoveProgressStore(sql);
+          const report = {
+            ...destination,
+            attempt: 4,
+            revision: 1,
+            stage: "activating" as const,
+            completedBytes: 0,
+            totalBytes: null,
+            completedArtifacts: 0,
+            totalArtifacts: null,
+          };
+          yield* progress.report(yield* store.getMove(move), report);
+          yield* store.destinationReady({ ...destination, ...manifest, attempt: 4 });
+          yield* store.reportFailure({
+            ...destination,
+            attempt: 2,
+            detail: "Delayed pre-ready failure",
+          });
+          expect((yield* store.getMove(move)).failureDetail).toBeNull();
+          yield* store.reportFailure({
+            ...destination,
+            attempt: 4,
+            detail: "Failure after readiness",
+          });
+          yield* store.destinationReady({ ...destination, ...manifest, attempt: 4 });
+          expect((yield* store.getMove(move)).failureDetail).toBe("Failure after readiness");
+          expect(yield* Effect.flip(store.commitMove(move))).toMatchObject({
+            _tag: "ThreadPlacementConflict",
+          });
+          yield* progress.report(yield* store.getMove(move), { ...report, attempt: 5 });
+          expect((yield* store.commitMove(move)).phase).toBe("committed");
+          expect(
+            yield* Effect.flip(
+              store.reportFailure({ ...destination, attempt: 6, detail: "Too late" }),
+            ),
+          ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+        }),
+      ),
+    );
+
+    it.effect("retains resolution tombstones and isolates the two participant attempts", () =>
+      run((store, sql) =>
+        Effect.gen(function* () {
+          const { enrollment, move, owner, manifest } = fixture();
+          yield* store.enroll(enrollment);
+          yield* store.beginMove(move);
+          yield* store.reportFailure({
+            ...move,
+            ...owner,
+            attempt: 3,
+            detail: "Source failed before progress",
+          });
+          yield* makeThreadJournalStore(sql).confirmThrough({
+            ...owner,
+            sourceSequence: manifest.sourceCursor,
+          });
+          yield* store.sourceFrozen({ ...move, ...owner, ...manifest, attempt: 4 });
+          yield* store.reportFailure({
+            ...move,
+            ...owner,
+            attempt: 2,
+            detail: "Late source failure",
+          });
+          expect((yield* store.getMove(move)).failureDetail).toBeNull();
+          yield* store.reportFailure({
+            ...move,
+            ...owner,
+            attempt: 4,
+            detail: "Failure after freeze",
+          });
+          yield* store.sourceFrozen({ ...move, ...owner, ...manifest, attempt: 4 });
+          expect((yield* store.getMove(move)).failureDetail).toBe("Failure after freeze");
+          yield* store.reportFailure({
+            ...move,
+            environmentId: "vm",
+            generation: 2,
+            attempt: 1,
+            detail: "Destination failure",
+          });
+          const progress = makeThreadMoveProgressStore(sql);
+          yield* progress.report(yield* store.getMove(move), {
+            ...owner,
+            attempt: 5,
+            revision: 1,
+            stage: "uploading",
+            completedBytes: 1,
+            totalBytes: 1,
+            completedArtifacts: 1,
+            totalArtifacts: 1,
+          });
+          expect((yield* store.getMove(move)).failureDetail).toBe("Destination failure");
+          expect((yield* store.getMove(move)).participantStates).toHaveLength(2);
+          expect((yield* store.getMove(move)).participantStates).toContainEqual(
+            expect.objectContaining({ environmentId: "local", resolvedBeforeAttempt: 4 }),
+          );
+        }),
+      ),
+    );
+
+    it.effect("keeps untagged milestone clearing separate from correlated failures", () =>
+      run((store, sql) =>
+        Effect.gen(function* () {
+          const { enrollment, move, owner, manifest } = fixture();
+          yield* store.enroll(enrollment);
+          yield* store.beginMove(move);
+          yield* makeThreadJournalStore(sql).confirmThrough({
+            ...owner,
+            sourceSequence: manifest.sourceCursor,
+          });
+          yield* store.sourceFrozen({ ...move, ...owner, ...manifest });
+          const destination = { ...move, environmentId: "vm", generation: 2 };
+          yield* store.reportFailure({ ...destination, detail: "Legacy failure" });
+          yield* store.reportFailure({ ...destination, attempt: 2, detail: "Correlated failure" });
+          expect((yield* store.getMove(move)).failureDetail).toBe("Legacy failure");
+          yield* store.destinationReady({ ...destination, ...manifest });
+          expect((yield* store.getMove(move)).failureDetail).toBe("Correlated failure");
+          yield* store.destinationReady({ ...destination, ...manifest, attempt: 3 });
+          expect((yield* store.getMove(move)).failureDetail).toBeNull();
+        }),
+      ),
+    );
+
+    it.effect("accepts stable destination auth waits but rejects source auth-wait reports", () =>
+      run((store, sql) =>
+        Effect.gen(function* () {
+          const { enrollment, move } = fixture();
+          yield* store.enroll(enrollment);
+          const journal = yield* store.beginMove(move);
+          const progress = makeThreadMoveProgressStore(sql);
+          const report = {
+            environmentId: "vm",
+            generation: 2,
+            attempt: 1,
+            revision: 1,
+            stage: "downloading" as const,
+            completedBytes: 0,
+            totalBytes: null,
+            completedArtifacts: 0,
+            totalArtifacts: null,
+            waitingForAuth: "account_selection" as const,
+          };
+          yield* progress.report(journal, report);
+          yield* progress.report(journal, {
+            ...report,
+            revision: 2,
+            waitingForAuth: "personal_sign_in",
+          });
+          expect(yield* progress.read(move.operationId)).toMatchObject([
+            { attempt: 1, revision: 2, waitingForAuth: "personal_sign_in" },
+          ]);
+          yield* progress.report(journal, {
+            ...report,
+            environmentId: "local",
+            generation: 1,
+            stage: "capturing",
+          });
+          expect(yield* progress.read(move.operationId)).toHaveLength(1);
+          yield* progress.report(journal, { ...report, revision: 3, waitingForAuth: null });
+          expect(yield* progress.read(move.operationId)).toMatchObject([
+            { revision: 3, waitingForAuth: null },
+          ]);
+          const cancelling = yield* store.requestAbort(move);
+          yield* progress.report(cancelling, { ...report, attempt: 2 });
+          expect(yield* progress.read(move.operationId)).toMatchObject([
+            { attempt: 1, revision: 3 },
+          ]);
+          expect(
+            yield* Effect.flip(
+              store.reportFailure({
+                ...move,
+                environmentId: "vm",
+                generation: 2,
+                attempt: 2,
+                detail: "Late cancellation error",
+              }),
+            ),
+          ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+        }),
+      ),
+    );
+
+    it.effect("projects the same correlated failures in private placement and move reads", () =>
+      run((store, sql) =>
+        Effect.gen(function* () {
+          const { enrollment, move, owner, manifest } = fixture();
+          const userId = NodeCrypto.randomUUID();
+          yield* sql`INSERT INTO relay_organizations(organization_id,name,created_at,updated_at)
+            VALUES('org','Tests','now','now') ON CONFLICT DO NOTHING`;
+          yield* sql`INSERT INTO relay_repositories(repository_id,organization_id,name,created_at,updated_at)
+            VALUES('repo','org','Tests','now','now') ON CONFLICT DO NOTHING`;
+          yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at)
+            VALUES('org',${userId},'admin','now','now')`;
+          yield* store.enroll({ ...enrollment, ownerUserId: userId });
+          yield* store.beginMove({ ...move, actorUserId: userId });
+          yield* makeThreadJournalStore(sql).confirmThrough({
+            ...owner,
+            sourceSequence: manifest.sourceCursor,
+          });
+          yield* store.sourceFrozen({ ...move, ...owner, ...manifest, attempt: 1 });
+          const destination = { ...move, environmentId: "vm", generation: 2 };
+          yield* store.reportFailure({ ...destination, attempt: 2, detail: "Earlier failure" });
+          const db = yield* PgDrizzle.makeWithDefaults().pipe(
+            Effect.provideService(PgClient.PgClient, sql),
+          );
+          const read = (reader: string) =>
+            getPortableThreadPlacement(move.threadId).pipe(
+              Effect.provideService(RelayDb, db),
+              Effect.provideService(RelayClientPrincipal, { userId: reader, token: "test" }),
+            );
+          expect(yield* read(userId)).toMatchObject({
+            moveFailureDetail: "Earlier failure",
+            moveFailures: [{ environmentId: "vm", generation: 2, attempt: 2, active: true }],
+          });
+          yield* makeThreadMoveProgressStore(sql).report(yield* store.getMove(move), {
+            ...destination,
+            attempt: 3,
+            revision: 1,
+            stage: "downloading",
+            waitingForAuth: "account_selection",
+            completedBytes: 0,
+            totalBytes: null,
+            completedArtifacts: 0,
+            totalArtifacts: null,
+          });
+          expect((yield* store.getMove(move)).failureDetail).toBeNull();
+          expect(yield* read(userId)).toMatchObject({
+            moveFailureDetail: null,
+            moveFailures: [{ attempt: 2, active: false }],
+            moveProgress: [{ attempt: 3, waitingForAuth: "account_selection" }],
+          });
+          expect((yield* Effect.flip(read("foreign-user")))._tag).toBe("RelayTenancyNotFoundError");
+        }),
+      ),
+    );
+
     it.effect("retains the first move failure without granting destination ownership", () =>
       run((store, sql) =>
         Effect.gen(function* () {

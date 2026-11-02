@@ -140,6 +140,29 @@ it.effect("fails closed for an installed VM when source discovery is unavailable
   );
 });
 
+for (const [reason, expected] of [
+  ["source_unavailable", "account_selection_required"],
+  ["not_connected", "reconnect_required"],
+  ["invalid_grant", "reconnect_required"],
+  ["uncertain", "reconnect_required"],
+  ["configuration", "configuration"],
+  ["access_denied", "access_denied"],
+] as const)
+  it.effect(`preserves the typed ${reason} account boundary`, () => {
+    const f = fixture();
+    f.response({ _tag: "CodexVmConnectionError", reason }, 409);
+    return f.provide(
+      Effect.gen(function* () {
+        const source = yield* makeThreadVmCodexAuthContext;
+        expect((yield* source.current.pipe(Effect.flip)).reason).toBe(expected);
+        expect((yield* source.refresh.pipe(Effect.flip)).reason).toBe(expected);
+        f.response({ mode: "personal" });
+        expect(yield* source.refresh).toBe(true);
+        expect(yield* source.current).toBeNull();
+      }),
+    );
+  });
+
 it.effect("checks a managed connection before each new operation without fetching tokens", () => {
   const f = fixture();
   return f.provide(

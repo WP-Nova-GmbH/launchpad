@@ -5,6 +5,7 @@ import {
   MessageId,
   ThreadId,
   ProjectId,
+  ProviderInstanceId,
   type ThreadMoveQueueEntry,
 } from "@t3tools/contracts";
 import type { RelayPortableThreadPlacement, RelayThreadVmStatus } from "@t3tools/contracts/relay";
@@ -67,6 +68,103 @@ const status: RelayThreadVmStatus = {
 };
 
 describe("move queue presentation", () => {
+  it("shows worker account waits neutrally and returns to real progress without stale auth errors", () => {
+    const pending = {
+      ...status,
+      pendingProviderAuth: {
+        operationId: "move",
+        allocationId: "vm",
+        environmentId: EnvironmentId.make("vm"),
+        generation: 3,
+        instanceId: "codex" as const,
+      },
+    };
+    const progress = {
+      ...placement.moveProgress![0]!,
+      environmentId: "vm",
+      generation: 3,
+      participant: "destination" as const,
+      stage: "downloading" as const,
+      completedBytes: 0,
+      totalBytes: null,
+    };
+    for (const [waitingForAuth, label] of [
+      ["account_selection", "Choose a Codex account"],
+      ["personal_sign_in", "Waiting for Codex sign-in"],
+      ["organization_connection", "Connect organization Codex"],
+      ["verification", "Checking Codex sign-in"],
+    ] as const) {
+      expect(
+        threadMoveQueuePresentation({
+          entry,
+          placement: { ...placement, moveProgress: [{ ...progress, waitingForAuth }] },
+          status: pending,
+        }),
+      ).toMatchObject({ label, tone: "neutral", step: 1, ownsNotice: true });
+    }
+    expect(
+      threadMoveQueuePresentation({
+        entry,
+        placement: { ...placement, moveProgress: [{ ...progress, waitingForAuth: null }] },
+        status: pending,
+        providerAuth: {
+          ...pending.pendingProviderAuth,
+          requirement: "provider_unavailable",
+          auth: {
+            instanceId: ProviderInstanceId.make("codex"),
+            phase: "failed",
+            flowId: null,
+            authorizationUrl: null,
+            expiresAt: null,
+            message: "Earlier auth error",
+            interaction: null,
+          },
+        },
+      }),
+    ).toMatchObject({ label: "Downloading files", tone: "neutral", step: 1 });
+    expect(
+      threadMoveQueuePresentation({
+        entry,
+        placement: {
+          ...placement,
+          moveProgress: [{ ...progress, waitingForAuth: "personal_sign_in" }],
+        },
+        status: pending,
+        workerAuth: null,
+      }),
+    ).toMatchObject({ label: "Downloading files", tone: "neutral", step: 1 });
+  });
+
+  it("keeps only bounded inactive diagnostics for the exact running operation", () => {
+    const failure = {
+      environmentId: "mac",
+      generation: 2,
+      attempt: 1,
+      detail: "Earlier upload failed",
+      reportedAt: "2026-10-26T09:00:00Z",
+      active: false,
+    };
+    const withErrors = { ...placement, moveFailures: [failure, { ...failure, active: true }] };
+    expect(threadMoveQueuePresentation({ entry, placement: withErrors })?.previousErrors).toEqual([
+      failure,
+    ]);
+    expect(
+      threadMoveQueuePresentation({
+        entry,
+        placement: { ...withErrors, operationId: "another" },
+      })?.previousErrors,
+    ).toEqual([]);
+    expect(
+      threadMoveQueuePresentation({ entry: { ...entry, state: "pending" }, placement: withErrors })
+        ?.previousErrors,
+    ).toEqual([]);
+    expect(
+      threadMoveQueuePresentation({
+        entry,
+        placement: { ...withErrors, moveFailureDetail: "Current preparation failed" },
+      }),
+    ).toMatchObject({ label: "Move needs attention", detail: "Current preparation failed" });
+  });
   it("does not substitute a generic operation ID for restore, reset or final-save controls", () => {
     for (const lifecycle of [
       {

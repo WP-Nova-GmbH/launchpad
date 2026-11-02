@@ -16,6 +16,7 @@ import type {
   RelayThreadVmProviderAuth,
   RelayThreadVmProviderAuthBinding,
   RelayThreadVmCodexAuthSource,
+  RelayPortableThreadPlacement,
 } from "@t3tools/contracts/relay";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -39,6 +40,7 @@ import type { ThreadMoveSubmissionStorage } from "./threadMoveSubmission.ts";
 import { layer as tenancyLayer } from "./managedRelayTenancy.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import { managedRelaySessionAtom } from "./managedRelayState.ts";
+import { rememberPortableThreadPlacement } from "./portableThreadPresentation.ts";
 
 const environmentId = EnvironmentId.make("retired-environment"),
   threadId = ThreadId.make("vm-thread"),
@@ -1675,6 +1677,477 @@ describe("completed thread location handoff", () => {
 });
 
 describe("owner-bound pending VM authentication", () => {
+  it.effect(
+    "refreshes account controls on a worker transition and rejects a late source failure",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>(),
+            returned = Promise.withResolvers<void>();
+          let reads = 0;
+          const h = yield* harness(async (url) => {
+            const path = new URL(String(url)).pathname;
+            if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+            if (path.endsWith("codex-vm-connection"))
+              return Response.json(managedSource.connection);
+            if (!path.endsWith("provider-auth/source"))
+              return Response.json({ ...waitingAuth, auth: idleAuth });
+            if (++reads === 2) {
+              requested.resolve();
+              await release.promise;
+              returned.resolve();
+              return new Response(null, { status: 503 });
+            }
+            return Response.json({ mode: "personal" });
+          });
+          const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+            query = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          expect(h.registry.get(view).data?.source).toEqual({ mode: "personal" });
+          const placement: RelayPortableThreadPlacement = {
+            ...currentPlacement,
+            operationId: authBinding.operationId,
+            moveProgress: [
+              {
+                ...authBinding,
+                threadId,
+                participant: "destination",
+                attempt: 2,
+                revision: 1,
+                stage: "downloading",
+                completedBytes: 0,
+                totalBytes: null,
+                completedArtifacts: 0,
+                totalArtifacts: null,
+                waitingForAuth: "organization_connection",
+                updatedAt: at,
+              },
+            ],
+          };
+          const session = h.registry.get(managedRelaySessionAtom)!;
+          rememberPortableThreadPlacement(h.registry, session, relayUrl, placement);
+          expect(h.registry.get(view).data).toBeNull();
+          yield* Effect.promise(() => requested.promise);
+          rememberPortableThreadPlacement(h.registry, session, relayUrl, {
+            ...placement,
+            moveProgress: placement.moveProgress!.map((p) => ({
+              ...p,
+              attempt: 3,
+              waitingForAuth: null,
+            })),
+          });
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          release.resolve();
+          yield* Effect.promise(() => returned.promise);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          expect(h.registry.get(view).error).toBeNull();
+          expect(h.registry.get(view).data).toMatchObject({
+            source: { mode: "personal" },
+            error: null,
+          });
+          expect(reads).toBe(3);
+        }),
+      ),
+  );
+  it.effect("fences retained and late auth failures while preserving a new current failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>(),
+          returned = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* harness(async (url) => {
+          if (new URL(String(url)).pathname.endsWith("vm-status"))
+            return Response.json(pendingVmStatus);
+          const read = ++reads;
+          if (read === 2) {
+            requested.resolve();
+            await release.promise;
+            returned.resolve();
+          }
+          return read === 3
+            ? Response.json({ ...waitingAuth, requirement: "authenticated", auth: idleAuth })
+            : new Response(null, { status: 503 });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          query = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+          Effect.result,
+        );
+        expect(h.registry.get(view)?.providerAuthError).not.toBeNull();
+        const placement: RelayPortableThreadPlacement = {
+          ...currentPlacement,
+          operationId: authBinding.operationId,
+          moveProgress: [
+            {
+              ...authBinding,
+              threadId,
+              participant: "destination",
+              attempt: 2,
+              revision: 1,
+              stage: "downloading",
+              completedBytes: 0,
+              totalBytes: null,
+              completedArtifacts: 0,
+              totalArtifacts: null,
+              waitingForAuth: "personal_sign_in",
+              updatedAt: at,
+            },
+          ],
+        };
+        const session = h.registry.get(managedRelaySessionAtom)!;
+        rememberPortableThreadPlacement(h.registry, session, relayUrl, placement);
+        expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        yield* Effect.promise(() => requested.promise);
+        rememberPortableThreadPlacement(h.registry, session, relayUrl, {
+          ...placement,
+          moveProgress: placement.moveProgress!.map((p) => ({
+            ...p,
+            attempt: 3,
+            waitingForAuth: null,
+          })),
+        });
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        release.resolve();
+        yield* Effect.promise(() => returned.promise);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.requirement).toBe("authenticated");
+        expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        h.registry.refresh(query);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+          Effect.result,
+        );
+        expect(h.registry.get(view)?.providerAuthError).not.toBeNull();
+      }),
+    ),
+  );
+  for (const outcome of [
+    "completed",
+    "completed_lost_reply",
+    "cancelled",
+    "different_environment",
+    "different_generation",
+    "replacement",
+  ] as const)
+    it.effect(`resolves a sign-in reply racing with ${outcome} from exact placement proof`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          let pending = true,
+            writes = 0;
+          const completedPlacement = {
+            ...currentPlacement,
+            environmentId:
+              outcome === "cancelled"
+                ? environmentId
+                : outcome === "different_environment"
+                  ? "other-vm"
+                  : authBinding.environmentId,
+            generation: outcome === "cancelled" ? 1 : outcome === "different_generation" ? 3 : 2,
+            operationId: null,
+          };
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            if (path.endsWith("vm-status"))
+              return Response.json({
+                ...pendingVmStatus,
+                pendingProviderAuth: pending
+                  ? authBinding
+                  : outcome === "replacement"
+                    ? { ...authBinding, operationId: "next-move", allocationId: "next-vm" }
+                    : undefined,
+              });
+            if (path.endsWith("/placement")) return Response.json(completedPlacement);
+            if (request.method === "POST") {
+              writes++;
+              requested.resolve();
+              await release.promise;
+              if (outcome === "completed_lost_reply")
+                throw new Error("Sign-in reply lost after completion");
+            }
+            return Response.json({ ...waitingAuth, requirement: "authenticated", auth: idleAuth });
+          });
+          yield* AtomRegistry.mount(h.registry, h.query);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          const action = yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              environmentId,
+              threadId,
+              accountId: "owner",
+              binding: authBinding,
+              action: { type: "start" },
+            }),
+          ).pipe(Effect.forkScoped);
+          yield* Effect.promise(() => requested.promise);
+          pending = false;
+          h.registry.refresh(h.query);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          release.resolve();
+          expect((yield* Fiber.join(action))._tag).toBe(
+            outcome.startsWith("completed") ? "Success" : "Failure",
+          );
+          expect(writes).toBe(1);
+        }),
+      ),
+    );
+  for (const cached of ["authenticated", "provider_unavailable"] as const)
+    it.effect(
+      `fences cached ${cached} auth on an accepted worker transition with the dialog closed`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const requested = Promise.withResolvers<void>(),
+              release = Promise.withResolvers<void>();
+            let reads = 0;
+            const paths: string[] = [];
+            const h = yield* harness(async (url) => {
+              const path = new URL(String(url)).pathname;
+              paths.push(path);
+              if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+              reads++;
+              if (reads === 2) {
+                requested.resolve();
+                await release.promise;
+              }
+              return Response.json({
+                ...waitingAuth,
+                requirement: reads === 1 ? cached : "authenticated",
+                auth: { ...idleAuth, message: reads === 1 ? "Earlier provider failure" : null },
+              });
+            });
+            const view = h.controls.viewAtom(environmentId, threadId),
+              query = h.controls.providerAuthQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, view);
+            yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view)?.providerAuth?.requirement).toBe(cached);
+            const progress = {
+              operationId: authBinding.operationId,
+              threadId,
+              environmentId: authBinding.environmentId,
+              generation: authBinding.generation,
+              participant: "destination" as const,
+              attempt: 2,
+              revision: 1,
+              stage: "downloading" as const,
+              completedBytes: 0,
+              totalBytes: null,
+              completedArtifacts: 0,
+              totalArtifacts: null,
+              waitingForAuth: cached === "authenticated" ? ("personal_sign_in" as const) : null,
+              updatedAt: at,
+            };
+            const placement: RelayPortableThreadPlacement = {
+              ...currentPlacement,
+              operationId: authBinding.operationId,
+              moveProgress: [progress],
+            };
+            const session = h.registry.get(managedRelaySessionAtom)!;
+            rememberPortableThreadPlacement(h.registry, session, relayUrl, placement);
+            expect(h.registry.get(view)?.providerAuth).toBeNull();
+            expect(h.registry.get(view)?.providerAuthError).toBeNull();
+            yield* Effect.promise(() => requested.promise);
+            expect(h.registry.get(view)?.workerAuth).toBe(progress.waitingForAuth);
+            release.resolve();
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view)?.providerAuth?.requirement).toBe("authenticated");
+            rememberPortableThreadPlacement(h.registry, session, relayUrl, {
+              ...placement,
+              moveProgress: [{ ...progress, revision: 2, completedBytes: 1024 }],
+            });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(reads).toBe(2);
+            rememberPortableThreadPlacement(h.registry, session, relayUrl, {
+              ...placement,
+              moveProgress: undefined,
+            });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view)?.workerAuth).toBe(progress.waitingForAuth);
+            expect(reads).toBe(2);
+            expect(paths).not.toContain(`/v1/threads/${threadId}/provider-auth/source`);
+          }),
+        ),
+    );
+  it.effect("asks for an explicit account without errors before restoring a fresh VM sign-in", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let selected = false;
+        const writes: unknown[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init),
+            path = new URL(request.url).pathname;
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path.endsWith("codex-vm-connection"))
+            return Response.json(
+              managedSource.mode === "organization" ? managedSource.connection : null,
+            );
+          if (path.endsWith("provider-auth/source") && request.method === "PUT") {
+            writes.push(await request.json());
+            selected = true;
+            return Response.json(managedSource);
+          }
+          if (!selected)
+            return Response.json(
+              { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+              { status: 409 },
+            );
+          return Response.json(
+            path.endsWith("provider-auth/source")
+              ? managedSource
+              : {
+                  ...waitingAuth,
+                  auth: idleAuth,
+                  authSource: managedSource,
+                  requirement: "authenticated",
+                },
+          );
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+          sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.mount(h.registry, sourceView);
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(sourceView).data).toMatchObject({
+          accountSelectionRequired: true,
+          source: null,
+          connection: { status: "connected", connectionId: "org-codex" },
+          error: null,
+        });
+        expect(
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true }),
+        ).toBeNull();
+        expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        expect(writes).toEqual([]);
+        const result = yield* Effect.promise(() =>
+          h.controls.providerAuthAction.run(h.registry, {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            binding: authBinding,
+            action: {
+              type: "select_source",
+              source: { mode: "organization", connectionId: "org-codex" },
+            },
+          }),
+        );
+        expect(result._tag).toBe("Success");
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(sourceView).data).toMatchObject({
+          accountSelectionRequired: false,
+          source: managedSource,
+          error: null,
+        });
+        expect(h.registry.get(view)?.providerAuth?.requirement).toBe("authenticated");
+        expect(writes).toEqual([
+          {
+            operationId: authBinding.operationId,
+            allocationId: authBinding.allocationId,
+            generation: authBinding.generation,
+            source: { mode: "organization", connectionId: "org-codex" },
+          },
+        ]);
+      }),
+    ),
+  );
+  it.effect("keeps organization lookup failures visible while an account choice is required", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path.endsWith("codex-vm-connection")) return new Response(null, { status: 503 });
+          return Response.json(
+            { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+            { status: 409 },
+          );
+        });
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(h.registry.get(view).data).toMatchObject({
+          accountSelectionRequired: true,
+          source: null,
+        });
+        expect(h.registry.get(view).data?.error).toContain("read Codex VM connection");
+      }),
+    ),
+  );
+  it.effect("does not treat an unavailable account without a pending binding as a choice", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status")) return Response.json(status);
+          return Response.json(
+            { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+            { status: 409 },
+          );
+        });
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(h.registry.get(view).data).toMatchObject({ accountSelectionRequired: false });
+        expect(h.registry.get(view).data?.error).toContain("account selection is unavailable");
+      }),
+    ),
+  );
+  it.effect("preserves genuine Codex failures instead of presenting an account choice", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path.endsWith("codex-vm-connection"))
+            return Response.json(
+              managedSource.mode === "organization" ? managedSource.connection : null,
+            );
+          return Response.json(
+            { _tag: "CodexVmConnectionError", reason: "invalid_grant" },
+            { status: 409 },
+          );
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.mount(h.registry, sourceView);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(h.registry.get(sourceView).data).toMatchObject({ accountSelectionRequired: false });
+        expect(h.registry.get(sourceView).data?.error).toContain("expired or was revoked");
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        ).pipe(Effect.result);
+        expect(h.registry.get(view)?.providerAuthError).toContain("expired or was revoked");
+      }),
+    ),
+  );
   for (const lostReply of [false, true])
     it.effect(
       `confirms a selected organization account ${lostReply ? "after a lost write reply without repeating the write" : "through guest readiness"}`,

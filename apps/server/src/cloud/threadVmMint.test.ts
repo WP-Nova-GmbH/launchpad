@@ -3,6 +3,8 @@ import * as NodeEffectCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeCrypto from "node:crypto";
 import { assert, describe, it } from "@effect/vitest";
 import { AuthStandardClientScopes, EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { RelayEnvironmentHealthResponseProofPayload } from "@t3tools/contracts/relay";
+import { THREAD_TRANSFER_SUPPORTED_FORMATS } from "@t3tools/shared/threadTransferEncoding";
 import {
   RELAY_HEALTH_REQUEST_TYP,
   RELAY_HEALTH_RESPONSE_TYP,
@@ -29,6 +31,7 @@ import {
 } from "./http.ts";
 import { CLOUD_LINKED_USER_ID, CLOUD_MINT_PUBLIC_KEY, RELAY_ISSUER_SECRET } from "./config.ts";
 
+const decodeHealthProof = Schema.decodeUnknownEffect(RelayEnvironmentHealthResponseProofPayload);
 const keys = () =>
   NodeCrypto.generateKeyPairSync("ed25519", {
     privateKeyEncoding: { format: "pem", type: "pkcs8" },
@@ -204,7 +207,10 @@ const fixture = Effect.gen(function* () {
               label: "Private VM",
               platform: { os: "linux", arch: "arm64" },
               serverVersion: "test",
-              capabilities: { repositoryIdentity: true },
+              capabilities: {
+                repositoryIdentity: true,
+                threadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS,
+              },
             }),
           },
         },
@@ -302,6 +308,11 @@ describe("private VM signed health", () => {
         nowEpochSeconds: Math.floor((yield* DateTime.now).epochMilliseconds / 1000),
       });
       assert.equal(verified.environmentId, vm.environmentId);
+      const admitted = yield* decodeHealthProof(verified);
+      assert.deepEqual(
+        admitted.descriptor.capabilities.threadTransferFormats,
+        THREAD_TRANSFER_SUPPORTED_FORMATS,
+      );
       assert.equal(f.issued.length, 0);
       assert.equal((yield* f.health(proof).pipe(Effect.flip))._tag, "EnvironmentHttpConflictError");
     }),

@@ -8,7 +8,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   CodexConversationManifest,
   ThreadNativeCheckpointArchiveManifest,
-  ThreadTransferChunkManifest,
+  ThreadTransferArtifactManifest,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -34,7 +34,7 @@ const decodeHistory = Schema.decodeEffect(historyCodec);
 const encodeHistory = Schema.encodeEffect(historyCodec);
 const decodeNative = Schema.decodeEffect(Schema.fromJsonString(CodexConversationManifest));
 const decodeHeaderValue = Schema.decodeEffect(ThreadNativeCheckpointArchiveManifest);
-const decodeChunks = Schema.decodeEffect(ThreadTransferChunkManifest);
+const decodeChunks = Schema.decodeUnknownEffect(ThreadTransferArtifactManifest);
 const decodeHeader = Schema.decodeEffect(
   Schema.fromJsonString(ThreadNativeCheckpointArchiveManifest),
 );

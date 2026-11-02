@@ -47,17 +47,19 @@ export class ThreadTransferReadinessError extends Schema.TaggedError<ThreadTrans
 const fail = (message: string) => new ThreadTransferReadinessError({ message });
 const isProviderProbeError = Schema.is(ProviderAdapterProbeError);
 
-/** Internal move worker only. The destination remains frozen throughout setup and
- * native resume validation. An unfinished claim is never an invitation to rerun a
- * script: cancellation/recovery must first prove that its worker has stopped.
- */
-export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
-  function* (input: {
-    readonly threadId: ThreadId;
-    readonly operationId: string;
-    readonly generation: number;
-    readonly manifestSha256: string;
-  }) {
+type ThreadTransferPreparationIdentity = {
+  readonly threadId: ThreadId;
+  readonly operationId: string;
+  readonly generation: number;
+  readonly manifestSha256: string;
+  readonly environmentId?: string;
+  readonly relayUrl?: string;
+  readonly projectId?: string;
+};
+
+/** Validate an installed baseline without starting provider work or reinstalling it. */
+export const readThreadTransferInstallation = Effect.fn("readThreadTransferInstallation")(
+  function* (input: ThreadTransferPreparationIdentity) {
     const sql = yield* SqlClient.SqlClient;
     yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
       Effect.mapError((error) => fail(error.message)),
@@ -90,6 +92,10 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
         WHERE b.operation_id = ${input.operationId} AND b.thread_id = ${input.threadId}
           AND b.generation = ${input.generation} AND b.manifest_sha256 = ${input.manifestSha256}
           AND f.operation_id = b.operation_id AND f.generation = b.generation AND f.phase = 'frozen'
+          AND f.project_id = ${claim.projectId}
+          AND (${input.environmentId ?? null} IS NULL OR f.environment_id = ${input.environmentId ?? null})
+          AND (${input.relayUrl ?? null} IS NULL OR f.relay_url = ${input.relayUrl ?? null})
+          AND (${input.projectId ?? null} IS NULL OR c.project_id = ${input.projectId ?? null})
           AND c.phase = 'installed' AND c.manifest_sha256 = b.manifest_sha256
           AND t.project_id = ${claim.projectId} AND t.deleted_at IS NULL`;
       if (!baseline || baseline.nativeRuntime === null)
@@ -120,6 +126,64 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
     const setupSha256 = NodeCrypto.createHash("sha256")
       .update(yield* encodeSetup({ script, modelSelection, runtimeMode }))
       .digest("hex");
+    return {
+      claim,
+      baseline,
+      native,
+      modelSelection,
+      runtimeMode,
+      script,
+      setupSha256,
+      readBaseline,
+    };
+  },
+);
+
+/** A matching durable ready receipt recovers relay handoff replies without reopening auth or probes. */
+export const assertThreadTransferReady = Effect.fn("assertThreadTransferReady")(
+  function* (
+    input: ThreadTransferPreparationIdentity & {
+      readonly environmentId: string;
+      readonly relayUrl: string;
+      readonly projectId: string;
+    },
+  ) {
+    const { baseline, setupSha256 } = yield* readThreadTransferInstallation(input);
+    const sql = yield* SqlClient.SqlClient;
+    const [ready] = yield* sql`SELECT 1 FROM thread_transfer_readiness
+      WHERE operation_id=${input.operationId} AND manifest_sha256=${input.manifestSha256}
+        AND native_runtime_json=${baseline.nativeRuntime} AND setup_sha256=${setupSha256}
+        AND phase='ready' AND setup_succeeded=1 AND setup_output_json IS NOT NULL
+        AND provider_probe_attempt_id IS NULL`;
+    if (!ready) return yield* fail("Destination readiness no longer matches this move.");
+  },
+  Effect.mapError(() => fail("Destination readiness could not be verified for this move.")),
+);
+
+/** Internal move worker only. The destination remains frozen throughout setup and
+ * native resume validation. An unfinished claim is never an invitation to rerun a
+ * script: cancellation/recovery must first prove that its worker has stopped.
+ */
+export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
+  function* (input: {
+    readonly threadId: ThreadId;
+    readonly operationId: string;
+    readonly generation: number;
+    readonly manifestSha256: string;
+  }) {
+    const sql = yield* SqlClient.SqlClient;
+    const fs = yield* FileSystem.FileSystem;
+    const claims = makeThreadCheckoutClaims(sql);
+    const {
+      claim,
+      baseline,
+      native,
+      modelSelection,
+      runtimeMode,
+      script,
+      setupSha256,
+      readBaseline,
+    } = yield* readThreadTransferInstallation(input);
     const registry = yield* ProviderInstanceRegistry;
     const instance = yield* registry.getInstance(modelSelection.instanceId);
     if (!instance || !instance.enabled || instance.driverKind !== "codex")

@@ -14,6 +14,7 @@ import {
   makeAttachmentCheckpointFixture,
   runAttachmentCheckpointTest as run,
 } from "./testUtils/threadAttachmentCheckpoint.ts";
+import { packThreadTransferArchiveV2 } from "./ThreadTransferChunks.ts";
 
 const fixture = Effect.gen(function* () {
   const f = yield* attachmentCheckpointFixture;
@@ -39,6 +40,38 @@ const fixture = Effect.gen(function* () {
     });
   return { ...f, saved, transfer, input, recover };
 });
+
+it.effect("reads v2 attachment recovery while its checkpoint writer remains v1", () =>
+  run(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const legacy = yield* f.transfer.pack(f.input);
+      expect(legacy.manifest.format).toBe("launchpad-thread-chunks-v1");
+      const archive = yield* f.recover(legacy);
+      const packed = yield* packThreadTransferArchiveV2({
+        archiveDirectory: archive.directory,
+        scratchRoot: f.path.join(f.root, "packed-attachments"),
+        expectedManifestSha256: legacy.manifest.transferManifestSha256,
+      });
+      const restored = yield* materializeAttachmentCheckpoint({
+        manifest: packed.manifest,
+        expected: legacy.header,
+        chunkDirectory: packed.directory,
+        destinationRoot: f.path.join(f.root, "v2-attachments-restored"),
+        threadId: f.input.threadId,
+        operationId: legacy.header.operationId,
+        transferManifestSha256: legacy.manifest.transferManifestSha256,
+      });
+      expect(restored.header).toEqual(archive.header);
+      for (const [index, attachment] of f.attachments.slice(0, 2).entries())
+        expect(
+          yield* f.fs.readFileString(
+            f.path.join(restored.attachmentsDirectory, attachmentRelativePath(attachment)!),
+          ),
+        ).toBe(`data${index}`);
+    }),
+  ),
+);
 
 it.effect(
   "restores all retained chat files from chunks after the original files and local outbox are removed",

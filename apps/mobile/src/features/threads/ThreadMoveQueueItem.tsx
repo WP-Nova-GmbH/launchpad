@@ -15,7 +15,10 @@ import {
   type ThreadMoveQueueEntry,
   type ThreadPromptQueue,
 } from "@t3tools/contracts";
-import type { RelayPortableThreadPlacement } from "@t3tools/contracts/relay";
+import type {
+  RelayPortableThreadPlacement,
+  ThreadMoveFailureDiagnostic,
+} from "@t3tools/contracts/relay";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Pressable, View } from "react-native";
 import { AppText as Text } from "../../components/AppText";
@@ -46,6 +49,33 @@ function Action({
     >
       <Text className="text-xs text-foreground-muted">{label}</Text>
     </Pressable>
+  );
+}
+
+function PreviousMoveErrors({ errors }: { errors: ReadonlyArray<ThreadMoveFailureDiagnostic> }) {
+  const [expanded, setExpanded] = useState(false);
+  const label = errors.length === 1 ? "Previous error" : "Previous errors";
+  return (
+    <View className="gap-2">
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={label}
+        accessibilityState={{ expanded }}
+        onPress={() => setExpanded((value) => !value)}
+        className="min-h-11 justify-center"
+      >
+        <Text className="text-xs text-foreground-muted">{label}</Text>
+      </Pressable>
+      {expanded &&
+        errors.map((failure) => (
+          <Text
+            key={`${failure.environmentId}:${failure.generation}:${failure.attempt}`}
+            className="text-xs text-foreground-muted"
+          >
+            {failure.detail}
+          </Text>
+        ))}
+    </View>
   );
 }
 
@@ -82,6 +112,7 @@ export function ThreadMoveQueueItem({
     queuePaused,
     status: view?.data?.status,
     providerAuth: view?.providerAuth,
+    workerAuth: view?.workerAuth,
     error: view?.error,
   });
   if (!presentation) return null;
@@ -147,17 +178,13 @@ export function ThreadMoveQueueItem({
           </Text>
           {detail && <Text className="text-xs text-foreground-muted">{detail}</Text>}
         </View>
-        {presentation.ownsNotice &&
-          !waiting &&
-          !cancelling &&
-          ui?.moveAction &&
-          tone !== "neutral" && (
-            <Action
-              label={ui.moveAction.label}
-              disabled={ui.moveAction.disabled}
-              onPress={ui.moveAction.onPress}
-            />
-          )}
+        {presentation.ownsNotice && !waiting && !cancelling && ui?.moveAction && (
+          <Action
+            label={ui.moveAction.label}
+            disabled={ui.moveAction.disabled}
+            onPress={ui.moveAction.onPress}
+          />
+        )}
       </View>
       {!waiting && (
         <View className="flex-row gap-2" accessibilityLabel="Move stages">
@@ -177,6 +204,12 @@ export function ThreadMoveQueueItem({
             </View>
           ))}
         </View>
+      )}
+      {presentation.previousErrors.length > 0 && (
+        <PreviousMoveErrors
+          key={`${threadId}:${entry?.operationId ?? placement?.operationId}`}
+          errors={presentation.previousErrors}
+        />
       )}
       {!waiting && ui?.moveFeedback}
       {waiting && !cancelling && children && (

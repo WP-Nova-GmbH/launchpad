@@ -33,6 +33,7 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as HttpApiError from "effect/unstable/httpapi/HttpApiError";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
+import { THREAD_TRANSFER_SUPPORTED_FORMATS } from "@t3tools/shared/threadTransferEncoding";
 import { httpHeaderRedactionLayer } from "@t3tools/shared/httpObservability";
 
 import {
@@ -517,6 +518,7 @@ export const healthApi = HttpApiBuilder.group(
           return {
             ok: true,
             service: "relay" as const,
+            threadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS,
             threadVmConfigured: settings !== undefined,
             threadVmCapabilities: {
               configured: settings !== undefined,

@@ -1,6 +1,10 @@
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import { makeThreadLocalEnrollmentWorker } from "./ThreadLocalEnrollmentWorker.ts";
-import { RelayOrganizationId, RelayRepositoryId } from "@t3tools/contracts/relay";
+import {
+  RelayOrganizationId,
+  RelayRepositoryId,
+  ThreadTransferArtifactManifest,
+} from "@t3tools/contracts/relay";
 import * as Option from "effect/Option";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
@@ -21,7 +25,7 @@ import {
   TurnId,
   TerminalProcessExitError,
 } from "@t3tools/contracts";
-import type { RelayThreadMove } from "@t3tools/contracts/relay";
+import type { RelayThreadMove, ThreadMoveProgressReport } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -41,6 +45,7 @@ import {
   ProviderSessionRuntimeRepository,
 } from "../persistence/ProviderSessionRuntime.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { makeThreadMoveTransferIntent } from "../persistence/ThreadMoveTransferIntent.ts";
 import { makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import { ProcessRunner, layer as RunnerLayer } from "../processRunner.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
@@ -51,6 +56,14 @@ import { TerminalManager } from "../terminal/Manager.ts";
 import { makeThreadHistorySync } from "./ThreadHistorySync.ts";
 import { ThreadMoveError, type ThreadMoveTransport } from "./ThreadMoveTransport.ts";
 import { makeThreadMoveWorker } from "./ThreadMoveWorker.ts";
+import { ThreadVmProviderAuth, makeThreadVmProviderAuth } from "./ThreadVmProviderAuth.ts";
+import { ProviderAuthService } from "../provider/Services/ProviderAuthService.ts";
+import {
+  ThreadVmCodexAuthContext,
+  ThreadVmCodexAuthSourceError,
+} from "./ThreadVmCodexAuthSource.ts";
+import { THREAD_VM_IDENTITY_SECRET } from "./ThreadVmEnrollment.ts";
+import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { ThreadExecution } from "./ThreadExecution.ts";
 import { makeThreadExecutionRelay } from "./ThreadExecutionRelay.ts";
 
@@ -156,6 +169,9 @@ const environment = (root: string) =>
   );
 const decodeQueue = Schema.decodeEffect(Schema.fromJsonString(ThreadPromptQueue));
 const encodeMoveJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeTransferIndex = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ThreadTransferArtifactManifest),
+);
 const queue = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const [row] = yield* sql<{
@@ -175,9 +191,18 @@ for (const lost of [
   "recovery-publish",
   "recovery-ready",
   "recovery-sticky-failure",
+  "recovery-two-failures",
   "destination-awaits-recovery",
   "parallel-transfer",
   "upload",
+  "packed-v2",
+  "encoding-health-retry",
+  "encoding-cancel-fresh",
+  "encoding-cancel-v2",
+  "encoding-wait",
+  "encoding-change",
+  "encoding-missing",
+  "ready",
   "commit",
   "activate",
   "cancel-setup",
@@ -185,6 +210,8 @@ for (const lost of [
   "cancel-uncertain",
   "cancel-report",
   "destination-auth",
+  "vm-auth-personal",
+  "vm-auth-organization",
   "source-export",
   "shared-active",
   "shared-ready-no-git",
@@ -209,43 +236,48 @@ for (const lost of [
   "destination-unconfirmed-repository",
   "destination-repointed-during-download",
   "destination-ready-receipt",
+  "destination-baseline-receipt",
 ] as const)
   it.effect(
-    lost === "published"
-      ? "keeps a published move frozen without uploading the archive again after a restart"
-      : lost === "recovery-sticky-failure"
-        ? "retries the missing frozen recovery save despite a retained move failure"
-        : lost === "destination-awaits-recovery"
-          ? "waits after destination readiness until the frozen recovery save is verified"
-          : lost === "parallel-transfer"
-            ? "moves files in bounded parallel transfers and publishes only after every upload completes"
-            : lost === "commit"
-              ? "activates a verified checkout after a lost commit reply despite changed repository metadata"
-              : lost === "source-retargeted-project"
-                ? "retains the exact queued project when the relay returns another destination"
-                : lost === "shared-active" || lost === "shared-ready-no-git"
-                  ? "drains canonical checkout siblings and checkpoints before sealing, then reuses the archive"
-                  : lost === "capture-cancel"
-                    ? "releases a draining checkout before a lost cancellation reply"
-                    : lost === "capture-failure"
-                      ? "releases a settled capture failure while the moving thread stays frozen"
-                      : lost === "capture-stop-failure"
-                        ? "releases a draining checkout after an uncertain terminal stop"
-                        : lost === "capture-upload-blocked"
-                          ? "releases sibling admission while the sealed source upload waits"
-                          : lost.startsWith("capture-retargeted")
-                            ? `rejects ${lost} after capture admission before exporting`
-                            : lost.startsWith("capture-rename")
-                              ? `syncs the recovered archive rename before releasing ${lost}`
-                              : lost === "sealed-missing"
-                                ? "refuses to recapture a missing sealed source archive after restart"
-                                : lost === "destination-wrong-repository" ||
-                                    lost === "destination-repointed-project" ||
-                                    lost === "destination-nested-project" ||
-                                    lost === "destination-unconfirmed-repository" ||
-                                    lost === "destination-repointed-during-download"
-                                  ? `blocks ${lost} before installing a checkout or changing local files`
-                                  : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
+    lost.startsWith("vm-auth-")
+      ? `preserves installed receipts while ${lost} waits and resumes without replay after restart`
+      : lost === "published"
+        ? "keeps a published move frozen without uploading the archive again after a restart"
+        : lost === "recovery-ready"
+          ? "repairs the frozen recovery save before committing an already-ready destination"
+          : lost === "recovery-sticky-failure"
+            ? "retries the missing frozen recovery save despite a retained move failure"
+            : lost === "destination-awaits-recovery"
+              ? "waits after destination readiness until the frozen recovery save is verified"
+              : lost === "parallel-transfer"
+                ? "moves files in bounded parallel transfers and publishes only after every upload completes"
+                : lost === "commit"
+                  ? "activates a verified checkout after a lost commit reply despite changed repository metadata"
+                  : lost === "source-retargeted-project"
+                    ? "retains the exact queued project when the relay returns another destination"
+                    : lost === "shared-active" || lost === "shared-ready-no-git"
+                      ? "drains canonical checkout siblings and checkpoints before sealing, then reuses the archive"
+                      : lost === "capture-cancel"
+                        ? "releases a draining checkout before a lost cancellation reply"
+                        : lost === "capture-failure"
+                          ? "releases a settled capture failure while the moving thread stays frozen"
+                          : lost === "capture-stop-failure"
+                            ? "releases a draining checkout after an uncertain terminal stop"
+                            : lost === "capture-upload-blocked"
+                              ? "releases sibling admission while the sealed source upload waits"
+                              : lost.startsWith("capture-retargeted")
+                                ? `rejects ${lost} after capture admission before exporting`
+                                : lost.startsWith("capture-rename")
+                                  ? `syncs the recovered archive rename before releasing ${lost}`
+                                  : lost === "sealed-missing"
+                                    ? "refuses to recapture a missing sealed source archive after restart"
+                                    : lost === "destination-wrong-repository" ||
+                                        lost === "destination-repointed-project" ||
+                                        lost === "destination-nested-project" ||
+                                        lost === "destination-unconfirmed-repository" ||
+                                        lost === "destination-repointed-during-download"
+                                      ? `blocks ${lost} before installing a checkout or changing local files`
+                                      : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -257,6 +289,10 @@ for (const lost of [
           );
           const src = path.join(root, "source"),
             dst = path.join(root, "destination");
+          const postInstallAuthLoss = lost.startsWith("vm-auth-");
+          const targetProjectId = postInstallAuthLoss
+            ? ProjectId.make(`vm:${threadId}`)
+            : projectId;
           const validationFailure =
             lost === "destination-wrong-repository" ||
             lost === "destination-repointed-project" ||
@@ -327,13 +363,73 @@ for (const lost of [
             lostReply = false,
             commits = 0,
             commitAttempts = 0;
+          let formatReads = 0,
+            selections = 0,
+            vmBegins = 0;
+          const destinationProgress: ThreadMoveProgressReport[] = [];
+          const downloadedArtifacts: string[] = [];
+          const packedEncoding = [
+            "packed-v2",
+            "encoding-health-retry",
+            "encoding-wait",
+            "encoding-change",
+            "encoding-missing",
+          ].includes(lost);
           const failure = () => new ThreadMoveError({ threadId, detail: "Lost relay reply" });
           const current = Effect.suspend(() =>
             remote ? Effect.succeed(remote) : Effect.fail(failure()),
           );
           const transport: ThreadMoveTransport = {
+            sourceFormats: () =>
+              Effect.gen(function* () {
+                formatReads++;
+                if (lost.startsWith("encoding-cancel-"))
+                  return yield* Effect.die("Cancellation must not discover a new encoding");
+                if (lost === "encoding-health-retry" && formatReads === 1) return yield* failure();
+                return packedEncoding && (formatReads === 1 || lost === "encoding-health-retry")
+                  ? (["launchpad-thread-chunks-v1", "launchpad-thread-chunks-v2"] as const)
+                  : (["launchpad-thread-chunks-v1"] as const);
+              }),
+            selectEncoding: () =>
+              Effect.sync(() => {
+                selections++;
+                if (lost === "encoding-missing") {
+                  const missing = { ...remote! };
+                  delete missing.transferEncodingPolicy;
+                  return (remote = missing);
+                }
+                return (remote = {
+                  ...remote!,
+                  transferEncodingPolicy:
+                    lost === "encoding-wait" && selections === 1 ? null : "workspace-raw-v2-8MiB",
+                });
+              }),
             pending: () => Effect.succeed({ entries: [], next: null }),
-            beginVm: () => Effect.die("Unexpected VM creation"),
+            beginVm: (owner, input) =>
+              Effect.sync(() => {
+                expect(lost.startsWith("encoding-cancel-")).toBe(true);
+                expect(input.cancelBeforeStart).toBe(true);
+                expect(input.sourceThreadTransferFormats).toEqual(
+                  lost === "encoding-cancel-v2"
+                    ? ["launchpad-thread-chunks-v1", "launchpad-thread-chunks-v2"]
+                    : undefined,
+                );
+                vmBegins++;
+                remote = {
+                  manifestArtifactId: null,
+                  threadId,
+                  operationId: owner.operationId,
+                  actorUserId: input.actorUserId,
+                  sourceEnvironmentId: sourceId,
+                  expectedGeneration: 1,
+                  destinationEnvironmentId: destinationId,
+                  destinationProjectId: projectId,
+                  phase: "aborted",
+                  sourceCursor: null,
+                  manifestSha256: null,
+                };
+                return { status: "accepted" as const, move: remote };
+              }),
             begin: (owner, input) =>
               Effect.sync(
                 () =>
@@ -346,7 +442,9 @@ for (const lost of [
                     expectedGeneration: 1,
                     destinationEnvironmentId: destinationId,
                     destinationProjectId:
-                      lost === "source-retargeted-project" ? ProjectId.make("sibling") : projectId,
+                      lost === "source-retargeted-project"
+                        ? ProjectId.make("sibling")
+                        : targetProjectId,
                     ...(lost === "destination-unconfirmed-repository"
                       ? {}
                       : {
@@ -358,18 +456,70 @@ for (const lost of [
                     phase: "preparing",
                     sourceCursor: null,
                     manifestSha256: null,
+                    ...(packedEncoding ? { transferEncodingPolicy: null } : {}),
                   }),
               ),
             get: () => current,
-            progress: () => Effect.succeed({ accepted: true }),
-            failed: (_owner, detail) =>
+            progress: (owner, report) =>
+              Effect.sync(() => {
+                if (owner.environmentId === destinationId) destinationProgress.push(report);
+                remote = {
+                  ...remote!,
+                  progress: [
+                    ...(remote?.progress ?? []).filter(
+                      (snapshot) => snapshot.environmentId !== owner.environmentId,
+                    ),
+                    {
+                      ...report,
+                      operationId: owner.operationId,
+                      threadId,
+                      environmentId: owner.environmentId,
+                      generation: owner.generation,
+                      participant: owner.environmentId === sourceId ? "source" : "destination",
+                      updatedAt: at,
+                    },
+                  ],
+                };
+                if (remote.participantStates?.length)
+                  remote = {
+                    ...remote,
+                    failureDetail:
+                      remote.participantStates.find(
+                        (participant) =>
+                          participant.failure &&
+                          participant.failure.attempt >= participant.resolvedBeforeAttempt &&
+                          participant.failure.attempt >=
+                            (remote?.progress?.find(
+                              (snapshot) => snapshot.environmentId === participant.environmentId,
+                            )?.attempt ?? 0),
+                      )?.failure?.detail ?? null,
+                  };
+                return { accepted: true };
+              }),
+            failed: (owner, detail, attempt) =>
               lost === "cancel-report"
                 ? Effect.fail(failure())
                 : Effect.sync(() => {
                     expect(["preparing", "frozen", "ready"]).toContain(remote?.phase);
                     return (remote = {
                       ...remote!,
-                      failureDetail: remote!.failureDetail ?? detail,
+                      failureDetail:
+                        attempt === undefined ? (remote!.failureDetail ?? detail) : detail,
+                      ...(attempt === undefined
+                        ? {}
+                        : {
+                            participantStates: [
+                              ...(remote?.participantStates ?? []).filter(
+                                (state) => state.environmentId !== owner.environmentId,
+                              ),
+                              {
+                                environmentId: owner.environmentId,
+                                generation: owner.generation,
+                                resolvedBeforeAttempt: 0,
+                                failure: { attempt, detail, reportedAt: at },
+                              },
+                            ],
+                          }),
                     });
                   }),
             freeze: (_owner, input) =>
@@ -403,7 +553,12 @@ for (const lost of [
                       if (uploads.has(file.artifactId))
                         expect(bytes).toEqual(Buffer.from(uploads.get(file.artifactId)!));
                       uploads.set(file.artifactId, bytes);
-                      if ((lost === "upload" || lost === "sealed-missing") && !lostReply) {
+                      if (
+                        ["upload", "sealed-missing", "packed-v2", "encoding-change"].includes(
+                          lost,
+                        ) &&
+                        !lostReply
+                      ) {
                         lostReply = true;
                         return yield* failure();
                       }
@@ -423,7 +578,8 @@ for (const lost of [
                 if (
                   (lost === "recovery-publish" ||
                     lost === "recovery-ready" ||
-                    lost === "recovery-sticky-failure") &&
+                    lost === "recovery-sticky-failure" ||
+                    lost === "recovery-two-failures") &&
                   !lostReply
                 ) {
                   lostReply = true;
@@ -433,6 +589,7 @@ for (const lost of [
                 return { manifestArtifactId: id, artifactCount: uploads.size };
               }),
             artifact: (_owner, id) => {
+              downloadedArtifacts.push(id);
               const bytes = uploads.get(id);
               if (!bytes) return Effect.fail(failure());
               if (
@@ -463,7 +620,14 @@ for (const lost of [
               );
             },
             ready: () =>
-              Effect.sync(() => (remote = { ...remote!, phase: "ready", failureDetail: null })),
+              Effect.gen(function* () {
+                remote = { ...remote!, phase: "ready", failureDetail: null };
+                if (lost === "ready" && !lostReply) {
+                  lostReply = true;
+                  return yield* failure();
+                }
+                return remote;
+              }),
             commit: () =>
               Effect.gen(function* () {
                 commitAttempts++;
@@ -526,7 +690,9 @@ for (const lost of [
               commandId: CommandId.make("queue-move"),
               threadId,
               messageId: MessageId.make("move"),
-              destination: { kind: "environment", environmentId: destinationId, projectId },
+              destination: lost.startsWith("encoding-cancel-")
+                ? { kind: "vm" }
+                : { kind: "environment", environmentId: destinationId, projectId: targetProjectId },
               author: { userId: "owner", displayName: "Owner", imageUrl: null },
               createdAt: at,
             });
@@ -728,6 +894,59 @@ for (const lost of [
             const captures = makeCheckoutCapture(sql);
             const execution = yield* ThreadExecution;
             const sibling = ThreadId.make("sibling");
+            if (lost.startsWith("encoding-cancel-")) {
+              const pending = yield* queue;
+              const head = pending.entries[0]!;
+              yield* engine.dispatch({
+                type: "thread.move.claim",
+                threadId,
+                commandId: CommandId.make("claim-before-cancel"),
+                messageId: head.messageId,
+                expectedRevision: head.revision,
+                expectedControlRevision: pending.revision,
+                createdAt: at,
+              });
+              const claimed = (yield* queue).entries[0]!;
+              if (claimed.kind !== "move" || !claimed.operationId)
+                return yield* Effect.die("Expected a claimed move");
+              const owner = { ...enrolled, operationId: claimed.operationId };
+              const intents = makeThreadMoveTransferIntent(sql);
+              if (lost === "encoding-cancel-v2") {
+                yield* intents.create(owner, [
+                  "launchpad-thread-chunks-v1",
+                  "launchpad-thread-chunks-v2",
+                ]);
+                yield* intents.bind(owner, "workspace-raw-v2-8MiB", "a".repeat(64));
+              }
+              yield* engine.dispatch({
+                type: "thread.move.cancel",
+                threadId,
+                commandId: CommandId.make("cancel-before-begin"),
+                messageId: claimed.messageId,
+                expectedRevision: claimed.revision,
+                createdAt: at,
+              });
+              yield* source.source(threadId);
+              yield* source.source(threadId);
+              expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
+              expect((yield* fences.get(threadId))?.phase).toBe("active");
+              expect(remote?.phase).toBe("aborted");
+              expect(formatReads).toBe(0);
+              expect(vmBegins).toBe(1);
+              expect(selections).toBe(0);
+              expect(uploadStarts).toBe(0);
+              expect(yield* captures.active).toEqual([]);
+              expect(yield* intents.get(owner)).toMatchObject({
+                sourceThreadTransferFormats:
+                  lost === "encoding-cancel-v2"
+                    ? ["launchpad-thread-chunks-v1", "launchpad-thread-chunks-v2"]
+                    : ["launchpad-thread-chunks-v1"],
+                transferEncodingPolicy:
+                  lost === "encoding-cancel-v2" ? "workspace-raw-v2-8MiB" : "v1-64MiB",
+                manifestSha256: lost === "encoding-cancel-v2" ? "a".repeat(64) : null,
+              });
+              return;
+            }
             if (lost.startsWith("capture-retargeted")) {
               const entered = yield* Deferred.make<void>();
               const release = yield* Deferred.make<void>();
@@ -1160,7 +1379,8 @@ for (const lost of [
             if (
               lost === "recovery-publish" ||
               lost === "recovery-ready" ||
-              lost === "recovery-sticky-failure"
+              lost === "recovery-sticky-failure" ||
+              lost === "recovery-two-failures"
             ) {
               expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
               expect(remote?.manifestArtifactId).not.toBeNull();
@@ -1168,12 +1388,67 @@ for (const lost of [
               if (lost === "recovery-ready") remote = { ...remote!, phase: "ready" };
               if (lost === "recovery-sticky-failure")
                 remote = { ...remote!, failureDetail: "Frozen recovery save is not confirmed." };
+              if (lost === "recovery-two-failures")
+                remote = {
+                  ...remote!,
+                  phase: "ready",
+                  failureDetail: "Destination preparation is blocked.",
+                  participantStates: [
+                    ...remote!.participantStates!,
+                    {
+                      environmentId: destinationId,
+                      generation: 2,
+                      resolvedBeforeAttempt: 0,
+                      failure: {
+                        attempt: 1,
+                        detail: "Destination preparation is blocked.",
+                        reportedAt: at,
+                      },
+                    },
+                  ],
+                };
               source = yield* makeThreadMoveWorker(transport, history, commands);
               yield* source.source(threadId);
               expect(uploadStarts).toBe(completedUploads);
               expect(remote?.recoveryVerified).toBe(true);
+              if (lost === "recovery-two-failures") {
+                expect(remote?.failureDetail).toBe("Destination preparation is blocked.");
+                expect(commits).toBe(0);
+                yield* source.source(threadId);
+                expect(remote?.phase).toBe("ready");
+                expect(remote?.failureDetail).toBe("Destination preparation is blocked.");
+                expect(commits).toBe(0);
+                expect(uploadStarts).toBe(completedUploads);
+                return;
+              }
             }
-            if (lost === "upload") {
+            if (lost === "encoding-missing") {
+              expect(yield* Effect.flip(source.source(threadId))).toMatchObject({
+                detail: expect.stringContaining("did not confirm"),
+              });
+              expect(uploadStarts).toBe(0);
+              expect(yield* captures.active).toEqual([]);
+              const [intent] =
+                yield* sql`SELECT encoding_policy,manifest_sha256 FROM thread_move_transfer_intents`;
+              expect(intent).toEqual({ encoding_policy: null, manifest_sha256: null });
+              return;
+            }
+            if (lost === "encoding-health-retry") {
+              expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
+              expect(remote).toBeUndefined();
+              expect(uploadStarts).toBe(0);
+              expect(yield* sql`SELECT * FROM thread_move_transfer_intents`).toEqual([]);
+              expect(yield* captures.active).toEqual([]);
+              source = yield* makeThreadMoveWorker(transport, history, commands);
+            }
+            if (lost === "encoding-wait") {
+              yield* source.source(threadId);
+              expect(remote?.transferEncodingPolicy).toBeNull();
+              expect(uploadStarts).toBe(0);
+              expect(yield* captures.active).toEqual([]);
+              source = yield* makeThreadMoveWorker(transport, history, commands);
+            }
+            if (["upload", "packed-v2", "encoding-change"].includes(lost)) {
               expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
               expect(activeUploads).toBe(0);
               expect(remote?.manifestArtifactId).toBeNull();
@@ -1183,9 +1458,25 @@ for (const lost of [
                 "prompt",
               ]);
               source = yield* makeThreadMoveWorker(transport, history, commands);
+              if (lost === "encoding-change") {
+                const before = uploadStarts;
+                remote = { ...remote!, transferEncodingPolicy: "v1-64MiB" };
+                expect(yield* Effect.flip(source.source(threadId))).toMatchObject({
+                  detail: expect.stringContaining("encoding changed"),
+                });
+                expect(uploadStarts).toBe(before);
+                expect(remote?.failureDetail).toContain("encoding changed");
+                return;
+              }
             }
             yield* source.source(threadId);
             expect(remote?.phase).toBe(lost === "recovery-ready" ? "committed" : "frozen");
+            if (lost === "recovery-ready") {
+              expect(remote?.recoveryVerified).toBe(true);
+              expect((yield* fences.get(threadId))?.phase).toBe("retired");
+              expect(commits).toBe(1);
+              return;
+            }
             const [capture] = yield* sql<{
               phase: string;
               outcome: string;
@@ -1194,6 +1485,14 @@ for (const lost of [
             if (lost.startsWith("shared-"))
               expect((yield* queue).entries[0]).not.toHaveProperty("waitingForCheckout");
             expect(remote?.manifestArtifactId).not.toBeNull();
+            const index = yield* decodeTransferIndex(
+              new TextDecoder().decode(uploads.get(remote!.manifestArtifactId!)!),
+            );
+            expect(index.format).toBe(
+              packedEncoding ? "launchpad-thread-chunks-v2" : "launchpad-thread-chunks-v1",
+            );
+            expect(formatReads).toBe(lost === "encoding-health-retry" ? 2 : 1);
+            if (lost === "encoding-health-retry") expect(selections).toBe(1);
             if (lost === "parallel-transfer") expect(maximumUploads).toBe(4);
             if (lost === "published") {
               const completedUploads = uploadStarts;
@@ -1218,7 +1517,7 @@ for (const lost of [
               yield* destinationEngine.dispatch({
                 type: "project.create",
                 commandId: CommandId.make("destination-project"),
-                projectId,
+                projectId: targetProjectId,
                 title: "Destination",
                 workspaceRoot: destinationRoot,
                 createdAt: at,
@@ -1256,16 +1555,25 @@ for (const lost of [
                 confirmThrough: () => Effect.void,
               });
               let destinationAuthenticated = false;
+              let recoveryMustSkipAuth = false;
               const destinationInstance: ProviderInstance = {
                 ...instance,
                 snapshot: {
                   ...instance.snapshot,
-                  refresh: Effect.sync(() => ({
-                    ...status,
-                    auth: {
-                      status: destinationAuthenticated ? "authenticated" : "unauthenticated",
-                    },
-                  })),
+                  refresh: Effect.suspend(() =>
+                    recoveryMustSkipAuth
+                      ? Effect.die("A durable ready receipt must recover without provider auth")
+                      : Effect.succeed({
+                          ...status,
+                          auth: {
+                            status:
+                              (lost !== "destination-auth" && !postInstallAuthLoss) ||
+                              destinationAuthenticated
+                                ? "authenticated"
+                                : "unauthenticated",
+                          },
+                        }),
+                  ),
                 },
               };
               let destination = yield* makeThreadMoveWorker(
@@ -1274,7 +1582,7 @@ for (const lost of [
                 commands,
               ).pipe(
                 Effect.provide(
-                  lost === "destination-auth"
+                  ["destination-auth", "ready", "commit"].includes(lost) || postInstallAuthLoss
                     ? Layer.mock(ProviderInstanceRegistry)({
                         getInstance: () => Effect.succeed(destinationInstance),
                       })
@@ -1297,6 +1605,17 @@ for (const lost of [
                   yield* destinationSql`SELECT setup_succeeded,provider_probe_attempt_id FROM thread_transfer_readiness WHERE operation_id=${owner.operationId}`,
                 ).toEqual([{ setup_succeeded: 1, provider_probe_attempt_id: null }]);
                 yield* destinationSql`DROP TRIGGER fail_destination_ready`;
+              }
+              if (lost === "destination-baseline-receipt") {
+                yield* destinationSql`CREATE TEMP TRIGGER fail_baseline BEFORE INSERT ON thread_transfer_baselines
+                  BEGIN SELECT RAISE(ABORT,'lost baseline receipt'); END`;
+                yield* Effect.flip(destination.destination(owner));
+                expect(
+                  yield* destinationSql`SELECT phase FROM thread_checkout_claims
+                  WHERE operation_id=${owner.operationId}`,
+                ).toEqual([{ phase: "installed" }]);
+                expect(yield* destinationSql`SELECT 1 FROM thread_transfer_baselines`).toEqual([]);
+                yield* destinationSql`DROP TRIGGER fail_baseline`;
               }
               if (validationFailure) {
                 const worktreesRoot = (yield* ServerConfig).worktreesDir;
@@ -1396,9 +1715,10 @@ for (const lost of [
                 yield* destination.destination(owner);
                 return;
               }
-              if (lost === "commit" || lost === "activate") {
+              if (lost === "ready" || lost === "commit" || lost === "activate") {
                 yield* Effect.flip(destination.destination(owner));
                 expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
+                if (lost === "ready" || lost === "commit") recoveryMustSkipAuth = true;
                 if (lost === "commit") {
                   expect(remote?.phase).toBe("committed");
                   expect(
@@ -1425,9 +1745,21 @@ for (const lost of [
                     kind: "provider",
                   }),
                 );
-                destination = yield* makeThreadMoveWorker(transport, destinationHistory, commands);
+                destination = yield* makeThreadMoveWorker(
+                  transport,
+                  destinationHistory,
+                  commands,
+                ).pipe(
+                  Effect.provide(
+                    lost === "ready" || lost === "commit"
+                      ? Layer.mock(ProviderInstanceRegistry)({
+                          getInstance: () => Effect.succeed(destinationInstance),
+                        })
+                      : Layer.empty,
+                  ),
+                );
               }
-              if (lost === "destination-auth") {
+              if (lost === "destination-auth" || postInstallAuthLoss) {
                 const error = yield* Effect.flip(destination.destination(owner));
                 expect(error.message).toContain("configured sign-in");
                 expect(remote?.failureDetail).toBe(error.message);
@@ -1438,6 +1770,143 @@ for (const lost of [
                 expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
                 expect(commits).toBe(0);
                 destinationAuthenticated = true;
+                const transfers = path.join((yield* ServerConfig).stateDir, "move-transfers");
+                destination = yield* makeThreadMoveWorker(
+                  transport,
+                  destinationHistory,
+                  commands,
+                ).pipe(
+                  Effect.provideService(FileSystem.FileSystem, {
+                    ...fs,
+                    readFileString: (file, encoding) =>
+                      file.startsWith(`${transfers}${path.sep}`)
+                        ? Effect.die("Authentication recovery must reuse the installed baseline")
+                        : fs.readFileString(file, encoding),
+                  }),
+                  Effect.provideService(ProviderInstanceRegistry, {
+                    getInstance: () => Effect.succeed(destinationInstance),
+                    listInstances: Effect.succeed([destinationInstance]),
+                    listUnavailable: Effect.succeed([]),
+                    streamChanges: Stream.empty,
+                    subscribeChanges: Effect.die("No provider subscription during transfer"),
+                  }),
+                );
+                if (postInstallAuthLoss) {
+                  const vm = {
+                    operationId: owner.operationId,
+                    environmentId: destinationId,
+                    relayUrl: owner.relayUrl,
+                    relayIssuer: owner.relayUrl,
+                    environmentCredential: "fixture-private-credential",
+                    cloudMintPublicKey: "fixture-key",
+                    scope: {
+                      allocationId: "allocation",
+                      threadId,
+                      repositoryId: "repository",
+                      generation: 2,
+                    },
+                  };
+                  let authReads = 0;
+                  let authLost = true;
+                  const tracked = Layer.mergeAll(
+                    Layer.succeed(VmWorkloadTracking, true),
+                    Layer.succeed(ServerEnvironmentIdentity, {
+                      getEnvironmentId: Effect.succeed(destinationId),
+                    }),
+                    Layer.mock(ServerSecretStore)({
+                      get: (key) =>
+                        Effect.succeed(
+                          key === THREAD_VM_IDENTITY_SECRET
+                            ? Option.some(new TextEncoder().encode(JSON.stringify(vm)))
+                            : Option.none(),
+                        ),
+                    }),
+                    Layer.mock(ThreadVmProviderAuth)({
+                      readiness: () =>
+                        Effect.sync(() => {
+                          authReads++;
+                          return authLost && authReads === 2
+                            ? {
+                                _tag: "Waiting" as const,
+                                reason:
+                                  lost === "vm-auth-personal"
+                                    ? ("personal_sign_in" as const)
+                                    : ("organization_connection" as const),
+                              }
+                            : { _tag: "Ready" as const };
+                        }),
+                    }),
+                  );
+                  const installedClaim =
+                    yield* destinationSql`SELECT * FROM thread_checkout_claims WHERE operation_id=${owner.operationId}`;
+                  const importedBaseline =
+                    yield* destinationSql`SELECT * FROM thread_transfer_baselines WHERE operation_id=${owner.operationId}`;
+                  expect(installedClaim).toHaveLength(1);
+                  expect(importedBaseline).toHaveLength(1);
+                  const resumed = () =>
+                    makeThreadMoveWorker(transport, destinationHistory, commands).pipe(
+                      Effect.provide(tracked),
+                      Effect.provideService(FileSystem.FileSystem, {
+                        ...fs,
+                        readFileString: (file, encoding) =>
+                          file.startsWith(`${transfers}${path.sep}`)
+                            ? Effect.die(
+                                "VM auth recovery must not reconstruct or reinstall the archive",
+                              )
+                            : fs.readFileString(file, encoding),
+                      }),
+                    );
+                  destination = yield* resumed();
+                  const completedDownloads = downloadStarts;
+                  yield* destination.destination(owner);
+                  expect(authReads).toBe(2);
+                  expect(remote?.phase).toBe("frozen");
+                  expect(remote?.failureDetail).toBeNull();
+                  expect(destinationProgress.at(-1)?.waitingForAuth).toBe(
+                    lost === "vm-auth-personal" ? "personal_sign_in" : "organization_connection",
+                  );
+                  expect(
+                    yield* destinationSql`SELECT * FROM thread_checkout_claims WHERE operation_id=${owner.operationId}`,
+                  ).toEqual(installedClaim);
+                  expect(
+                    yield* destinationSql`SELECT * FROM thread_transfer_baselines WHERE operation_id=${owner.operationId}`,
+                  ).toEqual(importedBaseline);
+                  expect(
+                    yield* destinationSql`SELECT 1 FROM thread_transfer_readiness WHERE operation_id=${owner.operationId}`,
+                  ).toEqual([]);
+                  expect(downloadStarts).toBe(completedDownloads);
+                  expect(commits).toBe(0);
+                  expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+                  yield* Effect.flip(
+                    destinationFences.beginWork({
+                      threadId,
+                      generation: 2,
+                      workId: "premature-auth-wait",
+                      kind: "provider",
+                    }),
+                  );
+                  authLost = false;
+                  destination = yield* resumed();
+                  yield* destination.destination(owner);
+                  expect(authReads).toBe(4);
+                  expect(remote?.phase).toBe("completed");
+                  expect(downloadStarts).toBe(completedDownloads);
+                  expect(
+                    yield* destinationSql`SELECT * FROM thread_checkout_claims WHERE operation_id=${owner.operationId}`,
+                  ).toEqual(
+                    installedClaim.map((claim) => ({
+                      ...claim,
+                      phase: "released",
+                      release_reason: "activated",
+                    })),
+                  );
+                  expect(
+                    yield* destinationSql`SELECT * FROM thread_transfer_baselines WHERE operation_id=${owner.operationId}`,
+                  ).toEqual(importedBaseline);
+                  expect(
+                    yield* destinationSql`SELECT phase,setup_succeeded FROM thread_transfer_readiness WHERE operation_id=${owner.operationId}`,
+                  ).toEqual([{ phase: "ready", setup_succeeded: 1 }]);
+                }
               }
               if (lost === "destination-awaits-recovery") {
                 remote = {
@@ -1459,6 +1928,18 @@ for (const lost of [
               yield* destination.destination(owner);
               expect(remote?.phase).toBe("completed");
               expect((yield* destinationFences.get(threadId))?.phase).toBe("active");
+              if (packedEncoding) {
+                const completed = destinationProgress.findLast(
+                  (report) => report.stage === "downloading",
+                )!;
+                expect(completed.totalArtifacts).toBe(uploads.size);
+                expect(completed.completedArtifacts).toBe(uploads.size);
+                expect(completed.completedBytes).toBe(
+                  Array.from(uploads.values()).reduce((sum, bytes) => sum + bytes.length, 0),
+                );
+                expect(new Set(downloadedArtifacts).size).toBe(uploads.size);
+                expect(downloadedArtifacts.length).toBe(uploads.size);
+              }
               expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
               expect(yield* fs.readFileString(path.join(dst, "README"))).toBe("uncommitted work\n");
               if (lost === "capture-upload-blocked")
@@ -1568,6 +2049,8 @@ for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as co
               for (const workId of ["provider:start-session:idle", "provider:send-turn:settled"])
                 yield* fences.beginWork({ ...enrolled, workId, kind: "provider" });
             const transport: ThreadMoveTransport = {
+              sourceFormats: () => Effect.succeed(["launchpad-thread-chunks-v1"] as const),
+              selectEncoding: unused,
               pending: unused,
               begin: unused,
               get: unused,
@@ -1852,6 +2335,8 @@ for (const kind of ["terminal", "setup"] as const)
           yield* fences.activate(owner);
           yield* fences.beginWork({ ...owner, kind, workId: `${kind}:local-process` });
           const transport: ThreadMoveTransport = {
+            sourceFormats: () => Effect.succeed(["launchpad-thread-chunks-v1"] as const),
+            selectEncoding: unused,
             pending: unused,
             begin: unused,
             beginVm: unused,
@@ -1914,4 +2399,291 @@ for (const kind of ["terminal", "setup"] as const)
         }).pipe(Effect.provide(environment(root)));
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+for (const reportFault of ["none", "lookup", "journal", "controller"] as const)
+  it.effect(
+    reportFault === "controller"
+      ? "resumes VM download through the real guest auth controller without a client request"
+      : reportFault === "none"
+        ? "waits for the exact VM account without transfer work, resumes across worker restarts and cancels first"
+        : `ends an auth-wait attempt before a lost failure report ${reportFault}`,
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const root = yield* fs.realPath(
+            yield* fs.makeTempDirectoryScoped({ prefix: "move-auth-gate-" }),
+          );
+          yield* Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            const engine = yield* OrchestrationEngineService;
+            const operationId = NodeCrypto.randomUUID();
+            const owner = {
+              threadId,
+              operationId,
+              environmentId: destinationId,
+              generation: 2,
+              relayUrl: "https://relay.test",
+            };
+            let move: RelayThreadMove = {
+              operationId,
+              threadId,
+              actorUserId: "owner",
+              sourceEnvironmentId: sourceId,
+              expectedGeneration: 1,
+              destinationEnvironmentId: destinationId,
+              destinationProjectId: ProjectId.make(`vm:${threadId}`),
+              phase: "frozen",
+              sourceCursor: 1,
+              manifestSha256: "a".repeat(64),
+              manifestArtifactId: "00000000-0000-4000-8000-000000000001",
+              recoveryVerified: true,
+            };
+            const reports: ThreadMoveProgressReport[] = [];
+            const failures: { detail: string; attempt: number | undefined }[] = [];
+            let downloads = 0;
+            let loseFailureLookup = false,
+              lookupReads = 0;
+            const unexpected = () => Effect.die("Unexpected move work before authentication");
+            const transport: ThreadMoveTransport = {
+              sourceFormats: unexpected,
+              selectEncoding: unexpected,
+              pending: unexpected,
+              beginVm: unexpected,
+              begin: unexpected,
+              get: () =>
+                Effect.gen(function* () {
+                  lookupReads++;
+                  if (loseFailureLookup && lookupReads === 2) {
+                    expect(
+                      yield* sql`SELECT ended FROM thread_move_attempts WHERE operation_id=${operationId}`.pipe(
+                        Effect.orDie,
+                      ),
+                    ).toEqual([{ ended: 1 }]);
+                    return yield* new ThreadMoveError({ threadId, detail: "Failure lookup lost" });
+                  }
+                  return move;
+                }),
+              progress: (_owner, report) =>
+                Effect.sync(() => {
+                  reports.push(report);
+                  return { accepted: true };
+                }),
+              failed: (_owner, detail, attempt) =>
+                Effect.sync(() => {
+                  failures.push({ detail, attempt });
+                  return move;
+                }),
+              freeze: unexpected,
+              upload: unexpected,
+              publish: unexpected,
+              artifact: () =>
+                Effect.suspend(() => {
+                  downloads++;
+                  return Effect.fail(
+                    new ThreadMoveError({ threadId, detail: "Authenticated download reached" }),
+                  );
+                }),
+              ready: unexpected,
+              commit: unexpected,
+              activate: unexpected,
+              abort: unexpected,
+              removed: unexpected,
+            };
+            const history = makeThreadHistorySync(sql, engine, {
+              append: () => Effect.void,
+              confirmThrough: () => Effect.void,
+            });
+            let readiness: import("./ThreadVmProviderAuth.ts").ThreadVmAuthReadiness = {
+              _tag: "Waiting",
+              reason: "account_selection",
+            };
+            let authReads = 0;
+            const personalWait =
+              reportFault === "controller" ? "organization_connection" : "personal_sign_in";
+            const makeController =
+              reportFault === "controller"
+                ? makeThreadVmProviderAuth.pipe(
+                    Effect.provideService(ThreadVmCodexAuthContext, {
+                      refresh: Effect.suspend(() => {
+                        authReads++;
+                        return readiness._tag === "Waiting"
+                          ? Effect.fail(
+                              new ThreadVmCodexAuthSourceError({
+                                reason:
+                                  readiness.reason === "account_selection"
+                                    ? "account_selection_required"
+                                    : "reconnect_required",
+                              }),
+                            )
+                          : Effect.succeed(false);
+                      }),
+                      current: Effect.succeed({
+                        connectionId: "org-connection",
+                        label: "Organization Codex",
+                        preflight: Effect.void,
+                        status: Effect.succeed({
+                          connectionId: "org-connection",
+                          label: "Organization Codex",
+                          status: "connected" as const,
+                          epoch: 1,
+                          tokenRevision: 1,
+                          refreshing: false,
+                          errorCode: null,
+                        }),
+                      }),
+                      personalPreflight: Effect.void,
+                      withReloadLock: (effect) => effect,
+                      markApplied: Effect.void,
+                    }),
+                    Effect.provide(Layer.mock(ProviderAuthService)({})),
+                  )
+                : null;
+            const realController = makeController ? yield* makeController : null;
+            const vm = {
+              operationId,
+              environmentId: destinationId,
+              relayUrl: owner.relayUrl,
+              relayIssuer: owner.relayUrl,
+              environmentCredential: "fixture-private-credential",
+              cloudMintPublicKey: "fixture-key",
+              scope: {
+                allocationId: "allocation",
+                threadId,
+                repositoryId: "repository",
+                generation: 2,
+              },
+            };
+            const vmLayer = Layer.mergeAll(
+              Layer.succeed(VmWorkloadTracking, true),
+              Layer.succeed(ServerEnvironmentIdentity, {
+                getEnvironmentId: Effect.succeed(destinationId),
+              }),
+              Layer.mock(ServerSecretStore)({
+                get: (key) =>
+                  Effect.succeed(
+                    key === THREAD_VM_IDENTITY_SECRET
+                      ? Option.some(new TextEncoder().encode(JSON.stringify(vm)))
+                      : Option.none(),
+                  ),
+              }),
+              realController
+                ? Layer.succeed(ThreadVmProviderAuth, realController)
+                : Layer.mock(ThreadVmProviderAuth)({
+                    readiness: (installed, binding) =>
+                      Effect.sync(() => {
+                        expect(installed).toEqual(vm);
+                        expect(binding).toEqual({
+                          operationId,
+                          allocationId: "allocation",
+                          environmentId: destinationId,
+                          generation: 2,
+                          instanceId: "codex",
+                        });
+                        authReads++;
+                        return readiness;
+                      }),
+                  }),
+            );
+            const make = makeThreadMoveWorker(transport, history, {
+              synchronize: () => Effect.void,
+            }).pipe(Effect.provide(vmLayer));
+            let worker = yield* make;
+            yield* worker.destination(owner);
+            expect(reports).toMatchObject([
+              {
+                attempt: 1,
+                revision: 1,
+                stage: "downloading",
+                waitingForAuth: "account_selection",
+              },
+            ]);
+            worker = yield* make;
+            yield* worker.destination(owner);
+            expect(reports).toHaveLength(1);
+            readiness = { _tag: "Waiting", reason: personalWait };
+            yield* worker.destination(owner);
+            expect(reports).toMatchObject([
+              { attempt: 1, revision: 1, waitingForAuth: "account_selection" },
+              { attempt: 1, revision: 2, waitingForAuth: personalWait },
+            ]);
+            expect(downloads).toBe(0);
+            expect(failures).toEqual([]);
+            expect(yield* sql`SELECT 1 FROM thread_checkout_claims`).toEqual([]);
+            expect(yield* sql`SELECT 1 FROM thread_transfer_baselines`).toEqual([]);
+            expect(yield* sql`SELECT 1 FROM thread_transfer_readiness`).toEqual([]);
+            let expectedWorkAttempt = 2;
+            if (reportFault === "lookup" || reportFault === "journal") {
+              readiness = { _tag: "Unavailable", message: "Sign-in verification unavailable" };
+              lookupReads = 0;
+              loseFailureLookup = reportFault === "lookup";
+              if (reportFault === "journal")
+                yield* sql`CREATE TEMP TRIGGER reject_attempt_end BEFORE UPDATE OF ended ON thread_move_attempts
+                WHEN NEW.ended=1 BEGIN SELECT RAISE(ABORT,'attempt end unavailable'); END`;
+              yield* Effect.flip(worker.destination(owner));
+              expect(failures).toEqual([]);
+              if (reportFault === "journal") {
+                expect(lookupReads).toBe(1);
+                yield* sql`DROP TRIGGER reject_attempt_end`;
+                yield* Effect.flip(worker.destination(owner));
+                expect(failures).toEqual([
+                  { detail: "Sign-in verification unavailable", attempt: 1 },
+                ]);
+              }
+              expect(
+                yield* sql`SELECT ended FROM thread_move_attempts WHERE operation_id=${operationId}`,
+              ).toEqual([{ ended: 1 }]);
+              loseFailureLookup = false;
+              readiness = { _tag: "Waiting", reason: "personal_sign_in" };
+              worker = yield* make;
+              yield* worker.destination(owner);
+              expect(reports.at(-1)).toMatchObject({
+                attempt: 2,
+                revision: 1,
+                waitingForAuth: "personal_sign_in",
+              });
+              expectedWorkAttempt = 3;
+            }
+            const previousAuthReads = authReads;
+            readiness = { _tag: "Ready" };
+            if (makeController)
+              worker = yield* makeThreadMoveWorker(transport, history, {
+                synchronize: () => Effect.void,
+              }).pipe(
+                Effect.provideService(ThreadVmProviderAuth, yield* makeController),
+                Effect.provide(vmLayer),
+              );
+            yield* Effect.flip(worker.destination(owner));
+            expect(downloads).toBe(1);
+            expect(reports.at(-1)).toMatchObject({
+              attempt: expectedWorkAttempt,
+              stage: "downloading",
+              waitingForAuth: null,
+            });
+            expect(failures.at(-1)).toEqual({
+              detail: "Authenticated download reached",
+              attempt: expectedWorkAttempt,
+            });
+            expect(authReads).toBe(previousAuthReads + 1);
+            move = { ...move, phase: "aborting" };
+            yield* Effect.flip(worker.destination(owner));
+            expect(authReads).toBe(previousAuthReads + 1);
+            expect(downloads).toBe(1);
+            yield* makeThreadExecutionFence(sql).prepare({
+              ...owner,
+              projectId: move.destinationProjectId,
+            });
+            move = { ...move, phase: "ready" };
+            const invalidReady = yield* Effect.flip(worker.destination(owner));
+            expect(invalidReady).toMatchObject({
+              _tag: "ThreadTransferReadinessError",
+              message: expect.stringContaining("readiness"),
+            });
+            expect((yield* makeThreadExecutionFence(sql).get(threadId))?.phase).toBe("frozen");
+            expect(authReads).toBe(previousAuthReads + 1);
+            expect(downloads).toBe(1);
+          }).pipe(Effect.provide(environment(root)));
+        }),
+      ).pipe(Effect.provide(NodeServices.layer)),
   );

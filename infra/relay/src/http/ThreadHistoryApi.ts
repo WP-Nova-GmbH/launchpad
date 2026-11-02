@@ -1,5 +1,6 @@
 import type { CommandId } from "@t3tools/contracts";
 import { makeThreadMoveProgressStore } from "../threads/ThreadMoveProgressStore.ts";
+import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 import { makeThreadCurrentQueueStore } from "../threads/ThreadCurrentQueueStore.ts";
 import { threadVmQuotaUsage } from "../threads/ThreadVmQuota.ts";
 import { makeThreadVmPolicyStore } from "../threads/ThreadVmPolicy.ts";
@@ -174,11 +175,12 @@ export const getPortableThreadPlacement = Effect.fn("relay.api.thread_history.pl
     return yield* withPrivateThreadAccess(threadId, "read", (placement) =>
       Effect.gen(function* () {
         const sql = (yield* RelayDb).$client;
-        const [move] = placement.operationId
-          ? yield* sql<{ failureDetail: string | null }>`SELECT failure_detail AS "failureDetail"
-              FROM relay_thread_moves WHERE operation_id=${placement.operationId}
-                AND thread_id=${threadId} AND phase IN ('preparing','frozen','ready')`
-          : [];
+        const move = placement.operationId
+          ? yield* makeThreadPlacementStore(sql).findMove({
+              threadId,
+              operationId: placement.operationId,
+            })
+          : null;
         const previousLocations = yield* sql<{
           environmentId: string;
           generation: number;
@@ -187,6 +189,7 @@ export const getPortableThreadPlacement = Effect.fn("relay.api.thread_history.pl
           ...placement,
           previousLocations,
           moveFailureDetail: move?.failureDetail ?? null,
+          moveFailures: move?.moveFailures ?? [],
           moveProgress: placement.operationId
             ? yield* makeThreadMoveProgressStore(sql).read(placement.operationId)
             : [],

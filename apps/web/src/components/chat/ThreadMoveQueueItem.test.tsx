@@ -10,7 +10,11 @@ import {
   type ThreadMoveQueueEntry,
   type ThreadPromptQueue,
 } from "@t3tools/contracts";
-import type { RelayPortableThreadPlacement, RelayThreadVmStatus } from "@t3tools/contracts/relay";
+import type {
+  RelayPortableThreadPlacement,
+  RelayThreadVmStatus,
+  ThreadMoveWaitingForAuth,
+} from "@t3tools/contracts/relay";
 import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
 
 function deferred<T>() {
@@ -144,6 +148,49 @@ const initialQueue: ThreadPromptQueue = {
   ...emptyThreadPromptQueue(),
   entries: [initialMove],
 };
+function withWorkerAuth(waitingForAuth: ThreadMoveWaitingForAuth): RelayPortableThreadPlacement {
+  fixture.status = {
+    threadId,
+    generation: 2,
+    allocation: null,
+    setupPhase: "pending",
+    capacityState: "started",
+    activity: "unknown",
+    sourceActivationPending: false,
+    pausePhase: null,
+    resumePhase: null,
+    backupPhase: null,
+    lastVerifiedBackupAt: null,
+    pendingProviderAuth: {
+      operationId: "move",
+      allocationId: "vm",
+      environmentId: EnvironmentId.make("vm"),
+      generation: 3,
+      instanceId: "codex",
+    },
+  };
+  return {
+    ...placement,
+    moveProgress: [
+      {
+        threadId,
+        operationId: "move",
+        environmentId: "vm",
+        generation: 3,
+        participant: "destination",
+        attempt: 2,
+        revision: 1,
+        stage: "downloading",
+        completedBytes: 0,
+        totalBytes: null,
+        completedArtifacts: 0,
+        totalArtifacts: null,
+        waitingForAuth,
+        updatedAt: "2026-10-26T09:01:00Z",
+      },
+    ],
+  };
+}
 
 for (const [surface, Component, useCancellation, MoveItem] of [
   ["web", SavedThreadQueue, useSavedThreadMoveCancellation, ThreadMoveQueueItem],
@@ -155,10 +202,12 @@ for (const [surface, Component, useCancellation, MoveItem] of [
       queue,
       environment = environmentId,
       logicalThread = threadId,
+      movePlacement = placement,
     }: {
       queue: ThreadPromptQueue;
       environment?: EnvironmentId;
       logicalThread?: ThreadId;
+      movePlacement?: RelayPortableThreadPlacement;
     }) {
       const cancellation = useCancellation(logicalThread);
       const refresh = async () => {
@@ -173,7 +222,7 @@ for (const [surface, Component, useCancellation, MoveItem] of [
             environmentId={environment}
             threadId={logicalThread}
             queue={queue}
-            placement={placement}
+            placement={movePlacement}
             cancellation={cancellation}
             onChange={refresh}
           />
@@ -184,6 +233,7 @@ for (const [surface, Component, useCancellation, MoveItem] of [
       queue: ThreadPromptQueue | undefined = initialQueue,
       environment = environmentId,
       logicalThread = threadId,
+      movePlacement = placement,
     ) => {
       await act(async () => {
         const view = (
@@ -191,6 +241,7 @@ for (const [surface, Component, useCancellation, MoveItem] of [
             queue={queue ?? initialQueue}
             environment={environment}
             logicalThread={logicalThread}
+            movePlacement={movePlacement}
           />
         );
         if (renderer) renderer.update(view);
@@ -472,6 +523,59 @@ for (const [surface, Component, useCancellation, MoveItem] of [
       await render();
       await click("Sign in to Codex");
       expect(fixture.signIn).toHaveBeenCalledTimes(1);
+      expect(fixture.dispatch).not.toHaveBeenCalled();
+    });
+    it.each([
+      ["account_selection", "Choose a Codex account"],
+      ["personal_sign_in", "Waiting for Codex sign-in"],
+      ["organization_connection", "Connect organization Codex"],
+    ] as const)("keeps the neutral %s wait actionable", async (reason, label) => {
+      const movePlacement = withWorkerAuth(reason);
+      await render(initialQueue, environmentId, threadId, movePlacement);
+      expect(JSON.stringify(renderer!.toJSON())).toContain(label);
+      await click("Sign in to Codex");
+      expect(fixture.signIn).toHaveBeenCalledTimes(1);
+      expect(fixture.dispatch).not.toHaveBeenCalled();
+    });
+    it("keeps superseded failures in a passive disclosure and resets it for another move", async () => {
+      const earlierError = "Earlier VM connection failed";
+      const movePlacement: RelayPortableThreadPlacement = {
+        ...withWorkerAuth("personal_sign_in"),
+        moveFailures: [
+          {
+            environmentId: "vm",
+            generation: 3,
+            attempt: 1,
+            detail: earlierError,
+            reportedAt: "2026-10-26T09:00:00Z",
+            active: false,
+          },
+        ],
+      };
+      await render(initialQueue, environmentId, threadId, movePlacement);
+      expect(JSON.stringify(renderer!.toJSON())).toContain("Waiting for Codex sign-in");
+      if (surface === "web") {
+        const disclosure = renderer!.root.findByType("details");
+        expect(disclosure.props.open).not.toBe(true);
+        expect(disclosure.findByType("summary").children.join("")).toBe("Previous error");
+        expect(disclosure.findByType("p").children.join("")).toBe(earlierError);
+      } else {
+        expect(JSON.stringify(renderer!.toJSON())).not.toContain(earlierError);
+        expect(button("Previous error")!.props.accessibilityState.expanded).toBe(false);
+        await click("Previous error");
+        expect(button("Previous error")!.props.accessibilityState.expanded).toBe(true);
+        expect(JSON.stringify(renderer!.toJSON())).toContain(earlierError);
+        const operationId = CommandId.make("next-move");
+        await render(
+          { ...initialQueue, entries: [{ ...initialMove, operationId }] },
+          environmentId,
+          threadId,
+          { ...movePlacement, operationId },
+        );
+        expect(button("Previous error")!.props.accessibilityState.expanded).toBe(false);
+        expect(JSON.stringify(renderer!.toJSON())).not.toContain(earlierError);
+      }
+      expect(fixture.signIn).not.toHaveBeenCalled();
       expect(fixture.dispatch).not.toHaveBeenCalled();
     });
     it.each(["account", "relay", "thread"] as const)(

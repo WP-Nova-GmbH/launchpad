@@ -1,4 +1,10 @@
 import * as Stream from "effect/Stream";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as TestClock from "effect/testing/TestClock";
+import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import { THREAD_VM_IDENTITY_SECRET } from "./ThreadVmEnrollment.ts";
 import { assert, describe, it } from "@effect/vitest";
 import { EnvironmentId, EventId, ThreadId, type OrchestrationEvent } from "@t3tools/contracts";
@@ -21,7 +27,187 @@ const work = {
   workId: "provider:turn-1",
   kind: "provider" as const,
 };
+const uploadFile = {
+  artifactId: "00000000-0000-4000-8000-000000000077",
+  operationId: "00000000-0000-5000-8000-000000000077",
+  kind: "workspace" as const,
+  sha256: "a".repeat(64),
+  sizeBytes: 3,
+};
+const uploadReceipt = {
+  ...uploadFile,
+  threadId: ThreadId.make(work.threadId),
+  state: "complete" as const,
+};
+const uploadAuthority = (client: HttpClient.HttpClient, credential = () => "current-token") =>
+  makeThreadExecutionAuthority.pipe(
+    Effect.provideService(ServerSecretStore, {
+      get: (name) =>
+        Effect.sync(() =>
+          name === RELAY_URL_SECRET
+            ? Option.some(new TextEncoder().encode(work.relayUrl))
+            : name === RELAY_ENVIRONMENT_CREDENTIAL_SECRET
+              ? Option.some(new TextEncoder().encode(credential()))
+              : Option.none(),
+        ),
+      set: () => Effect.void,
+      create: () => Effect.void,
+      remove: () => Effect.void,
+      getOrCreateRandom: () => Effect.succeed(new Uint8Array()),
+    }),
+    Effect.provideService(ServerEnvironmentIdentity, {
+      getEnvironmentId: Effect.succeed(EnvironmentId.make(work.environmentId)),
+    }),
+    Effect.provideService(HttpClient.HttpClient, client),
+  );
 describe("thread execution authority transport", () => {
+  it.effect(
+    "replays only the failed artifact after an HTTP/2 GOAWAY with current credentials",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "artifact-goaway-" });
+        const file = `${directory}/chunk`;
+        yield* fs.writeFile(file, Uint8Array.from([1, 2, 3]));
+        const failed = yield* Deferred.make<void>();
+        const calls: Array<{ authorization: string; body: number[]; query: unknown }> = [];
+        let credential = "first-token";
+        let opened = 0;
+        const authority = yield* uploadAuthority(
+          HttpClient.make((request) =>
+            Effect.gen(function* () {
+              assert.equal(request.body._tag, "Stream");
+              if (request.body._tag !== "Stream") return yield* Effect.die("Expected upload body");
+              const body = Array.from(
+                yield* Stream.runCollect(
+                  request.body.stream.pipe(
+                    Stream.mapError(() => ({ _tag: "TestBodyFailure" as const })),
+                  ),
+                ).pipe(Effect.orDie),
+              ).flatMap((part) => Array.from(part));
+              calls.push({
+                authorization: request.headers.authorization!,
+                body,
+                query: Object.fromEntries(request.urlParams),
+              });
+              if (calls.length === 1) {
+                credential = "rotated-token";
+                yield* Deferred.succeed(failed, undefined);
+                return yield* new HttpClientError.HttpClientError({
+                  reason: new HttpClientError.TransportError({
+                    request,
+                    cause: new TypeError("fetch failed", {
+                      cause: Object.assign(new Error("HTTP/2: GOAWAY frame received"), {
+                        name: "InformationalError",
+                        code: "UND_ERR_INFO",
+                      }),
+                    }),
+                  }),
+                });
+              }
+              return HttpClientResponse.fromWeb(request, Response.json(uploadReceipt));
+            }),
+          ),
+          () => credential,
+        );
+        const upload = yield* authority.moves
+          .upload(
+            { ...work, operationId: uploadFile.operationId },
+            uploadFile,
+            Stream.unwrap(
+              Effect.sync(() => {
+                opened += 1;
+                return fs.stream(file);
+              }),
+            ),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(failed);
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual(yield* Fiber.join(upload), uploadReceipt);
+        assert.equal(opened, 2);
+        assert.deepEqual(
+          calls.map((call) => call.authorization),
+          ["Bearer first-token", "Bearer rotated-token"],
+        );
+        assert.deepEqual(
+          calls.map((call) => call.body),
+          [
+            [1, 2, 3],
+            [1, 2, 3],
+          ],
+        );
+        assert.deepEqual(calls[0]?.query, calls[1]?.query);
+        assert.deepEqual(calls[1]?.query, {
+          generation: "4",
+          operationId: uploadFile.operationId,
+          kind: uploadFile.kind,
+          sha256: uploadFile.sha256,
+          sizeBytes: "3",
+        });
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect("bounds persistent artifact transport failures to three attempts", () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const started = yield* Deferred.make<void>();
+      const authority = yield* uploadAuthority(
+        HttpClient.make((request) =>
+          Effect.gen(function* () {
+            attempts += 1;
+            yield* Deferred.succeed(started, undefined);
+            return yield* new HttpClientError.HttpClientError({
+              reason: new HttpClientError.TransportError({ request, cause: new Error("GOAWAY") }),
+            });
+          }),
+        ),
+      );
+      const upload = yield* authority.checkpoints
+        .upload(work, uploadFile, Stream.empty)
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(started);
+      yield* TestClock.adjust("1 second");
+      assert.equal((yield* Fiber.join(upload))._tag, "ThreadCheckpointPublishError");
+      assert.equal(attempts, 3);
+    }),
+  );
+  for (const status of [400, 401, 403, 409, 413, 500])
+    it.effect(`does not retry an artifact HTTP ${status} response`, () =>
+      Effect.gen(function* () {
+        let attempts = 0;
+        const authority = yield* uploadAuthority(
+          HttpClient.make((request) =>
+            Effect.sync(() => {
+              attempts += 1;
+              return HttpClientResponse.fromWeb(request, Response.json({}, { status }));
+            }),
+          ),
+        );
+        assert.equal(
+          (yield* Effect.flip(authority.checkpoints.upload(work, uploadFile, Stream.empty)))._tag,
+          "ThreadCheckpointPublishError",
+        );
+        assert.equal(attempts, 1);
+      }),
+    );
+  it.effect("does not retry an invalid artifact receipt", () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const authority = yield* uploadAuthority(
+        HttpClient.make((request) =>
+          Effect.sync(() => {
+            attempts += 1;
+            return HttpClientResponse.fromWeb(request, Response.json({ state: "invalid" }));
+          }),
+        ),
+      );
+      assert.equal(
+        (yield* Effect.flip(authority.checkpoints.upload(work, uploadFile, Stream.empty)))._tag,
+        "ThreadCheckpointPublishError",
+      );
+      assert.equal(attempts, 1);
+    }),
+  );
   it.effect(
     "uses the current environment credential and refuses a changed relay or environment before networking",
     () => {

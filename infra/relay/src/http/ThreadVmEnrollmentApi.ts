@@ -1,4 +1,5 @@
 import { ThreadId } from "@t3tools/contracts";
+import { normalizeThreadTransferFormats } from "@t3tools/shared/threadTransferEncoding";
 import {
   RelayApi,
   RelayAuthInvalidError,
@@ -80,6 +81,7 @@ export const enrollThreadVm = Effect.fn("relay.api.thread_vm.enroll")(
             const scope = yield* makeThreadVmBindingStore(sql).bind({ ...input, credentialId });
             const response = {
               environmentId: input.environmentId,
+              threadTransferFormats: normalizeThreadTransferFormats(input.threadTransferFormats),
               scope: { ...scope, threadId: ThreadId.make(scope.threadId) },
               relayIssuer,
               cloudMintPublicKey: config.cloudMintPublicKey,

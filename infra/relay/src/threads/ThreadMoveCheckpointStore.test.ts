@@ -12,6 +12,9 @@ import { prepareMoveCheckpointArchive } from "./testUtils/moveCheckpointCatalog.
 import { repositoryUploadCatalogFixture } from "./testUtils/repositoryUploadCatalog.ts";
 import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
 import { makeThreadJournalStore } from "./ThreadJournalStore.ts";
+import { makeThreadMoveArtifactStore } from "./ThreadMoveArtifactStore.ts";
+import { normalizeThreadTransferManifest } from "@t3tools/shared/threadTransferManifest";
+import type { ThreadTransferPackedManifest } from "@t3tools/contracts/relay";
 const decode = Schema.decodeUnknownSync(OrchestrationEvent);
 const fixture = Effect.fnUntraced(function* (
   input: {
@@ -21,6 +24,13 @@ const fixture = Effect.fnUntraced(function* (
     priorProvider?: boolean;
     vmDestination?: boolean;
     bundleContent?: Uint8Array;
+    packed?: boolean;
+    selectTransferEncoding?: boolean;
+    workspaceContents?: ReadonlyMap<string, Uint8Array>;
+    mutatePackedManifest?: (
+      manifest: ThreadTransferPackedManifest,
+      indexId: string,
+    ) => ThreadTransferPackedManifest;
   } = {},
 ) {
   const sql = yield* PgClient.PgClient,
@@ -103,6 +113,229 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
   "frozen move recovery saves (Postgres)",
   () => {
     layer(nativeCheckpointCatalogTestLayer)((it) => {
+      for (const policy of ["unset", "legacy"] as const)
+        it.effect(`rejects packed publication with ${policy} encoding policy`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture({ packed: true, selectTransferEncoding: false });
+              if (policy === "legacy")
+                yield* f.placements.selectEncoding({
+                  ...f.move,
+                  destinationThreadTransferFormats: ["launchpad-thread-chunks-v1"],
+                });
+              expect((yield* Effect.flip(f.publish))._tag).toBe("ThreadMoveArtifactConflict");
+              expect(yield* f.store.get(f.move.operationId)).toBeNull();
+              const [pins] = yield* (yield* PgClient.PgClient)<{
+                count: number;
+              }>`SELECT count(*)::int AS count
+            FROM relay_thread_artifact_pins WHERE operation_id=${f.move.operationId}`;
+              expect(pins?.count).toBe(0);
+            }),
+          ),
+        );
+      it.effect(
+        "publishes shared workspace objects once and retains an exclusive reset bundle after workspace collection",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture({
+                packed: true,
+                vmDestination: true,
+                bundleContent: new Uint8Array(9 * 1024 * 1024).fill(19),
+                workspaceContents: new Map([
+                  [".env", new TextEncoder().encode("SETTING=preserved\n")],
+                  ["proof.txt", new TextEncoder().encode("proof from the VM\n")],
+                ]),
+              });
+              const sql = yield* PgClient.PgClient;
+              const normalized = normalizeThreadTransferManifest(f.artifactManifest);
+              const workspace = normalized.files.filter((file) =>
+                file.path.startsWith("workspace/objects/"),
+              );
+              expect(workspace).toHaveLength(2);
+              const packId = workspace[0]!.slices[0]!.artifactId;
+              expect(workspace[1]!.slices[0]!.artifactId).toBe(packId);
+              const reads = new Map<string, number>();
+              const store = makeThreadMoveArtifactStore(sql, {
+                ...f.objects,
+                read: (key) =>
+                  Effect.sync(() => {
+                    reads.set(key, (reads.get(key) ?? 0) + 1);
+                  }).pipe(Effect.andThen(f.objects.read(key))),
+              });
+              const published = yield* store.publish({
+                ...f.move,
+                manifestArtifactId: f.manifestArtifactId,
+              });
+              expect(published.artifactCount).toBe(normalized.objects.length + 1);
+              expect(reads.get(`thread-artifacts/v1/${packId}`)).toBe(1);
+              const [pins] = yield* sql<{ count: number }>`SELECT count(*)::int AS count
+            FROM relay_thread_artifact_pins WHERE operation_id=${f.move.operationId}`;
+              expect(pins?.count).toBe(normalized.objects.length + 1);
+              const recovery = makeThreadMoveCheckpointStore(sql, f.objects);
+              const [checkpoint] = yield* sql<{ count: number }>`SELECT artifact_count AS count
+            FROM relay_thread_move_checkpoints WHERE operation_id=${f.move.operationId}`;
+              expect(checkpoint?.count).toBe(
+                normalized.objects.filter((object) => object.kind !== "workspace").length + 1,
+              );
+              yield* f.ready;
+              yield* f.placements.commitMove(f.move);
+              yield* f.placements.activated({
+                ...f.move,
+                environmentId: f.move.destinationEnvironmentId,
+                generation: 2,
+              });
+              yield* store.releasePins(f.move.operationId);
+              yield* sql`UPDATE relay_thread_artifacts SET retention_until=clock_timestamp()-interval '40 days'
+            WHERE thread_id=${f.move.threadId}`;
+              while (yield* f.transfer.collectOne()) {
+                /* Drain disposable workspace objects. */
+              }
+              const [pack] = yield* sql<{
+                state: string;
+              }>`SELECT state FROM relay_thread_artifacts WHERE artifact_id=${packId}`;
+              expect(pack?.state).toBe("deleted");
+              const repository = (yield* recovery.repositoryUpload(f.move.threadId))!;
+              const bundle = normalized.files.find(
+                (file) => file.path === "workspace/repository.bundle",
+              )!;
+              expect(repository.bundle.chunks).toHaveLength(2);
+              expect(repository.bundle.chunks.map((chunk) => chunk.artifactId)).toEqual(
+                bundle.slices.map((slice) => slice.artifactId),
+              );
+              for (const chunk of repository.bundle.chunks) {
+                expect(chunk.artifactId).not.toBe(packId);
+                const stream = yield* recovery.openRepositoryUpload({
+                  threadId: f.move.threadId,
+                  operationId: repository.operationId,
+                  artifactId: chunk.artifactId,
+                });
+                let size = 0;
+                const digest = NodeCrypto.createHash("sha256");
+                yield* Stream.runForEach(stream, (bytes) =>
+                  Effect.sync(() => {
+                    size += bytes.length;
+                    digest.update(bytes);
+                  }),
+                );
+                expect(size).toBe(chunk.sizeBytes);
+                expect(digest.digest("hex")).toBe(chunk.sha256);
+              }
+              expect((yield* recovery.latest(f.move.threadId))?.operationId).toBe(
+                f.move.operationId,
+              );
+            }),
+          ),
+      );
+      for (const invalid of ["index alias", "missing root", "changed frozen checksum"] as const)
+        it.effect(`rejects a packed move with ${invalid} before publishing pins`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture({
+                packed: true,
+                mutatePackedManifest: (manifest, indexId) => {
+                  if (invalid === "index alias") {
+                    const oldId = manifest.objects[0]!.artifactId;
+                    return {
+                      ...manifest,
+                      objects: manifest.objects.map((object) =>
+                        object.artifactId === oldId ? { ...object, artifactId: indexId } : object,
+                      ),
+                      files: manifest.files.map((file) => ({
+                        ...file,
+                        slices: file.slices.map((slice) =>
+                          slice.artifactId === oldId ? { ...slice, artifactId: indexId } : slice,
+                        ),
+                      })),
+                    };
+                  }
+                  const root = manifest.files.find((file) => file.path === "manifest.json")!;
+                  const ids = new Set(root.slices.map((slice) => slice.artifactId));
+                  if (invalid === "missing root")
+                    return {
+                      ...manifest,
+                      objects: manifest.objects.filter((object) => !ids.has(object.artifactId)),
+                      files: manifest.files.filter((file) => file !== root),
+                    };
+                  const sha256 = "b".repeat(64);
+                  return {
+                    ...manifest,
+                    transferManifestSha256: sha256,
+                    objects: manifest.objects.map((object) =>
+                      ids.has(object.artifactId) ? { ...object, sha256 } : object,
+                    ),
+                    files: manifest.files.map((file) =>
+                      file === root ? { ...file, sha256 } : file,
+                    ),
+                  };
+                },
+              });
+              const sql = yield* PgClient.PgClient;
+              const error = yield* Effect.flip(f.publish);
+              expect(error._tag).toBe("ThreadMoveArtifactConflict");
+              expect(error.message).toMatch(
+                invalid === "index alias"
+                  ? /alias/
+                  : invalid === "missing root"
+                    ? /archive header/
+                    : /frozen source/,
+              );
+              expect(yield* f.store.get(f.move.operationId)).toBeNull();
+              const [pins] = yield* sql<{ count: number }>`SELECT count(*)::int AS count
+              FROM relay_thread_artifact_pins WHERE operation_id=${f.move.operationId}`;
+              expect(pins?.count).toBe(0);
+              expect((yield* f.placements.get(f.move.threadId))?.environmentId).toBe(
+                f.owner.environmentId,
+              );
+            }),
+          ),
+        );
+      it.effect(
+        "corrupted shared pack bytes block checkpoint verification and ownership cutover",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture({
+                packed: true,
+                workspaceContents: new Map([
+                  ["a.txt", new TextEncoder().encode("first")],
+                  ["b.txt", new TextEncoder().encode("second")],
+                ]),
+              });
+              const sql = yield* PgClient.PgClient;
+              const normalized = normalizeThreadTransferManifest(f.artifactManifest);
+              const id = normalized.files.find((file) =>
+                file.path.startsWith("workspace/objects/"),
+              )!.slices[0]!.artifactId;
+              const damaged = new Uint8Array(
+                f.uploads.find((upload) => upload.artifactId === id)!.content,
+              );
+              damaged[0] = damaged[0]! ^ 1;
+              const store = makeThreadMoveArtifactStore(sql, {
+                ...f.objects,
+                read: (key) =>
+                  key === `thread-artifacts/v1/${id}`
+                    ? Effect.succeed(Stream.succeed(damaged))
+                    : f.objects.read(key),
+              });
+              expect(
+                (yield* Effect.flip(
+                  store.publish({ ...f.move, manifestArtifactId: f.manifestArtifactId }),
+                ))._tag,
+              ).toBe("ThreadMoveCheckpointConflict");
+              const [saved] = yield* sql<{ count: number }>`SELECT count(*)::int AS count
+            FROM relay_thread_move_checkpoints WHERE operation_id=${f.move.operationId}`;
+              expect(saved?.count).toBe(0);
+              yield* f.ready;
+              expect((yield* Effect.flip(f.placements.commitMove(f.move)))._tag).toBe(
+                "ThreadPlacementConflict",
+              );
+              expect((yield* f.placements.get(f.move.threadId))?.environmentId).toBe(
+                f.owner.environmentId,
+              );
+            }),
+          ),
+      );
       it.effect("replaces the retained upload only after a new local move completes", () =>
         Effect.scoped(
           Effect.gen(function* () {

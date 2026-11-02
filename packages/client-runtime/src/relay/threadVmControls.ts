@@ -8,7 +8,7 @@ import {
   type ThreadPromptQueue,
 } from "@t3tools/contracts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
-import { RelayThreadVmPreviewPort } from "@t3tools/contracts/relay";
+import { CodexVmConnectionError, RelayThreadVmPreviewPort } from "@t3tools/contracts/relay";
 import type {
   RelayThreadVmStatus,
   RelayThreadVmResetRequest,
@@ -22,10 +22,13 @@ import type {
   RelayThreadVmCodexAuthSource,
   RelayThreadVmCodexAuthSelection,
   RelayCodexVmConnection,
+  ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
+import * as Data from "effect/Data";
 import * as Option from "effect/Option";
 import { HttpClientError } from "effect/unstable/http";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
@@ -157,6 +160,12 @@ const unsupportedAuthSource = (error: ManagedRelayClientError) =>
   error._tag === "ManagedRelayRequestFailedError" &&
   HttpClientError.isHttpClientError(error.cause) &&
   error.cause.response?.status === 404;
+
+const isCodexVmConnectionError = Schema.is(CodexVmConnectionError);
+const requiresVmAccountSelection = (error: ManagedRelayClientError) =>
+  error._tag === "ManagedRelayRequestFailedError" &&
+  isCodexVmConnectionError(error.cause) &&
+  error.cause.reason === "source_unavailable";
 
 /** Managed VMs never expose a device-code prompt or a local account logout. */
 export function threadVmProviderAuthPresentation(
@@ -436,6 +445,25 @@ export function threadVmCapabilityLabel(
       : "Inactive";
 }
 
+const authWaitPresentation = {
+  account_selection: {
+    label: "Choose a Codex account",
+    detail: "Choose personal sign-in or the organization’s Codex account to continue.",
+  },
+  personal_sign_in: {
+    label: "Waiting for Codex sign-in",
+    detail: "Finish Codex sign-in to continue preparing this VM.",
+  },
+  organization_connection: {
+    label: "Connect organization Codex",
+    detail: "Connect or reconnect Codex for VMs in Organization settings.",
+  },
+  verification: {
+    label: "Checking Codex sign-in",
+    detail: "Checking whether Codex is ready. Preparation continues automatically.",
+  },
+} satisfies Record<ThreadMoveWaitingForAuth, { label: string; detail: string }>;
+
 /** A single presentation model is shared by the chat, VM overview and mobile client. */
 export function threadVmPresentation(input: {
   readonly status: RelayThreadVmStatus | null;
@@ -444,8 +472,16 @@ export function threadVmPresentation(input: {
   readonly queuePaused?: boolean;
   readonly capabilities?: ThreadVmCapabilities | null;
   readonly providerAuth?: RelayThreadVmProviderAuth | null;
+  readonly workerAuth?: ThreadMoveWaitingForAuth | null | undefined;
 }) {
   const { status } = input;
+  const workerAuth = status?.pendingProviderAuth ? input.workerAuth : undefined;
+  const workerWait = workerAuth !== undefined && workerAuth !== null;
+  const providerAuth = workerAuth === null ? null : input.providerAuth;
+  const authWait =
+    typeof workerAuth === "string" && providerAuth?.requirement !== "authenticated"
+      ? authWaitPresentation[workerAuth]
+      : null;
   const awaitingSourceActivation =
     status?.allocation?.state === "running" && status.sourceActivationPending;
   const held = !!(
@@ -469,7 +505,9 @@ export function threadVmPresentation(input: {
     !activePause;
   const failed = !!(
     input.error ||
-    (status?.pendingProviderAuth && input.providerAuth?.requirement === "provider_unavailable") ||
+    (status?.pendingProviderAuth &&
+      !workerWait &&
+      providerAuth?.requirement === "provider_unavailable") ||
     status?.restore?.errorCode ||
     status?.reset?.errorCode ||
     status?.finalSave?.errorCode ||
@@ -477,26 +515,37 @@ export function threadVmPresentation(input: {
   );
   const label = input.error
     ? "VM status unavailable"
-    : status?.pendingProviderAuth && input.providerAuth?.requirement === "provider_unavailable"
-      ? "Codex needs attention"
-      : status?.pendingProviderAuth && input.providerAuth?.requirement === "authenticated"
-        ? "Preparing VM"
-        : status
-          ? threadVmStatusLabel(status)
-          : "VM status unavailable";
+    : status?.pendingProviderAuth && workerAuth === null
+      ? "Preparing VM"
+      : authWait
+        ? authWait.label
+        : status?.pendingProviderAuth && providerAuth?.requirement === "provider_unavailable"
+          ? "Codex needs attention"
+          : status?.pendingProviderAuth && providerAuth?.requirement === "authenticated"
+            ? "Preparing VM"
+            : status
+              ? threadVmStatusLabel(status)
+              : "VM status unavailable";
   let primary: { type: ThreadVmPrimaryAction; label: string } | null = null;
   if (input.error || !status) primary = { type: "check", label: "Check status" };
   else if (status.pendingProviderAuth)
     primary =
-      input.providerAuth?.requirement === "authenticated"
+      workerAuth === null ||
+      workerAuth === "verification" ||
+      providerAuth?.requirement === "authenticated"
         ? null
-        : input.providerAuth?.requirement === "provider_unavailable"
+        : !workerWait && providerAuth?.requirement === "provider_unavailable"
           ? { type: "check", label: "Check status" }
           : {
               type: "sign_in",
-              label: ["waiting", "verifying"].includes(input.providerAuth?.auth.phase ?? "")
-                ? "Finish Codex sign-in"
-                : "Sign in to Codex",
+              label:
+                workerAuth === "account_selection"
+                  ? "Choose account"
+                  : workerAuth === "organization_connection"
+                    ? "Connect Codex"
+                    : ["waiting", "verifying"].includes(providerAuth?.auth.phase ?? "")
+                      ? "Finish Codex sign-in"
+                      : "Sign in to Codex",
             };
   else if (status.replacement?.phase === "awaiting_choice")
     primary = { type: "replace", label: "Choose a VM to replace" };
@@ -516,12 +565,16 @@ export function threadVmPresentation(input: {
   const detail =
     input.error ??
     (status?.pendingProviderAuth
-      ? input.providerAuth?.requirement === "provider_unavailable"
-        ? (input.providerAuth.auth.message ??
-          "Codex is unavailable in this VM. Its runner needs attention before preparation can continue.")
-        : input.providerAuth?.requirement === "authenticated"
-          ? "Codex is signed in. VM preparation continues automatically."
-          : "Sign in to Codex inside this VM. Your Launchpad Connect account is already connected."
+      ? workerAuth === null
+        ? "VM preparation continues automatically."
+        : authWait
+          ? authWait.detail
+          : providerAuth?.requirement === "provider_unavailable"
+            ? (providerAuth.auth.message ??
+              "Codex is unavailable in this VM. Its runner needs attention before preparation can continue.")
+            : providerAuth?.requirement === "authenticated"
+              ? "Codex is signed in. VM preparation continues automatically."
+              : "Sign in to Codex inside this VM. Your Launchpad Connect account is already connected."
       : status?.setupPhase === "failed" && !status.pendingProviderAuth
         ? "Preparation stopped. Cancel this setup before trying another move. Your conversation is kept."
         : status?.restore?.errorCode || status?.reset?.errorCode || status?.finalSave?.errorCode
@@ -564,7 +617,7 @@ export function threadVmPresentation(input: {
       ? ("danger" as const)
       : ready
         ? ("success" as const)
-        : primary
+        : primary && !workerWait
           ? ("attention" as const)
           : ("neutral" as const),
     detail,
@@ -592,6 +645,39 @@ export function threadVmPresentation(input: {
   };
 }
 
+function threadVmWorkerAuthProgress(
+  placement: RelayPortableThreadPlacement | null | undefined,
+  status: RelayThreadVmStatus | null | undefined,
+) {
+  const binding = status?.pendingProviderAuth;
+  if (
+    !placement?.operationId ||
+    status?.threadId !== placement.threadId ||
+    status.generation !== placement.generation ||
+    binding?.operationId !== placement.operationId ||
+    ![placement.generation, placement.generation + 1].includes(binding.generation)
+  )
+    return undefined;
+  return placement.moveProgress
+    ?.filter(
+      (progress) =>
+        progress.threadId === placement.threadId &&
+        progress.operationId === binding.operationId &&
+        progress.environmentId === binding.environmentId &&
+        progress.generation === binding.generation &&
+        progress.participant === "destination",
+    )
+    .sort((a, b) => b.attempt - a.attempt || b.revision - a.revision)[0];
+}
+
+/** Only the pending destination's accepted receipt can change its auth overlay. */
+export function threadVmWorkerAuthState(
+  placement: RelayPortableThreadPlacement | null | undefined,
+  status: RelayThreadVmStatus | null | undefined,
+): ThreadMoveWaitingForAuth | null | undefined {
+  return threadVmWorkerAuthProgress(placement, status)?.waitingForAuth;
+}
+
 /** Byte counts come from verified transfer receipts, with no guessed overall percentage. */
 export function threadMoveProgressPresentation(
   placement: RelayPortableThreadPlacement | null | undefined,
@@ -600,7 +686,15 @@ export function threadMoveProgressPresentation(
   const snapshots =
     placement.moveProgress?.filter(
       (progress) =>
-        progress.operationId === placement.operationId && progress.threadId === placement.threadId,
+        progress.operationId === placement.operationId &&
+        progress.threadId === placement.threadId &&
+        progress.generation ===
+          placement.generation +
+            (progress.environmentId === placement.environmentId
+              ? 0
+              : progress.participant === "destination"
+                ? 1
+                : -1),
     ) ?? [];
   const destination = snapshots.filter((progress) => progress.participant === "destination");
   const progress = [...(destination.length ? destination : snapshots)].sort(
@@ -608,6 +702,10 @@ export function threadMoveProgressPresentation(
       b.attempt - a.attempt || b.revision - a.revision || b.updatedAt.localeCompare(a.updatedAt),
   )[0];
   if (!progress) return null;
+  const authWait =
+    progress.participant === "destination" && progress.waitingForAuth
+      ? authWaitPresentation[progress.waitingForAuth]
+      : null;
   const labels = {
     capturing: "Saving conversation",
     packing: "Preparing files",
@@ -624,11 +722,12 @@ export function threadMoveProgressPresentation(
         ? `${Math.round(value / 1024)} KB`
         : `${value} B`;
   return {
-    label: labels[progress.stage],
+    label: authWait?.label ?? labels[progress.stage],
     detail:
-      progress.totalBytes === null
+      authWait?.detail ??
+      (progress.totalBytes === null
         ? null
-        : `${bytes(progress.completedBytes)} of ${bytes(progress.totalBytes)} verified`,
+        : `${bytes(progress.completedBytes)} of ${bytes(progress.totalBytes)} verified`),
     stage: progress.stage,
   };
 }
@@ -1063,6 +1162,81 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       Atom.setIdleTTL(0),
     ),
   );
+  type AuthTransition = {
+    session: ManagedRelaySession | null;
+    route: ThreadRelayRouting | null;
+    binding: RelayThreadVmProviderAuthBinding | null;
+    receipt: ReturnType<typeof threadVmWorkerAuthProgress>;
+    key: string;
+    valid: boolean;
+  };
+  const providerAuthTransitionAtom = Atom.family((key: string) =>
+    Atom.make((get): AuthTransition => {
+      const session = get(managedRelaySessionAtom),
+        route = get(routeAtom(key)),
+        binding = get(providerAuthBindingAtom(key)),
+        proofs = get(portableThreadPlacementsAtom),
+        [, threadId] = decodeKey(key);
+      const placement =
+        proofs?.session === session &&
+        proofs.relayUrl === normalizeSecureRelayUrl(route?.relayUrl ?? "")
+          ? proofs.placements.get(threadId)
+          : undefined;
+      const status = readManagedRelaySnapshotState(get.once(queryAtom(key))).data?.status;
+      const previous = Option.getOrUndefined(get.self<AuthTransition>());
+      const same =
+        previous?.session === session &&
+        previous.route === route &&
+        (previous.binding === binding ||
+          (!!previous.binding && !!binding && sameAuthBinding(previous.binding, binding)));
+      // Library rows omit detailed receipts. They must not undo a newer exact placement read.
+      const receipt =
+        placement?.moveProgress !== undefined
+          ? threadVmWorkerAuthProgress(placement, status)
+          : placement?.operationId === binding?.operationId && same
+            ? previous.receipt
+            : undefined;
+      const valid = !placement || !binding || placement.operationId === binding.operationId;
+      return {
+        session,
+        route,
+        binding,
+        receipt,
+        valid,
+        key:
+          JSON.stringify(binding) +
+          JSON.stringify([
+            valid,
+            receipt?.waitingForAuth === undefined
+              ? null
+              : [receipt.attempt, receipt.waitingForAuth],
+          ]),
+      };
+    }).pipe(
+      Atom.withEquality<AuthTransition>(
+        (a, b) => a.session === b.session && a.route === b.route && a.key === b.key,
+      ),
+      Atom.setIdleTTL(0),
+    ),
+  );
+  class AuthReadError extends Data.TaggedError("ThreadVmAuthReadError")<{
+    message: string;
+    cause: unknown;
+    transition: AuthTransition;
+  }> {}
+  const currentAuthReadError = (
+    result: AsyncResult.AsyncResult<unknown, unknown>,
+    transition: AuthTransition,
+  ) => {
+    if (result._tag !== "Failure") return null;
+    const error = Cause.squash(result.cause);
+    return error instanceof AuthReadError &&
+      error.transition.session === transition.session &&
+      error.transition.route === transition.route &&
+      error.transition.key === transition.key
+      ? error.message
+      : null;
+  };
   const validateAuthBinding = (
     binding: RelayThreadVmProviderAuthBinding,
     reply: RelayThreadVmProviderAuth | null,
@@ -1077,28 +1251,36 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
   };
   const providerAuthQueryAtom = Atom.family((key: string) =>
     runtime
-      .atom((get) =>
-        Effect.gen(function* () {
-          const session = get(managedRelaySessionAtom),
-            route = get(routeAtom(key)),
-            binding = get(providerAuthBindingAtom(key));
-          if (!session || !route || !binding) return null;
+      .atom((get) => {
+        const transition = get(providerAuthTransitionAtom(key));
+        return Effect.gen(function* () {
+          const { session, route, binding } = transition;
+          if (!session || !route || !binding || !transition.valid) return null;
           const registry = yield* AtomRegistry.AtomRegistry;
           const { relay, clerkToken } = yield* authorize(registry, key);
           const [, threadId] = decodeKey(key);
-          const reply = yield* relay.getThreadVmProviderAuth({ clerkToken, threadId });
+          const reply = yield* relay
+            .getThreadVmProviderAuth({ clerkToken, threadId })
+            .pipe(Effect.catchIf(requiresVmAccountSelection, () => Effect.succeed(null)));
           const current = pendingAuthBinding(registry, key);
           if (
             registry.get(managedRelaySessionAtom) !== session ||
+            registry.get(providerAuthTransitionAtom(key)).key !== transition.key ||
             !current ||
             !sameAuthBinding(binding, current)
           )
             return null;
           yield* validateAuthBinding(binding, reply);
           // AsyncResult retains the previous value during refresh; never show its code to a new account.
-          return reply ? { ...reply, accountId: session.accountId, route } : null;
-        }),
-      )
+          return reply
+            ? { ...reply, accountId: session.accountId, route, transition: transition.key }
+            : null;
+        }).pipe(
+          Effect.mapError(
+            (cause): Error => new AuthReadError({ message: cause.message, cause, transition }),
+          ),
+        );
+      })
       .pipe(Atom.setIdleTTL(0)),
   );
   const providerAuthRefreshingAtom = Atom.family((key: string) =>
@@ -1123,12 +1305,11 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
   // Mounted only by account controls. Older relays must not break ordinary VM reads.
   const providerAuthSourceQueryAtom = Atom.family((key: string) =>
     runtime
-      .atom((get) =>
-        Effect.gen(function* () {
-          const session = get(managedRelaySessionAtom),
-            route = get(routeAtom(key)),
-            binding = get(providerAuthBindingAtom(key));
-          if (!session || !route) return null;
+      .atom((get) => {
+        const transition = get(providerAuthTransitionAtom(key));
+        return Effect.gen(function* () {
+          const { session, route, binding } = transition;
+          if (!session || !route || !transition.valid) return null;
           const registry = yield* AtomRegistry.AtomRegistry;
           const { relay, clerkToken } = yield* authorize(registry, key);
           const [, threadId] = decodeKey(key);
@@ -1141,20 +1322,27 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
           const current = pendingAuthBinding(registry, key);
           if (
             registry.get(managedRelaySessionAtom) !== session ||
+            registry.get(providerAuthTransitionAtom(key)).key !== transition.key ||
             (binding === null
               ? current !== null
               : current === null || !sameAuthBinding(binding, current))
           )
             return null;
+          const accountSelectionRequired =
+            binding !== null &&
+            source._tag === "Failure" &&
+            requiresVmAccountSelection(source.failure);
           return {
             session,
             route,
             binding,
+            transition: transition.key,
             source: source._tag === "Success" ? source.success : null,
             connection: connection?._tag === "Success" ? connection.success : null,
+            accountSelectionRequired,
             unsupported: source._tag === "Failure" && unsupportedAuthSource(source.failure),
             error:
-              source._tag === "Failure"
+              source._tag === "Failure" && !accountSelectionRequired
                 ? unsupportedAuthSource(source.failure)
                   ? "This Launchpad Connect version does not support VM account selection. Update it to use organization Codex; personal sign-in remains available."
                   : source.failure.message
@@ -1162,19 +1350,27 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
                   ? connection.failure.message
                   : null,
           };
-        }),
-      )
+        }).pipe(
+          Effect.mapError(
+            (cause): Error => new AuthReadError({ message: cause.message, cause, transition }),
+          ),
+        );
+      })
       .pipe(Atom.setIdleTTL(0)),
   );
   const providerAuthSourceViewAtom = Atom.family((key: string) =>
     Atom.make((get) => {
-      const state = readManagedRelaySnapshotState(get(providerAuthSourceQueryAtom(key))),
+      const result = get(providerAuthSourceQueryAtom(key)),
+        state = readManagedRelaySnapshotState(result),
         value = state.data,
-        binding = get(providerAuthBindingAtom(key));
+        binding = get(providerAuthBindingAtom(key)),
+        transition = get(providerAuthTransitionAtom(key));
       return {
         ...state,
+        error: currentAuthReadError(result, transition),
         data:
           value?.session === get(managedRelaySessionAtom) &&
+          value.transition === transition.key &&
           value.route === get(routeAtom(key)) &&
           (value.binding === null
             ? binding === null
@@ -1352,22 +1548,27 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       if (!session || !route) return null;
       const [environmentId, threadId] = decodeKey(key);
       const state = readManagedRelaySnapshotState(get(queryAtom(key)));
-      const providerAuth = state.data?.status?.pendingProviderAuth
-        ? readManagedRelaySnapshotState(get(providerAuthPollAtom(key)))
+      const authResult = state.data?.status?.pendingProviderAuth
+        ? get(providerAuthPollAtom(key))
         : null;
+      const providerAuth = authResult ? readManagedRelaySnapshotState(authResult) : null;
       const authValue = providerAuth?.data;
       const binding = state.data?.status?.pendingProviderAuth;
+      const transition = get(providerAuthTransitionAtom(key));
       return {
         ...state,
+        workerAuth: transition.receipt?.waitingForAuth,
+        authTransitionKey: binding && transition.valid ? transition.key : null,
         providerAuth:
           authValue &&
           binding &&
           authValue.accountId === session.accountId &&
           authValue.route === route &&
+          authValue.transition === transition.key &&
           sameAuthBinding(binding, authValue)
             ? authValue
             : null,
-        providerAuthError: providerAuth?.error ?? null,
+        providerAuthError: authResult ? currentAuthReadError(authResult, transition) : null,
         providerAuthPending: providerAuth?.isPending ?? false,
         accountId: session.accountId,
         queuePaused: threadDetailAtom
@@ -1562,6 +1763,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
                 })
               : relay.getThreadVmProviderAuth(auth);
       const reply = yield* request.pipe(
+        Effect.result,
         Effect.ensuring(
           Effect.sync(() => {
             registry.refresh(providerAuthQueryAtom(key));
@@ -1573,14 +1775,53 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       const latest = pendingAuthBinding(registry, key);
       if (
         registry.get(managedRelaySessionAtom) !== session ||
-        !latest ||
-        !sameAuthBinding(latest, current)
+        (latest && !sameAuthBinding(latest, current))
       )
         return yield* new OrchestrationDispatchCommandError({
           message: "Your account or VM preparation changed. Refresh the thread.",
         });
-      yield* validateAuthBinding(current, reply);
-      return reply;
+      if (latest && reply._tag === "Success") {
+        yield* validateAuthBinding(current, reply.success);
+        return reply.success;
+      }
+      // The worker may finish between account selection and its status reply.
+      // Resolve that race through reads; never repeat the sign-in/account write.
+      const refreshed = yield* AtomRegistry.getResult(registry, queryAtom(key), {
+        suspendOnWaiting: true,
+      }).pipe(Effect.result);
+      if (
+        refreshed._tag === "Success" &&
+        !refreshed.success?.status?.pendingProviderAuth &&
+        registry.get(managedRelaySessionAtom) === session
+      ) {
+        const proofs = registry.get(portableThreadPlacementsAtom);
+        const cached =
+          proofs?.session === session && proofs.relayUrl === normalizeSecureRelayUrl(relay.relayUrl)
+            ? proofs.placements.get(input.threadId)
+            : undefined;
+        // An enrolled environment stays bound to one allocation/operation after revocation.
+        // Abort leaves the source generation; only that operation can commit this destination pair.
+        const completed = (placement: RelayPortableThreadPlacement | null | undefined) =>
+          placement?.threadId === input.threadId &&
+          placement.operationId === null &&
+          placement.environmentId === current.environmentId &&
+          placement.generation === current.generation;
+        const placement = completed(cached)
+          ? cached
+          : yield* readLocation(registry, key).pipe(Effect.catch(() => Effect.succeed(null)));
+        if (
+          completed(placement) &&
+          registry.get(managedRelaySessionAtom) === session &&
+          !pendingAuthBinding(registry, key) &&
+          normalizeSecureRelayUrl(registry.get(routeAtom(key))?.relayUrl ?? "") ===
+            normalizeSecureRelayUrl(relay.relayUrl)
+        )
+          return null;
+      }
+      if (reply._tag === "Failure") return yield* Effect.fail(reply.failure);
+      return yield* new OrchestrationDispatchCommandError({
+        message: "Your account or VM preparation changed. Refresh the thread.",
+      });
     }),
   });
   const refreshStatus = createRuntimeCommand(runtime, {

@@ -4,8 +4,21 @@ export {
   ThreadVmWarmRestoreBootstrapReceipt,
 } from "./threadVm.ts";
 import { OrchestrationCommandReceipt, ThreadWorkspaceManifest } from "./threadTransfer.ts";
+import { ThreadTransferFormats, ThreadTransferEncodingPolicy } from "./threadTransferFormat.ts";
+export {
+  ThreadTransferFormat,
+  ThreadTransferFormats,
+  ThreadTransferEncodingPolicy,
+} from "./threadTransferFormat.ts";
 import { ThreadMoveProgressReport, ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
-export { ThreadMoveProgressReport, ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
+export {
+  ThreadMoveProgressReport,
+  ThreadMoveProgressSnapshot,
+  ThreadMoveWaitingForAuth,
+  ThreadMoveParticipantState,
+  ThreadMoveFailureDiagnostic,
+} from "./threadMoveProgress.ts";
+import { ThreadMoveParticipantState } from "./threadMoveProgress.ts";
 import {
   RelayPortableThreadPlacement,
   RelayThreadCurrentQueue,
@@ -115,6 +128,7 @@ import {
   CommandId,
   EnvironmentId,
   NonNegativeInt,
+  PositiveInt,
   ProjectId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -2295,6 +2309,7 @@ export const RelayThreadVmBootstrap = Schema.Struct({
 export type RelayThreadVmBootstrap = typeof RelayThreadVmBootstrap.Type;
 export const RelayThreadVmEnrollmentReceipt = Schema.Struct({
   enrolled: Schema.Literal(true),
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
   environmentId: EnvironmentId,
   allocationId: TrimmedNonEmptyString,
   operationId: TrimmedNonEmptyString,
@@ -2305,6 +2320,7 @@ export type RelayThreadVmEnrollmentReceipt = typeof RelayThreadVmEnrollmentRecei
 
 export const RelayThreadVmEnrollProofPayload = Schema.Struct({
   ...RelaySignedJwtRegisteredClaims,
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
   allocationId: TrimmedNonEmptyString,
   operationId: TrimmedNonEmptyString,
   seed: TrimmedNonEmptyString,
@@ -2316,6 +2332,7 @@ export const RelayThreadVmEnrollRequest = Schema.Struct({
 });
 export const RelayThreadVmEnrollResponse = Schema.Struct({
   environmentId: EnvironmentId,
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
   scope: RelayThreadVmCredentialScope,
   relayIssuer: TrimmedNonEmptyString,
   cloudMintPublicKey: TrimmedNonEmptyString,
@@ -2480,6 +2497,7 @@ export type RelayPublishResponse = typeof RelayPublishResponse.Type;
 export const RelayHealthResponse = Schema.Struct({
   ok: Schema.Boolean,
   service: Schema.Literal("relay"),
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
   threadVmConfigured: Schema.optionalKey(Schema.Boolean),
   threadVmCapabilities: Schema.optionalKey(ThreadVmCapabilities),
 });
@@ -3627,6 +3645,7 @@ const RelayThreadArtifactsGroup = HttpApiGroup.make("threadArtifacts")
 const RelayThreadMoveFailureDetail = TrimmedNonEmptyString.check(Schema.isMaxLength(2000));
 export const RelayThreadMove = Schema.Struct({
   manifestArtifactId: Schema.NullOr(RelayThreadArtifactId),
+  transferEncodingPolicy: Schema.optionalKey(Schema.NullOr(ThreadTransferEncodingPolicy)),
   recoveryVerified: Schema.optional(Schema.Boolean),
   threadId: ThreadId,
   operationId: RelayThreadArtifactId,
@@ -3649,6 +3668,9 @@ export const RelayThreadMove = Schema.Struct({
   manifestSha256: Schema.NullOr(RelayThreadArtifactHash),
   failureDetail: Schema.optional(Schema.NullOr(RelayThreadMoveFailureDetail)),
   progress: Schema.optional(Schema.Array(ThreadMoveProgressSnapshot)),
+  participantStates: Schema.optionalKey(
+    Schema.Array(ThreadMoveParticipantState).check(Schema.isMaxLength(2)),
+  ),
 });
 export type RelayThreadMove = typeof RelayThreadMove.Type;
 const RelayThreadMoveParams = Schema.Struct({
@@ -3672,6 +3694,7 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
       payload: Schema.Struct({
         after: Schema.NullOr(RelayThreadArtifactId),
         limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
+        threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
       }),
       success: Schema.Struct({
         entries: Schema.Array(RelayThreadMove),
@@ -3704,6 +3727,7 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           actorUserId: TrimmedNonEmptyString,
           destinationEnvironmentId: EnvironmentId,
           destinationProjectId: ProjectId,
+          sourceThreadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
         }),
         success: RelayThreadMove,
         error: RelayTenancyErrors,
@@ -3718,11 +3742,22 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           ...RelayThreadGeneration,
           actorUserId: TrimmedNonEmptyString,
           cancelBeforeStart: Schema.Boolean,
+          sourceThreadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
         }),
         success: Schema.Union([
           Schema.Struct({ status: Schema.Literal("accepted"), move: RelayThreadMove }),
           RelayThreadVmQuotaResponse,
         ]),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "selectEncoding",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/encoding",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
         error: RelayTenancyErrors,
       },
     ),
@@ -3744,6 +3779,7 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
         payload: Schema.Struct({
           ...RelayThreadGeneration,
           detail: RelayThreadMoveFailureDetail,
+          attempt: Schema.optionalKey(PositiveInt),
         }),
         success: RelayThreadMove,
         error: RelayTenancyErrors,
@@ -3758,6 +3794,7 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           ...RelayThreadGeneration,
           sourceCursor: NonNegativeInt,
           manifestSha256: RelayThreadArtifactHash,
+          attempt: Schema.optionalKey(PositiveInt),
         }),
         success: RelayThreadMove,
         error: RelayTenancyErrors,
@@ -3788,6 +3825,7 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           ...RelayThreadGeneration,
           sourceCursor: NonNegativeInt,
           manifestSha256: RelayThreadArtifactHash,
+          attempt: Schema.optionalKey(PositiveInt),
         }),
         success: RelayThreadMove,
         error: [...RelayTenancyErrors, CodexVmConnectionError],
@@ -4965,6 +5003,8 @@ export {
   ThreadVmPolicyRecord,
   DEFAULT_THREAD_VM_POLICY,
   ThreadTransferChunkManifest,
+  ThreadTransferPackedManifest,
+  ThreadTransferArtifactManifest,
   ThreadNativeCheckpointArchiveManifest,
   ThreadNativeCheckpointPublicationReceipt,
   ThreadAttachmentManifest,

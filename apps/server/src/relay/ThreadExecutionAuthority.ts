@@ -8,12 +8,14 @@ import {
   type ThreadCheckpointTransport,
 } from "./ThreadCheckpointPublisher.ts";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
+import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import { ThreadCommandSyncError, type ThreadCommandTransport } from "./ThreadCommandSync.ts";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import {
   ThreadHistorySyncError,
@@ -235,16 +237,16 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
   const checkpoints: ThreadCheckpointTransport = {
     upload: Effect.fn("ThreadExecutionAuthority.uploadCheckpointArtifact")(
       function* (owner, input, body) {
-        const client = yield* configuredClient(
-          owner,
-          "history",
-          HttpClientRequest.bodyStream(body, {
-            contentType: "application/octet-stream",
-            contentLength: input.sizeBytes,
-          }),
-        ).pipe(Effect.mapError(() => checkpointFailure(owner.threadId)));
-        return yield* client.threadArtifacts
-          .upload({
+        return yield* Effect.gen(function* () {
+          const client = yield* configuredClient(
+            owner,
+            "history",
+            HttpClientRequest.bodyStream(body, {
+              contentType: "application/octet-stream",
+              contentLength: input.sizeBytes,
+            }),
+          );
+          return yield* client.threadArtifacts.upload({
             params: {
               environmentId: EnvironmentId.make(owner.environmentId),
               threadId: ThreadId.make(owner.threadId),
@@ -257,8 +259,18 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
               sha256: input.sha256,
               sizeBytes: input.sizeBytes,
             },
-          })
-          .pipe(Effect.mapError(() => checkpointFailure(owner.threadId)));
+          });
+        }).pipe(
+          // File-backed bodies reopen on each execution; the immutable artifact
+          // identity makes replay safe even when only the receipt was lost.
+          Effect.retry({
+            times: 2,
+            schedule: Schedule.spaced("100 millis"),
+            while: (error) =>
+              HttpClientError.isHttpClientError(error) && error.reason._tag === "TransportError",
+          }),
+          Effect.mapError(() => checkpointFailure(owner.threadId)),
+        );
       },
     ),
     publishNative: Effect.fn("ThreadExecutionAuthority.publishNativeCheckpoint")(

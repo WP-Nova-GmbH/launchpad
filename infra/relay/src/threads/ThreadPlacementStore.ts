@@ -1,8 +1,24 @@
-import type { RelayPortableThreadPlacement } from "@t3tools/contracts/relay";
+import {
+  ThreadMoveProgressReport,
+  type RelayPortableThreadPlacement,
+  type ThreadMoveParticipantState,
+  type ThreadMoveFailureDiagnostic,
+} from "@t3tools/contracts/relay";
+import {
+  ThreadTransferFormats,
+  type ThreadTransferFormat,
+  type ThreadTransferEncodingPolicy,
+} from "@t3tools/contracts/threadTransferFormat";
+import {
+  normalizeThreadTransferFormats,
+  threadTransferPolicyForFormat,
+  THREAD_TRANSFER_SUPPORTED_FORMATS,
+} from "@t3tools/shared/threadTransferEncoding";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { makeThreadVmActivityStore } from "./ThreadVmActivityStore.ts";
+import { makeThreadMoveParticipantStatus } from "./ThreadMoveParticipantStatus.ts";
 
 export class ThreadPlacementConflict extends Schema.TaggedError<ThreadPlacementConflict>()(
   "ThreadPlacementConflict",
@@ -29,6 +45,9 @@ export interface ThreadMove {
   readonly sourceCursor: number | null;
   readonly manifestSha256: string | null;
   readonly failureDetail?: string | null;
+  readonly transferEncodingPolicy?: ThreadTransferEncodingPolicy | null;
+  readonly participantStates?: readonly ThreadMoveParticipantState[];
+  readonly moveFailures?: readonly ThreadMoveFailureDiagnostic[];
 }
 interface Admission {
   readonly environmentId: string;
@@ -37,8 +56,10 @@ interface Admission {
 }
 type Owner = Pick<Placement, "threadId" | "environmentId" | "generation">;
 type MoveIdentity = Pick<ThreadMove, "threadId" | "operationId">;
+const encodeFormats = Schema.encodeSync(Schema.fromJsonString(ThreadTransferFormats));
 
 const conflict = (message: string) => new ThreadPlacementConflict({ message });
+const validAttempt = Schema.is(ThreadMoveProgressReport.fields.attempt);
 
 /**
  * Internal transactional store. Authentication and access-policy locks belong to its caller.
@@ -46,6 +67,7 @@ const conflict = (message: string) => new ThreadPlacementConflict({ message });
  * Methods compose with the caller's PgClient transaction so authorization can share that lock.
  */
 export function makeThreadPlacementStore(sql: PgClient) {
+  const participants = makeThreadMoveParticipantStatus(sql);
   const markVmWork = Effect.fnUntraced(function* (
     input: Owner & { readonly workId?: string },
     requireRunning: boolean,
@@ -128,15 +150,19 @@ export function makeThreadPlacementStore(sql: PgClient) {
     if (!placement) return yield* conflict("Portable thread does not exist");
     return placement;
   });
-  const getMove = Effect.fn("relay.thread_placement.get_move")(function* (input: MoveIdentity) {
+  const findMove = Effect.fn("relay.thread_placement.find_move")(function* (input: MoveIdentity) {
     const [row] =
       yield* sql<ThreadMove>`SELECT operation_id AS "operationId", thread_id AS "threadId",
       actor_user_id AS "actorUserId", source_environment_id AS "sourceEnvironmentId", expected_generation AS "expectedGeneration",
       destination_environment_id AS "destinationEnvironmentId", destination_project_id AS "destinationProjectId",
-      phase, source_cursor AS "sourceCursor", manifest_sha256 AS "manifestSha256", failure_detail AS "failureDetail"
+      phase, source_cursor AS "sourceCursor", manifest_sha256 AS "manifestSha256", failure_detail AS "failureDetail",
+      transfer_encoding_policy AS "transferEncodingPolicy"
       FROM relay_thread_moves WHERE operation_id = ${input.operationId} AND thread_id = ${input.threadId}`;
-    if (!row) return yield* conflict("Move does not exist for this thread");
-    return row;
+    return row ? yield* participants.project(row) : null;
+  });
+  const getMove = Effect.fn("relay.thread_placement.get_move")(function* (input: MoveIdentity) {
+    const move = yield* findMove(input);
+    return move ?? (yield* conflict("Move does not exist for this thread"));
   });
   const requireOwner = (placement: Placement, input: Owner) =>
     placement.environmentId === input.environmentId && placement.generation === input.generation
@@ -225,8 +251,12 @@ export function makeThreadPlacementStore(sql: PgClient) {
   });
 
   const beginMove = Effect.fn("relay.thread_placement.begin_move")(function* (
-    input: Omit<ThreadMove, "phase" | "manifestSha256" | "sourceCursor">,
+    input: Omit<ThreadMove, "phase" | "manifestSha256" | "sourceCursor"> & {
+      readonly sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
+    },
   ) {
+    const formats = normalizeThreadTransferFormats(input.sourceThreadTransferFormats);
+    if (!formats.length) return yield* conflict("The source offers no supported transfer format");
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const placement = yield* lock(input.threadId);
@@ -237,12 +267,18 @@ export function makeThreadPlacementStore(sql: PgClient) {
           yield* sql`SELECT operation_id FROM relay_thread_moves WHERE operation_id = ${input.operationId}`;
         if (prior.length) {
           const move = yield* getMove(input);
+          const [offer] = yield* sql<{
+            formats: readonly ThreadTransferFormat[];
+          }>`SELECT source_formats_json AS formats
+            FROM relay_thread_moves WHERE operation_id=${input.operationId}`;
           if (
             move.actorUserId !== input.actorUserId ||
             move.sourceEnvironmentId !== input.sourceEnvironmentId ||
             move.expectedGeneration !== input.expectedGeneration ||
             move.destinationEnvironmentId !== input.destinationEnvironmentId ||
-            move.destinationProjectId !== input.destinationProjectId
+            move.destinationProjectId !== input.destinationProjectId ||
+            !offer ||
+            normalizeThreadTransferFormats(offer.formats).join(",") !== formats.join(",")
           )
             return yield* conflict("Move ID reused with different intent");
           return move;
@@ -281,17 +317,66 @@ export function makeThreadPlacementStore(sql: PgClient) {
         if (input.sourceEnvironmentId === input.destinationEnvironmentId)
           return yield* conflict("Destination is already the current environment");
         yield* sql`INSERT INTO relay_thread_moves (operation_id, thread_id, actor_user_id, source_environment_id,
-        expected_generation, destination_environment_id, destination_project_id, phase)
+        expected_generation, destination_environment_id, destination_project_id, phase, source_formats_json,transfer_encoding_policy)
         VALUES (${input.operationId}, ${input.threadId}, ${input.actorUserId}, ${input.sourceEnvironmentId},
-        ${input.expectedGeneration}, ${input.destinationEnvironmentId}, ${input.destinationProjectId}, 'preparing')`;
+        ${input.expectedGeneration}, ${input.destinationEnvironmentId}, ${input.destinationProjectId}, 'preparing',
+          ${encodeFormats(formats)}::jsonb,${formats.includes("launchpad-thread-chunks-v2") ? null : "v1-64MiB"})`;
         yield* sql`UPDATE relay_thread_placements SET operation_id = ${input.operationId} WHERE thread_id = ${input.threadId}`;
         return yield* getMove(input);
       }),
     );
   });
 
+  const selectEncoding = Effect.fn("relay.thread_placement.select_encoding")(function* (
+    input: Pick<
+      ThreadMove,
+      | "threadId"
+      | "operationId"
+      | "actorUserId"
+      | "sourceEnvironmentId"
+      | "expectedGeneration"
+      | "destinationEnvironmentId"
+      | "destinationProjectId"
+    > & {
+      readonly destinationThreadTransferFormats: readonly ThreadTransferFormat[];
+    },
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const placement = yield* lock(input.threadId);
+        const move = yield* getMove(input);
+        if (
+          placement.operationId !== input.operationId ||
+          placement.environmentId !== input.sourceEnvironmentId ||
+          placement.generation !== input.expectedGeneration ||
+          !["preparing", "frozen"].includes(move.phase) ||
+          move.actorUserId !== input.actorUserId ||
+          move.sourceEnvironmentId !== input.sourceEnvironmentId ||
+          move.expectedGeneration !== input.expectedGeneration ||
+          move.destinationEnvironmentId !== input.destinationEnvironmentId ||
+          move.destinationProjectId !== input.destinationProjectId
+        )
+          return yield* conflict("The move participants changed during encoding selection");
+        if (move.transferEncodingPolicy != null) return move;
+        const [offer] = yield* sql<{
+          formats: readonly ThreadTransferFormat[];
+        }>`SELECT source_formats_json AS formats
+        FROM relay_thread_moves WHERE operation_id=${input.operationId} FOR UPDATE`;
+        if (!offer) return yield* conflict("The source format offer is unavailable");
+        const source = normalizeThreadTransferFormats(offer.formats);
+        const destination = normalizeThreadTransferFormats(input.destinationThreadTransferFormats);
+        const format = THREAD_TRANSFER_SUPPORTED_FORMATS.toReversed().find(
+          (format) => source.includes(format) && destination.includes(format),
+        );
+        if (!format) return yield* conflict("The environments share no supported transfer format");
+        yield* sql`UPDATE relay_thread_moves SET transfer_encoding_policy=${threadTransferPolicyForFormat(format)}
+        WHERE operation_id=${input.operationId} AND transfer_encoding_policy IS NULL`;
+        return yield* getMove(input);
+      }),
+    );
+  });
   const reportFailure = Effect.fn("relay.thread_placement.report_failure")(function* (
-    input: MoveIdentity & Owner & { readonly detail: string },
+    input: MoveIdentity & Owner & { readonly detail: string; readonly attempt?: number },
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -312,8 +397,13 @@ export function makeThreadPlacementStore(sql: PgClient) {
           return yield* conflict("Move no longer accepts participant failure reports");
         const detail = input.detail.trim();
         if (!detail || detail.length > 2000) return yield* conflict("Invalid move failure detail");
-        yield* sql`UPDATE relay_thread_moves SET failure_detail = COALESCE(failure_detail,${detail})
-          WHERE operation_id = ${input.operationId}`;
+        if (input.attempt === undefined)
+          yield* sql`UPDATE relay_thread_moves SET failure_detail = COALESCE(failure_detail,${detail})
+            WHERE operation_id = ${input.operationId}`;
+        else {
+          if (!validAttempt(input.attempt)) return yield* conflict("Invalid move failure attempt");
+          yield* participants.reportFailure({ ...input, attempt: input.attempt, detail });
+        }
         return yield* getMove(input);
       }),
     );
@@ -321,13 +411,19 @@ export function makeThreadPlacementStore(sql: PgClient) {
 
   const sourceFrozen = Effect.fn("relay.thread_placement.source_frozen")(function* (
     input: MoveIdentity &
-      Owner & { readonly sourceCursor: number; readonly manifestSha256: string },
+      Owner & {
+        readonly sourceCursor: number;
+        readonly manifestSha256: string;
+        readonly attempt?: number;
+      },
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const placement = yield* lock(input.threadId);
         yield* requireOwner(placement, input);
         const move = yield* getMove(input);
+        if (input.attempt !== undefined && !validAttempt(input.attempt))
+          return yield* conflict("Invalid move freeze attempt");
         if (placement.operationId !== input.operationId)
           return yield* conflict("Move no longer owns the handoff");
         if (move.phase === "frozen" || move.phase === "ready") {
@@ -336,7 +432,9 @@ export function makeThreadPlacementStore(sql: PgClient) {
             move.manifestSha256 !== input.manifestSha256
           )
             return yield* conflict("Frozen source manifest cannot change");
-          return move;
+          if (input.attempt !== undefined)
+            yield* participants.resolveBefore({ ...input, attempt: input.attempt });
+          return yield* getMove(input);
         }
         if (move.phase !== "preparing") return yield* conflict("Move is not preparing");
         const unfinished = yield* sql`SELECT work_id FROM relay_thread_execution_admissions
@@ -355,6 +453,8 @@ export function makeThreadPlacementStore(sql: PgClient) {
           return yield* conflict("Source history has not been mirrored through the freeze");
         yield* sql`UPDATE relay_thread_moves SET phase = 'frozen', source_cursor = ${input.sourceCursor}, manifest_sha256 = ${input.manifestSha256}, failure_detail = NULL
         WHERE operation_id = ${input.operationId}`;
+        if (input.attempt !== undefined)
+          yield* participants.resolveBefore({ ...input, attempt: input.attempt });
         return yield* getMove(input);
       }),
     );
@@ -365,6 +465,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
       readonly environmentId: string;
       readonly sourceCursor: number;
       readonly manifestSha256: string;
+      readonly attempt?: number;
     },
   ) {
     return yield* sql.withTransaction(
@@ -379,7 +480,15 @@ export function makeThreadPlacementStore(sql: PgClient) {
           move.manifestSha256 !== input.manifestSha256
         )
           return yield* conflict("Destination does not match the frozen source");
+        if (input.attempt !== undefined && !validAttempt(input.attempt))
+          return yield* conflict("Invalid move readiness attempt");
         yield* sql`UPDATE relay_thread_moves SET phase = 'ready', failure_detail = NULL WHERE operation_id = ${input.operationId}`;
+        if (input.attempt !== undefined)
+          yield* participants.resolveBefore({
+            ...input,
+            generation: move.expectedGeneration + 1,
+            attempt: input.attempt,
+          });
         return yield* getMove(input);
       }),
     );
@@ -492,9 +601,11 @@ export function makeThreadPlacementStore(sql: PgClient) {
     get,
     enroll,
     getMove,
+    findMove,
     admit,
     completeWork,
     beginMove,
+    selectEncoding,
     reportFailure,
     sourceFrozen,
     destinationReady,

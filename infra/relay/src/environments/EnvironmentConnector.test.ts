@@ -65,6 +65,24 @@ const otherEnvironmentKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
   publicKeyEncoding: { format: "pem", type: "spki" },
 });
 
+it.effect("binds an encoding status probe to the expected environment key before networking", () =>
+  Effect.gen(function* () {
+    const connector = yield* EnvironmentConnector.EnvironmentConnector;
+    const failure = yield* Effect.flip(
+      connector.status({
+        userId: "user_123",
+        environmentId: "env-connector-test",
+        expectedEnvironmentPublicKey: otherEnvironmentKeyPair.publicKey,
+      }),
+    );
+    expect(failure._tag).toBe("EnvironmentMintResponseInvalid");
+  }).pipe(
+    Effect.provide(
+      connectorTestLayer(() => Effect.die("key mismatch must not make a health request")),
+    ),
+  ),
+);
+
 const decodeHealthRequestBody = Schema.decodeUnknownSync(
   Schema.fromJsonString(RelayCloudEnvironmentHealthRequest),
 );

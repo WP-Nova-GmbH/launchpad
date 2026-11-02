@@ -26,6 +26,10 @@
     "./threadTransfer": {
       "types": "./src/threadTransfer.ts",
       "import": "./src/threadTransfer.ts"
+    },
+    "./threadTransferFormat": {
+      "types": "./src/threadTransferFormat.ts",
+      "import": "./src/threadTransferFormat.ts"
     }
   },
   "scripts": {

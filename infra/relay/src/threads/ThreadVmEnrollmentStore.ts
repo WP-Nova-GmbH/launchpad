@@ -1,4 +1,9 @@
-import type { RelayThreadVmEnrollmentReceipt } from "@t3tools/contracts/relay";
+import {
+  ThreadTransferFormats,
+  type ThreadTransferFormat,
+  type RelayThreadVmEnrollmentReceipt,
+} from "@t3tools/contracts/relay";
+import { normalizeThreadTransferFormats } from "@t3tools/shared/threadTransferEncoding";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -26,7 +31,9 @@ interface Enrollment {
   readonly credentialId: string | null;
   readonly expired: boolean;
   readonly installed: boolean;
+  readonly threadTransferFormats: readonly ThreadTransferFormat[] | null;
 }
+const encodeFormats = Schema.encodeSync(Schema.fromJsonString(ThreadTransferFormats));
 
 /** Internal store. The caller verifies the signed proof and current owner access before exchange. */
 export function makeThreadVmEnrollmentStore(sql: PgClient) {
@@ -40,7 +47,8 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
     const [row] =
       yield* sql<Enrollment>`SELECT allocation_id AS "allocationId", operation_id AS "operationId", seed_hash AS "seedHash",
       sealed_seed AS "sealedSeed", environment_id AS "environmentId", environment_public_key AS "environmentPublicKey",
-      sealed_response AS "sealedResponse", credential_id AS "credentialId", expires_at <= clock_timestamp() AS expired, installed_at IS NOT NULL AS installed
+      sealed_response AS "sealedResponse", credential_id AS "credentialId", expires_at <= clock_timestamp() AS expired, installed_at IS NOT NULL AS installed,
+      thread_transfer_formats_json AS "threadTransferFormats"
       FROM relay_thread_vm_enrollments WHERE allocation_id = ${allocationId}`;
     return row ?? null;
   });
@@ -100,12 +108,16 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
       seed: Redacted.Redacted<string>;
       environmentId: string;
       environmentPublicKey: string;
+      threadTransferFormats?: readonly ThreadTransferFormat[];
     },
     issue: Effect.Effect<{ credentialId: string; response: Redacted.Redacted<string> }, E, R>,
   ) =>
     Effect.gen(function* () {
       const box = yield* RelaySecretBox;
       const seedHash = yield* hash(input.seed);
+      const formats = normalizeThreadTransferFormats(input.threadTransferFormats);
+      if (formats.length === 0) return yield* new ThreadVmEnrollmentInvalid();
+      const encodedFormats = encodeFormats(formats);
       return yield* sql.withTransaction(
         Effect.gen(function* () {
           yield* lockAllocation(input);
@@ -124,6 +136,7 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
             if (
               row.environmentId !== input.environmentId ||
               row.environmentPublicKey !== input.environmentPublicKey ||
+              normalizeThreadTransferFormats(row.threadTransferFormats).join() !== formats.join() ||
               !row.sealedResponse ||
               !row.credentialId
             )
@@ -138,7 +151,8 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
           yield* requireLiveBinding(issued.credentialId);
           const sealedResponse = yield* box.seal(Redacted.value(issued.response));
           yield* sql`UPDATE relay_thread_vm_enrollments SET environment_id = ${input.environmentId}, environment_public_key = ${input.environmentPublicKey},
-        sealed_response = ${sealedResponse}, credential_id = ${issued.credentialId} WHERE allocation_id = ${input.allocationId}`;
+        sealed_response = ${sealedResponse}, credential_id = ${issued.credentialId},
+        thread_transfer_formats_json = ${encodedFormats}::jsonb WHERE allocation_id = ${input.allocationId}`;
           return issued.response;
         }),
       );
@@ -149,14 +163,21 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
     yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* lockAllocation(receipt);
-        const rows = yield* sql`SELECT b.environment_id FROM relay_thread_vm_enrollments e
+        const rows = yield* sql<{
+          threadTransferFormats: readonly ThreadTransferFormat[] | null;
+        }>`SELECT e.thread_transfer_formats_json AS "threadTransferFormats" FROM relay_thread_vm_enrollments e
         JOIN relay_thread_vm_bindings b ON b.allocation_id = e.allocation_id AND b.credential_id = e.credential_id
         JOIN relay_environment_credentials c ON c.credential_id = b.credential_id
         WHERE e.allocation_id = ${receipt.allocationId} AND e.operation_id = ${receipt.operationId}
         AND e.environment_id = ${receipt.environmentId} AND b.environment_id = e.environment_id
         AND b.environment_public_key = e.environment_public_key AND b.thread_id = ${receipt.threadId}
         AND b.generation = ${receipt.generation} AND b.revoked_at IS NULL AND c.revoked_at IS NULL FOR SHARE OF b, c`;
-        if (!rows.length) return yield* new ThreadVmEnrollmentInvalid();
+        if (
+          !rows.length ||
+          normalizeThreadTransferFormats(rows[0]!.threadTransferFormats).join() !==
+            normalizeThreadTransferFormats(receipt.threadTransferFormats).join()
+        )
+          return yield* new ThreadVmEnrollmentInvalid();
         // Keep the encrypted seed until the guest confirms durable local installation.
         // Otherwise a relay restart after exchange but before delivery loses retryability.
         yield* sql`UPDATE relay_thread_vm_enrollments SET installed_at = COALESCE(installed_at, clock_timestamp()), sealed_seed = NULL

@@ -9,6 +9,8 @@ import {
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
+import type { ThreadTransferFormat } from "@t3tools/contracts/threadTransferFormat";
+import { normalizeThreadTransferFormats } from "@t3tools/shared/threadTransferEncoding";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import { makeThreadVmMoveDestinationStore } from "../threads/ThreadVmMoveDestinationStore.ts";
@@ -71,14 +73,31 @@ const response = Effect.fnUntraced(function* (move: ThreadMove) {
 /** Destination checks never substitute a client's UUID for a live trusted identity. */
 const requireDestination = Effect.fnUntraced(function* (
   placement: RelayPortableThreadPlacement,
-  input: { destinationEnvironmentId: string; expectedGeneration: number },
+  input: {
+    destinationEnvironmentId: string;
+    expectedGeneration: number;
+    publicKey?: string;
+    credentialId?: string;
+    grantSource?: "link" | "machine";
+  },
 ) {
   const sql = (yield* RelayDb).$client;
   const credentials = yield* sql<{ credentialId: string; publicKey: string }>`SELECT
     credential_id AS "credentialId", environment_public_key AS "publicKey"
     FROM relay_environment_credentials WHERE environment_id=${input.destinationEnvironmentId}
-      AND revoked_at IS NULL ORDER BY credential_id FOR SHARE`;
+      AND revoked_at IS NULL AND (${input.publicKey ?? null}::text IS NULL OR environment_public_key=${input.publicKey ?? null})
+      AND (${input.credentialId ?? null}::text IS NULL OR credential_id=${input.credentialId ?? null}) ORDER BY credential_id FOR SHARE`;
   for (const credential of credentials) {
+    if (input.grantSource) {
+      const grant =
+        input.grantSource === "link"
+          ? yield* sql`SELECT user_id FROM relay_environment_links WHERE environment_id=${input.destinationEnvironmentId}
+            AND environment_public_key=${credential.publicKey} AND user_id=${placement.ownerUserId} AND revoked_at IS NULL FOR SHARE`
+          : yield* sql`SELECT machine_id FROM relay_machines WHERE environment_id=${input.destinationEnvironmentId}
+            AND environment_public_key=${credential.publicKey} AND organization_id=${placement.organizationId}
+            AND deprovisioned_at IS NULL FOR SHARE`;
+      if (!grant.length) continue;
+    }
     const [binding] = yield* sql<{
       allocationId: string;
       threadId: string;
@@ -106,7 +125,7 @@ const requireDestination = Effect.fnUntraced(function* (
       Effect.as(true),
       Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(false)),
     );
-    if (allowed) return;
+    if (allowed) return credential;
   }
   return yield* tenancyNotFound("thread_not_found");
 });
@@ -167,6 +186,7 @@ export const beginPortableThreadMove = Effect.fn("relay.api.thread_moves.begin")
     actorUserId: string;
     destinationEnvironmentId: string;
     destinationProjectId: string;
+    sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
   },
 ) {
   const sql = (yield* RelayDb).$client;
@@ -190,7 +210,13 @@ export const beginPortableThreadMove = Effect.fn("relay.api.thread_moves.begin")
 }, Effect.catchTags(failures));
 
 export const beginPortableThreadVmMove = Effect.fn("relay.api.thread_moves.begin_vm")(
-  function* (input: Participant & { actorUserId: string; cancelBeforeStart: boolean }) {
+  function* (
+    input: Participant & {
+      actorUserId: string;
+      cancelBeforeStart: boolean;
+      sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
+    },
+  ) {
     const sql = (yield* RelayDb).$client;
     const { settings } = yield* ThreadVmRuntimeConfiguration;
     if (!settings) return yield* relayInternalErrorResponse("upstream_unavailable");
@@ -255,6 +281,13 @@ export const beginPortableThreadVmMove = Effect.fn("relay.api.thread_moves.begin
                 sourceCredentialId: principal.credentialId,
                 sourcePublicKey: principal.environmentPublicKey,
                 sourceAllocationId: principal.threadVm?.allocationId ?? null,
+                ...(input.sourceThreadTransferFormats === undefined
+                  ? {}
+                  : {
+                      sourceThreadTransferFormats: normalizeThreadTransferFormats(
+                        input.sourceThreadTransferFormats,
+                      ),
+                    }),
               },
             });
             const candidate = yield* makeThreadVmReplacementStore(sql).suggest(input.actorUserId);
@@ -290,6 +323,51 @@ export const getPortableThreadMove = Effect.fn("relay.api.thread_moves.get")(fun
   );
 }, Effect.catchTags(failures));
 
+/** Select before packing; an admitted guest can report formats without starting its import server. */
+export const selectPortableThreadMoveEncoding = Effect.fn("relay.api.thread_moves.encoding")(
+  function* (input: Participant) {
+    const sql = (yield* RelayDb).$client;
+    const store = makeThreadPlacementStore(sql);
+    const selected = yield* withThreadMoveParticipant(input, "source", true, (move, placement) =>
+      Effect.gen(function* () {
+        if (move.transferEncodingPolicy != null) return move;
+        const [guest] = yield* sql<{
+          allocationId: string;
+          environmentId: string | null;
+        }>`SELECT d.allocation_id AS "allocationId",e.environment_id AS "environmentId",
+      d.operation_id FROM relay_thread_vm_move_destinations d
+      LEFT JOIN relay_thread_vm_enrollments e USING(allocation_id) WHERE d.operation_id=${move.operationId}`;
+        // Ordinary receivers attest formats on their authenticated move poll.
+        // Their public endpoint may be absent or stale while the relay link works.
+        if (!guest || guest.environmentId === null) return move;
+        const valid = yield* sql<{
+          formats: readonly ThreadTransferFormat[] | null;
+        }>`SELECT e.thread_transfer_formats_json AS formats FROM relay_thread_vm_allocations a
+        JOIN relay_thread_vm_bindings b USING(allocation_id)
+        JOIN relay_environment_credentials c ON c.credential_id=b.credential_id
+        JOIN relay_thread_vm_enrollments e USING(allocation_id)
+        WHERE a.allocation_id=${guest.allocationId} AND a.thread_id=${move.threadId}
+          AND a.owner_user_id=${move.actorUserId} AND a.state='running' AND a.deleted_at IS NULL
+          AND b.environment_id=${guest.environmentId} AND b.thread_id=${move.threadId}
+          AND b.repository_id=${placement.repositoryId} AND b.generation=${move.expectedGeneration + 1}
+          AND b.revoked_at IS NULL AND c.revoked_at IS NULL AND c.environment_id=b.environment_id
+          AND c.environment_public_key=b.environment_public_key AND e.environment_id=b.environment_id
+          AND e.environment_public_key=b.environment_public_key AND e.credential_id=b.credential_id
+          AND e.operation_id=${move.operationId}
+          AND (${move.destinationEnvironmentId}=${`pending-vm:${move.operationId}`} OR b.environment_id=${move.destinationEnvironmentId})
+        FOR SHARE OF a,b,c,e`;
+        if (!valid.length) return yield* tenancyNotFound("thread_not_found");
+        return yield* store.selectEncoding({
+          ...move,
+          destinationThreadTransferFormats: normalizeThreadTransferFormats(valid[0]!.formats),
+        });
+      }),
+    );
+    return yield* response(selected);
+  },
+  Effect.catchTags(failures),
+);
+
 export const reportPortableThreadMoveProgress = Effect.fn("relay.api.thread_moves.progress")(
   function* (input: Participant & ThreadMoveProgressReport) {
     const sql = (yield* RelayDb).$client;
@@ -302,7 +380,12 @@ export const reportPortableThreadMoveProgress = Effect.fn("relay.api.thread_move
 );
 
 export const pendingPortableThreadMoves = Effect.fn("relay.api.thread_moves.pending")(
-  function* (input: { environmentId: string; after: string | null; limit: number }) {
+  function* (input: {
+    environmentId: string;
+    after: string | null;
+    limit: number;
+    threadTransferFormats?: readonly ThreadTransferFormat[];
+  }) {
     const principal = yield* RelayEnvironmentPrincipal;
     if (!principal.credentialId || principal.environmentId !== input.environmentId)
       return yield* tenancyNotFound("thread_not_found");
@@ -323,20 +406,50 @@ export const pendingPortableThreadMoves = Effect.fn("relay.api.thread_moves.pend
     const page = candidates.slice(0, input.limit);
     const entries: RelayThreadMove[] = [];
     for (const candidate of page) {
-      const move = yield* getPortableThreadMove({
+      const participant = {
         ...candidate,
         environmentId: input.environmentId,
         generation: candidate.generation + (candidate.source === input.environmentId ? 0 : 1),
-      }).pipe(Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)));
+      };
+      const move = yield* withThreadMoveParticipant(participant, "either", true, (move) =>
+        Effect.gen(function* () {
+          if (
+            principal.threadVm ||
+            move.destinationEnvironmentId !== input.environmentId ||
+            move.transferEncodingPolicy !== null ||
+            !["preparing", "frozen"].includes(move.phase)
+          )
+            return move;
+          const [offer] = yield* sql<{ formats: readonly ThreadTransferFormat[] }>`SELECT
+            source_formats_json AS formats FROM relay_thread_moves WHERE operation_id=${move.operationId}`;
+          if (!offer) return yield* tenancyNotFound("thread_not_found");
+          const destination = normalizeThreadTransferFormats(input.threadTransferFormats);
+          const source = normalizeThreadTransferFormats(offer.formats);
+          const store = makeThreadPlacementStore(sql);
+          if (!source.some((format) => destination.includes(format)))
+            return yield* store.reportFailure({
+              ...participant,
+              detail:
+                "The source and destination do not share a supported transfer format. Update the destination or cancel this move.",
+            });
+          return yield* store.selectEncoding({
+            ...move,
+            destinationThreadTransferFormats: destination,
+          });
+        }),
+      ).pipe(
+        Effect.flatMap(response),
+        Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)),
+      );
       if (move) entries.push(move);
     }
     return { entries, next: candidates.length > input.limit ? page.at(-1)!.operationId : null };
   },
-  Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
+  Effect.catchTags(failures),
 );
 
 export const freezePortableThreadMove = Effect.fn("relay.api.thread_moves.freeze")(function* (
-  input: Participant & { sourceCursor: number; manifestSha256: string },
+  input: Participant & { sourceCursor: number; manifestSha256: string; attempt?: number },
 ) {
   const sql = (yield* RelayDb).$client;
   return yield* response(
@@ -347,7 +460,7 @@ export const freezePortableThreadMove = Effect.fn("relay.api.thread_moves.freeze
 }, Effect.catchTags(failures));
 
 export const reportPortableThreadMoveFailure = Effect.fn("relay.api.thread_moves.failed")(
-  function* (input: Participant & { detail: string }) {
+  function* (input: Participant & { detail: string; attempt?: number }) {
     const sql = (yield* RelayDb).$client;
     return yield* response(
       yield* withThreadMoveParticipant(input, "either", true, () =>
@@ -412,7 +525,7 @@ export const readPortableThreadMoveArtifact = Effect.fn("relay.api.thread_moves.
 );
 
 export const readyPortableThreadMove = Effect.fn("relay.api.thread_moves.ready")(function* (
-  input: Participant & { sourceCursor: number; manifestSha256: string },
+  input: Participant & { sourceCursor: number; manifestSha256: string; attempt?: number },
 ) {
   const sql = (yield* RelayDb).$client;
   return yield* response(
@@ -498,6 +611,9 @@ export const threadMovesApi = HttpApiBuilder.group(RelayApi, "threadMoves", (han
       beginPortableThreadVmMove({ ...params, ...payload }),
     )
     .handle("get", ({ params, payload }) => getPortableThreadMove({ ...params, ...payload }))
+    .handle("selectEncoding", ({ params, payload }) =>
+      selectPortableThreadMoveEncoding({ ...params, ...payload }),
+    )
     .handle("failed", ({ params, payload }) =>
       reportPortableThreadMoveFailure({ ...params, ...payload }),
     )

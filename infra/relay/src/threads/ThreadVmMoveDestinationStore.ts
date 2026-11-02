@@ -4,6 +4,8 @@ import { makeThreadPlacementStore, ThreadPlacementConflict } from "./ThreadPlace
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
 import type { RelayThreadVmEnrollmentReceipt } from "@t3tools/contracts/relay";
+import type { ThreadTransferFormat } from "@t3tools/contracts/threadTransferFormat";
+import { normalizeThreadTransferFormats } from "@t3tools/shared/threadTransferEncoding";
 
 /** Internal coordinator only. The caller rechecks the private owner and source
  * credential. A reserved destination is quarantined, never the serving owner. */
@@ -21,6 +23,7 @@ export function makeThreadVmMoveDestinationStore(sql: PgClient) {
     templateId: string;
     cancelBeforeStart: boolean;
     replacementRequestId?: string;
+    sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -34,11 +37,18 @@ export function makeThreadVmMoveDestinationStore(sql: PgClient) {
         }>`SELECT allocation_id AS "allocationId" FROM relay_thread_vm_move_destinations WHERE operation_id=${input.operationId}`;
         if (prior) {
           const move = yield* placements.getMove(input);
+          const [offer] = yield* sql<{
+            formats: readonly ThreadTransferFormat[];
+          }>`SELECT source_formats_json AS formats
+            FROM relay_thread_moves WHERE operation_id=${input.operationId}`;
           const provision = yield* makeThreadVmProvisionStore(sql).get(prior.allocationId);
           if (
             move.actorUserId !== input.actorUserId ||
             move.sourceEnvironmentId !== input.sourceEnvironmentId ||
             move.expectedGeneration !== input.expectedGeneration ||
+            !offer ||
+            normalizeThreadTransferFormats(offer.formats).join(",") !==
+              normalizeThreadTransferFormats(input.sourceThreadTransferFormats).join(",") ||
             !provision ||
             provision.threadId !== input.threadId ||
             provision.operationId !== input.operationId ||
@@ -51,6 +61,9 @@ export function makeThreadVmMoveDestinationStore(sql: PgClient) {
           ...input,
           destinationEnvironmentId: `pending-vm:${input.operationId}`,
           destinationProjectId: `vm:${input.threadId}`,
+          ...(input.sourceThreadTransferFormats === undefined
+            ? {}
+            : { sourceThreadTransferFormats: input.sourceThreadTransferFormats }),
         });
         if (input.cancelBeforeStart) {
           yield* placements.requestAbort(input);

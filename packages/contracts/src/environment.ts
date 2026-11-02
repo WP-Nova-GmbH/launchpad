@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { ThreadTransferFormats } from "./threadTransferFormat.ts";
 
 import {
   EnvironmentId,
@@ -87,6 +88,7 @@ export const ServerSelfUpdateCapability = Schema.Literals([
 export type ServerSelfUpdateCapability = typeof ServerSelfUpdateCapability.Type;
 
 export const ExecutionEnvironmentCapabilities = Schema.Struct({
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
   /** Environment owns durable shared prompt queues; ordinary sends must enqueue. */
   sharedPromptQueue: Schema.optionalKey(Schema.Boolean),
   sharedPreparation: Schema.optionalKey(Schema.Boolean),

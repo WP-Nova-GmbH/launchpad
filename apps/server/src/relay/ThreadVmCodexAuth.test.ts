@@ -41,6 +41,7 @@ import {
 import { THREAD_VM_IDENTITY_SECRET, type InstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import {
   THREAD_VM_PROVIDER_AUTH_PATH,
+  ThreadVmProviderAuth,
   threadVmProviderAuthRouteLayer,
 } from "./ThreadVmProviderAuth.ts";
 
@@ -250,9 +251,21 @@ describe("VM-only structured native Codex sign-in", () => {
             ),
           ),
         );
+        const workerRoute = HttpRouter.add(
+          "GET",
+          "/worker-readiness",
+          Effect.gen(function* () {
+            const controller = yield* ThreadVmProviderAuth;
+            return yield* HttpServerResponse.json({
+              readiness: yield* controller.readiness(vm, binding),
+              flowId: (yield* controller.control(vm, { binding, action: "status" })).auth.flowId,
+            });
+          }),
+        );
         const router = HttpRouter.toWebHandler(
-          Layer.mergeAll(threadVmProviderAuthRouteLayer, ordinaryRoute).pipe(
+          Layer.mergeAll(threadVmProviderAuthRouteLayer, ordinaryRoute, workerRoute).pipe(
             Layer.provideMerge(ProviderAuthServiceLive),
+            Layer.provideMerge(ThreadVmProviderAuth.layer),
             Layer.provideMerge(dependencies),
           ),
           { disableLogger: true },
@@ -290,6 +303,13 @@ describe("VM-only structured native Codex sign-in", () => {
         expect(waiting.auth.interaction).toMatchObject({
           type: "deviceCode",
           userCode: "N20N-IKIRK",
+        });
+        const workerRead = yield* Effect.promise(() =>
+          router.handler(new Request("http://127.0.0.1:3773/worker-readiness")),
+        );
+        expect(yield* Effect.promise(() => workerRead.json())).toEqual({
+          readiness: { _tag: "Waiting", reason: "personal_sign_in" },
+          flowId: first.auth.flowId,
         });
         const retry = yield* request("start");
         expect(retry.auth.flowId).toBe(first.auth.flowId);

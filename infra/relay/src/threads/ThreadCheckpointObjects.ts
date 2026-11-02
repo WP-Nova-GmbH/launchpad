@@ -1,14 +1,17 @@
 import { sha256 } from "@noble/hashes/sha2";
 import type { PgClient } from "@effect/sql-pg/PgClient";
-import { ThreadTransferChunkManifest } from "@t3tools/contracts/relay";
+import {
+  normalizeThreadTransferManifest,
+  THREAD_TRANSFER_MANIFEST_MAX_BYTES,
+  type NormalizedThreadTransferManifest,
+} from "@t3tools/shared/threadTransferManifest";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
-import { makeThreadArtifactStore } from "./ThreadArtifactStore.ts";
+import { makeThreadArtifactStore, type ThreadArtifact } from "./ThreadArtifactStore.ts";
 
-const decodeChunks = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferChunkManifest));
 const hex = (bytes: Uint8Array) =>
   Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 const encodeEntries = Schema.encodeSync(
@@ -24,7 +27,11 @@ const encodeEntries = Schema.encodeSync(
   ),
 );
 
-type File = ThreadTransferChunkManifest["files"][number];
+type File = NormalizedThreadTransferManifest["files"][number];
+type StorageObject = Pick<
+  ThreadArtifact,
+  "artifactId" | "storageKey" | "kind" | "sha256" | "sizeBytes"
+>;
 type Input = {
   readonly threadId: string;
   readonly operationId: string;
@@ -52,7 +59,7 @@ export function makeThreadCheckpointObjects<E extends Error>(
       artifact.operationId !== input.operationId ||
       artifact.kind !== "manifest" ||
       artifact.state !== "complete" ||
-      artifact.sizeBytes > 32 * 1024 * 1024
+      artifact.sizeBytes > THREAD_TRANSFER_MANIFEST_MAX_BYTES
     )
       return yield* Effect.fail(conflict("Checkpoint chunk manifest is unavailable."));
     const readPinId = yield* (yield* Crypto.Crypto).randomUUIDv4;
@@ -62,45 +69,54 @@ export function makeThreadCheckpointObjects<E extends Error>(
       operationId: readPinId,
       leaseMinutes: 60,
     });
-    const readObject = Effect.fnUntraced(function* (artifactId: string, maxBytes: number) {
-      const object = yield* catalog.get(artifactId);
-      if (
-        !object ||
-        object.threadId !== input.threadId ||
-        object.operationId !== input.operationId ||
-        object.state !== "complete" ||
-        object.sizeBytes > maxBytes
-      )
-        return yield* Effect.fail(conflict("Checkpoint object is unavailable."));
-      const chunks: Uint8Array[] = [],
-        digest = sha256.create();
-      let length = 0;
-      const stream = yield* objects.read(object.storageKey);
-      yield* stream.pipe(
+    const streamObject = (object: StorageObject) =>
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const digest = sha256.create();
+          let length = 0;
+          return (yield* objects.read(object.storageKey)).pipe(
+            Stream.mapEffect((part) =>
+              Effect.gen(function* () {
+                length += part.length;
+                if (length > object.sizeBytes)
+                  return yield* Effect.fail(
+                    conflict("Checkpoint object exceeded its declared size."),
+                  );
+                digest.update(part);
+                return part;
+              }),
+            ),
+            Stream.concat(
+              Stream.fromEffect(
+                Effect.suspend(() =>
+                  length === object.sizeBytes && hex(digest.digest()) === object.sha256
+                    ? Effect.void
+                    : Effect.fail(conflict("Checkpoint object failed verification.")),
+                ),
+              ).pipe(Stream.drain),
+            ),
+          );
+        }),
+      );
+    const readObject = Effect.fnUntraced(function* (object: StorageObject) {
+      const bytes = new Uint8Array(object.sizeBytes);
+      let offset = 0;
+      yield* streamObject(object).pipe(
         Stream.runForEach((part) =>
-          Effect.gen(function* () {
-            length += part.length;
-            if (length > maxBytes || length > object.sizeBytes)
-              return yield* Effect.fail(conflict("Checkpoint object exceeded its declared size."));
-            chunks.push(part);
-            digest.update(part);
+          Effect.sync(() => {
+            bytes.set(part, offset);
+            offset += part.length;
           }),
         ),
       );
-      if (length !== object.sizeBytes || hex(digest.digest()) !== object.sha256)
-        return yield* Effect.fail(conflict("Checkpoint object failed verification."));
-      const bytes = new Uint8Array(length);
-      let offset = 0;
-      for (const part of chunks) {
-        bytes.set(part, offset);
-        offset += part.length;
-      }
       return bytes;
     });
     return yield* Effect.gen(function* () {
-      const manifest = yield* decodeChunks(
-        yield* text(yield* readObject(artifact.artifactId, 32 * 1024 * 1024)),
-      );
+      const encodedManifest = yield* text(yield* readObject(artifact));
+      const manifest = yield* Effect.try({
+        try: () => normalizeThreadTransferManifest(encodedManifest),
+        catch: () => conflict("Checkpoint chunk manifest is invalid."),
+      });
       if (
         manifest.threadId !== input.threadId ||
         manifest.operationId !== input.operationId ||
@@ -110,8 +126,10 @@ export function makeThreadCheckpointObjects<E extends Error>(
         return yield* Effect.fail(
           conflict("Checkpoint manifest belongs to a different or unbounded point."),
         );
-      const names = new Set<string>(),
-        ids = new Set<string>([artifact.artifactId]);
+      if (manifest.objects.some((object) => object.artifactId === artifact.artifactId))
+        return yield* Effect.fail(
+          conflict("The checkpoint index cannot also be a payload object."),
+        );
       const entries = [
         {
           artifactId: artifact.artifactId,
@@ -122,133 +140,73 @@ export function makeThreadCheckpointObjects<E extends Error>(
       ];
       for (const file of manifest.files) {
         if (
-          names.has(file.path) ||
-          (file.path !== "manifest.json" &&
-            !(input.kind === "move"
-              ? /^(history|workspace|attachments|native)\//u.test(file.path)
-              : file.path.startsWith(`${input.kind === "native" ? "native" : "attachments"}/`) ||
-                (input.kind === "native" && file.path.startsWith("history/")))) ||
-          file.chunks.reduce((n, chunk) => n + chunk.sizeBytes, 0) !== file.sizeBytes
+          file.path !== "manifest.json" &&
+          !(input.kind === "move"
+            ? /^(history|workspace|attachments|native)\//u.test(file.path)
+            : file.path.startsWith(`${input.kind === "native" ? "native" : "attachments"}/`) ||
+              (input.kind === "native" && file.path.startsWith("history/")))
         )
           return yield* Effect.fail(conflict("Checkpoint file set is invalid."));
-        names.add(file.path);
-        for (const chunk of file.chunks) {
-          if (
-            ids.has(chunk.artifactId) ||
-            chunk.sizeBytes > 64 * 1024 * 1024 ||
-            entries.length >= 100_000
-          )
-            return yield* Effect.fail(conflict("Checkpoint chunks are duplicated or unbounded."));
-          ids.add(chunk.artifactId);
-          entries.push({
-            ...chunk,
-            kind:
-              file.path === "manifest.json"
-                ? "manifest"
-                : input.kind === "move"
-                  ? file.path.startsWith("attachments/")
-                    ? "attachment"
-                    : file.path.split("/")[0]!
-                  : file.path.startsWith("history/")
-                    ? "history"
-                    : input.kind,
-          });
-        }
       }
+      entries.push(...manifest.objects);
       const encoded = encodeEntries(entries);
       // Pin every candidate together, before streaming any body. GC cannot race verification.
-      yield* sql.withTransaction(
+      const pinned = yield* sql.withTransaction(
         Effect.gen(function* () {
-          const [matched] = yield* sql<{ count: number }>`WITH expected AS (
+          const matched = yield* sql<StorageObject>`WITH expected AS (
           SELECT * FROM jsonb_to_recordset(${encoded}::jsonb)
             AS e("artifactId" text,sha256 text,"sizeBytes" bigint,kind text)
         ), locked AS MATERIALIZED (
-          SELECT a.artifact_id FROM relay_thread_artifacts a JOIN expected e
+          SELECT a.artifact_id AS "artifactId",a.storage_key AS "storageKey",a.kind,a.sha256,
+            a.size_bytes::int AS "sizeBytes" FROM relay_thread_artifacts a JOIN expected e
             ON a.artifact_id=e."artifactId" AND a.sha256=e.sha256
               AND a.size_bytes=e."sizeBytes" AND a.kind=e.kind
           WHERE a.thread_id=${input.threadId} AND a.operation_id=${input.operationId} AND a.state='complete'
           ORDER BY a.artifact_id FOR UPDATE OF a
         ), pinned AS (
           INSERT INTO relay_thread_artifact_pins (artifact_id,operation_id,expires_at)
-          SELECT artifact_id,${readPinId},clock_timestamp()+interval '1 hour' FROM locked
+          SELECT "artifactId",${readPinId},clock_timestamp()+interval '1 hour' FROM locked
           ON CONFLICT DO NOTHING
-        ) SELECT count(*)::int AS count FROM locked`;
-          if (matched?.count !== entries.length)
+        ) SELECT * FROM locked`;
+          if (matched.length !== entries.length)
             return yield* Effect.fail(
               conflict("Checkpoint has missing or mismatched completed objects."),
             );
+          return matched;
         }),
       );
+      const objectById = new Map(pinned.map((object) => [object.artifactId, object]));
       const byName = new Map(manifest.files.map((file) => [file.path, file]));
-      const readFile = Effect.fnUntraced(function* (
-        file: File,
-        observe: (part: Uint8Array) => void,
-      ) {
-        const whole = sha256.create();
-        for (const chunk of file.chunks) {
-          const object = yield* catalog.get(chunk.artifactId);
-          if (!object || object.state !== "complete")
-            return yield* Effect.fail(conflict("Pinned checkpoint chunk disappeared."));
-          const digest = sha256.create();
-          let length = 0;
-          yield* (yield* objects.read(object.storageKey)).pipe(
-            Stream.runForEach((part) =>
-              Effect.gen(function* () {
-                length += part.length;
-                if (length > chunk.sizeBytes)
-                  return yield* Effect.fail(
-                    conflict("Checkpoint chunk changed during verification."),
-                  );
-                digest.update(part);
-                whole.update(part);
-                observe(part);
-              }),
-            ),
-          );
-          if (length !== chunk.sizeBytes || hex(digest.digest()) !== chunk.sha256)
-            return yield* Effect.fail(conflict("Checkpoint chunk failed its integrity check."));
-        }
-        if (hex(whole.digest()) !== file.sha256)
-          return yield* Effect.fail(conflict("Checkpoint file failed verification."));
-      });
+      const references = new Map<string, number>();
+      for (const file of manifest.files)
+        for (const slice of file.slices)
+          references.set(slice.artifactId, (references.get(slice.artifactId) ?? 0) + 1);
       const streamFile = (file: File) =>
         Stream.unwrap(
-          Effect.sync(() => {
+          Effect.gen(function* () {
+            if (byName.get(file.path) !== file)
+              return yield* Effect.fail(conflict("File is not part of this checkpoint."));
+            const privateObjects: StorageObject[] = [];
+            for (const slice of file.slices) {
+              const object = objectById.get(slice.artifactId);
+              if (
+                !object ||
+                slice.offset !== 0 ||
+                slice.length !== object.sizeBytes ||
+                references.get(slice.artifactId) !== 1
+              )
+                return yield* Effect.fail(
+                  conflict("Shared workspace packs require bulk verification."),
+                );
+              privateObjects.push(object);
+            }
             const whole = sha256.create();
-            const chunks = Stream.fromIterable(file.chunks).pipe(
-              Stream.flatMap((chunk) =>
-                Stream.unwrap(
-                  Effect.gen(function* () {
-                    const object = yield* catalog.get(chunk.artifactId);
-                    if (!object || object.state !== "complete")
-                      return yield* Effect.fail(conflict("Pinned checkpoint chunk disappeared."));
-                    const digest = sha256.create();
-                    let length = 0;
-                    return (yield* objects.read(object.storageKey)).pipe(
-                      Stream.mapEffect((part) =>
-                        Effect.gen(function* () {
-                          length += part.length;
-                          if (length > chunk.sizeBytes)
-                            return yield* Effect.fail(
-                              conflict("Checkpoint chunk exceeded its declared size."),
-                            );
-                          digest.update(part);
-                          whole.update(part);
-                          return part;
-                        }),
-                      ),
-                      Stream.concat(
-                        Stream.fromEffect(
-                          Effect.suspend(() =>
-                            length === chunk.sizeBytes && hex(digest.digest()) === chunk.sha256
-                              ? Effect.void
-                              : Effect.fail(conflict("Checkpoint chunk failed verification.")),
-                          ),
-                        ).pipe(Stream.drain),
-                      ),
-                    );
-                  }),
-                ),
+            const chunks = Stream.fromIterable(privateObjects).pipe(
+              Stream.flatMap(streamObject),
+              Stream.tap((part) =>
+                Effect.sync(() => {
+                  whole.update(part);
+                }),
               ),
             );
             return chunks.pipe(
@@ -264,6 +222,41 @@ export function makeThreadCheckpointObjects<E extends Error>(
             );
           }),
         );
+      const readFile = Effect.fnUntraced(function* (
+        file: File,
+        observe: (part: Uint8Array) => void,
+      ) {
+        yield* streamFile(file).pipe(Stream.runForEach((part) => Effect.sync(() => observe(part))));
+      });
+      const verifyFiles = Effect.fnUntraced(function* (files: ReadonlyArray<File>) {
+        const seen = new Set<string>();
+        const seenPacks = new Set<string>();
+        let pack: { artifactId: string; bytes: Uint8Array } | undefined;
+        for (const file of files) {
+          if (byName.get(file.path) !== file || seen.has(file.path))
+            return yield* Effect.fail(conflict("Bulk verification has unknown or repeated files."));
+          seen.add(file.path);
+          const slice = file.slices[0];
+          if (slice && references.get(slice.artifactId)! > 1) {
+            if (!pack || pack.artifactId !== slice.artifactId) {
+              if (seenPacks.has(slice.artifactId))
+                return yield* Effect.fail(
+                  conflict("Bulk verification must follow canonical pack order."),
+                );
+              seenPacks.add(slice.artifactId);
+              const object = objectById.get(slice.artifactId)!;
+              pack = undefined;
+              pack = { artifactId: object.artifactId, bytes: yield* readObject(object) };
+            }
+            const bytes = pack.bytes.subarray(slice.offset, slice.offset + slice.length);
+            if (hex(sha256(bytes)) !== file.sha256)
+              return yield* Effect.fail(conflict("Checkpoint file failed verification."));
+          } else {
+            if (file.sizeBytes > 0) pack = undefined;
+            yield* readFile(file, () => {});
+          }
+        }
+      });
       const readMetadata = Effect.fnUntraced(function* (name: string, maxBytes = 2 * 1024 * 1024) {
         const file = byName.get(name);
         if (!file || file.sizeBytes > maxBytes || maxBytes > 32 * 1024 * 1024)
@@ -276,7 +269,17 @@ export function makeThreadCheckpointObjects<E extends Error>(
         });
         return yield* text(bytes);
       });
-      return { artifact, readPinId, manifest, entries, byName, readFile, streamFile, readMetadata };
+      return {
+        artifact,
+        readPinId,
+        manifest,
+        entries,
+        byName,
+        readFile,
+        streamFile,
+        readMetadata,
+        verifyFiles,
+      };
     }).pipe(
       Effect.onError(() =>
         sql`DELETE FROM relay_thread_artifact_pins WHERE operation_id=${readPinId}`.pipe(

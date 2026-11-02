@@ -8,6 +8,7 @@ import {
   threadVmActionUnavailableReason,
   threadMoveProgressPresentation,
   threadVmCapabilityLabel,
+  threadVmWorkerAuthState,
 } from "./threadVmControls.ts";
 
 const threadId = ThreadId.make("thread");
@@ -33,6 +34,86 @@ const savedDisk = {
 };
 
 describe("VM presentation uses confirmed runtime state", () => {
+  it("matches worker auth to the exact pending destination and gives normal waits a neutral action", () => {
+    const binding = {
+      operationId: "move",
+      allocationId: "vm",
+      environmentId: EnvironmentId.make("next-vm"),
+      generation: 3,
+      instanceId: "codex" as const,
+    };
+    const pending = { ...status, pendingProviderAuth: binding };
+    const placement: RelayPortableThreadPlacement = {
+      threadId,
+      environmentId: "mac",
+      generation: 2,
+      operationId: "move",
+      projectId: "project",
+      organizationId: "org",
+      repositoryId: "repo",
+      ownerUserId: "owner",
+      moveProgress: [
+        {
+          threadId,
+          operationId: "move",
+          environmentId: "next-vm",
+          generation: 3,
+          participant: "destination",
+          attempt: 2,
+          revision: 1,
+          stage: "downloading",
+          completedBytes: 0,
+          totalBytes: null,
+          completedArtifacts: 0,
+          totalArtifacts: null,
+          waitingForAuth: "account_selection",
+          updatedAt: "2026-10-30T00:00:00Z",
+        },
+      ],
+    };
+    expect(threadVmWorkerAuthState(placement, pending)).toBe("account_selection");
+    for (const changed of [
+      { ...placement, operationId: "old" },
+      { ...placement, generation: 3 },
+      {
+        ...placement,
+        moveProgress: placement.moveProgress!.map((p) => ({ ...p, environmentId: "other-vm" })),
+      },
+      { ...placement, moveProgress: placement.moveProgress!.map((p) => ({ ...p, generation: 4 })) },
+    ])
+      expect(threadVmWorkerAuthState(changed, pending)).toBeUndefined();
+    expect(
+      threadVmPresentation({ status: pending, workerAuth: "account_selection" }),
+    ).toMatchObject({
+      label: "Choose a Codex account",
+      tone: "neutral",
+      primary: { type: "sign_in", label: "Choose account" },
+    });
+    expect(threadVmPresentation({ status: pending, workerAuth: "verification" })).toMatchObject({
+      label: "Checking Codex sign-in",
+      tone: "neutral",
+      primary: null,
+    });
+    expect(
+      threadVmPresentation({
+        status: pending,
+        workerAuth: "personal_sign_in",
+        providerAuth: {
+          ...binding,
+          requirement: "authenticated",
+          auth: {
+            instanceId: ProviderInstanceId.make("codex"),
+            phase: "idle",
+            flowId: null,
+            authorizationUrl: null,
+            expiresAt: null,
+            message: null,
+            interaction: null,
+          },
+        },
+      }),
+    ).toMatchObject({ label: "Preparing VM", tone: "neutral", primary: null });
+  });
   it("waits for source activation after power resume before advertising readiness", () => {
     for (const [pausePhase, backupPhase] of [
       ["cancelled", "retired"],
@@ -390,6 +471,53 @@ describe("move transfer progress", () => {
       })?.detail,
     ).toBe("0 B of 0 B verified");
   });
+  it("describes an exact destination auth wait instead of its synthetic download stage", () => {
+    const progress = {
+      ...placement.moveProgress![0]!,
+      participant: "destination" as const,
+      environmentId: "destination",
+      generation: 3,
+      stage: "downloading" as const,
+      completedBytes: 0,
+      totalBytes: null,
+      completedArtifacts: 0,
+      totalArtifacts: null,
+      waitingForAuth: "account_selection" as const,
+    };
+    expect(
+      threadMoveProgressPresentation({ ...placement, moveProgress: [progress] }),
+    ).toMatchObject({
+      label: "Choose a Codex account",
+      detail: expect.stringContaining("Choose personal sign-in"),
+    });
+    expect(
+      threadMoveProgressPresentation({
+        ...placement,
+        moveProgress: [{ ...progress, waitingForAuth: null }],
+      }),
+    ).toMatchObject({
+      label: "Downloading files",
+      detail: null,
+    });
+    for (const stale of [
+      { ...progress, operationId: "old" },
+      { ...progress, generation: 4 },
+    ])
+      expect(threadMoveProgressPresentation({ ...placement, moveProgress: [stale] })).toBeNull();
+    expect(
+      threadMoveProgressPresentation({
+        ...placement,
+        moveFailureDetail: "Current failure",
+        moveProgress: [progress],
+      }),
+    ).toBeNull();
+    expect(
+      threadMoveProgressPresentation({
+        ...placement,
+        moveProgress: [{ ...placement.moveProgress![0]!, waitingForAuth: "account_selection" }],
+      }),
+    ).toMatchObject({ label: "Uploading files" });
+  });
   it("ignores stale operation snapshots, errors, and terminal placements", () => {
     expect(threadMoveProgressPresentation({ ...placement, operationId: null })).toBeNull();
     expect(
@@ -406,6 +534,7 @@ describe("move transfer progress", () => {
           {
             ...placement.moveProgress![0]!,
             participant: "destination",
+            generation: 3,
             environmentId: EnvironmentId.make("destination"),
             stage: "setup",
             totalBytes: null,

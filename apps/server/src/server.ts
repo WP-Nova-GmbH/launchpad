@@ -1,6 +1,9 @@
 import * as CheckoutAccess from "./workspace/CheckoutAccess.ts";
 import { readInstalledThreadVm } from "./relay/ThreadVmEnrollment.ts";
-import { threadVmProviderAuthRouteLayer } from "./relay/ThreadVmProviderAuth.ts";
+import {
+  ThreadVmProviderAuth,
+  threadVmProviderAuthRouteLayer,
+} from "./relay/ThreadVmProviderAuth.ts";
 import { threadVmPreviewMiddlewareLayer } from "./relay/ThreadVmPreview.ts";
 import { managedTunnelsDisabled } from "./cloud/config.ts";
 import { runThreadVmManagedEndpoint } from "./relay/ThreadVmManagedEndpoint.ts";
@@ -566,6 +569,7 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(
     Layer.provideMerge(WorkflowRunStore.layer),
     Layer.provideMerge(AntigravityInstallationRefreshLive),
     Layer.provideMerge(ProviderAuthServiceLive),
+    Layer.provideMerge(ThreadVmProviderAuth.layer),
     // Core Services
     Layer.provideMerge(ServerSettingsLayerLive),
     Layer.provideMerge(CheckpointingLayerLive),

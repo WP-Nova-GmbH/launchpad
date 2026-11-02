@@ -95,6 +95,7 @@ it("permits streamed checkpoints and moves only for the assigned thread", () => 
   for (const action of [
     "",
     "/begin",
+    "/encoding",
     "/freeze",
     "/failed",
     "/progress",
@@ -107,6 +108,12 @@ it("permits streamed checkpoints and moves only for the assigned thread", () => 
     expect(threadVmCredentialAllows(principal, "POST", path + "/moves/" + id + action)).toBe(true);
   for (const [method, url] of [
     ["POST", path + "/moves/" + id + "/removed"],
+    ["GET", path + "/moves/" + id + "/encoding"],
+    ["PUT", path + "/moves/" + id + "/encoding"],
+    ["POST", path + "/moves/" + id + "/encoding/extra"],
+    ["POST", path + "/moves/" + id + "/encoding/"],
+    ["POST", path.replace("vm-env", "another-env") + "/moves/" + id + "/encoding"],
+    ["POST", path.replace("private-thread", "another-thread") + "/moves/" + id + "/encoding"],
     ["POST", path + "/moves/" + id + "/reset"],
     ["POST", path + "/moves/" + id + "/failed/extra"],
     ["POST", path + "/moves/" + id + "/progress/extra"],

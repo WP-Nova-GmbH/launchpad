@@ -1,4 +1,6 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
+import { ThreadTransferFormats } from "@t3tools/contracts/threadTransferFormat";
+import { normalizeThreadTransferFormats } from "@t3tools/shared/threadTransferEncoding";
 import {
   RelayThreadVmResetRequest,
   RelayThreadVmRestoreRequest,
@@ -49,10 +51,22 @@ const Intent = Schema.Union([
     sourceCredentialId: Schema.String,
     sourcePublicKey: Schema.String,
     sourceAllocationId: Schema.NullOr(Schema.String),
+    sourceThreadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
   }),
 ]);
 export type ThreadVmReplacementIntent = typeof Intent.Type;
-const encode = Schema.encodeEffect(Schema.fromJsonString(Intent));
+const encodeIntent = Schema.encodeEffect(Schema.fromJsonString(Intent));
+const encode = (intent: ThreadVmReplacementIntent) =>
+  encodeIntent(
+    intent.kind === "move"
+      ? {
+          ...intent,
+          sourceThreadTransferFormats: normalizeThreadTransferFormats(
+            intent.sourceThreadTransferFormats,
+          ),
+        }
+      : intent,
+  );
 const decode = Schema.decodeEffect(Schema.fromJsonString(Intent));
 export interface ThreadVmReplacement {
   readonly requestId: string;

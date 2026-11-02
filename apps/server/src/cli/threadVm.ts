@@ -1,4 +1,5 @@
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { normalizeThreadTransferFormats } from "@t3tools/shared/threadTransferEncoding";
 import {
   importInstalledThreadVmRestore,
   ThreadVmRestoreInstallError,
@@ -290,6 +291,7 @@ export const threadVmEnrollmentCommand = Command.make("__thread-vm-enroll", {
           operationId: enrolled.operationId,
           threadId: enrolled.scope.threadId,
           generation: enrolled.scope.generation,
+          threadTransferFormats: normalizeThreadTransferFormats(enrolled.threadTransferFormats),
         }),
       );
     }),

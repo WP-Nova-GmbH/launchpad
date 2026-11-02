@@ -3,9 +3,14 @@ import {
   RelayThreadVmBootstrap,
   RelayThreadVmEnrollRequest,
   RelayThreadVmEnrollResponse,
+  ThreadTransferFormats,
 } from "@t3tools/contracts/relay";
 import { EnvironmentId } from "@t3tools/contracts";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
+import {
+  normalizeThreadTransferFormats,
+  THREAD_TRANSFER_SUPPORTED_FORMATS,
+} from "@t3tools/shared/threadTransferEncoding";
 import { RELAY_THREAD_VM_ENROLL_PROOF_TYP, signRelayJwt } from "@t3tools/shared/relayJwt";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -34,6 +39,7 @@ const InstalledThreadVm = Schema.Struct({
   environmentId: EnvironmentId,
   environmentCredential: Schema.NonEmptyString,
   cloudMintPublicKey: Schema.NonEmptyString,
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
 });
 export type InstalledThreadVm = typeof InstalledThreadVm.Type;
 const decodeInstalled = Schema.decodeUnknownEffect(Schema.fromJsonString(InstalledThreadVm));
@@ -116,6 +122,7 @@ export const enrollThreadVm = Effect.fn("ThreadVmEnrollment.enroll")(function* (
       seed: Redacted.value(input.seed),
       environmentId,
       environmentPublicKey: keys.publicKey,
+      threadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS,
     },
   }).pipe(Effect.mapError(failed("identity")));
   const client = yield* HttpClient.HttpClient;
@@ -134,10 +141,18 @@ export const enrollThreadVm = Effect.fn("ThreadVmEnrollment.enroll")(function* (
   if (
     response.environmentId !== environmentId ||
     !sameScope(response.scope, input.scope) ||
-    response.relayIssuer !== relayIssuer
+    response.relayIssuer !== relayIssuer ||
+    (response.threadTransferFormats !== undefined &&
+      normalizeThreadTransferFormats(response.threadTransferFormats).join(",") !==
+        THREAD_TRANSFER_SUPPORTED_FORMATS.join(","))
   )
     return yield* new ThreadVmEnrollmentError({ stage: "response" });
-  const installed = { ...response, relayUrl, operationId: input.operationId };
+  const installed = {
+    ...response,
+    threadTransferFormats: normalizeThreadTransferFormats(response.threadTransferFormats),
+    relayUrl,
+    operationId: input.operationId,
+  };
   const encoded = yield* encodeInstalled(installed).pipe(Effect.mapError(failed("persist")));
   yield* secrets
     .create(THREAD_VM_IDENTITY_SECRET, new TextEncoder().encode(encoded))

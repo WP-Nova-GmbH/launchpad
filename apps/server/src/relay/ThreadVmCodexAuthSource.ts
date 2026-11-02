@@ -1,4 +1,5 @@
 import {
+  CodexVmConnectionError,
   type RelayCodexVmConnection,
   type RelayThreadVmCodexAuthSource,
 } from "@t3tools/contracts/relay";
@@ -16,10 +17,25 @@ import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 
 export class ThreadVmCodexAuthSourceError extends Schema.TaggedError<ThreadVmCodexAuthSourceError>()(
   "ThreadVmCodexAuthSourceError",
-  { reason: Schema.Literals(["unavailable", "selection_changed", "reconnect_required"]) },
+  {
+    reason: Schema.Literals([
+      "unavailable",
+      "selection_changed",
+      "reconnect_required",
+      "account_selection_required",
+      "configuration",
+      "access_denied",
+    ]),
+  },
 ) {
   override get message() {
     switch (this.reason) {
+      case "account_selection_required":
+        return "Choose a Codex account to continue preparing this VM.";
+      case "configuration":
+        return "The VM's Codex connection needs a configuration check before preparation can continue.";
+      case "access_denied":
+        return "Launchpad Connect could not authorize this VM's Codex account. Check its access before retrying.";
       case "selection_changed":
         return "This VM's Codex account selection changed. Finish VM preparation before starting work.";
       case "reconnect_required":
@@ -30,6 +46,30 @@ export class ThreadVmCodexAuthSourceError extends Schema.TaggedError<ThreadVmCod
   }
 }
 const unavailable = () => new ThreadVmCodexAuthSourceError({ reason: "unavailable" });
+const isConnectionError = Schema.is(CodexVmConnectionError);
+const isSourceError = Schema.is(ThreadVmCodexAuthSourceError);
+const sourceError = (error: unknown) => {
+  if (isSourceError(error)) return error;
+  if (!isConnectionError(error)) return unavailable();
+  switch (error.reason) {
+    case "source_unavailable":
+      return new ThreadVmCodexAuthSourceError({ reason: "account_selection_required" });
+    case "not_connected":
+    case "invalid_grant":
+    case "uncertain":
+      return new ThreadVmCodexAuthSourceError({ reason: "reconnect_required" });
+    case "configuration":
+    case "missing_scope":
+    case "vm_update_required":
+      return new ThreadVmCodexAuthSourceError({ reason: "configuration" });
+    case "access_denied":
+    case "identity_mismatch":
+    case "invalid_token":
+      return new ThreadVmCodexAuthSourceError({ reason: "access_denied" });
+    default:
+      return unavailable();
+  }
+};
 
 /** Read the current relay binding. A missing/unreachable VM source never means personal sign-in. */
 export const readThreadVmCodexAuthSource = Effect.fn("ThreadVmCodexAuthSource.read")(
@@ -51,7 +91,7 @@ export const readThreadVmCodexAuthSource = Effect.fn("ThreadVmCodexAuthSource.re
     });
   },
   Effect.timeout("5 seconds"),
-  Effect.mapError(unavailable),
+  Effect.mapError(sourceError),
 );
 
 export interface ManagedThreadVmCodexAuthContext {

@@ -19,6 +19,8 @@ import type {
   RelayThreadVmRepositoryUpload,
   RelayIssueTrackerService,
   RelayJiraSite,
+  ThreadTransferFormat,
+  ThreadTransferEncodingPolicy,
 } from "@t3tools/contracts/relay";
 import { sql } from "drizzle-orm";
 import {
@@ -975,6 +977,13 @@ export const relayThreadMoves = pgTable(
       >(),
     sourceCursor: integer("source_cursor"),
     manifestSha256: varchar("manifest_sha256", { length: 64 }),
+    sourceThreadTransferFormats: jsonb("source_formats_json")
+      .$type<readonly ThreadTransferFormat[]>()
+      .notNull()
+      .default(sql`'["launchpad-thread-chunks-v1"]'::jsonb`),
+    transferEncodingPolicy: varchar("transfer_encoding_policy", { length: 32 })
+      .$type<ThreadTransferEncodingPolicy>()
+      .default("v1-64MiB"),
     failureDetail: varchar("failure_detail", { length: 2000 }),
   },
   (table) => [
@@ -983,6 +992,17 @@ export const relayThreadMoves = pgTable(
       sql`${table.phase} IN ('preparing','frozen','ready','committed','completed','aborting','aborted')`,
     ),
     check("relay_thread_moves_generation", sql`${table.expectedGeneration} > 0`),
+    check(
+      "relay_thread_moves_source_formats",
+      sql`${table.sourceThreadTransferFormats} IN (
+      '["launchpad-thread-chunks-v1"]'::jsonb, '["launchpad-thread-chunks-v2"]'::jsonb,
+      '["launchpad-thread-chunks-v1","launchpad-thread-chunks-v2"]'::jsonb)`,
+    ),
+    check(
+      "relay_thread_moves_encoding_policy",
+      sql`${table.transferEncodingPolicy} IS NULL OR
+      ${table.transferEncodingPolicy} IN ('v1-64MiB','workspace-raw-v2-8MiB')`,
+    ),
     check(
       "relay_thread_moves_manifest",
       sql`${table.phase} NOT IN ('frozen','ready','committed','completed') OR (${table.sourceCursor} IS NOT NULL AND ${table.sourceCursor} >= 0 AND ${table.manifestSha256} IS NOT NULL AND ${table.manifestSha256} ~ '^[0-9a-f]{64}$')`,
@@ -1005,6 +1025,40 @@ export const relayThreadMoveProgress = pgTable(
     snapshot: jsonb("snapshot").notNull(),
   },
   (table) => [primaryKey({ columns: [table.operationId, table.environmentId] })],
+);
+
+export const relayThreadMoveParticipantStatus = pgTable(
+  "relay_thread_move_participant_status",
+  {
+    operationId: varchar("operation_id", { length: 64 })
+      .notNull()
+      .references(() => relayThreadMoves.operationId, { onDelete: "cascade" }),
+    environmentId: varchar("environment_id", { length: 191 }).notNull(),
+    generation: integer("generation").notNull(),
+    resolvedBeforeAttempt: bigint("resolved_before_attempt", { mode: "number" })
+      .notNull()
+      .default(0),
+    failureAttempt: bigint("failure_attempt", { mode: "number" }),
+    failureDetail: varchar("failure_detail", { length: 2000 }),
+    failureReportedAt: timestamp("failure_reported_at", { withTimezone: true }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.operationId, table.environmentId] }),
+    check("relay_thread_move_participant_generation", sql`${table.generation} > 0`),
+    check(
+      "relay_thread_move_participant_resolution",
+      sql`${table.resolvedBeforeAttempt} BETWEEN 0 AND 9007199254740991`,
+    ),
+    check(
+      "relay_thread_move_participant_failure",
+      sql`(
+      ${table.failureAttempt} IS NULL AND ${table.failureDetail} IS NULL AND ${table.failureReportedAt} IS NULL
+    ) OR (
+      ${table.failureAttempt} IS NOT NULL AND ${table.failureAttempt} BETWEEN 1 AND 9007199254740991 AND ${table.failureDetail} IS NOT NULL
+      AND length(trim(${table.failureDetail})) > 0 AND ${table.failureReportedAt} IS NOT NULL
+    )`,
+    ),
+  ],
 );
 
 /** Work IDs survive moves: a lost reply must never admit the same work at a new owner. */
@@ -1717,6 +1771,9 @@ export const relayThreadVmEnrollments = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     environmentId: varchar("environment_id", { length: 191 }),
     environmentPublicKey: text("environment_public_key"),
+    threadTransferFormats: jsonb("thread_transfer_formats_json").$type<
+      readonly ThreadTransferFormat[]
+    >(),
     sealedResponse: text("sealed_response"),
     installedAt: timestamp("installed_at", { withTimezone: true }),
     credentialId: varchar("credential_id", { length: 64 }).references(
@@ -1728,6 +1785,13 @@ export const relayThreadVmEnrollments = pgTable(
       "relay_thread_vm_enrollments_claim",
       sql`(${table.environmentId} IS NULL AND ${table.environmentPublicKey} IS NULL AND ${table.sealedResponse} IS NULL AND ${table.credentialId} IS NULL AND ${table.sealedSeed} IS NOT NULL AND ${table.installedAt} IS NULL)
       OR (${table.environmentId} IS NOT NULL AND ${table.environmentPublicKey} IS NOT NULL AND ${table.sealedResponse} IS NOT NULL AND ${table.credentialId} IS NOT NULL AND (${table.installedAt} IS NULL OR ${table.sealedSeed} IS NULL))`,
+    ),
+    check(
+      "relay_thread_vm_enrollments_transfer_formats",
+      sql`${table.threadTransferFormats} IS NULL OR (
+      ${table.environmentId} IS NOT NULL AND ${table.threadTransferFormats} IN (
+        '["launchpad-thread-chunks-v1"]'::jsonb, '["launchpad-thread-chunks-v2"]'::jsonb,
+        '["launchpad-thread-chunks-v1","launchpad-thread-chunks-v2"]'::jsonb))`,
     ),
   ],
 );

@@ -49,12 +49,12 @@ export const materializeThreadVmIndependentHistory = Effect.fn(
     "history/events.jsonl",
     "history/receipts.jsonl",
   ]);
-  if (packed.manifest.files.length !== 3) return yield* fail();
+  if (packed.normalized.files.length !== 3) return yield* fail();
   const directory = yield* fs.makeTempDirectoryScoped({
     directory: input.scratchRoot,
     prefix: "independent-history-",
   });
-  for (const file of packed.manifest.files) {
+  for (const file of packed.normalized.files) {
     if (!expected.delete(file.path)) return yield* fail();
     const destination = path.join(directory, file.path.slice("history/".length)),
       hash = NodeCrypto.createHash("sha256");
@@ -62,16 +62,21 @@ export const materializeThreadVmIndependentHistory = Effect.fn(
     yield* Effect.scoped(
       Effect.gen(function* () {
         const output = yield* fs.open(destination, { flag: "wx", mode: 0o600 });
-        for (const chunk of file.chunks)
-          yield* fs.stream(path.join(packed.chunkDirectory, chunk.artifactId)).pipe(
-            Stream.runForEach((part) =>
-              Effect.gen(function* () {
-                count += part.length;
-                hash.update(part);
-                yield* output.writeAll(part);
-              }),
-            ),
-          );
+        for (const slice of file.slices)
+          yield* fs
+            .stream(path.join(packed.chunkDirectory, slice.artifactId), {
+              offset: slice.offset,
+              bytesToRead: slice.length,
+            })
+            .pipe(
+              Stream.runForEach((part) =>
+                Effect.gen(function* () {
+                  count += part.length;
+                  hash.update(part);
+                  yield* output.writeAll(part);
+                }),
+              ),
+            );
         yield* output.sync;
       }),
     );

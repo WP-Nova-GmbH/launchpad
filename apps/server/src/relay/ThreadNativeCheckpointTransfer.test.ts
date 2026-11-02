@@ -20,6 +20,7 @@ import {
   makeThreadNativeCheckpointTransfer,
   materializeNativeCheckpoint,
 } from "./ThreadNativeCheckpointTransfer.ts";
+import { packThreadTransferArchiveV2 } from "./ThreadTransferChunks.ts";
 
 const nativeId = "01900000-0000-7000-8000-000000000001";
 const version = "0.159.3";
@@ -130,6 +131,31 @@ const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Effect.scoped,
     Effect.provide(Layer.mergeAll(NodeServices.layer, SqlitePersistenceMemory)),
   );
+
+it.effect("reads v2 native recovery while its checkpoint writer remains v1", () =>
+  run(
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      expect(f.packed.manifest.format).toBe("launchpad-thread-chunks-v1");
+      const legacy = yield* materializeNativeCheckpoint(f.reconstruct);
+      const packed = yield* packThreadTransferArchiveV2({
+        archiveDirectory: legacy.directory,
+        scratchRoot: f.path.join(f.root, "packed-native"),
+        expectedManifestSha256: f.reconstruct.transferManifestSha256,
+      });
+      const restored = yield* materializeNativeCheckpoint({
+        ...f.reconstruct,
+        manifest: packed.manifest,
+        chunkDirectory: packed.directory,
+        destinationRoot: f.path.join(f.root, "v2-native-restored"),
+      });
+      expect(restored.header).toEqual(legacy.header);
+      expect(yield* digestNativeCheckpointArchive(restored.nativeDirectory)).toBe(
+        f.point.archiveSha256,
+      );
+    }),
+  ),
+);
 
 it.effect(
   "round trips a whole native checkpoint and relocates its referenced file without credentials",

@@ -113,6 +113,7 @@ describe("relay health VM capability", () => {
           expect(body).toEqual({
             ok: true,
             service: "relay",
+            threadTransferFormats: ["launchpad-thread-chunks-v1", "launchpad-thread-chunks-v2"],
             threadVmConfigured: testCase.settings !== undefined,
             threadVmCapabilities: {
               configured: testCase.settings !== undefined,

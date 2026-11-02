@@ -1,8 +1,5 @@
 import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
-import {
-  threadMoveQueueOwnership,
-  threadMoveQueuePresentation,
-} from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
+import { threadMoveQueueOwnership } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import { useThreadVmActionJournal } from "../../state/use-thread-vm-actions";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { threadMoveRelayUrl } from "../../state/thread-move-submissions";
@@ -15,9 +12,11 @@ import type {
   RelayThreadVmProviderAuth,
   RelayThreadVmProviderAuthBinding,
   RelayThreadVmBackupRecoveryCandidate,
+  ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
 import {
   threadVmPresentation,
+  threadVmWorkerAuthState,
   threadVmProviderAuthPresentation,
   threadVmAuthSourcePresentation,
   threadVmAuthSourceChoice,
@@ -225,6 +224,12 @@ export function ThreadVmControlsProvider({
       providerAuth={view?.providerAuth ?? null}
       providerAuthError={view?.providerAuthError ?? null}
       providerAuthPending={view?.providerAuthPending ?? false}
+      authTransitionKey={view?.authTransitionKey ?? null}
+      workerAuth={
+        view?.workerAuth !== undefined
+          ? view.workerAuth
+          : threadVmWorkerAuthState(placement, activeStatus)
+      }
       queuePaused={view?.queuePaused ?? false}
     >
       {children}
@@ -254,7 +259,8 @@ function VmCodexSignIn({
     threadVmControls.providerAuthSourceViewAtom(environmentId, threadId),
   );
   const sourceData = sourceState.data;
-  const accountSource = sourceData?.source ?? value?.authSource;
+  const accountSelectionRequired = sourceData?.accountSelectionRequired === true;
+  const accountSource = accountSelectionRequired ? null : (sourceData?.source ?? value?.authSource);
   const accountPresentation = accountSource
     ? threadVmAuthSourcePresentation(accountSource, sourceData?.connection ?? null)
     : null;
@@ -271,16 +277,17 @@ function VmCodexSignIn({
     );
     return () => clearTimeout(timer);
   }, [expiresAt]);
-  const presentation = value
-    ? threadVmProviderAuthPresentation(
-        {
-          ...value,
-          organizationConnection: sourceData?.connection ?? null,
-          ...(accountSource ? { authSource: accountSource } : {}),
-        },
-        now,
-      )
-    : null;
+  const presentation =
+    value && !accountSelectionRequired
+      ? threadVmProviderAuthPresentation(
+          {
+            ...value,
+            organizationConnection: sourceData?.connection ?? null,
+            ...(accountSource ? { authSource: accountSource } : {}),
+          },
+          now,
+        )
+      : null;
   const run = async (action: Parameters<typeof dispatch>[0]["action"]) => {
     if (busy) return;
     setBusy(true);
@@ -299,6 +306,13 @@ function VmCodexSignIn({
       setBusy(false);
     }
   };
+  const errors = [
+    ...new Set(
+      [error ?? readError, sourceData?.error ?? sourceState.error].filter(
+        (message) => message !== null && message !== undefined,
+      ),
+    ),
+  ];
   const open = async () => {
     if (!presentation?.url || busy) return;
     setError(null);
@@ -384,10 +398,15 @@ function VmCodexSignIn({
         </>
       ) : null}
       <Text className="text-xs font-semibold text-foreground">
-        {presentation?.title ?? "Checking Codex sign-in in the new VM"}
+        {accountSelectionRequired
+          ? "Choose a Codex account"
+          : (presentation?.title ?? "Checking Codex sign-in in the new VM")}
       </Text>
       <Note>
-        {presentation?.message ?? "The VM is preparing. Its Codex sign-in status will appear here."}
+        {accountSelectionRequired
+          ? "Choose personal sign-in or a connected organization account to continue."
+          : (presentation?.message ??
+            "The VM is preparing. Its Codex sign-in status will appear here.")}
       </Note>
       {presentation?.userCode ? (
         <Text selectable className="text-sm text-foreground">
@@ -422,21 +441,18 @@ function VmCodexSignIn({
           onPress={() => void run({ type: "cancel", flowId: value.auth.flowId! })}
         />
       ) : null}
-      <ActionButton
-        label={busy || loading ? "Checking sign-in…" : "Check sign-in status"}
-        disabled={busy || loading}
-        onPress={() => void run({ type: "refresh" })}
-      />
-      {error || readError ? (
-        <Text accessibilityLiveRegion="polite" className="text-xs text-destructive">
-          {error ?? readError}
-        </Text>
+      {!accountSelectionRequired ? (
+        <ActionButton
+          label={busy || loading ? "Checking sign-in…" : "Check sign-in status"}
+          disabled={busy || loading}
+          onPress={() => void run({ type: "refresh" })}
+        />
       ) : null}
-      {sourceData?.error || sourceState.error ? (
-        <Text accessibilityLiveRegion="polite" className="text-xs text-destructive">
-          {sourceData?.error ?? sourceState.error}
+      {errors.map((message) => (
+        <Text key={message} accessibilityLiveRegion="polite" className="text-xs text-destructive">
+          {message}
         </Text>
-      ) : null}
+      ))}
     </View>
   );
 }
@@ -489,6 +505,8 @@ function ThreadVmControlPanel({
   providerAuth,
   providerAuthError,
   providerAuthPending,
+  authTransitionKey,
+  workerAuth,
   children,
   queuePaused,
 }: {
@@ -503,6 +521,8 @@ function ThreadVmControlPanel({
   providerAuth: RelayThreadVmProviderAuth | null;
   providerAuthError: string | null;
   providerAuthPending: boolean;
+  authTransitionKey: string | null;
+  workerAuth: ThreadMoveWaitingForAuth | null | undefined;
   children: ReactNode;
   queuePaused: boolean;
 }) {
@@ -588,6 +608,7 @@ function ThreadVmControlPanel({
     pendingRequest: !!pending,
     queuePaused,
     providerAuth,
+    workerAuth,
     capabilities: capabilities.error || capabilities.isPending ? null : capabilities.data,
   });
   const { held } = presentation;
@@ -907,28 +928,11 @@ function ThreadVmControlPanel({
                 : null,
             moveFeedback: requestFeedback,
             ownsMoveNotice: (queue: ThreadPromptQueue | null | undefined) => {
-              const ownership = threadMoveQueueOwnership({
+              return threadMoveQueueOwnership({
                 entries: queue?.entries,
                 placement,
                 status,
-              });
-              if (!ownership.ownsNotice) return false;
-              const entry = queue?.entries.find(
-                (item) =>
-                  item.kind === "move" &&
-                  item.state !== "pending" &&
-                  item.operationId === placement?.operationId,
-              );
-              const move = threadMoveQueuePresentation({
-                entry: entry?.kind === "move" ? entry : undefined,
-                placement,
-                status,
-                providerAuth,
-                error: readError,
-              });
-              return (
-                !!move && (move.cancelling || !presentation.primary || move.tone !== "neutral")
-              );
+              }).ownsNotice;
             },
             actions,
           }
@@ -936,7 +940,6 @@ function ThreadVmControlPanel({
     [
       status,
       placement,
-      providerAuth,
       readError,
       pending,
       deletionNote,
@@ -1034,7 +1037,7 @@ function ThreadVmControlPanel({
                   </>
                 ) : confirm === "sign_in" && status?.pendingProviderAuth ? (
                   <VmCodexSignIn
-                    key={`${accountId}:${status?.pendingProviderAuth.allocationId}:${status?.pendingProviderAuth.operationId}`}
+                    key={`${accountId}:${status?.pendingProviderAuth.allocationId}:${status?.pendingProviderAuth.operationId}:${authTransitionKey}`}
                     environmentId={environmentId}
                     threadId={threadId}
                     accountId={accountId}

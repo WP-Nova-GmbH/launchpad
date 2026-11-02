@@ -22,7 +22,7 @@ import { layer as RunnerLayer } from "../processRunner.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import { ProviderAdapterProbeError } from "../provider/Errors.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
-import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
+import { assertThreadTransferReady, prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
 import { workspaceGit } from "./ThreadWorkspaceGit.ts";
 
 const encode = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
@@ -189,6 +189,7 @@ const fixture = Effect.fnUntraced(function* (options?: {
   }>`SELECT phase FROM thread_transfer_readiness WHERE operation_id = ${operationId}`;
   return {
     input,
+    projectId,
     prepare,
     phase,
     fence,
@@ -220,6 +221,68 @@ it.layer(
     }),
   );
 
+  it.effect(
+    "recovers verified readiness without checking credentials or repeating setup and native validation",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.prepare;
+        const ready = assertThreadTransferReady({
+          ...f.input,
+          environmentId: "destination",
+          relayUrl: "https://relay.example",
+          projectId: f.projectId,
+        });
+        yield* f.sql`CREATE TEMP TRIGGER preserve_ready BEFORE UPDATE ON thread_transfer_readiness
+          BEGIN SELECT RAISE(ABORT, 'readiness recovery must be read-only'); END`;
+        yield* ready;
+        yield* ready;
+        expect(f.calls).toEqual(["credentials", "resume", "stop"]);
+        expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
+        yield* f.sql`DROP TRIGGER preserve_ready`;
+        expect(
+          (yield* Effect.flip(
+            assertThreadTransferReady({
+              ...f.input,
+              environmentId: "another-environment",
+              relayUrl: "https://relay.example",
+              projectId: f.projectId,
+            }),
+          )).message,
+        ).toContain("readiness");
+        yield* f.sql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id='uncertain'
+          WHERE operation_id=${f.input.operationId}`;
+        expect((yield* Effect.flip(ready)).message).toContain("readiness");
+        yield* f.sql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id=NULL,phase='started'
+          WHERE operation_id=${f.input.operationId}`;
+        expect((yield* Effect.flip(ready)).message).toContain("readiness");
+      }),
+  );
+  it.effect("rejects a recovered ready receipt after the installed setup intent changes", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.prepare;
+      yield* f.fs.writeFileString(
+        f.path.join(f.root, "t3.json"),
+        encode({
+          scripts: [
+            { id: "changed", name: "Changed", command: "false", runOnWorktreeCreate: true },
+          ],
+        }),
+      );
+      expect(
+        (yield* Effect.flip(
+          assertThreadTransferReady({
+            ...f.input,
+            environmentId: "destination",
+            relayUrl: "https://relay.example",
+            projectId: f.projectId,
+          }),
+        )).message,
+      ).toContain("readiness");
+      expect(f.calls).toEqual(["credentials", "resume", "stop"]);
+    }),
+  );
   it.effect(
     "runs setup once, resumes only the native conversation, closes it and stays fenced until activation",
     () =>

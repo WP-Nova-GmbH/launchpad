@@ -1,5 +1,5 @@
 import { ThreadHistoryArchiveManifest } from "./threadHistory.ts";
-import { ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
+import { ThreadMoveFailureDiagnostic, ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
 import { CodexConversationManifest } from "./codexConversation.ts";
 import { AuthSessionUser } from "./auth.ts";
 import * as DateTime from "effect/DateTime";
@@ -109,6 +109,9 @@ export const RelayPortableThreadPlacement = Schema.Struct({
   moveProgress: Schema.optional(Schema.Array(ThreadMoveProgressSnapshot)),
   moveFailureDetail: Schema.optional(
     Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(2000))),
+  ),
+  moveFailures: Schema.optionalKey(
+    Schema.Array(ThreadMoveFailureDiagnostic).check(Schema.isMaxLength(2)),
   ),
 });
 export type RelayPortableThreadPlacement = typeof RelayPortableThreadPlacement.Type;
@@ -243,6 +246,45 @@ export const ThreadTransferChunkManifest = Schema.Struct({
   ),
 });
 export type ThreadTransferChunkManifest = typeof ThreadTransferChunkManifest.Type;
+
+/** Physical objects are shared only by the canonical workspace payload packing policy. */
+export const ThreadTransferPackedManifest = Schema.Struct({
+  format: Schema.Literal("launchpad-thread-chunks-v2"),
+  threadId: TrimmedNonEmptyString,
+  operationId: TrimmedNonEmptyString,
+  sourceEnvironmentId: TrimmedNonEmptyString,
+  generation: PositiveInt,
+  transferManifestSha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+  objects: Schema.Array(
+    Schema.Struct({
+      artifactId: Schema.String.check(Schema.isUUID()),
+      kind: Schema.Literals(["manifest", "history", "workspace", "attachment", "native"]),
+      sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+      sizeBytes: PositiveInt,
+    }),
+  ),
+  files: Schema.Array(
+    Schema.Struct({
+      path: Schema.String.check(Schema.isNonEmpty()),
+      sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+      sizeBytes: NonNegativeInt,
+      slices: Schema.Array(
+        Schema.Struct({
+          artifactId: Schema.String.check(Schema.isUUID()),
+          offset: NonNegativeInt,
+          length: PositiveInt,
+        }),
+      ),
+    }),
+  ),
+});
+export type ThreadTransferPackedManifest = typeof ThreadTransferPackedManifest.Type;
+
+export const ThreadTransferArtifactManifest = Schema.Union([
+  ThreadTransferChunkManifest,
+  ThreadTransferPackedManifest,
+]);
+export type ThreadTransferArtifactManifest = typeof ThreadTransferArtifactManifest.Type;
 
 /** A whole native checkpoint is retained independently of its VM disk. */
 export const ThreadNativeCheckpointArchiveManifest = Schema.Struct({

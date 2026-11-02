@@ -54,6 +54,7 @@ export function threadVmCredentialAllows(
       parts.length === 9 &&
       [
         "begin",
+        "encoding",
         "freeze",
         "failed",
         "progress",

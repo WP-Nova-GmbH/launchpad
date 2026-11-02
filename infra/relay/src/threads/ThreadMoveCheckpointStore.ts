@@ -160,9 +160,11 @@ export function makeThreadMoveCheckpointStore(
             view.byName.get("native/manifest.json")?.sha256 !== hash(encodeNative(header.native))
           )
             return yield* conflict("Move native manifest is incomplete.");
-          for (const file of view.manifest.files)
-            if (!["history/events.jsonl", "history/receipts.jsonl"].includes(file.path))
-              yield* view.readFile(file, () => {});
+          yield* view.verifyFiles(
+            view.manifest.files.filter(
+              (file) => !["history/events.jsonl", "history/receipts.jsonl"].includes(file.path),
+            ),
+          );
           const eventFile = view.byName.get("history/events.jsonl")!;
           const lines = (file: typeof eventFile) =>
             Stream.unwrap(
@@ -384,6 +386,38 @@ export function makeThreadMoveCheckpointStore(
                     WHERE b.environment_id=m.source_environment_id AND b.thread_id=m.thread_id)`;
               if (localUpload) {
                 const bundle = view.byName.get("workspace/repository.bundle")!;
+                const byId = new Map(
+                  view.manifest.objects.map((object) => [object.artifactId, object]),
+                );
+                const chunks: RelayThreadVmRepositoryUpload["bundle"]["chunks"][number][] = [];
+                const bundleIds = new Set(bundle.slices.map((slice) => slice.artifactId));
+                for (const slice of bundle.slices) {
+                  const object = byId.get(slice.artifactId);
+                  if (
+                    !object ||
+                    object.kind !== "workspace" ||
+                    slice.offset !== 0 ||
+                    slice.length !== object.sizeBytes
+                  )
+                    return yield* conflict(
+                      "Reset repository chunks must contain only the complete Git bundle.",
+                    );
+                  chunks.push({
+                    artifactId: object.artifactId,
+                    sha256: object.sha256,
+                    sizeBytes: object.sizeBytes,
+                  });
+                }
+                if (
+                  view.manifest.files.some(
+                    (file) =>
+                      file.path !== bundle.path &&
+                      file.slices.some((slice) => bundleIds.has(slice.artifactId)),
+                  )
+                )
+                  return yield* conflict(
+                    "Reset repository objects cannot be shared with other files.",
+                  );
                 const repository: RelayThreadVmRepositoryUpload = {
                   operationId: input.operationId,
                   threadId: ThreadId.make(input.threadId),
@@ -395,10 +429,10 @@ export function makeThreadMoveCheckpointStore(
                   bundle: {
                     sha256: bundle.sha256,
                     sizeBytes: bundle.sizeBytes,
-                    chunks: bundle.chunks,
+                    chunks,
                   },
                 };
-                const ids = encodeIds(bundle.chunks.map((chunk) => chunk.artifactId));
+                const ids = encodeIds(chunks.map((chunk) => chunk.artifactId));
                 yield* sql`INSERT INTO relay_thread_artifact_pins(artifact_id,operation_id)
                   SELECT p.artifact_id,${repositoryPinId(input.operationId)} FROM relay_thread_artifact_pins p
                   WHERE p.operation_id=${view.readPinId} AND p.artifact_id IN

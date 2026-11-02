@@ -59,6 +59,7 @@ export function ThreadMoveQueueItem({
     queuePaused,
     status: view?.data?.status,
     providerAuth: view?.providerAuth,
+    workerAuth: view?.workerAuth,
     error: view?.error,
   });
   if (!presentation) return null;
@@ -123,20 +124,16 @@ export function ThreadMoveQueueItem({
           </p>
           {detail && <p className="mt-1 break-words text-muted-foreground">{detail}</p>}
         </div>
-        {presentation.ownsNotice &&
-          !waiting &&
-          !cancelling &&
-          ui?.moveAction &&
-          tone !== "neutral" && (
-            <Button
-              size="xs"
-              variant="secondary"
-              disabled={ui.moveAction.disabled}
-              onClick={ui.moveAction.onPress}
-            >
-              {ui.moveAction.label}
-            </Button>
-          )}
+        {presentation.ownsNotice && !waiting && !cancelling && ui?.moveAction && (
+          <Button
+            size="xs"
+            variant="secondary"
+            disabled={ui.moveAction.disabled}
+            onClick={ui.moveAction.onPress}
+          >
+            {ui.moveAction.label}
+          </Button>
+        )}
       </div>
       {!waiting && (
         <ol className="mt-3 grid grid-cols-3 gap-2" aria-label="Move stages">
@@ -155,6 +152,26 @@ export function ThreadMoveQueueItem({
             </li>
           ))}
         </ol>
+      )}
+      {presentation.previousErrors.length > 0 && (
+        <details
+          key={`${threadId}:${entry?.operationId ?? placement?.operationId}`}
+          className="mt-3 text-muted-foreground"
+        >
+          <summary className="cursor-pointer">
+            {presentation.previousErrors.length === 1 ? "Previous error" : "Previous errors"}
+          </summary>
+          <div className="mt-2 grid gap-1">
+            {presentation.previousErrors.map((failure) => (
+              <p
+                key={`${failure.environmentId}:${failure.generation}:${failure.attempt}`}
+                className="break-words"
+              >
+                {failure.detail}
+              </p>
+            ))}
+          </div>
+        </details>
       )}
       {!waiting && ui?.moveFeedback}
       {waiting && !cancelling && children && (

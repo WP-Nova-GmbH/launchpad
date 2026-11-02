@@ -1,12 +1,15 @@
 import * as NodeCrypto from "node:crypto";
+import * as Path from "effect/Path";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import type * as FileSystem from "effect/FileSystem";
 import * as Effect from "effect/Effect";
+import { THREAD_TRANSFER_SUPPORTED_FORMATS } from "@t3tools/shared/threadTransferEncoding";
 import * as Schema from "effect/Schema";
 import { OrchestrationEvent } from "@t3tools/contracts";
 import { ThreadTransferArchiveManifest } from "@t3tools/contracts/threadTransfer";
 import {
   ThreadTransferChunkManifest,
+  ThreadTransferPackedManifest,
   type CodexConversationManifest,
   type ThreadAttachmentManifest,
 } from "@t3tools/contracts/relay";
@@ -14,6 +17,7 @@ import { makeThreadPlacementStore } from "../ThreadPlacementStore.ts";
 import { makeThreadArtifactTransfer } from "../ThreadArtifactTransfer.ts";
 import { makeThreadMoveArtifactStore } from "../ThreadMoveArtifactStore.ts";
 import { makeLocalThreadArtifactObjects } from "../ThreadArtifactLocalObjects.ts";
+import { packThreadTransferArchiveV2 } from "../../../../../apps/server/src/relay/ThreadTransferChunks.ts";
 
 const encodeArchive = Schema.encodeSync(Schema.fromJsonString(ThreadTransferArchiveManifest));
 const encodeHistory = Schema.encodeSync(
@@ -26,6 +30,7 @@ const encodeWorkspace = Schema.encodeSync(
   Schema.fromJsonString(ThreadTransferArchiveManifest.fields.workspace),
 );
 const encodeChunks = Schema.encodeSync(Schema.fromJsonString(ThreadTransferChunkManifest));
+const encodePacked = Schema.encodeSync(Schema.fromJsonString(ThreadTransferPackedManifest));
 const decodeChunks = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferChunkManifest));
 const bytes = (value: string) => new TextEncoder().encode(value);
 const encodeEvent = Schema.encodeSync(Schema.fromJsonString(OrchestrationEvent));
@@ -48,7 +53,15 @@ export const prepareMoveCheckpointArchive = Effect.fnUntraced(function* (input: 
   corruptHistoryText?: boolean;
   vmDestination?: boolean;
   bundleContent?: Uint8Array;
+  packed?: boolean;
+  selectTransferEncoding?: boolean;
+  workspaceContents?: ReadonlyMap<string, Uint8Array>;
+  mutatePackedManifest?: (
+    manifest: ThreadTransferPackedManifest,
+    indexId: string,
+  ) => ThreadTransferPackedManifest;
 }) {
+  const path = yield* Path.Path;
   const placements = makeThreadPlacementStore(input.sql),
     operationId = input.operationId ?? NodeCrypto.randomUUID();
   const move = {
@@ -60,7 +73,15 @@ export const prepareMoveCheckpointArchive = Effect.fnUntraced(function* (input: 
     destinationEnvironmentId: `destination-${input.threadId}`,
     destinationProjectId: "destination-project",
   };
-  yield* placements.beginMove(move);
+  yield* placements.beginMove({
+    ...move,
+    ...(input.packed ? { sourceThreadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS } : {}),
+  });
+  if (input.packed && input.selectTransferEncoding !== false)
+    yield* placements.selectEncoding({
+      ...move,
+      destinationThreadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS,
+    });
   if (input.vmDestination) {
     yield* input.sql`INSERT INTO relay_thread_vm_allocations(allocation_id,thread_id,organization_id,owner_user_id,template_id,state)
       VALUES(${operationId},${input.threadId},'org','user','template','creating')`;
@@ -108,7 +129,13 @@ export const prepareMoveCheckpointArchive = Effect.fnUntraced(function* (input: 
     checkpoints: [],
     bundle: part(input.bundleContent ?? empty),
     index: part(empty),
-    files: [],
+    files: [...(input.workspaceContents ?? [])].map(([path, content]) => ({
+      kind: "file" as const,
+      path,
+      sha256: digest(content),
+      size: content.length,
+      executable: false,
+    })),
   };
   const header = {
     format: "launchpad-thread-transfer-v1" as const,
@@ -127,6 +154,10 @@ export const prepareMoveCheckpointArchive = Effect.fnUntraced(function* (input: 
     ["workspace/manifest.json", bytes(encodeWorkspace(workspace))],
     ["workspace/repository.bundle", input.bundleContent ?? empty],
     ["workspace/index", empty],
+    ...[...(input.workspaceContents?.values() ?? [])].map((content): [string, Uint8Array] => [
+      `workspace/objects/${digest(content)}`,
+      content,
+    ]),
     ...(input.extraFiles ?? []),
   ]);
   if (input.omit && files.get(input.omit)?.length === 0) files.delete(input.omit);
@@ -174,9 +205,15 @@ export const prepareMoveCheckpointArchive = Effect.fnUntraced(function* (input: 
         : [],
     })),
   };
-  const manifestBytes = bytes(encodeChunks(chunkManifest)),
-    manifestArtifactId = NodeCrypto.randomUUID();
-  const uploads = [
+  const manifestBytes = bytes(encodeChunks(chunkManifest));
+  let manifestArtifactId: string = NodeCrypto.randomUUID();
+  let artifactManifest: ThreadTransferChunkManifest | ThreadTransferPackedManifest = chunkManifest;
+  let uploads: Array<
+    Pick<ThreadTransferPackedManifest["objects"][number], "artifactId" | "kind"> & {
+      path: string;
+      content: Uint8Array;
+    }
+  > = [
     ...entries,
     {
       artifactId: manifestArtifactId,
@@ -185,6 +222,42 @@ export const prepareMoveCheckpointArchive = Effect.fnUntraced(function* (input: 
       content: manifestBytes,
     },
   ];
+  if (input.packed) {
+    const archiveDirectory = path.join(input.root, `archive-${operationId}`);
+    for (const [name, content] of files) {
+      const target = path.join(archiveDirectory, name);
+      yield* input.fs.makeDirectory(path.dirname(target), { recursive: true });
+      yield* input.fs.writeFile(target, content);
+    }
+    const packed = yield* packThreadTransferArchiveV2({
+      archiveDirectory,
+      scratchRoot: path.join(input.root, "packs"),
+      expectedManifestSha256: digest(manifest),
+    });
+    manifestArtifactId = packed.artifactId;
+    artifactManifest =
+      input.mutatePackedManifest?.(packed.manifest, manifestArtifactId) ?? packed.manifest;
+    uploads = [];
+    for (const upload of packed.uploads) {
+      const members = packed.manifest.files.filter((file) =>
+        file.slices.some((slice) => slice.artifactId === upload.artifactId),
+      );
+      uploads.push({
+        artifactId: upload.artifactId,
+        kind: upload.kind,
+        path:
+          upload.artifactId === manifestArtifactId
+            ? "chunks.json"
+            : members.length === 1
+              ? members[0]!.path
+              : `packs/${upload.artifactId}`,
+        content:
+          upload.artifactId === manifestArtifactId
+            ? bytes(encodePacked(artifactManifest))
+            : yield* input.fs.readFile(upload.path),
+      });
+    }
+  }
   const upload = Effect.fnUntraced(function* () {
     for (const e of uploads)
       if (e.path !== input.omit && e.content.length)
@@ -225,6 +298,7 @@ export const prepareMoveCheckpointArchive = Effect.fnUntraced(function* (input: 
     ready,
     manifestArtifactId,
     uploads,
+    artifactManifest,
   };
 });
 export const readPackedMoveFiles = Effect.fnUntraced(function* (
