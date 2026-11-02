@@ -529,10 +529,11 @@ export const readyPortableThreadMove = Effect.fn("relay.api.thread_moves.ready")
 ) {
   const sql = (yield* RelayDb).$client;
   return yield* response(
-    yield* withThreadMoveParticipant(input, "destination", true, (_, placement) =>
+    yield* withThreadMoveParticipant(input, "destination", true, (move, placement) =>
       Effect.gen(function* () {
         const principal = yield* RelayEnvironmentPrincipal;
-        if (principal.threadVm)
+        // Accepted readiness survives a later Codex disconnect; replays still validate the frozen handoff.
+        if (principal.threadVm && move.phase !== "ready")
           yield* makeThreadVmCodexAuthStore(sql).requireAcknowledged({
             ...input,
             allocationId: principal.threadVm.allocationId,

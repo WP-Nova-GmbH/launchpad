@@ -29,11 +29,17 @@ import {
 } from "../tenancy/CodexVmConnections.test-fixture.ts";
 import { makeThreadVmCodexAuthStore } from "../threads/ThreadVmCodexAuthStore.ts";
 import { makeThreadVmBindingStore } from "../threads/ThreadVmBindingStore.ts";
+import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 import { readPendingThreadVmProviderAuth } from "../threads/ThreadVmPendingProviderAuth.ts";
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import type { ThreadVmProviderAuthControl } from "@t3tools/contracts/relay";
 import { threadVmProviderAuth } from "./ThreadVmProviderAuthApi.ts";
-import { readyPortableThreadMove } from "./ThreadMovesApi.ts";
+import {
+  activatePortableThreadMove,
+  commitPortableThreadMove,
+  readyPortableThreadMove,
+  reportPortableThreadMoveFailure,
+} from "./ThreadMovesApi.ts";
 import { confirmInitialVmActivation } from "./ThreadEnvironmentApi.ts";
 import { confirmThreadVmRestoreActivation } from "./ThreadVmRestoreRecoveryApi.ts";
 import { ThreadArtifactObjectStorage } from "../threads/ThreadArtifactObjects.ts";
@@ -99,6 +105,13 @@ const threadId = ThreadId.make("vm-codex-thread"),
 const identity = { organizationId, threadId, allocationId, environmentId, generation: 2 };
 const owner = { threadId, environmentId, generation: 2 };
 const binding = { operationId, allocationId, generation: 2 };
+const readyInput = {
+  ...owner,
+  operationId,
+  sourceCursor: 0,
+  manifestSha256: "a".repeat(64),
+  attempt: 1,
+};
 const principal = {
   environmentId,
   credentialId,
@@ -254,12 +267,25 @@ const fixture = Effect.fnUntraced(function* (connectionId: string) {
     yield* sql`INSERT INTO relay_thread_vm_setups(allocation_id,canonical_key,branch,revision,phase,environment_id,receipt_sha256)
       VALUES(${allocationId},'github.com/test/repo','main',${"a".repeat(40)},'ready',${environmentId},${"b".repeat(64)})`;
   });
+  const freezeMove = Effect.gen(function* () {
+    yield* sql`UPDATE relay_thread_moves SET phase='frozen',source_cursor=${readyInput.sourceCursor},manifest_sha256=${readyInput.manifestSha256} WHERE operation_id=${operationId}`;
+    const artifactId = yield* (yield* Crypto.Crypto).randomUUIDv4;
+    yield* sql`INSERT INTO relay_thread_artifacts
+      (artifact_id,thread_id,operation_id,kind,storage_key,sha256,size_bytes,state)
+      VALUES(${artifactId},${threadId},${operationId},'manifest',${`thread-artifacts/v1/${artifactId}`},${readyInput.manifestSha256},0,'complete')`;
+    yield* sql`INSERT INTO relay_thread_artifact_pins(artifact_id,operation_id)
+      VALUES(${artifactId},${operationId}),(${artifactId},${`move-recovery:${operationId}`})`;
+    yield* sql`INSERT INTO relay_thread_move_artifacts(operation_id,manifest_artifact_id) VALUES(${operationId},${artifactId})`;
+    yield* sql`INSERT INTO relay_thread_move_checkpoints(operation_id,thread_id,manifest_artifact_id,artifact_count)
+      VALUES(${operationId},${threadId},${artifactId},1)`;
+  });
   return {
     db,
     sql,
     provide,
     select,
     ready,
+    freezeMove,
     connectionId,
     setRefresh: (next: typeof refresh) => {
       refresh = next;
@@ -515,6 +541,234 @@ describe.skipIf(!databaseUrl)("generation-bound VM Codex authentication (Postgre
           );
         }),
       ),
+  );
+
+  for (const unavailable of ["disconnected", "reconnect_required", "replaced", "deleted"] as const)
+    it.effect(`recovers accepted move readiness after its Codex connection is ${unavailable}`, () =>
+      withDatabase((request) =>
+        Effect.gen(function* () {
+          const connected = yield* connect(request);
+          yield* request(() =>
+            Effect.gen(function* () {
+              const vm = yield* fixture(connected.connectionId);
+              yield* vm.freezeMove;
+              yield* vm.select();
+              yield* vm.provide(getEnvironmentThreadVmCodexAuthSource(owner));
+              // The relay committed readiness, but the destination never received its reply.
+              yield* vm.provide(readyPortableThreadMove(readyInput));
+              if (unavailable === "deleted")
+                yield* vm.sql`DELETE FROM relay_codex_vm_connections WHERE organization_id=${organizationId}`;
+              else if (unavailable === "replaced")
+                yield* vm.sql`UPDATE relay_codex_vm_connections SET connection_id='replacement-connection' WHERE organization_id=${organizationId}`;
+              else
+                yield* vm.sql`UPDATE relay_codex_vm_connections SET status=${unavailable},payload_sealed=NULL WHERE organization_id=${organizationId}`;
+              const accountBefore =
+                yield* vm.sql`SELECT * FROM relay_codex_vm_connections WHERE organization_id=${organizationId}`;
+              const selectionBefore =
+                yield* vm.sql`SELECT * FROM relay_thread_vm_codex_auth WHERE allocation_id=${allocationId}`;
+              expect(yield* readPendingThreadVmProviderAuth(vm.sql, threadId)).toBeNull();
+              expect(
+                yield* vm.provide(readyPortableThreadMove({ ...readyInput, attempt: 2 })),
+              ).toMatchObject({ phase: "ready", recoveryVerified: true });
+              expect(yield* vm.provide(commitPortableThreadMove(readyInput))).toMatchObject({
+                phase: "committed",
+              });
+              yield* vm.provide(readyPortableThreadMove(readyInput)).pipe(Effect.flip);
+              expect(yield* vm.provide(activatePortableThreadMove(readyInput))).toMatchObject({
+                phase: "completed",
+              });
+              expect(yield* makeThreadPlacementStore(vm.sql).get(threadId)).toMatchObject({
+                environmentId,
+                generation: 2,
+                operationId: null,
+              });
+              yield* vm.provide(readyPortableThreadMove(readyInput)).pipe(Effect.flip);
+              expect(
+                yield* vm.sql`SELECT * FROM relay_codex_vm_connections WHERE organization_id=${organizationId}`,
+              ).toEqual(accountBefore);
+              expect(
+                yield* vm.sql`SELECT * FROM relay_thread_vm_codex_auth WHERE allocation_id=${allocationId}`,
+              ).toEqual(selectionBefore);
+              expect(guest.calls).toBe(0);
+            }),
+          );
+        }),
+      ),
+    );
+
+  it.effect("requires a live, acknowledged selection before first move readiness", () =>
+    withDatabase((request) =>
+      Effect.gen(function* () {
+        const connected = yield* connect(request);
+        yield* request(() =>
+          Effect.gen(function* () {
+            const vm = yield* fixture(connected.connectionId);
+            yield* vm.freezeMove;
+            yield* vm.select();
+            const ready = vm.provide(readyPortableThreadMove(readyInput));
+            expect(yield* ready.pipe(Effect.flip)).toMatchObject({
+              reason: "vm_update_required",
+            });
+            yield* vm.provide(getEnvironmentThreadVmCodexAuthSource(owner));
+            yield* vm.sql`UPDATE relay_codex_vm_connections SET status='disconnected',payload_sealed=NULL WHERE organization_id=${organizationId}`;
+            expect(yield* ready.pipe(Effect.flip)).toMatchObject({ reason: "not_connected" });
+            yield* vm.sql`UPDATE relay_codex_vm_connections SET status='connected',payload_sealed=${yield* encodeBundle(bundle)},connection_id='replacement-connection' WHERE organization_id=${organizationId}`;
+            expect(yield* ready.pipe(Effect.flip)).toMatchObject({ reason: "not_connected" });
+            expect(yield* makeThreadPlacementStore(vm.sql).getMove(readyInput)).toMatchObject({
+              phase: "frozen",
+            });
+            expect(yield* makeThreadPlacementStore(vm.sql).get(threadId)).toMatchObject({
+              environmentId: "local",
+              generation: 1,
+              operationId,
+            });
+          }),
+        );
+      }),
+    ),
+  );
+
+  it.effect("validates ready replay evidence and current access before resolving failures", () =>
+    withDatabase((request) =>
+      Effect.gen(function* () {
+        const connected = yield* connect(request);
+        yield* request(() =>
+          Effect.gen(function* () {
+            const vm = yield* fixture(connected.connectionId);
+            yield* vm.freezeMove;
+            yield* vm.select();
+            yield* vm.provide(getEnvironmentThreadVmCodexAuthSource(owner));
+            yield* vm.provide(readyPortableThreadMove(readyInput));
+            yield* vm.provide(
+              reportPortableThreadMoveFailure({ ...readyInput, attempt: 2, detail: "Keep me" }),
+            );
+            const store = makeThreadPlacementStore(vm.sql);
+            const before = yield* store.getMove(readyInput);
+            const replay = { ...readyInput, attempt: 3 };
+            for (const change of [
+              { operationId: "00000000-0000-4000-8000-000000000001" },
+              { environmentId: "local" },
+              { generation: 1 },
+              { manifestSha256: "b".repeat(64) },
+              { sourceCursor: 1 },
+              { attempt: 0 },
+            ]) {
+              yield* vm
+                .provide(readyPortableThreadMove({ ...replay, ...change }))
+                .pipe(Effect.flip);
+              expect(yield* store.getMove(readyInput)).toEqual(before);
+            }
+            for (const scope of [
+              { ...principal.threadVm, allocationId: "wrong-allocation" },
+              { ...principal.threadVm, repositoryId: "wrong-repository" },
+              { ...principal.threadVm, generation: 3 },
+            ]) {
+              expect(
+                yield* vm
+                  .provide(readyPortableThreadMove(replay), userId, {
+                    ...principal,
+                    threadVm: scope,
+                  })
+                  .pipe(Effect.flip),
+              ).toMatchObject({ reason: "thread_not_found" });
+              expect(yield* store.getMove(readyInput)).toEqual(before);
+            }
+            yield* vm.sql`UPDATE relay_thread_vm_bindings SET revoked_at=clock_timestamp() WHERE allocation_id=${allocationId}`;
+            expect(
+              yield* vm.provide(readyPortableThreadMove(replay)).pipe(Effect.flip),
+            ).toMatchObject({ reason: "thread_not_found" });
+            yield* vm.sql`UPDATE relay_thread_vm_bindings SET revoked_at=NULL WHERE allocation_id=${allocationId}`;
+            yield* vm.sql`UPDATE relay_environment_credentials SET revoked_at=clock_timestamp() WHERE credential_id=${credentialId}`;
+            expect(
+              yield* vm.provide(readyPortableThreadMove(replay)).pipe(Effect.flip),
+            ).toMatchObject({ reason: "thread_not_found" });
+            yield* vm.sql`UPDATE relay_environment_credentials SET revoked_at=NULL WHERE credential_id=${credentialId}`;
+            yield* vm.sql`DELETE FROM relay_organization_members WHERE organization_id=${organizationId} AND user_id=${userId}`;
+            expect(
+              yield* vm.provide(readyPortableThreadMove(replay)).pipe(Effect.flip),
+            ).toMatchObject({ reason: "thread_not_found" });
+            expect(yield* store.getMove(readyInput)).toEqual(before);
+            expect(yield* store.get(threadId)).toMatchObject({
+              environmentId: "local",
+              generation: 1,
+            });
+          }),
+        );
+      }),
+    ),
+  );
+
+  it.effect("does not reopen cancelled move readiness", () =>
+    withDatabase((request) =>
+      Effect.gen(function* () {
+        const connected = yield* connect(request);
+        yield* request(() =>
+          Effect.gen(function* () {
+            const vm = yield* fixture(connected.connectionId);
+            yield* vm.freezeMove;
+            yield* vm.provide(readyPortableThreadMove(readyInput));
+            const store = makeThreadPlacementStore(vm.sql);
+            yield* store.requestAbort(readyInput);
+            expect(
+              yield* vm.provide(readyPortableThreadMove(readyInput)).pipe(Effect.flip),
+            ).toMatchObject({ reason: "thread_placement_changed" });
+            yield* store.destinationRemoved(readyInput);
+            expect(
+              yield* vm.provide(readyPortableThreadMove(readyInput)).pipe(Effect.flip),
+            ).toMatchObject({ reason: "thread_placement_changed" });
+            expect(yield* store.getMove(readyInput)).toMatchObject({ phase: "aborted" });
+            expect(yield* store.get(threadId)).toMatchObject({
+              environmentId: "local",
+              generation: 1,
+            });
+          }),
+        );
+      }),
+    ),
+  );
+
+  it.effect("ready replays resolve only older failures from the same destination", () =>
+    withDatabase((request) =>
+      Effect.gen(function* () {
+        const connected = yield* connect(request);
+        yield* request(() =>
+          Effect.gen(function* () {
+            const vm = yield* fixture(connected.connectionId);
+            yield* vm.freezeMove;
+            yield* vm.provide(readyPortableThreadMove(readyInput));
+            const failure = { ...readyInput, attempt: 3, detail: "Current destination failure" };
+            yield* vm.provide(reportPortableThreadMoveFailure(failure));
+            for (const attempt of [2, 3]) {
+              expect(
+                yield* vm.provide(readyPortableThreadMove({ ...readyInput, attempt })),
+              ).toMatchObject({ failureDetail: failure.detail });
+              expect(
+                yield* vm.provide(commitPortableThreadMove(readyInput)).pipe(Effect.flip),
+              ).toMatchObject({ reason: "thread_placement_changed" });
+            }
+            expect(
+              yield* vm.provide(readyPortableThreadMove({ ...readyInput, attempt: 4 })),
+            ).toMatchObject({ failureDetail: null });
+            expect(yield* vm.provide(reportPortableThreadMoveFailure(failure))).toMatchObject({
+              failureDetail: null,
+            });
+            yield* makeThreadPlacementStore(vm.sql).reportFailure({
+              ...readyInput,
+              environmentId: "local",
+              generation: 1,
+              attempt: 1,
+              detail: "Unresolved source failure",
+            });
+            expect(
+              yield* vm.provide(readyPortableThreadMove({ ...readyInput, attempt: 5 })),
+            ).toMatchObject({ failureDetail: "Unresolved source failure" });
+            expect(
+              yield* vm.provide(commitPortableThreadMove(readyInput)).pipe(Effect.flip),
+            ).toMatchObject({ reason: "thread_placement_changed" });
+          }),
+        );
+      }),
+    ),
   );
 
   it.effect(
