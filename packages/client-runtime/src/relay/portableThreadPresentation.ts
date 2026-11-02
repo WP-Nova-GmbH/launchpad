@@ -95,8 +95,36 @@ export function rememberPortableThreadPlacement(
     const placements = new Map(sameScope ? previous.placements : []);
     const known = placements.get(placement.threadId);
     if (known && known.generation > placement.generation) return previous;
+    const sameMove =
+      known !== undefined &&
+      placement.operationId !== null &&
+      known.threadId === placement.threadId &&
+      known.organizationId === placement.organizationId &&
+      known.repositoryId === placement.repositoryId &&
+      known.ownerUserId === placement.ownerUserId &&
+      known.environmentId === placement.environmentId &&
+      known.projectId === placement.projectId &&
+      known.generation === placement.generation &&
+      known.operationId === placement.operationId;
     accepted = true;
-    placements.set(placement.threadId, placement);
+    // Library summaries omit move details; only the same active move may retain them.
+    placements.set(
+      placement.threadId,
+      sameMove
+        ? {
+            ...placement,
+            ...(placement.moveProgress === undefined && known.moveProgress !== undefined
+              ? { moveProgress: known.moveProgress }
+              : {}),
+            ...(placement.moveFailureDetail === undefined && known.moveFailureDetail !== undefined
+              ? { moveFailureDetail: known.moveFailureDetail }
+              : {}),
+            ...(placement.moveFailures === undefined && known.moveFailures !== undefined
+              ? { moveFailures: known.moveFailures }
+              : {}),
+          }
+        : placement,
+    );
     const reads = new Map(sameScope ? previous.reads : []);
     reads.set(placement.threadId, request);
     const summaries = new Map(sameScope ? previous.summaries : []);

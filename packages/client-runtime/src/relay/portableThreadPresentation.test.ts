@@ -2,7 +2,15 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { managedRelaySessionAtom } from "./managedRelayState.ts";
-import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  type ThreadMoveQueueEntry,
+} from "@t3tools/contracts";
 import type { RelayPortableThreadPlacement } from "@t3tools/contracts/relay";
 import type { EnvironmentThreadShell } from "../state/models.ts";
 import {
@@ -13,6 +21,7 @@ import {
   canCreateThreadInEnvironment,
   selectPortableThreadPresentation,
 } from "./portableThreadPresentation.ts";
+import { threadMoveQueuePresentation } from "./threadMoveQueuePresentation.ts";
 
 const relay = "https://relay.example.com";
 const placement: RelayPortableThreadPlacement = {
@@ -24,6 +33,37 @@ const placement: RelayPortableThreadPlacement = {
   projectId: "project",
   generation: 2,
   operationId: null,
+};
+const moveEntry: ThreadMoveQueueEntry = {
+  kind: "move",
+  messageId: MessageId.make("message"),
+  destination: { kind: "vm" },
+  revision: 1,
+  acceptedSequence: 1,
+  createdAt: "2026-11-02T12:00:00Z",
+  state: "moving",
+  operationId: CommandId.make("move"),
+};
+const moving: RelayPortableThreadPlacement = {
+  ...placement,
+  operationId: "move",
+  moveProgress: [
+    {
+      threadId: "thread",
+      operationId: "move",
+      environmentId: "vm",
+      generation: 2,
+      participant: "source",
+      attempt: 1,
+      revision: 1,
+      stage: "uploading",
+      completedBytes: 1024,
+      totalBytes: 2048,
+      completedArtifacts: 1,
+      totalArtifacts: 2,
+      updatedAt: "2026-11-02T12:01:00Z",
+    },
+  ],
 };
 const shell = (environmentId: string, relayUrl = relay): EnvironmentThreadShell => ({
   id: ThreadId.make("thread"),
@@ -223,6 +263,254 @@ describe("portable navigation", () => {
         ),
       ).toBe(false);
       expect(registry.get(portableThreadPlacementsAtom)?.relayUrl).toBe(nextRelay);
+    } finally {
+      registry.dispose();
+    }
+  });
+});
+
+describe("portable move progress", () => {
+  it.each(["uploading", "downloading"] as const)(
+    "keeps %s progress visible across a newer sparse library summary",
+    (stage) => {
+      const registry = AtomRegistry.make();
+      try {
+        const session = { accountId: "owner", readClerkToken: () => Effect.succeed("token") };
+        registry.set(managedRelaySessionAtom, session);
+        const receipt = {
+          ...moving.moveProgress![0]!,
+          stage,
+          ...(stage === "downloading"
+            ? { participant: "destination" as const, environmentId: "next-vm", generation: 3 }
+            : {}),
+        };
+        const detailed = { ...moving, moveProgress: [receipt] };
+        rememberPortableThreadPlacement(registry, session, relay, detailed);
+        const expected = {
+          label: stage === "uploading" ? "Uploading files" : "Downloading files",
+          detail: "1 KB of 2 KB verified",
+        };
+        expect(
+          threadMoveQueuePresentation({ entry: moveEntry, placement: detailed }),
+        ).toMatchObject(expected);
+
+        rememberPortableThreadPlacement(registry, session, `${relay}/`, {
+          ...placement,
+          operationId: "move",
+        });
+        expect(
+          threadMoveQueuePresentation({
+            entry: moveEntry,
+            placement: registry.get(portableThreadPlacementsAtom)?.placements.get("thread"),
+          }),
+        ).toMatchObject(expected);
+
+        rememberPortableThreadPlacement(registry, session, relay, {
+          ...detailed,
+          moveProgress: [{ ...receipt, revision: 2, completedBytes: 1536 }],
+        });
+        expect(
+          threadMoveQueuePresentation({
+            entry: moveEntry,
+            placement: registry.get(portableThreadPlacementsAtom)?.placements.get("thread"),
+          }),
+        ).toMatchObject({ ...expected, detail: "2 KB of 2 KB verified" });
+      } finally {
+        registry.dispose();
+      }
+    },
+  );
+
+  it("retains an active failure across a sparse summary and honors explicit clears", () => {
+    const registry = AtomRegistry.make();
+    try {
+      const session = { accountId: "owner", readClerkToken: () => Effect.succeed("token") };
+      registry.set(managedRelaySessionAtom, session);
+      const failed: RelayPortableThreadPlacement = {
+        ...moving,
+        moveFailureDetail: "Upload could not finish",
+        moveFailures: [
+          {
+            environmentId: "vm",
+            generation: 2,
+            attempt: 1,
+            detail: "Upload could not finish",
+            reportedAt: "2026-11-02T12:01:00Z",
+            active: true,
+          },
+        ],
+      };
+      rememberPortableThreadPlacement(registry, session, relay, failed);
+      rememberPortableThreadPlacement(registry, session, relay, {
+        ...placement,
+        operationId: "move",
+      });
+      const cached = registry.get(portableThreadPlacementsAtom)?.placements.get("thread");
+      expect(cached?.moveFailures).toEqual(failed.moveFailures);
+      expect(threadMoveQueuePresentation({ entry: moveEntry, placement: cached })).toMatchObject({
+        label: "Move needs attention",
+        detail: "Upload could not finish",
+      });
+
+      const cleared = {
+        ...placement,
+        operationId: "move",
+        moveProgress: [],
+        moveFailureDetail: null,
+        moveFailures: [],
+      };
+      rememberPortableThreadPlacement(registry, session, relay, cleared);
+      const current = registry.get(portableThreadPlacementsAtom)?.placements.get("thread");
+      expect(current).toEqual(cleared);
+      expect(threadMoveQueuePresentation({ entry: moveEntry, placement: current })).toMatchObject({
+        label: "Moving thread…",
+        detail: null,
+        previousErrors: [],
+      });
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it("accepts real progress resets when a new attempt starts a different stage", () => {
+    const registry = AtomRegistry.make();
+    try {
+      const session = { accountId: "owner", readClerkToken: () => Effect.succeed("token") };
+      registry.set(managedRelaySessionAtom, session);
+      rememberPortableThreadPlacement(registry, session, relay, moving);
+      const retry: RelayPortableThreadPlacement = {
+        ...moving,
+        moveProgress: [
+          {
+            ...moving.moveProgress![0]!,
+            attempt: 2,
+            stage: "packing",
+            completedBytes: 0,
+            totalBytes: null,
+            completedArtifacts: 0,
+            totalArtifacts: null,
+          },
+        ],
+        moveFailureDetail: null,
+        moveFailures: [],
+      };
+      rememberPortableThreadPlacement(registry, session, relay, retry);
+      const current = registry.get(portableThreadPlacementsAtom)?.placements.get("thread");
+      expect(current).toEqual(retry);
+      expect(threadMoveQueuePresentation({ entry: moveEntry, placement: current })).toMatchObject({
+        label: "Preparing files",
+        detail: null,
+      });
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it.each([
+    ["thread", { threadId: "other-thread" }],
+    ["organization", { organizationId: "other-org" }],
+    ["repository", { repositoryId: "other-repo" }],
+    ["owner", { ownerUserId: "other-owner" }],
+    ["environment", { environmentId: "other-environment" }],
+    ["project", { projectId: "other-project" }],
+    ["generation", { generation: 3 }],
+    ["operation", { operationId: "reset" }],
+    ["completed operation", { operationId: null }],
+  ] satisfies ReadonlyArray<readonly [string, Partial<RelayPortableThreadPlacement>]>)(
+    "does not carry move progress across a changed %s",
+    (_field, changed) => {
+      const registry = AtomRegistry.make();
+      try {
+        const session = { accountId: "owner", readClerkToken: () => Effect.succeed("token") };
+        registry.set(managedRelaySessionAtom, session);
+        rememberPortableThreadPlacement(registry, session, relay, moving);
+        const next = { ...placement, operationId: "move", ...changed };
+        rememberPortableThreadPlacement(registry, session, relay, next);
+        expect(registry.get(portableThreadPlacementsAtom)?.placements.get(next.threadId)).toEqual(
+          next,
+        );
+      } finally {
+        registry.dispose();
+      }
+    },
+  );
+
+  it.each(["session", "account", "relay"] as const)(
+    "does not carry move progress across a changed %s scope",
+    (changed) => {
+      const registry = AtomRegistry.make();
+      try {
+        const session = { accountId: "owner", readClerkToken: () => Effect.succeed("token") };
+        registry.set(managedRelaySessionAtom, session);
+        rememberPortableThreadPlacement(registry, session, relay, moving);
+        const nextSession =
+          changed === "relay"
+            ? session
+            : { ...session, accountId: changed === "account" ? "other-owner" : session.accountId };
+        registry.set(managedRelaySessionAtom, nextSession);
+        const next = { ...placement, operationId: "move" };
+        rememberPortableThreadPlacement(
+          registry,
+          nextSession,
+          changed === "relay" ? "https://other-relay.example.com" : relay,
+          next,
+        );
+        expect(registry.get(portableThreadPlacementsAtom)?.placements.get("thread")).toEqual(next);
+      } finally {
+        registry.dispose();
+      }
+    },
+  );
+
+  it("does not retain historical move fields when neither placement has an active operation", () => {
+    const registry = AtomRegistry.make();
+    try {
+      const session = { accountId: "owner", readClerkToken: () => Effect.succeed("token") };
+      registry.set(managedRelaySessionAtom, session);
+      rememberPortableThreadPlacement(registry, session, relay, { ...moving, operationId: null });
+      rememberPortableThreadPlacement(registry, session, relay, placement);
+      expect(registry.get(portableThreadPlacementsAtom)?.placements.get("thread")).toEqual(
+        placement,
+      );
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it("advances read ordering for a sparse summary while retaining its accepted progress", () => {
+    const registry = AtomRegistry.make();
+    try {
+      const session = { accountId: "owner", readClerkToken: () => Effect.succeed("token") };
+      registry.set(managedRelaySessionAtom, session);
+      rememberPortableThreadPlacement(registry, session, relay, moving);
+      const oldRead = beginPortableThreadPlacementRead(registry, session, relay);
+      const summaryRead = beginPortableThreadPlacementRead(registry, session, relay);
+      expect(
+        rememberPortableThreadPlacement(
+          registry,
+          session,
+          relay,
+          { ...placement, operationId: "move" },
+          undefined,
+          summaryRead,
+        ),
+      ).toBe(true);
+      expect(
+        rememberPortableThreadPlacement(
+          registry,
+          session,
+          relay,
+          {
+            ...moving,
+            moveProgress: [{ ...moving.moveProgress![0]!, revision: 2, completedBytes: 1536 }],
+          },
+          undefined,
+          oldRead,
+        ),
+      ).toBe(false);
+      const proofs = registry.get(portableThreadPlacementsAtom);
+      expect(proofs?.reads.get("thread")).toBe(summaryRead);
+      expect(proofs?.placements.get("thread")?.moveProgress).toEqual(moving.moveProgress);
     } finally {
       registry.dispose();
     }
