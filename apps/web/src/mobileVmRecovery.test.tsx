@@ -11,7 +11,7 @@ import {
   ThreadId,
   type ServerConfig,
 } from "@t3tools/contracts";
-import type { RelayThreadVmStatus } from "@t3tools/contracts/relay";
+import type { RelayThreadVmStatus, ThreadMoveWaitingForAuth } from "@t3tools/contracts/relay";
 import type { ThreadVmActionSubmission } from "@t3tools/client-runtime/relay/threadVmActionSubmission";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 type VmCapabilitiesState = {
@@ -59,6 +59,7 @@ const fixture = vi.hoisted(() => ({
   backup: vi.fn(),
   preview: vi.fn(),
   auth: vi.fn(),
+  refreshVm: vi.fn(),
   removeFile: vi.fn(),
   removeCloud: vi.fn(async () => undefined),
   loaded: vi.fn(async () => undefined),
@@ -100,6 +101,9 @@ vi.mock("../../mobile/node_modules/react-native-safe-area-context", () => ({
 vi.mock("../../mobile/src/components/ContextSheetSize", () => ({ ContextSheetSize: () => null }));
 vi.mock("../../mobile/src/components/AppSymbol", () => ({ SymbolView: () => null }));
 vi.mock("../../mobile/src/components/AppText", () => ({ AppText: "span", AppTextInput: "input" }));
+vi.mock("../../mobile/src/features/settings/appearance/AppearancePreferencesProvider", () => ({
+  useAppearancePreferences: () => ({ themeVariables: { "--color-subtle-strong": "transparent" } }),
+}));
 vi.mock("../../mobile/src/state/entities", () => ({
   useProjects: () => [],
   useServerConfigs: () => fixture.configs,
@@ -116,6 +120,17 @@ vi.mock("../../mobile/src/state/server", async () => {
 vi.mock("../../mobile/src/state/threads", async () => {
   const { Atom } = await import("effect/unstable/reactivity");
   const locationAtom = Atom.make(null);
+  const authSourceAtom = Atom.make({
+    data: {
+      source: { mode: "personal" },
+      connection: null,
+      unsupported: false,
+      accountSelectionRequired: false,
+      error: null,
+    },
+    isPending: false,
+    error: null,
+  });
   return {
     environmentThreadShells: { threadShellsAtom: Atom.make([]).pipe(Atom.keepAlive) },
     threadEnvironment: { enqueuePrompt: "enqueue", getCommandReceipt: "receipt" },
@@ -125,7 +140,8 @@ vi.mock("../../mobile/src/state/threads", async () => {
       checkBackupRecovery: "backup",
       openPreview: "preview",
       providerAuthAction: "auth",
-      refresh: vi.fn(),
+      providerAuthSourceViewAtom: () => authSourceAtom,
+      refresh: fixture.refreshVm,
       capabilitiesAtom: Atom.make({
         data: {
           configured: true,
@@ -303,6 +319,8 @@ const initialVmView: {
   providerAuth: import("@t3tools/contracts/relay").RelayThreadVmProviderAuth | null;
   providerAuthError: string | null;
   providerAuthPending: boolean;
+  workerAuth?: ThreadMoveWaitingForAuth | null | undefined;
+  authTransitionKey?: string | null;
   data: {
     candidates: import("@t3tools/contracts/relay").RelayThreadVmReplacementCandidate[];
     status: RelayThreadVmStatus;
@@ -536,24 +554,29 @@ describe("mobile VM recovery", () => {
     expect(anyButton("Permanently delete thread")).toBeUndefined();
   });
 
-  it("omits the empty actions section and shows it when an action becomes available", async () => {
+  it("omits the empty preparation actions section and shows it when the VM becomes ready", async () => {
     fixture.vmLifecycle.ready = true;
     fixture.vmLifecycle.error = null;
     appAtomRegistry.set(vmViewAtom, {
       ...initialVmView,
       data: {
         ...initialVmView.data,
-        status: { ...initialVmStatus, lastVerifiedBackupAt: null },
+        status: {
+          ...initialVmStatus,
+          pendingProviderAuth: {
+            operationId: "move",
+            allocationId: "destination-vm",
+            environmentId: EnvironmentId.make("new-vm"),
+            generation: 3,
+            instanceId: "codex",
+          },
+        },
       },
-    });
-    appAtomRegistry.set(vmCapabilitiesAtom, {
-      ...initialVmCapabilities,
-      data: { ...initialVmCapabilities.data, privatePreview: false },
     });
     await mountVm(true);
     expect(renderer!.root.findAllByProps({ accessibilityLabel: "VM actions" })).toHaveLength(0);
     await act(async () => {
-      appAtomRegistry.set(vmCapabilitiesAtom, initialVmCapabilities);
+      appAtomRegistry.set(vmViewAtom, initialVmView);
     });
     expect(anyButton("Open preview…")).toBeDefined();
   });
@@ -741,6 +764,7 @@ describe("mobile VM recovery", () => {
     };
     appAtomRegistry.set(vmViewAtom, {
       ...initialVmView,
+      workerAuth: "personal_sign_in",
       providerAuth: {
         ...binding,
         requirement: "sign_in_required",
@@ -763,6 +787,138 @@ describe("mobile VM recovery", () => {
       expect.objectContaining({ environmentId: "mac", binding, action: { type: "start" } }),
     );
   });
+  it.each([false, true])(
+    "keeps premature VM account actions out of mobile controls (chat: %s)",
+    async (chat) => {
+      fixture.vmLifecycle.ready = true;
+      fixture.vmLifecycle.error = null;
+      appAtomRegistry.set(vmViewAtom, {
+        ...initialVmView,
+        providerAuthError: "Earlier sign-in read failed.",
+        data: {
+          ...initialVmView.data,
+          status: {
+            ...initialVmStatus,
+            pendingProviderAuth: {
+              operationId: "move",
+              allocationId: "destination-vm",
+              environmentId: EnvironmentId.make("new-vm"),
+              generation: 3,
+              instanceId: "codex",
+            },
+          },
+        },
+      });
+      await mountVm(chat);
+      expect(anyButton("Sign in to Codex") !== undefined).toBe(false);
+      expect(anyButton("Codex account…") !== undefined).toBe(false);
+      expect(renderer!.root.findAllByType("dialog")).toHaveLength(0);
+      expect(fixture.auth).not.toHaveBeenCalled();
+    },
+  );
+  it("keeps an open mobile account dialog neutral after its move auth wait clears", async () => {
+    fixture.vmLifecycle.ready = true;
+    fixture.vmLifecycle.error = null;
+    const binding = {
+      operationId: "move",
+      allocationId: "destination-vm",
+      environmentId: EnvironmentId.make("new-vm"),
+      generation: 3,
+      instanceId: "codex" as const,
+    };
+    const waiting = {
+      ...initialVmView,
+      workerAuth: "personal_sign_in" as const,
+      authTransitionKey: "waiting",
+      providerAuthError: "Earlier sign-in read failed.",
+      providerAuth: {
+        ...binding,
+        requirement: "sign_in_required" as const,
+        auth: {
+          instanceId: ProviderInstanceId.make("codex"),
+          phase: "waiting" as const,
+          flowId: "old-flow",
+          authorizationUrl: "https://chatgpt.com/activate",
+          expiresAt: null,
+          message: null,
+          interaction: {
+            type: "deviceCode" as const,
+            id: "old-flow",
+            url: "https://chatgpt.com/activate",
+            userCode: "OLD-MOBILE-CODE",
+          },
+        },
+      },
+      data: { ...initialVmView.data, status: { ...initialVmStatus, pendingProviderAuth: binding } },
+    };
+    appAtomRegistry.set(vmViewAtom, waiting);
+    await mountVm(true);
+    await press("Finish Codex sign-in");
+    expect(modalText().includes("OLD-MOBILE-CODE")).toBe(true);
+    await act(async () => {
+      appAtomRegistry.set(vmViewAtom, {
+        ...waiting,
+        workerAuth: null,
+        authTransitionKey: "preparing",
+      });
+    });
+    expect(renderer!.root.findAllByType("dialog")).toHaveLength(1);
+    expect(modalText().includes("VM preparation continues automatically.")).toBe(true);
+    expect(modalText().includes("OLD-MOBILE-CODE")).toBe(false);
+    expect(modalText().includes("Earlier sign-in read failed.")).toBe(false);
+    expect(modalButton("Check sign-in status") !== undefined).toBe(false);
+    expect(fixture.auth).not.toHaveBeenCalled();
+  });
+  it.each([false, true])(
+    "keeps current verification failures retryable in the open mobile dialog (chat: %s)",
+    async (chat) => {
+      fixture.vmLifecycle.ready = true;
+      fixture.vmLifecycle.error = null;
+      const waiting = {
+        ...initialVmView,
+        workerAuth: "personal_sign_in" as const,
+        authTransitionKey: "waiting",
+        data: {
+          ...initialVmView.data,
+          status: {
+            ...initialVmStatus,
+            pendingProviderAuth: {
+              operationId: "move",
+              allocationId: "destination-vm",
+              environmentId: EnvironmentId.make("new-vm"),
+              generation: 3,
+              instanceId: "codex" as const,
+            },
+          },
+        },
+      };
+      appAtomRegistry.set(vmViewAtom, waiting);
+      await mountVm(chat);
+      await press("Sign in to Codex");
+      const verifying = {
+        ...waiting,
+        workerAuth: "verification" as const,
+        authTransitionKey: "verification",
+        providerAuthError: "The VM could not be reached.",
+      };
+      await act(async () => appAtomRegistry.set(vmViewAtom, verifying));
+      expect(modalText()).toContain("The VM could not be reached.");
+      expect(modalButton("Sign in to Codex")).toBeUndefined();
+      expect(anyButton("Codex account…")).toBeUndefined();
+      await press("Check status", true);
+      expect(fixture.refreshVm).toHaveBeenCalledWith(
+        null,
+        EnvironmentId.make(chat ? "mac" : "vm"),
+        source.id,
+      );
+      expect(fixture.auth).not.toHaveBeenCalled();
+      await act(async () =>
+        appAtomRegistry.set(vmViewAtom, { ...verifying, providerAuthError: null }),
+      );
+      expect(modalText()).toContain("Checking whether Codex is ready");
+      expect(modalButton("Check status")).toBeUndefined();
+    },
+  );
   it("exposes replacement and cancellation while the source thread is still on the Mac", async () => {
     fixture.vmLifecycle.ready = true;
     fixture.vmLifecycle.error = null;

@@ -3,7 +3,11 @@ import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import { describe, expect, layer } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
-import { RelayClientPrincipal, type ThreadVmProviderAuthControl } from "@t3tools/contracts/relay";
+import {
+  RelayClientPrincipal,
+  type ThreadVmProviderAuthControl,
+  type ThreadMoveProgressSnapshot,
+} from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
@@ -14,10 +18,11 @@ import { finalSaveCatalogFixture } from "../threads/testUtils/finalSaveCatalog.t
 import { readPendingThreadVmProviderAuth } from "../threads/ThreadVmPendingProviderAuth.ts";
 import { getThreadVmStatus } from "./ThreadVmsApi.ts";
 import { threadVmProviderAuth } from "./ThreadVmProviderAuthApi.ts";
+import { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 
 const guest = vi.hoisted(() => ({
   calls: 0,
-  after: undefined as (() => Effect.Effect<void>) | undefined,
+  after: undefined as (() => Effect.Effect<void, ThreadVmComputeError>) | undefined,
 }));
 vi.mock("../machines/E2BThreadVmProviderAuth.ts", () => ({
   makeE2BThreadVmProviderAuth: () => (input: { control: ThreadVmProviderAuthControl }) =>
@@ -100,6 +105,34 @@ const fixture = Effect.fnUntraced(function* () {
       Effect.provideService(RelayClientPrincipal, { userId, token: "test" }),
       Effect.provideService(ThreadVmRuntimeConfiguration, { settings }),
     );
+  const freeze =
+    sql`UPDATE relay_thread_moves SET phase='frozen',source_cursor=0,manifest_sha256=${"a".repeat(64)} WHERE operation_id=${operationId}`.pipe(
+      Effect.asVoid,
+    );
+  const reportProgress = (overrides: Partial<ThreadMoveProgressSnapshot> = {}) => {
+    const snapshot: ThreadMoveProgressSnapshot = {
+      threadId,
+      operationId,
+      environmentId,
+      generation: 2,
+      participant: "destination",
+      attempt: 1,
+      revision: 1,
+      stage: "downloading",
+      completedBytes: 0,
+      totalBytes: null,
+      completedArtifacts: 0,
+      totalArtifacts: null,
+      waitingForAuth: null,
+      updatedAt: "2026-11-02T00:00:00.000Z",
+      ...overrides,
+    };
+    return sql`INSERT INTO relay_thread_move_progress(operation_id,environment_id,generation,attempt,revision,stage,snapshot)
+      VALUES(${operationId},${snapshot.environmentId},${snapshot.generation},${snapshot.attempt},${snapshot.revision},3,${sql.json(snapshot)})
+      ON CONFLICT(operation_id,environment_id) DO UPDATE SET generation=excluded.generation,attempt=excluded.attempt,revision=excluded.revision,snapshot=excluded.snapshot`.pipe(
+      Effect.asVoid,
+    );
+  };
   return {
     sql,
     threadId,
@@ -112,6 +145,8 @@ const fixture = Effect.fnUntraced(function* () {
     environmentId,
     request: { operationId, allocationId, generation: 2 },
     provide,
+    freeze,
+    reportProgress,
   };
 });
 
@@ -120,7 +155,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
   () => {
     layer(services)((it) => {
       it.effect(
-        "discovers next-generation auth on a local source without contacting compute for status",
+        "discovers a preparing binding without contacting compute for provider-auth status",
         () =>
           Effect.gen(function* () {
             const f = yield* fixture();
@@ -132,12 +167,75 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
             });
             expect(guest.calls).toBe(0);
             const auth = yield* f.provide(threadVmProviderAuth(f.threadId, "status"));
-            expect(auth?.requirement).toBe("sign_in_required");
-            expect(guest.calls).toBe(1);
+            expect(auth).toBeNull();
+            expect(guest.calls).toBe(0);
             const [placement] =
               yield* f.sql`SELECT environment_id,generation FROM relay_thread_placements WHERE thread_id=${f.threadId}`;
             expect(placement).toEqual({ environment_id: "local", generation: 1 });
           }),
+      );
+      it.effect("holds guest controls through preparation and the frozen boot gap", () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          for (const phase of ["preparing", "frozen"] as const) {
+            if (phase === "frozen") yield* f.freeze;
+            expect(yield* f.provide(threadVmProviderAuth(f.threadId, "status"))).toBeNull();
+            for (const action of ["start", "cancel"] as const)
+              expect(
+                yield* f
+                  .provide(threadVmProviderAuth(f.threadId, action, f.request))
+                  .pipe(Effect.flip),
+              ).toMatchObject({ _tag: "RelayTenancyConflictError" });
+          }
+          yield* f.reportProgress({
+            environmentId: EnvironmentId.make("local"),
+            generation: 1,
+            participant: "source",
+            stage: "uploading",
+          });
+          expect(yield* f.provide(threadVmProviderAuth(f.threadId, "status"))).toBeNull();
+          expect(guest.calls).toBe(0);
+        }),
+      );
+      it.effect("requires an exact destination receipt before contacting the guest", () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          yield* f.reportProgress();
+          expect(yield* f.provide(threadVmProviderAuth(f.threadId, "status"))).toBeNull();
+          yield* f.freeze;
+          for (const overrides of [
+            { threadId: "other-thread" },
+            { operationId: "other-operation" },
+            { environmentId: EnvironmentId.make("other-environment") },
+            { generation: 3 },
+            { participant: "source" as const },
+            { attempt: 0 },
+            { revision: 0 },
+          ]) {
+            yield* f.sql`DELETE FROM relay_thread_move_progress WHERE operation_id=${f.operationId}`;
+            yield* f.reportProgress(overrides);
+            expect(yield* f.provide(threadVmProviderAuth(f.threadId, "status"))).toBeNull();
+          }
+          expect(guest.calls).toBe(0);
+          yield* f.reportProgress();
+          expect(yield* f.provide(threadVmProviderAuth(f.threadId, "status"))).toMatchObject({
+            requirement: "sign_in_required",
+          });
+          expect(guest.calls).toBe(1);
+        }),
+      );
+      it.effect("keeps a started destination's compute failure visible", () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          yield* f.freeze;
+          yield* f.reportProgress();
+          guest.after = () =>
+            Effect.fail(new ThreadVmComputeError({ operation: "startup", message: "Unavailable" }));
+          expect(
+            yield* f.provide(threadVmProviderAuth(f.threadId, "status")).pipe(Effect.flip),
+          ).toMatchObject({ _tag: "RelayInternalError", reason: "upstream_unavailable" });
+          expect(guest.calls).toBe(1);
+        }),
       );
       it.effect("rejects other users, even organization administrators", () =>
         Effect.gen(function* () {
@@ -154,6 +252,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
       it.effect("rejects stale mutation intent before touching the guest", () =>
         Effect.gen(function* () {
           const f = yield* fixture();
+          yield* f.freeze;
+          yield* f.reportProgress();
           for (const request of [
             { ...f.request, generation: 3 },
             { ...f.request, allocationId: "other" },
@@ -170,6 +270,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
       it.effect("rejects revoked repository access and revoked guest credentials", () =>
         Effect.gen(function* () {
           const f = yield* fixture();
+          yield* f.freeze;
+          yield* f.reportProgress();
           yield* f.sql`DELETE FROM relay_repository_access WHERE repository_id=${f.repositoryId} AND user_id=${f.owner}`;
           expect(
             (yield* f.provide(threadVmProviderAuth(f.threadId, "status")).pipe(Effect.flip))._tag,
@@ -194,6 +296,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
       it.effect("rechecks the exact pending target after a guest reply", () =>
         Effect.gen(function* () {
           const f = yield* fixture();
+          yield* f.freeze;
+          yield* f.reportProgress();
           guest.after = () =>
             f.sql`UPDATE relay_thread_moves SET phase='aborting' WHERE operation_id=${f.operationId}`.pipe(
               Effect.asVoid,
@@ -241,8 +345,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   yield* f.sql`INSERT INTO relay_thread_vm_resets(operation_id,thread_id,allocation_id,actor_user_id,expected_generation,saved_disk_operation_id,native_checkpoint_operation_id,source_environment_id,source_sequence,host_id,template_id,canonical_key,branch,revision,phase)
           VALUES(${op},${f.threadId},${allocation},${f.input.actorUserId},1,${f.input.operationId},${point.native.header.operationId},${f.sourceEnvironmentId},0,${f.hostId},'template:build','github.com/acme/test','main',${"a".repeat(40)},'importing')`;
                 else
-                  yield* f.sql`INSERT INTO relay_thread_vm_restores(operation_id,saved_disk_operation_id,thread_id,allocation_id,actor_user_id,generation,host_id,native_checkpoint_operation_id,source_template_id,source_build_id,phase,serving_requested,boot_prepare_started_at,probe_removed_at,prepared_receipt,boot_receipt,committed_at)
-          VALUES(${op},${f.input.operationId},${f.threadId},${allocation},${f.input.actorUserId},1,${f.hostId},${point.native.header.operationId},'template',${NodeCrypto.randomUUID()},'importing',true,clock_timestamp(),clock_timestamp(),'{}'::jsonb,'{}'::jsonb,clock_timestamp())`;
+                  yield* f.sql`INSERT INTO relay_thread_vm_restores(operation_id,saved_disk_operation_id,thread_id,allocation_id,actor_user_id,generation,target_generation,host_id,native_checkpoint_operation_id,source_template_id,source_build_id,phase,serving_requested,boot_prepare_started_at,probe_removed_at,prepared_receipt,boot_receipt,bootstrap_receipt,committed_at)
+          VALUES(${op},${f.input.operationId},${f.threadId},${allocation},${f.input.actorUserId},1,2,${f.hostId},${point.native.header.operationId},'template',${NodeCrypto.randomUUID()},'importing',true,clock_timestamp(),clock_timestamp(),'{}'::jsonb,'{}'::jsonb,'{"kind":"native-warm-restore-bootstrap-v1"}'::jsonb,clock_timestamp())`;
                 const pending = yield* readPendingThreadVmProviderAuth(f.sql, f.threadId);
                 expect(pending?.binding).toEqual({
                   operationId: op,
@@ -251,6 +355,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   generation: 2,
                   instanceId: "codex",
                 });
+                expect(pending?.controlsReady).toBe(true);
                 if (kind === "reset")
                   yield* f.sql`UPDATE relay_thread_vm_resets SET phase='cancelling' WHERE operation_id=${op}`;
                 else

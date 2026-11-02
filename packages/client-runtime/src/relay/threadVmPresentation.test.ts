@@ -34,6 +34,71 @@ const savedDisk = {
 };
 
 describe("VM presentation uses confirmed runtime state", () => {
+  it("waits for a next-generation worker before offering provider account controls", () => {
+    const binding = {
+      operationId: "move",
+      allocationId: "next-vm",
+      environmentId: EnvironmentId.make("destination"),
+      generation: status.generation + 1,
+      instanceId: "codex" as const,
+    };
+    for (const workerAuth of [undefined, null])
+      expect(
+        threadVmPresentation({
+          status: { ...status, pendingProviderAuth: binding },
+          workerAuth,
+          providerAuthError: "Earlier VM auth read failed",
+          providerAuth: {
+            ...binding,
+            requirement: "provider_unavailable",
+            auth: {
+              instanceId: ProviderInstanceId.make("codex"),
+              phase: "failed",
+              flowId: null,
+              authorizationUrl: null,
+              expiresAt: null,
+              message: "Earlier VM auth failure",
+              interaction: null,
+            },
+          },
+        }),
+      ).toMatchObject({
+        label: "Preparing VM",
+        tone: "neutral",
+        primary: null,
+        canManageProviderAuth: false,
+        detail: "VM preparation continues automatically.",
+      });
+    expect(
+      threadVmPresentation({
+        status: { ...status, pendingProviderAuth: { ...binding, generation: status.generation } },
+      }),
+    ).toMatchObject({ primary: { type: "sign_in" }, canManageProviderAuth: true });
+  });
+  it("shows a current verification failure with a status retry instead of sign-in controls", () => {
+    expect(
+      threadVmPresentation({
+        status: {
+          ...status,
+          pendingProviderAuth: {
+            operationId: "move",
+            allocationId: "next-vm",
+            environmentId: EnvironmentId.make("destination"),
+            generation: status.generation + 1,
+            instanceId: "codex",
+          },
+        },
+        workerAuth: "verification",
+        providerAuthError: "The VM could not be reached.",
+      }),
+    ).toMatchObject({
+      label: "Could not check Codex sign-in",
+      detail: "The VM could not be reached.",
+      tone: "danger",
+      primary: { type: "check", label: "Check status" },
+      canManageProviderAuth: false,
+    });
+  });
   it("matches worker auth to the exact pending destination and gives normal waits a neutral action", () => {
     const binding = {
       operationId: "move",
@@ -88,11 +153,13 @@ describe("VM presentation uses confirmed runtime state", () => {
       label: "Choose a Codex account",
       tone: "neutral",
       primary: { type: "sign_in", label: "Choose account" },
+      canManageProviderAuth: true,
     });
     expect(threadVmPresentation({ status: pending, workerAuth: "verification" })).toMatchObject({
       label: "Checking Codex sign-in",
       tone: "neutral",
       primary: null,
+      canManageProviderAuth: false,
     });
     expect(
       threadVmPresentation({
@@ -387,7 +454,7 @@ describe("VM sign-in expiry", () => {
       operationId: "move",
       allocationId: "vm",
       environmentId: EnvironmentId.make("destination"),
-      generation: 3,
+      generation: status.generation,
       instanceId: "codex" as const,
     };
     const waiting = { ...value, ...binding };

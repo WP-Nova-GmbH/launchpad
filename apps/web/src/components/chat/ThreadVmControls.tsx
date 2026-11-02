@@ -627,6 +627,7 @@ function ThreadVmControlPanel({
     pendingRequest: !!pending,
     queuePaused,
     providerAuth,
+    providerAuthError,
     workerAuth,
     capabilities: capabilities.error || capabilities.isPending ? null : capabilities.data,
   });
@@ -816,7 +817,7 @@ function ThreadVmControlPanel({
       {status?.allocation && !status.pendingProviderAuth ? (
         <VmCodexAccountSummary environmentId={environmentId} threadId={threadId} />
       ) : null}
-      {status?.pendingProviderAuth && presentation.primary?.type !== "sign_in" ? (
+      {presentation.canManageProviderAuth && presentation.primary?.type !== "sign_in" ? (
         <MenuAction
           label="Codex account…"
           disabled={disabled}
@@ -1011,7 +1012,9 @@ function ThreadVmControlPanel({
               {confirm === "preview"
                 ? "Enter the port your application is listening on inside this VM."
                 : confirm === "sign_in"
-                  ? "Choose personal sign-in or the organization's Codex account to finish preparing this VM."
+                  ? presentation.canManageProviderAuth
+                    ? "Choose personal sign-in or the organization's Codex account to finish preparing this VM."
+                    : "VM preparation continues automatically."
                   : confirm === "replacement"
                     ? "Your VM allowance is full. Choose a VM to save and stop. The least recently active choice is listed first."
                     : confirm === "delete"
@@ -1039,7 +1042,9 @@ function ThreadVmControlPanel({
                     onPress={() => void openPreview()}
                   />
                 </>
-              ) : confirm === "sign_in" && status?.pendingProviderAuth ? (
+              ) : confirm === "sign_in" &&
+                presentation.canManageProviderAuth &&
+                status?.pendingProviderAuth ? (
                 <VmCodexSignIn
                   key={`${accountId}:${status?.pendingProviderAuth.allocationId}:${status?.pendingProviderAuth.operationId}:${authTransitionKey}`}
                   environmentId={environmentId}
@@ -1059,7 +1064,16 @@ function ThreadVmControlPanel({
                   }}
                 />
               ) : confirm === "sign_in" ? (
-                <Note>{presentation.label}. This VM no longer needs Codex sign-in.</Note>
+                <>
+                  <Note>
+                    {status?.pendingProviderAuth
+                      ? (presentation.detail ?? "VM preparation continues automatically.")
+                      : "This VM no longer needs Codex sign-in."}
+                  </Note>
+                  {presentation.primary?.type === "check" ? (
+                    <ActionButton label="Check status" disabled={disabled} onPress={primary} />
+                  ) : null}
+                </>
               ) : confirm === "replacement" && status?.replacement?.phase !== "awaiting_choice" ? (
                 <Note>This VM request changed. Close this dialog to check its current status.</Note>
               ) : confirm === "replacement" ? (

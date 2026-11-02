@@ -31,6 +31,7 @@ const fixture = vi.hoisted(() => ({
   actionDisabled: false,
   sourceIsVm: false,
   status: null as RelayThreadVmStatus | null,
+  providerAuthError: null as string | null,
   dispatch: vi.fn(),
   receipt: vi.fn(),
   refresh: vi.fn(),
@@ -39,7 +40,12 @@ const fixture = vi.hoisted(() => ({
 }));
 function read(atom: unknown) {
   if (atom === "session") return fixture.session;
-  if (atom === "view") return { data: { status: fixture.status }, providerAuth: null };
+  if (atom === "view")
+    return {
+      data: { status: fixture.status },
+      providerAuth: null,
+      providerAuthError: fixture.providerAuthError,
+    };
   return null;
 }
 function commands(atom: unknown) {
@@ -267,6 +273,7 @@ for (const [surface, Component, useCancellation, MoveItem] of [
       fixture.actionDisabled = false;
       fixture.sourceIsVm = false;
       fixture.status = null;
+      fixture.providerAuthError = null;
       let id = 0;
       fixture.uuid.mockImplementation(() => `cancel-${++id}`);
       fixture.dispatch.mockImplementation(async ({ command }) => ({
@@ -280,6 +287,14 @@ for (const [surface, Component, useCancellation, MoveItem] of [
       if (renderer) await act(async () => renderer!.unmount());
       renderer = undefined;
       vi.unstubAllGlobals();
+    });
+    it("shows current verification read failures in the move row that owns the notice", async () => {
+      const current = withWorkerAuth("verification");
+      fixture.providerAuthError = "The VM could not be reached.";
+      await render(initialQueue, environmentId, threadId, current);
+      const content = JSON.stringify(renderer!.toJSON());
+      expect(content).toContain("Could not check Codex sign-in");
+      expect(content).toContain("The VM could not be reached.");
     });
     it("keeps prompts before and after a move in execution order", async () => {
       const prompt = (id: string) => ({

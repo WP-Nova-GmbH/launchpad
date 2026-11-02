@@ -65,6 +65,7 @@ export function threadMoveQueuePresentation(input: {
   placement?: RelayPortableThreadPlacement | null | undefined;
   status?: RelayThreadVmStatus | null | undefined;
   providerAuth?: RelayThreadVmProviderAuth | null | undefined;
+  providerAuthError?: string | null | undefined;
   workerAuth?: ThreadMoveWaitingForAuth | null | undefined;
   cancellation?: "sending" | "requested" | "unknown" | undefined;
   queuePaused?: boolean | undefined;
@@ -118,7 +119,12 @@ export function threadMoveQueuePresentation(input: {
         : threadVmWorkerAuthState(matching, currentStatus)
       : undefined;
   const vm = currentStatus
-    ? threadVmPresentation({ status: currentStatus, providerAuth: auth, workerAuth })
+    ? threadVmPresentation({
+        status: currentStatus,
+        providerAuth: auth,
+        providerAuthError: input.providerAuthError ?? null,
+        workerAuth,
+      })
     : null;
   const snapshots = currentMoveSnapshots(matching);
   const progress = matching

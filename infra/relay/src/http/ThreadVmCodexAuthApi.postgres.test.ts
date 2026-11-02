@@ -30,6 +30,7 @@ import {
 import { makeThreadVmCodexAuthStore } from "../threads/ThreadVmCodexAuthStore.ts";
 import { makeThreadVmBindingStore } from "../threads/ThreadVmBindingStore.ts";
 import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
+import { makeThreadMoveProgressStore } from "../threads/ThreadMoveProgressStore.ts";
 import { readPendingThreadVmProviderAuth } from "../threads/ThreadVmPendingProviderAuth.ts";
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import type { ThreadVmProviderAuthControl } from "@t3tools/contracts/relay";
@@ -279,6 +280,21 @@ const fixture = Effect.fnUntraced(function* (connectionId: string) {
     yield* sql`INSERT INTO relay_thread_move_checkpoints(operation_id,thread_id,manifest_artifact_id,artifact_count)
       VALUES(${operationId},${threadId},${artifactId},1)`;
   });
+  const reportProgress = Effect.gen(function* () {
+    const move = yield* makeThreadPlacementStore(sql).getMove({ threadId, operationId });
+    yield* makeThreadMoveProgressStore(sql).report(move, {
+      environmentId,
+      generation: 2,
+      attempt: 1,
+      revision: 1,
+      stage: "downloading",
+      completedBytes: 0,
+      totalBytes: null,
+      completedArtifacts: 0,
+      totalArtifacts: null,
+      waitingForAuth: "account_selection",
+    });
+  });
   return {
     db,
     sql,
@@ -286,6 +302,7 @@ const fixture = Effect.fnUntraced(function* (connectionId: string) {
     select,
     ready,
     freezeMove,
+    reportProgress,
     connectionId,
     setRefresh: (next: typeof refresh) => {
       refresh = next;
@@ -461,6 +478,17 @@ describe.skipIf(!databaseUrl)("generation-bound VM Codex authentication (Postgre
                 expect(yield* activate).toEqual({ ready: true });
                 yield* makeThreadVmCodexAuthStore(vm.sql).select(identity, { mode: "personal" });
                 expect(yield* activate).toEqual({ ready: true });
+                yield* vm.sql`UPDATE relay_thread_placements SET operation_id=${operationId} WHERE thread_id=${threadId}`;
+                if (kind === "reset")
+                  yield* vm.sql`UPDATE relay_thread_vm_resets SET phase='importing' WHERE operation_id=${operationId}`;
+                else
+                  yield* vm.sql`UPDATE relay_thread_vm_restores SET phase='importing' WHERE operation_id=${operationId}`;
+                guest.mode = "personal";
+                expect(yield* vm.provide(threadVmProviderAuth(threadId, "status"))).toMatchObject({
+                  requirement: "authenticated",
+                  authSource: { mode: "personal" },
+                });
+                expect(guest.calls).toBe(1);
                 if (kind === "restore") {
                   // Stock restores reserve their target separately from the historical disk generation.
                   const native = nativeRestoreReceipts(6);
@@ -889,6 +917,8 @@ describe.skipIf(!databaseUrl)("generation-bound VM Codex authentication (Postgre
           yield* request(() =>
             Effect.gen(function* () {
               const vm = yield* fixture(connected.connectionId);
+              yield* vm.freezeMove;
+              yield* vm.reportProgress;
               guest.mode = "personal";
               guest.after = request(() =>
                 Effect.gen(function* () {
@@ -979,7 +1009,23 @@ describe.skipIf(!databaseUrl)("generation-bound VM Codex authentication (Postgre
             expect(yield* vm.provide(getThreadVmCodexAuthSource(threadId))).toMatchObject({
               mode: "organization",
             });
+            expect(yield* vm.provide(threadVmProviderAuth(threadId, "status"))).toBeNull();
+            for (const action of ["start", "cancel"] as const)
+              expect(
+                yield* vm
+                  .provide(threadVmProviderAuth(threadId, action, binding))
+                  .pipe(Effect.flip),
+              ).toMatchObject({ _tag: "RelayTenancyConflictError" });
+            // The guest's first source lookup must work before it can report progress.
+            expect(yield* vm.provide(getEnvironmentThreadVmCodexAuthSource(owner))).toMatchObject({
+              mode: "organization",
+              connectionId: connected.connectionId,
+            });
+            yield* makeThreadVmCodexAuthStore(vm.sql).requireAcknowledged(identity);
+            yield* vm.freezeMove;
+            expect(yield* vm.provide(threadVmProviderAuth(threadId, "status"))).toBeNull();
             expect(guest.calls).toBe(0);
+            yield* vm.reportProgress;
             expect(yield* vm.provide(threadVmProviderAuth(threadId, "status"))).toMatchObject({
               requirement: "authenticated",
               authSource: { mode: "organization" },

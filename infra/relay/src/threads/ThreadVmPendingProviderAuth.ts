@@ -3,7 +3,10 @@ import { EnvironmentId } from "@t3tools/contracts";
 import type { RelayThreadVmProviderAuthBinding } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 
-/** Database-only discovery. The caller holds private owner access and the placement lock. */
+/**
+ * Database-only discovery under private owner access and the placement lock.
+ * Enrollment permits source selection before the move guest starts.
+ */
 export const readPendingThreadVmProviderAuth = Effect.fn("relay.thread_vm.pending_provider_auth")(
   function* (sql: PgClient, threadId: string) {
     const [row] = yield* sql<{
@@ -14,9 +17,24 @@ export const readPendingThreadVmProviderAuth = Effect.fn("relay.thread_vm.pendin
       repositoryId: string;
       computeRef: string;
       templateId: string;
+      controlsReady: boolean;
     }>`SELECT e.operation_id AS "operationId",b.allocation_id AS "allocationId",
       b.environment_id AS "environmentId",b.generation,b.repository_id AS "repositoryId",
-      a.compute_ref AS "computeRef",a.template_id AS "templateId"
+      a.compute_ref AS "computeRef",a.template_id AS "templateId",
+      (b.generation=t.generation OR EXISTS(
+        SELECT 1 FROM relay_thread_moves m
+        JOIN relay_thread_move_progress progress ON progress.operation_id=m.operation_id
+          AND progress.environment_id=b.environment_id AND progress.generation=b.generation
+        WHERE m.operation_id=t.operation_id AND m.thread_id=t.thread_id AND m.phase='frozen'
+          AND progress.attempt>0 AND progress.revision>0
+          AND progress.snapshot->>'threadId'=t.thread_id
+          AND progress.snapshot->>'operationId'=m.operation_id
+          AND progress.snapshot->>'environmentId'=b.environment_id
+          AND progress.snapshot->'generation'=to_jsonb(b.generation)
+          AND progress.snapshot->>'participant'='destination'
+          AND progress.snapshot->'attempt'=to_jsonb(progress.attempt)
+          AND progress.snapshot->'revision'=to_jsonb(progress.revision)
+      )) AS "controlsReady"
       FROM relay_thread_placements t
       JOIN relay_thread_vm_bindings b ON b.thread_id=t.thread_id AND b.repository_id=t.repository_id
       JOIN relay_thread_vm_allocations a ON a.allocation_id=b.allocation_id AND a.owner_user_id=t.owner_user_id
@@ -63,6 +81,7 @@ export const readPendingThreadVmProviderAuth = Effect.fn("relay.thread_vm.pendin
       repositoryId: row.repositoryId,
       computeRef: row.computeRef,
       templateId: row.templateId,
+      controlsReady: row.controlsReady,
     };
   },
 );

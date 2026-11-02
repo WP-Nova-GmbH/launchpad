@@ -112,6 +112,7 @@ export function ThreadMoveQueueItem({
     queuePaused,
     status: view?.data?.status,
     providerAuth: view?.providerAuth,
+    providerAuthError: view?.providerAuthError,
     workerAuth: view?.workerAuth,
     error: view?.error,
   });

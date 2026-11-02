@@ -214,8 +214,15 @@ describe("move queue presentation", () => {
     };
     expect(threadMoveQueuePresentation({ placement, status: pending })).toMatchObject({
       ownsNotice: true,
-      label: "Sign in to Codex",
-      tone: "attention",
+      label: "Uploading files",
+      tone: "neutral",
+    });
+    expect(
+      threadMoveQueuePresentation({ placement, status: pending, workerAuth: "personal_sign_in" }),
+    ).toMatchObject({
+      ownsNotice: true,
+      label: "Waiting for Codex sign-in",
+      tone: "neutral",
     });
     expect(
       threadMoveQueuePresentation({
@@ -405,7 +412,25 @@ describe("move queue presentation", () => {
         placement,
         status: { ...status, pendingProviderAuth: binding },
       }),
-    ).toMatchObject({ label: "Sign in to Codex", tone: "attention", step: 1, completedSteps: [] });
+    ).toMatchObject({
+      label: "Waiting for shared checkout",
+      tone: "neutral",
+      step: null,
+      completedSteps: [],
+    });
+    expect(
+      threadMoveQueuePresentation({
+        entry: { ...entry, waitingForCheckout: true },
+        placement,
+        status: { ...status, pendingProviderAuth: binding },
+        workerAuth: "personal_sign_in",
+      }),
+    ).toMatchObject({
+      label: "Waiting for Codex sign-in",
+      tone: "neutral",
+      step: 1,
+      completedSteps: [],
+    });
     expect(
       threadMoveQueuePresentation({
         entry,

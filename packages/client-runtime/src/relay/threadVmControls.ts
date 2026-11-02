@@ -360,7 +360,10 @@ export function threadVmStatusLabel(status: RelayThreadVmStatus) {
   if (status.finalSave?.errorCode) return "Saving VM needs attention";
   if (status.setupPhase === "failed" && !status.pendingProviderAuth)
     return "VM setup needs attention";
-  if (status.pendingProviderAuth) return "Sign in to Codex";
+  if (status.pendingProviderAuth)
+    return status.pendingProviderAuth.generation === status.generation + 1
+      ? "Preparing VM"
+      : "Sign in to Codex";
   if (status.replacement?.phase === "awaiting_choice") return "VM limit reached";
   if (status.replacement?.phase === "waiting") return "Saving the selected VM before replacement";
   if (status.finalSave)
@@ -464,6 +467,20 @@ const authWaitPresentation = {
   },
 } satisfies Record<ThreadMoveWaitingForAuth, { label: string; detail: string }>;
 
+/** Enrollment identifies the target; a move worker must confirm that its guest can inspect auth. */
+function threadVmProviderAuthReady(
+  status: RelayThreadVmStatus | null | undefined,
+  workerAuth: ThreadMoveWaitingForAuth | null | undefined,
+) {
+  const binding = status?.pendingProviderAuth;
+  return !!(
+    status &&
+    binding &&
+    (binding.generation === status.generation ||
+      (binding.generation === status.generation + 1 && typeof workerAuth === "string"))
+  );
+}
+
 /** A single presentation model is shared by the chat, VM overview and mobile client. */
 export function threadVmPresentation(input: {
   readonly status: RelayThreadVmStatus | null;
@@ -472,12 +489,17 @@ export function threadVmPresentation(input: {
   readonly queuePaused?: boolean;
   readonly capabilities?: ThreadVmCapabilities | null;
   readonly providerAuth?: RelayThreadVmProviderAuth | null;
+  readonly providerAuthError?: string | null;
   readonly workerAuth?: ThreadMoveWaitingForAuth | null | undefined;
 }) {
   const { status } = input;
   const workerAuth = status?.pendingProviderAuth ? input.workerAuth : undefined;
   const workerWait = workerAuth !== undefined && workerAuth !== null;
-  const providerAuth = workerAuth === null ? null : input.providerAuth;
+  const authReady = threadVmProviderAuthReady(status, workerAuth);
+  const verificationError =
+    authReady && workerAuth === "verification" ? input.providerAuthError : null;
+  const canManageProviderAuth = !input.error && authReady && workerAuth !== "verification";
+  const providerAuth = authReady ? input.providerAuth : null;
   const authWait =
     typeof workerAuth === "string" && providerAuth?.requirement !== "authenticated"
       ? authWaitPresentation[workerAuth]
@@ -505,6 +527,7 @@ export function threadVmPresentation(input: {
     !activePause;
   const failed = !!(
     input.error ||
+    verificationError ||
     (status?.pendingProviderAuth &&
       !workerWait &&
       providerAuth?.requirement === "provider_unavailable") ||
@@ -515,24 +538,25 @@ export function threadVmPresentation(input: {
   );
   const label = input.error
     ? "VM status unavailable"
-    : status?.pendingProviderAuth && workerAuth === null
-      ? "Preparing VM"
-      : authWait
-        ? authWait.label
-        : status?.pendingProviderAuth && providerAuth?.requirement === "provider_unavailable"
-          ? "Codex needs attention"
-          : status?.pendingProviderAuth && providerAuth?.requirement === "authenticated"
-            ? "Preparing VM"
-            : status
-              ? threadVmStatusLabel(status)
-              : "VM status unavailable";
+    : verificationError
+      ? "Could not check Codex sign-in"
+      : status?.pendingProviderAuth && !authReady
+        ? "Preparing VM"
+        : authWait
+          ? authWait.label
+          : status?.pendingProviderAuth && providerAuth?.requirement === "provider_unavailable"
+            ? "Codex needs attention"
+            : status?.pendingProviderAuth && providerAuth?.requirement === "authenticated"
+              ? "Preparing VM"
+              : status
+                ? threadVmStatusLabel(status)
+                : "VM status unavailable";
   let primary: { type: ThreadVmPrimaryAction; label: string } | null = null;
-  if (input.error || !status) primary = { type: "check", label: "Check status" };
+  if (input.error || verificationError || !status)
+    primary = { type: "check", label: "Check status" };
   else if (status.pendingProviderAuth)
     primary =
-      workerAuth === null ||
-      workerAuth === "verification" ||
-      providerAuth?.requirement === "authenticated"
+      !canManageProviderAuth || providerAuth?.requirement === "authenticated"
         ? null
         : !workerWait && providerAuth?.requirement === "provider_unavailable"
           ? { type: "check", label: "Check status" }
@@ -564,8 +588,9 @@ export function threadVmPresentation(input: {
   else if (label === "VM status unavailable") primary = { type: "check", label: "Check status" };
   const detail =
     input.error ??
+    verificationError ??
     (status?.pendingProviderAuth
-      ? workerAuth === null
+      ? !authReady
         ? "VM preparation continues automatically."
         : authWait
           ? authWait.detail
@@ -624,6 +649,7 @@ export function threadVmPresentation(input: {
     primary,
     held,
     ready,
+    canManageProviderAuth,
     canPreview:
       ready &&
       !failed &&
@@ -1167,6 +1193,8 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     route: ThreadRelayRouting | null;
     binding: RelayThreadVmProviderAuthBinding | null;
     receipt: ReturnType<typeof threadVmWorkerAuthProgress>;
+    authReady: boolean;
+    canManageProviderAuth: boolean;
     key: string;
     valid: boolean;
   };
@@ -1193,20 +1221,37 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
       const receipt =
         placement?.moveProgress !== undefined
           ? threadVmWorkerAuthProgress(placement, status)
-          : placement?.operationId === binding?.operationId && same
-            ? previous.receipt
+          : placement && placement.operationId === binding?.operationId && same
+            ? threadVmWorkerAuthProgress(
+                { ...placement, moveProgress: previous.receipt ? [previous.receipt] : [] },
+                status,
+              )
             : undefined;
-      const valid = !placement || !binding || placement.operationId === binding.operationId;
+      // Restore/reset status can advance while a disconnected source keeps its old placement cached.
+      const valid =
+        !placement ||
+        !binding ||
+        placement.operationId === binding.operationId ||
+        (placement.operationId === null &&
+          placement.generation < binding.generation &&
+          binding.generation === status?.generation &&
+          (status.reset?.operationId === binding.operationId ||
+            status.restore?.operationId === binding.operationId));
+      const authReady = valid && threadVmProviderAuthReady(status, receipt?.waitingForAuth);
+      const canManageProviderAuth = authReady && receipt?.waitingForAuth !== "verification";
       return {
         session,
         route,
         binding,
         receipt,
+        authReady,
+        canManageProviderAuth,
         valid,
         key:
           JSON.stringify(binding) +
           JSON.stringify([
             valid,
+            authReady,
             receipt?.waitingForAuth === undefined
               ? null
               : [receipt.attempt, receipt.waitingForAuth],
@@ -1255,9 +1300,10 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         const transition = get(providerAuthTransitionAtom(key));
         return Effect.gen(function* () {
           const { session, route, binding } = transition;
-          if (!session || !route || !binding || !transition.valid) return null;
+          if (!session || !route || !binding || !transition.authReady) return null;
           const registry = yield* AtomRegistry.AtomRegistry;
           const { relay, clerkToken } = yield* authorize(registry, key);
+          if (registry.get(providerAuthTransitionAtom(key)).key !== transition.key) return null;
           const [, threadId] = decodeKey(key);
           const reply = yield* relay
             .getThreadVmProviderAuth({ clerkToken, threadId })
@@ -1309,9 +1355,16 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         const transition = get(providerAuthTransitionAtom(key));
         return Effect.gen(function* () {
           const { session, route, binding } = transition;
-          if (!session || !route || !transition.valid) return null;
+          if (
+            !session ||
+            !route ||
+            !transition.valid ||
+            (binding && !transition.canManageProviderAuth)
+          )
+            return null;
           const registry = yield* AtomRegistry.AtomRegistry;
           const { relay, clerkToken } = yield* authorize(registry, key);
+          if (registry.get(providerAuthTransitionAtom(key)).key !== transition.key) return null;
           const [, threadId] = decodeKey(key);
           const source = yield* relay
             .getThreadVmProviderAuthSource({ clerkToken, threadId })
@@ -1560,6 +1613,7 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
         workerAuth: transition.receipt?.waitingForAuth,
         authTransitionKey: binding && transition.valid ? transition.key : null,
         providerAuth:
+          transition.authReady &&
           authValue &&
           binding &&
           authValue.accountId === session.accountId &&
@@ -1734,12 +1788,17 @@ export function createThreadVmControlAtoms<R, E, AE = never>(
     },
     execute: Effect.fnUntraced(function* (input, registry) {
       const key = keyFor(input.environmentId, input.threadId),
-        current = pendingAuthBinding(registry, key);
-      if (!current || !sameAuthBinding(current, input.binding))
+        current = pendingAuthBinding(registry, key),
+        transition = registry.get(providerAuthTransitionAtom(key));
+      if (!current || !sameAuthBinding(current, input.binding) || !transition.canManageProviderAuth)
         return yield* new OrchestrationDispatchCommandError({
           message: "VM preparation changed. Refresh before signing in.",
         });
       const { relay, clerkToken, session } = yield* authorize(registry, key, input.accountId);
+      if (registry.get(providerAuthTransitionAtom(key)).key !== transition.key)
+        return yield* new OrchestrationDispatchCommandError({
+          message: "VM preparation changed. Refresh before signing in.",
+        });
       const auth = { clerkToken, threadId: input.threadId },
         payload = {
           operationId: current.operationId,

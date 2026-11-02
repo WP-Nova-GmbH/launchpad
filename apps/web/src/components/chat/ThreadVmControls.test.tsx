@@ -33,6 +33,7 @@ const fixture = vi.hoisted(() => ({
   replacementEnabled: true,
   readError: null as string | null,
   authAction: vi.fn(),
+  refresh: vi.fn(),
   navigate: vi.fn(),
   signedIn: false,
   session: { accountId: "owner" },
@@ -113,7 +114,7 @@ vi.mock("../../state/threads", () => ({
     }),
     checkBackupRecovery: "backup",
     openPreview: "preview",
-    refresh: vi.fn(),
+    refresh: fixture.refresh,
     capabilitiesAtom: {
       data: {
         configured: true,
@@ -282,6 +283,13 @@ function deferred() {
 let renderer: ReactTestRenderer | undefined;
 const env = EnvironmentId.make("vm"),
   thread = ThreadId.make("thread");
+const moveAuthBinding = {
+  allocationId: "new-vm",
+  operationId: "move",
+  environmentId: EnvironmentId.make("guest"),
+  generation: 3,
+  instanceId: "codex" as const,
+};
 const view = (chat = false) =>
   chat ? (
     <ThreadVmControlsProvider environmentId={env} threadId={thread}>
@@ -779,12 +787,142 @@ describe("simplified VM controls", () => {
       action: { type: "resume" },
     });
   });
+  it.each([false, true])(
+    "keeps account controls hidden while the move has no destination auth wait (chat: %s)",
+    async (chat) => {
+      fixture.local = true;
+      fixture.status = {
+        pendingProviderAuth: {
+          allocationId: "new-vm",
+          operationId: "move",
+          environmentId: EnvironmentId.make("guest"),
+          generation: 3,
+          instanceId: "codex",
+        },
+        setupPhase: "pending",
+      };
+      fixture.auth = {
+        requirement: "sign_in_required",
+        auth: { phase: "waiting", expiresAt: null },
+      };
+      fixture.authReadError = "Earlier sign-in read failed.";
+      await mount(chat);
+      if (chat) await openRunOn();
+      expect(button("Sign in to Codex") !== undefined).toBe(false);
+      expect(button("Finish Codex sign-in") !== undefined).toBe(false);
+      expect(button("Codex account…") !== undefined).toBe(false);
+      expect(dialogs()).toHaveLength(0);
+      expect(JSON.stringify(renderer!.toJSON()).includes("Earlier sign-in read failed.")).toBe(
+        false,
+      );
+      expect(fixture.authAction).not.toHaveBeenCalled();
+    },
+  );
+  it("replaces an open move sign-in dialog with preparation when the auth wait clears", async () => {
+    fixture.local = true;
+    fixture.status = {
+      pendingProviderAuth: {
+        allocationId: "new-vm",
+        operationId: "move",
+        environmentId: EnvironmentId.make("guest"),
+        generation: 3,
+        instanceId: "codex",
+      },
+      setupPhase: "pending",
+    };
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authSource = { mode: "personal" };
+    fixture.authReadError = "Earlier sign-in read failed.";
+    fixture.auth = {
+      requirement: "sign_in_required",
+      auth: {
+        phase: "waiting",
+        expiresAt: null,
+        flowId: "old-flow",
+        authorizationUrl: "https://chatgpt.com/activate",
+        interaction: {
+          type: "deviceCode",
+          id: "old-flow",
+          url: "https://chatgpt.com/activate",
+          userCode: "OLD-MOVE-CODE",
+        },
+      },
+    };
+    await mount(true);
+    await act(async () => button("Finish Codex sign-in").props.onClick());
+    expect(JSON.stringify(renderer!.toJSON())).toContain("OLD-MOVE-CODE");
+    fixture.workerAuth = null;
+    fixture.authTransitionKey = "preparing";
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogs()).toHaveLength(1);
+    const preparing = JSON.stringify(renderer!.toJSON());
+    expect(preparing.includes("VM preparation continues automatically.")).toBe(true);
+    expect(preparing.includes("OLD-MOVE-CODE")).toBe(false);
+    expect(preparing.includes("Earlier sign-in read failed.")).toBe(false);
+    expect(dialogButton("Check sign-in status")).toBeUndefined();
+    expect(dialogButton("Open Codex sign-in page")).toBeUndefined();
+    fixture.workerAuth = "personal_sign_in";
+    fixture.authTransitionKey = "waiting-again";
+    fixture.authReadError = null;
+    fixture.auth = {
+      requirement: "sign_in_required",
+      auth: { phase: "idle", expiresAt: null },
+    };
+    await act(async () => renderer!.update(view(true)));
+    expect(dialogButton("Sign in to Codex")).toBeDefined();
+    expect(fixture.authAction).not.toHaveBeenCalled();
+  });
+  it.each([false, true])(
+    "keeps current verification failures visible and retryable in an open dialog (chat: %s)",
+    async (chat) => {
+      fixture.local = true;
+      fixture.status = {
+        pendingProviderAuth: {
+          allocationId: "new-vm",
+          operationId: "move",
+          environmentId: EnvironmentId.make("guest"),
+          generation: 3,
+          instanceId: "codex",
+        },
+        setupPhase: "pending",
+      };
+      fixture.workerAuth = "personal_sign_in";
+      fixture.authSource = { mode: "personal" };
+      fixture.auth = {
+        requirement: "sign_in_required",
+        auth: { phase: "idle", expiresAt: null },
+      };
+      await mount(chat);
+      if (chat) await openRunOn();
+      await act(async () => button("Sign in to Codex").props.onClick());
+      fixture.workerAuth = "verification";
+      fixture.authTransitionKey = "verification";
+      fixture.authReadError = "The VM could not be reached.";
+      await act(async () => renderer!.update(view(chat)));
+      const dialogText = () =>
+        dialogs()[0]!
+          .findAllByType("p")
+          .map((node) => node.children.join(""))
+          .join("\n");
+      expect(dialogText()).toContain("The VM could not be reached.");
+      expect(dialogButton("Sign in to Codex")).toBeUndefined();
+      expect(button("Codex account…")).toBeUndefined();
+      await act(async () => dialogButton("Check status").props.onClick());
+      expect(fixture.refresh).toHaveBeenCalledWith(null, env, thread);
+      expect(fixture.authAction).not.toHaveBeenCalled();
+      fixture.authReadError = null;
+      await act(async () => renderer!.update(view(chat)));
+      expect(dialogText()).toContain("Checking whether Codex is ready");
+      expect(dialogButton("Check status")).toBeUndefined();
+    },
+  );
   it("keeps destination sign-in reachable while the current machine is local", async () => {
     fixture.local = true;
     fixture.status = {
-      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      pendingProviderAuth: moveAuthBinding,
       setupPhase: "running",
     };
+    fixture.workerAuth = "personal_sign_in";
     fixture.auth = { requirement: "sign_in_required", auth: { phase: "idle", expiresAt: null } };
     await mount(true);
     expect(
@@ -797,7 +935,7 @@ describe("simplified VM controls", () => {
     await act(async () => dialogButton("Sign in to Codex").props.onClick());
     expect(fixture.authAction).toHaveBeenCalledWith(
       expect.objectContaining({
-        binding: { allocationId: "new-vm", operationId: "move" },
+        binding: moveAuthBinding,
         action: { type: "start" },
       }),
     );
@@ -805,12 +943,13 @@ describe("simplified VM controls", () => {
   it("shows account selection as a normal step before offering provider actions", async () => {
     fixture.local = true;
     fixture.status = {
-      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      pendingProviderAuth: moveAuthBinding,
       setupPhase: "running",
     };
     fixture.accountSelectionRequired = true;
+    fixture.workerAuth = "account_selection";
     await mount(true);
-    await act(async () => button("Sign in to Codex").props.onClick());
+    await act(async () => button("Choose account").props.onClick());
     const dialog = dialogs()[0]!;
     expect(JSON.stringify(renderer!.toJSON())).toContain("Choose a Codex account");
     expect(dialog.findAllByProps({ role: "alert" })).toHaveLength(0);
@@ -830,12 +969,13 @@ describe("simplified VM controls", () => {
   it("opens organization account setup without selecting an account or changing the move", async () => {
     fixture.local = true;
     fixture.status = {
-      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      pendingProviderAuth: moveAuthBinding,
       setupPhase: "running",
     };
     fixture.accountSelectionRequired = true;
+    fixture.workerAuth = "organization_connection";
     await mount(true);
-    await act(async () => button("Sign in to Codex").props.onClick());
+    await act(async () => button("Connect Codex").props.onClick());
     await act(async () => dialogButton("Open organization settings").props.onClick());
     expect(dialogs()).toHaveLength(0);
     expect(fixture.navigate).toHaveBeenCalledWith({
@@ -849,10 +989,11 @@ describe("simplified VM controls", () => {
   it("shows each real sign-in error once while keeping different failures visible", async () => {
     fixture.local = true;
     fixture.status = {
-      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      pendingProviderAuth: moveAuthBinding,
       setupPhase: "running",
     };
     fixture.authSourceError = "Could not reach the relay.";
+    fixture.workerAuth = "personal_sign_in";
     fixture.authReadError = "Could not reach the relay.";
     await mount(true);
     await act(async () => button("Sign in to Codex").props.onClick());
@@ -866,7 +1007,7 @@ describe("simplified VM controls", () => {
     async (lateReply) => {
       fixture.local = true;
       fixture.status = {
-        pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+        pendingProviderAuth: moveAuthBinding,
         setupPhase: "running",
       };
       fixture.authSource = { mode: "personal" };
@@ -895,10 +1036,11 @@ describe("simplified VM controls", () => {
   it("hides an old personal challenge when an account choice is required", async () => {
     fixture.local = true;
     fixture.status = {
-      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      pendingProviderAuth: moveAuthBinding,
       setupPhase: "running",
     };
     fixture.accountSelectionRequired = true;
+    fixture.workerAuth = "account_selection";
     fixture.auth = {
       requirement: "sign_in_required",
       auth: {
@@ -914,14 +1056,14 @@ describe("simplified VM controls", () => {
       },
     };
     await mount(true);
-    await act(async () => button("Finish Codex sign-in").props.onClick());
+    await act(async () => button("Choose account").props.onClick());
     expect(JSON.stringify(renderer!.toJSON())).not.toContain("OLD-CODE");
     expect(dialogButton("Open Codex sign-in page")).toBeUndefined();
     expect(dialogButton("Cancel sign-in")).toBeUndefined();
   });
-  it("lets a managed VM with a failed probe reopen account selection without offering personal device actions", async () => {
+  it("lets a managed VM import with a failed probe reopen account selection without personal device actions", async () => {
     fixture.status = {
-      pendingProviderAuth: { allocationId: "new-vm", operationId: "move" },
+      pendingProviderAuth: { ...moveAuthBinding, generation: 2 },
       setupPhase: "running",
     };
     fixture.codexConnection = {

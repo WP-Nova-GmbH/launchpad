@@ -27,9 +27,10 @@ export const threadVmProviderAuth = Effect.fn("relay.api.thread_vm.provider_auth
       (placement) =>
         Effect.gen(function* () {
           const pending = yield* readPendingThreadVmProviderAuth(sql, threadId);
-          if (!pending && action === "status") return null;
+          if ((!pending || !pending.controlsReady) && action === "status") return null;
           if (
             !pending ||
+            !pending.controlsReady ||
             (action !== "status" &&
               (!input ||
                 input.operationId !== pending.binding.operationId ||

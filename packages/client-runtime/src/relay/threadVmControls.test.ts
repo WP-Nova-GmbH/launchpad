@@ -17,6 +17,7 @@ import type {
   RelayThreadVmProviderAuthBinding,
   RelayThreadVmCodexAuthSource,
   RelayPortableThreadPlacement,
+  ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -1677,6 +1678,292 @@ describe("completed thread location handoff", () => {
 });
 
 describe("owner-bound pending VM authentication", () => {
+  const authPlacement = (
+    waitingForAuth: ThreadMoveWaitingForAuth | null = "personal_sign_in",
+    binding = authBinding,
+  ): RelayPortableThreadPlacement => ({
+    ...currentPlacement,
+    operationId: binding.operationId,
+    moveProgress: [
+      {
+        ...binding,
+        threadId,
+        participant: "destination",
+        attempt: 1,
+        revision: 1,
+        stage: "downloading",
+        completedBytes: 0,
+        totalBytes: null,
+        completedArtifacts: 0,
+        totalArtifacts: null,
+        waitingForAuth,
+        updatedAt: at,
+      },
+    ],
+  });
+  const rememberAuthPlacement = (
+    h: Effect.Success<ReturnType<typeof harness>>,
+    placement = authPlacement(),
+  ) =>
+    rememberPortableThreadPlacement(
+      h.registry,
+      h.registry.get(managedRelaySessionAtom)!,
+      relayUrl,
+      placement,
+    );
+  const authHarness = Effect.fnUntraced(function* (fetchFn: typeof fetch) {
+    const h = yield* harness(fetchFn);
+    rememberAuthPlacement(h);
+    return h;
+  });
+  it.effect("does not inspect or change move auth before an exact destination wait", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const calls: string[] = [];
+        const h = yield* harness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          calls.push(path);
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path === "/health") return Response.json({ ok: true, service: "relay" });
+          return Response.json({ ...waitingAuth, auth: idleAuth });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          query = h.controls.providerAuthQueryAtom(environmentId, threadId),
+          source = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+        const progressWithoutAuth = { ...authPlacement().moveProgress![0]! };
+        delete progressWithoutAuth.waitingForAuth;
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        for (const placement of [
+          undefined,
+          currentPlacement,
+          { ...authPlacement(), moveProgress: [] },
+          ...[
+            { operationId: "other-operation" },
+            { environmentId: "other-vm" },
+            { generation: 3 },
+          ].map((change) => ({
+            ...authPlacement(),
+            moveProgress: authPlacement().moveProgress!.map((progress) => ({
+              ...progress,
+              ...change,
+            })),
+          })),
+          { ...authPlacement(), moveProgress: [progressWithoutAuth] },
+          {
+            ...authPlacement(),
+            moveProgress: [
+              {
+                ...progressWithoutAuth,
+                participant: "source",
+                environmentId,
+                generation: 1,
+                stage: "capturing",
+              },
+            ],
+          },
+          authPlacement(null),
+        ] satisfies ReadonlyArray<RelayPortableThreadPlacement | undefined>) {
+          if (placement) rememberAuthPlacement(h, placement);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, source, { suspendOnWaiting: true });
+          for (const action of [
+            { type: "start" },
+            { type: "refresh" },
+            { type: "cancel", flowId: "old-flow" },
+            { type: "select_source", source: { mode: "personal" } },
+          ] as const) {
+            const result = yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                environmentId,
+                threadId,
+                accountId: "owner",
+                binding: authBinding,
+                action,
+              }),
+            );
+            expect(result._tag).toBe("Failure");
+          }
+          expect(h.registry.get(view)?.providerAuth).toBeNull();
+          expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        }
+        yield* Effect.promise(() =>
+          h.controls.refreshStatus.run(h.registry, { environmentId, threadId }),
+        );
+        expect(calls.filter((path) => path.includes("provider-auth"))).toEqual([]);
+        rememberAuthPlacement(h);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.requirement).toBe("sign_in_required");
+        expect(calls.filter((path) => path.endsWith("provider-auth"))).toHaveLength(1);
+        rememberAuthPlacement(h, { ...authPlacement(), generation: 2, moveProgress: undefined });
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth).toBeNull();
+        expect(h.registry.get(view)?.workerAuth).toBeUndefined();
+        expect(calls.filter((path) => path.endsWith("provider-auth"))).toHaveLength(1);
+      }),
+    ),
+  );
+  it.effect("rejects an auth action if the worker wait clears while its token is loading", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let block = false;
+        const calls: string[] = [];
+        const h = yield* harness(async (url) => {
+          calls.push(new URL(String(url)).pathname);
+          return Response.json(pendingVmStatus);
+        });
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "owner",
+          readClerkToken: () =>
+            block
+              ? Effect.promise(async () => {
+                  requested.resolve();
+                  await release.promise;
+                  return "owner-token";
+                })
+              : Effect.succeed("owner-token"),
+        });
+        rememberAuthPlacement(h);
+        yield* AtomRegistry.mount(h.registry, h.query);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        block = true;
+        const action = yield* Effect.promise(() =>
+          h.controls.providerAuthAction.run(h.registry, {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            binding: authBinding,
+            action: { type: "start" },
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* Effect.promise(() => requested.promise);
+        rememberAuthPlacement(h, authPlacement(null));
+        release.resolve();
+        expect((yield* Fiber.join(action))._tag).toBe("Failure");
+        expect(calls.filter((path) => path.includes("provider-auth"))).toEqual([]);
+      }),
+    ),
+  );
+  for (const lifecycle of ["reset", "restore"] as const)
+    for (const cachedPlacement of [false, true])
+      it.effect(
+        `allows same-generation ${lifecycle} auth ${cachedPlacement ? "with a cached prior placement" : "without move receipts"}`,
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const writes: string[] = [];
+              const h = yield* harness(async (url, init) => {
+                const request = new Request(url, init),
+                  path = new URL(request.url).pathname;
+                if (request.method !== "GET") writes.push(`${request.method} ${path}`);
+                if (path.endsWith("vm-status"))
+                  return Response.json({
+                    ...pendingVmStatus,
+                    generation: authBinding.generation,
+                    [lifecycle]: {
+                      operationId: authBinding.operationId,
+                      phase: "importing",
+                      errorCode: null,
+                    },
+                  });
+                if (path.endsWith("provider-auth/source"))
+                  return Response.json({ mode: "personal" });
+                if (path.endsWith("codex-vm-connection")) return Response.json(null);
+                return Response.json({ ...waitingAuth, auth: idleAuth });
+              });
+              if (cachedPlacement) rememberAuthPlacement(h, currentPlacement);
+              yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+              const auth = yield* AtomRegistry.getResult(
+                  h.registry,
+                  h.controls.providerAuthQueryAtom(environmentId, threadId),
+                  { suspendOnWaiting: true },
+                ),
+                source = yield* AtomRegistry.getResult(
+                  h.registry,
+                  h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+                  { suspendOnWaiting: true },
+                );
+              for (const action of [
+                { type: "start" },
+                { type: "refresh" },
+                { type: "select_source", source: { mode: "personal" } },
+              ] as const) {
+                const result = yield* Effect.promise(() =>
+                  h.controls.providerAuthAction.run(h.registry, {
+                    environmentId,
+                    threadId,
+                    accountId: "owner",
+                    binding: authBinding,
+                    action,
+                  }),
+                );
+                expect(result._tag).toBe("Success");
+              }
+              expect(auth).toMatchObject({ requirement: "sign_in_required" });
+              expect(source).toMatchObject({ source: { mode: "personal" } });
+              expect(writes).toEqual([
+                `POST /v1/threads/${threadId}/provider-auth/start`,
+                `PUT /v1/threads/${threadId}/provider-auth/source`,
+              ]);
+            }),
+          ),
+      );
+  it.effect("keeps superseded and conflicting placements fenced during same-generation auth", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const placement of [
+          { ...currentPlacement, operationId: "other-operation" },
+          { ...currentPlacement, generation: authBinding.generation },
+          { ...currentPlacement, generation: authBinding.generation + 1 },
+        ]) {
+          const calls: string[] = [];
+          const h = yield* harness(async (url) => {
+            calls.push(new URL(String(url)).pathname);
+            return Response.json({
+              ...pendingVmStatus,
+              generation: authBinding.generation,
+              reset: { operationId: authBinding.operationId, phase: "importing", errorCode: null },
+            });
+          });
+          rememberAuthPlacement(h, placement);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          expect(
+            yield* AtomRegistry.getResult(
+              h.registry,
+              h.controls.providerAuthQueryAtom(environmentId, threadId),
+              { suspendOnWaiting: true },
+            ),
+          ).toBeNull();
+          expect(
+            yield* AtomRegistry.getResult(
+              h.registry,
+              h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+              { suspendOnWaiting: true },
+            ),
+          ).toBeNull();
+          for (const action of [
+            { type: "start" },
+            { type: "refresh" },
+            { type: "select_source", source: { mode: "personal" } },
+          ] as const) {
+            const result = yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                environmentId,
+                threadId,
+                accountId: "owner",
+                binding: authBinding,
+                action,
+              }),
+            );
+            expect(result._tag).toBe("Failure");
+          }
+          expect(calls.filter((path) => path.includes("provider-auth"))).toEqual([]);
+        }
+      }),
+    ),
+  );
   it.effect(
     "refreshes account controls on a worker transition and rejects a late source failure",
     () =>
@@ -1686,7 +1973,7 @@ describe("owner-bound pending VM authentication", () => {
             release = Promise.withResolvers<void>(),
             returned = Promise.withResolvers<void>();
           let reads = 0;
-          const h = yield* harness(async (url) => {
+          const h = yield* authHarness(async (url) => {
             const path = new URL(String(url)).pathname;
             if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
             if (path.endsWith("codex-vm-connection"))
@@ -1744,6 +2031,13 @@ describe("owner-bound pending VM authentication", () => {
           yield* Effect.promise(() => returned.promise);
           yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
           expect(h.registry.get(view).error).toBeNull();
+          expect(h.registry.get(view).data).toBeNull();
+          expect(reads).toBe(2);
+          rememberAuthPlacement(h, {
+            ...placement,
+            moveProgress: placement.moveProgress!.map((p) => ({ ...p, attempt: 4 })),
+          });
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
           expect(h.registry.get(view).data).toMatchObject({
             source: { mode: "personal" },
             error: null,
@@ -1759,7 +2053,7 @@ describe("owner-bound pending VM authentication", () => {
           release = Promise.withResolvers<void>(),
           returned = Promise.withResolvers<void>();
         let reads = 0;
-        const h = yield* harness(async (url) => {
+        const h = yield* authHarness(async (url) => {
           if (new URL(String(url)).pathname.endsWith("vm-status"))
             return Response.json(pendingVmStatus);
           const read = ++reads;
@@ -1816,6 +2110,13 @@ describe("owner-bound pending VM authentication", () => {
         release.resolve();
         yield* Effect.promise(() => returned.promise);
         yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth).toBeNull();
+        expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        rememberAuthPlacement(h, {
+          ...placement,
+          moveProgress: placement.moveProgress!.map((p) => ({ ...p, attempt: 4 })),
+        });
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
         expect(h.registry.get(view)?.providerAuth?.requirement).toBe("authenticated");
         expect(h.registry.get(view)?.providerAuthError).toBeNull();
         h.registry.refresh(query);
@@ -1852,7 +2153,7 @@ describe("owner-bound pending VM authentication", () => {
             generation: outcome === "cancelled" ? 1 : outcome === "different_generation" ? 3 : 2,
             operationId: null,
           };
-          const h = yield* harness(async (url, init) => {
+          const h = yield* authHarness(async (url, init) => {
             const request = new Request(url, init),
               path = new URL(request.url).pathname;
             if (path.endsWith("vm-status"))
@@ -1907,7 +2208,7 @@ describe("owner-bound pending VM authentication", () => {
               release = Promise.withResolvers<void>();
             let reads = 0;
             const paths: string[] = [];
-            const h = yield* harness(async (url) => {
+            const h = yield* authHarness(async (url) => {
               const path = new URL(String(url)).pathname;
               paths.push(path);
               if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
@@ -1941,7 +2242,7 @@ describe("owner-bound pending VM authentication", () => {
               totalBytes: null,
               completedArtifacts: 0,
               totalArtifacts: null,
-              waitingForAuth: cached === "authenticated" ? ("personal_sign_in" as const) : null,
+              waitingForAuth: "personal_sign_in" as const,
               updatedAt: at,
             };
             const placement: RelayPortableThreadPlacement = {
@@ -1980,7 +2281,7 @@ describe("owner-bound pending VM authentication", () => {
       Effect.gen(function* () {
         let selected = false;
         const writes: unknown[] = [];
-        const h = yield* harness(async (url, init) => {
+        const h = yield* authHarness(async (url, init) => {
           const request = new Request(url, init),
             path = new URL(request.url).pathname;
           if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
@@ -2063,7 +2364,7 @@ describe("owner-bound pending VM authentication", () => {
   it.effect("keeps organization lookup failures visible while an account choice is required", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const h = yield* harness(async (url) => {
+        const h = yield* authHarness(async (url) => {
           const path = new URL(String(url)).pathname;
           if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
           if (path.endsWith("codex-vm-connection")) return new Response(null, { status: 503 });
@@ -2091,7 +2392,7 @@ describe("owner-bound pending VM authentication", () => {
   it.effect("does not treat an unavailable account without a pending binding as a choice", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const h = yield* harness(async (url) => {
+        const h = yield* authHarness(async (url) => {
           const path = new URL(String(url)).pathname;
           if (path.endsWith("vm-status")) return Response.json(status);
           return Response.json(
@@ -2115,7 +2416,7 @@ describe("owner-bound pending VM authentication", () => {
   it.effect("preserves genuine Codex failures instead of presenting an account choice", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const h = yield* harness(async (url) => {
+        const h = yield* authHarness(async (url) => {
           const path = new URL(String(url)).pathname;
           if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
           if (path.endsWith("codex-vm-connection"))
@@ -2157,7 +2458,7 @@ describe("owner-bound pending VM authentication", () => {
             let selected: RelayThreadVmCodexAuthSource = { mode: "personal" };
             const writes: unknown[] = [],
               calls: string[] = [];
-            const h = yield* harness(async (url, init) => {
+            const h = yield* authHarness(async (url, init) => {
               const request = new Request(url, init),
                 path = new URL(request.url).pathname;
               calls.push(`${request.method} ${path}`);
@@ -2223,7 +2524,7 @@ describe("owner-bound pending VM authentication", () => {
     Effect.scoped(
       Effect.gen(function* () {
         const calls: string[] = [];
-        const h = yield* harness(async (url, init) => {
+        const h = yield* authHarness(async (url, init) => {
           const request = new Request(url, init),
             path = new URL(request.url).pathname;
           expect(request.method).toBe("GET");
@@ -2254,7 +2555,7 @@ describe("owner-bound pending VM authentication", () => {
   it.effect("keeps personal device sign-in usable when an older relay lacks source endpoints", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const h = yield* harness(async (url) => {
+        const h = yield* authHarness(async (url) => {
           const path = new URL(String(url)).pathname;
           if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
           if (path.endsWith("provider-auth/source") || path.endsWith("codex-vm-connection"))
@@ -2292,7 +2593,7 @@ describe("owner-bound pending VM authentication", () => {
       Effect.gen(function* () {
         const requested = Promise.withResolvers<void>(),
           release = Promise.withResolvers<void>();
-        const h = yield* harness(async (url) => {
+        const h = yield* authHarness(async (url) => {
           if (new URL(String(url)).pathname.endsWith("vm-status")) return Response.json(status);
           requested.resolve();
           await release.promise;
@@ -2318,7 +2619,7 @@ describe("owner-bound pending VM authentication", () => {
         const requested = Promise.withResolvers<void>(),
           release = Promise.withResolvers<void>();
         const requests: Request[] = [];
-        const h = yield* harness(async (url, init) => {
+        const h = yield* authHarness(async (url, init) => {
           const request = new Request(url, init);
           if (new URL(request.url).pathname.endsWith("vm-status"))
             return Response.json(pendingVmStatus);
@@ -2351,7 +2652,7 @@ describe("owner-bound pending VM authentication", () => {
         const requested = Promise.withResolvers<void>(),
           release = Promise.withResolvers<void>();
         const requests: Request[] = [];
-        const h = yield* harness(async (url, init) => {
+        const h = yield* authHarness(async (url, init) => {
           const request = new Request(url, init);
           if (new URL(request.url).pathname.endsWith("vm-status"))
             return Response.json(pendingVmStatus);
@@ -2387,7 +2688,7 @@ describe("owner-bound pending VM authentication", () => {
           release = Promise.withResolvers<void>();
         let binding = authBinding;
         const next = { ...authBinding, allocationId: "replacement-vm", operationId: "next-move" };
-        const h = yield* harness(async (url, init) => {
+        const h = yield* authHarness(async (url, init) => {
           const request = new Request(url, init);
           if (new URL(request.url).pathname.endsWith("vm-status"))
             return Response.json({ ...pendingVmStatus, pendingProviderAuth: binding });
@@ -2404,6 +2705,7 @@ describe("owner-bound pending VM authentication", () => {
         yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
         expect(h.registry.get(view)?.providerAuth?.allocationId).toBe(authBinding.allocationId);
         binding = next;
+        rememberAuthPlacement(h, authPlacement("personal_sign_in", next));
         h.registry.refresh(h.query);
         yield* Effect.promise(() => requested.promise);
         expect(h.registry.get(view)?.providerAuth).toBeNull();
@@ -2421,7 +2723,7 @@ describe("owner-bound pending VM authentication", () => {
           const calls: string[] = [],
             bodies: unknown[] = [];
           let providerAuth: RelayThreadVmProviderAuth = { ...waitingAuth, auth: idleAuth };
-          const h = yield* harness(async (url, init) => {
+          const h = yield* authHarness(async (url, init) => {
             const request = new Request(url, init),
               pathname = new URL(request.url).pathname;
             expect(new URL(request.url).hostname).toBe("relay.example.test");
@@ -2489,7 +2791,7 @@ describe("owner-bound pending VM authentication", () => {
       Effect.scoped(
         Effect.gen(function* () {
           const calls: string[] = [];
-          const h = yield* harness(async (url, init) => {
+          const h = yield* authHarness(async (url, init) => {
             const request = new Request(url, init);
             calls.push(new URL(request.url).pathname);
             return Response.json(status);
@@ -2504,7 +2806,7 @@ describe("owner-bound pending VM authentication", () => {
     Effect.scoped(
       Effect.gen(function* () {
         const calls: string[] = [];
-        const h = yield* harness(async (url, init) => {
+        const h = yield* authHarness(async (url, init) => {
           const request = new Request(url, init);
           calls.push(request.method + " " + new URL(request.url).pathname);
           return Response.json(pendingVmStatus);
@@ -2548,7 +2850,7 @@ describe("owner-bound pending VM authentication", () => {
         vi.useFakeTimers();
         yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
         let reads = 0;
-        const h = yield* harness(async (url, init) => {
+        const h = yield* authHarness(async (url, init) => {
           const request = new Request(url, init);
           if (new URL(request.url).pathname.endsWith("vm-status"))
             return Response.json(pendingVmStatus);
@@ -2577,7 +2879,7 @@ describe("owner-bound pending VM authentication", () => {
         Effect.gen(function* () {
           const requested = Promise.withResolvers<void>(),
             release = Promise.withResolvers<void>();
-          const h = yield* harness(async (url, init) => {
+          const h = yield* authHarness(async (url, init) => {
             const request = new Request(url, init);
             if (new URL(request.url).pathname.endsWith("vm-status")) {
               if (request.headers.get("authorization") === "Bearer other-token") {
@@ -2616,7 +2918,7 @@ describe("owner-bound pending VM authentication", () => {
         Effect.gen(function* () {
           const requested = Promise.withResolvers<void>(),
             release = Promise.withResolvers<void>();
-          const h = yield* harness(async (url, init) => {
+          const h = yield* authHarness(async (url, init) => {
             const request = new Request(url, init);
             if (new URL(request.url).pathname.endsWith("vm-status"))
               return Response.json(
@@ -2654,7 +2956,7 @@ describe("owner-bound pending VM authentication", () => {
       Effect.gen(function* () {
         const requested = Promise.withResolvers<void>(),
           release = Promise.withResolvers<void>();
-        const h = yield* harness(async (url, init) => {
+        const h = yield* authHarness(async (url, init) => {
           const request = new Request(url, init);
           if (new URL(request.url).pathname.endsWith("vm-status"))
             return Response.json(pendingVmStatus);
@@ -2690,7 +2992,7 @@ describe("owner-bound pending VM authentication", () => {
       Effect.scoped(
         Effect.gen(function* () {
           let providerAuth: RelayThreadVmProviderAuth = { ...waitingAuth, auth: idleAuth };
-          const h = yield* harness(async (url, init) => {
+          const h = yield* authHarness(async (url, init) => {
             const request = new Request(url, init);
             if (new URL(request.url).pathname.endsWith("vm-status"))
               return Response.json(pendingVmStatus);
@@ -2736,7 +3038,7 @@ describe("owner-bound pending VM authentication", () => {
             returned = Promise.withResolvers<void>();
           let reads = 0,
             cancelled = false;
-          const h = yield* harness(async (url, init) => {
+          const h = yield* authHarness(async (url, init) => {
             const request = new Request(url, init);
             if (new URL(request.url).pathname.endsWith("vm-status"))
               return Response.json(pendingVmStatus);
