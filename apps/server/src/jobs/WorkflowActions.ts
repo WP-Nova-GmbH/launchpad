@@ -150,12 +150,12 @@ export const make = Effect.gen(function* () {
         ? access.requireWorkflowProject({
             organizationId: run.workflow.organizationId,
             repositoryId: run.workflow.repositoryId,
-            projectId: run.workflow.definition.projectId,
+            projectId: run.runtime.projectId,
             repositoryCanonicalKey: run.repositoryCanonicalKey,
           })
         : access.requireProject(
             { user: { userId: run.userId!, displayName: null, imageUrl: null } },
-            run.workflow.definition.projectId,
+            run.runtime.projectId,
           )
     ).pipe(Effect.mapError(error));
     if (

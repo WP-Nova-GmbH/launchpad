@@ -15,7 +15,7 @@ import {
   updateWorkflowDrafts,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import type {
   RepositoryWorkflowJob,
@@ -130,7 +130,11 @@ const summary = (id: string): RepositoryWorkflowJobSummary => ({
   jobId: id,
   repositoryId: RelayRepositoryId.make("A"),
   workflowId: "workflow",
-  environmentId: EnvironmentId.make("environment"),
+  runtime: {
+    kind: "machine",
+    environmentId: EnvironmentId.make("environment"),
+    projectId: ProjectId.make("project"),
+  },
   instruction: id,
   status: "done",
   detail: null,

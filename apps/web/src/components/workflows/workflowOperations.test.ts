@@ -33,8 +33,11 @@ const saved: RepositoryWorkflow = {
   archived: false,
   definition: {
     name: "Workflow",
-    environmentId: EnvironmentId.make("environment"),
-    projectId: ProjectId.make("project"),
+    target: {
+      kind: "machine" as const,
+      environmentId: EnvironmentId.make("environment"),
+      projectId: ProjectId.make("project"),
+    },
     steps: [
       { id: "agent", kind: "agent", title: "Agent", instruction: "Work", modelSelection: null },
     ],
@@ -46,7 +49,7 @@ const job: RepositoryWorkflowJob = {
   jobId: "job",
   repositoryId: scope.repositoryId,
   workflowId: saved.workflowId,
-  environmentId: saved.definition.environmentId,
+  runtime: saved.definition.target.kind === "machine" ? saved.definition.target : null,
   instruction: "Task",
   status: "queued",
   detail: null,
@@ -439,7 +442,15 @@ it("retransmits only the captured automation payload and preserves newer incompl
       [key]: {
         ...state.editors[key]!,
         targetConfirmed: false,
-        definition: { ...saved.definition, name: "", projectId: ProjectId.make("later-target") },
+        definition: {
+          ...saved.definition,
+          name: "",
+          target: {
+            kind: "machine",
+            environmentId: EnvironmentId.make("environment"),
+            projectId: ProjectId.make("later-target"),
+          },
+        },
         automation: { ...auto, trigger: { ...autoTrigger, teamId: "" } },
       },
     },

@@ -68,7 +68,7 @@ describe("automation enable preparation (PostgreSQL)", () => {
               accepted: false,
               threadId: null,
               workflowResult: {
-                protocol: 8,
+                protocol: 9,
                 outcome: "missing",
                 detail: null,
                 progress: null,
@@ -124,7 +124,7 @@ describe("automation enable preparation (PostgreSQL)", () => {
                 Effect.succeed({
                   accepted: false,
                   threadId: null,
-                  workflowResult: { protocol: 8, outcome: "missing", detail: null, progress: null },
+                  workflowResult: { protocol: 9, outcome: "missing", detail: null, progress: null },
                 }),
             }),
           ]),
@@ -151,8 +151,8 @@ describe("automation enable preparation (PostgreSQL)", () => {
       }),
     ),
   );
-  it.live.each([7, 8] as const)(
-    "requires protocol 8 and each selected publishing action (protocol %s)",
+  it.live.each([8, 9] as const)(
+    "requires protocol 9 and each selected publishing action (protocol %s)",
     (protocol) =>
       testDb(
         Effect.gen(function* () {
@@ -252,7 +252,7 @@ describe("automation enable preparation (PostgreSQL)", () => {
                 Effect.succeed({
                   accepted: false,
                   threadId: null,
-                  workflowResult: { protocol: 8, outcome: "missing", progress: null, detail: null },
+                  workflowResult: { protocol: 9, outcome: "missing", progress: null, detail: null },
                 }),
             }),
           ),
@@ -318,7 +318,7 @@ describe("automation enable preparation (PostgreSQL)", () => {
                       accepted: false,
                       threadId: null,
                       workflowResult: {
-                        protocol: 8,
+                        protocol: 9,
                         outcome: "missing",
                         detail: null,
                         progress: null,
@@ -354,7 +354,7 @@ describe("automation enable preparation (PostgreSQL)", () => {
                   ? []
                   : [
                       {
-                        projectId: definition.projectId,
+                        projectId: definition.target.projectId,
                         title: "Rebound",
                         repositoryCanonicalKey: "github.com/example/alternate",
                         createdAt: "2026-10-01T00:00:00.000Z",

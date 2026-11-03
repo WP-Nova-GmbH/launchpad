@@ -10,14 +10,15 @@ import { makeThreadVmPauseRecoveryStore } from "../ThreadVmPauseRecoveryStore.ts
 import { makeThreadVmPauseStore } from "../ThreadVmPauseStore.ts";
 import { makeThreadVmProvisionStore } from "../ThreadVmProvisionStore.ts";
 import {
-  attachmentCheckpointCatalogFixture,
+  makeAttachmentCheckpointCatalogFixture,
   laterAttachmentCheckpoint,
 } from "./attachmentCheckpointCatalog.ts";
 
 export const finalSaveCatalogFixture = Effect.fnUntraced(function* (
   state: "running" | "paused" = "running",
+  organizationId = "org",
 ) {
-  const f = yield* attachmentCheckpointCatalogFixture;
+  const f = yield* makeAttachmentCheckpointCatalogFixture(organizationId);
   const actorUserId = NodeCrypto.randomUUID(),
     allocationId = NodeCrypto.randomUUID(),
     hostId = NodeCrypto.randomUUID(),
@@ -30,7 +31,7 @@ export const finalSaveCatalogFixture = Effect.fnUntraced(function* (
   yield* allocations.reserve({
     allocationId,
     threadId: f.threadId,
-    organizationId: "org",
+    organizationId,
     ownerUserId: actorUserId,
     templateId: "template:build-verified",
   });

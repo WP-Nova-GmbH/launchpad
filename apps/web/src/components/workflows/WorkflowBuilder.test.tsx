@@ -726,7 +726,10 @@ describe("workflow templates and copies", () => {
     const copied = copiedWorkflowDraft(source, [destination], false)!;
     expect(copied.workflowId).not.toBe(source.workflowId);
     expect(copied.definition.name).toBe("Copy of Saved source");
-    expect(copied.definition.projectId).toBe(destination.projectId);
+    expect(copied.definition.target).toMatchObject({
+      kind: "machine",
+      projectId: destination.projectId,
+    });
     expect(copied.baseline).toBeNull();
     expect(copied.operation).toBeNull();
     expect(copied.definition.steps).toEqual(source.definition.steps);
@@ -796,7 +799,11 @@ describe("captured automation recovery in the editor", () => {
           definition: {
             ...current.definition,
             name: "",
-            projectId: ProjectId.make("later-project"),
+            target: {
+              kind: "machine",
+              environmentId: project.environmentId,
+              projectId: ProjectId.make("later-project"),
+            },
           },
           automation: {
             ...recoveryAuto,

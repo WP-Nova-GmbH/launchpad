@@ -110,7 +110,7 @@ export function makeThreadVmBackupRecoveryStore(
       -- placements have no visibility/deleted_at fields. begin also requires that exact actor.
       WHERE t.thread_id=${threadId} AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=t.thread_id)
         AND NOT EXISTS(SELECT 1 FROM relay_thread_local_enrollments e WHERE e.thread_id=t.thread_id AND e.phase='aborted')
-        AND a.owner_user_id=t.owner_user_id AND a.thread_id=t.thread_id AND a.deleted_at IS NULL AND a.state IN ('running','paused') AND a.runtime_protocol='native-v1'
+        AND a.owner_user_id=t.owner_user_id AND a.thread_id=t.thread_id AND a.deleted_at IS NULL AND a.state IN ('running','paused') AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
         AND a.compute_ref IS NOT NULL AND p.phase='created' AND p.generation=t.generation
         AND b.environment_id=t.environment_id AND b.generation=t.generation AND b.revoked_at IS NULL AND k.revoked_at IS NULL`;
     return row ?? null;
@@ -131,7 +131,7 @@ export function makeThreadVmBackupRecoveryStore(
       SELECT b.operation_id AS "backupOperationId",to_char(b.capture_started_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "capturedAt",
         b.source_template_id AS "sourceTemplateId",b.source_build_id AS "sourceBuildId",b.native_capture_receipt AS proof
       FROM relay_thread_vm_backups b JOIN relay_thread_vm_allocations a USING(allocation_id)
-      WHERE a.thread_id=${input.threadId} AND b.allocation_id=${input.sourceAllocationId} AND b.generation=${input.generation} AND a.runtime_protocol='native-v1'
+      WHERE a.thread_id=${input.threadId} AND b.allocation_id=${input.sourceAllocationId} AND b.generation=${input.generation} AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
         AND (${input.backupOperationId ?? null}::text IS NULL OR b.operation_id=${input.backupOperationId ?? null})
         AND b.phase='verified' AND b.native_capture_receipt IS NOT NULL AND b.snapshot_id IS NOT NULL AND b.source_template_id IS NOT NULL AND b.source_build_id IS NOT NULL
       ORDER BY b.capture_started_at DESC NULLS LAST,b.created_at DESC,b.operation_id DESC LIMIT 1`;
@@ -202,7 +202,7 @@ export function makeThreadVmBackupRecoveryStore(
     const row = (yield* get(operationId))!;
     if (row.phase === "cancelled" || row.phase === "completed") return row;
     const [nativeSource] = yield* sql`SELECT 1 FROM relay_thread_vm_allocations
-      WHERE allocation_id=${row.sourceAllocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
+      WHERE allocation_id=${row.sourceAllocationId} AND runtime_protocol='native-v1' AND resource_kind='personal' FOR UPDATE`;
     if (
       !nativeSource ||
       !placement ||
@@ -322,7 +322,7 @@ export function makeThreadVmBackupRecoveryStore(
           operationId: string;
         }>`SELECT r.operation_id AS "operationId" FROM relay_thread_vm_backup_recoveries r JOIN relay_thread_placements t USING(thread_id)
           JOIN relay_thread_vm_allocations a ON a.allocation_id=r.source_allocation_id
-          WHERE r.host_id=${hostId} AND a.runtime_protocol='native-v1' AND r.phase IN ('pending','retaining','retained','stopped') AND t.operation_id=r.operation_id AND t.generation=r.generation AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp()) ORDER BY r.created_at,r.operation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
+          WHERE r.host_id=${hostId} AND a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND r.phase IN ('pending','retaining','retained','stopped') AND t.operation_id=r.operation_id AND t.generation=r.generation AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp()) ORDER BY r.created_at,r.operation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
         if (!next) return null;
         const row = yield* lock(next.operationId),
           claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;

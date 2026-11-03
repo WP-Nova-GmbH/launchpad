@@ -28,6 +28,7 @@ import {
   bigserial,
   boolean,
   check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -798,9 +799,10 @@ export const relayWorkflowJobs = pgTable(
       .$type<RepositoryWorkflowJobSummary>()
       .generatedAlwaysAs(
         sql`jsonb_object(
-        ARRAY['jobId','repositoryId','workflowId','environmentId','instruction','status','detail','createdAt','updatedAt'],
-        ARRAY["job_id"::text,"repository_id"::text,"record"->>'workflowId',"record"->>'environmentId',left(CASE WHEN "record"->'event' IS NOT NULL THEN COALESCE("record"#>>'{issueSnapshot,identifier}',"record"#>>'{event,identifier}') || ': ' || COALESCE("record"#>>'{issueSnapshot,title}',"record"#>>'{event,title}') ELSE "record"->>'instruction' END,500),"status"::text,left("record"->>'detail',500),"created_at"::text,"record"->>'updatedAt']
-      ) || CASE WHEN "status" IN ('awaiting_review','awaiting_input','paused')
+        ARRAY['jobId','repositoryId','workflowId','instruction','status','detail','createdAt','updatedAt'],
+        ARRAY["job_id"::text,"repository_id"::text,"record"->>'workflowId',left(CASE WHEN "record"->'event' IS NOT NULL THEN COALESCE("record"#>>'{issueSnapshot,identifier}',"record"#>>'{event,identifier}') || ': ' || COALESCE("record"#>>'{issueSnapshot,title}',"record"#>>'{event,title}') ELSE "record"->>'instruction' END,500),"status"::text,left("record"->>'detail',500),"created_at"::text,"record"->>'updatedAt']
+      ) || ('{"runtime":' || COALESCE("record"->'runtime','null'::jsonb)::text || '}')::jsonb
+      || CASE WHEN "status" IN ('awaiting_review','awaiting_input','paused')
         OR ("status" = 'queued' AND CASE WHEN "record" ? 'queueReason' THEN COALESCE("record"#>>'{queueReason,code}' NOT IN ('environment_offline','environment_busy','source_unavailable','source_rate_limited','workflow_changed'),false) ELSE "record"->>'detail' IS NOT NULL END)
         OR ("status" = 'cancelling' AND "record"#>>'{progress,retryableCancellation}' = 'true')
         THEN '{"needsAttention":true}'::jsonb ELSE '{"needsAttention":false}'::jsonb END
@@ -839,10 +841,15 @@ export const relayWorkflowJobs = pgTable(
         AND length(trim("record"#>>'{origin,source,connectionId}')) > 0
         AND length(trim("record"#>>'{origin,source,grantId}')) > 0
         AND length(trim("record"#>>'{origin,occurrenceId}')) > 0
-        AND "record"->'requiredProtocol' = '8'::jsonb)
+        AND "record"->'requiredProtocol' IN ('8'::jsonb,'9'::jsonb))
     ) IS TRUE`,
     ),
     index("idx_workflow_jobs_repository").on(table.repositoryId, table.createdAt),
+    uniqueIndex("idx_workflow_jobs_tenant").on(
+      table.jobId,
+      table.organizationId,
+      table.repositoryId,
+    ),
     index("idx_workflow_jobs_status").on(table.status, table.checkedAt),
     index("idx_workflow_jobs_active_page")
       .on(table.repositoryId, table.createdAt, table.jobId)
@@ -940,9 +947,14 @@ export const relayThreadPlacements = pgTable(
     threadId: varchar("thread_id", { length: 191 }).primaryKey(),
     organizationId: varchar("organization_id", { length: 64 }).notNull(),
     repositoryId: varchar("repository_id", { length: 64 }).notNull(),
-    ownerUserId: varchar("owner_user_id", { length: 191 }).notNull(),
-    environmentId: varchar("environment_id", { length: 191 }).notNull(),
-    projectId: varchar("project_id", { length: 191 }).notNull(),
+    ownerUserId: varchar("owner_user_id", { length: 191 }),
+    audience: varchar("audience", { length: 16 })
+      .notNull()
+      .default("private")
+      .$type<"private" | "repository">(),
+    workflowJobId: varchar("workflow_job_id", { length: 64 }),
+    environmentId: varchar("environment_id", { length: 191 }),
+    projectId: varchar("project_id", { length: 191 }),
     originalEnvironmentId: varchar("original_environment_id", { length: 191 }),
     originalProjectId: varchar("original_project_id", { length: 191 }),
     generation: integer("generation").notNull().default(1),
@@ -951,10 +963,32 @@ export const relayThreadPlacements = pgTable(
   (table) => [
     check("relay_thread_placements_generation", sql`${table.generation} > 0`),
     check(
+      "relay_thread_placements_audience",
+      sql`(${table.audience} = 'private' AND ${table.ownerUserId} IS NOT NULL
+        AND ${table.workflowJobId} IS NULL AND ${table.environmentId} IS NOT NULL AND ${table.projectId} IS NOT NULL)
+      OR (${table.audience} = 'repository' AND ${table.ownerUserId} IS NULL AND ${table.workflowJobId} IS NOT NULL
+        AND ((${table.environmentId} IS NOT NULL AND ${table.projectId} IS NOT NULL)
+          OR (${table.environmentId} IS NULL AND ${table.projectId} IS NULL AND ${table.generation} = 1
+            AND ${table.operationId} IS NOT NULL AND ${table.originalEnvironmentId} IS NULL AND ${table.originalProjectId} IS NULL)))`,
+    ),
+    check(
       "relay_thread_placements_original_location",
       sql`(${table.originalEnvironmentId} IS NULL) = (${table.originalProjectId} IS NULL)`,
     ),
     index("idx_relay_thread_placements_owner").on(table.ownerUserId),
+    uniqueIndex("idx_relay_thread_placements_tenant").on(table.threadId, table.organizationId),
+    uniqueIndex("idx_relay_thread_placements_workflow_job")
+      .on(table.workflowJobId)
+      .where(sql`${table.workflowJobId} IS NOT NULL`),
+    foreignKey({
+      name: "relay_thread_placements_workflow_job_tenant_fk",
+      columns: [table.workflowJobId, table.organizationId, table.repositoryId],
+      foreignColumns: [
+        relayWorkflowJobs.jobId,
+        relayWorkflowJobs.organizationId,
+        relayWorkflowJobs.repositoryId,
+      ],
+    }),
   ],
 );
 
@@ -1085,6 +1119,8 @@ export const relayThreadVmPolicies = pgTable(
     organizationId: varchar("organization_id", { length: 64 }).primaryKey(),
     revision: integer("revision").notNull().default(1),
     maxVmsPerUser: integer("max_vms_per_user").notNull().default(3),
+    workflowPolicyRevision: integer("workflow_policy_revision").notNull().default(1),
+    maxRunningWorkflowVms: integer("max_running_workflow_vms").notNull().default(10),
     pauseAfterIdleMinutes: integer("pause_after_idle_minutes").notNull().default(30),
     deleteAfterIdleWeekdays: integer("delete_after_idle_weekdays").notNull().default(2),
     backupIntervalMinutes: integer("backup_interval_minutes").notNull().default(15),
@@ -1094,7 +1130,7 @@ export const relayThreadVmPolicies = pgTable(
   (table) => [
     check(
       "relay_thread_vm_policies_limits",
-      sql`${table.revision} > 0 AND ${table.maxVmsPerUser} >= 0 AND ${table.pauseAfterIdleMinutes} > 0 AND ${table.deleteAfterIdleWeekdays} > 0 AND ${table.backupIntervalMinutes} > 0 AND ${table.savedDiskRetentionDays} > 0`,
+      sql`${table.revision} > 0 AND ${table.maxVmsPerUser} >= 0 AND ${table.workflowPolicyRevision} > 0 AND ${table.maxRunningWorkflowVms} >= 0 AND ${table.pauseAfterIdleMinutes} > 0 AND ${table.deleteAfterIdleWeekdays} > 0 AND ${table.backupIntervalMinutes} > 0 AND ${table.savedDiskRetentionDays} > 0`,
     ),
   ],
 );
@@ -1108,7 +1144,11 @@ export const relayThreadVmAllocations = pgTable(
       .notNull()
       .references(() => relayThreadPlacements.threadId),
     organizationId: varchar("organization_id", { length: 64 }).notNull(),
-    ownerUserId: varchar("owner_user_id", { length: 191 }).notNull(),
+    ownerUserId: varchar("owner_user_id", { length: 191 }),
+    resourceKind: varchar("resource_kind", { length: 32 })
+      .notNull()
+      .default("personal")
+      .$type<"personal" | "organization_workflow">(),
     runtimeProtocol: varchar("runtime_protocol", { length: 16 })
       .$type<"legacy" | "native-v1">()
       .notNull()
@@ -1146,6 +1186,16 @@ export const relayThreadVmAllocations = pgTable(
     uniqueIndex("idx_relay_thread_vm_allocations_live_thread")
       .on(table.threadId)
       .where(sql`${table.deletedAt} IS NULL`),
+    foreignKey({
+      name: "relay_thread_vm_allocations_placement_tenant_fk",
+      columns: [table.threadId, table.organizationId],
+      foreignColumns: [relayThreadPlacements.threadId, relayThreadPlacements.organizationId],
+    }),
+    check(
+      "relay_thread_vm_allocations_resource_owner",
+      sql`(${table.resourceKind} = 'personal' AND ${table.ownerUserId} IS NOT NULL)
+        OR (${table.resourceKind} = 'organization_workflow' AND ${table.ownerUserId} IS NULL)`,
+    ),
     uniqueIndex("idx_relay_thread_vm_allocations_compute").on(table.computeRef),
     index("idx_relay_thread_vm_allocations_owner").on(table.ownerUserId, table.deletedAt),
     check(

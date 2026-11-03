@@ -47,16 +47,18 @@ export const validateWorkflowTarget = Effect.fn("WorkflowDispatcher.validateTarg
   repositoryId: string,
   definition: WorkflowDefinition,
 ) {
+  if (definition.target.kind !== "machine")
+    return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
+  const target = definition.target;
   const machine = yield* (yield* Machines).getActiveByEnvironmentId({
-    environmentId: definition.environmentId,
+    environmentId: target.environmentId,
   });
   const repository = yield* (yield* Repositories).getById({ repositoryId });
   const catalog = yield* (yield* OrganizationProjectCatalog).listForOrganization({
     organizationId,
   });
   const project = catalog.find(
-    (entry) =>
-      entry.environmentId === definition.environmentId && entry.projectId === definition.projectId,
+    (entry) => entry.environmentId === target.environmentId && entry.projectId === target.projectId,
   );
   return yield* requireBinding(
     organizationId,
@@ -72,6 +74,9 @@ export const lockWorkflowTarget = Effect.fn("WorkflowTarget.lock")(function* (
   repositoryId: string,
   definition: WorkflowDefinition,
 ) {
+  if (definition.target.kind !== "machine")
+    return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
+  const target = definition.target;
   const db = yield* RelayDb;
   const [repository] = yield* db
     .select()
@@ -83,7 +88,7 @@ export const lockWorkflowTarget = Effect.fn("WorkflowTarget.lock")(function* (
     .from(relayMachines)
     .where(
       and(
-        eq(relayMachines.environmentId, definition.environmentId),
+        eq(relayMachines.environmentId, target.environmentId),
         isNull(relayMachines.deprovisionedAt),
       ),
     )
@@ -93,7 +98,7 @@ export const lockWorkflowTarget = Effect.fn("WorkflowTarget.lock")(function* (
   const [catalog] = yield* db
     .select()
     .from(relayOrganizationProjectCatalogs)
-    .where(eq(relayOrganizationProjectCatalogs.environmentId, definition.environmentId))
+    .where(eq(relayOrganizationProjectCatalogs.environmentId, target.environmentId))
     .for("share");
   if (
     !machine ||
@@ -108,8 +113,8 @@ export const lockWorkflowTarget = Effect.fn("WorkflowTarget.lock")(function* (
     .from(relayOrganizationProjects)
     .where(
       and(
-        eq(relayOrganizationProjects.environmentId, definition.environmentId),
-        eq(relayOrganizationProjects.projectId, definition.projectId),
+        eq(relayOrganizationProjects.environmentId, target.environmentId),
+        eq(relayOrganizationProjects.projectId, target.projectId),
       ),
     )
     .for("share");

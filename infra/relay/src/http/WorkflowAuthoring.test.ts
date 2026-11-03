@@ -20,8 +20,11 @@ import { Workflows } from "../jobs/Workflows.ts";
 import { saveRepositoryWorkflow } from "./WorkflowsApi.ts";
 const definition: RepositoryWorkflow["definition"] = {
   name: "Workflow",
-  environmentId: EnvironmentId.make("environment"),
-  projectId: ProjectId.make("project"),
+  target: {
+    kind: "machine",
+    environmentId: EnvironmentId.make("environment"),
+    projectId: ProjectId.make("project"),
+  },
   steps: [
     { kind: "agent", id: "agent", title: "Agent", instruction: "Implement", modelSelection: null },
   ],
@@ -46,7 +49,7 @@ const previous: RepositoryWorkflow = {
   updatedAt: "2026",
 };
 describe("manual target validation with explicit automation Off", () => {
-  for (const mode of ["create", "changed target", "restore", "disable", "archive"] as const)
+  for (const mode of ["create", "changed target", "restore", "disable", "archive", "VM"] as const)
     it.effect(mode, () =>
       Effect.gen(function* () {
         const baseline = mode === "create" ? null : { ...previous, archived: mode === "restore" };
@@ -54,9 +57,18 @@ describe("manual target validation with explicit automation Off", () => {
           workflowId: "flow",
           expectedRevision: baseline?.revision ?? 0,
           definition:
-            mode === "changed target"
-              ? { ...definition, projectId: ProjectId.make("changed") }
-              : definition,
+            mode === "VM"
+              ? { ...definition, target: { kind: "vm" as const, baseBranch: null } }
+              : mode === "changed target"
+                ? {
+                    ...definition,
+                    target: {
+                      kind: "machine" as const,
+                      environmentId: EnvironmentId.make("environment"),
+                      projectId: ProjectId.make("changed"),
+                    },
+                  }
+                : definition,
           archived: mode === "archive",
           automation: { enabled: false, trigger: mode === "create" ? null : trigger },
         };

@@ -35,6 +35,7 @@ export function initial() {
     userId: "user",
     repositoryCanonicalKey: "github.com/acme/repo",
     instruction: "Implement",
+    runtime: { kind: "machine", environmentId: "env", projectId: "project" },
     createdAt: "2026-10-15T00:00:00Z",
     workflow: {
       workflowId: "workflow",
@@ -46,8 +47,7 @@ export function initial() {
       updatedAt: "now",
       definition: {
         name: "Ship",
-        environmentId: "env",
-        projectId: "project",
+        target: { kind: "machine", environmentId: "env", projectId: "project" },
         steps: [
           {
             id: "agent",

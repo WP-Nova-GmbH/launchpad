@@ -4782,6 +4782,7 @@ effectIt.effect(
         userId: "first-maintainer",
         repositoryCanonicalKey: "github.com/acme/repo",
         instruction: "Work",
+        runtime: { kind: "machine", environmentId: EnvironmentId.make("env"), projectId },
         workflow: {
           workflowId: "workflow",
           organizationId: "org",
@@ -4792,8 +4793,7 @@ effectIt.effect(
           updatedAt: now(),
           definition: {
             name: "Workflow",
-            environmentId: EnvironmentId.make("env"),
-            projectId,
+            target: { kind: "machine", environmentId: EnvironmentId.make("env"), projectId },
             steps: [
               {
                 id: "agent",

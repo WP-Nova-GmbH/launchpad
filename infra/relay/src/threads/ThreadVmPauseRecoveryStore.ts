@@ -51,7 +51,7 @@ export function makeThreadVmPauseRecoveryStore(
              AND c.state='started' AND c.compute_ref=a.compute_ref)))) AS "canActivate"
         FROM relay_thread_vm_pauses x JOIN relay_thread_vm_allocations a USING(allocation_id)
         JOIN relay_thread_vm_bindings b USING(allocation_id) JOIN relay_thread_placements t ON t.thread_id=a.thread_id
-        WHERE a.runtime_protocol='native-v1' AND a.thread_id=${owner.threadId} AND b.environment_id=${owner.environmentId}
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.thread_id=${owner.threadId} AND b.environment_id=${owner.environmentId}
           AND x.generation=${owner.generation} AND t.environment_id=b.environment_id AND t.generation=x.generation
           AND b.generation=x.generation AND b.revoked_at IS NULL AND a.deleted_at IS NULL`;
         if (!row) return null;
@@ -83,7 +83,7 @@ export function makeThreadVmPauseRecoveryStore(
         }
         const [owned] =
           yield* sql`SELECT 1 FROM relay_thread_placements t JOIN relay_thread_vm_allocations a USING(thread_id)
-        WHERE a.runtime_protocol='native-v1' AND t.thread_id=${input.threadId} AND t.generation=${input.generation} AND t.operation_id IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND t.thread_id=${input.threadId} AND t.generation=${input.generation} AND t.operation_id IS NULL
           AND a.allocation_id=${pause.allocationId} AND a.state='running' AND a.deleted_at IS NULL FOR UPDATE OF a`;
         if (!owned || pause.phase !== "pending")
           return yield* conflict("Pause cannot accept a source acknowledgement.");
@@ -118,7 +118,7 @@ export function makeThreadVmPauseRecoveryStore(
           provisionOperationId: string;
         }>`SELECT a.compute_ref AS "computeRef",p.operation_id AS "provisionOperationId"
           FROM relay_thread_vm_allocations a JOIN relay_thread_vm_provisions p USING(allocation_id)
-          WHERE a.runtime_protocol='native-v1' AND a.allocation_id=${pause.allocationId} AND p.phase='created'`;
+          WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=${pause.allocationId} AND p.phase='created'`;
         const sourceReceipt = yield* decodeSource({
           allocationId: pause.allocationId,
           computeRef: allocation?.computeRef,

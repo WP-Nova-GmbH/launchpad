@@ -59,26 +59,12 @@ const origin: WorkflowOrigin = {
   },
   occurrenceId: "event",
 };
-const automated = (input: WorkflowRequest): WorkflowRequest => {
+const automated = <T extends WorkflowRequest>(input: T) => {
   const { userId: _, ...rest } = input;
   return { ...rest, origin };
 };
-const legacyResult = WorkflowControlResult.mapFields((fields) => ({
-  ...fields,
-  protocol: Schema.Literals([1, 2, 3, 4, 5, 6, 7]),
-}));
-const decodeLegacyResponse = Schema.decodeUnknownSync(
-  RelayEnvironmentDispatchJobResponse.mapFields((fields) => ({
-    ...fields,
-    workflowResult: Schema.optional(legacyResult),
-  })),
-);
-const decodeLegacyProof = Schema.decodeUnknownSync(
-  RelayEnvironmentDispatchJobResponseProofPayload.mapFields((fields) => ({
-    ...fields,
-    workflowResult: Schema.optional(legacyResult),
-  })),
-);
+const decodeResponse = Schema.decodeUnknownSync(RelayEnvironmentDispatchJobResponse);
+const decodeProof = Schema.decodeUnknownSync(RelayEnvironmentDispatchJobResponseProofPayload);
 const issuer = "https://relay.example.test";
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const signedHarness = (publishing = false) =>
@@ -111,7 +97,7 @@ const signedHarness = (publishing = false) =>
     const dependencies = {
       secrets: auth.secrets,
       environment: {
-        getEnvironmentId: Effect.succeed(workflow.definition.environmentId),
+        getEnvironmentId: Effect.succeed(workflow.definition.target.environmentId),
         getDescriptor: Effect.die("unused"),
       },
       jobRunner: { run: () => Effect.die("personal dispatch forbidden") },
@@ -138,7 +124,7 @@ const signedHarness = (publishing = false) =>
           typ: RELAY_DISPATCH_JOB_REQUEST_TYP,
           payload: {
             iss: issuer,
-            aud: `t3-env:${workflow.definition.environmentId}`,
+            aud: `t3-env:${workflow.definition.target.environmentId}`,
             sub:
               input.origin?.kind === "automation"
                 ? `workflow:${input.jobId}`
@@ -146,7 +132,7 @@ const signedHarness = (publishing = false) =>
             jti: requestId,
             iat: now,
             exp: now + 120,
-            environmentId: workflow.definition.environmentId,
+            environmentId: workflow.definition.target.environmentId,
             jobId: input.jobId,
             repositoryCanonicalKey: input.repositoryCanonicalKey,
             baseBranch: "HEAD",
@@ -161,7 +147,7 @@ const signedHarness = (publishing = false) =>
           publicKey: environment.publicKey,
           token: response.proof,
           typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
-          issuer: `t3-env:${workflow.definition.environmentId}`,
+          issuer: `t3-env:${workflow.definition.target.environmentId}`,
           audience: issuer,
           nowEpochSeconds: now,
         });
@@ -184,27 +170,27 @@ const signedHarness = (publishing = false) =>
     };
   });
 it.effect.each([false, true])(
-  "real signed legacy responses decode on an older relay with publishing=%s",
+  "real signed workflow responses decode on the relay with publishing=%s",
   (publishing) =>
     test(
       Effect.gen(function* () {
         const f = yield* signedHarness(publishing);
         for (const input of [control("status"), request()]) {
           const { response, signed } = yield* f.send(input);
-          assert.equal(decodeLegacyResponse(response).workflowResult?.protocol, publishing ? 7 : 6);
-          assert.equal(decodeLegacyProof(signed).workflowResult?.protocol, publishing ? 7 : 6);
+          assert.equal(decodeResponse(response).workflowResult?.protocol, 9);
+          assert.equal(decodeProof(signed).workflowResult?.protocol, 9);
         }
         yield* f.h.complete;
         const review = yield* f.send({ ...control("status"), userId: "bob" });
         assert.equal(
-          decodeLegacyProof(review.signed).workflowResult?.progress?.status,
+          decodeProof(review.signed).workflowResult?.progress?.status,
           "awaiting_review",
         );
         const modern = yield* f.send({
           ...control("status"),
           origin: { kind: "manual", userId: "user-1" },
         });
-        assert.equal(modern.response.workflowResult?.protocol, 8);
+        assert.equal(modern.response.workflowResult?.protocol, 9);
       }),
     ),
 );
@@ -225,7 +211,7 @@ it.effect("real signed cancellation persists before acceptance with revoked poli
       assert.equal(missingHuman.response.workflowResult?.outcome, "conflict");
       const cancel = yield* f.send({ ...automated(control("cancel")), requestedBy: "bob" });
       assert.equal(cancel.response.workflowResult?.outcome, "cancelled");
-      assert.equal(cancel.response.workflowResult?.protocol, 8);
+      assert.equal(cancel.response.workflowResult?.protocol, 9);
       assert.isTrue(yield* f.invoke(cancel.proof).pipe(Effect.isFailure));
       const restarted = yield* f.h.newRunner.pipe(
         Effect.provideService(RepositoryAccess, f.auth.access),
@@ -336,7 +322,7 @@ it.effect.each(["cancel-first", "accept-first"] as const)(
           origin,
           organizationId: "org-1",
           repositoryId: "repo-1",
-          projectId: workflow.definition.projectId,
+          projectId: workflow.definition.target.projectId,
           repositoryCanonicalKey: request().repositoryCanonicalKey,
           createdAt: seed.createdAt,
         };
@@ -403,7 +389,10 @@ it.effect("revocation before native arm prevents automatic command delivery", ()
           ...run.workflow,
           organizationId: "org-1",
           repositoryId: "repo-1",
-          definition: { ...run.workflow.definition, projectId: workflow.definition.projectId },
+          definition: {
+            ...run.workflow.definition,
+            projectId: workflow.definition.target.projectId,
+          },
         },
       }));
       assert.isTrue(
@@ -577,7 +566,7 @@ it.effect.each(["initial", "successor", "unavailable-provider"] as const)(
         let gate = true;
         const query = {
           ...auth.query,
-          getProjectShellById: (id: typeof workflow.definition.projectId) =>
+          getProjectShellById: (id: typeof workflow.definition.target.projectId) =>
             Effect.gen(function* () {
               const run = yield* store.get("job-1");
               if (
@@ -715,7 +704,7 @@ it.effect("accepted enqueue bookkeeping precedes a concurrent policy acknowledge
 );
 
 it.effect.each([false, true])(
-  "legacy reviewer reconciles a modern manual cancellation after restart: publishing=%s",
+  "a reviewer reconciles a manual cancellation after restart: publishing=%s",
   (publishing) =>
     test(
       Effect.gen(function* () {
@@ -735,14 +724,8 @@ it.effect.each([false, true])(
         for (const operation of ["cancel", "status"] as const) {
           const result = yield* f.send({ ...control(operation), userId: "bob" });
           assert.equal(result.response.workflowResult?.outcome, "cancelled");
-          assert.equal(
-            decodeLegacyResponse(result.response).workflowResult?.protocol,
-            publishing ? 7 : 6,
-          );
-          assert.equal(
-            decodeLegacyProof(result.signed).workflowResult?.protocol,
-            publishing ? 7 : 6,
-          );
+          assert.equal(decodeResponse(result.response).workflowResult?.protocol, 9);
+          assert.equal(decodeProof(result.signed).workflowResult?.protocol, 9);
           assert.isTrue(yield* f.invoke(result.proof).pipe(Effect.isFailure));
         }
         const wrongOrigin = yield* f.send({

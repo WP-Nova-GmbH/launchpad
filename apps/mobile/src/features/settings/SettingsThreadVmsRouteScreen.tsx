@@ -22,6 +22,7 @@ import { decodedRelayClientError } from "../cloud/linkEnvironment";
 import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "../cloud/publicConfig";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { SettingsSection } from "./components/SettingsSection";
+import { WorkflowVmPolicySettings } from "./WorkflowVmPolicySettings";
 
 export function SettingsThreadVmsRouteScreen() {
   if (!hasCloudPublicConfig())
@@ -58,6 +59,7 @@ function SignedInThreadVmsSettings() {
   const [record, setRecord] = useState<ThreadVmPolicyRecord | null>(null);
   const [draft, setDraft] = useState<ThreadVmPolicyDraft | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [organizationId, setOrganizationId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -71,17 +73,20 @@ function SignedInThreadVmsSettings() {
       const clerkToken = await getToken(resolveRelayClerkTokenOptions());
       if (!clerkToken) throw new Error("Sign in to Launchpad Connect first.");
       if (request !== epoch.current) return;
-      const [membership, next, health] = await runtime.runPromise(
+      const membership = await runtime.runPromise(
+        ManagedRelayTenancy.ManagedRelayTenancyClient.pipe(
+          Effect.flatMap((client) => client.getOrganization({ clerkToken })),
+          Effect.mapError(decodedRelayClientError("Could not read the VM policy")),
+        ),
+      );
+      if (request !== epoch.current) return;
+      setOrganizationId(membership.organization.organizationId);
+      const [next, health] = await runtime.runPromise(
         ManagedRelayTenancy.ManagedRelayTenancyClient.pipe(
           Effect.flatMap((client) =>
-            Effect.all(
-              [
-                client.getOrganization({ clerkToken }),
-                client.getThreadVmPolicy({ clerkToken }),
-                client.getHealth(),
-              ],
-              { concurrency: 2 },
-            ),
+            Effect.all([client.getThreadVmPolicy({ clerkToken }), client.getHealth()], {
+              concurrency: 2,
+            }),
           ),
           Effect.mapError(decodedRelayClientError("Could not read the VM policy")),
         ),
@@ -254,6 +259,9 @@ function SignedInThreadVmsSettings() {
             ) : null}
             <MaterialButton label="Reload policy" disabled={busy} onPress={() => void load()} />
           </View>
+          {organizationId ? (
+            <WorkflowVmPolicySettings key={organizationId} organizationId={organizationId} />
+          ) : null}
         </>
       </ScreenScrollView>
     </SettingsScreen>

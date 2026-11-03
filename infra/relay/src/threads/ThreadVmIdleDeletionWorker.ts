@@ -29,7 +29,7 @@ export function makeThreadVmIdleDeletionWorker(
         JOIN relay_thread_vm_ready s USING(allocation_id) JOIN relay_thread_vm_activity v USING(allocation_id)
         JOIN relay_thread_vm_policies policy ON policy.organization_id=a.organization_id
         JOIN LATERAL (SELECT host_id,state FROM relay_thread_vm_capacity WHERE allocation_id=a.allocation_id ORDER BY position DESC LIMIT 1) c ON true
-        WHERE c.host_id=${hostId} AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND t.operation_id IS NULL
+        WHERE a.resource_kind='personal' AND c.host_id=${hostId} AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND t.operation_id IS NULL
           AND a.owner_user_id=t.owner_user_id AND b.revoked_at IS NULL AND b.environment_id=t.environment_id AND b.generation=t.generation
           AND p.phase='created' AND p.generation=t.generation AND s.phase='ready' AND v.idle_since IS NOT NULL
           AND ((a.state='running' AND c.state='started' AND v.activity='idle' AND v.observed_at>=clock_timestamp()-interval '2 minutes')

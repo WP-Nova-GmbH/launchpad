@@ -1,6 +1,10 @@
 import { describe, expect, it } from "@effect/vitest";
 import { DEFAULT_THREAD_VM_POLICY } from "@t3tools/contracts/relay";
-import { parseThreadVmPolicyDraft, threadVmPolicyDraft } from "./threadVmPolicyForm.ts";
+import {
+  parseThreadVmPolicyDraft,
+  threadVmPolicyDraft,
+  parseWorkflowVmLimit,
+} from "./threadVmPolicyForm.ts";
 
 describe("VM policy form input", () => {
   it("accepts a disabled quota and a valid installation time zone", () => {
@@ -37,4 +41,21 @@ describe("VM policy form input", () => {
       parseThreadVmPolicyDraft({ ...draft, calendarTimeZone: "Mars/Olympus" }),
     ).toThrow();
   });
+});
+
+describe("workflow VM limit input", () => {
+  it("accepts zero and the database integer range without changing personal policy", () => {
+    expect(parseWorkflowVmLimit(" 0 ")).toBe(0);
+    expect(parseWorkflowVmLimit("10")).toBe(10);
+    expect(parseWorkflowVmLimit("2147483647")).toBe(2147483647);
+    expect(parseThreadVmPolicyDraft(threadVmPolicyDraft(DEFAULT_THREAD_VM_POLICY))).toEqual(
+      DEFAULT_THREAD_VM_POLICY,
+    );
+  });
+  it.each(["", " ", "-1", "2.5", "1e3", "0x10", "10 VMs", "2147483648", "Infinity"])(
+    "rejects invalid limit %j",
+    (value) => {
+      expect(() => parseWorkflowVmLimit(value)).toThrow();
+    },
+  );
 });

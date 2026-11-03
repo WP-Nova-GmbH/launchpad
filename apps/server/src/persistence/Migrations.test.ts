@@ -286,7 +286,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json) VALUES ('job', 'thread', 'running', 1, '{}')`;
+      yield* sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json) VALUES ('job', 'thread', 'running', 0, '{}')`;
       yield* markSharedThreadDatabase;
       yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json) VALUES ('workflow-delete-test', 'thread', 'another-thread', 1, 'thread.deleted', '2026-10-08T00:00:00Z', 'system', '{}', '{}')`;
       assert.deepStrictEqual(
@@ -303,7 +303,7 @@ it.effect("upgrades workflow ownership without changing accepted jobs", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* runMigrations({ toMigrationInclusive: 76 });
-    yield* sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json) VALUES ('retained-job', 'retained-thread', 'running', 1, '{"retained":"job"}')`;
+    yield* sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json) VALUES ('retained-job', 'retained-thread', 'running', 0, '{"retained":"job"}')`;
     assert.deepStrictEqual(
       yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 1`,
       [{ name: "OrchestrationEvents_WorkflowReaderV1" }],
@@ -321,13 +321,14 @@ it.effect("upgrades workflow ownership without changing accepted jobs", () =>
       [86, "ThreadMoveTransferIntents"],
       [87, "ThreadMoveAttempts"],
       [88, "CheckoutOperationBoot"],
+      [89, "WorkflowExecutionBinding"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM repository_workflow_jobs`, [
       {
         job_id: "retained-job",
         thread_id: "retained-thread",
         status: "running",
-        execution_reserved: 1,
+        execution_reserved: 0,
         record_json: '{"retained":"job"}',
       },
     ]);
@@ -392,6 +393,7 @@ it.effect(
         [86, "ThreadMoveTransferIntents"],
         [87, "ThreadMoveAttempts"],
         [88, "CheckoutOperationBoot"],
+        [89, "WorkflowExecutionBinding"],
       ]);
       const rows = yield* sql<{
         state: string;
@@ -445,6 +447,7 @@ it.effect("V4 upgrade preserves cleanup proof and blocks old PID-only fence read
       [86, "ThreadMoveTransferIntents"],
       [87, "ThreadMoveAttempts"],
       [88, "CheckoutOperationBoot"],
+      [89, "WorkflowExecutionBinding"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT record_json FROM setup_processes`, [
       { record_json: record },
@@ -478,6 +481,7 @@ it.effect(
         [86, "ThreadMoveTransferIntents"],
         [87, "ThreadMoveAttempts"],
         [88, "CheckoutOperationBoot"],
+        [89, "WorkflowExecutionBinding"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT record_json FROM repository_workflow_jobs`, [
         { record_json: record },

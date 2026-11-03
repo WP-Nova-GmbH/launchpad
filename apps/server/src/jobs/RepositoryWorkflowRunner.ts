@@ -18,6 +18,7 @@ import {
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import {
+  WORKFLOW_PROTOCOL,
   isTerminalWorkflowJob,
   type WorkflowControl,
   type WorkflowControlResult,
@@ -89,7 +90,7 @@ export class RepositoryWorkflowRunner extends Context.Reference<RepositoryWorkfl
     defaultValue: () => ({
       handle: () =>
         Effect.succeed({
-          protocol: 6,
+          protocol: WORKFLOW_PROTOCOL,
           outcome: "unavailable",
           detail: "Workflow execution is unavailable on this environment.",
           progress: null,
@@ -376,7 +377,7 @@ export const make = Effect.gen(function* () {
         cwd: "",
         resolveCwd: readThread(run).pipe(
           Effect.map((current) =>
-            current?.projectId === run.workflow.definition.projectId ? current.worktreePath : null,
+            current?.projectId === run.runtime.projectId ? current.worktreePath : null,
           ),
         ),
         modelSelection: run.modelSelection,
@@ -402,12 +403,12 @@ export const make = Effect.gen(function* () {
       ? access.requireWorkflowProject({
           organizationId: run.workflow.organizationId,
           repositoryId: run.workflow.repositoryId,
-          projectId: run.workflow.definition.projectId,
+          projectId: run.runtime.projectId,
           repositoryCanonicalKey: run.repositoryCanonicalKey,
         })
       : access.requireProject(
           { user: { userId: run.userId!, displayName: null, imageUrl: null } },
-          run.workflow.definition.projectId,
+          run.runtime.projectId,
         );
   const blockedExecutionDetail =
     "Repository access is unavailable. Cancel this run or restore its repository binding.";
@@ -457,9 +458,7 @@ export const make = Effect.gen(function* () {
       if (step?.kind !== "agent") return run;
       run = { ...run, modelSelection: step.modelSelection ?? run.modelSelection };
     }
-    const project = yield* query
-      .getProjectShellById(run.workflow.definition.projectId)
-      .pipe(Effect.orDie);
+    const project = yield* query.getProjectShellById(run.runtime.projectId).pipe(Effect.orDie);
     if (Option.isNone(project))
       return yield* new WorkflowRunnerError({ message: "The selected project no longer exists." });
     const existing = yield* readThread(run);
@@ -717,7 +716,7 @@ export const make = Effect.gen(function* () {
         const preparation = thread?.promptQueue?.preparation;
         if (
           !thread ||
-          thread.projectId !== run.workflow.definition.projectId ||
+          thread.projectId !== run.runtime.projectId ||
           thread.worktreePath !== run.worktreePath ||
           !preparation ||
           preparation.attemptId !== cleanup.attemptId ||
@@ -762,7 +761,7 @@ export const make = Effect.gen(function* () {
           return yield* updated.failure;
         }
         if (
-          projected?.projectId !== run.workflow.definition.projectId ||
+          projected?.projectId !== run.runtime.projectId ||
           projected.worktreePath !== run.worktreePath ||
           current?.attemptId !== cleanup.attemptId ||
           current.target?.worktreePath !== run.worktreePath
@@ -1534,7 +1533,7 @@ export const make = Effect.gen(function* () {
         outcome: WorkflowControlResult["outcome"] = run ? "accepted" : "missing",
         detail: string | null = null,
       ): WorkflowControlResult => ({
-        protocol: request.origin ? 8 : publishingSupported ? 7 : 6,
+        protocol: WORKFLOW_PROTOCOL,
         actions: publishingSupported
           ? actions.canOpenPullRequest
             ? ["push", "open_pull_request"]
@@ -1544,6 +1543,12 @@ export const make = Effect.gen(function* () {
         detail,
         progress: run ? workflowProgress(run) : null,
       });
+      if (
+        request.control.operation === "start" &&
+        (request.control.workflow.definition.target.kind !== "machine" ||
+          request.control.runtime.kind !== "machine")
+      )
+        return result(null, "unavailable", "VM workflows are not available yet.");
       let run = yield* store.get(request.jobId);
       const savedCancellation = yield* store.getCancellation(request.jobId);
       const requestedBy = request.requestedBy ?? request.userId;
@@ -1629,7 +1634,7 @@ export const make = Effect.gen(function* () {
         run &&
         (run.workflow.organizationId !== request.control.organizationId ||
           run.workflow.repositoryId !== request.control.repositoryId ||
-          run.workflow.definition.projectId !== request.control.projectId)
+          run.runtime.projectId !== request.control.projectId)
       )
         return result(null, "unavailable", "The job binding does not match this request.");
       // Cancellation wins over an undispatched retry intent, including after restart.
@@ -1669,7 +1674,7 @@ export const make = Effect.gen(function* () {
         yield* access
           .requireProject(
             { user: { userId: requestedBy!, displayName: null, imageUrl: null } },
-            run.workflow.definition.projectId,
+            run.runtime.projectId,
           )
           .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
         if (isTerminalWorkflowJob(run.progress.status) || run.progress.status === "cancelling")
@@ -1744,12 +1749,20 @@ export const make = Effect.gen(function* () {
         yield* access
           .requireProject(
             { user: { userId: requestedBy!, displayName: null, imageUrl: null } },
-            run.workflow.definition.projectId,
+            run.runtime.projectId,
           )
           .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
       if (request.control.operation === "start") {
         if (run) return result(run);
         const workflow = request.control.workflow;
+        const runtime = request.control.runtime;
+        if (workflow.definition.target.kind !== "machine" || runtime.kind !== "machine")
+          return result(null, "unavailable", "VM workflows are not available yet.");
+        if (
+          runtime.environmentId !== workflow.definition.target.environmentId ||
+          runtime.projectId !== workflow.definition.target.projectId
+        )
+          return result(null, "unavailable", "Invalid workflow execution binding.");
         const publishing = workflow.definition.steps.filter((step) => step.kind === "action");
         if (publishing.length && !publishingSupported)
           return result(
@@ -1760,7 +1773,7 @@ export const make = Effect.gen(function* () {
         if (
           workflow.organizationId !== request.control.organizationId ||
           workflow.repositoryId !== request.control.repositoryId ||
-          workflow.definition.projectId !== request.control.projectId
+          runtime.projectId !== request.control.projectId
         )
           return result(null, "unavailable", "Invalid workflow target binding.");
         if (yield* store.isExecuting())
@@ -1899,6 +1912,7 @@ export const make = Effect.gen(function* () {
           userId: origin.kind === "manual" ? origin.userId : null,
           repositoryCanonicalKey: request.repositoryCanonicalKey,
           instruction: request.instruction,
+          runtime,
           workflow: {
             ...workflow,
             definition: {

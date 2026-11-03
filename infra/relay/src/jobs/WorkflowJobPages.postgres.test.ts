@@ -39,7 +39,7 @@ const job = (
     jobId,
     repositoryId,
     workflowId: "workflow",
-    environmentId: EnvironmentId.make("environment"),
+    runtime: null,
     instruction: "x".repeat(2000),
     status,
     detail: null,
@@ -101,6 +101,16 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
                 )
                   yield* sql.unsafe(statement);
 
+              const foundation = yield* fs.readFileString(
+                new URL(
+                  "../../migrations/postgres/20261102170843_workflow_execution_foundation/migration.sql",
+                  import.meta.url,
+                ).pathname,
+              );
+              for (const statement of foundation.split("--> statement-breakpoint"))
+                if (statement.trim() && !statement.includes("relay_thread_"))
+                  yield* sql.unsafe(statement);
+
               expect((yield* store.getJob(waiting.jobId))?.record.origin).toEqual({
                 kind: "manual",
                 userId: "author",
@@ -116,8 +126,11 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
                 archived: true,
                 definition: {
                   name: "Archived workflow",
-                  environmentId: EnvironmentId.make("environment"),
-                  projectId: ProjectId.make("project"),
+                  target: {
+                    kind: "machine",
+                    environmentId: EnvironmentId.make("environment"),
+                    projectId: ProjectId.make("project"),
+                  },
                   steps: [
                     {
                       id: "agent",

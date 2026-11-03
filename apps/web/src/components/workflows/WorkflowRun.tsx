@@ -55,10 +55,10 @@ function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) 
   const drafts = useWorkflowDrafts();
   const key = workflowSessionKey(scope, workflow.workflowId);
   const draft = drafts.runs[key] ?? emptyWorkflowRun;
+  const machine = workflow.definition.target.kind === "machine" ? workflow.definition.target : null;
   const target = projects.find(
     (project) =>
-      project.environmentId === workflow.definition.environmentId &&
-      project.projectId === workflow.definition.projectId,
+      project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
   const pending = draft.operation?.state === "pending";
   const uncertain = draft.operation?.state === "uncertain";

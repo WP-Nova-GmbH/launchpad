@@ -180,7 +180,7 @@ export function makeThreadVmResetStore(
         WHERE s.thread_id=${input.threadId} AND t.generation=${input.expectedGeneration} AND s.phase='expired' AND f.phase='completed'
           AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}))
           AND f.thread_id=s.thread_id AND f.generation=s.generation
-          AND a.runtime_protocol='native-v1' AND a.state='deleted' AND a.deleted_at IS NOT NULL
+          AND a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.state='deleted' AND a.deleted_at IS NOT NULL
           AND (s.generation<t.generation OR f.environment_id=${placement.environmentId})
           AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations live WHERE live.thread_id=s.thread_id AND live.deleted_at IS NULL)
           AND NOT EXISTS(SELECT 1 FROM relay_thread_execution_admissions w WHERE w.thread_id=s.thread_id AND NOT w.completed)
@@ -283,7 +283,7 @@ export function makeThreadVmResetStore(
           operationId: string;
         }>`SELECT r.operation_id AS "operationId"
         FROM relay_thread_vm_resets r JOIN relay_thread_placements t USING(thread_id)
-        WHERE NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations legacy WHERE legacy.runtime_protocol<>'native-v1'
+        WHERE t.audience='private' AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations legacy WHERE legacy.runtime_protocol<>'native-v1'
           AND (legacy.allocation_id=r.allocation_id OR legacy.allocation_id IN(SELECT f.allocation_id FROM relay_thread_vm_saved_disks s JOIN relay_thread_vm_final_saves f ON f.operation_id=s.operation_id WHERE s.operation_id=r.saved_disk_operation_id))) AND r.host_id=${hostId} AND r.phase='cancelling' AND t.operation_id=r.operation_id
           AND t.generation=r.expected_generation
           AND (t.environment_id=r.source_environment_id OR EXISTS(

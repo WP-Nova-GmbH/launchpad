@@ -1882,7 +1882,13 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
         (principal.kind !== "machine" ||
           principal.organizationId !== proof.workflowControl.organizationId ||
           (proof.workflowControl.operation === "start" &&
-            proof.workflowControl.workflow.definition.environmentId !== environmentId)))
+            (proof.workflowControl.runtime.kind !== "machine" ||
+              proof.workflowControl.workflow.definition.target.kind !== "machine" ||
+              proof.workflowControl.runtime.environmentId !== environmentId ||
+              proof.workflowControl.runtime.projectId !== proof.workflowControl.projectId ||
+              proof.workflowControl.workflow.definition.target.environmentId !== environmentId ||
+              proof.workflowControl.workflow.definition.target.projectId !==
+                proof.workflowControl.projectId))))
     ) {
       return yield* new EnvironmentHttpUnauthorizedError({
         message: "This workflow request is not bound to the enrolled organization.",

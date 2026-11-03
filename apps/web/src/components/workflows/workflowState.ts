@@ -147,8 +147,7 @@ export function newWorkflowDraft(
     error: null,
     definition: {
       name: template === "publish" ? "Reviewed implementation" : "New workflow",
-      environmentId: target.environmentId,
-      projectId: target.projectId,
+      target: { kind: "machine", environmentId: target.environmentId, projectId: target.projectId },
       steps: [
         {
           id: "agent",
@@ -186,20 +185,30 @@ export function copiedWorkflowDraft(
 ) {
   const draft = newWorkflowDraft(projects);
   if (!draft) return null;
-  const target = sameRepository
-    ? projects.find(
-        (project) =>
-          project.environmentId === source.definition.environmentId &&
-          project.projectId === source.definition.projectId,
-      )
-    : undefined;
+  const sourceTarget = source.definition.target;
+  const target =
+    sameRepository && sourceTarget.kind === "machine"
+      ? projects.find(
+          (project) =>
+            project.environmentId === sourceTarget.environmentId &&
+            project.projectId === sourceTarget.projectId,
+        )
+      : undefined;
   return {
     ...draft,
     targetConfirmed: !!target || projects.length === 1,
     definition: {
       ...draft.definition,
       name: `Copy of ${source.definition.name}`.slice(0, 120),
-      ...(target ? { environmentId: target.environmentId, projectId: target.projectId } : {}),
+      ...(target
+        ? {
+            target: {
+              kind: "machine" as const,
+              environmentId: target.environmentId,
+              projectId: target.projectId,
+            },
+          }
+        : {}),
       steps: structuredClone(source.definition.steps),
     },
   };

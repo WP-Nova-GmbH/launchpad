@@ -112,12 +112,12 @@ export function makeThreadVmRestoreStore(
       ? yield* sql`SELECT 1 FROM relay_thread_vm_backup_recoveries r JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
         WHERE r.operation_id=${operationId} AND r.thread_id=${row.threadId} AND r.phase='restoring'
           AND r.stop_receipt IS NOT NULL AND r.independent_history IS NOT NULL
-          AND a.allocation_id=${row.allocationId} AND a.owner_user_id=${row.actorUserId} AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1'
+          AND a.allocation_id=${row.allocationId} AND a.owner_user_id=${row.actorUserId} AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
         FOR UPDATE OF r,a`
       : yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks s JOIN relay_thread_vm_allocations a ON a.allocation_id=s.restore_allocation_id
         WHERE s.operation_id=${row.savedDiskOperationId} AND s.thread_id=${row.threadId} AND s.phase='restoring'
           AND s.restore_operation_id=${operationId} AND s.restore_allocation_id=${row.allocationId}
-          AND a.owner_user_id=${row.actorUserId} AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1' FOR UPDATE OF s,a`;
+          AND a.owner_user_id=${row.actorUserId} AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1' AND a.resource_kind='personal' FOR UPDATE OF s,a`;
     if (
       !current ||
       placement?.operationId !== operationId ||
@@ -380,7 +380,7 @@ export function makeThreadVmRestoreStore(
         JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
         WHERE r.host_id=${hostId} AND r.phase IN ('pending','preparing','prepared','aborting') AND r.committed_at IS NULL
-          AND a.runtime_protocol='native-v1'
+          AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
           AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp())
           AND (r.phase='aborting' OR c.state='reserved')
           AND (r.phase!='prepared' OR NOT r.serving_requested)

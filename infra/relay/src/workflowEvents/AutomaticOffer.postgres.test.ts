@@ -69,7 +69,7 @@ const harness = Effect.gen(function* () {
             return {
               accepted: false,
               workflowResult: {
-                protocol: 8 as const,
+                protocol: 9 as const,
                 outcome: "busy" as const,
                 detail: null,
                 progress: null,
@@ -78,7 +78,7 @@ const harness = Effect.gen(function* () {
           return {
             accepted: true,
             workflowResult: {
-              protocol: 8 as const,
+              protocol: 9 as const,
               outcome: "accepted" as const,
               detail: null,
               progress: {
@@ -94,7 +94,7 @@ const harness = Effect.gen(function* () {
         return {
           accepted: false,
           workflowResult: {
-            protocol: 8 as const,
+            protocol: 9 as const,
             outcome:
               input.workflowControl?.operation === "cancel"
                 ? ("cancelled" as const)
@@ -349,7 +349,7 @@ describe("automatic offers (PostgreSQL)", () => {
                 return {
                   accepted: true,
                   workflowResult: {
-                    protocol: 8 as const,
+                    protocol: 9 as const,
                     outcome: "accepted" as const,
                     detail: null,
                     progress: {
@@ -365,7 +365,7 @@ describe("automatic offers (PostgreSQL)", () => {
               return {
                 accepted: false,
                 workflowResult: {
-                  protocol: 8 as const,
+                  protocol: 9 as const,
                   outcome: "missing" as const,
                   detail: null,
                   progress: null,

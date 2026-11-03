@@ -24,8 +24,9 @@ export const automation = (value: RepositoryWorkflow["automation"] | null | unde
 export const triggerKey = (trigger: WorkflowTrigger | null) => stableStringify(trigger);
 export const targetKey = (definition: RepositoryWorkflow["definition"]) =>
   stableStringify({
-    environmentId: definition.environmentId,
-    projectId: definition.projectId,
+    ...(definition.target.kind === "machine"
+      ? { environmentId: definition.target.environmentId, projectId: definition.target.projectId }
+      : { target: definition.target }),
     actions: [
       ...new Set(definition.steps.filter((s) => s.kind === "action").map((s) => s.action)),
     ].sort(),

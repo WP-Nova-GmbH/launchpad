@@ -20,7 +20,7 @@ import {
   type OrchestrationEvent,
   type OrganizationRepositoryPolicy,
 } from "@t3tools/contracts";
-import { type RepositoryWorkflow } from "@t3tools/contracts/workflows";
+import { type RepositoryWorkflow, type WorkflowControl } from "@t3tools/contracts/workflows";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -64,7 +64,11 @@ const decodeProvider = Schema.decodeUnknownEffect(ServerProvider);
 export const NOW = "2026-10-08T12:00:00.000Z";
 export const MODEL = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-test" };
 export const PROJECT = ProjectId.make("project-workflow");
-export const workflow: RepositoryWorkflow = {
+export const workflow: RepositoryWorkflow & {
+  definition: RepositoryWorkflow["definition"] & {
+    target: Extract<RepositoryWorkflow["definition"]["target"], { kind: "machine" }>;
+  };
+} = {
   workflowId: "workflow-1",
   organizationId: "org-1",
   repositoryId: "repo-1",
@@ -74,8 +78,7 @@ export const workflow: RepositoryWorkflow = {
   updatedAt: NOW,
   definition: {
     name: "Implement and review",
-    environmentId: EnvironmentId.make("env-1"),
-    projectId: PROJECT,
+    target: { kind: "machine", environmentId: EnvironmentId.make("env-1"), projectId: PROJECT },
     steps: [
       {
         id: "agent",
@@ -88,7 +91,9 @@ export const workflow: RepositoryWorkflow = {
     ],
   },
 };
-export const request = (jobId = "job-1"): WorkflowRequest => ({
+export const request = (
+  jobId = "job-1",
+): WorkflowRequest & { control: Extract<WorkflowControl, { operation: "start" }> } => ({
   jobId,
   userId: "user-1",
   repositoryCanonicalKey: "github.com/acme/repo",
@@ -99,6 +104,7 @@ export const request = (jobId = "job-1"): WorkflowRequest => ({
     repositoryId: "repo-1",
     projectId: PROJECT,
     workflow,
+    runtime: workflow.definition.target,
   },
 });
 export const control = (operation: "status" | "cancel", jobId = "job-1"): WorkflowRequest => ({

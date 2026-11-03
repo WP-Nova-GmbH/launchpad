@@ -1,4 +1,4 @@
-import { ThreadVmPolicy } from "@t3tools/contracts/relay";
+import { ThreadVmPolicy, WorkflowVmPolicyRecord } from "@t3tools/contracts/relay";
 import * as Schema from "effect/Schema";
 
 export const THREAD_VM_POLICY_FIELDS = [
@@ -68,3 +68,12 @@ export function parseThreadVmPolicyDraft(draft: ThreadVmPolicyDraft): ThreadVmPo
 
 export const THREAD_VM_POLICY_INPUT_ERROR =
   "Enter whole numbers for VM limits and durations, and a valid time zone such as UTC or Europe/Berlin. Durations must be at least 1.";
+
+export const WORKFLOW_VM_LIMIT_DESCRIPTION =
+  "Organization-wide. Counts starting and running VMs, including those kept ready after a run. Paused and saved VMs don’t count. Set 0 to block new starts and resumes.";
+export const WORKFLOW_VM_LIMIT_INPUT_ERROR = "Enter a whole number from 0 to 2,147,483,647.";
+const decodeWorkflowVmLimit = Schema.decodeUnknownSync(WorkflowVmPolicyRecord.fields.maxRunningVms);
+
+export function parseWorkflowVmLimit(value: string): number {
+  return decodeWorkflowVmLimit(Number(decodeWholeNumber(value.trim())));
+}

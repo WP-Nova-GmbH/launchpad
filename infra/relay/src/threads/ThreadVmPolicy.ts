@@ -1,11 +1,17 @@
-import { ThreadVmPolicy, type ThreadVmPolicyRecord } from "@t3tools/contracts/relay";
+import {
+  ThreadVmPolicy,
+  WorkflowVmPolicyRecord,
+  type ThreadVmPolicyRecord,
+} from "@t3tools/contracts/relay";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { ThreadPlacementConflict } from "./ThreadPlacementStore.ts";
+import { lockWorkflowVmOrganization } from "./WorkflowVmPolicyLock.ts";
 
 const decodePolicy = Schema.decodeEffect(ThreadVmPolicy);
+const decodeWorkflowPolicy = Schema.decodeUnknownEffect(WorkflowVmPolicyRecord);
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** Count actual elapsed weekday time, including nights; only Saturday/Sunday are excluded. */
@@ -53,6 +59,37 @@ export function savedDiskExpiresAt(savedAt: DateTime.Utc, policy: ThreadVmPolicy
 }
 
 export function makeThreadVmPolicyStore(sql: PgClient) {
+  const getWorkflow = Effect.fn("relay.workflow_vm.policy_get")(function* (organizationId: string) {
+    yield* sql`INSERT INTO relay_thread_vm_policies (organization_id) VALUES (${organizationId}) ON CONFLICT DO NOTHING`;
+    const [row] = yield* sql<WorkflowVmPolicyRecord>`SELECT organization_id AS "organizationId",
+      workflow_policy_revision AS revision, max_running_workflow_vms AS "maxRunningVms"
+      FROM relay_thread_vm_policies WHERE organization_id=${organizationId}`;
+    if (!row)
+      return yield* new ThreadPlacementConflict({ message: "Workflow VM policy is missing" });
+    return yield* decodeWorkflowPolicy(row);
+  });
+  const updateWorkflow = Effect.fn("relay.workflow_vm.policy_update")(function* (
+    input: WorkflowVmPolicyRecord,
+  ) {
+    const record = yield* decodeWorkflowPolicy(input);
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* lockWorkflowVmOrganization(sql, record.organizationId);
+        yield* getWorkflow(record.organizationId);
+        const [row] = yield* sql<WorkflowVmPolicyRecord>`UPDATE relay_thread_vm_policies
+          SET workflow_policy_revision=workflow_policy_revision+1,
+            max_running_workflow_vms=${record.maxRunningVms}
+          WHERE organization_id=${record.organizationId} AND workflow_policy_revision=${record.revision}
+          RETURNING organization_id AS "organizationId",workflow_policy_revision AS revision,
+            max_running_workflow_vms AS "maxRunningVms"`;
+        if (!row)
+          return yield* new ThreadPlacementConflict({
+            message: "Workflow VM limit changed; reload before saving",
+          });
+        return row;
+      }),
+    );
+  });
   const get = Effect.fn("relay.thread_vm.policy_get")(function* (organizationId: string) {
     yield* sql`INSERT INTO relay_thread_vm_policies (organization_id) VALUES (${organizationId}) ON CONFLICT DO NOTHING`;
     const [row] = yield* sql<
@@ -98,7 +135,7 @@ export function makeThreadVmPolicyStore(sql: PgClient) {
       }),
     );
   });
-  return { get, update };
+  return { get, update, getWorkflow, updateWorkflow };
 }
 
 /** Hold this before locking activity; policy edits recompute deadlines under the same order. */

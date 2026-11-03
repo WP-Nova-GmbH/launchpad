@@ -28,7 +28,7 @@ export const confirmThreadVmCleanupIdentity = Effect.fn("relay.thread_vm.cleanup
     },
   ) {
     const pending = yield* sql.unsafe(
-      `SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations WHERE allocation_id=$1 AND runtime_protocol='native-v1')
+      `SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations WHERE allocation_id=$1 AND runtime_protocol='native-v1' AND resource_kind='personal')
        UNION ALL SELECT 1 FROM relay_thread_vm_provisions WHERE allocation_id=$1 AND (phase IN ('pending','creating') OR ingress_recovery_claim_id IS NOT NULL)
        UNION ALL SELECT 1 FROM relay_thread_vm_pauses WHERE allocation_id=$1 AND pause_dispatch_claim_id IS NOT NULL
        UNION ALL SELECT 1 FROM relay_thread_vm_resumes WHERE allocation_id=$1 AND connect_claim_id IS NOT NULL

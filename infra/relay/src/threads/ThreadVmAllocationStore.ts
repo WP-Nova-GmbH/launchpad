@@ -12,32 +12,41 @@ export class ThreadVmAllocationConflict extends Schema.TaggedError<ThreadVmAlloc
   "ThreadVmAllocationConflict",
   { message: Schema.String },
 ) {}
-export interface ThreadVmAllocation {
+interface ThreadVmAllocationState {
   readonly allocationId: string;
   readonly threadId: string;
   readonly organizationId: string;
-  readonly ownerUserId: string;
   readonly templateId: string;
   readonly runtimeProtocol: "legacy" | "native-v1";
   readonly computeRef: string | null;
   readonly state: "creating" | "running" | "paused" | "deleting" | "deleted";
   readonly deletedAt: string | null;
 }
+export type ThreadVmAllocation = ThreadVmAllocationState &
+  (
+    | { readonly resourceKind: "personal"; readonly ownerUserId: string }
+    | { readonly resourceKind: "organization_workflow"; readonly ownerUserId: null }
+  );
+export type PersonalThreadVmAllocation = Extract<ThreadVmAllocation, { resourceKind: "personal" }>;
 type AllocationIntent = Omit<
-  ThreadVmAllocation,
-  "computeRef" | "state" | "deletedAt" | "runtimeProtocol"
+  PersonalThreadVmAllocation,
+  "computeRef" | "state" | "deletedAt" | "runtimeProtocol" | "resourceKind"
 >;
 const conflict = (message: string) => new ThreadVmAllocationConflict({ message });
 
 /** Private storage API: callers authorize the thread and reserve before contacting compute. */
 export function makeThreadVmAllocationStore(sql: PgClient) {
-  const get = Effect.fn("relay.thread_vm.get")(function* (allocationId: string) {
+  const getAny = Effect.fn("relay.thread_vm.get_any")(function* (allocationId: string) {
     const [row] =
       yield* sql<ThreadVmAllocation>`SELECT allocation_id AS "allocationId", thread_id AS "threadId",
-      organization_id AS "organizationId", owner_user_id AS "ownerUserId", template_id AS "templateId",
+      organization_id AS "organizationId", owner_user_id AS "ownerUserId", resource_kind AS "resourceKind", template_id AS "templateId",
       compute_ref AS "computeRef",runtime_protocol AS "runtimeProtocol", state, deleted_at AS "deletedAt"
       FROM relay_thread_vm_allocations WHERE allocation_id = ${allocationId}`;
     return row ?? null;
+  });
+  const get = Effect.fn("relay.thread_vm.get")(function* (allocationId: string) {
+    const row = yield* getAny(allocationId);
+    return row?.resourceKind === "personal" ? row : null;
   });
   const lock = Effect.fnUntraced(function* (allocationId: string) {
     yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id = ${allocationId} FOR UPDATE`;
@@ -64,13 +73,14 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
         // Recovery reserves its destination ID before stopping the source. Share
         // this namespace lock with admission, including across different owners.
         yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.allocationId}, 721865))`;
-        const prior = yield* get(input.allocationId);
+        const prior = yield* getAny(input.allocationId);
         if (prior) {
           if (prior.runtimeProtocol !== "native-v1")
             return yield* conflict(
               "This VM belongs to an earlier runtime and requires manual migration.",
             );
           if (
+            prior.resourceKind !== "personal" ||
             prior.threadId !== input.threadId ||
             prior.ownerUserId !== input.ownerUserId ||
             prior.organizationId !== input.organizationId ||
@@ -146,7 +156,8 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
           });
         const threads =
           yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id = ${input.threadId}
-        AND organization_id = ${input.organizationId} FOR UPDATE`;
+        AND organization_id = ${input.organizationId} AND audience='private'
+          AND owner_user_id=${input.ownerUserId} AND environment_id IS NOT NULL AND project_id IS NOT NULL FOR UPDATE`;
         if (!threads.length)
           return yield* conflict("Thread does not belong to the allocation organization");
         const saved = yield* sql<{ restoreOperationId: string | null; operationId: string | null }>`
@@ -320,5 +331,5 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
       }),
     );
   });
-  return { get, reserve, recordCreated, recordPowerState, requestDeletion, confirmDeleted };
+  return { get, getAny, reserve, recordCreated, recordPowerState, requestDeletion, confirmDeleted };
 }

@@ -31,8 +31,11 @@ vi.mock("../chat/ProviderModelPicker", () => ({ ProviderModelPicker: () => null 
 import { WorkflowStepEditor } from "./WorkflowStepEditor";
 const original: WorkflowDefinition = {
   name: "Example",
-  environmentId: EnvironmentId.make("environment"),
-  projectId: ProjectId.make("project"),
+  target: {
+    kind: "machine" as const,
+    environmentId: EnvironmentId.make("environment"),
+    projectId: ProjectId.make("project"),
+  },
   steps: [
     {
       id: "plan",

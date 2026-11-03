@@ -1,6 +1,8 @@
 import {
   ThreadMoveProgressReport,
   type RelayPortableThreadPlacement,
+  type RelayThreadPlacement,
+  isPrivateThreadPlacement,
   type ThreadMoveParticipantState,
   type ThreadMoveFailureDiagnostic,
 } from "@t3tools/contracts/relay";
@@ -124,11 +126,12 @@ export function makeThreadPlacementStore(sql: PgClient) {
         ),
       );
   });
-  const get = Effect.fn("relay.thread_placement.get")(function* (threadId: string) {
+  const getAny = Effect.fn("relay.thread_placement.get_any")(function* (threadId: string) {
     const [row] = yield* sql<
-      Placement & { localEnrollment: boolean }
+      RelayThreadPlacement & { localEnrollment: boolean }
     >`SELECT thread_id AS "threadId", organization_id AS "organizationId",
       repository_id AS "repositoryId", owner_user_id AS "ownerUserId", environment_id AS "environmentId",
+      audience, workflow_job_id AS "workflowJobId",
       project_id AS "projectId", generation, operation_id AS "operationId",
       CASE WHEN original_environment_id IS NULL THEN NULL ELSE
         jsonb_build_object('environmentId',original_environment_id,'projectId',original_project_id)
@@ -138,9 +141,104 @@ export function makeThreadPlacementStore(sql: PgClient) {
       FROM relay_thread_placements WHERE thread_id = ${threadId} AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=${threadId})`;
     if (!row) return null;
     const { originalLocation, localEnrollment, ...current } = row;
-    const placement: Placement = current;
+    const placement: RelayThreadPlacement = current;
     if (originalLocation != null) return { ...placement, originalLocation };
     return localEnrollment ? placement : { ...placement, originalLocation: null };
+  });
+  const get = Effect.fn("relay.thread_placement.get")(function* (threadId: string) {
+    const placement = yield* getAny(threadId);
+    if (placement?.audience !== "private" || !isPrivateThreadPlacement(placement)) return null;
+    const { audience: _audience, workflowJobId: _workflowJobId, ...privatePlacement } = placement;
+    return privatePlacement;
+  });
+  const prepareWorkflow = Effect.fn("relay.thread_placement.prepare_workflow")(function* (input: {
+    threadId: string;
+    workflowJobId: string;
+    organizationId: string;
+    repositoryId: string;
+    operationId: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const jobs = yield* sql`SELECT job_id FROM relay_workflow_jobs
+          WHERE job_id=${input.workflowJobId} AND organization_id=${input.organizationId}
+            AND repository_id=${input.repositoryId} AND record#>>'{workflow,definition,target,kind}'='vm'
+            AND status='preparing' AND record#>>'{runtime,kind}'='vm'
+            AND record#>>'{runtime,threadId}'=${input.threadId}
+          FOR SHARE`;
+        if (!jobs.length)
+          return yield* conflict("Workflow preparation has no matching accepted VM job");
+        yield* sql`INSERT INTO relay_thread_placements
+          (thread_id,organization_id,repository_id,audience,owner_user_id,workflow_job_id,
+            environment_id,project_id,generation,operation_id)
+          VALUES(${input.threadId},${input.organizationId},${input.repositoryId},'repository',NULL,
+            ${input.workflowJobId},NULL,NULL,1,${input.operationId})
+          ON CONFLICT DO NOTHING`;
+        yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${input.threadId} FOR UPDATE`;
+        const placement = yield* getAny(input.threadId);
+        if (
+          !placement ||
+          placement.audience !== "repository" ||
+          placement.workflowJobId !== input.workflowJobId ||
+          placement.organizationId !== input.organizationId ||
+          placement.repositoryId !== input.repositoryId ||
+          placement.generation !== 1 ||
+          placement.operationId !== input.operationId ||
+          placement.environmentId !== null ||
+          placement.projectId !== null
+        )
+          return yield* conflict("Workflow preparation identity is already assigned or changed");
+        return placement;
+      }),
+    );
+  });
+  const assignWorkflow = Effect.fn("relay.thread_placement.assign_workflow")(function* (input: {
+    threadId: string;
+    workflowJobId: string;
+    allocationId: string;
+    operationId: string;
+    environmentId: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${input.threadId} FOR UPDATE`;
+        const placement = yield* getAny(input.threadId);
+        if (
+          !placement ||
+          placement.audience !== "repository" ||
+          placement.generation !== 1 ||
+          placement.workflowJobId !== input.workflowJobId ||
+          placement.operationId !== input.operationId
+        )
+          return yield* conflict("Workflow preparation no longer owns this placement");
+        const bindings = yield* sql`SELECT b.environment_id FROM relay_thread_vm_allocations a
+          JOIN relay_thread_vm_provisions p USING(allocation_id)
+          JOIN relay_thread_vm_bindings b USING(allocation_id)
+          JOIN relay_thread_vm_enrollments e USING(allocation_id)
+          JOIN relay_environment_credentials c ON c.credential_id=b.credential_id
+          WHERE a.allocation_id=${input.allocationId} AND a.resource_kind='organization_workflow'
+            AND a.organization_id=${placement.organizationId} AND a.thread_id=${input.threadId}
+            AND a.state='running' AND a.deleted_at IS NULL AND p.operation_id=${input.operationId}
+            AND p.generation=1 AND p.phase='created' AND b.thread_id=${input.threadId}
+            AND b.repository_id=${placement.repositoryId} AND b.generation=1
+            AND b.environment_id=${input.environmentId} AND b.revoked_at IS NULL
+            AND e.environment_id=b.environment_id AND e.credential_id=b.credential_id
+            AND e.operation_id=${input.operationId} AND e.installed_at IS NOT NULL
+            AND c.environment_id=b.environment_id AND c.environment_public_key=b.environment_public_key
+            AND c.revoked_at IS NULL FOR SHARE OF a,b,e,c`;
+        if (!bindings.length)
+          return yield* conflict("Workflow assignment requires its installed VM identity");
+        const projectId = `vm:${input.threadId}`;
+        if (
+          placement.environmentId !== null &&
+          (placement.environmentId !== input.environmentId || placement.projectId !== projectId)
+        )
+          return yield* conflict("Workflow placement is already assigned to another environment");
+        yield* sql`UPDATE relay_thread_placements SET environment_id=${input.environmentId},project_id=${projectId}
+          WHERE thread_id=${input.threadId}`;
+        return (yield* getAny(input.threadId))!;
+      }),
+    );
   });
   const lock = Effect.fnUntraced(function* (threadId: string) {
     const rows =
@@ -599,6 +697,9 @@ export function makeThreadPlacementStore(sql: PgClient) {
 
   return {
     get,
+    getAny,
+    prepareWorkflow,
+    assignWorkflow,
     enroll,
     getMove,
     findMove,

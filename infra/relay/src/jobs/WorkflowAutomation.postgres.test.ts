@@ -374,7 +374,7 @@ describe.skipIf(!url)("automatic workflow production handoff", () => {
                 requiredProtocol: 8,
                 repositoryId: "repo-1",
                 workflowId: workflow.workflowId,
-                environmentId: workflow.definition.environmentId,
+                runtime: workflow.definition.target,
                 instruction: "Fixture issue",
                 status: "dispatching",
                 workflow: publishedWorkflow,

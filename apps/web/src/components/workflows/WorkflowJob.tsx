@@ -197,10 +197,12 @@ export function WorkflowJob({
     setOpeningResult(true);
     setResultError(null);
     try {
+      if (selectedJob.runtime?.kind !== "machine")
+        throw new Error("This run has no available machine execution binding.");
       const result = await openResult({
         threadId: selectedJob.progress.threadId,
         title: selectedJob.workflow?.definition.name ?? "Workflow result",
-        workflowResult: { ...scope, originalEnvironmentId: selectedJob.environmentId },
+        workflowResult: { ...scope, originalEnvironmentId: selectedJob.runtime.environmentId },
       });
       if (!owns()) return;
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
@@ -245,10 +247,10 @@ export function WorkflowJob({
         </Button>
       </div>
     );
+  const machine = selectedJob.runtime?.kind === "machine" ? selectedJob.runtime : null;
   const target = projects.find(
     (project) =>
-      project.environmentId === selectedJob.environmentId &&
-      (!selectedJob.workflow || project.projectId === selectedJob.workflow.definition.projectId),
+      project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
   const checkpointStep = selectedJob.workflow?.definition.steps.find(
     (step) => step.id === (checkpoint?.stepId ?? selectedJob.progress?.stepId),

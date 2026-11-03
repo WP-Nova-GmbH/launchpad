@@ -32,6 +32,8 @@ import {
   RelayThreadInboxEntry,
   RelayThreadPersistedReceipt,
   ThreadVmPolicyRecord,
+  WorkflowVmPolicyRecord,
+  WorkflowVmCapabilities,
 } from "./threadVm.ts";
 import {
   RepositoryWorkflow,
@@ -2502,6 +2504,7 @@ export const RelayHealthResponse = Schema.Struct({
   threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
   threadVmConfigured: Schema.optionalKey(Schema.Boolean),
   threadVmCapabilities: Schema.optionalKey(ThreadVmCapabilities),
+  workflowVmCapabilities: Schema.optionalKey(WorkflowVmCapabilities),
 });
 export type RelayHealthResponse = typeof RelayHealthResponse.Type;
 
@@ -3988,6 +3991,17 @@ const RelayThreadVmPolicyGroup = HttpApiGroup.make("threadVmPolicy")
       success: ThreadVmPolicyRecord,
       error: RelayTenancyErrors,
     }),
+    HttpApiEndpoint.get("getWorkflowVmPolicy", "/v1/organization/workflow-vm-policy", {
+      headers: RelayBearerRequestHeaders,
+      success: WorkflowVmPolicyRecord,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.put("updateWorkflowVmPolicy", "/v1/organization/workflow-vm-policy", {
+      headers: RelayBearerRequestHeaders,
+      payload: WorkflowVmPolicyRecord,
+      success: WorkflowVmPolicyRecord,
+      error: RelayTenancyErrors,
+    }),
   )
   .middleware(RelayClientAuth);
 
@@ -5004,6 +5018,14 @@ export type RelayApi = typeof RelayApi;
 export {
   RelayThreadPendingCommandPage,
   RelayPortableThreadPlacement,
+  RelayPrivateThreadPlacement,
+  RelayWorkflowThreadPlacement,
+  RelayPreparingWorkflowThreadPlacement,
+  RelayAssignedWorkflowThreadPlacement,
+  RelayThreadPlacement,
+  type RelayAssignedThreadPlacement,
+  isPrivateThreadPlacement,
+  isAssignedThreadPlacement,
   RelayThreadHistoryPage,
   RelayPortableThreadSummary,
   RelayPortableThreadPage,
@@ -5016,6 +5038,9 @@ export {
   RelayThreadPersistedReceipt,
   ThreadVmPolicy,
   ThreadVmPolicyRecord,
+  WorkflowVmPolicyRecord,
+  WorkflowVmCapabilities,
+  DEFAULT_WORKFLOW_VM_LIMIT,
   DEFAULT_THREAD_VM_POLICY,
   ThreadTransferChunkManifest,
   ThreadTransferPackedManifest,

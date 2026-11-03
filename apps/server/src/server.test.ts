@@ -14040,6 +14040,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         const now = DateTime.formatIso(TEST_EPOCH);
         const run: WorkflowRun = {
           jobId: "ownership-job",
+          runtime: {
+            kind: "machine",
+            environmentId: EnvironmentId.make("env"),
+            projectId: ProjectId.make("project"),
+          },
           userId: "user",
           repositoryCanonicalKey: "github.com/acme/repo",
           instruction: "Fix issue",
@@ -14069,8 +14074,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             updatedAt: now,
             definition: {
               name: "Implement",
-              environmentId: EnvironmentId.make("env"),
-              projectId: ProjectId.make("project"),
+              target: {
+                kind: "machine",
+                environmentId: EnvironmentId.make("env"),
+                projectId: ProjectId.make("project"),
+              },
               steps: [
                 {
                   id: "agent",

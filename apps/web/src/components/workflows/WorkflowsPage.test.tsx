@@ -171,8 +171,11 @@ const workflow: RepositoryWorkflow = {
   revision: 1,
   definition: {
     name: "Recovered workflow",
-    environmentId: EnvironmentId.make("environment"),
-    projectId: ProjectId.make("project"),
+    target: {
+      kind: "machine" as const,
+      environmentId: EnvironmentId.make("environment"),
+      projectId: ProjectId.make("project"),
+    },
     steps: [
       {
         id: "agent",
@@ -190,7 +193,7 @@ const row = (jobId: string) => ({
   jobId,
   repositoryId,
   workflowId: workflow.workflowId,
-  environmentId: workflow.definition.environmentId,
+  runtime: workflow.definition.target.kind === "machine" ? workflow.definition.target : null,
   instruction: jobId,
   status: "done" as const,
   detail: null,

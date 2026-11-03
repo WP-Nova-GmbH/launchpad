@@ -4,6 +4,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 export const legacyWorkflowOffset = 16;
 export const combinedReaderMarker = "OrchestrationEvents_WorkflowPortableReaderV1";
+export const executionBindingReaderMarker = "OrchestrationEvents_WorkflowExecutionBindingReaderV1";
 export const workflowNames = [
   "RepositoryWorkflowJobs",
   "WorkflowCancellationFences",
@@ -90,6 +91,7 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
   combined: boolean,
   probeReceipt: boolean,
   checkoutOperationBoot: boolean,
+  executionBinding: boolean,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const schema = yield* sql<{
@@ -234,6 +236,40 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
     )
   )
     return yield* fail("The combined reader barrier is missing.");
+  if (executionBinding) {
+    for (const operation of ["INSERT", "UPDATE"]) {
+      if (
+        !schema.some(
+          (entry) =>
+            entry.type === "trigger" &&
+            entry.name === `execution_binding_reader_${operation}` &&
+            entry.sql?.includes(executionBindingReaderMarker),
+        ) ||
+        !schema.some(
+          (entry) =>
+            entry.type === "trigger" &&
+            entry.name === `execution_binding_slot_${operation}` &&
+            entry.sql?.includes("$.runtime.environmentId"),
+        )
+      )
+        return yield* fail("Workflow execution binding guards are missing.");
+    }
+    if (
+      !schema.some(
+        (entry) =>
+          entry.type === "index" &&
+          entry.name === "repository_workflow_execution_slot" &&
+          entry.sql?.includes("$.runtime.environmentId"),
+      ) ||
+      !schema.some(
+        (entry) =>
+          entry.type === "trigger" &&
+          entry.name === "workflow_portable_reader_preserve" &&
+          entry.sql?.includes(executionBindingReaderMarker),
+      )
+    )
+      return yield* fail("The workflow execution binding fence is missing.");
+  }
 });
 
 /** Recognizes only the two shipped histories, before any ledger writes. */
@@ -261,7 +297,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
       return yield* fail("Migration IDs must be positive.");
     const legacy = recorded.some((row) => row.migration_id === 60 && row.name === workflowNames[0]);
     const highest = Math.max(0, ...recorded.map((row) => row.migration_id));
-    const through = Math.min(highest, 88);
+    const through = Math.min(highest, 89);
     const marker = recorded.find((row) => row.migration_id === 1)?.name;
     const has = (id: number, name: string) =>
       recorded.some((row) => row.migration_id === id && row.name === name);
@@ -284,7 +320,8 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
       sharedMarker ||
       workflowBarrier ||
       (!legacy && vmVersion !== undefined && vmVersion <= vmThrough) ||
-      (marker === combinedReaderMarker && combined);
+      (marker === combinedReaderMarker && combined) ||
+      (marker === executionBindingReaderMarker && through >= 89);
     if (recorded.length && !knownMarker)
       return yield* fail(`Invalid reader marker ${marker ?? "missing"}.`);
     const limit = legacy ? highest : through;
@@ -299,7 +336,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
         );
     }
     // Unknown future rows remain tolerated only after the complete known prefix.
-    if (!legacy && highest > 88 && through !== 88)
+    if (!legacy && highest > 89 && through !== 89)
       return yield* fail("Future migration skips the required prefix.");
     if (through >= 59)
       yield* verifySchema(
@@ -308,6 +345,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
         combined,
         !legacy && through >= 85,
         !legacy && through >= 88,
+        !legacy && through >= 89,
       );
     return {
       kind: legacy ? ("legacy-workflow" as const) : ("canonical" as const),
@@ -315,6 +353,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
         workflowBarrier ||
         vmVersion !== undefined ||
         marker === combinedReaderMarker ||
+        marker === executionBindingReaderMarker ||
         marker === "OrchestrationEvents_ThreadCleanupReaderV1",
       through,
     };

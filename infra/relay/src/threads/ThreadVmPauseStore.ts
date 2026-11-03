@@ -45,7 +45,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           JOIN relay_thread_vm_ready s ON s.allocation_id = a.allocation_id
           JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
           JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-          WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'started'
+          WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND c.state = 'started'
             AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
             AND p.phase = 'created' AND s.phase = 'ready' AND b.revoked_at IS NULL
             AND b.generation = p.generation AND t.environment_id = b.environment_id
@@ -102,7 +102,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
             allocationId: string;
           }>`SELECT a.allocation_id AS "allocationId" FROM relay_thread_vm_allocations a
         JOIN relay_thread_vm_bindings b USING(allocation_id)
-        WHERE a.runtime_protocol='native-v1' AND a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
           AND b.environment_id=${input.environmentId} AND b.generation=${input.generation} AND b.revoked_at IS NULL FOR UPDATE OF a`;
           if (!allocation) return false;
           const rows =
@@ -135,7 +135,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           JOIN relay_thread_vm_bindings b ON b.allocation_id = x.allocation_id
             AND b.generation = x.generation AND b.revoked_at IS NULL
           JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-          WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND x.phase IN ('pending','sealed')
+          WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND x.phase IN ('pending','sealed')
             AND a.state = 'running' AND a.deleted_at IS NULL
             AND t.generation = x.generation AND t.environment_id = b.environment_id
             AND t.operation_id IS NULL
@@ -190,7 +190,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           AND x.pause_dispatched_at IS NULL AND x.pause_dispatch_claim_id IS NULL
           AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a JOIN relay_thread_placements t USING(thread_id)
             JOIN relay_thread_vm_bindings b USING(allocation_id) JOIN relay_thread_vm_provisions p USING(allocation_id)
-            WHERE a.runtime_protocol='native-v1' AND a.allocation_id=x.allocation_id AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${claim.computeRef}
+            WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=x.allocation_id AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${claim.computeRef}
               AND t.thread_id=${claim.threadId} AND t.generation=x.generation AND t.operation_id IS NULL
               AND b.generation=x.generation AND b.environment_id=t.environment_id AND b.revoked_at IS NULL
               AND p.phase='created' AND p.operation_id=${claim.provisionOperationId})
@@ -207,7 +207,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
       yield* sql`UPDATE relay_thread_vm_pauses x SET pause_dispatch_claim_id=NULL,pause_acknowledged_at=clock_timestamp()
       WHERE x.allocation_id=${claim.allocationId} AND x.operation_id=${claim.operationId} AND x.generation=${claim.generation}
         AND x.pause_dispatch_claim_id=${claim.claimId} AND x.pause_dispatched_at IS NOT NULL
-        AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.runtime_protocol='native-v1' AND a.allocation_id=x.allocation_id AND a.thread_id=${claim.threadId} AND a.compute_ref=${claim.computeRef})
+        AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=x.allocation_id AND a.thread_id=${claim.threadId} AND a.compute_ref=${claim.computeRef})
       RETURNING x.allocation_id`;
     return rows.length === 1;
   });

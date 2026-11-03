@@ -22,6 +22,7 @@ import {
   type RelayCodexVmSignInAttempt,
   type RelayHealthResponse,
   type ThreadVmPolicyRecord,
+  type WorkflowVmPolicyRecord,
   type RelayThreadVmStatus,
   type RelayThreadVmProviderAuth,
   type RelayThreadVmProviderAuthRequest,
@@ -422,6 +423,13 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly getThreadVmPolicy: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ThreadVmPolicyRecord, ManagedRelayClientError>;
+    readonly getWorkflowVmPolicy: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<WorkflowVmPolicyRecord, ManagedRelayClientError>;
+    readonly updateWorkflowVmPolicy: (input: {
+      readonly clerkToken: string;
+      readonly payload: WorkflowVmPolicyRecord;
+    }) => Effect.Effect<WorkflowVmPolicyRecord, ManagedRelayClientError>;
     readonly updateThreadVmPolicy: (input: {
       readonly clerkToken: string;
       readonly payload: ThreadVmPolicyRecord;
@@ -656,6 +664,8 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
       "clientRuntime.managedRelayTenancy.cancelThreadVmReplacement",
     ),
     getThreadVmPolicy: unavailable("clientRuntime.managedRelayTenancy.getThreadVmPolicy"),
+    getWorkflowVmPolicy: unavailable("clientRuntime.managedRelayTenancy.getWorkflowVmPolicy"),
+    updateWorkflowVmPolicy: unavailable("clientRuntime.managedRelayTenancy.updateWorkflowVmPolicy"),
     updateThreadVmPolicy: unavailable("clientRuntime.managedRelayTenancy.updateThreadVmPolicy"),
     listMachines: unavailable("clientRuntime.managedRelayTenancy.listMachines"),
     provisionMachine: unavailable("clientRuntime.managedRelayTenancy.provisionMachine"),
@@ -1734,6 +1744,33 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmPolicy"),
+      withRelayClientTracing,
+    ),
+    getWorkflowVmPolicy: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVmPolicy
+          .getWorkflowVmPolicy({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.mapError(relayRequestError("read workflow VM limit")),
+            timeoutRelayRequest("Workflow VM limit read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getWorkflowVmPolicy"),
+      withRelayClientTracing,
+    ),
+    updateWorkflowVmPolicy: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVmPolicy
+          .updateWorkflowVmPolicy({
+            headers: bearerHeaders(input.clerkToken),
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("save workflow VM limit")),
+            timeoutRelayRequest("Workflow VM limit update"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.updateWorkflowVmPolicy"),
       withRelayClientTracing,
     ),
     updateThreadVmPolicy: Effect.fnUntraced(

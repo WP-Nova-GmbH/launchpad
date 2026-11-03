@@ -16,10 +16,8 @@ import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 
 const fixture = Effect.fnUntraced(function* (state: "running" | "paused" = "running") {
-  const f = yield* finalSaveCatalogFixture(state),
-    organizationId = NodeCrypto.randomUUID();
-  yield* f.sql`UPDATE relay_thread_placements SET organization_id=${organizationId} WHERE thread_id=${f.threadId}`;
-  yield* f.sql`UPDATE relay_thread_vm_allocations SET organization_id=${organizationId} WHERE allocation_id=${f.input.allocationId}`;
+  const organizationId = NodeCrypto.randomUUID();
+  const f = yield* finalSaveCatalogFixture(state, organizationId);
   const policies = makeThreadVmPolicyStore(f.sql),
     policy = yield* policies.get(organizationId);
   return {
@@ -94,6 +92,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                     operationId: f.input.operationId,
                     environmentId: f.sourceEnvironmentId,
                     generation: 1,
+                    bootId: NodeCrypto.randomUUID(),
+                    sealEpoch: 1,
                     nativeCheckpointOperationId: point!.operationId,
                   });
                   expect((yield* operation(f))?.phase).toBe("frozen");
@@ -110,6 +110,9 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
           Effect.scoped(
             Effect.gen(function* () {
               const f = yield* fixture(state);
+              const backups = f.sql`SELECT operation_id FROM relay_thread_vm_backups
+                WHERE allocation_id=${f.input.allocationId} ORDER BY operation_id`;
+              const backupsBefore = yield* backups;
               expect(yield* f.worker.runOne()).toBe(true);
               const saved = (yield* operation(f))!;
               expect(saved).toMatchObject({
@@ -123,9 +126,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               expect(
                 yield* f.sql`SELECT 1 FROM relay_thread_vm_resumes WHERE allocation_id=${f.input.allocationId}`,
               ).toHaveLength(0);
-              expect(
-                yield* f.sql`SELECT 1 FROM relay_thread_vm_backups WHERE allocation_id=${f.input.allocationId}`,
-              ).toHaveLength(0);
+              expect(yield* backups).toEqual(backupsBefore);
               expect(yield* f.worker.runOne()).toBe(false);
               expect((yield* deadlines(f)).witnessed).toBe(true);
             }),

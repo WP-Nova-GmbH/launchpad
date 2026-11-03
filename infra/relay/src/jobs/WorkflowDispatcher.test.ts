@@ -22,7 +22,11 @@ import { Workflows, type WorkflowJobRecord } from "./Workflows.ts";
 import { refreshWorkflowJob, validateWorkflowTarget } from "./WorkflowDispatcher.ts";
 
 const NOW = "2026-10-08T12:00:00.000Z";
-const workflow: RepositoryWorkflow = {
+const workflow: RepositoryWorkflow & {
+  definition: RepositoryWorkflow["definition"] & {
+    target: Extract<RepositoryWorkflow["definition"]["target"], { kind: "machine" }>;
+  };
+} = {
   workflowId: "flow-1",
   organizationId: "org-1",
   repositoryId: "repo-1",
@@ -32,8 +36,11 @@ const workflow: RepositoryWorkflow = {
   updatedAt: NOW,
   definition: {
     name: "Implement",
-    environmentId: EnvironmentId.make("env-1"),
-    projectId: ProjectId.make("project-1"),
+    target: {
+      kind: "machine",
+      environmentId: EnvironmentId.make("env-1"),
+      projectId: ProjectId.make("project-1"),
+    },
     steps: [
       {
         id: "agent",
@@ -80,7 +87,7 @@ const initial: WorkflowJobRecord = {
     jobId: "job-1",
     repositoryId: "repo-1",
     workflowId: "flow-1",
-    environmentId: workflow.definition.environmentId,
+    runtime: null,
     instruction: "Fix issue",
     status: "queued",
     detail: null,
@@ -91,7 +98,7 @@ const initial: WorkflowJobRecord = {
   },
 };
 const accepted: WorkflowControlResult = {
-  protocol: 6,
+  protocol: 9,
   outcome: "accepted",
   detail: null,
   progress: {
@@ -104,7 +111,7 @@ const accepted: WorkflowControlResult = {
   },
 };
 const missing: WorkflowControlResult = {
-  protocol: 6,
+  protocol: 9,
   outcome: "missing",
   detail: null,
   progress: null,
@@ -125,7 +132,7 @@ const harness = Effect.gen(function* () {
     | "protocol2"
     | "protocol3"
     | "protocol5"
-    | "protocol7"
+    | "publishing"
     | "pause-waiting"
     | "cancel_during_approve"
   >("online");
@@ -313,7 +320,7 @@ const harness = Effect.gen(function* () {
               pendingControl: { userId: "canceller", response: { operation: "cancel" as const } },
             }));
           }
-          if (current === "protocol7") {
+          if (current === "publishing") {
             if (input.workflowControl?.operation === "start") {
               yield* Ref.update(offers, (all) => [
                 ...all,
@@ -325,7 +332,7 @@ const harness = Effect.gen(function* () {
                 accepted: true,
                 workflowResult: {
                   ...accepted,
-                  protocol: 7 as const,
+                  protocol: 9 as const,
                   actions: ["push" as const, "open_pull_request" as const],
                 },
               };
@@ -334,7 +341,7 @@ const harness = Effect.gen(function* () {
               accepted: false,
               workflowResult: {
                 ...((yield* Ref.get(reply)) ?? missing),
-                protocol: 7 as const,
+                protocol: 9 as const,
                 actions: ["push" as const, "open_pull_request" as const],
               },
             };
@@ -452,13 +459,13 @@ for (const operation of ["retry_preparation", "retry_cancellation"] as const)
           {
             organizationId: "org-1",
             repositoryId: "repo-1",
-            projectId: workflow.definition.projectId,
+            projectId: workflow.definition.target.projectId,
             ...response,
           },
           {
             organizationId: "org-1",
             repositoryId: "repo-1",
-            projectId: workflow.definition.projectId,
+            projectId: workflow.definition.target.projectId,
             ...response,
           },
         ],
@@ -566,11 +573,11 @@ it.effect(
     }),
 );
 
-it.effect("pins protocol 6 with the offer and rejects downgrade completion or approval", () =>
+it.effect("pins protocol 9 with the offer and rejects downgrade completion or approval", () =>
   Effect.gen(function* () {
     const h = yield* harness;
     yield* h.refresh;
-    assert.strictEqual((yield* Ref.get(h.row)).record.requiredProtocol, 6);
+    assert.strictEqual((yield* Ref.get(h.row)).record.requiredProtocol, 9);
     const progress = { ...accepted.progress!, status: "done" as const, revision: 20 };
     yield* Ref.set(h.reply, { ...accepted, progress });
     yield* Ref.set(h.mode, "protocol2");
@@ -854,7 +861,7 @@ it.effect("a saved Pause holds an accepted capacity waiter before any advancing 
 );
 
 it.effect(
-  "requires publishing capabilities before offering and retains protocol 7 across downgrade",
+  "requires publishing capabilities before offering and retains protocol 9 across downgrade",
   () =>
     Effect.gen(function* () {
       const h = yield* harness;
@@ -877,9 +884,9 @@ it.effect(
       const unsupported = yield* h.refresh;
       assert.equal(unsupported?.status, "queued");
       assert.equal((yield* Ref.get(h.offers)).length, 0);
-      yield* Ref.set(h.mode, "protocol7");
+      yield* Ref.set(h.mode, "publishing");
       assert.equal((yield* h.refresh)?.status, "running");
-      assert.equal((yield* Ref.get(h.row)).record.requiredProtocol, 7);
+      assert.equal((yield* Ref.get(h.row)).record.requiredProtocol, 9);
       assert.equal((yield* Ref.get(h.offers)).length, 1);
       yield* Ref.set(h.reply, {
         ...accepted,
@@ -889,7 +896,7 @@ it.effect(
       yield* Ref.set(h.mode, "online");
       const held = yield* h.refresh;
       assert.equal(held?.status, "running");
-      assert.equal(held?.requiredProtocol, 7);
+      assert.equal(held?.requiredProtocol, 9);
       assert.include(held!.detail!, "Update this environment");
     }),
 );
@@ -937,7 +944,43 @@ it.effect("keeps unoffered automation queued and never adopts the current manual
     assert.lengthOf(yield* Ref.get(h.controls), 0);
   }),
 );
-it.effect("a frozen automation offer probes protocol 8 before sending Start", () =>
+for (const outcome of ["accepted", "missing", "cancelled"] as const)
+  it.effect(`reconciles an uncertain protocol 8 offer through status (${outcome})`, () =>
+    Effect.gen(function* () {
+      const h = yield* harness;
+      yield* Ref.update(h.row, (row) => ({
+        ...row,
+        repositoryCanonicalKey: "github.com/acme/repo",
+        record: {
+          ...row.record,
+          workflow,
+          runtime: workflow.definition.target,
+          status: "dispatching" as const,
+          requiredProtocol: 8 as const,
+        },
+      }));
+      yield* Ref.set(h.reply, {
+        ...(outcome === "accepted" ? accepted : missing),
+        protocol: 8,
+        outcome,
+      });
+      const result = yield* h.refresh;
+      assert.equal(
+        result?.status,
+        outcome === "accepted" ? "running" : outcome === "cancelled" ? "cancelled" : "dispatching",
+      );
+      assert.isNotNull(result?.workflow);
+      assert.equal(result?.requiredProtocol, 8);
+      assert.isUndefined(result?.startAttempted);
+      assert.lengthOf(yield* Ref.get(h.offers), 0);
+      assert.deepEqual(
+        (yield* Ref.get(h.controls)).map((entry) => entry.operation),
+        ["status"],
+      );
+    }),
+  );
+
+it.effect("a frozen automation offer remains pinned until its executor can reconcile", () =>
   Effect.gen(function* () {
     const h = yield* harness;
     const origin = {
@@ -962,10 +1005,12 @@ it.effect("a frozen automation offer probes protocol 8 before sending Start", ()
         ...row.record,
         origin,
         workflow,
+        runtime: workflow.definition.target,
         status: "dispatching" as const,
         requiredProtocol: 8 as const,
       },
     }));
+    yield* Ref.set(h.reply, { ...missing, protocol: 7 as const });
     const result = yield* h.refresh;
     assert.equal(result?.status, "dispatching");
     assert.equal(result?.requiredProtocol, 8);

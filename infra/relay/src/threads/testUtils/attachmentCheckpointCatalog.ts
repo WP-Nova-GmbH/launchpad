@@ -13,15 +13,17 @@ import { makeThreadAttachmentCheckpointTransfer } from "../../../../../apps/serv
 import { makeThreadAttachmentCheckpointStore } from "../ThreadAttachmentCheckpointStore.ts";
 import { makeThreadJournalStore } from "../ThreadJournalStore.ts";
 import {
-  nativeCheckpointCatalogFixture,
+  makeNativeCheckpointCatalogFixture,
   packedCheckpoint,
   nativeId,
 } from "./nativeCheckpointCatalog.ts";
 
 const decodeEvent = Schema.decodeUnknownSync(OrchestrationEvent);
 const serverState = OrchestrationEventStoreLive.pipe(Layer.provideMerge(SqlitePersistenceMemory));
-export const attachmentCheckpointCatalogFixture = Effect.gen(function* () {
-  const f = yield* nativeCheckpointCatalogFixture;
+export const makeAttachmentCheckpointCatalogFixture = Effect.fnUntraced(function* (
+  organizationId?: string,
+) {
+  const f = yield* makeNativeCheckpointCatalogFixture(organizationId);
   const sourceEnvironmentId = `source-${f.threadId}`;
   yield* f.sql`UPDATE relay_thread_placements SET environment_id=${sourceEnvironmentId} WHERE thread_id=${f.threadId}`;
   const bundle = yield* Effect.gen(function* () {
@@ -166,6 +168,8 @@ export const attachmentCheckpointCatalogFixture = Effect.gen(function* () {
     recovery,
   };
 });
+
+export const attachmentCheckpointCatalogFixture = makeAttachmentCheckpointCatalogFixture();
 
 /** Packs real event-store history. The caller reserves any capture operation before publication. */
 export const laterAttachmentCheckpoint = Effect.fnUntraced(function* (

@@ -91,7 +91,7 @@ export function makeThreadVmFinalSaveStore(
       const [owned] = yield* sql`SELECT 1 FROM relay_thread_placements t
         JOIN relay_thread_vm_allocations a ON a.thread_id=t.thread_id
         JOIN relay_thread_vm_bindings b ON b.allocation_id=a.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND t.thread_id=${current.threadId} AND t.operation_id=${operationId}
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND t.thread_id=${current.threadId} AND t.operation_id=${operationId}
           AND t.environment_id=${current.environmentId} AND t.generation=${current.generation}
           AND a.allocation_id=${current.allocationId} AND a.compute_ref=${current.computeRef}
           AND a.deleted_at IS NULL AND b.environment_id=t.environment_id AND b.generation=t.generation
@@ -127,7 +127,7 @@ export function makeThreadVmFinalSaveStore(
   const requireStillIdle = Effect.fnUntraced(function* (operation: FinalSave) {
     const [idle] =
       yield* sql`SELECT 1 FROM relay_thread_vm_allocations a JOIN relay_thread_vm_activity v USING(allocation_id)
-      WHERE a.runtime_protocol='native-v1' AND a.allocation_id=${operation.allocationId} AND a.state=${operation.originalState}
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=${operation.allocationId} AND a.state=${operation.originalState}
         AND date_trunc('milliseconds',v.idle_since)=${operation.idleSince}::timestamptz
         AND (a.state='paused' OR v.activity='idle')`;
     if (!idle) return yield* conflict("New source activity changed the final-save idle boundary.");
@@ -192,7 +192,7 @@ export function makeThreadVmFinalSaveStore(
         FROM relay_thread_vm_allocations a JOIN relay_thread_vm_bindings b USING(allocation_id)
         JOIN relay_thread_vm_provisions p USING(allocation_id) JOIN relay_thread_vm_ready s USING(allocation_id)
         JOIN relay_thread_vm_activity v USING(allocation_id)
-        JOIN LATERAL (SELECT host_id,state FROM relay_thread_vm_capacity WHERE a.runtime_protocol='native-v1' AND allocation_id=a.allocation_id ORDER BY position DESC LIMIT 1) c ON true
+        JOIN LATERAL (SELECT host_id,state FROM relay_thread_vm_capacity WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND allocation_id=a.allocation_id ORDER BY position DESC LIMIT 1) c ON true
         WHERE a.allocation_id=${input.allocationId} AND a.thread_id=${input.threadId}
           AND a.owner_user_id=${input.actorUserId} AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
           AND b.environment_id=${placement.environmentId} AND b.generation=${placement.generation} AND b.revoked_at IS NULL
@@ -437,7 +437,7 @@ export function makeThreadVmFinalSaveStore(
         const [candidate] = yield* sql<{
           operationId: string;
         }>`SELECT f.operation_id AS "operationId" FROM relay_thread_vm_final_saves f
-        JOIN relay_thread_placements t USING(thread_id) WHERE f.host_id=${hostId} AND (( ${step}='delete' AND f.phase='deleting') OR (${step}='save' AND f.phase IN ('frozen','saving')) OR (${step}='abort' AND f.phase='aborting'))
+        JOIN relay_thread_placements t USING(thread_id) WHERE t.audience='private' AND f.host_id=${hostId} AND (( ${step}='delete' AND f.phase='deleting') OR (${step}='save' AND f.phase IN ('frozen','saving')) OR (${step}='abort' AND f.phase='aborting'))
           AND t.operation_id=f.operation_id AND f.retry_at<=clock_timestamp()
           AND (${step}!='abort' OR NOT EXISTS(SELECT 1 FROM relay_thread_vm_backups x WHERE x.operation_id=f.backup_operation_id AND x.claim_until>clock_timestamp()))
           AND (f.claim_until IS NULL OR f.claim_until<=clock_timestamp())
@@ -786,7 +786,7 @@ export function makeThreadVmFinalSaveStore(
             JOIN relay_thread_vm_allocations a ON a.allocation_id=${operation.allocationId} AND a.thread_id=t.thread_id
             JOIN relay_thread_vm_bindings b USING(allocation_id)
             JOIN relay_environment_credentials k USING(credential_id)
-            WHERE a.runtime_protocol='native-v1' AND a.state='running' AND a.deleted_at IS NULL
+            WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.state='running' AND a.deleted_at IS NULL
               AND a.compute_ref=${operation.computeRef} AND t.thread_id=${input.threadId}
               AND t.environment_id=${input.environmentId} AND t.generation=${input.generation}
               AND t.owner_user_id=a.owner_user_id AND b.environment_id=t.environment_id

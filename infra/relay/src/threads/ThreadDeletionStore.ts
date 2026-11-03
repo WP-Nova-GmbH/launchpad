@@ -154,9 +154,12 @@ export function makeThreadDeletionStore(sql: PgClient) {
       Effect.gen(function* () {
         const [row] = yield* sql<{
           threadId: string;
-        }>`SELECT thread_id AS "threadId" FROM relay_thread_deletions d WHERE host_id=${hostId} AND phase!='completed' AND retry_at<=clock_timestamp() AND (claim_until IS NULL OR claim_until<=clock_timestamp())
+        }>`SELECT d.thread_id AS "threadId" FROM relay_thread_deletions d
+        JOIN relay_thread_placements t ON t.thread_id=d.thread_id
+        WHERE t.audience='private' AND t.owner_user_id=d.owner_user_id
+          AND d.host_id=${hostId} AND d.phase!='completed' AND d.retry_at<=clock_timestamp() AND (d.claim_until IS NULL OR d.claim_until<=clock_timestamp())
           AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.thread_id=d.thread_id AND a.runtime_protocol!='native-v1')
-          ORDER BY retry_at,created_at,thread_id LIMIT 1 FOR UPDATE SKIP LOCKED`;
+          ORDER BY d.retry_at,d.created_at,d.thread_id LIMIT 1 FOR UPDATE OF d SKIP LOCKED`;
         if (!row) return null;
         const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
         yield* sql`UPDATE relay_thread_deletions SET claim_id=${claimId},claim_until=clock_timestamp()+interval '3 minutes' WHERE thread_id=${row.threadId}`;

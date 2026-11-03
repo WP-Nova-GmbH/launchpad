@@ -88,13 +88,23 @@ export const ThreadVmPolicyRecord = Schema.Struct({
 });
 export type ThreadVmPolicyRecord = typeof ThreadVmPolicyRecord.Type;
 
-export const RelayPortableThreadPlacement = Schema.Struct({
+export const WorkflowVmPolicyRecord = Schema.Struct({
+  organizationId: TrimmedNonEmptyString,
+  revision: PositiveInt,
+  maxRunningVms: NonNegativeInt.check(Schema.isLessThanOrEqualTo(2_147_483_647)),
+});
+export type WorkflowVmPolicyRecord = typeof WorkflowVmPolicyRecord.Type;
+export const DEFAULT_WORKFLOW_VM_LIMIT = 10;
+export const WorkflowVmCapabilities = Schema.Struct({
+  configuration: Schema.Boolean,
+  execution: Schema.Boolean,
+});
+export type WorkflowVmCapabilities = typeof WorkflowVmCapabilities.Type;
+
+const threadPlacementFields = {
   threadId: TrimmedNonEmptyString,
   organizationId: TrimmedNonEmptyString,
   repositoryId: TrimmedNonEmptyString,
-  ownerUserId: TrimmedNonEmptyString,
-  environmentId: TrimmedNonEmptyString,
-  projectId: TrimmedNonEmptyString,
   generation: PositiveInt,
   operationId: Schema.NullOr(TrimmedNonEmptyString),
   // Missing means unresolved; null identifies a VM-created thread with no original local project.
@@ -113,8 +123,70 @@ export const RelayPortableThreadPlacement = Schema.Struct({
   moveFailures: Schema.optionalKey(
     Schema.Array(ThreadMoveFailureDiagnostic).check(Schema.isMaxLength(2)),
   ),
+};
+
+export const RelayPrivateThreadPlacement = Schema.Struct({
+  ...threadPlacementFields,
+  audience: Schema.optionalKey(Schema.Literal("private")),
+  workflowJobId: Schema.optionalKey(Schema.Null),
+  ownerUserId: TrimmedNonEmptyString,
+  environmentId: TrimmedNonEmptyString,
+  projectId: TrimmedNonEmptyString,
 });
+export type RelayPrivateThreadPlacement = typeof RelayPrivateThreadPlacement.Type;
+// Existing portable-thread endpoints authorize private assigned threads only.
+export const RelayPortableThreadPlacement = RelayPrivateThreadPlacement;
 export type RelayPortableThreadPlacement = typeof RelayPortableThreadPlacement.Type;
+
+export const RelayAssignedWorkflowThreadPlacement = Schema.Struct({
+  ...threadPlacementFields,
+  audience: Schema.Literal("repository"),
+  workflowJobId: TrimmedNonEmptyString,
+  ownerUserId: Schema.Null,
+  environmentId: TrimmedNonEmptyString,
+  projectId: TrimmedNonEmptyString,
+});
+export type RelayAssignedWorkflowThreadPlacement = typeof RelayAssignedWorkflowThreadPlacement.Type;
+export const RelayPreparingWorkflowThreadPlacement = Schema.Struct({
+  ...threadPlacementFields,
+  audience: Schema.Literal("repository"),
+  workflowJobId: TrimmedNonEmptyString,
+  ownerUserId: Schema.Null,
+  environmentId: Schema.Null,
+  projectId: Schema.Null,
+  generation: Schema.Literal(1),
+  operationId: TrimmedNonEmptyString,
+  originalLocation: Schema.optionalKey(Schema.Null),
+});
+export type RelayPreparingWorkflowThreadPlacement =
+  typeof RelayPreparingWorkflowThreadPlacement.Type;
+export const RelayWorkflowThreadPlacement = Schema.Union([
+  RelayPreparingWorkflowThreadPlacement,
+  RelayAssignedWorkflowThreadPlacement,
+]);
+export type RelayWorkflowThreadPlacement = typeof RelayWorkflowThreadPlacement.Type;
+export const RelayThreadPlacement = Schema.Union([
+  RelayPrivateThreadPlacement,
+  RelayWorkflowThreadPlacement,
+]);
+export type RelayThreadPlacement = typeof RelayThreadPlacement.Type;
+export type RelayAssignedThreadPlacement =
+  | RelayPrivateThreadPlacement
+  | RelayAssignedWorkflowThreadPlacement;
+
+/** A private API result stays distinct from repository workflow metadata. */
+export function isPrivateThreadPlacement(
+  placement: RelayThreadPlacement,
+): placement is RelayPrivateThreadPlacement {
+  return placement.audience !== "repository";
+}
+
+/** An unassigned preparation record carries no current environment authority. */
+export function isAssignedThreadPlacement(
+  placement: RelayThreadPlacement,
+): placement is RelayAssignedThreadPlacement {
+  return placement.environmentId !== null;
+}
 /** Effective relay features; policy values alone do not enable a worker. */
 export const ThreadVmCapabilities = Schema.Struct({
   configured: Schema.Boolean,

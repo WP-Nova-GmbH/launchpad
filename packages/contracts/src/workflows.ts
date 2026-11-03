@@ -72,10 +72,29 @@ export function workflowDefinitionError(steps: ReadonlyArray<WorkflowStep>): str
   }
   return null;
 }
-export const WorkflowDefinition = Schema.Struct({
-  name: Label,
+export const WorkflowMachineTarget = Schema.Struct({
+  kind: Schema.Literal("machine"),
   environmentId: EnvironmentId,
   projectId: ProjectId,
+});
+export type WorkflowMachineTarget = typeof WorkflowMachineTarget.Type;
+export const WorkflowVmTarget = Schema.Struct({
+  kind: Schema.Literal("vm"),
+  baseBranch: Schema.NullOr(TrimmedNonEmptyString),
+});
+export const WorkflowTarget = Schema.Union([WorkflowMachineTarget, WorkflowVmTarget]);
+export type WorkflowTarget = typeof WorkflowTarget.Type;
+/** Saved intent is independent of the execution binding accepted by a job. */
+export const WorkflowRuntime = Schema.Union([
+  WorkflowMachineTarget,
+  Schema.Struct({ kind: Schema.Literal("vm"), threadId: ThreadId }),
+]);
+export type WorkflowRuntime = typeof WorkflowRuntime.Type;
+export const WORKFLOW_PROTOCOL = 9;
+
+export const WorkflowDefinition = Schema.Struct({
+  name: Label,
+  target: WorkflowTarget,
   steps: Schema.Array(WorkflowStep).check(Schema.isMinLength(1), Schema.isMaxLength(32)),
 }).check(Schema.makeFilter((definition) => workflowDefinitionError(definition.steps) ?? true));
 export type WorkflowDefinition = typeof WorkflowDefinition.Type;
@@ -286,11 +305,11 @@ export const RepositoryWorkflowJob = Schema.Struct({
   origin: Schema.optional(WorkflowOrigin),
   originSummary: Schema.optional(WorkflowOriginSummary),
   /** Pinned with the offer so a downgrade cannot acknowledge newer lifecycle semantics. */
-  requiredProtocol: Schema.optional(Schema.Literals([2, 3, 4, 5, 6, 7, 8])),
+  requiredProtocol: Schema.optional(Schema.Literals([2, 3, 4, 5, 6, 7, 8, 9])),
   jobId: TrimmedNonEmptyString,
   repositoryId: TrimmedNonEmptyString,
   workflowId: TrimmedNonEmptyString,
-  environmentId: EnvironmentId,
+  runtime: Schema.NullOr(WorkflowRuntime),
   instruction: Instruction,
   status: Schema.Literals([
     "queued",
@@ -325,7 +344,7 @@ export const RepositoryWorkflowJobSummary = Schema.Struct({
   jobId: RepositoryWorkflowJob.fields.jobId,
   repositoryId: RepositoryWorkflowJob.fields.repositoryId,
   workflowId: RepositoryWorkflowJob.fields.workflowId,
-  environmentId: RepositoryWorkflowJob.fields.environmentId,
+  runtime: RepositoryWorkflowJob.fields.runtime,
   instruction: RepositoryWorkflowJob.fields.instruction,
   status: RepositoryWorkflowJob.fields.status,
   detail: RepositoryWorkflowJob.fields.detail,
@@ -368,6 +387,7 @@ export const WorkflowControl = Schema.Union([
     ...ControlBinding,
     operation: Schema.Literal("start"),
     workflow: RepositoryWorkflow,
+    runtime: WorkflowRuntime,
   }),
   Schema.Struct({
     ...ControlBinding,
@@ -402,7 +422,7 @@ export const WorkflowControl = Schema.Union([
 export type WorkflowControl = typeof WorkflowControl.Type;
 export const WorkflowControlResult = Schema.Struct({
   actions: Schema.optional(Schema.Array(Schema.Literals(["push", "open_pull_request"]))),
-  protocol: Schema.Literals([1, 2, 3, 4, 5, 6, 7, 8]),
+  protocol: Schema.Literals([1, 2, 3, 4, 5, 6, 7, 8, 9]),
   outcome: Schema.Literals(["accepted", "cancelled", "missing", "busy", "unavailable", "conflict"]),
   detail: Schema.NullOr(Schema.String),
   progress: Schema.NullOr(WorkflowJobProgress),

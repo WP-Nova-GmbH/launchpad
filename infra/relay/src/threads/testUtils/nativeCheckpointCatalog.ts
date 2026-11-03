@@ -139,7 +139,9 @@ export const packedCheckpoint = Effect.fnUntraced(function* (input: {
     chunkSizeBytes: 128,
   });
 });
-export const nativeCheckpointCatalogFixture = Effect.gen(function* () {
+export const makeNativeCheckpointCatalogFixture = Effect.fnUntraced(function* (
+  organizationId = "org",
+) {
   const sql = yield* PgClient.PgClient,
     fs = yield* FileSystem.FileSystem;
   const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "native-catalog-" }));
@@ -148,7 +150,7 @@ export const nativeCheckpointCatalogFixture = Effect.gen(function* () {
     threadId,
     environmentId: "local",
     projectId: "project",
-    organizationId: "org",
+    organizationId,
     repositoryId: "repo",
     ownerUserId: "user",
   });
@@ -199,3 +201,5 @@ export const nativeCheckpointCatalogFixture = Effect.gen(function* () {
     });
   return { sql, fs, root, threadId, objects, transfer, store, pack, upload, publish, mirror };
 });
+
+export const nativeCheckpointCatalogFixture = makeNativeCheckpointCatalogFixture();

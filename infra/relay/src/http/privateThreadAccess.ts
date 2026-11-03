@@ -22,9 +22,9 @@ export const withPrivateThreadOwnerAccess = <A, E, R>(
           const rows =
             mode === "write"
               ? yield* sql`SELECT thread_id FROM relay_thread_placements
-                WHERE thread_id = ${threadId} AND owner_user_id = ${userId} FOR UPDATE`
+                WHERE thread_id = ${threadId} AND audience='private' AND owner_user_id = ${userId} FOR UPDATE`
               : yield* sql`SELECT thread_id FROM relay_thread_placements
-                WHERE thread_id = ${threadId} AND owner_user_id = ${userId} FOR SHARE`;
+                WHERE thread_id = ${threadId} AND audience='private' AND owner_user_id = ${userId} FOR SHARE`;
           if (!rows.length) return yield* tenancyNotFound("thread_not_found");
           if ((yield* sql`SELECT 1 FROM relay_thread_deletions WHERE thread_id=${threadId}`).length)
             return yield* tenancyNotFound("thread_not_found");

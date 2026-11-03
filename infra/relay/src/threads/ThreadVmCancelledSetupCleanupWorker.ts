@@ -30,7 +30,7 @@ export function makeThreadVmCancelledSetupCleanupWorker(
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-      WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'started'
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND c.state = 'started'
         AND a.state = 'deleting' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
         AND p.phase = 'created' AND p.generation = 1
         AND t.operation_id = a.allocation_id AND t.generation = 1

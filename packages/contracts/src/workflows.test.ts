@@ -5,6 +5,7 @@ import {
   WorkflowDefinition,
   WorkflowCatalog,
   WorkflowJobPageQuery,
+  WorkflowRuntime,
   RespondToWorkflowJob,
   workflowZones,
   type WorkflowStep,
@@ -12,6 +13,7 @@ import {
 const decodeCatalog = Schema.decodeUnknownSync(WorkflowCatalog);
 const isDefinition = Schema.is(WorkflowDefinition);
 const isResponse = Schema.is(RespondToWorkflowJob);
+const isRuntime = Schema.is(WorkflowRuntime);
 const agent: WorkflowStep = {
   id: "implement",
   kind: "agent",
@@ -29,11 +31,33 @@ const input: WorkflowStep = {
 };
 const definition = (steps: ReadonlyArray<WorkflowStep>) => ({
   name: "Workflow",
-  environmentId: EnvironmentId.make("env"),
-  projectId: ProjectId.make("project"),
+  target: {
+    kind: "machine" as const,
+    environmentId: EnvironmentId.make("env"),
+    projectId: ProjectId.make("project"),
+  },
   steps,
 });
 describe("workflow boundaries", () => {
+  it("separates a VM's saved branch intent from a machine execution binding", () => {
+    expect(isDefinition({ ...definition([agent]), target: { kind: "vm", baseBranch: null } })).toBe(
+      true,
+    );
+    expect(
+      isDefinition({ ...definition([agent]), target: { kind: "vm", baseBranch: "release" } }),
+    ).toBe(true);
+    expect(
+      isDefinition({
+        name: "Legacy wire shape",
+        environmentId: "env",
+        projectId: "project",
+        steps: [agent],
+      }),
+    ).toBe(false);
+    expect(isRuntime({ kind: "machine", environmentId: "env" })).toBe(false);
+    expect(isRuntime({ kind: "vm", environmentId: "env", projectId: "project" })).toBe(false);
+    expect(isRuntime({ kind: "vm", threadId: "thread" })).toBe(true);
+  });
   it("accepts repeated kinds with stable IDs, Input first, and an explicit earlier rework target", () => {
     expect(
       isDefinition(

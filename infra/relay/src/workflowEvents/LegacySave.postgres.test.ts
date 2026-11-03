@@ -39,7 +39,7 @@ const result = {
   accepted: false,
   threadId: null,
   workflowResult: {
-    protocol: 8,
+    protocol: 9,
     outcome: "missing",
     detail: null,
     progress: null,
@@ -119,7 +119,7 @@ const ordered = Effect.fn(function* <A, E, R, B, F, S>(
   yield* Fiber.join(contender);
 });
 const project = {
-  projectId: definition.projectId,
+  projectId: definition.target.projectId,
   title: "Repository",
   repositoryCanonicalKey: "github.com/example/repository",
   createdAt: "2026-10-01T00:00:00.000Z",
@@ -151,7 +151,13 @@ describe("legacy workflow Save compatibility (PostgreSQL)", () => {
               revision: 1,
               projects: [project],
             });
-            next = { ...definition, environmentId: EnvironmentId.make("other-environment") };
+            next = {
+              ...definition,
+              target: {
+                ...definition.target,
+                environmentId: EnvironmentId.make("other-environment"),
+              },
+            };
           } else if (change === "project") {
             yield* (yield* OrganizationProjectCatalog).replace({
               organizationId: "org",
@@ -160,7 +166,10 @@ describe("legacy workflow Save compatibility (PostgreSQL)", () => {
               revision: 2,
               projects: [project, { ...project, projectId: ProjectId.make("other-project") }],
             });
-            next = { ...definition, projectId: ProjectId.make("other-project") };
+            next = {
+              ...definition,
+              target: { ...definition.target, projectId: ProjectId.make("other-project") },
+            };
           } else if (change === "add-action")
             next = { ...definition, steps: [...definition.steps, push] };
           const updated = yield* legacySave(saved, next);
@@ -284,12 +293,12 @@ describe("legacy workflow Save compatibility (PostgreSQL)", () => {
             expect((yield* Routing.read("flow"))?.record.automation?.enabled).toBe(false);
             expect((yield* receive(issue(payload.webhookTimestamp + 1))).status).toBe(200);
             const jobs = yield* sql<{
-              record: { environmentId: string; workflow: unknown };
+              record: { runtime: unknown; workflow: unknown };
             }>`SELECT record FROM relay_workflow_jobs`;
             expect(jobs).toHaveLength(admissionFirst ? 1 : 0);
             for (const job of jobs)
               expect(job.record).toMatchObject({
-                environmentId: definition.environmentId,
+                runtime: null,
                 workflow: null,
               });
           }),

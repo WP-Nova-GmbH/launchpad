@@ -68,7 +68,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
             JOIN relay_thread_vm_provisions p USING(allocation_id)
             JOIN relay_thread_placements t ON t.thread_id=a.thread_id
             JOIN relay_thread_vm_capacity c ON c.allocation_id=a.allocation_id
-            WHERE a.runtime_protocol='native-v1' AND a.allocation_id=${input.allocationId} AND a.compute_ref=${input.computeRef}
+            WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=${input.allocationId} AND a.compute_ref=${input.computeRef}
               AND a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
               AND t.generation=${input.generation} AND ${threadVmResumePlacement(sql)}
               AND t.owner_user_id=a.owner_user_id AND t.environment_id=b.environment_id
@@ -292,7 +292,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
               SELECT 1 FROM relay_thread_vm_backups z WHERE z.operation_id=f.backup_operation_id
                 AND z.source_receipt IS NOT NULL AND z.source_reopened_at IS NULL)))
           ORDER BY f.completed_at DESC,f.operation_id LIMIT 1) final ON true
-        WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND r.phase IN ('waiting','resuming')
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND r.phase IN ('waiting','resuming')
           AND c.state IN ('reserved','started') AND a.state IN ('paused','running')
           AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
           AND (a.native_paused_generation=r.generation OR (x.phase='completed' AND x.generation=r.generation))
@@ -321,7 +321,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
       JOIN relay_thread_vm_provisions p USING(allocation_id)
       JOIN relay_organization_members m ON m.organization_id=t.organization_id AND m.user_id=t.owner_user_id
       JOIN relay_repositories repo ON repo.repository_id=t.repository_id AND repo.organization_id=t.organization_id
-      WHERE a.runtime_protocol='native-v1' AND t.thread_id=${claim.threadId} AND t.generation=${claim.generation}
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND t.thread_id=${claim.threadId} AND t.generation=${claim.generation}
         AND (t.operation_id IS NULL OR t.operation_id=${claim.finalSaveOperationId}) AND ${threadVmResumePlacement(sql)}
         AND a.allocation_id=${claim.allocationId} AND a.compute_ref=${claim.computeRef} AND a.deleted_at IS NULL
         AND a.state IN ('paused','running') AND a.template_id=${claim.templateId}
@@ -391,7 +391,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
       WHERE r.allocation_id=${claim.allocationId} AND r.operation_id=${claim.operationId}
         AND r.generation=${claim.generation} AND r.connect_claim_id=${claim.claimId}
         AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a
-          WHERE a.runtime_protocol='native-v1' AND a.allocation_id=r.allocation_id AND a.thread_id=${claim.threadId} AND a.compute_ref=${claim.computeRef})
+          WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=r.allocation_id AND a.thread_id=${claim.threadId} AND a.compute_ref=${claim.computeRef})
       RETURNING r.allocation_id`;
     return rows.length === 1;
   });
@@ -436,7 +436,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
         yield* requireActive(claim);
         const rows = yield* sql`UPDATE relay_thread_vm_resumes r SET phase = 'completed',
       claim_id = NULL, claim_until = NULL FROM relay_thread_vm_allocations a
-      WHERE a.runtime_protocol='native-v1' AND r.allocation_id = ${claim.allocationId} AND r.operation_id = ${claim.operationId}
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND r.allocation_id = ${claim.allocationId} AND r.operation_id = ${claim.operationId}
         AND r.claim_id = ${claim.claimId} AND r.claim_until > clock_timestamp()
         AND r.phase = 'resuming' AND r.connect_claim_id IS NULL AND a.allocation_id = r.allocation_id
         AND a.state = 'running' AND a.compute_ref = ${claim.computeRef}

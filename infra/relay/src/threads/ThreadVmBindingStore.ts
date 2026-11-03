@@ -24,6 +24,7 @@ export function makeThreadVmBindingStore(sql: PgClient) {
         FROM relay_thread_vm_allocations a JOIN relay_thread_vm_provisions p USING (allocation_id)
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
         WHERE a.allocation_id = ${input.allocationId} AND p.operation_id = ${input.operationId}
+        AND a.resource_kind='personal' AND t.audience='private'
         AND a.state = 'running' AND a.deleted_at IS NULL AND p.phase = 'created' AND a.compute_ref IS NOT NULL
         FOR UPDATE OF a`;
         if (!allocation)

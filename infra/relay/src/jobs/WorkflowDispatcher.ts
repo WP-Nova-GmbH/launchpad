@@ -1,6 +1,7 @@
 import { WorkflowOrigin } from "@t3tools/contracts";
 import { RelayJobId } from "@t3tools/contracts/relay";
 import {
+  WORKFLOW_PROTOCOL,
   WorkflowInvalidError,
   WorkflowManualControl,
   isTerminalWorkflowJob,
@@ -56,7 +57,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       workflowOrigin: origin,
       ...(row!.pendingControl ? { requestedBy: row!.pendingControl.userId } : {}),
     });
-    const minimumProtocol = origin.kind === "automation" ? 8 : job.workflow === null ? 6 : 4;
+    const minimumProtocol =
+      job.workflow === null ? WORKFLOW_PROTOCOL : origin.kind === "automation" ? 8 : 4;
     if ((job.requiredProtocol ?? 2) < minimumProtocol) {
       row = yield* update(
         row!,
@@ -111,16 +113,21 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           job.repositoryId,
           workflow.definition,
         );
+        if (workflow.definition.target.kind !== "machine")
+          return yield* new WorkflowInvalidError({
+            message: "VM workflows are not available yet.",
+          });
+        const machineTarget = workflow.definition.target;
         const publishing = workflow.definition.steps.filter((step) => step.kind === "action");
-        const protocol = publishing.length ? 7 : 6;
+        const protocol = WORKFLOW_PROTOCOL;
         const binding = {
           organizationId: row!.organizationId,
           repositoryId: job.repositoryId,
-          projectId: workflow.definition.projectId,
+          projectId: machineTarget.projectId,
         };
         const probe = yield* connector.dispatchJob({
           ...dispatchIdentity(),
-          environmentId: workflow.definition.environmentId,
+          environmentId: machineTarget.environmentId,
           jobId: RelayJobId.make(jobId),
           repositoryCanonicalKey: canonicalKey,
           baseBranch: "HEAD",
@@ -145,7 +152,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           });
         job = {
           ...job,
-          environmentId: workflow.definition.environmentId,
+          runtime: machineTarget,
+          startAttempted: false,
           workflow,
           requiredProtocol: protocol,
           status: "dispatching",
@@ -162,10 +170,15 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         row = { ...row, repositoryCanonicalKey: canonicalKey };
       }
     }
+    const runtime = job.runtime;
+    if (runtime?.kind !== "machine" || workflow.definition.target.kind !== "machine")
+      return yield* new WorkflowInvalidError({
+        message: "This workflow has no supported execution binding.",
+      });
     const binding = {
       organizationId: row!.organizationId,
       repositoryId: job.repositoryId,
-      projectId: workflow.definition.projectId,
+      projectId: runtime.projectId,
     };
     const canonicalKey = row!.repositoryCanonicalKey;
     if (canonicalKey === null)
@@ -219,7 +232,50 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         return row.record;
       }
       control = { ...binding, ...response };
-    } else if (job.progress === null) control = { ...binding, operation: "start", workflow };
+    } else if (job.progress === null)
+      control = { ...binding, operation: "start", workflow, runtime };
+    if (control.operation === "start" && (job.requiredProtocol ?? 2) < WORKFLOW_PROTOCOL) {
+      const reconciled = yield* connector.dispatchJob({
+        ...dispatchIdentity(),
+        environmentId: runtime.environmentId,
+        jobId: RelayJobId.make(jobId),
+        repositoryCanonicalKey: canonicalKey,
+        baseBranch: "HEAD",
+        instruction: job.instruction,
+        workflowControl: { ...binding, operation: "status" },
+      });
+      const known = reconciled.workflowResult;
+      if (known?.outcome === "cancelled" && known.protocol >= (job.requiredProtocol ?? 2))
+        return (yield* update(
+          row!,
+          {
+            ...job,
+            status: "cancelled",
+            detail: known.detail ?? "Cancelled before acceptance.",
+            updatedAt: now,
+          },
+          null,
+          false,
+        )).record;
+      if (known?.progress && known.protocol >= (job.requiredProtocol ?? 2)) {
+        return (yield* update(
+          row!,
+          {
+            ...job,
+            progress: known.progress,
+            status: known.progress.status,
+            detail: known.detail ?? known.progress.detail,
+            updatedAt: now,
+          },
+          row!.pendingControl,
+          false,
+        )).record;
+      }
+      if (!known || known.protocol < WORKFLOW_PROTOCOL)
+        return yield* new WorkflowInvalidError({
+          message: "Update this environment to reconcile the pinned workflow offer.",
+        });
+    }
     const manualControl =
       control.operation === "pause" || control.operation === "resume" ? control : null;
     const manual = manualControl !== null;
@@ -241,7 +297,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     ) {
       const capability = yield* connector.dispatchJob({
         ...dispatchIdentity(),
-        environmentId: job.environmentId,
+        environmentId: runtime.environmentId,
         jobId: RelayJobId.make(jobId),
         repositoryCanonicalKey: canonicalKey,
         baseBranch: "HEAD",
@@ -256,19 +312,21 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           message: "Update this environment before responding to this workflow.",
         });
     }
-    let mayRetireOffer = origin.kind !== "automation";
+    const mayRetireOffer = job.startAttempted === false;
     if (origin.kind === "automation" && control.operation === "start") {
-      mayRetireOffer = job.startAttempted === false;
       const capability = yield* connector.dispatchJob({
         ...dispatchIdentity(),
-        environmentId: job.environmentId,
+        environmentId: runtime.environmentId,
         jobId: RelayJobId.make(jobId),
         repositoryCanonicalKey: canonicalKey,
         baseBranch: "HEAD",
         instruction: job.instruction,
         workflowControl: { ...binding, operation: "status" },
       });
-      if (!capability.workflowResult || capability.workflowResult.protocol < 8) {
+      if (
+        !capability.workflowResult ||
+        capability.workflowResult.protocol < (job.requiredProtocol ?? 8)
+      ) {
         // A confirmed missing result relinquishes an unaccepted offer; unknown delivery stays pinned.
         if (
           mayRetireOffer &&
@@ -280,6 +338,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
             {
               ...job,
               workflow: null,
+              runtime: null,
               issueSnapshot: undefined,
               offerAuthority: undefined,
               startAttempted: undefined,
@@ -288,7 +347,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
                 : job.instruction,
               queueReason: { code: "environment_update", retryAt: null },
               status: "queued",
-              requiredProtocol: 8,
+              requiredProtocol: WORKFLOW_PROTOCOL,
               detail: "Update this environment before running automatic workflows.",
               updatedAt: now,
             },
@@ -312,9 +371,13 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       row = yield* update(row!, { ...job, startAttempted: true }, row!.pendingControl, false);
       job = row.record;
     }
+    if (control.operation === "start" && origin.kind === "manual") {
+      row = yield* update(row!, { ...job, startAttempted: true }, row!.pendingControl, false);
+      job = row.record;
+    }
     const response = yield* connector.dispatchJob({
       ...dispatchIdentity(),
-      environmentId: job.environmentId,
+      environmentId: runtime.environmentId,
       jobId: RelayJobId.make(jobId),
       repositoryCanonicalKey: canonicalKey,
       baseBranch: "HEAD",
@@ -385,6 +448,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         {
           ...job,
           workflow: null,
+          runtime: null,
           issueSnapshot: undefined,
           offerAuthority: undefined,
           startAttempted: undefined,

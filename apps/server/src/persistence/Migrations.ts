@@ -108,6 +108,7 @@ import Migration0085 from "./Migrations/085_ThreadTransferProbeReceipt.ts";
 import Migration0086 from "./Migrations/086_ThreadMoveTransferIntents.ts";
 import Migration0087 from "./Migrations/087_ThreadMoveAttempts.ts";
 import Migration0088 from "./Migrations/088_CheckoutOperationBoot.ts";
+import Migration0089 from "./Migrations/089_WorkflowExecutionBinding.ts";
 /**
  * Migration loader with all migrations defined inline.
  *
@@ -207,6 +208,7 @@ const migrationEntries = [
   [86, "ThreadMoveTransferIntents", Migration0086],
   [87, "ThreadMoveAttempts", Migration0087],
   [88, "CheckoutOperationBoot", Migration0088],
+  [89, "WorkflowExecutionBinding", Migration0089],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -329,7 +331,7 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
         for (const row of original)
           yield* sql`INSERT INTO effect_sql_migrations (migration_id, name, created_at) VALUES (${row.migration_id + legacyWorkflowOffset}, ${row.name}, ${row.created_at})`;
       }
-      const target = toMigrationInclusive ?? 86;
+      const target = toMigrationInclusive ?? 89;
       if (target >= 76 && history.through < 84)
         yield* sql`DROP TRIGGER IF EXISTS checkout_capture_preserve_reader_barrier`;
       executed.push(...(yield* run({ loader: makeMigrationLoader(toMigrationInclusive) })));

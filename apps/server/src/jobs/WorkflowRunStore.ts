@@ -10,12 +10,14 @@ import {
 } from "@t3tools/contracts";
 import {
   RepositoryWorkflow,
+  WorkflowMachineTarget,
   WorkflowJobProgress,
   WorkflowReviewCheckpoint,
   WorkflowResponseSummary,
   WorkflowManualControl,
   WorkflowManualPause,
 } from "@t3tools/contracts/workflows";
+import { normalizeStoredWorkflow } from "@t3tools/shared/workflowStorage";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -115,6 +117,7 @@ export const WorkflowRun = Schema.Struct({
   repositoryCanonicalKey: Schema.String,
   instruction: Schema.String,
   workflow: RepositoryWorkflow,
+  runtime: WorkflowMachineTarget,
   progress: WorkflowJobProgress,
   modelSelection: ModelSelection,
   baseBranch: Schema.String,
@@ -186,9 +189,22 @@ const WorkflowCancellation = Schema.Struct({
 export type WorkflowCancellation = typeof WorkflowCancellation.Type;
 const decodeCancellation = Schema.decodeUnknownSync(Schema.fromJsonString(WorkflowCancellation));
 const encodeCancellation = Schema.encodeSync(Schema.fromJsonString(WorkflowCancellation));
-const decodeRun = Schema.decodeUnknownSync(Schema.fromJsonString(WorkflowRun));
+const readStoredRun = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      ...WorkflowRun.fields,
+      workflow: Schema.Unknown,
+      runtime: Schema.optional(WorkflowMachineTarget),
+    }),
+  ),
+);
+const decodeRun = Schema.decodeUnknownSync(WorkflowRun);
 const decode = (json: string): WorkflowRun => {
-  const run = decodeRun(json);
+  const stored = readStoredRun(json);
+  const workflow = normalizeStoredWorkflow(stored.workflow);
+  const runtime = stored.runtime ?? workflow.definition.target;
+  if (runtime.kind !== "machine") throw new Error("Unsupported persisted workflow runtime.");
+  const run = decodeRun({ ...stored, workflow, runtime });
   const origin = workflowRunOrigin(run);
   if (
     origin.kind === "manual"
@@ -242,7 +258,7 @@ export const make = Effect.gen(function* () {
       projectId: string;
       worktreePath: string | null;
       record_json: string;
-    }>`SELECT j.record_json, j.job_id AS "jobId", j.thread_id AS "threadId", json_extract(j.record_json, '$.workflow.definition.projectId') AS "projectId", COALESCE(json_extract(j.record_json, '$.worktreePath'), t.worktree_path) AS "worktreePath" FROM repository_workflow_jobs j LEFT JOIN projection_threads t ON t.thread_id = j.thread_id
+    }>`SELECT j.record_json, j.job_id AS "jobId", j.thread_id AS "threadId", COALESCE(json_extract(j.record_json, '$.runtime.projectId'), json_extract(j.record_json, '$.workflow.definition.target.projectId'), json_extract(j.record_json, '$.workflow.definition.projectId')) AS "projectId", COALESCE(json_extract(j.record_json, '$.worktreePath'), t.worktree_path) AS "worktreePath" FROM repository_workflow_jobs j LEFT JOIN projection_threads t ON t.thread_id = j.thread_id
       WHERE j.status NOT IN ('done','cancelled','failed') OR j.execution_reserved = 1
         OR json_extract(j.record_json,'$.executionReserved') = 1
         OR json_extract(j.record_json,'$.progress.status') NOT IN ('done','cancelled','failed')

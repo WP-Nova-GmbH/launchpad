@@ -1,6 +1,10 @@
 import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
-import { RepositoryWorkflow, WorkflowQueueReason } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_PROTOCOL,
+  RepositoryWorkflow,
+  WorkflowQueueReason,
+} from "@t3tools/contracts/workflows";
 import { RelayJobId, WorkflowSourceError } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -79,6 +83,8 @@ export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticO
     );
   const workflow = yield* store.get(row.record.workflowId);
   if (!workflow || workflow.archived) return yield* blocked("workflow_unavailable");
+  if (workflow.definition.target.kind !== "machine") return yield* blocked("target_invalid");
+  const machineTarget = workflow.definition.target;
   const canonicalKey = yield* validateWorkflowTarget(
     row.organizationId,
     row.repositoryId,
@@ -89,7 +95,7 @@ export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticO
     .dispatchJob({
       userId: null,
       workflowOrigin: origin,
-      environmentId: workflow.definition.environmentId,
+      environmentId: machineTarget.environmentId,
       jobId: RelayJobId.make(row.jobId),
       repositoryCanonicalKey: canonicalKey,
       baseBranch: "HEAD",
@@ -98,14 +104,14 @@ export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticO
         operation: "status",
         organizationId: row.organizationId,
         repositoryId: row.repositoryId,
-        projectId: workflow.definition.projectId,
+        projectId: machineTarget.projectId,
       },
     })
     .pipe(Effect.mapError(() => blocked("environment_offline")));
   const capability = probe.workflowResult;
   if (
     !capability ||
-    capability.protocol < 8 ||
+    capability.protocol < WORKFLOW_PROTOCOL ||
     workflow.definition.steps.some(
       (s) => s.kind === "action" && !capability.actions?.includes(s.action),
     )
@@ -146,6 +152,7 @@ export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticO
       }>`SELECT record FROM relay_repository_workflows WHERE workflow_id=${workflow.workflowId} FOR UPDATE`;
       if (!saved) return yield* blocked("workflow_unavailable");
       const latest = yield* decodeWorkflow(saved.record);
+      if (latest.definition.target.kind !== "machine") return yield* blocked("target_invalid");
       if (latest.archived) return yield* blocked("workflow_unavailable");
       if (latest.revision !== workflow.revision)
         return yield* blocked("workflow_changed", (yield* Store.now) + 1000);
@@ -176,8 +183,8 @@ export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticO
         {
           ...row.record,
           workflow: latest,
-          environmentId: latest.definition.environmentId,
-          requiredProtocol: 8,
+          runtime: latest.definition.target,
+          requiredProtocol: WORKFLOW_PROTOCOL,
           issueSnapshot: context.snapshot,
           instruction: context.instruction,
           startAttempted: false,

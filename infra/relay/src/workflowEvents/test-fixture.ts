@@ -34,10 +34,15 @@ export const trigger: WorkflowTrigger = {
   labelIds: [],
   event: "issue_created",
 };
-export const definition: RepositoryWorkflow["definition"] = {
+export const definition: RepositoryWorkflow["definition"] & {
+  target: Extract<RepositoryWorkflow["definition"]["target"], { kind: "machine" }>;
+} = {
   name: "Implement",
-  environmentId: EnvironmentId.make("environment"),
-  projectId: ProjectId.make("project"),
+  target: {
+    kind: "machine",
+    environmentId: EnvironmentId.make("environment"),
+    projectId: ProjectId.make("project"),
+  },
   steps: [
     {
       kind: "agent",

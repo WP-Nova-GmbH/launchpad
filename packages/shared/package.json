@@ -394,6 +394,10 @@
     "./threadTransferEncoding": {
       "types": "./src/threadTransferEncoding.ts",
       "import": "./src/threadTransferEncoding.ts"
+    },
+    "./workflowStorage": {
+      "types": "./src/workflowStorage.ts",
+      "import": "./src/workflowStorage.ts"
     }
   },
   "scripts": {

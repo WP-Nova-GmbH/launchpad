@@ -1,6 +1,7 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { lockWorkflowVmOrganization } from "./WorkflowVmPolicyLock.ts";
 
 export class ThreadVmCapacityConflict extends Schema.TaggedError<ThreadVmCapacityConflict>()(
   "ThreadVmCapacityConflict",
@@ -79,7 +80,10 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
       }),
     );
   });
-  const admitNext = Effect.fn("relay.vm_capacity.admit_next")(function* (hostId: string) {
+  const admitNext = Effect.fn("relay.vm_capacity.admit_next")(function* (
+    hostId: string,
+    scope: "personal" | "all" = "personal",
+  ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         // Serializes admission and limit edits across relay instances. No expiring
@@ -87,7 +91,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
         const [host] = yield* sql<{
           limit: number;
         }>`SELECT max_running_vms AS "limit" FROM relay_thread_vm_hosts
-        WHERE host_id = ${hostId} FOR UPDATE`;
+        WHERE host_id = ${hostId} FOR NO KEY UPDATE`;
         if (!host) return yield* conflict("Compute host capacity has not been configured");
         const [usage] = yield* sql<{
           count: number;
@@ -96,12 +100,40 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
         if ((usage?.count ?? 0) >= host.limit) return null;
         const [row] = yield* sql<{
           operationId: string;
-        }>`SELECT c.operation_id AS "operationId" FROM relay_thread_vm_capacity c
+          organizationId: string;
+          resourceKind: "personal" | "organization_workflow";
+        }>`SELECT c.operation_id AS "operationId", a.organization_id AS "organizationId",
+          a.resource_kind AS "resourceKind" FROM relay_thread_vm_capacity c
         JOIN relay_thread_vm_allocations a USING (allocation_id)
         WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'waiting' AND a.state IN ('creating', 'paused')
-        ORDER BY c.position FOR UPDATE OF c LIMIT 1`;
+          AND (a.resource_kind='personal' OR (${scope === "all"} AND a.resource_kind='organization_workflow'
+            AND (SELECT count(*) FROM relay_thread_vm_capacity occupied
+              JOIN relay_thread_vm_allocations charged ON charged.allocation_id=occupied.allocation_id
+              WHERE charged.organization_id=a.organization_id AND charged.resource_kind='organization_workflow'
+                AND occupied.state IN ('reserved','started')) < COALESCE((
+                  SELECT max_running_workflow_vms FROM relay_thread_vm_policies
+                  WHERE organization_id=a.organization_id),10)))
+        ORDER BY c.position LIMIT 1`;
         if (!row) return null;
-        yield* sql`UPDATE relay_thread_vm_capacity SET state = 'reserved' WHERE operation_id = ${row.operationId}`;
+        if (row.resourceKind === "organization_workflow") {
+          yield* lockWorkflowVmOrganization(sql, row.organizationId);
+          const [organization] = yield* sql<{ limit: number; used: number }>`SELECT
+            COALESCE((SELECT max_running_workflow_vms FROM relay_thread_vm_policies
+              WHERE organization_id=${row.organizationId}),10) AS "limit",
+            (SELECT count(*)::int FROM relay_thread_vm_capacity c
+              JOIN relay_thread_vm_allocations a USING(allocation_id)
+              WHERE a.organization_id=${row.organizationId} AND a.resource_kind='organization_workflow'
+                AND c.state IN ('reserved','started')) AS used`;
+          if (!organization || organization.used >= organization.limit) return null;
+        }
+        const rows = yield* sql`UPDATE relay_thread_vm_capacity c SET state = 'reserved'
+          WHERE c.operation_id = ${row.operationId} AND c.state='waiting'
+            AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a
+              WHERE a.allocation_id=c.allocation_id AND a.runtime_protocol='native-v1'
+                AND a.resource_kind=${row.resourceKind} AND a.organization_id=${row.organizationId}
+                AND a.state IN ('creating','paused') AND a.deleted_at IS NULL)
+          RETURNING operation_id`;
+        if (!rows.length) return null;
         return yield* get(row.operationId);
       }),
     );

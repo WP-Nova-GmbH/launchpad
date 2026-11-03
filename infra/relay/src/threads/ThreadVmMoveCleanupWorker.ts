@@ -36,7 +36,7 @@ export function makeThreadVmMoveCleanupWorker(sql: PgClient, compute: Compute, h
         JOIN relay_thread_placements t ON t.thread_id=a.thread_id
         LEFT JOIN relay_thread_vm_move_destinations d ON d.operation_id=m.operation_id AND d.allocation_id=a.allocation_id
         LEFT JOIN relay_thread_vm_bindings b ON b.allocation_id=a.allocation_id
-      WHERE a.runtime_protocol='native-v1' AND c.host_id=${hostId} AND (
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id=${hostId} AND (
         (d.allocation_id IS NOT NULL AND m.phase='aborting' AND t.operation_id=m.operation_id
           AND t.generation=m.expected_generation AND p.generation=m.expected_generation+1)
         OR (d.allocation_id IS NULL AND m.phase='completed' AND a.deleted_at IS NULL

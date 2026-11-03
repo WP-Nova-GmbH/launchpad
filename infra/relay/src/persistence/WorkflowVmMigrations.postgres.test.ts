@@ -7,6 +7,10 @@ import { migrate } from "drizzle-orm/effect-postgres/migrator";
 import { generateDrizzleJson, generateMigration } from "drizzle-kit/api-postgres";
 import { Effect, FileSystem, Path, Redacted, Schema } from "effect";
 import * as schema from "./schema.ts";
+import {
+  normalizeStoredWorkflow,
+  normalizeStoredWorkflowJob,
+} from "@t3tools/shared/workflowStorage";
 
 const url = process.env.WORKFLOW_SOURCES_TEST_DATABASE_URL;
 const migrationsDir = new URL("../../migrations/postgres/", import.meta.url).pathname;
@@ -16,6 +20,7 @@ const vmHead = "d42d70fa-bc6e-4f9a-93db-956ca63fa8e3";
 const codexVmHead = "dab2362b-4578-42d4-a278-a4ee43d1214e";
 const stockVmHead = "c57df92d-b498-403e-9d19-d8453f1502dd";
 const runtimeMigration = "20261028221922_thread_vm_runtime_protocol";
+const foundationMigration = "20261102170843_workflow_execution_foundation";
 const prefix = "workflow_vm_merge_20261027_";
 type Snapshot = Awaited<ReturnType<typeof generateDrizzleJson>>;
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
@@ -135,6 +140,20 @@ const seed = (sql: PgClient.PgClient, names: ReadonlySet<string>) =>
         updatedAt: "2026",
       };
       yield* sql`INSERT INTO relay_workflow_jobs(job_id,repository_id,organization_id,submitter_user_id,status,record,revision,created_at,checked_at) VALUES ('merge-job','merge-repo','merge-org','merge-user','queued',${sql.json(record)},0,'2026','2026')`;
+      const accepted = {
+        ...record,
+        jobId: "merge-accepted-job",
+        status: "dispatching",
+        workflow: flow,
+        requiredProtocol: 8,
+        startAttempted: true,
+      };
+      yield* sql`INSERT INTO relay_workflow_jobs(job_id,repository_id,organization_id,submitter_user_id,status,record,revision,created_at,checked_at) VALUES ('merge-accepted-job','merge-repo','merge-org','merge-user','dispatching',${sql.json(accepted)},0,'2026','2026')`;
+      const { startAttempted: _attempted, ...uncertain } = {
+        ...accepted,
+        jobId: "merge-uncertain-job",
+      };
+      yield* sql`INSERT INTO relay_workflow_jobs(job_id,repository_id,organization_id,submitter_user_id,status,record,revision,created_at,checked_at) VALUES ('merge-uncertain-job','merge-repo','merge-org','merge-user','dispatching',${sql.json(uncertain)},0,'2026','2026')`;
       yield* sql`INSERT INTO relay_workflow_connections(connection_id,owner_user_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health) VALUES ('merge-connection','merge-user','app','workspace','Workspace','Owner','connected','2026','sealed-fixture','{"code":"healthy","retryAt":null}')`;
       yield* sql`INSERT INTO relay_workflow_repository_grants(grant_id,connection_id,organization_id,repository_id,owner_user_id,generation,created_at) VALUES ('merge-grant','merge-connection','merge-org','merge-repo','merge-user',1,'2026')`;
     }
@@ -153,6 +172,9 @@ const seed = (sql: PgClient.PgClient, names: ReadonlySet<string>) =>
       yield* sql`INSERT INTO relay_thread_vm_codex_auth(allocation_id,environment_id,generation,thread_id,organization_id,mode,connection_id,acknowledged_connection_id)
         VALUES ('merge-allocation','environment',1,'merge-thread','merge-org','organization','preserved-codex-connection','preserved-codex-connection')`;
     }
+    if (names.has("20261102155030_thread_vm_codex_preferences"))
+      yield* sql`INSERT INTO relay_thread_vm_codex_preferences(thread_id,organization_id,revision,mode,connection_id)
+        VALUES('merge-thread','merge-org',7,'organization','preserved-codex-connection')`;
   });
 
 const records = (sql: PgClient.PgClient, omitNativeAllocationColumns = false) =>
@@ -162,10 +184,31 @@ const records = (sql: PgClient.PgClient, omitNativeAllocationColumns = false) =>
     }>`SELECT tablename AS name FROM pg_tables WHERE schemaname='public' ORDER BY tablename`;
     const values: Record<string, unknown> = {};
     for (const { name } of tables) {
-      const rows = yield* sql.unsafe(
-        `SELECT to_jsonb(t)${omitNativeAllocationColumns && name === "relay_thread_vm_allocations" ? "-'runtime_protocol'-'sealed_traffic_access_token'" : ""} AS row FROM "${name}" t ORDER BY to_jsonb(t)::text`,
+      const omitted =
+        name === "relay_thread_placements"
+          ? "-'audience'-'workflow_job_id'"
+          : name === "relay_thread_vm_allocations"
+            ? "-'resource_kind'"
+            : name === "relay_thread_vm_policies"
+              ? "-'workflow_policy_revision'-'max_running_workflow_vms'"
+              : name === "relay_workflow_jobs"
+                ? "-'summary'"
+                : "";
+      const rows = yield* sql.unsafe<{ row: Record<string, unknown> }>(
+        `SELECT to_jsonb(t)${omitted}${omitNativeAllocationColumns && name === "relay_thread_vm_allocations" ? "-'runtime_protocol'-'sealed_traffic_access_token'" : ""} AS row FROM "${name}" t ORDER BY to_jsonb(t)::text`,
       );
-      if (rows.length) values[name] = rows;
+      if (rows.length)
+        values[name] = rows.map(({ row }) => ({
+          row: {
+            ...row,
+            ...(name === "relay_repository_workflows"
+              ? { record: normalizeStoredWorkflow(row.record) }
+              : {}),
+            ...(name === "relay_workflow_jobs"
+              ? { record: normalizeStoredWorkflowJob(row.record) }
+              : {}),
+          },
+        }));
     }
     return values;
   });
@@ -205,6 +248,9 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
         const vms = new Set([...ancestors(vmHead), ...common]);
         const codex = ancestors(codexVmHead);
         const stock = ancestors(stockVmHead);
+        const foundation = entries.find((entry) => entry.name === foundationMigration);
+        expect(foundation).toBeDefined();
+        const current = new Set(foundation!.snapshot.prevIds.flatMap((id) => [...ancestors(id)]));
         expect([common.size, workflows.size, vms.size]).toEqual([27, 33, 98]);
         const parents = new Set(entries.flatMap((entry) => entry.snapshot.prevIds));
         const leaves = entries.filter((entry) => !parents.has(entry.snapshot.id));
@@ -236,6 +282,7 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
           ["vms", vms],
           ["codex", codex],
           ["stock", stock],
+          ["current", current],
         ] as const) {
           const baselineFolder = path.join(folder, label);
           yield* fs.makeDirectory(baselineFolder);
@@ -271,6 +318,52 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
                   protocol: omitNativeAllocationColumns ? "legacy" : "native-v1",
                   ingress: omitNativeAllocationColumns ? null : "preserved-sealed-ingress",
                 });
+                const [ownership] = yield* sql`SELECT t.audience,t.workflow_job_id,a.resource_kind
+                  FROM relay_thread_placements t JOIN relay_thread_vm_allocations a USING(thread_id)
+                  WHERE t.thread_id='merge-thread'`;
+                expect(ownership).toEqual({
+                  audience: "private",
+                  workflow_job_id: null,
+                  resource_kind: "personal",
+                });
+              }
+              if (baseline.has("20261019163246_workflow_automatic_starts")) {
+                const [saved] = yield* sql<{
+                  record: Record<string, unknown>;
+                }>`SELECT record FROM relay_repository_workflows WHERE workflow_id='merge-flow'`;
+                expect(saved!.record).toMatchObject({
+                  revision: 1,
+                  definition: {
+                    target: { kind: "machine", environmentId: "environment", projectId: "project" },
+                  },
+                });
+                expect(saved!.record.definition).not.toHaveProperty("environmentId");
+                const jobs = yield* sql<{
+                  jobId: string;
+                  record: Record<string, unknown>;
+                  summary: Record<string, unknown>;
+                }>`SELECT job_id AS "jobId",record,summary FROM relay_workflow_jobs ORDER BY job_id`;
+                for (const job of jobs) {
+                  expect(job.record).not.toHaveProperty("environmentId");
+                  expect(job.summary.runtime).toEqual(job.record.runtime);
+                  if (job.jobId === "merge-job") {
+                    expect(job.record).toMatchObject({ workflow: null, runtime: null });
+                  } else {
+                    expect(job.record).toMatchObject({
+                      requiredProtocol: 8,
+                      runtime: {
+                        kind: "machine",
+                        environmentId: "environment",
+                        projectId: "project",
+                      },
+                    });
+                    expect(job.record.workflow).toEqual(saved!.record);
+                  }
+                  if (job.jobId === "merge-accepted-job")
+                    expect(job.record.startAttempted).toBe(true);
+                  if (job.jobId === "merge-uncertain-job")
+                    expect(job.record).not.toHaveProperty("startAttempted");
+                }
               }
               for (const [table, rows] of Object.entries(before))
                 expect(after[table], label + ": " + table).toEqual(rows);

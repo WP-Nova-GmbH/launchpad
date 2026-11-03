@@ -63,8 +63,11 @@ beforeEach(() => {
         workflowId: "flow",
         definition: {
           name: "Unsaved",
-          environmentId: EnvironmentId.make("environment"),
-          projectId: ProjectId.make("project"),
+          target: {
+            kind: "machine" as const,
+            environmentId: EnvironmentId.make("environment"),
+            projectId: ProjectId.make("project"),
+          },
           steps: [],
         },
         baseline: null,

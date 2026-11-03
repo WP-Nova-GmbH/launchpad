@@ -289,11 +289,12 @@ function WorkflowJobsContent(props: Props) {
       invalidateWorkflowJobRead(appAtomRegistry, scope, selectedJobId);
     };
   }, [refreshJob, terminal, read.mutation, scope, selectedJobId, focused]);
-  const target = selectedJob?.workflow
+  const machine = selectedJob?.runtime?.kind === "machine" ? selectedJob.runtime : null;
+  const target = machine
     ? projects.find(
         (project) =>
-          project.environmentId === selectedJob.environmentId &&
-          project.projectId === selectedJob.workflow?.definition.projectId,
+          project.environmentId === machine.environmentId &&
+          project.projectId === machine.projectId,
       )
     : undefined;
   const canRespond = membership?.role === "admin" || selectedRepository?.role === "maintainer";
@@ -393,10 +394,12 @@ function WorkflowJobsContent(props: Props) {
     setError(null);
     const session = appAtomRegistry.get(managedRelaySessionAtom);
     try {
+      if (selectedJob.runtime?.kind !== "machine")
+        throw new Error("This run has no available machine execution binding.");
       const result = await openPortableResult({
         threadId: selectedJob.progress.threadId,
         title: selectedJob.workflow?.definition.name ?? "Workflow result",
-        workflowResult: { ...scope, originalEnvironmentId: selectedJob.environmentId },
+        workflowResult: { ...scope, originalEnvironmentId: selectedJob.runtime.environmentId },
       });
       if (
         resultRequest.current !== request ||

@@ -34,8 +34,11 @@ const scope = {
 };
 const definition: WorkflowDefinition = {
   name: "Implementation",
-  environmentId: EnvironmentId.make("environment"),
-  projectId: ProjectId.make("project"),
+  target: {
+    kind: "machine" as const,
+    environmentId: EnvironmentId.make("environment"),
+    projectId: ProjectId.make("project"),
+  },
   steps: [
     {
       id: "agent",
@@ -51,7 +54,7 @@ const job = (revision = 1): RepositoryWorkflowJob => ({
   jobId: "job",
   repositoryId: scope.repositoryId,
   workflowId: "workflow",
-  environmentId: definition.environmentId,
+  runtime: definition.target.kind === "machine" ? definition.target : null,
   instruction: "Task",
   status: "running",
   detail: null,

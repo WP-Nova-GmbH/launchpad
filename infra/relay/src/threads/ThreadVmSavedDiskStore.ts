@@ -59,7 +59,7 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
       FROM relay_thread_vm_backups b JOIN relay_thread_vm_allocations a USING(allocation_id)
       WHERE b.operation_id=${backupOperationId} AND b.generation=${generation}
         AND (b.phase='verified' OR (${retiring} AND b.phase IN ('retiring','retired')))
-        AND a.thread_id=${threadId} AND a.runtime_protocol='native-v1'`;
+        AND a.thread_id=${threadId} AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'`;
     const receipt = yield* decodeNativeCapture(backup?.receipt).pipe(
       Effect.mapError(() => conflict("Saved disk has no completed native snapshot.")),
     );
@@ -397,7 +397,7 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         JOIN relay_thread_vm_backups b ON b.operation_id=s.backup_operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=b.allocation_id
         WHERE s.host_id=${hostId} AND s.phase IN ('available','expiring')
-          AND b.native_capture_receipt IS NOT NULL AND a.runtime_protocol='native-v1'
+          AND b.native_capture_receipt IS NOT NULL AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
           AND s.retry_at <= clock_timestamp()
           AND (s.claim_until IS NULL OR s.claim_until <= clock_timestamp())
           AND (s.phase='expiring' OR (t.operation_id IS NULL AND

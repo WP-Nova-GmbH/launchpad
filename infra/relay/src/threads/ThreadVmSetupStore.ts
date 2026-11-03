@@ -60,7 +60,8 @@ export function makeThreadVmSetupStore(sql: PgClient) {
       COALESCE(s.error_code, p.error_code) AS "errorCode", s.receipt_sha256 AS "receiptSha256"
       FROM relay_thread_vm_setups s JOIN relay_thread_vm_allocations a USING (allocation_id)
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
-      JOIN relay_thread_placements t ON t.thread_id = a.thread_id WHERE s.allocation_id = ${allocationId}`;
+      JOIN relay_thread_placements t ON t.thread_id = a.thread_id
+      WHERE s.allocation_id = ${allocationId} AND a.resource_kind='personal' AND t.audience='private'`;
     return row
       ? {
           ...row,

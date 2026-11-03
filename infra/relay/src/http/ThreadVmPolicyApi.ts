@@ -2,6 +2,7 @@ import {
   RelayApi,
   RelayClientPrincipal,
   type ThreadVmPolicyRecord,
+  type WorkflowVmPolicyRecord,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
@@ -55,5 +56,42 @@ export const updateThreadVmPolicy = Effect.fn("relay.api.thread_vm_policy.update
 export const threadVmPolicyApi = HttpApiBuilder.group(RelayApi, "threadVmPolicy", (handlers) =>
   handlers
     .handle("getThreadVmPolicy", () => getThreadVmPolicy())
-    .handle("updateThreadVmPolicy", ({ payload }) => updateThreadVmPolicy(payload)),
+    .handle("updateThreadVmPolicy", ({ payload }) => updateThreadVmPolicy(payload))
+    .handle("getWorkflowVmPolicy", () => getWorkflowVmPolicy())
+    .handle("updateWorkflowVmPolicy", ({ payload }) => updateWorkflowVmPolicy(payload)),
 );
+
+export const getWorkflowVmPolicy = Effect.fn("relay.api.workflow_vm_policy.get")(function* () {
+  const { userId } = yield* RelayClientPrincipal;
+  const membership = yield* resolveMembership({ userId });
+  return yield* makeThreadVmPolicyStore((yield* RelayDb).$client)
+    .getWorkflow(membership.organization.organizationId)
+    .pipe(Effect.catch(() => relayInternalErrorResponse("internal_error")));
+}, mapRelayCommonApiErrors("not_authorized"));
+
+export const updateWorkflowVmPolicy = Effect.fn("relay.api.workflow_vm_policy.update")(function* (
+  input: WorkflowVmPolicyRecord,
+) {
+  const { userId } = yield* RelayClientPrincipal;
+  const membership = yield* resolveMembership({ userId });
+  if (input.organizationId !== membership.organization.organizationId)
+    return yield* tenancyConflict("vm_policy_changed");
+  const sql = (yield* RelayDb).$client;
+  return yield* sql
+    .withTransaction(
+      Effect.gen(function* () {
+        const admins = yield* sql`SELECT user_id FROM relay_organization_members
+        WHERE user_id=${userId} AND organization_id=${input.organizationId} AND role='admin' FOR SHARE`;
+        if (!admins.length) return yield* tenancyForbidden("not_an_admin");
+        return yield* makeThreadVmPolicyStore(sql)
+          .updateWorkflow(input)
+          .pipe(
+            Effect.catchTags({
+              ThreadPlacementConflict: () => tenancyConflict("vm_policy_changed"),
+              SchemaError: () => relayInternalErrorResponse("internal_error"),
+            }),
+          );
+      }),
+    )
+    .pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("internal_error")));
+}, mapRelayCommonApiErrors("not_authorized"));

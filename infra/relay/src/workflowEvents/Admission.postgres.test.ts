@@ -100,7 +100,7 @@ describe("verified event admission (PostgreSQL)", () => {
           for (const j of jobs) {
             expect(j.submitterUserId).toBeNull();
             expect(j.record).toMatchObject({
-              requiredProtocol: 8,
+              requiredProtocol: 9,
               status: "queued",
               workflow: null,
               progress: null,

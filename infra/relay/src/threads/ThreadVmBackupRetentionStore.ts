@@ -23,7 +23,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         WHERE thread_id = ${input.threadId} FOR UPDATE`;
         const [backup] = yield* sql`SELECT x.operation_id FROM relay_thread_vm_backups x
         JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND a.thread_id = ${input.threadId} AND x.operation_id = ${input.backupOperationId}
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.thread_id = ${input.threadId} AND x.operation_id = ${input.backupOperationId}
           AND x.phase = 'verified' AND x.snapshot_id IS NOT NULL AND x.native_capture_receipt IS NOT NULL
         FOR UPDATE OF x`;
         if (!backup)
@@ -54,7 +54,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         FROM relay_thread_vm_backups x
         JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-        WHERE a.runtime_protocol='native-v1' AND x.phase IN ('verified','retiring') AND x.snapshot_id IS NOT NULL AND x.native_capture_receipt IS NOT NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND x.phase IN ('verified','retiring') AND x.snapshot_id IS NOT NULL AND x.native_capture_receipt IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_saved_disks s
             WHERE s.backup_operation_id=x.operation_id AND s.phase='expiring')
           AND x.retry_at <= clock_timestamp()
@@ -124,7 +124,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         }>`SELECT x.operation_id AS "operationId",a.thread_id AS "threadId"
         FROM relay_thread_vm_backups x JOIN relay_thread_vm_allocations a USING(allocation_id)
         JOIN relay_thread_placements t ON t.thread_id=a.thread_id
-        WHERE a.runtime_protocol='native-v1' AND x.phase IN ('failed','retiring') AND x.source_receipt IS NOT NULL AND x.native_capture_receipt IS NULL AND x.capture_started_at IS NOT NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND x.phase IN ('failed','retiring') AND x.source_receipt IS NOT NULL AND x.native_capture_receipt IS NULL AND x.capture_started_at IS NOT NULL
           AND x.snapshot_id IS NOT NULL AND x.source_template_id IS NOT NULL AND x.source_build_id IS NOT NULL
           AND x.retry_at<=clock_timestamp() AND (x.claim_until IS NULL OR x.claim_until<=clock_timestamp())
           AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_final_saves f WHERE f.backup_operation_id=x.operation_id)
@@ -154,7 +154,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         const [owner] = yield* sql<{
           threadId: string;
         }>`SELECT a.thread_id AS "threadId" FROM relay_thread_vm_backups x
-        JOIN relay_thread_vm_allocations a USING(allocation_id) WHERE a.runtime_protocol='native-v1' AND x.operation_id=${input.operationId}`;
+        JOIN relay_thread_vm_allocations a USING(allocation_id) WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND x.operation_id=${input.operationId}`;
         if (!owner) return false;
         yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${owner.threadId} FOR UPDATE`;
         const [row] = yield* sql<{

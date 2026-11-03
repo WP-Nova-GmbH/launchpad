@@ -8,6 +8,10 @@ import {
   type WorkflowJobPage,
   type SaveRepositoryWorkflow,
 } from "@t3tools/contracts/workflows";
+import {
+  normalizeStoredWorkflow,
+  normalizeStoredWorkflowJob,
+} from "@t3tools/shared/workflowStorage";
 import { WorkflowOrigin, sameWorkflowOrigin } from "@t3tools/contracts";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import * as Context from "effect/Context";
@@ -46,6 +50,7 @@ const persist = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.mapError((cause) => new WorkflowPersistenceError({ cause })));
 
 function validateOrigin(row: WorkflowJobRecord, record = row.record) {
+  record = normalizeStoredWorkflowJob(record);
   const origin = decodeOrigin(
     record.origin ??
       (row.submitterUserId ? { kind: "manual", userId: row.submitterUserId } : undefined),
@@ -73,11 +78,15 @@ export const make = Effect.gen(function* () {
         .from(relayRepositoryWorkflows)
         .where(eq(relayRepositoryWorkflows.workflowId, workflowId))
         .limit(1),
-    ).pipe(Effect.map((rows) => rows[0]?.record ?? null));
+    ).pipe(Effect.map((rows) => (rows[0] ? normalizeStoredWorkflow(rows[0].record) : null)));
   const getJob = (jobId: string) =>
     persist(
       db.select().from(relayWorkflowJobs).where(eq(relayWorkflowJobs.jobId, jobId)).limit(1),
-    ).pipe(Effect.map((rows): WorkflowJobRecord | null => rows[0] ?? null));
+    ).pipe(
+      Effect.map((rows): WorkflowJobRecord | null =>
+        rows[0] ? { ...rows[0], record: normalizeStoredWorkflowJob(rows[0].record) } : null,
+      ),
+    );
   return {
     get,
     getJob,
@@ -87,13 +96,15 @@ export const make = Effect.gen(function* () {
           .select({ record: relayRepositoryWorkflows.record })
           .from(relayRepositoryWorkflows)
           .where(eq(relayRepositoryWorkflows.repositoryId, repositoryId)),
-      ).pipe(Effect.map((rows) => rows.map((row) => row.record))),
+      ).pipe(Effect.map((rows) => rows.map((row) => normalizeStoredWorkflow(row.record)))),
     save: Effect.fn("Workflows.save")(function* (
       organizationId: string,
       repositoryId: string,
       input: typeof SaveRepositoryWorkflow.Type,
       context?: Routing.SaveContext,
     ) {
+      if (input.definition.target.kind !== "machine")
+        return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
       const timestamp = yield* now;
       const previous = yield* get(input.workflowId);
       if (
@@ -257,7 +268,7 @@ export const make = Effect.gen(function* () {
                 ? sql`${relayWorkflowJobs.jobId} IN (SELECT job_id FROM relay_workflow_admissions WHERE connection_id=${scope.connectionId})`
                 : undefined,
               scope.environmentId
-                ? sql`(${relayWorkflowJobs.record}->>'environmentId'=${scope.environmentId} OR (${relayWorkflowJobs.record}->'workflow'='null'::jsonb AND ${relayWorkflowJobs.record}->>'workflowId' IN (SELECT workflow_id FROM relay_repository_workflows WHERE record#>>'{definition,environmentId}'=${scope.environmentId})))`
+                ? sql`(${relayWorkflowJobs.record}#>>'{runtime,environmentId}'=${scope.environmentId} OR (${relayWorkflowJobs.record}->'workflow'='null'::jsonb AND ${relayWorkflowJobs.record}->>'workflowId' IN (SELECT workflow_id FROM relay_repository_workflows WHERE record#>>'{definition,target,environmentId}'=${scope.environmentId})))`
                 : undefined,
               sql`(${relayWorkflowJobs.pendingControl} IS NOT NULL OR ${relayWorkflowJobs.record}->'workflow'<>'null'::jsonb OR COALESCE((${relayWorkflowJobs.record}#>>'{queueReason,retryAt}')::double precision,0)<=extract(epoch FROM clock_timestamp())*1000)`,
               inArray(relayWorkflowJobs.status, [
@@ -298,7 +309,9 @@ export const make = Effect.gen(function* () {
           )
           .returning(),
       );
-      const row: WorkflowJobRecord | null = rows[0] ?? null;
+      const row: WorkflowJobRecord | null = rows[0]
+        ? { ...rows[0], record: normalizeStoredWorkflowJob(rows[0].record) }
+        : null;
       return row;
     }),
     updateJob: Effect.fn("Workflows.updateJob")(function* (

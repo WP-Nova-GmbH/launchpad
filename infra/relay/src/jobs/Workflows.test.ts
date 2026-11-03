@@ -10,7 +10,11 @@ import { RelayDb } from "../db.ts";
 import { make, type WorkflowJobRecord } from "./Workflows.ts";
 
 const NOW = "2026-10-08T12:00:00.000Z";
-const workflow: RepositoryWorkflow = {
+const workflow: RepositoryWorkflow & {
+  definition: RepositoryWorkflow["definition"] & {
+    target: Extract<RepositoryWorkflow["definition"]["target"], { kind: "machine" }>;
+  };
+} = {
   workflowId: "flow-1",
   organizationId: "org-1",
   repositoryId: "repo-1",
@@ -20,8 +24,11 @@ const workflow: RepositoryWorkflow = {
   updatedAt: NOW,
   definition: {
     name: "Implement",
-    environmentId: EnvironmentId.make("env-1"),
-    projectId: ProjectId.make("project-1"),
+    target: {
+      kind: "machine",
+      environmentId: EnvironmentId.make("env-1"),
+      projectId: ProjectId.make("project-1"),
+    },
     steps: [
       {
         id: "agent",
@@ -105,7 +112,7 @@ it.effect("prevents late acceptance from replacing a saved cancellation", () =>
         jobId: "job-1",
         repositoryId: "repo-1",
         workflowId: workflow.workflowId,
-        environmentId: workflow.definition.environmentId,
+        runtime: workflow.definition.target,
         instruction: "Fix issue",
         status: "dispatching",
         detail: null,

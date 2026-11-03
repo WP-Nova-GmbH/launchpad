@@ -60,7 +60,7 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
       JOIN relay_thread_vm_provisions p USING (allocation_id)
       WHERE a.allocation_id = ${input.allocationId} AND p.operation_id = ${input.operationId}
       AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
-      AND a.runtime_protocol='native-v1' FOR UPDATE OF a`;
+      AND a.runtime_protocol='native-v1' AND a.resource_kind='personal' FOR UPDATE OF a`;
     if (!rows.length) return yield* new ThreadVmEnrollmentInvalid();
     // Read after the allocation lock is acquired: an exchange already waiting on
     // that lock must see a recovery fence committed by the stop worker.

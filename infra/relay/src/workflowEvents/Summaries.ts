@@ -26,7 +26,7 @@ export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: 
       JOIN relay_organization_projects p ON p.machine_id=m.machine_id AND p.environment_id=pc.environment_id AND p.organization_id=r.organization_id
       JOIN relay_repository_aliases a ON a.canonical_key=p.repository_canonical_key AND a.repository_id=w.repository_id AND a.organization_id=r.organization_id
       WHERE m.organization_id=r.organization_id AND m.enrolled_at IS NOT NULL AND m.deprovisioned_at IS NULL
-        AND m.environment_id=w.record->'definition'->>'environmentId' AND p.project_id=w.record->'definition'->>'projectId'
+        AND m.environment_id=w.record#>>'{definition,target,environmentId}' AND p.project_id=w.record#>>'{definition,target,projectId}'
         AND p.repository_canonical_key=w.target_capability->>'canonicalKey') AS target_bound
     FROM relay_repository_workflows w
     JOIN relay_repositories r ON r.repository_id=w.repository_id

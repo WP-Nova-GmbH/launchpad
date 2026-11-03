@@ -91,6 +91,30 @@ const recoverDelivery = Effect.fn(function* (h: Effect.Success<typeof harness>) 
   yield* Ref.set(h.currentThread, current);
 });
 
+it.effect("rejects a VM workflow before reserving or starting machine work", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const runner = yield* h.newRunner;
+      const start = request();
+      const result = yield* runner.handle({
+        ...start,
+        control: {
+          ...start.control,
+          runtime: { kind: "vm", threadId: ThreadId.make("workflow-vm") },
+          workflow: {
+            ...workflow,
+            definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+          },
+        },
+      });
+      assert.equal(result.outcome, "unavailable");
+      assert.isNull(yield* (yield* Store.WorkflowRunStore).get(start.jobId));
+      assert.lengthOf(yield* h.starts, 0);
+    }),
+  ),
+);
+
 it.effect("durably cancels before acceptance and refuses a delayed Start after restart", () =>
   test(
     Effect.gen(function* () {
@@ -933,12 +957,13 @@ it.effect("persists one execution reservation per environment and frees it at re
       const otherEnvironment = {
         ...another,
         jobId: "other-env-job",
+        runtime: { ...another.runtime, environmentId: EnvironmentId.make("env-2") },
         progress: { ...another.progress, threadId: ThreadId.make("workflow:other-env-job:agent") },
         workflow: {
           ...another.workflow,
           definition: {
             ...another.workflow.definition,
-            environmentId: EnvironmentId.make("env-2"),
+            target: { ...another.runtime, environmentId: EnvironmentId.make("env-2") },
           },
         },
       };
@@ -2552,7 +2577,7 @@ it.effect("publishing runs outside the control mutex and keeps Pause at the acti
           },
         },
       };
-      assert.equal((yield* runner.handle(start)).protocol, 7);
+      assert.equal((yield* runner.handle(start)).protocol, 9);
       yield* h.complete;
       const review = (yield* runner.handle(control("status"))).progress!;
       yield* runner.handle(approve(review));
@@ -3172,7 +3197,7 @@ const automationOrigin: WorkflowOrigin = {
   },
   occurrenceId: "event-1",
 };
-const automated = (input: WorkflowRequest): WorkflowRequest => {
+const automated = <T extends WorkflowRequest>(input: T) => {
   const { userId: _userId, ...rest } = input;
   return { ...rest, origin: automationOrigin };
 };
@@ -3226,8 +3251,8 @@ it.effect(
           Effect.provideService(Scope.Scope, scoped),
         );
         const start = automated(request());
-        assert.equal((yield* runner.handle(start)).protocol, 8);
-        assert.equal((yield* runner.handle(start)).protocol, 8);
+        assert.equal((yield* runner.handle(start)).protocol, 9);
+        assert.equal((yield* runner.handle(start)).protocol, 9);
         assert.lengthOf(yield* h.starts, 1);
         const first = (yield* h.starts)[0]!;
         assert.isUndefined(first.author);
@@ -3341,11 +3366,7 @@ it.effect(
     ),
 );
 
-const legacyWorkflowResult = WorkflowControlResult.mapFields((fields) => ({
-  ...fields,
-  protocol: Schema.Literals([1, 2, 3, 4, 5, 6, 7]),
-}));
-const decodeLegacyWorkflowResult = Schema.decodeUnknownSync(legacyWorkflowResult);
+const decodeWorkflowResult = Schema.decodeUnknownSync(WorkflowControlResult);
 const automationAccess = Effect.gen(function* () {
   const base = yield* RepositoryAccess;
   const allowed = yield* Ref.make(true);
@@ -3396,7 +3417,7 @@ it.effect("releases capacity after automation completion despite repository acce
   ),
 );
 it.effect.each([false, true])(
-  "legacy manual responses remain decodable with publishing=%s",
+  "current manual responses use the signed workflow protocol with publishing=%s",
   (publishing) =>
     test(
       Effect.gen(function* () {
@@ -3409,7 +3430,7 @@ it.effect.each([false, true])(
           }),
         );
         const check = (response: WorkflowControlResult) =>
-          assert.equal(decodeLegacyWorkflowResult(response).protocol, publishing ? 7 : 6);
+          assert.equal(decodeWorkflowResult(response).protocol, 9);
         check(yield* runner.handle(control("status")));
         check(yield* runner.handle(request()));
         yield* h.complete;
@@ -3426,7 +3447,7 @@ it.effect.each([false, true])(
             ...control("status"),
             origin: { kind: "manual", userId: "user-1" },
           })).protocol,
-          8,
+          9,
         );
         check(yield* runner.handle(control("cancel")));
       }),

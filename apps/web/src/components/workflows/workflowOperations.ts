@@ -16,6 +16,7 @@ import {
   WorkflowConflictError,
   WorkflowInvalidError,
   SaveRepositoryWorkflow,
+  WorkflowTarget,
   type RepositoryWorkflow,
   type WorkflowCatalog,
   type RepositoryWorkflowJob,
@@ -55,6 +56,7 @@ type SaveOptions = {
   readonly read: () => Promise<WorkflowCatalog>;
 };
 type SaveOperation = NonNullable<WorkflowEditorDraft["operation"]>;
+const sameWorkflowTarget = Schema.toEquivalence(WorkflowTarget);
 
 export function assertWorkflowSaveSupport(operation: SaveOperation, catalog?: WorkflowCatalog) {
   if (typeof operation.includesAutomation !== "boolean")
@@ -87,9 +89,7 @@ export function applyWorkflowSaveReceipt(
     workflowDraftAutomation(current),
     operation.automation,
   );
-  const sameTarget =
-    current.definition.environmentId === operation.definition.environmentId &&
-    current.definition.projectId === operation.definition.projectId;
+  const sameTarget = sameWorkflowTarget(current.definition.target, operation.definition.target);
   return {
     ...current,
     ...(sameWorkflowDefinition(current.definition, operation.definition)

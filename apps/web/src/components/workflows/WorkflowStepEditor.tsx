@@ -280,14 +280,14 @@ export function WorkflowStepEditor({
 }
 
 export function useWorkflowEditorModels(definition: WorkflowDefinition) {
+  const target = definition.target;
+  if (target.kind !== "machine") throw new Error("VM workflow editing is not available yet.");
   const { environments } = useEnvironments();
-  const environment = environments.find(
-    (entry) => entry.environmentId === definition.environmentId,
-  );
-  const settings = useEnvironmentSettings(definition.environmentId);
+  const environment = environments.find((entry) => entry.environmentId === target.environmentId);
+  const settings = useEnvironmentSettings(target.environmentId);
   const project = useProject({
-    environmentId: definition.environmentId,
-    projectId: definition.projectId,
+    environmentId: target.environmentId,
+    projectId: target.projectId,
   });
   return workflowModelState(
     definition,

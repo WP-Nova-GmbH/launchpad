@@ -6,6 +6,7 @@ export * as CodexVmSignIn from "./codexVmSignIn.ts";
 export * as ManagedRelayTenancy from "./managedRelayTenancy.ts";
 export * from "./managedRelayState.ts";
 export * from "./threadVmPolicyForm.ts";
+export * as WorkflowVmPolicy from "./workflowVmPolicy.ts";
 
 export type {
   ManagedRelayAccessTokenScopesUnexpectedError,

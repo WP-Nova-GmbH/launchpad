@@ -109,6 +109,7 @@ CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_
               "20261015151148_workflow_origin",
               "20261016074602_workflow_events",
               "20261019163246_workflow_automatic_starts",
+              "20261102170843_workflow_execution_foundation",
             ].map(
               (name) =>
                 new URL(`../../migrations/postgres/${name}/migration.sql`, import.meta.url)
@@ -116,8 +117,16 @@ CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_
             ),
           ]) {
             const migration = yield* fs.readFileString(file);
-            for (const statement of migration.split("--> statement-breakpoint"))
+            for (const statement of migration.split("--> statement-breakpoint")) {
+              // This source harness has no VM tables. Execute the actual current
+              // workflow DDL; the complete migration chain has its own parity proof.
+              if (
+                file.includes("workflow_execution_foundation") &&
+                statement.includes("relay_thread_")
+              )
+                continue;
               if (statement.trim()) yield* sql.unsafe(statement);
+            }
           }
           yield* sql`INSERT INTO relay_organizations(organization_id,name) VALUES ('org','Organization'),('other-org','Other')`;
           yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role) VALUES ('org','owner','member'),('org','maintainer','member'),('org','reader','member'),('org','admin','admin'),('other-org','outsider','admin')`;

@@ -2,7 +2,7 @@ import { act, createElement } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import type { WorkflowJobPage } from "@t3tools/contracts/workflows";
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 
 const fixture = vi.hoisted(() => ({
@@ -28,7 +28,11 @@ const row = (jobId: string) => ({
   jobId,
   repositoryId: "repo",
   workflowId: "workflow",
-  environmentId: EnvironmentId.make("env"),
+  runtime: {
+    kind: "machine" as const,
+    environmentId: EnvironmentId.make("env"),
+    projectId: ProjectId.make("project"),
+  },
   instruction: jobId,
   status: "running" as const,
   detail: null,

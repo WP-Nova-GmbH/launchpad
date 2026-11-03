@@ -37,7 +37,7 @@ export function makeThreadVmRestoreImportStore(
           operationId: string;
         }>`SELECT r.operation_id AS "operationId" FROM relay_thread_vm_restores r
         JOIN relay_thread_placements t USING(thread_id) JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
-        WHERE r.host_id=${hostId} AND r.serving_requested AND r.phase IN ('importing','completed') AND a.state='running' AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1'
+        WHERE r.host_id=${hostId} AND r.serving_requested AND r.phase IN ('importing','completed') AND a.state='running' AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
           AND r.boot_ingress_recovery_claim_id IS NULL AND r.boot_recovery_started_at IS NULL
           AND t.generation=r.target_generation AND (t.operation_id=r.operation_id OR (r.phase='completed' AND t.operation_id IS NULL))
           AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp())
@@ -81,7 +81,7 @@ export function makeThreadVmRestoreImportStore(
           AND b.allocation_id=${row.allocationId} AND b.environment_id=t.environment_id AND b.generation=t.generation AND b.repository_id=t.repository_id
           AND b.revoked_at IS NULL AND e.operation_id=${row.operationId} AND e.installed_at IS NOT NULL AND e.environment_id=b.environment_id
           AND e.credential_id=b.credential_id AND e.environment_public_key=b.environment_public_key AND k.revoked_at IS NULL
-          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${row.bootReceipt?.sandboxId ?? ""} AND a.runtime_protocol='native-v1'
+          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${row.bootReceipt?.sandboxId ?? ""} AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
           AND p.operation_id=${row.operationId} AND p.phase='created' AND p.generation=t.generation
           AND c.state='started' AND c.compute_ref=a.compute_ref FOR SHARE OF b,e,a,p,k,c`;
           if (!binding) return yield* fail();

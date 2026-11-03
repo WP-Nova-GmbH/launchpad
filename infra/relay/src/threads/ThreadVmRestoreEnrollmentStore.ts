@@ -17,7 +17,7 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
       JOIN relay_thread_vm_provisions p ON p.allocation_id=r.allocation_id
       JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
       WHERE r.operation_id=${input.operationId} AND r.allocation_id=${input.allocationId}
-        AND a.runtime_protocol='native-v1'
+        AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
         AND r.thread_id=${input.threadId} AND r.target_generation=${input.generation}
         AND r.serving_requested AND r.phase='booted' AND r.boot_ingress_recovery_claim_id IS NULL AND r.boot_recovery_started_at IS NULL AND t.operation_id=r.operation_id
         AND t.generation=r.target_generation AND p.operation_id=r.operation_id AND p.phase='created'`;
@@ -55,7 +55,7 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
           AND e.environment_id=b.environment_id AND e.credential_id=b.credential_id
           AND e.environment_public_key=b.environment_public_key AND c.revoked_at IS NULL
           AND p.operation_id=${receipt.operationId} AND p.generation=t.generation AND p.phase='created'
-          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND a.runtime_protocol='native-v1'
+          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
           AND b.environment_id<> COALESCE((SELECT environment_id FROM relay_thread_vm_final_saves
             WHERE operation_id=(SELECT saved_disk_operation_id FROM relay_thread_vm_restores WHERE operation_id=${receipt.operationId})),
             (SELECT environment_id FROM relay_thread_vm_backup_recoveries WHERE operation_id=${receipt.operationId}))

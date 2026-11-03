@@ -14,6 +14,52 @@ import { relayProtectedErrorMessage } from "./errorPresentation.ts";
 const decodeVmCreateRequest = Schema.decodeUnknownSync(RelayThreadVmCreateRequest);
 
 describe("thread VM policy client", () => {
+  it.effect("uses the independent authenticated workflow limit endpoint and revision", () => {
+    const calls: Array<{ path: string; method: string; authorization: string | null }> = [];
+    const initial = { organizationId: "org-test", revision: 3, maxRunningVms: 10 };
+    return Effect.gen(function* () {
+      const client = yield* ManagedRelayTenancyClient;
+      expect(yield* client.getWorkflowVmPolicy({ clerkToken: "workflow-token" })).toEqual(initial);
+      expect(
+        yield* client.updateWorkflowVmPolicy({
+          clerkToken: "workflow-token",
+          payload: { ...initial, maxRunningVms: 0 },
+        }),
+      ).toEqual({ ...initial, revision: 4, maxRunningVms: 0 });
+      expect(calls).toEqual([
+        {
+          path: "/v1/organization/workflow-vm-policy",
+          method: "GET",
+          authorization: "Bearer workflow-token",
+        },
+        {
+          path: "/v1/organization/workflow-vm-policy",
+          method: "PUT",
+          authorization: "Bearer workflow-token",
+        },
+      ]);
+    }).pipe(
+      Effect.provide(
+        layer({ relayUrl: "https://relay.example.test" }).pipe(
+          Layer.provide(
+            remoteHttpClientLayer(async (input, init) => {
+              const request = new Request(input, init);
+              calls.push({
+                path: new URL(request.url).pathname,
+                method: request.method,
+                authorization: request.headers.get("authorization"),
+              });
+              if (request.method === "PUT") {
+                expect(await request.json()).toEqual({ ...initial, maxRunningVms: 0 });
+                return Response.json({ ...initial, revision: 4, maxRunningVms: 0 });
+              }
+              return Response.json(initial);
+            }),
+          ),
+        ),
+      ),
+    );
+  });
   it.effect("carries authentication and the policy revision through the shared client", () => {
     const calls: Array<{ url: string; method: string; authorization: string | null }> = [];
     const policy = { organizationId: "org-test", revision: 2, policy: DEFAULT_THREAD_VM_POLICY };
@@ -704,7 +750,7 @@ it.effect(
         jobId: "job-1",
         repositoryId: "repo-1",
         workflowId: "workflow-1",
-        environmentId: "env-1",
+        runtime: { kind: "machine", environmentId: "env-1", projectId: "project-1" },
         instruction: "Fix issue",
         status: "paused",
         detail: "Setup failed",

@@ -35,7 +35,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
       a.thread_id AS "threadId", a.template_id AS "templateId", a.compute_ref AS "computeRef", a.state AS "allocationState",
       p.phase, p.claim_id AS "claimId", p.ingress_recovery_claim_id AS "ingressRecoveryClaimId", p.error_code AS "errorCode"
       FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
-      WHERE a.runtime_protocol='native-v1' AND p.allocation_id = ${allocationId}`;
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND p.allocation_id = ${allocationId}`;
     return row ?? null;
   });
   const enqueue = Effect.fn("relay.thread_vm_provision.enqueue")(function* (input: {
@@ -48,7 +48,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
       Effect.gen(function* () {
         const [allocation] = yield* sql<{
           state: string;
-        }>`SELECT state FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
+        }>`SELECT state FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' AND resource_kind='personal' FOR UPDATE`;
         if (!allocation) return yield* conflict("Reserve the VM allocation before provisioning");
         const prior = yield* get(input.allocationId);
         if (prior) {
@@ -80,7 +80,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         }>`SELECT p.allocation_id AS "allocationId" FROM relay_thread_vm_provisions p
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id = p.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND p.phase IN ('pending', 'creating') AND p.retry_at <= clock_timestamp()
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND p.phase IN ('pending', 'creating') AND p.retry_at <= clock_timestamp()
         AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
         AND p.ingress_recovery_claim_id IS NULL
         AND (c.state IN ('reserved', 'started') OR a.state = 'deleting')
@@ -95,7 +95,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
   const locked = Effect.fnUntraced(function* (input: { allocationId: string; claimId: string }) {
     // All writers take allocation then operation, including cancellation and late create receipts.
     const [allocation] =
-      yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
+      yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' AND resource_kind='personal' FOR UPDATE`;
     if (!allocation)
       return yield* conflict(
         "This VM belongs to an earlier runtime and requires manual migration.",
@@ -306,7 +306,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         LEFT JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND e.installed_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND e.installed_at IS NULL
           AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
         ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
         if (!candidate) return null;
@@ -364,7 +364,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
       JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
       JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
       JOIN relay_thread_vm_setups s ON s.allocation_id = p.allocation_id
-      WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
       AND e.installed_at IS NOT NULL AND s.phase IN ('pending','running')
       AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
       ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
@@ -387,7 +387,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         JOIN relay_thread_vm_setups s ON s.allocation_id = p.allocation_id
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-        WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
         AND p.generation=1 AND s.phase = 'ready' AND s.receipt_sha256 IS NOT NULL
         AND t.environment_id = s.environment_id AND t.generation = p.generation AND t.operation_id IS NULL
         AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
@@ -416,7 +416,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
           JOIN relay_thread_vm_bindings b ON b.allocation_id=p.allocation_id
           JOIN relay_environment_credentials k ON k.credential_id=b.credential_id
           JOIN relay_thread_move_artifacts r ON r.operation_id=m.operation_id
-        WHERE a.runtime_protocol='native-v1' AND c.host_id=${hostId} AND p.phase='created' AND a.state='running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id=${hostId} AND p.phase='created' AND a.state='running' AND a.deleted_at IS NULL
           AND e.installed_at IS NOT NULL AND b.revoked_at IS NULL AND k.revoked_at IS NULL
           AND b.environment_id=m.destination_environment_id AND b.generation=p.generation
           AND ((m.phase IN ('frozen','ready') AND t.operation_id=m.operation_id AND t.generation=m.expected_generation)

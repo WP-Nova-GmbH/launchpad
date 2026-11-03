@@ -75,8 +75,11 @@ const overview = vi.fn();
 async function mountCanvas() {
   const definition = {
     name: "Zoom example",
-    environmentId: EnvironmentId.make("environment"),
-    projectId: ProjectId.make("project"),
+    target: {
+      kind: "machine" as const,
+      environmentId: EnvironmentId.make("environment"),
+      projectId: ProjectId.make("project"),
+    },
     steps: [first, second, last],
   };
   await act(() => {
@@ -203,8 +206,11 @@ function ScrollHarness({
   }, [steps, selection]);
   const definition = {
     name: "Long workflow",
-    environmentId: EnvironmentId.make("environment"),
-    projectId: ProjectId.make("project"),
+    target: {
+      kind: "machine" as const,
+      environmentId: EnvironmentId.make("environment"),
+      projectId: ProjectId.make("project"),
+    },
     steps,
   };
   return (

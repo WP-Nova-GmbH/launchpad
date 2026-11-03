@@ -1,7 +1,7 @@
 import { act, createElement, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer, type ReactTestRendererJSON } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
@@ -46,7 +46,11 @@ const job: RepositoryWorkflowJob = {
   jobId: "job",
   repositoryId: "repo",
   workflowId: "workflow",
-  environmentId: EnvironmentId.make("original"),
+  runtime: {
+    kind: "machine",
+    environmentId: EnvironmentId.make("original"),
+    projectId: ProjectId.make("project"),
+  },
   instruction: "Implement",
   status: "done",
   detail: null,
@@ -156,7 +160,7 @@ describe("workflow result location navigation", () => {
     );
     await press("Open conversation");
     expect(fixture.navigate).toHaveBeenCalledTimes(2);
-    expect(job.environmentId).toBe("original");
+    expect(job.runtime).toMatchObject({ kind: "machine", environmentId: "original" });
   });
   it("keeps a failed location lookup visible and retries without opening a stale route", async () => {
     fixture.open.mockRejectedValueOnce(new Error("Location unavailable"));

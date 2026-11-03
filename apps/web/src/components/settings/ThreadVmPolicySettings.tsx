@@ -20,13 +20,26 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
+import { WorkflowVmPolicySettings } from "./WorkflowVmPolicySettings";
 
-export function ThreadVmPolicySettings({ isAdmin }: { readonly isAdmin: boolean }) {
+export function ThreadVmPolicySettings({
+  isAdmin,
+  organizationId,
+}: {
+  readonly isAdmin: boolean;
+  readonly organizationId: string;
+}) {
   const { userId } = useAuth();
-  return <ThreadVmPolicyEditor key={userId} isAdmin={isAdmin} />;
+  return <ThreadVmPolicyEditor key={userId} isAdmin={isAdmin} organizationId={organizationId} />;
 }
 
-function ThreadVmPolicyEditor({ isAdmin }: { readonly isAdmin: boolean }) {
+function ThreadVmPolicyEditor({
+  isAdmin,
+  organizationId,
+}: {
+  readonly isAdmin: boolean;
+  readonly organizationId: string;
+}) {
   const { getToken } = useAuth();
   const [capabilities, setCapabilities] = useState<ThreadVmCapabilities | null>(null);
   const [record, setRecord] = useState<ThreadVmPolicyRecord | null>(null);
@@ -217,6 +230,7 @@ function ThreadVmPolicyEditor({ isAdmin }: { readonly isAdmin: boolean }) {
           Reload policy
         </Button>
       </div>
+      <WorkflowVmPolicySettings organizationId={organizationId} />
     </SettingsSection>
   );
 }

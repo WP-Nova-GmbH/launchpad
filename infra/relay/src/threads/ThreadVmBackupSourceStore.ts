@@ -34,7 +34,7 @@ export function makeThreadVmBackupSourceStore(
       (a.state='running' AND x.phase IN ('verified','failed','retiring','retired')) AS "canActivate",x.source_reopened_at IS NOT NULL AS "sourceReopened"
       FROM relay_thread_vm_backups x JOIN relay_thread_vm_allocations a USING(allocation_id)
       JOIN relay_thread_vm_bindings b USING(allocation_id) JOIN relay_thread_placements t ON t.thread_id=a.thread_id
-      WHERE a.runtime_protocol='native-v1' AND a.thread_id=${owner.threadId} AND b.environment_id=${owner.environmentId} AND x.generation=${owner.generation}
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.thread_id=${owner.threadId} AND b.environment_id=${owner.environmentId} AND x.generation=${owner.generation}
         AND b.generation=x.generation AND b.revoked_at IS NULL AND t.environment_id=b.environment_id AND t.generation=x.generation
         AND t.operation_id IS NULL AND a.deleted_at IS NULL
         AND (x.phase='pending' OR x.source_receipt IS NOT NULL OR (x.phase='failed' AND x.capture_started_at IS NULL))
@@ -73,7 +73,7 @@ export function makeThreadVmBackupSourceStore(
         }>`
         SELECT a.allocation_id AS "allocationId",a.compute_ref AS "computeRef",p.operation_id AS "provisionOperationId"
         FROM relay_thread_vm_allocations a JOIN relay_thread_vm_provisions p USING(allocation_id)
-        WHERE a.runtime_protocol='native-v1' AND a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
           AND a.compute_ref IS NOT NULL AND p.phase='created' AND p.generation=${input.generation} FOR UPDATE OF a`;
         const point = yield* natives.get(input.nativeCheckpointOperationId);
         if (

@@ -60,7 +60,7 @@ export function makeThreadVmRestoreServingStore(
         JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
         WHERE r.host_id=${hostId} AND r.serving_requested AND r.prepared_receipt->>'kind'='native-restore-catalog-v1'
-          AND a.runtime_protocol='native-v1'
+          AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
           AND (r.phase IN ('prepared','committed','creating','bootstrapping') OR
             (r.phase='aborting' AND r.committed_at IS NOT NULL) OR
             (r.phase='booted' AND (r.boot_recovery_started_at IS NOT NULL OR r.error_code IS NOT NULL OR

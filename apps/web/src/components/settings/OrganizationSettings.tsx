@@ -1624,7 +1624,10 @@ function ConfiguredOrganizationSettings() {
           <SkillsSection state={state} />
           <RepositoriesSection state={state} />
           {state.snapshot ? (
-            <ThreadVmPolicySettings isAdmin={state.snapshot.membership.role === "admin"} />
+            <ThreadVmPolicySettings
+              isAdmin={state.snapshot.membership.role === "admin"}
+              organizationId={state.snapshot.membership.organization.organizationId}
+            />
           ) : null}
           <MachinesSection state={state} />
         </>

@@ -115,6 +115,7 @@ describe("relay health VM capability", () => {
             service: "relay",
             threadTransferFormats: ["launchpad-thread-chunks-v1", "launchpad-thread-chunks-v2"],
             threadVmConfigured: testCase.settings !== undefined,
+            workflowVmCapabilities: { configuration: true, execution: false },
             threadVmCapabilities: {
               configured: testCase.settings !== undefined,
               autoPause: testCase.settings?.autoPauseEnabled ?? false,

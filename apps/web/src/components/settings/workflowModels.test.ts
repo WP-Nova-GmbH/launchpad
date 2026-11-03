@@ -15,8 +15,11 @@ const instanceId = ProviderInstanceId.make("codex_work");
 const selection = { instanceId, model: "custom-a" };
 const definition: WorkflowDefinition = {
   name: "Workflow",
-  environmentId: EnvironmentId.make("environment-a"),
-  projectId: ProjectId.make("project"),
+  target: {
+    kind: "machine" as const,
+    environmentId: EnvironmentId.make("environment-a"),
+    projectId: ProjectId.make("project"),
+  },
   steps: [
     { id: "first", kind: "agent", title: "First", instruction: "Work", modelSelection: selection },
     {
@@ -75,7 +78,14 @@ describe("workflow target model choices", () => {
       "custom-a",
     ]);
     const targetB = workflowModelState(
-      { ...definition, environmentId: EnvironmentId.make("environment-b") },
+      {
+        ...definition,
+        target: {
+          kind: "machine",
+          environmentId: EnvironmentId.make("environment-b"),
+          projectId: ProjectId.make("project"),
+        },
+      },
       providers,
       settings("custom-b"),
       null,

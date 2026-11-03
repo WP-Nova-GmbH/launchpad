@@ -52,7 +52,7 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
         JOIN relay_thread_vm_allocations a USING(allocation_id)
         JOIN relay_thread_placements t ON t.thread_id=a.thread_id
         JOIN relay_thread_vm_bindings b USING(allocation_id)
-        WHERE a.runtime_protocol='native-v1' AND a.state='paused' AND a.deleted_at IS NULL AND v.idle_since IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.state='paused' AND a.deleted_at IS NULL AND v.idle_since IS NULL
           AND x.phase='completed' AND x.generation=t.generation AND b.generation=t.generation
           AND b.environment_id=t.environment_id AND b.revoked_at IS NULL AND t.operation_id IS NULL
           AND x.native_checkpoint_operation_id IS NOT NULL AND x.source_frozen_at IS NOT NULL
@@ -82,7 +82,7 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
       LEFT JOIN relay_thread_vm_activity v ON v.allocation_id = a.allocation_id
-      WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND a.state = 'running' AND a.compute_ref IS NOT NULL
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND a.state = 'running' AND a.compute_ref IS NOT NULL
         AND a.deleted_at IS NULL AND p.phase = 'created' AND s.phase = 'ready'
         AND b.revoked_at IS NULL AND b.generation = p.generation
         AND t.environment_id = b.environment_id AND t.generation = p.generation
@@ -130,7 +130,7 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-      WHERE a.runtime_protocol='native-v1' AND a.allocation_id = ${row.allocationId} AND a.compute_ref = ${row.computeRef}
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id = ${row.allocationId} AND a.compute_ref = ${row.computeRef}
         AND a.state = 'running' AND a.deleted_at IS NULL AND p.operation_id = ${row.operationId}
         AND p.generation = ${row.generation} AND b.generation = p.generation
         AND b.revoked_at IS NULL AND t.environment_id = b.environment_id

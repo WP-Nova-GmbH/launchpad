@@ -2,6 +2,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
+  WORKFLOW_PROTOCOL,
   WorkflowInvalidError,
   type SaveRepositoryWorkflow,
   type RepositoryWorkflow,
@@ -24,6 +25,9 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
   input: typeof SaveRepositoryWorkflow.Type,
   previous: RepositoryWorkflow | null,
 ) {
+  if (input.definition.target.kind !== "machine")
+    return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
+  const target = input.definition.target;
   const next = Routing.automation(
     input.automation === undefined ? previous?.automation : input.automation,
   );
@@ -91,7 +95,7 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
     .dispatchJob({
       userId: user,
       workflowOrigin: { kind: "manual", userId: user },
-      environmentId: input.definition.environmentId,
+      environmentId: target.environmentId,
       jobId: RelayJobId.make(`probe-${probeId}`),
       repositoryCanonicalKey: canonicalKey,
       baseBranch: "HEAD",
@@ -100,7 +104,7 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
         operation: "status",
         organizationId: org,
         repositoryId: repo,
-        projectId: input.definition.projectId,
+        projectId: target.projectId,
       },
     })
     .pipe(
@@ -113,7 +117,7 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
     );
   if (
     !response.workflowResult ||
-    response.workflowResult.protocol < 8 ||
+    response.workflowResult.protocol < WORKFLOW_PROTOCOL ||
     input.definition.steps.some(
       (s) => s.kind === "action" && !response.workflowResult?.actions?.includes(s.action),
     )

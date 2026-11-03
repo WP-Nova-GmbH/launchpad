@@ -247,6 +247,8 @@ export const saveRepositoryWorkflow = Effect.fn("WorkflowsApi.save")(function* (
   payload: typeof import("@t3tools/contracts/workflows").SaveRepositoryWorkflow.Type,
 ) {
   const membership = yield* authorizeWorkflowRepository(repositoryId, true);
+  if (payload.definition.target.kind !== "machine")
+    return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
   const store = yield* Workflows;
   const previous = yield* store.get(payload.workflowId);
   const saveContext = yield* prepareAutomationSave(
@@ -307,7 +309,7 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
             jobId: record.jobId,
             repositoryId: record.repositoryId,
             workflowId: record.workflowId,
-            environmentId: record.environmentId,
+            runtime: record.runtime,
             instruction: record.instruction.slice(0, 280),
             status: record.status,
             detail: record.detail?.slice(0, 500) ?? null,
@@ -348,7 +350,7 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
           jobId,
           repositoryId: params.repositoryId,
           workflowId: workflow.workflowId,
-          environmentId: workflow.definition.environmentId,
+          runtime: null,
           instruction: payload.instruction,
           status: "queued" as const,
           detail: null,

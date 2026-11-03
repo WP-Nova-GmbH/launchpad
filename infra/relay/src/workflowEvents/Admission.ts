@@ -2,7 +2,11 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
-import { RepositoryWorkflow, RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_PROTOCOL,
+  RepositoryWorkflow,
+  RepositoryWorkflowJob,
+} from "@t3tools/contracts/workflows";
 import { RelayDb } from "../db.ts";
 import { relayWorkflowJobs, relayWorkflowAdmissions } from "../persistence/schema.ts";
 import * as Sources from "../workflowSources/Store.ts";
@@ -178,6 +182,7 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
             !automation?.enabled ||
             !trigger ||
             flow.archived ||
+            flow.definition.target.kind !== "machine" ||
             !matches(trigger, event)
           )
             continue;
@@ -221,7 +226,7 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
             jobId,
             repositoryId: row.repository_id,
             workflowId: flow.workflowId,
-            environmentId: flow.definition.environmentId,
+            runtime: null,
             origin: {
               kind: "automation",
               organizationId: flow.organizationId,
@@ -237,7 +242,7 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
               occurrenceId,
             },
             event: event.facts,
-            requiredProtocol: 8,
+            requiredProtocol: WORKFLOW_PROTOCOL,
             instruction: `${event.facts.identifier}: ${event.facts.title}\nAwaiting issue context before starting.`,
             status: "queued",
             detail: "Waiting for the selected environment to start this workflow.",

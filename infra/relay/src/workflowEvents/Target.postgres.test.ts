@@ -40,7 +40,7 @@ const hold = Effect.fn(function* <A, E, R>(operation: Effect.Effect<A, E, R>) {
   return { fiber, release };
 });
 const project = {
-  projectId: definition.projectId,
+  projectId: definition.target.projectId,
   title: "Repository",
   repositoryCanonicalKey: "github.com/example/repository",
   createdAt: "2026-10-01T00:00:00.000Z",

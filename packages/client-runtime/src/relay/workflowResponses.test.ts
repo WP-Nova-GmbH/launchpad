@@ -1,4 +1,4 @@
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WorkflowJobProgress, RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
 import { describe, expect, it } from "vite-plus/test";
 import {
@@ -126,7 +126,11 @@ const manualJob = (): RepositoryWorkflowJob => ({
   jobId: "job",
   repositoryId: "repo",
   workflowId: "flow",
-  environmentId: EnvironmentId.make("env"),
+  runtime: {
+    kind: "machine",
+    environmentId: EnvironmentId.make("env"),
+    projectId: ProjectId.make("project"),
+  },
   instruction: "work",
   status: "running",
   detail: null,

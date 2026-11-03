@@ -175,6 +175,8 @@ function WorkflowBuilderEditor({
   }, [isNew, id, draft?.baseline, active, scope, key, navigate]);
   if (!canConfigure)
     return <p>Repository maintainers and organization admins can configure workflows.</p>;
+  if (draft?.definition.target.kind === "vm")
+    return <p>VM workflow editing is not available yet.</p>;
   if (!draft)
     return (
       <p className="text-sm text-muted-foreground">
@@ -595,10 +597,10 @@ function WorkflowBuilderWorkspace({
   const returnFocus = useRef<HTMLElement | null>(null);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
   const panelOpen = triggerOpen || settingsOpen || !!selected;
+  const machine = draft.definition.target.kind === "machine" ? draft.definition.target : null;
   const target = projects.find(
     (project) =>
-      project.environmentId === draft.definition.environmentId &&
-      project.projectId === draft.definition.projectId,
+      project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
   const targetLabel = draft.targetConfirmed
     ? target
@@ -820,8 +822,8 @@ function WorkflowBuilderWorkspace({
           <p className="text-sm">Execution target</p>
           <Select
             value={
-              draft.targetConfirmed
-                ? `${draft.definition.environmentId}:${draft.definition.projectId}`
+              draft.targetConfirmed && draft.definition.target.kind === "machine"
+                ? `${draft.definition.target.environmentId}:${draft.definition.target.projectId}`
                 : null
             }
             onValueChange={(value) => {
@@ -834,8 +836,11 @@ function WorkflowBuilderWorkspace({
                   targetConfirmed: true,
                   definition: {
                     ...current.definition,
-                    environmentId: next.environmentId,
-                    projectId: next.projectId,
+                    target: {
+                      kind: "machine",
+                      environmentId: next.environmentId,
+                      projectId: next.projectId,
+                    },
                   },
                 }));
             }}
